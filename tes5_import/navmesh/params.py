@@ -237,10 +237,15 @@ RIBBON_GROW_SLAB_HALF_WIDTH = 20.0
 # of depth give the ribbon a small standoff from furniture instead of pressing
 # right against the bed frames, and cost nothing at a wall.
 RIBBON_GROW_SLAB_DEPTH = 6.0
-# The slab starts slightly ABOVE the floor so the floor's own collision (and a
-# threshold lip or a stair tread) is not read as a wall, and rises to
-# AGENT_HEIGHT so anything an actor's body would hit stops the growth.
-RIBBON_GROW_SLAB_Z_BOTTOM = 12.0
+# The slab starts above the floor so collision the actor simply STEPS ONTO is
+# not read as a wall, and rises to AGENT_HEIGHT so anything the actor's body
+# would hit stops the growth.  The floor is MAX_CLIMB: a step, curb, or stair
+# tread whose top is within one climb of the floor is walkable, so its riser
+# face must be ignored — otherwise a 20u curb across a passable route (the Anvil
+# main-gate ramp, the center-circle steps) walls the corridor shut and splits
+# the navmesh into disconnected islands.  A real wall extends far above
+# MAX_CLIMB and is still caught by the band above it.
+RIBBON_GROW_SLAB_Z_BOTTOM = MAX_CLIMB
 # Bisection rounds used to place the stop exactly at the wall once the swept
 # step has detected one.  4 rounds resolve an 8u step to 0.5u.
 RIBBON_GROW_BISECT = 4
