@@ -120,7 +120,7 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
     # property bindings and GLOB records written into the ESM.
     from tes5_import.dialog_unlocks import build_unlock_plan
     by_type = {}
-    for sig in ('DIAL', 'INFO', 'QUST'):
+    for sig in ('DIAL', 'INFO', 'QUST', 'SCPT'):
         path = os.path.join(export_dir, f'{sig}.txt')
         by_type[sig] = parse_export_file(path) if os.path.exists(path) else []
     unlock_plan = build_unlock_plan(by_type)

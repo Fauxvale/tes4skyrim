@@ -65,11 +65,13 @@ from .dialog_conditions import (
     FUNC_GET_QUEST_RUNNING,
     build_ctda,
     build_or_chain,
+    convert_ctda,
     convert_ctda_list_with_strings,
     has_any_conditions,
     has_audience_condition,
     read_func_param_fids,
     read_getisid_fids,
+    shared_state_conditions,
 )
 
 _PLAYER_FORMID = 0x14
@@ -1826,9 +1828,17 @@ def _build_one_topic(dial_rec, info_by_dial, writer, offset,
         # greeting bark can't hold a menu, so the engine surfaces the response
         # as a top-level topic once the bark's TCLT points at it; a Normal
         # branch there leaves the player with the line but no way to select it.
+        # A topic AddTopic'd from a SCRIPT counts as "explicitly added" for this
+        # rule even though it is never gated (nothing in Skyrim can open such a
+        # gate — see dialog_unlocks). Oblivion's Startup script adds the
+        # globally-available topics, and INFOGENERAL ("Rumors") is also a TCLT
+        # target 472 times; without this it was judged choice-only and vanished
+        # from every topic menu.
         is_linked = (dial_fid in tclt_targets
                      and dial_fid not in bark_choice_targets
-                     and (dial_fid & 0xFFFFFF) not in unlock_plan['gated'])
+                     and (dial_fid & 0xFFFFFF) not in unlock_plan['gated']
+                     and (dial_fid & 0xFFFFFF)
+                     not in unlock_plan.get('script_added', ()))
         dlbr_fid = writer.alloc_formid()
         dlbr_edid = (f'TES4_{edid}_Branch' if edid
                      else f'TES4_DLBR_{dlbr_fid:08X}')
@@ -1868,11 +1878,28 @@ def _build_one_topic(dial_rec, info_by_dial, writer, offset,
     bark_choice_gate_bytes = _bark_choice_gate_bytes(
         bark_choice_gate.get(dial_fid, []))
 
+    # A conditionless line in a topic whose every other line shares a world-
+    # state gate inherits that gate. Oblivion could leave the line loose because
+    # the TOPIC was AddTopic-gated; Skyrim has no such implicit scoping, so the
+    # loose line would keep the topic alive forever (see shared_state_conditions).
+    shared_state_bytes = b''
+    if not is_bark and not service_kind:
+        parts = []
+        for raw_hex in shared_state_conditions(child_infos):
+            try:
+                ctda = convert_ctda(bytes.fromhex(raw_hex), offset)
+            except (ValueError, struct.error):
+                continue
+            if ctda is not None:
+                parts.append(pack_subrecord('CTDA', ctda))
+        shared_state_bytes = b''.join(parts)
+
     # Shared context passed to the per-INFO converter.
     info_ctx = dict(
         is_bark=is_bark, npc_to_vtyp=npc_to_vtyp, topic_vtyps=topic_vtyps,
         topic_npc_fids=topic_npc_fids, service_gate_bytes=service_gate_bytes,
         unlock_gate_bytes=unlock_gate_bytes,
+        shared_state_bytes=shared_state_bytes,
         bark_choice_gate_bytes=bark_choice_gate_bytes, service_kind=service_kind,
         orig_quest_fid=orig_quest_fid, sge_quest_fids=sge_quest_fids,
         offset=offset, unlock_plan=unlock_plan,
@@ -1956,7 +1983,8 @@ def _convert_topic_infos(child_infos, owner_qfid, ctx):
                 + bc_gate,
                 ctx['unlock_gate_bytes'], ctx['offset'], ctx['stats'],
                 sibling_factions=ctx.get('sibling_factions'),
-                sibling_npcs=ctx.get('sibling_npcs'))
+                sibling_npcs=ctx.get('sibling_npcs'),
+                shared_state_bytes=ctx.get('shared_state_bytes', b''))
             # Revealer INFO: its OnEnd fragment sets the unlock globals; bind
             # each global name -> GLOB FormID as a VMAD property.
             reveal_names = ctx['unlock_plan']['info_reveals'].get(
@@ -2201,7 +2229,7 @@ def _build_service_fallback_info(writer, service_kind: str,
 def _build_injected_ctdas(info_rec, is_bark, npc_to_vtyp, topic_vtyps,
                           topic_npc_fids, quest_gate_bytes, unlock_gate_bytes,
                           offset, stats, sibling_factions=None,
-                          sibling_npcs=None):
+                          sibling_npcs=None, shared_state_bytes=b''):
     """Build the Skyrim-required gates for one INFO, ordered for OR-chain safety.
 
     Order (outermost AND first): [quest-running gate] [AddTopic unlock gate]
@@ -2250,10 +2278,19 @@ def _build_injected_ctdas(info_rec, is_bark, npc_to_vtyp, topic_vtyps,
             sib_bytes = build_or_chain(FUNC_GET_IS_ID, sorted(sibling_npcs))
             stats['sibling_gated'] += 1
 
+    # Inherited topic state gate for a CONDITIONLESS conversation line (see
+    # shared_state_conditions). Only when the line states nothing of its own —
+    # a line with conditions already knows when it applies.
+    state_bytes = b''
+    if (not is_bark and shared_state_bytes
+            and not has_any_conditions(info_rec)):
+        state_bytes = shared_state_bytes
+        stats['shared_state_gated'] = stats.get('shared_state_gated', 0) + 1
+
     if unlock_gate_bytes:
         stats['unlock_gated'] += 1
     if quest_gate_bytes:
         stats['quest_gated'] += 1
 
-    return (quest_gate_bytes + unlock_gate_bytes + voice_bytes + id_bytes
-            + sib_bytes)
+    return (quest_gate_bytes + unlock_gate_bytes + state_bytes + voice_bytes
+            + id_bytes + sib_bytes)

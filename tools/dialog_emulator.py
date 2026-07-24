@@ -710,9 +710,14 @@ class ConditionEvaluator:
             elif func == FUNC_GETRANDOMPERC:
                 return self._compare(50.0, comp, cv)  # Mid-range
             elif func == FUNC_GETINFACTION:
-                return self._compare(0.0, comp, cv)  # Player not in NPC factions
+                # Player factions are modelled via --player-faction so that
+                # guild-membership-gated dialogue (join/contract flows) can be
+                # reproduced faithfully; default is "not a member".
+                pf = self.game_state.get('player_factions', {})
+                return self._compare(1.0 if p1 in pf else 0.0, comp, cv)
             elif func == FUNC_GETFACTIONRANK:
-                return self._compare(-1.0, comp, cv)  # Not in faction
+                pf = self.game_state.get('player_factions', {})
+                return self._compare(float(pf.get(p1, -1)), comp, cv)
             elif func == FUNC_GETDEAD:
                 return self._compare(0.0, comp, cv)  # Player alive
             elif func == FUNC_GETLEVEL:
@@ -798,7 +803,11 @@ class ConditionEvaluator:
         elif func == 53:  # GetScriptVariable
             actual = 0.0  # Script variables never set
         elif func == FUNC_GETTALKEDTOPC:
-            actual = 0.0  # NPC hasn't talked to player yet
+            # Flips 0->1 the first time the NPC has spoken to the player, and
+            # stays 1 for the rest of the session — the ONE piece of state that
+            # changes between a first and a repeat conversation. Settable via
+            # --talked-to-pc so the "re-enter dialogue" case can be reproduced.
+            actual = 1.0 if self.game_state.get('talked_to_pc') else 0.0
         elif func == FUNC_GETDISEASE:
             actual = 0.0  # No disease
         elif func == FUNC_GETISCLASS:
@@ -1422,7 +1431,7 @@ def batch_test(db: DialogDB, max_npcs: int = 0, verbose: bool = False):
 # ---------------------------------------------------------------------------
 
 def build_game_state(db, stage_args, completed_args, global_args=(),
-                     unlock_all=False, relationship_rank=0):
+                     unlock_all=False, relationship_rank=0, player_faction_args=()):
     """Turn --stage/--completed into the dict ConditionEvaluator reads.
 
     Quests are named by EditorID (or by hex FormID) so that callers do not have
@@ -1485,6 +1494,27 @@ def build_game_state(db, stage_args, completed_args, global_args=(),
                 sys.exit(f'no global named {name!r}')
         state[f'global_{fid}'] = value
         print(f'  game state: global {name} = {value:g} [{fid:08X}]')
+
+    if player_faction_args:
+        fact_by_edid = {edid.lower(): fid for fid, edid in db.facts.items()}
+        player_factions = {}
+        for spec in player_faction_args:
+            name, _, rank_raw = spec.partition(':')
+            try:
+                rank = int(rank_raw) if rank_raw else 0
+            except ValueError:
+                sys.exit(f'--player-faction wants FACTION:RANK, got {spec!r}')
+            fid = fact_by_edid.get(name.lower())
+            if fid is None:
+                try:
+                    fid = int(name, 16)
+                except ValueError:
+                    sys.exit(f'no faction named {name!r}; pass an EditorID or '
+                             'hex FormID')
+            player_factions[fid] = rank
+            print(f'  game state: player in faction {name} rank {rank} '
+                  f'[{fid:08X}]')
+        state['player_factions'] = player_factions
     return state
 
 
@@ -1519,12 +1549,27 @@ def main():
                              '(-4..4, default 0 Acquaintance). This is what '
                              "Oblivion's disposition converts into; it pairs "
                              'with the Oblivion emulator\'s --disposition.')
+    parser.add_argument('--talked-to-pc', action='store_true',
+                        help='Model GetTalkedToPC as 1 (the NPC has already '
+                             'spoken to the player this session). Use to '
+                             'reproduce re-entering dialogue: say-once greetings '
+                             'gated GetTalkedToPC==0 stop firing on the 2nd talk.')
+    parser.add_argument('--player-faction', action='append', metavar='FACTION:RANK',
+                        default=[],
+                        help='Model the player as a member of a faction at RANK, '
+                             'e.g. --player-faction FightersGuild:0. FACTION is an '
+                             'EditorID or hex FormID; RANK defaults to 0 if omitted. '
+                             'Resolves RunOn=Target GetInFaction/GetFactionRank so '
+                             'guild-membership-gated dialogue can be reproduced. '
+                             'Repeatable.')
     args = parser.parse_args()
 
     db = DialogDB(args.esm)
     game_state = build_game_state(db, args.stage, args.completed,
                                   args.globals, args.unlock_all,
-                                  args.relationship_rank)
+                                  args.relationship_rank, args.player_faction)
+    if args.talked_to_pc:
+        game_state['talked_to_pc'] = True
 
     if args.npc:
         sim = DialogSimulator(db, game_state=game_state)

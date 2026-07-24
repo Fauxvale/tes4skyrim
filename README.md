@@ -52,14 +52,22 @@ A decent PC. The more cores and ram the better. The more cores, the more ram it 
 | **[PyFFI](https://pyffi.sourceforge.net/)** | NIF mesh reading/writing | `pip install PyFFI` |
 | **[numpy](https://numpy.org/)** | Skin retargeting math | `pip install numpy` |
 | **[scipy](https://scipy.org/)** | Navmesh triangulation, collision hulls, trees | `pip install scipy` |
+| **[shapely](https://shapely.readthedocs.io/)** | Navmesh corridor boolean union | `pip install shapely` |
 | **[pytest](https://pytest.org/)** | Test runner | `pip install pytest` |
 | **ffmpeg** | Voice/sound audio conversion | On `PATH` |
 | **xWMAEncode.exe** | xWMA voice compression | See note below |
 | **LipGenerator.exe** | Lip sync generation | Install the Creation Kit |
 
 ```bash
-pip install PyFFI numpy scipy pytest
+pip install PyFFI numpy scipy shapely pytest
 ```
+
+> **Navmesh native extensions.** The navmesh build requires two compiled modules,
+> committed prebuilt in `native/dist/` for **CPython 3.14 / 64-bit Windows**. A
+> `.pyd` only loads in a matching interpreter, so on any other Python version or
+> platform rebuild them with `python native/build.py` — that needs "Build Tools
+> for Visual Studio" with the C++ workload (a full Visual Studio install is not
+> required). See `native/dist/README.md`.
 
 > **xWMAEncode.exe** ships with the [Microsoft DirectX SDK (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=6812)
 > and cannot be redistributed. After installing the SDK, find it in `Utilities\bin\x86\`

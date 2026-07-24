@@ -176,6 +176,139 @@ ISLAND_DOOR_ZTOL = 128.0
 # into the next cell" and is kept — its continuation lives in the neighbour
 # cell's navmesh.  ~1.5 exterior cells.
 ISLAND_EDGE_MARGIN = 48.0
+# A component with a mesh vertex within this of a PATHGRID sample carries the
+# walked line and is never dropped as an island — the pathgrid is the one input
+# that asserts an actor walks there.  Sized to the ribbon half-width so a
+# ribbon's own vertices always qualify.
+ISLAND_PGRD_RADIUS = 48.0
+
+# --- Corridor ribbons (Phase 1, corridor.py) --------------------------------------
+# Half-width of the flat ribbon laid down each pathgrid edge.  ~80u total sits
+# inside a standard ~110u Oblivion doorway with clearance for the jambs; wide
+# enough for a Skyrim NPC's path radius.  Phase 2 will grow this out to walls.
+RIBBON_HALF_WIDTH = 40.0
+# Spacing of cross-sections along an edge, so a long edge is several quads and
+# the ribbon can follow the pathgrid line's slope in Z rather than one flat
+# quad bridging the whole span.
+#
+# This ALSO sets how finely the overlap cut is resolved.  A quad between two
+# cross-sections is a straight sheet, but the boundary between two corridors'
+# owned ground bends at every junction, so a long quad paints outside the region
+# it owns.  Measured on AnvilFightersGuild (coverage / double-covered ground):
+#   32u -> 85.7% / 14.9%     16u -> 94.7% / 6.0%     8u -> 97.8% / 4.1%
+# 8u costs more triangles but is the difference between a corridor network that
+# is visibly stacked and one that is not.
+RIBBON_STEP = 8.0
+# How close a door-quad corner must be to a ribbon vertex to weld onto it
+# (share the index, hence a shared edge -> adjacency).  Half a ribbon width:
+# tight enough not to fuse across a real gap, wide enough to catch the strip.
+RIBBON_WELD_EPS = 24.0
+# A dead-end pathgrid node (degree 1) has its ribbon extended this far past the
+# node along the edge direction: the pathgrid ends before the room does, so a
+# corridor that stopped at the last node would leave a gap in front of the wall
+# or door it was heading for.  ~one ribbon half-width reaches the threshold.
+RIBBON_END_EXTEND = 40.0
+
+# --- Corridor width-grow (Phase 2, corridor.py) -----------------------------------
+# Phase 2 replaces the fixed RIBBON_HALF_WIDTH with a per-cross-section, per-side
+# grown half-width: an actor-sized box marches outward perpendicular to the
+# centerline (in the centerline's own flat plane, principle 2) until it either
+# (a) hits blocking collision, (b) reaches the midpoint toward the nearest OTHER
+# pathgrid edge's centerline (so two parallel corridors meet cleanly instead of
+# overrunning), or (c) hits the hard cap.  Overlap that results is resolved by
+# the boolean union (corridor_union), exactly like the fixed-width overlap.
+#
+# Enable/disable the grow.  When False, corridor.py lays the Phase-1 fixed-width
+# rectangle (RIBBON_HALF_WIDTH) — kept as a fallback and for A/B testing.
+RIBBON_GROW = True
+# Step size of the outward march (game units).  Finer = tighter fit to a wall at
+# more cost.  Half the agent radius resolves a doorway jamb without over-sampling.
+RIBBON_GROW_STEP = 8.0
+
+# The probe is a THIN vertical slab, not an agent-radius box: actor HEIGHT and
+# ~actor WIDTH along the edge tangent, but only a sliver DEEP along the march
+# direction.  A fat box stops an agent-radius short of every wall, which
+# narrowed doorways by 24u a side — the navmesh must instead come right up to
+# the collision.  Depth is a sliver so "hit" means the slab genuinely touches
+# the wall at this step, not that a wall is somewhere nearby.
+RIBBON_GROW_SLAB_HALF_WIDTH = 20.0
+# Depth is a sliver so "hit" means the slab genuinely touches collision at this
+# step, not that something is vaguely nearby — but not razor-thin: a few units
+# of depth give the ribbon a small standoff from furniture instead of pressing
+# right against the bed frames, and cost nothing at a wall.
+RIBBON_GROW_SLAB_DEPTH = 6.0
+# The slab starts above the floor so collision the actor simply STEPS ONTO is
+# not read as a wall, and rises to AGENT_HEIGHT so anything the actor's body
+# would hit stops the growth.  The floor is MAX_CLIMB: a step, curb, or stair
+# tread whose top is within one climb of the floor is walkable, so its riser
+# face must be ignored — otherwise a 20u curb across a passable route (the Anvil
+# main-gate ramp, the center-circle steps) walls the corridor shut and splits
+# the navmesh into disconnected islands.  A real wall extends far above
+# MAX_CLIMB and is still caught by the band above it.
+RIBBON_GROW_SLAB_Z_BOTTOM = MAX_CLIMB
+# Bisection rounds used to place the stop exactly at the wall once the swept
+# step has detected one.  4 rounds resolve an 8u step to 0.5u.
+RIBBON_GROW_BISECT = 4
+# Two edges count as opposing parallel corridors only when their directions
+# agree to at least this |dot|.  A crossing/diverging edge is NOT a corridor
+# wall and must not cap width (that pinched every dense junction).
+RIBBON_GROW_PARALLEL_DOT = 0.70
+# An edge steeper than this (rise/run) is a STAIRCASE or ramp and is NOT grown:
+# its ribbon is a tilted plane, so a perpendicular rail leaves the treads at
+# once — off the side of the flight, or through the stairwell wall.  Stairs keep
+# the Phase-1 width, which is what the pathgrid asserts.  0.20 ~ 11 degrees:
+# well above a floor's slop, well below any real flight.
+RIBBON_GROW_MAX_SLOPE = 0.20
+# Douglas-Peucker tolerance applied to each grown RAIL before it becomes the
+# ribbon outline.  The march samples a width every RIBBON_STEP, and the
+# triangulator FORCES every outline corner as a Steiner point — an un-simplified
+# rail therefore seeds a vertex every 8u and fills rooms with sliver fans.  At
+# 12u the rail still hugs a wall it followed, but a straight run collapses to
+# two points and the hex lattice governs the interior.
+RIBBON_RAIL_SIMPLIFY = 12.0
+# Rays in the radial fan grown around each pathgrid NODE.  Ribbons grow only
+# perpendicular to their own edge, so the outer corner where two edges meet at
+# an angle is a notch no ribbon reaches (a right-angle junction leaves a square
+# bite out of the mesh).  16 rays = one every 22.5 deg, enough to resolve a
+# square corner without a fan of near-duplicate boundary points.
+RIBBON_GROW_DISC_RAYS = 16
+
+# --- Decimation (corridor_clean.decimate) ------------------------------------
+# Collapse edges shorter than this, turning the needle fans that outline corners
+# breed into near-equilateral triangles.  A collapse is only taken when it keeps
+# the outline, flips nothing, and does not worsen the local edge ratio, so this
+# can only improve shape and never changes coverage.  ~0.4 * TRI_TARGET_EDGE:
+# short enough that a real feature edge survives, long enough to eat the slivers.
+DECIMATE_MIN_EDGE = 0.0
+# Passes.  Each round re-derives the boundary and re-sorts candidates; the mesh
+# converges in a couple of rounds.
+DECIMATE_ROUNDS = 3
+# How far the OUTLINE may move when a boundary vertex is decimated away: the
+# vertex's distance from the chord between its two boundary neighbours.  The
+# outline is the wall standoff, so this is deliberately small — straight runs of
+# boundary samples collapse freely, a real corner never moves and the mesh
+# cannot cut through a wall.  Freezing the outline entirely (tol 0) left 17-21%
+# sliver triangles; this recovers the decimation without the corner-cutting.
+DECIMATE_OUTLINE_TOL = 6.0
+# Vertices within this of a door threshold are PINNED — never collapsed.  A
+# decimated door corner destroys the Door Triangle and the doorway goes dead in
+# the engine (no cross-cell/room pathing through it).  Comfortably covers the
+# door quad (DOOR_QUAD_HALF_WIDTH 48 / HALF_DEPTH 32).
+DECIMATE_PIN_RADIUS = 80.0
+# Lower bound: a rail never grows NARROWER than this half-width even if a wall or
+# a neighbour centerline is closer, so a corridor squeezed between two close
+# obstacles still carries a walkable strip (the Phase-1 width was unconditional).
+RIBBON_GROW_MIN_HALF = 16.0
+# Hard cap on grown half-width.  A corridor in open space (no wall, no neighbour)
+# stops here rather than ballooning across a whole exterior cell.  ~1.5 doorways;
+# wide enough for room coverage, bounded enough that a doorway leak is a nub.
+RIBBON_GROW_MAX_HALF = 160.0
+# When measuring the distance to the nearest OTHER edge's centerline, ignore
+# edges that share a node with this one (they meet AT the junction, they are not
+# an opposing wall of corridor) and edges whose centerline Z is more than this
+# from the trial point's Z (a corridor on the storey above must not stop growth
+# on the floor below).
+RIBBON_GROW_NEIGHBOUR_ZTOL = 96.0
 
 # --- Limits ----------------------------------------------------------------------
 # Hard cap on grid dimension per cell; beyond this CS is coarsened.  Guards
