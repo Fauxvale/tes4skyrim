@@ -117,8 +117,118 @@ def _snap_node_z(sample, x, y, z):
 # Ribbon generation
 # ---------------------------------------------------------------------------
 
+def _plan_stations(nodes, edges, node_z, degree, grow):
+    """Every march station the grow needs, as a plan the native batch consumes.
+
+    Returns (stations, plan) where `stations` is an (N, 9) float64 array
+    (cx, cy, cz, dirx, diry, tanx, tany, lo, edge_index) and `plan` records how
+    to reassemble the results:
+
+        ('edge', (i, j), pa, pb, u, w, length, k, base)   k+1 stations per side
+        ('disc', ni, nx, ny, nz, base)                    DISC_RAYS stations
+
+    Splitting planning from marching is what lets the ~890k probes for a dense
+    cell cross the Python/C boundary ONCE instead of once each.  The geometry
+    each station measures against is fixed, so batching cannot change any
+    result -- the march was already order-independent by design.
+    """
+    ext = params.RIBBON_END_EXTEND
+    rows = []
+    plan = []
+    # edge -> index, so a station can name the endpoint pair to exclude from
+    # the neighbour query without shipping node ids per row.
+    edge_index = {}
+    for e, (i, j) in enumerate(edges):
+        edge_index[(i, j)] = e
+    # node -> slot in the synthetic self-pair table appended after `edges`.
+    disc_self = {}
+
+    if not grow:
+        return np.zeros((0, 9), dtype=np.float64), plan, []
+
+    for (i, j) in edges:
+        if i >= len(nodes) or j >= len(nodes) or i == j:
+            continue
+        ax, ay = nodes[i][0], nodes[i][1]
+        bx, by = nodes[j][0], nodes[j][1]
+        az, bz = node_z[i], node_z[j]
+        dx, dy = bx - ax, by - ay
+        length = math.hypot(dx, dy)
+        if length < 1e-4:
+            continue
+        ux, uy = dx / length, dy / length
+        wx, wy = -uy, ux
+        dz = bz - az
+        ea = ext if degree.get(i, 0) <= 1 else 0.0
+        eb = ext if degree.get(j, 0) <= 1 else 0.0
+        pa = (ax - ux * ea, ay - uy * ea, az - dz * (ea / length))
+        pb = (bx + ux * eb, by + uy * eb, bz + dz * (eb / length))
+        if abs(pb[2] - pa[2]) / max(length, 1e-6) > params.RIBBON_GROW_MAX_SLOPE:
+            continue                      # steep: keeps Phase-1 width, no march
+
+        total = length + ea + eb
+        k = max(1, int(round(total / params.RIBBON_STEP)))
+        ramp = params.RIBBON_HALF_WIDTH
+        lo0 = params.RIBBON_HALF_WIDTH
+        lo1 = params.RIBBON_GROW_MIN_HALF
+        ei = edge_index.get((i, j), -1)
+        base = len(rows)
+        for s in range(k + 1):
+            t = s / k
+            cxs = pa[0] + (pb[0] - pa[0]) * t
+            cys = pa[1] + (pb[1] - pa[1]) * t
+            czs = pa[2] + (pb[2] - pa[2]) * t
+            d_end = min(t, 1.0 - t) * total
+            frac = min(1.0, d_end / ramp) if ramp > 1e-6 else 1.0
+            floor_h = lo0 + (lo1 - lo0) * frac
+            # left (+w) then right (-w), so results interleave predictably.
+            rows.append((cxs, cys, czs, wx, wy, ux, uy, floor_h, ei))
+            rows.append((cxs, cys, czs, -wx, -wy, ux, uy, floor_h, ei))
+        plan.append(('edge', (i, j), pa, pb, (ux, uy), (wx, wy),
+                     length, k, base))
+
+    # NODE DISCS -- radial fan filling the outer corner at each junction.
+    steep_nodes = set()
+    for (i, j) in edges:
+        if i >= len(nodes) or j >= len(nodes) or i == j:
+            continue
+        run = math.hypot(nodes[j][0] - nodes[i][0], nodes[j][1] - nodes[i][1])
+        if run > 1e-6 and abs(node_z[j] - node_z[i]) / run > \
+                params.RIBBON_GROW_MAX_SLOPE:
+            steep_nodes.add(i)
+            steep_nodes.add(j)
+    nrays = params.RIBBON_GROW_DISC_RAYS
+    for ni in sorted(degree):
+        if ni >= len(nodes) or ni in steep_nodes:
+            continue
+        nx, ny = nodes[ni][0], nodes[ni][1]
+        nz = node_z[ni]
+        base = len(rows)
+        # The disc excludes only its OWN node.  There is no real edge (ni, ni)
+        # to point at, so a synthetic self-pair is appended to the edge table
+        # the native side receives (see `extra_edges` below) and indexed here.
+        ei = len(edges) + disc_self.setdefault(ni, len(disc_self))
+        for kk in range(nrays):
+            ang = 2.0 * math.pi * kk / nrays
+            ddx, ddy = math.cos(ang), math.sin(ang)
+            # Floor 0: a wall must always beat any minimum here, or the disc
+            # pushes mesh through a wall standing close to the node.
+            rows.append((nx, ny, nz, ddx, ddy, -ddy, ddx, 0.0, ei))
+        plan.append(('disc', ni, nx, ny, nz, base))
+
+    st = (np.asarray(rows, dtype=np.float64) if rows
+          else np.zeros((0, 9), dtype=np.float64))
+    # Synthetic (ni, ni) rows appended to the edge table so a disc station can
+    # exclude its own node.  They are only ever read as an exclusion pair; the
+    # native NeighbourField skips zero-length segments, so they add no geometry.
+    extra_edges = [(ni, ni) for ni, _slot in
+                   sorted(disc_self.items(), key=lambda kv: kv[1])]
+    return st, plan, extra_edges
+
+
 def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
-                           walk_probe=None, field=None):
+                           walk_probe=None, field=None,
+                           blocking=None, walkable=None):
     """One corridor per pathgrid edge.  Returns a list of dicts, each:
 
         {'edge': (i, j),
@@ -136,11 +246,17 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
     squeezed.  Corridors are NOT yet a shared mesh — corridor_union takes their
     boolean union and retriangulates it; keeping them as parametric strips lets
     it recover each vertex's height along the centerline.
+
+    The Phase-2 march itself runs NATIVELY and in ONE batch (see
+    corridor_grow.grow_batch): planning every station first, marching them all
+    in C++, then reassembling turns ~890k Python/C crossings per dense cell
+    into one.  The march was already order-independent (it measures against
+    fixed geometry, never against another corridor's grown width), so batching
+    cannot change any result.
     """
     half = params.RIBBON_HALF_WIDTH
     ext = params.RIBBON_END_EXTEND
-    grow = params.RIBBON_GROW and wall_hit is not None and field is not None \
-        and walk_probe is not None
+    grow = params.RIBBON_GROW and blocking is not None
 
     # Degree of every node, so only DEAD ENDS get the end extension.  Extending
     # past a node that another corridor also uses puts this corridor's stub
@@ -153,6 +269,20 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
     for (i, j) in edges:
         degree[i] = degree.get(i, 0) + 1
         degree[j] = degree.get(j, 0) + 1
+
+    # ---- Phase 2 march: plan every station, run them all natively, reassemble.
+    # `widths` is indexed by the `base` offsets recorded in the plan.
+    stations, plan, extra_edges = _plan_stations(nodes, edges, node_z,
+                                                 degree, grow)
+    widths = None
+    if len(stations):
+        widths = corridor_grow.grow_batch(
+            blocking, walkable, nodes, list(edges) + extra_edges,
+            node_z, stations)
+
+    # Edges that were PLANNED (flat enough to grow) map to their plan entry;
+    # every other edge keeps the Phase-1 fixed rectangle below.
+    grown_edges = {p[1]: p for p in plan if p[0] == 'edge'}
 
     strips = []
     for (i, j) in edges:
@@ -184,55 +314,27 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
             'u': (ux, uy), 'w': (wx, wy), 'len': length,
         }
 
-        # A STEEP edge is a staircase/ramp.  Growing it sideways is meaningless
-        # and actively harmful: the ribbon is a tilted plane, so a perpendicular
-        # rail immediately leaves the treads — it either floats off the side of
-        # the flight or drives through the stairwell wall (measured: the Guild's
-        # stair edge grew to 82u and put mesh through the wall beside it).  A
-        # staircase is exactly as wide as the pathgrid says, so keep Phase-1
-        # width there and only grow genuinely FLAT corridors.
-        steep = abs(pb[2] - pa[2]) / max(length, 1e-6) > params.RIBBON_GROW_MAX_SLOPE
-
-        if not grow or steep:
+        # A STEEP edge is a staircase/ramp and is never grown — the ribbon is a
+        # tilted plane, so a perpendicular rail immediately leaves the treads
+        # (measured: the Guild's stair edge grew to 82u and put mesh through the
+        # wall beside it).  _plan_stations applies the same test, so an edge
+        # absent from the plan is exactly a steep or ungrown one.
+        entry = grown_edges.get((i, j)) if widths is not None else None
+        if entry is None:
             strip['half'] = half
             strips.append(strip)
             continue
 
-        # Phase 2: march the width out per cross-section on each side.  Sample
-        # at RIBBON_STEP stations from a-end to b-end; the flat plane means the
-        # floor Z under the box is the centerline Z at that station.
-        #
-        # Connectivity guard: near a NODE the width must not fall below the
-        # Phase-1 half-width, or two corridors meeting there stop overlapping and
-        # the union splits the mesh (Pinarus's 73 dense edges fragmented into 11
-        # components when the grow was allowed to pinch to the global minimum at a
-        # junction).  So the per-station FLOOR ramps from RIBBON_HALF_WIDTH at
-        # each endpoint down to RIBBON_GROW_MIN_HALF over a RIBBON_HALF_WIDTH-long
-        # zone: the overlapping core around every shared node is preserved, while
-        # the middle of a long edge is still free to pinch to a wall.
-        total = length + ea + eb
-        k = max(1, int(round(total / params.RIBBON_STEP)))
-        ramp = params.RIBBON_HALF_WIDTH          # length of the endpoint zone
-        lo0 = params.RIBBON_HALF_WIDTH
-        lo1 = params.RIBBON_GROW_MIN_HALF
+        _, _, ppa, ppb, _u, _w, _len, k, base = entry
         left = []                   # (x, y) along +w
         right = []                  # (x, y) along -w
-        max_h = lo0
+        max_h = params.RIBBON_HALF_WIDTH
         for s in range(k + 1):
             t = s / k
-            cxs = pa[0] + (pb[0] - pa[0]) * t
-            cys = pa[1] + (pb[1] - pa[1]) * t
-            czs = pa[2] + (pb[2] - pa[2]) * t
-            # distance from this station to the nearer endpoint, along the edge
-            d_end = min(t, 1.0 - t) * total
-            frac = min(1.0, d_end / ramp) if ramp > 1e-6 else 1.0
-            floor_h = lo0 + (lo1 - lo0) * frac    # lo0 at the ends, lo1 mid-edge
-            hl = corridor_grow.grow_half_width(
-                cxs, cys, czs, wx, wy, ux, uy, (i, j),
-                wall_hit, walk_probe, field, floor_h)
-            hr = corridor_grow.grow_half_width(
-                cxs, cys, czs, -wx, -wy, ux, uy, (i, j),
-                wall_hit, walk_probe, field, floor_h)
+            cxs = ppa[0] + (ppb[0] - ppa[0]) * t
+            cys = ppa[1] + (ppb[1] - ppa[1]) * t
+            hl = float(widths[base + 2 * s])
+            hr = float(widths[base + 2 * s + 1])
             left.append((cxs + wx * hl, cys + wy * hl))
             right.append((cxs - wx * hr, cys - wy * hr))
             max_h = max(max_h, hl, hr)
@@ -255,33 +357,20 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
 
     # NODE DISCS.  A ribbon only grows perpendicular to its OWN edge, so the
     # outer corner where two edges meet at an angle is a notch no ribbon reaches
-    # — a right-angle junction leaves a square bite out of the mesh.  Grow each
-    # node radially under the same stop rules and add the resulting polygon to
-    # the union, which fills exactly those corners.
-    if grow:
-        # A node on a STEEP edge (stair/ramp landing) is not grown, for the same
-        # reason the steep edge itself is not: a radial fan there leaves the
-        # treads at once and reaches over the stairwell wall.
-        steep_nodes = set()
-        for (i, j) in edges:
-            if i >= len(nodes) or j >= len(nodes) or i == j:
+    # — a right-angle junction leaves a square bite out of the mesh.  The disc
+    # rays were marched in the same batch; close each fan into a polygon here.
+    if widths is not None:
+        nrays = params.RIBBON_GROW_DISC_RAYS
+        for entry in plan:
+            if entry[0] != 'disc':
                 continue
-            run = math.hypot(nodes[j][0] - nodes[i][0], nodes[j][1] - nodes[i][1])
-            if run > 1e-6 and abs(node_z[j] - node_z[i]) / run > \
-                    params.RIBBON_GROW_MAX_SLOPE:
-                steep_nodes.add(i)
-                steep_nodes.add(j)
-        for ni in sorted(degree):
-            if ni >= len(nodes) or ni in steep_nodes:
-                continue
-            nx, ny = nodes[ni][0], nodes[ni][1]
-            nz = node_z[ni]
-            # Floor of 0: a wall must always win over any minimum, or the disc
-            # pushes mesh through a wall standing close to the node (the same
-            # defect the rails' connectivity floor caused).  The node's own
-            # ribbons already guarantee the corridor width here.
-            disc = corridor_grow.grow_node_disc(
-                nx, ny, nz, (ni,), wall_hit, walk_probe, field, 0.0)
+            _, ni, nx, ny, nz, base = entry
+            disc = []
+            for kk in range(nrays):
+                ang = 2.0 * math.pi * kk / nrays
+                ddx, ddy = math.cos(ang), math.sin(ang)
+                d = float(widths[base + kk])
+                disc.append((nx + ddx * d, ny + ddy * d))
             disc = _simplify(disc, params.RIBBON_RAIL_SIMPLIFY)
             if len(disc) < 3:
                 continue
@@ -357,19 +446,22 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     node_z = [_snap_node_z(sample, nodes[i][0], nodes[i][1], nodes[i][2])
               for i in range(len(nodes))]
 
-    # Phase-2 width-grow inputs.  All are built once per cell over FIXED
-    # geometry, so growth is order-independent and the output byte-reproducible:
-    #   wall_hit    thin actor slab vs blocking  -> stop AT the wall/jamb
-    #   walk_probe  walkable height (multi-bucket) -> stop at a floor edge, so a
-    #               rail never climbs a bed/table or widen into another storey
-    #   field       nearest roughly-PARALLEL other centerline -> meet halfway
-    # wall_hit is built unconditionally: the DOOR footprint needs it to refuse a
-    # bridge that crosses a wall, whether or not width-grow is enabled.
-    wall_hit = corridor_grow.wall_slab_sampler(blocking)
-    walk_probe = field = None
-    if params.RIBBON_GROW:
-        walk_probe = corridor_grow.walkable_sampler(walkable)
-        field = corridor_grow.NeighbourField(nodes, edges, node_z)
+    # The Phase-2 grow builds its own indices natively (over the same fixed
+    # geometry, so growth stays order-independent and byte-reproducible).  Only
+    # the DOOR footprint still needs a Python-side wall test — it runs a few
+    # probes per door, not the ~890k the width march does, so it is not worth
+    # crossing into C++ for.
+    #
+    # Built LAZILY: indexing the blocking soup costs ~0.4s on a dense cell, and
+    # a cell with no doors never asks a single question of it.  Once the grow
+    # went native that build was the second-largest remaining cost, spent
+    # entirely on an object most cells discard unused.
+    _wall_hit_cache = []
+
+    def wall_hit(*a, **kw):
+        if not _wall_hit_cache:
+            _wall_hit_cache.append(corridor_grow.wall_slab_sampler(blocking))
+        return _wall_hit_cache[0](*a, **kw)
 
     from . import corridor_doors, corridor_clean, corridor_union
 
@@ -387,7 +479,7 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     # stays one storey with the floors it joins while two floors stacked in plan
     # view are unioned separately and never flattened together.
     corridors = _build_corridor_strips(nodes, edges, node_z,
-                                       wall_hit, walk_probe, field)
+                                       blocking=blocking, walkable=walkable)
 
     # Exterior meshes are clipped to their own cell rectangle so a cross-seam
     # ribbon (built from a PGRI InterCell link, which reaches into the neighbour

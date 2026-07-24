@@ -21,7 +21,13 @@ import sys
 import sysconfig
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(ROOT, 'native', 'src', 'decimate.cpp')
+
+# module name -> source file.  Each builds to its own .pyd; they share no code,
+# so a failure in one does not block the other.
+MODULES = {
+    '_navmesh_native': os.path.join(ROOT, 'native', 'src', 'decimate.cpp'),
+    '_navgrow_native': os.path.join(ROOT, 'native', 'src', 'grow.cpp'),
+}
 
 # The built .pyd is COMMITTED (see native/dist/README.md) so the pipeline runs
 # on a machine without a compiler.  Only the .pyd is needed at runtime; the .lib
@@ -54,32 +60,18 @@ def find_vcvars():
     return None
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--force', action='store_true')
-    a = ap.parse_args()
-
-    import numpy
-    ext_suffix = sysconfig.get_config_var('EXT_SUFFIX') or '.pyd'
-    os.makedirs(OUT_DIR, exist_ok=True)
-    target = os.path.join(OUT_DIR, '_navmesh_native' + ext_suffix)
-
-    if (not a.force and os.path.exists(target)
-            and os.path.getmtime(target) > os.path.getmtime(SRC)):
+def build_one(name, src, vcvars, py_inc, np_inc, py_lib, ext_suffix, force):
+    """Compile one module; returns a shell return code (0 = ok)."""
+    target = os.path.join(OUT_DIR, name + ext_suffix)
+    if (not force and os.path.exists(target)
+            and os.path.getmtime(target) > os.path.getmtime(src)):
         print('up to date:', target)
         return 0
 
-    vcvars = find_vcvars()
-    if not vcvars:
-        print('ERROR: MSVC not found (looked via vswhere).\n'
-              'Install "Build Tools for Visual Studio" with the C++ workload.',
-              file=sys.stderr)
-        return 1
-
-    py_inc = sysconfig.get_paths()['include']
-    np_inc = numpy.get_include()
-    py_lib = os.path.join(sys.base_prefix, 'libs')
-    obj_dir = os.path.join(ROOT, 'native', 'build')
+    # Per-module object dir: two modules compiled into ONE directory overwrite
+    # each other's .obj when a source basename repeats, and /GL then links stale
+    # code into the wrong .pyd.
+    obj_dir = os.path.join(ROOT, 'native', 'build', name)
     os.makedirs(obj_dir, exist_ok=True)
 
     # /O2 optimise, /GL whole-program, /fp:precise so the compiler may NOT
@@ -104,19 +96,49 @@ def main():
         # Doubling it keeps the separator and terminates the argument.
         # /IMPLIB keeps the .lib/.exp out of dist/ -- only the .pyd is a runtime
         # artifact and only it is committed.
-        implib = os.path.join(obj_dir, '_navmesh_native.lib')
+        implib = os.path.join(obj_dir, name + '.lib')
         fh.write(
             f'cl /nologo /LD /O2 /GL /EHsc /std:c++17 /fp:precise /W3 '
             f'/I"{py_inc}" /I"{np_inc}" '
-            f'/Fo"{obj_dir}\\\\" /Fe:"{target}" "{SRC}" '
+            f'/Fo"{obj_dir}\\\\" /Fe:"{target}" "{src}" '
             f'/link /LIBPATH:"{py_lib}" /IMPLIB:"{implib}" '
             f'/OPT:REF /OPT:ICF\n')
     print('building', target)
     r = subprocess.run([bat], cwd=ROOT, shell=True)
     if r.returncode != 0:
-        print('BUILD FAILED', file=sys.stderr)
+        print('BUILD FAILED:', name, file=sys.stderr)
         return r.returncode
     print('ok:', target)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--force', action='store_true')
+    ap.add_argument('--module', help='build only this module')
+    a = ap.parse_args()
+
+    import numpy
+    ext_suffix = sysconfig.get_config_var('EXT_SUFFIX') or '.pyd'
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    vcvars = find_vcvars()
+    if not vcvars:
+        print('ERROR: MSVC not found (looked via vswhere).\n'
+              'Install "Build Tools for Visual Studio" with the C++ workload.',
+              file=sys.stderr)
+        return 1
+
+    py_inc = sysconfig.get_paths()['include']
+    np_inc = numpy.get_include()
+    py_lib = os.path.join(sys.base_prefix, 'libs')
+
+    todo = MODULES if not a.module else {a.module: MODULES[a.module]}
+    for name, src in todo.items():
+        rc = build_one(name, src, vcvars, py_inc, np_inc, py_lib,
+                       ext_suffix, a.force)
+        if rc != 0:
+            return rc
     return 0
 
 

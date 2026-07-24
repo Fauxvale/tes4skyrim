@@ -36,6 +36,61 @@ import math
 import numpy as np
 
 from . import params
+from ._native_loader import load_native
+
+_native = load_native('_navgrow_native')
+
+
+def _native_params():
+    """The tunables the native march needs, mirrored from params.py.
+
+    Passed per call rather than compiled in, so the C++ and the Python can
+    never drift apart when a constant is retuned.
+    """
+    return {
+        'step': float(params.RIBBON_GROW_STEP),
+        'cap': float(params.RIBBON_GROW_MAX_HALF),
+        'min_half': float(params.RIBBON_GROW_MIN_HALF),
+        'half_width': float(params.RIBBON_HALF_WIDTH),
+        'slab_half_w': float(params.RIBBON_GROW_SLAB_HALF_WIDTH),
+        'slab_depth': float(params.RIBBON_GROW_SLAB_DEPTH),
+        'slab_z_bottom': float(params.RIBBON_GROW_SLAB_Z_BOTTOM),
+        'agent_height': float(params.AGENT_HEIGHT),
+        'max_climb': float(params.MAX_CLIMB),
+        'ztol': float(params.RIBBON_GROW_NEIGHBOUR_ZTOL),
+        'pdot': float(params.RIBBON_GROW_PARALLEL_DOT),
+        'bisect': float(params.RIBBON_GROW_BISECT),
+    }
+
+
+def grow_batch(blocking, walkable, nodes, edges, node_z, stations):
+    """Grown half-width for every march station, in ONE native call.
+
+    THE REASON THIS IS BATCHED: the march is ~890k wall-slab probes for a
+    single dense interior cell (Wendir02, 938 edges), each of which tests ~140
+    candidate triangles.  At ~170us per probe in Python that is ~150s for one
+    cell -- the dominant cost of the whole navmesh pipeline.  Crossing the
+    Python/C boundary once per CELL instead of once per probe is what makes it
+    tractable; a native wall_hit alone would still pay 890k crossings.
+
+    stations: (N, 9) float64 -- cx, cy, cz, dirx, diry, tanx, tany, lo,
+    edge_index.  edge_index selects the endpoint pair excluded from the
+    neighbour query (-1 for none).  Returns an (N,) float64 array.
+    """
+    if not len(stations):
+        return np.zeros(0, dtype=np.float64)
+    blk = np.ascontiguousarray(blocking, dtype=np.float64).reshape(-1, 3, 3) \
+        if len(blocking) else np.zeros((0, 3, 3), dtype=np.float64)
+    wlk = (np.ascontiguousarray(walkable, dtype=np.float64).reshape(-1, 3, 3)
+           if walkable is not None and len(walkable) else None)
+    nd = np.ascontiguousarray(
+        [(n[0], n[1]) for n in nodes], dtype=np.float64).reshape(-1, 2) \
+        if len(nodes) else np.zeros((0, 2), dtype=np.float64)
+    eg = np.ascontiguousarray(edges, dtype=np.int32).reshape(-1, 2) \
+        if len(edges) else np.zeros((0, 2), dtype=np.int32)
+    nz = np.ascontiguousarray(node_z, dtype=np.float64)
+    st = np.ascontiguousarray(stations, dtype=np.float64).reshape(-1, 9)
+    return _native.grow_strips(blk, wlk, nd, eg, nz, st, _native_params())
 
 
 # ---------------------------------------------------------------------------

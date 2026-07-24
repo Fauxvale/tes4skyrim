@@ -746,8 +746,8 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
         if not t2:
             continue
 
-        # per 2D vertex: the list of surface heights there
-        levels = [_levels_at(strips, x, y) for (x, y) in v2]
+        # per 2D vertex: the list of surface heights there (one native call)
+        levels = _levels_batch(strips, v2)
         vid = [[] for _ in v2]              # per corner: list of (height, id)
 
         def vertex_at(k, z):
@@ -866,6 +866,42 @@ def _drop_point_attached(tris):
             break
         tris = keep
     return tris
+
+
+def _levels_batch(strips, points):
+    """_levels_at for MANY points at once, natively.  Returns a list of lists.
+
+    THE REASON THIS IS BATCHED: per point _levels_at scans every strip (~1,900
+    in a dense cell), and a grown strip's admission test is a point-in-polygon
+    plus a min-distance over its whole outline.  Measured on Wendir02 that was
+    29.3s of a 31.9s build — 4.5ms per call over 6,491 calls — making it the
+    single hottest thing left after the width-grow went native.
+
+    The strips are flattened ONCE per union (not per point) and the native side
+    buckets them by XY bounds, so each point tests only strips that could
+    actually cover it.
+    """
+    from ._native_loader import load_native
+    native = load_native('_navgrow_native')
+
+    rows = []
+    poly = []
+    for s in strips:
+        p = s.get('poly')
+        off, n = 0, 0
+        if p is not None:
+            off, n = len(poly), len(p)
+            poly.extend(p)
+        a, b = s['a'], s['b']
+        rows.append((a[0], a[1], a[2], b[0], b[1], b[2],
+                     float(s['half']), float(off), float(n), 0.0, 0.0))
+    sarr = (np.asarray(rows, dtype=np.float64) if rows
+            else np.zeros((0, 11), dtype=np.float64))
+    parr = (np.asarray(poly, dtype=np.float64).reshape(-1, 2) if poly
+            else np.zeros((0, 2), dtype=np.float64))
+    qarr = (np.asarray(points, dtype=np.float64).reshape(-1, 2) if len(points)
+            else np.zeros((0, 2), dtype=np.float64))
+    return native.levels_at(sarr, parr, qarr, float(SAME_SURFACE_Z))
 
 
 def _levels_at(strips, px, py):
