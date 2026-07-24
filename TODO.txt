@@ -1,5 +1,5 @@
 Work Order:
-	Navmesh not sufficient for real gameplay M4, L2
+	Navmesh not sufficient for real gameplay M4
 	Dialog not exact L1
 	Voice lines missing L6
 	Fix stairs L8
@@ -18,7 +18,10 @@ Major Issues for V1:
 				uppersilverpitcher01.nif
 				uppergobletceramic01.nif
 
-	4 - Outdoor navmesh needs serious work
+	4 - Navmesh refinement
+		ensure corridors connect pathgrid islands
+		delete islands not under a pathgrid
+		needs MAJOR speedup
 
 	5 - Fix CK Loading (not sure why it doesn't finish)
 
@@ -31,8 +34,6 @@ Major Issues for V1:
 Later Issues:
 
 	1 - Refine dialog conversion based on dialog emulators to exactly match Oblivion
-
-	2 - Refine navmesh generation further using ck-inspired algorithms
 
 	3 - Refine creature conversion further. Speed is still a bit off
 	
@@ -62,17 +63,8 @@ Later Issues:
 
 	17 - More granular navmesh caching to make rebuilds fewer
 
-	Current state — 
-	width-grow with thin-slab swept collision: on
-	node discs: rolled back
-	rail simplification: rolled back (0.0)
-	decimator: rolled back (0.0)
-
 	DECIMATE_MIN_EDGE
 	RIBBON_RAIL_SIMPLIFY
-
-	test-navmesh-2 had some good work to speed up generation of navmesh. It takes an unacceptably long amount of time now (over 1.5 hours)
-	Specifically, it disabled garbage collection (unnecessary) and moved hotspot code to compiled C++ analyze the time it takes to generate a few cells for hotspots and then create similar optimizations. I am expecting under 20 minutes.
 
 Minor Issues:
 

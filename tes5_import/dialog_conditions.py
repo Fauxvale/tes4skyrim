@@ -616,6 +616,79 @@ def has_any_conditions(rec: dict) -> bool:
 _AUDIENCE_FUNCS = frozenset({67, 68, 69, 71, 72, 73})
 
 
+# Condition functions that express a WORLD-STATE precondition for a topic
+# rather than an audience: quest stage/running/completed and the player's
+# standing. A conditionless INFO whose every conditioned sibling shares one of
+# these is not "always valid" — the shared gate IS the topic's precondition.
+_STATE_FUNCS = frozenset({
+    56,   # GetQuestRunning
+    58,   # GetStage
+    59,   # GetStageDone
+    71,   # GetInFaction      (only when RunOn=Target, i.e. about the PLAYER)
+    73,   # GetFactionRank    (ditto)
+    99,   # GetQuestCompleted
+})
+
+
+def shared_state_conditions(recs: list) -> list:
+    """Raw CTDA blobs that EVERY conditioned record in `recs` carries.
+
+    Oblivion frequently leaves one INFO of a topic conditionless and lets its
+    siblings' conditions scope the whole topic — the topic itself being
+    AddTopic-gated meant the loose line could never show early. Skyrim has no
+    such implicit scoping, so a conditionless line becomes permanently valid.
+
+    The Fighters Guild join topic is the case that proves it: three of its four
+    lines carry `GetInFaction(FightersGuild)[Target] == 0` ("player is not a
+    member") and the fourth carries nothing, so after joining, that fourth line
+    kept the topic alive and Azzan went on offering "Join the Fighters Guild"
+    to a member forever.
+
+    Returns the intersection of the conditioned records' state conditions, as
+    raw hex blobs, preserving the order of the first record that has them.
+    """
+    per_rec = []
+    for rec in recs:
+        if not has_any_conditions(rec):
+            continue
+        blobs = []
+        i = 0
+        while True:
+            raw_hex = rec.get(f'Condition[{i}].Raw')
+            if raw_hex is None:
+                break
+            i += 1
+            if not raw_hex or len(raw_hex) < 24:
+                continue
+            try:
+                raw = bytes.fromhex(raw_hex)
+                func = struct.unpack_from('<H', raw, 8)[0]
+            except (ValueError, struct.error):
+                continue
+            if func not in _STATE_FUNCS:
+                continue
+            # A faction check only describes world state when it runs on the
+            # TARGET (the player). On the subject it is an audience test.
+            if func in (71, 73) and not (raw[0] & 0x02):
+                continue
+            # An OR-flagged condition belongs to a group; lifting one member
+            # out of its chain would change the meaning, so skip the whole run.
+            if raw[0] & 0x01:
+                continue
+            blobs.append(raw_hex)
+        if not blobs:
+            return []          # a sibling with no state gate ⇒ no unanimity
+        per_rec.append(blobs)
+    if len(per_rec) < 2:
+        return []
+    common = set(per_rec[0])
+    for blobs in per_rec[1:]:
+        common &= set(blobs)
+    if not common:
+        return []
+    return [b for b in per_rec[0] if b in common]
+
+
 def has_audience_condition(rec: dict) -> bool:
     """True if the record already restricts WHICH actors the line reaches.
 

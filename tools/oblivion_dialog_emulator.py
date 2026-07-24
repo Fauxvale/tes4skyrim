@@ -295,6 +295,11 @@ class QUST:
     flags: int
     priority: int
     stages: list
+    # Every stage-log result script concatenated. AddTopic commands live here
+    # (not only in INFO result scripts), and a topic revealed by a quest stage
+    # is invisible until that stage runs — omitting these leaked quest topics
+    # (TGAboutThievesGuild, MagesGuildTopic, contract, Duties) onto every NPC.
+    scripts: str = ''
 
 
 class OblivionDB:
@@ -371,8 +376,27 @@ class OblivionDB:
             fid = _fid(r, 'FormID')
             stages = [_int(r, f'Stage[{i}].Index')
                       for i in range(_int(r, 'StageCount'))]
+            # Concatenate every stage-log result script (AddTopic lives here).
+            scripts = []
+            for i in range(_int(r, 'StageCount')):
+                s = r.get(f'Stage[{i}].ResultScript')
+                if s:
+                    scripts.append(s)
+                j = 0
+                while True:
+                    s = r.get(f'Stage[{i}].Log[{j}].ResultScript')
+                    if s is None:
+                        # Log entries are contiguous only until a gap; probe a
+                        # few indices before giving up (some stages skip Log[0]).
+                        if j > 8:
+                            break
+                        j += 1
+                        continue
+                    scripts.append(s)
+                    j += 1
             q = QUST(fid, r.get('EditorID', ''), r.get('FULL', ''),
-                     _int(r, 'DATA.Flags'), _int(r, 'DATA.Priority'), stages)
+                     _int(r, 'DATA.Flags'), _int(r, 'DATA.Priority'), stages,
+                     '\n'.join(scripts))
             self.qusts[fid] = q
             if q.editor_id:
                 self.quest_by_edid[q.editor_id.lower()] = q
@@ -407,16 +431,32 @@ class OblivionDB:
         This is Oblivion's central topic-visibility rule.
         """
         revealers = defaultdict(list)
+        dial_by_edid = {d.editor_id.lower(): d.form_id
+                        for d in self.dials.values() if d.editor_id}
         for info in self.infos.values():
             for t in info.add_topics:
                 revealers[t].append(info)
             # `AddTopic X` in a result script reveals it just the same.
-            for name in re.findall(r'\bAddTopic\s+(\w+)',
+            # NB: no leading \b — export result scripts store newlines as the
+            # LITERAL two chars "\r\n", so the char before AddTopic is often a
+            # word char ('n') and \b would never match.
+            for name in re.findall(r'AddTopic\s+(\w+)',
                                    info.result_script or '', re.I):
-                for d in self.dials.values():
-                    if d.editor_id.lower() == name.lower():
-                        revealers[d.form_id].append(info)
-                        break
+                tfid = dial_by_edid.get(name.lower())
+                if tfid:
+                    revealers[tfid].append(info)
+        # QUST stage result scripts also AddTopic (the guild-join flows reveal
+        # `contract`, `Duties`, `TGAboutThievesGuild`, `MagesGuildTopic`, ...
+        # from a stage script, not an INFO). A topic revealed only this way is
+        # hidden until the stage runs; mark the quest as its revealer so
+        # topic_available() can gate it (a QUST has no conditions of its own,
+        # so a stage-revealed topic is treated as revealed once we choose to
+        # model that stage — otherwise it must stay hidden, not leak to all).
+        for q in self.qusts.values():
+            for name in re.findall(r'AddTopic\s+(\w+)', q.scripts or '', re.I):
+                tfid = dial_by_edid.get(name.lower())
+                if tfid:
+                    revealers[tfid].append(q)
         return revealers
 
 
@@ -470,12 +510,24 @@ class Evaluator:
                              c.comp_type, c.comp_value)
         if f == F_GETINFACTION:
             if run_on_target:
-                return None
+                # The player's factions are modelled explicitly
+                # (--player-faction) so guild-membership-gated dialogue can be
+                # compared against the Skyrim emulator; unmodelled stays
+                # unknown rather than silently assuming non-membership.
+                pf = self.state.get('player_factions')
+                if pf is None:
+                    return None
+                return self._cmp(1.0 if p1 in pf else 0.0,
+                                 c.comp_type, c.comp_value)
             return self._cmp(1.0 if p1 in subject.factions else 0.0,
                              c.comp_type, c.comp_value)
         if f == F_GETFACTIONRANK:
             if run_on_target:
-                return None
+                pf = self.state.get('player_factions')
+                if pf is None:
+                    return None
+                return self._cmp(float(pf.get(p1, -1)),
+                                 c.comp_type, c.comp_value)
             return self._cmp(float(subject.factions.get(p1, -1)),
                              c.comp_type, c.comp_value)
         if f == F_GETLEVEL:
@@ -582,9 +634,15 @@ class Simulator:
         key = f'topic_{dial_fid}'
         if key in self.state:
             return bool(self.state[key])
-        # Revealed if any revealing line can itself play right now.
-        for info in revealers:
-            ok, _ = ev.passes(info.conditions)
+        # Revealed if any revealing line can itself play right now. A QUST
+        # revealer (topic AddTopic'd from a stage script) has no conditions of
+        # its own — it is revealed only once that stage runs, which the caller
+        # models explicitly (--global topic_<fid>=1 or --unlock-all). Left
+        # unmodelled it stays HIDDEN rather than leaking to every NPC.
+        for rev in revealers:
+            if not hasattr(rev, 'conditions'):
+                continue          # QUST stage revealer — not auto-available
+            ok, _ = ev.passes(rev.conditions)
             if ok:
                 return True
         return False
@@ -704,8 +762,24 @@ class Simulator:
                 self._print_children(cd, ci, d, verbose, depth + 1, seen)
 
 
-def build_state(db, stages, completed, globals_, unlock_all, disposition=50):
+def build_state(db, stages, completed, globals_, unlock_all, disposition=50,
+                player_factions=()):
     state = {'disposition': disposition}
+    if player_factions:
+        fact_by_edid = {e.lower(): f for f, e in db.facts.items()}
+        pf = {}
+        for spec in player_factions:
+            name, _, rank_raw = spec.partition(':')
+            fid = fact_by_edid.get(name.lower())
+            if fid is None:
+                try:
+                    fid = int(name, 16)
+                except ValueError:
+                    sys.exit(f'no faction named {name!r}')
+            pf[fid] = int(rank_raw) if rank_raw else 0
+            print(f'  game state: player in faction {name} rank {pf[fid]} '
+                  f'[{fid:08X}]')
+        state['player_factions'] = pf
     if unlock_all:
         state['unlock_all'] = True
         print('  game state: all AddTopic gates treated as revealed')
@@ -755,6 +829,12 @@ def main():
     ap.add_argument('--disposition', type=int, default=50,
                     help='the disposition GetDisposition conditions see '
                          '(default 50); Oblivion tiers greetings at 30/50/70')
+    ap.add_argument('--player-faction', action='append', default=[],
+                    metavar='FACTION:RANK',
+                    help='model the player as a member of FACTION at RANK '
+                         '(EditorID or hex FormID). Resolves RunOn=Target '
+                         'GetInFaction/GetFactionRank; pairs with the Skyrim '
+                         "emulator's --player-faction. Repeatable.")
     ap.add_argument('--verbose', '-v', action='store_true')
     args = ap.parse_args()
 
@@ -776,7 +856,8 @@ def main():
     if not npc:
         sys.exit(f'NPC {args.npc!r} not found (try --list-npcs)')
     state = build_state(db, args.stage, args.completed, args.globals,
-                        args.unlock_all, args.disposition)
+                        args.unlock_all, args.disposition,
+                        args.player_faction)
     Simulator(db, state).report(npc, verbose=args.verbose)
 
 
