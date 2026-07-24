@@ -58,13 +58,15 @@ from . import params
 # small so a genuine step between stacked sheets is never fused, but large enough
 # to absorb the little disagreement where two ribbons cross on a slope.
 SAME_SURFACE_Z = 36.0
+# Half-width of the hairline gap opened along every wall when splitting the
+# union (see wall_cuts).  Just wide enough to separate the two sides reliably in
+# floating point; far below any real corridor width, so it costs no coverage.
+WALL_CUT_WIDTH = 1.0
 
 # Two levels at one point belong to DIFFERENT storeys only when they are at
 # least this far apart.  Anything closer is one walkable surface — a stair step,
 # a ramp, two ribbons meeting at a slight angle — and must produce ONE triangle;
 # emitting both stacks them (measured: levels 39u apart on a Chorrol stair).
-# Real storeys are separated by ~200u or more, so this sits well below them and
-# well above any within-surface variation.
 STOREY_GAP_Z = 120.0
 
 
@@ -77,7 +79,15 @@ def _ribbon_polygon(s):
     from shapely.geometry import Polygon
 
     if s.get('poly') is not None:
-        return Polygon(s['poly'])
+        p = Polygon(s['poly'])
+        # A grown corridor outline (corridor.py Phase 2) can self-intersect where
+        # two cross-sections' rails cross at a sharp concavity.  Repair with
+        # buffer(0) rather than letting build_union_mesh's is_valid filter DROP
+        # the whole corridor (which would lose that ground).  A simple door quad
+        # is already valid, so this is a no-op there.
+        if not p.is_valid:
+            p = p.buffer(0)
+        return p
 
     ax, ay = s['a'][0], s['a'][1]
     bx, by = s['b'][0], s['b'][1]
@@ -341,7 +351,144 @@ def _triangulate(poly, target_edge, fixed_edges=None, steep_seeds=None):
     verts = [(float(p[0]), float(p[1])) for p in arr]
     if not tris:
         return _earcut_fallback(poly)
+    # Delaunay does not GUARANTEE a constraint edge: seeding its endpoints and
+    # keeping other samples clear only makes it likely, and when the surrounding
+    # geometry won, a door's base line came out split — the door then touched the
+    # mesh at a single VERTEX with a rogue triangle hanging off it.  Recover each
+    # constraint explicitly, which keeps the door inside the ONE triangulation
+    # (so it still shares edges with its neighbours) while making its long side a
+    # real edge.
+    if fixed_pts:
+        verts, tris = _recover_constraints(verts, tris, fixed_pts)
     return verts, tris
+
+
+def _recover_constraints(verts, tris, segments):
+    """Force each segment to appear as a triangle edge.
+
+    Any triangle whose interior the segment crosses is split at the crossing
+    points: the segment's intersections with that triangle's edges become
+    vertices, and the triangle is re-fanned around them.  The result stays a
+    valid triangulation of the same area — no triangle is dropped and no new
+    ground is invented — but the segment now runs along triangle edges.
+    """
+    verts = [list(v) for v in verts]
+    tris = [tuple(t) for t in tris]
+
+    index = {}
+    for i, v in enumerate(verts):
+        index.setdefault((round(v[0], 3), round(v[1], 3)), i)
+
+    def vid(x, y):
+        key = (round(x, 3), round(y, 3))
+        i = index.get(key)
+        if i is None:
+            i = len(verts)
+            verts.append([float(x), float(y)])
+            index[key] = i
+        return i
+
+    for (p0, p1) in segments:
+        ax, ay = float(p0[0]), float(p0[1])
+        bx, by = float(p1[0]), float(p1[1])
+        if math.hypot(bx - ax, by - ay) < 1e-9:
+            continue
+        for _round in range(4):
+            out = []
+            changed = False
+            for t in tris:
+                pts = [verts[t[0]], verts[t[1]], verts[t[2]]]
+                if _has_edge(verts, t, ax, ay, bx, by):
+                    out.append(t)
+                    continue
+                cuts = _segment_cuts(pts, ax, ay, bx, by)
+                if len(cuts) < 2:
+                    out.append(t)
+                    continue
+                out.extend(_split_triangle(t, pts, cuts, vid, verts))
+                changed = True
+            tris = out
+            if not changed:
+                break
+    return [tuple(v) for v in verts], tris
+
+
+def _has_edge(verts, t, ax, ay, bx, by):
+    """True if the triangle already has an edge lying along the segment."""
+    for k in range(3):
+        p = verts[t[k]]
+        q = verts[t[(k + 1) % 3]]
+        if (_near(p, ax, ay) and _near(q, bx, by)) or \
+                (_near(p, bx, by) and _near(q, ax, ay)):
+            return True
+    return False
+
+
+def _near(p, x, y):
+    return abs(p[0] - x) < 1e-6 and abs(p[1] - y) < 1e-6
+
+
+def _segment_cuts(pts, ax, ay, bx, by):
+    """Points where the segment crosses this triangle's edges (deduped)."""
+    cuts = []
+    for k in range(3):
+        p, q = pts[k], pts[(k + 1) % 3]
+        hit = _seg_intersect(p[0], p[1], q[0], q[1], ax, ay, bx, by)
+        if hit is None:
+            continue
+        if not any(abs(hit[0] - c[0]) < 1e-6 and abs(hit[1] - c[1]) < 1e-6
+                   for c in cuts):
+            cuts.append(hit)
+    return cuts
+
+
+def _seg_intersect(x1, y1, x2, y2, x3, y3, x4, y4):
+    d = (x2 - x1) * (y4 - y3) - (y2 - y1) * (x4 - x3)
+    if abs(d) < 1e-12:
+        return None
+    t = ((x3 - x1) * (y4 - y3) - (y3 - y1) * (x4 - x3)) / d
+    u = ((x3 - x1) * (y2 - y1) - (y3 - y1) * (x2 - x1)) / d
+    if t < -1e-9 or t > 1 + 1e-9 or u < -1e-9 or u > 1 + 1e-9:
+        return None
+    return (x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)
+
+
+def _split_triangle(t, pts, cuts, vid, verts):
+    """Re-triangulate one triangle around the two points the segment cuts."""
+    c0 = vid(cuts[0][0], cuts[0][1])
+    c1 = vid(cuts[1][0], cuts[1][1])
+    if c0 == c1:
+        return [t]
+    ring = []
+    for k in range(3):
+        ring.append(t[k])
+        p, q = pts[k], pts[(k + 1) % 3]
+        on = [c for c in (c0, c1)
+              if _on_segment(verts[c], p, q) and
+              not _near(verts[c], p[0], p[1]) and
+              not _near(verts[c], q[0], q[1])]
+        on.sort(key=lambda c: (verts[c][0] - p[0]) ** 2 +
+                (verts[c][1] - p[1]) ** 2)
+        ring.extend(on)
+    ring = [v for i, v in enumerate(ring) if v not in ring[:i]]
+    if len(ring) < 3:
+        return [t]
+    out = []
+    for i in range(1, len(ring) - 1):
+        tri = (ring[0], ring[i], ring[i + 1])
+        if len(set(tri)) == 3:
+            out.append(tri)
+    return out or [t]
+
+
+def _on_segment(c, p, q):
+    cross = ((q[0] - p[0]) * (c[1] - p[1]) - (q[1] - p[1]) * (c[0] - p[0]))
+    if abs(cross) > 1e-6:
+        return False
+    dot = (c[0] - p[0]) * (q[0] - p[0]) + (c[1] - p[1]) * (q[1] - p[1])
+    if dot < -1e-9:
+        return False
+    return dot <= (q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2 + 1e-9
 
 
 def _seg_dist2(px, py, a, b):
@@ -452,8 +599,50 @@ def _ribbon_seeds(strips, target_edge):
 RIBBON_SEED_STEP = 24.0
 
 
+def wall_cuts(blocking, z_lo, z_hi):
+    """Thin 2D polygons for every wall standing between z_lo and z_hi.
+
+    The union merges all the ribbons into ONE polygon and triangulates it, with
+    no notion of collision — so a ribbon on each side of a wall becomes one
+    region and the triangulation spans straight through the wall (measured on
+    Pinarus's house: 438 of 575 triangles had an edge crossing a wall, doors not
+    involved).  Subtracting these cuts SPLITS the polygon along every wall, so a
+    triangle physically cannot bridge one.
+
+    Each near-vertical blocking triangle contributes its footprint segment,
+    buffered to a hairline so the subtraction actually separates the sides.
+    """
+    from shapely.geometry import LineString
+    from shapely.ops import unary_union
+
+    B = np.asarray(blocking, dtype=float).reshape(-1, 3, 3)
+    if not len(B):
+        return None
+    segs = []
+    for tri in B:
+        if tri[:, 2].max() < z_lo or tri[:, 2].min() > z_hi:
+            continue
+        # Footprint of a wall triangle: its longest projected edge.
+        best = None
+        for k in range(3):
+            p, q = tri[k], tri[(k + 1) % 3]
+            d2 = (q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2
+            if best is None or d2 > best[0]:
+                best = (d2, p, q)
+        if best is None or best[0] < 1.0:
+            continue
+        _d2, p, q = best
+        segs.append(LineString([(p[0], p[1]), (q[0], q[1])]))
+    if not segs:
+        return None
+    try:
+        return unary_union(segs).buffer(WALL_CUT_WIDTH)
+    except Exception:
+        return None
+
+
 def build_union_mesh(strips, extra_strips=None, door_edges=None,
-                     cell_bounds=None):
+                     cell_bounds=None, wall_cut=None):
     """Union the corridor ribbons per storey and retriangulate.
 
     Returns (verts, tris) with 3D vertices.  Coverage is the exact union of the
@@ -508,6 +697,14 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
         merged = merged.intersection(box(minx, miny, maxx, maxy))
         if merged.is_empty:
             return [], []
+    # Split the coverage along every wall, so no triangle can span one.
+    if wall_cut is not None:
+        try:
+            cut = merged.difference(wall_cut)
+            if not cut.is_empty:
+                merged = cut
+        except Exception:
+            pass
     # The clip may turn one polygon into a MultiPolygon or drop degenerate
     # slivers to lines/points inside a GeometryCollection; keep only polygons.
     if hasattr(merged, 'geoms'):
@@ -627,7 +824,48 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
                 tris.append((vertex_at(a, z), vertex_at(b, z),
                              vertex_at(c, z)))
 
+    tris = _drop_point_attached(tris)
     return verts, tris
+
+
+def _drop_point_attached(tris):
+    """Drop triangles that touch the rest of the mesh at a single VERTEX only.
+
+    One 2D triangle of the union is emitted once per SURFACE its corners' levels
+    suggest.  Where a corridor and a nearby quad at a different height both cover
+    a point, that produces a second copy at the other height — and because none
+    of its edges is shared with anything at that height, it hangs off the mesh by
+    a corner.  That is the rogue triangle climbing a staircase toward a door.
+
+    A triangle that shares no full EDGE with any other triangle cannot be walked
+    onto (NVNM adjacency links only across shared edges — see
+    pgrd_to_navm._compute_adjacency), so it is never useful mesh; dropping it
+    removes the artefact without touching anything reachable.  Iterated, because
+    removing one can leave its neighbour edge-isolated in turn.
+    """
+    tris = [tuple(t) for t in tris]
+    for _round in range(4):
+        counts = {}
+        for t in tris:
+            for k in range(3):
+                a, b = t[k], t[(k + 1) % 3]
+                key = (a, b) if a < b else (b, a)
+                counts[key] = counts.get(key, 0) + 1
+        keep = []
+        for t in tris:
+            shared = False
+            for k in range(3):
+                a, b = t[k], t[(k + 1) % 3]
+                key = (a, b) if a < b else (b, a)
+                if counts.get(key, 0) >= 2:
+                    shared = True
+                    break
+            if shared:
+                keep.append(t)
+        if len(keep) == len(tris):
+            break
+        tris = keep
+    return tris
 
 
 def _levels_at(strips, px, py):
@@ -640,7 +878,18 @@ def _levels_at(strips, px, py):
     """
     zs = []
     for s in strips:
-        if _distance_to(s, px, py) <= s['half'] + 1e-6:
+        # A poly strip (door quad, or a Phase-2 GROWN corridor) owns exactly its
+        # outline — admit only where the point is inside it.  Using the scalar
+        # 'half' as the admission radius is only correct for a fixed-width
+        # rectangle; for a grown ribbon 'half' is the MAX half-width (up to
+        # RIBBON_GROW_MAX_HALF), so 'distance <= half' would claim the point far
+        # OUTSIDE the actual ribbon and inject phantom surface levels that split
+        # the triangulation (Pinarus fragmented into 11 components).
+        if s.get('poly') is not None:
+            hit = _distance_to(s, px, py) <= 1e-6      # 0 == inside the outline
+        else:
+            hit = _distance_to(s, px, py) <= s['half'] + 1e-6
+        if hit:
             zs.append(_height_on(s, px, py))
     if not zs:
         return []

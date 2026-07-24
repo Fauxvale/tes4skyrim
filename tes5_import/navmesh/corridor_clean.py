@@ -15,6 +15,8 @@ The corridor model needs NOTHING else: no welding (ribbon vertices are shared
 by construction), no stitching, no island cull (there are no stray scraps).
 """
 
+import math
+
 import numpy as np
 
 from . import params
@@ -109,7 +111,8 @@ def _make_manifold(verts, tris):
     return tris
 
 
-def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None):
+def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None,
+             pin_xy=None):
     """V1 cleanup: drop degenerate triangles, guarantee manifold, compact.
 
     corridor_union already produces ONE connected, non-overlapping surface (the
@@ -128,8 +131,211 @@ def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None):
     """
     verts, tris = _weld_coincident(verts, tris)
     tris = _make_manifold(verts, tris)
-    tris = _drop_unreachable_islands(verts, tris, doors, cell_bounds)
+    # Only DOORS pin the decimator: a collapse at a threshold kills the Door
+    # Triangle.  (pin_xy carries every pathgrid sample and is used by the island
+    # pass below; pinning all of it would disable decimation everywhere.)
+    verts, tris = decimate(verts, tris,
+                           pinned_xy=[(d[0], d[1]) for d in (doors or ())])
+    tris = _drop_unreachable_islands(verts, tris, doors, cell_bounds, pin_xy)
     return _compact(verts, tris)
+
+
+def decimate(verts, tris, pinned_xy=None):
+    """Collapse sliver-producing SHORT edges into near-equilateral triangles.
+
+    The grown ribbon outlines (Phase 2) contribute many boundary corners, and a
+    corner landing a few units from a lattice point yields a needle however good
+    the point sampling was.  Rather than tune the sampler for every case, remove
+    the needles directly: repeatedly collapse the shortest edge whose length is
+    below DECIMATE_MIN_EDGE, provided the collapse
+
+      * NEVER moves a BOUNDARY vertex.  The outline is the wall standoff: any
+        boundary motion — even sliding one boundary vertex onto another, which
+        cuts the corner between them — pushes mesh through walls.  So only an
+        INTERIOR vertex may be collapsed, and it collapses INTO its neighbour.
+      * never touches a PINNED vertex (door threshold corners): collapsing those
+        destroys the Door Triangle and the doorway goes dead in the engine,
+      * does not flip or degenerate any triangle around it, and
+      * does not make the worst edge ratio of the affected triangles worse than
+        it already was (so a collapse can only improve shape).
+
+    This is the "minor decimation" that turns fans of slivers into big
+    well-shaped triangles without touching coverage.
+
+    pinned_xy: [(x, y), ...] positions that must survive (door thresholds).
+    """
+    from . import params
+    tris = [tuple(int(i) for i in t) for t in tris]
+    verts = [list(map(float, v)) for v in verts]
+    if not tris:
+        return verts, tris
+
+    min_edge = params.DECIMATE_MIN_EDGE
+    if min_edge <= 0.0:
+        return verts, tris
+
+    # Vertices near a door threshold are pinned: the Door Triangle must keep its
+    # shape or _build_door_links finds nothing to flag.
+    pin = set()
+    if pinned_xy:
+        pr2 = params.DECIMATE_PIN_RADIUS ** 2
+        for vi, v in enumerate(verts):
+            for (px, py) in pinned_xy:
+                if (v[0] - px) ** 2 + (v[1] - py) ** 2 <= pr2:
+                    pin.add(vi)
+                    break
+
+    def _boundary_verts(tl):
+        """(boundary vertex set, {vertex: [boundary neighbours]})."""
+        cnt = {}
+        for t in tl:
+            for k in range(3):
+                a, b = t[k], t[(k + 1) % 3]
+                key = (a, b) if a < b else (b, a)
+                cnt[key] = cnt.get(key, 0) + 1
+        bset = set()
+        nbr = {}
+        for (a, b), c in cnt.items():
+            if c == 1:
+                bset.add(a)
+                bset.add(b)
+                nbr.setdefault(a, []).append(b)
+                nbr.setdefault(b, []).append(a)
+        return bset, nbr
+
+    def _outline_error(vi, nbr):
+        """How far the outline would move if boundary vertex vi were removed:
+        vi's distance from the chord between its two boundary neighbours."""
+        ns = nbr.get(vi, ())
+        if len(ns) != 2:
+            return 1e9                  # a junction/fork on the outline: keep
+        p = verts[vi]
+        a, b = verts[ns[0]], verts[ns[1]]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        d2 = dx * dx + dy * dy
+        if d2 < 1e-12:
+            return math.hypot(p[0] - a[0], p[1] - a[1])
+        t = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / d2))
+        return math.hypot(p[0] - (a[0] + dx * t), p[1] - (a[1] + dy * t))
+
+    def _edge_ratio(t):
+        p, q, r = verts[t[0]], verts[t[1]], verts[t[2]]
+        e = [math.dist(p[:2], q[:2]), math.dist(q[:2], r[:2]),
+             math.dist(r[:2], p[:2])]
+        lo = min(e)
+        return (max(e) / lo) if lo > 1e-9 else 1e9
+
+    def _area2(t):
+        p, q, r = verts[t[0]], verts[t[1]], verts[t[2]]
+        return ((q[0] - p[0]) * (r[1] - p[1]) -
+                (q[1] - p[1]) * (r[0] - p[0]))
+
+    for _ in range(params.DECIMATE_ROUNDS):
+        boundary, bnbr = _boundary_verts(tris)
+        # candidate edges, shortest first
+        cands = []
+        seen = set()
+        for t in tris:
+            for k in range(3):
+                a, b = t[k], t[(k + 1) % 3]
+                key = (a, b) if a < b else (b, a)
+                if key in seen:
+                    continue
+                seen.add(key)
+                d = math.dist(verts[a][:2], verts[b][:2])
+                if d < min_edge:
+                    cands.append((d, key))
+        if not cands:
+            break
+        cands.sort()
+
+        gone = set()
+        remap = {}
+
+        def _res(i):
+            while i in remap:
+                i = remap[i]
+            return i
+
+        changed = False
+        for _d, (a, b) in cands:
+            a, b = _res(a), _res(b)
+            if a == b or a in gone or b in gone:
+                continue
+            a_b, b_b = a in boundary, b in boundary
+            # The OUTLINE MAY NOT MOVE.  A boundary vertex is the wall standoff;
+            # sliding one boundary vertex onto another cuts the corner between
+            # them and pushes the mesh through the wall.  So a boundary vertex is
+            # never dropped and never moved — only an INTERIOR vertex collapses,
+            # into its neighbour.  Pinned (door) vertices never move either.
+            if a in pin or b in pin:
+                continue
+            if a_b and b_b:
+                # Both on the outline.  Removing one MOVES the silhouette, which
+                # is how a collapse pushes mesh through a wall — so allow it only
+                # when the vertex is nearly collinear with its two boundary
+                # neighbours, i.e. the outline barely changes (within
+                # DECIMATE_OUTLINE_TOL).  This is the happy medium: straight runs
+                # of boundary samples decimate away, real corners never move.
+                ea, eb = _outline_error(a, bnbr), _outline_error(b, bnbr)
+                if min(ea, eb) > params.DECIMATE_OUTLINE_TOL:
+                    continue
+                if ea <= eb:
+                    keep, drop = b, a        # drop the flatter one (a)
+                else:
+                    keep, drop = a, b
+                target = verts[keep][:]
+            elif a_b:                        # b interior -> merge b into a
+                keep, drop = a, b
+                target = verts[keep][:]
+            elif b_b:                        # a interior -> merge a into b
+                keep, drop = b, a
+                target = verts[keep][:]
+            else:
+                keep, drop = a, b            # both interior: midpoint
+                target = [(verts[a][0] + verts[b][0]) * 0.5,
+                          (verts[a][1] + verts[b][1]) * 0.5,
+                          (verts[a][2] + verts[b][2]) * 0.5]
+
+            affected = [t for t in tris
+                        if (keep in t or drop in t) and not (
+                            keep in t and drop in t)]
+            before = max([_edge_ratio(t) for t in affected], default=1.0)
+            old = verts[keep][:]
+            old_signs = [_area2(t) > 0 for t in affected]
+            verts[keep] = target
+            ok = True
+            new_tris = [tuple(keep if i == drop else i for i in t)
+                        for t in affected]
+            for t, s0 in zip(new_tris, old_signs):
+                if len(set(t)) < 3:
+                    ok = False
+                    break
+                ar = _area2(t)
+                if abs(ar) < 1e-6 or ((ar > 0) != s0):
+                    ok = False             # degenerate or flipped
+                    break
+            if ok:
+                after = max([_edge_ratio(t) for t in new_tris], default=1.0)
+                if after > before + 1e-9:
+                    ok = False             # only ever improve shape
+            if not ok:
+                verts[keep] = old
+                continue
+            # commit
+            remap[drop] = keep
+            gone.add(drop)
+            out = []
+            for t in tris:
+                nt = tuple(keep if i == drop else i for i in t)
+                if len(set(nt)) == 3:
+                    out.append(nt)
+            tris = out
+            changed = True
+        if not changed:
+            break
+
+    return verts, tris
 
 
 # TODO(navmesh): revisit — some of these dropped fringe islands are REAL
@@ -142,13 +348,21 @@ def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None):
 # so a doorstep or a border-crossing scrap is always preserved even if tiny.
 
 
-def _drop_unreachable_islands(verts, tris, doors=None, cell_bounds=None):
+def _drop_unreachable_islands(verts, tris, doors=None, cell_bounds=None,
+                              pin_xy=None):
     """Drop disconnected components that lead nowhere.
 
     A component is KEPT when it can reach another cell:
       * it comes within ISLAND_DOOR_RADIUS of a door (leads through the door),
       * or (exterior) it touches the cell border, where a worldspace edge-link
-        continues it into the neighbour cell.
+        continues it into the neighbour cell,
+      * or it carries a PATHGRID line (pin_xy).  The pathgrid is the one part of
+        the input that asserts "an actor walks here", so a component covering it
+        is reachable BY DEFINITION however isolated this cell's mesh makes it
+        look.  Without this, a steep hillside ribbon — kept narrow because steep
+        edges are not width-grown — was dropped wholesale on exterior grid
+        (-48,-8): all four of its pathgrid edges lost their mesh (4/4 midpoints
+        covered before the island pass, 0/4 after).
     Everything still connected to the main body is kept as one component.  Only
     a component that is BOTH disconnected from the main mesh AND reaches no cell
     exit is unreachable noise, and only those are dropped — never by size.
@@ -163,6 +377,9 @@ def _drop_unreachable_islands(verts, tris, doors=None, cell_bounds=None):
     dz = params.ISLAND_DOOR_ZTOL
     margin = params.ISLAND_EDGE_MARGIN
 
+    pins = list(pin_xy or ())
+    pr2 = params.ISLAND_PGRD_RADIUS ** 2
+
     def reaches_exit(comp):
         for ci in comp:
             for i in tris[ci]:
@@ -171,6 +388,10 @@ def _drop_unreachable_islands(verts, tris, doors=None, cell_bounds=None):
                     if ((vx - dxp) ** 2 + (vy - dyp) ** 2 <= dr2 and
                             abs(vz - dzp) <= dz):
                         return True
+                for p in pins:
+                    if ((vx - p[0]) ** 2 + (vy - p[1]) ** 2 <= pr2 and
+                            (len(p) < 3 or abs(vz - p[2]) <= dz)):
+                        return True        # carries a pathgrid line
                 if cell_bounds is not None:
                     minx, miny, maxx, maxy = cell_bounds
                     if (vx - minx <= margin or maxx - vx <= margin or

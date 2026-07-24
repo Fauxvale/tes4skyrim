@@ -62,6 +62,18 @@ Later Issues:
 
 	17 - More granular navmesh caching to make rebuilds fewer
 
+	Current state — 
+	width-grow with thin-slab swept collision: on
+	node discs: rolled back
+	rail simplification: rolled back (0.0)
+	decimator: rolled back (0.0)
+
+	DECIMATE_MIN_EDGE
+	RIBBON_RAIL_SIMPLIFY
+
+	test-navmesh-2 had some good work to speed up generation of navmesh. It takes an unacceptably long amount of time now (over 1.5 hours)
+	Specifically, it disabled garbage collection (unnecessary) and moved hotspot code to compiled C++ analyze the time it takes to generate a few cells for hotspots and then create similar optimizations. I am expecting under 20 minutes.
+
 Minor Issues:
 
 	1 -	Override gold with skyrim gold
