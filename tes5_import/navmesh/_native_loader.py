@@ -3,7 +3,7 @@
 The .pyd lives outside the package (in `native/dist/`, alongside its sources and
 build script, and committed there) rather than inside `tes5_import/navmesh/`, so
 the Python tree holds no build artifacts.  That means a plain `from . import
-_navmesh_native` cannot find it and the module has to be loaded by path.
+_navgrow_native` cannot find it and the module has to be loaded by path.
 
 The extension is REQUIRED.  Falling back to a Python implementation when it is
 missing would make navmesh output depend on whether a build artifact happened to
@@ -17,7 +17,7 @@ import os
 import sys
 import sysconfig
 
-_MOD = '_navmesh_native'
+_MOD = '_navgrow_native'
 _DIST = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     'native', 'dist')

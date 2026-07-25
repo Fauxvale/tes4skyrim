@@ -2,7 +2,7 @@
 
 Two views, because they answer different questions:
 
-  STAGE  wall-clock per pipeline stage (voxelize / region / spanmesh / post),
+  STAGE  wall-clock per pipeline stage (geometry / grow / union / clean),
          measured by wrapping the module boundaries build.py calls.  This is
          the number that decides a rewrite: Amdahl's law caps any speedup of a
          stage at that stage's share of the total.
@@ -29,21 +29,31 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
-from tes5_import.navmesh import build, region, spanmesh, voxel  # noqa: E402
+from tes5_import.navmesh import (  # noqa: E402
+    build, corridor_clean, corridor_grow, corridor_union, world,
+)
 from tools.navmesh_probe import load_cell  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Stage timing
 #
-# Stages are wrapped where build.py calls them, so each number is true
-# wall-clock inclusive of everything that stage does.  build.py does
-# `from . import region, spanmesh, voxel` and looks attributes up at call time,
-# so patching the module attribute is enough.  Whatever is left over appears as
+# Stages are wrapped at the module boundaries the corridor build calls, so each
+# number is true wall-clock inclusive of everything that stage does.  Callers do
+# `from . import corridor_union` (etc.) and look attributes up at call time, so
+# patching the module attribute is enough.  Whatever is left over appears as
 # "(other)" -- recovered by subtraction so no time goes silently unattributed.
+#
+# NOTE the nesting: build_union_mesh CONTAINS _split_plan_overlaps and friends,
+# so those rows double-count against it.  Read the sub-rows to locate a hotspot
+# inside the union and the union row for its share of the whole build.
 # ---------------------------------------------------------------------------
 
 _ACC = {}
+
+# Labels that run INSIDE another timed stage; excluded from the "(other)"
+# subtraction so it cannot go negative.  See stage_report.
+_NESTED = set()
 
 
 def _rss_note():
@@ -95,39 +105,58 @@ def _wrap(mod, fname, label):
 
 
 def install_stage_timers():
-    """Wrap only the calls build.py actually makes."""
-    _wrap(spanmesh, 'build_mesh', 'spanmesh.build_mesh')
-    _wrap(region, 'build_regions', 'region.build_regions')
-    _wrap(region, 'keep_pathgrid_heights', 'region.keep_pathgrid_heights')
-    for fn in ('erode_walkable', 'rasterize_triangles', 'rasterize',
-               'build_heightfield', 'filter_low_hanging_obstacles',
-               'filter_ledge_spans', 'filter_walkable_low_height'):
-        _wrap(voxel, fn, 'voxel.' + fn)
+    """Wrap the stages the CORRIDOR build actually runs.
+
+    These used to wrap voxel/region/spanmesh, which stopped being on the build
+    path when the corridor model landed and have since been deleted — so every
+    stage read 0.00 and the whole run showed up as "(other)".
+    """
+    _wrap(world, 'gather_cell_geometry', 'world.gather_cell_geometry')
+    _wrap(corridor_grow, 'grow_batch', 'corridor_grow.grow_batch')
+    _wrap(corridor_union, 'build_union_mesh', 'corridor_union.build_union_mesh')
+    for fn in ('_split_plan_overlaps', '_merge_at_pathgrid_nodes',
+               '_stitch_shared_nodes', '_split_t_junctions', '_weld_sheets',
+               '_triangulate', '_emit_surfaces'):
+        label = 'corridor_union.' + fn
+        _NESTED.add(label)
+        _wrap(corridor_union, fn, label)
+    for fn in ('finalize', 'decimate'):
+        _wrap(corridor_clean, fn, 'corridor_clean.' + fn)
 
 
 def stage_report(total_wall):
     rows = sorted(_ACC.items(), key=lambda kv: -kv[1][0])
-    named = sum(v[0] for _k, v in rows)
     print('\n%-40s %9s %7s %7s' % ('STAGE', 'SEC', 'SHARE', 'CALLS'))
     print('-' * 67)
     for k, (dt, n) in rows:
-        print('%-40s %9.2f %6.1f%% %7d' % (k, dt, 100.0 * dt / total_wall, n))
+        # Sub-stages are marked, so a nested row is never mistaken for another
+        # slice of the total.
+        mark = '  ' if k in _NESTED else ''
+        print('%-40s %9.2f %6.1f%% %7d'
+              % (mark + k, dt, 100.0 * dt / total_wall, n))
+    # Only TOP-LEVEL stages may be subtracted.  The sub-stage rows run INSIDE
+    # build_union_mesh, so counting them here made "(other)" negative (-63.5% on
+    # Moranda) -- which reads as a measurement bug rather than the double-count
+    # it actually is.
+    named = sum(dt for k, (dt, _n) in _ACC.items() if k not in _NESTED)
     other = total_wall - named
     print('%-40s %9.2f %6.1f%%' % ('(other / unattributed)', other,
                                    100.0 * other / total_wall))
     print('-' * 67)
     print('%-40s %9.2f %6.1f%%' % ('TOTAL', total_wall, 100.0))
 
-    # The headline: what a perfect rewrite of spanmesh would actually buy.
-    sm = sum(dt for k, (dt, _n) in _ACC.items() if k.startswith('spanmesh'))
+    # The headline: what a perfect rewrite of the union stage would buy.  Amdahl
+    # caps any speedup at that stage's share, so this is the number that decides
+    # whether a C++ kernel is worth writing at all.
+    sm = _ACC.get('corridor_union.build_union_mesh', (0.0, 0))[0]
     if sm and total_wall:
-        print('\nspanmesh share: %.1f%%' % (100.0 * sm / total_wall))
+        print('\nbuild_union_mesh share: %.1f%%' % (100.0 * sm / total_wall))
         for factor, lbl in ((20.0, '20x (C++ kernel)'),
                             (10.0, '10x (numba-ish)'),
                             (float('inf'), 'infinite (upper bound)')):
             newt = (total_wall - sm) + (0.0 if factor == float('inf')
                                         else sm / factor)
-            print('  spanmesh %-24s -> total %5.2fx faster'
+            print('  union %-24s -> total %5.2fx faster'
                   % (lbl, total_wall / newt))
 
 

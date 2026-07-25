@@ -17,7 +17,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
-from tes5_import.navmesh import voxel, world  # noqa: E402
+from tes5_import.navmesh import world  # noqa: E402
 from tes5_import.text_reader import (  # noqa: E402
     parse_export_directory, group_records_by_type, get_float, get_int, get_str,
 )
@@ -257,10 +257,8 @@ def cell_geometry(ctx, pad=200.0):
 
 
 def probe_point(ctx, px, py, radius=64.0):
-    """Dump everything the navmesh build knows about one XY spot:
-    nearby REFRs, pathgrid nodes/edge samples, and the heightfield span
-    column (with walkable/protected state) after each pipeline stage."""
-    from tes5_import.navmesh import build as nbuild, region, params
+    """Dump what the navmesh build knows about one XY spot: nearby REFRs and
+    pathgrid nodes/edge samples."""
     import math
 
     print('--- probe (%.0f, %.0f) r=%.0f ---' % (px, py, radius))
@@ -291,25 +289,8 @@ def probe_point(ctx, px, py, radius=64.0):
             print('  PGRD edge %d-%d  z@closest=%.0f (a=%.0f b=%.0f t=%.2f)'
                   % (i, j, a[2] + t * (b[2] - a[2]), a[2], b[2], t))
 
-    walk, block, bounds = cell_geometry(ctx)
-    if bounds is None:
-        print('  (cell has no collision geometry; span dump skipped)')
-        return
-    hf = voxel.build_heightfield(walk, block, bounds)
-    def dump(tag):
-        cx = int((px - hf.min_x) / hf.cs)
-        cy = int((py - hf.min_y) / hf.cs)
-        col = hf.spans[cy * hf.w + cx]
-        print('  [%s] col(%d,%d):' % (tag, cx, cy))
-        for s in col:
-            print('    z %.0f..%.0f walk=%s prot=%s pgz=%s'
-                  % (s[0], s[1], s[2], s[3],
-                     ('%.0f' % s[4]) if s[4] is not None else '-'))
-    dump('raw')
-    voxel.stamp_pathgrid(hf, ctx['nodes'], ctx['edges'])
-    dump('stamped')
-    voxel.apply_filters(hf)
-    dump('filtered')
+    # (The voxel span-column dump that used to follow went away with the
+    # voxel/region/spanmesh generator — the corridor model has no heightfield.)
 
 
 def main():
@@ -335,31 +316,8 @@ def main():
     if bounds is None:
         print('no geometry')
         return
-
-    hf = voxel.build_heightfield(walk, block, bounds)
-    voxel.apply_filters(hf)
-    cols = voxel.walkable_columns(hf)
-    print('grid %dx%d cs=%.0f  walkable columns=%d'
-          % (hf.w, hf.h, hf.cs, len(cols)))
-
-    # How well does the pathgrid land on the voxelized floor?
-    hit = miss = 0
-    zerr = []
-    for (x, y, z) in ctx['nodes']:
-        cx = int((x - hf.min_x) / hf.cs)
-        cy = int((y - hf.min_y) / hf.cs)
-        ws = cols.get((cx, cy))
-        if ws:
-            hit += 1
-            best = min(ws, key=lambda s: abs(s[1] - z))
-            zerr.append(best[1] - z)
-        else:
-            miss += 1
-    print('pathgrid nodes on a walkable column: %d   missed: %d' % (hit, miss))
-    if zerr:
-        zerr.sort()
-        print('span-top minus node-z: median %+.1f  min %+.1f  max %+.1f'
-              % (zerr[len(zerr) // 2], zerr[0], zerr[-1]))
+    print('bounds: x %.0f..%.0f  y %.0f..%.0f  z %.0f..%.0f'
+          % (bounds[0], bounds[3], bounds[1], bounds[4], bounds[2], bounds[5]))
 
 
 if __name__ == '__main__':

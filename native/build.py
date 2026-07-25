@@ -3,10 +3,10 @@
     python native/build.py            # build in place
     python native/build.py --force    # rebuild even if up to date
 
-The compiled module lands next to the sources as
-`tes5_import/navmesh/_navmesh_native*.pyd`, which spanmesh imports opportunis-
-tically -- if it is missing, the pure-Python path runs instead, so the pipeline
-never hard-depends on a compiler being installed.
+The compiled module lands in `native/dist/` and is loaded by path (see
+`tes5_import/navmesh/_native_loader.py`).  It is REQUIRED at runtime -- falling
+back to Python would make output depend on whether a build artifact happened to
+be present, which breaks byte-reproducibility -- so the .pyd is committed.
 
 MSVC is located through vswhere (Build Tools are enough; a full Visual Studio
 install is not required), so this works on a machine that has never opened an
@@ -25,7 +25,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # module name -> source file.  Each builds to its own .pyd; they share no code,
 # so a failure in one does not block the other.
 MODULES = {
-    '_navmesh_native': os.path.join(ROOT, 'native', 'src', 'decimate.cpp'),
     '_navgrow_native': os.path.join(ROOT, 'native', 'src', 'grow.cpp'),
 }
 

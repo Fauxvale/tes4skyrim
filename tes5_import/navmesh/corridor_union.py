@@ -118,7 +118,34 @@ def _ribbon_polygon(s):
 
     A strip may instead carry an explicit 'poly' outline — the door triangles
     do — in which case that shape is used verbatim.
+
+    MEMOISED on the strip's identity.  This is a pure function of the strip, but
+    the nested ribbon-pair loops (_same_surface_region, _split_plan_overlaps)
+    call it for the same strips over and over — 379,250 calls for a cell holding
+    a few thousand strips, ~12.7s of a 33s build, and the invalid-outline repair
+    path above re-ran its buffer/union work every single time.  Strips are plain
+    dicts that live for the whole build and are never mutated after the polygon
+    could first be asked for, so identity is a sound key; the cache is cleared
+    per build by `_ribbon_cache_clear` so nothing leaks between cells (and a
+    freed dict's id cannot be recycled onto a stale entry, because the cache
+    holds a reference to every strip it keys).
     """
+    cached = _RIBBON_CACHE.get(id(s))
+    if cached is not None:
+        return cached[1]
+    p = _ribbon_polygon_uncached(s)
+    _RIBBON_CACHE[id(s)] = (s, p)
+    return p
+
+
+_RIBBON_CACHE = {}
+
+
+def _ribbon_cache_clear():
+    _RIBBON_CACHE.clear()
+
+
+def _ribbon_polygon_uncached(s):
     from shapely.geometry import Polygon
 
     if s.get('poly') is not None:
@@ -758,6 +785,10 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
     from shapely.geometry import Polygon, MultiPolygon, box
     from shapely.ops import unary_union
 
+    # Bound the ribbon-polygon memo to one build: a worker converts thousands of
+    # cells in a row and the cache pins a Polygon (and the strip) per entry.
+    _ribbon_cache_clear()
+
     if not strips:
         return [], []
 
@@ -1126,15 +1157,54 @@ def _merge_at_pathgrid_nodes(verts, tris, node_pts, node_half):
             i = remap[i]
         return i
 
+    # comp/vcomp describe the CURRENT triangle soup, so they only go stale when
+    # a node actually welds something -- and most nodes weld nothing (they hit
+    # the `continue`s below).  Rebuilding them per node regardless made this the
+    # single hottest function in the whole navmesh build: full-mesh union-find
+    # once per pathgrid node is O(nodes x tris), 831 x ~4000 on Moranda, ~60% of
+    # a large cell's total time.  Computing them lazily and invalidating only on
+    # a real weld is the same answer for a fraction of the work.
+    #
+    # `near` additionally needs a SPATIAL index: scanning every vertex per node
+    # is the other half of the quadratic.  Vertices are bucketed once into a
+    # grid whose cell equals the largest search radius, so a query touches only
+    # the 3x3 neighbourhood around the node.
+    cache = {}
+
+    def _state():
+        """(comp-per-tri, vertex -> set-of-comps, xy-bucket index), memoised."""
+        if 'comp' not in cache:
+            comp = _tri_components(tris)
+            vcomp = {}
+            for ti, t in enumerate(tris):
+                for i in t:
+                    vcomp.setdefault(resolve(i), set()).add(comp[ti])
+            cell = max(GRID_R, 1.0)
+            buckets = {}
+            for i in vcomp:
+                v = verts[i]
+                buckets.setdefault((int(v[0] // cell), int(v[1] // cell)),
+                                   []).append(i)
+            cache['comp'] = (comp, vcomp, buckets, cell)
+        return cache['comp']
+
+    GRID_R = max([float(node_half.get(ni, 0.0)) for ni in node_pts]
+                 + [params.RIBBON_HALF_WIDTH])
+
     for ni, (nx, ny) in sorted(node_pts.items()):
         r = max(float(node_half.get(ni, 0.0)), params.RIBBON_HALF_WIDTH)
-        comp = _tri_components(tris)
-        vcomp = {}
-        for ti, t in enumerate(tris):
-            for i in t:
-                vcomp.setdefault(resolve(i), set()).add(comp[ti])
-        near = [i for i in vcomp
-                if math.hypot(verts[i][0] - nx, verts[i][1] - ny) <= r]
+        comp, vcomp, buckets, cell = _state()
+        # Candidates from the 3x3 bucket neighbourhood, then the exact radius
+        # test.  Sorted so the banding below stays deterministic regardless of
+        # bucket iteration order (byte-reproducibility contract).
+        gx, gy = int(nx // cell), int(ny // cell)
+        near = []
+        for ddx in (-1, 0, 1):
+            for ddy in (-1, 0, 1):
+                for i in buckets.get((gx + ddx, gy + ddy), ()):
+                    if math.hypot(verts[i][0] - nx, verts[i][1] - ny) <= r:
+                        near.append(i)
+        near.sort()
         if len(near) < 2:
             continue
         # Group by walkable surface: one step apart is the same surface, a
@@ -1154,6 +1224,7 @@ def _merge_at_pathgrid_nodes(verts, tris, node_pts, node_half):
                 bands[-1].append(i)
             else:
                 bands.append([i])
+        welded_any = False
         for band in bands:
             comps = set()
             for i in band:
@@ -1165,8 +1236,15 @@ def _merge_at_pathgrid_nodes(verts, tris, node_pts, node_half):
             for i in band:
                 if i != keep:
                     remap[i] = keep
-        tris = [t for t in ((resolve(a), resolve(b), resolve(c))
-                            for (a, b, c) in tris) if len(set(t)) == 3]
+                    welded_any = True
+        # Only a real weld changes the soup.  Skipping the rewrite (and the
+        # cache drop) when nothing welded is what makes the memo above pay off:
+        # the vertex roots, the components and the buckets are all still exactly
+        # what _state() last computed.
+        if welded_any:
+            tris = [t for t in ((resolve(a), resolve(b), resolve(c))
+                                for (a, b, c) in tris) if len(set(t)) == 3]
+            cache.clear()
 
     tris = [t for t in ((resolve(a), resolve(b), resolve(c))
                         for (a, b, c) in tris) if len(set(t)) == 3]
@@ -1632,32 +1710,53 @@ def _split_plan_overlaps(groups):
                     if abs(za - zb) <= SAME_SURFACE_Z:
                         bonded.add((min(ka, kb), max(ka, kb)))
 
+        # Candidate pairs from an R-tree instead of all-pairs.  A ribbon is a
+        # short, local quad, so of the n(n-1)/2 pairs only a handful can touch --
+        # but testing them all cost 7.4M scalar shapely `intersects` calls on
+        # Moranda (~33% of the cell's build time).  STRtree.query does the same
+        # box filter in bulk C, and `intersects` is then evaluated only on real
+        # candidates.  Pairs are (a<b)-normalised and SORTED so the union-find
+        # below sees them in the same order as the old nested loop, which the
+        # byte-reproducibility contract requires.
         conflicts = set()
-        for a in range(n):
+        polys = [p for (_s, p) in items]
+        pairs = []
+        if n > 1:
+            from shapely import STRtree
+            tree = STRtree(polys)
+            qa, qb = tree.query(polys, predicate='intersects')
+            for a, b in zip(qa.tolist(), qb.tolist()):
+                if a < b:
+                    pairs.append((a, b))
+            pairs.sort()
+        # NOTE: batching these intersections through shapely's vectorised
+        # `intersection`/`area` was measured SLOWER (17.0s -> 17.9s over the
+        # 6-cell set).  The cost here is GEOS clipping itself, not Python call
+        # overhead, and the bulk form materialises an intersection for every
+        # candidate pair whereas this loop discards most of them on the cheap
+        # area test.  Left scalar deliberately.
+        for (a, b) in pairs:
             sa, pa = items[a]
-            for b in range(a + 1, n):
-                sb, pb = items[b]
-                if not pa.intersects(pb):
-                    continue
-                inter = pa.intersection(pb)
-                if inter.is_empty or inter.area < 1.0:
-                    continue
-                gap = _overlap_height_gap(sa, sb, inter)
-                # A bond outranks a plan conflict.  Two ribbons meeting at a node
-                # where they agree in height are one junction even if their
-                # ribbons ALSO overlap somewhere else at a different storey --
-                # which is exactly what a staircase does: Pinarus's flight (0,1)
-                # meets the landing at node 1 (heights 68.6 vs 68.6) and passes
-                # UNDER five upper-floor ribbons near its bottom end.  Judging it
-                # on those overlaps alone put the flight in a different sheet from
-                # its own landing, and the clip then took its top 51.2u as
-                # duplicate ground.
-                if gap > STOREY_GAP_Z and (a, b) not in bonded:
-                    conflicts.add((a, b))
-                else:
-                    ra, rb = find(a), find(b)
-                    if ra != rb:
-                        parent[ra] = rb
+            sb, pb = items[b]
+            inter = pa.intersection(pb)
+            if inter.is_empty or inter.area < 1.0:
+                continue
+            gap = _overlap_height_gap(sa, sb, inter)
+            # A bond outranks a plan conflict.  Two ribbons meeting at a node
+            # where they agree in height are one junction even if their
+            # ribbons ALSO overlap somewhere else at a different storey --
+            # which is exactly what a staircase does: Pinarus's flight (0,1)
+            # meets the landing at node 1 (heights 68.6 vs 68.6) and passes
+            # UNDER five upper-floor ribbons near its bottom end.  Judging it
+            # on those overlaps alone put the flight in a different sheet from
+            # its own landing, and the clip then took its top 51.2u as
+            # duplicate ground.
+            if gap > STOREY_GAP_Z and (a, b) not in bonded:
+                conflicts.add((a, b))
+            else:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
 
         # Bonds also merge directly, so a junction survives even when the two
         # ribbons never overlap in plan at all.
@@ -1684,15 +1783,34 @@ def _split_plan_overlaps(groups):
             # from ONE floor across several sub-sheets, and those sub-sheets then
             # overlap in plan at the SAME height — duplicate ground, measured as
             # 7% of Chorrol's triangles stacked on another at the same height.
+            # Per-ribbon neighbour sets, so "does this ribbon conflict with (or
+            # bond to) anything in that sub-sheet?" is a SET INTERSECTION instead
+            # of a scan over the sub-sheet's members.  The scanning form rebuilt
+            # a (min,max) tuple per member per candidate sub-sheet -- 17.8M
+            # min/max calls and ~4.5s on Moranda02, the top cost once the union
+            # and merge passes were indexed.
+            cadj = {}
+            for (a, b) in cset:
+                cadj.setdefault(a, set()).add(b)
+                cadj.setdefault(b, set()).add(a)
+            badj = {}
+            for (a, b) in bonded:
+                if a in members and b in members:
+                    badj.setdefault(a, set()).add(b)
+                    badj.setdefault(b, set()).add(a)
+
             subs = []
+            sub_sets = []                   # same membership, as sets
             sub_h = []                      # representative height per sub-sheet
             for i in sorted(members,
                             key=lambda k: -0.5 * (items[k][0]['na'][2] +
                                                   items[k][0]['nb'][2])):
                 zi = 0.5 * (items[i][0]['na'][2] + items[i][0]['nb'][2])
+                ci = cadj.get(i) or ()
+                bi = badj.get(i) or ()
                 best = None
                 for si, sub in enumerate(subs):
-                    if any((min(i, j), max(i, j)) in cset for j in sub):
+                    if ci and not sub_sets[si].isdisjoint(ci):
                         continue
                     # A sub-sheet this ribbon is BONDED to (they meet at a
                     # pathgrid node and agree in height there) always wins: that
@@ -1702,18 +1820,19 @@ def _split_plan_overlaps(groups):
                     # is never near either sub-sheet and lands wherever the
                     # ordering happens to put it.
                     d = abs(sub_h[si] - zi)
-                    rank = 0 if any((min(i, j), max(i, j)) in bonded
-                                    for j in sub) else 1
+                    rank = 0 if (bi and not sub_sets[si].isdisjoint(bi)) else 1
                     if best is None or (rank, d) < (best[0], best[1]):
                         best = (rank, d, si)
                 if best is not None:
                     best = (best[1], best[2])
                 if best is None:
                     subs.append([i])
+                    sub_sets.append({i})
                     sub_h.append(zi)
                 else:
                     si = best[1]
                     subs[si].append(i)
+                    sub_sets[si].add(i)
                     # Track the sub-sheet's height as a running mean so a stair
                     # does not drag it away from the floor it belongs to.
                     sub_h[si] = (sub_h[si] * (len(subs[si]) - 1) + zi) / \
@@ -1728,9 +1847,14 @@ def _split_plan_overlaps(groups):
             merged_subs = []
             for sub in subs:
                 target = None
+                # Everything `sub` conflicts with, once -- then each candidate
+                # merge target is one disjointness test rather than a nested
+                # scan over both membership lists.
+                sub_conf = set()
+                for i in sub:
+                    sub_conf |= cadj.get(i) or set()
                 for mi, msub in enumerate(merged_subs):
-                    if any((min(i, j), max(i, j)) in cset
-                           for i in sub for j in msub):
+                    if sub_conf and not sub_conf.isdisjoint(msub):
                         continue
                     if _subs_same_floor(items, sub, msub):
                         target = mi
@@ -1771,15 +1895,26 @@ def _same_surface_region(group_a, group_b, shared):
     containing a staircase spans many heights and a single test would either
     surrender a whole floor or nothing.
     """
+    from shapely import STRtree
     from shapely.ops import unary_union as _uu
     dup = []
+    # R-tree over group_b, so each ribbon of group_a tests only the group_b
+    # ribbons whose box actually meets it instead of all of them.  Candidates are
+    # visited in ascending index order, which is the order the old nested loop
+    # used, so `dup` is assembled identically.
+    b_strips = list(group_b)
+    b_polys = [_ribbon_polygon(sb) for sb in b_strips]
+    if not b_strips:
+        return None
+    b_tree = STRtree(b_polys)
     for sa in group_a:
         pa = _ribbon_polygon(sa)
         if pa.is_empty or not pa.intersects(shared):
             continue
-        for sb in group_b:
-            pb = _ribbon_polygon(sb)
-            if pb.is_empty or not pb.intersects(pa):
+        for bi in sorted(b_tree.query(pa, predicate='intersects').tolist()):
+            sb = b_strips[bi]
+            pb = b_polys[bi]
+            if pb.is_empty:
                 continue
             try:
                 piece = pa.intersection(pb).intersection(shared)
@@ -1826,23 +1961,22 @@ def _overlap_height_gap(sa, sb, inter):
         pass
     try:
         minx, miny, maxx, maxy = inter.bounds
-        for fx in (0.25, 0.5, 0.75):
-            for fy in (0.25, 0.5, 0.75):
-                px = minx + (maxx - minx) * fx
-                py = miny + (maxy - miny) * fy
-                if inter.intersects(_pt(px, py)):
-                    pts.append((px, py))
+        # All 9 grid samples tested in ONE vectorised call.  Building a shapely
+        # Point per sample and testing it scalar-wise cost 274k Point objects and
+        # ~4.8s of a 17s cell; shapely.points + shapely.intersects do the same
+        # work in bulk C.  Order is preserved, so the sample list -- and hence the
+        # min below -- is identical to the scalar version.
+        import shapely as _sh
+        grid = [(minx + (maxx - minx) * fx, miny + (maxy - miny) * fy)
+                for fx in (0.25, 0.5, 0.75) for fy in (0.25, 0.5, 0.75)]
+        hits = _sh.intersects(inter, _sh.points(grid))
+        pts.extend(g for g, hit in zip(grid, hits.tolist()) if hit)
     except Exception:
         pass
     if not pts:
         return float('inf')
     return min(abs(_height_on(sa, px, py) - _height_on(sb, px, py))
                for (px, py) in pts)
-
-
-def _pt(x, y):
-    from shapely.geometry import Point
-    return Point(x, y)
 
 
 def _subs_same_floor(items, sub_a, sub_b):

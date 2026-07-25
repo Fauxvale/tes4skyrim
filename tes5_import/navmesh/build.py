@@ -8,9 +8,8 @@ get a threshold quad welded into the ribbon; cross-cell edge links and NAVI are
 downstream, unchanged.
 
 `build_navmesh` keeps its historical signature and delegates to corridor.py.
-The old voxel/span-graph generator (voxel.py / region.py / spanmesh.py) is no
-longer on the build path but remains importable — some debug tools still poke
-its internals.
+(The old voxel/span-graph generator — voxel.py / region.py / spanmesh.py — came
+off the build path when this model landed and has since been deleted.)
 
 Returns (verts, tris) in world space.  The caller (pgrd_to_navm) owns the
 NVNM/NAVM binary packing, validated byte-exact against Skyrim.esm — do not
