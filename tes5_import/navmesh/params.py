@@ -208,6 +208,23 @@ RIBBON_WELD_EPS = 24.0
 # corridor that stopped at the last node would leave a gap in front of the wall
 # or door it was heading for.  ~one ribbon half-width reaches the threshold.
 RIBBON_END_EXTEND = 40.0
+# A STEEP (stair/ramp) ribbon extends this far past BOTH its end nodes, junction
+# or not.  A steep edge is never width-grown, so it keeps the narrow Phase-1
+# width while the flat landing it meets grows to 100u+; the stair mouth is then
+# much narrower than the landing and the two meet only at the landing's CORNER
+# vertices.  At the top of Pinarus's stairs that left the whole descent routed
+# through two 27-degree wedges (one of edge ratio 6.1) hanging off those corners
+# — one connected component, but not walkable.  Extending the flight onto the
+# flat at each end gives the boolean union a real overlap, so the mouth becomes a
+# span of shared edges.  Kept modest: the extension carries the LINE's slope, so
+# too much would push ramp mesh out across the landing floor.
+RIBBON_STAIR_END_EXTEND = 48.0
+# Half-width of a STEEP ribbon.  Wider than RIBBON_HALF_WIDTH because a flight
+# has to present a mouth comparable to the landing it joins, and because a
+# staircase in Oblivion is a full-width architectural feature, not a corridor.
+# Still well inside a standard flight so the ribbon does not overhang the
+# stringers. Only used for edges the width-grow refuses (see RIBBON_GROW_MAX_SLOPE).
+RIBBON_STAIR_HALF_WIDTH = 64.0
 
 # --- Corridor width-grow (Phase 2, corridor.py) -----------------------------------
 # Phase 2 replaces the fixed RIBBON_HALF_WIDTH with a per-cross-section, per-side

@@ -400,3 +400,133 @@ Still open, to resolve during the Phase 1 build:
 | Door with no pathgrid edge through it → no Door Triangle → dead doorway | Step 4 skips only genuinely walled-off doors; author asserts doorways have pathgrid. Acceptance counts doors that got a Door Triangle vs. total; a shortfall is a real bug to chase. |
 | Exterior sparse pathgrid → spiderweb over open terrain | Accepted for Phase 1; Phase 2 width-grow + terrain already in `walkable`. |
 | Cross-cell connectivity | Unchanged — NAVI/NVMI + edge-link passes already handle it and consume `(verts,tris)`; Phase 1 only owes them border edges at the seam. |
+
+---
+
+## Connectivity invariant: status 2026-07-25
+
+Acceptance test is `tools/navmesh_component_audit.py` (SINGLE-PROCESS — see its
+docstring): **one connected pathgrid component must produce one connected
+navmesh component.** Anything more means the engine cannot make a walk the
+pathgrid asserts, however good the mesh looks in the preview.
+
+Measured over `--all --limit 60`: **18 bad (32.7%) -> 15 bad (27.3%)** after
+raising `_weld_sheets`' `WELD_R` 12.0 -> 16.0. The four reference houses
+(Pinarus / Arvena / ChorrolFG / AnvilFG) are all `pathgrid=1 navmesh=1`.
+
+### Fixed: sheet weld radius (the stair-top class)
+
+Where a stair FLIGHT meets its LANDING the two sheets both seed a vertex at the
+shared pathgrid node, but at different Z — the flight's last row sits on the
+ribbon CHORD, the landing's on the floor. Pinarus's stair top came out
+**12.66u** apart (identical XY, pure Z gap), just outside a 12u weld, so the
+house shipped as 150/148 triangles with no shared edge across the joint.
+
+`WELD_R = 16.0` closes it. The value is bounded on both sides and must stay
+there: it equals `RIBBON_GROW_MIN_HALF`, so the radius cannot span two distinct
+rails, and it is far under `MAX_CLIMB` (34) so it cannot fuse a step an actor is
+supposed to climb. A trial at 20.0 scored marginally better (14 bad) but eroded
+triangle counts everywhere and pushed `XPGloomstonePassage02` from 16 to 17
+components — a tolerance past its justification, not a fix. **Do not raise it
+further to chase a component count.**
+
+The weld must stay **3D**. Measured in plan alone, Pinarus `B v56` is 0.00u from
+a main-mesh edge and **267u** below it — a different storey. A plan-only or
+grid-snapped weld fuses floors.
+
+### Remaining failures — diagnosed, NOT fixed
+
+Diagnose with `temp/_edgecheck.py <cell>`, which reports every pathgrid edge
+whose endpoints land in different navmesh components together with that edge's
+slope; that slope separates the classes below. `temp/_gap2.py <cell> <ci> <cj>`
+measures the closest approach between two named components.
+
+1. **Vertical drops (NOT a geometry bug — needs an edge link).**
+   `VeyondCave02` `n35->n36`: run **24.7u**, dz **308u**, slope **12.49**. The
+   two components sit at the same XY (`341.5, 606.9`) 308u apart in Z — a shaft
+   an NPC FALLS down. Oblivion pathgrids legitimately connect across such
+   ledges. No continuous surface can represent it, and forcing triangles here
+   reproduces exactly the unnavigable "fold" rejected at Pinarus's stair top.
+   Skyrim's representation is a NAVM edge/portal link, not geometry. The audit
+   should classify a crossing edge steeper than ~1.5 as link-only and stop
+   counting it as a component violation.
+
+2. **Real holes: the ribbon never got built (the big splits).**
+   `VeyondCave02` `n47->n48`: run **329.5u**, dz 44u, slope **0.13** — nearly
+   flat, so it SHOULD be one surface, yet comp1<->comp2 are **97.3u** apart at
+   the closest point. A gentle ramp was severed outright; no weld radius can or
+   should bridge 97u. This is the cause of the large multi-way cave splits
+   (`XPAichan01` 23-24 comps, `XPGloomstonePassage02/03`, `XPMilchar02a`,
+   `Elenglynn`, `SENSGreenmoteSilo`, `XPXeddefen03spire`) and the 121.86u gap in
+   `XPGloomstonePassage03`. Find why the width-grow/clip drops these ribbons
+   before touching tolerances again.
+
+3. **1-2 triangle specks** (`KvatchChapelUndercroft` [419,2,2],
+   `GoblinJimsCave` [1633,2], `BrumaJGhastasHouse` [415,2],
+   `BramblePointCave03` [2540,2], `Piukanda02` [5294,1]).
+   Vertex-only contact: the speck shares VERTEX ids with the main mesh but zero
+   common EDGES, so `_drop_point_attached` / `_split_t_junctions` do not fire.
+   Note `_split_t_junctions` tests candidate vertices in **3D** with `tol=2.0`;
+   a speck lying on a main-mesh edge in plan but offset in Z is never split in.
+   Cheapest correct fix is to DROP a component under a few triangles that has no
+   shared edge, rather than to stitch it.
+
+### The real Pinarus defect: triangles that exceed MAX_CLIMB (2026-07-25)
+
+"One component" is NOT sufficient. Pinarus passed the component audit and was
+still unnavigable in game — the upper floor hung off a single vertex through a
+fan of triangles each climbing 44-54u, and the pathfinder will not traverse a
+triangle whose rise exceeds `MAX_CLIMB` (34). Measure it with
+`tools/navmesh_bottleneck.py`, which reports single-edge BRIDGES (a shared edge
+whose removal splits the mesh) and the total shared-edge width across each Z
+level. Pinarus's stair throat showed **1 shared edge / 106.7u** where every
+other level had 6 edges / ~520u.
+
+**The pathgrid was NOT the problem.** `tools/navmesh_surface_residual.py`
+measures mesh_z minus real collision_z per vertex: Pinarus's upper floor is
+**100% of vertices at exactly 0.00u** (flush on collision), and 86.5% of the
+whole cell is within +/-2u. The hover theory is disproved for this cell —
+lowering the upper floor would sink it INTO the floor. No pathgrid edge in any
+of the four houses is steeper than **0.91** (Arvena's worst is 0.53), so the
+input lines are all ordinary staircases.
+
+**Cause: two thresholds in `_ribbon_seeds` were set from `STOREY_GAP_Z` when the
+walkability question is `MAX_CLIMB`.**
+
+- the steep DETECTION test was `rise/run*target_edge > STOREY_GAP_Z * 0.5` (60u),
+  so any ribbon climbing 34-60u per triangle was treated as flat ground and kept
+  128u triangles.
+- the steep SPACING aimed at `STOREY_GAP_Z * 0.33` = **39.6u of climb per step,
+  above MAX_CLIMB**. Its stated goal was only to keep a triangle under
+  `STOREY_GAP_Z` so the per-surface emission would not DROP it; whether an actor
+  could walk it was never considered.
+
+Both now key off `MAX_CLIMB` (detection at `> MAX_CLIMB`, spacing at
+`MAX_CLIMB * 0.6`). On Pinarus's 515u/264u stair that is **13 segments at 20.56u
+climb** instead of 6 at 44.55u. Over-climb triangles per cell:
+
+| cell | before | after |
+|---|---|---|
+| Pinarus | 33 | **17** |
+| Arvena | 34 | **15** |
+| ChorrolFG | 65 | **45** |
+| AnvilFG | 20 | 28 |
+
+Ramp fidelity is untouched (slopes identical to HEAD, `ramp_miss=0/38`), the
+component invariant is unchanged over `--all --limit 60` (15 bad, same as the
+weld fix alone), Chorrol's Z-seam went 1 -> 0, and the 28 targeted tests pass.
+
+**STILL OPEN — the remaining over-climb triangles, and Pinarus's sliver joint.**
+The joint is still a fan around ONE vertex (v14, z=68.6): `edge(14,116)` spans
+z 68.6 -> 15.1. The seeding fix demonstrably reaches the area (a new intermediate
+vertex appears at z=48.0, dz=-20.6) but the triangulator still draws the long
+diagonal PAST those seeds, so the top step remains 41-53u. Suspect the Poisson
+keepout in `_triangulate` (`min_dist=target_edge*0.6`, `keepout2`) thinning the
+fine stair seeds, and/or the plan-space Delaunay preferring the long diagonal
+because the stair polygon is a narrow band in plan. Fixing this needs work in
+`_triangulate`, not another threshold.
+
+**DO NOT "fix" this by dropping over-climb triangles.** Measured: dropping every
+triangle spanning > MAX_CLIMB shatters ChorrolFG into `[153,124,123,123,12]` and
+Pinarus into `[128,107,57]`. Those triangles ARE the only floor-to-floor
+connection — they must be SUBDIVIDED into walkable steps, never removed.

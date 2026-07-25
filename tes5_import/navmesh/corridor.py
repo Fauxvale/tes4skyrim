@@ -188,18 +188,25 @@ def _plan_stations(nodes, edges, node_z, degree, grow):
                      length, k, base))
 
     # NODE DISCS -- radial fan filling the outer corner at each junction.
-    steep_nodes = set()
-    for (i, j) in edges:
-        if i >= len(nodes) or j >= len(nodes) or i == j:
-            continue
-        run = math.hypot(nodes[j][0] - nodes[i][0], nodes[j][1] - nodes[i][1])
-        if run > 1e-6 and abs(node_z[j] - node_z[i]) / run > \
-                params.RIBBON_GROW_MAX_SLOPE:
-            steep_nodes.add(i)
-            steep_nodes.add(j)
+    #
+    # A node touching a STEEP edge used to be excluded from this fan.  That was a
+    # blanket rule with no stated justification, and it is what left the corner at
+    # the top of a staircase DEAD: measured on Pinarus, nodes 0 and 1 (the stair's
+    # two endpoints) were the ONLY nodes in the cell without a disc — every other
+    # node, 2 through 38, had one.  The upper floor's ribbon coverage therefore
+    # stopped at y=146 with the corner beyond it unmeshed, and the union bridged
+    # the gap with a single tilted triangle that flapped 38.6u under the landing —
+    # the sole, unnavigable link between the two floors.
+    #
+    # The disc is a FLAT radial fan at the node's own height, which is precisely
+    # what a stair top needs: the landing there IS flat.  It cannot spill over the
+    # stairwell either, because each ray marches against real collision and stops
+    # at the drop (verified: a ray heading out over the void reads the floor below
+    # and terminates).  So there is no reason to exclude these nodes, and excluding
+    # them removes the fan exactly where the geometry most needs it.
     nrays = params.RIBBON_GROW_DISC_RAYS
     for ni in sorted(degree):
-        if ni >= len(nodes) or ni in steep_nodes:
+        if ni >= len(nodes):
             continue
         nx, ny = nodes[ni][0], nodes[ni][1]
         nz = node_z[ni]
@@ -270,6 +277,22 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
         degree[i] = degree.get(i, 0) + 1
         degree[j] = degree.get(j, 0) + 1
 
+    # A node where TWO OR MORE steep runs meet is a mid-flight landing, not the
+    # place a flight reaches a floor.  A steep ribbon must not extend flat through
+    # such a node (see below): both runs would claim the same ground at different
+    # heights and tear the mesh.
+    steep_count = {}
+    for (i, j) in edges:
+        if i >= len(nodes) or j >= len(nodes) or i == j:
+            continue
+        run = math.hypot(nodes[j][0] - nodes[i][0], nodes[j][1] - nodes[i][1])
+        if run < 1e-4:
+            continue
+        if abs(node_z[j] - node_z[i]) / run > params.RIBBON_GROW_MAX_SLOPE:
+            steep_count[i] = steep_count.get(i, 0) + 1
+            steep_count[j] = steep_count.get(j, 0) + 1
+    steep_node = {n: (c >= 2) for n, c in steep_count.items()}
+
     # ---- Phase 2 march: plan every station, run them all natively, reassemble.
     # `widths` is indexed by the `base` offsets recorded in the plan.
     stations, plan, extra_edges = _plan_stations(nodes, edges, node_z,
@@ -304,8 +327,36 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
         # stop short of a junction.
         ea = ext if degree.get(i, 0) <= 1 else 0.0
         eb = ext if degree.get(j, 0) <= 1 else 0.0
-        pa = (ax - ux * ea, ay - uy * ea, az - dz * (ea / length))
-        pb = (bx + ux * eb, by + uy * eb, bz + dz * (eb / length))
+
+        # A STEEP edge (a flight of stairs) also extends past its END NODES, even
+        # though they are junctions.  A steep ribbon is never width-grown (see
+        # below), so it keeps the narrow Phase-1 width while the flat landing it
+        # meets has grown to ~100u+.  The stair mouth is then far narrower than
+        # the landing, and the two only meet at the landing's CORNER vertices:
+        # measured at the top of Pinarus's stairs, the entire route from the
+        # landing onto the flight ran through two 27-degree wedges (one with edge
+        # ratio 6.1) hanging off those corners, each dropping 39-45u.  The mesh
+        # was ONE component and still not walkable.
+        #
+        # Extending the flight a little onto the flat at each end gives the union
+        # a real overlap to work with, so the stair mouth becomes a proper span of
+        # shared edges instead of a pair of needles.  The extension carries the
+        # line's own slope (principle 2), so it stays on the ramp plane rather
+        # than lifting onto the landing.
+        steep = abs(dz) / length > params.RIBBON_GROW_MAX_SLOPE
+
+        # NOTE: a stair-end EXTENSION was tried here (both as a sloped projection
+        # and as a footprint-only overhang) and both are wrong.  Sloped, it drives
+        # the ramp plane past the node — up into the air above the landing at the
+        # top (measured: ramp triangles at z=93 where the landing is z=69).
+        # Footprint-only, the overhang keeps interpolating the ramp slope while the
+        # landing is flat, so the flight's last row tilts UP off the landing edge:
+        # measured a 38.9-degree joint whose ramp apex sat 14.8u above the shared
+        # edge — a connection an actor cannot cross.  A stair ribbon therefore
+        # runs node to node exactly, like any other edge.
+        eza, ezb = dz * (ea / length), dz * (eb / length)
+        pa = (ax - ux * ea, ay - uy * ea, az - eza)
+        pb = (bx + ux * eb, by + uy * eb, bz + ezb)
 
         strip = {
             'edge': (i, j),
@@ -321,7 +372,11 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
         # absent from the plan is exactly a steep or ungrown one.
         entry = grown_edges.get((i, j)) if widths is not None else None
         if entry is None:
-            strip['half'] = half
+            # A steep flight keeps a FIXED width (it is never grown, since a
+            # perpendicular rail would leave the treads), but a wider one than a
+            # plain corridor: it has to present a mouth comparable to the landing
+            # it joins, or the two meet only at the landing's corners.
+            strip['half'] = (params.RIBBON_STAIR_HALF_WIDTH if steep else half)
             strips.append(strip)
             continue
 

@@ -106,6 +106,12 @@ WALL_CUT_WIDTH = 1.0
 # emitting both stacks them (measured: levels 39u apart on a Chorrol stair).
 STOREY_GAP_Z = 120.0
 
+# How far a corner's own ground may be from a surface and still count as being ON
+# that surface (_reaches, inside _emit_surfaces).  This is a STEP tolerance, not a
+# storey threshold — the two answer different questions, and using STOREY_GAP_Z
+# here was a category error.  See _reaches for the measured consequence.
+REACH_TOL = STOREY_GAP_Z
+
 
 def _ribbon_polygon(s):
     """The corridor's ribbon as a 2D polygon (a rectangle around its segment).
@@ -192,7 +198,14 @@ def _poly_strip(poly2d, z):
 
 
 def _height_on(s, px, py):
-    """Height of corridor s's surface at (px, py), following its own slope."""
+    """Height of corridor s's surface at (px, py), following its own slope.
+
+    Strictly the straight A->B line (principle 2): the pathgrid edge IS the walk
+    ramp, so the ribbon's angle is the LINE's angle.  Re-fitting it to sampled
+    collision was tried and is wrong — it changes the staircase's angle away from
+    the pathgrid line the designer drew, which is the one thing this model treats
+    as ground truth.
+    """
     ax, ay, az = s['a']
     bx, by, bz = s['b']
     dx, dy = bx - ax, by - ay
@@ -890,13 +903,93 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
     # existed across sheets.  Each piece of ground must have exactly one owner, so
     # a later sheet is clipped against the parts of earlier sheets that describe
     # the SAME surface height there.
+    # THE JUNCTION UNION.
+    #
+    # Corridors that meet at a pathgrid node must come out as ONE merged surface.
+    # Where both ribbons are in the same sheet the union does that already.  Where
+    # the sheet split separated them (a staircase genuinely conflicts in plan with
+    # the floor it passes UNDER, so no scoring can keep it with the landing it
+    # arrives at) the junction has to be unioned explicitly — and it must be
+    # unioned into exactly ONE sheet, never kept by both.  Keeping it in both is
+    # not a union at all: each sheet triangulates that ground independently and
+    # the result is stacked, overlapping triangles (measured on Pinarus: 16 pairs
+    # of same-surface triangles overlapping by 5,582u^2).
+    #
+    # So each node is OWNED by the first sheet that reaches it, and that sheet
+    # unions in the far ribbon of every edge arriving from another sheet, clipped
+    # to the node's own corridor width.  The junction is then a single polygon in
+    # a single sheet — one triangulation, no stacking — while the far sheet is
+    # clipped against it by the normal `claimed` pass below, exactly as any other
+    # shared ground is.
+    node_owner = {}
+    for gi, group in enumerate(sheets):
+        for s in group:
+            (i, j) = s.get('edge', (-1, -1))
+            if i < 0:
+                continue
+            for nd in ((i,) if j == i else (i, j)):
+                node_owner.setdefault(nd, gi)
+
+    junction_extra = {}
+    junction_strips = {}
+    junction_drop = {}
+    if node_pts:
+        from shapely.geometry import Point as _Point
+        sheet_of = {}
+        for gi, group in enumerate(sheets):
+            for s in group:
+                sheet_of[s.get('edge', (-1, -1))] = gi
+        for s in strips:
+            (i, j) = s.get('edge', (-1, -1))
+            if i < 0:
+                continue
+            gi = sheet_of.get((i, j))
+            if gi is None:
+                continue
+            for nd in ((i,) if j == i else (i, j)):
+                own = node_owner.get(nd)
+                if own is None or own == gi or nd not in node_pts:
+                    continue
+                # This ribbon reaches a node owned by ANOTHER sheet: give that
+                # sheet the ribbon's ground at the node so the two merge there.
+                nx, ny = node_pts[nd]
+                r = max(float(node_half.get(nd, 0.0)),
+                        params.RIBBON_HALF_WIDTH)
+                try:
+                    piece = _ribbon_polygon(s).intersection(
+                        _Point(nx, ny).buffer(r))
+                except Exception:
+                    continue
+                if piece.is_empty or piece.area < 1.0:
+                    continue
+                junction_extra.setdefault(own, []).append(piece)
+                # The far sheet keeps its centreline height there, so the merged
+                # polygon still knows how high the arriving corridor is.
+                junction_strips.setdefault(own, []).append(s)
+                # ...and the sheet that does NOT own the node gives that ground
+                # up.  Ownership has to be EXCLUSIVE or this is not a union at
+                # all: both sheets would triangulate the junction independently
+                # and the two results stack (measured before this subtraction:
+                # Chorrol 135 same-surface triangle pairs overlapping by
+                # 90,947u^2, Pinarus 20 pairs / 3,448u^2).
+                junction_drop.setdefault(gi, []).append(piece)
+
     claimed = []
     for gi, group in enumerate(sheets):
         gpolys = [p for p in (_ribbon_polygon(s) for s in group)
                   if p.is_valid and not p.is_empty]
+        gpolys.extend(junction_extra.get(gi, ()))
         if not gpolys:
             continue
         gmerged = unary_union(gpolys)
+        drop = junction_drop.get(gi)
+        if drop:
+            try:
+                cut = gmerged.difference(unary_union(drop))
+                if not cut.is_empty:
+                    gmerged = cut
+            except Exception:
+                pass
         if cell_bounds is not None:
             minx, miny, maxx, maxy = cell_bounds
             gmerged = gmerged.intersection(box(minx, miny, maxx, maxy))
@@ -936,6 +1029,13 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
         gparts = ([g for g in gmerged.geoms if isinstance(g, Polygon)]
                   if hasattr(gmerged, 'geoms')
                   else ([gmerged] if isinstance(gmerged, Polygon) else []))
+        # The ribbons arriving from another sheet at a node THIS sheet owns are
+        # part of this sheet's surface now (see the junction union above), so they
+        # must contribute their centreline heights and their seeds — otherwise the
+        # merged ground is triangulated here but takes its height only from the
+        # local ribbons, and the arriving corridor's end is flattened onto this
+        # floor instead of keeping its own slope.
+        group = list(group) + junction_strips.get(gi, [])
         gseeds = _ribbon_seeds(group, params.TRI_TARGET_EDGE)
         # Every pathgrid node of this sheet is a FORCED seed (the True flag), so a
         # node shared with another sheet becomes a vertex in both and the weld can
@@ -968,7 +1068,108 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
     verts, tris = _weld_sheets(verts, tris)
     tris = _split_t_junctions(verts, tris)
     tris = _stitch_shared_nodes(verts, tris, stitch_nodes)
+    # THE GUARANTEE: corridors that meet at a pathgrid node are merged, EVERY
+    # TIME.  Runs last, over the finished surface, and is driven by the PATHGRID
+    # rather than by any property of the geometry — so there is no case it can
+    # decline to handle.  See _merge_at_pathgrid_nodes.
+    verts, tris = _merge_at_pathgrid_nodes(verts, tris, node_pts, node_half)
     tris = _drop_point_attached(tris)
+    return verts, tris
+
+
+def _merge_at_pathgrid_nodes(verts, tris, node_pts, node_half):
+    """Guarantee that the corridors meeting at each pathgrid node are ONE
+    connected surface.
+
+    The pathgrid is the one input that asserts where an actor walks, so two
+    edges meeting at a node describe a junction an actor walks through.  The
+    navmesh must therefore be walkable across it — not merely present on both
+    sides.
+
+    Everything upstream tries to arrange this and can each fail for its own
+    reason: the sheet split can put the two corridors in different sheets (a
+    staircase genuinely conflicts with the floor it passes UNDER, so no scoring
+    keeps it with the landing it arrives at); the clip can then take the
+    junction ground as "duplicate"; the 3D weld only fuses vertices that already
+    coincide; and a bridge triangle cannot be laid where the surrounding fan is
+    already closed.  Measured on AnvilPinarusInventiusHouse the result was a
+    flight whose top row sat ~32u BELOW its landing at nearly the same XY (v120
+    (-255.8,132.9,36.8) vs v80 (-255.4,134.9,68.6)), joined only by skew edges
+    hanging off a vertex 61u to the SIDE: 191.7u of joint at the top of the
+    flight against 686.4u at its bottom.  One component, so no invariant caught
+    it — and in game the navmesh at the top of the stairs did not connect.
+
+    So this pass does not try to prevent the split; it repairs it afterwards,
+    unconditionally, at every node:
+
+      1. Collect the mesh vertices within the node's own corridor half-width.
+      2. Group them by SURFACE (heights within one MAX_CLIMB step are the same
+         walkable level, so a stair top and its landing are one group while a
+         floor two storeys down is not).
+      3. Where a group holds vertices from two or more edge-connected
+         components, weld them onto the single vertex nearest the node.
+
+    Welding — rather than adding triangles — is what makes this total: it needs
+    no border edge, cannot raise an edge above two owners, and cannot invent
+    ground.  Triangles that collapse to a degenerate are dropped, which is
+    exactly the duplicate sliver at the seam.
+    """
+    if not tris or not node_pts:
+        return verts, tris
+
+    verts = [list(v) for v in verts]
+    remap = list(range(len(verts)))
+
+    def resolve(i):
+        while remap[i] != i:
+            remap[i] = remap[remap[i]]
+            i = remap[i]
+        return i
+
+    for ni, (nx, ny) in sorted(node_pts.items()):
+        r = max(float(node_half.get(ni, 0.0)), params.RIBBON_HALF_WIDTH)
+        comp = _tri_components(tris)
+        vcomp = {}
+        for ti, t in enumerate(tris):
+            for i in t:
+                vcomp.setdefault(resolve(i), set()).add(comp[ti])
+        near = [i for i in vcomp
+                if math.hypot(verts[i][0] - nx, verts[i][1] - ny) <= r]
+        if len(near) < 2:
+            continue
+        # Group by walkable surface: one step apart is the same surface, a
+        # storey apart is not.  (Sorting makes the banding deterministic, which
+        # the byte-reproducibility contract requires.)
+        # Band on the STOREY gap, not on one step.  Two corridors meeting at a
+        # node are the same junction even when the sheets left them a step or two
+        # apart in Z — that disagreement is precisely the defect being repaired,
+        # so a one-step band refuses to weld exactly the pair that needs it
+        # (measured at Pinarus's stair top: v120 at z=36.8 and v80 at z=68.6, 2.0u
+        # apart in plan but 31.8u in Z).  Only a genuine storey above or below the
+        # junction must stay separate, and that is STOREY_GAP_Z away.
+        near.sort(key=lambda i: (verts[i][2], i))
+        bands = [[near[0]]]
+        for i in near[1:]:
+            if verts[i][2] - verts[bands[-1][-1]][2] <= STOREY_GAP_Z:
+                bands[-1].append(i)
+            else:
+                bands.append([i])
+        for band in bands:
+            comps = set()
+            for i in band:
+                comps |= vcomp.get(i, set())
+            if len(band) < 2 or len(comps) < 2:
+                continue                # already one surface here
+            keep = min(band, key=lambda i: (
+                math.hypot(verts[i][0] - nx, verts[i][1] - ny), i))
+            for i in band:
+                if i != keep:
+                    remap[i] = keep
+        tris = [t for t in ((resolve(a), resolve(b), resolve(c))
+                            for (a, b, c) in tris) if len(set(t)) == 3]
+
+    tris = [t for t in ((resolve(a), resolve(b), resolve(c))
+                        for (a, b, c) in tris) if len(set(t)) == 3]
     return verts, tris
 
 
@@ -1028,6 +1229,11 @@ def _stitch_shared_nodes(verts, tris, stitch_nodes):
         # and left the other, so the house stayed in two pieces.
         junctions = sorted(i for i, cs in vcomp.items() if len(cs) > 1)
         added = []
+        # Edges the bridges add this round, so two bridges cannot between them
+        # push one edge past two owners.
+        extra = {}
+        # Triangle index -> replacement pair, for fans opened below.
+        replaced = {}
         for i0v in junctions:
             cands = [i0v]
             # group the border edges at this junction by component
@@ -1035,6 +1241,67 @@ def _stitch_shared_nodes(verts, tris, stitch_nodes):
             for i in cands:
                 for key in inc.get(i, ()):
                     by_comp.setdefault(owner[key], []).append((i, key))
+            # A component may USE the junction while presenting no BORDER edge
+            # there: the other surface arrives into the MIDDLE of its fan, so the
+            # fan is closed all the way round and every edge at the junction
+            # already has two owners.  A bridge triangle cannot help then —
+            # `_compute_adjacency` links an edge shared by 3+ triangles to
+            # NOTHING, so laying a bridge on one SEVERS the fan it landed on
+            # instead of joining it.  Measured at Pinarus's stair top: the landing
+            # offered 8 triangles at the junction and 0 border slots, the flight 2
+            # and 2; every candidate bridge died on the manifold guard and the
+            # mesh stayed in two pieces.
+            #
+            # OPEN the fan instead — split one of that component's triangles at
+            # the junction in two by inserting the midpoint of its opposite edge.
+            # The split is area-preserving and purely internal (it re-meshes the
+            # same ground) and leaves a fresh border edge at the junction for the
+            # bridge below to use legitimately.  The neighbour across the split
+            # edge is split to match, so that edge keeps exactly two owners.
+            for i in cands:
+                for c in sorted(vcomp.get(i, ())):
+                    if c in by_comp:
+                        continue
+                    cand_t = [ti for ti, t in enumerate(tris)
+                              if comp[ti] == c and i in t and ti not in replaced]
+                    if not cand_t:
+                        continue
+                    ti = max(cand_t, key=lambda x: _tri_area(verts, tris[x]))
+                    t = tris[ti]
+                    k = t.index(i)
+                    p, q = t[(k + 1) % 3], t[(k + 2) % 3]
+                    okey = (p, q) if p < q else (q, p)
+                    nb = [tj for tj, tt in enumerate(tris)
+                          if tj != ti and tj not in replaced
+                          and p in tt and q in tt]
+                    if counts.get(okey, 0) > 1 and not nb:
+                        continue          # cannot keep the opposite edge manifold
+                    # The split must not manufacture a near-VERTICAL or degenerate
+                    # triangle: the halves inherit the parent's corners plus the
+                    # midpoint of (p,q), so a parent that already spans a big drop
+                    # (a stairwell-edge triangle) would hand both halves that drop
+                    # and the result reads as a wall, not floor.  Splitting those
+                    # is what added OPPOSITE_NORMALS/DOWNFACING triangles to
+                    # ImperialSewers03 and Bruma.
+                    if abs(verts[p][2] - verts[q][2]) > params.MAX_CLIMB:
+                        continue
+                    if _tri_area(verts, t) < 4.0 * params.MIN_XY_FOOTPRINT:
+                        continue
+                    mid = len(verts)
+                    verts.append([0.5 * (verts[p][0] + verts[q][0]),
+                                  0.5 * (verts[p][1] + verts[q][1]),
+                                  0.5 * (verts[p][2] + verts[q][2])])
+                    replaced[ti] = [(i, p, mid), (i, mid, q)]
+                    for tj in nb[:1]:
+                        tt = tris[tj]
+                        opp = [x for x in tt if x != p and x != q]
+                        if len(opp) == 1:
+                            replaced[tj] = [(opp[0], p, mid), (opp[0], mid, q)]
+                    key = (i, mid) if i < mid else (mid, i)
+                    owner[key] = c
+                    counts[key] = 1
+                    by_comp.setdefault(c, []).append((i, key))
+                    counts.pop(okey, None)
             if len(by_comp) < 2:
                 continue
             order = sorted(by_comp)
@@ -1056,13 +1323,44 @@ def _stitch_shared_nodes(verts, tris, stitch_nodes):
                         # cannot sew two distant surfaces together.
                         if _tri_span(verts, tri) > 160.0:
                             continue
+                        # ...and never a near-VERTICAL one.  A bridge whose
+                        # corners differ by more than a step is the unnavigable
+                        # flap this module already fought once — a triangle an
+                        # actor would climb rather than walk.
+                        zs = [verts[x][2] for x in tri]
+                        if max(zs) - min(zs) > params.MAX_CLIMB:
+                            continue
+                        # MANIFOLD GUARD: every edge the bridge introduces must
+                        # end with at most TWO owners, or adjacency links none of
+                        # them and the bridge disconnects rather than joins.
+                        if any(counts.get(e, 0) + extra.get(e, 0) >= 2
+                               for e in _tri_edges(tri)):
+                            continue
+                        for e in _tri_edges(tri):
+                            extra[e] = extra.get(e, 0) + 1
                         added.append(tri)
                         made = True
                         break
-        if not added:
+        if not added and not replaced:
             break
-        tris = list(tris) + added
+        out = []
+        for ti, t in enumerate(tris):
+            out.extend(replaced.get(ti, [t]))
+        tris = [t for t in out + added if len(set(t)) == 3]
     return tris
+
+
+def _tri_edges(tri):
+    """The triangle's three edges as sorted (lo, hi) keys."""
+    return [(tri[k], tri[(k + 1) % 3]) if tri[k] < tri[(k + 1) % 3]
+            else (tri[(k + 1) % 3], tri[k]) for k in range(3)]
+
+
+def _tri_area(verts, tri):
+    """XY-projected area of a triangle."""
+    a, b, c = verts[tri[0]], verts[tri[1]], verts[tri[2]]
+    return abs((b[0] - a[0]) * (c[1] - a[1]) -
+               (b[1] - a[1]) * (c[0] - a[0])) * 0.5
 
 
 def _tri_span(verts, tri):
@@ -1122,9 +1420,14 @@ def _weld_sheets(verts, tris):
     # one, the two then meet along that cut boundary, and each triangulation
     # densifies it at its own offsets — ImperialSewers03's two sheets came out
     # 7.68u apart there, just outside a 6u weld, leaving pathgrid=1 / navmesh=2.
-    # 12u is half the minimum grown half-width (RIBBON_GROW_MIN_HALF 16) and a
-    # tenth of the target edge, so it cannot fuse two genuinely distinct rails.
-    WELD_R = 12.0
+    # Raised again from 12u to 16u: where a STAIR flight meets its landing the
+    # two sheets sample the shared pathgrid node at different Z — the flight's
+    # last row sits on the chord, the landing's on the floor — and Pinarus's
+    # stair top came out 12.66u apart, just outside a 12u weld (pathgrid=1 /
+    # navmesh=2, the halves 150/148).  16u equals RIBBON_GROW_MIN_HALF, so the
+    # radius still cannot span two distinct rails, and it stays far under
+    # MAX_CLIMB (34) so nothing an actor could not step over is fused.
+    WELD_R = 16.0
     cell = WELD_R
     grid = {}
     remap = [0] * len(verts)
@@ -1296,6 +1599,39 @@ def _split_plan_overlaps(groups):
                 x = parent[x]
             return x
 
+        # BONDED PAIRS -- two ribbons that meet at a pathgrid NODE where their
+        # heights agree.  The pathgrid asserts an actor walks from one onto the
+        # other there, so they describe ONE walkable junction and MUST end up in
+        # the same sheet: the union then merges their ribbons and the junction
+        # comes out as shared edges, with nothing left to repair afterwards.
+        #
+        # This bond is unconditional.  Scoping it (to steep ribbons, to a disc
+        # around the node, to "stair mouths") was tried repeatedly and every
+        # variant fails the same way -- whatever ground the two sheets both keep
+        # gets meshed twice, once per sheet, and since each sheet is triangulated
+        # independently the two copies share no edges and the mesh fragments.
+        # Measured across 9 cells, the scoped variants cost 3-6 cells their
+        # connectivity (Chorrol 1->4 components, ImperialSewers03 2->6, Skingrad
+        # 500->261/236) while fixing one junction.  The only sound answer is to
+        # not split the junction in the first place.
+        bonded = set()
+        node_h = {}
+        for k in range(n):
+            sk = items[k][0]
+            (ni, nj) = sk.get('edge', (-1, -1))
+            if ni < 0:
+                continue
+            node_h.setdefault(ni, []).append((k, sk['na'][2]))
+            if nj != ni:
+                node_h.setdefault(nj, []).append((k, sk['nb'][2]))
+        for entries in node_h.values():
+            for x in range(len(entries)):
+                for y in range(x + 1, len(entries)):
+                    ka, za = entries[x]
+                    kb, zb = entries[y]
+                    if abs(za - zb) <= SAME_SURFACE_Z:
+                        bonded.add((min(ka, kb), max(ka, kb)))
+
         conflicts = set()
         for a in range(n):
             sa, pa = items[a]
@@ -1307,12 +1643,28 @@ def _split_plan_overlaps(groups):
                 if inter.is_empty or inter.area < 1.0:
                     continue
                 gap = _overlap_height_gap(sa, sb, inter)
-                if gap > STOREY_GAP_Z:
+                # A bond outranks a plan conflict.  Two ribbons meeting at a node
+                # where they agree in height are one junction even if their
+                # ribbons ALSO overlap somewhere else at a different storey --
+                # which is exactly what a staircase does: Pinarus's flight (0,1)
+                # meets the landing at node 1 (heights 68.6 vs 68.6) and passes
+                # UNDER five upper-floor ribbons near its bottom end.  Judging it
+                # on those overlaps alone put the flight in a different sheet from
+                # its own landing, and the clip then took its top 51.2u as
+                # duplicate ground.
+                if gap > STOREY_GAP_Z and (a, b) not in bonded:
                     conflicts.add((a, b))
                 else:
                     ra, rb = find(a), find(b)
                     if ra != rb:
                         parent[ra] = rb
+
+        # Bonds also merge directly, so a junction survives even when the two
+        # ribbons never overlap in plan at all.
+        for (a, b) in bonded:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
 
         buckets = {}
         for i in range(n):
@@ -1342,9 +1694,20 @@ def _split_plan_overlaps(groups):
                 for si, sub in enumerate(subs):
                     if any((min(i, j), max(i, j)) in cset for j in sub):
                         continue
+                    # A sub-sheet this ribbon is BONDED to (they meet at a
+                    # pathgrid node and agree in height there) always wins: that
+                    # is the junction, and splitting it is the defect.  Scoring on
+                    # mean height alone loses it for the case it matters most --
+                    # a STAIRCASE's mean sits midway between its two floors, so it
+                    # is never near either sub-sheet and lands wherever the
+                    # ordering happens to put it.
                     d = abs(sub_h[si] - zi)
-                    if best is None or d < best[0]:
-                        best = (d, si)
+                    rank = 0 if any((min(i, j), max(i, j)) in bonded
+                                    for j in sub) else 1
+                    if best is None or (rank, d) < (best[0], best[1]):
+                        best = (rank, d, si)
+                if best is not None:
+                    best = (best[1], best[2])
                 if best is None:
                     subs.append([i])
                     sub_h.append(zi)
@@ -1379,6 +1742,22 @@ def _split_plan_overlaps(groups):
             for sub in merged_subs:
                 out.append([items[i][0] for i in sub])
     return out
+
+
+def _is_steep(s):
+    """Is this strip a STAIRCASE/ramp rather than a flat corridor?
+
+    The same rise/run test corridor.py uses to decide a ribbon is not
+    width-grown (params.RIBBON_GROW_MAX_SLOPE), so "steep" means the same thing
+    on both sides of the pipeline.  Node discs and door footprints (a == b) are
+    flat by construction and never steep.
+    """
+    ax, ay, az = s['a']
+    bx, by, bz = s['b']
+    run = math.hypot(bx - ax, by - ay)
+    if run < 1e-4:
+        return False
+    return abs(bz - az) / run > params.RIBBON_GROW_MAX_SLOPE
 
 
 def _same_surface_region(group_a, group_b, shared):
@@ -1700,12 +2079,30 @@ def _emit_surfaces(v2, t2, levels):
 
         A band is an interval [lo, hi]; on a stair it spans the whole rise, so a
         plain point test is right — the corner genuinely has ground everywhere
-        between.  The band is widened by the storey gap because the corner's
-        ground may be a step below/above the surface the triangle sits on and
-        that is still the SAME storey by definition of STOREY_GAP_Z.
+        between.
+
+        The band is widened only by MAX_CLIMB, a single STEP.  Widening it by
+        STOREY_GAP_Z (120u) instead let a corner vote for a surface it has no
+        ground on at all, and that produced the flap that made Pinarus's only
+        floor-to-floor link unnavigable:
+
+            2D triangle (-242.7,132.5) (-316.9,134.9) (-317.5,173.3)
+            corner 1 band [30.0, 30.0]    (stair ribbon only)
+            corners 2,3 band [68.6, 68.6] (landing)
+
+        With a 120u tolerance BOTH 30.0 and 68.6 passed for every corner, so the
+        one triangle was emitted twice — once at 30.0 (tilted 27 degrees) and once
+        at 68.6 (flat) — with identical 1425u^2 plan footprints, 38.6u apart,
+        sharing edge (126,127).  That shared edge was the ONLY connection between
+        the two floors, and an actor crossing it would have to step onto a surface
+        directly beneath the one it is standing on.
+
+        A step is the right tolerance: an actor can step up/down MAX_CLIMB onto an
+        adjoining surface, so a corner one step off still legitimately belongs to
+        that surface.  Anything further and it does not.
         """
-        return any(lo - STOREY_GAP_Z <= z <= hi + STOREY_GAP_Z
-                   for (lo, hi) in bands)
+        tol = REACH_TOL
+        return any(lo - tol <= z <= hi + tol for (lo, hi) in bands)
 
     tri_surfaces = []
     for (a, b, c) in t2:
@@ -1928,15 +2325,15 @@ def _levels_batch(strips, points):
 
     rows = []
     poly = []
-    for s in strips:
-        p = s.get('poly')
+    for s_ in strips:
+        p = s_.get('poly')
         off, n = 0, 0
         if p is not None:
             off, n = len(poly), len(p)
             poly.extend(p)
-        a, b = s['a'], s['b']
-        rows.append((a[0], a[1], a[2], b[0], b[1], b[2],
-                     float(s['half']), float(off), float(n), 0.0, 0.0))
+        a_, b_ = s_['a'], s_['b']
+        rows.append((a_[0], a_[1], a_[2], b_[0], b_[1], b_[2],
+                     float(s_['half']), float(off), float(n), 0.0, 0.0))
     sarr = (np.asarray(rows, dtype=np.float64) if rows
             else np.zeros((0, 11), dtype=np.float64))
     parr = (np.asarray(poly, dtype=np.float64).reshape(-1, 2) if poly
