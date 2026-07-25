@@ -19,6 +19,8 @@ names by EditorID), resolved to the OUTPUT plugin's FormID space.  The record
 converters then splice the VMAD in right after EDID (Skyrim order: EDID VMAD OBND …).
 """
 
+import re
+
 from script_convert.converter import ScriptConverter
 from script_convert.constants import (_safe_property_name, papyrus_script_name,
                                       resolve_property_formid)
@@ -193,24 +195,66 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
 
     n_moved = _relocate_actor_scripts_to_refs(by_type, offset)
     if n_moved:
-        print(f"  Actor scripts relocated to placed refs (GetVMScriptVariable "
-              f"package gates): {n_moved}")
+        print(f"  Actor scripts relocated to placed refs (reference events / "
+              f"GetVMScriptVariable package gates): {n_moved}")
     return count
 
 
-def _relocate_actor_scripts_to_refs(by_type: dict, offset: int) -> int:
-    """Move an actor's script VMAD from the base NPC_/CREA to its placed ACHR
-    when a package condition reads that script's variables via
-    ``GetVMScriptVariable``.
+# Reference-only events, per the vanilla Papyrus base classes (Scripts.zip):
+# Actor.psc defines OnPackageEnd/OnPackageStart/OnDeath; ObjectReference.psc
+# defines OnActivate/OnCellAttach/OnLoad/OnHit.  A base NPC_ record is an
+# ActorBase (a Form), NOT an Actor, so a VMAD attached there receives NONE of
+# these — they are delivered only to the placed REFERENCE.
+#
+# TES4 spellings of the same events (the converter maps these onto the Papyrus
+# events above); matched against the raw SCTX source.
+_TES4_REFERENCE_EVENTS = frozenset({
+    'onpackagedone', 'onpackagestart', 'onpackagechange',
+    'onactivate', 'ondeath', 'onhit', 'onalarm', 'onstartcombat',
+    'onload', 'onequip', 'onunequip', 'onadd', 'ondrop', 'onsell',
+})
 
-    Why: ``GetVMScriptVariable(ref, "::var_var")`` reads the property off a
-    script attached to the *reference named in param1* (the ACHR), not off the
-    base record — verified against Skyrim.esm, where 100% of vanilla func-630
-    package conditions name a REFR that carries its own VMAD holding the
-    variable.  A base-attached script propagates to instances for property
-    *access* (fragment writes work), but the condition *read* fails, so the
-    quest package never wins its arbitration and the actor stays put
-    (Pinarus/FGC01Rats, Arielle/MG04Restore, ~142 actors).
+
+_BEGIN_BLOCK_RE = re.compile(r'(?:^|[\r\n;])\s*begin\s+(\w+)', re.IGNORECASE)
+
+
+def _script_uses_reference_event(sctx: str) -> bool:
+    """True when a TES4 script DECLARES an event the engine delivers only to a
+    placed reference.
+
+    Must match the ``begin <event>`` declaration, not a bare substring: a
+    comment mentioning an event name is not a handler, and relocating on that
+    would move scripts that have no reason to leave the base record.
+    """
+    return any(m.group(1).lower() in _TES4_REFERENCE_EVENTS
+               for m in _BEGIN_BLOCK_RE.finditer(sctx))
+
+
+def _relocate_actor_scripts_to_refs(by_type: dict, offset: int) -> int:
+    """Move an actor's script VMAD from the base NPC_/CREA to its placed ACHR.
+
+    Two independent reasons an actor script MUST live on the reference:
+
+    1. ``GetVMScriptVariable(ref, "::var_var")`` reads the property off a
+       script attached to the *reference named in param1* (the ACHR), not off
+       the base record — verified against Skyrim.esm, where 100% of vanilla
+       func-630 package conditions name a REFR that carries its own VMAD
+       holding the variable.  A base-attached script propagates to instances
+       for property *access* (fragment writes work), but the condition *read*
+       fails, so the quest package never wins its arbitration and the actor
+       stays put (Pinarus/FGC01Rats, Arielle/MG04Restore, ~142 actors).
+
+    2. REFERENCE EVENTS never fire on a base-attached script.  ``OnPackageEnd``
+       and friends are declared on ``Actor``/``ObjectReference`` (vanilla
+       Scripts.zip); ``NPC_`` is an ActorBase, so an event-driven script bound
+       there is inert.  This silently killed every converted quest that
+       sequences on package completion — CharacterGen sets stage 12 from
+       Renote's ``OnPackageEnd``, so the chain stopped at stage 10 and the
+       Emperor/guards had no ``GetStage ==`` package to select at all.
+
+    Vanilla does exactly this split: instance-identified logic lives on the
+    ACHR (masterAmbushScript, 464 placements), while generic per-actor
+    behaviour stays on the base (WIDeadBodyCleanupScript, defaultGhostScript).
 
     The script is moved (base entry removed) rather than duplicated so there is
     exactly ONE instance — both the fragment write (via the ACHR-typed self
@@ -223,7 +267,20 @@ def _relocate_actor_scripts_to_refs(by_type: dict, offset: int) -> int:
     for rec in by_type.get('PACK', []):
         for ref in _scriptvar_refs_from_conditions(rec):
             wanted_low.add(ref & 0x00FFFFFF)
-    if not wanted_low:
+
+    # Base actors (raw low-24) whose script handles a reference-only event.
+    scpt_src = {r.get('FormID', ''): r.get('SCTX', '')
+                for r in by_type.get('SCPT', [])}
+    event_bases = set()
+    for sig in ('NPC_', 'CREA'):
+        for rec in by_type.get(sig, []):
+            src = scpt_src.get(rec.get('SCRI', ''), '')
+            if src and _script_uses_reference_event(src):
+                try:
+                    event_bases.add(int(rec.get('FormID', ''), 16) & 0x00FFFFFF)
+                except ValueError:
+                    pass
+    if not wanted_low and not event_bases:
         return 0
 
     # How many times each base actor is placed — a script may be moved off the
@@ -251,14 +308,17 @@ def _relocate_actor_scripts_to_refs(by_type: dict, offset: int) -> int:
                 ref_raw = int(fid_str, 16)
             except ValueError:
                 continue
-            if (ref_raw & 0x00FFFFFF) not in wanted_low:
-                continue
             base_str = rec.get('NAME', '')
             if not base_str:
                 continue
             try:
                 base_raw = int(base_str, 16)
             except ValueError:
+                continue
+            # Qualify by EITHER trigger: a package condition reads this ref's
+            # script vars, or the base's script handles a reference-only event.
+            if ((ref_raw & 0x00FFFFFF) not in wanted_low
+                    and (base_raw & 0x00FFFFFF) not in event_bases):
                 continue
             base_out = _remap(base_raw, offset)
             vmad = _OBJECT_VMAD.get(base_out)

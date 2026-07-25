@@ -480,6 +480,24 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
     # --- Follow / Accompany: exact.  Skyrim models Accompany as a Follow
     # input, so type 7 is not an approximation. ---
     if ptype in (T4_FOLLOW, T4_ACCOMPANY):
+        # ...but a TES4 Follow that ALSO carries a PLDT destination is really
+        # "escort this target TO somewhere", and Skyrim's Follow template has
+        # no location slot at all — it trails the target forever and never
+        # ARRIVES.  That matters because arrival is what ends the package, and
+        # OnPackageEnd is where these quests advance: CGEmperorToMarkerB
+        # (Follow Renault to Marker B, radius 70) is what sets CharacterGen
+        # stage 16, the Emperor's force-greet.  Dropping the location left the
+        # package running forever, so the Emperor never spoke and the intro
+        # stalled with the player locked out of controls.  Route it to ESCORT,
+        # which has both slots.  23 Oblivion packages do this, several
+        # quest-critical (MQ16MartinFollowPCToPalace, MS26FollowItiusToJail).
+        if _has_location(rec) and get_formid(rec, 'PLDT.Location'):
+            i = Inputs(ESCORT)
+            i.set('target', tgt)
+            i.set('location', loc)
+            if use_horse:
+                i.set('ride_horse', 1)
+            return i
         i = Inputs(FOLLOW)
         i.set('target', tgt)
         i.set('accompany', 1 if ptype == T4_ACCOMPANY else 0)

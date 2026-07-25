@@ -19,8 +19,64 @@ _COND_LINE_RE = re.compile(r'^(\s*(?:If|ElseIf)\s+)(.*)$', re.IGNORECASE)
 _SLEEP_READ_RE = re.compile(r'\b(?:ispcsleeping|isplayersleeping|getpcissleeping)\b',
                             re.IGNORECASE)
 # Stand-in for the voice-line duration TES4's Say/SayTo returned (seconds).
-# Drives the pacing of every converted polling conversation.
+# Only reached for a Say whose topic drives no conversation timer we can clear.
 SAY_LINE_SECONDS = 3.0
+# Longest line to assume for a Say whose topic has NO measured audio. NOT pacing:
+# the INFO's End fragment clears the timer when the line actually finishes, and
+# the park only has to hold the polling loop off until then.
+#
+# Sized from the MEASURED corpus rather than guessed. The longest of Oblivion's
+# 19,800 measured topics is 21.63s, so 24s covers every real line with margin. It
+# used to be a flat 60s, which mattered because the park is also the dropped-line
+# timeout (see `_say_seconds`): `CGEmperorBirthsign` has ZERO INFOs — the only
+# such topic in the game — so `SayTo player, CGEmperorBirthsign` in
+# CGEmperorScript can never produce a line, and CharacterGen's birthsign step
+# stalled for the whole 60s every single run.
+SAY_LONGEST_UNMEASURED_LINE = 24.0
+# Park for a topic with no measured audio: the unmeasured-line assumption plus
+# the same threshold and slack a measured topic gets.
+SAY_LINE_PARK_SECONDS = 60.0
+# Threshold the End fragment tests to decide "is this timer still parked?".
+# It must sit BELOW the park because the owning loop counts the timer DOWN
+# while the line plays (`If timer > 0 : timer = timer - dt`), so by the time
+# the line ends a 60s park has decayed to 60 minus the line's length — a
+# `>= park` test never fired and Valen Dreth's loop stalled after one line.
+# It must sit ABOVE any deliberate beat that OWNER stages, so a timer holding a
+# released beat is never mistaken for a parked one.
+#
+# This is the FLOOR, used when the owner stages no beat at all (19,601 of the
+# 19,800 measured topics). It is deliberately small: the threshold sets the park,
+# the park is also the dropped-line timeout, and every second of it is dead air
+# when a Say produces no line. `say_beat_threshold` raises it per owner for the
+# few that need it — only 2 scripts in Oblivion stage a beat above 10s
+# (AncontarScript 20, HackdirtCellDoorScript 15), and a global floor sized for
+# those charged all 19,798 others a ~32s stall instead of ~14s.
+SAY_TIMER_PARKED_THRESHOLD = 8.0
+# Slack over an owner's largest staged beat, so a released beat sitting in the
+# timer stays clear of the "still parked?" test.
+SAY_BEAT_THRESHOLD_MARGIN = 2.0
+# How long a parked timer may sit before the park is treated as a DROPPED line
+# and released without an End fragment.
+#
+# Papyrus `Say()` is fire-and-forget and silently does nothing whenever no INFO
+# under the topic passes its conditions, or the speaker is dead / unloaded /
+# already talking.  No line means no End fragment, so the park is stranded and
+# the conversation stops until the owning loop has counted the full park down.
+# Oblivion could not have this failure: `SayTo` RETURNED 0 for a dropped line,
+# so the timer was never armed and the next tick simply tried again.
+#
+# CharacterGen reaches that state by design — its convCount chain runs up to a
+# deliberate GAP (14, 17, 23, 24, 27, ...) where no CharGenMain INFO exists and
+# a STAGE re-seeds convCount — and three of its segment ends (convCount 36, 43,
+# 45) leave `speaker` non-zero, so a poller does fire a Say with nothing to say.
+# Waiting out a 60s park there is indistinguishable from a broken quest, and the
+# stage that would re-seed the chain often needs the timer clear to run at all.
+#
+# It is added to the topic's longest MEASURED line to size the park, so it is
+# pure slack over the engine's Say-to-audio lag plus the owning loop's tick
+# granularity — not the whole timeout. 4s is comfortably above both and far
+# below anything a player reads as a hang.
+SAY_LINE_DROPPED_TIMEOUT = 4.0
 # Papyrus method name for an OBSE user-defined function (`begin Function{...}`).
 # One fixed name per script: OBSE allowed exactly one Function block per script
 # and `Call <ScriptName> args` names the SCRIPT, never the function.
@@ -121,6 +177,22 @@ def _repair_commented_condition(line: str) -> str:
 class ScriptConverter:
     """Converts Oblivion script source to Papyrus .psc source."""
 
+    # topic (lowercase) -> real spoken duration in seconds, measured from the
+    # exported Oblivion voice files. Populated once per run by the pipeline;
+    # empty falls back to SAY_LINE_SECONDS.
+    say_durations: dict = {}
+
+    # owner EditorID (lower) -> {timer field names needing a pending-beat
+    # companion}. Built once per run by the pipeline from a whole-export scan
+    # and shipped to every worker, so a `SomeQuest.convTimer` beat staged by
+    # one script is declared on SomeQuest's script regardless of conversion
+    # order or which process handles either script.
+    beat_fields_by_owner: dict = {}
+    # topic (lower) -> (kind, spec, beat), from pipeline.build_say_timer_owners.
+    # The call site needs the same `beat` the End fragment uses so both derive an
+    # identical park threshold (see say_beat_threshold).
+    say_timer_owners: dict = {}
+
     def __init__(self, xref: CrossRefGraph):
         self.xref = xref
         self._property_refs: dict[str, str] = {}
@@ -136,6 +208,216 @@ class ScriptConverter:
         self._line_comments: list[str] = []  # Comments accumulated during expression conversion
         self._udf_returns = False      # OBSE Function block uses SetFunctionValue
         self._udf_return_value = ''    # value staged by SetFunctionValue
+        # Timers a Say() parked (see _say_seconds). They hold a large sentinel
+        # until the topic's End fragment clears them, so any expression that
+        # READS one back is no longer reading a line length and must not be
+        # translated literally.
+        self._parked_timers: set = set()
+        # Timer expressions that need a pending-beat companion property
+        # declared on THIS script (only those whose owner is this script; a
+        # `Quest.field` beat is declared by the quest's own converted script).
+        self._say_beat_targets: set = set()
+
+    _SAY_TOPIC_RE = re.compile(r'\.?Say\(\s*([A-Za-z_]\w*)')
+
+    def _say_seconds(self, say_expr: str) -> float:
+        """Seconds to charge a converted Say() timer at the CALL SITE.
+
+        TES4's Say/SayTo RETURNED the line's length and the script stored it in
+        a timer so the next speaker would not start until this line finished.
+        Papyrus' Say() returns nothing, so the call site must supply a duration.
+
+        The wait is NOT a duration.  The engine already blocks for the whole
+        audio file, so charging a measured length here makes the engine's wait
+        and the script's wait ADD — that is the "really long pause between
+        every single response" failure, and it must not come back.
+
+        The timer is PARKED instead, and the topic's End fragment clears it the
+        instant the line truly finishes.  The park value is pure backstop: it
+        only has to outlast one line, and nothing paces off it.
+
+        But the backstop is also the DROPPED-LINE TIMEOUT, and that is why it is
+        sized per topic rather than left at the flat 60s.  `Say()` is
+        fire-and-forget: it does nothing at all when no INFO under the topic
+        passes its conditions, or the speaker is dead / unloaded / already
+        talking.  No line means no End fragment, so nothing ever clears the park
+        and the scene waits the whole thing out — a minute of NPCs standing mute,
+        which reads as a broken quest rather than a slow one.  Oblivion could not
+        reach that state: `SayTo` returned 0 for a dropped line, so the timer was
+        never armed and the next tick simply retried.
+
+        CharacterGen hits it by design.  Its `convCount` chain deliberately runs
+        up to a GAP where no CharGenMain INFO exists (14, 17, 23, 24, 27, ... — a
+        quest STAGE re-seeds convCount past it) and three segment ends (convCount
+        36, 43, 45) leave `speaker` non-zero, so a poller really does fire a Say
+        with nothing to say.  Worse, several of the stages that would re-seed the
+        chain are themselves gated on `convTimer <= 0`, so a stranded park blocks
+        its own recovery.
+
+        Skyrim offers no way to ask whether an actor is speaking (Actor.psc has
+        no IsTalking — that is a Fallout CONDITION function; IsInDialogueWithPlayer
+        covers only player conversations, not the NPC-to-NPC Say used here), so
+        the timeout is enforced by the countdown the owning script already runs:
+        park only far enough above the release threshold to outlast this topic's
+        LONGEST MEASURED line, and the park drains back through the threshold on
+        its own shortly after any real line of that topic would have ended.  A
+        line that did play had its fragment clear the park long before then.
+
+        Everything above that point is dead air on a dropped line, so a topic
+        whose longest response is 2s now retries in a few seconds instead of 60.
+        Topics with no measured audio keep the flat park.
+        """
+        tm = self._SAY_TOPIC_RE.search(say_expr or '')
+        topic = tm.group(1).lower() if tm else ''
+        # A topic with no measured audio still gets a bounded park: assume the
+        # longest line the measured corpus contains rather than the old flat 60s.
+        line = float((self.say_durations or {}).get(topic)
+                     or SAY_LONGEST_UNMEASURED_LINE)
+        # Same threshold the End fragment will test against — derived from the
+        # same per-topic beat, so the two cannot drift apart.
+        owner = (self.say_timer_owners or {}).get(topic)
+        thresh = self.say_beat_threshold(owner[2] if owner else 0.0)
+        return min(SAY_LINE_PARK_SECONDS,
+                   thresh + line + SAY_LINE_DROPPED_TIMEOUT)
+
+    @staticmethod
+    def say_beat_threshold(beat: float = 0.0) -> float:
+        """The "is this timer still parked?" threshold for one park site.
+
+        Both emitters must agree exactly: the CALL SITE sizes its park above this
+        (`_say_seconds`) and the End FRAGMENT tests against it, so a mismatch
+        either never releases the park or releases it mid-line.  Deriving both
+        from the same `beat` — the deliberate pause the owning script stacks after
+        this topic's line, which `build_say_timer_owners` already reports per
+        topic — keeps them in step.
+
+        The threshold has to clear that beat, because a released beat sits in the
+        timer and must not read as a fresh park.  Everything above that is pure
+        cost: the threshold sets the park, and the park is also how long a DROPPED
+        line stalls the scene.
+        """
+        return max(SAY_TIMER_PARKED_THRESHOLD,
+                   float(beat or 0.0) + SAY_BEAT_THRESHOLD_MARGIN)
+
+    @staticmethod
+    def beat_property(timer_expr: str) -> str:
+        """Name of the pending-beat companion for a Say timer.
+
+        `CharacterGen.convTimer` -> `CharacterGen.convTimerPendingBeat`
+        `timer`                  -> `timerPendingBeat`
+
+        Static so the INFO-fragment emitter (pipeline) derives the identical
+        name from the same timer expression.
+        """
+        if '.' in timer_expr:
+            owner, field = timer_expr.rsplit('.', 1)
+            return f'{owner}.{field}PendingBeat'
+        return f'{timer_expr}PendingBeat'
+
+    def _beat_property(self, target: str) -> str:
+        self._say_beat_targets.add(target)
+        return self.beat_property(target)
+
+    # `set <timer> to <ref.>Say[To] [target] <topic>` — the park sites.  Only
+    # the ASSIGNMENT target matters here (which timer gets parked), so the
+    # topic is not captured; `[^\n]*` keeps the match on ONE line.
+    _PARK_SITE_RE = re.compile(
+        r'set\s+([\w.]+)\s+to\s+[^\n]*?\bsay(?:to)?\b', re.IGNORECASE)
+    # `set <timer> to <timer> - <getSecondsPassed|literal>` — the countdown.
+    _COUNTDOWN_RE = re.compile(
+        r'^\s*set\s+([\w.]+)\s+to\s+([\w.]+)\s*-\s*(\S+)\s*$', re.IGNORECASE)
+
+    def _prescan_parked_timers(self, source: str) -> None:
+        """Record every timer a Say() in this source will park.
+
+        Populated up front because the countdown that decrements a parked timer
+        is written ABOVE the park site in the source, and the countdown has to
+        be emitted park-safe (see _parked_decrement).
+        """
+        for m in self._PARK_SITE_RE.finditer(source):
+            self._parked_timers.add(m.group(1).lower())
+
+    def _parked_decrement(self, target: str, value: str) -> Optional[str]:
+        """Park-safe form of `timer = timer - dt` for a PARKED timer.
+
+        The plain translation is a read-modify-write, and the timer is shared
+        across processes that are not synchronised: the owning script counts it
+        down on its own update while the speaking line's End fragment clears it
+        to 0 from the engine's dialogue thread.  Papyrus gives no atomicity, so
+        the fragment's release can land BETWEEN this statement's read and its
+        write — the write then stores `park - dt`, RESURRECTING a park that was
+        already released.  The next speaker's `timer <= 0` gate never opens, and
+        because every INFO in these conversations is gated on an exact
+        `convCount`, the chain does not resume late — it stops dead.  That is
+        the intermittency: the line plays or it does not, depending purely on
+        where the 0.1s tick fell relative to the line ending.
+
+        The fix is to RE-READ the timer immediately before storing and drop the
+        decrement if it no longer matches what was read.  A release that lands
+        anywhere inside the statement changes the value, so the write is
+        abandoned and the released 0 stands; only an uncontended tick stores.
+        Losing one 0.1s decrement to a contended tick is invisible (the next
+        tick takes it), whereas resurrecting the park is fatal.
+        """
+        if target.lower() not in self._parked_timers:
+            return None
+        # Match the snapshot's type to the timer's, and put the SUBTRACTION
+        # through the same Float->Int coercion the plain assignment would have
+        # used. TES4 let a `short` hold a Say duration
+        # (SERelmynaVerenimScript's RelmynaSayToCorpse), and Papyrus rejects a
+        # Float expression assigned into an Int without a cast.
+        vtype = self._var_types.get(target.lower().split('.')[-1], '')
+        if vtype not in ('Int', 'Float'):
+            vtype = 'Float'
+        local = '_tes4Tick' + re.sub(r'\W', '', target)
+        expr = self._coerce_float_to_int(target, f'{local} - {value}')
+        return (
+            f'{vtype} {local} = {target}  ; the End fragment can clear this '
+            f'mid-statement\n'
+            f'  If {local} > 0 && {target} == {local}\n'
+            f'    {target} = {expr}\n'
+            f'  EndIf')
+
+
+    def _resolve_parked_timer_expr(self, value: str) -> str:
+        """Rewrite `<parked timer> +/- k` to just the adjustment.
+
+        Substituting 0 for the parked read keeps the designer's deliberate
+        beat (Oblivion's 13 such expressions are all "add a pause": +3 between
+        assassin taunts, +2.5 after "My job right now...", +10 between taunt
+        stages) while dropping the sentinel that would otherwise stall the
+        conversation for a minute.
+        """
+        if not self._parked_timers or not value:
+            return value
+        for name in self._parked_timers:
+            # match the bare variable (or Quest.field) followed by +/- number
+            m = re.match(r'^\s*' + re.escape(name) + r'\s*([+-])\s*([\d.]+)\s*$',
+                         value, re.IGNORECASE)
+            if m:
+                sign, num = m.group(1), m.group(2)
+                if sign != '+':
+                    # 0 - k would arm a negative timer; the guard is `<= 0`, so
+                    # a subtraction simply means "no extra wait".
+                    return '0'
+                # An ADD is a deliberate beat Oblivion charged ON TOP of the
+                # line's length — it starts when the line ENDS.  It cannot be
+                # written into the timer here: the call site runs while the
+                # line is still playing and the owning loop counts the timer
+                # DOWN, so any value encoded in it is eroded by the line's
+                # length before the End fragment can read it back.  Redirect it
+                # to a dedicated pending-beat property the loop never touches;
+                # the End fragment moves that into the timer once the line is
+                # actually over.  Keeping the write HERE is what makes the beat
+                # per-call-site: a topic Said by several scripts (CharGenMain
+                # has five) gives each its own beat, and the branch guards that
+                # wrap it (`If convCount == 5`) still apply.
+                self._say_beat_targets.add(name)
+                return f'__BEAT__{num}'
+            if re.match(r'^\s*' + re.escape(name) + r'\s*$', value,
+                        re.IGNORECASE):
+                return '0'
+        return value
 
     def _is_ref_typed_access(self, dotted_expr: str) -> bool:
         """Check if a dotted expression (e.g. 'SEHerdirRef.TargetRef') accesses a ref-typed variable.
@@ -273,6 +555,13 @@ class ScriptConverter:
                 self._var_renames[vname.lower()] = safe
 
         source_low = source.lower()
+        # Which of this script's own timers a Say() will PARK.  Must be known
+        # BEFORE any line is converted: the countdown that decrements the timer
+        # is written ABOVE the park site in every one of these scripts
+        # (CharGenQuest counts convTimer down at the top of its GameMode block
+        # and parks it 40 lines later), so discovering parks lazily as they are
+        # converted leaves the decrement unguarded.  See _parked_decrement.
+        self._prescan_parked_timers(source)
         self._uses_getsecondspassed = 'getsecondspassed' in source_low
         self._uses_timer = bool(re.search(r'\btimer\b', source_low))
         self._has_gamemode = any(b[0] == 'gamemode' for b in blocks)
@@ -663,6 +952,24 @@ class ScriptConverter:
                 # currently in an attached cell, so this cannot re-create the
                 # "every scripted object in the game starts ticking at load"
                 # failure — an unconditional OnInit register is what did that.
+                #
+                # But OnInit ALONE is not enough once the script lives on the
+                # placed reference (which reference events like OnPackageEnd
+                # require).  On a reference OnInit runs at load BEFORE the 3D
+                # exists, so Is3DLoaded() is false and the poll never starts —
+                # that is what silenced Valen Dreth.  OnLoad is the event that
+                # actually means "this object is completely loaded ... fired
+                # every time this object is loaded" (vanilla ObjectReference.psc),
+                # so it starts the loop for an actor already standing in the
+                # player's current cell, which OnCellAttach cannot do.
+                if not any(b[0] == 'onload' for b in blocks):
+                    out.append('Event OnLoad()')
+                    if needs_oninit_update:
+                        out.append(f'  RegisterForSingleUpdate({interval})')
+                    if needs_sleep_reg:
+                        out.append('  RegisterForSleep()')
+                    out.append('EndEvent')
+                    out.append('')
                 if not any(b[0] == 'oninit' for b in blocks):
                     out.append('Event OnInit()')
                     out.append('  If (Is3DLoaded())')
@@ -756,6 +1063,34 @@ class ScriptConverter:
                             for bidx in range(var_start_idx + len(_var_info) + 1, len(out)):
                                 if none_re.match(out[bidx]):
                                     out[bidx] = none_re.sub(r'\g<1>0', out[bidx])
+
+        # Pending-beat companions for Say timers this script owns.  Declared
+        # after conversion because the need is discovered while converting the
+        # body.  Only script-LOCAL timers get a declaration here; a
+        # `SomeQuest.convTimer` beat lives on that quest's own script.
+        # A beat written as `SomeQuest.convTimer` needs its companion declared
+        # on SomeQuest's script, not here.  `beat_fields_by_owner` is built once
+        # by the pipeline (a whole-export scan) and shipped to every worker, so
+        # the declaration does not depend on which script converted first.
+        #
+        # Dedupe CASE-INSENSITIVELY: Papyrus identifiers are case-insensitive,
+        # and the two sources disagree on casing (this script's own writes keep
+        # the source's `sayLength`, the export scan lowercases), so a
+        # case-sensitive set declared both and the compiler rejected the file
+        # with "property with `saylengthPendingBeat` name already exists".
+        beat_locals = []
+        _beat_seen = set()
+        for field in (sorted(t for t in self._say_beat_targets if '.' not in t)
+                      + sorted(self.beat_fields_by_owner.get(_edid_low, ()))):
+            if field.lower() not in _beat_seen:
+                _beat_seen.add(field.lower())
+                beat_locals.append(field)
+        if beat_locals:
+            decls = [f'Float Property {self.beat_property(t)} = 0.0 Auto'
+                     '  ; pause to run after the current Say line ends'
+                     for t in beat_locals]
+            out[var_start_idx + len(_var_info):
+                var_start_idx + len(_var_info)] = decls
 
         # Post-process: upgrade ObjectReference/Actor variables to more specific types
         # based on usage (Actor from actor-only functions, or script type from SCRO/xref)
@@ -1660,6 +1995,32 @@ class ScriptConverter:
         if set_m:
             target = self._convert_ref(set_m.group(1), extends)
             value = self._convert_expression(set_m.group(2), extends)
+            # A PARKED timer's own countdown (`set t to t - getSecondsPassed`)
+            # is a read-modify-write on a variable the dialogue thread clears
+            # asynchronously — emit it park-safe rather than literally.  Tested
+            # on the RAW source spelling: the target and the value must name the
+            # SAME timer, which is only visible before `_convert_ref` renames
+            # the target and `_resolve_parked_timer_expr` collapses the value.
+            cd_m = self._COUNTDOWN_RE.match(stripped)
+            if cd_m and cd_m.group(1).lower() == cd_m.group(2).lower():
+                safe = self._parked_decrement(
+                    target, self._convert_expression(cd_m.group(3), extends))
+                if safe:
+                    return safe
+            # A timer PARKED by a Say (see _say_seconds) holds a sentinel, not
+            # the line length TES4 put there, so reading it back and adjusting
+            # ("convTimer = timer - .5" to cut a speaker off, "timer + 10" for
+            # an inter-stage beat) would propagate the sentinel and stall the
+            # conversation. The line is over when the End fragment clears the
+            # timer to 0, so the faithful value of these expressions is the
+            # ADJUSTMENT alone.
+            value = self._resolve_parked_timer_expr(value)
+            # A beat redirect: `set convTimer to convTimer + 2.5` becomes a
+            # write to the pending-beat property instead of the timer, so the
+            # loop's countdown cannot erode it before the line ends.
+            if value.startswith('__BEAT__'):
+                return (f'{self._beat_property(target)} = {value[8:]}'
+                        "  ;pause after this line; applied when it ends")
             # Can't assign to Self/GetTargetActor()/akSpeakerRef in Papyrus
             if target in ('Self', 'GetTargetActor()', 'akSpeakerRef'):
                 return f';{target} = {value}  ;cannot assign to Self in Papyrus'
@@ -1740,19 +2101,33 @@ class ScriptConverter:
                     # polling conversation counts that timer down before speaking
                     # the next line.  Papyrus Say() returns nothing; substituting
                     # 0 made converted conversations machine-gun a line per tick
-                    # (overlapping audio, skipped result scripts).  Approximate a
-                    # spoken line as SAY_LINE_SECONDS instead.
-                    delay_f = SAY_LINE_SECONDS + (float(delay_m.group(1)) if delay_m else 0.0)
+                    # (overlapping audio, skipped result scripts).
+                    #
+                    # The timer is PARKED here and released by the INFO's End
+                    # fragment when the line really finishes — see
+                    # _say_seconds and pipeline.build_say_timer_owners.  It is
+                    # written BEFORE the Say call because the fragment for a
+                    # very short line can run before this statement would
+                    # otherwise execute; parking afterwards would re-block a
+                    # conversation the engine had already released.
+                    delay_f = (self._say_seconds(say_call) +
+                               (float(delay_m.group(1)) if delay_m else 0.0))
                     delay_val = f'{delay_f:g}'
                     # An Int target (TES4 `short`) can't take a Float literal
                     if self._var_types.get(target.lower().split('.')[-1]) == 'Int':
                         delay_val = str(int(delay_f))
-                    return f'{say_call}\n  {target} = {delay_val}  ;Say() returns None in Papyrus; line duration approximated'
-                say_dflt = (str(int(SAY_LINE_SECONDS)) if self._var_types.get(
+                    self._parked_timers.add(target.lower())
+                    return (f'{target} = {delay_val}'
+                            '  ;parked; the topic\'s End fragment clears it\n'
+                            f'  {say_call}')
+                secs = self._say_seconds(value)
+                say_dflt = (str(int(round(secs))) if self._var_types.get(
                     target.lower().split('.')[-1]) == 'Int'
-                    else f'{SAY_LINE_SECONDS:g}')
-                return (f'{value}\n  {target} = {say_dflt}'
-                        '  ;Say() returns None in Papyrus; line duration approximated')
+                    else f'{secs:g}')
+                self._parked_timers.add(target.lower())
+                return (f'{target} = {say_dflt}'
+                        '  ;parked; the topic\'s End fragment clears it\n'
+                        f'  {value}')
             # GlobalVariable: use SetValue() instead of direct assignment
             tgt_low = target.lower().split('.')[-1]
             if self._property_refs.get(target, self._property_refs.get(tgt_low, '')) == 'GlobalVariable':
@@ -3820,9 +4195,15 @@ class ScriptConverter:
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
             return f'{ref}.GetParentCell().IsInterior()'
 
-        # Unlock: ref.Unlock -> ref.Lock(false)
+        # Unlock: ref.Unlock -> ref.Lock(false).  Lock() is declared on
+        # ObjectReference and its TES4 targets are doors/containers, so this
+        # must NOT promote the property to Actor: doing so made CGAmbushBDoor /
+        # CGDungeon02Exit / CGPrisonSecretWallRef (all REFRs) declare as
+        # `Actor Property`, which the VM refuses to bind ("cannot be bound
+        # because <fid> is not the right type") — the property comes back None
+        # and the door never unlocks.
         if fname_low == 'unlock':
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            ref = self._resolve_objref_ref(ref_name, extends)
             return f'{ref}.Lock(false)'
 
         # Cast: TES4 ref.cast spell [target] -> Papyrus spell.Cast(ref, target)
@@ -3926,7 +4307,11 @@ class ScriptConverter:
                 'handstohandsattack': 'attackStart',
             }
             event = _anim_map.get(anim_name.lower(), anim_name)
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            # SendAnimationEvent takes an ObjectReference, and TES4 aims
+            # PlayGroup at doors and animated statics as often as at actors
+            # (CGPrisonSecretWallRef.playgroup backward), so promoting the
+            # property to Actor would leave the VM unable to bind a REFR.
+            ref = self._resolve_objref_ref(ref_name, extends)
             return f'Debug.SendAnimationEvent({ref}, "{event}")'
 
         # PickIdle / PlayIdle: -> Debug.SendAnimationEvent(ref, "IdleForceDefaultState")

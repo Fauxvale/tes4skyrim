@@ -13,7 +13,8 @@ from script_convert.constants import (_PAPYRUS_RESERVED, _RECORD_TYPE_PAPYRUS, _
                                      _record_type_to_papyrus, papyrus_script_name,
                                      PAPYRUS_MAX_SCRIPT_NAME)
 from script_convert.cross_ref import CrossRefGraph
-from script_convert.converter import ScriptConverter
+from script_convert.converter import (ScriptConverter, SAY_LINE_PARK_SECONDS,
+                                      SAY_TIMER_PARKED_THRESHOLD)
 
 
 # ===========================================================================
@@ -38,11 +39,22 @@ def _new_stats() -> dict:
 
 
 def _script_worker_init(xref, output_dir, info_reveals, service_topics,
-                        stage_reveals):
+                        stage_reveals, say_durations=None,
+                        say_timer_owners=None, topic_by_dial=None,
+                        beat_fields_by_owner=None):
     _WORKER_CTX.update(xref=xref, output_dir=output_dir,
                        info_reveals=info_reveals,
                        service_topics=service_topics,
-                       stage_reveals=stage_reveals)
+                       stage_reveals=stage_reveals,
+                       say_timer_owners=say_timer_owners or {},
+                       topic_by_dial=topic_by_dial or {})
+    # Class-level, so every ScriptConverter a worker builds sees the measured
+    # voice-line lengths that converted Say() timers are charged with.
+    ScriptConverter.say_durations = say_durations or {}
+    ScriptConverter.beat_fields_by_owner = beat_fields_by_owner or {}
+    # The call site sizes its park from the SAME per-topic beat the End fragment
+    # tests against, so the two thresholds cannot drift (see say_beat_threshold).
+    ScriptConverter.say_timer_owners = say_timer_owners or {}
 
 
 def _script_worker_run(job):
@@ -154,8 +166,23 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
 
     info_reveals = unlock_plan['info_reveals']
 
+    # Which conversation timer each Say-driven topic parks, and the topic name
+    # behind each DIAL FormID.  Needed HERE, before the filter below, because
+    # an INFO under a parked topic must produce a fragment even when it has no
+    # result script of its own.
+    say_timer_owners = build_say_timer_owners(by_type)
+    topic_by_dial = {d.get('FormID', ''): (d.get('EditorID') or '').lower()
+                     for d in by_type.get('DIAL', []) if d.get('FormID')}
+
     def _info_makes_output(rec):
         if rec.get('ResultScript', '').strip():
+            return True
+        # A line under a topic whose timer was PARKED must emit a fragment to
+        # release it, script or not.  Requiring a result script dropped 87% of
+        # them (5,450 of 6,248): the parked timer was then never cleared and
+        # the conversation stopped for good on the first script-less line —
+        # CharacterGen died on Glenroy's "Baurus, lock the door behind us".
+        if say_timer_owners.get(topic_by_dial.get(rec.get('ParentDIAL', ''), '')):
             return True
         try:
             return (int(rec.get('FormID', ''), 16) & 0xFFFFFF) in info_reveals
@@ -171,8 +198,26 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
     print(f'  Converting {len(scpt_work)} SCPT / {len(info_work)} INFO / '
           f'{len(qust_work)} QUST scripts ({len(jobs)} jobs)...')
 
+    # Measured spoken-line lengths for converted Say() timers. A converted
+    # polling conversation that re-Says before the previous line ends is
+    # silently dropped by the engine (and loses its End fragment), so these
+    # must be real durations, not a constant.
+    from script_convert.say_durations import scan_voice_durations
+    say_durations = scan_voice_durations(export_dir)
+    if say_durations:
+        print(f'    voice durations: {len(say_durations)} topics measured '
+              f'(Say() timers)')
+
+    # (say_timer_owners / topic_by_dial are built above, before the INFO filter
+    # that consumes them.)
+    beat_fields_by_owner = build_beat_fields_by_owner(by_type)
+    if say_timer_owners:
+        print(f'    say timers: {len(say_timer_owners)} topics drive a quest '
+              f'conversation timer (per-line correction)')
+
     initargs = (xref, output_dir, info_reveals, service_topics,
-                unlock_plan['stage_reveals'])
+                unlock_plan['stage_reveals'], say_durations,
+                say_timer_owners, topic_by_dial, beat_fields_by_owner)
     if workers <= 1 or len(jobs) <= 2:
         _script_worker_init(*initargs)
         for job in jobs:
@@ -236,6 +281,199 @@ _SERVICE_MENU_CALL = {
 }
 
 
+# `set <timer> to [<ref>.]Say <topic> [flag]`
+#           or  `set <timer> to [<ref>.]SayTo <target> <topic> [flag]`
+#
+# The keyword decides the ARITY, so it has to be captured: SayTo takes a target
+# BEFORE the topic, Say does not.  An `(?:\w+[\s,]+)?` optional-target group
+# cannot tell the two apart and greedily consumed the topic of every `Say
+# <topic> 1` form, capturing the trailing "say the line even if the speaker is
+# not the player's target" FLAG as the topic ("1").  That silently denied a
+# release owner to 120+ topics — every Daedric shrine speech, the Boethia
+# champions, SE quest chatter, MQ13/MQ06 speeches — so their parked timers were
+# never cleared and each conversation stopped after ONE line.
+#
+# `[^\S\n]` (not `\s`) keeps every match on a single line: SCTX is one long
+# escaped blob, and `\s` let a match run past the end of a statement and pick up
+# `else`/`endif`/`setstage` from following lines as the "topic".
+_SAY_TIMER_RE = re.compile(
+    r'set\s+([\w.]+)\s+to[^\S\n]+(?:[\w]+\.)?(say(?:to)?)'
+    r'[^\S\n,]*[\s,][^\S\n,]*(\w+)'
+    r'(?:[^\S\n,]*[,][^\S\n,]*|[^\S\n]+)(\w+)?',
+    re.IGNORECASE)
+
+
+def _say_timer_topic(m: 're.Match') -> str:
+    """The TOPIC captured by _SAY_TIMER_RE, honouring Say vs SayTo arity.
+
+    SayTo's first argument is the dialogue TARGET and the second is the topic;
+    Say's first argument IS the topic.  A trailing numeric flag is never a
+    topic, so a digit in the topic slot means the optional group matched the
+    flag instead and the earlier group holds the real topic.
+    """
+    kw, first, second = m.group(2).lower(), m.group(3), m.group(4)
+    if kw == 'sayto' and second and not second.isdigit():
+        return second
+    return first
+
+
+def build_say_timer_owners(by_type: dict) -> dict:
+    """topic (lowercase) -> the Papyrus timer expression to clear when a line
+    of that topic FINISHES.
+
+    Oblivion wrote `set CharacterGen.convTimer to SayTo player, CharGenMain 1`
+    — the timer held the line's own length purely so the NEXT speaker's
+    `convTimer <= 0` guard would not fire until this line finished.
+
+    Skyrim needs no such countdown: the INFO's result script becomes its End
+    fragment and the engine runs it when the line FINISHES.  Clearing the timer
+    there releases the next speaker at exactly the right moment, with no
+    estimation anywhere.  (Charging a measured duration instead makes the
+    engine's wait and the script's wait ADD, which reads in game as a long dead
+    pause after every line.)
+    """
+    # script EditorID (lower) -> the QUST EditorID that runs it.  A quest
+    # script's bare `set convTimer to ...` names a variable on the QUEST, so
+    # its End fragment must bind a quest property rather than cast the speaker.
+    _script_edid = {(r.get('FormID') or '').upper(): (r.get('EditorID') or '')
+                    for r in by_type.get('SCPT', [])}
+    quest_script_owner = {}
+    for rec in by_type.get('QUST', []):
+        sname = _script_edid.get((rec.get('SCRI') or '').upper(), '')
+        qname = rec.get('EditorID') or ''
+        if sname and qname:
+            quest_script_owner[sname.lower()] = qname
+
+    # Every QUST EditorID, so a dotted timer target can be told apart from one
+    # prefixed by a placed reference (see the `.` branch below).
+    quest_edids = {(r.get('EditorID') or '').lower()
+                   for r in by_type.get('QUST', []) if r.get('EditorID')}
+
+    owners = {}
+    for rec in by_type.get('SCPT', []):
+        txt = (rec.get('SCTX') or '').replace('\\r\\n', '\n')
+        edid = rec.get('EditorID') or ''
+        for m in _SAY_TIMER_RE.finditer(txt):
+            target, topic = m.group(1), _say_timer_topic(m).lower()
+            # A deliberate beat (`set convTimer to convTimer + 2.5`) that the
+            # script applies right after this Say. Oblivion charged it on top
+            # of the line's length, so it belongs AFTER the line — the End
+            # fragment applies it, because anything written at the call site
+            # decays under the loop's countdown while the line plays.
+            short = target.split('.')[-1]
+            beat = 0.0
+            bm = re.search(r'set\s+[\w.]*\b' + re.escape(short) +
+                           r'\b\s+to\s+[\w.]*\b' + re.escape(short) +
+                           r'\b\s*\+\s*([\d.]+)', txt, re.IGNORECASE)
+            if bm:
+                try:
+                    beat = float(bm.group(1))
+                except ValueError:
+                    beat = 0.0
+            if '.' in target and target.split('.')[0].lower() in quest_edids:
+                # Quest-scoped (`CharacterGen.convTimer`): bind a property to
+                # that quest in the fragment.
+                owners.setdefault(topic, ('quest', target, beat))
+            elif '.' in target:
+                # A dotted target whose prefix is NOT a quest — `set
+                # MS27CarvingWall.timer to Say MS27Voice`, where MS27CarvingWall
+                # is a placed REFR and the timer lives on that object's own
+                # script.  Binding it as a quest property emitted
+                # `Quest Property MS27CarvingWall` and the fragment failed to
+                # compile ("field or property `timer` not found"), because a bare
+                # Quest has no converted script members.  There is no reliable
+                # handle from a TopicInfo fragment to an arbitrary third-party
+                # reference, so leave it unowned: the call site's park still
+                # holds the loop off and the dropped-line watchdog bounds it.
+                continue
+            elif edid and edid.lower() in quest_script_owner:
+                # A QUEST script writing its OWN timer with no prefix
+                # (`set convTimer to BaurusRef.SayTo ...` in CharGenQuest).
+                # It is script-local in TES4 syntax but the timer lives on the
+                # QUEST, so it must bind a quest property — casting the SPEAKER
+                # to a Quest script yields None, the write is silently dropped
+                # and the parked timer is NEVER released.  That one
+                # misclassification killed every CharGenVoice line, which is
+                # where CharacterGen stopped after "Baurus, lock the door".
+                owners.setdefault(
+                    topic,
+                    ('quest', f'{quest_script_owner[edid.lower()]}.{target}',
+                     beat))
+            elif edid:
+                # Script-local (`timer` on ValenDrethScript): the timer lives
+                # on the SPEAKER's own script, which a TopicInfo fragment
+                # reaches by casting akSpeakerRef to that script type.
+                owners.setdefault(topic, ('speaker', f'{edid}|{target}', beat))
+    return owners
+
+
+def build_beat_fields_by_owner(by_type: dict) -> dict:
+    """owner EditorID (lower) -> {timer fields needing a pending-beat property}.
+
+    A script that pauses between lines writes `set SomeQuest.convTimer to
+    SomeQuest.convTimer + 2.5`.  The converter redirects that to a
+    `convTimerPendingBeat` companion (the timer itself is counted DOWN while
+    the line plays, so a value stored there is eroded before the End fragment
+    can read it back) — but the companion has to be DECLARED on SomeQuest's
+    script, which a different converter run produces.  Scanning the whole
+    export up front makes that independent of conversion order and safe across
+    the process pool.
+    """
+    owners: dict = {}
+    for rec in by_type.get('SCPT', []):
+        txt = (rec.get('SCTX') or '').replace('\\r\\n', '\n')
+        script_name = (rec.get('EditorID') or '').lower()
+        for m in _SAY_TIMER_RE.finditer(txt):
+            target = m.group(1)
+            owner, field = (target.rsplit('.', 1) if '.' in target
+                            else (script_name, target))
+            if not owner:
+                continue
+            pat = (r'set\s+[\w.]*\b' + re.escape(field) + r'\b\s+to\s+'
+                   r'[\w.]*\b' + re.escape(field) + r'\b\s*\+\s*[\d.]+')
+            if re.search(pat, txt, re.IGNORECASE):
+                owners.setdefault(owner.lower(), set()).add(field)
+    # Re-key from the RECORD's EditorID (`charactergen`) to the EditorID of the
+    # SCRIPT that record runs (`chargenquest`), because that is the script the
+    # property must be declared on and the name each converter matches itself
+    # against.
+    scri_by_edid = {}
+    script_edid = {}
+    for rec in by_type.get('SCPT', []):
+        script_edid[(rec.get('FormID') or '').upper()] = rec.get('EditorID') or ''
+    for sig in ('QUST', 'NPC_', 'CREA', 'ACHR', 'ACRE', 'REFR'):
+        for rec in by_type.get(sig, []):
+            e = (rec.get('EditorID') or '').lower()
+            scri = (rec.get('SCRI') or '').upper()
+            if e and scri:
+                scri_by_edid[e] = script_edid.get(scri, '')
+    # A key that is already a SCRIPT name (script-local timer) stays as-is;
+    # only a RECORD name is redirected to the script it runs.
+    known_scripts = {v.lower() for v in script_edid.values() if v}
+    out: dict = {}
+    for rec_edid, fields in owners.items():
+        key = rec_edid
+        if rec_edid not in known_scripts:
+            key = (scri_by_edid.get(rec_edid) or rec_edid).lower()
+        out.setdefault(key, set()).update(fields)
+    return out
+
+
+def _owner_has_beat(spec: str, kind: str) -> bool:
+    """Does the script owning this Say timer declare a pending-beat companion?
+
+    Mirrors the declaration rule in ScriptConverter (`beat_fields_by_owner`,
+    keyed by SCRIPT EditorID) so a fragment never references a property that
+    was not emitted.
+    """
+    by_owner = ScriptConverter.beat_fields_by_owner or {}
+    if kind == 'quest':
+        owner, field = spec.split('.', 1)
+    else:
+        owner, field = spec.split('|', 1)
+    return field.lower() in {f.lower() for f in by_owner.get(owner.lower(), ())}
+
+
 def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 stats: dict, info_reveals: dict = None,
                 service_topics: dict = None):
@@ -251,6 +489,9 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
     """
     info_reveals = info_reveals or {}
     service_topics = service_topics or {}
+    timer_owners = _WORKER_CTX.get('say_timer_owners') or {}
+    durations = ScriptConverter.say_durations or {}
+    topic_by_dial = _WORKER_CTX.get('topic_by_dial') or {}
 
     for rec in records:
         result_script = rec.get('ResultScript', '')
@@ -262,7 +503,78 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             fid24 = 0
         reveals = info_reveals.get(fid24, [])
         service_kind = service_topics.get(rec.get('ParentDIAL', ''), '')
-        if not has_script and not reveals:
+        # This INFO's own measured length, and the conversation timer its topic
+        # drives — see build_say_timer_owners. Emitting `<timer> = <secs>` in
+        # the End fragment replaces the call site's worst-case estimate with
+        # the length of the line that actually played.
+        timer_fix = ''
+        topic_name = topic_by_dial.get(rec.get('ParentDIAL', ''), '')
+        owner = timer_owners.get(topic_name)
+        # Release the conversation timer this topic drives. The call site
+        # PARKED it (see converter._say_seconds) so the 0.1s polling loop could
+        # not re-Say mid-line; the engine runs this fragment when the line
+        # ENDS, so clearing it here is the exact "line finished" signal — no
+        # duration estimate is involved in the pacing.
+        #
+        # Assign 0 — never `timer - park`. Several actor scripts poll the SAME
+        # quest timer on independent 0.5s updates while the quest script
+        # decrements it every 0.1s, and `Say()` is asynchronous, so a relative
+        # adjustment is a race: if this fragment's subtraction lands before the
+        # call site's park (short line, or an interleaved tick) the timer ends
+        # at +park with nobody speaking and the conversation stalls for a
+        # minute; if two speakers park in the same window, both subtract. An
+        # absolute 0 is idempotent and order-independent, so the handoff is
+        # deterministic no matter how the ticks interleave.
+        #
+        # The 13 scripts that stack a deliberate beat re-read the timer at the
+        # CALL SITE (converter._resolve_parked_timer_expr rewrites those), so
+        # they do not depend on the value this fragment leaves behind.
+        # Release is GUARDED (`If timer >= park`) and subtracts the park rather
+        # than assigning 0 outright. Both details matter:
+        #
+        #  * The guard makes it idempotent under interleaving. Several actor
+        #    scripts poll this one timer on independent 0.5s updates while the
+        #    quest script decrements it every 0.1s, and Say() is asynchronous,
+        #    so an unguarded relative adjustment races: land it before the call
+        #    site's park and the timer sits at +park with nobody speaking (a
+        #    minute-long stall); let two speakers park in one window and it is
+        #    subtracted twice. Only a timer still holding the park is released.
+        #  * Subtracting (not zeroing) preserves the deliberate beats. Oblivion
+        #    charged those ON TOP of the line's length, so the call site emits
+        #    `park + k` (see converter._resolve_parked_timer_expr) — writing the
+        #    bare pause there would release the guard mid-line and the next
+        #    speaker's Say would be dropped. `park + k` is still >= park, so
+        #    this fires and leaves exactly `k` to run after the line ends.
+        owner_prop = ''
+        if owner:
+            kind, spec = owner[0], owner[1]
+            # Per-topic, from the beat this topic stages — the call site sizes
+            # its park off the identical call, so the two stay in step.
+            thresh = ScriptConverter.say_beat_threshold(owner[2])
+            if kind == 'quest':
+                owner_prop, field = spec.split('.', 1)
+                ref = f'{_safe_property_name(owner_prop)}.{field}'
+            else:
+                script_edid, field = spec.split('|', 1)
+                cls = papyrus_script_name(script_edid)
+                ref = f'(akSpeakerRef as {cls}).{field}'
+            # Consume the staged pause only when the owning script actually
+            # HAS one — most Say timers never take a beat, and referencing a
+            # companion that was never declared fails to compile ("field or
+            # property `timerPendingBeat` not found", 300+ fragments).
+            if _owner_has_beat(spec, kind):
+                beat_ref = ScriptConverter.beat_property(ref)
+                # The beat travels in its own property because the owning loop
+                # counts the timer DOWN while the line plays, so anything
+                # encoded in the timer itself is eroded before this runs.
+                release = (f'    {ref} = {beat_ref}\n'
+                           f'    {beat_ref} = 0\n')
+            else:
+                release = f'    {ref} = 0\n'
+            timer_fix = (f'  If {ref} > {thresh:g}\n'
+                         f'{release}'
+                         f'  EndIf')
+        if not has_script and not reveals and not timer_fix:
             # Script-less service-menu INFOs use the shared static scripts.
             continue
 
@@ -287,6 +599,16 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             for gname in reveals:
                 declared.add(gname.lower())
                 out_lines.append(f'GlobalVariable Property {gname} Auto')
+            # Only the quest-scoped form needs a bound property; the speaker
+            # form casts akSpeakerRef and declares nothing.
+            if owner_prop:
+                # Must be typed as the quest's CONVERTED script class, not
+                # `Quest` — convTimer lives on the generated script.
+                safe_owner = _safe_property_name(owner_prop)
+                if safe_owner.lower() not in declared:
+                    declared.add(safe_owner.lower())
+                    otype = xref.get_quest_script_type(owner_prop)
+                    out_lines.append(f'{otype} Property {safe_owner} Auto')
             if prop_refs:
                 for pname, ptype in sorted(prop_refs.items()):
                     safe = _safe_property_name(pname)
@@ -301,6 +623,13 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             # line finishes, right before the topic menu refreshes.
             for gname in reveals:
                 out_lines.append(f'  {gname}.SetValue(1)')
+            # Correct the conversation timer to THIS line's real length BEFORE
+            # the converted body: Oblivion's value at this point was the line's
+            # own duration, and a result script that retimes the beat does so
+            # RELATIVE to it (CharGenMain 0x32B0C cuts Glenroy off with
+            # `convTimer - .4`). Writing it afterwards would discard that.
+            if timer_fix:
+                out_lines.append(f'{timer_fix}  ; line ended: release the parked timer')
             out_lines.extend(body_lines)
             if service_kind:
                 out_lines.append(_SERVICE_MENU_CALL[service_kind])
@@ -479,11 +808,20 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 '',
             ]
 
+            # A stage has ONE objective (index = stage index) no matter how many
+            # journal entries it carried in TES4 — MQ01's tutorial stages ship a
+            # gamepad text and a keyboard text, and emitting the objective calls
+            # per entry displayed the same objective twice.
+            objective_emitted = set()
             for stage_idx, log_idx, log_text, script_src, complete_flag, stage_arr_idx, log_arr_idx in fragments:
                 # Load per-stage SCROs for this fragment
                 _preload_stage_scro_refs(conv, rec, xref, stage_arr_idx, log_arr_idx)
                 func_name = f'Fragment_Stage_{stage_idx:04d}_Item_{log_idx}'
                 out_lines.append(f'Function {func_name}()')
+                if stage_idx in objective_emitted:
+                    log_text = None
+                elif log_text:
+                    objective_emitted.add(stage_idx)
                 # Objective tracking.  Oblivion's journal is an append-only LOG:
                 # setting stage 20 just adds entry 20 under entry 10, and 10 stays
                 # as history — it was never a checkbox, so nothing "completes" it.

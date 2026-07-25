@@ -560,6 +560,78 @@ def _quest_dnam(rec: dict) -> bytes:
     return struct.pack('<HBBII', flags, priority, 0, 0, qtype)
 
 
+# Oblivion shipped TWO journal texts for a control-tutorial stage — a gamepad
+# variant and a keyboard/mouse variant — and the engine picked by platform at
+# runtime (the same `if isXbox == 0 ... else` split that guards the matching
+# MessageBox calls in MQ01Script).  Skyrim has no such selector: it renders
+# every QSDT/CNAM pair the record carries, so emitting both left the console
+# text showing on PC ("Use the left stick to move around", "press A to equip")
+# and, because the objective takes the FIRST non-empty text, made the gamepad
+# line the visible objective.  Keep the PC variant only.
+#
+# Only MQ01 (the tutorial) has these pairs — 7 stages — so the match is
+# deliberately narrow: a stage must have MULTIPLE texts and the pair must
+# split cleanly into one gamepad-only and one PC-only reading, otherwise all
+# texts are kept untouched.
+_GAMEPAD_TEXT_RE = re.compile(
+    r'left stick|right stick|d-pad|dpad|right trigger|left trigger'
+    r'|\bpress [ABXY]\b|\bbumper\b|holding [ABXY]\b|pull the (right|left)',
+    re.IGNORECASE)
+_PC_TEXT_RE = re.compile(
+    r'\bmouse\b|\bshift\b|\bspacebar\b|\bTAB\b|\bctrl\b|\bclick\b'
+    r'|number key|&sUActn', re.IGNORECASE)
+
+
+# Oblivion's journal text embeds control-name tokens (`&sUActnForward;`) that
+# its UI expanded to the player's live key binding.  Skyrim has no such
+# expansion and prints the token verbatim, so the tutorial read "To move
+# forward, &sUActnForward;".  Substitute Skyrim's DEFAULT PC bindings, phrased
+# to fit the surrounding sentence ("To move forward, press W").  Only MQ01
+# uses these — 9 occurrences.
+_CONTROL_TOKENS = {
+    'sUActnForward':   'press W',
+    'sUActnBack':      'press S',
+    'sUActnSldleft':   'press A',
+    'sUActnSldright':  'press D',
+    'sUActnRun':       'hold Shift',
+    'sUActnActivate':  'press E',
+    'sUActnMenumode':  'press Tab',
+    'sUActnRdyitem':   'press R',
+    'sUActnUse':       'click the left mouse button',
+    'sUActnBlock':     'click the right mouse button',
+    'sUActnCast':      'click the right mouse button',
+    'sUActnCrouch':    'press Ctrl',
+    'sUActnJump':      'press Space',
+}
+_CONTROL_TOKEN_RE = re.compile(r'&(\w+);')
+
+
+def _expand_control_tokens(text: str) -> str:
+    """Replace Oblivion `&sUActnX;` control tokens with Skyrim PC key names."""
+    if not text or '&' not in text:
+        return text
+    return _CONTROL_TOKEN_RE.sub(
+        lambda m: _CONTROL_TOKENS.get(m.group(1), m.group(0)), text)
+
+
+def _pc_stage_texts(texts: list) -> list:
+    """Drop console-only journal variants and expand PC control tokens.
+
+    `texts` is the stage's log entries in record order (None/'' preserved so
+    callers keep their QSDT pairing). Returns a list of the same length with
+    gamepad-only entries blanked to None and `&sUActnX;` tokens resolved to
+    Skyrim's default PC key names in whatever survives.
+    """
+    real = [(i, t) for i, t in enumerate(texts) if t]
+    if len(real) >= 2:
+        pad = [i for i, t in real
+               if _GAMEPAD_TEXT_RE.search(t) and not _PC_TEXT_RE.search(t)]
+        pc = [i for i, t in real if _PC_TEXT_RE.search(t)]
+        if pad and pc:
+            texts = [None if i in pad else t for i, t in enumerate(texts)]
+    return [_expand_control_tokens(t) if t else t for t in texts]
+
+
 def convert_QUST(rec: dict, fid_to_edid: dict = None,
                  well_known_props: dict = None,
                  unlock_plan: dict = None,
@@ -614,10 +686,13 @@ def convert_QUST(rec: dict, fid_to_edid: dict = None,
         subs += pack_subrecord('INDX', struct.pack('<HBB', stage_idx, 0, 0))
         log_count = get_int(rec, f'Stage[{i}].LogCount')
         if log_count > 0:
+            stage_texts = _pc_stage_texts(
+                [get_str(rec, f'Stage[{i}].Log[{j}].Text')
+                 for j in range(log_count)])
             for j in range(log_count):
                 log_flags = get_int(rec, f'Stage[{i}].Log[{j}].Flags')
                 subs += pack_uint8_subrecord('QSDT', log_flags & 0x03)
-                txt = get_str(rec, f'Stage[{i}].Log[{j}].Text')
+                txt = stage_texts[j]
                 if txt:
                     subs += pack_string_subrecord('CNAM', txt)
         else:
@@ -669,8 +744,9 @@ def convert_QUST(rec: dict, fid_to_edid: dict = None,
         if stage_idx in seen_stages:
             continue
         log_count = get_int(rec, f'Stage[{i}].LogCount')
-        texts = ([get_str(rec, f'Stage[{i}].Log[{j}].Text')
-                  for j in range(log_count)] if log_count > 0
+        texts = (_pc_stage_texts([get_str(rec, f'Stage[{i}].Log[{j}].Text')
+                                  for j in range(log_count)])
+                 if log_count > 0
                  else [get_str(rec, f'Stage[{i}].LogEntry')])
         txt = next((x for x in texts if x), None)
         if not txt:
@@ -1020,11 +1096,39 @@ SERVICE_MENU_SCRIPTS = {
 }
 
 
+_SAY_TIMER_OWNERS: dict = {}
+_SAY_TIMER_TOPIC_BY_DIAL: dict = {}
+
+
+def _say_timer_props(info_rec: dict, ctx: dict) -> dict:
+    """{quest_property_name: quest FormID} for an INFO whose topic parks a
+    conversation timer, else {}.
+
+    script_convert emits an End fragment for every line under such a topic —
+    including the 87% with no result script of their own — whose whole body is
+    `<Quest>.convTimer = 0`.  Without the quest bound as a VMAD property that
+    write has no target, the parked timer is never released, and the
+    conversation stops permanently on the first script-less line.
+
+    Only the QUEST-scoped form needs a binding; the speaker-scoped form casts
+    akSpeakerRef and declares nothing.
+    """
+    if not _SAY_TIMER_OWNERS:
+        return {}
+    topic = _SAY_TIMER_TOPIC_BY_DIAL.get(info_rec.get('ParentDIAL', ''), '')
+    owner = _SAY_TIMER_OWNERS.get(topic)
+    if not owner or owner[0] != 'quest':
+        return {}
+    quest_edid = owner[1].split('.', 1)[0]
+    fid = (ctx.get('quest_fid_by_edid') or {}).get(quest_edid.lower())
+    return {quest_edid: fid} if fid else {}
+
+
 def convert_INFO(rec: dict, *, injected_ctdas: bytes = b'',
                  fid_to_edid: dict = None, well_known_props: dict = None,
                  xref=None, reveal_props: dict = None,
                  service_menu: str = '', bark_dial_fids: set = None,
-                 script_vars: dict = None) -> bytes:
+                 script_vars: dict = None, timer_props: dict = None) -> bytes:
     """INFO — Dialog response.
 
     Order: EDID [VMAD] ENAM CNAM [TCLT...] [TRDT NAM1 NAM2 NAM3]* CTDAs.
@@ -1059,7 +1163,7 @@ def convert_INFO(rec: dict, *, injected_ctdas: bytes = b'',
     if result_script:
         code_lines = [ln for ln in result_script.strip().splitlines()
                       if ln.strip() and not ln.strip().startswith(';')]
-    if info_fid and (code_lines or reveal_props):
+    if info_fid and (code_lines or reveal_props or timer_props):
         from script_convert.pipeline import build_vmad_info_fragment
         prop_vals = (_build_info_script_properties(result_script, xref)
                      if code_lines else {})
@@ -1067,6 +1171,8 @@ def convert_INFO(rec: dict, *, injected_ctdas: bytes = b'',
             prop_vals.update(well_known_props)
         if reveal_props:
             prop_vals.update(reveal_props)
+        if timer_props:
+            prop_vals.update(timer_props)
         subs += pack_subrecord('VMAD', build_vmad_info_fragment(
             info_fid, property_values=prop_vals or None))
     elif service_menu:
@@ -1453,6 +1559,19 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
                          for r in by_type.get('QUST', [])
                          if get_formid(r, 'FormID')}
     quest_edid_by_fid[generic_quest_fid] = 'TES4DialogueGeneric'
+    quest_fid_by_edid = {e.lower(): f for f, e in quest_edid_by_fid.items() if e}
+
+    # Which topics park a conversation timer, and the topic behind each DIAL.
+    # Mirrors script_convert's plan so the VMAD the importer writes matches the
+    # fragment script_convert generated (its body is `<Quest>.convTimer = 0`,
+    # which needs that quest bound as a property).
+    from script_convert.pipeline import build_say_timer_owners
+    _SAY_TIMER_OWNERS.clear()
+    _SAY_TIMER_OWNERS.update(build_say_timer_owners(by_type))
+    _SAY_TIMER_TOPIC_BY_DIAL.clear()
+    _SAY_TIMER_TOPIC_BY_DIAL.update(
+        {d.get('FormID', ''): (d.get('EditorID') or '').lower()
+         for d in by_type.get('DIAL', []) if d.get('FormID')})
 
     # Quest-level dialogue conditions: in Oblivion a QUST's own CTDAs gate ALL
     # of that quest's dialogue (e.g. NQDBeggars = GetInFaction(Beggars), so its
@@ -1654,7 +1773,8 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
                 quest_npc_fids, sge_quest_fids, quest_edid_by_fid,
                 quest_priority, voice_map,
                 fid_to_edid, xref, well_known_props,
-                quest_dialog_ctdas, vtyp_edid_by_fid, stats, script_vars)
+                quest_dialog_ctdas, vtyp_edid_by_fid, stats, script_vars,
+                quest_fid_by_edid)
             if not content:      # dropped (e.g. service topic with no gate)
                 stats['skipped'] += 1
                 continue
@@ -1674,6 +1794,7 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
         unlock_globals=unlock_globals, fid_to_edid=fid_to_edid,
         well_known_props=well_known_props, xref=xref, voice_map=voice_map,
         quest_edid_by_fid=quest_edid_by_fid, quest_priority=quest_priority,
+        quest_fid_by_edid=quest_fid_by_edid,
         quest_dialog_ctdas=quest_dialog_ctdas, vtyp_edid_by_fid=vtyp_edid_by_fid,
         bark_dial_fids=bark_dial_fids, stats=stats, script_vars=script_vars)
     bark_content, bark_sge = _build_bark_pass(
@@ -1757,7 +1878,7 @@ def _build_one_topic(dial_rec, info_by_dial, writer, offset,
                      quest_priority, voice_map,
                      fid_to_edid, xref, well_known_props,
                      quest_dialog_ctdas, vtyp_edid_by_fid, stats,
-                     script_vars=None):
+                     script_vars=None, quest_fid_by_edid=None):
     """Convert one DIAL topic and its child INFOs. Returns
     (dial_group_bytes, dlbr_bytes, owner_quest_fid, dial_fid, dlbr_fid)."""
     dial_fid = get_formid(dial_rec, 'FormID')
@@ -1906,6 +2027,7 @@ def _build_one_topic(dial_rec, info_by_dial, writer, offset,
         unlock_globals=unlock_globals, fid_to_edid=fid_to_edid,
         well_known_props=well_known_props, xref=xref, voice_map=voice_map,
         quest_edid_by_fid=quest_edid_by_fid, edid=edid,
+        quest_fid_by_edid=quest_fid_by_edid,
         quest_dialog_ctdas=quest_dialog_ctdas, vtyp_edid_by_fid=vtyp_edid_by_fid,
         stats=stats, script_vars=script_vars)
 
@@ -1995,11 +2117,17 @@ def _convert_topic_infos(child_infos, owner_qfid, ctx):
                                 if n in ctx['unlock_globals']}
                 if reveal_props:
                     ctx['stats']['revealers'] += 1
+            # A line under a topic whose conversation timer was PARKED needs an
+            # End fragment to release it even with no result script of its own
+            # (script_convert generates one for exactly these).  Bind the quest
+            # whose script owns the timer, or the write has nothing to target.
+            timer_props = _say_timer_props(info_rec, ctx)
             topic_children += convert_INFO(
                 info_rec, injected_ctdas=injected,
                 fid_to_edid=ctx['fid_to_edid'],
                 well_known_props=ctx['well_known_props'], xref=ctx['xref'],
                 reveal_props=reveal_props, service_menu=ctx['service_kind'],
+                timer_props=timer_props,
                 bark_dial_fids=(ctx.get('bark_dial_fids')
                                 if ctx['is_bark'] else None),
                 script_vars=ctx.get('script_vars'))

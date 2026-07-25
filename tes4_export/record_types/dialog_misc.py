@@ -13,6 +13,8 @@ from .common import (
     emit_float,
     emit_formid,
     emit_icon,
+    emit_model,
+    emit_raw_hex,
     emit_script,
     emit_string,
     emit_u8,
@@ -401,6 +403,8 @@ def export_CLMT(rec: Record) -> list:
                 lines.append(f"Weather[{i}].Chance={chance}")
     emit_string(lines, "FNAM.SunTexture", get_subrecord(rec, "FNAM"))
     emit_string(lines, "GNAM.GlareTexture", get_subrecord(rec, "GNAM"))
+    # MODL — the night-sky / stars mesh (TES5 CLMT keeps the same field).
+    emit_model(lines, "Model", rec)
     tnam = get_subrecord(rec, "TNAM")
     if tnam and len(tnam.data) >= 6:
         d = tnam.data
@@ -537,10 +541,14 @@ def export_WTHR(rec: Record) -> list:
     # Cloud textures CNAM/DNAM
     emit_string(lines, "CNAM.LowerCloudLayer", get_subrecord(rec, "CNAM"))
     emit_string(lines, "DNAM.UpperCloudLayer", get_subrecord(rec, "DNAM"))
-    # NAM0 - Colors by time of day (huge struct)
+    # Model — TES4 WTHR may carry a MODL (rare; SI storm weathers).
+    emit_model(lines, "Model", rec)
+    # NAM0 - Colors by time of day: 10 types x 4 times x 4 bytes (rgba) = 160.
+    # Dump the raw bytes; the import remaps TES4's 10 types into TES5's layout.
     nam0 = get_subrecord(rec, "NAM0")
     if nam0:
         lines.append(f"NAM0.Size={len(nam0.data)}")
+        emit_raw_hex(lines, "NAM0.Data", nam0)
     # FNAM - Fog distances
     fnam = get_subrecord(rec, "FNAM")
     if fnam and len(fnam.data) >= 16:
@@ -560,7 +568,9 @@ def export_WTHR(rec: Record) -> list:
         for i, name in enumerate(fields):
             if i * 4 + 4 <= len(d):
                 lines.append(f"HNAM.{name}={struct.unpack_from('<f', d, i*4)[0]}")
-    # DATA - Wind speed, cloud speeds, trans delta, sun glare, sun damage
+    # DATA (15 bytes) — full dump. Offsets 6-14 (precipitation/thunder fades,
+    # lightning frequency, weather classification, lightning colour) exist in
+    # TES5's DATA too and were previously dropped on the floor.
     data = get_subrecord(rec, "DATA")
     if data and len(data.data) >= 15:
         d = data.data
@@ -570,6 +580,15 @@ def export_WTHR(rec: Record) -> list:
         lines.append(f"DATA.TransDelta={d[3]}")
         lines.append(f"DATA.SunGlare={d[4]}")
         lines.append(f"DATA.SunDamage={d[5]}")
+        lines.append(f"DATA.PrecipBeginFadeIn={d[6]}")
+        lines.append(f"DATA.PrecipEndFadeOut={d[7]}")
+        lines.append(f"DATA.ThunderBeginFadeIn={d[8]}")
+        lines.append(f"DATA.ThunderEndFadeOut={d[9]}")
+        lines.append(f"DATA.ThunderFrequency={d[10]}")
+        lines.append(f"DATA.Classification={d[11]}")
+        lines.append(f"DATA.LightningR={d[12]}")
+        lines.append(f"DATA.LightningG={d[13]}")
+        lines.append(f"DATA.LightningB={d[14]}")
     # Sound references
     snams = get_all_subrecords(rec, "SNAM")
     if snams:

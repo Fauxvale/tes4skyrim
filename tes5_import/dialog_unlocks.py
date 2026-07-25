@@ -309,11 +309,64 @@ def build_unlock_plan(by_type: dict) -> dict:
                     for fid, gs in info_reveals.items() if gs & kept}
 
     # --- Quest-stage revealers ---
-    stage_reveals = {}
+    stage_reveals = defaultdict(set)
     for key, fids in stage_addtopics.items():
-        gnames = sorted({gated[f] for f in fids if f in gated})
+        gnames = {gated[f] for f in fids if f in gated}
         if gnames:
-            stage_reveals[key] = gnames
+            stage_reveals[key] |= gnames
+
+    # A dialogue reveal is only as reliable as the line firing again — and an
+    # INFO's OnEnd fragment fires ONCE, while you are still in the menu. If the
+    # topic's only revealer for a given NPC is that one line, and no post-reveal
+    # greeting re-fires it, a single missed/raced SetValue leaves the gate shut
+    # forever (globals persist, so a reload does not help). This is the Azzan
+    # vs Burz split: Burz has a member greeting ("Maybe you want a contract?")
+    # that re-reveals `contract` on every talk, so his gate is continually
+    # re-armed; Azzan's post-join greetings are all gated to LATER stages, so
+    # once you join him nothing re-reveals it and the fragile one-shot is the
+    # whole story.
+    #
+    # The robust anchor is the QUEST STAGE the same result script sets: a stage
+    # fragment is guaranteed to run when the stage is reached, independent of
+    # dialogue timing, and it too persists. So any reveal whose result script
+    # also does `SetStage QUEST N` is additionally emitted as a stage reveal for
+    # (QUEST, N) — the Fighters Guild join line's `SetStage FGD00JoinFG 100`
+    # makes the JoinFG stage-100 fragment set TES4Unlock_contract, giving Azzan
+    # the same always-armed guarantee Burz gets from his greeting. Covers 806
+    # reveals game-wide, not a special case.
+    # A reveal can only be anchored to a stage that ACTUALLY emits a fragment:
+    # the QUST VMAD fragment list (tes5_import) and the generated .psc functions
+    # (script_convert) must match exactly, so binding a SetValue to a stage with
+    # no fragment would either be dropped or create a dangling VMAD entry. Build
+    # the set of stages that already have a fragment (journal text or a result
+    # script), keyed the same way _quest_stage_fragments computes it.
+    from .dialog_converter import _quest_stage_fragments
+    frag_stages = defaultdict(set)   # quest_edid_lower -> {stage_index, ...}
+    for rec in qusts:
+        qedid = (rec.get('EditorID', '') or '').lower()
+        if not qedid:
+            continue
+        for stage_idx, _log in _quest_stage_fragments(rec):
+            frag_stages[qedid].add(stage_idx)
+
+    info_by_fid24 = {}
+    for rec in infos:
+        f = _low24(rec.get('FormID', ''))
+        if f:
+            info_by_fid24[f] = rec
+    for info_fid24, gnames in info_reveals.items():
+        rec = info_by_fid24.get(info_fid24)
+        if not rec:
+            continue
+        script = rec.get('ResultScript', '')
+        if not script:
+            continue
+        for m in re.finditer(r'setstage\s+(\w+)\s+(\d+)', script, re.IGNORECASE):
+            qedid, stage = m.group(1).lower(), int(m.group(2))
+            if stage in frag_stages.get(qedid, ()):
+                stage_reveals[(qedid, stage)] |= set(gnames)
+
+    stage_reveals = {k: sorted(v) for k, v in stage_reveals.items() if v}
 
     # --- INVARIANT: a gate with no revealer is an unopenable door ---
     # The gate (GetGlobalValue in the ESM) and the thing that opens it (a

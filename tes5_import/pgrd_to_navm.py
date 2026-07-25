@@ -60,22 +60,26 @@ Triangle struct (16 bytes):
 ALGORITHM: PGRD → NAVM
 =============================================================================
 
-The geometry is built in `tes5_import/navmesh/` by VOXELIZING THE REAL HAVOK
-COLLISION MESHES of everything placed in the cell (plus LAND terrain outdoors).
-This module keeps only the record-level concerns: reading the PGRD, doors,
-water flags, adjacency, and the NVNM/NAVM binary packing (validated byte-exact
-against Skyrim.esm — do not change it).
+The geometry is built in `tes5_import/navmesh/` from the PATHGRID: a boolean
+union of fixed-width corridor ribbons, one per pathgrid edge, sat onto the real
+Havok collision (plus LAND terrain outdoors) and stopped at walls.  This module
+keeps only the record-level concerns: reading the PGRD, doors, water flags,
+adjacency, and the NVNM/NAVM binary packing (validated byte-exact against
+Skyrim.esm — do not change it).
 
-The previous approach reconstructed a "walkable floor" by buffering the pathgrid
-graph into capsules/discs and subtracting the 2D CONVEX HULLS of placed objects.
-That could never work: an architecture shell is a HOLLOW BOX, so its convex hull
-is a solid rectangle covering the entire room.  The code was therefore forced to
-classify such shells as "floors" and never carve them, which is why walls never
-appeared in the output, and why rooms came out as blobs with holes.
+Two earlier approaches are worth knowing about, because both failure modes are
+easy to reinvent:
 
-Collision geometry answers the question directly — it is what the engine itself
-uses to decide what an NPC stands on and what stops them.  See
-docs/navmesh_rebuild_plan.md and tes5_import/navmesh/voxel.py.
+  * Buffering the pathgrid into capsules/discs and subtracting the 2D CONVEX
+    HULLS of placed objects.  An architecture shell is a HOLLOW BOX, so its hull
+    is a solid rectangle over the whole room; such shells had to be classified
+    "floor" and never carved, so walls never appeared and rooms came out as
+    blobs with holes.
+  * VOXELIZING the collision and re-discovering walkable surface (regions →
+    contours → triangles).  Correct in principle, but it introduced seams that
+    fought connectivity, which is what the corridor model exists to avoid.
+
+See docs/navmesh_corridor_redesign.md and tes5_import/navmesh/corridor.py.
 
 Returns per-navmesh metadata (centroid, parent) so the caller can build NAVI.
 =============================================================================
@@ -334,8 +338,9 @@ def _collect_doors(refr_recs, door_fids):
 def _build_door_links(verts, tris, doors):
     """Return [(triangle_index, door_ref_fid), ...], one per door.
 
-    The mesh generator stamps an exact oriented quad on every door threshold
-    (spanmesh._stamp_door_quads), so the door triangle is normally simply the
+    The mesh generator forces every door's base line in as a triangle edge
+    (corridor_doors + build_union_mesh's door_edges), so the door triangle is
+    normally simply the
     triangle CONTAINING the door position at the door's height — precise by
     construction.  When no triangle contains the point (the quad was culled or
     there is no mesh at the door), fall back to the nearest triangle centred
@@ -525,7 +530,7 @@ def _pack_navm_record(form_id: int, subrecords: bytes) -> bytes:
 # Geometry cache
 # ---------------------------------------------------------------------------
 #
-# Building a cell's navmesh geometry (voxelize -> filter -> mesh -> decimate)
+# Building a cell's navmesh geometry (ribbons -> union -> triangulate -> clean)
 # costs seconds; packing it into an NVNM costs milliseconds.  The geometry
 # depends ONLY on inputs that rarely change between imports — the pathgrid,
 # the placed REFRs, the LAND heights, the collision cache and the generator

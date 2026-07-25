@@ -2178,24 +2178,22 @@ class TestSayTopicRetarget:
         assert convert_ctda(self._raw_ctda(), offset=1,
                             drop_run_on_target=True) is None
 
-    def test_identity_conditions_are_never_retargeted(self):
-        """GetIsID/GetIsRace/GetInFaction/... ask WHO is being addressed — only
-        the dialogue target can answer, so they must stay RunOn=Target.
+    def test_base_form_identity_conditions_are_never_retargeted(self):
+        """GetIsID/GetIsClass answer by comparing a BASE FORM, so they must
+        stay RunOn=Target and never be pinned to PlayerRef.
 
-        Retargeting them onto a reference changes their meaning, and when that
-        reference is the player it makes them UNPASSABLE: GetIsID compares the
-        runtime actor's BASE form, and PlayerRef's base is vanilla Skyrim's
-        0x00000007, never the converted TES4 player NPC_ 0x01000007. That
-        silently killed 667 GREETING/bark INFOs across 101 topics — every
+        PlayerRef's base is vanilla Skyrim's 0x00000007, never the converted
+        TES4 player NPC_ 0x01000007, so retargeting makes them UNPASSABLE.
+        That silently killed 667 GREETING/bark INFOs across 101 topics — every
         affected NPC lost their whole topic list because the greeting that
         opens it could not pass (Pinarus Inventius kept only 'rumors').
+
+        Vanilla Skyrim.esm corroborates the split: GetIsID appears with
+        RunOn=Reference ZERO times.
         """
         import struct
         from tes5_import.dialog_conditions import convert_ctda
-        # GetIsRace(69) is excluded here only because its PARAM is race-mapped
-        # and this fixture's dummy FormID is not a real TES4 race (it would be
-        # dropped for that unrelated reason); the exemption covers it too.
-        for func in (72, 70, 68, 71, 73):
+        for func in (72, 68):
             raw = self._raw_ctda(func=func)
             # ...neither the retarget...
             out = convert_ctda(raw, offset=1, run_on_target_ref=0x14)
@@ -2208,6 +2206,33 @@ class TestSayTopicRetarget:
             assert out is not None, f'identity func {func} must not be dropped'
             run_on, _ = struct.unpack_from('<II', out, 20)
             assert run_on == 1
+
+    def test_actor_state_conditions_are_retargeted(self):
+        """GetIsRace/GetIsSex/GetInFaction/GetFactionRank read live actor STATE,
+        not a base-form identity, so a Say()-driven topic MUST pin them to the
+        resolved target reference — Skyrim's Say has no target at all
+        (ObjectReference.psc `Say(Topic, Actor akActorToSpeakAs, bool)`: arg 2
+        is the SPEAKER), so RunOn=Target evaluates against nothing and the
+        wrong response wins.
+
+        Vanilla Skyrim.esm uses RunOn=Reference->PlayerRef for exactly these:
+        GetIsSex 125x, GetInFaction 136x, GetIsRace 29x, GetFactionRank 22x.
+
+        Left on RunOn=Target, Valen Dreth's per-race CharacterGen taunts all
+        failed and only the single race-less line could play, so the tutorial
+        never advanced past its first taunt.
+        """
+        import struct
+        from tes5_import.dialog_conditions import convert_ctda
+        # GetIsRace(69) is exercised separately: its PARAM is race-mapped and
+        # this fixture's dummy FormID is not a real TES4 race.
+        for func in (70, 71, 73):
+            raw = self._raw_ctda(func=func)
+            out = convert_ctda(raw, offset=1, run_on_target_ref=0x14)
+            assert out is not None, f'func {func} must not be dropped'
+            run_on, reference = struct.unpack_from('<II', out, 20)
+            assert (run_on, reference) == (2, 0x14), \
+                f'state func {func} not retargeted: {run_on}/{reference:#x}'
 
     def test_default_still_target(self):
         import struct
@@ -2241,3 +2266,1023 @@ class TestSayTopicRetarget:
         param1 = struct.unpack_from('<I', out, 12)[0]
         assert param1 == 0x00000007, \
             f'engine-fixed Player id was remapped to {param1:#010x}'
+
+
+class TestQuestJournalPlatformText:
+    """MQ01's journal shipped a gamepad AND a keyboard variant per tutorial
+    stage; Oblivion picked one at runtime, Skyrim renders both (2026-07-24)."""
+
+    def test_gamepad_variant_dropped_when_pc_variant_exists(self):
+        from tes5_import.dialog_converter import _pc_stage_texts
+        out = _pc_stage_texts([
+            '',
+            'Use the left stick to move around. The right stick turns you.',
+            'To move forward, &sUActnForward;. The mouse turns you.',
+        ])
+        assert out[1] is None, 'gamepad journal text must be dropped'
+        assert 'left stick' not in (out[2] or '')
+        assert out[2].startswith('To move forward, press W')
+
+    def test_control_tokens_expanded(self):
+        """&sUActnX; is an Oblivion UI token; Skyrim prints it verbatim."""
+        from tes5_import.dialog_converter import _pc_stage_texts
+        out = _pc_stage_texts(
+            ['To ready your weapon, &sUActnRdyitem;. To block, '
+             '&sUActnBlock;.'])
+        assert '&sUActn' not in out[0]
+        assert 'press R' in out[0] and 'right mouse button' in out[0]
+
+    def test_ordinary_multi_entry_stage_untouched(self):
+        """Only a clean gamepad/PC split may drop anything — a quest with two
+        unrelated journal entries must keep both."""
+        from tes5_import.dialog_converter import _pc_stage_texts
+        texts = ['Kill the bandit leader.', 'Return to Jauffre.']
+        assert _pc_stage_texts(texts) == texts
+
+
+class TestSayLineDurations:
+    """Converted Say() pacing must come from the ENGINE, not an estimate
+    (2026-07-25).
+
+    TES4's Say/SayTo returned the line's length and the script counted it down
+    before letting the next speaker start. Skyrim needs no such countdown: the
+    INFO's result script becomes its End fragment, which the engine runs when
+    the line FINISHES (vanilla uses the End flag on 3,415 of its Say-driven
+    CUST responses). So the call site PARKS the timer, the fragment RELEASES
+    it, and no measured duration enters the pacing.
+
+    Charging a measured duration instead made the engine's wait and the
+    script's wait add up — a dead pause after every line as long as the line.
+    """
+
+    def test_call_site_parks_the_timer(self):
+        from script_convert.converter import (
+            ScriptConverter, SAY_LONGEST_UNMEASURED_LINE,
+            SAY_TIMER_PARKED_THRESHOLD, SAY_LINE_DROPPED_TIMEOUT)
+        from script_convert.cross_ref import CrossRefGraph
+        conv = ScriptConverter(CrossRefGraph())
+        saved = ScriptConverter.say_durations
+        try:
+            ScriptConverter.say_durations = {'chargentaunt2': 14.63}
+            # Never zero: the polling loop ticks every 0.1s, long before the End
+            # fragment can run, so a zero timer re-Says the line immediately.
+            # It must outlast the line itself, with threshold headroom on top.
+            park = conv._say_seconds('Self.Say(CharGenTaunt2)')
+            assert park > 14.63 + SAY_TIMER_PARKED_THRESHOLD
+            # An unmeasured topic assumes the corpus' longest line, not a
+            # hand-picked constant.
+            assert conv._say_seconds('Self.Say(X)') == (
+                SAY_TIMER_PARKED_THRESHOLD + SAY_LONGEST_UNMEASURED_LINE
+                + SAY_LINE_DROPPED_TIMEOUT)
+        finally:
+            ScriptConverter.say_durations = saved
+
+    def test_parked_timer_read_back_does_not_leak_the_sentinel(self):
+        """`convTimer = timer - .5` must not propagate the park value."""
+        from script_convert.converter import ScriptConverter
+        from script_convert.cross_ref import CrossRefGraph
+        conv = ScriptConverter(CrossRefGraph())
+        conv._parked_timers.add('timer')
+        # a subtraction means "no extra wait"
+        assert conv._resolve_parked_timer_expr('timer - 0.5') == '0'
+        # a bare read likewise
+        assert conv._resolve_parked_timer_expr('timer') == '0'
+        # an ADD is a deliberate beat: it must be REDIRECTED out of the timer
+        # (which decays while the line plays) into the pending-beat companion,
+        # signalled by the __BEAT__ marker the assignment emitter rewrites
+        assert conv._resolve_parked_timer_expr('timer + 10') == '__BEAT__10'
+        # unrelated expressions are untouched
+        assert conv._resolve_parked_timer_expr('foo + 1') == 'foo + 1'
+
+    def test_mp3_duration_reads_frame_headers(self, tmp_path):
+        """A silent MPEG-1 Layer III CBR stream of known length."""
+        import struct
+        from script_convert.say_durations import mp3_duration
+        # 128kbps, 44100Hz, no padding -> 417-byte frames of 1152 samples
+        frame = bytes([0xFF, 0xFB, 0x90, 0x00]) + b'\x00' * 413
+        n = 38  # 38 * 1152 / 44100 ~= 0.9927s
+        p = tmp_path / 'x.mp3'
+        p.write_bytes(frame * n)
+        assert abs(mp3_duration(str(p)) - n * 1152 / 44100) < 0.01
+
+
+class TestSayTimerRaceFree:
+    """Say pacing handshake: park at the call site, release in the End
+    fragment, beats carried in a decay-proof companion (2026-07-25).
+
+    Three defects drove this design, in order:
+      1. A flat/measured wait ADDED to the engine's own wait (the engine
+         already runs the End fragment when the line finishes).
+      2. A relative release raced the other scripts polling the same timer —
+         four actors on independent 0.5s updates plus the quest script
+         decrementing every 0.1s — so a different handoff stalled each run.
+      3. A `>= park` guard never fired, because the owning loop counts the
+         timer DOWN while the line plays: a 60s park is ~50 after a 10s line.
+         Valen Dreth said his first line and then stalled forever.
+    """
+
+    PARK = 60.0
+    THRESH = 20.0
+
+    def _run(self, line_len, beat=0.0, dt=0.1):
+        """Simulate call site -> countdown -> End fragment."""
+        timer, pending = self.PARK, beat      # park, Say(), stage the beat
+        elapsed = 0.0
+        while elapsed < line_len:             # loop decays the timer
+            if timer > 0:
+                timer -= dt
+            elapsed += dt
+        if timer > self.THRESH:               # End fragment releases
+            timer, pending = pending, 0.0
+        return timer
+
+    def test_releases_for_every_real_line_length(self):
+        """The guard must survive decay: Oblivion lines run 0.65s to ~30s."""
+        for line_len in (0.65, 3.0, 10.29, 14.6, 30.0):
+            assert abs(self._run(line_len)) < 1e-9,                 f'{line_len}s line did not release the timer'
+
+    def test_beat_survives_any_line_length(self):
+        """A staged pause must arrive intact however long the line ran."""
+        for line_len in (0.65, 10.29, 30.0):
+            assert abs(self._run(line_len, beat=2.5) - 2.5) < 1e-9
+            assert abs(self._run(line_len, beat=10.0) - 10.0) < 1e-9
+
+    def test_release_is_idempotent(self):
+        """A second fire must not re-arm the timer or go negative."""
+        released = self._run(3.0)
+        assert released <= self.THRESH   # guard no longer fires
+        assert released == 0.0
+
+    def test_threshold_sits_between_beat_and_decayed_park(self):
+        """Per-OWNER now, not one global constant.
+
+        The threshold sets the park, and the park is also how long a dropped line
+        stalls the scene, so a global floor sized for Oblivion's largest beat (20s,
+        staged by exactly ONE script) charged all 19,798 other topics a ~32s stall
+        instead of ~14s. `say_beat_threshold` raises it only for the owner that
+        needs it.
+        """
+        from script_convert.converter import (
+            ScriptConverter, SAY_TIMER_PARKED_THRESHOLD,
+            SAY_LINE_DROPPED_TIMEOUT)
+        for beat, line in ((0.0, 21.63), (3.0, 8.33), (10.0, 14.63),
+                           (20.0, 21.63)):
+            thresh = ScriptConverter.say_beat_threshold(beat)
+            # above this owner's beat, so a released beat never reads as parked
+            assert thresh > beat
+            park = thresh + line + SAY_LINE_DROPPED_TIMEOUT
+            # ...and below the park decayed by the whole line, so the End
+            # fragment's release still fires
+            assert park - line > thresh
+        # the floor applies when nothing is staged
+        assert (ScriptConverter.say_beat_threshold(0.0)
+                == SAY_TIMER_PARKED_THRESHOLD)
+
+    def test_beat_property_name_is_shared_by_both_emitters(self):
+        """Call site and fragment must derive the identical companion name."""
+        from script_convert.converter import ScriptConverter
+        assert ScriptConverter.beat_property('timer') == 'timerPendingBeat'
+        assert (ScriptConverter.beat_property('CharacterGen.convTimer')
+                == 'CharacterGen.convTimerPendingBeat')
+
+
+class TestSayTimerRaces:
+    """The setstage-CharacterGen intermittency (2026-07-25).
+
+    "Sometimes actors play their lines and sometimes they do not" had three
+    independent causes, all in the park/release handshake around Say().
+    """
+
+    def _owners(self, sctx, extra=None):
+        from script_convert.pipeline import build_say_timer_owners
+        by_type = {'SCPT': [{'EditorID': 'CharGenQuest', 'FormID': '0002480B',
+                             'SCTX': sctx}],
+                   'QUST': [{'EditorID': 'Charactergen', 'FormID': '0002466E',
+                             'SCRI': '0002480B'}]}
+        if extra:
+            for sig, recs in extra.items():
+                by_type.setdefault(sig, []).extend(recs)
+        return build_say_timer_owners(by_type)
+
+    def test_say_with_a_trailing_flag_keeps_its_topic(self):
+        """`Say <topic> 1`'s topic must not be eaten by the target group.
+
+        SayTo takes a TARGET before the topic and Say does not, so an optional
+        `(?:\\w+[\\s,]+)?` target group greedily consumed the topic of every
+        `Say <topic> 1` and captured the trailing flag as the topic ("1").
+        120+ topics were left with no release owner — every Daedric shrine
+        speech, the Boethia champions, the SE quest chatter — so their parked
+        timers were never cleared and each scene died after ONE line.
+        """
+        ow = self._owners('set CharacterGen.convTimer to Say CharGenMain 1')
+        assert '1' not in ow, 'the trailing Say flag was captured as the topic'
+        assert 'chargenmain' in ow
+
+    def test_sayto_still_skips_its_target_argument(self):
+        ow = self._owners(
+            'set CharacterGen.convTimer to SayTo BaurusRef, CharGenMain 1')
+        assert 'chargenmain' in ow
+        assert 'baurusref' not in ow
+
+    def test_a_match_never_runs_past_the_end_of_its_line(self):
+        """SCTX is one escaped blob; `\\s` let a match swallow the next lines."""
+        ow = self._owners('set CharacterGen.convTimer to Say CharGenMain 1\n'
+                          'else\n'
+                          'setstage CharacterGen 20\n'
+                          'endif')
+        for junk in ('else', 'endif', 'setstage', 'charactergen'):
+            assert junk not in ow, f'{junk!r} was captured as a topic'
+
+    def test_a_non_quest_prefix_is_not_bound_as_a_quest(self):
+        """`set <REFR>.timer to Say <topic>` has no quest to bind.
+
+        MS27CarvingWall is a placed REFR, so emitting `Quest Property
+        MS27CarvingWall` made the fragment fail to compile ("field or property
+        `timer` not found"). A dotted target is only quest-scoped when the
+        prefix really is a QUST EditorID.
+        """
+        ow = self._owners('set MS27CarvingWall.timer to Say MS27Voice')
+        assert 'ms27voice' not in ow
+
+    def test_countdown_of_a_parked_timer_cannot_resurrect_the_park(self):
+        """The decrement is a read-modify-write on an async-cleared variable.
+
+        The owning script counts the timer down on its own update while the
+        line's End fragment clears it to 0 from the engine's dialogue thread.
+        Papyrus has no atomicity, so a release landing between the read and the
+        write stored `park - dt` and RE-PARKED a timer that was already
+        released. Every INFO here is gated on an exact convCount, so the chain
+        did not resume late — it stopped dead.
+        """
+        from script_convert.converter import ScriptConverter
+        from script_convert.cross_ref import CrossRefGraph
+        src = ('scn CharGenQuest\n'
+               'float convTimer\n'
+               'short speaker\n'
+               'begin gamemode\n'
+               '\tif convTimer > 0\n'
+               '\t\tset convTimer to convTimer - getSecondsPassed\n'
+               '\tendif\n'
+               '\tif speaker == 1 && convTimer <= 0\n'
+               '\t\tset convTimer to BaurusRef.SayTo player CharGenVoice 1\n'
+               '\tendif\n'
+               'end\n')
+        out = ScriptConverter(CrossRefGraph()).convert_standalone(
+            'CharGenQuest', src, 'Quest', editor_id='CharGenQuest')
+        # the naive read-modify-write must be gone
+        assert 'convTimer = convTimer - 0.1' not in out
+        # ...replaced by a snapshot whose write-back is abandoned if the value
+        # moved while the statement ran
+        assert 'convTimer == _tes4TickconvTimer' in out
+        assert 'convTimer = _tes4TickconvTimer - 0.1' in out
+
+    def test_countdown_snapshot_matches_an_int_timer_type(self):
+        """TES4 let a `short` hold a Say duration; Float locals break that."""
+        from script_convert.converter import ScriptConverter
+        from script_convert.cross_ref import CrossRefGraph
+        src = ('scn X\n'
+               'short sayLen\n'
+               'begin gamemode\n'
+               '\tif sayLen > 0\n'
+               '\t\tset sayLen to sayLen - getSecondsPassed\n'
+               '\telse\n'
+               '\t\tset sayLen to say SomeTopic\n'
+               '\tendif\n'
+               'end\n')
+        out = ScriptConverter(CrossRefGraph()).convert_standalone(
+            'X', src, 'ObjectReference', editor_id='X')
+        assert 'Float _tes4TicksayLen' not in out
+        assert 'Int _tes4TicksayLen' in out
+
+    def test_park_is_sized_so_a_dropped_line_times_out_quickly(self):
+        """A Say that produces no line never runs an End fragment.
+
+        Nothing then clears the park, so the scene waits the WHOLE park out. At
+        a flat 60s that is indistinguishable from a broken quest. Sizing the
+        park to the topic's longest measured line makes the countdown itself the
+        dropped-line timeout.
+        """
+        from script_convert.converter import (
+            ScriptConverter, SAY_LINE_PARK_SECONDS,
+            SAY_TIMER_PARKED_THRESHOLD, SAY_LINE_DROPPED_TIMEOUT)
+        from script_convert.cross_ref import CrossRefGraph
+        conv = ScriptConverter(CrossRefGraph())
+        saved = ScriptConverter.say_durations
+        try:
+            ScriptConverter.say_durations = {'shortline': 2.0}
+            park = conv._say_seconds('Self.Say(ShortLine)')
+            # bounded by the measured line, NOT the flat fallback
+            assert park < SAY_LINE_PARK_SECONDS
+            assert park == (SAY_TIMER_PARKED_THRESHOLD + 2.0
+                            + SAY_LINE_DROPPED_TIMEOUT)
+            # ...and still recognisable as parked after the line has played,
+            # or the End fragment's release guard would never fire
+            assert park - 2.0 > SAY_TIMER_PARKED_THRESHOLD
+        finally:
+            ScriptConverter.say_durations = saved
+
+    def test_unmeasured_topic_is_still_bounded(self):
+        """A topic with no audio must not fall back to a 60s stall.
+
+        `CGEmperorBirthsign` is the only Oblivion topic with ZERO INFOs, so a
+        `Say` on it can never produce a line and never runs an End fragment. The
+        park is therefore its full cost, and a flat 60s there is a quest that
+        looks broken. Assume the measured corpus' longest line instead.
+        """
+        from script_convert.converter import (
+            ScriptConverter, SAY_LINE_PARK_SECONDS,
+            SAY_LONGEST_UNMEASURED_LINE, SAY_TIMER_PARKED_THRESHOLD,
+            SAY_LINE_DROPPED_TIMEOUT)
+        from script_convert.cross_ref import CrossRefGraph
+        conv = ScriptConverter(CrossRefGraph())
+        saved = ScriptConverter.say_durations
+        try:
+            ScriptConverter.say_durations = {}
+            park = conv._say_seconds('Self.Say(NoAudio)')
+            assert park == (SAY_TIMER_PARKED_THRESHOLD
+                            + SAY_LONGEST_UNMEASURED_LINE
+                            + SAY_LINE_DROPPED_TIMEOUT)
+            assert park < SAY_LINE_PARK_SECONDS
+            # still long enough to outlast any real Oblivion line (max measured
+            # is 21.63s across 19,800 topics)
+            assert SAY_LONGEST_UNMEASURED_LINE > 21.63
+        finally:
+            ScriptConverter.say_durations = saved
+
+    def test_park_and_release_agree_for_every_real_topic(self):
+        """Whole-export check of the park/release contract.
+
+        Two ways this can silently break, both fatal to a scene:
+          * park too LOW relative to the threshold - the End fragment's
+            `If timer > thresh` never fires, so the park is never released
+          * a staged beat at or ABOVE the threshold - the released beat sitting
+            in the timer reads as a fresh park and gets cleared immediately
+
+        And because 23 timers are driven by MORE than one topic, each topic's
+        park must also clear the largest threshold on its own timer, or one
+        topic's release fires while another's line is still playing.
+
+        Checked against the real export rather than synthetic values: the
+        constants only have to hold for the topic/beat/duration combinations
+        Oblivion actually ships.
+        """
+        import json
+        import os
+        from collections import defaultdict
+        from script_convert.pipeline import build_say_timer_owners
+        from script_convert.converter import (
+            ScriptConverter, SAY_LINE_PARK_SECONDS, SAY_LINE_DROPPED_TIMEOUT,
+            SAY_LONGEST_UNMEASURED_LINE)
+        from tes5_import.text_reader import parse_export_file
+        ed = 'export/Oblivion.esm'
+        if not os.path.isdir(ed):
+            import pytest
+            pytest.skip('no export to check against')
+        by_type = {sig: parse_export_file(os.path.join(ed, f'{sig}.txt'))
+                   for sig in ('DIAL', 'INFO', 'QUST', 'SCPT')}
+        owners = build_say_timer_owners(by_type)
+        assert owners, 'no Say timers found - the owner scan is broken'
+        dur_path = os.path.join(ed, 'voice_durations.json')
+        durations = (json.load(open(dur_path, encoding='utf-8'))
+                     if os.path.isfile(dur_path) else {})
+
+        rows = {}
+        by_timer = defaultdict(list)
+        for topic, (_kind, spec, beat) in owners.items():
+            thresh = ScriptConverter.say_beat_threshold(beat)
+            line = float(durations.get(topic) or SAY_LONGEST_UNMEASURED_LINE)
+            park = min(SAY_LINE_PARK_SECONDS,
+                       thresh + line + SAY_LINE_DROPPED_TIMEOUT)
+            rows[topic] = (beat, thresh, line, park)
+            by_timer[spec].append(topic)
+
+        for topic, (beat, thresh, line, park) in rows.items():
+            assert park - line > thresh, (
+                f'{topic}: park {park:.2f} decayed by its own {line:.2f}s line '
+                f'falls to/below the release threshold {thresh:.2f} - the End '
+                f'fragment would never release it')
+            assert not beat or beat < thresh, (
+                f'{topic}: staged beat {beat} is not below its release '
+                f'threshold {thresh} - a released beat reads as a fresh park')
+
+        for spec, topics in by_timer.items():
+            if len(topics) < 2:
+                continue
+            worst = max(rows[t][1] for t in topics)
+            for t in topics:
+                _b, _th, line, park = rows[t]
+                assert park - line > worst, (
+                    f'{t} on shared timer {spec}: park {park:.2f} decayed by '
+                    f'its {line:.2f}s line falls to/below the largest threshold '
+                    f'({worst:.2f}) on that timer')
+
+    def test_park_never_blocks_the_polling_loop(self):
+        """No Utility.Wait at a park site.
+
+        An earlier watchdog polled for the line to start, which blocked the very
+        OnUpdate that owns the countdown (and deferred the actor scripts' next
+        RegisterForSingleUpdate), stalling the timer it was meant to protect.
+        """
+        from script_convert.converter import ScriptConverter
+        from script_convert.cross_ref import CrossRefGraph
+        src = ('scn CGGlenroyScript\n'
+               'short target\n'
+               'begin gamemode\n'
+               'if CharacterGen.speaker == 3 && CharacterGen.convTimer <= 0\n'
+               '\tset CharacterGen.convTimer to Say CharGenMain 1\n'
+               'endif\n'
+               'end\n')
+        out = ScriptConverter(CrossRefGraph()).convert_standalone(
+            'CGGlenroyScript', src, 'Actor', editor_id='CGGlenroyScript')
+        assert 'Utility.Wait' not in out
+
+
+class TestActorScriptOnPlacedRef:
+    """A converted actor script must live on the placed reference, not the base.
+
+    Reference events (OnPackageEnd/OnActivate/OnDeath/OnHit) are declared on
+    Actor/ObjectReference in vanilla Papyrus (Scripts.zip).  A base NPC_ record
+    is an ActorBase (a Form), so a VMAD bound there receives NONE of them.
+
+    This silently broke every converted quest that sequences on package
+    completion: CharacterGen advances 10 -> 12 from Renote's OnPackageEnd, and
+    with the script stranded on the base NPC_ the chain stopped dead at stage
+    10, leaving the Emperor and guards with no `GetStage ==` package to select.
+    """
+
+    def test_reference_event_declaration_is_detected(self):
+        from tes5_import.object_scripts import _script_uses_reference_event
+        assert _script_uses_reference_event('begin OnPackageDone CGRenoteToMarkerA')
+        assert _script_uses_reference_event('scn X\r\nbegin gamemode\r\nend\r\nbegin onhit\r\nend')
+        assert _script_uses_reference_event('begin OnActivate\nActivate')
+
+    def test_non_reference_scripts_are_left_on_the_base(self):
+        """Only a `begin <event>` DECLARATION counts.
+
+        A bare substring match relocated scripts that merely mentioned an event
+        name in a comment, moving records that had no reason to leave the base.
+        """
+        from tes5_import.object_scripts import _script_uses_reference_event
+        assert not _script_uses_reference_event('begin GameMode\nset x to 1\nend')
+        assert not _script_uses_reference_event('; comment mentioning onhit behaviour')
+        assert not _script_uses_reference_event('begin MenuMode 1027')
+        # not an actor event, and must not match on the 'onhit' substring
+        assert not _script_uses_reference_event('begin OnMagicEffectHit')
+
+
+class TestLoadGatedPollStart:
+    """A load-gated update loop must start from OnLoad, not OnInit alone.
+
+    OnInit on a PLACED REFERENCE runs at load BEFORE the actor's 3D exists, so
+    an `If Is3DLoaded()` guard there is false and the poll never starts.
+    OnCellAttach cannot cover it either — it fires only when a cell BECOMES
+    attached, never for an actor already standing in the player's current cell.
+
+    This silenced Valen Dreth the moment actor scripts moved to the ACHR (which
+    reference events like OnPackageEnd require). Vanilla starts update loops
+    from OnLoad in 27 scripts vs 2 that gate OnInit on Is3DLoaded; per
+    ObjectReference.psc OnLoad is "fired every time this object is loaded".
+    """
+
+    def _emit(self, src):
+        from script_convert.converter import ScriptConverter
+        from script_convert.cross_ref import CrossRefGraph
+        conv = ScriptConverter(CrossRefGraph())
+        return conv.convert_standalone('T', src, 'Actor', 'T')
+
+    def test_gamemode_actor_script_registers_from_onload(self):
+        out = self._emit('scn T\nbegin gamemode\nset x to 1\nend\n')
+        assert 'Event OnLoad()' in out
+        onload = out.split('Event OnLoad()', 1)[1].split('EndEvent', 1)[0]
+        assert 'RegisterForSingleUpdate' in onload
+
+    def test_oncellattach_and_onload_both_present(self):
+        """OnCellAttach still handles streaming in; OnLoad covers the rest."""
+        out = self._emit('scn T\nbegin gamemode\nset x to 1\nend\n')
+        assert 'Event OnCellAttach()' in out
+        assert 'Event OnCellDetach()' in out
+
+
+# ---------------------------------------------------------------------------
+# Weather / climate conversion
+# ---------------------------------------------------------------------------
+
+class TestWeatherConversion:
+    """WTHR conversion.
+
+    Field SEMANTICS come from UESP 'Skyrim Mod:Mod File Format/WTHR' and
+    xEdit wbDefinitionsCommon; the defaults come from a census of the 84
+    vanilla WTHR records in Skyrim.esm.  Several of these fields tint additive
+    sky passes, so a guessed value blows the scene out rather than merely
+    looking a bit off -- hence a test per field.
+    """
+
+    def _nam0(self):
+        """TES4 NAM0: 10 types x 4 times x RGBA, one recognisable colour each."""
+        raw = bytearray(160)
+        for t in range(10):
+            for time in range(4):
+                o = (t * 4 + time) * 4
+                raw[o:o + 4] = bytes((10 * t, 10 * t + 1, 10 * t + 2, 0))
+        return bytes(raw).hex().upper()
+
+    def _convert(self, rec):
+        """convert_WTHR returns (wthr_bytes, imgs_bytes); most tests want the WTHR."""
+        from tes5_import.record_types.dialog_misc import convert_WTHR
+        wthr, _imgs = convert_WTHR(rec)
+        return wthr
+
+    def _rec(self, **over):
+        rec = {
+            'Signature': 'WTHR', 'FormID': '00000200', 'RecordFlags': '0',
+            'EditorID': 'TestWeather',
+            'CNAM.LowerCloudLayer': 'Sky\\Lower.dds',
+            'DNAM.UpperCloudLayer': 'Sky\\Upper.dds',
+            'NAM0.Size': '160', 'NAM0.Data': self._nam0(),
+            'DATA.WindSpeed': '25', 'DATA.CloudSpeedLower': '42',
+            'DATA.CloudSpeedUpper': '19', 'DATA.TransDelta': '3',
+            'DATA.SunGlare': '255', 'DATA.SunDamage': '200',
+            'DATA.PrecipBeginFadeIn': '5', 'DATA.PrecipEndFadeOut': '6',
+            'DATA.ThunderBeginFadeIn': '7', 'DATA.ThunderEndFadeOut': '8',
+            'DATA.ThunderFrequency': '188', 'DATA.Classification': '4',
+            'DATA.LightningR': '11', 'DATA.LightningG': '12',
+            'DATA.LightningB': '13',
+        }
+        rec.update(over)
+        return rec
+
+    def test_subrecord_sizes_match_vanilla(self):
+        rec = self._convert(self._rec())
+        for sig, size in ((b'NAM0', 272), (b'DATA', 19), (b'FNAM', 32),
+                          (b'RNAM', 32), (b'QNAM', 32), (b'PNAM', 512),
+                          (b'JNAM', 512), (b'IMSP', 16)):
+            assert len(_find_subrecord(rec, sig)) == size, sig
+        dalc = _find_all_subrecords(rec, b'DALC')
+        assert len(dalc) == 4 and all(len(d) == 32 for d in dalc)
+
+    def test_nam0_colours_are_remapped_not_stubbed(self):
+        """The first version wrote flat 128-grey over the whole table."""
+        nam0 = _find_subrecord(self._convert(self._rec()), b'NAM0')
+
+        def rgb(slot, time=1):
+            o = (slot * 4 + time) * 4
+            return tuple(nam0[o:o + 3])
+
+        assert rgb(0) == (0, 1, 2)        # Sky-Upper
+        assert rgb(1) == (10, 11, 12)     # Fog -> Fog Near
+        assert rgb(3) == (30, 31, 32)     # Ambient
+        assert rgb(6) == (60, 61, 62)     # Stars
+        assert rgb(8) == (80, 81, 82)     # Horizon
+        # TES4's two cloud tints move to TES5's Cloud LOD slots
+        assert rgb(10) == (90, 91, 92)    # Clouds-Upper -> Cloud LOD Diffuse
+        assert rgb(11) == (20, 21, 22)    # Clouds-Lower -> Cloud LOD Ambient
+        assert rgb(12) == (10, 11, 12)    # Fog Far reuses the single TES4 fog
+
+    def test_glare_and_sky_static_slots_default_dark(self):
+        """Slots 13/15/16 tint ADDITIVE passes.
+
+        Copying the TES4 Sun/Stars colours into Sun Glare / Moon Glare, and
+        forcing Sky Statics white, produced a blinding sky.  Vanilla ships
+        black in all three (Sky Statics 7/84 exact-black and never white,
+        Sun Glare 35/84 black, Moon Glare 27/84 black).
+        """
+        nam0 = _find_subrecord(self._convert(self._rec()), b'NAM0')
+
+        def rgb(slot, time=1):
+            o = (slot * 4 + time) * 4
+            return tuple(nam0[o:o + 3])
+
+        assert rgb(13) == (0, 0, 0), 'Sky Statics must not be white'
+        assert rgb(15) == (0, 0, 0), 'Sun Glare must not copy the Sun colour'
+        assert rgb(16) == (0, 0, 0), 'Moon Glare must not copy the Stars colour'
+        # Water Multiplier is the one slot that genuinely defaults to white
+        assert rgb(14) == (255, 255, 255)
+
+    def test_data_carries_every_tes4_field(self):
+        """Offsets 6-14 were dropped entirely by the original converter."""
+        d = _find_subrecord(self._convert(self._rec()), b'DATA')
+        assert d[0] == 25                        # wind speed
+        assert (d[1], d[2]) == (0, 0)            # TES5 padding (was cloud speed)
+        assert d[3] == 3 and d[4] == 255         # trans delta, sun glare
+        assert d[5] == 200                       # sun damage
+        assert (d[6], d[7]) == (5, 6)            # precipitation fades
+        assert (d[8], d[9]) == (7, 8)            # thunder fades
+        assert d[10] == 188                      # thunder frequency
+        assert d[11] == 4                        # classification (Rainy)
+        assert (d[12], d[13], d[14]) == (11, 12, 13)   # lightning colour
+
+    def test_thunder_frequency_keeps_inverted_scale(self):
+        """Both games use 255=never .. 15=constant, so it is a passthrough.
+
+        Vanilla Oblivion agrees: every clear weather is 255 and the
+        thunderstorms are 188/132/100/24.  Inverting it here would make clear
+        skies thunder constantly.
+        """
+        from tes5_import.record_types.dialog_misc import convert_WTHR
+        clear = self._convert(self._rec(**{'DATA.ThunderFrequency': '255'}))
+        assert _find_subrecord(clear, b'DATA')[10] == 255
+
+    def test_classification_defaults_to_pleasant(self):
+        out = self._convert(self._rec(**{'DATA.Classification': '0'}))
+        assert _find_subrecord(out, b'DATA')[11] == 0x01
+
+    def test_only_unused_cloud_layers_are_disabled(self):
+        """NAM1=0xFFFFFFFF disabled layers 0/1 too, blanking every sky."""
+        nam1 = struct.unpack('<I', _find_subrecord(self._convert(self._rec()), b'NAM1'))[0]
+        assert nam1 & 0b11 == 0
+        assert nam1 == 0xFFFFFFFC
+
+    def test_weather_with_no_cloud_textures_disables_all_layers(self):
+        rec = self._rec(**{'CNAM.LowerCloudLayer': '', 'DNAM.UpperCloudLayer': ''})
+        out = self._convert(rec)
+        assert struct.unpack('<I', _find_subrecord(out, b'NAM1'))[0] == 0xFFFFFFFF
+
+    def test_cloud_speed_uses_the_shared_physical_scale(self):
+        """Both engines cap cloud drift at 0.1 units.
+
+        Oblivion scales its unsigned 0..255 byte by fWeatherCloudSpeedMax
+        (0.1, read from Oblivion.exe at 0xA2FAAC); Skyrim encodes a SIGNED
+        -0.1..+0.1 as 0x00..0xFE with 0x7F = 0.  So the byte must be rescaled,
+        not copied.  `0x7F + speed//2` ran clouds ~10x too fast.
+        """
+        from tes5_import.record_types.dialog_misc import _cloud_speed_tes4_to_tes5 as conv
+
+        def to_float(b):
+            return (b - 127) / 127 / 10
+
+        assert conv(0) == 0x7F                      # still stays still
+        assert conv(255) == 0xFE                    # TES4 max == TES5 max
+        for tes4 in (19, 25, 42, 50, 101, 200):
+            assert abs(to_float(conv(tes4)) - tes4 / 255 * 0.1) < 0.001
+        assert all(0x7F <= conv(v) <= 0xFE for v in range(256))
+
+    def test_cloud_speed_lands_in_rnam_layers(self):
+        from tes5_import.record_types.dialog_misc import convert_WTHR
+        rnam = _find_subrecord(self._convert(self._rec()), b'RNAM')
+        assert rnam[0] == 0x94 and rnam[1] == 0x88   # TES4 42 / 19
+        assert set(rnam[2:]) == {0x7F}               # untouched layers neutral
+
+    def test_only_textured_layers_are_opaque(self):
+        """A blanket alpha 1.0 draws 30 opaque empty layers over the sky."""
+        jnam = struct.unpack('<128f', _find_subrecord(self._convert(self._rec()), b'JNAM'))
+        assert jnam[0:4] == (1.0,) * 4      # layer 0 has a texture
+        assert jnam[4:8] == (1.0,) * 4      # layer 1 has a texture
+        assert set(jnam[8:]) == {0.0}       # layers 2..31 do not
+
+    def test_required_subrecords_present(self):
+        """LNAM/MNAM/NNAM are .SetRequired in xEdit; LNAM=0 allocated no layers."""
+        rec = self._convert(self._rec())
+        assert struct.unpack('<I', _find_subrecord(rec, b'LNAM'))[0] == 29
+        assert _find_subrecord(rec, b'MNAM') == b'\x00\x00\x00\x00'
+        assert _find_subrecord(rec, b'NNAM') == b'\x00\x00\x00\x00'
+
+    def test_dalc_follows_vanilla_face_weights(self):
+        """Z+ is the DARKEST face and Z- the brightest.
+
+        Medians over all 84 vanilla weathers: X+ .98 X- .94 Y+ .96 Y- .95
+        Z+ .67 Z- 1.28.  Writing Ambient verbatim into all six faces and then
+        BRIGHTENING Z+ (the first version) overdrove the whole cube.
+        """
+        dalc = _find_all_subrecords(self._convert(self._rec()), b'DALC')[1]
+        faces = [tuple(dalc[i * 4:i * 4 + 3]) for i in range(6)]
+        amb = (30, 31, 32)                       # NAM0 Ambient, day
+        assert faces[4][0] < amb[0], 'Z+ must be darker than Ambient'
+        assert faces[5][0] > amb[0], 'Z- must be brighter than Ambient'
+        assert faces[4][0] < faces[5][0]
+        for f in faces[:4]:                      # horizontals sit near Ambient
+            assert abs(f[0] - amb[0]) <= 3
+        assert struct.unpack_from('<f', dalc, 28)[0] == 1.0    # Fresnel
+
+    def test_default_weather_editorid_avoids_skyrim_collision(self):
+        out = self._convert(self._rec(EditorID='DefaultWeather'))
+        assert _find_subrecord(out, b'EDID') == b'TES4DefaultWeather\x00'
+
+    def test_missing_nam0_does_not_crash(self):
+        rec = self._rec()
+        del rec['NAM0.Data']
+        assert len(_find_subrecord(self._convert(rec), b'NAM0')) == 272
+
+
+class TestClimateConversion:
+    def _rec(self, **over):
+        rec = {
+            'Signature': 'CLMT', 'FormID': '0000015F', 'RecordFlags': '0',
+            'EditorID': 'TestClimate',
+            'WeatherCount': '2',
+            'Weather[0].FormID': '00000200', 'Weather[0].Chance': '70',
+            'Weather[1].FormID': '00000201', 'Weather[1].Chance': '30',
+            'FNAM.SunTexture': 'Sky\\Sun.dds',
+            'GNAM.GlareTexture': 'Sky\\SunGlare.dds',
+            'Model.MODL': 'Sky\\Stars.nif',
+            'TNAM.SunriseBegin': '36', 'TNAM.SunriseEnd': '60',
+            'TNAM.SunsetBegin': '96', 'TNAM.SunsetEnd': '120',
+            'TNAM.Volatility': '0', 'TNAM.MoonsPhaseLength': '195',
+        }
+        rec.update(over)
+        return rec
+
+    def test_wlst_entries_are_widened_to_12_bytes(self):
+        """TES4's entry is 8 bytes; TES5 appends a Global FormID."""
+        from tes5_import.record_types.dialog_misc import convert_CLMT
+        wlst = _find_subrecord(convert_CLMT(self._rec()), b'WLST')
+        assert len(wlst) == 24
+        w0, c0, g0 = struct.unpack_from('<IiI', wlst, 0)
+        w1, c1, g1 = struct.unpack_from('<IiI', wlst, 12)
+        assert (c0, c1) == (70, 30)
+        assert (g0, g1) == (0, 0)
+        assert w0 != 0 and w1 != 0
+
+    def test_stars_model_and_sun_textures_are_namespaced(self):
+        from tes5_import.record_types.dialog_misc import convert_CLMT
+        out = convert_CLMT(self._rec())
+        assert _find_subrecord(out, b'MODL') == b'tes4\\Sky\\Stars.nif\x00'
+        assert _find_subrecord(out, b'FNAM') == b'tes4\\Sky\\Sun.dds\x00'
+        assert _find_subrecord(out, b'GNAM') == b'tes4\\Sky\\SunGlare.dds\x00'
+        assert _find_subrecord(out, b'MODT') is not None
+
+    def test_climate_without_model_still_gets_stars(self):
+        """Every vanilla Skyrim climate has a MODL; without one, no stars."""
+        from tes5_import.record_types.dialog_misc import convert_CLMT
+        rec = self._rec()
+        del rec['Model.MODL']
+        assert _find_subrecord(convert_CLMT(rec), b'MODL') == b'tes4\\Sky\\Stars.nif\x00'
+
+    def test_tnam_timing_is_six_bytes_verbatim(self):
+        from tes5_import.record_types.dialog_misc import convert_CLMT
+        tnam = _find_subrecord(convert_CLMT(self._rec()), b'TNAM')
+        assert tnam == bytes((36, 60, 96, 120, 0, 195))
+
+    def test_climate_is_not_skipped(self):
+        from tes5_import.constants import IMPORT_DISPATCH, SKIP_TYPES
+        assert 'CLMT' not in SKIP_TYPES
+        assert 'CLMT' in IMPORT_DISPATCH
+        # WTHR is deliberately NOT in the generic dispatch: it mints an IMGS
+        # companion, so it runs in its own serial phase (import_main 2b).
+        assert 'WTHR' not in IMPORT_DISPATCH
+
+
+class TestWorldspaceClimate:
+    def _rec(self, **over):
+        rec = {'Signature': 'WRLD', 'FormID': '0000003C', 'RecordFlags': '0',
+               'EditorID': 'Tamriel'}
+        rec.update(over)
+        return rec
+
+    def test_authored_climate_is_kept(self):
+        from tes5_import.record_types.world import convert_WRLD
+        out = convert_WRLD(self._rec(**{'CNAM.Climate': '00097C60'}))
+        cnam = struct.unpack('<I', _find_subrecord(out, b'CNAM'))[0]
+        assert cnam & 0x00FFFFFF == 0x97C60
+
+    def test_worldspace_without_climate_falls_back_to_default(self):
+        """Oblivion.exe resolves a null worldspace climate to DefaultClimate
+        (0x15F) at runtime -- the sky setup at 0x667688 falls through to
+        0x543200, which does LookupForm(0x15F).  Skyrim has no such fallback,
+        and 57 of 84 TES4 worldspaces (incl. Tamriel and every city) author no
+        CNAM, so it must be written explicitly."""
+        from tes5_import.record_types.world import convert_WRLD
+        cnam = _find_subrecord(convert_WRLD(self._rec()), b'CNAM')
+        assert cnam is not None, 'a CNAM-less worldspace would use Skyrim weather'
+        assert struct.unpack('<I', cnam)[0] & 0x00FFFFFF == 0x15F
+
+
+class TestSkyMeshShaders:
+    """Sky geometry needs BSSkyShaderProperty, not the lighting shader.
+
+    Skyrim draws sky through a dedicated pass keyed on Sky Object Type; a sky
+    mesh carrying BSLightingShaderProperty is treated as ordinary world
+    geometry, which made converted stars draw on top of the landscape.
+    """
+
+    def test_sky_meshes_are_classified_by_type(self):
+        from asset_convert.nif_converter import (
+            sky_object_type_for, SKY_STARS, SKY_CLOUDS, SKY_BASE)
+        assert sky_object_type_for('export/x/meshes/sky/stars.nif') == SKY_STARS
+        assert sky_object_type_for('export/x/meshes/sky/clouds.nif') == SKY_CLOUDS
+        assert sky_object_type_for('export/x/meshes/sky/atmosphere.nif') == SKY_BASE
+        assert sky_object_type_for(r'export\x\meshes\Sky\Stars.NIF') == SKY_STARS
+
+    def test_non_sky_meshes_are_not_misclassified(self):
+        from asset_convert.nif_converter import sky_object_type_for
+        assert sky_object_type_for('meshes/clutter/barrel01.nif') is None
+        # must key on the sky/ DIRECTORY, not just the basename
+        assert sky_object_type_for('meshes/architecture/sky/wall.nif') is None
+        assert sky_object_type_for('meshes/dungeons/clouds.nif') is None
+        assert sky_object_type_for('') is None
+
+
+class TestSayTimerRelease:
+    """Every line under a PARKED topic must be able to release the timer.
+
+    A converted Say() parks its conversation timer (the engine already blocks
+    for the audio, so charging a duration would make the two waits ADD). The
+    topic's End fragment clears it when the line really finishes. Two bugs made
+    that release unreachable and stalled CharacterGen for good:
+
+      1. A QUEST script writing its own timer with no prefix (`set convTimer to
+         BaurusRef.SayTo ...` in CharGenQuest) was classified as SPEAKER-scoped
+         purely because the name had no dot, emitting
+         `(akSpeakerRef as TES4_CharGenQuest)` — casting an actor to a Quest
+         script always yields None, so the write silently did nothing.
+      2. The fragment was only generated/attached for an INFO that HAD a result
+         script, but 87% of the INFOs under a parked topic (5,450 of 6,248)
+         have none. Those lines parked the timer forever.
+    """
+
+    def _owners(self):
+        from script_convert.pipeline import build_say_timer_owners
+        scpt = {'EditorID': 'CharGenQuest', 'FormID': '0002480B',
+                'SCTX': 'begin gamemode\n'
+                        'set convTimer to BaurusRef.SayTo player CharGenVoice 1\n'
+                        'end'}
+        qust = {'EditorID': 'Charactergen', 'FormID': '0002466E',
+                'SCRI': '0002480B'}
+        return build_say_timer_owners({'SCPT': [scpt], 'QUST': [qust]})
+
+    def test_quest_script_bare_timer_is_quest_scoped(self):
+        """The owner must resolve to the QUEST, not the speaker."""
+        owner = self._owners().get('chargenvoice')
+        assert owner is not None
+        assert owner[0] == 'quest', (
+            'a quest script\'s own timer must bind a quest property; casting '
+            'akSpeakerRef to a Quest script yields None and drops the write')
+        assert owner[1].split('.', 1)[0].lower() == 'charactergen'
+
+    def test_speaker_local_timer_still_casts_the_speaker(self):
+        """An actor script's own timer must NOT be redirected to a quest."""
+        from script_convert.pipeline import build_say_timer_owners
+        scpt = {'EditorID': 'ValenDrethScript', 'FormID': '0001FC44',
+                'SCTX': 'begin gamemode\n'
+                        'set timer to SayTo player, CharGenTaunt2 1\n'
+                        'end'}
+        owner = build_say_timer_owners({'SCPT': [scpt], 'QUST': []})
+        assert owner['chargentaunt2'][0] == 'speaker'
+
+
+class TestWeatherImageSpace:
+    """WTHR HDR tone mapping -> companion IMGS records.
+
+    Oblivion stores HDR per WEATHER (WTHR.HNAM, 14 floats); Skyrim has NO
+    per-weather HDR field -- it lives in imagespaces the weather points at
+    (WTHR.IMSP -> IMGS.HNAM, 9 floats), FOUR of them, one per time of day.
+    Pointing every weather at the stock 0x161 left HDR undefined: 0x161 is one
+    of only two vanilla imagespaces that ship ENAM and no HNAM.
+    """
+
+    class _FakeWriter:
+        def __init__(self):
+            self.next_fid = 0x01001000
+
+        def alloc_formid(self):
+            self.next_fid += 1
+            return self.next_fid
+
+    # (min, max) per field across the 213 vanilla imagespaces a Skyrim.esm
+    # WEATHER actually references (interior/dungeon ones excluded).
+    VANILLA_RANGES = [
+        (15.0, 50.0), (0.8, 8.0), (0.0, 0.80), (0.0, 7.0), (0.2, 1.0),
+        (0.6, 1.075), (0.4, 3.85), (0.0, 0.45), (1.0, 30.0),
+    ]
+    DAWN, DAY, DUSK, NIGHT = 0, 1, 2, 3
+
+    def _nam0(self, day_rgb=(100, 141, 191), night_rgb=(6, 8, 14)):
+        """TES4 NAM0 with a bright day sky and a dark night sky."""
+        raw = bytearray(160)
+        for t, rgb in ((0, day_rgb), (1, day_rgb), (2, day_rgb), (3, night_rgb)):
+            o = (0 * 4 + t) * 4          # slot 0 = Sky-Upper
+            raw[o:o + 3] = bytes(rgb)
+        return bytes(raw).hex().upper()
+
+    def _rec(self, **over):
+        rec = {
+            'Signature': 'WTHR', 'FormID': '00000200', 'RecordFlags': '0',
+            'EditorID': 'TestWeather',
+            'NAM0.Size': '160', 'NAM0.Data': self._nam0(),
+            'HNAM.EyeAdaptSpeed': '0.7', 'HNAM.BlurRadius': '4.0',
+            'HNAM.BlurPasses': '2.0', 'HNAM.EmissiveMult': '1.0',
+            'HNAM.TargetLum': '1.2', 'HNAM.UpperLumClamp': '1.0',
+            'HNAM.BrightScale': '1.75', 'HNAM.BrightClamp': '0.3',
+            'HNAM.SunlightDimmer': '1.3', 'HNAM.GrassDimmer': '1.3',
+            'HNAM.TreeDimmer': '1.2',
+        }
+        rec.update(over)
+        return rec
+
+    def _convert(self, rec):
+        from tes5_import.record_types.dialog_misc import convert_WTHR
+        return convert_WTHR(rec, self._FakeWriter())
+
+    def _hnam(self, imgs_bytes):
+        return struct.unpack('<9f', _find_subrecord(imgs_bytes, b'HNAM')[:36])
+
+    def test_weather_mints_four_imagespaces_with_hdr(self):
+        """70% of vanilla weathers use DISTINCT imagespaces per time of day;
+        collapsing to one gives day and night identical tone mapping."""
+        _wthr, imgs = self._convert(self._rec())
+        assert len(imgs) == 4
+        for b in imgs:
+            assert _find_subrecord(b, b'HNAM') is not None, (
+                'an ENAM-only stub leaves HDR undefined')
+            assert len(_find_subrecord(b, b'HNAM')) == 36
+
+    def test_imsp_points_at_the_generated_imagespaces_in_order(self):
+        wthr, imgs = self._convert(self._rec())
+        fids = [struct.unpack_from('<I', b, 12)[0] for b in imgs]
+        slots = list(struct.unpack('<4I', _find_subrecord(wthr, b'IMSP')))
+        assert slots == fids
+        assert 0x161 not in slots, 'must not use the HNAM-less stock imagespace'
+        assert len(set(slots)) == 4
+
+    def test_hdr_fields_come_from_the_tes4_block(self):
+        _w, imgs = self._convert(self._rec())
+        h = self._hnam(imgs[self.DAY])
+        # BrightScale 1.75 rescaled from TES4 1..3 onto vanilla 2.5..4
+        assert 2.5 <= h[3] <= 4.0
+        # SunlightDimmer 1.3 rescaled from TES4 0.5..2 onto vanilla 0.9..2.7
+        assert 1.5 <= h[6] <= 2.4
+
+    def test_bloom_blur_radius_is_the_engine_constant(self):
+        """All 213 vanilla weather-used imagespaces use exactly 7.0.  TES4's
+        BlurRadius is a different quantity (Oblivion's own blur pass)."""
+        _w, imgs = self._convert(self._rec(**{'HNAM.BlurRadius': '4.0'}))
+        for b in imgs:
+            assert self._hnam(b)[1] == 7.0
+
+    def test_luminance_fields_are_rescaled_off_the_tes5_ceiling(self):
+        """TES4 TargetLum spans 0.75..1.2 but TES5 Receive Bloom Threshold
+        spans 0.2..1.0; copying raw pinned it at 1.0, so the WHOLE frame
+        bloomed.  Same for UpperLumClamp (1.0..1.3) vs White (0.6..1.075)."""
+        _w, imgs = self._convert(self._rec(**{'HNAM.TargetLum': '1.2',
+                                              'HNAM.UpperLumClamp': '1.3'}))
+        h = self._hnam(imgs[self.DAY])
+        assert h[4] < 0.8, 'Receive Bloom Threshold must not sit at the ceiling'
+        assert h[5] < 1.05, 'White must not sit at the ceiling'
+
+    def test_sky_scale_tracks_sky_brightness(self):
+        """Sky Scale is the sky's contribution to exposure and TES4 has no
+        equivalent.  Vanilla: ~0.025 for a dark night sky, ~0.20 for a lit
+        one.  A flat value washes the day sky out to near-white."""
+        _w, imgs = self._convert(self._rec())
+        day = self._hnam(imgs[self.DAY])[7]
+        night = self._hnam(imgs[self.NIGHT])[7]
+        assert night < 0.06, 'night sky scale must be near zero'
+        assert day > 0.15, 'day sky scale must be the lit value'
+        assert day > night
+
+    def test_eye_adapt_varies_by_time_of_day(self):
+        """Vanilla per-slot medians: speed 37/40/37/45, strength 15/5/15/20."""
+        _w, imgs = self._convert(self._rec())
+        strength = [self._hnam(b)[8] for b in imgs]
+        assert strength == [15.0, 5.0, 15.0, 20.0]
+        speed = [self._hnam(b)[0] for b in imgs]
+        assert speed[self.NIGHT] > speed[self.DAY] > speed[self.DAWN]
+
+    def test_eye_adapt_speed_is_rescaled_not_copied(self):
+        """Oblivion's rate is 0..1 (Oblivion.ini fEyeAdaptSpeed=0.7); Skyrim's
+        weather-used range is 15..50.  Copying 0.7 freezes adaptation."""
+        _w, imgs = self._convert(self._rec(**{'HNAM.EyeAdaptSpeed': '0.7'}))
+        speed = self._hnam(imgs[self.DAY])[0]
+        assert speed > 15.0, 'a raw 0.7 would sit far below the vanilla floor'
+        assert 15.0 <= speed <= 50.0
+
+    def test_unauthored_tes4_hdr_uses_vanilla_defaults(self):
+        """DefaultWeather ships an ALL-ZERO HNAM -- and it is exactly the
+        weather the 57 CNAM-less worldspaces (Tamriel, every city) fall back
+        to.  Copied verbatim that gives White=0 / SunlightScale=0 (a zero
+        white point); clamping to the range MINIMUM instead pins every field
+        at its flattest legal value.  Neither is right: use vanilla defaults."""
+        zero = {k: '0.0' for k in self._rec() if k.startswith('HNAM.')}
+        _w, imgs = self._convert(self._rec(**zero))
+        h = self._hnam(imgs[self.DAY])
+        assert h[1] == 7.0                   # Bloom Blur Radius
+        assert abs(h[3] - 3.0) < 1e-6        # Bloom Scale, vanilla median
+        assert abs(h[6] - 1.9) < 1e-3        # Sunlight Scale, vanilla median
+        assert h[5] >= 0.6, 'White must never be 0 (degenerate white point)'
+        for v, (lo, hi) in zip(h, self.VANILLA_RANGES):
+            assert lo - 1e-6 <= v <= hi + 1e-6
+
+    def test_every_field_stays_inside_the_vanilla_envelope(self):
+        wild = {k: '999.0' for k in self._rec() if k.startswith('HNAM.')}
+        for rec in (self._rec(**wild), self._rec()):
+            _w, imgs = self._convert(rec)
+            for b in imgs:
+                for v, (lo, hi) in zip(self._hnam(b), self.VANILLA_RANGES):
+                    assert lo - 1e-6 <= v <= hi + 1e-6
+
+    def test_imagespace_ships_cinematic_and_tint(self):
+        """Every vanilla IMGS with an HNAM also ships CNAM+TNAM."""
+        _w, imgs = self._convert(self._rec())
+        cnam = struct.unpack('<3f', _find_subrecord(imgs[0], b'CNAM'))
+        tnam = struct.unpack('<4f', _find_subrecord(imgs[0], b'TNAM'))
+        assert cnam == (1.0, 1.0, 1.0)
+        assert tnam[0] == 0.0
+
+    def test_imagespace_is_written_before_the_weather(self):
+        """IMGS must precede WTHR in the group order: the weather's IMSP
+        resolves against it, and CLMT then resolves against the weather."""
+        import inspect
+
+        from tes5_import.writer import PluginWriter
+        src = inspect.getsource(PluginWriter)
+        assert src.index("'IMGS'") < src.index("'WTHR'")
+        assert src.index("'WTHR'") < src.index("'CLMT'")

@@ -230,6 +230,7 @@ def _init_dispatch():
         convert_QUST,
     )
     from .record_types.dialog_misc import (
+        convert_CLMT,
         convert_WTHR,
     )
     from .record_types.equipment import (
@@ -334,6 +335,7 @@ def _init_dispatch():
         # needs the QUST aliases, which the generic dispatch runs too early for.
         'WATR': convert_WATR,
         'WTHR': convert_WTHR,
+        'CLMT': convert_CLMT,
     })
 
     TYPE_MAP.update({
@@ -361,7 +363,13 @@ def _init_dispatch():
         # to TES4 globals (TES4Fame, quest counters...), which read None if the
         # records don't exist. convert_GLOB drops the engine-time globals
         # (GameHour etc.) whose references are canonicalized to vanilla forms.
-        'CLMT',   # Climate system differs
+        # CLMT is NOT skipped: TES5's climate record is near-identical to
+        # TES4's (same WLST list, FNAM/GNAM sun textures, TNAM timing; only the
+        # WLST entry widened by a Global FormID).  It is also the ONLY path to
+        # the converted WTHR records — weather is reached via
+        # WRLD -> CNAM -> CLMT -> WLST, never referenced directly — so skipping
+        # it left all 37 converted weathers orphaned and Cyrodiil rendering
+        # under Skyrim's default climate, sun and moons.
         'REGN',   # Region system differs
         'EYES',   # Do not convert — NPCs map to Skyrim head parts
         'HAIR',   # Do not convert — NPCs map to Skyrim head parts

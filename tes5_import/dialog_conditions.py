@@ -36,24 +36,31 @@ FUNC_GET_GLOBAL_VALUE = 74     # GetGlobalValue(glob)
 FUNC_GET_IS_VOICE_TYPE = 426   # GetIsVoiceType(vtyp)  — TES5-only, no TES4 source
 
 # Run-on-Target conditions that must NOT be retargeted onto a specific
-# reference. These ask "WHO is being addressed?" — a question only the dialogue
-# target can answer. Rewriting them to RunOn=Reference pins them to one actor
-# and changes what they mean; when that actor is the player the result is a
-# condition that can NEVER pass, because GetIsID compares the runtime actor's
-# BASE form and PlayerRef's base is vanilla Skyrim's 0x00000007, never the
-# converted TES4 player NPC_ 0x01000007. That mistake silently killed 667
-# GREETING/bark INFOs across 101 topics — every affected NPC lost their whole
-# topic list, because the greeting that opens it could not pass (Pinarus
-# Inventius kept only quest-less 'rumors'). They fall back to RunOn=Target,
-# which is the faithful translation for menu dialogue; a Say()-driven line
-# simply keeps a condition that no longer applies rather than one that inverts.
+# reference. GetIsID asks "WHICH ACTOR is this?" and answers by comparing the
+# runtime actor's BASE form; PlayerRef's base is vanilla Skyrim's 0x00000007,
+# never the converted TES4 player NPC_ 0x01000007, so retargeting it onto the
+# player yields a condition that can NEVER pass. That mistake silently killed
+# 667 GREETING/bark INFOs across 101 topics — every affected NPC lost their
+# whole topic list, because the greeting that opens it could not pass (Pinarus
+# Inventius kept only quest-less 'rumors'). It falls back to RunOn=Target.
+#
+# Vanilla Skyrim.esm agrees on exactly this split: GetIsID appears with
+# RunOn=Reference ZERO times, while GetIsRace(29), GetIsSex(125),
+# GetInFaction(136) and GetFactionRank(22) all use RunOn=Reference->PlayerRef
+# routinely.  Those four read live actor STATE rather than a base-form
+# identity, so pinning them to the player is both legal and meaning-preserving
+# — and it is the ONLY way they can evaluate inside a Say()-driven topic,
+# because Skyrim's Say has no target at all (ObjectReference.psc:
+# `Say(Topic, Actor akActorToSpeakAs, bool abSpeakInPlayersHead)` — the second
+# arg is the SPEAKER, not the addressee; only menu dialogue populates the
+# target that Actor.GetDialogueTarget() returns).  Leaving them on
+# RunOn=Target inside a Say topic made every per-race/per-sex line evaluate
+# against nothing, so the wrong response won: Valen Dreth taunted the player
+# with lines written for a different race, and the CharacterGen intro never
+# advanced past its first taunt.
 _NO_TARGET_RETARGET_FUNCS = frozenset({
-    72,    # GetIsID
-    69,    # GetIsRace
-    70,    # GetIsSex
-    68,    # GetIsClass
-    71,    # GetInFaction
-    73,    # GetFactionRank
+    72,    # GetIsID — base-form compare; never valid against PlayerRef
+    68,    # GetIsClass — TES4 CLAS identity, same base-form problem
 })
 
 # --- Function-index reconciliation (data-derived; see module docstring) --------

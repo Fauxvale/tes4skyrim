@@ -12,6 +12,7 @@ from ..constants import (
 from ..locations import WORLD_NAMES
 from ..skyrim_overrides import TES4_MARKER_FORMID_TO_SKYRIM
 from .items import get_base_origin_shift
+from ..text_reader import remap_formid
 from .common import (
     _prefix_path,
     get_float,
@@ -26,6 +27,12 @@ from .common import (
     pack_subrecord,
     pack_uint8_subrecord,
 )
+
+
+# TES4 'DefaultClimate' (Oblivion.esm 0x0000015F).  The engine hardcodes this
+# form as the climate for any worldspace with no CNAM — see convert_WRLD.
+# Raw TES4 id: it MUST go through remap_formid before being written.
+_TES4_DEFAULT_CLIMATE = 0x0000015F
 
 
 # Interior CELL FormID -> LCTN FormID of the map-marker location it belongs to.
@@ -303,8 +310,27 @@ def convert_WRLD(rec: dict) -> bytes:
     if wnam:
         subs += pack_formid_subrecord('WNAM', wnam)
 
-    # TES4 CNAM/SNAM reference TES4 records — omit (would be dangling refs).
+    # CNAM — Climate.  TES4 CLMT records ARE converted (they are the only path
+    # to the converted WTHR records: weather is selected via
+    # WRLD -> CNAM -> CLMT -> WLST), so this is a live reference, not a
+    # dangling one.  Without it the worldspace silently falls back to Skyrim's
+    # default climate and Cyrodiil renders under Skyrim's weather, sun and
+    # moons.  SNAM is still omitted — it references a TES4 record we skip.
     #
+    # 57 of 84 TES4 worldspaces author no CNAM at all — including Tamriel
+    # itself, every Imperial City district and every walled city.  Oblivion
+    # resolves those at RUNTIME rather than at load: verified in Oblivion.exe
+    # (GOG/Steam 1.2.0.416), the sky setup at 0x667688 calls the worldspace's
+    # get-climate (0x4CAF90) and, when it returns null, falls through to
+    # 0x543200, which does LookupForm(0x15F) — the engine-created
+    # 'DefaultClimate' form (bootstrap at 0x44CCE9 pushes 0x15F and names it
+    # from the string at 0xA37CA0).  Skyrim has no such fallback: a missing
+    # CNAM there just yields Skyrim's own default climate.  So write TES4's
+    # DefaultClimate explicitly and the converted worldspace keeps Cyrodiil's
+    # sun, moons and weather list.
+    cnam = get_formid(rec, 'CNAM.Climate') or remap_formid(_TES4_DEFAULT_CLIMATE)
+    subs += pack_formid_subrecord('CNAM', cnam)
+
     # Water: TES4 WATR records are in skipTypes (we use Skyrim's water), so
     # point NAM2 (water type) and NAM3 (LOD water type) at Skyrim.esm's
     # DefaultWater (0x18, master index 0).  Vanilla Tamriel uses the same

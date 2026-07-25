@@ -228,6 +228,55 @@ _SF2_ENV_MAP_LIGHT_FADE = 0x00008000
 _SF2_DOUBLE_SIDED       = 0x00000010
 SHADER_FLAGS_2 = _SF2_Z_BUFFER_WRITE | _SF2_VERTEX_COLORS | _SF2_ENV_MAP_LIGHT_FADE
 
+
+# --- Sky meshes ------------------------------------------------------------
+#
+# Sky geometry is NOT a world object.  Skyrim draws it through a dedicated sky
+# pass keyed on BSSkyShaderProperty.Sky Object Type; a sky mesh that ships a
+# BSLightingShaderProperty instead is lit, fogged and depth-sorted as ordinary
+# world geometry, which is why converted stars drew ON TOP of the landscape.
+#
+# SkyObjectType enum (references/nif 0.10.0.0.xml):
+#   0 BSSM_SKY_TEXTURE, 1 BSSM_SKY_SUNGLARE, 2 BSSM_SKY, 3 BSSM_SKY_CLOUDS,
+#   5 BSSM_SKY_STARS, 7 BSSM_SKY_MOON_STARS_MASK
+# Confirmed against the shipped meshes: sky/stars.nif is type 5 throughout and
+# sky/clouds.nif is type 3.
+SKY_TEXTURE, SKY_SUNGLARE, SKY_BASE = 0, 1, 2
+SKY_CLOUDS, SKY_STARS, SKY_MOON_STARS_MASK = 3, 5, 7
+
+# Oblivion's Sky/ meshes, keyed by lowercase basename, mapped to the sky object
+# type Skyrim's sky pass expects.  Oblivion had no such enum — it identified sky
+# geometry by which slot of the climate/weather record referenced it — so this
+# table is the mapping between the two models and cannot be derived from the
+# NIF itself.
+_SKY_MESH_TYPES = {
+    'stars.nif':            SKY_STARS,
+    'stars_oblivion.nif':   SKY_STARS,
+    'sestars.nif':          SKY_STARS,
+    'clouds.nif':           SKY_CLOUDS,
+    'clouds_oblivion.nif':  SKY_CLOUDS,
+    'atmosphere.nif':       SKY_BASE,
+    'sky.nif':              SKY_BASE,
+    'sunbeam01.nif':        SKY_SUNGLARE,
+    'sunbeam02.nif':        SKY_SUNGLARE,
+    'sunbeam03.nif':        SKY_SUNGLARE,
+}
+
+
+def sky_object_type_for(src_path):
+    """Return the BSSkyShaderProperty sky object type for a mesh, else None.
+
+    Only meshes living under a `sky/` directory are eligible: the basenames
+    alone are generic enough to collide with ordinary clutter.
+    """
+    if not src_path:
+        return None
+    norm = str(src_path).replace('\\', '/').lower()
+    parts = norm.rsplit('/', 2)
+    if len(parts) < 2 or parts[-2] != 'sky':
+        return None
+    return _SKY_MESH_TYPES.get(parts[-1])
+
 # Supported source versions — anything else is skipped (not copied to output)
 _SUPPORTED_VERSIONS = {
     0x14000004,  # Gamebryo v20.0.0.4 — primary Oblivion format
@@ -880,7 +929,7 @@ def _plan_flipbook_atlas(frame_rels, stats):
     return atlas_rel, n_pad, n_real
 
 
-def _process_geometry(strips_or_shape, fix_textures, stats=None):
+def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     """Convert a NiTriStrips or NiTriShape into a ready Skyrim NiTriShape.
 
     Returns the NiTriShape (may be a new object if input was NiTriStrips).
@@ -994,6 +1043,37 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None):
         tex_set.textures[0] = diffuse.encode('utf-8')
         base = diffuse.rsplit('.', 1)[0] if '.' in diffuse else diffuse
         tex_set.textures[1] = (base + '_n.dds').encode('utf-8')
+
+    # Sky geometry takes the dedicated sky shader instead of the lighting one.
+    # Skyrim's sky pass draws these before the world, unlit and unfogged, with
+    # the horizon/atmosphere blend the weather record drives; routing them
+    # through BSLightingShaderProperty made the stars ordinary world geometry
+    # that drew over the terrain.
+    if sky_type is not None:
+        sky_shader = NifFormat.BSSkyShaderProperty()
+        ssf1 = sky_shader.shader_flags_1
+        ssf1.slsf_1_z_buffer_test = 1
+        ssf2 = sky_shader.shader_flags_2
+        ssf2.slsf_2_z_buffer_write = 1
+        # Oblivion tints its star/cloud layers with vertex colours; vanilla
+        # sky/stars.nif sets the same flag, and SSE renders geometry black when
+        # the flag disagrees with the mesh data.
+        if getattr(ts.data, 'has_vertex_colors', False):
+            ssf2.slsf_2_vertex_colors = 1
+        sky_shader.uv_offset.u = 0.0
+        sky_shader.uv_offset.v = 0.0
+        sky_shader.uv_scale.u = 1.0
+        sky_shader.uv_scale.v = 1.0
+        sky_shader.source_texture = (tex_set.textures[0] if diffuse_path else b'')
+        sky_shader.sky_object_type = sky_type
+        # The sky pass does its own blending; vanilla sky meshes carry NO
+        # NiAlphaProperty, so the Oblivion one is dropped rather than copied
+        # into bs_properties[1].
+        ts.bs_properties[0] = sky_shader
+        ts.bs_properties[1] = None
+        if stats is not None:
+            stats['sky_shaders'] = stats.get('sky_shaders', 0) + 1
+        return ts
 
     # Build BSLightingShaderProperty
     shader = NifFormat.BSLightingShaderProperty()
@@ -1756,7 +1836,8 @@ def _walk_node(parent, node, fix_textures, stats):
     # Geometry conversion
     if isinstance(node, (NifFormat.NiTriStrips, NifFormat.NiTriShape)):
         try:
-            ts = _process_geometry(node, fix_textures, stats)
+            ts = _process_geometry(node, fix_textures, stats,
+                                   sky_type=(stats or {}).get('_sky_type'))
         except UnreconstructibleGeometry as e:
             # dev-era Oblivion shapes with NO topology in the file at all
             # (minotaur hair01/hornsa/minotaurold, has_triangles=False with a
@@ -2440,6 +2521,9 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         'bones_remapped': 0,
         'textures_fixed': 0,
         '_src_path': str(src_path),   # for flip-book frame resolution
+        # Sky geometry (stars/clouds/atmosphere) needs BSSkyShaderProperty
+        # rather than the lighting shader — see sky_object_type_for.
+        '_sky_type': sky_object_type_for(src_path),
     }
 
     # Drop orphaned non-scene-graph roots before anything walks data.roots.
@@ -2626,8 +2710,12 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                 data.roots[i] = wrapper
                 root = wrapper
 
-        # Convert NiNode root → BSFadeNode (skip for worn armor: they use NiNode)
-        if type(root).__name__ == 'NiNode' and not _is_worn_armor:
+        # Convert NiNode root → BSFadeNode (skip for worn armor: they use NiNode).
+        # Sky meshes also keep a plain NiNode: BSFadeNode applies distance-based
+        # fading, which is meaningless for a dome that is always drawn around the
+        # camera, and every vanilla sky/*.nif root is a plain NiNode.
+        _is_sky = stats.get('_sky_type') is not None
+        if type(root).__name__ == 'NiNode' and not _is_worn_armor and not _is_sky:
             old_root = root
             fade = NifFormat.BSFadeNode()
             fade.name = root.name

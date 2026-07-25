@@ -143,6 +143,53 @@ from comparing two conversion runs.
   should differ), zero dangling refs, zero records at undefined master ids, and
   every override nested exactly as the master nests it.
 
+## Navmesh Performance (learned 2026-07-25)
+
+Corridor navmesh generation was **9.8x** faster after four fixes, all
+**byte-identical output** (13 cells A/B'd on (verts, tris) hashes; large
+interiors 11-14x, small cells 1.3-2.5x). Profile with
+`python tools/navmesh_profile.py --cells <A,B> --stages` (its stage timers now
+wrap the CORRIDOR path; they used to wrap the deleted voxel/region/spanmesh and
+so reported everything as "(other)"). Sub-stage rows are INDENTED because they
+nest inside `build_union_mesh` — only top-level rows may be subtracted, or
+"(other)" goes negative.
+
+- **Never recompute a whole-mesh property inside a per-node loop.**
+  `_merge_at_pathgrid_nodes` called `_tri_components` (full-mesh union-find) once
+  per pathgrid node — 831 x ~4000 tris, ~60% of a large cell. It is only stale
+  after an ACTUAL weld, and most nodes weld nothing, so memoise it and clear the
+  memo only when a weld happens (61% -> 0.5% of build time).
+- **All-pairs shapely predicates are the default hotspot.** `pa.intersects(pb)`
+  over N ribbons was 7.4M scalar calls (~33%). `shapely.STRtree(polys)` +
+  `tree.query(polys, predicate='intersects')` does the same box filter in bulk C.
+  Same in `_same_surface_region`. **Sort the candidate pairs** — the union-find
+  that consumes them must see the old nested-loop order or output shifts.
+- **Memoise `_ribbon_polygon`** (pure function of the strip, called 379,250x for
+  a few thousand strips; the invalid-outline buffer/union repair re-ran every
+  time). Keyed on `id(strip)` while holding a reference to the strip, cleared per
+  `build_union_mesh` so a worker converting thousands of cells cannot leak.
+- **Set-membership beats rebuilding tuples in a loop:**
+  `any((min(i,j),max(i,j)) in cset for j in sub)` over sub-sheet members was
+  17.8M min/max calls; per-ribbon adjacency sets + `set.isdisjoint` replace it.
+- **Batch scalar shapely into vectorised calls only where the work is Python
+  overhead, not GEOS.** 9 grid samples per `_overlap_height_gap` built 274k
+  `Point` objects; `shapely.points(list)` + `shapely.intersects` in one call won.
+  But batching the pairwise `intersection`/`area` was **SLOWER** (17.0 -> 17.9s):
+  GEOS clipping dominates and the bulk form materialises an intersection for
+  every candidate instead of discarding most on a cheap area test. Measure.
+- **C++ is NOT warranted here (measured).** After the above, 46% of remaining
+  tottime is inside shapely/GEOS (robust boolean ops + triangulation) and only
+  30% is our Python; a perfect union rewrite is Amdahl-capped at 5.3x and would
+  mean reimplementing GEOS against a byte-exact output contract. `grow.cpp`
+  (`_navgrow_native`) stays. `decimate.cpp`/`_navmesh_native` was DELETED — it
+  served only spanmesh.
+- **DELETED with the old generator:** `navmesh/voxel.py`, `region.py`,
+  `spanmesh.py`, `native/src/decimate.cpp`, and their tests/fixtures in
+  `tests/test_pgrd_navm.py` (which asserted collision-discovery rules the
+  corridor model does not have — it derives the mesh from the pathgrid).
+  Corridor geometry is verified against real cells by `tools/navmesh_check.py`,
+  `navmesh_reach.py`, `navmesh_slope_check.py`.
+
 ## Parallelism Rules (learned 2026-07-16)
 
 - **ThreadPoolExecutor is ONLY for I/O or subprocess work** (file reads, papyrus.exe, xWMAEncode). Pure-Python record conversion/parsing/formatting holds the GIL — threads pin one core AND (when converters allocate companion FormIDs) make output nondeterministic. Use ProcessPoolExecutor.
@@ -163,7 +210,9 @@ relevant doc when working in that area:
 | [docs/record_mapping_reference.md](docs/record_mapping_reference.md) | Full TES4→TES5 record type mapping table, OBND/structural requirements, skipped/problem records, skill/weapon/biped-slot/enchantment mapping tables, Skyblivion best-practices (NPC_/ENCH/SPEL/FACT/ALCH/CELL/WRLD/REFR/LTEX/SOUN/CLAS conversion rules) |
 | [docs/nif_conversion_notes.md](docs/nif_conversion_notes.md) | NIF mesh conversion deep-dive: bhk collision/MOPP/CMS, particle systems, FlameNode grafting, worn armor/shields/furniture markers, skin retargeting, clutter physics, terrain LOD, SpeedTree procedural conversion |
 | [docs/dialogue_conversion_notes.md](docs/dialogue_conversion_notes.md) | DIAL/INFO/QUST/DLBR/DLVW conversion implementation notes, voice type routing, AddTopic unlock system, GetIsID injection |
+| [docs/ambient_dialogue_channel_plan.md](docs/ambient_dialogue_channel_plan.md) | Oblivion's 3 delivery channels (GREETING on-activate / HELLO ambient / Type-1 NPC-to-NPC) vs Skyrim's 2; why NPCs quip every 5s and why NPC-to-NPC topics show as EditorIDs in the player menu; fix plan ordered by ease |
 | [docs/world_land_navmesh_notes.md](docs/world_land_navmesh_notes.md) | PGRD→NAVM/NAVI conversion algorithm, LAND record structure, landscape TXST |
+| [docs/weather_climate_conversion.md](docs/weather_climate_conversion.md) | WTHR/CLMT conversion: the WRLD→CNAM→CLMT→WLST chain and Oblivion's runtime DefaultClimate fallback, NAM0 17-slot remap + which slots must be black, cloud-speed unit conversion (both games cap at 0.1), measured DALC face weights, sky meshes needing BSSkyShaderProperty |
 | [docs/creature_conversion.md](docs/creature_conversion.md) | CREA→Skyrim actor conversion plan + implementation status: generated behavior graphs, HKX skeleton/animation/ragdoll, creature records |
 | [docs/horse_rideability_plan.md](docs/horse_rideability_plan.md) | Feasibility + plan for rideable horses: RACE Mount Data, horse/rider behavior graph pair, vanilla rider-animation sourcing (Oblivion has none) |
 | [docs/python_tools_reference.md](docs/python_tools_reference.md) | Command reference for `tes4_export`/`tes5_import`/`asset_convert` modules and `tools/` debug utilities |

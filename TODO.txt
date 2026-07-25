@@ -1,19 +1,17 @@
 Work Order:
-	Navmesh not sufficient for real gameplay M4
 	Dialog not exact L1
 	Voice lines missing L6
 	Fix stairs L8
 	Crime System L11, mi5
-	Main Quest M8
 
 Major Issues for V1:
-	1 - Iterate on quest and dialog conversion until everything is playable
+	1 - Iterate on quest and dialog conversion until everything is playable startin with Oblivion Main Quest
 
 	2 - Havok feels off. Items don't move like they should. Specifically, there seems to be too much inertia on small items, like I'm dragging a heavy object when it is something as small as a cup, Animated signs will get stuck in a position after swinging a bit, defying gravicty
 		ctrigtripwire01.nif also break when walked over, and prisoncellchains01.nif doesn't properly swing (this is most likely because it is a static and not an activator).
 
 	4 - Navmesh refinement
-		ensure corridors connect pathgrid islands
+		ensure corridors connect pathgrid islands + other connectivity issues
 		allow growth even on slopes
 
 	5 - Fix CK Loading (not sure why it doesn't finish)
@@ -21,9 +19,7 @@ Major Issues for V1:
 	6 - Need new skyrim body mesh to actually work to allow leg skin to appear
 	
 	7 - If I join the fighter's guild by speaking to Azzan, but don't select "contract' and leave dialog. the next time I talk to him he is missing all topics but "rumors"
-	
-	8 - Attempting to start the game using setStage charactergen 5 teleports me to the dungeon but nothing happens other than I get a quest stage to use right stick (even though I'm playing on mouse) to move around.
-	
+		
 Later Issues:
 
 	1 - Refine dialog conversion based on dialog emulators to exactly match Oblivion
@@ -52,12 +48,9 @@ Later Issues:
 
 	15 - Find additional inverted collision examples in Nehrim
 
-	16 - Nehrim signposts missing texture
+	16 - Restore Oblivion's NPC-to-NPC conversations (dropped, see docs/ambient_dialogue_channel_plan.md)
 
-	17 - More granular navmesh caching to make rebuilds fewer
-
-	DECIMATE_MIN_EDGE
-	RIBBON_RAIL_SIMPLIFY
+	17 - Nehrim signposts missing texture
 
 Minor Issues:
 

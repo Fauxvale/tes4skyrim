@@ -339,6 +339,21 @@ def get_str(record: dict, key: str, default: str = '') -> str:
     return str(val)
 
 
+def get_hex_bytes(record: dict, key: str, default: bytes = b'') -> bytes:
+    """Get a raw byte blob exported as an uppercase hex string.
+
+    Used by records the export dumps verbatim (WTHR NAM0 colour tables).
+    Returns `default` if the key is absent or is not valid hex.
+    """
+    val = record.get(key)
+    if not val:
+        return default
+    try:
+        return bytes.fromhex(str(val))
+    except ValueError:
+        return default
+
+
 def get_indexed_list(record: dict, prefix: str, field: str, count_key: str = None) -> list:
     """Get a list of indexed values like Item[0].FormID, Item[1].FormID, etc.
 
