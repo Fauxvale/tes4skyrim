@@ -152,7 +152,7 @@ def _crea_acbs(rec: dict) -> bytes:
                        calc_min, calc_max, 100, 0, 0, 0, 0)
 
 
-def _npc_aidt(rec: dict) -> bytes:
+def _npc_aidt(rec: dict, is_creature: bool = False) -> bytes:
     """Build TES5 AIDT subrecord (20 bytes).
 
     TES5 layout:
@@ -172,12 +172,49 @@ def _npc_aidt(rec: dict) -> bytes:
     conf = get_int(rec, 'AIDT.Confidence')
     energy = get_int(rec, 'AIDT.EnergyLevel', 50)
     resp = get_int(rec, 'AIDT.Responsibility')
-    # TES4 aggression → TES5 tier. TES4 semantics: attack anything with
-    # disposition < aggression, default 5 — so anything above 5 initiates
-    # combat against disliked targets and maps to TES5 1 (attacks enemies).
-    # The old >=40 threshold left mid-range actors (dog=30) at 0 =
-    # Unaggressive, which never initiates combat at all.
-    tes5_aggr = 2 if aggr >= 70 else (1 if aggr > 5 else 0)
+    pers = get_int(rec, 'DATA.Personality', 50)
+    # TES4 aggression → TES5 tier. Both games gate combat on the SAME two axes,
+    # only renamed, so the mapping models the TES4 rule directly rather than
+    # bucketing aggression alone.
+    #
+    #   TES4 (UESP Oblivion:Aggression / Oblivion:Disposition): an actor attacks
+    #   a target when disposition(actor→target) < aggression - 5. Starting
+    #   disposition toward the player ≈ the actor's Personality, shifted by
+    #   race/faction reactions; "enemies are programmed to have NEGATIVE
+    #   dispositions towards you." aggression <= 5 never attacks; >= 106 attacks
+    #   anyone regardless of disposition.
+    #
+    #   TES5 replaces the 0-100 disposition scalar with a discrete combat
+    #   reaction (Enemy/Neutral/Friend/Ally) and makes aggression a TIER that
+    #   says which reactions it will attack: 0 attacks nobody unprovoked, 1
+    #   "Aggressive" attacks only Enemies (a neutral player is not attacked — the
+    #   actor merely RETALIATES when hit), 2 "VeryAggressive" attacks Neutrals on
+    #   sight too, 3 "Frenzied" attacks everyone incl. allies.
+    #
+    # So the faithful tier is: does the TES4 actor attack the (neutral) player
+    # ON SIGHT? If yes it needs tier 2, because our converter does not rebuild
+    # the TES4 predator/prey faction-reaction network that would make the player
+    # an Enemy and let tier 1 suffice; if it only attacks once provoked it is
+    # tier 1; aggression<=5 is tier 0; >=106 is tier 3.
+    #
+    # disposition estimate: NPCs default NEUTRAL to a stranger (disp ≈
+    # Personality). CREATURES are the player's enemy by default — vanilla puts
+    # them in CreatureFaction/Prey which carry negative relations to the player
+    # — so their effective disposition sits an enemy-reaction penalty below
+    # Personality. That penalty is the missing reaction term (NOT a type
+    # shortcut): without it a marginal predator like the FGC01Rats hunt lion
+    # (aggr=10, Personality=10) reads disp 10 !< 5 and never hunts, while the
+    # basement lion (aggr=70) works — exactly the reported bug.
+    ENEMY_REACTION = 40  # TES4 predator/prey→player reaction, negative-disposition side
+    disp = pers - ENEMY_REACTION if is_creature else pers
+    if aggr <= 5:
+        tes5_aggr = 0
+    elif aggr >= 106:
+        tes5_aggr = 3
+    elif disp < aggr - 5:
+        tes5_aggr = 2   # attacks the neutral player on sight
+    else:
+        tes5_aggr = 1   # peaceful until provoked, then retaliates
     # TES4 confidence → TES5 tier
     tes5_conf = 0 if conf < 30 else (3 if conf >= 70 else 2)
     # TES4 responsibility → TES5 morality (inverted: high resp = no crime)
@@ -805,8 +842,10 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
         subs += pack_uint32_subrecord('COCT', coct)
         subs += item_data
 
-    # AIDT — 20 bytes (TES5 format, shared with NPC_)
-    subs += pack_subrecord('AIDT', _npc_aidt(rec))
+    # AIDT — 20 bytes (TES5 format, shared with NPC_). Creatures use the
+    # predator threshold: any TES4 aggression above the passive default (5)
+    # means "attack on sight", which in TES5 requires VeryAggressive.
+    subs += pack_subrecord('AIDT', _npc_aidt(rec, is_creature=True))
 
     # PKID — TES4 PACK records are skipped (SKIP_TYPES), so a raw pass-through
     # gave creatures NO working packages → the AI layer made no decisions and
