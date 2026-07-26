@@ -649,7 +649,9 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
         # drives — see build_say_timer_owners. Emitting `<timer> = <secs>` in
         # the End fragment replaces the call site's worst-case estimate with
         # the length of the line that actually played.
-        timer_fix = ''
+        timer_fix = False
+        timer_ref = ''
+        timer_beat_ref = ''
         topic_name = topic_by_dial.get(rec.get('ParentDIAL', ''), '')
         owner = timer_owners.get(topic_name)
         seq_gate = _sequence_gate(rec, owner)
@@ -684,13 +686,14 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             # any. Oblivion charged those ON TOP of the line's length. Consume
             # it only when the owner actually HAS one — referencing a companion
             # that was never declared fails to compile.
+            timer_ref = ref
             if _owner_has_beat(spec, kind):
-                beat_ref = ScriptConverter.beat_property(ref)
-                timer_fix = (f'  {ref} = {beat_ref}\n'
-                             f'  {beat_ref} = 0')
-            else:
-                # The line is over; let the next speaker start on the next tick.
-                timer_fix = f'  {ref} = 0'
+                timer_beat_ref = ScriptConverter.beat_property(ref)
+            # The line is over; let the next speaker start on the next tick.
+            # The value is committed at the END of the fragment (see below) —
+            # releasing it before the body advances the sequence state lets the
+            # owning script's poll re-fire the SAME line.
+            timer_fix = True
         if not has_script and not reveals and not timer_fix:
             # Script-less service-menu INFOs use the shared static scripts.
             continue
@@ -740,13 +743,30 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             # line finishes, right before the topic menu refreshes.
             for gname in reveals:
                 out_lines.append(f'  {gname}.SetValue(1)')
-            # Correct the conversation timer to THIS line's real length BEFORE
-            # the converted body: Oblivion's value at this point was the line's
-            # own duration, and a result script that retimes the beat does so
-            # RELATIVE to it (CharGenMain 0x32B0C cuts Glenroy off with
-            # `convTimer - .4`). Writing it afterwards would discard that.
-            if timer_fix:
-                out_lines.append(f'{timer_fix}  ; line ended')
+            # The timer release must be the LAST thing this fragment does.
+            #
+            # The release is what re-opens the owning script's poll guard
+            # (`If <quest>.speaker == 2 && <quest>.convTimer <= 0`, or Valen
+            # Dreth's `ElseIf talk == 1`).  The BODY is what advances the state
+            # that guard reads — the counter (`convCount + 1`), the speaker
+            # (`speaker = 0`), the stage (`SetStage(18)`).  Releasing first
+            # opens the guard while the old state is still in place, so the
+            # poller re-fires the SAME line before the body ever runs:
+            #   RENAULT FIRE cnt=15 -> FRAG accepted -> RENAULT FIRE cnt=15
+            # Renault repeated her line and the re-Say re-armed convTimer to
+            # 8.33, which held stage 18 open past the EvaluatePackage() the
+            # stage fragment had just issued, so CGRenoteOpenSecretDoor was
+            # never selected and the secret door never opened.  Valen Dreth
+            # repeats for the same reason (his `talk` flag never advances, so
+            # only the re-armed timer stops it looping).
+            #
+            # A body that RETIMES the beat is not a problem here.  Oblivion ran
+            # this while the line was still playing, so `convTimer - .4` cut
+            # SHORT a value that was still counting down.  Our fragment runs
+            # when the line has ALREADY ended, so the base is 0 and `0 - .4` is
+            # negative — which the `<= 0` guards read as "release now", the
+            # same outcome.  So the release can simply come last.
+            #
             # A polled-conversation line whose turn has already passed (a quest
             # stage re-seeded the counter mid-line) must apply NOTHING, or its
             # `counter + 1` overshoots the re-seeded value. See _sequence_gate.
@@ -756,6 +776,17 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 out_lines.append('  EndIf')
             else:
                 out_lines.extend(body_lines)
+            # Release LAST — after the body advanced the counter/speaker/stage
+            # the owning script's poll guard reads.
+            if timer_fix:
+                if timer_beat_ref:
+                    # The pause the owning script stacks after this line.
+                    # Oblivion charged it ON TOP of the line's length.
+                    out_lines.append(f'  {timer_ref} = {timer_beat_ref}'
+                                     '  ; line ended (+ stacked beat)')
+                    out_lines.append(f'  {timer_beat_ref} = 0')
+                else:
+                    out_lines.append(f'  {timer_ref} = 0  ; line ended')
             if service_kind:
                 out_lines.append(_SERVICE_MENU_CALL[service_kind])
             out_lines.append('EndFunction')

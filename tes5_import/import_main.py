@@ -526,7 +526,29 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     set_quest_packages(pack_plan.owner_quest.keys())
 
     from .pack_converter import PackContext
-    pack_ctx = PackContext(plan=pack_plan, script_vars=_script_vars)
+    # REFR -> base signature, so UseItemAt can tell furniture (sit) from a
+    # switch/lever/door (activate).  Built from the base records already parsed.
+    _base_sig = {}
+    for _sig in ('ACTI', 'FURN', 'DOOR', 'CONT', 'STAT', 'MISC', 'LIGH'):
+        for _r in by_type.get(_sig, []):
+            try:
+                _base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _sig
+            except ValueError:
+                pass
+    _ref_base_sig = {}
+    for _sig in ('REFR',):
+        for _r in by_type.get(_sig, []):
+            _b = _r.get('NAME')
+            if not _b:
+                continue
+            try:
+                _bs = _base_sig.get(int(_b, 16) & 0xFFFFFF)
+                if _bs:
+                    _ref_base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _bs
+            except ValueError:
+                pass
+    pack_ctx = PackContext(plan=pack_plan, script_vars=_script_vars,
+                           ref_base_sig=_ref_base_sig)
     _step_done('package plan')
 
     # --- Phase 0h: placed leveled creatures (REFR→LVLC) ---

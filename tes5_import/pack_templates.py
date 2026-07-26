@@ -244,6 +244,23 @@ HOLD_POSITION = Template(
     slots={'location': 0},
 )
 
+# --- Activate (00019B2D) -------------------------------------------------
+# "Walk to this reference and ACTIVATE it" — pulling a lever, opening a door,
+# throwing a switch.  TES4's UseItemAt (PKDT.Type 8) with a specific target is
+# this, NOT SitTarget: routing it to SitTarget told the actor to sit on the
+# object, so an actor sent to a switch just stood there and the scripted door
+# never opened (CharacterGen stage 18, Renault at the secret wall switch).
+#
+# Copied from CWEscapeCitySceneActivateDoor: 2 inputs, UNAM [0, 2], XNAM 6.
+# Slot 1 (Int) is 1 in every vanilla instance.
+ACTIVATE = Template(
+    formid=0x00019B2D, edid='Activate', xnam=6, version=13,
+    index_list=(0, 2),
+    inputs=(T_SINGLEREF, T_INT),
+    defaults={1: 1},
+    slots={'target': 0},
+)
+
 # --- SitTarget (000A9277) — 276 instances --------------------------------
 # procedures: Wait.  Sits at a *specific* furniture ref.
 SIT_TARGET = Template(

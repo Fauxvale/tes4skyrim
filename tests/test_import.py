@@ -3171,6 +3171,49 @@ class TestSayTimerRelease:
         owner = build_say_timer_owners({'SCPT': [scpt], 'QUST': []})
         assert owner['chargentaunt2'][0] == 'speaker'
 
+    def test_release_comes_after_the_body_advances_the_sequence(self):
+        """The timer release must be the LAST statement in the fragment.
+
+        The release re-opens the owning script's poll guard
+        (`speaker == 2 && convTimer <= 0`, or Valen Dreth's `ElseIf talk == 1`);
+        the BODY advances the state that guard reads (convCount/speaker/stage).
+        Releasing first opens the guard while the OLD state still stands, so the
+        poller re-fires the same line — observed in a runtime trace as
+        `RENAULT FIRE cnt=15` -> fragment accepted -> `RENAULT FIRE cnt=15`.
+        The re-Say re-armed convTimer to 8.33, which held stage 18 open past the
+        EvaluatePackage() its stage fragment had just issued, so
+        CGRenoteOpenSecretDoor was never selected and the secret door never
+        opened. Valen Dreth repeats his taunt for the same reason.
+        """
+        import os
+        import re
+        src = os.path.join('output', 'Oblivion.esm', 'scripts', 'source')
+        if not os.path.isdir(src):
+            pytest.skip('no generated scripts to check')
+        advances = re.compile(
+            r'still this line|SetStage\(|convCount|\.speaker =|\.target =')
+        offenders = []
+        checked = 0
+        for fn in os.listdir(src):
+            if not fn.startswith('TES4_TIF__'):
+                continue
+            lines = open(os.path.join(src, fn),
+                         encoding='utf-8', errors='replace').read().splitlines()
+            rel = [i for i, ln in enumerate(lines) if '; line ended' in ln]
+            if not rel:
+                continue
+            checked += 1
+            for r in rel:
+                after = [ln for ln in lines[r + 1:] if advances.search(ln)]
+                if after:
+                    offenders.append(f'{fn}: {after[0].strip()}')
+                    break
+        assert checked, 'expected some fragments to release a say timer'
+        assert not offenders, (
+            'these fragments release the conversation timer BEFORE advancing '
+            'the sequence state, so the owning script re-fires the same line:\n'
+            + '\n'.join(offenders[:10]))
+
 
 class TestWeatherImageSpace:
     """WTHR HDR tone mapping -> companion IMGS records.
@@ -3339,3 +3382,79 @@ class TestWeatherImageSpace:
         src = inspect.getsource(PluginWriter)
         assert src.index("'IMGS'") < src.index("'WTHR'")
         assert src.index("'WTHR'") < src.index("'CLMT'")
+
+
+class TestVanillaMgefDataSize:
+    """The vanilla MGEF DATA table must hold FULL 152-byte structs.
+
+    tools/gen_vanilla_mgef_table.py used to read the Skyrim.esm dump with
+    `line.split('...')[0]`, and the dump truncated hex at 96 bytes — so every
+    committed blob was 96 bytes and every synthesized aimed-variant MGEF
+    shipped a DATA missing its last 14 fields (HitEffectArt, ImpactData,
+    DualCasting, EnchantArt, HitVisuals, EquipAbility, IMAD, PerkToApply,
+    CastingSoundLevel, ScriptEffect AI score/delay).
+    """
+
+    def test_every_committed_blob_is_a_full_struct(self):
+        from tes5_import.vanilla_mgef_data import (
+            MGEF_DATA_SIZE,
+            VANILLA_MGEF_DATA,
+        )
+        assert MGEF_DATA_SIZE == 152
+        assert VANILLA_MGEF_DATA, 'table is empty'
+        for fid, (edid, data_hex) in VANILLA_MGEF_DATA.items():
+            n = len(bytes.fromhex(data_hex))
+            assert n == MGEF_DATA_SIZE, (
+                f'{edid} ({fid:08X}) DATA is {n} bytes, expected '
+                f'{MGEF_DATA_SIZE} — regenerate the table')
+
+    def test_aimed_variant_writes_a_full_length_data(self):
+        """The synthesized clone must be a complete, correctly-patched MGEF."""
+        from tes5_import import magic_effects
+        from tes5_import.vanilla_mgef_data import MGEF_DATA_SIZE
+
+        class _Writer:
+            def __init__(self):
+                self.fid = 0x01000000
+                self.records = []
+
+            def alloc_formid(self):
+                self.fid += 1
+                return self.fid
+
+            def add_record(self, rec_type, data):
+                self.records.append((rec_type, data))
+
+        magic_effects.set_tes4_effect_names(
+            [{'EditorID': 'FIDG', 'FULL': 'Fire Damage'}])
+        writer = _Writer()
+        # FireDamageFFAimed — a vanilla effect that already has a projectile.
+        assert magic_effects.aimed_variant(0x00012F03, 'FIDG', writer)
+
+        rec_type, blob = writer.records[0]
+        assert rec_type == 'MGEF'
+        data = _find_subrecord(blob, b'DATA')
+        assert len(data) == MGEF_DATA_SIZE
+
+        # The patched fields: Fire and Forget + Aimed + a real projectile, and
+        # no counter-effect slots (the clone carries no ESCE subrecords).
+        assert struct.unpack_from('<I', data, 80)[0] == 1   # Casting Type
+        assert struct.unpack_from('<I', data, 84)[0] == 2   # Delivery = Aimed
+        assert struct.unpack_from('<I', data, 72)[0] != 0   # Projectile
+        assert struct.unpack_from('<I', data, 20)[0] == 0   # Counter count
+
+        # A field that only exists past the old 96-byte cut, proving the tail
+        # is present: vanilla FireDamageFFAimed has DualCastScale == 1.0.
+        assert struct.unpack_from('<f', data, 112)[0] == pytest.approx(1.0)
+
+    def test_short_blob_is_rejected_rather_than_written(self):
+        from tes5_import import magic_effects
+        original = magic_effects.VANILLA_MGEF_DATA.get(0x00012F03)
+        magic_effects.VANILLA_MGEF_DATA[0x00012F03] = ('Truncated', '00' * 96)
+        magic_effects._cache.clear()
+        try:
+            with pytest.raises(ValueError, match='expected 152'):
+                magic_effects.aimed_variant(0x00012F03, 'FIDG', object())
+        finally:
+            magic_effects.VANILLA_MGEF_DATA[0x00012F03] = original
+            magic_effects._cache.clear()

@@ -37,6 +37,7 @@ from .pack_templates import (
     PKDT_TYPE_PACKAGE,
     SANDBOX,
     SIT_TARGET,
+    ACTIVATE,
     SLEEP,
     TRAVEL,
     T_BOOL,
@@ -279,12 +280,28 @@ def build_location(loc_type: int, value: int, radius: int) -> bytes:
     return struct.pack('<iIi', loc_type, value & 0xFFFFFFFF, radius)
 
 
-def build_target(t_type: int, target: int, count: int) -> bytes:
+def build_target(t_type: int, target: int) -> bytes:
     """TES4 PTDT -> TES5 PTDA.  Types 0 (specific ref), 1 (object id) and
-    2 (object type) map 1:1."""
+    2 (object type) map 1:1.
+
+    The third field is NOT TES4's Count.  xEdit names it 'Count / Distance'
+    (wbDefinitionsTES5.pas ~8665) and for a Specific-Reference target the
+    engine reads it as the DISTANCE the actor must be within to act on the
+    target -- so TES4's usage Count lands in a slot that means something else
+    entirely.  CGRenoteOpenSecretDoor carries PTDT.Count=1, which became
+    "activate this switch only from within 1 unit": Renault was handed the
+    package (log shows her taking 1A04D84D for a single frame at dist=120),
+    could not satisfy it, and the engine dropped her straight back to
+    CGRenoteWalkToMarkerB (GetStage >= 15, still true at 18) -- so she stood
+    at the switch forever and the secret door never opened.
+
+    Skyrim never uses the field: ALL 3,740 PTDA records in Skyrim.esm +
+    Dawnguard + Dragonborn + HearthFires + Update have it at 0, across every
+    target type (0/1/2/3/4/6).  There is nothing to translate, so write 0.
+    """
     if t_type < 0 or t_type > 2:
         return _null_target()
-    return struct.pack('<iIi', t_type, target & 0xFFFFFFFF, count)
+    return struct.pack('<iIi', t_type, target & 0xFFFFFFFF, 0)
 
 
 def build_alias_target(alias_index: int) -> bytes:
@@ -402,13 +419,21 @@ class PackContext:
     translate GetScriptVariable conditions.
     """
 
-    def __init__(self, plan=None, script_vars=None, greeting_topic=0):
+    def __init__(self, plan=None, script_vars=None, greeting_topic=0,
+                 ref_base_sig=None):
         self.plan = plan
         self.script_vars = script_vars or {}
         # Converted FormID of the GREETING topic (TES4 DIAL 0x000000C8).  A
         # ForceGreet package opens THIS -- Oblivion's force-greet raised the
         # dialogue menu, whose greeting comes from the shared GREETING topic.
         self.greeting_topic = greeting_topic
+        # raw24 REFR fid -> its BASE record signature ('ACTI', 'FURN', ...).
+        # UseItemAt has to know whether its target is furniture (sit) or
+        # something to operate (activate); see _choose().
+        self.ref_base_sig = ref_base_sig or {}
+
+    def base_sig_of(self, ref_fid: int) -> str:
+        return self.ref_base_sig.get(ref_fid & 0x00FFFFFF, '')
 
     def quest_of(self, pack_fid: int):
         if self.plan is None:
@@ -434,7 +459,6 @@ def resolve_target(rec: dict, ctx: PackContext, pack_fid: int) -> bytes:
     if t_type < 0:
         return _null_target()
     target = get_formid(rec, 'PTDT.Target')
-    count = get_int(rec, 'PTDT.Count', 0)
 
     if t_type == 0:
         if not target:
@@ -445,7 +469,7 @@ def resolve_target(rec: dict, ctx: PackContext, pack_fid: int) -> bytes:
         alias = ctx.alias_for(pack_fid, target)
         if alias is not None:
             return build_alias_target(alias)
-    return build_target(t_type, target, count)
+    return build_target(t_type, target)
 
 
 def resolve_location(rec: dict, ctx: PackContext, pack_fid: int) -> bytes:
@@ -639,6 +663,19 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
     # have no direct TES5 input here; they degrade to sandbox. ---
     if ptype == T4_USEITEMAT:
         if get_int(rec, 'PTDT.Type', -1) == 0 and get_formid(rec, 'PTDT.Target'):
+            # "Use item at" covers BOTH sitting on furniture and OPERATING a
+            # thing (lever, switch, door).  Routing every target to SitTarget
+            # told the actor to sit on a wall switch, so it walked over and
+            # stood there forever and the scripted door never opened —
+            # CharacterGen stage 18, Renault at CGPrisonWallSwitchRef (base
+            # ACTI PrisonSecretWallSwitch01).  Only real furniture sits.
+            # The map is keyed on the RAW TES4 id (low 24 bits are identical
+            # either way, so the remapped value keys it correctly too).
+            sig = ctx.base_sig_of(get_formid(rec, 'PTDT.Target'))
+            if sig and sig not in FURNITURE_SIGS:
+                i = Inputs(ACTIVATE)
+                i.set('target', tgt)
+                return i
             i = Inputs(SIT_TARGET)
             i.set('target', tgt)
             return i
@@ -650,10 +687,24 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
         i.set('allow_wandering', 0)
         return i
 
-    # --- Find: travel to the location, then sandbox there.  The "locate this
-    # object" tail has no TES5 standalone equivalent and is dropped; the travel
-    # and the destination — what a player actually observes — are exact. ---
+    # --- Find ---
     if ptype == T4_FIND:
+        # "Find the PLAYER" is the same force-greet idiom as a player-targeted
+        # Ambush — 73 of Oblivion's 741 Find packages aim at the player and are
+        # named accordingly (SE37ThankPC, SE03KilibanFindPC,
+        # SE10StaadaForceGreetPlayerDeath).  Sandboxing them made the actor
+        # wander instead of seeking the player out and talking.
+        if get_formid(rec, 'PTDT.Target') == PLAYER_FID:
+            i = Inputs(FORCE_GREET)
+            i.set('target', _target(0, PLAYER_FID, 0))
+            i.set('topic', greet_topic or 0)
+            radius = float(get_int(rec, 'PLDT.Radius', 0) or 0)
+            if radius > 0:
+                i.set('forcegreet_distance',
+                      _location(0, PLAYER_FID, int(radius)))
+            return i
+        # Otherwise: travel to the location, then sandbox there.  The "locate
+        # this object" tail has no TES5 standalone equivalent.
         i = Inputs(SANDBOX)
         i.set('location', loc)
         i.set('allow_wandering', 1)
@@ -691,10 +742,20 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
     # An Ambush aimed at the PLAYER is Oblivion's scripted-approach idiom, not
     # a hostile ambush: the actor walks over so dialogue can fire.  Real
     # ambushes wait on a location (no PTDT) or target another actor.
-    is_forcegreet = (ptype == T4_AMBUSH
+    is_forcegreet = (ptype in (T4_AMBUSH, T4_FIND)
                      and get_formid(rec, 'PTDT.Target') == PLAYER_FID)
     flags, speed = convert_flags(get_int(rec, 'PKDT.Flags'), ptype,
                                  not is_forcegreet)
+    # A scripted one-shot (force-greet, or "go operate that switch") must run
+    # at vanilla's pace and with vanilla's interrupt authorisation, or the actor
+    # dawdles / can never break off to do the thing.  Both were measured from
+    # real instances: MS05InductionForcegreet and CWEscapeCitySceneActivateDoor.
+    is_activate = (ptype == T4_USEITEMAT
+                   and get_int(rec, 'PTDT.Type', -1) == 0
+                   and get_formid(rec, 'PTDT.Target')
+                   and ctx.base_sig_of(get_formid(rec, 'PTDT.Target'))
+                   not in FURNITURE_SIGS
+                   and ctx.base_sig_of(get_formid(rec, 'PTDT.Target')))
     if is_forcegreet:
         # Copy vanilla's force-greet PKDT exactly (MS05InductionForcegreet):
         # no flags, speed 2 (run), and interrupt flags 0xFEFF.  The interrupts
@@ -704,6 +765,11 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
         # open dialogue no matter how close the actor gets.
         subs += pack_subrecord('PKDT', build_pkdt(0, SPEED_RUN,
                                                   interrupt=0xFEFF))
+    elif is_activate:
+        # Keep the TES4 flags (Must Complete / Once Per Day are real), but take
+        # vanilla's speed and interrupts.
+        subs += pack_subrecord('PKDT', build_pkdt(flags, SPEED_RUN,
+                                                  interrupt=0xFFFF))
     else:
         subs += pack_subrecord('PKDT', build_pkdt(flags, speed))
     subs += pack_subrecord('PSDT', build_psdt(rec))
