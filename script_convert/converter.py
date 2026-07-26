@@ -1999,29 +1999,41 @@ class ScriptConverter:
                     remainder = value[paren_end + 1:].strip()
                     # If remainder is just "+ number", extract the delay for the timer
                     delay_m = re.match(r'[+\-]\s*([\d.]+)', remainder) if remainder else None
-                    # TES4 Say/SayTo RETURNED the voice line's duration and every
-                    # polling conversation counts that timer down before speaking
-                    # the next line.  Papyrus Say() returns nothing, so charge the
-                    # MEASURED duration and let the owning script's existing
-                    # countdown drain it — the same self-clearing delay Oblivion
-                    # had.  Written BEFORE the Say call so the value is in place
-                    # whatever the engine does with the line.
+                    # TES4 `set t to Say ...` charged the line's duration and the
+                    # owning script counted it down before the next speaker went.
+                    #
+                    # ORDER MATTERS. The charge is emitted AFTER the Say call, not
+                    # before. These conversations share ONE quest timer between
+                    # four polling actor scripts, and `Say()` is asynchronous: the
+                    # INFO's End fragment (which zeroes the timer and hands
+                    # `speaker` to the next actor) can run on the engine's
+                    # dialogue thread at any point. Charging FIRST lets a speaker
+                    # stamp the shared timer and then have its line dropped or its
+                    # fragment land immediately — leaving a stale charge that
+                    # holds the NEXT speaker's `timer <= 0` guard shut. In game
+                    # that reads as counters advancing with no audio and a timer
+                    # that "never reaches 0 because it resets whenever dialogue
+                    # plays" (CharacterGen's cell-door exchange).
+                    #
+                    # Charging after the call keeps the timer owned by the speaker
+                    # that actually spoke, and a dropped Say leaves it clear so
+                    # the next tick simply retries.
                     delay_f = (self._say_seconds(say_call) +
                                (float(delay_m.group(1)) if delay_m else 0.0))
                     delay_val = f'{delay_f:g}'
                     # An Int target (TES4 `short`) can't take a Float literal
                     if self._var_types.get(target.lower().split('.')[-1]) == 'Int':
                         delay_val = str(int(delay_f))
-                    return (f'{target} = {delay_val}'
-                            '  ;line length; blocks a re-Say until the End fragment clears it\n'
-                            f'  {say_call}')
+                    return (f'{say_call}\n'
+                            f'  {target} = {delay_val}'
+                            '  ;line length; the End fragment clears it early')
                 secs = self._say_seconds(value)
                 say_dflt = (str(int(round(secs))) if self._var_types.get(
                     target.lower().split('.')[-1]) == 'Int'
                     else f'{secs:g}')
-                return (f'{target} = {say_dflt}'
-                        '  ;line length; blocks a re-Say until the End fragment clears it\n'
-                        f'  {value}')
+                return (f'{value}\n'
+                        f'  {target} = {say_dflt}'
+                        '  ;line length; the End fragment clears it early')
             # GlobalVariable: use SetValue() instead of direct assignment
             tgt_low = target.lower().split('.')[-1]
             if self._property_refs.get(target, self._property_refs.get(tgt_low, '')) == 'GlobalVariable':

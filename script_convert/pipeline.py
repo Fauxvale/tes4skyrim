@@ -40,13 +40,16 @@ def _new_stats() -> dict:
 def _script_worker_init(xref, output_dir, info_reveals, service_topics,
                         stage_reveals, say_durations=None,
                         say_timer_owners=None, topic_by_dial=None,
-                        beat_fields_by_owner=None):
+                        beat_fields_by_owner=None, quest_script_vars=None,
+                        quest_edid_by_fid=None):
     _WORKER_CTX.update(xref=xref, output_dir=output_dir,
                        info_reveals=info_reveals,
                        service_topics=service_topics,
                        stage_reveals=stage_reveals,
                        say_timer_owners=say_timer_owners or {},
-                       topic_by_dial=topic_by_dial or {})
+                       topic_by_dial=topic_by_dial or {},
+                       quest_script_vars=quest_script_vars or {},
+                       quest_edid_by_fid=quest_edid_by_fid or {})
     # Class-level, so every ScriptConverter a worker builds sees the measured
     # voice-line lengths that converted Say() timers are charged with.
     ScriptConverter.say_durations = say_durations or {}
@@ -213,9 +216,15 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
         print(f'    say timers: {len(say_timer_owners)} topics drive a quest '
               f'conversation timer (per-line correction)')
 
+    quest_script_vars = build_quest_script_vars(by_type)
+    quest_edid_by_fid = {int(r.get('FormID','0'),16) & 0xFFFFFF:
+                         (r.get('EditorID') or '')
+                         for r in by_type.get('QUST', [])
+                         if r.get('FormID')}
     initargs = (xref, output_dir, info_reveals, service_topics,
                 unlock_plan['stage_reveals'], say_durations,
-                say_timer_owners, topic_by_dial, beat_fields_by_owner)
+                say_timer_owners, topic_by_dial, beat_fields_by_owner,
+                quest_script_vars, quest_edid_by_fid)
     if workers <= 1 or len(jobs) <= 2:
         _script_worker_init(*initargs)
         for job in jobs:
@@ -406,6 +415,46 @@ def build_say_timer_owners(by_type: dict) -> dict:
     return owners
 
 
+def build_quest_script_vars(by_type: dict) -> dict:
+    """quest fid (low-24) -> {script-local var index: name}.
+
+    A TES4 `GetQuestVariable` condition stores the variable's SLSD INDEX; the
+    name lives only in the SCPT the quest runs. `_seq_counter_condition` needs
+    the name to emit a Papyrus property reference.
+    """
+    script_vars = {}
+    for rec in by_type.get('SCPT', []):
+        try:
+            sfid = int(rec.get('FormID', ''), 16) & 0x00FFFFFF
+        except ValueError:
+            continue
+        table = {}
+        i = 0
+        while f'Variable[{i}].Index' in rec:
+            try:
+                idx = int(rec[f'Variable[{i}].Index'])
+            except (TypeError, ValueError):
+                i += 1
+                continue
+            name = rec.get(f'Variable[{i}].Name')
+            if name:
+                table[idx] = name
+            i += 1
+        if table:
+            script_vars[sfid] = table
+
+    out = {}
+    for rec in by_type.get('QUST', []):
+        try:
+            qfid = int(rec.get('FormID', ''), 16) & 0x00FFFFFF
+            scri = int(rec.get('SCRI', '') or '0', 16) & 0x00FFFFFF
+        except ValueError:
+            continue
+        if scri in script_vars:
+            out[qfid] = script_vars[scri]
+    return out
+
+
 def build_beat_fields_by_owner(by_type: dict) -> dict:
     """owner EditorID (lower) -> {timer fields needing a pending-beat property}.
 
@@ -473,6 +522,101 @@ def _owner_has_beat(spec: str, kind: str) -> bool:
     return field.lower() in {f.lower() for f in by_owner.get(owner.lower(), ())}
 
 
+_GET_QUEST_VARIABLE = 79        # TES4 func index; param2 = script-local index
+
+
+def _same_quest(rec: dict, quest_edid: str) -> bool:
+    """True when this INFO's GetQuestVariable condition names `quest_edid`."""
+    names = _WORKER_CTX.get('quest_edid_by_fid') or {}
+    i = -1
+    while True:
+        i += 1
+        raw = rec.get(f'Condition[{i}].Raw')
+        if raw is None:
+            return False
+        try:
+            d = bytes.fromhex(raw)
+        except ValueError:
+            continue
+        if len(d) < 20 or struct.unpack_from('<H', d, 8)[0] != _GET_QUEST_VARIABLE:
+            continue
+        qfid = struct.unpack_from('<I', d, 12)[0] & 0x00FFFFFF
+        if (names.get(qfid, '') or '').lower() == quest_edid.lower():
+            return True
+    return False
+
+
+def _seq_counter_condition(rec: dict):
+    """(var_name, int_value) from this INFO's `GetQuestVariable <q>.<v> == N`
+    condition, or None. Equality only — a `>=`/`<` gate is not a sequencer."""
+    script_vars = _WORKER_CTX.get('quest_script_vars') or {}
+    i = -1
+    while True:
+        i += 1
+        raw = rec.get(f'Condition[{i}].Raw')
+        if raw is None:
+            return None
+        try:
+            d = bytes.fromhex(raw)
+        except ValueError:
+            continue
+        if len(d) < 20 or struct.unpack_from('<H', d, 8)[0] != _GET_QUEST_VARIABLE:
+            continue
+        if (d[0] >> 5) != 0:                      # operator must be '=='
+            continue
+        comp = struct.unpack_from('<f', d, 4)[0]
+        if comp != int(comp):
+            continue
+        quest_fid = struct.unpack_from('<I', d, 12)[0] & 0x00FFFFFF
+        var_idx = struct.unpack_from('<I', d, 16)[0]
+        name = script_vars.get(quest_fid, {}).get(var_idx)
+        if name:
+            return name, int(comp)
+    return None
+
+
+def _sequence_gate(rec: dict, owner: tuple) -> str:
+    """`<quest>.<var> == <n>` guard for a polled-conversation INFO, else ''.
+
+    These conversations are a sequencer: each INFO is gated on an exact counter
+    (`GetQuestVariable CharacterGen.convCount == 8`) and its result script does
+    `convCount + 1` to hand off to the next line. The counter is ALSO re-seeded
+    out-of-band by quest stages ("make sure we're at the right spot", 10 of them
+    in CharacterGen alone), and those stages fire off package completion —
+    which lands whenever the actor arrives, not when the line ends.
+
+    `Say()` is asynchronous, so a re-seed can land while a line is still
+    playing. The in-flight line's End fragment then applies `+1` to the
+    RE-SEEDED value and overshoots: CharacterGen stage 12 sets convCount=8 for
+    "What's this prisoner doing here?" while line 7 is still audible, line 7's
+    fragment makes it 9, and the cell-door exchange never plays (verified from
+    a runtime trace: `FRAG 00032B0A cnt=8` -> `cnt=9 spk=0`).
+
+    Oblivion could not hit this: `SayTo` returned the duration synchronously, so
+    the walk conversation always finished before the actor reached the marker.
+
+    Guarding the fragment on the counter the INFO itself requires makes the
+    re-seed authoritative — a line whose turn has passed applies nothing.
+    """
+    if not owner or owner[0] != 'quest':
+        return ''
+    var = _seq_counter_condition(rec)
+    if not var:
+        return ''
+    quest_prop, _field = owner[1].split('.', 1)
+    name, value = var
+    # The counter and the timer are DIFFERENT variables on the same quest
+    # script (convCount vs convTimer) — the link between them is the quest, so
+    # that is what must match, not the field name.
+    if not _same_quest(rec, quest_prop):
+        return ''
+    # The VARIABLE name needs the same sanitising the converter gives every
+    # property it declares — TES4 allows names Papyrus reserves (`endstate`,
+    # MS40) and a raw name here is a parser error.
+    return (f'{_safe_property_name(quest_prop)}.'
+            f'{_safe_property_name(name)} == {value}')
+
+
 def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 stats: dict, info_reveals: dict = None,
                 service_topics: dict = None):
@@ -508,6 +652,7 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
         timer_fix = ''
         topic_name = topic_by_dial.get(rec.get('ParentDIAL', ''), '')
         owner = timer_owners.get(topic_name)
+        seq_gate = _sequence_gate(rec, owner)
         # Correct the conversation timer this topic drives to THIS line's own
         # measured length. The call site charged the topic's worst case (it
         # cannot know which INFO will win); the engine runs this fragment when
@@ -602,7 +747,15 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             # `convTimer - .4`). Writing it afterwards would discard that.
             if timer_fix:
                 out_lines.append(f'{timer_fix}  ; line ended')
-            out_lines.extend(body_lines)
+            # A polled-conversation line whose turn has already passed (a quest
+            # stage re-seeded the counter mid-line) must apply NOTHING, or its
+            # `counter + 1` overshoots the re-seeded value. See _sequence_gate.
+            if seq_gate and body_lines:
+                out_lines.append(f'  If {seq_gate}  ; still this line\'s turn')
+                out_lines.extend('  ' + b for b in body_lines)
+                out_lines.append('  EndIf')
+            else:
+                out_lines.extend(body_lines)
             if service_kind:
                 out_lines.append(_SERVICE_MENU_CALL[service_kind])
             out_lines.append('EndFunction')
