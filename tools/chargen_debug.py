@@ -37,6 +37,17 @@ LOG = 'TES4CharGen'
 QUEST_SCRIPT = 'TES4_CharGenQuest'
 QUEST_FRAGMENTS = 'TES4_QF_Charactergen'
 
+# Stage 18: Renault must run CGRenoteOpenSecretDoor (an Activate package aimed
+# at CGPrisonWallSwitchRef).  The switch's OWN script is what opens the door --
+# it sets charactergen.secretDoor = 1, gated on `isActionRef RenoteRef`, and the
+# quest script needs `stage 18 && secretDoor == 1 && convTimer <= 0` to reach
+# stage 19.  So the door failing means the ACTIVATION never happened.
+#
+# Everything about the PACK record has been verified against vanilla
+# (condition form, PTDA shape, template/UNAM/XNAM, interrupt flags), so the
+# remaining unknowns are runtime-only.  These probes answer them directly.
+SWITCH_SCRIPT = 'TES4_CGPrisonSecretWallSwitchSCRIPT'
+
 # The four actor scripts that poll the shared conversation timer.
 SPEAKERS = {
     'TES4_CGRenoteScript': 'RENAULT',
@@ -59,7 +70,15 @@ _STATE_DECL = '''
 Bool _dbgOpen = False
 String _dbgLast = ""
 String _dbgPkg = ""
+String _dbgR18 = ""
 '''
+
+# The switch reference the stage-18 Activate package targets
+# (CGPrisonWallSwitchRef, TES4 0004E90D -> converted 0x0104E90D).  Renault's
+# script does not reference it and a debug-only PROPERTY could not be filled
+# (that needs a VMAD edit), so the probe resolves it by FormID at runtime.
+SWITCH_FID = '0x0104E90D'
+ESM_NAME = 'Oblivion.esm'
 
 
 def _open_block(indent='  '):
@@ -88,6 +107,88 @@ def _speaker_block(tag, quest):
     _dbgPkg = _pk
     Debug.TraceUser("{LOG}", "{tag} PKG " + _pk)
   EndIf
+'''
+
+
+def _renault_probe_block(quest):
+    """Stage-18 probe: WHY the Activate package is not running.
+
+    GetCurrentPackage() only names the WINNER, so it cannot distinguish
+    "the engine never considered CGRenoteOpenSecretDoor" from "it considered
+    it and rejected it".  These read the inputs the engine itself uses:
+
+      OWNS   is the package even in this actor's list (property bound at all)?
+      COND   does its GetStage condition pass RIGHT NOW (IsRunning + stage)?
+      SWITCH where is the switch, and can she path to it?  An Activate package
+             that cannot reach its target is dropped silently, which looks
+             exactly like the package never being offered.
+      DOOR   did the activation land?  secretDoor is the flag the switch script
+             sets and the quest script waits on.
+    """
+    return f'''
+  ; --- TEMP DIAGNOSTIC stage-18 probe (tools/chargen_debug.py) ---
+  If {quest}.GetStage() == 18
+    String _r18 = "st18 secretDoor=" + {quest}.secretDoor + " tmr=" + {quest}.convTimer
+    If CGRenoteOpenSecretDoor
+      _r18 = _r18 + " ownsPkg=YES"
+    Else
+      _r18 = _r18 + " ownsPkg=NO(unbound)"
+    EndIf
+    ObjectReference _sw = Game.GetFormFromFile({SWITCH_FID}, "{ESM_NAME}") as ObjectReference
+    If _sw
+      _r18 = _r18 + " switch3d=" + _sw.Is3DLoaded() + " switchDist=" + (Self.GetDistance(_sw) as Int) + " switchEnabled=" + _sw.IsEnabled()
+    Else
+      _r18 = _r18 + " switchRef=NULL"
+    EndIf
+    Package _cur = Self.GetCurrentPackage()
+    If _cur
+      _r18 = _r18 + " cur=" + _cur
+    Else
+      _r18 = _r18 + " cur=NONE"
+    EndIf
+    If _r18 != _dbgR18
+      _dbgR18 = _r18
+      Debug.TraceUser("{LOG}", "RENAULT " + _r18)
+    EndIf
+  EndIf
+'''
+
+
+# Every package the engine STARTS, not just the one GetCurrentPackage() reports.
+# GetCurrentPackage() is sampled on our 0.1s poll, so a package the engine tries
+# and abandons within one tick is invisible to it — exactly what would happen if
+# CGRenoteOpenSecretDoor is selected and then immediately dropped (unreachable
+# target, failed procedure).  OnPackageStart/Change/End are pushed by the engine
+# and cannot be missed, so they separate:
+#   start(04D84D) then end        -> the package RUNS but its procedure fails
+#   no start(04D84D) ever         -> arbitration never picks it
+_PKG_EVENT_BLOCK = '''
+Event OnPackageStart(Package akNewPackage)
+  ; chargen_debug.py
+  If !_dbgOpen
+    _dbgOpen = Debug.OpenUserLog("{LOG}")
+  EndIf
+  Debug.TraceUser("{LOG}", "{tag} PKGSTART " + akNewPackage)
+EndEvent
+
+Event OnPackageChange(Package akOldPackage)
+  ; chargen_debug.py
+  If !_dbgOpen
+    _dbgOpen = Debug.OpenUserLog("{LOG}")
+  EndIf
+  Debug.TraceUser("{LOG}", "{tag} PKGCHANGE from " + akOldPackage + " to " + Self.GetCurrentPackage())
+EndEvent
+'''
+
+
+_SWITCH_BLOCK = f'''
+  ; --- TEMP DIAGNOSTIC (tools/chargen_debug.py) ---
+  ; Fires on ANY activation, before the isActionRef gate, so a Renault
+  ; activation that is rejected by the gate is still visible.
+  If !_dbgOpen
+    _dbgOpen = Debug.OpenUserLog("{LOG}")
+  EndIf
+  Debug.TraceUser("{LOG}", "SWITCH activated by " + akActionRef + " stage=" + charactergen.GetStage())
 '''
 
 
@@ -122,8 +223,11 @@ def instrument_speaker(path, tag):
     quest = m.group(1)
     src = re.sub(r'(\{Converted from TES4:[^}]*\}\n)', r'\1' + _STATE_DECL,
                  src, count=1)
+    block = _speaker_block(tag, quest)
+    if tag == 'RENAULT':
+        block += _renault_probe_block(quest)
     src = src.replace('Event OnUpdate()\n',
-                      'Event OnUpdate()\n' + _speaker_block(tag, quest), 1)
+                      'Event OnUpdate()\n' + block, 1)
     # log every dispatch, right where the guard opens
     src = re.sub(
         r'(If ' + re.escape(quest) + r'\.speaker == \d+ && '
@@ -137,6 +241,16 @@ def instrument_speaker(path, tag):
         r'(Event OnPackageEnd\(Package akOldPackage\)\n)',
         r'\1  Debug.TraceUser("' + LOG + '", "' + tag
         + ' PKGEND " + akOldPackage)\n', src, count=1)
+    # Engine-pushed package events. Only add the ones the converted script does
+    # not already define — a duplicate Event is a compile error.
+    events = _PKG_EVENT_BLOCK.format(LOG=LOG, tag=tag)
+    if 'Event OnPackageStart(' in src:
+        events = re.sub(r'Event OnPackageStart\(.*?EndEvent\n', '', events,
+                        flags=re.S)
+    if 'Event OnPackageChange(' in src:
+        events = re.sub(r'Event OnPackageChange\(.*?EndEvent\n', '', events,
+                        flags=re.S)
+    src += events
     open(path, 'w', encoding='utf-8').write(src)
     return True
 
@@ -149,6 +263,25 @@ def instrument_quest(path):
                  src, count=1)
     src = src.replace('Event OnUpdate()\n',
                       'Event OnUpdate()\n' + _quest_block(), 1)
+    open(path, 'w', encoding='utf-8').write(src)
+    return True
+
+
+def instrument_switch(path):
+    """Log EVERY activation of the secret-wall switch.
+
+    The switch script's own `isActionRef RenoteRef` gate decides whether the
+    door opens, so logging before it separates "Renault never activated it"
+    from "she did, but the gate rejected her".
+    """
+    src = open(path, encoding='utf-8').read()
+    if 'chargen_debug.py' in src:
+        return False
+    src = re.sub(r'(\{Converted from TES4:[^}]*\}\n)', r'\1' + _STATE_DECL,
+                 src, count=1)
+    src = src.replace(
+        'Event OnActivate(ObjectReference akActionRef)\n',
+        'Event OnActivate(ObjectReference akActionRef)\n' + _SWITCH_BLOCK, 1)
     open(path, 'w', encoding='utf-8').write(src)
     return True
 
@@ -234,7 +367,8 @@ def main():
             print(f'  instrumented {stem} [{tag}]')
 
     for stem, fn in ((QUEST_SCRIPT, instrument_quest),
-                     (QUEST_FRAGMENTS, instrument_quest_fragments)):
+                     (QUEST_FRAGMENTS, instrument_quest_fragments),
+                     (SWITCH_SCRIPT, instrument_switch)):
         path = os.path.join(SRC, stem + '.psc')
         if os.path.isfile(path) and fn(path):
             touched.append(stem)

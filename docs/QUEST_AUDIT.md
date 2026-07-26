@@ -5,8 +5,8 @@
 
 ## How the audit works
 
-A new tool — the **quest walkthrough emulator** ([tools/quest_walkthrough.py](tools/quest_walkthrough.py) +
-[tools/quest_walkthrough_tes5.py](tools/quest_walkthrough_tes5.py)) — symbolically "plays" every quest in the
+A new tool — the **quest walkthrough emulator** ([tools/quest_walkthrough.py](../tools/quest_walkthrough.py) +
+[tools/quest_walkthrough_tes5.py](../tools/quest_walkthrough_tes5.py)) — symbolically "plays" every quest in the
 converted plugin. It collects every stage-advancement edge that survived conversion (dialogue TIF
 fragments, QF stage fragments, attached quest scripts, object-script VMAD attachments), gates each edge
 by real Skyrim rules, and runs a fixpoint from new-game state until nothing more can fire. A quest is
@@ -56,7 +56,7 @@ per-quest list is `temp/quest_audit_raw.md`.
 ## Bugs found and FIXED on this branch
 
 ### 1. `End ;comment` silently dropped whole event blocks — the biggest find
-[script_convert/converter.py](script_convert/converter.py) `_parse_source` only recognized a bare `end`
+[script_convert/converter.py](../script_convert/converter.py) `_parse_source` only recognized a bare `end`
 line. Shivering Isles scripts end blocks with `End ;OnActivate`, `End GameMode`, etc. — the End line fell
 into the block body and the block was **silently discarded** (and a following `Begin` also discarded the
 accumulated previous block). 15 scripts were affected, 11 of them quest-critical: the entire OnActivate
@@ -74,9 +74,9 @@ quests healed by one fix. Fix: recognize `End` + trailing comment/label, close a
 found nothing, and silently skipped the binding → `myMS14` was None at runtime and every
 `myMS14.SetStage(...)` in 8 dialogue fragments plus the attached scripts did nothing. **MS14 (Nothing You
 Can Possess) was uncompletable.** Fix: `resolve_property_formid()` in
-[script_convert/constants.py](script_convert/constants.py) reverses the `my` rename on lookup miss; used by
-both the INFO-fragment binder ([tes5_import/dialog_converter.py](tes5_import/dialog_converter.py)) and the
-object-script binder ([tes5_import/object_scripts.py](tes5_import/object_scripts.py)). Verified: TIF props
+[script_convert/constants.py](../script_convert/constants.py) reverses the `my` rename on lookup miss; used by
+both the INFO-fragment binder ([tes5_import/dialog_converter.py](../tes5_import/dialog_converter.py)) and the
+object-script binder ([tes5_import/object_scripts.py](../tes5_import/object_scripts.py)). Verified: TIF props
 now bind `myMS14 → 01017606`, and SE09AddItemsScript's props now include `SE09` + all activator refs.
 
 ### 3. `StartConversation target topic` discarded the topic (`Say(None)`)
@@ -90,14 +90,14 @@ registered for VMAD binding (verified: `BejeenREF.Say(DANocturnalConvo1)` with b
 `convert_LIGH` was the only script-capable converter that hand-rolls its header and never spliced
 `get_object_vmad()` — so `SE06FlameOfAgnonSCRIPT` (sets SE06 stages 9/190, the Flame of Agnon mechanic)
 was converted+compiled but attached to nothing. Fixed in
-[tes5_import/record_types/items.py](tes5_import/record_types/items.py); all other types go through
+[tes5_import/record_types/items.py](../tes5_import/record_types/items.py); all other types go through
 `_common_header_subs`, which splices it.
 
 ### 5. QUST VMAD declared fragments the .psc doesn't define
 The importer's fragment filter counted a whitespace-only (`"\r\n"`) stage result script; the psc
 generator's filter (`script.strip()`) didn't. `TES4_QF_E3` and `TES4_QF_SEObelisks` VMADs referenced a
 `Fragment_Stage_0100_Item_0` that doesn't exist. Fixed by aligning the importer filter
-([tes5_import/dialog_converter.py](tes5_import/dialog_converter.py) `_quest_stage_fragments`).
+([tes5_import/dialog_converter.py](../tes5_import/dialog_converter.py) `_quest_stage_fragments`).
 
 ### 6. Inherited bark gate dead-ended conversation-revealed choice topics (SE36 froze)
 The bark-choice promotion stamps the revealing greeting's timing gate onto the choice topic's INFOs. SE36's

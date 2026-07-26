@@ -1,18 +1,28 @@
 # Navmesh redesign: pathgrid corridor ribbons
 
-**Status:** design, not yet implemented. Author-approved direction 2026-07-23.
-**Supersedes (once built):** whatever navmesh surface generator lives in
-`tes5_import/navmesh/build.py::build_navmesh`. Work happens directly on
-`master`. The prior Recast-based generator (and its ~900 lines of stitch/clip
-repair) has been moved to branch **`test-navmesh-2`** and can be pulled from
-there if any piece is needed.
+> **Status: IMPLEMENTED and live on `master`** (design approved 2026-07-23;
+> status corrected 2026-07-26 — this header previously read "design, not yet
+> implemented"). `build.py::build_navmesh` keeps its historical signature and
+> **delegates to `corridor.build_corridors`**. The corridor modules are
+> `corridor.py`, `corridor_clean.py`, `corridor_doors.py`, `corridor_grow.py`,
+> `corridor_union.py`, plus `params.py` and `world.py`.
+>
+> The superseded voxel/span-graph generator is **DELETED** from `master`:
+> `voxel.py`, `region.py`, `spanmesh.py` and `native/src/decimate.cpp` no longer
+> exist. The Recast-era generator remains on branch **`test-navmesh-2`**.
+> Performance work on the corridor path is recorded in
+> [performance_notes.md](performance_notes.md); geometry is verified by
+> `tools/navmesh_check.py`, `navmesh_reach.py`, `navmesh_slope_check.py`.
+>
+> Read the rest of this document as the design rationale for what was built.
 
-## Baseline on `master` (verified 2026-07-23)
+## Baseline before the rewrite (historical — verified 2026-07-23)
 
-`master`'s navmesh is NOT the Recast pipeline — it is a **voxel / span-graph**
-generator: `voxel.py` (heightfield + `stamp_pathgrid` + filters + erosion),
-`region.py` (region flood + pathgrid seeding), `spanmesh.py` (mesh the span
-graph directly). `build_navmesh` signature:
+The pre-corridor `master` was **not** the Recast pipeline — it was a **voxel /
+span-graph** generator: `voxel.py` (heightfield + `stamp_pathgrid` + filters +
+erosion), `region.py` (region flood + pathgrid seeding), `spanmesh.py` (mesh the
+span graph directly). **All three are now deleted.** `build_navmesh`'s signature
+was, and still is:
 
 ```
 build_navmesh(refr_recs, base_model_by_fid, get_collision, nodes, edges,
@@ -20,15 +30,19 @@ build_navmesh(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     -> (verts, tris)   # world-space; [] , [] on failure
 ```
 
-There is **no `door_carve.py` on master** — doors are stamped into the voxel
-grid and passed to `spanmesh.build_mesh(doors=door_rects)`. The Recast-era
-`door_carve.py` (shapely cut-and-earcut) lives on `test-navmesh-2`.
+(`budget` is now accepted only for signature compatibility — the corridor build
+has no budget knob.)
 
-This voxel pipeline is cleaner than the Recast one (pathgrid stamped first,
-span-graph meshing so adjacency is structural), but it is still heavy: voxel
-grid, filters, region flood, erosion, span meshing, steep-tri drop, flap cull,
-island prune. The corridor model replaces the whole surface generator with a
-direct ribbon build.
+There was **no `door_carve.py`** — doors were stamped into the voxel grid and
+passed to `spanmesh.build_mesh(doors=door_rects)`. The Recast-era `door_carve.py`
+(shapely cut-and-earcut) lives on `test-navmesh-2`; the corridor model handles
+doors in `corridor_doors.py`.
+
+That voxel pipeline was cleaner than the Recast one (pathgrid stamped first,
+span-graph meshing so adjacency is structural), but still heavy: voxel grid,
+filters, region flood, erosion, span meshing, steep-tri drop, flap cull, island
+prune. The corridor model replaced the whole surface generator with a direct
+ribbon build.
 
 ---
 

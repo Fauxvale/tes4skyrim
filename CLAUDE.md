@@ -36,10 +36,35 @@ caching, skipped record types, the export text format, and the directory layout.
   conversion would be complicated.
 - **If you don't see the problem described, the test data is not stale** — there
   is always a REAL problem to find.
+- **Census vanilla before calling something wrong.** If Skyrim.esm or the DLCs do
+  the same thing at scale, it is legal and is not your bug — several docs record
+  "verified vanilla-legal, don't fix this" for exactly the things that looked
+  broken. Conversely, "all 3,740 vanilla records write 0 here" is the strongest
+  possible evidence for what to write.
+- **Prefer the engine's own mechanism over a Papyrus/script approximation.** Force
+  greet is a package, not a function call; `SetAlert` is native, not
+  `DrawWeapon()`. Check for a real equivalent before declaring one absent — the
+  wikis under-document both games.
+- **A symptom's cause is often several layers from the symptom.** Frozen NPCs have
+  traced to navmesh, condition params, package data, and behavior graphs in turn.
+  Confirm the mechanism before fixing; a plausible story that explains the symptom
+  is not yet a diagnosis.
 - Don't preserve backwards compatibility. Delete code that is no longer used.
 - Keep files under ~1000 lines; split by responsibility when one grows.
+- <a id="tools-first"></a>**CHECK `tools/` BEFORE BUILDING ANYTHING BESPOKE.**
+  ~95 tools already exist and one probably answers your question — the full
+  catalogue is [docs/python_tools_reference.md](docs/python_tools_reference.md).
+  The order is:
+  1. **Use** the existing tool.
+  2. If it *almost* fits, **extend or fix it** — new flags, wider output. Never
+     write a parallel script that duplicates a tool's job, and never leave a
+     broken tool in place while working around it.
+  3. Only if nothing is close, write a new one — and **add its entry to
+     `python_tools_reference.md` in the same pass**, before you report back. An
+     undocumented tool is one the next session will rebuild from scratch.
 - Put throwaway files in `temp/`. Don't write one-off scripts with hardcoded
-  output — build reusable `tools/` scripts with arguments.
+  output — `tools/` scripts take arguments and produce general output, so they are
+  reusable next time.
 - **Always record new learnings** in this file or, more likely, the relevant `docs/` file.
 - Docs can be wrong: they sometimes describe fixes that were never implemented.
   Grep the source before claiming a mechanism exists, and fix the doc.
@@ -49,7 +74,10 @@ caching, skipped record types, the export text format, and the directory layout.
 **Always check theories against several of these** before acting:
 
 1. The Skyrim executable at `D:\Other Games\Skyrim Anniversary Edition\SkyrimSE.exe`
-   — note this is the GOG version and **NOT DRM-packed**;
+   — this is the GOG/AE build and is **NOT DRM-packed**, so it disassembles
+   statically. (Only the *Steam* copy is encrypted, `.text` entropy 8.00 — don't
+   confuse the two and conclude the exe is unreadable.) Crash logs from the Steam
+   build map across via the Address Library (stable ID → per-build RVA).
 2. The Oblivion/Nehrim install at `D:\Other Games\Nehrim At Fate's Edge\Data`.
 3. xEdit source at `references/xEdit` — `Core/` documents the binary structure of
    every record type. This is the first stop for any format question.
@@ -59,8 +87,12 @@ caching, skipped record types, the export text format, and the directory layout.
 5. UESP / CK wiki via `python tools/uesp_lookup.py`. **Never WebSearch or
    WebFetch for these** (they 403). An empty result means fix the query.
 6. A web search for other authoritative sources.
-7. Failing all the above, add comprehensive logging so the user's next run
-   captures everything needed. The user's time is far more valuable than yours.
+7. The Papyrus logs from the last in-game run — read them to diagnose a runtime
+   symptom (see the directory-purpose table under Hard prohibitions).
+8. Failing all the above, add comprehensive logging so the user's next run
+   captures everything needed. Make it thorough — one wasted round trip costs the
+   user a full build-and-play cycle, and their time is far more valuable than
+   yours.
 
 Never attribute a bug to LE-vs-SSE mesh format differences — verify engine
 theories externally first.
@@ -71,23 +103,75 @@ theories externally first.
 - **NEVER `git commit` or `git push`.** The user commits after in-game testing.
 - **NEVER `git add` / `git rm`** (staging, including staged deletions). Use plain
   `rm`. `git reset` destroys the user's own staging.
-- **NEVER open the game folder when the data is already available locally in references**
-- **NEVER inspect the game Data folder or BSAs to verify deployment.** Trust the
-  user's deployment statements.
+- **NEVER go snooping in the live, heavily-modded SSE install.** It is full of
+  other mods' assets, so nothing you find there tells you anything about this
+  converter. In particular: **never inspect it to check whether your changes were
+  deployed or installed correctly** — trust the user's deployment statements, and
+  never argue with an in-game result by reading their setup.
+  Each external directory has ONE sanctioned purpose:
+  | Path | Use it for | Not for |
+  |---|---|---|
+  | `D:\Other Games\Skyrim Anniversary Edition\` (GOG/AE) | exe decompilation | assets, deployment checks |
+  | Oblivion / Nehrim LE install | BSA files and NIFs | anything Skyrim-side |
+  | The modded SSE install | **Papyrus logs, and reading `Skyrim.esm`** | everything else, especially verifying deployment |
 - **NEVER touch `unknown_byte` / `unknown_int` fields.** They are padding, never
   the cause.
 - **Never run the full pytest suite** — only the tests for files you changed.
+- **KEEP EVERY TEST UNDER 60 SECONDS. Never set a long timeout.** If a command
+  needs minutes, you have picked the wrong scope — narrow it instead: one cell,
+  not a worldspace; 2-3 NIFs, not a tree; one record type, not the whole plugin;
+  the per-cell tool (`navmesh_tri_check --cell X`) instead of the batch sweep.
+  Most tools take `--cell` / `--max N` / `--workers` for exactly this. A long
+  timeout burns the user's wall-clock and usually hides a scoping mistake; if
+  something genuinely cannot be scoped down, say so instead of waiting on it.
 - If file recovery is in progress, make zero writes to the affected drive; ask
   first before any bulk operation.
 
 ### Working with the user
 
-- **Trust the user's in-game test results as ground truth.** Never argue against
-  them with log or mtime timelines.
+- **Trust the user's in-game test results as ground truth.** Never question
+  whether they tested something, and never rebut a reported result with file
+  timestamps or a reconstructed timeline. (Reading Papyrus logs to *diagnose* is
+  encouraged — using them to dispute the user's report is not.)
 - **Never assume `output/Oblivion.esm` reflects the latest code** from its
   timestamp. Ask, or rebuild first.
-- **Build and compile yourself** — run `python convert.py --scripts-only` (or the
-  stage matching your change) into `output/` and compile.
+- **BUILD EVERY STAGE YOUR CHANGES TOUCH, before reporting back.** The user should
+  be able to launch the game and verify immediately — never leave them to work out
+  which stage to re-run, and never hand back a change that only compiles in
+  theory. Map the files you edited to stages and run each one into `output/`:
+
+  | Changed | Run |
+  |---|---|
+  | `tes4_export/` | `python convert.py -f <plugin> --export-only` |
+  | `tes5_import/` (records, navmesh, packages, dialogue) | `--import-only` |
+  | `script_convert/` | `--scripts-only` (compiles .psc → .pex) |
+  | `asset_convert/nif_converter.py`, collision, skin | `--meshes-only` |
+  | `spt_*` | `--speedtrees-only` |
+  | sound conversion | `--sounds-only` |
+  | LOD | `--lod-only` |
+  | BSA packing | `--pack-only` |
+
+  Touching several areas means running several stages — import *and* scripts if
+  you changed both. Other flags: `--creatures-only`, `--extract-only`,
+  `--prune-textures-only`, `--pack-zip-only`. Report what you built and any
+  failures verbatim; if a stage genuinely cannot be run, say which and why rather
+  than staying silent.
+- **While iterating on a repeated failure, don't write tests or update docs until
+  the fix is CONFIRMED in-game.** Each round trip costs the user a full
+  build-and-play cycle, so spend it on the diagnosis and the candidate fix only.
+  Tests and docs written against an unconfirmed theory usually just encode the
+  wrong theory and have to be rewritten. Once the user confirms, then add the
+  regression test and the doc note.
+- **If the user questions a design twice, stop** and get an explicit decision
+  before writing more code.
+- **When a fix doesn't work, don't re-apply a variant of the same theory.** Two
+  failed attempts on one theory means the theory is wrong — go back to the
+  sources in "Verifying your work" and find a *different* mechanism. Say plainly
+  that the previous explanation was wrong rather than layering another guess on
+  top of it.
+- **Report honestly.** If something is untested, say so; if you skipped part of
+  the scope, say which part and why. Never describe an unverified change as
+  working.
 
 ### Assets and references
 
@@ -153,10 +237,12 @@ relevant doc when working in that area.
 | Doc | Covers |
 |---|---|
 | [package_ai_contracts.md](docs/package_ai_contracts.md) | CTDA param remapping (the crash rule), PTDA Distance, Ambush→approach, force-greet packages, quest priority band |
-| [package_conversion_plan.md](docs/package_conversion_plan.md) | PACK template model + census (status header is stale — PACK *is* converted) |
+| [package_conversion_plan.md](docs/package_conversion_plan.md) | PACK template model + vanilla census (implemented — the design behind `pack_converter.py`) |
 | [dialogue_conversion_notes.md](docs/dialogue_conversion_notes.md) | DIAL/INFO/QUST/DLBR/DLVW implementation, voice type routing, AddTopic unlocks, GetIsID injection |
 | [dialogue_engine_contracts.md](docs/dialogue_engine_contracts.md) | Verified engine rules for dialogue routing |
+| [dialogue_transfer_gaps.md](docs/dialogue_transfer_gaps.md) | Measured gaps: what Oblivion dialogue does NOT survive conversion, with counts from both emulators |
 | [ambient_dialogue_channel_plan.md](docs/ambient_dialogue_channel_plan.md) | Oblivion's 3 delivery channels vs Skyrim's 2; constant quipping, NPC-to-NPC topics in the player menu |
+| [QUEST_AUDIT.md](docs/QUEST_AUDIT.md) | Quest completability audit via the walkthrough emulator (2026-07-17, all 390 QUSTs) |
 | [creature_conversion.md](docs/creature_conversion.md) | CREA→actor: behavior graphs, HKX skeleton/animation/ragdoll, creature records |
 | [horse_rideability_plan.md](docs/horse_rideability_plan.md) | Rideable horses: RACE Mount Data, horse/rider graph pair, rider-animation sourcing |
 
@@ -166,6 +252,8 @@ relevant doc when working in that area.
 | [papyrus_conversion_notes.md](docs/papyrus_conversion_notes.md) | TES4→Papyrus mapping, paired on/off soft-lock trap, Say() timers and fragment release order, syntax traps, OBSE constructs |
 | [Script_Conversion_Plan.md](docs/Script_Conversion_Plan.md) | Script conversion scope, counts, block/variable distributions |
 | [skse_conversion_audit.md](docs/skse_conversion_audit.md) | SKSE/OBSE function coverage audit |
+| [skyrim_commands.md](docs/skyrim_commands.md) | Raw table of Skyrim script command IDs, names, and argument types |
+| [php_scriptconverter_analysis.md](docs/php_scriptconverter_analysis.md) | How Skyblivion's AST-based PHP converter works vs our regex approach — prior art, not a dependency |
 
 ### World, meshes & navmesh
 | Doc | Covers |

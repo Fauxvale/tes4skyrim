@@ -4,16 +4,24 @@ Goal: **Oblivion-equivalent AI behavior expressed in Skyrim syntax.** Not
 "records that load" — actors must keep their schedules, walk their routes,
 follow, escort, flee, and ambush the way they did in Oblivion.
 
-Status: `PACK` is in `SKIP_TYPES` ([tes5_import/constants.py:367](../tes5_import/constants.py#L367)).
-Zero package records are written. Every converted actor instead receives a single
-vanilla `DefaultSandboxCurrentLocation1024` substitution from
-[tes5_import/packages.py](../tes5_import/packages.py), so **no NPC in the game
-keeps its Oblivion schedule** — they all sandbox in place forever.
-
-`convert_PACK` exists in [tes5_import/record_types/dialog_misc.py:155](../tes5_import/record_types/dialog_misc.py#L155)
-but is dead code, and its brainstorm docstring is **wrong on the central point**
-(it claims `PKDT.Type` carries the TES4 behavior enum). Delete the docstring's
-claims; the facts below replace them.
+> **Status: IMPLEMENTED (updated 2026-07-26).** This document is the design plan
+> that the implementation followed; the ground-truth sections below are still the
+> reference for how Skyrim's package model works. The status text that used to
+> head this file described the pre-implementation state and is preserved at the
+> bottom under "Historical: pre-implementation status" so its dated claims are not
+> mistaken for current behavior.
+>
+> Current reality:
+> - `PACK` is **NOT** in `SKIP_TYPES` — it is converted.
+> - `convert_PACK` lives in [tes5_import/pack_converter.py](../tes5_import/pack_converter.py)
+>   (with templates in [pack_templates.py](../tes5_import/pack_templates.py)), not
+>   in `record_types/dialog_misc.py`, and is live code.
+> - PACK is written in its **own phase (import_main Phase 3b2), after QUST**,
+>   because quest packages need the aliases to exist first — it is deliberately
+>   not in the generic dispatch table.
+> - For the verified engine contracts that came out of this work (PTDA distance,
+>   Ambush→approach, force-greet topic binding, template data inputs), see
+>   [package_ai_contracts.md](package_ai_contracts.md).
 
 ---
 

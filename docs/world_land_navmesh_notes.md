@@ -16,9 +16,24 @@ cell PLUS a single top-level NAVI (Navmesh Info Map). Implemented in
   indexed in a top-level NAVI record. NAVM records alone are ignored. NAVI goes
   in the top-level group order immediately BEFORE CELL (verified vs xEdit
   `wbAddGroupOrder`, and added to `writer._group_order`).
-- **Algorithm (collision-voxel, rewritten 2026-07-12 — replaces the pathgrid-
-  buffering approach that could not represent walls; see
-  [navmesh_rebuild_plan.md](navmesh_rebuild_plan.md))**: VOXELIZE the real Havok
+> ### ⚠ Surface-generation sections below are HISTORICAL (flagged 2026-07-26)
+>
+> The **collision-voxel** algorithm described in the next block — and every
+> `voxel.*` / `region.*` / `spanmesh.*` / decimation rule that follows from it —
+> **is no longer how the navmesh is built.** Those modules are deleted from
+> `master`. The live generator is the **pathgrid corridor-ribbon** model:
+> [navmesh_corridor_redesign.md](navmesh_corridor_redesign.md) (implemented),
+> tuned per [performance_notes.md](performance_notes.md).
+>
+> **Still current and safe to rely on** in this file: NAVI-is-mandatory, the NVNM
+> and NVMI binary layouts, door handling/links, the base-model index, triangle
+> flags, LAND VHGT decode, REFR rotation transpose, world-space obstruction, the
+> collision cache, and the iteration tools. Treat the voxel/region/spanmesh
+> pipeline details as background on a superseded attempt.
+
+- **Algorithm (collision-voxel — HISTORICAL, see the notice above; rewritten
+  2026-07-12 to replace the pathgrid-buffering approach that could not represent
+  walls)**: VOXELIZE the real Havok
   collision geometry of everything placed in the cell. The collision mesh is
   exactly what the engine uses to decide what an NPC stands on / is blocked by,
   so we use it directly instead of guessing from the pathgrid. Modules live in
@@ -195,7 +210,7 @@ Result over 150 interior cells: **0 wrong-floor, 0 steep, 0.9% of pathgrid lengt
 uncovered** (was 2.5% uncovered / 2452 broken pathgrid edges with contours).
 
 - **Quality invariants** (`tools/navmesh_audit.py --interiors N` sweeps many cells
-  in parallel; `tools/navmesh_diag.py <cell>` for one). The metric that matters is
+  in parallel; `tools/navmesh_tri_check.py --cell <id>` for one). The metric that matters is
   **BROKEN PATHGRID EDGES** — an edge whose two ends land on navmesh an NPC cannot
   cross between. A raw component count is NOT a bug metric: a cave with six
   chambers this cell's pathgrid never links is legitimately six components.

@@ -78,6 +78,34 @@ def surface_dz(px, py, pz, walk_tris, buckets, bucket, zwin=200.0):
     return best, best is not None
 
 
+def wrong_floor(nodes, verts):
+    """Pathgrid nodes whose nearest navmesh vertex is far off in Z.
+
+    A node sitting a storey away from the mesh built for it means the surface
+    sampler locked onto the wrong floor (the classic stacked-storey failure), so
+    the mesh can look locally clean while describing the wrong ground.  Returns
+    (bad_count, total, median_dz, max_dz) or None when no node is near a vertex.
+
+    Folded in from the retired tools/navmesh_diag.py, whose other two checks
+    (STEEP, ISLANDS) are covered here and by navmesh_audit/navmesh_component_audit.
+    """
+    v = np.asarray(verts)
+    if not len(v):
+        return None
+    zerr = []
+    for (nx, ny, nz) in nodes:
+        d = (v[:, 0] - nx) ** 2 + (v[:, 1] - ny) ** 2
+        near = d < (params.SEED_SNAP * 1.5) ** 2
+        if near.any():
+            zerr.append(float(np.min(np.abs(v[near, 2] - nz))))
+    if not zerr:
+        return None
+    zerr.sort()
+    tol = params.MAX_CLIMB * 2
+    bad = sum(1 for z in zerr if z > tol)
+    return bad, len(zerr), tol, zerr[len(zerr) // 2], zerr[-1]
+
+
 def check_cell(cell_arg, export_dir, args):
     ctx = load_cell(export_dir, cell_arg)
     walk, _block, _b = cell_geometry(ctx)
@@ -159,6 +187,12 @@ def check_cell(cell_arg, export_dir, args):
     print('%s: %d tris, %d flagged  %s' % (
         name, len(rows), len(flagged),
         ' '.join('%s=%d' % kv for kv in sorted(counts.items()))))
+
+    wf = wrong_floor(ctx['nodes'], verts)
+    if wf:
+        bad, total, tol, med, mx = wf
+        print('  WRONG-FLOOR: %d/%d nodes with nearest-vert |dz|>%.0f '
+              '(median %.0f max %.0f)' % (bad, total, tol, med, mx))
 
     show = rows if args.all else flagged
     show = sorted(show, key=lambda r: (r['flags'] == '', -abs(r['float']),

@@ -30,7 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import (  # noqa: E402
-    build, corridor_clean, corridor_grow, corridor_union, world,
+    build, corridor, corridor_clean, corridor_doors, corridor_grow,
+    corridor_union, world,
 )
 from tools.navmesh_probe import load_cell  # noqa: E402
 
@@ -112,7 +113,21 @@ def install_stage_timers():
     stage read 0.00 and the whole run showed up as "(other)".
     """
     _wrap(world, 'gather_cell_geometry', 'world.gather_cell_geometry')
-    _wrap(corridor_grow, 'grow_batch', 'corridor_grow.grow_batch')
+
+    # Surface samplers and strip planning — folded in from the retired
+    # tools/navmesh_corridor_profile.py.  corridor.py imports the union/doors/
+    # clean modules INSIDE build_corridors, so patching the module attribute is
+    # what the call actually resolves through.
+    _wrap(corridor, '_surface_sampler', 'corridor._surface_sampler')
+    _wrap(corridor_grow, 'wall_slab_sampler', 'corridor_grow.wall_slab_sampler')
+    _wrap(corridor, '_build_corridor_strips', 'corridor._build_corridor_strips')
+    for fn, label in (('grow_batch', 'corridor_grow.grow_batch(native)'),):
+        _NESTED.add(label)
+        _wrap(corridor_grow, fn, label)
+    _NESTED.add('corridor._plan_stations')
+    _wrap(corridor, '_plan_stations', 'corridor._plan_stations')
+    _wrap(corridor_doors, 'door_footprints', 'corridor_doors.door_footprints')
+
     _wrap(corridor_union, 'build_union_mesh', 'corridor_union.build_union_mesh')
     for fn in ('_split_plan_overlaps', '_merge_at_pathgrid_nodes',
                '_stitch_shared_nodes', '_split_t_junctions', '_weld_sheets',

@@ -70,9 +70,18 @@ topic binding is patched in after Phase 5. Read the phase comments in
 single source of truth. Currently skipped: ROAD, SCPT, SKIL, BSGN, RACE, MGEF,
 CSTY, IDLE, GMST, REGN, EYES, HAIR.
 
-Notably **converted** (do not assume otherwise): GLOB, CLAS, CLMT, WTHR, WATR,
-PACK. CLMT in particular must stay converted — weather is only reachable via
-WRLD → CNAM → CLMT → WLST, so skipping it orphans every converted WTHR.
+Notably **converted** (do not assume otherwise): GLOB, CLAS, CLMT, WATR, PACK.
+PACK is converted in its own phase (3b2, after QUST) rather than via the generic
+dispatch.
+
+**WTHR is NOT converted on `master` as of 2026-07-26.** A `convert_WTHR` dispatch
+entry exists in `constants.py`, but the work that actually enables weather
+conversion lives on **another branch and is not merged** — don't read the
+dispatch entry as proof the feature is live, and don't "fix" docs that describe
+weather as unconverted (e.g. the WTHR row in
+[skse_conversion_audit.md](skse_conversion_audit.md)). CLMT stays converted
+regardless: weather is only reachable via WRLD → CNAM → CLMT → WLST, so CLMT is
+the chain that the branch's WTHR records will hang from.
 GMST is skipped wholesale *except* the four ambient-dialogue pacing settings in
 `AMBIENT_GMST_OVERRIDES`, which exist in both engines with identical meaning.
 

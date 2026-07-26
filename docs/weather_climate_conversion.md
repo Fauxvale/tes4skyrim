@@ -1,5 +1,11 @@
 # Weather / Climate Conversion (WTHR, CLMT, sky meshes)
 
+> **Status (2026-07-26): WTHR conversion is NOT on `master`** — it lives on a
+> separate, unmerged branch. `constants.py` on `master` carries a `convert_WTHR`
+> dispatch entry, but that alone does not make the feature live, so do not cite it
+> as evidence weather is converted. CLMT *is* converted on `master`. Everything
+> below is the format/semantics reference and is valid on either branch.
+
 Sources of truth for everything here: UESP `Skyrim Mod:Mod File Format/WTHR`
 and `.../CLMT`, xEdit `wbDefinitionsCommon.pas` (`wbWeather*`) and
 `wbDefinitionsTES4/TES5.pas`, a census of the **84 vanilla WTHR records in
