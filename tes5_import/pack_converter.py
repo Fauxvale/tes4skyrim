@@ -32,6 +32,7 @@ from .pack_templates import (
     EAT,
     FLEE_TO,
     FOLLOW,
+    FORCE_GREET,
     HOLD_POSITION,
     PKDT_TYPE_PACKAGE,
     SANDBOX,
@@ -42,6 +43,7 @@ from .pack_templates import (
     T_FLOAT,
     T_INT,
     T_LOCATION,
+    T_TOPIC,
     T_OBJECTLIST,
     T_SINGLEREF,
     T_TARGETSEL,
@@ -202,11 +204,18 @@ class Inputs:
             out += pack_string_subrecord('ANAM', atype)
             v = self.values.get(i)
             if atype == T_LOCATION:
+                if isinstance(v, tuple):        # (type, target, radius)
+                    v = _location(*v)
                 out += pack_subrecord('PLDT', v if isinstance(v, bytes)
                                       else _null_location())
             elif atype in (T_SINGLEREF, T_TARGETSEL):
                 out += pack_subrecord('PTDA', v if isinstance(v, bytes)
                                       else _null_target())
+            elif atype == T_TOPIC:
+                # PDTO: (u32 type, u32 formid); type 0 names a DIAL record.
+                # This input is what opens dialogue for a ForceGreet package.
+                out += pack_subrecord('PDTO', struct.pack('<II', 0,
+                                                          int(v or 0)))
             elif atype == T_BOOL:
                 # Bool CNAM is a single byte (verified against vanilla).
                 out += pack_subrecord('CNAM', bytes([1 if v else 0]))
@@ -227,10 +236,20 @@ def _null_location() -> bytes:
     return struct.pack('<iIi', 3, 0, 0)
 
 
+def _location(ltype: int, target: int, radius: int) -> bytes:
+    """A PLDT payload: (type u32, target/formid i32, radius i32)."""
+    return struct.pack('<iIi', ltype, target, radius)
+
+
 # wbObjectTypeEnum values used by vanilla PTDA type-2 ("Object Type") defaults.
 OBJTYPE_FOOD = 15
 OBJTYPE_CHAIR = 27
 OBJTYPE_BED = 26
+
+
+def _target(ttype: int, target: int, count: int) -> bytes:
+    """A PTDA payload: (type u32, target/formid i32, count i32)."""
+    return struct.pack('<iIi', ttype, target, count)
 
 
 def _null_target() -> bytes:
@@ -291,11 +310,16 @@ def build_alias_location(alias_index: int, radius: int = 0) -> bytes:
 # PKDT / PSDT
 # ---------------------------------------------------------------------------
 
-def convert_flags(t4_flags: int, pack_type: int) -> tuple:
+def convert_flags(t4_flags: int, pack_type: int,
+                  hostile_ambush: bool = True) -> tuple:
     """TES4 PKDT flags -> (TES5 flags, preferred speed).
 
     Returns the speed separately because TES4's "always run" is a *flag* while
     TES5's speed is a *field* (plus the 0x2000 'use preferred speed' opt-in).
+
+    `hostile_ambush` gates the weapon-drawn/sneak flags an Ambush package would
+    otherwise always get — see the T4_AMBUSH branch in _choose(): the type also
+    covers scripted APPROACHES (CharacterGen's `CGEmperorGreetPlayerInCell`).
     """
     flags = 0
     for t4_bit, t5_bit in _FLAG_MAP:
@@ -316,8 +340,11 @@ def convert_flags(t4_flags: int, pack_type: int) -> tuple:
     # counterpart.  Dropped.  Use-horse IS honored — it becomes the template
     # "Ride Horse?" input in _choose().
 
-    if pack_type == T4_AMBUSH:
-        # Wait hidden, weapon out, don't call for help.
+    if pack_type == T4_AMBUSH and hostile_ambush:
+        # Wait hidden, weapon out, don't call for help.  NOT applied to an
+        # Ambush that targets the player as a scripted approach — drawing a
+        # weapon there reads as hostility and suppresses the force-greet the
+        # package exists to set up (Uriel at the prison cell).
         flags |= T5_WEAPON_DRAWN | T5_NO_COMBAT_ALERT | T5_ALWAYS_SNEAK
 
     return flags, speed
@@ -375,9 +402,13 @@ class PackContext:
     translate GetScriptVariable conditions.
     """
 
-    def __init__(self, plan=None, script_vars=None):
+    def __init__(self, plan=None, script_vars=None, greeting_topic=0):
         self.plan = plan
         self.script_vars = script_vars or {}
+        # Converted FormID of the GREETING topic (TES4 DIAL 0x000000C8).  A
+        # ForceGreet package opens THIS -- Oblivion's force-greet raised the
+        # dialogue menu, whose greeting comes from the shared GREETING topic.
+        self.greeting_topic = greeting_topic
 
     def quest_of(self, pack_fid: int):
         if self.plan is None:
@@ -452,6 +483,7 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
     target; only the procedure is re-expressed.
     """
     ptype = get_int(rec, 'PKDT.Type', -1)
+    greet_topic = getattr(ctx, 'greeting_topic', 0)
     loc = resolve_location(rec, ctx, pack_fid)
     tgt = resolve_target(rec, ctx, pack_fid)
     radius = get_int(rec, 'PLDT.Radius', 0)
@@ -546,8 +578,50 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
         i.set('location', loc)
         return i
 
-    # --- Ambush -> hold position, weapon drawn (flags set in convert_flags) ---
+    # --- Ambush ---
+    # TES4 "Ambush" is not necessarily hostile: the type means "wait for the
+    # TARGET to come near, then act on it", and Oblivion uses it for scripted
+    # APPROACHES as well as literal ambushes.  CharacterGen's
+    # `CGEmperorGreetPlayerInCell` is an Ambush on the PLAYER, radius 500 — the
+    # Emperor walking over to force-greet you through the cell bars.
+    #
+    # A player-targeted one is a FORCE GREET and must use Skyrim's ForceGreet
+    # template.  Skyrim has NO Papyrus "walk over and talk to the player" call;
+    # a forced conversation is a package whose Topic data input names the
+    # dialogue to open (228 vanilla instances do exactly this).  Follow was not
+    # enough: the actor approached and then stood there, because nothing in the
+    # package told the engine to open dialogue — Uriel idling at 211 units from
+    # the player with `IsInDialogueWithPlayer() == False`.
+    #
+    # Targetless Ambushes keep HoldPosition; ones aimed at another ACTOR keep
+    # Follow (a scripted approach with no player conversation to open).
     if ptype == T4_AMBUSH:
+        if _has_target(rec):
+            radius = float(get_int(rec, 'PLDT.Radius', 0) or 0)
+            if get_formid(rec, 'PTDT.Target') == PLAYER_FID:
+                i = Inputs(FORCE_GREET)
+                # Vanilla's ForceGreet SingleRef is (type 0, player, count 0);
+                # TES4's PTDT.Count (100 here) is a percentage that has no
+                # meaning for a reference target.
+                i.set('target', _target(0, PLAYER_FID, 0))
+                i.set('topic', greet_topic or 0)
+                # TES4's PLDT.Radius is how close the player had to get. In
+                # Skyrim that is the forcegreet distance, and it must be
+                # ANCHORED ON THE PLAYER (type 0, ref 0x14) exactly as vanilla
+                # does — a type-2/type-3 location here is not relative to the
+                # player, so the actor walks to a world spot instead of talking.
+                if radius > 0:
+                    i.set('forcegreet_distance',
+                          _location(0, PLAYER_FID, int(radius)))
+                return i
+            i = Inputs(FOLLOW)
+            i.set('target', tgt)
+            # PLDT.Radius is the trigger distance TES4 waited at; use it as the
+            # stopping distance rather than Follow's 128/256 escort spacing.
+            if radius > 0:
+                i.set('min_radius', max(64.0, radius * 0.5))
+                i.set('max_radius', radius)
+            return i
         i = Inputs(HOLD_POSITION)
         i.set('location', loc)
         return i
@@ -614,8 +688,24 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
         subs += pack_string_subrecord('EDID', edid)
 
     ptype = get_int(rec, 'PKDT.Type', -1)
-    flags, speed = convert_flags(get_int(rec, 'PKDT.Flags'), ptype)
-    subs += pack_subrecord('PKDT', build_pkdt(flags, speed))
+    # An Ambush aimed at the PLAYER is Oblivion's scripted-approach idiom, not
+    # a hostile ambush: the actor walks over so dialogue can fire.  Real
+    # ambushes wait on a location (no PTDT) or target another actor.
+    is_forcegreet = (ptype == T4_AMBUSH
+                     and get_formid(rec, 'PTDT.Target') == PLAYER_FID)
+    flags, speed = convert_flags(get_int(rec, 'PKDT.Flags'), ptype,
+                                 not is_forcegreet)
+    if is_forcegreet:
+        # Copy vanilla's force-greet PKDT exactly (MS05InductionForcegreet):
+        # no flags, speed 2 (run), and interrupt flags 0xFEFF.  The interrupts
+        # are the point — they AUTHORISE the actor to break off the package to
+        # speak.  Our global default is 0x0000 (all interrupts denied, which is
+        # right for ordinary packages), and with that a force-greet can never
+        # open dialogue no matter how close the actor gets.
+        subs += pack_subrecord('PKDT', build_pkdt(0, SPEED_RUN,
+                                                  interrupt=0xFEFF))
+    else:
+        subs += pack_subrecord('PKDT', build_pkdt(flags, speed))
     subs += pack_subrecord('PSDT', build_psdt(rec))
 
     # Conditions carry the activation logic and ARE the package's gate.  A
@@ -647,4 +737,89 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
         subs += pack_formid_subrecord('INAM', 0)
         subs += pack_subrecord('PDTO', struct.pack('<II', 0, 0))
 
+    if inputs.t is FORCE_GREET:
+        # The greeting topic does not exist yet (Phase 5); remember which quest
+        # this package belongs to so patch_forcegreet_topics can bind it.
+        # Only 120 of 7,209 packages are quest-OWNED, so fall back to the quest
+        # the package's own conditions test (GetStage/GetQuestVariable) — that
+        # is the quest whose greeting the force-greet is part of.
+        _FORCEGREET_PENDING[pack_fid] = owner or _condition_quest(rec)
+
     return pack_record('PACK', pack_fid, get_int(rec, 'RecordFlags'), subs)
+
+
+# pack fid -> owning quest fid, for packages whose ForceGreet Topic input still
+# holds the 0 placeholder. Drained by patch_forcegreet_topics.
+_FORCEGREET_PENDING: dict = {}
+
+# TES4 condition functions whose param1 is a QUEST FormID.
+_QUEST_PARAM_FUNCS = frozenset({
+    58,    # GetStage
+    59,    # GetStageDone
+    79,    # GetQuestVariable
+    62,    # GetQuestRunning
+})
+
+
+def _condition_quest(rec: dict) -> int:
+    """The quest this package's conditions gate on (converted fid), or 0.
+
+    A force-greet is part of a quest's dialogue even when the PACKAGE is not
+    quest-owned, and `GetStage <quest> == N` is how Oblivion scheduled it.
+    """
+    i = 0
+    while True:
+        raw = rec.get(f'Condition[{i}].Raw')
+        if raw is None:
+            return 0
+        i += 1
+        try:
+            d = bytes.fromhex(raw)
+        except ValueError:
+            continue
+        if len(d) < 20:
+            continue
+        if struct.unpack_from('<H', d, 8)[0] in _QUEST_PARAM_FUNCS:
+            from .text_reader import remap_formid
+            return remap_formid(struct.unpack_from('<I', d, 12)[0])
+    return 0
+
+# The Topic input is the FIRST data input of a ForceGreet instance, so its PDTO
+# is the first PDTO in the record. The POBA/POEA/POCA blocks that follow also
+# carry PDTOs, hence "first" rather than "any".
+_FORCEGREET_TOPIC_SLOT = 0
+
+
+def patch_forcegreet_topics(writer) -> int:
+    """Bind each ForceGreet package's Topic input to its quest's GREETING.
+
+    Skyrim opens a forced conversation by naming a DIAL in the package's Topic
+    data input (PDTO). Those topics are built per quest in Phase 5, after PACK
+    is written, so conversion leaves a 0 placeholder and this fills it in.
+    """
+    from .dialog_converter import GREET_TOPIC_BY_QUEST
+    if not _FORCEGREET_PENDING or not GREET_TOPIC_BY_QUEST:
+        return 0
+    records = writer._top_groups.get('PACK') or []
+    patched = 0
+    for i, blob in enumerate(records):
+        if len(blob) < 24:
+            continue
+        fid = struct.unpack_from('<I', blob, 12)[0]
+        quest = _FORCEGREET_PENDING.get(fid)
+        if quest is None:
+            continue
+        topic = GREET_TOPIC_BY_QUEST.get(quest)
+        if not topic:
+            continue
+        # First PDTO in the data-input block: 6-byte header then (type, fid).
+        at = blob.find(b'PDTO', 24)
+        if at < 0:
+            continue
+        off = at + 6
+        if struct.unpack_from('<I', blob, off + 4)[0] != 0:
+            continue          # already bound
+        records[i] = (blob[:off + 4] + struct.pack('<I', topic)
+                      + blob[off + 8:])
+        patched += 1
+    return patched

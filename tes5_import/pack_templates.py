@@ -40,6 +40,9 @@ T_OBJECTLIST = 'ObjectList'      # payload subrecord: CNAM (u32 formid, 0 = none
 T_BOOL = 'Bool'                  # payload subrecord: CNAM (1 byte)
 T_INT = 'Int'                    # payload subrecord: CNAM (u32)
 T_FLOAT = 'Float'                # payload subrecord: CNAM (f32)
+# payload subrecord: PDTO (u32 type, u32 formid); type 0 = a DIAL topic.
+# This is what makes a ForceGreet package OPEN DIALOGUE — see FORCE_GREET.
+T_TOPIC = 'Topic'
 
 # PKDT.Type
 PKDT_TYPE_PACKAGE = 18
@@ -193,6 +196,43 @@ ESCORT = Template(
         8: 500.0,    # run-if-behind distance
     },
     slots={'target': 0, 'location': 2, 'ride_horse': 6},
+)
+
+# --- ForceGreet (0003C1C4) — 228 vanilla instances -----------------------
+# THE force-greet mechanism. Skyrim has no Papyrus "walk over and talk to the
+# player" call; a forced conversation is a PACKAGE whose first data input is the
+# DIALOGUE TOPIC to open (ANAM=Topic + PDTO -> a DIAL record). Without that
+# input the actor just stands there — converting Oblivion's force-greet
+# packages to Follow/HoldPosition produced exactly that (Uriel at the prison
+# cell, walking no closer than 211 units and never entering dialogue).
+#
+# Slots copied from MS05InductionForcegreet (0001703F): [0] Topic,
+# [1] trigger location, [2] greet location, [3] forcegreet distance,
+# [4,5] Bools, [6] SingleRef = who to greet, [7] leash location, rest Bools +
+# one Float. Slot 5 ("Player must be detected?") is 1 in vanilla.
+#
+# EVERY LOCATION DEFAULT MATTERS.  An unset Location slot falls back to
+# `_null_location()` = type 3 "near EDITOR location", which sends the actor
+# walking back to where the CK placed him instead of to the player — Uriel
+# turning around and going up the stairs mid-force-greet.  Vanilla anchors
+# slots 3 and 7 on the PLAYER (type 0, ref 0x14) with generous radii, and uses
+# type 2 "near current location" for the greet spot, so the actor stays put and
+# talks.  These defaults reproduce that; only the trigger radius is taken from
+# the TES4 package.
+_PLDT_PLAYER_350 = (0, 0x14, 350)     # forcegreet distance, anchored on player
+_PLDT_PLAYER_5000 = (0, 0x14, 5000)   # leash — do not wander off
+_PLDT_HERE_1000 = (2, 0, 1000)        # greet near current location
+FORCE_GREET = Template(
+    formid=0x0003C1C4, edid='ForceGreet', xnam=80, version=18,
+    index_list=(7, 8, 62, 75, 79, 65, 17, 22, 26, 40, 29, 30, 31, 32, 33, 34,
+                36, 67, 69, 81),
+    inputs=(T_TOPIC, T_LOCATION, T_LOCATION, T_LOCATION, T_BOOL, T_BOOL,
+            T_SINGLEREF, T_LOCATION) + (T_BOOL,) * 9 + (T_FLOAT, T_BOOL,
+                                                        T_BOOL),
+    defaults={1: _PLDT_HERE_1000, 2: _PLDT_HERE_1000, 3: _PLDT_PLAYER_350,
+              4: 0, 5: 1, 7: _PLDT_PLAYER_5000, 17: 50.0},
+    slots={'topic': 0, 'trigger_location': 1, 'greet_location': 2,
+           'forcegreet_distance': 3, 'target': 6, 'leash_location': 7},
 )
 
 # --- HoldPosition (000503D0) — 116 instances -----------------------------

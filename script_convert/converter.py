@@ -2002,38 +2002,43 @@ class ScriptConverter:
                     # TES4 `set t to Say ...` charged the line's duration and the
                     # owning script counted it down before the next speaker went.
                     #
-                    # ORDER MATTERS. The charge is emitted AFTER the Say call, not
-                    # before. These conversations share ONE quest timer between
-                    # four polling actor scripts, and `Say()` is asynchronous: the
-                    # INFO's End fragment (which zeroes the timer and hands
-                    # `speaker` to the next actor) can run on the engine's
-                    # dialogue thread at any point. Charging FIRST lets a speaker
-                    # stamp the shared timer and then have its line dropped or its
-                    # fragment land immediately — leaving a stale charge that
-                    # holds the NEXT speaker's `timer <= 0` guard shut. In game
-                    # that reads as counters advancing with no audio and a timer
-                    # that "never reaches 0 because it resets whenever dialogue
-                    # plays" (CharacterGen's cell-door exchange).
+                    # ORDER MATTERS, and BOTH orders have failed in game:
                     #
-                    # Charging after the call keeps the timer owned by the speaker
-                    # that actually spoke, and a dropped Say leaves it clear so
-                    # the next tick simply retries.
+                    #  * Charge AFTER the Say: a SHORT line's End fragment (which
+                    #    zeroes the timer and advances `speaker`) runs on the
+                    #    engine's dialogue thread BEFORE this statement lands, so
+                    #    the charge RESURRECTS a timer that was already released.
+                    #    The same speaker's guard reopens, it re-Says the same
+                    #    line, and the counter never moves — NPCs repeating a line
+                    #    "sometimes, not the same each run" (CharacterGen lines
+                    #    12/13 re-fired 2x and 4x, ~3s apart).
+                    #
+                    #  * Charge BEFORE with nothing else: a DROPPED Say (no INFO
+                    #    qualifies) leaves a stale charge nobody clears, holding
+                    #    the next speaker's `timer <= 0` guard shut.
+                    #
+                    # Charge BEFORE, which shuts this speaker's guard immediately
+                    # so a re-fire is impossible, and let the End fragment clear
+                    # it. The stale-charge case is now harmless: the fragment's
+                    # sequence gate (pipeline._sequence_gate) makes the counter
+                    # authoritative, so a stranded timer only costs one line's
+                    # pacing before it drains.
                     delay_f = (self._say_seconds(say_call) +
                                (float(delay_m.group(1)) if delay_m else 0.0))
                     delay_val = f'{delay_f:g}'
                     # An Int target (TES4 `short`) can't take a Float literal
                     if self._var_types.get(target.lower().split('.')[-1]) == 'Int':
                         delay_val = str(int(delay_f))
-                    return (f'{say_call}\n'
-                            f'  {target} = {delay_val}'
-                            '  ;line length; the End fragment clears it early')
+                    return (f'{target} = {delay_val}'
+                            '  ;line length; the End fragment clears it early\n'
+                            f'  {say_call}')
                 secs = self._say_seconds(value)
                 say_dflt = (str(int(round(secs))) if self._var_types.get(
                     target.lower().split('.')[-1]) == 'Int'
                     else f'{secs:g}')
-                return (f'{value}\n'
-                        f'  {target} = {say_dflt}'
-                        '  ;line length; the End fragment clears it early')
+                return (f'{target} = {say_dflt}'
+                        '  ;line length; the End fragment clears it early\n'
+                        f'  {value}')
             # GlobalVariable: use SetValue() instead of direct assignment
             tgt_low = target.lower().split('.')[-1]
             if self._property_refs.get(target, self._property_refs.get(tgt_low, '')) == 'GlobalVariable':

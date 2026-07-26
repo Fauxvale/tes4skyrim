@@ -841,6 +841,14 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     else:
         dialog_sge_fids = build_dialog_groups(by_type, writer, npc_to_vtyp, fid_to_edid=fid_to_edid, xref=xref, well_known_props=_WELL_KNOWN_PROPERTIES, voice_map=voice_map, unlock_plan=unlock_plan, unlock_globals=unlock_globals, script_vars=_script_vars)
     sge_quest_fids |= dialog_sge_fids
+    # ForceGreet packages name the topic they open (PDTO), but the per-quest
+    # GREETING topics only exist now (Phase 5), long after PACK was written in
+    # Phase 3b2. Patch the placeholder in the packed bytes rather than reorder
+    # the phases — PACK must stay after QUST for its alias indices.
+    from .pack_converter import patch_forcegreet_topics
+    n_fg = patch_forcegreet_topics(writer)
+    if n_fg:
+        print(f"  ForceGreet packages bound to a greeting topic: {n_fg}")
     _write_voice_map(output_path, voice_map)
     from .dialog_converter import get_lip_texts
     _write_lip_text(output_path, get_lip_texts())

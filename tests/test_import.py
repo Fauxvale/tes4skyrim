@@ -2003,6 +2003,48 @@ class TestCKWarningFixes:
         from tes5_import.pack_converter import _null_target
         assert struct.unpack('<iIi', _null_target())[0] == 6
 
+    def test_player_ambush_becomes_forcegreet(self):
+        """A player-targeted TES4 Ambush is a FORCE GREET.
+
+        Skyrim has no Papyrus "walk over and talk to the player" call — the
+        force greet is the PACKAGE. Every field below was wrong at some point
+        and each one on its own stops the conversation:
+          * template must be ForceGreet (0003C1C4), not Follow/HoldPosition
+          * the Topic input (PDTO) names the dialogue to open
+          * Location slots must NOT default to type 3 "near editor location",
+            or the actor walks back to his CK spot (Uriel up the stairs)
+          * the leash/forcegreet distances anchor on the PLAYER (type 0, 0x14)
+          * PKDT interrupt flags must AUTHORISE speaking (vanilla 0xFEFF); the
+            0x0000 default denies every interrupt and no greet can fire
+        """
+        from tes5_import.pack_converter import (_choose, PackContext,
+                                                convert_flags, build_pkdt,
+                                                SPEED_RUN, T4_AMBUSH)
+        from tes5_import.pack_templates import FORCE_GREET
+        rec = {'Signature': 'PACK', 'FormID': '0002C2F0',
+               'EditorID': 'CGEmperorGreetPlayerInCell',
+               'PKDT.Type': str(T4_AMBUSH), 'PKDT.Flags': '5124',
+               'PLDT.Type': '2', 'PLDT.Location': '0', 'PLDT.Radius': '500',
+               'PTDT.Type': '0', 'PTDT.Target': '00000014',
+               'PTDT.Count': '100'}
+        inp = _choose(rec, PackContext(), 0x0102C2F0)
+        assert inp.t is FORCE_GREET
+        blob = inp.emit()
+        assert b'Topic' in blob and b'PDTO' in blob
+        # no Location slot may be left as the "near editor location" filler
+        for slot in (1, 2, 3, 7):
+            assert slot in inp.values, f'Location slot {slot} unset'
+        def _pldt(v):
+            return v if isinstance(v, tuple) else struct.unpack('<iIi', v)
+        assert _pldt(inp.values[3])[:2] == (0, 0x14)
+        assert _pldt(inp.values[7])[:2] == (0, 0x14)
+        # the weapon-drawn/sneak ambush flags must NOT be applied
+        flags, _speed = convert_flags(5124, T4_AMBUSH, hostile_ambush=False)
+        assert not (flags & 0x00800000), 'weapon drawn on a force greet'
+        # interrupts must be authorised, exactly as vanilla force-greets are
+        pkdt = build_pkdt(0, SPEED_RUN, interrupt=0xFEFF)
+        assert struct.unpack('<IBBBBHH', pkdt)[5] == 0xFEFF
+
     def test_spel_cast_type_fire_and_forget(self):
         from tes5_import.record_types.equipment import convert_SPEL
         rec = {'Signature': 'SPEL', 'FormID': '00001234', 'RecordFlags': '0',

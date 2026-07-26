@@ -1450,6 +1450,12 @@ def collect_tclt_target_fids(by_type: dict) -> set:
 # Populated by build_dialog_groups (same lifecycle as _EMPTY_DIAL_FIDS).
 _SAY_TOPIC_DISPOSITIONS: dict = {}
 
+# owner quest fid -> converted GREETING topic fid, filled while bark topics are
+# split per quest.  A ForceGreet PACKAGE must name the topic it opens (PDTO),
+# and Skyrim keeps one bark topic per subtype per quest, so the package needs
+# THIS quest's greeting rather than a single global one.
+GREET_TOPIC_BY_QUEST: dict = {}
+
 _SAYTO_RE = re.compile(r'\bsayto[\s,]+(\w+)[\s,]+(\w+)', re.IGNORECASE)
 _SAY_RE = re.compile(r'\bsay[\s,]+(\w+)', re.IGNORECASE)
 _STARTCONV_RE = re.compile(r'\bstartconversation[\s,]+(\w+)(?:[\s,]+(\w+))?',
@@ -2382,6 +2388,9 @@ def _build_bark_pass(bark_dials, info_by_dial, writer,
             this_dial_fid = writer.alloc_formid()
         this_edid = f"{g['edid']}_{owner_qfid:08X}" if g['edid'] else \
             f"TES4Bark_{subtype}_{owner_qfid:08X}"
+        # Remember this quest's GREETING so a ForceGreet package can open it.
+        if (g['edid'] or '').upper() == 'GREETING':
+            GREET_TOPIC_BY_QUEST.setdefault(owner_qfid, this_dial_fid)
 
         # Per-group INFO context: voice types are pooled from THIS group's INFOs
         # (a generic bark line inherits its siblings' voices). The voice-file

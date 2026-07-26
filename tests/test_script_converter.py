@@ -1403,6 +1403,24 @@ class TestSayTimerConversion:
         assert m, result
         assert f'timer - {m.group(1)}' in result
 
+    def test_say_timer_is_charged_before_the_say_call(self, converter):
+        """The charge must precede Say(), or a short line re-fires.
+
+        Say() is asynchronous and the INFO's End fragment (which zeroes the
+        timer and advances `speaker`) runs on the engine's dialogue thread. With
+        the charge AFTER the call, a short line's fragment lands first and the
+        charge then RESURRECTS the released timer — the same speaker's guard
+        reopens and re-Says the line, so the counter never moves. That is the
+        intermittent "NPC says a line twice" bug (CharacterGen lines 12/13).
+
+        The stale-charge risk of ordering it first is covered by the fragment's
+        sequence gate (pipeline._sequence_gate).
+        """
+        converter._property_refs['ThadonRef'] = 'Actor'
+        result = converter._convert_line(
+            'set timer to ThadonRef.Say DeathSpeech01', 'Quest')
+        assert result.index('timer =') < result.index('ThadonRef.Say('), result
+
     def test_say_assignment_gets_line_duration(self, converter):
         """A converted Say() timer holds the line's length, never zero.
 
