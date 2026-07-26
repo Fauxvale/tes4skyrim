@@ -17,6 +17,10 @@ Major Issues for V1:
 	7 - Shops missing full inventory of items
 
 	8 - Crime system
+
+	9 - Repeat lines in charactergen. Stages will completely fail if certain lines are repeated (like valen dreth). Also should remove debug quest stages
+
+	analyze the magic conversion. ie spells and effects. currently we are replacing a bunch with skyrim equivalents and probably missing a bunch. we've since improved our mesh conversion significantly. Once your analysis is complete, write a doc detailing the path to complete spell / magic effect conversion
 		
 Later Issues:
 

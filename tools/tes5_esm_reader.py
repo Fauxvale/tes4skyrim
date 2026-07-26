@@ -605,6 +605,78 @@ def _dec_enit_ench(data: bytes) -> list:
     ]
 
 
+# MGEF DATA archetypes (xEdit wbDefinitionsTES5.pas wbMGEFType).
+_MGEF_ARCHETYPES = {
+    0: 'ValueModifier', 1: 'Script', 2: 'Dispel', 3: 'CureDisease',
+    4: 'Absorb', 5: 'DualValueModifier', 6: 'Calm', 7: 'Demoralize',
+    8: 'Frenzy', 9: 'Disarm', 10: 'CommandSummoned', 11: 'Invisibility',
+    12: 'Light', 15: 'Lock', 16: 'Open', 17: 'BoundWeapon',
+    18: 'SummonCreature', 19: 'DetectLife', 20: 'Telekinesis',
+    21: 'Paralysis', 22: 'Reanimate', 23: 'SoulTrap', 24: 'TurnUndead',
+    25: 'Guide', 26: 'WerewolfFeed', 27: 'CureParalysis', 28: 'CureAddiction',
+    29: 'CurePoison', 30: 'Concussion', 31: 'ValueAndParts',
+    32: 'AccumulateMagnitude', 33: 'Stagger', 34: 'PeakValueModifier',
+    35: 'Cloak', 36: 'Werewolf', 37: 'SlowTime', 38: 'Rally',
+    39: 'EnhanceWeapon', 40: 'SpawnHazard', 41: 'Etherealize', 42: 'Banish',
+    43: 'SpawnScriptedRef', 44: 'Disguise', 45: 'GrabActor', 46: 'VampireLord',
+}
+
+# (offset, name, kind) for every field of the 152-byte TES5 MGEF DATA struct.
+# Layout from xEdit wbDefinitionsTES5.pas wbMGEFData; verified field-by-field
+# against references/Skyrim.esm MGEF records (e.g. SummonFlameAtronach carries
+# Archetype=18 SummonCreature with AssocItem = a real NPC_).
+_MGEF_DATA_FIELDS = (
+    (0, 'Flags', 'x'), (4, 'BaseCost', 'f'), (8, 'AssocItem', 'fid'),
+    (12, 'MagicSkill', 'i'), (16, 'ResistValue', 'i'),
+    (20, 'CounterEffectCount', 'h'), (24, 'CastingLight', 'fid'),
+    (28, 'TaperWeight', 'f'), (32, 'HitShader', 'fid'),
+    (36, 'EnchantShader', 'fid'), (40, 'MinimumSkillLevel', 'u'),
+    (44, 'SpellmakingArea', 'u'), (48, 'SpellmakingCastingTime', 'f'),
+    (52, 'TaperCurve', 'f'), (56, 'TaperDuration', 'f'),
+    (60, 'SecondAVWeight', 'f'), (64, 'Archetype', 'arch'),
+    (68, 'ActorValue', 'i'), (72, 'Projectile', 'fid'),
+    (76, 'Explosion', 'fid'), (80, 'CastingType', 'u'), (84, 'Delivery', 'u'),
+    (88, 'SecondActorValue', 'i'), (92, 'CastingArt', 'fid'),
+    (96, 'HitEffectArt', 'fid'), (100, 'ImpactData', 'fid'),
+    (104, 'SkillUsageMultiplier', 'f'), (108, 'DualCastArt', 'fid'),
+    (112, 'DualCastScale', 'f'), (116, 'EnchantArt', 'fid'),
+    (120, 'HitVisuals', 'fid'), (124, 'EnchantVisuals', 'fid'),
+    (128, 'EquipAbility', 'fid'), (132, 'ImageSpaceModifier', 'fid'),
+    (136, 'PerkToApply', 'fid'), (140, 'CastingSoundLevel', 'u'),
+    (144, 'ScriptEffectAIScore', 'f'), (148, 'ScriptEffectAIDelayTime', 'f'),
+)
+
+
+def _dec_mgef_data(data: bytes) -> list:
+    """MGEF DATA — 152 bytes in TES5.
+
+    Emits the full hex UNTRUNCATED: tools/gen_vanilla_mgef_table.py bakes these
+    blobs into a committed table, and the generic hex fallback used to cut them
+    at 96 bytes, silently dropping the last 14 fields (HitEffectArt..AI delay).
+    """
+    lines = [f'DATA.size={len(data)}', f'DATA.hex={data.hex().upper()}']
+    if len(data) < 152:
+        lines.append(f'DATA.TRUNCATED=expected 152 bytes, got {len(data)}')
+        return lines
+    for off, name, kind in _MGEF_DATA_FIELDS:
+        if kind == 'f':
+            lines.append(f'DATA.{name}={struct.unpack_from("<f", data, off)[0]:.6g}')
+        elif kind == 'fid':
+            lines.append(f'DATA.{name}={struct.unpack_from("<I", data, off)[0]:08X}')
+        elif kind == 'i':
+            lines.append(f'DATA.{name}={struct.unpack_from("<i", data, off)[0]}')
+        elif kind == 'h':
+            lines.append(f'DATA.{name}={struct.unpack_from("<H", data, off)[0]}')
+        elif kind == 'x':
+            lines.append(f'DATA.{name}=0x{struct.unpack_from("<I", data, off)[0]:08X}')
+        elif kind == 'arch':
+            v = struct.unpack_from('<I', data, off)[0]
+            lines.append(f'DATA.{name}={v} ({_MGEF_ARCHETYPES.get(v, "?")})')
+        else:
+            lines.append(f'DATA.{name}={struct.unpack_from("<I", data, off)[0]}')
+    return lines
+
+
 def _dec_hdpt_data(data: bytes) -> list:
     """HDPT DATA — 1 byte type, then flags."""
     if not data:
@@ -1118,6 +1190,9 @@ _TYPED_DECODERS: dict = {
     ('REFR', 'XTEL'): _dec_refr_xtel,
     ('REFR', 'XLOC'): _dec_refr_xloc,
     ('ACHR', 'DATA'): _dec_refr_data,
+
+    # Magic effects
+    ('MGEF', 'DATA'): _dec_mgef_data,
 
     # Spells / Enchantments
     ('SPEL', 'SPIT'): _dec_spit,

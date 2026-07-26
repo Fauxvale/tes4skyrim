@@ -21,7 +21,7 @@ users don't have references/).
 import struct
 import threading
 
-from .vanilla_mgef_data import VANILLA_MGEF_DATA
+from .vanilla_mgef_data import MGEF_DATA_SIZE, VANILLA_MGEF_DATA
 from .writer import pack_record, pack_string_subrecord, pack_subrecord
 
 # MGEF DATA offsets (TES5, 152 bytes — see xEdit wbDefinitionsTES5 Magic Effect
@@ -91,6 +91,13 @@ def aimed_variant(mgef_fid: int, tes4_code: str, writer) -> int:
 
         edid, data_hex = entry
         data = bytearray(bytes.fromhex(data_hex))
+        # A short blob means the generated table was built from a truncated
+        # dump; writing it would emit an MGEF the CK/engine cannot read.
+        if len(data) != MGEF_DATA_SIZE:
+            raise ValueError(
+                f'vanilla MGEF {mgef_fid:08X} ({edid}) DATA is {len(data)} '
+                f'bytes, expected {MGEF_DATA_SIZE} — regenerate with '
+                f'tools/gen_vanilla_mgef_table.py')
         hostile = struct.unpack_from('<I', data, _OFF_FLAGS)[0] & _HOSTILE
         proj = _PROJ_HOSTILE if hostile else _PROJ_BENEFICIAL
         struct.pack_into('<I', data, _OFF_PROJECTILE, proj)
