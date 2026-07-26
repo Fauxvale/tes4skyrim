@@ -1,89 +1,81 @@
-Work Order:
-	Dialog not exact L1
-	Voice lines missing L6
-	Fix stairs L8
-	Crime System L11, mi5
-
 Major Issues for V1:
 	1 - Iterate on quest and dialog conversion until everything is playable startin with Oblivion Main Quest
 
 	2 - Havok feels off. Items don't move like they should. Specifically, there seems to be too much inertia on small items, like I'm dragging a heavy object when it is something as small as a cup, Animated signs will get stuck in a position after swinging a bit, defying gravicty
 		ctrigtripwire01.nif also break when walked over, and prisoncellchains01.nif doesn't properly swing (this is most likely because it is a static and not an activator).
 
-	4 - Navmesh refinement
+	3 - Navmesh refinement
 		ensure corridors connect pathgrid islands + other connectivity issues
 		allow growth even on slopes
 
-	5 - Fix CK Loading (not sure why it doesn't finish)
+	4 - Fix CK Loading (not sure why it doesn't finish)
 
-	6 - Need new skyrim body mesh to actually work to allow leg skin to appear
+	5 - Need new skyrim body mesh to actually work to allow leg skin to appear
 	
-	7 - If I join the fighter's guild by speaking to Azzan, but don't select "contract' and leave dialog. the next time I talk to him he is missing all topics but "rumors"
+	6 - If I join the fighter's guild by speaking to Azzan, but don't select "contract' and leave dialog. the next time I talk to him he is missing all topics but "rumors"
+
+	7 - Shops missing full inventory of items
+
+	8 - Crime system
 		
 Later Issues:
 
-	1 - Refine dialog conversion based on dialog emulators to exactly match Oblivion
-
-	3 - Refine creature conversion further. Speed is still a bit off
+	2 - Refine creature conversion further. Speed is still a bit off
 	
-	4 - Convert weathers
+	3 - Convert weathers
 
-	5 - Goblins don't properly hold weapons
+	4 - Goblins don't properly hold weapons
 
-	6 - Missing greeting voice lines (like Hello)
+	5 - Missing greeting voice lines (like Hello)
 
-	7 - Allow running process on zip (mod)
+	6 - Allow running process on zip (mod)
 
-	8 - Fix walking up stairs
+	7 - Fix walking up stairs
 
-	9 - NPC levels / health is inordinately high!
+	8 - NPC levels / health is inordinately high!
 
-	11 - Crime system
+	9 - Arrows are held at an invisible location behind the arrow when nocking, and can't be picked up after shooting
 
-	12 - Arrows are held at an invisible location behind the arrow when nocking, and can't be picked up after shooting
+	10 - Some converted books (scrolls) are using the wrong Skyrim base mesh
 
-	13 - Some converted books (scrolls) are using the wrong Skyrim base mesh
+	11 - Nehrim script TODOs Use skse_conversion_audit
 
-	14 - Nehrim script TODOs Use skse_conversion_audit
+	12 - Restore Oblivion's NPC-to-NPC conversations (dropped, see docs/ambient_dialogue_channel_plan.md)
 
-	15 - Find additional inverted collision examples in Nehrim
+	13 - Spell Conversion including effects
 
-	16 - Restore Oblivion's NPC-to-NPC conversations (dropped, see docs/ambient_dialogue_channel_plan.md)
-
-	17 - Nehrim signposts missing texture
+	14 - Make horses rideable
 
 Minor Issues:
 
 	1 -	Override gold with skyrim gold
 
-	2 - Weapons have an attack animation of unknown instead of default
-
-	3 - Improve landscape layer blending
+	2 - Improve landscape layer blending
 	
-	4 - Should properly position inventory items. The side that allows the largest view should face out
+	3 - Replace Prison marker with the skyrim equivalent as we are doing with the other markers
 
-	5 - Replace Prison marker with the skyrim equivalent as we are doing with the other markers
+	4 - Harvested plants don't make a sound. Intentional?
 
-	6 - Harvested plants don't make a sound. Intentional?
+	5 - Update world map cloud mesh and texture
 
-	7 - Update world map cloud mesh and texture
+	6 - Convert Skyrim LE meshes to Skyrim SE format
 
-	8 - Convert Skyrim LE meshes to Skyrim SE format
-
-	10 - Flame atronach animated section not properly converted
+	7 - Flame atronach animated section not properly converted
 	
-	11 - Refine LOD, Still too big and holes in distant meshes
+	8 - Refine LOD, Still too big and holes in distant meshes
 
-	12 - Should trim skin in converted clothing that would be occluded by the clothing mesh to avoid clipping
+	9 - Should trim skin in converted clothing that would be occluded by the clothing mesh to avoid clipping
 
-	13 - Clothes don't move which character skin, resulting in clipping
+	10 - Clothes don't move which character skin, resulting in clipping
 
-	14 - Can see back of head of skinned helmets
+	11 - Can see back of head of skinned helmets
 
-	15 - Minor issues with 44 patch plugin
+	12 - Minor issues with 44 patch plugin
 
-	16 - Taskbar and app icon
+	13 - Taskbar and app icon
 
-	17 - Cleanup output log and update colors
+	14 - Cleanup output log and update colors
 
-	18 - Shops missing full inventory of items
+	15 - Keep on the lookout for additional inverted collision examples in Nehrim
+	
+	16 - Missing location topics (Anvil)

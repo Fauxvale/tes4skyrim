@@ -182,6 +182,12 @@ def _qem_decimate(verts: np.ndarray, tris: np.ndarray,
 
     hom = np.ones(4)
 
+    # Python-list views of the per-node data the inner loop touches.  cost_of
+    # and the flip guard run ~100k times per shape on 3-vectors, where NumPy's
+    # per-call dispatch overhead dwarfs the arithmetic (np.cross alone spent
+    # more time in normalize_axis_tuple/moveaxis than on the cross product).
+    PL = [tuple(map(float, p)) for p in P]
+
     def cost_of(u, v):
         hom[:3] = P[v]
         q = Q[u] + Q[v]
@@ -189,9 +195,28 @@ def _qem_decimate(verts: np.ndarray, tris: np.ndarray,
         # edge-length regularization: discourage long-distance collapses that
         # stretch faces into "sails" even when the quadric error is small.
         # Scaled like "one average face displaced by the collapse distance".
-        dv = P[u] - P[v]
-        c += _EDGE_LEN_REG * mean_face_area * float(dv @ dv)
+        ux, uy, uz = PL[u]
+        vx, vy, vz = PL[v]
+        dx, dy, dz = ux - vx, uy - vy, uz - vz
+        c += _EDGE_LEN_REG * mean_face_area * (dx * dx + dy * dy + dz * dz)
         return c
+
+    def _flips(a, b, ox, oy, oz, nx_, ny_, nz_):
+        """True if triangle (a, b, ·) flips when its third vertex moves from
+        (ox,oy,oz) to (nx_,ny_,nz_).  Scalar cross products + dot."""
+        ax, ay, az = PL[a]
+        bx, by, bz = PL[b]
+        a1x, a1y, a1z = ax - ox, ay - oy, az - oz
+        b1x, b1y, b1z = bx - ox, by - oy, bz - oz
+        c1x = a1y * b1z - a1z * b1y
+        c1y = a1z * b1x - a1x * b1z
+        c1z = a1x * b1y - a1y * b1x
+        a2x, a2y, a2z = ax - nx_, ay - ny_, az - nz_
+        b2x, b2y, b2z = bx - nx_, by - ny_, bz - nz_
+        c2x = a2y * b2z - a2z * b2y
+        c2y = a2z * b2x - a2x * b2z
+        c2z = a2x * b2y - a2y * b2x
+        return (c1x * c2x + c1y * c2y + c1z * c2z) <= 0.0
 
     def neighbors(u):
         out = set()
@@ -228,16 +253,15 @@ def _qem_decimate(verts: np.ndarray, tris: np.ndarray,
 
         # normal-flip guard: faces of u that survive (don't contain v)
         flip = False
-        pu, pv = P[u], P[v]
+        ux, uy, uz = PL[u]
+        vx, vy, vz = PL[v]
         for fi in vert_faces[u]:
             f = faces[fi]
             if v in f:
                 continue
             i = f.index(u)
             a, b = f[(i + 1) % 3], f[(i + 2) % 3]
-            n_before = np.cross(P[a] - pu, P[b] - pu)
-            n_after = np.cross(P[a] - pv, P[b] - pv)
-            if np.dot(n_before, n_after) <= 0:
+            if _flips(a, b, ux, uy, uz, vx, vy, vz):
                 flip = True
                 break
         if flip:
@@ -851,24 +875,45 @@ def generate_far_nif(src_path: Path, dst_path: Path,
     if not src_path.exists():
         return False
 
+    nif_data = _read_skyrim_nif(src_path)
+    if nif_data is None:
+        return False
+    return _decimate_and_write(nif_data, src_path.stem, dst_path,
+                               decimate_ratio, cap, max_dev_frac)
+
+
+def _read_skyrim_nif(src_path: Path):
+    """Parse a Skyrim-version NIF, or None if unreadable/wrong version.
+
+    PyFFI's reader is ~65% of all _far.nif generation time (it builds a Python
+    object per struct field), so callers that need several outputs from one
+    source should read ONCE and reuse the parsed tree.
+    """
     nif_data = NifFormat.Data()
     try:
         with open(src_path, 'rb') as fh:
             nif_data.inspect(fh)
             if nif_data.version != _SKYRIM_VER:
-                return False
+                return None
             nif_data.read(fh)
     except Exception:
-        return False
+        return None
+    return nif_data
 
+
+def _decimate_and_write(nif_data, src_stem: str, dst_path: Path,
+                        decimate_ratio: float, cap: int,
+                        max_dev_frac: float) -> bool:
+    """Decimate an already-parsed NIF in place and write it to dst_path."""
     if not _decimate_nif_inplace(nif_data, decimate_ratio, cap, max_dev_frac):
         return False
 
     # Rename root to <stem>_far
     for root in nif_data.roots:
         if root is not None:
-            stem = src_path.stem
-            root.name = (stem + '_far').encode('latin1') if not stem.endswith('_far') else stem.encode('latin1')
+            root.name = ((src_stem + '_far').encode('latin1')
+                         if not src_stem.endswith('_far')
+                         else src_stem.encode('latin1'))
 
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     buf = io.BytesIO()
@@ -1023,16 +1068,42 @@ def _far_nif_worker(args: tuple) -> bool:
             return False
         if not generate_far_nif(src, dst):
             return False
+
     # Far-ring tiers are decimated FROM the _far.nif (also works for the
     # hand-crafted vanilla _far meshes, which are already low-poly).
+    #
+    # Decimation mutates the parsed tree in place, so each tier needs its own
+    # parse — but they can all come from ONE disk read of the _far.nif we just
+    # wrote, instead of re-reading (and re-stat'ing) the file per tier.  PyFFI
+    # parsing is ~65% of this stage's runtime and 48% of all reads were these
+    # tier re-reads.
+    tiers = []
     if need8:
         p8 = _tier_path(dst, _TIER8['suffix'])
         if not p8.exists() or _is_generated(p8):
-            generate_far_nif(dst, p8, _TIER8['ratio'], _TIER8['cap'],
-                             _TIER8['dev'])
+            tiers.append((p8, _TIER8))
     if need16:
         p16 = _tier_path(dst, _TIER16['suffix'])
         if not p16.exists() or _is_generated(p16):
-            generate_far_nif(dst, p16, _TIER16['ratio'], _TIER16['cap'],
-                             _TIER16['dev'])
+            tiers.append((p16, _TIER16))
+    if not tiers:
+        return True
+
+    try:
+        far_bytes = dst.read_bytes()
+    except OSError:
+        return True
+
+    for tier_path, tier in tiers:
+        nif_data = NifFormat.Data()
+        try:
+            fh = io.BytesIO(far_bytes)
+            nif_data.inspect(fh)
+            if nif_data.version != _SKYRIM_VER:
+                continue
+            nif_data.read(fh)
+        except Exception:
+            continue
+        _decimate_and_write(nif_data, dst.stem, tier_path,
+                            tier['ratio'], tier['cap'], tier['dev'])
     return True

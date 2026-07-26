@@ -485,53 +485,39 @@ def _fill_missing(h: np.ndarray, c: np.ndarray):
       2. If an entire column is NaN, copy from the nearest non-NaN column.
     """
     tv = h.shape[0]
+    nan = np.isnan(h)
+    if not nan.any():
+        return
+    valid = ~nan
+    rows = np.arange(tv)
+    cols = np.arange(tv)
 
-    # Step 1: fill each column vertically
-    for col in range(tv):
-        col_h = h[:, col]
-        valid = ~np.isnan(col_h)
-        if valid.all():
-            continue
-        if not valid.any():
-            continue  # whole column empty — handled in step 2
+    # Step 1: per-column forward fill, then backward fill for anything the
+    # forward pass could not reach.  Both are running-extremum scans over the
+    # row axis, so they vectorise across all columns at once — the old
+    # row×column Python loop was ~1.4s on a LOD32 tile.
+    ff = np.maximum.accumulate(np.where(valid, rows[:, None], -1), axis=0)
+    bf = np.minimum.accumulate(np.where(valid, rows[:, None], tv)[::-1],
+                               axis=0)[::-1]
+    src_row = np.where(ff >= 0, ff, bf)
 
-        # Forward fill (propagate downward from last valid)
-        last_val = None
-        last_col_c = None
-        for row in range(tv):
-            if valid[row]:
-                last_val   = col_h[row]
-                last_col_c = c[row, col].copy()
-            elif last_val is not None:
-                h[row, col]    = last_val
-                c[row, col]    = last_col_c
+    col_has = valid.any(axis=0)
+    fill = nan & col_has[None, :]          # columns with at least one real value
+    if fill.any():
+        src_row = np.clip(src_row, 0, tv - 1)
+        h[fill] = h[src_row, cols[None, :]][fill]
+        c[fill] = c[src_row, cols[None, :]][fill]
 
-        # Backward fill (propagate upward from first valid)
-        first_val = None
-        first_col_c = None
-        for row in range(tv - 1, -1, -1):
-            if not np.isnan(h[row, col]):
-                first_val   = h[row, col]
-                first_col_c = c[row, col].copy()
-            elif first_val is not None:
-                h[row, col]    = first_val
-                c[row, col]    = first_col_c
-
-    # Step 2: fill any columns that are entirely NaN from adjacent column
-    for col in range(tv):
-        if not np.any(np.isnan(h[:, col])):
-            continue
-        # Search left then right for a valid column
-        src = None
-        for d in range(1, tv):
-            if col - d >= 0 and not np.any(np.isnan(h[:, col - d])):
-                src = col - d; break
-            if col + d < tv and not np.any(np.isnan(h[:, col + d])):
-                src = col + d; break
-        if src is not None:
-            nan_rows = np.isnan(h[:, col])
-            h[nan_rows, col] = h[nan_rows, src]
-            c[nan_rows, col] = c[nan_rows, src]
+    # Step 2: columns that are entirely NaN take the nearest valid column
+    # (ties go left, matching the old left-then-right search).
+    if not col_has.all():
+        valid_cols = np.where(col_has)[0]
+        if len(valid_cols):
+            nearest = valid_cols[np.abs(cols[:, None]
+                                        - valid_cols[None, :]).argmin(axis=1)]
+            empty = ~col_has
+            h[:, empty] = h[:, nearest[empty]]
+            c[:, empty] = c[:, nearest[empty]]
 
     # Fallback: any remaining NaN → 0
     nan_mask = np.isnan(h)
@@ -639,12 +625,28 @@ def _make_dds_header_dxt1(w, h, linear_size, mip_count=1):
     return hdr
 
 
+def _blocks_4x4(a: np.ndarray) -> np.ndarray:
+    """Reshape a padded (ph, pw[, ch]) image into (n_blocks, 16[, ch]) in the
+    row-major block order DXT/BC formats store (block row 0 left-to-right first).
+    """
+    ph, pw = a.shape[:2]
+    tail = a.shape[2:]
+    return (a.reshape(ph // 4, 4, pw // 4, 4, *tail)
+             .transpose(0, 2, 1, 3, *range(4, 4 + len(tail)))
+             .reshape(-1, 16, *tail))
+
+
 def _encode_dxt1_quality(img: np.ndarray) -> bytes:
     """DXT1 encoder with per-block min/max color endpoints for better quality.
 
     For each 4×4 block, finds the two most distant colors (min/max in each
     channel) and uses them as DXT1 endpoints c0 > c1 (opaque mode).
     Each pixel is then assigned the nearest of the 4 interpolated colors.
+
+    Fully vectorised over blocks: a 1024² tile is ~65k blocks, and the old
+    per-block Python loop made this the single hottest function in terrain LOD
+    (1.4s per LOD16 tile, ~33% of all tile time).  Output is byte-identical to
+    the per-block version — same endpoints, same palette, same index packing.
     """
     h, w = img.shape[:2]
     ph = (h + 3) & ~3
@@ -652,55 +654,57 @@ def _encode_dxt1_quality(img: np.ndarray) -> bytes:
     padded = np.zeros((ph, pw, 3), dtype=np.uint8)
     padded[:h, :w] = img
 
-    out = bytearray()
-    for by in range(0, ph, 4):
-        for bx in range(0, pw, 4):
-            block = padded[by:by+4, bx:bx+4].reshape(16, 3).astype(np.int32)
+    blocks = _blocks_4x4(padded).astype(np.int32)     # (N,16,3)
 
-            # Find min/max per channel
-            cmin = block.min(axis=0)
-            cmax = block.max(axis=0)
+    cmax = blocks.max(axis=1)                          # (N,3)
+    cmin = blocks.min(axis=1)
+    c0 = _rgb_to_565_vec(cmax)
+    c1 = _rgb_to_565_vec(cmin)
 
-            c0_rgb = cmax.astype(np.uint8)
-            c1_rgb = cmin.astype(np.uint8)
+    # Ensure c0 > c1 for opaque DXT1 (4-colour mode).
+    swap = c0 < c1
+    c0, c1 = np.where(swap, c1, c0), np.where(swap, c0, c1)
+    eq = c0 == c1
+    c1 = np.where(eq & (c0 != 0), c0 - 1, c1)
+    c0 = np.where(eq & (c0 == 0), 1, c0)
 
-            c0 = _rgb_to_565(c0_rgb)
-            c1 = _rgb_to_565(c1_rgb)
+    # Palette: code 0 → c0, 1 → c1, 2 → (2c0+c1)/3, 3 → (c0+2c1)/3.
+    # Endpoints are re-expanded FROM 565 (matching the scalar version, which
+    # built its palette from _565_to_rgb of the quantised endpoints).
+    p0 = _565_to_rgb_vec(c0)                           # (N,3) int32
+    p1 = _565_to_rgb_vec(c1)
+    palette = np.stack([p0, p1, (2 * p0 + p1) // 3, (p0 + 2 * p1) // 3], axis=1)
 
-            # Ensure c0 > c1 for opaque DXT1 (4-color mode)
-            if c0 < c1:
-                c0, c1 = c1, c0
-                c0_rgb, c1_rgb = c1_rgb, c0_rgb
-            elif c0 == c1:
-                if c0 == 0:
-                    c0 = 1
-                else:
-                    c1 = c0 - 1
+    diffs = blocks[:, :, None, :] - palette[:, None, :, :]   # (N,16,4,3)
+    codes = (diffs * diffs).sum(axis=3).argmin(axis=2)       # (N,16)
 
-            # The 4 palette entries in opaque mode:
-            #   code 0 → c0
-            #   code 1 → c1
-            #   code 2 → 2/3*c0 + 1/3*c1
-            #   code 3 → 1/3*c0 + 2/3*c1
-            palette = np.array([
-                _565_to_rgb(c0),
-                _565_to_rgb(c1),
-                ((2 * _565_to_rgb(c0).astype(np.int32) + _565_to_rgb(c1).astype(np.int32)) // 3).astype(np.uint8),
-                ((_565_to_rgb(c0).astype(np.int32) + 2 * _565_to_rgb(c1).astype(np.int32)) // 3).astype(np.uint8),
-            ], dtype=np.int32)  # (4,3)
+    shifts = (np.arange(16, dtype=np.uint32) * 2)
+    packed = (codes.astype(np.uint32) << shifts).sum(axis=1, dtype=np.uint32)
 
-            # Assign each pixel to nearest palette entry
-            diffs = block[:, None, :] - palette[None, :, :]  # (16,4,3)
-            dist2 = (diffs * diffs).sum(axis=2)               # (16,4)
-            codes = dist2.argmin(axis=1)                       # (16,)
+    out = np.empty(len(blocks),
+                   dtype=np.dtype([('c0', '<u2'), ('c1', '<u2'), ('p', '<u4')]))
+    out['c0'] = c0
+    out['c1'] = c1
+    out['p'] = packed
+    return out.tobytes()
 
-            # Pack 4 rows of 4×2-bit codes into 4 bytes
-            packed = 0
-            for i, code in enumerate(codes):
-                packed |= (int(code) & 3) << (i * 2)
 
-            out += struct.pack('<HHI', c0, c1, packed)
-    return bytes(out)
+def _rgb_to_565_vec(rgb: np.ndarray) -> np.ndarray:
+    """Vectorised _rgb_to_565 over an (N,3) int array."""
+    r = rgb[:, 0].astype(np.int32)
+    g = rgb[:, 1].astype(np.int32)
+    b = rgb[:, 2].astype(np.int32)
+    return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+
+
+def _565_to_rgb_vec(c565: np.ndarray) -> np.ndarray:
+    """Vectorised _565_to_rgb → (N,3) int32."""
+    r = (c565 >> 11) & 0x1F
+    g = (c565 >> 5) & 0x3F
+    b = c565 & 0x1F
+    return np.stack([(r << 3) | (r >> 2),
+                     (g << 2) | (g >> 4),
+                     (b << 3) | (b >> 2)], axis=-1).astype(np.int32)
 
 
 def _rgb_to_565(rgb):
@@ -822,23 +826,37 @@ def _make_bc5_dds_header(size: int, mip_count: int) -> bytes:
     return hdr
 
 
-def _encode_bc4_block(vals16: np.ndarray) -> bytes:
-    """Encode one 4x4 block of a single channel (16 uint8 values) as BC4 (8 bytes)."""
-    v = vals16.astype(np.int32)
-    r0 = int(v.max())
-    r1 = int(v.min())
-    if r0 == r1:
-        # all equal -> endpoints equal, indices all 0
-        return struct.pack('BB', r0, r1) + b'\x00' * 6
-    # 8-value interpolation mode (r0 > r1)
-    palette = [r0, r1] + [((7 - i) * r0 + i * r1) // 7 for i in range(1, 7)]
-    palette = np.array(palette, dtype=np.int32)
-    idx = np.abs(v[:, None] - palette[None, :]).argmin(axis=1)
-    bits = 0
-    for i, code in enumerate(idx):
-        bits |= (int(code) & 7) << (3 * i)
-    idx_bytes = bits.to_bytes(6, 'little')
-    return struct.pack('BB', r0, r1) + idx_bytes
+def _encode_bc4_channel(chan: np.ndarray) -> np.ndarray:
+    """Encode a whole padded single-channel (ph,pw) uint8 image as BC4.
+
+    Returns an (n_blocks, 8) uint8 array — 8 bytes per 4×4 block, in row-major
+    block order.  Vectorised over blocks; byte-identical to encoding each block
+    separately (same 8-value interpolation mode, same endpoint and index rules).
+    """
+    blocks = _blocks_4x4(chan).astype(np.int32)        # (N,16)
+    r0 = blocks.max(axis=1)
+    r1 = blocks.min(axis=1)
+    flat = r0 == r1                                     # all-equal → indices 0
+
+    i = np.arange(1, 7)
+    palette = np.empty((len(blocks), 8), np.int32)
+    palette[:, 0] = r0
+    palette[:, 1] = r1
+    palette[:, 2:] = ((7 - i)[None, :] * r0[:, None]
+                      + i[None, :] * r1[:, None]) // 7
+
+    idx = np.abs(blocks[:, :, None] - palette[:, None, :]).argmin(axis=2)
+    idx = idx.astype(np.uint64)
+    idx[flat] = 0
+
+    bits = (idx << (np.arange(16, dtype=np.uint64) * 3)).sum(axis=1,
+                                                             dtype=np.uint64)
+    out = np.empty((len(blocks), 8), np.uint8)
+    out[:, 0] = r0
+    out[:, 1] = r1
+    for k in range(6):
+        out[:, 2 + k] = ((bits >> np.uint64(8 * k)) & np.uint64(0xFF)).astype(np.uint8)
+    return out
 
 
 def _write_normal_dds(normal_rgb: np.ndarray, path: Path):
@@ -866,10 +884,11 @@ def _write_normal_dds(normal_rgb: np.ndarray, path: Path):
         pw = (s + 3) & ~3
         Rp = np.zeros((ph, pw), np.uint8); Rp[:s, :s] = R
         Gp = np.zeros((ph, pw), np.uint8); Gp[:s, :s] = G
-        for by in range(0, ph, 4):
-            for bx in range(0, pw, 4):
-                mip_data += _encode_bc4_block(Rp[by:by+4, bx:bx+4].reshape(16))
-                mip_data += _encode_bc4_block(Gp[by:by+4, bx:bx+4].reshape(16))
+        # BC5 stores the two BC4 channels interleaved per block: R block then
+        # G block, repeating.  Encode each channel in bulk and weave them.
+        rb = _encode_bc4_channel(Rp)                  # (N,8)
+        gb = _encode_bc4_channel(Gp)
+        mip_data += np.stack([rb, gb], axis=1).reshape(-1).tobytes()
         mip_count += 1
         if s == 1:
             break
@@ -1211,6 +1230,14 @@ CELL_DIFFUSE_PX = 64
 
 _EMPTY_LAYERS = {'base': {}, 'alpha': {}}
 
+# Per-cell composited diffuse cache, shared by every tile a worker builds.
+# A cell appears in one tile per LOD level (4 levels), so caching removes most
+# of the ~70,000 composite_cell calls a Tamriel run makes for 14,686 cells.
+# Each entry is CELL_DIFFUSE_PX² × 3 bytes (12 KB at 64px); the cap simply
+# bounds a long-lived worker rather than targeting a memory budget.
+_CELL_IMG_CACHE = {}
+_CELL_IMG_CACHE_MAX = 16384
+
 
 def _composite_tile_diffuse(lands, tile_x, tile_y, level, ltex_map, tex_root,
                             tile_heights, cell_water, default_wh):
@@ -1235,10 +1262,24 @@ def _composite_tile_diffuse(lands, tile_x, tile_y, level, ltex_map, tex_root,
             # 33x33 height patch for this cell from the filled tile grid
             h33 = tile_heights[cy*32:cy*32+33, cx*32:cx*32+33]
             wh = _cell_water_height(cell_water, key, default_wh)
-            img = composite_cell(layers, colors,
-                                 ltex_map, tex_root, tile_x + cx, tile_y + cy,
-                                 cell_px=CELL_DIFFUSE_PX, tex_size=128,
-                                 heights=h33, water_height=wh)
+
+            # Every cell is composited once per LOD level even though the
+            # result is identical each time — 14,686 Tamriel cells produce
+            # ~70,000 composites, 4.8x more work than needed.  Cache per cell.
+            # The key includes the height patch and water height (the only
+            # per-tile inputs) so a cell whose edge-filled heights DID depend
+            # on the tile extent still recomputes rather than reusing a
+            # mismatched image.
+            ck = (key, wh, h33.tobytes())
+            img = _CELL_IMG_CACHE.get(ck)
+            if img is None:
+                img = composite_cell(layers, colors,
+                                     ltex_map, tex_root, tile_x + cx, tile_y + cy,
+                                     cell_px=CELL_DIFFUSE_PX, tex_size=128,
+                                     heights=h33, water_height=wh)
+                if len(_CELL_IMG_CACHE) >= _CELL_IMG_CACHE_MAX:
+                    _CELL_IMG_CACHE.clear()
+                _CELL_IMG_CACHE[ck] = img
             col0 = cx * CELL_DIFFUSE_PX
             # north (+Y, higher cy) at the TOP of the image
             row0 = (level - 1 - cy) * CELL_DIFFUSE_PX
@@ -1401,47 +1442,61 @@ def generate_terrain_lod(esm_path: Path, output_dir: Path,
     n_workers = worker_count()
     print(f"  Using {n_workers} worker process(es).")
 
-    total_tiles = 0
+    # Build the work list for EVERY level up front and run it through ONE pool.
+    # A pool per level serialised each level's tail: LOD32 has only ~21 tiles
+    # for all of Tamriel but they are by far the most expensive (a level-N tile
+    # composites N² cells), so 29 workers ran 21 tasks and then idled while the
+    # slowest finished.  One pool lets the cheap LOD4 tiles backfill those
+    # stragglers.  Tasks are submitted LONGEST-FIRST (highest level first) —
+    # classic longest-processing-time scheduling, which keeps the expensive
+    # tiles off the critical path at the end of the run.
+    work = []
     for level in LOD_LEVELS:
-        # Align SW corner to tile grid
         tx_start = (min_x // level) * level
         ty_start = (min_y // level) * level
         tx_end   = ((max_x + level - 1) // level) * level
         ty_end   = ((max_y + level - 1) // level) * level
 
-        # Build work items for tiles that have at least one LAND cell.
         # Only tile coords are passed per-task; lands is sent once via initializer.
-        work = []
+        n_level = 0
         for ty in range(ty_start, ty_end, level):
             for tx in range(tx_start, tx_end, level):
                 if any((tx + cx, ty + cy) in lands
                        for cy in range(level) for cx in range(level)):
                     work.append((tx, ty, level, worldspace_edid))
+                    n_level += 1
+        print(f"  LOD {level}: {n_level} tiles queued")
 
-        if not work:
-            print(f"  LOD {level}: 0 tiles")
-            continue
+    if not work:
+        print("  No tiles to generate.")
+        return False
 
-        tile_count = 0
-        warn_count = 0
-        with ProcessPoolExecutor(
-            max_workers=n_workers,
-            initializer=_worker_init,
-            initargs=(lands, str(mesh_dir), str(tex_dir), ltex_map, str(tex_root),
-                      cell_water, default_wh),
-        ) as pool:
-            for tag, ok, err in pool.map(_process_tile, work):
-                if ok:
-                    tile_count += 1
-                else:
-                    warn_count += 1
-                    print(f"  WARNING: {tag}: {err}")
+    # Descending level = descending cost.
+    work.sort(key=lambda w: -w[2])
 
-        msg = f"  LOD {level}: {tile_count} tiles"
-        if warn_count:
-            msg += f" ({warn_count} failed)"
-        print(msg)
-        total_tiles += tile_count
+    per_level_ok = {}
+    warn_count = 0
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_worker_init,
+        initargs=(lands, str(mesh_dir), str(tex_dir), ltex_map, str(tex_root),
+                  cell_water, default_wh),
+    ) as pool:
+        # chunksize=1: tiles differ in cost by ~20x, so batching would hand one
+        # worker a run of expensive tiles and undo the ordering above.
+        for (tag, ok, err), item in zip(
+                pool.map(_process_tile, work, chunksize=1), work):
+            if ok:
+                per_level_ok[item[2]] = per_level_ok.get(item[2], 0) + 1
+            else:
+                warn_count += 1
+                print(f"  WARNING: {tag}: {err}")
+
+    total_tiles = sum(per_level_ok.values())
+    for level in LOD_LEVELS:
+        print(f"  LOD {level}: {per_level_ok.get(level, 0)} tiles generated")
+    if warn_count:
+        print(f"  {warn_count} tiles failed")
 
     print(f"[TerrainLOD] Done — {total_tiles} tiles generated.")
     return True
