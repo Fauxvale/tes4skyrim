@@ -2144,3 +2144,358 @@ class TestTextureTransformControllerConversion:
         assert all(c.interpolator is not None and c.interpolator.data is not None
                    for c in ctrls), 'controller lost its curve'
 
+
+
+# ---------------------------------------------------------------------------
+# NiTimeController "Compute Scaled Time" (CharacterGen secret wall never opened)
+# ---------------------------------------------------------------------------
+
+_SECRET_WALL_SAMPLE = 'Dungeons/Chargen/prisonsecretwall01.nif'
+_SECRET_SWITCH_SAMPLE = 'Dungeons/Chargen/prisonsecretwallswitch01.nif'
+
+# nif.xml TimeControllerFlags bit 6, default="true".
+_COMPUTE_SCALED_TIME = 0x40
+
+
+class TestControllerComputeScaledTime:
+    """Oblivion never sets flags bit 0x40; Skyrim needs it to advance a sequence.
+
+    Without it, ObjectReference.PlayAnimation() binds the sequence and returns
+    success with no Papyrus error, but scaled time never advances and the object
+    stays on frame 0 — CharacterGen's secret wall reported "opened" while
+    physically staying shut.  Vanilla Skyrim animated doors ship
+    NiMultiTargetTransformController=108 and every other controller=76.
+    """
+
+    @pytest.mark.parametrize('sample', [_SECRET_WALL_SAMPLE, _SECRET_SWITCH_SAMPLE])
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_every_controller_computes_scaled_time(self, tmp_path, sample):
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+
+        src = EXPORT_MESHES / sample
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+
+        # The source must actually exhibit the defect, or the test proves nothing.
+        src_data = NF.Data()
+        with open(str(src), 'rb') as f:
+            src_data.read(f)
+        src_ctrls = [b for b in src_data.blocks if isinstance(b, NF.NiTimeController)]
+        assert src_ctrls, 'sample has no controllers — wrong test mesh'
+        assert all(not (c.flags & _COMPUTE_SCALED_TIME) for c in src_ctrls), \
+            'Oblivion source unexpectedly already sets 0x40; test is stale'
+
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+
+        dst_data = NF.Data()
+        with open(str(dst), 'rb') as f:
+            dst_data.read(f)
+
+        ctrls = [b for b in dst_data.blocks if isinstance(b, NF.NiTimeController)]
+        assert ctrls, 'conversion dropped every controller'
+        missing = [type(c).__name__ for c in ctrls
+                   if not (c.flags & _COMPUTE_SCALED_TIME)]
+        assert not missing, \
+            f'controllers missing Compute Scaled Time (0x40): {sorted(set(missing))}'
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_flags_match_vanilla_values(self, tmp_path):
+        """Converted flags equal the vanilla census: MTTC=108, others=76."""
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+
+        src = EXPORT_MESHES / _SECRET_WALL_SAMPLE
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+
+        dst_data = NF.Data()
+        with open(str(dst), 'rb') as f:
+            dst_data.read(f)
+
+        mgrs = [b for b in dst_data.blocks
+                if isinstance(b, NF.NiControllerManager)]
+        assert mgrs, 'NiControllerManager was dropped — wall cannot animate'
+        assert all(m.flags == 76 for m in mgrs), \
+            f'manager flags {[m.flags for m in mgrs]} != vanilla 76'
+
+        mttcs = [b for b in dst_data.blocks
+                 if isinstance(b, NF.NiMultiTargetTransformController)]
+        assert mttcs, 'NiMultiTargetTransformController was dropped'
+        assert all(m.flags == 108 for m in mttcs), \
+            f'MTTC flags {[m.flags for m in mttcs]} != vanilla 108'
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_open_sequence_keyframes_survive(self, tmp_path):
+        """The 'Forward' sequence keeps the tracks that actually move the wall."""
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+
+        src = EXPORT_MESHES / _SECRET_WALL_SAMPLE
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+
+        dst_data = NF.Data()
+        with open(str(dst), 'rb') as f:
+            dst_data.read(f)
+
+        seqs = {str(b.name): b for b in dst_data.blocks
+                if isinstance(b, NF.NiControllerSequence)}
+        # PlayAnimation("Forward") is what the converted switch script calls.
+        fwd = next((s for n, s in seqs.items() if 'Forward' in n), None)
+        assert fwd is not None, f'Forward sequence lost; have {list(seqs)}'
+
+        # The moving parts are the 'wall' and 'bed' transform tracks.  Palette
+        # offsets must have been resolved to real names (Skyrim has no palette).
+        targets = {str(cb.node_name) for cb in fwd.controlled_blocks}
+        joined = ' '.join(targets)
+        assert 'wall' in joined and 'bed' in joined, \
+            f'transform tracks missing from Forward: {sorted(targets)}'
+        assert '' not in targets, 'unresolved (empty) node_name in sequence'
+
+
+# ---------------------------------------------------------------------------
+# Animated-object behaviour graphs (BGED -> hkx project)
+# ---------------------------------------------------------------------------
+
+
+class TestAnimObjectBehaviorGraph:
+    """PlayAnimation() needs an animation graph manager, which only exists when
+    the NIF carries a BSBehaviorGraphExtraData naming an hkx project.
+
+    Without the graph the call is accepted, returns immediately and does
+    nothing — no Papyrus error — so the secret wall stayed shut.  Shape is
+    copied from vanilla `BlackPoolSecretDoor` Behavior00.hkx: one
+    BGSGamebryoSequenceGenerator per NiControllerSequence, wrapped in states
+    reached by same-named events through `wildcardTransitions`.
+    """
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_graph_tree_generated_and_bged_attached(self, tmp_path):
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+
+        src = EXPORT_MESHES / _SECRET_WALL_SAMPLE
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+
+        # Must go through a real 'meshes' tree — the output root is derived
+        # from dst_path, and no meshes/ segment means no graph.
+        dst = tmp_path / 'meshes' / 'tes4' / 'dungeons' / 'chargen' / 'wall.nif'
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        convert_nif(str(src), str(dst))
+
+        base = dst.parent / 'wall_behavior'
+        for rel in ('wall.hkx', 'Behaviors/Behavior00.hkx',
+                    'Characters/Character01.hkx',
+                    'CharacterAssets/Skeleton.hkx'):
+            f = base / rel
+            assert f.is_file(), f'missing generated hkx: {rel}'
+            # SSE only loads 64-bit packfiles (pointer size at offset 0x10).
+            assert f.read_bytes()[0x10] == 8, f'{rel} is not AMD64'
+
+        dst_data = NF.Data()
+        with open(str(dst), 'rb') as f:
+            dst_data.read(f)
+        root = dst_data.roots[0]
+
+        bged = [e for e in root.extra_data_list
+                if isinstance(e, NF.BSBehaviorGraphExtraData)]
+        assert bged, 'no BGED — PlayAnimation() has no graph manager'
+        # Relative to meshes\, with NO 'meshes\' prefix — the engine prepends
+        # "Meshes\%s".  A doubled prefix means the project is never found, the
+        # object gets no graph, and it is invisible in-game (NifSkope, which
+        # never loads the hkx, still renders and animates it).
+        graph = bged[0].behaviour_graph_file.decode('latin-1')
+        assert not graph.lower().startswith('meshes\\'), \
+            f'BGED must not repeat the meshes prefix: {graph}'
+        assert graph.lower() == r'tes4\dungeons\chargen\wall_behavior\wall.hkx', \
+            f'BGED path wrong: {graph}'
+
+        # The engine never ticks the graph without the BSX Animated bit.
+        bsx = [e for e in root.extra_data_list if isinstance(e, NF.BSXFlags)]
+        assert bsx and (int(bsx[0].integer_data) & 0x01), \
+            'BSX Animated bit (0x01) not set — graph loads but never ticks'
+
+    def test_events_match_sequence_names(self):
+        """PlayAnimation("<seq>") only works if <seq> is an event AND a state.
+
+        The script calls PlayAnimation("Forward"); the graph must expose a
+        'Forward' event routed to a generator whose pSequence is 'Forward'.
+        """
+        from asset_convert.hkx_animobject import _behavior_xml
+
+        xml = _behavior_xml('wall', ['Forward', 'Backward'])
+        for seq in ('Forward', 'Backward'):
+            assert f'<hkcstring>{seq}</hkcstring>' in xml, f'{seq} not an event'
+            assert f'<hkparam name="pSequence">{seq}</hkparam>' in xml, \
+                f'{seq} has no Gamebryo generator'
+            assert f'<hkparam name="name">{seq}</hkparam>' in xml, \
+                f'{seq} has no state'
+
+        # SERIALIZE_IGNORED in the vanilla template — emitting any of these
+        # makes hkxcmd fail the compile SILENTLY (no file, no error text).
+        for dead in ('bLooping', 'bDelayedActivate', 'fTime'):
+            assert f'name="{dead}"' not in xml, \
+                f'{dead} is SERIALIZE_IGNORED and breaks the compile'
+
+    def test_no_sequences_means_no_graph(self, tmp_path):
+        """A static mesh must not get a BGED pointing at a nonexistent graph."""
+        from asset_convert.hkx_animobject import generate_animobject_project
+
+        assert generate_animobject_project(str(tmp_path), 'a/b.nif', []) == ''
+        assert not list(tmp_path.rglob('*.hkx'))
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_engine_driven_doors_get_no_graph(self, tmp_path):
+        """Open/Close doors are driven natively — a graph CTDs them.
+
+        prisonCellGate01 animated correctly through its own
+        NiControllerManager; attaching a behaviour graph made the engine bind
+        the sequence through the graph instead and crash on cell load
+        (EXCEPTION_ACCESS_VIOLATION, rax=0, "GamebryoSequenceGenerator00").
+        No script names Open/Close — only Forward/Backward/Equip/... appear in
+        converted PlayAnimation() calls.
+        """
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+        from asset_convert.nif_converter import collect_sequence_names
+
+        src = EXPORT_MESHES / 'Dungeons/Chargen/prisoncellgate01.nif'
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+
+        # The mesh really does have Open/Close sequences, or this proves nothing.
+        src_data = NF.Data()
+        with open(str(src), 'rb') as f:
+            src_data.read(f)
+        raw = {str(b.name) for b in src_data.blocks
+               if isinstance(b, NF.NiControllerSequence)}
+        assert any('Open' in n for n in raw), f'test mesh changed: {raw}'
+        assert collect_sequence_names(src_data) == [], \
+            'engine-driven Open/Close must not qualify for a graph'
+
+        dst = tmp_path / 'meshes' / 'tes4' / 'gate.nif'
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        convert_nif(str(src), str(dst))
+
+        assert not list(tmp_path.rglob('*.hkx')), 'graph generated for a native door'
+        dst_data = NF.Data()
+        with open(str(dst), 'rb') as f:
+            dst_data.read(f)
+        assert not [e for e in dst_data.roots[0].extra_data_list
+                    if isinstance(e, NF.BSBehaviorGraphExtraData)], \
+            'BGED attached to an engine-driven door — this is the CTD'
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_bged_mesh_never_sets_bsx_articulated(self, tmp_path):
+        """BSX bit 0x80 + a BGED = invisible object.
+
+        0x80 marks the mesh articulated/ragdoll-driven; with a behaviour graph
+        attached the engine waits on a physics rig a Gamebryo-sequence graph
+        never provides and never draws the mesh — while NifSkope, which does not
+        load the hkx, renders and animates it perfectly.  Census: of 217 vanilla
+        animated-object meshes carrying a BGED, ZERO set 0x80 (values 0x4-0x20;
+        vanilla NocturnalsSecretDoor01 is 0x0B).  The converter's default
+        BSX_FLAGS_ANIMATED (0x8B) stays correct for graph-less meshes.
+        """
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+
+        src = EXPORT_MESHES / _SECRET_WALL_SAMPLE
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'meshes' / 'tes4' / 'wall.nif'
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        convert_nif(str(src), str(dst))
+
+        data = NF.Data()
+        with open(str(dst), 'rb') as f:
+            data.read(f)
+        root = data.roots[0]
+        bged = [e for e in root.extra_data_list
+                if isinstance(e, NF.BSBehaviorGraphExtraData)]
+        bsx = [e for e in root.extra_data_list if isinstance(e, NF.BSXFlags)]
+        assert bged and bsx, 'expected both BGED and BSXFlags on this mesh'
+
+        value = int(bsx[0].integer_data)
+        assert not (value & 0x80), \
+            f'BSX {hex(value)} sets 0x80 with a BGED — object will be invisible'
+        assert value & 0x01, f'BSX {hex(value)} missing Animated bit'
+        assert value == 0x0B, f'BSX {hex(value)} != vanilla 0x0B'
+
+    def test_skeleton_matches_vanilla_bytes(self, tmp_path):
+        """The generated skeleton must equal vanilla SingleBoneSkeleton.hkx.
+
+        hkxcmd compiles the identity pose text every shipped creature skeleton
+        uses into a reference pose whose ROTATION SLOT IS ALL ZEROS.  A zero
+        quaternion is not a rotation, so the single bone had no valid bind pose
+        and the whole object rendered NOTHING in-game while the behaviour graph
+        loaded without error.  `_fix_identity_quat` patches it to (1,0,0,0);
+        Havok's binary quaternion is w-first, unlike the XML's xyzw.
+        """
+        import struct
+        from asset_convert.hkx_animobject import _skeleton_xml, _fix_identity_quat
+        from asset_convert.hkx_xml import compile_hkx
+
+        vanilla = Path('references/Skyrim Animations/meshes/clutter/beehive'
+                       '/characterassets/singleboneskeleton.hkx')
+        if not vanilla.exists():
+            pytest.skip(f'{vanilla} not found')
+
+        xml = tmp_path / 's.xml'
+        hkx = tmp_path / 's.hkx'
+        # Same bone name as vanilla, or the string table differs legitimately.
+        xml.write_text(_skeleton_xml('x_SingleBone'), newline='\n')
+        compile_hkx(str(xml), str(hkx))
+        _fix_identity_quat(str(hkx))
+
+        got = hkx.read_bytes()
+        assert got == vanilla.read_bytes(), \
+            'generated skeleton is not byte-identical to vanilla'
+
+        # Spell out the two values that actually broke rendering.
+        quat = struct.unpack_from('<4f', got, 812)
+        scale = struct.unpack_from('<4f', got, 828)
+        assert quat == (1.0, 0.0, 0.0, 0.0), f'quaternion not identity: {quat}'
+        assert scale == (1.0, 1.0, 1.0, 1.0), f'scale not unit: {scale}'
+
+    def test_skeleton_has_one_pose_per_bone(self):
+        """1 bone + 0 reference poses = null deref when a sequence binds.
+
+        An empty `referencePose` emitted before the real one wins (hkxcmd keeps
+        the FIRST), producing a skeleton the engine crashes on. The identity
+        quaternion must also be (0,0,0,1): a 4-wide translation tuple shifts
+        w to 0, and a zero quaternion normalizes to NaN.
+        """
+        from asset_convert.hkx_animobject import _skeleton_xml
+        import re
+
+        xml = _skeleton_xml('gate')
+        poses = re.findall(r'<hkparam name="referencePose" numelements="(\d+)"', xml)
+        assert poses == ['1'], f'expected exactly one 1-element pose, got {poses}'
+
+        body = re.search(r'<hkparam name="referencePose"[^>]*>(.*?)</hkparam>',
+                         xml, re.S).group(1)
+        tuples = re.findall(r'\(([^)]*)\)', body)
+        assert [len(t.split()) for t in tuples] == [3, 4, 3], \
+            f'referencePose must be trans(3) quat(4) scale(3), got {tuples}'
+        assert tuples[1].split() == ['0.000000', '0.000000', '0.000000', '1.000000'], \
+            f'identity quaternion must be (0,0,0,1), got ({tuples[1]})'

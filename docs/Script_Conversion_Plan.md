@@ -130,7 +130,23 @@ Same or very similar Papyrus function exists. Mechanical substitution.
 Function exists in Oblivion but not Papyrus. A polyfill script provides the equivalent:
 - `GetRandomPercent` → `Utility.RandomInt(0, 99)`
 - `GetButtonPressed` → Queue-based message system via polyfill
-- `PlayGroup` → `Debug.SendAnimationEvent()` (animation group name mapping)
+- `PlayGroup` → **routes on WHAT THE TARGET IS, never on call syntax**:
+  animated OBJECTS (ACTI/DOOR/STAT/MSTT — a NiControllerManager NIF that keeps
+  its TES4 sequence names) get `PlayAnimation("Forward")`; ACTORS
+  (NPC_/CREA/ACHR/ACRE) get `Debug.SendAnimationEvent()` (animation group name
+  mapping), because `PlayAnimation()` on an actor corrupts its behavior graph.
+  Resolve the base record via `CrossRefGraph.get_base_signature()`; an unknown
+  target keeps the event (inert on an object, never harmful to an actor).
+  `PlayAnimation` is an ObjectReference method, so an explicit ref must play on
+  THAT ref, not on `Self`.
+  Sending every explicit-ref call to `SendAnimationEvent` broke **every
+  lever-operated secret door in the game** (196 calls / 86 scripts: Anvil
+  Castle ×4, Bravil Castle, Anga, mine traps). CharacterGen's
+  `CGPrisonSecretWallRef.playgroup forward 1` went inert, so Renault threw the
+  switch, the quest advanced, and the wall never moved — while the SELF-call on
+  the next TES4 line converted correctly. **When one of a pair of identical TES4
+  statements converts and the other doesn't, suspect the branch that
+  distinguishes them.** Guarded by `TestPlayGroupTargetRouting`.
 - `GetPos X/Y/Z` → `GetPositionX()` / `GetPositionY()` / `GetPositionZ()`
 - `SetPos X/Y/Z` → `SetPosition(x, y, z)` (needs axis decomposition)
 - `GetAngle X/Y/Z` → `GetAngleX()` / `GetAngleY()` / `GetAngleZ()`

@@ -4191,27 +4191,50 @@ class ScriptConverter:
             sex_val = '1' if 'female' in arg else '0'
             return f'({ref} as Actor).GetActorBase().GetSex() == {sex_val}'
 
-        # PlayGroup:
-        #  - SELF-calls in object scripts (activators/doors with a
+        # PlayGroup: the API depends on WHAT THE TARGET IS, not on whether the
+        # call names a reference.
+        #  - Animated OBJECTS (activators/doors/statics with a
         #    NiControllerManager): the converted NIF keeps its TES4 sequences
         #    ('Forward', 'Unequip', …), so PlayGroup Forward 0 ->
-        #    Self.PlayAnimation("Forward").  The old Debug.SendAnimationEvent
-        #    mapping only works on behavior-graph actors and silently did
-        #    nothing on activators (tripwires never played their break
-        #    animation, swinging traps never got kicked).
-        #  - Actor scripts AND explicit-ref calls keep the behavior-graph
-        #    event mapping: PlayAnimation() on an actor corrupts its behavior
-        #    graph (BShkbAnimationGraph/hkbRagdollDriver crash), and an
-        #    explicit ref target may well be an actor even in an object
-        #    script.  SendAnimationEvent is safe on both.
+        #    PlayAnimation("Forward").  Debug.SendAnimationEvent only works on
+        #    behavior-graph ACTORS and silently does nothing on an activator
+        #    (tripwires never played their break animation, swinging traps
+        #    never got kicked).
+        #  - ACTORS keep the behavior-graph event mapping: PlayAnimation() on
+        #    an actor corrupts its behavior graph
+        #    (BShkbAnimationGraph/hkbRagdollDriver crash).
+        #
+        # Routing EXPLICIT-REF calls to SendAnimationEvent unconditionally was
+        # wrong: TES4 aims PlayGroup at animated objects as often as at actors.
+        # `CGPrisonSecretWallRef.playgroup forward 1` (CharacterGen's secret
+        # door, base ACTI prisonSecretWall01, whose NIF carries the 'Forward'
+        # NiControllerSequence) became SendAnimationEvent(..., "moveStart") and
+        # did nothing, so Renault threw the switch and the wall never moved —
+        # note the SELF-call on the very next line converted correctly, making
+        # two identical TES4 statements behave differently.  Resolve the base
+        # record instead and only treat real actors as actors.
         if fname_low == 'playgroup':
             parts = args_str.strip().split() if args_str else ['Idle']
             anim_name = parts[0].rstrip(',').strip('"').strip("'") if parts else 'Idle'
-            if extends != 'Actor' and not ref_name:
+            target_is_actor = (extends == 'Actor') if not ref_name else False
+            if ref_name:
+                sig = ''
+                if self.xref:
+                    sig = self.xref.get_base_signature(ref_name)
+                if sig:
+                    target_is_actor = sig in ('NPC_', 'CREA', 'ACHR', 'ACRE')
+                else:
+                    # Unknown target: keep the behavior-graph event, which is
+                    # inert on an object but never corrupts an actor's graph.
+                    target_is_actor = True
+            if not target_is_actor:
                 # NiControllerSequence names in Oblivion NIFs are capitalized
                 # ('Forward', 'Backward', 'Unequip', 'Open', 'Close', 'Idle').
                 seq = anim_name.capitalize()
-                return f'Self.PlayAnimation("{seq}")'
+                # PlayAnimation is an ObjectReference method, so an explicit
+                # ref plays on THAT object, not on Self.
+                obj = self._resolve_objref_ref(ref_name, extends) if ref_name else 'Self'
+                return f'{obj}.PlayAnimation("{seq}")'
             # Map common Oblivion animation groups to Skyrim behavior events
             _anim_map = {
                 'forward': 'moveStart', 'backward': 'moveStartBackward',

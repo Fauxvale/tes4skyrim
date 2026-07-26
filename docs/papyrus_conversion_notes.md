@@ -48,6 +48,51 @@ the original state. Audit the partner call before accepting either.
   player controls disabled. 97 scripts across the game use SetAlert, most in
   talking scenes (MQ13/MQ14 Bruma, SE06 battle, MS13), not fights.
 
+## Silent mis-conversion — the unmarked loss
+
+**A `;NE:`/`;TODO:` marker is the HEALTHY failure. The dangerous conversions are
+the ones that emit a plausible call which compiles, runs, and does nothing.**
+Audited output carries only 2 `;TODO:` markers across 18,566 scripts, so marker
+counts measure honesty, not correctness — never treat a clean output scan as
+evidence the conversion is complete.
+
+Two recurring shapes, both found in the animation handlers:
+
+- **Wrong target vocabulary.** The emitted call is valid Papyrus but the string
+  argument comes from TES4's namespace, which the engine silently drops.
+  `PlayIdle`/`PickIdle` passes the raw TES4 IDLE EditorID straight into
+  `Debug.SendAnimationEvent(ref, "<edid>")`; Skyrim defines no such event, so the
+  idle never plays and nothing is logged (`"fastforward"` survives into output
+  this way, next to correctly-mapped events like `moveStart`).
+- **Unconditional target-type assumption.** *The correct API depends on WHAT THE
+  TARGET IS, not on whether the call names a reference.* `PlayGroup` routed every
+  explicit-ref call to `Debug.SendAnimationEvent` (behavior-graph actors only), so
+  `CGPrisonSecretWallRef.playgroup forward 1` — an ACTI whose NIF carries a
+  `Forward` NiControllerSequence — did nothing and Renault's switch never moved
+  the wall, while the SELF-call on the very next line converted correctly. Fix:
+  resolve the base record via `CrossRefGraph.get_base_signature()` and treat only
+  `NPC_`/`CREA`/`ACHR`/`ACRE` as actors; unknown targets keep the behavior event,
+  which is inert on an object but never corrupts an actor's graph. `PlayIdle`
+  still uses the old `actor_func=True` assumption and needs the same treatment.
+
+**Census the no-op lists against the real API, not against intuition.** Six
+entries in `_NO_OP_FUNCS`/`_BARE_NO_EQUIV_COMMANDS` exist natively in Skyrim:
+`AddAchievement` (59 call sites), `PlayBink` (5), `SendTrespassAlarm` (2),
+`SetPublic` (1), `AttachAshPile`, and `GetCurrentPackage` (already special-cased
+for the PACK-comparison form; the residual sites compare TES4 package-TYPE codes,
+which genuinely have no equivalent). `SetCellPublicFlag` (100 sites) sets the same
+Cell flag as `SetPublic` and should route there rather than no-op. The
+authoritative list is the vanilla Papyrus sources at
+`references/skse64-master/scripts/vanilla` — extract every `Function` declaration
+and diff it against the no-op sets before assuming a command was dropped for a
+good reason.
+
+Losses that ARE correct and should not be re-litigated: `AddTopic` (223 `;NE:`)
+is deliberate — `tes5_import/dialog_unlocks.py` re-expresses topic visibility as
+`TES4Unlock_*` GLOB gates and scans SCPT sources *because* script_convert leaves
+an inert comment. `ModDisposition` (414) is a genuine engine removal, with the
+`<= -100` hostility case already converting to `StartCombat`.
+
 ## Event / timer conversion
 
 - `begin OnAlarm` → `OnCombatStateChanged` guarded `aeCombatState != 0`;

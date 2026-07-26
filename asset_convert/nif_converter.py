@@ -2160,6 +2160,153 @@ def _resolve_palette_strings(data):
                         pass
 
 
+# NiTimeController.flags bit 6 (0x40) is "Compute Scaled Time"
+# (references/nif 0.10.0.0.xml TimeControllerFlags, default="true").  Oblivion's
+# engine computed scaled time unconditionally and never wrote the bit: across the
+# Chargen secret-wall/switch NIFs every controller stores 12 / 40 / 44 — always
+# 0x40 CLEAR.  Skyrim reads the flag, so a sequence started via
+# ObjectReference.PlayAnimation() binds its targets and reports success but its
+# scaled time never advances, leaving the object frozen on frame 0.
+#
+# Vanilla Skyrim never ships it clear: across 62 animated door/activator meshes
+# (Windhelm animated secret doors, Nordic animated doors, Dwemer doors,
+# Labyrinthian panel, Winterhold anim door) 157/157
+# NiMultiTargetTransformController have flags=108 (0x6C) and every other
+# NiTimeController — NiTransformController, NiControllerManager, NiVisController,
+# NiFloatExtraDataController — has flags=76 (0x4C).  Both set 0x40; the only
+# difference between vanilla's 108 and our 44 is this one bit.
+#
+# This is why CharacterGen's secret wall never physically opened: the quest
+# script ran, the switch fired and PlayAnimation("Forward") was accepted with no
+# Papyrus error, but the wall stayed shut.
+_CTLR_COMPUTE_SCALED_TIME = 0x40
+
+
+def _fix_controller_flags(data):
+    """Set "Compute Scaled Time" on every NiTimeController (Skyrim requirement).
+
+    Oblivion sources always leave bit 0x40 clear; Skyrim needs it set or the
+    controller's scaled time never advances and the animation never plays.
+    Applies to the whole tree, so animated activators, doors, traps and levers
+    are all covered — not just the record that surfaced the bug.
+    """
+    fixed = 0
+    for root in data.roots:
+        if root is None:
+            continue
+        for block in root.tree():
+            if not isinstance(block, NifFormat.NiTimeController):
+                continue
+            flags = getattr(block, 'flags', None)
+            if flags is None or (flags & _CTLR_COMPUTE_SCALED_TIME):
+                continue
+            block.flags = flags | _CTLR_COMPUTE_SCALED_TIME
+            fixed += 1
+    return fixed
+
+
+# TES4 animation GROUP names that a script can drive with `playgroup`, which
+# converts to ObjectReference.PlayAnimation().  Census of the converted output
+# (18,566 scripts): Forward 418, Backward 192, Unequip 45, Equip 27,
+# SpecialIdle 10, FastForward 8, Left 6, FastBackward 6, Right 5, Stagger 1.
+#
+# 'Open'/'Close' are deliberately ABSENT.  They are the engine's own DOOR group
+# names, driven natively through the NIF's NiControllerManager — no script ever
+# names them, and giving such a mesh a behaviour graph is what CTD'd
+# prisonCellGate01 on cell load (2026-07-26).  Vanilla agrees: the graph-driven
+# NocturnalsSecretDoor01 uses AnimIdle01/AnimPlay01, never Open/Close.
+_SCRIPT_DRIVEN_SEQUENCES = frozenset((
+    'forward', 'backward', 'fastforward', 'fastbackward',
+    'left', 'right', 'equip', 'unequip', 'specialidle', 'stagger',
+))
+
+
+def collect_sequence_names(data):
+    """NiControllerSequence names a script can reach via PlayAnimation().
+
+    These become both the behaviour-graph state names and the events that
+    select them, so `PlayAnimation("Forward")` reaches the right sequence.
+    Order is the manager's own, deduplicated, so the generated graph is
+    byte-reproducible across runs.
+
+    Only SCRIPT-DRIVEN group names qualify (see _SCRIPT_DRIVEN_SEQUENCES).  A
+    mesh whose sequences are all engine-native ('Open'/'Close' on doors) is
+    already animated by the engine and must NOT get a graph — attaching one
+    makes the engine bind the sequence through the graph instead and crash.
+
+    Empty when the mesh has no controller manager — a static mesh needs no
+    graph and must not get a BGED.
+    """
+    names = []
+    seen = set()
+    for root in data.roots:
+        if root is None:
+            continue
+        for block in root.tree():
+            if not isinstance(block, NifFormat.NiControllerManager):
+                continue
+            for seq in block.controller_sequences:
+                if seq is None:
+                    continue
+                raw = getattr(seq, 'name', b'') or b''
+                name = raw.decode('latin-1') if isinstance(raw, bytes) else str(raw)
+                # A sequence stripped down to nothing by
+                # _process_controller_manager animates no node; giving it a
+                # state would make PlayAnimation() succeed on a dead sequence.
+                if not name or name in seen or not seq.num_controlled_blocks:
+                    continue
+                if name.lower() not in _SCRIPT_DRIVEN_SEQUENCES:
+                    continue
+                seen.add(name)
+                names.append(name)
+    return names
+
+
+def _add_animobject_bged(data, graph_file):
+    """Point the root at the generated hkx project + mark the tree Animated.
+
+    Mirrors the vanilla animated-object contract (and `bow_rig._add_bged`):
+    without the BGED there is no animation graph manager, so PlayAnimation()
+    returns immediately and does nothing; without the BSX Animated bit the
+    engine never ticks the graph it just loaded.
+    """
+    for root in data.roots:
+        if root is None or not hasattr(root, 'extra_data_list'):
+            continue
+        for ed in root.extra_data_list:
+            if isinstance(ed, NifFormat.BSBehaviorGraphExtraData):
+                ed.behaviour_graph_file = graph_file.encode('latin-1')
+                break
+        else:
+            bged = NifFormat.BSBehaviorGraphExtraData()
+            bged.name = b'BGED'
+            bged.behaviour_graph_file = graph_file.encode('latin-1')
+            # 0 = graph drives this object only, not a shared base skeleton.
+            bged.controls_base_skeleton = 0
+            root.num_extra_data_list += 1
+            root.extra_data_list.update_size()
+            root.extra_data_list[root.num_extra_data_list - 1] = bged
+        for ed in root.extra_data_list:
+            if isinstance(ed, NifFormat.BSXFlags):
+                # Animated bit ON (or the engine never ticks the graph) and
+                # bit 0x80 OFF.  0x80 marks the object as articulated/
+                # ragdoll-driven; paired with a BGED the engine waits on a
+                # physics rig that a Gamebryo-sequence graph never provides and
+                # NEVER DRAWS THE MESH — invisible in game, perfect in NifSkope
+                # (which does not load the hkx at all).
+                #
+                # Census of all 217 vanilla animated-object meshes that carry a
+                # BGED: **0 set bit 0x80** (values 0x4-0x20; the graph-driven
+                # NocturnalsSecretDoor01 is 0x0B).  Our converter's longstanding
+                # BSX_FLAGS_ANIMATED is 0x8B, which is correct for a mesh with
+                # NO graph — prisonCellGate01 renders fine with it — so the
+                # illegal combination only appears where we add the BGED.
+                ed.integer_data = (int(ed.integer_data) | 0x01) & ~0x80
+                break
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Armor / clothing NIF helpers
 # ---------------------------------------------------------------------------
@@ -2539,6 +2686,10 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
     # ignored — leaving every node_name as b''.  Skyrim uses node_name to look
     # up animation targets; empty names → null → crash on NIF load.
     _resolve_palette_strings(data)
+
+    # Oblivion never sets NiTimeController "Compute Scaled Time" (0x40); Skyrim
+    # requires it or a PlayAnimation()'d sequence binds but never advances.
+    _fix_controller_flags(data)
 
     # Fix non-finite render geometry (NaN UVs/verts in Oblivion sources) BEFORE
     # any tangent computation or skin retargeting can propagate the NaNs.
@@ -3462,6 +3613,35 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
                     except Exception:
                         pass  # shader falls back to sampling a missing atlas;
                               # frames were pre-validated so this is unexpected
+
+    # Animated objects (activators/doors/levers): Skyrim will not drive an
+    # in-NIF NiControllerSequence from ObjectReference.PlayAnimation() — that
+    # call needs an animation graph manager, which only exists when the root
+    # carries a BSBehaviorGraphExtraData naming an hkx project.  Generate the
+    # 4-file project/character/skeleton/behavior tree beside the mesh, with one
+    # BGSGamebryoSequenceGenerator state per surviving sequence, and point the
+    # BGED at it.  Runs AFTER _convert_nif so stripped/empty sequences (which
+    # would give PlayAnimation a dead state) are already gone, and before the
+    # write so the BGED ships in the file.  See asset_convert/hkx_animobject.py.
+    _seq_names = collect_sequence_names(data)
+    if _seq_names:
+        _dstn = str(dst_path).replace('/', os.sep).replace('\\', os.sep)
+        _k = os.sep + 'meshes' + os.sep
+        _i = _dstn.lower().rfind(_k)
+        if _i >= 0:
+            _meshes_root = _dstn[:_i + len(_k)]
+            _model_rel = _dstn[_i + len(_k):]
+            try:
+                from .hkx_animobject import generate_animobject_project
+                _bged = generate_animobject_project(
+                    _meshes_root, _model_rel, _seq_names)
+                if _bged and _add_animobject_bged(data, _bged):
+                    result['animobject_graph'] = _bged
+                    stats['animobject_sequences'] = len(_seq_names)
+            except Exception as _e:
+                # A missing/failing hkxcmd must not lose the whole mesh: the
+                # object still converts and renders, it just stays unanimated.
+                result['animobject_error'] = str(_e)
 
     # Generate tangent space for all NiTriShapeData that don't already have it.
     # Missing tangents cause incorrect normal-map lighting in Skyrim which

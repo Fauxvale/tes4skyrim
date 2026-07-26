@@ -328,7 +328,8 @@ def build_alias_location(alias_index: int, radius: int = 0) -> bytes:
 # ---------------------------------------------------------------------------
 
 def convert_flags(t4_flags: int, pack_type: int,
-                  hostile_ambush: bool = True) -> tuple:
+                  hostile_ambush: bool = True,
+                  quest_gated: bool = False) -> tuple:
     """TES4 PKDT flags -> (TES5 flags, preferred speed).
 
     Returns the speed separately because TES4's "always run" is a *flag* while
@@ -342,6 +343,21 @@ def convert_flags(t4_flags: int, pack_type: int,
     for t4_bit, t5_bit in _FLAG_MAP:
         if t4_flags & t4_bit:
             flags |= t5_bit
+
+    # "Once Per Day" latches the package to at most one run per 24 game-hours.
+    # On an Oblivion *routine* package that is the intent, but on a QUEST-gated
+    # one the GetStage condition already scopes when it may run, and the daily
+    # latch actively breaks it: a persistent actor loaded since game start is
+    # already counted as having used the package today, so the engine takes the
+    # package for a single frame and immediately drops the actor back to the
+    # next passing package.  That is CharacterGen stage 18 — Renault took
+    # CGRenoteOpenSecretDoor (ONCE_PER_DAY set) and fell straight back to
+    # CGRenoteWalkToMarkerB, so the secret door never opened.  Whether the latch
+    # was already spent depends on the in-game clock when the stage fired, which
+    # is why it intermittently worked.  676 of 7,209 TES4 packages set this bit,
+    # 235 of them UseItemAt, so this is not one record's problem.
+    if quest_gated:
+        flags &= ~T5_ONCE_PER_DAY
 
     speed = SPEED_WALK
     if t4_flags & T4_ALWAYS_RUN:
@@ -745,7 +761,8 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
     is_forcegreet = (ptype in (T4_AMBUSH, T4_FIND)
                      and get_formid(rec, 'PTDT.Target') == PLAYER_FID)
     flags, speed = convert_flags(get_int(rec, 'PKDT.Flags'), ptype,
-                                 not is_forcegreet)
+                                 not is_forcegreet,
+                                 quest_gated=ctx.quest_of(pack_fid) is not None)
     # A scripted one-shot (force-greet, or "go operate that switch") must run
     # at vanilla's pace and with vanilla's interrupt authorisation, or the actor
     # dawdles / can never break off to do the thing.  Both were measured from

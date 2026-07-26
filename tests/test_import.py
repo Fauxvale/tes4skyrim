@@ -3171,48 +3171,102 @@ class TestSayTimerRelease:
         owner = build_say_timer_owners({'SCPT': [scpt], 'QUST': []})
         assert owner['chargentaunt2'][0] == 'speaker'
 
-    def test_release_comes_after_the_body_advances_the_sequence(self):
-        """The timer release must be the LAST statement in the fragment.
-
-        The release re-opens the owning script's poll guard
-        (`speaker == 2 && convTimer <= 0`, or Valen Dreth's `ElseIf talk == 1`);
-        the BODY advances the state that guard reads (convCount/speaker/stage).
-        Releasing first opens the guard while the OLD state still stands, so the
-        poller re-fires the same line — observed in a runtime trace as
-        `RENAULT FIRE cnt=15` -> fragment accepted -> `RENAULT FIRE cnt=15`.
-        The re-Say re-armed convTimer to 8.33, which held stage 18 open past the
-        EvaluatePackage() its stage fragment had just issued, so
-        CGRenoteOpenSecretDoor was never selected and the secret door never
-        opened. Valen Dreth repeats his taunt for the same reason.
-        """
+    def _fragments(self):
         import os
-        import re
         src = os.path.join('output', 'Oblivion.esm', 'scripts', 'source')
         if not os.path.isdir(src):
             pytest.skip('no generated scripts to check')
-        advances = re.compile(
-            r'still this line|SetStage\(|convCount|\.speaker =|\.target =')
-        offenders = []
-        checked = 0
-        for fn in os.listdir(src):
+        for fn in sorted(os.listdir(src)):
             if not fn.startswith('TES4_TIF__'):
                 continue
             lines = open(os.path.join(src, fn),
                          encoding='utf-8', errors='replace').read().splitlines()
-            rel = [i for i, ln in enumerate(lines) if '; line ended' in ln]
-            if not rel:
-                continue
+            if any('; line ended' in ln for ln in lines):
+                yield fn, lines
+
+    def test_release_is_unconditional(self):
+        """The release must sit OUTSIDE the sequence gate.
+
+        A line whose turn has passed still has to free the timer. Moving the
+        release inside the `still this line's turn` gate stopped CharacterGen
+        dead at `FRAG 00032B0A cnt=8 needs 7 accepted=False`: quest stage 12
+        re-seeded convCount while line 7 was still playing, the fragment was
+        rejected, and nothing ever cleared convTimer.
+        """
+        import re
+        offenders = []
+        checked = 0
+        for fn, lines in self._fragments():
             checked += 1
+            depth = 0
+            for ln in lines:
+                if "still this line's turn" in ln:
+                    depth += 1
+                elif re.match(r'\s*EndIf\b', ln, re.IGNORECASE) and depth:
+                    depth -= 1
+                elif '; line ended' in ln and depth > 0:
+                    offenders.append(fn)
+                    break
+        assert checked, 'expected some fragments to release a say timer'
+        assert not offenders, (
+            'these fragments release the timer INSIDE the sequence gate, so a '
+            'rejected line never frees it and the conversation stalls:\n'
+            + '\n'.join(offenders[:10]))
+
+    def test_nothing_advances_the_sequence_after_the_release(self):
+        """The release must be the LAST thing the fragment does.
+
+        It re-opens the owning script's poll guard, and the body advances the
+        state that guard reads. Releasing first re-fires the same line —
+        observed as `RENAULT FIRE cnt=15` twice, whose re-Say re-armed the
+        timer.
+        """
+        import re
+        advances = re.compile(
+            r'SetStage\(|convCount|\.speaker\s*=|\.target\s*=')
+        offenders = []
+        for fn, lines in self._fragments():
+            rel = [i for i, ln in enumerate(lines) if '; line ended' in ln]
             for r in rel:
                 after = [ln for ln in lines[r + 1:] if advances.search(ln)]
                 if after:
                     offenders.append(f'{fn}: {after[0].strip()}')
                     break
-        assert checked, 'expected some fragments to release a say timer'
         assert not offenders, (
-            'these fragments release the conversation timer BEFORE advancing '
-            'the sequence state, so the owning script re-fires the same line:\n'
+            'these fragments advance the sequence AFTER releasing the timer, '
+            'so the owning script re-fires the same line:\n'
             + '\n'.join(offenders[:10]))
+
+    def test_state_writes_precede_setstage_within_the_body(self):
+        """Inside the body, speaker/target/counter land before any SetStage.
+
+        SetStage runs that stage's fragment INLINE and those call
+        `EvaluatePackage()`, which arbitrates against whatever is committed at
+        that instant. This is ordering WITHIN the gate only — the release
+        itself stays outside and last (see the two tests above).
+        """
+        import re
+        setstage = re.compile(r'^\s*(\w[\w.]*)\.SetStage\s*\(', re.IGNORECASE)
+        offenders = []
+        checked = 0
+        for fn, lines in self._fragments():
+            first = next((i for i, ln in enumerate(lines)
+                          if setstage.match(ln)), None)
+            if first is None:
+                continue
+            checked += 1
+            quest = setstage.match(lines[first]).group(1).lower()
+            book = re.compile(
+                r'^\s*' + re.escape(quest) + r'\.(convCount|speaker|target)\s*=',
+                re.IGNORECASE)
+            after = [ln for ln in lines[first + 1:] if book.match(ln)]
+            if after:
+                offenders.append(f'{fn}: {after[0].strip()}')
+        assert checked, 'expected some fragments to call SetStage'
+        assert not offenders, (
+            'these fragments write conversation state AFTER a SetStage on the '
+            'same quest, so the stage fragment\'s EvaluatePackage() arbitrates '
+            'against stale state:\n' + '\n'.join(offenders[:10]))
 
 
 class TestWeatherImageSpace:
@@ -3458,3 +3512,74 @@ class TestVanillaMgefDataSize:
         finally:
             magic_effects.VANILLA_MGEF_DATA[0x00012F03] = original
             magic_effects._cache.clear()
+
+
+class TestPlayGroupTargetRouting:
+    """`PlayGroup` picks its API from WHAT THE TARGET IS, not from syntax.
+
+    Animated OBJECTS (ACTI/DOOR/STAT/MSTT with a NiControllerManager) keep
+    their TES4 sequence names in the converted NIF, so they need
+    `PlayAnimation("Forward")`. ACTORS need `Debug.SendAnimationEvent` — a
+    PlayAnimation() on an actor corrupts its behavior graph.
+
+    Routing every EXPLICIT-REF call to SendAnimationEvent broke every
+    lever-operated secret door in the game (196 calls across 86 scripts:
+    Anvil/Bravil castle doors, Anga, mine traps). CharacterGen's
+    `CGPrisonSecretWallRef.playgroup forward 1` became
+    `SendAnimationEvent(..., "moveStart")`, which an activator has no behavior
+    graph to receive, so Renault threw the switch and the wall never moved.
+    The tell: the SELF-call on the very next TES4 line converted correctly, so
+    two identical statements behaved differently.
+    """
+
+    def _xref(self, sigs):
+        """A real CrossRefGraph with just the records this test needs.
+
+        `sigs` is {EditorID: base signature}; each entry gets a FormID, a
+        record_type, and (for placed refs) a record_base so
+        get_base_signature() resolves exactly as it does in a real run.
+        """
+        from script_convert.cross_ref import CrossRefGraph
+        x = CrossRefGraph()
+        for i, (name, sig) in enumerate(sigs.items()):
+            ref_fid = f'{0x00010000 + i * 2:08X}'
+            base_fid = f'{0x00010001 + i * 2:08X}'
+            x.edid_to_formid[name.lower()] = ref_fid
+            x.formid_to_edid[ref_fid] = name
+            x.record_type[ref_fid] = 'REFR'
+            x.record_base[ref_fid] = base_fid
+            x.record_type[base_fid] = sig
+        return x
+
+    def _convert(self, line, sigs, extends='ObjectReference'):
+        from script_convert.converter import ScriptConverter
+        conv = ScriptConverter(self._xref(sigs))
+        return '\n'.join(conv.convert_fragment(line, extends))
+
+    def test_activator_ref_gets_playanimation(self):
+        out = self._convert('CGPrisonSecretWallRef.playgroup forward 1',
+                            {'CGPrisonSecretWallRef': 'ACTI'})
+        assert 'PlayAnimation("Forward")' in out, out
+        assert 'SendAnimationEvent' not in out, (
+            'an activator has no behavior graph — SendAnimationEvent is inert '
+            'and the door never moves')
+        assert 'CGPrisonSecretWallRef.PlayAnimation' in out, (
+            'PlayAnimation is an ObjectReference method: it must play on the '
+            'named ref, not on Self')
+
+    def test_actor_ref_keeps_animation_event(self):
+        out = self._convert('ArmandChristopheRef.playgroup idle 1',
+                            {'ArmandChristopheRef': 'NPC_'})
+        assert 'SendAnimationEvent' in out, out
+        assert 'PlayAnimation' not in out, (
+            'PlayAnimation on an actor corrupts its behavior graph')
+
+    def test_unknown_ref_falls_back_to_the_safe_api(self):
+        """Unknown target: the event is inert on an object but never corrupts
+        an actor, so it is the safe default."""
+        out = self._convert('SomeUnknownRef.playgroup forward 1', {})
+        assert 'SendAnimationEvent' in out, out
+
+    def test_self_call_in_object_script_still_plays_the_sequence(self):
+        out = self._convert('playgroup forward 1', {})
+        assert 'Self.PlayAnimation("Forward")' in out, out

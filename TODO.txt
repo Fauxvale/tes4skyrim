@@ -20,7 +20,12 @@ Major Issues for V1:
 
 	9 - Repeat lines in charactergen. Stages will completely fail if certain lines are repeated (like valen dreth). Also should remove debug quest stages
 
-	analyze the magic conversion. ie spells and effects. currently we are replacing a bunch with skyrim equivalents and probably missing a bunch. we've since improved our mesh conversion significantly. Once your analysis is complete, write a doc detailing the path to complete spell / magic effect conversion
+	10 - Script conversion: silent mis-conversions that compile but do nothing (see docs/papyrus_conversion_notes.md "Silent mis-conversion")
+		PlayIdle/PickIdle passes the raw TES4 IDLE EditorID into Debug.SendAnimationEvent - Skyrim has no such event so the idle never plays, nothing logged.
+		Same handler still uses the unconditional actor assumption that PlayGroup was just fixed for; needs the get_base_signature() treatment so animated objects get PlayAnimation instead.
+		Six no-op'd commands exist natively in Skyrim: AddAchievement (59 sites), PlayBink (5), SendTrespassAlarm (2), SetPublic (1), AttachAshPile, GetCurrentPackage. SetCellPublicFlag (100 sites) is the same Cell flag as SetPublic.
+		Output has only 2 ;TODO markers across 18,566 scripts - marker counts measure honesty not correctness, so audit against references/skse64-master/scripts/vanilla rather than scanning output for markers.
+
 		
 Later Issues:
 
@@ -46,7 +51,7 @@ Later Issues:
 
 	12 - Restore Oblivion's NPC-to-NPC conversations (dropped, see docs/ambient_dialogue_channel_plan.md)
 
-	13 - Spell Conversion including effects
+	13 - Magic and Spell Conversion including effects (see magic conversion md)
 
 	14 - Make horses rideable
 

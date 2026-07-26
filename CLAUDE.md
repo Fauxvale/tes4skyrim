@@ -68,6 +68,8 @@ caching, skipped record types, the export text format, and the directory layout.
 - **Always record new learnings** in this file or, more likely, the relevant `docs/` file.
 - Docs can be wrong: they sometimes describe fixes that were never implemented.
   Grep the source before claiming a mechanism exists, and fix the doc.
+- If using subagents, ONLY use the lower tier Sonnet or Haiku models. NEVER Opus. Limit additional agents to only 2 at a time.
+- When building test scripts, always output as they go so that if the time goes past the hard 120 second timeout limit you still get some output
 
 ### Verifying your work
 
@@ -80,7 +82,7 @@ caching, skipped record types, the export text format, and the directory layout.
    build map across via the Address Library (stable ID → per-build RVA).
 2. The Oblivion/Nehrim install at `D:\Other Games\Nehrim At Fate's Edge\Data`.
 3. xEdit source at `references/xEdit` — `Core/` documents the binary structure of
-   every record type. This is the first stop for any format question.
+   every record type. This is the first stop for any format question. Or if working with meshes, go to the Nifskope source at `references/Nifskope`
 4. The Skyrim.esm dump at `references/Skyrim.esm`, real Skyrim.esm, and
    `references/Skyrim Meshes`. **Verify binary layout against BOTH the xEdit
    definition AND a real Skyrim.esm dump — never skip either.**
@@ -114,10 +116,8 @@ theories externally first.
   | `D:\Other Games\Skyrim Anniversary Edition\` (GOG/AE) | exe decompilation | assets, deployment checks |
   | Oblivion / Nehrim LE install | BSA files and NIFs | anything Skyrim-side |
   | The modded SSE install | **Papyrus logs, and reading `Skyrim.esm`** | everything else, especially verifying deployment |
-- **NEVER touch `unknown_byte` / `unknown_int` fields.** They are padding, never
-  the cause.
 - **Never run the full pytest suite** — only the tests for files you changed.
-- **KEEP EVERY TEST UNDER 60 SECONDS. Never set a long timeout.** If a command
+- **KEEP EVERY TEST COMMAND / SCRIPT UNDER 120 SECONDS. Never set a long timeout.** If a command
   needs minutes, you have picked the wrong scope — narrow it instead: one cell,
   not a worldspace; 2-3 NIFs, not a tree; one record type, not the whole plugin;
   the per-cell tool (`navmesh_tri_check --cell X`) instead of the batch sweep.
@@ -135,7 +135,7 @@ theories externally first.
   encouraged — using them to dispute the user's report is not.)
 - **Never assume `output/Oblivion.esm` reflects the latest code** from its
   timestamp. Ask, or rebuild first.
-- **BUILD EVERY STAGE YOUR CHANGES TOUCH, before reporting back.** The user should
+- **BUILD EVERY FILE YOUR CHANGES TOUCH, before reporting back.** The user should
   be able to launch the game and verify immediately — never leave them to work out
   which stage to re-run, and never hand back a change that only compiles in
   theory. Map the files you edited to stages and run each one into `output/`:
@@ -156,16 +156,14 @@ theories externally first.
   `--prune-textures-only`, `--pack-zip-only`. Report what you built and any
   failures verbatim; if a stage genuinely cannot be run, say which and why rather
   than staying silent.
-- **While iterating on a repeated failure, don't write tests or update docs until
+- **While iterating on a repeated failure, don't write tests, update docs, or ANYTHING until
   the fix is CONFIRMED in-game.** Each round trip costs the user a full
   build-and-play cycle, so spend it on the diagnosis and the candidate fix only.
   Tests and docs written against an unconfirmed theory usually just encode the
   wrong theory and have to be rewritten. Once the user confirms, then add the
   regression test and the doc note.
-- **If the user questions a design twice, stop** and get an explicit decision
-  before writing more code.
-- **When a fix doesn't work, don't re-apply a variant of the same theory.** Two
-  failed attempts on one theory means the theory is wrong — go back to the
+- **When a fix doesn't work, don't continue to re-apply a variant of the same theory without new evidence.** Two
+  failed attempts on one theory likely means the theory is wrong — go back to the
   sources in "Verifying your work" and find a *different* mechanism. Say plainly
   that the previous explanation was wrong rather than layering another guess on
   top of it.
@@ -186,6 +184,8 @@ theories externally first.
   (`read_nif` converts BSTriShape graphs to LE NiTriShape graphs in-memory;
   pyffi Patch 8 supplies the SSE read layouts). Output is always written LE
   (uv2=83), which SSE loads natively.
+- **The LE-compatibility rule above does NOT extend to `.hkx`: every hkx we ship
+  is 64-bit.** `convert_hkx_to_amd64()` is the mandatory final step
 - Use `references/nif [version].xml` for valid Skyrim NIF behavior — newer and
   more correct than pyffi 2.2.3's bundled version. Use pyffi with the clock
   monkey patch when analyzing.

@@ -37,6 +37,20 @@ SIGNATURES = {
     'hkbProjectStringData': '0x76ad60a',
     'hkaSplineCompressedAnimation': '0x792ee0bb',
     'hkaAnimationBinding': '0x66eac971',
+    # Animated-object behaviour graphs (asset_convert/hkx_animobject.py);
+    # signatures read off vanilla BlackPoolSecretDoor Behavior00.hkx.
+    'hkbBehaviorGraph': '0xb1218f86',
+    'hkbBehaviorGraphData': '0x95aca5d',
+    'hkbBehaviorGraphStringData': '0xc713064e',
+    'hkbVariableValueSet': '0x27812d8d',
+    'hkbStateMachine': '0x816c1dcb',
+    'hkbStateMachineStateInfo': '0xed7f9d0',
+    'hkbStateMachineTransitionInfoArray': '0xe397b11e',
+    'hkbBlendingTransitionEffect': '0xfd8584fe',
+    'BGSGamebryoSequenceGenerator': '0xc8df2d77',
+    'hkbCharacterData': '0x300d6808',
+    'hkbCharacterStringData': '0x655b42bc',
+    'hkbMirroredSkeletonInfo': '0xc6c2da4f',
 }
 
 

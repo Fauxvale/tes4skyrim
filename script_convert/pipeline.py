@@ -617,6 +617,96 @@ def _sequence_gate(rec: dict, owner: tuple) -> str:
             f'{_safe_property_name(name)} == {value}')
 
 
+_SETSTAGE_RE = re.compile(r'^\s*\w[\w.]*\.SetStage\s*\(', re.IGNORECASE)
+# The conversation bookkeeping: `<quest>.<field> = <literal>` (speaker, target)
+# and the counter handoff `<quest>.<field> = <quest>.<field> +/- <literal>`
+# (convCount). Deliberately narrow — no calls, nothing whose value depends on
+# anything a SetStage could change except the counter itself, which MUST be
+# hoisted: 13 CharacterGen stage fragments RE-SEED convCount, and a `+ 1`
+# landing after such a SetStage overshoots the re-seeded value (the very drift
+# _sequence_gate exists to stop).
+_STATE_WRITE_RE = re.compile(
+    r'^\s*(?P<lhs>\w[\w.]*)\s*=\s*'
+    r'(?:[-+]?[\d.]+|(?P<base>\w[\w.]*)\s*[-+]\s*[\d.]+)\s*(;.*)?$')
+
+
+def _is_state_write(line: str) -> bool:
+    """A bare literal assignment, or a counter step `x = x + n` on ITSELF."""
+    m = _STATE_WRITE_RE.match(line)
+    if not m:
+        return False
+    base = m.group('base')
+    return base is None or base.lower() == m.group('lhs').lower()
+
+
+def _setstage_on_owner(lines: list, timer_ref: str) -> bool:
+    """True when the body calls SetStage on the quest that owns the timer.
+
+    Only then can the inline stage fragment's `EvaluatePackage()` see a stale
+    timer; a SetStage on some OTHER quest shares no state with it.
+    """
+    owner = (timer_ref or '').rsplit('.', 1)[0].strip().lower()
+    if not owner:
+        return False
+    pat = re.compile(r'^\s*' + re.escape(owner) + r'\.SetStage\s*\(',
+                     re.IGNORECASE)
+    return any(pat.match(ln) for ln in lines)
+
+
+def _split_counter_step(lines: list, seq_gate: str) -> tuple:
+    """Split off the `<counter> = <counter> + n` step the sequence gate tests.
+
+    The gate is `<quest>.<counter> == K`. Emitting that step FIRST closes the
+    gate against a re-fire, so the timer release can follow immediately —
+    before the body's SetStage hands control to the engine. Returns
+    (counter_lines, rest) preserving order; (,[]) when there is no such step,
+    in which case the caller just emits the body unchanged.
+    """
+    m = re.match(r'\s*(\S+)\s*==', seq_gate or '')
+    if not m:
+        return [], list(lines)
+    counter = m.group(1)
+    step = re.compile(
+        r'^\s*' + re.escape(counter) + r'\s*=\s*' + re.escape(counter)
+        + r'\s*[-+]\s*[\d.]+\s*(;.*)?$', re.IGNORECASE)
+    idx = next((i for i, ln in enumerate(lines) if step.match(ln)), None)
+    if idx is None:
+        return [], list(lines)
+    return [lines[idx]], lines[:idx] + lines[idx + 1:]
+
+
+def _state_writes_before_setstage(lines: list) -> list:
+    """Move plain state assignments ahead of the first SetStage call.
+
+    `SetStage(N)` executes stage N's fragment INLINE, and those fragments call
+    `EvaluatePackage()`. The engine then arbitrates packages against whatever
+    state is committed at that instant — so a `speaker`/`convCount` write that
+    comes after the SetStage is invisible to it. CharacterGen stage 18 showed
+    this directly: the package was selected and then kicked back within the
+    same second (`PKGSTART 04D84D` -> `PKGCHANGE` back to `032B14`), and
+    whether it stuck varied run to run purely on engine latency.
+
+    Only literal assignments are hoisted, and only from AFTER the first
+    SetStage. Anything with a call, an expression, or a conditional keeps its
+    place, so no side-effecting statement is ever reordered.
+    """
+    first = next((i for i, ln in enumerate(lines) if _SETSTAGE_RE.match(ln)),
+                 None)
+    if first is None:
+        return lines
+    # Only hoist from a FLAT tail — a nested block (If/While) after the
+    # SetStage may depend on what the stage did.
+    tail = lines[first + 1:]
+    if any(re.match(r'\s*(If|While|Else|ElseIf|EndIf|EndWhile)\b', ln,
+                    re.IGNORECASE) for ln in tail):
+        return lines
+    hoist = [ln for ln in tail if _is_state_write(ln)]
+    if not hoist:
+        return lines
+    rest = [ln for ln in tail if not _is_state_write(ln)]
+    return lines[:first] + hoist + [lines[first]] + rest
+
+
 def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 stats: dict, info_reveals: dict = None,
                 service_topics: dict = None):
@@ -743,50 +833,75 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             # line finishes, right before the topic menu refreshes.
             for gname in reveals:
                 out_lines.append(f'  {gname}.SetValue(1)')
-            # The timer release must be the LAST thing this fragment does.
+            # THREE constraints, each one demonstrated by an in-game failure:
             #
-            # The release is what re-opens the owning script's poll guard
-            # (`If <quest>.speaker == 2 && <quest>.convTimer <= 0`, or Valen
-            # Dreth's `ElseIf talk == 1`).  The BODY is what advances the state
-            # that guard reads — the counter (`convCount + 1`), the speaker
-            # (`speaker = 0`), the stage (`SetStage(18)`).  Releasing first
-            # opens the guard while the old state is still in place, so the
-            # poller re-fires the SAME line before the body ever runs:
-            #   RENAULT FIRE cnt=15 -> FRAG accepted -> RENAULT FIRE cnt=15
-            # Renault repeated her line and the re-Say re-armed convTimer to
-            # 8.33, which held stage 18 open past the EvaluatePackage() the
-            # stage fragment had just issued, so CGRenoteOpenSecretDoor was
-            # never selected and the secret door never opened.  Valen Dreth
-            # repeats for the same reason (his `talk` flag never advances, so
-            # only the re-armed timer stops it looping).
+            #  1. The release must be UNCONDITIONAL — reachable even when the
+            #     sequence gate REJECTS this line.  A line whose turn has
+            #     passed still has to free the timer.  Putting the release
+            #     inside the gate stopped CharacterGen dead at
+            #     `FRAG 00032B0A cnt=8 needs 7 accepted=False`: stage 12
+            #     re-seeded convCount mid-line, the fragment was rejected, and
+            #     nothing ever cleared convTimer.
+            #  2. The poll guard must not re-fire this line.  The guard is
+            #     `speaker == N && convTimer <= 0`, and the gate is
+            #     `convCount == K`, so releasing the timer while the COUNTER
+            #     still reads K lets the owner re-Say the same line
+            #     (`RENAULT FIRE cnt=15` twice), which re-arms the timer.
+            #  3. The timer must already be released when the body's
+            #     `SetStage` runs.  SetStage executes that stage's fragment
+            #     INLINE and those fragments call `EvaluatePackage()`, which
+            #     arbitrates against whatever is committed at that instant.
+            #     With convTimer still 7.63 the engine picked
+            #     CGRenoteOpenSecretDoor and kicked it straight back to
+            #     CGRenoteWalkToMarkerB in the SAME second — a race on engine
+            #     latency, so it worked one run and failed the next.
             #
-            # A body that RETIMES the beat is not a problem here.  Oblivion ran
-            # this while the line was still playing, so `convTimer - .4` cut
-            # SHORT a value that was still counting down.  Our fragment runs
-            # when the line has ALREADY ended, so the base is 0 and `0 - .4` is
-            # negative — which the `<= 0` guards read as "release now", the
-            # same outcome.  So the release can simply come last.
+            # All three hold by ordering the gate body as:
+            #     <counter step>   — closes the gate against a re-fire (2)
+            #     <release>        — timer free before any SetStage (3)
+            #     <rest of body>   — speaker/target, then SetStage
+            # plus an unconditional release after the gate for the rejected
+            # case (1).  The release is idempotent, so running it twice on the
+            # accepted path is harmless.
             #
+            # A body that RETIMES the beat still works.  Oblivion ran this
+            # while the line was playing, so `convTimer - .4` cut short a live
+            # countdown; here the base is already 0 and `0 - .4` is negative,
+            # which every `<= 0` guard reads as "release now" — same outcome.
+            release = []
+            if timer_fix:
+                if timer_beat_ref:
+                    release.append(f'{timer_ref} = {timer_beat_ref}'
+                                   '  ; line ended (+ stacked beat)')
+                    release.append(f'{timer_beat_ref} = 0')
+                else:
+                    release.append(f'{timer_ref} = 0  ; line ended')
+            body_lines = _state_writes_before_setstage(body_lines)
             # A polled-conversation line whose turn has already passed (a quest
             # stage re-seeded the counter mid-line) must apply NOTHING, or its
             # `counter + 1` overshoots the re-seeded value. See _sequence_gate.
             if seq_gate and body_lines:
+                counter, rest = _split_counter_step(body_lines, seq_gate)
                 out_lines.append(f'  If {seq_gate}  ; still this line\'s turn')
-                out_lines.extend('  ' + b for b in body_lines)
+                out_lines.extend('  ' + b for b in counter)
+                out_lines.extend('  ' + r for r in release)
+                out_lines.extend('  ' + b for b in rest)
                 out_lines.append('  EndIf')
+                # Rejected path: the gate did nothing, so the timer is still
+                # armed and must be freed here (constraint 1).
+                out_lines.extend('  ' + r for r in release)
             else:
-                out_lines.extend(body_lines)
-            # Release LAST — after the body advanced the counter/speaker/stage
-            # the owning script's poll guard reads.
-            if timer_fix:
-                if timer_beat_ref:
-                    # The pause the owning script stacks after this line.
-                    # Oblivion charged it ON TOP of the line's length.
-                    out_lines.append(f'  {timer_ref} = {timer_beat_ref}'
-                                     '  ; line ended (+ stacked beat)')
-                    out_lines.append(f'  {timer_beat_ref} = 0')
+                # Ungated: there is no counter to close the guard with, but the
+                # timer must still be free before any SetStage hands control to
+                # the engine (constraint 3).  Release first when the body calls
+                # SetStage on the timer's OWN quest, otherwise keep the release
+                # last so the body's state writes land first (constraint 2).
+                if _setstage_on_owner(body_lines, timer_ref):
+                    out_lines.extend('  ' + r for r in release)
+                    out_lines.extend(body_lines)
                 else:
-                    out_lines.append(f'  {timer_ref} = 0  ; line ended')
+                    out_lines.extend(body_lines)
+                    out_lines.extend('  ' + r for r in release)
             if service_kind:
                 out_lines.append(_SERVICE_MENU_CALL[service_kind])
             out_lines.append('EndFunction')

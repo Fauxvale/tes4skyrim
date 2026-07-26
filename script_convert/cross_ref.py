@@ -326,6 +326,24 @@ class CrossRefGraph:
             return 'Quest'
         return papyrus_script_name(script_edid)
 
+    def get_base_signature(self, name: str) -> str:
+        """Record signature a name ultimately refers to ('ACTI', 'NPC_', ...).
+
+        For a placed reference (REFR/ACHR/ACRE) this follows the NAME chain to
+        the BASE record, so `CGPrisonSecretWallRef` reports 'ACTI' (its base
+        `prisonSecretWall01`) rather than 'REFR'. Returns '' when unknown.
+
+        Callers use this to tell an ANIMATED OBJECT from an ACTOR, which decide
+        completely different animation APIs — see PlayGroup in converter.py.
+        """
+        fid = self.edid_to_formid.get(name.lower(), '')
+        if not fid:
+            return ''
+        base_fid = self.record_base.get(fid, '')
+        if base_fid:
+            return self.record_type.get(base_fid, '')
+        return self.record_type.get(fid, '')
+
     def get_record_script_type(self, name: str) -> str:
         """Get the Papyrus script class name for any record with an attached script.
         For placed references (ACHR/ACRE/REFR), follows the NAME chain to the

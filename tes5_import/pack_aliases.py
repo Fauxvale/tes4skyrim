@@ -226,11 +226,21 @@ class PackagePlan:
         #     quest is found by asking who WRITES that variable (scriptvar_owner,
         #     built from INFO/QUST result scripts).  FGC01Rats' escort package
         #     uses exactly this form, so skipping it loses the case we care about.
+        # A CTDA's param1 is a RAW TES4 FormID straight out of the condition
+        # bytes, but `quest_fids` comes from get_formid(), which has already
+        # applied the load-order index offset.  Comparing the two directly
+        # matches nothing whenever the offset is non-zero (i.e. every real
+        # import), so EVERY package silently lost its owning quest: no ALPCs,
+        # no quest packages, and each actor fell back to its standing schedule.
+        # Match on the low 24 bits, which are identical either way, and keep
+        # the REMAPPED fid as the owner so downstream alias lookups line up.
+        quest_by_low = {q & 0x00FFFFFF: q for q in quest_fids}
+
         for fid, rec in packs.items():
             owner = None
             for qfid in _quest_fids_from_conditions(rec):
-                if qfid in quest_fids:
-                    owner = qfid
+                owner = quest_by_low.get(qfid & 0x00FFFFFF)
+                if owner:
                     break
             if owner is None:
                 for ref in _scriptvar_refs_from_conditions(rec):

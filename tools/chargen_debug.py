@@ -56,6 +56,47 @@ SPEAKERS = {
     'TES4_CGEmperorScript': 'URIEL',
 }
 
+# Stage 22: the Ambush A assassins.  Their packages are gated GetStage >= 23,
+# EXCEPT CGAssassinsAmbushA4 (>= 22) -- so A4 is the designed starter: stage 22
+# wakes all four, only A4's package can pass, and A4's OnPackageEnd is what sets
+# stage 23 and releases A1/A2/A3.  The whole ambush therefore hinges on A4
+# completing its travel package.  These probes show, per assassin: whether the
+# ref is enabled/3d-loaded at all (02/03/04 are Initially Disabled and rely on
+# an XESP enable-parent chain off A1), which package it holds, and whether it
+# ever reaches OnPackageEnd.
+ASSASSINS = {
+    'TES4_CGMythicDawnAmbushA1Script': 'ASSASSIN1',
+    'TES4_CGMythicDawnAmbushA2Script': 'ASSASSIN2',
+    'TES4_CGMythicDawnAmbushA3Script': 'ASSASSIN3',
+    'TES4_CGMythicDawnAmbushA4Script': 'ASSASSIN4',
+}
+
+# The rest of CharacterGen's cast: the Ambush B / Ambush C assassins and the
+# generic Mythic Dawn actors.  Same probe as ASSASSINS (enable + package +
+# package events), so any actor that fails to wake is visible without having to
+# extend this tool again.
+OTHER_ACTORS = {
+    'TES4_CGMythicDawnAmbushB1Script': 'ASSASSIN_B1',
+    'TES4_CGMythicDawnAmbushB2Script': 'ASSASSIN_B2',
+    'TES4_CGAssassinAmbushCScript': 'ASSASSIN_C',
+    'TES4_CGAssassinScript': 'ASSASSIN_FINAL',
+    'TES4_CGMythicDawnAssassinGenericScript': 'ASSASSIN_GEN',
+}
+
+# Trigger zones, doors and gates that gate stage progression.  Each gets an
+# entry/activation trace so a stage that never advances can be traced to the
+# trigger that never fired rather than guessed at.
+TRIGGER_SCRIPTS = [
+    'TES4_CGTrigZoneAmbushBSCRIPT',
+    'TES4_CGTrigZoneEmperorBirthsignSCRIPT',
+    'TES4_CGTriggerZoneCellScript',
+    'TES4_CGTrigZone01SCRIPT',
+    'TES4_CGTrigZoneACTORSCRIPT',
+    'TES4_CGAmbushAGateScript',
+    'TES4_CGAmbushCGateScript',
+    'TES4_CGAmbushCBackGateScript',
+]
+
 # INFO fragments: the walk-down + cell-door lines (convCount 0..13), Uriel's
 # CharGenVoice reaction (32B11) and the force-greet lines that follow it.
 FRAGMENT_FIDS = [
@@ -255,6 +296,132 @@ def instrument_speaker(path, tag):
     return True
 
 
+def _assassin_block(tag, quest):
+    """Per-tick state for one Ambush A assassin.
+
+    Unlike the speaker scripts these have no OnUpdate loop of their own, so the
+    probe adds one (OnInit -> RegisterForSingleUpdate, re-armed each tick).
+    IsEnabled/Is3DLoaded are the first question: 02/03/04 ship Initially
+    Disabled and are enabled only through the XESP parent chain off A1, so a
+    disabled assassin never runs a package no matter what the package says.
+    """
+    return f'''
+Event OnInit()
+  If !_dbgOpen
+    _dbgOpen = Debug.OpenUserLog("{LOG}")
+  EndIf
+  RegisterForSingleUpdate(1.0)
+EndEvent
+
+Event OnUpdate()
+{_open_block()}  Package _cp = Self.GetCurrentPackage()
+  String _p = ""
+  If _cp
+    _p = _cp as String
+  EndIf
+  String _s = "st=" + {quest}.GetStage() + " en=" + Self.IsEnabled() + " 3d=" + Self.Is3DLoaded() + " dead=" + Self.IsDead() + " combat=" + Self.IsInCombat() + " pkg=" + _p
+  If _s != _dbgLast
+    _dbgLast = _s
+    Debug.TraceUser("{LOG}", "{tag} " + _s)
+  EndIf
+  RegisterForSingleUpdate(1.0)
+EndEvent
+
+Event OnPackageStart(Package akNewPackage)
+  Debug.TraceUser("{LOG}", "{tag} PKGSTART " + akNewPackage)
+EndEvent
+
+Event OnPackageChange(Package akOldPackage)
+  Debug.TraceUser("{LOG}", "{tag} PKGCHANGE from " + akOldPackage + " to " + Self.GetCurrentPackage())
+EndEvent
+'''
+
+
+def instrument_assassin(path, tag):
+    """Add enable/package probes to an Ambush A assassin script.
+
+    The A4 script's OnPackageEnd is the linchpin -- it sets stage 23, which is
+    what releases the other three -- so that handler is logged unconditionally,
+    before its `akOldPackage == CGAssassinsAmbushA4` guard, to distinguish "the
+    event never fired" from "it fired but the guard rejected the package".
+    """
+    src = open(path, encoding='utf-8').read()
+    if 'chargen_debug.py' in src:
+        return False
+    m = re.search(r'(\w+) Property (Charactergen|CharacterGen) Auto', src,
+                  re.I)
+    quest = m.group(2) if m else 'Charactergen'
+    src = re.sub(r'(\{Converted from TES4:[^}]*\}\n)', r'\1' + _STATE_DECL,
+                 src, count=1)
+    # log the package-end event before its guard, so a mismatch is visible
+    src = re.sub(
+        r'(Event OnPackageEnd\(Package akOldPackage\)\n)',
+        r'\1  Debug.TraceUser("' + LOG + '", "' + tag
+        + ' PKGEND " + akOldPackage)\n', src, count=1)
+    src += _assassin_block(tag, quest)
+    open(path, 'w', encoding='utf-8').write(src)
+    return True
+
+
+def instrument_actor(path, tag):
+    """Enable/package probe for a CharacterGen actor script.
+
+    Same shape as instrument_assassin, but tolerant of scripts that already
+    define OnUpdate / the package events (a duplicate Event is a compile
+    error, and this set is more varied than the four Ambush A scripts).
+    """
+    src = open(path, encoding='utf-8').read()
+    if 'chargen_debug.py' in src:
+        return False
+    if not re.match(r'ScriptName \w+ extends (Actor|ObjectReference)', src):
+        return False
+    m = re.search(r'(\w+) Property (Charactergen|CharacterGen) Auto', src,
+                  re.I)
+    quest = m.group(2) if m else None
+    src = re.sub(r'(\{Converted from TES4:[^}]*\}\n)', r'\1' + _STATE_DECL,
+                 src, count=1)
+    src = re.sub(
+        r'(Event OnPackageEnd\(Package akOldPackage\)\n)',
+        r'\1  Debug.TraceUser("' + LOG + '", "' + tag
+        + ' PKGEND " + akOldPackage)\n', src, count=1)
+    block = _assassin_block(tag, quest) if quest else ''
+    if not block:
+        return False
+    # Drop any handler the converted script already defines.
+    for ev in ('OnInit', 'OnUpdate', 'OnPackageStart', 'OnPackageChange'):
+        if re.search(r'Event ' + ev + r'\(', src):
+            block = re.sub(r'Event ' + ev + r'\(.*?EndEvent\n', '', block,
+                           flags=re.S)
+    src += block
+    open(path, 'w', encoding='utf-8').write(src)
+    return True
+
+
+def instrument_trigger(path, tag):
+    """Trace every OnTrigger / OnActivate on a gating trigger zone or door.
+
+    Logged before the script's own guards so a trigger that fires but is
+    rejected by a stage check is distinguishable from one that never fires.
+    """
+    src = open(path, encoding='utf-8').read()
+    if 'chargen_debug.py' in src:
+        return False
+    hit = False
+    for ev, arg in (('OnTriggerEnter', 'akActionRef'),
+                    ('OnTrigger', 'akActionRef'),
+                    ('OnActivate', 'akActionRef')):
+        pat = r'(Event ' + ev + r'\(ObjectReference ' + arg + r'\)\n)'
+        if re.search(pat, src):
+            src = re.sub(pat, r'\1  Debug.TraceUser("' + LOG + '", "'
+                         + tag + ' ' + ev + ' by " + ' + arg + ')\n',
+                         src, count=1)
+            hit = True
+    if not hit:
+        return False
+    open(path, 'w', encoding='utf-8').write(src)
+    return True
+
+
 def instrument_quest(path):
     src = open(path, encoding='utf-8').read()
     if 'chargen_debug.py' in src:
@@ -363,6 +530,26 @@ def main():
     for stem, tag in SPEAKERS.items():
         path = os.path.join(SRC, stem + '.psc')
         if os.path.isfile(path) and instrument_speaker(path, tag):
+            touched.append(stem)
+            print(f'  instrumented {stem} [{tag}]')
+
+    for stem, tag in ASSASSINS.items():
+        path = os.path.join(SRC, stem + '.psc')
+        if os.path.isfile(path) and instrument_assassin(path, tag):
+            touched.append(stem)
+            print(f'  instrumented {stem} [{tag}]')
+
+    for stem, tag in OTHER_ACTORS.items():
+        path = os.path.join(SRC, stem + '.psc')
+        if os.path.isfile(path) and instrument_actor(path, tag):
+            touched.append(stem)
+            print(f'  instrumented {stem} [{tag}]')
+
+    for stem in TRIGGER_SCRIPTS:
+        path = os.path.join(SRC, stem + '.psc')
+        tag = stem.replace('TES4_CG', '').replace('SCRIPT', '') \
+                  .replace('Script', '').upper()
+        if os.path.isfile(path) and instrument_trigger(path, tag):
             touched.append(stem)
             print(f'  instrumented {stem} [{tag}]')
 

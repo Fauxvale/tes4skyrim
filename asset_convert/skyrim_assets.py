@@ -59,13 +59,22 @@ def find_skyrim_data():
     return _skyrim_data
 
 
-def _bsa_glob_for(rel):
-    """BSA name pattern that holds files under this top-level folder."""
-    top = rel.replace('/', '\\').split('\\', 1)[0].lower()
+def _bsa_globs_for(rel):
+    """BSA name patterns that may hold this file, in search order.
+
+    Behaviour graphs and animations live under `meshes\\` but ship in
+    `Skyrim - Animations.bsa`, NOT the mesh archives — so a .hkx lookup has to
+    try both or it silently returns None (which is what hid the animated-
+    activator behaviour graphs).
+    """
+    norm = rel.replace('/', '\\').lstrip('\\').lower()
+    top = norm.split('\\', 1)[0]
+    if norm.endswith('.hkx'):
+        return ['Skyrim - Animations.bsa', 'Skyrim - Meshes*.bsa']
     return {
-        'meshes': 'Skyrim - Meshes*.bsa',
-        'textures': 'Skyrim - Textures*.bsa',
-    }.get(top, 'Skyrim - *.bsa')
+        'meshes': ['Skyrim - Meshes*.bsa'],
+        'textures': ['Skyrim - Textures*.bsa'],
+    }.get(top, ['Skyrim - *.bsa'])
 
 
 def get_asset_bytes(rel):
@@ -85,7 +94,10 @@ def get_asset_bytes(rel):
     if not data_dir:
         return None
     from .bsa_extract import read_bsa_files
-    for bsa in sorted(Path(data_dir).glob(_bsa_glob_for(rel))):
+    candidates = []
+    for pattern in _bsa_globs_for(rel):
+        candidates.extend(sorted(Path(data_dir).glob(pattern)))
+    for bsa in candidates:
         found = read_bsa_files(str(bsa), [rel])
         raw = found.get(rel.lower())
         if raw is not None:
