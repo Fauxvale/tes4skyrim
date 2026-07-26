@@ -20,7 +20,8 @@ import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
-from .constants import IMPORT_DISPATCH, SKIP_TYPES, TYPE_MAP
+from .constants import (AMBIENT_GMST_OVERRIDES, IMPORT_DISPATCH, SKIP_TYPES,
+                        TYPE_MAP)
 from .master_manifest import write_manifest
 from .overrides import (OverrideContext, build_nested_overrides,
                         detect_injected_records)
@@ -119,6 +120,43 @@ def _create_tes4_special_records(writer: PluginWriter):
     print(f"  Created TES4 special records: "
           f"TES4Fame={fame_fid:08X}, TES4Infamy={infamy_fid:08X}, "
           f"TES4CyrodiilCrimeFaction={crime_fid:08X}")
+
+
+def _create_ambient_gmst_overrides(writer: PluginWriter, by_type: dict):
+    """Carry Oblivion's GLOBAL ambient-dialogue pacing across.
+
+    Oblivion has no per-package chatter control — its package flags concern
+    doors, speed, sneak, equipment and combat, nothing about dialogue (xEdit
+    wbPackageFlags; UESP "Oblivion Mod:Mod File Format/PACK"). Pacing lives
+    entirely in these game settings, and Skyrim's equivalents run far faster
+    (greeting retry 5s vs Oblivion's 20s; idle chatter 10s vs Oblivion's
+    authored 100s). Because 'GMST' is in SKIP_TYPES, none of that pacing was
+    carried over and converted NPCs ran Skyrim's clock over Oblivion's much
+    larger line pool — the constant-quipping defect.
+
+    The TES4 export's own value wins when the record exists there (that is what
+    Oblivion.esm actually shipped); otherwise the Oblivion.exe engine default
+    recorded in AMBIENT_GMST_OVERRIDES is used.
+    """
+    authored = {}
+    for rec in by_type.get('GMST', []):
+        edid = get_str(rec, 'EditorID', '')
+        if edid in AMBIENT_GMST_OVERRIDES:
+            try:
+                authored[edid] = float(get_str(rec, 'DATA.Value'))
+            except (TypeError, ValueError):
+                pass
+
+    written = []
+    for edid, (default, _is_float) in sorted(AMBIENT_GMST_OVERRIDES.items()):
+        value = authored.get(edid, default)
+        subs = pack_string_subrecord('EDID', edid)
+        subs += pack_subrecord('DATA', struct.pack('<f', value))
+        writer.add_record('GMST', pack_record(
+            'GMST', writer.alloc_formid(), 0, subs))
+        written.append(f"{edid}={value:g}"
+                       + ('' if edid in authored else ' (exe default)'))
+    print(f"  Ambient dialogue pacing (GMST): {', '.join(written)}")
 
 
 def _create_vtyp_records(writer: PluginWriter):
@@ -313,6 +351,9 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
 
         # --- Phase 0a: TES4-specific globals/factions for converted scripts ---
         _create_tes4_special_records(writer)
+
+        # Oblivion's global ambient-dialogue pacing (GMST is otherwise skipped).
+        _create_ambient_gmst_overrides(writer, by_type)
     _step_done('vtyp/special records')
 
     # --- Phase 0b: Pre-scan for dialogue conversion ---

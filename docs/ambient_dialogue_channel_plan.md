@@ -176,7 +176,7 @@ TODO.txt #16 and restored by Step 4 when scenes are built properly.
 
 ## Plan of attack — ordered by ease of fixing
 
-### Step 1 — Drop the NPC-to-NPC topics entirely (easiest)
+### Step 1 — Drop the NPC-to-NPC topics entirely ✅ IMPLEMENTED 2026-07-25
 
 **Decision (2026-07-25): better absent than wrong.** These lines have no correct
 destination in Skyrim short of full SCEN synthesis (Step 4), and every partial
@@ -209,9 +209,63 @@ This is the reason to skip properly rather than to suppress `BNAM`.
 **Do not lose the content.** Recorded as TODO.txt "Later Issues" #16 so the
 dropped families can be restored via Step 4.
 
-**Verify:** `tools/ambient_bark_audit.py --by-source` — expect
-`Conversation(NPC-to-NPC)` to fall from 4,260 INFOs to ~0 in the CUST
-attribution, and zero dangling TCLT in `tools/dialog_validator.py`.
+#### ⚠ The trap that nearly broke CharacterGen
+
+A drop keyed on `DATA.Type == 1` alone is **wrong**. Measured against the real
+export, **293 of the 535 Type-1 topics are script-driven** — spoken by an
+explicit `Say`/`SayTo`/`StartConversation` in a quest script, which converts to
+a real Skyrim `Actor.Say()` and works correctly. That set includes:
+
+- every CharGen topic (`CharGenMain`, `CharGenVoice`, `CharGenBaurus`,
+  `CharGenEmperor`, `CharGenGlenroy`, `CharGenBlades`, `CharGenRenote`,
+  `CharGenTaunt2`) — the Emperor/Blades tutorial intro;
+- the Daedric-prince speeches (`DASheogorathSpeech`, `DANamiraSpeech`,
+  `DAClavicusSpeech`), the arena/announcer topics (`ICAnnouncer`, `Announcer`),
+  `FGD02Insults`, `OblivionGateConv`, the SE and Thieves-Guild scripted scenes.
+
+Dropping by type alone would have deleted all of them and broken the tutorial
+outright. The predicate therefore consults `_SAY_TOPIC_DISPOSITIONS` (the
+converter's existing Say/SayTo/StartConversation scanner) and keeps anything a
+script speaks. Note this detector finds **295** Type-1 topics where a naive
+`\bsay\b` regex finds only 12 — it also handles `StartConversation` and
+`ref.Say Topic` forms.
+
+**Ordering requirement:** `build_say_topic_dispositions` must run *before* the
+first `should_skip_dial` call. It is now built in the `build_dialog_groups`
+pre-scan. `dialog_unlocks.build_unlock_plan` also calls `should_skip_dial`, and
+runs much earlier (`import_main.py:332` vs `:801`), so the predicate **fails
+safe**: an empty map keeps every topic rather than dropping all 293.
+
+#### The script-driven topics still needed unlisting
+
+Keeping them is necessary but not sufficient. They were still emitted with a
+**top-level `BNAM` branch** and an EditorID `FULL`, so `CharGenVoice`,
+`Dark18TraitorTalk`, `SE11SheogorathFarewell2` … sat in the player's menu —
+the same defect, on a different set of topics. Fix: force a **Normal
+(non-top-level) branch** for script-driven Type-1 topics. `Actor.Say()` reaches
+an INFO through its topic regardless of branch visibility and TCLT links still
+resolve, so the scripted lines play exactly as before while the topic leaves the
+menu. `INFOGENERAL` is exempt — it is genuinely player-selectable.
+
+#### Measured result
+
+```
+Type-1 named-keep    :   3 topics  4891 INFOs   (INFOGENERAL/HELLO/GOODBYE)
+Type-1 script-driven : 293 topics  1266 INFOs   <- KEPT, unlisted
+Type-1 droppable     : 242 topics  1157 INFOs   <- dropped
+
+converted DIAL 3461 -> 3330
+NPC-to-NPC conversation topics dropped: 258
+Type-1-sourced CUST topics: TOP-LEVEL(menu)=1 (INFOGENERAL), NORMAL(hidden)=292
+dangling TCLT in output: 0
+```
+
+(258 > 242 because the count includes topics whose INFOs were already skipped
+for other reasons.)
+
+**Verify:** `tools/ambient_bark_audit.py --by-source`; regression tests in
+`tests/test_import.py::TestNpcToNpcConversationDrop` (5 tests, incl. the
+fail-safe and the CharGen keep).
 
 ---
 
@@ -305,9 +359,10 @@ Target end state after Steps 1–2:
 |---|---|---|
 | HELO INFOs from GREETING | 3,743 (66%) | 0 |
 | HELO INFOs total | 5,636 | ~1,893 |
-| Conversation-sourced CUST topics | 423 | 0 (dropped) |
-| Conversation-sourced CUST INFOs | 4,260 | 0 (dropped) |
-| Dangling TCLT after the drop | — | 0 |
+| Conversation-sourced topics in the player MENU | 423 | 1 (`INFOGENERAL`/Rumors) ✅ |
+| Pure NPC-to-NPC topics emitted | 242 | 0 (dropped) ✅ |
+| Script-driven Type-1 topics kept | 293 | 293, unlisted ✅ |
+| Dangling TCLT after the drop | — | 0 ✅ |
 | SCEN records | 0 | 0 (Steps 1–3) / >0 (Step 4, deferred) |
 
 Ground truth is in-game: the fix is confirmed when NPCs stop quipping

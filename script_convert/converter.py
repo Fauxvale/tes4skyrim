@@ -18,65 +18,31 @@ _COND_LINE_RE = re.compile(r'^(\s*(?:If|ElseIf)\s+)(.*)$', re.IGNORECASE)
 # TES4 reads of "is the player sleeping right now" (the MenuMode sleep idiom)
 _SLEEP_READ_RE = re.compile(r'\b(?:ispcsleeping|isplayersleeping|getpcissleeping)\b',
                             re.IGNORECASE)
-# Stand-in for the voice-line duration TES4's Say/SayTo returned (seconds).
-# Only reached for a Say whose topic drives no conversation timer we can clear.
+# Fallback line length (seconds) charged to a converted Say() timer at the CALL
+# SITE when the topic has no measured audio.
+#
+# What the timer is actually for. Papyrus `Say()` is FIRE-AND-FORGET: it does not
+# block, does not queue, and silently does nothing when no INFO under the topic
+# qualifies (CK wiki, Say - ObjectReference). The owning script polls on its own
+# update (0.1-0.5s) and re-issues `Say()` while its guard reads `timer <= 0`, but
+# the INFO's End FRAGMENT — the thing that advances the conversation — only runs
+# when the line FINISHES. So the timer has exactly one job: cover the window
+# between issuing the line and its fragment firing. Charge zero and the poller
+# re-Says the same line every tick, restarting it forever so the fragment never
+# runs (Valen Dreth's CharacterGen taunts repeat line 1 endlessly).
+#
+# Why the LINE'S OWN LENGTH is the right value, and not more:
+#   * It is the smallest value that reliably outlasts the window.
+#   * The End fragment clears it the instant the line really ends, so a line that
+#     played costs NO extra silence — the wait is not additive in practice.
+#   * It self-clears via the owning script's countdown, so a line that never
+#     played (Say dropped) costs one line's pacing and the scene continues.
+#
+# Do NOT "park" a large sentinel here that only the End fragment can clear. That
+# inverts the failure mode: no line means no fragment, so the value strands and
+# the conversation HALTS (CharacterGen's prison-cell scene sat ~20s between lines
+# and stalled outright where its convCount chain runs through gaps with no INFO).
 SAY_LINE_SECONDS = 3.0
-# Longest line to assume for a Say whose topic has NO measured audio. NOT pacing:
-# the INFO's End fragment clears the timer when the line actually finishes, and
-# the park only has to hold the polling loop off until then.
-#
-# Sized from the MEASURED corpus rather than guessed. The longest of Oblivion's
-# 19,800 measured topics is 21.63s, so 24s covers every real line with margin. It
-# used to be a flat 60s, which mattered because the park is also the dropped-line
-# timeout (see `_say_seconds`): `CGEmperorBirthsign` has ZERO INFOs — the only
-# such topic in the game — so `SayTo player, CGEmperorBirthsign` in
-# CGEmperorScript can never produce a line, and CharacterGen's birthsign step
-# stalled for the whole 60s every single run.
-SAY_LONGEST_UNMEASURED_LINE = 24.0
-# Park for a topic with no measured audio: the unmeasured-line assumption plus
-# the same threshold and slack a measured topic gets.
-SAY_LINE_PARK_SECONDS = 60.0
-# Threshold the End fragment tests to decide "is this timer still parked?".
-# It must sit BELOW the park because the owning loop counts the timer DOWN
-# while the line plays (`If timer > 0 : timer = timer - dt`), so by the time
-# the line ends a 60s park has decayed to 60 minus the line's length — a
-# `>= park` test never fired and Valen Dreth's loop stalled after one line.
-# It must sit ABOVE any deliberate beat that OWNER stages, so a timer holding a
-# released beat is never mistaken for a parked one.
-#
-# This is the FLOOR, used when the owner stages no beat at all (19,601 of the
-# 19,800 measured topics). It is deliberately small: the threshold sets the park,
-# the park is also the dropped-line timeout, and every second of it is dead air
-# when a Say produces no line. `say_beat_threshold` raises it per owner for the
-# few that need it — only 2 scripts in Oblivion stage a beat above 10s
-# (AncontarScript 20, HackdirtCellDoorScript 15), and a global floor sized for
-# those charged all 19,798 others a ~32s stall instead of ~14s.
-SAY_TIMER_PARKED_THRESHOLD = 8.0
-# Slack over an owner's largest staged beat, so a released beat sitting in the
-# timer stays clear of the "still parked?" test.
-SAY_BEAT_THRESHOLD_MARGIN = 2.0
-# How long a parked timer may sit before the park is treated as a DROPPED line
-# and released without an End fragment.
-#
-# Papyrus `Say()` is fire-and-forget and silently does nothing whenever no INFO
-# under the topic passes its conditions, or the speaker is dead / unloaded /
-# already talking.  No line means no End fragment, so the park is stranded and
-# the conversation stops until the owning loop has counted the full park down.
-# Oblivion could not have this failure: `SayTo` RETURNED 0 for a dropped line,
-# so the timer was never armed and the next tick simply tried again.
-#
-# CharacterGen reaches that state by design — its convCount chain runs up to a
-# deliberate GAP (14, 17, 23, 24, 27, ...) where no CharGenMain INFO exists and
-# a STAGE re-seeds convCount — and three of its segment ends (convCount 36, 43,
-# 45) leave `speaker` non-zero, so a poller does fire a Say with nothing to say.
-# Waiting out a 60s park there is indistinguishable from a broken quest, and the
-# stage that would re-seed the chain often needs the timer clear to run at all.
-#
-# It is added to the topic's longest MEASURED line to size the park, so it is
-# pure slack over the engine's Say-to-audio lag plus the owning loop's tick
-# granularity — not the whole timeout. 4s is comfortably above both and far
-# below anything a player reads as a hang.
-SAY_LINE_DROPPED_TIMEOUT = 4.0
 # Papyrus method name for an OBSE user-defined function (`begin Function{...}`).
 # One fixed name per script: OBSE allowed exactly one Function block per script
 # and `Call <ScriptName> args` names the SCRIPT, never the function.
@@ -189,8 +155,8 @@ class ScriptConverter:
     # order or which process handles either script.
     beat_fields_by_owner: dict = {}
     # topic (lower) -> (kind, spec, beat), from pipeline.build_say_timer_owners.
-    # The call site needs the same `beat` the End fragment uses so both derive an
-    # identical park threshold (see say_beat_threshold).
+    # `beat` is the deliberate pause the owning script stacks AFTER this topic's
+    # line; the End fragment applies it once the line has actually finished.
     say_timer_owners: dict = {}
 
     def __init__(self, xref: CrossRefGraph):
@@ -223,81 +189,17 @@ class ScriptConverter:
     def _say_seconds(self, say_expr: str) -> float:
         """Seconds to charge a converted Say() timer at the CALL SITE.
 
-        TES4's Say/SayTo RETURNED the line's length and the script stored it in
-        a timer so the next speaker would not start until this line finished.
-        Papyrus' Say() returns nothing, so the call site must supply a duration.
-
-        The wait is NOT a duration.  The engine already blocks for the whole
-        audio file, so charging a measured length here makes the engine's wait
-        and the script's wait ADD — that is the "really long pause between
-        every single response" failure, and it must not come back.
-
-        The timer is PARKED instead, and the topic's End fragment clears it the
-        instant the line truly finishes.  The park value is pure backstop: it
-        only has to outlast one line, and nothing paces off it.
-
-        But the backstop is also the DROPPED-LINE TIMEOUT, and that is why it is
-        sized per topic rather than left at the flat 60s.  `Say()` is
-        fire-and-forget: it does nothing at all when no INFO under the topic
-        passes its conditions, or the speaker is dead / unloaded / already
-        talking.  No line means no End fragment, so nothing ever clears the park
-        and the scene waits the whole thing out — a minute of NPCs standing mute,
-        which reads as a broken quest rather than a slow one.  Oblivion could not
-        reach that state: `SayTo` returned 0 for a dropped line, so the timer was
-        never armed and the next tick simply retried.
-
-        CharacterGen hits it by design.  Its `convCount` chain deliberately runs
-        up to a GAP where no CharGenMain INFO exists (14, 17, 23, 24, 27, ... — a
-        quest STAGE re-seeds convCount past it) and three segment ends (convCount
-        36, 43, 45) leave `speaker` non-zero, so a poller really does fire a Say
-        with nothing to say.  Worse, several of the stages that would re-seed the
-        chain are themselves gated on `convTimer <= 0`, so a stranded park blocks
-        its own recovery.
-
-        Skyrim offers no way to ask whether an actor is speaking (Actor.psc has
-        no IsTalking — that is a Fallout CONDITION function; IsInDialogueWithPlayer
-        covers only player conversations, not the NPC-to-NPC Say used here), so
-        the timeout is enforced by the countdown the owning script already runs:
-        park only far enough above the release threshold to outlast this topic's
-        LONGEST MEASURED line, and the park drains back through the threshold on
-        its own shortly after any real line of that topic would have ended.  A
-        line that did play had its fragment clear the park long before then.
-
-        Everything above that point is dead air on a dropped line, so a topic
-        whose longest response is 2s now retries in a few seconds instead of 60.
-        Topics with no measured audio keep the flat park.
+        This topic's longest MEASURED line (see SAY_LINE_SECONDS for why that is
+        the right value): enough to stop the owning script's poller re-issuing
+        `Say()` before the INFO's End fragment can run, and no more. The fragment
+        clears it as soon as the line actually ends, so a line that played adds
+        no silence; a line that was dropped drains through the owning script's
+        own countdown instead of stranding the scene.
         """
         tm = self._SAY_TOPIC_RE.search(say_expr or '')
         topic = tm.group(1).lower() if tm else ''
-        # A topic with no measured audio still gets a bounded park: assume the
-        # longest line the measured corpus contains rather than the old flat 60s.
-        line = float((self.say_durations or {}).get(topic)
-                     or SAY_LONGEST_UNMEASURED_LINE)
-        # Same threshold the End fragment will test against — derived from the
-        # same per-topic beat, so the two cannot drift apart.
-        owner = (self.say_timer_owners or {}).get(topic)
-        thresh = self.say_beat_threshold(owner[2] if owner else 0.0)
-        return min(SAY_LINE_PARK_SECONDS,
-                   thresh + line + SAY_LINE_DROPPED_TIMEOUT)
-
-    @staticmethod
-    def say_beat_threshold(beat: float = 0.0) -> float:
-        """The "is this timer still parked?" threshold for one park site.
-
-        Both emitters must agree exactly: the CALL SITE sizes its park above this
-        (`_say_seconds`) and the End FRAGMENT tests against it, so a mismatch
-        either never releases the park or releases it mid-line.  Deriving both
-        from the same `beat` — the deliberate pause the owning script stacks after
-        this topic's line, which `build_say_timer_owners` already reports per
-        topic — keeps them in step.
-
-        The threshold has to clear that beat, because a released beat sits in the
-        timer and must not read as a fresh park.  Everything above that is pure
-        cost: the threshold sets the park, and the park is also how long a DROPPED
-        line stalls the scene.
-        """
-        return max(SAY_TIMER_PARKED_THRESHOLD,
-                   float(beat or 0.0) + SAY_BEAT_THRESHOLD_MARGIN)
+        return float((self.say_durations or {}).get(topic)
+                     or SAY_LINE_SECONDS)
 
     @staticmethod
     def beat_property(timer_expr: str) -> str:
@@ -2099,34 +2001,26 @@ class ScriptConverter:
                     delay_m = re.match(r'[+\-]\s*([\d.]+)', remainder) if remainder else None
                     # TES4 Say/SayTo RETURNED the voice line's duration and every
                     # polling conversation counts that timer down before speaking
-                    # the next line.  Papyrus Say() returns nothing; substituting
-                    # 0 made converted conversations machine-gun a line per tick
-                    # (overlapping audio, skipped result scripts).
-                    #
-                    # The timer is PARKED here and released by the INFO's End
-                    # fragment when the line really finishes — see
-                    # _say_seconds and pipeline.build_say_timer_owners.  It is
-                    # written BEFORE the Say call because the fragment for a
-                    # very short line can run before this statement would
-                    # otherwise execute; parking afterwards would re-block a
-                    # conversation the engine had already released.
+                    # the next line.  Papyrus Say() returns nothing, so charge the
+                    # MEASURED duration and let the owning script's existing
+                    # countdown drain it — the same self-clearing delay Oblivion
+                    # had.  Written BEFORE the Say call so the value is in place
+                    # whatever the engine does with the line.
                     delay_f = (self._say_seconds(say_call) +
                                (float(delay_m.group(1)) if delay_m else 0.0))
                     delay_val = f'{delay_f:g}'
                     # An Int target (TES4 `short`) can't take a Float literal
                     if self._var_types.get(target.lower().split('.')[-1]) == 'Int':
                         delay_val = str(int(delay_f))
-                    self._parked_timers.add(target.lower())
                     return (f'{target} = {delay_val}'
-                            '  ;parked; the topic\'s End fragment clears it\n'
+                            '  ;line length; blocks a re-Say until the End fragment clears it\n'
                             f'  {say_call}')
                 secs = self._say_seconds(value)
                 say_dflt = (str(int(round(secs))) if self._var_types.get(
                     target.lower().split('.')[-1]) == 'Int'
                     else f'{secs:g}')
-                self._parked_timers.add(target.lower())
                 return (f'{target} = {say_dflt}'
-                        '  ;parked; the topic\'s End fragment clears it\n'
+                        '  ;line length; blocks a re-Say until the End fragment clears it\n'
                         f'  {value}')
             # GlobalVariable: use SetValue() instead of direct assignment
             tgt_low = target.lower().split('.')[-1]
@@ -3755,17 +3649,24 @@ class ScriptConverter:
         if fname_low == 'getdisposition':
             return '50'
 
-        # SetAlert → DrawWeapon / no-op
+        # SetAlert → Actor.SetAlert (native, same name and semantics both ways).
+        # NOT DrawWeapon: Oblivion's SetAlert sets the AI combat-READINESS flag,
+        # which the engine clears on its own and which does NOT block dialogue.
+        # DrawWeapon puts the actor in a weapon-drawn state that suppresses the
+        # force-greet, and `SetAlert 0` (the sheathe half) was a NO-OP, so an
+        # actor alerted for a scripted ambush never stood down: CharacterGen
+        # stage 15 alerts Uriel for the prison-cell ambush and stage 17/24
+        # clears it to run the conversation, so converted Uriel drew his sword,
+        # never sheathed it, and could never initiate dialogue with the player
+        # — the intro soft-locked with controls disabled.
         if fname_low == 'setalert':
-            arg = args_str.strip() if args_str else '0'
+            arg = args_str.strip().lower() if args_str else '0'
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
-            if arg in ('1', 'true'):
-                # DrawWeapon is Actor-only; cast if ref is ObjectReference
-                if ref == 'Self' and extends not in ('Actor',):
-                    ref = '(Self as Actor)'
-                return f'{ref}.DrawWeapon()'
-            self._line_comments.append(';NE: SetAlert 0')
-            return '0'
+            # SetAlert is Actor-only; cast if ref is ObjectReference
+            if ref == 'Self' and extends not in ('Actor',):
+                ref = '(Self as Actor)'
+            alerted = 'true' if arg in ('1', 'true') else 'false'
+            return f'{ref}.SetAlert({alerted})'
 
         # StartConversation: caller.StartConversation Target [, TopicID].
         # The topic INFO (and its result-script fragment) is the payload —

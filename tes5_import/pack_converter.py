@@ -130,10 +130,36 @@ _FLAG_MAP = (
 # PKDT preferred speed
 SPEED_WALK, SPEED_JOG, SPEED_RUN, SPEED_FASTWALK = 0, 1, 2, 3
 
-# Default interrupt flags — vanilla instances use 0xFFFF (all interrupts
-# allowed: hellos, conversations, combat observation).  Oblivion packages have
-# no equivalent field, and allowing interrupts is what makes NPCs feel alive.
-DEFAULT_INTERRUPT = 0xFFFF
+# PKDT Interrupt Flags (TES5 only).  These authorise an actor to INTERRUPT the
+# running package to speak: 0x01 Hellos to player, 0x02 Random conversations,
+# 0x80 Allow Idle Chatter, plus combat/corpse/aggro observation bits.
+#
+# Oblivion has NO equivalent.  Its complete package flag set (xEdit
+# wbDefinitionsCommon.pas:7635 wbPackageFlags, and UESP "Oblivion Mod:Mod File
+# Format/PACK") is Offers Services / Must Reach Location / Must Complete /
+# Lock+Unlock Doors / Continue If PC Near / Once Per Day / Skip Fallout
+# Behavior / Always Run / Always Sneak / Allow Swimming / Allow Falls / Armor
+# Unequipped / Weapons Unequipped / Defensive Combat / Use Horse / No Idle
+# Anims.  Not one concerns dialogue -- "No Idle Anims" is idle ANIMATIONS
+# ("Turns off Idle animations during package", CS wiki).  Oblivion gates
+# ambient chatter GLOBALLY through GMSTs instead (see AMBIENT_GMST_OVERRIDES
+# in tes5_import/constants.py), never per package.
+#
+# So there is nothing to convert from and no per-package rule to derive.  This
+# value was 0xFFFF, which is not a translation of anything: per UESP, 0xFFFF is
+# precisely what the CK's "Set all interrupt flags" button writes.  Every one of
+# the 7,209 converted packages therefore force-authorised all nine interrupts,
+# so every NPC was permanently allowed to break off whatever they were doing to
+# greet or chatter -- the "NPCs quip every few seconds, anywhere, even mid-
+# scripted-sequence" defect.
+#
+# Vanilla Skyrim does the opposite: 192 distinct values across 5,961 packages,
+# the single most common being 0x0000 (1,411 = 23.7%, all ambient interrupts
+# OFF), and 39.7% have "Hellos to player" CLEAR.  With no TES4 source field,
+# the faithful choice is the one that does not invent per-package behaviour and
+# does not force chatter on: leave the interrupts unset and let Oblivion's own
+# global GMST pacing govern, exactly as Oblivion did.
+DEFAULT_INTERRUPT = 0x0000
 
 # Furniture object types (TES5 wbObjectTypeEnum) used to decide whether a TES4
 # UseItemAt target is "sit-like".

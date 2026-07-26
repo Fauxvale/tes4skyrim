@@ -2268,6 +2268,167 @@ class TestSayTopicRetarget:
             f'engine-fixed Player id was remapped to {param1:#010x}'
 
 
+class TestAmbientChatterPacing:
+    """NPCs quipped every few seconds anywhere, even mid-scripted-sequence
+    (2026-07-25).
+
+    Two causes, both from Skyrim-only mechanisms having no TES4 source:
+
+    1. PKDT Interrupt Flags authorise an actor to INTERRUPT its package to
+       speak. Oblivion has no such field -- its package flags cover doors,
+       speed, sneak, equipment and combat only (xEdit wbPackageFlags; UESP
+       "Oblivion Mod:Mod File Format/PACK"), and "No Idle Anims" is idle
+       ANIMATIONS. The converter wrote 0xFFFF on all 7,209 packages, which per
+       UESP is exactly what the CK's "Set all interrupt flags" button writes.
+    2. Oblivion paces ambient dialogue GLOBALLY via GMSTs, which were skipped.
+    """
+
+    def test_interrupt_flags_not_force_enabled(self):
+        from tes5_import.pack_converter import DEFAULT_INTERRUPT
+        assert DEFAULT_INTERRUPT != 0xFFFF, \
+            "0xFFFF is the CK's 'set all interrupt flags'; it forces every " \
+            "NPC to be allowed to break off any activity to chatter"
+        # Bit 0 is "Hellos to player"; vanilla Skyrim leaves it clear on 39.7%
+        # of packages and TES4 provides nothing to derive it from.
+        assert not (DEFAULT_INTERRUPT & 0x01)
+
+    def test_pkdt_writes_the_interrupt_field(self):
+        import struct
+        from tes5_import.pack_converter import build_pkdt, DEFAULT_INTERRUPT
+        b = build_pkdt(0, 2)
+        assert len(b) == 12
+        assert struct.unpack_from('<H', b, 8)[0] == DEFAULT_INTERRUPT
+
+    def test_oblivion_pacing_gmsts_carried(self):
+        """Oblivion is far slower than Skyrim on both ambient clocks; without
+        these the converted game runs Skyrim's pacing over Oblivion's much
+        larger line pool."""
+        from tes5_import.constants import AMBIENT_GMST_OVERRIDES
+        # Skyrim.esm ships 5.0 / 10.0 for these two.
+        assert AMBIENT_GMST_OVERRIDES['fAIGreetingTimer'][0] == 20.0
+        assert AMBIENT_GMST_OVERRIDES['fIdleChatterCommentTimer'][0] == 100.0
+        for _edid, (value, is_float) in AMBIENT_GMST_OVERRIDES.items():
+            assert is_float and isinstance(value, float)
+
+
+class TestBarkResetTimer:
+    """Ambient bark lines need a non-zero ENAM reset or the NPC repeats them
+    forever (2026-07-25).
+
+    The reset field is the engine's per-line lockout: once spoken, that INFO is
+    ineligible until it expires, and when every greeting is on a timer the
+    actor falls silent. TES4 has no such field, so the converter wrote 0 --
+    meaning NO lockout, every line permanently re-playable, NPCs quipping on
+    repeat. Vanilla Skyrim sets a real value on 65% of its HELO lines.
+    """
+
+    def test_reset_ticks_match_vanilla_half_hour(self):
+        from tes5_import.dialog_converter import (_BARK_RESET_TICKS,
+                                                  _BARK_RESET_HOURS)
+        # The engine stores this as trunc(days * 65535); 1365 is the exact
+        # value on 2809 of vanilla Skyrim.esm's 5287 HELO lines (53%).
+        assert _BARK_RESET_TICKS == 1365
+        assert abs(_BARK_RESET_TICKS / 65535 * 24 - _BARK_RESET_HOURS) < 0.001
+
+    def _enam(self, rec, *, is_bark):
+        import struct
+        from tes5_import.dialog_converter import convert_INFO
+        out = convert_INFO(rec, bark_dial_fids=set() if is_bark else None)
+        pos = 24          # skip the record header; subrecords follow
+        while pos + 6 <= len(out):
+            sig = out[pos:pos + 4]
+            size = struct.unpack_from('<H', out, pos + 4)[0]
+            if sig == b'ENAM':
+                return struct.unpack_from('<HH', out, pos + 6)
+            pos += 6 + size
+        raise AssertionError('no ENAM emitted')
+
+    def test_bark_line_gets_reset(self):
+        rec = {'FormID': '00001234', 'DATA.Flags': '0', 'ResponseCount': '0'}
+        _flags, reset = self._enam(rec, is_bark=True)
+        assert reset == 1365, 'ambient bark must carry a repeat lockout'
+
+    def test_conversation_line_keeps_zero(self):
+        """A player-selected topic is not ambient; the player controls when it
+        plays, so a lockout would wrongly make it unavailable."""
+        rec = {'FormID': '00001234', 'DATA.Flags': '0', 'ResponseCount': '0'}
+        _flags, reset = self._enam(rec, is_bark=False)
+        assert reset == 0
+
+    def test_say_once_bark_keeps_zero(self):
+        """Say-once (0x04) already locks permanently after one play; a reset
+        would only weaken it."""
+        rec = {'FormID': '00001234', 'DATA.Flags': '4', 'ResponseCount': '0'}
+        flags, reset = self._enam(rec, is_bark=True)
+        assert flags & 0x04, 'say-once flag must survive'
+        assert reset == 0
+
+
+class TestNpcToNpcConversationDrop:
+    """Oblivion Type-1 Conversation topics are NPC-to-NPC chatter with no
+    Skyrim equivalent short of a SCEN scene, so they are dropped rather than
+    converted into player-menu entries labelled with their EditorID
+    (2026-07-25). See docs/ambient_dialogue_channel_plan.md Step 1."""
+
+    def _dial(self, edid, dtype=1, fid='00001234'):
+        return {'EditorID': edid, 'DATA.Type': str(dtype), 'FormID': fid}
+
+    def test_npc_to_npc_topic_is_dropped(self):
+        import tes5_import.dialog_converter as dc
+        dc._SAY_TOPIC_DISPOSITIONS.clear()
+        dc._SAY_TOPIC_DISPOSITIONS[0x0000AAAA] = ('drop', None)   # unrelated
+        try:
+            assert dc.should_skip_dial(self._dial('SkingradNQDResponses'))
+        finally:
+            dc._SAY_TOPIC_DISPOSITIONS.clear()
+
+    def test_script_driven_topic_is_kept(self):
+        """CharGen's lines are spoken by an explicit Say/SayTo in a quest
+        script — a real Skyrim Actor.Say(). Dropping Type-1 by DATA.Type alone
+        would delete the whole tutorial conversation."""
+        import tes5_import.dialog_converter as dc
+        dc._SAY_TOPIC_DISPOSITIONS.clear()
+        dc._SAY_TOPIC_DISPOSITIONS[0x00001234] = ('drop', None)
+        try:
+            assert not dc.should_skip_dial(
+                self._dial('CharGenMain', fid='00001234'))
+        finally:
+            dc._SAY_TOPIC_DISPOSITIONS.clear()
+
+    def test_named_keeps_survive(self):
+        """INFOGENERAL is Oblivion's Rumors channel (a real Skyrim player
+        topic); HELLO/GOODBYE are engine bark channels that happen to carry
+        DIAL Type 1."""
+        import tes5_import.dialog_converter as dc
+        dc._SAY_TOPIC_DISPOSITIONS.clear()
+        dc._SAY_TOPIC_DISPOSITIONS[0x0000BBBB] = ('drop', None)
+        try:
+            for name in ('INFOGENERAL', 'HELLO', 'GOODBYE'):
+                assert not dc.should_skip_dial(self._dial(name)), name
+        finally:
+            dc._SAY_TOPIC_DISPOSITIONS.clear()
+
+    def test_empty_say_map_drops_nothing(self):
+        """FAIL-SAFE: an empty map means the say-driven scan has not run yet
+        (dialog_unlocks.build_unlock_plan calls should_skip_dial long before
+        build_dialog_groups populates it). Treating that as 'nothing is
+        script-driven' would drop all 293 scripted topics including CharGen."""
+        import tes5_import.dialog_converter as dc
+        dc._SAY_TOPIC_DISPOSITIONS.clear()
+        assert not dc.should_skip_dial(self._dial('SkingradNQDResponses'))
+
+    def test_other_dial_types_unaffected(self):
+        """Only Type 1 is NPC-to-NPC; Type 0 player topics must be untouched."""
+        import tes5_import.dialog_converter as dc
+        dc._SAY_TOPIC_DISPOSITIONS.clear()
+        dc._SAY_TOPIC_DISPOSITIONS[0x0000CCCC] = ('drop', None)
+        try:
+            assert not dc.should_skip_dial(
+                self._dial('SomePlayerTopic', dtype=0))
+        finally:
+            dc._SAY_TOPIC_DISPOSITIONS.clear()
+
+
 class TestQuestJournalPlatformText:
     """MQ01's journal shipped a gamepad AND a keyboard variant per tutorial
     stage; Oblivion picked one at runtime, Skyrim renders both (2026-07-24)."""
@@ -2301,39 +2462,36 @@ class TestQuestJournalPlatformText:
 
 
 class TestSayLineDurations:
-    """Converted Say() pacing must come from the ENGINE, not an estimate
-    (2026-07-25).
+    """A converted Say() timer is charged the line's own MEASURED length.
 
-    TES4's Say/SayTo returned the line's length and the script counted it down
-    before letting the next speaker start. Skyrim needs no such countdown: the
-    INFO's result script becomes its End fragment, which the engine runs when
-    the line FINISHES (vanilla uses the End flag on 3,415 of its Say-driven
-    CUST responses). So the call site PARKS the timer, the fragment RELEASES
-    it, and no measured duration enters the pacing.
+    Papyrus Say() is fire-and-forget: it does not block or queue, and does
+    nothing when no INFO under the topic qualifies. The owning script polls and
+    re-issues Say() while its guard reads `timer <= 0`, but the INFO's End
+    fragment — which advances the conversation — only runs when the line
+    FINISHES. The timer's one job is to cover that window.
 
-    Charging a measured duration instead made the engine's wait and the
-    script's wait add up — a dead pause after every line as long as the line.
+    Both extremes have been tried in game and each fails:
+      * ZERO — the poller re-Says every tick, restarting the line so its
+        fragment never runs (Valen Dreth repeats taunt 1 forever).
+      * A large PARK only the fragment can clear — no line means no fragment, so
+        it strands and the scene HALTS (CharacterGen's prison-cell gap/stall).
+    The line's own length is the smallest value that covers the window, and the
+    fragment clears it the moment the line really ends, so it adds no silence.
     """
 
-    def test_call_site_parks_the_timer(self):
-        from script_convert.converter import (
-            ScriptConverter, SAY_LONGEST_UNMEASURED_LINE,
-            SAY_TIMER_PARKED_THRESHOLD, SAY_LINE_DROPPED_TIMEOUT)
+    def test_call_site_charges_the_measured_line_length(self):
+        from script_convert.converter import (ScriptConverter,
+                                              SAY_LINE_SECONDS)
         from script_convert.cross_ref import CrossRefGraph
         conv = ScriptConverter(CrossRefGraph())
         saved = ScriptConverter.say_durations
         try:
             ScriptConverter.say_durations = {'chargentaunt2': 14.63}
-            # Never zero: the polling loop ticks every 0.1s, long before the End
-            # fragment can run, so a zero timer re-Says the line immediately.
-            # It must outlast the line itself, with threshold headroom on top.
-            park = conv._say_seconds('Self.Say(CharGenTaunt2)')
-            assert park > 14.63 + SAY_TIMER_PARKED_THRESHOLD
-            # An unmeasured topic assumes the corpus' longest line, not a
-            # hand-picked constant.
-            assert conv._say_seconds('Self.Say(X)') == (
-                SAY_TIMER_PARKED_THRESHOLD + SAY_LONGEST_UNMEASURED_LINE
-                + SAY_LINE_DROPPED_TIMEOUT)
+            # Never zero — that re-Says the line every tick.
+            assert conv._say_seconds('Self.Say(CharGenTaunt2)') == 14.63
+            # Unmeasured topics fall back to the generic stand-in, still > 0.
+            assert conv._say_seconds('Self.Say(X)') == SAY_LINE_SECONDS
+            assert SAY_LINE_SECONDS > 0
         finally:
             ScriptConverter.say_durations = saved
 
@@ -2412,31 +2570,6 @@ class TestSayTimerRaceFree:
         released = self._run(3.0)
         assert released <= self.THRESH   # guard no longer fires
         assert released == 0.0
-
-    def test_threshold_sits_between_beat_and_decayed_park(self):
-        """Per-OWNER now, not one global constant.
-
-        The threshold sets the park, and the park is also how long a dropped line
-        stalls the scene, so a global floor sized for Oblivion's largest beat (20s,
-        staged by exactly ONE script) charged all 19,798 other topics a ~32s stall
-        instead of ~14s. `say_beat_threshold` raises it only for the owner that
-        needs it.
-        """
-        from script_convert.converter import (
-            ScriptConverter, SAY_TIMER_PARKED_THRESHOLD,
-            SAY_LINE_DROPPED_TIMEOUT)
-        for beat, line in ((0.0, 21.63), (3.0, 8.33), (10.0, 14.63),
-                           (20.0, 21.63)):
-            thresh = ScriptConverter.say_beat_threshold(beat)
-            # above this owner's beat, so a released beat never reads as parked
-            assert thresh > beat
-            park = thresh + line + SAY_LINE_DROPPED_TIMEOUT
-            # ...and below the park decayed by the whole line, so the End
-            # fragment's release still fires
-            assert park - line > thresh
-        # the floor applies when nothing is staged
-        assert (ScriptConverter.say_beat_threshold(0.0)
-                == SAY_TIMER_PARKED_THRESHOLD)
 
     def test_beat_property_name_is_shared_by_both_emitters(self):
         """Call site and fragment must derive the identical companion name."""
@@ -2553,128 +2686,6 @@ class TestSayTimerRaces:
             'X', src, 'ObjectReference', editor_id='X')
         assert 'Float _tes4TicksayLen' not in out
         assert 'Int _tes4TicksayLen' in out
-
-    def test_park_is_sized_so_a_dropped_line_times_out_quickly(self):
-        """A Say that produces no line never runs an End fragment.
-
-        Nothing then clears the park, so the scene waits the WHOLE park out. At
-        a flat 60s that is indistinguishable from a broken quest. Sizing the
-        park to the topic's longest measured line makes the countdown itself the
-        dropped-line timeout.
-        """
-        from script_convert.converter import (
-            ScriptConverter, SAY_LINE_PARK_SECONDS,
-            SAY_TIMER_PARKED_THRESHOLD, SAY_LINE_DROPPED_TIMEOUT)
-        from script_convert.cross_ref import CrossRefGraph
-        conv = ScriptConverter(CrossRefGraph())
-        saved = ScriptConverter.say_durations
-        try:
-            ScriptConverter.say_durations = {'shortline': 2.0}
-            park = conv._say_seconds('Self.Say(ShortLine)')
-            # bounded by the measured line, NOT the flat fallback
-            assert park < SAY_LINE_PARK_SECONDS
-            assert park == (SAY_TIMER_PARKED_THRESHOLD + 2.0
-                            + SAY_LINE_DROPPED_TIMEOUT)
-            # ...and still recognisable as parked after the line has played,
-            # or the End fragment's release guard would never fire
-            assert park - 2.0 > SAY_TIMER_PARKED_THRESHOLD
-        finally:
-            ScriptConverter.say_durations = saved
-
-    def test_unmeasured_topic_is_still_bounded(self):
-        """A topic with no audio must not fall back to a 60s stall.
-
-        `CGEmperorBirthsign` is the only Oblivion topic with ZERO INFOs, so a
-        `Say` on it can never produce a line and never runs an End fragment. The
-        park is therefore its full cost, and a flat 60s there is a quest that
-        looks broken. Assume the measured corpus' longest line instead.
-        """
-        from script_convert.converter import (
-            ScriptConverter, SAY_LINE_PARK_SECONDS,
-            SAY_LONGEST_UNMEASURED_LINE, SAY_TIMER_PARKED_THRESHOLD,
-            SAY_LINE_DROPPED_TIMEOUT)
-        from script_convert.cross_ref import CrossRefGraph
-        conv = ScriptConverter(CrossRefGraph())
-        saved = ScriptConverter.say_durations
-        try:
-            ScriptConverter.say_durations = {}
-            park = conv._say_seconds('Self.Say(NoAudio)')
-            assert park == (SAY_TIMER_PARKED_THRESHOLD
-                            + SAY_LONGEST_UNMEASURED_LINE
-                            + SAY_LINE_DROPPED_TIMEOUT)
-            assert park < SAY_LINE_PARK_SECONDS
-            # still long enough to outlast any real Oblivion line (max measured
-            # is 21.63s across 19,800 topics)
-            assert SAY_LONGEST_UNMEASURED_LINE > 21.63
-        finally:
-            ScriptConverter.say_durations = saved
-
-    def test_park_and_release_agree_for_every_real_topic(self):
-        """Whole-export check of the park/release contract.
-
-        Two ways this can silently break, both fatal to a scene:
-          * park too LOW relative to the threshold - the End fragment's
-            `If timer > thresh` never fires, so the park is never released
-          * a staged beat at or ABOVE the threshold - the released beat sitting
-            in the timer reads as a fresh park and gets cleared immediately
-
-        And because 23 timers are driven by MORE than one topic, each topic's
-        park must also clear the largest threshold on its own timer, or one
-        topic's release fires while another's line is still playing.
-
-        Checked against the real export rather than synthetic values: the
-        constants only have to hold for the topic/beat/duration combinations
-        Oblivion actually ships.
-        """
-        import json
-        import os
-        from collections import defaultdict
-        from script_convert.pipeline import build_say_timer_owners
-        from script_convert.converter import (
-            ScriptConverter, SAY_LINE_PARK_SECONDS, SAY_LINE_DROPPED_TIMEOUT,
-            SAY_LONGEST_UNMEASURED_LINE)
-        from tes5_import.text_reader import parse_export_file
-        ed = 'export/Oblivion.esm'
-        if not os.path.isdir(ed):
-            import pytest
-            pytest.skip('no export to check against')
-        by_type = {sig: parse_export_file(os.path.join(ed, f'{sig}.txt'))
-                   for sig in ('DIAL', 'INFO', 'QUST', 'SCPT')}
-        owners = build_say_timer_owners(by_type)
-        assert owners, 'no Say timers found - the owner scan is broken'
-        dur_path = os.path.join(ed, 'voice_durations.json')
-        durations = (json.load(open(dur_path, encoding='utf-8'))
-                     if os.path.isfile(dur_path) else {})
-
-        rows = {}
-        by_timer = defaultdict(list)
-        for topic, (_kind, spec, beat) in owners.items():
-            thresh = ScriptConverter.say_beat_threshold(beat)
-            line = float(durations.get(topic) or SAY_LONGEST_UNMEASURED_LINE)
-            park = min(SAY_LINE_PARK_SECONDS,
-                       thresh + line + SAY_LINE_DROPPED_TIMEOUT)
-            rows[topic] = (beat, thresh, line, park)
-            by_timer[spec].append(topic)
-
-        for topic, (beat, thresh, line, park) in rows.items():
-            assert park - line > thresh, (
-                f'{topic}: park {park:.2f} decayed by its own {line:.2f}s line '
-                f'falls to/below the release threshold {thresh:.2f} - the End '
-                f'fragment would never release it')
-            assert not beat or beat < thresh, (
-                f'{topic}: staged beat {beat} is not below its release '
-                f'threshold {thresh} - a released beat reads as a fresh park')
-
-        for spec, topics in by_timer.items():
-            if len(topics) < 2:
-                continue
-            worst = max(rows[t][1] for t in topics)
-            for t in topics:
-                _b, _th, line, park = rows[t]
-                assert park - line > worst, (
-                    f'{t} on shared timer {spec}: park {park:.2f} decayed by '
-                    f'its {line:.2f}s line falls to/below the largest threshold '
-                    f'({worst:.2f}) on that timer')
 
     def test_park_never_blocks_the_polling_loop(self):
         """No Utility.Wait at a park site.

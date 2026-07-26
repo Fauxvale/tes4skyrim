@@ -956,6 +956,61 @@ def service_menu_kind(rec: dict) -> str:
     return info[0] if info else ''
 
 
+# Oblivion Type-1 "Conversation" topics that are NOT NPC-to-NPC chatter and so
+# survive the drop below. Everything else of that type is dropped; see
+# _is_npc_to_npc_conversation.
+_CONV_KEEP_EDIDS = frozenset({
+    # Oblivion's one conversation channel Skyrim also has: subtype RUMO, a real
+    # player-selectable topic. Converts correctly already.
+    'INFOGENERAL',
+    # Engine bark channels that happen to carry DIAL Type 1 (see _EDID_SUBTYPE):
+    # HELLO is the genuine ambient greeting, GOODBYE a real Skyrim subtype.
+    'HELLO', 'GOODBYE',
+    # Bark/idle channels routed by _EDID_SUBTYPE rather than by DATA.Type.
+    'IdleChatter',
+})
+
+
+def _is_npc_to_npc_conversation(rec: dict) -> bool:
+    """True for an Oblivion Type-1 topic that is pure NPC-to-NPC chatter.
+
+    These are the `*NQDResponses` / `*RumorResponses` / interrogation families:
+    lines Oblivion's AI has one NPC speak TO ANOTHER when they pass in the
+    street. They are never player-selectable there.
+
+    Skyrim has no equivalent reachable-but-not-selectable channel short of a
+    full SCEN scene (which needs actor pairing Oblivion does not record — it
+    picks the pair at runtime from proximity + AI packages). Converted as
+    ordinary topics they became player-menu entries labelled with their
+    EditorID ("SEMiscQuestResponses", "FGD02Insults", "SE"), because they never
+    had a player-facing FULL prompt to use. Dropping them is deliberate: better
+    absent than wrong. Tracked in TODO.txt "Later Issues" #16, restored by
+    docs/ambient_dialogue_channel_plan.md Step 4.
+
+    CRITICAL — script-driven topics are NOT dropped. 293 of the 535 Type-1
+    topics are spoken by an explicit `Say`/`SayTo`/`StartConversation` call in a
+    quest script, which is a real Skyrim `Actor.Say()` and works fine. That set
+    includes every CharGen topic (the Emperor/Baurus/Glenroy intro), the
+    Announcers, the Daedric-prince speeches and the arena taunts. Dropping by
+    DATA.Type alone would delete all of them and break the tutorial outright.
+    `_SAY_TOPIC_DISPOSITIONS` is populated before the first skip test in
+    build_dialog_groups precisely so this check can see it.
+    """
+    if get_int(rec, 'DATA.Type') != DIAL_TYPE_CONVERSATION:
+        return False
+    if get_str(rec, 'EditorID', '') in _CONV_KEEP_EDIDS:
+        return False
+    if not _SAY_TOPIC_DISPOSITIONS:
+        # Fail SAFE, never silently. An empty map means the caller reached a
+        # skip test before the say-driven scan ran (dialog_unlocks does: its
+        # build_unlock_plan runs long before build_dialog_groups), and treating
+        # that as "nothing is script-driven" would drop all 293 scripted topics
+        # including CharGen. Keep the topic instead — build_dialog_groups makes
+        # the real decision later, with the map populated.
+        return False
+    return (get_formid(rec, 'FormID') & 0xFFFFFF) not in _SAY_TOPIC_DISPOSITIONS
+
+
 def should_skip_dial(rec: dict) -> bool:
     dtype = get_int(rec, 'DATA.Type')
     if dtype in _SKIP_TYPES and not service_menu_kind(rec):
@@ -964,6 +1019,8 @@ def should_skip_dial(rec: dict) -> bool:
     if edid in _SKIP_EDIDS:
         return True
     if edid.startswith('Test') or edid.startswith('MarkNTest'):
+        return True
+    if _is_npc_to_npc_conversation(rec):
         return True
     return False
 
@@ -1053,6 +1110,13 @@ def convert_DIAL(rec: dict, *, info_count: int, dlbr_fid: int,
 #   0x01 Goodbye, 0x02 Random, 0x04 Say once, 0x10 Info Refusal, 0x20 Random end
 # (0x08 Run Immediately and 0x40 Run for Rumors have no faithful TES5 meaning.)
 _ENAM_COMPATIBLE_MASK = 0x37
+
+# "Hours until reset" for an ambient bark line, in the engine's stored form
+# trunc(days * 65535).  0.5 hours is vanilla Skyrim's dominant choice: 2809 of
+# its 5287 HELO lines (53%) use exactly this value.
+#   0.5h / 24h * 65535 = 1365
+_BARK_RESET_HOURS = 0.5
+_BARK_RESET_TICKS = int(_BARK_RESET_HOURS / 24.0 * 65535)   # 1365
 
 
 def _build_info_script_properties(result_script: str, xref) -> dict:
@@ -1180,10 +1244,37 @@ def convert_INFO(rec: dict, *, injected_ctdas: bytes = b'',
         subs += pack_subrecord('VMAD', build_vmad_info_fragment(
             info_fid, script_name=SERVICE_MENU_SCRIPTS[service_menu]))
 
-    # ENAM (Flags U16 + Reset Hours U16)
+    # ENAM (Flags U16 + Reset U16). The reset field is what stops an NPC
+    # repeating a line: once spoken, that INFO is ineligible until the timer
+    # expires, and when every greeting is on a timer the actor falls silent
+    # (Beyond Skyrim's Arcane University: "Hours until reset means they can't
+    # repeat that topic info for that many in-game hours... when all Greetings
+    # are on a timer, the NPC will fall back to generic dialogue").
+    #
+    # TES4 has NO equivalent field -- Oblivion INFO DATA is only
+    # DialogType/NextSpeaker/Flags -- so leaving it 0 was a faithful-looking
+    # translation of something Oblivion simply does not record. But 0 means NO
+    # lockout at all: every eligible line stays permanently re-playable, the
+    # engine re-picks from the whole pool on each greeting attempt, and NPCs
+    # quip on repeat. All 5,636 converted HELO lines had reset=0 where vanilla
+    # sets a real value on 65% of its greetings.
+    #
+    # Units: the engine reads DATA/ENAM's second field as trunc(days * 65535)
+    # (docs/dialogue_engine_contracts.md -- TESTopicInfo::LoadForm mulss by
+    # 65535.0), so the CK's "hours until reset" H is stored as
+    # H/24 * 65535. Vanilla's values decode to clean hours: 1365=0.5h (its
+    # most common, 53% of greetings), 2730=1h, 10922=4h, 32767=12h,
+    # 65535=24h.
     tes4_flags = get_int(rec, 'DATA.Flags')
+    reset = 0
+    if bark_dial_fids is not None and not (tes4_flags & 0x04):
+        # Ambient bark line (greeting/hello/etc). SAY-ONCE lines (0x04) are
+        # already permanently locked after one play, so a reset would only
+        # weaken them.
+        reset = _BARK_RESET_TICKS
     subs += pack_subrecord('ENAM', struct.pack('<HH',
-                                               tes4_flags & _ENAM_COMPATIBLE_MASK, 0))
+                                               tes4_flags & _ENAM_COMPATIBLE_MASK,
+                                               reset))
 
     # CNAM — favor level (None)
     subs += pack_subrecord('CNAM', struct.pack('<B', 0))
@@ -1545,8 +1636,23 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
     bark_generic_quests = {}   # source DIAL EditorID -> synthetic quest FID
 
     # --- Pre-scan ---
+    # Say-driven topics MUST be resolved before the first should_skip_dial call:
+    # _is_npc_to_npc_conversation consults _SAY_TOPIC_DISPOSITIONS to spare the
+    # 293 scripted Type-1 topics (CharGen, Announcers, Daedric speeches) from
+    # the NPC-to-NPC drop. With an empty map every one of them would be skipped
+    # and the tutorial would lose its dialogue.
+    _SAY_TOPIC_DISPOSITIONS.clear()
+    _SAY_TOPIC_DISPOSITIONS.update(build_say_topic_dispositions(by_type))
+    n_ref = sum(1 for v in _SAY_TOPIC_DISPOSITIONS.values() if v[0] == 'ref')
+    print(f"    say-driven topics: {len(_SAY_TOPIC_DISPOSITIONS)} "
+          f"({n_ref} retargeted to a unique ref, "
+          f"{len(_SAY_TOPIC_DISPOSITIONS) - n_ref} drop target-conditions)")
+
     skipped_fids = {get_formid(d, 'FormID') for d in dials if should_skip_dial(d)}
     _strip_dead_tclt(infos, skipped_fids)
+    n_conv = sum(1 for d in dials if _is_npc_to_npc_conversation(d))
+    print(f"    NPC-to-NPC conversation topics dropped: {n_conv} "
+          f"(TODO.txt #16 — restored by SCEN synthesis)")
 
     # SGE quests are running from a new game (via the .seq file), so injected
     # GetQuestRunning gates on them are redundant. Raw (unremapped) FormIDs.
@@ -1622,13 +1728,8 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
         if not info_by_dial.get(get_formid(d, 'FormID'))
         and not service_menu_kind(d))
 
-    # Say-driven topics: how each one's RunOn=Target conditions convert.
-    _SAY_TOPIC_DISPOSITIONS.clear()
-    _SAY_TOPIC_DISPOSITIONS.update(build_say_topic_dispositions(by_type))
-    n_ref = sum(1 for v in _SAY_TOPIC_DISPOSITIONS.values() if v[0] == 'ref')
-    print(f"    say-driven topics: {len(_SAY_TOPIC_DISPOSITIONS)} "
-          f"({n_ref} retargeted to a unique ref, "
-          f"{len(_SAY_TOPIC_DISPOSITIONS) - n_ref} drop target-conditions)")
+    # (_SAY_TOPIC_DISPOSITIONS is built in the pre-scan above — the NPC-to-NPC
+    # drop needs it before the first should_skip_dial call.)
 
     tclt_targets = collect_tclt_target_fids(by_type)
     # Remapped FormIDs of every bark DIAL (greetings + combat/detection/misc
@@ -1960,6 +2061,25 @@ def _build_one_topic(dial_rec, info_by_dial, writer, offset,
                      and (dial_fid & 0xFFFFFF) not in unlock_plan['gated']
                      and (dial_fid & 0xFFFFFF)
                      not in unlock_plan.get('script_added', ()))
+        # A SCRIPT-DRIVEN Oblivion Conversation topic is never player-selectable
+        # in Oblivion either: a quest script picks the speaker AND the topic via
+        # Say/SayTo/StartConversation. Converted top-level it becomes a menu
+        # entry, and since these topics have no player-facing prompt the FULL
+        # falls back to the EditorID -- "CharGenVoice", "SE11SheogorathFarewell2",
+        # "Dark18TraitorTalk" -- the same defect that made the dropped NPC-to-NPC
+        # families player-visible. Force a Normal branch: Actor.Say() reaches an
+        # INFO through its topic regardless of branch visibility, and TCLT links
+        # still resolve, so the scripted lines play exactly as before while the
+        # topic stays out of the menu.
+        #
+        # INFOGENERAL is exempt -- it is Oblivion's Rumors channel, a genuinely
+        # player-selectable topic in both games (subtype RUMO, FULL "Rumors").
+        if (get_int(dial_rec, 'DATA.Type') == DIAL_TYPE_CONVERSATION
+                and get_str(dial_rec, 'EditorID', '') not in _CONV_KEEP_EDIDS
+                and (dial_fid & 0xFFFFFF) in _SAY_TOPIC_DISPOSITIONS):
+            is_linked = True
+            stats['script_topic_unlisted'] = \
+                stats.get('script_topic_unlisted', 0) + 1
         dlbr_fid = writer.alloc_formid()
         dlbr_edid = (f'TES4_{edid}_Branch' if edid
                      else f'TES4_DLBR_{dlbr_fid:08X}')

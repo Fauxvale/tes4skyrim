@@ -373,11 +373,50 @@ def _init_dispatch():
         'REGN',   # Region system differs
         'EYES',   # Do not convert — NPCs map to Skyrim head parts
         'HAIR',   # Do not convert — NPCs map to Skyrim head parts
+        # NOTE: GMST is skipped WHOLESALE above, but the ambient-dialogue
+        # pacing settings are an exception — see AMBIENT_GMST_OVERRIDES below,
+        # emitted by import_main regardless of this skip.
         # PACK is converted (tes5_import/pack_converter.py) as TES5 template
         # instances. It is NOT in the generic dispatch — quest packages need the
         # QUST aliases to exist first, so PACK is written in its own phase after
         # QUST (import_main Phase 3b2).
     })
+
+
+# ---------------------------------------------------------------------------
+# Ambient-dialogue pacing (GMST)
+# ---------------------------------------------------------------------------
+# Oblivion has NO per-package chatter control (see DEFAULT_INTERRUPT in
+# pack_converter.py). It paces ambient dialogue GLOBALLY with these settings,
+# so they are the ONLY faithful mechanism available — and Skyrim's defaults are
+# dramatically faster, which is why converted NPCs quip constantly:
+#
+#   GMST                                  Oblivion   Skyrim   effect
+#   fAIGreetingTimer                         20.0      5.0    4x more often
+#   fIdleChatterCommentTimer                100.0     10.0    10x more often
+#   fAISocialchanceForConversation          100.0     10.0
+#   fAISocialRadiusToTriggerConversation   1800.0    500.0
+#
+# Oblivion values: the last three are AUTHORED in Oblivion.esm (its GMST
+# records — note Bethesda deliberately raised fIdleChatterCommentTimer from the
+# engine default of 5.0 to 100.0, slowing chatter twentyfold); fAIGreetingTimer
+# is Oblivion.exe's built-in default, read from the settings-registration
+# thunks (`fld dword ptr [const]` + `push <name string>`) by
+# temp/ob_gmst_values.py.
+#
+# Emitted even though 'GMST' is in SKIP_TYPES: the wholesale skip is right for
+# TES4 settings generally (most have no TES5 counterpart or differ in meaning),
+# but these four exist in both engines with the SAME meaning and units, and
+# dropping them silently swaps Oblivion's pacing for Skyrim's.
+#
+# {EditorID: (value, is_float)} — value taken from the TES4 export when the
+# record exists there, else the Oblivion.exe engine default recorded here.
+AMBIENT_GMST_OVERRIDES = {
+    'fAIGreetingTimer':                     (20.0,   True),
+    'fIdleChatterCommentTimer':             (100.0,  True),
+    'fAISocialchanceForConversation':       (100.0,  True),
+    'fAISocialRadiusToTriggerConversation': (1800.0, True),
+}
 
 
 # Initialize on import

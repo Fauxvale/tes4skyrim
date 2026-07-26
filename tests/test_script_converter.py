@@ -1268,6 +1268,30 @@ class TestOnAlarmBlock:
         assert 'If aeCombatState == 1' in text
 
 
+class TestSetAlert:
+    """SetAlert maps to Skyrim's native Actor.SetAlert, NOT DrawWeapon.
+
+    Oblivion's SetAlert sets the AI combat-readiness flag; it does not block
+    dialogue. Mapping `SetAlert 1` to DrawWeapon() while `SetAlert 0` was a
+    no-op left CharacterGen's Uriel permanently weapon-drawn after the prison
+    ambush, so he could never initiate the conversation with the player and
+    the intro soft-locked with controls disabled.
+    """
+
+    def test_setalert_1_alerts_not_draws(self, converter):
+        result = converter._convert_line('UrielSeptimRef.setalert 1', 'Quest')
+        assert 'UrielSeptimRef.SetAlert(true)' in result
+        assert 'DrawWeapon' not in result
+
+    def test_setalert_0_stands_down(self, converter):
+        result = converter._convert_line('UrielSeptimRef.setalert 0', 'Quest')
+        assert 'UrielSeptimRef.SetAlert(false)' in result
+
+    def test_setalert_bare_ref_casts_to_actor(self, converter):
+        result = converter._convert_line('setalert 1', 'Quest')
+        assert '(Self as Actor).SetAlert(true)' in result
+
+
 class TestSingletonFixes:
     def test_getiscreature_polyfill(self, converter):
         result = converter._convert_line('if GetIsCreature == 0', 'ActiveMagicEffect')
@@ -1380,11 +1404,18 @@ class TestSayTimerConversion:
         assert f'timer - {m.group(1)}' in result
 
     def test_say_assignment_gets_line_duration(self, converter):
+        """A converted Say() timer holds the line's length, never zero.
+
+        Say() is fire-and-forget and the owning script polls; with a zero timer
+        the poller re-Says the same line every tick, restarting it so its End
+        fragment never runs (Valen Dreth's taunts repeat line 1 forever). The
+        fragment clears the timer when the line truly ends, so it adds no
+        silence.
+        """
         converter._property_refs['ThadonRef'] = 'Actor'
         result = converter._convert_line(
             'set timer to ThadonRef.Say DeathSpeech01', 'Quest')
         assert 'ThadonRef.Say(' in result
-        # timer must NOT be 0 — that machine-guns the conversation
         assert 'timer = 0.0' not in result
         assert 'timer = 3' in result
 

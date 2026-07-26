@@ -46,6 +46,8 @@ Later Issues:
 
 	14 - Make horses rideable
 
+	15 - NPCS don't say quips anymore (preferable to always quipping)
+
 Minor Issues:
 
 	1 -	Override gold with skyrim gold

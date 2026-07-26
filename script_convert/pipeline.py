@@ -13,8 +13,7 @@ from script_convert.constants import (_PAPYRUS_RESERVED, _RECORD_TYPE_PAPYRUS, _
                                      _record_type_to_papyrus, papyrus_script_name,
                                      PAPYRUS_MAX_SCRIPT_NAME)
 from script_convert.cross_ref import CrossRefGraph
-from script_convert.converter import (ScriptConverter, SAY_LINE_PARK_SECONDS,
-                                      SAY_TIMER_PARKED_THRESHOLD)
+from script_convert.converter import ScriptConverter
 
 
 # ===========================================================================
@@ -52,8 +51,7 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
     # voice-line lengths that converted Say() timers are charged with.
     ScriptConverter.say_durations = say_durations or {}
     ScriptConverter.beat_fields_by_owner = beat_fields_by_owner or {}
-    # The call site sizes its park from the SAME per-topic beat the End fragment
-    # tests against, so the two thresholds cannot drift (see say_beat_threshold).
+    # Per-topic timer target + any deliberate beat, applied by the End fragment.
     ScriptConverter.say_timer_owners = say_timer_owners or {}
 
 
@@ -323,14 +321,15 @@ def build_say_timer_owners(by_type: dict) -> dict:
 
     Oblivion wrote `set CharacterGen.convTimer to SayTo player, CharGenMain 1`
     — the timer held the line's own length purely so the NEXT speaker's
-    `convTimer <= 0` guard would not fire until this line finished.
+    `convTimer <= 0` guard would not fire until this line finished.  The owning
+    script counts it DOWN every tick, so it is self-clearing.
 
-    Skyrim needs no such countdown: the INFO's result script becomes its End
-    fragment and the engine runs it when the line FINISHES.  Clearing the timer
-    there releases the next speaker at exactly the right moment, with no
-    estimation anywhere.  (Charging a measured duration instead makes the
-    engine's wait and the script's wait ADD, which reads in game as a long dead
-    pause after every line.)
+    The conversion keeps that countdown (the call site charges the measured
+    length, see converter._say_seconds) and uses the End fragment only to
+    CORRECT it to the line that actually played, plus apply any deliberate beat.
+    The timer must never DEPEND on the fragment: `Say()` does nothing when no
+    INFO under the topic passes its conditions, so a fragment-only release turns
+    a dropped line into a halted conversation.
     """
     # script EditorID (lower) -> the QUST EditorID that runs it.  A quest
     # script's bare `set convTimer to ...` names a variable on the QUEST, so
@@ -490,7 +489,6 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
     info_reveals = info_reveals or {}
     service_topics = service_topics or {}
     timer_owners = _WORKER_CTX.get('say_timer_owners') or {}
-    durations = ScriptConverter.say_durations or {}
     topic_by_dial = _WORKER_CTX.get('topic_by_dial') or {}
 
     for rec in records:
@@ -510,47 +508,26 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
         timer_fix = ''
         topic_name = topic_by_dial.get(rec.get('ParentDIAL', ''), '')
         owner = timer_owners.get(topic_name)
-        # Release the conversation timer this topic drives. The call site
-        # PARKED it (see converter._say_seconds) so the 0.1s polling loop could
-        # not re-Say mid-line; the engine runs this fragment when the line
-        # ENDS, so clearing it here is the exact "line finished" signal — no
-        # duration estimate is involved in the pacing.
+        # Correct the conversation timer this topic drives to THIS line's own
+        # measured length. The call site charged the topic's worst case (it
+        # cannot know which INFO will win); the engine runs this fragment when
+        # the line ENDS, so here the exact line is known.
         #
-        # Assign 0 — never `timer - park`. Several actor scripts poll the SAME
-        # quest timer on independent 0.5s updates while the quest script
-        # decrements it every 0.1s, and `Say()` is asynchronous, so a relative
-        # adjustment is a race: if this fragment's subtraction lands before the
-        # call site's park (short line, or an interleaved tick) the timer ends
-        # at +park with nobody speaking and the conversation stalls for a
-        # minute; if two speakers park in the same window, both subtract. An
-        # absolute 0 is idempotent and order-independent, so the handoff is
-        # deterministic no matter how the ticks interleave.
+        # This is a pacing CORRECTION, not a release: the timer is an ordinary
+        # countdown (Oblivion's `if convTimer > 0 : convTimer -=
+        # getSecondsPassed`), so it drains on its own and a line that never
+        # plays simply costs its charged duration instead of stalling the
+        # scene. An earlier scheme parked a sentinel here and depended on this
+        # fragment to clear it, which made "line dropped" mean "conversation
+        # halted" — the CharacterGen prison-cell silence.
         #
-        # The 13 scripts that stack a deliberate beat re-read the timer at the
-        # CALL SITE (converter._resolve_parked_timer_expr rewrites those), so
-        # they do not depend on the value this fragment leaves behind.
-        # Release is GUARDED (`If timer >= park`) and subtracts the park rather
-        # than assigning 0 outright. Both details matter:
-        #
-        #  * The guard makes it idempotent under interleaving. Several actor
-        #    scripts poll this one timer on independent 0.5s updates while the
-        #    quest script decrements it every 0.1s, and Say() is asynchronous,
-        #    so an unguarded relative adjustment races: land it before the call
-        #    site's park and the timer sits at +park with nobody speaking (a
-        #    minute-long stall); let two speakers park in one window and it is
-        #    subtracted twice. Only a timer still holding the park is released.
-        #  * Subtracting (not zeroing) preserves the deliberate beats. Oblivion
-        #    charged those ON TOP of the line's length, so the call site emits
-        #    `park + k` (see converter._resolve_parked_timer_expr) — writing the
-        #    bare pause there would release the guard mid-line and the next
-        #    speaker's Say would be dropped. `park + k` is still >= park, so
-        #    this fires and leaves exactly `k` to run after the line ends.
+        # Assigning an absolute value (never `timer - x`) keeps it idempotent:
+        # several actor scripts poll the SAME quest timer on independent 0.5s
+        # updates while the quest script decrements it every 0.1s, and `Say()`
+        # is asynchronous, so a relative adjustment races and can double-apply.
         owner_prop = ''
         if owner:
             kind, spec = owner[0], owner[1]
-            # Per-topic, from the beat this topic stages — the call site sizes
-            # its park off the identical call, so the two stay in step.
-            thresh = ScriptConverter.say_beat_threshold(owner[2])
             if kind == 'quest':
                 owner_prop, field = spec.split('.', 1)
                 ref = f'{_safe_property_name(owner_prop)}.{field}'
@@ -558,22 +535,17 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 script_edid, field = spec.split('|', 1)
                 cls = papyrus_script_name(script_edid)
                 ref = f'(akSpeakerRef as {cls}).{field}'
-            # Consume the staged pause only when the owning script actually
-            # HAS one — most Say timers never take a beat, and referencing a
-            # companion that was never declared fails to compile ("field or
-            # property `timerPendingBeat` not found", 300+ fragments).
+            # The deliberate pause the owning script stacks after this line, if
+            # any. Oblivion charged those ON TOP of the line's length. Consume
+            # it only when the owner actually HAS one — referencing a companion
+            # that was never declared fails to compile.
             if _owner_has_beat(spec, kind):
                 beat_ref = ScriptConverter.beat_property(ref)
-                # The beat travels in its own property because the owning loop
-                # counts the timer DOWN while the line plays, so anything
-                # encoded in the timer itself is eroded before this runs.
-                release = (f'    {ref} = {beat_ref}\n'
-                           f'    {beat_ref} = 0\n')
+                timer_fix = (f'  {ref} = {beat_ref}\n'
+                             f'  {beat_ref} = 0')
             else:
-                release = f'    {ref} = 0\n'
-            timer_fix = (f'  If {ref} > {thresh:g}\n'
-                         f'{release}'
-                         f'  EndIf')
+                # The line is over; let the next speaker start on the next tick.
+                timer_fix = f'  {ref} = 0'
         if not has_script and not reveals and not timer_fix:
             # Script-less service-menu INFOs use the shared static scripts.
             continue
@@ -629,7 +601,7 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             # RELATIVE to it (CharGenMain 0x32B0C cuts Glenroy off with
             # `convTimer - .4`). Writing it afterwards would discard that.
             if timer_fix:
-                out_lines.append(f'{timer_fix}  ; line ended: release the parked timer')
+                out_lines.append(f'{timer_fix}  ; line ended')
             out_lines.extend(body_lines)
             if service_kind:
                 out_lines.append(_SERVICE_MENU_CALL[service_kind])
