@@ -17,6 +17,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
       - name: Compute and push next tag
         run: |
           git fetch --tags
@@ -39,7 +44,24 @@ jobs:
           echo "Latest tag: ${latest:-<none>}"
           echo "Next tag: $next_tag"
 
+          # Commit list + the GUI steps those commits require re-running.
+          if [ -n "$latest" ]; then
+            python tools/release_notes.py --from "$latest" --to HEAD \
+                                          --tag "$next_tag" --output "$RUNNER_TEMP/notes.txt"
+          else
+            python tools/release_notes.py --to HEAD \
+                                          --tag "$next_tag" --output "$RUNNER_TEMP/notes.txt"
+          fi
+          cat "$RUNNER_TEMP/notes.txt"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$next_tag" -m "Release $next_tag"
+          git tag -a "$next_tag" -F "$RUNNER_TEMP/notes.txt"
           git push origin "$next_tag"
+
+          # Surface the same notes in the Actions run summary.
+          {
+            echo '```'
+            cat "$RUNNER_TEMP/notes.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

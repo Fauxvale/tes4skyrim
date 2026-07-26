@@ -2276,9 +2276,23 @@ class TestAnimObjectBehaviorGraph:
 
     Without the graph the call is accepted, returns immediately and does
     nothing — no Papyrus error — so the secret wall stayed shut.  Shape is
-    copied from vanilla `BlackPoolSecretDoor` Behavior00.hkx: one
-    BGSGamebryoSequenceGenerator per NiControllerSequence, wrapped in states
-    reached by same-named events through `wildcardTransitions`.
+    copied from vanilla `NocturnalsSecretDoor01`: one
+    BGSGamebryoSequenceGenerator per NiControllerSequence, each wrapped in a
+    state reached by a same-named event, plus a Rest start state.
+
+    Four separate defects had to be fixed before CharacterGen's secret wall
+    worked in-game (2026-07-26); each one is guarded below because every one of
+    them was INVISIBLE to structural inspection and to NifSkope, which renders
+    and animates the NIF perfectly while never loading the hkx at all:
+
+      1. BGED carried a 'meshes\\' prefix  -> project never found -> no graph
+         -> the object was never rendered.
+      2. Skeleton bone named after the model -> engine bound the placeholder
+         rig onto the object -> wall placed far from its authored position.
+      3. startStateId pointed at a motion sequence -> the wall swung open by
+         itself on cell load instead of waiting for the switch.
+      4. Rest state had transitions=null -> dead end -> nothing could ever
+         open it again, from the quest or from console `activate`.
     """
 
     @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
@@ -2476,6 +2490,70 @@ class TestAnimObjectBehaviorGraph:
         scale = struct.unpack_from('<4f', got, 828)
         assert quat == (1.0, 0.0, 0.0, 0.0), f'quaternion not identity: {quat}'
         assert scale == (1.0, 1.0, 1.0, 1.0), f'scale not unit: {scale}'
+
+    def test_skeleton_bone_is_the_vanilla_dummy_name(self):
+        """The placeholder bone must never be named after the model.
+
+        The rig is a stand-in — the real motion lives in the NIF's
+        NiControllerSequences — so vanilla's single-bone object skeleton uses
+        the fixed name `x_SingleBone`.  Naming the bone after the model made the
+        engine bind the graph's identity bind pose onto the object and place it
+        far from its authored worldspace position.
+        """
+        from asset_convert.hkx_animobject import (_skeleton_xml, _DUMMY_BONE,
+                                                  generate_animobject_project)
+        import tempfile
+
+        assert _DUMMY_BONE == 'x_SingleBone'
+        assert f'<hkparam name="name">{_DUMMY_BONE}</hkparam>' in \
+            _skeleton_xml(_DUMMY_BONE)
+
+        # The generator must pass the dummy name, not the model stem.
+        out = tempfile.mkdtemp()
+        generate_animobject_project(out, 'tes4/dungeons/chargen/mywall.nif',
+                                    ['Forward'])
+        skel = (Path(out) / 'tes4' / 'dungeons' / 'chargen' /
+                'mywall_behavior' / 'CharacterAssets' / 'Skeleton.hkx')
+        raw = skel.read_bytes()
+        assert b'x_SingleBone' in raw, 'skeleton lost the vanilla dummy bone'
+        assert b'mywall' not in raw, \
+            'skeleton names the model — object will be mispositioned'
+
+    def test_starts_at_rest_and_rest_can_reach_every_sequence(self):
+        """Start on a non-playing state, and never let it be a dead end.
+
+        Vanilla starts on an idle (BlackPoolSecretDoor startStateId=3 =
+        AnimIdle01) and reaches the motion only by event.  Oblivion sources have
+        no idle, so we synthesise a Rest state with an empty pSequence.
+
+        Both halves matter and each was a separate in-game bug: starting on a
+        motion state made the wall open by itself on load; giving Rest a null
+        transition array made it a DEAD END so nothing could open it again.
+        Transitions must live ON THE STATE — vanilla's Gamebryo state machine
+        sets wildcardTransitions=null and gives each state its own array.
+        """
+        import re
+        from asset_convert.hkx_animobject import _behavior_xml
+
+        seqs = ['Forward', 'Backward']
+        xml = _behavior_xml('wall', seqs)
+
+        # Rest is the last state and plays nothing.
+        rest_id = len(seqs)
+        assert '<hkparam name="pSequence"></hkparam>' in xml, \
+            'Rest state must have an empty pSequence'
+        assert f'<hkparam name="startStateId">{rest_id}</hkparam>' in xml, \
+            'must start on the Rest state, not on a motion sequence'
+
+        # Every state, Rest included, owns a real transition array.
+        states = re.findall(
+            r'class="hkbStateMachineStateInfo".*?'
+            r'<hkparam name="transitions">([^<]*)</hkparam>.*?'
+            r'<hkparam name="name">([^<]*)</hkparam>', xml, re.S)
+        assert states, 'no states parsed — emitter shape changed'
+        for transitions, name in states:
+            assert transitions.strip() != 'null', \
+                f'state {name!r} has no transitions — it is a dead end'
 
     def test_skeleton_has_one_pose_per_bone(self):
         """1 bone + 0 reference poses = null deref when a sequence binds.

@@ -157,6 +157,9 @@ Correctness first, then quality, then geometry probes. See
 - **Cell grass lister**: `python tools/cell_grass.py <export_dir> --cell <id>` — walks CELL to LAND to LTEX to GRAS to list the grass types a cell can spawn.
 - **NPC skin census**: `python -m tools.census_npc_skin [--dump references/Skyrim.esm] [--race NordRace]` — joins RACE tint-mask definitions with NPC_ tint layers to report the colors/TINV/QNAM vanilla NPCs actually use. Source of `_RACE_SKIN_TONES`.
 
+### Release / repo
+- **Release notes**: `python tools/release_notes.py [--from <rev>] [--to <rev>] [--tag N.NN] [--output FILE]` — commits since the previous `MAJOR.MM` tag plus the GUI pipeline steps those changes require re-running. Defaults to *latest tag → HEAD*. Used by `.github/workflows/tag-on-push.yml` to write the annotated tag message. The path→step map (`RULES`) mirrors `gui.py`'s `STEPS` table; **add a rule whenever a new top-level package lands**, otherwise unmapped paths conservatively select every step.
+
 ## verify_plugin.py
 
 Also usable directly as a module entry point (same tool as **Plugin verify** above):
