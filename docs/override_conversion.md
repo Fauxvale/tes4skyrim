@@ -108,6 +108,32 @@ from comparing two conversion runs.
   overridden, its converted bytes are pulled in VERBATIM as the anchor —
   the engine pairs a children GRUP with the record preceding it, so a group
   can never stand alone (same as xEdit's copy-as-override of a reference).
+- **LOD: a plugin can ship LOD ASSETS for a worldspace it does not DEFINE.**
+  The GOTY `DLCShiveringIsles.esp` is an 85-byte header-only stub — every SI
+  record was merged into `Oblivion.esm` — yet its BSA carries all of SEWorld's
+  LOD tiles, so the export has `meshes\landscape\lod\40728.*` and no
+  `WRLD.txt` at all. Two consequences, both in `phase_lod`:
+  - `shipped_lod_worldspaces` must resolve the decimal-FormID prefix to an
+    EditorID through the MASTERS' `WRLD.txt` as well as the plugin's own, or
+    it falls back to a raw hex id (`00009F18`) that no downstream EDID match
+    can resolve and every stage reports "worldspace not found".
+  - The generators read WRLD/CELL/LAND out of ONE esm, so point them at the
+    master's converted output when the plugin doesn't define the worldspace.
+    Records move; **assets and generated output stay in the plugin's own dir**
+    — writing them into the master's tree makes the master ship content that
+    belongs to the plugin.
+- **An override plugin must not re-bake its masters' LOD.** Pass the masters'
+  output dirs as `generate_lod(master_dirs=...)`: any model whose `_far.nif`
+  a master already ships is dropped from both billboard generation and the
+  LODGen input. Without it, SI would regenerate all of Oblivion's object LOD
+  to gain the ~370 models it actually introduces. Note this filters by MODEL,
+  not by worldspace — SEWorld's terrain tiles are still generated in full,
+  because the master's LOD run never covered SEWorld at all.
+- **Only list meshes that exist under the single `PathData` root.** LODGen
+  resolves every path in its input against that one directory and aborts with
+  `file not found` / exit 404 — baking NO tiles — if one resolves only in
+  another plugin's tree. A cross-tree search may decide whether a mesh needs
+  GENERATING; it must never widen what gets LISTED.
 - Verify with: zero non-text diffs vs the master (only FULL/NAM1/DESC/CNAM/NNAM
   should differ), zero dangling refs, zero records at undefined master ids, and
   every override nested exactly as the master nests it.

@@ -424,9 +424,17 @@ def _lod_meshes_for(stat: dict, output_meshes_dir: Path):
 def write_lodgen_input(esm_path: Path, output_dir: Path,
                        worldspace_edid: str,
                        _parsed=None,
-                       cell_sw: tuple = None) -> Path:
+                       cell_sw: tuple = None,
+                       master_dirs=None) -> Path:
     """
     Parse the converted ESM and write the LODGen input text file.
+
+    `master_dirs` lists the converted output dirs of this plugin's MASTERS.
+    An override plugin re-uses its masters' records wholesale, so every ref
+    whose LOD mesh the master already ships is DROPPED here: the master's own
+    LOD run already baked it, and re-baking it would have this plugin ship a
+    duplicate copy of the master's entire object LOD to gain the handful of
+    objects it actually introduces.
 
     Returns path to the written file, or None if no LOD refs found.
     """
@@ -462,7 +470,12 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
     else:
         sw_x = wrld_info['sw_x']
         sw_y = wrld_info['sw_y']
+    # LODGen resolves every listed mesh under the single PathData root, so a
+    # mesh may only be listed if it exists in THIS output dir — a path that
+    # resolves in some other plugin's tree makes LODGen abort with "file not
+    # found" (exit 404) and no tiles at all get baked.
     output_meshes_dir = output_dir / 'meshes'
+    master_meshes = [Path(d) / 'meshes' for d in (master_dirs or [])]
 
     # Index cells by form_id → parent_wrld for fast lookup
     cell_wrld = {fid: c['parent_wrld'] for fid, c in cells.items()}
@@ -490,6 +503,10 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
         stat_is_lod = bool(stat_flags_val & (_FLAG_DISTANT_LOD | _FLAG_WORLD_MAP))
         if not stat_is_lod:
             continue
+        # Already covered by a master's own LOD run — don't re-bake it.
+        if any(_mesh_exists(_far_nif_path(model), m) for m in master_meshes):
+            continue
+
         lod4, lod8, lod16 = _lod_meshes_for(stat, output_meshes_dir)
         if not (lod4 or lod8 or lod16):
             continue
@@ -581,7 +598,8 @@ def run_lodgen(lodgen_input: Path, output_dir: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def generate_lod(esm_path: Path, output_dir: Path,
-                 worldspace_edid: str = 'Tamriel') -> bool:
+                 worldspace_edid: str = 'Tamriel',
+                 master_dirs=None) -> bool:
     """
     Full LOD generation pipeline:
       1. Write LODSettings/<worldspace>.lod
@@ -589,9 +607,15 @@ def generate_lod(esm_path: Path, output_dir: Path,
       3. Run LODGenx64.exe
 
     Args:
-        esm_path:          Path to the converted .esm/.esp
-        output_dir:        The per-plugin output directory (contains meshes/, textures/, etc.)
+        esm_path:          Path to the converted .esm/.esp holding the WRLD/
+                           CELL/REFR records. For an OVERRIDE plugin this is
+                           the MASTER's output, not the plugin's own.
+        output_dir:        Output dir owning the assets and receiving the
+                           generated LOD (contains meshes/, textures/, …).
         worldspace_edid:   Editor ID of the worldspace to generate LOD for
+        master_dirs:       Converted output dirs of this plugin's masters.
+                           Anything they already ship LOD for is skipped, so
+                           an override plugin bakes only what IT introduces.
 
     Returns True on success.
     """
@@ -641,16 +665,35 @@ def generate_lod(esm_path: Path, output_dir: Path,
             if m:
                 referenced_models.add(m)
 
+    # Drop models a master already ships LOD for: this plugin overrides the
+    # master's records, so re-deriving their billboards would duplicate the
+    # master's whole LOD set for the sake of the few models it adds.
+    master_meshes = [Path(d) / 'meshes' for d in (master_dirs or [])]
+    if master_meshes:
+        before = len(referenced_models)
+        referenced_models = {
+            m for m in referenced_models
+            if not any(_mesh_exists(_far_nif_path(m), mm) for mm in master_meshes)
+        }
+        skipped = before - len(referenced_models)
+        if skipped:
+            print(f"  Skipping {skipped} model(s) already covered by a "
+                  f"master's LOD; generating only this plugin's "
+                  f"{len(referenced_models)}")
+
     from .lod_far_gen import generate_missing_far_nifs
     generate_missing_far_nifs(stats, output_dir / 'meshes',
                                referenced_models=referenced_models,
                                force_regen_generated=True,
                                tex_root=output_dir / 'textures')
 
-    # Write LOD input (all LOD-flagged objects) and run LODGenx64 once
+    # Write LOD input (all LOD-flagged objects) and run LODGenx64 once.
+    # LODGen resolves every mesh under the single PathData root (output_dir),
+    # so only meshes that exist THERE may be listed.
     lodgen_txt = write_lodgen_input(esm_path, output_dir, edid,
                                     _parsed=(worldspaces, cells, stats, refs),
-                                    cell_sw=(eff_sw_x, eff_sw_y))
+                                    cell_sw=(eff_sw_x, eff_sw_y),
+                                    master_dirs=master_dirs)
     ok = False
     if lodgen_txt:
         # Remove stale tiles first: LODGen only rewrites tiles that still have

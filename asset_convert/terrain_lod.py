@@ -179,6 +179,21 @@ def detect_terrain_worldspaces(esm_path: Path, include_children: bool = False):
     return ranked
 
 
+def _master_names(export_dir: Path):
+    """The TES4 master file names listed in an export's _HEADER.txt."""
+    header = Path(export_dir) / '_HEADER.txt'
+    if not header.is_file():
+        return []
+    names = []
+    for line in header.read_text(encoding='utf-8', errors='replace').splitlines():
+        if line.startswith('Master['):
+            _, _, val = line.partition('=')
+            val = val.strip()
+            if val:
+                names.append(val)
+    return names
+
+
 def shipped_lod_worldspaces(export_dir: Path):
     """Return the worldspace EditorIDs the SOURCE game shipped distant-LOD for.
 
@@ -215,10 +230,20 @@ def shipped_lod_worldspaces(export_dir: Path):
     if not counts:
         return []
 
-    # 2. Map decimal FormID -> EditorID from the export's WRLD.txt.
+    # 2. Map decimal FormID -> EditorID from WRLD.txt.
+    #
+    # An OVERRIDE plugin ships LOD assets for a worldspace it does not itself
+    # define: the GOTY DLCShiveringIsles.esp is an 85-byte header-only stub
+    # (all Shivering Isles records were merged into Oblivion.esm) yet its BSA
+    # supplies every SEWorld LOD tile. So scan this export's WRLD.txt AND each
+    # master's, or the lookup falls through to a raw hex FormID that no
+    # downstream EDID match can ever resolve.
     edid_by_fid = {}
-    wrld_txt = export_dir / 'WRLD.txt'
-    if wrld_txt.is_file():
+
+    def _scan_wrld(d):
+        wrld_txt = d / 'WRLD.txt'
+        if not wrld_txt.is_file():
+            return
         cur_fid = None
         for line in wrld_txt.read_text(encoding='utf-8', errors='replace').splitlines():
             if line.startswith('FormID='):
@@ -227,7 +252,11 @@ def shipped_lod_worldspaces(export_dir: Path):
                 except ValueError:
                     cur_fid = None
             elif line.startswith('EditorID=') and cur_fid is not None:
-                edid_by_fid[cur_fid] = line[9:].strip()
+                edid_by_fid.setdefault(cur_fid, line[9:].strip())
+
+    _scan_wrld(export_dir)
+    for master in _master_names(export_dir):
+        _scan_wrld(export_dir.parent / master)
 
     # The importer renames Oblivion's 'Tamriel' worldspace to 'TES4Tamriel'
     # (tes5_import/record_types/world.py) so it doesn't override Skyrim's

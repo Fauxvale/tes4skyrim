@@ -541,7 +541,13 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
     from asset_convert.lod_gen import generate_lod
     from asset_convert.terrain_lod import (generate_terrain_lod,
                                            shipped_lod_worldspaces,
-                                           detect_terrain_worldspaces)
+                                           detect_terrain_worldspaces,
+                                           _master_names as _tes4_master_names,
+                                           _find_worldspace_fid)
+
+    def _esm_defines_worldspace(path, edid):
+        raw = path.read_bytes()
+        return _find_worldspace_fid(raw, len(raw), edid) is not None
 
     out_root   = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
     output_dir = out_root / file_name
@@ -580,14 +586,43 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
                       f"skipping LOD")
                 return True
 
+    # A plugin can ship LOD assets for a worldspace defined by one of its
+    # MASTERS rather than by itself — the GOTY DLCShiveringIsles.esp is an
+    # 85-byte header-only stub whose BSA still carries every SEWorld tile
+    # (all SI records were merged into Oblivion.esm). The generators read
+    # WRLD/CELL/LAND records out of one ESM, so for those worldspaces point
+    # them at the master's converted output, which is where the records are.
+    # Only the RECORDS move; the assets and the generated LOD stay in this
+    # plugin's own output dir, which is what it ships. The master's dir is
+    # returned alongside so anything the master's own LOD run already covers
+    # is skipped rather than duplicated here.
+    def _records_esm(edid):
+        if _esm_defines_worldspace(esm_path, edid):
+            return esm_path, []
+        for master in _tes4_master_names(SCRIPT_DIR / "export" / file_name):
+            m_dir = out_root / master
+            m_esm = m_dir / master
+            if m_esm.exists() and _esm_defines_worldspace(m_esm, edid):
+                print(f"[{file_name}] Worldspace '{edid}' is defined by master "
+                      f"'{master}'; sourcing its records from there")
+                return m_esm, [m_dir]
+        return None, []
+
     all_ok = True
     for worldspace_edid in worldspaces:
+        rec_esm, extra_assets = _records_esm(worldspace_edid)
+        if rec_esm is None:
+            print(f"[{file_name}] Worldspace '{worldspace_edid}' not found in "
+                  f"{esm_path.name} or any converted master; skipping its LOD")
+            continue
+
         print(f"[{file_name}] Generating object LOD "
               f"(worldspace: {worldspace_edid})...")
         ok = generate_lod(
-            esm_path=esm_path,
+            esm_path=rec_esm,
             output_dir=output_dir,
             worldspace_edid=worldspace_edid,
+            master_dirs=extra_assets,
         )
 
         # Terrain LOD: heightmap .btr tiles + composited landscape-texture
@@ -595,7 +630,7 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
         print(f"[{file_name}] Generating terrain LOD "
               f"(worldspace: {worldspace_edid})...")
         ok_terrain = generate_terrain_lod(
-            esm_path=esm_path,
+            esm_path=rec_esm,
             output_dir=output_dir,
             worldspace_edid=worldspace_edid,
         )
