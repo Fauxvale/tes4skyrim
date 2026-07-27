@@ -7,6 +7,7 @@ Major Issues for V1:
 	3 - Navmesh refinement
 		ensure corridors connect pathgrid islands + other connectivity issues
 		allow growth even on slopes
+		some doors are rotated (imperialdungeon01)
 
 	4 - Fix CK Loading (not sure why it doesn't finish)
 
@@ -26,6 +27,7 @@ Major Issues for V1:
 		Six no-op'd commands exist natively in Skyrim: AddAchievement (59 sites), PlayBink (5), SendTrespassAlarm (2), SetPublic (1), AttachAshPile, GetCurrentPackage. SetCellPublicFlag (100 sites) is the same Cell flag as SetPublic.
 		Output has only 2 ;TODO markers across 18,566 scripts - marker counts measure honesty not correctness, so audit against references/skse64-master/scripts/vanilla rather than scanning output for markers.
 
+	11 - There is a second, independent bug in the same fragment worth fixing regardless: SetActorValue("Aggression", 10) is rejected by the engine ("attempt made to set illegal value") for Renault, Glenroy, and Baurus at TES4_QF_Charactergen.psc:362-364. Skyrim's Aggression is a 0-3 tier, not Oblivion's 0-100, so all three calls silently no-op and the Blades never become aggressive. That won't unstick the door, but it will suppress the fight even once stage 23 lands.
 		
 Later Issues:
 

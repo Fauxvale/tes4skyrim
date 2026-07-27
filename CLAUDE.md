@@ -70,6 +70,7 @@ caching, skipped record types, the export text format, and the directory layout.
   Grep the source before claiming a mechanism exists, and fix the doc.
 - If using subagents, ONLY use the lower tier Sonnet or Haiku models. NEVER Opus. Limit additional agents to only 2 at a time.
 - When building test scripts, always output as they go so that if the time goes past the hard 120 second timeout limit you still get some output
+- **LISTEN CAREFULLY to EXACTLY what the user's prompt says**. Seek to understand any implementation ideas instead of using your pre-conceived notions
 
 ### Verifying your work
 
@@ -126,9 +127,14 @@ theories externally first.
   something genuinely cannot be scoped down, say so instead of waiting on it.
 - If file recovery is in progress, make zero writes to the affected drive; ask
   first before any bulk operation.
+- **NEVER stop in the middle of an incomplete task to give a mid-session update**
+  I don't want to know. I want you to complete the task you have been given
 
 ### Working with the user
 
+- **NEVER STOP TO GIVE A MID-SESSION STATUS REPORT.** Not "here's where I am",
+  not "should I continue?", not a summary of progress so far. Finish the whole task, then report once. A status update mid-task is a failure, not politeness.
+- **Measure the invariant the user asked for, not a proxy for it.**
 - **Trust the user's in-game test results as ground truth.** Never question
   whether they tested something, and never rebut a reported result with file
   timestamps or a reconstructed timeline. (Reading Papyrus logs to *diagnose* is
