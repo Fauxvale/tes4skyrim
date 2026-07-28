@@ -24,12 +24,17 @@ RACE_MAP = {
     'Orc':           0x00013747,
     'Redguard':      0x00013748,
     'WoodElf':       0x00013749,
-    # Shivering Isles playable-ish races — mapped to proper CC races where available
-    # GoldenSaint: ccbgssse025-advdsgs.esm local 0x000816 ccBGSSSE025_GoldenSaintRace
-    # DarkSeducer: ccbgssse025-advdsgs.esm local 0x000817 ccBGSSSE025_DarkSeducerRace
+    # Shivering Isles playable-ish races.
+    # The Golden Saint / Dark Seducer races only exist in the ccbgssse025
+    # Creation ("Adventurer's Backpack"/AdvDSGS), which we cannot depend on as
+    # a master.  DremoraRace was the previous stand-in, but it carries the
+    # Dremora head mesh, horns and tint set, which suits neither.  Both are
+    # golden-/dusk-skinned elves, so they map onto the base-game elf races:
+    #   GoldenSaint → HighElfRace  (Skyrim.esm 0x00013743, verified in dump)
+    #   DarkSeducer → DarkElfRace  (Skyrim.esm 0x00013742, verified in dump)
     # Dremora:     Skyrim.esm 0x000131F0 DremoraRace
-    'GoldenSaint':   0x000131F0,  # → DremoraRace (Skyrim.esm); ideal=ccbgssse025 0x000816
-    'DarkSeducer':   0x000131F0,  # → DremoraRace (Skyrim.esm); ideal=ccbgssse025 0x000817
+    'GoldenSaint':   0x00013743,  # → HighElfRace (Skyrim.esm 0x00013743)
+    'DarkSeducer':   0x00013742,  # → DarkElfRace (Skyrim.esm 0x00013742)
     'Dremora':       0x000131F0,  # → DremoraRace (Skyrim.esm 0x000131F0) — exact match
     'SEDremora':     0x000131F0,  # → DremoraRace (Skyrim.esm 0x000131F0)
     'Sheogorath':    0x00013744,  # → Imperial (no Sheogorath race in any source)
@@ -755,6 +760,12 @@ _RACE_HAIR_FALLBACK: dict[str, tuple[list, list]] = {
     'DarkElf':   (_ELF_M_HAIR,  _ELF_F_HAIR),
     'HighElf':   (_ELF_M_HAIR,  _ELF_F_HAIR),
     'WoodElf':   (_ELF_M_HAIR,  _ELF_F_HAIR),
+    # SI races follow RACE_MAP onto the elf races; without these keys they
+    # would fall through to the human pool and get human hair on an elf head.
+    'GoldenSaint': (_ELF_M_HAIR, _ELF_F_HAIR),
+    'DarkSeducer': (_ELF_M_HAIR, _ELF_F_HAIR),
+    'Dremora':     (_ELF_M_HAIR, _ELF_F_HAIR),
+    'SEDremora':   (_ELF_M_HAIR, _ELF_F_HAIR),
     # Human races all share the human pool
     'Imperial':  (_HUMAN_M_HAIR, _HUMAN_F_HAIR),
     'Nord':      (_HUMAN_M_HAIR, _HUMAN_F_HAIR),

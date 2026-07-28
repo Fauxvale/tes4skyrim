@@ -125,8 +125,8 @@ _RACE_HEAD_TXST: dict[str, dict[str, int]] = {
 
 _SKIN_RACE_ALIAS = {
     # Must follow RACE_MAP's target Skyrim race — tint indices are per-race.
-    'GoldenSaint': 'Dremora',
-    'DarkSeducer': 'Dremora',
+    'GoldenSaint': 'HighElf',
+    'DarkSeducer': 'DarkElf',
     'SEDremora':   'Dremora',
     'Sheogorath':  'Imperial',
 }
