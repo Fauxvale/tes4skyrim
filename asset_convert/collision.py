@@ -1432,6 +1432,25 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
             pass                    # case 2: falls into the dynamic branch
         else:
             rb.mass = 0.0           # case 3: falls into the static branch
+
+    # Oblivion MO_SYS_FIXED (7) is the explicit "static element of the scene"
+    # motion type (nif.xml: landscape/architecture).  The static-vs-dynamic
+    # branch below dispatches on mass alone, which silently misreads any fixed
+    # body whose mass field is non-zero as clutter: Skyrim then simulates a
+    # 1000 kg mesh-collision prop, and it tips onto its side, sinks, or spins
+    # off through the air on cell load.
+    #
+    # Base Oblivion hid the bug — a 300-NIF census found 198 ms=7 bodies with
+    # mass EXACTLY 0 (0 non-zero), so mass alone happened to classify all of
+    # them right.  Third-party content does not follow that convention: the
+    # same census over Morroblivion found 186 ms=7 bodies of which 157 carry
+    # a junk mass (1000.0 is its idiom for "static"), i.e. the majority of its
+    # statics were being converted into dynamic clutter.
+    #
+    # A fixed body that owns a constraint is left alone: it is a real
+    # trap/chain part whose island the constraint branches handle.
+    if rb.motion_system == 7 and rb.num_constraints == 0:
+        rb.mass = 0.0               # falls into the static branch
     if keyframed_body:
         # Skyrim animated doors/activators: the collision body follows the
         # NiNode animation exactly (keyframed).  Values sourced from vanilla

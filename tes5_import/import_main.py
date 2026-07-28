@@ -293,6 +293,19 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     writer = PluginWriter(masters=masters, is_esm=is_esm,
                           description="Converted from TES4 by tes4_export")
 
+    # Every distinct BOOK model in the plugin, so convert_BOOK can resolve
+    # inventory-art basenames through the same collision-aware map the asset
+    # side uses (asset_convert/book_inam.py).  Two BOOK models can share a
+    # leaf filename across directories; only the whole-plugin view can tell
+    # which one keeps the bare name, and the STAT must agree with the mesh.
+    writer.export_dir = export_dir
+    try:
+        from asset_convert.book_inam import distinct_book_models
+        writer.book_models = distinct_book_models(export_dir)
+    except Exception as exc:
+        print(f"  [book INAM] model list unavailable ({exc}); using leaf names")
+        writer.book_models = []
+
     # Set FormID remapping. The TES5 master list is the TES4 one with N new
     # masters (Skyrim.esm) PREPENDED, so every TES4 load-order index — the
     # plugin's own and its masters' alike — shifts up by exactly N.

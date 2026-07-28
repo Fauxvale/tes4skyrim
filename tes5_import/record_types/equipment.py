@@ -124,6 +124,29 @@ def _pack_effects(rec: dict, count_key: str = 'EffectCount', pad_to: int = 0,
     return subs
 
 
+def _book_source_mesh_missing(writer, model: str) -> bool:
+    """True when the plugin's BOOK MODL has no source mesh in the export.
+
+    asset_convert/book_inam.py skips those models ("source mesh missing"), so
+    the INAM STAT must not point at a mesh that will never be generated.
+    Cached per writer; unknown export dir → assume present (old behaviour).
+    """
+    import os
+    export_dir = getattr(writer, 'export_dir', None)
+    if not export_dir or not model:
+        return False
+    cache = getattr(writer, '_book_src_missing', None)
+    if cache is None:
+        cache = writer._book_src_missing = {}
+    key = model.lower()
+    hit = cache.get(key)
+    if hit is None:
+        parts = model.replace('/', '\\').split('\\')
+        hit = not os.path.isfile(os.path.join(export_dir, 'meshes', *parts))
+        cache[key] = hit
+    return hit
+
+
 def _build_model_stat(edid: str, model_path: str, stat_fid: int) -> bytes:
     """Build a minimal STAT record wrapping a mesh (WEAP WNAM / BOOK INAM target).
 
@@ -630,22 +653,41 @@ def convert_BOOK(rec: dict, writer=None) -> bytes:
     # PageText quad, so a static mesh here opens invisible with no text.
     # asset_convert/book_inam.py bakes each distinct TES4 book model's cover
     # textures onto the vanilla book/note rig and writes it to
-    # meshes\tes4\clutter\books\inv\<model basename>.nif; one STAT per model
-    # is synthesised here (cached on the writer — BOOKs convert serially).
+    # meshes\tes4\clutter\books\inv\<inv_basename(model)>.nif; one STAT per
+    # model is synthesised here (cached on the writer — BOOKs convert
+    # serially).  The basename rule is imported from book_inam so the STAT
+    # target and the generated mesh cannot drift apart.
     inam_fid = 0x000E894C  # HighPolySkyrimBook — fallback for model-less books
     if writer is not None and model:
-        base = model.replace('/', '\\').rsplit('\\', 1)[-1].rsplit('.', 1)[0].lower()
-        cache = getattr(writer, '_book_inam_stats', None)
-        if cache is None:
-            cache = writer._book_inam_stats = {}
-        inam_fid = cache.get(base)
-        if inam_fid is None:
-            inam_fid = writer.alloc_formid()
-            inv_model = 'clutter\\books\\inv\\' + base + '.nif'
-            stat_bytes = _build_model_stat('InvArt_' + base, _prefix_path(inv_model),
-                                           inam_fid)
-            writer.add_record('STAT', stat_bytes)
-            cache[base] = inam_fid
+        # Resolve through the plugin-wide collision-aware map, exactly as the
+        # asset side does: two BOOK models can share a leaf filename across
+        # different directories, and only the map knows which one keeps the
+        # bare name.  Built once per writer (BOOKs convert serially).
+        from asset_convert.book_inam import inv_basename, inv_basename_map
+        bmap = getattr(writer, '_book_inam_names', None)
+        if bmap is None:
+            models = sorted(getattr(writer, 'book_models', None) or [],
+                            key=lambda m: m.lower())
+            bmap = writer._book_inam_names = inv_basename_map(models)
+        base = bmap.get(model) or inv_basename(model)
+        # The asset stage skips models whose source mesh the plugin never
+        # ships, so pointing a STAT at the mesh it would have generated
+        # leaves BookMenu loading a file that does not exist.  Fall back to
+        # the vanilla reading rig for those, same as a model-less book.
+        if _book_source_mesh_missing(writer, model):
+            base = None
+        if base is not None:
+            cache = getattr(writer, '_book_inam_stats', None)
+            if cache is None:
+                cache = writer._book_inam_stats = {}
+            inam_fid = cache.get(base)
+            if inam_fid is None:
+                inam_fid = writer.alloc_formid()
+                inv_model = 'clutter\\books\\inv\\' + base + '.nif'
+                stat_bytes = _build_model_stat('InvArt_' + base,
+                                               _prefix_path(inv_model), inam_fid)
+                writer.add_record('STAT', stat_bytes)
+                cache[base] = inam_fid
     subs += pack_formid_subrecord('INAM', inam_fid)
 
     # CNAM — Description (string, empty like vanilla non-descriptive books).

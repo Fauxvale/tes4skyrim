@@ -315,7 +315,13 @@ def calibrate(shapes):
                        if s['texs'] and s['texs'][0] != front_tex]
         if page_shapes:
             pages_tex = page_shapes[0]['texs'][0]
-            page_isles = [i for i in islands if i.shape in page_shapes]
+            # Identity, not `in`: shapes are dicts holding numpy arrays, so
+            # `i.shape in page_shapes` runs dict __eq__ -> element-wise array
+            # comparison, which raises as soon as two shapes have different
+            # vertex counts ("operands could not be broadcast together").
+            # Uniform-vertex-count books hid it; mixed ones failed to bake.
+            page_ids = {id(s) for s in page_shapes}
+            page_isles = [i for i in islands if id(i.shape) in page_ids]
             if page_isles:
                 big = max(page_isles, key=lambda i: i.area)
                 long_axis = int(np.argmax(big.span()[:2]))
@@ -625,29 +631,90 @@ def distinct_book_models(export_subdir):
 
 
 def inv_basename(model_path):
-    """BOOK MODL -> generated asset basename.  Must match the STAT synthesis
-    in tes5_import/record_types/equipment.py."""
+    """BOOK MODL -> generated asset basename (leaf filename, no extension).
+
+    Single source of truth: tes5_import/record_types/equipment.py imports this
+    for its STAT synthesis, so the mesh written here and the STAT that points
+    at it can never disagree.
+
+    NOT unique on its own — see inv_basename_map() for the collision-aware
+    form.  Callers that must handle a whole plugin's model set go through that.
+    """
     base = model_path.replace('/', '\\').rsplit('\\', 1)[-1]
     return base.rsplit('.', 1)[0].lower()
+
+
+def _qualified_basename(model_path):
+    """Collision fallback: fold the parent directory into the name."""
+    norm = model_path.replace('/', '\\').strip('\\')
+    parts = norm.split('\\')
+    base = parts[-1].rsplit('.', 1)[0].lower()
+    if len(parts) < 2:
+        return base
+    parent = ''.join(ch for ch in parts[-2].lower() if ch.isalnum())
+    return (parent + '_' + base) if parent else base
+
+
+def inv_basename_map(models):
+    """{model path -> unique asset basename} for one plugin's BOOK models.
+
+    The leaf filename alone is not unique: plugins that merge several asset
+    trees reuse a name across directories (Morroblivion ships both
+    Clutter\\Books\\Note01.NIF and Morroblivion\\Clutter\\Paper\\Note01.nif).
+    Both collapsed onto one basename, so two distinct models fought over a
+    single output mesh and the collision guard aborted the whole asset stage.
+
+    Resolution order is stable and additive: every model keeps its bare leaf
+    name (so existing generated assets are untouched), and ONLY the models
+    that actually collide fall back to a directory-qualified name, then to a
+    numeric suffix.  Input order decides who keeps the bare name, so callers
+    pass a deterministically ordered list.
+    """
+    counts = {}
+    for m in models:
+        counts[inv_basename(m)] = counts.get(inv_basename(m), 0) + 1
+
+    out, taken = {}, set()
+    for m in models:
+        base = inv_basename(m)
+        if counts[base] == 1:
+            out[m] = base
+            taken.add(base)
+            continue
+        for cand in (base, _qualified_basename(m)):
+            if cand not in taken:
+                out[m] = cand
+                taken.add(cand)
+                break
+        else:
+            i = 2
+            while '%s_%d' % (base, i) in taken:
+                i += 1
+            out[m] = '%s_%d' % (base, i)
+            taken.add(out[m])
+    return out
 
 
 # worker globals (populated by _worker_init in each pool process)
 _W = {}
 
 
-def _worker_init(book_tpl, note_tpl, extract_root, out_root):
+def _worker_init(book_tpl, note_tpl, extract_root, out_root, basenames=None):
     _W['book_tpl'] = book_tpl
     _W['note_tpl'] = note_tpl
     _W['book_cal'] = calibrate_book_template(read_shapes(book_tpl))
     _W['note_cal'] = calibrate_note_template(read_shapes(note_tpl))
     _W['extract_root'] = extract_root
     _W['out_root'] = out_root
+    # Collision-resolved {model -> basename}; workers must not re-derive it
+    # independently or two of them can pick the same output name.
+    _W['basenames'] = basenames or {}
 
 
 def _convert_one(model_rel):
     """Generate the INAM NIF + baked textures for one TES4 book model.
     Returns (model_rel, status, detail)."""
-    base = inv_basename(model_rel)
+    base = _W['basenames'].get(model_rel) or inv_basename(model_rel)
     rel = model_rel.replace('/', '\\')
     src_nif = os.path.join(_W['extract_root'], 'meshes', *rel.split('\\'))
     if not os.path.isfile(src_nif):
@@ -700,18 +767,17 @@ def generate_book_inams(source_file, extract_dir='export', output_dir='output',
     if not models:
         return {'ok': 0, 'skip': 0, 'fail': 0}
 
-    bases = {}
-    for m in models:
-        b = inv_basename(m)
-        if b in bases and bases[b].lower() != m.lower():
-            raise ValueError('INAM basename collision: %s vs %s' % (m, bases[b]))
-        bases[b] = m
+    # Distinct models sharing a leaf filename each get their own unique asset
+    # name (see inv_basename_map) — nothing is dropped, and the old hard
+    # ValueError that aborted the entire asset stage on a clash is gone.
+    models = sorted(models, key=lambda m: m.lower())
+    basenames = inv_basename_map(models)
 
     tpls = load_templates(templates_dir, skyrim_data)
     stats = {'ok': 0, 'skip': 0, 'fail': 0}
     n_workers = workers if workers is not None else max(1, cpu_count() - 1)
     n_workers = min(n_workers, len(models))
-    init_args = (tpls['book'], tpls['note'], export_subdir, out_root)
+    init_args = (tpls['book'], tpls['note'], export_subdir, out_root, basenames)
     # Validate templates in the parent BEFORE spawning workers: an initializer
     # crash in a pool worker (e.g. an SSE-format BSTriShape template pyffi
     # can't parse) surfaces only as an opaque BrokenProcessPool — and the
