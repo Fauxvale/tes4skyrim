@@ -120,6 +120,7 @@ half of `quest_walkthrough.py`).
 - **Havok constraint dump**: `python tools/havok_constraint_dump.py <nif>` — rigid-body filter/solver fields and full constraint descriptors that the NIF analyzers hide.
 - **Ragdoll validate**: `python tools/ragdoll_validate.py <skeleton_nif>` — runs the real `hkx_ragdoll.extract_ragdoll` and checks the ragdoll at bind pose (constraint tree, limits, motors).
 - **Creature vanilla A/B**: `python tools/creature_vanilla_ab.py` — builds test ESPs repointing a generated creature RACE at vanilla asset layers (behavior project / skeleton / body NIF) to bisect which generated layer breaks.
+- **CREA project gap**: `python tools/crea_project_gap.py <plugin> [master ...]` — audits how many CREA records actually map to a converted creature project. Misses ship as BASE SKYRIM creatures (`resolve_creature_race` aliasing), and the report splits them into "folder owned by a MASTER's project" vs "in neither" (never converted — usually a creature folder nested outside `meshes\creatures`). Use this whenever converted creatures appear in-game as vanilla Skyrim ones.
 - **Animation cache validate**: `python tools/animcache_validate.py` — validates merged `animationdatasinglefile.txt` / `animationsetdatasinglefile.txt` against ck-cmd's exact grammar.
 - **KF animation explorer**: `python tools/kf_animation_explorer.py --build-cache` / `--skeleton` — explores the Oblivion `.kf` corpus and skeleton for FK retargeting.
 

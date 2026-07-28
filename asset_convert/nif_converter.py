@@ -820,6 +820,13 @@ _TEX_TRANSFORM_VARS = {
 # Skyrim has no equivalent -- see the alpha handling in _process_geometry.
 _APPLY_HILIGHT2 = 4
 
+# NiVertexColorProperty.lighting_mode.  LIGHTING_E (0) = "emissive only": the
+# surface ignores scene lighting entirely.  That is Oblivion's declaration of
+# an UNLIT FX surface, and it maps onto Skyrim's BSEffectShaderProperty, while
+# LIGHTING_E_A_D (1) -- ordinary lit geometry -- maps onto
+# BSLightingShaderProperty.  See the shader choice in _process_geometry.
+_LIGHTING_EMISSIVE_ONLY = 0
+
 
 def _collect_tex_transform_ctrls(props):
     """Harvest animated NiTextureTransformControllers from Oblivion properties.
@@ -1006,6 +1013,10 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     emissive_r = 0.0
     emissive_g = 0.0
     emissive_b = 0.0
+    material_alpha = 1.0   # NiMaterialProperty.alpha → BSLightingShaderProperty.alpha
+    # NiVertexColorProperty.lighting_mode: 0 = unlit FX, 1 = lit.  Default to
+    # lit so a shape with no NiVertexColorProperty keeps the lighting shader.
+    vertex_lighting_mode = 1
     flip_ctrl = None   # NiFlipController on NiTexturingProperty → animated fire quads
 
     # NiTextureTransformController on NiTexturingProperty → scrolling/scaling UVs
@@ -1032,6 +1043,9 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
             emissive_r = ec.r
             emissive_g = ec.g
             emissive_b = ec.b
+            material_alpha = prop.alpha
+        elif isinstance(prop, NifFormat.NiVertexColorProperty):
+            vertex_lighting_mode = int(prop.lighting_mode)
         elif isinstance(prop, NifFormat.NiStencilProperty):
             has_double_sided = True
         elif isinstance(prop, NifFormat.NiAlphaProperty):
@@ -1118,6 +1132,17 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         # No emissive — clear the own_emit flag (reduces overdraw on most objects)
         sf1.slsf_1_own_emit = 0
 
+    # Carry NiMaterialProperty.alpha across.  Both engines store a per-material
+    # opacity multiplier -- Oblivion on NiMaterialProperty, Skyrim as
+    # BSLightingShaderProperty.alpha -- and dropping it forced every surface to
+    # fully opaque.  Oblivion authors invisible helper geometry as alpha 0.0:
+    # se11sheopooffx's EmitterMeshBodyGlow / EmitterMeshSwirly / GlowPlane are
+    # particle EMITTER SOURCES that should never be drawn (they only define
+    # where particles spawn), so at alpha 1.0 they render as solid white
+    # boxes over the effect.  The NiAlphaProperty is already present and says
+    # blend; without the material alpha there is simply nothing to blend by.
+    shader.alpha = material_alpha
+
     # NiFlipController: fire/effect quads animate through multiple texture frames
     # using NiFlipController on the NiTexturingProperty.  NiFlipController is
     # DEAD in Skyrim (0/17,216 vanilla meshes) — the Skyrim equivalent is a
@@ -1128,8 +1153,35 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     # controller — this restores the flip-book animation in game AND in
     # NifSkope (its EffectFloatController is supported; NiPSys chains are not).
     # Fallback when frames can't be resolved: static first-frame texture.
-    if flip_ctrl is not None:
-        srcs = [s for s in flip_ctrl.sources if s is not None and s.file_name]
+    # Static FX surfaces take the effect shader too.  BSLightingShaderProperty
+    # is a LIT material: it shades every pixel against the normal map named in
+    # texture slot 1.  Oblivion's FX textures ship no _n companion at all
+    # (SEFXWHITE, SEFXLightRippleINVERT, SEForceRipple), so routing this
+    # geometry through the lighting shader left it shaded against a texture
+    # that does not exist -- the "major texturing problem" on se11sheopooffx
+    # and se01waitingroomwalls.  BSEffectShaderProperty is the vanilla home for
+    # glow/FX geometry and has no normal-map slot at all.
+    #
+    # The discriminator is Oblivion's OWN declaration that a surface is unlit:
+    # NiVertexColorProperty.lighting_mode == LIGHTING_E (0), "emissive only --
+    # ignore scene lighting".  Lit geometry uses LIGHTING_E_A_D (1).  In
+    # se01waitingroomwalls the three roomRoomFX light-ripple shapes are the
+    # only mode-0 surfaces in the whole mesh; all 40-odd wall/trim shapes are
+    # mode 1.  That is exactly the lit/unlit split BSLightingShaderProperty vs
+    # BSEffectShaderProperty encodes in Skyrim.
+    #
+    # Do NOT infer this from the texture path or a missing _n: a 700-mesh
+    # census found 101 shapes whose diffuse has no _n companion, and they are
+    # overwhelmingly ordinary LIT geometry (troll skin, clothing, painted
+    # signs, plaster walls, grass) that must keep its lighting.  The material
+    # fields are useless here too -- these FX shapes disagree on every one of
+    # them (roomRoomFX emissive-white + blended, LightBeam emissive-black +
+    # blended, Cone01 no alpha property, GlowPlane material-alpha 0).
+    is_static_fx = (flip_ctrl is None and diffuse_path and
+                    vertex_lighting_mode == _LIGHTING_EMISSIVE_ONLY)
+    if flip_ctrl is not None or is_static_fx:
+        srcs = ([s for s in flip_ctrl.sources if s is not None and s.file_name]
+                if flip_ctrl is not None else [])
         frames = []
         for s in srcs:
             pth = s.file_name
@@ -1343,8 +1395,12 @@ def _process_controller_manager(node, palette):
                     new.phase = getattr(src_ctrl, 'phase', 0.0)
                     new.start_time = src_ctrl.start_time
                     new.stop_time = src_ctrl.stop_time
-                    new.type_of_controlled_variable = _TEX_TRANSFORM_VARS[op][0]
                     new.interpolator = blk.interpolator
+                    # Provisionally the Lighting variant; _match_seq_shader_types
+                    # re-stamps it as the Effect variant after the geometry walk,
+                    # once each node's real shader is known.
+                    new.type_of_controlled_variable = _TEX_TRANSFORM_VARS[op][0]
+                    new._tt_operation = op       # remembered for that pass
                     blk.controller = new
                     blk.controller_type = b'BSLightingShaderPropertyFloatController'
                     key += 1
@@ -1363,6 +1419,52 @@ def _process_controller_manager(node, palette):
                 continue
 
             key += 1
+
+
+def _match_seq_shader_types(root):
+    """Make each retargeted UV controller match its target node's shader.
+
+    Must run AFTER the geometry walk: _process_controller_manager rewrites the
+    Oblivion NiTextureTransformController entries before the shaders exist, so
+    it can only assume the Lighting variant.  Unlit surfaces (lighting_mode 0,
+    e.g. palacefont01's fountain water) end up on BSEffectShaderProperty, and
+    the two shaders number their controlled variables differently -- V Offset
+    is 22 on Lighting but 8 on Effect -- so an unreconciled entry leaves the
+    engine unable to bind the animation.
+    """
+    shader_of = {}
+    for blk in root.tree():
+        nm = getattr(blk, 'name', None)
+        if not nm:
+            continue
+        for pr in getattr(blk, 'bs_properties', []) or []:
+            if pr is None:
+                continue
+            cn = pr.__class__.__name__
+            if cn in ('BSEffectShaderProperty', 'BSLightingShaderProperty'):
+                shader_of[bytes(nm)] = cn
+
+    for blk in root.tree():
+        if not isinstance(blk, NifFormat.NiControllerSequence):
+            continue
+        for cb in blk.controlled_blocks:
+            ctrl = cb.controller
+            op = getattr(ctrl, '_tt_operation', None)
+            if op is None:
+                continue
+            want_effect = shader_of.get(bytes(cb.node_name)) == 'BSEffectShaderProperty'
+            if not want_effect:
+                continue
+            eff = NifFormat.BSEffectShaderPropertyFloatController()
+            eff.flags = ctrl.flags
+            eff.frequency = ctrl.frequency
+            eff.phase = ctrl.phase
+            eff.start_time = ctrl.start_time
+            eff.stop_time = ctrl.stop_time
+            eff.interpolator = ctrl.interpolator
+            eff.type_of_controlled_variable = _TEX_TRANSFORM_VARS[op][1]
+            cb.controller = eff
+            cb.controller_type = b'BSEffectShaderPropertyFloatController'
 
 
 # ---------------------------------------------------------------------------
@@ -3290,6 +3392,33 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                     replacement = block_map.get(id(block.emitter_meshes[mi]))
                     if replacement is not None:
                         block.emitter_meshes[mi] = replacement
+
+        # Reconcile retargeted UV controllers with the shader each target node
+        # actually received (Lighting vs Effect number their variables
+        # differently).  Must follow the geometry walk.
+        _match_seq_shader_types(root)
+
+        # Hide NiPSysMeshEmitter SOURCE geometry.  These shapes exist only to
+        # define where particles spawn and must never be drawn.  Oblivion hides
+        # them with NiMaterialProperty.alpha = 0.0; Skyrim has no material
+        # property, and our conversion also forces NIF_FLAGS (visible) onto
+        # every node, so they came through as solid untextured boxes sitting
+        # over the effect (se11sheopooffx's white blobs).
+        # Vanilla census of 119 emitter-source shapes across 80 particle
+        # meshes: 114 set the node's HIDDEN flag (0x000F, bit 0) *and* carry NO
+        # shader property at all.  Match that exactly -- it is what the engine
+        # expects, and it also drops the pointless texture/shader payload.
+        for block in root.tree():
+            if not isinstance(block, NifFormat.NiPSysMeshEmitter):
+                continue
+            for mesh in block.emitter_meshes:
+                if mesh is None:
+                    continue
+                mesh.flags = int(mesh.flags) | 0x0001   # hidden
+                for pi in range(len(mesh.bs_properties)):
+                    mesh.bs_properties[pi] = None
+                stats['emitter_meshes_hidden'] = \
+                    stats.get('emitter_meshes_hidden', 0) + 1
 
         # Skyrim requires collision on the root node only.
         # If we did NOT wrap, check whether a child holds the collision and hoist it.
