@@ -3065,13 +3065,17 @@ class TestClimateConversion:
         tnam = _find_subrecord(convert_CLMT(self._rec()), b'TNAM')
         assert tnam == bytes((36, 60, 96, 120, 0, 195))
 
-    def test_climate_is_not_skipped(self):
-        from tes5_import.constants import IMPORT_DISPATCH, SKIP_TYPES
-        assert 'CLMT' not in SKIP_TYPES
-        assert 'CLMT' in IMPORT_DISPATCH
-        # WTHR is deliberately NOT in the generic dispatch: it mints an IMGS
-        # companion, so it runs in its own serial phase (import_main 2b).
-        assert 'WTHR' not in IMPORT_DISPATCH
+    def test_climate_dispatch_follows_the_feature_flag(self):
+        """Climate conversion is gated on CONVERT_CLIMATE; the converter above
+        stays tested either way so the flag can be flipped back on."""
+        from tes5_import.constants import (
+            CONVERT_CLIMATE, IMPORT_DISPATCH, SKIP_TYPES)
+        if CONVERT_CLIMATE:
+            assert 'CLMT' not in SKIP_TYPES
+            assert 'CLMT' in IMPORT_DISPATCH
+        else:
+            assert 'CLMT' in SKIP_TYPES
+            assert 'CLMT' not in IMPORT_DISPATCH
 
 
 class TestWorldspaceClimate:
@@ -3082,7 +3086,10 @@ class TestWorldspaceClimate:
         return rec
 
     def test_authored_climate_is_kept(self):
+        from tes5_import.constants import CONVERT_CLIMATE
         from tes5_import.record_types.world import convert_WRLD
+        if not CONVERT_CLIMATE:
+            pytest.skip('climate conversion disabled (CONVERT_CLIMATE)')
         out = convert_WRLD(self._rec(**{'CNAM.Climate': '00097C60'}))
         cnam = struct.unpack('<I', _find_subrecord(out, b'CNAM'))[0]
         assert cnam & 0x00FFFFFF == 0x97C60
@@ -3093,10 +3100,23 @@ class TestWorldspaceClimate:
         0x543200, which does LookupForm(0x15F).  Skyrim has no such fallback,
         and 57 of 84 TES4 worldspaces (incl. Tamriel and every city) author no
         CNAM, so it must be written explicitly."""
+        from tes5_import.constants import CONVERT_CLIMATE
         from tes5_import.record_types.world import convert_WRLD
+        if not CONVERT_CLIMATE:
+            pytest.skip('climate conversion disabled (CONVERT_CLIMATE)')
         cnam = _find_subrecord(convert_WRLD(self._rec()), b'CNAM')
         assert cnam is not None, 'a CNAM-less worldspace would use Skyrim weather'
         assert struct.unpack('<I', cnam)[0] & 0x00FFFFFF == 0x15F
+
+    def test_no_dangling_climate_reference_when_disabled(self):
+        """With CLMT in SKIP_TYPES, a CNAM would point at a record that was
+        never written -- omit it rather than ship a dangling FormID."""
+        from tes5_import.constants import CONVERT_CLIMATE
+        from tes5_import.record_types.world import convert_WRLD
+        if CONVERT_CLIMATE:
+            pytest.skip('climate conversion enabled (CONVERT_CLIMATE)')
+        out = convert_WRLD(self._rec(**{'CNAM.Climate': '00097C60'}))
+        assert _find_subrecord(out, b'CNAM') is None
 
 
 class TestSkyMeshShaders:

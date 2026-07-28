@@ -3,6 +3,23 @@ Constants, lookup tables, and dispatch maps for TES4→TES5 conversion.
 """
 
 # ---------------------------------------------------------------------------
+# Feature flags
+# ---------------------------------------------------------------------------
+
+# Climate conversion — the WRLD -> CNAM -> CLMT -> WLST chain that makes the
+# converted WTHR records reachable in-game.  Development of this lives on the
+# `weather-conversion` branch; it is OFF here so master keeps the older,
+# known-good behaviour: WTHR records are still converted and written (they are
+# harmless and stay available for the branch to point at), but no CLMT is
+# emitted and worldspaces author no CNAM, so the game renders under Skyrim's
+# own default climate.
+#
+# Flip to True to re-enable — it gates every site: CLMT's dispatch entry and
+# SKIP_TYPES membership here, and the WRLD CNAM subrecord in
+# record_types/world.py.  convert_CLMT() itself is left intact and tested.
+CONVERT_CLIMATE = False
+
+# ---------------------------------------------------------------------------
 # Lookup tables
 # ---------------------------------------------------------------------------
 
@@ -335,8 +352,12 @@ def _init_dispatch():
         # needs the QUST aliases, which the generic dispatch runs too early for.
         'WATR': convert_WATR,
         'WTHR': convert_WTHR,
-        'CLMT': convert_CLMT,
     })
+
+    # Climate is gated on CONVERT_CLIMATE (see the flag at the top of this
+    # file).  Off by default; the converter and its tests stay in the tree.
+    if CONVERT_CLIMATE:
+        IMPORT_DISPATCH['CLMT'] = convert_CLMT
 
     TYPE_MAP.update({
         'CREA': 'NPC_',
@@ -363,13 +384,11 @@ def _init_dispatch():
         # to TES4 globals (TES4Fame, quest counters...), which read None if the
         # records don't exist. convert_GLOB drops the engine-time globals
         # (GameHour etc.) whose references are canonicalized to vanilla forms.
-        # CLMT is NOT skipped: TES5's climate record is near-identical to
-        # TES4's (same WLST list, FNAM/GNAM sun textures, TNAM timing; only the
-        # WLST entry widened by a Global FormID).  It is also the ONLY path to
-        # the converted WTHR records — weather is reached via
-        # WRLD -> CNAM -> CLMT -> WLST, never referenced directly — so skipping
-        # it left all 37 converted weathers orphaned and Cyrodiil rendering
-        # under Skyrim's default climate, sun and moons.
+        # CLMT is skipped unless CONVERT_CLIMATE is set — see the flag at the
+        # top of this file.  When enabled it is the ONLY path to the converted
+        # WTHR records (weather is reached via WRLD -> CNAM -> CLMT -> WLST,
+        # never referenced directly); when disabled the weathers are inert and
+        # Cyrodiil renders under Skyrim's default climate, sun and moons.
         'REGN',   # Region system differs
         'EYES',   # Do not convert — NPCs map to Skyrim head parts
         'HAIR',   # Do not convert — NPCs map to Skyrim head parts
@@ -381,6 +400,9 @@ def _init_dispatch():
         # QUST aliases to exist first, so PACK is written in its own phase after
         # QUST (import_main Phase 3b2).
     })
+
+    if not CONVERT_CLIMATE:
+        SKIP_TYPES.add('CLMT')
 
 
 # ---------------------------------------------------------------------------

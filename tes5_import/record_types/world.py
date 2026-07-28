@@ -4,6 +4,7 @@ import math
 import struct
 
 from ..constants import (
+    CONVERT_CLIMATE,
     MAP_MARKER_TYPE_MAP,
     MATT_MAP,
     SKYRIM_MAP_MARKER_LCRT,
@@ -310,26 +311,26 @@ def convert_WRLD(rec: dict) -> bytes:
     if wnam:
         subs += pack_formid_subrecord('WNAM', wnam)
 
-    # CNAM — Climate.  TES4 CLMT records ARE converted (they are the only path
-    # to the converted WTHR records: weather is selected via
-    # WRLD -> CNAM -> CLMT -> WLST), so this is a live reference, not a
-    # dangling one.  Without it the worldspace silently falls back to Skyrim's
-    # default climate and Cyrodiil renders under Skyrim's weather, sun and
-    # moons.  SNAM is still omitted — it references a TES4 record we skip.
+    # CNAM — Climate.  Gated on CONVERT_CLIMATE (tes5_import/constants.py):
+    # with climate conversion off, CLMT is in SKIP_TYPES, so a CNAM here would
+    # be a DANGLING reference — omit it and let the worldspace fall back to
+    # Skyrim's own default climate.  SNAM is omitted either way; it references a
+    # TES4 record we skip.
     #
-    # 57 of 84 TES4 worldspaces author no CNAM at all — including Tamriel
-    # itself, every Imperial City district and every walled city.  Oblivion
-    # resolves those at RUNTIME rather than at load: verified in Oblivion.exe
-    # (GOG/Steam 1.2.0.416), the sky setup at 0x667688 calls the worldspace's
-    # get-climate (0x4CAF90) and, when it returns null, falls through to
-    # 0x543200, which does LookupForm(0x15F) — the engine-created
-    # 'DefaultClimate' form (bootstrap at 0x44CCE9 pushes 0x15F and names it
-    # from the string at 0xA37CA0).  Skyrim has no such fallback: a missing
-    # CNAM there just yields Skyrim's own default climate.  So write TES4's
-    # DefaultClimate explicitly and the converted worldspace keeps Cyrodiil's
-    # sun, moons and weather list.
-    cnam = get_formid(rec, 'CNAM.Climate') or remap_formid(_TES4_DEFAULT_CLIMATE)
-    subs += pack_formid_subrecord('CNAM', cnam)
+    # With the flag on, the reference is live and matters: 57 of 84 TES4
+    # worldspaces author no CNAM at all — including Tamriel itself, every
+    # Imperial City district and every walled city.  Oblivion resolves those at
+    # RUNTIME rather than at load: verified in Oblivion.exe (GOG/Steam
+    # 1.2.0.416), the sky setup at 0x667688 calls the worldspace's get-climate
+    # (0x4CAF90) and, when it returns null, falls through to 0x543200, which
+    # does LookupForm(0x15F) — the engine-created 'DefaultClimate' form
+    # (bootstrap at 0x44CCE9 pushes 0x15F and names it from the string at
+    # 0xA37CA0).  Skyrim has no such fallback, so TES4's DefaultClimate is
+    # written explicitly and the worldspace keeps Cyrodiil's sun, moons and
+    # weather list.
+    if CONVERT_CLIMATE:
+        cnam = get_formid(rec, 'CNAM.Climate') or remap_formid(_TES4_DEFAULT_CLIMATE)
+        subs += pack_formid_subrecord('CNAM', cnam)
 
     # Water: TES4 WATR records are in skipTypes (we use Skyrim's water), so
     # point NAM2 (water type) and NAM3 (LOD water type) at Skyrim.esm's
