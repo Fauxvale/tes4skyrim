@@ -815,6 +815,12 @@ _TEX_TRANSFORM_VARS = {
 }
 
 
+# NiTexturingProperty.apply_mode = APPLY_HILIGHT2: Oblivion's detail/overlay
+# pass, where the diffuse alpha is a blend WEIGHT rather than transparency.
+# Skyrim has no equivalent -- see the alpha handling in _process_geometry.
+_APPLY_HILIGHT2 = 4
+
+
 def _collect_tex_transform_ctrls(props):
     """Harvest animated NiTextureTransformControllers from Oblivion properties.
 
@@ -996,6 +1002,7 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     diffuse_path = b''
     has_double_sided = False
     alpha_prop = None
+    tex_apply_mode = None   # NiTexturingProperty.apply_mode (detail-overlay detection)
     emissive_r = 0.0
     emissive_g = 0.0
     emissive_b = 0.0
@@ -1010,6 +1017,7 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         if isinstance(prop, NifFormat.NiTexturingProperty):
             if prop.has_base_texture and prop.base_texture.source:
                 diffuse_path = prop.base_texture.source.file_name
+            tex_apply_mode = int(prop.apply_mode)
             # Detect NiFlipController: Oblivion fire/effect quads animate through
             # multiple NiSourceTexture frames.  We'll move this to the NiTriShape
             # and use BSEffectShaderProperty so the frames survive conversion.
@@ -1202,7 +1210,31 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     else:
         ts.bs_properties[0] = shader
     if alpha_prop is not None:
-        ts.bs_properties[1] = alpha_prop
+        # Oblivion's APPLY_HILIGHT2 (4) is a DETAIL-OVERLAY apply mode: the
+        # diffuse's alpha channel is a per-texel BLEND WEIGHT for laying the
+        # texture over the surface, NOT a transparency mask.  Skyrim has no
+        # such mode -- it reads the same channel as plain transparency, so the
+        # SI mania/dementia rocks render see-through, and where the weight is
+        # low they disappear completely (seisland's body texture mrock01.dds
+        # averages alpha 133 = the whole island ~50% transparent).
+        #
+        # These are provably not cutout masks: 97-99% of texels are PARTIALLY
+        # opaque with almost no fully-transparent region (mrock01 97.9% >= 1
+        # but only 22% >= 254; DMRockSideRoot01 99.0% >= 1 and 0% >= 254), so
+        # there is no shape being cut out and nothing to preserve.  Vanilla
+        # agrees: across 600 landscape/clutter meshes, 1088/1313 shapes ship
+        # NO NiAlphaProperty at all and the commonest value on the rest is
+        # 0x12EC (test, blend OFF) -- vanilla rock simply does not alpha-blend.
+        # So drop the property and let the rock render solid.
+        #
+        # Only the overlay case is touched.  Genuine transparency (gems,
+        # bottles, curtains, potion liquids) ships MODULATE/HILIGHT and keeps
+        # its alpha exactly as authored.
+        if tex_apply_mode == _APPLY_HILIGHT2 and (int(alpha_prop.flags) & 0x0001):
+            stats['hilight2_alpha_dropped'] = \
+                stats.get('hilight2_alpha_dropped', 0) + 1
+        else:
+            ts.bs_properties[1] = alpha_prop
 
     # Re-emit the harvested UV animation onto whichever shader we settled on.
     _attach_tex_transform_ctrls(ts.bs_properties[0], tex_transforms)
@@ -1274,6 +1306,58 @@ def _process_controller_manager(node, palette):
             # Strip material and morph controllers (not supported in Skyrim)
             if isinstance(blk.controller, (NifFormat.NiMaterialColorController,
                                            NifFormat.NiGeomMorpherController)):
+                seq.controlled_blocks.pop(key)
+                seq.num_controlled_blocks -= 1
+                continue
+
+            # A NiControllerSequence names its controller TYPE as a string and
+            # the engine instantiates it by name when the sequence loads, so an
+            # Oblivion-only type here fails the WHOLE NIF -> red missing-mesh
+            # triangle (se11sheopooffx, palacefont01, se01waitingroomwalls).
+            # Census of ~8,300 vanilla Skyrim meshes: NiTextureTransformController
+            # and NiAlphaController appear ZERO times; the controlled_block types
+            # vanilla does use are BS*ShaderPropertyFloatController, NiPSys*Ctlr,
+            # NiTransformController and NiVisController.
+            #
+            # RETARGET rather than drop: the animation CURVE lives on the
+            # sequence entry's own interpolator (palacefont01's scrolling water
+            # is 3 x NiFloatInterpolator, 2 keys, V 0 -> -2/-4/-1 over 2s), while
+            # the controller block itself holds only a NiBlendFloatInterpolator
+            # with no inline keys -- which is exactly why the harvest in
+            # _collect_tex_transform_ctrls skips these and they would otherwise
+            # be lost.  Point the entry at the Skyrim shader float controller
+            # and keep the interpolator as-is; both engines read the curve as a
+            # UV offset/scale over time.
+            # The block the entry POINTS AT must be replaced too -- rewriting
+            # only the type string leaves the Oblivion block in the file's
+            # block-type table, which is what the engine rejects.
+            if isinstance(blk.controller, NifFormat.NiTextureTransformController):
+                src_ctrl = blk.controller
+                op = getattr(src_ctrl, 'operation', None)
+                if op in _TEX_TRANSFORM_VARS:
+                    new = NifFormat.BSLightingShaderPropertyFloatController()
+                    # 0x48 = Active | Compute Scaled Time (every vanilla shader
+                    # float controller); keep the source CLAMP/REVERSE bits.
+                    new.flags = 0x48 | (int(getattr(src_ctrl, 'flags', 0)) & 0x06)
+                    new.frequency = getattr(src_ctrl, 'frequency', 1.0) or 1.0
+                    new.phase = getattr(src_ctrl, 'phase', 0.0)
+                    new.start_time = src_ctrl.start_time
+                    new.stop_time = src_ctrl.stop_time
+                    new.type_of_controlled_variable = _TEX_TRANSFORM_VARS[op][0]
+                    new.interpolator = blk.interpolator
+                    blk.controller = new
+                    blk.controller_type = b'BSLightingShaderPropertyFloatController'
+                    key += 1
+                    continue
+                # TT_ROTATE has no Skyrim equivalent -- drop the entry.
+                seq.controlled_blocks.pop(key)
+                seq.num_controlled_blocks -= 1
+                continue
+
+            # NiAlphaController animates NiAlphaProperty's alpha.  There is no
+            # inline-key equivalent to retarget it onto here, so drop the entry
+            # rather than leave an unresolvable type in the sequence.
+            if isinstance(blk.controller, NifFormat.NiAlphaController):
                 seq.controlled_blocks.pop(key)
                 seq.num_controlled_blocks -= 1
                 continue
@@ -3165,6 +3249,24 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                         replacement = block_map.get(id(obj_entry.av_object))
                         if replacement is not None:
                             obj_entry.av_object = replacement
+
+            # Fix NiPSysMeshEmitter.emitter_meshes the same way.  Mesh emitters
+            # reference their source geometry through a SECOND link, outside the
+            # children arrays that _walk_node rewrites — so when a NiTriStrips
+            # emitter mesh is replaced by its NiTriShape equivalent, the emitter
+            # still points at the ORPHANED strips block.  PyFFI then re-serializes
+            # that block (it is still reachable), leaving raw Oblivion NiTriStrips
+            # in a Skyrim file.  Skyrim has no NiTriStrips renderer — vanilla is
+            # 107/107 NiTriShape across all 256 NiPSysMeshEmitter meshes — so the
+            # engine fails the whole NIF and draws the red missing-mesh triangle
+            # (se11sheopooffx, se01waitingroomwalls, palacefont01).
+            for block in root.tree():
+                if not isinstance(block, NifFormat.NiPSysMeshEmitter):
+                    continue
+                for mi in range(len(block.emitter_meshes)):
+                    replacement = block_map.get(id(block.emitter_meshes[mi]))
+                    if replacement is not None:
+                        block.emitter_meshes[mi] = replacement
 
         # Skyrim requires collision on the root node only.
         # If we did NOT wrap, check whether a child holds the collision and hoist it.
