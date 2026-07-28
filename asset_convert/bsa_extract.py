@@ -125,11 +125,24 @@ _EXTRA_BSA_BASES = {
 # SEWorld renders with no distant objects, and the 8 SI grasses count as
 # "missing" in the grass step.
 #
-# Keyed off Oblivion.esm ONLY. Converting DLCShiveringIsles.esp itself still
-# extracts just its own BSAs via the normal stem probe, so the assets are not
-# duplicated into both outputs.
+# This claim is EXCLUSIVE: because the merged-into plugin extracts the DLC's
+# BSAs, the DLC plugin itself must NOT extract them again (see
+# _SUPPRESSED_BSA_BASES). Its records all live in the master, so a second copy
+# of the same 15,914 files (~1.2 GB, byte-identical) buys nothing.
 _MERGED_DLC_BSA_BASES = {
     "oblivion": ["DLCShiveringIsles"],
+}
+
+# The reverse side of _MERGED_DLC_BSA_BASES: plugin stem → BSA name bases that
+# some OTHER plugin already extracts, so this plugin skips them entirely.
+# DLCShiveringIsles.esp is the header-only GOTY stub (HEDR.NumRecords=0) whose
+# every record was merged into Oblivion.esm; Oblivion.esm therefore owns the SI
+# assets and the stub extracts nothing. Derived from the table above so the two
+# halves cannot drift apart.
+_SUPPRESSED_BSA_BASES = {
+    base.lower()
+    for bases in _MERGED_DLC_BSA_BASES.values()
+    for base in bases
 }
 
 
@@ -144,9 +157,18 @@ def _get_bsa_files(data_path, source_file):
 
     Nehrim.esm → N - Meshes/Textures1/Textures2/Sounds/Misc.bsa and
                  L - Voices/Misc.bsa (see _EXTRA_BSA_BASES).
+
+    DLCShiveringIsles.esp extracts NOTHING: Oblivion.esm already claims the SI
+    BSAs (see _MERGED_DLC_BSA_BASES / _SUPPRESSED_BSA_BASES).
     """
     data_dir = Path(data_path)
     stem = Path(source_file).stem  # e.g. "Oblivion", "Knights", "Nehrim"
+
+    # A plugin whose BSAs another plugin already extracts claims none of its
+    # own. The GOTY DLCShiveringIsles.esp stub is the case: Oblivion.esm holds
+    # every SI record and extracts "DLCShiveringIsles - *.bsa" on its behalf.
+    if stem.lower() in _SUPPRESSED_BSA_BASES:
+        return []
 
     # Probe the plugin stem, any hardcoded extra bases (e.g. Nehrim → N, L),
     # and the BSAs of a DLC merged into this plugin (GOTY Oblivion.esm owns
@@ -395,6 +417,14 @@ def extract_assets_for_file(source_file, data_path, extract_dir, force=False):
     Returns:
         dict with overall stats.
     """
+    # Distinguish "another plugin owns these BSAs" from "we found nothing" —
+    # the former is the intended outcome, not a missing-asset warning.
+    if Path(source_file).stem.lower() in _SUPPRESSED_BSA_BASES:
+        print(f"Skipping BSA extraction for {source_file}: its archives are "
+              f"extracted by the plugin they were merged into "
+              f"(see _MERGED_DLC_BSA_BASES)")
+        return {'bsas_found': 0, 'suppressed': True}
+
     bsa_files = _get_bsa_files(data_path, source_file)
 
     if not bsa_files:
