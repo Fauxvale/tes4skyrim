@@ -186,6 +186,33 @@ def _part_sets_by_folder(export_dir: str) -> dict:
     return out
 
 
+def _crea_model_dirs(export_dir: str) -> set:
+    """The mesh directories CREA records point their Model.MODL at, as
+    lowercase paths relative to the meshes root (Model.MODL is already
+    meshes-relative: "Creatures\\Rat\\skeleton.nif").
+
+    Used to break ties when two folders share a leaf name (Morrowind_ob has
+    both meshes\\characters\\draugr — a humanoid body-part folder — and
+    meshes\\creatures\\aa_blood\\draugr, which is the one its CREA records
+    actually reference). Picking by what the records use beats any
+    walk-order heuristic."""
+    from tes5_import.text_reader import parse_export_file
+
+    crea_path = os.path.join(export_dir, 'CREA.txt')
+    if not os.path.exists(crea_path):
+        return set()
+    out = set()
+    for rec in parse_export_file(crea_path):
+        model = (rec.get('Model.MODL') or '').replace('/', '\\')
+        model = model.replace('\\\\', '\\').lower().lstrip('\\')
+        parts = [p for p in model.split('\\') if p]
+        if parts and parts[0] == 'meshes':
+            parts = parts[1:]
+        if len(parts) >= 2:
+            out.add('\\'.join(parts[:-1]))
+    return out
+
+
 def convert_creatures(export_dir: str, out_meshes_dir: str,
                       skyrim_data_path: str = None,
                       names: list = None, workers: int = None,
@@ -200,28 +227,58 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
     """
     from asset_convert.animation_data import write_singlefiles
 
-    creatures_root = os.path.join(export_dir, 'meshes', 'creatures')
-    if not os.path.isdir(creatures_root):
-        log(f'  No creatures folder at {creatures_root}')
+    meshes_root = os.path.join(export_dir, 'meshes')
+    if not os.path.isdir(meshes_root):
+        log(f'  No meshes folder at {meshes_root}')
         return {'projects': {}, 'errors': {}}
 
-    dirs = []
-    for name in sorted(os.listdir(creatures_root)):
-        cdir = os.path.join(creatures_root, name)
-        if not os.path.isdir(cdir):
+    # A creature is ANY folder holding a skeleton.nif plus .kf animations —
+    # not just the direct children of meshes\creatures.  Oblivion itself uses
+    # that flat layout, but plugins nest theirs freely: Morrowind_ob ships 67
+    # such folders under meshes\morro\creatures\<name>,
+    # meshes\morroblivion\creatures\<category>\<name> and deeper
+    # (…\symphony\fbr\fst), of which the old depth-1 scan of meshes\creatures
+    # found only 16 — the other 167 CREA records fell through to Skyrim race
+    # aliasing and shipped as BASE SKYRIM creatures.  Walking the whole mesh
+    # tree keys on the same last-path-component the record side derives from
+    # Model.MODL, so discovery and lookup agree for any layout.
+    referenced = _crea_model_dirs(export_dir)
+    candidates = []
+    for cdir, subdirs, files in os.walk(meshes_root):
+        lower = {f.lower() for f in files}
+        if 'skeleton.nif' not in lower:
             continue
+        name = os.path.basename(cdir)
         if names and name.lower() not in {n.lower() for n in names}:
             continue
         if name.lower() in _EXCLUDE and not names:
             log(f'  [skip] {name}: excluded (test/cinematic asset)')
             continue
-        if not os.path.exists(os.path.join(cdir, 'skeleton.nif')):
-            log(f'  [skip] {name}: no skeleton.nif')
-            continue
-        if not any(f.lower().endswith('.kf') for f in os.listdir(cdir)):
+        if not any(f.endswith('.kf') for f in lower):
             log(f'  [skip] {name}: no animations')
             continue
+        rel = os.path.relpath(cdir, meshes_root).lower().replace('/', '\\')
+        candidates.append((cdir, name, rel in referenced))
+
+    # Two folders can share a leaf name (Morrowind_ob ships both
+    # meshes\characters\draugr and meshes\creatures\aa_blood\draugr).  They
+    # would collide in the output tree (actors/tes4/<name>) and in the
+    # record-side lookup, which is keyed on that same leaf.  Prefer whichever
+    # folder the CREA records actually point at; otherwise fall back to the
+    # shallowest path, then alphabetical, so the choice is deterministic.
+    seen_names = {}
+    dirs = []
+    for cdir, name, is_ref in sorted(
+            candidates,
+            key=lambda c: (not c[2], c[0].count(os.sep), c[0].lower())):
+        key = name.lower()
+        if key in seen_names:
+            log(f'  [skip] {cdir}: duplicate creature name "{name}" '
+                f'(using {seen_names[key]})')
+            continue
+        seen_names[key] = cdir
         dirs.append((cdir, name))
+    dirs.sort(key=lambda d: d[1].lower())
 
     # Distinct NIFZ part sets per folder (dog/wolf/skeletal-hound share a
     # folder but each merges into its own whole-animal NIF).
