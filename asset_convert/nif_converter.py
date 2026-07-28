@@ -2887,6 +2887,29 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         if root is None:
             continue
 
+        # Bare geometry roots.  A few Oblivion-era meshes are authored with a
+        # NiTriShape/NiTriStrips as the ROOT block, with no node above it.
+        # Skyrim never ships one: a 400-mesh vanilla census found 0 geometry
+        # roots (BSFadeNode 340, NiNode 55, BSMasterParticleSystem 2,
+        # BSLeafAnimNode 3), and anything walking the tree as a node scene
+        # graph breaks on them — LODGenx64 hard-crashes with
+        # "Unable to cast NiTriShape to NiNode" and abandons the ENTIRE
+        # worldspace's object LOD, not just the offending mesh.  Wrap the
+        # geometry in a NiNode so it converts to BSFadeNode like any other
+        # static below.  The geometry keeps its own transform, so wrapping is
+        # visually identity.
+        if isinstance(root, (NifFormat.NiTriShape, NifFormat.NiTriStrips)):
+            holder = NifFormat.NiNode()
+            holder.name = root.name
+            holder.flags = NIF_FLAGS
+            holder.num_children = 1
+            holder.children.update_size()
+            holder.children[0] = root
+            data.roots[i] = holder
+            root = holder
+            stats['geometry_roots_wrapped'] = \
+                stats.get('geometry_roots_wrapped', 0) + 1
+
         # NiBillboardNode roots.  A NiBillboardNode re-orients its ENTIRE
         # subtree to face the camera every frame.  For a pure billboard sprite
         # that's fine, but Oblivion fire/effect NIFs put the particle-system

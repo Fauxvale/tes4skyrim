@@ -354,6 +354,49 @@ def _mesh_exists(path: str, output_meshes_dir: Path) -> bool:
     return (output_meshes_dir / rel).exists()
 
 
+# LODGenx64 casts every LOD mesh's root block to NiNode without checking. A
+# root that is a bare geometry block throws
+# "InvalidCastException: Unable to cast NiTriShape to NiNode" on a worker
+# thread, which is UNHANDLED — the process dies and the ENTIRE worldspace gets
+# no object LOD at all (two 4-triangle scum meshes cost Morrowind_ob all
+# 75,000 of its LOD references).  nif_converter now wraps geometry roots so
+# converted meshes are safe, but stale files from an older run, hand-authored
+# _far.nif meshes and anything a future source ships can still trip it, and
+# the failure mode is far too expensive to risk.  Screening costs one small
+# header read per unique mesh.
+_NIF_ROOT_SAFE_CACHE = {}
+
+
+def _lod_mesh_is_safe(path: str, output_meshes_dir: Path) -> bool:
+    """False if this mesh's root block would crash LODGen's NiNode cast."""
+    rel = path.lower().replace('/', '\\').lstrip('\\')
+    if rel.startswith('meshes\\'):
+        rel = rel[len('meshes\\'):]
+    full = output_meshes_dir / rel
+    key = str(full).lower()
+    cached = _NIF_ROOT_SAFE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    safe = True
+    try:
+        from .lod_far_gen import NifFormat
+        data = NifFormat.Data()
+        with open(full, 'rb') as fh:
+            data.read(fh)
+        roots = data.roots
+        if not roots or roots[0] is None:
+            safe = False
+        else:
+            safe = isinstance(roots[0], NifFormat.NiNode)
+    except Exception:
+        # Unreadable here means unreadable for LODGen too — leave it out
+        # rather than gamble the whole worldspace on it.
+        safe = False
+    _NIF_ROOT_SAFE_CACHE[key] = safe
+    return safe
+
+
 # Objects smaller than this (max OBND dimension, game units) are only baked
 # into the near LOD-4 tiles.  A level-8 tile starts ~2 cells out; small
 # clutter is invisible there but its baked geometry still costs disk/VRAM.
@@ -482,6 +525,7 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
 
     # Collect exterior REFR records in this worldspace whose base is a STAT/ACTI/etc.
     lines = []
+    skipped_unsafe = set()
 
     for ref in refs:
         # Must be in our worldspace
@@ -510,6 +554,14 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
         lod4, lod8, lod16 = _lod_meshes_for(stat, output_meshes_dir)
         if not (lod4 or lod8 or lod16):
             continue
+        # One mesh LODGen cannot parse aborts the whole worldspace, so screen
+        # each listed mesh (and the full model it falls back to) up front.
+        unsafe = [m for m in (model, lod4, lod8, lod16)
+                  if m and not _lod_mesh_is_safe(m, output_meshes_dir)]
+        if unsafe:
+            for m in unsafe:
+                skipped_unsafe.add(_normalize(m))
+            continue
         mat = ''
         stat_edid   = stat.get('edid', f'{base_fid:08X}')
         stat_flags  = f"{stat_flags_val:08X}"
@@ -529,6 +581,15 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
                 f"{rx:.4f}\t{ry:.4f}\t{rz:.4f}\t"
                 f"{scale:.4f}\t{base_entry}")
         lines.append(line)
+
+    if skipped_unsafe:
+        print(f"  WARNING: {len(skipped_unsafe)} LOD mesh(es) excluded — "
+              f"unreadable or non-NiNode root (would crash LODGen and lose "
+              f"ALL of this worldspace's object LOD):")
+        for m in sorted(skipped_unsafe)[:10]:
+            print(f"    {m}")
+        if len(skipped_unsafe) > 10:
+            print(f"    ... and {len(skipped_unsafe) - 10} more")
 
     if not lines:
         print(f"  No LOD references found for worldspace '{edid}'")
