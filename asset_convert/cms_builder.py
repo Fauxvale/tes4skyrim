@@ -293,7 +293,25 @@ def build_cms_collision(tris, sk_material, NifFormat):
 
     report = run_mopp_bridge(vertices, triangles, shape_keys)
     if report is None:
-        return None
+        # Degenerate-scale retry.  Havok's MOPP/welding builder access-violates
+        # on hulls only a few hundredths of a havok unit across (it divides by
+        # near-zero edge lengths): Oblivion clutter ships them (paintbrush01 =
+        # 0.034 hu) and Morroblivion worse (inucaveuplant00 = 0.0098 hu, ~1000x
+        # smaller than its own visual mesh).  The MOPP encodes geometry as
+        # (v - origin) * scale, so building it over vertices scaled by k and
+        # then storing origin/k with scale*k is an EXACT restatement of the
+        # same bytecode for the original geometry -- no approximation, and the
+        # CMS/chunk data below is untouched (still native scale).
+        for k in (10.0, 100.0, 1000.0):
+            scaled = [(x * k, y * k, z * k) for x, y, z in vertices]
+            report = run_mopp_bridge(scaled, triangles, shape_keys)
+            if report is not None:
+                report = dict(report)
+                report['mopp_origin'] = [c / k for c in report['mopp_origin']]
+                report['mopp_scale'] = report['mopp_scale'] * k
+                break
+        if report is None:
+            return None
     code = bytes.fromhex(report['mopp_data_hex'])
     if not code:
         return None

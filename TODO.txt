@@ -37,7 +37,7 @@ Major Issues for V1:
 		furnushrineurilmsu01.nif is on its side
 		containuchestusmallu02.nif is moving through the air
 		tikitorch.nif is spinning through the air
-		Also last 3 game crashes
+
 Later Issues:
 
 	2 - Refine creature conversion further. Speed is still a bit off

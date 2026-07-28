@@ -301,6 +301,39 @@ def _repair_inverted_floors(tris):
     return out, len(flip)
 
 
+def _set_packed_sub_shape(packed, num_vertices, sk_material, layer=1):
+    """Write the single covering sub-shape onto a bhkPackedNiTriStripsShape.
+
+    The sub-shape list MOVED between the two formats (nif.xml):
+
+        bhkPackedNiTriStripsShape.Num Sub Shapes   until="20.0.0.5"  (Oblivion)
+        hkPackedNiTriStripsData.Num Sub Shapes     since="20.2.0.7"  (Skyrim)
+
+    So at Skyrim's 20.2.0.7 the count written on the *shape* is not even
+    serialised, and the engine reads the one on the *data* block.  Writing
+    only the Oblivion-side field left every fallback shape claiming zero
+    sub-shapes while carrying real geometry; Skyrim's reader sizes its
+    sub-part allocation from that count, then memcpys the vertex/triangle
+    payload into the undersized buffer — an access violation inside
+    VCRUNTIME140 on load (crash-2026-07-27/28, inucaveuplant00.nif).
+
+    Both fields are set so the shape is correct at either version.
+    """
+    packed.num_sub_shapes = 1
+    packed.sub_shapes.update_size()
+    packed.sub_shapes[0].layer = layer
+    packed.sub_shapes[0].num_vertices = num_vertices
+    _set_havok_material(packed.sub_shapes[0].material, sk_material)
+
+    data = packed.data
+    if data is not None and hasattr(data, 'num_sub_shapes'):
+        data.num_sub_shapes = 1
+        data.sub_shapes.update_size()
+        data.sub_shapes[0].layer = layer
+        data.sub_shapes[0].num_vertices = num_vertices
+        _set_havok_material(data.sub_shapes[0].material, sk_material)
+
+
 def _ni_strips_to_packed(bhk_strips):
     """Convert bhkNiTriStripsShape → bhkPackedNiTriStripsShape.
 
@@ -352,18 +385,14 @@ def _ni_strips_to_packed(bhk_strips):
             hkdata.triangles[i].normal.z = nz
 
         packed = NifFormat.bhkPackedNiTriStripsShape()
-        packed.num_sub_shapes = 1
-        packed.sub_shapes.update_size()
-        packed.sub_shapes[0].layer = 1       # LAYER_STATIC
-        packed.sub_shapes[0].num_vertices = len(all_verts)
-        # material is an enum, copy from source
-        packed.sub_shapes[0].material = bhk_strips.material
+        packed.data = hkdata
+        _set_packed_sub_shape(packed, len(all_verts),
+                              _get_havok_material(bhk_strips.material))
         packed.scale.x = 1.0
         packed.scale.y = 1.0
         packed.scale.z = 1.0
         packed.unknown_float_1 = 0.1
         packed.unknown_float_3 = 0.1
-        packed.data = hkdata
         return packed
     except Exception:
         return None
@@ -505,18 +534,40 @@ def _packed_from_tris(tris, sk_material):
         hkdata.triangles[i].normal.z = nz
 
     packed = NifFormat.bhkPackedNiTriStripsShape()
-    packed.num_sub_shapes = 1
-    packed.sub_shapes.update_size()
-    packed.sub_shapes[0].layer = 1  # LAYER_STATIC
-    packed.sub_shapes[0].num_vertices = len(packed_verts)
-    _set_havok_material(packed.sub_shapes[0].material, sk_material)
+    packed.data = hkdata
+    _set_packed_sub_shape(packed, len(packed_verts), sk_material)
     packed.scale.x = 1.0
     packed.scale.y = 1.0
     packed.scale.z = 1.0
     packed.unknown_float_1 = 0.1
     packed.unknown_float_3 = 0.1
-    packed.data = hkdata
     return packed
+
+
+# Smallest AABB extent (havok units) a mesh collision hull may have.
+#
+# Havok's MOPP builder access-violates on hulls a few hundredths of a havok
+# unit across; cms_builder now recovers those by building the MOPP in a
+# scaled-up frame (exact, see the degenerate-scale retry there), so a small
+# hull is NOT by itself a reason to discard collision -- vanilla Oblivion
+# clutter genuinely ships them (paintbrush01 = 0.034 hu) and it must stay
+# grabbable.
+#
+# This threshold therefore only catches hulls that are sub-viable in the
+# engine regardless of MOPP: 0.01 hu is 0.07 game units, i.e. sub-millimetre,
+# far below the smallest vanilla Skyrim hull (0.179 hu) and small enough that
+# nothing can ever collide with it.  Morroblivion's inucaveuplant00 (0.0098 hu
+# against a 73.5-game-unit visual mesh, ~1000x too small) is the case in
+# point: its collision is meaningless, so it is dropped rather than shipped.
+_MIN_HULL_EXTENT = 0.01
+
+# Mesh collisions dropped as degenerate (list so process workers can mutate).
+_DEGENERATE_HULLS_DROPPED = [0]
+
+
+def degenerate_hull_drop_count():
+    """Mesh collision hulls dropped as sub-viable since process start."""
+    return _DEGENERATE_HULLS_DROPPED[0]
 
 
 def _rebuild_mesh_collision(rb, target_node):
@@ -525,8 +576,11 @@ def _rebuild_mesh_collision(rb, target_node):
     Handles rb.shape being bhkNiTriStripsShape, bhkPackedNiTriStripsShape,
     or a stale Oblivion bhkMoppBvTreeShape wrapping either.  Bakes any
     bhkRigidBodyT transform into the geometry (body becomes plain identity
-    bhkRigidBody).  Returns True when handled; False → caller uses the
-    primitive-shape conversion path.
+    bhkRigidBody).
+
+    Returns True when handled, False → caller uses the primitive-shape
+    conversion path, or 'drop' → caller removes the collision object
+    entirely (degenerate sub-viable hull).
     """
     shape = rb.shape
     inner = shape.shape if isinstance(shape, NifFormat.bhkMoppBvTreeShape) else shape
@@ -538,6 +592,16 @@ def _rebuild_mesh_collision(rb, target_node):
             if all(math.isfinite(c) for v in t for c in v)]
     if not tris:
         return False
+
+    # Degenerate hull: too small for Havok to build a MOPP over, and far too
+    # small to collide with anything.  Drop it instead of shipping a shape
+    # that crashes the MOPP builder and lands on the packed fallback.
+    lo = [min(v[i] for t in tris for v in t) for i in range(3)]
+    hi = [max(v[i] for t in tris for v in t) for i in range(3)]
+    if max(hi[i] - lo[i] for i in range(3)) < _MIN_HULL_EXTENT:
+        _DEGENERATE_HULLS_DROPPED[0] += 1
+        return 'drop'
+
     tris = _bake_body_transform_into_tris(rb, tris)
     tris, n_flipped = _repair_inverted_floors(tris)
     if n_flipped:
@@ -895,6 +959,41 @@ def _convert_shape(shape, root_node):
         return _convert_shape(shape.shape, root_node)
 
     if isinstance(shape, NifFormat.bhkPackedNiTriStripsShape):
+        # Reached only as a bhkListShape child (the standalone case is rebuilt
+        # as MOPP+CMS by _rebuild_mesh_collision).  Rebuild it the same way so
+        # a list child gets real Skyrim collision; if the MOPP bridge rejects
+        # the geometry, at least migrate the sub-shape count to the field
+        # Skyrim actually reads (see _set_packed_sub_shape) — leaving the
+        # Oblivion-side count made the engine allocate zero sub-parts and then
+        # memcpy the payload over unmapped memory (crash on load).
+        soup = _shape_tri_soup(shape)
+        if soup is not None:
+            tris, sk_material = soup
+            tris = [t for t in tris
+                    if all(math.isfinite(c) for v in t for c in v)]
+            if tris:
+                lo = [min(v[i] for t in tris for v in t) for i in range(3)]
+                hi = [max(v[i] for t in tris for v in t) for i in range(3)]
+                if max(hi[i] - lo[i] for i in range(3)) < _MIN_HULL_EXTENT:
+                    _DEGENERATE_HULLS_DROPPED[0] += 1
+                    return None
+                mopp = build_cms_collision(tris, sk_material, NifFormat)
+                if mopp is not None:
+                    mopp.shape.target = root_node
+                    return mopp
+                rebuilt = _packed_from_tris(tris, sk_material)
+                if rebuilt is not None:
+                    return rebuilt
+        # Could not rebuild — repair the sub-shape count in place.
+        data = getattr(shape, 'data', None)
+        if (data is not None and getattr(data, 'num_sub_shapes', 0) == 0
+                and getattr(data, 'num_vertices', 0) > 0):
+            material = 3741512247
+            if shape.num_sub_shapes > 0:
+                material = _get_havok_material(shape.sub_shapes[0].material)
+                if 0 <= material <= 31:
+                    material = _OB_TO_SK_MATERIAL.get(material, 3741512247)
+            _set_packed_sub_shape(shape, data.num_vertices, material)
         return shape
 
     # Unknown shape — return as-is
@@ -1424,7 +1523,13 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
     # body, like all 6341 vanilla CMS meshes).  The CMS target is the root
     # BSFadeNode — static collision must live on the root.
     target_node = actual_root if actual_root is not None else node
-    if not _rebuild_mesh_collision(rb, target_node):
+    rebuilt = _rebuild_mesh_collision(rb, target_node)
+    if rebuilt == 'drop':
+        # Sub-viable hull (see _MIN_HULL_EXTENT) — ship no collision at all
+        # rather than a shape that crashes Skyrim's loader.
+        node.collision_object = None
+        return
+    if not rebuilt:
         rb.shape = _convert_shape(rb.shape, target_node)
     _convert_materials(rb.shape)
 
