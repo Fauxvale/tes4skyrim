@@ -283,6 +283,58 @@ def _build_skin(writer, folder: str, bodies: list, race_fid: int,
     writer.add_record('ARMO', pack_record('ARMO', skin_fid, 4, subs))
 
 
+def _load_projects(export_dir: str) -> dict:
+    """This plugin's creature projects, with its MASTERS' projects merged in
+    underneath.
+
+    A plugin with a TES4 master re-uses the master's creature folders wholesale
+    (Morrowind_ob.esm places 86 CREA records on Oblivion.esm's rat/skeleton/
+    goblin/... meshes, which its own BSA never ships, so the creatures step
+    extracts no folder for them and its creature_projects.json has no entry).
+    Without the master's projects those CREA records fell through to
+    resolve_creature_race and shipped as BASE SKYRIM creatures — a Skyrim
+    frostbite spider or a Nord standing in for the converted Oblivion actor.
+
+    The master's generated behavior project, skeleton and merged body NIFs all
+    live under ITS output dir and are loaded by path at runtime, so pointing
+    this plugin's generated RACE chain at them is correct: the assets exist and
+    are shared, exactly as the source plugin intended. Own projects win on
+    conflict — this plugin's own conversion of a folder is the authoritative
+    one for the records it ships."""
+    own_path = os.path.join(export_dir, 'creature_projects.json')
+    own = {}
+    if os.path.exists(own_path):
+        with open(own_path, encoding='utf-8') as f:
+            own = json.load(f)
+
+    header = os.path.join(export_dir, '_HEADER.txt')
+    if not os.path.isfile(header):
+        return own
+    names = []
+    with open(header, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.startswith('Master['):
+                _, _, val = line.partition('=')
+                names.append(val.strip())
+
+    root = os.path.dirname(os.path.normpath(export_dir))
+    merged, inherited = {}, 0
+    for name in names:
+        mpath = os.path.join(root, name, 'creature_projects.json')
+        if not os.path.exists(mpath):
+            continue
+        with open(mpath, encoding='utf-8') as f:
+            for folder, proj in json.load(f).items():
+                if folder not in own and folder not in merged:
+                    merged[folder] = proj
+                    inherited += 1
+    if inherited:
+        print(f'  Creature projects: inherited {inherited} from master(s) '
+              f'{", ".join(names)} (own: {len(own)})')
+    merged.update(own)
+    return merged
+
+
 def build_creature_races(by_type: dict, writer, export_dir: str) -> None:
     """Phase 0f: one generated RACE + skin ARMO/ARMA per unique
     (creature folder, body-part set) among CREA records with a converted
@@ -290,13 +342,11 @@ def build_creature_races(by_type: dict, writer, export_dir: str) -> None:
     global _PROJECTS
     _CREA_RACE_MAP.clear()
 
-    proj_path = os.path.join(export_dir, 'creature_projects.json')
-    if not os.path.exists(proj_path):
+    _PROJECTS = _load_projects(export_dir)
+    if not _PROJECTS:
         print('  Creature projects: none (creature_projects.json missing — '
               'run the creatures step); CREA falls back to race aliasing')
         return
-    with open(proj_path, encoding='utf-8') as f:
-        _PROJECTS = json.load(f)
 
     def _folder_of(rec):
         model = (get_str(rec, 'Model.MODL') or '').replace('/', '\\')

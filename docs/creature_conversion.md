@@ -464,11 +464,36 @@ creature is fully proven.
   hkx deserialize cleanly through hkxcmd (real Havok).
 - **CREATURE PIPELINE IS LIVE END-TO-END (2026-07-09)** — pipeline Phase 4b /
   `--creatures-only` / GUI step "5. Creatures": `asset_convert/creature_pipeline.py`
-  converts every `export/<plugin>/meshes/creatures/<name>/` folder (32/32 real
-  Oblivion.esm creatures; `boxtest`+`endgame` excluded — test asset / unparseable KFM
-  cinematic) → behavior project + converted skeleton.nif/body NIFs + animation singlefile
-  registration + `export/<plugin>/creature_projects.json`. MUST run before import (Phase
-  0f consumes the json).
+  converts every creature folder → behavior project + converted skeleton.nif/body NIFs +
+  animation singlefile registration + `export/<plugin>/creature_projects.json`. MUST run
+  before import (Phase 0f consumes the json). `boxtest`+`endgame` are excluded (test asset
+  / unparseable KFM cinematic).
+- **A creature folder is ANY folder with `skeleton.nif` + `.kf` files, at any depth**
+  (fixed 2026-07-27). Oblivion.esm uses the flat `meshes\creatures\<name>\` layout, but
+  plugins nest theirs freely: Morrowind_ob ships 67 such folders under
+  `meshes\morro\creatures\<name>`, `meshes\morroblivion\creatures\<category>\<name>` and
+  deeper (`…\symphony\fbr\fst`). The old depth-1 scan of `meshes\creatures` found only 16
+  of them, so **167 of its 307 CREA records fell through to `resolve_creature_race`
+  aliasing and shipped as BASE SKYRIM creatures** (a frostbite spider or a Nord standing
+  in for the converted actor). `convert_creatures` now walks the whole mesh tree. Both
+  sides key on the folder's **leaf name** (the record side derives it from `Model.MODL`),
+  so discovery and lookup agree for any layout. Two folders sharing a leaf name are
+  disambiguated by `_crea_model_dirs()` — whichever folder the CREA records actually point
+  at wins (Morrowind_ob has both `meshes\characters\draugr`, a humanoid body-part folder,
+  and the referenced `meshes\creatures\aa_blood\draugr`), then shallowest path, then
+  alphabetical, so the choice is deterministic.
+- **A plugin inherits its MASTERS' creature projects** (fixed 2026-07-27,
+  `creature_races._load_projects`). A plugin with a TES4 master re-uses the master's
+  creature folders wholesale — Morrowind_ob places 86 CREA records on Oblivion.esm's
+  rat/skeleton/goblin/mudcrab/… meshes, which its own BSA never ships, so the creatures
+  step extracts no folder for them and its `creature_projects.json` has no entry. Without
+  the master's json those records also aliased to base Skyrim races. The master's project,
+  skeleton and merged body NIFs live under ITS output dir and are referenced by
+  **meshes-relative paths** (`Actors\TES4\rat\tes4ratproject.hkx`), so they resolve
+  identically whichever plugin ships them. Own projects win on conflict.
+  Combined with the nested-folder fix: Morrowind_ob went **54/307 → 307/307** CREA records
+  mapped to a real converted creature (240 own + 67 inherited), 64 local projects (was 10),
+  80 generated `TES4*Race` chains. Diagnose with `temp/crea_project_gap.py <plugin> <master>`.
 - **animationdata/boundanims/animationsetdata + singlefile merge
   (`asset_convert/animation_data.py`)**: the engine loads projects ONLY via merged
   `meshes/animationdatasinglefile.txt` + `animationsetdatasinglefile.txt`. Singlefile
