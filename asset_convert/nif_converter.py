@@ -838,6 +838,21 @@ _TEX_TRANSFORM_VARS = {
 # Skyrim has no equivalent -- see the alpha handling in _process_geometry.
 _APPLY_HILIGHT2 = 4
 
+# NiMaterialColorController.target_color: which material channel the curve
+# drives.  3 = TC_SELF_ILLUM (emissive) -- the only one with a Skyrim analogue.
+_MATERIAL_COLOR_EMISSIVE = 3
+
+# BS*ShaderPropertyColorController.type_of_controlled_color -- the two shaders
+# number this differently.  Vanilla census of 361 meshes carrying a shader
+# ColorController: Lighting uses 1 for emissive (124 blocks, vs 5 at 0 which is
+# Specular), Effect uses 0 (46 blocks).  (Lighting, Effect):
+_SHADER_COLOR_EMISSIVE = (1, 0)
+
+# BS*ShaderPropertyFloatController variable for opacity, (Lighting, Effect).
+# Per references/nif 0.10.0.0.xml: Lighting 12 = "Alpha", Effect 5 = "Alpha
+# Transparency"; both appear in the vanilla float-controller census.
+_SHADER_ALPHA_VAR = (12, 5)
+
 # NiVertexColorProperty.lighting_mode.  LIGHTING_E (0) = "emissive only": the
 # surface ignores scene lighting entirely.  That is Oblivion's declaration of
 # an UNLIT FX surface, and it maps onto Skyrim's BSEffectShaderProperty, while
@@ -1032,6 +1047,7 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     emissive_g = 0.0
     emissive_b = 0.0
     material_alpha = 1.0   # NiMaterialProperty.alpha → BSLightingShaderProperty.alpha
+    emissive_animated = False   # NiMaterialColorController drives the emissive
     # NiVertexColorProperty.lighting_mode: 0 = unlit FX, 1 = lit.  Default to
     # lit so a shape with no NiVertexColorProperty keeps the lighting shader.
     vertex_lighting_mode = 1
@@ -1062,6 +1078,17 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
             emissive_g = ec.g
             emissive_b = ec.b
             material_alpha = prop.alpha
+            # A NiMaterialColorController on the material ANIMATES a colour
+            # channel (target_color 3 = emissive).  The static values above are
+            # then only the curve's starting point -- frequently (0,0,0) -- so
+            # they must not be read as "this surface does not glow".
+            _c = prop.controller
+            while _c is not None:
+                if (isinstance(_c, NifFormat.NiMaterialColorController) and
+                        int(getattr(_c, 'target_color', -1)) ==
+                        _MATERIAL_COLOR_EMISSIVE):
+                    emissive_animated = True
+                _c = getattr(_c, 'next_controller', None)
         elif isinstance(prop, NifFormat.NiVertexColorProperty):
             vertex_lighting_mode = int(prop.lighting_mode)
         elif isinstance(prop, NifFormat.NiStencilProperty):
@@ -1140,11 +1167,15 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     shader.texture_set = tex_set
 
     # Transfer emissive from NiMaterialProperty to Skyrim shader
-    if emissive_r > 0.0 or emissive_g > 0.0 or emissive_b > 0.0:
+    if emissive_r > 0.0 or emissive_g > 0.0 or emissive_b > 0.0 or emissive_animated:
         sf1.slsf_1_own_emit = 1
         shader.emissive_color.r = emissive_r
         shader.emissive_color.g = emissive_g
         shader.emissive_color.b = emissive_b
+        # Skyrim MULTIPLIES the emissive colour by this, so a zero here leaves
+        # the surface black no matter what the colour animation does.  Vanilla
+        # shapes carrying an emissive colour controller set own_emit in 133/133
+        # cases and never pair it with a 0 multiple; 1.0 is the baseline.
         shader.emissive_multiple = 1.0
     else:
         # No emissive — clear the own_emit flag (reduces overdraw on most objects)
@@ -1338,20 +1369,34 @@ def _process_controller_manager(node, palette):
     mgr = node.controller
     root_name = node.name
 
-    def _resolve_name(name_or_offset):
-        """PyFFI may give bytes directly or a palette offset depending on version."""
-        if isinstance(name_or_offset, int) and palette is not None:
+    def _resolve_name(blk, seq, attr):
+        """Controlled-block names live EITHER in the bytes field OR, when the
+        sequence carries a NiStringPalette, at an offset into that palette.
+
+        Oblivion NIFs written with a palette leave the bytes field EMPTY and
+        put the name in <attr>_offset.  Reading only the bytes field therefore
+        returned '' for every entry, and the "drop blocks with an empty node
+        name" rule below then deleted the ENTIRE sequence -- 16 of 108 sampled
+        animated meshes lost 100% of their animation this way (candles, light
+        sconces, the gnarl spawner, Cameron's Paradise bricks).  Prefer the
+        bytes, fall back to the palette offset.
+        """
+        val = getattr(blk, attr, b'')
+        if isinstance(val, bytes) and val:
+            return val
+        if isinstance(val, int) and val and palette is not None:
             try:
-                return palette.get_string(name_or_offset)
+                return palette.get_string(val)
             except Exception:
-                return b''
-        return name_or_offset if isinstance(name_or_offset, bytes) else b''
+                pass
+        return _palette_lookup(_palette_bytes(getattr(seq, 'string_palette', None)),
+                               getattr(blk, attr + '_offset', None))
 
     for seq in mgr.controller_sequences:
         key = 0
         while key < seq.num_controlled_blocks:
             blk = seq.controlled_blocks[key]
-            node_name = _resolve_name(blk.node_name)
+            node_name = _resolve_name(blk, seq, 'node_name')
 
             # Remove blocks with empty or root node name
             if not node_name or node_name == root_name:
@@ -1373,9 +1418,42 @@ def _process_controller_manager(node, palette):
                     seq.num_controlled_blocks -= 1
                     continue
 
-            # Strip material and morph controllers (not supported in Skyrim)
-            if isinstance(blk.controller, (NifFormat.NiMaterialColorController,
-                                           NifFormat.NiGeomMorpherController)):
+            # Morph controllers have no Skyrim equivalent -- drop them.
+            if isinstance(blk.controller, NifFormat.NiGeomMorpherController):
+                seq.controlled_blocks.pop(key)
+                seq.num_controlled_blocks -= 1
+                continue
+
+            # NiMaterialColorController animates a material colour channel;
+            # target_color 3 is EMISSIVE.  Skyrim's equivalent is
+            # BS*ShaderPropertyColorController (present in vanilla sequences),
+            # so CONVERT it -- deleting it froze the animation at its first key,
+            # which for se11sheopooffx's Cone01 is emissive (0,0,0): a large
+            # PITCH BLACK cone where an orange force-ripple should pulse
+            # (the curve runs black -> (0.2,0.02,0) -> black over ~13s).
+            # The curve lives on the sequence entry's NiPoint3Interpolator; the
+            # controller block itself only holds a keyless blend interpolator.
+            if isinstance(blk.controller, NifFormat.NiMaterialColorController):
+                if (int(getattr(blk.controller, 'target_color', -1)) ==
+                        _MATERIAL_COLOR_EMISSIVE and
+                        isinstance(blk.interpolator,
+                                   NifFormat.NiPoint3Interpolator)):
+                    src_ctrl = blk.controller
+                    new = NifFormat.BSLightingShaderPropertyColorController()
+                    new.flags = 0x48 | (int(getattr(src_ctrl, 'flags', 0)) & 0x06)
+                    new.frequency = getattr(src_ctrl, 'frequency', 1.0) or 1.0
+                    new.phase = getattr(src_ctrl, 'phase', 0.0)
+                    new.start_time = src_ctrl.start_time
+                    new.stop_time = src_ctrl.stop_time
+                    # Provisionally Lighting; _match_seq_shader_types re-stamps
+                    # it for nodes that ended up on the Effect shader.
+                    new.type_of_controlled_color = _SHADER_COLOR_EMISSIVE[0]
+                    new.interpolator = blk.interpolator
+                    new._is_color_ctrl = True     # for _match_seq_shader_types
+                    blk.controller = new
+                    blk.controller_type = b'BSLightingShaderPropertyColorController'
+                    key += 1
+                    continue
                 seq.controlled_blocks.pop(key)
                 seq.num_controlled_blocks -= 1
                 continue
@@ -1428,15 +1506,224 @@ def _process_controller_manager(node, palette):
                 seq.num_controlled_blocks -= 1
                 continue
 
-            # NiAlphaController animates NiAlphaProperty's alpha.  There is no
-            # inline-key equivalent to retarget it onto here, so drop the entry
-            # rather than leave an unresolvable type in the sequence.
+            # NiAlphaController animates the material's opacity.  Skyrim drives
+            # the same thing through the shader's Alpha float variable, so
+            # CONVERT it -- dropping the entry froze the fade and left the
+            # surface static (se11sheopooffx's GlowPlane pulses 0 -> 1 -> 0
+            # over 13s).  Enum per references/nif 0.10.0.0.xml and confirmed by
+            # vanilla counts: Lighting var 12 "Alpha", Effect var 5 "Alpha
+            # Transparency".  The curve is on the sequence entry's
+            # NiFloatInterpolator; the controller block holds only a keyless
+            # blend interpolator.
             if isinstance(blk.controller, NifFormat.NiAlphaController):
+                if isinstance(blk.interpolator, NifFormat.NiFloatInterpolator):
+                    src_ctrl = blk.controller
+                    new = NifFormat.BSLightingShaderPropertyFloatController()
+                    new.flags = 0x48 | (int(getattr(src_ctrl, 'flags', 0)) & 0x06)
+                    new.frequency = getattr(src_ctrl, 'frequency', 1.0) or 1.0
+                    new.phase = getattr(src_ctrl, 'phase', 0.0)
+                    new.start_time = src_ctrl.start_time
+                    new.stop_time = src_ctrl.stop_time
+                    new.interpolator = blk.interpolator
+                    # Provisionally Lighting; re-stamped for Effect-shader nodes.
+                    new.type_of_controlled_variable = _SHADER_ALPHA_VAR[0]
+                    new._alpha_ctrl = True       # for _match_seq_shader_types
+                    blk.controller = new
+                    blk.controller_type = b'BSLightingShaderPropertyFloatController'
+                    key += 1
+                    continue
                 seq.controlled_blocks.pop(key)
                 seq.num_controlled_blocks -= 1
                 continue
 
             key += 1
+
+
+def _apply_rest_visibility(root, stats=None):
+    """Hide nodes a sequence keeps invisible at time 0.
+
+    Oblivion drives per-node visibility from a NiVisController inside a
+    NiControllerSequence.  Where that sequence is script-triggered, Skyrim
+    leaves it unplayed until the script fires -- but the NODE still renders,
+    because the engine only applies the sequence's keys while it is playing.
+    So geometry Oblivion keeps hidden until mid-effect is visible from the
+    moment the cell loads.
+
+    se11sheopooffx is the case in point: its `Forward` sequence holds Cone01 at
+    visibility 0 until t=0.3 and hides it again at 12.93, and nothing ever
+    plays the sequence (the STAT has no script), so the cone renders
+    permanently -- a large black cone over the effect.
+
+    Applying the t=0 value as the node's authored rest state matches what the
+    object looks like before its animation is triggered, which is the correct
+    resting appearance in both engines.  A node visible at t=0 is untouched.
+    """
+    hidden = 0
+    for block in root.tree():
+        if not isinstance(block, NifFormat.NiControllerSequence):
+            continue
+        # An AutoPlay sequence RUNS from cell load, so its own keys restore the
+        # node's visibility -- baking the t=0 value in would hide geometry the
+        # animation is about to show.
+        seq_name = bytes(getattr(block, 'name', b'') or b'')
+        if seq_name == _AUTOPLAY_SEQUENCE.encode('latin-1'):
+            continue
+        raw = _palette_bytes(getattr(block, 'string_palette', None))
+        for cb in block.controlled_blocks:
+            ctrl_type = bytes(getattr(cb, 'controller_type', b'') or b'')
+            if not ctrl_type:
+                ctrl_type = _palette_lookup(
+                    raw, getattr(cb, 'controller_type_offset', None))
+            if ctrl_type != b'NiVisController':
+                continue
+            interp = cb.interpolator
+            data = getattr(interp, 'data', None)
+            keys = getattr(data, 'data', None) if data is not None else None
+            if keys is None or not keys.num_keys:
+                continue
+            first = min(keys.keys, key=lambda k: k.time)
+            if first.value:
+                continue        # visible at rest -- leave it alone
+            name = bytes(getattr(cb, 'node_name', b'') or b'')
+            if not name:
+                name = _palette_lookup(raw, getattr(cb, 'node_name_offset', None))
+            if not name:
+                continue
+            for node in root.tree():
+                # ONLY scene graph objects have a "hidden" bit.  root.tree()
+                # also yields properties, and bit 0 of NiAlphaProperty.flags is
+                # ALPHA BLEND ENABLE -- setting it there turned opaque surfaces
+                # into additive blends (0x1042 -> 0x1043, src=ONE dst=SRC_COLOR)
+                # and they rendered as blown-out green/red.  Those blocks also
+                # have an empty name, so a name-only match hits every one of
+                # them at once.
+                if not isinstance(node, NifFormat.NiAVObject):
+                    continue
+                if bytes(getattr(node, 'name', b'') or b'') != name:
+                    continue
+                if not int(getattr(node, 'flags', 0)) & 0x0001:
+                    node.flags = int(node.flags) | 0x0001   # hidden
+                    hidden += 1
+    if hidden and stats is not None:
+        stats['rest_hidden_nodes'] = stats.get('rest_hidden_nodes', 0) + hidden
+    return hidden
+
+
+def _attach_seq_shader_controllers(root, stats=None):
+    """Hang each sequence's shader controller off the shader it drives.
+
+    A NiControllerSequence entry only says "while this sequence plays, drive
+    node N's controller of type T".  It does not itself connect the controller
+    to the property, and Skyrim resolves T against the controllers already
+    hanging off the target -- so a controller that exists ONLY as a sequence
+    entry drives nothing and the surface renders frozen (palacefont01's
+    fountain water, converted from Oblivion's NiTextureTransformController).
+
+    Vanilla never leaves one dangling: across 80 meshes carrying shader float
+    controllers, 481/481 are reachable from `shader.controller`.  Mirror that
+    -- put the controller on the shader's chain, targeted at the shader.
+    """
+    shaders = {}
+    for block in root.tree():
+        nm = bytes(getattr(block, 'name', b'') or b'')
+        if not nm:
+            continue
+        for pr in getattr(block, 'bs_properties', []) or []:
+            if pr is None:
+                continue
+            if pr.__class__.__name__ in ('BSLightingShaderProperty',
+                                         'BSEffectShaderProperty'):
+                shaders[nm] = pr
+
+    attached = 0
+    for block in root.tree():
+        if not isinstance(block, NifFormat.NiControllerSequence):
+            continue
+        raw = _palette_bytes(getattr(block, 'string_palette', None))
+        for cb in block.controlled_blocks:
+            ctrl = cb.controller
+            if ctrl is None or 'ShaderProperty' not in ctrl.__class__.__name__:
+                continue
+            name = bytes(getattr(cb, 'node_name', b'') or b'')
+            if not name:
+                name = _palette_lookup(raw, getattr(cb, 'node_name_offset', None))
+            shader = shaders.get(name)
+            if shader is None:
+                continue
+            existing = shader.controller
+            already = False
+            probe = existing
+            while probe is not None:
+                if probe is ctrl:
+                    already = True
+                    break
+                probe = probe.next_controller
+            if already:
+                continue
+            ctrl.target = shader
+            ctrl.next_controller = existing
+            shader.controller = ctrl
+            attached += 1
+    if attached and stats is not None:
+        stats['seq_shader_ctrls_attached'] = \
+            stats.get('seq_shader_ctrls_attached', 0) + attached
+    return attached
+
+
+def _autoplay_ambient_sequences(root, stats=None):
+    """Rename Oblivion's self-playing "Idle" sequence to Skyrim's "AutoPlay".
+
+    Oblivion starts a sequence called Idle on load; Skyrim starts nothing by
+    itself unless the sequence is named AutoPlay, so ambient animation arrived
+    frozen on its first frame (palacefont01's fountain water, the SE01 waiting
+    room light ripples).  Also force CYCLE_LOOP: Oblivion authors these as
+    CLAMP (cycle_type 0), which would play through once and stop, whereas every
+    vanilla AutoPlay is a loop.
+
+    Script-driven names (Forward, SpecialIdle, ...) are left alone -- those are
+    started through the behaviour graph BY NAME and renaming them would break
+    the PlayAnimation() call that drives them.
+    """
+    renamed = 0
+    for block in root.tree():
+        if not isinstance(block, NifFormat.NiControllerSequence):
+            continue
+        raw = getattr(block, 'name', b'') or b''
+        name = raw.decode('latin-1') if isinstance(raw, bytes) else str(raw)
+        if name.lower() not in _AMBIENT_SEQUENCES:
+            continue
+        block.name = _AUTOPLAY_SEQUENCE.encode('latin-1')
+        block.cycle_type = _CYCLE_LOOP
+        renamed += 1
+    if renamed and stats is not None:
+        stats['autoplay_sequences'] = stats.get('autoplay_sequences', 0) + renamed
+    return renamed
+
+
+def _palette_bytes(string_palette):
+    """Raw NUL-separated blob out of a NiStringPalette ref, or b''.
+
+    PyFFI nests it: NiStringPalette.palette is a StringPalette struct whose own
+    `palette` member is the byte string.
+    """
+    if string_palette is None:
+        return b''
+    pal = getattr(string_palette, 'palette', string_palette)
+    raw = getattr(pal, 'palette', pal)
+    if isinstance(raw, bytes):
+        return raw
+    try:
+        return bytes(raw)
+    except Exception:
+        return b''
+
+
+def _palette_lookup(raw, offset):
+    """Read the NUL-terminated string at `offset` in a palette blob."""
+    if not raw or offset is None or offset == 0xFFFFFFFF or offset >= len(raw):
+        return b''
+    end = raw.find(b'\x00', offset)
+    return raw[offset:end] if end >= 0 else raw[offset:]
 
 
 def _match_seq_shader_types(root):
@@ -1462,27 +1749,51 @@ def _match_seq_shader_types(root):
             if cn in ('BSEffectShaderProperty', 'BSLightingShaderProperty'):
                 shader_of[bytes(nm)] = cn
 
+    def _copy_timing(dst, src):
+        dst.flags = src.flags
+        dst.frequency = src.frequency
+        dst.phase = src.phase
+        dst.start_time = src.start_time
+        dst.stop_time = src.stop_time
+        dst.interpolator = src.interpolator
+
     for blk in root.tree():
         if not isinstance(blk, NifFormat.NiControllerSequence):
             continue
+        # The node name may live in the bytes field or in the sequence's string
+        # palette (see _resolve_name); a shape whose name only exists in the
+        # palette must still be matched, or its controller keeps the wrong type.
+        raw = _palette_bytes(getattr(blk, 'string_palette', None))
+
         for cb in blk.controlled_blocks:
             ctrl = cb.controller
+            if ctrl is None:
+                continue
+            name = bytes(getattr(cb, 'node_name', b'') or b'')
+            if not name:
+                name = _palette_lookup(raw, getattr(cb, 'node_name_offset', None))
+            if shader_of.get(name) != 'BSEffectShaderProperty':
+                continue
+
             op = getattr(ctrl, '_tt_operation', None)
-            if op is None:
-                continue
-            want_effect = shader_of.get(bytes(cb.node_name)) == 'BSEffectShaderProperty'
-            if not want_effect:
-                continue
-            eff = NifFormat.BSEffectShaderPropertyFloatController()
-            eff.flags = ctrl.flags
-            eff.frequency = ctrl.frequency
-            eff.phase = ctrl.phase
-            eff.start_time = ctrl.start_time
-            eff.stop_time = ctrl.stop_time
-            eff.interpolator = ctrl.interpolator
-            eff.type_of_controlled_variable = _TEX_TRANSFORM_VARS[op][1]
-            cb.controller = eff
-            cb.controller_type = b'BSEffectShaderPropertyFloatController'
+            if op is not None:
+                eff = NifFormat.BSEffectShaderPropertyFloatController()
+                _copy_timing(eff, ctrl)
+                eff.type_of_controlled_variable = _TEX_TRANSFORM_VARS[op][1]
+                cb.controller = eff
+                cb.controller_type = b'BSEffectShaderPropertyFloatController'
+            elif getattr(ctrl, '_alpha_ctrl', False):
+                eff = NifFormat.BSEffectShaderPropertyFloatController()
+                _copy_timing(eff, ctrl)
+                eff.type_of_controlled_variable = _SHADER_ALPHA_VAR[1]
+                cb.controller = eff
+                cb.controller_type = b'BSEffectShaderPropertyFloatController'
+            elif getattr(ctrl, '_is_color_ctrl', False):
+                eff = NifFormat.BSEffectShaderPropertyColorController()
+                _copy_timing(eff, ctrl)
+                eff.type_of_controlled_color = _SHADER_COLOR_EMISSIVE[1]
+                cb.controller = eff
+                cb.controller_type = b'BSEffectShaderPropertyColorController'
 
 
 # ---------------------------------------------------------------------------
@@ -2424,6 +2735,29 @@ _SCRIPT_DRIVEN_SEQUENCES = frozenset((
     'left', 'right', 'equip', 'unequip', 'specialidle', 'stagger',
 ))
 
+# Oblivion auto-plays a sequence named "Idle" as soon as the object loads.
+# Skyrim has NO such convention: a NiControllerSequence sits idle until
+# something starts it (a script's PlayGamebryoAnimation, an engine-native name
+# like Open/Close, or the behaviour graph).  So converted ambient animation --
+# palacefont01's fountain water, se01waitingroomwalls' light ripples -- simply
+# never ran, and the surface rendered as a frozen first frame.
+#
+# Vanilla's self-playing convention is the sequence name "AutoPlay": 66 meshes
+# use it, all ambient FX with no script behind them (atronach skins, dragon
+# priest mist, steam centurion vents).  It is ALWAYS a loop -- every AutoPlay
+# sampled is cycle_type 2 (CYCLE_LOOP) -- and 36/36 sit alongside a BGED.
+# Corroborating: across 345 graph-less vanilla sequence meshes the only names
+# are the engine-native Open/Close plus script-fired SpecialIdle_AreaEffect,
+# and 114/116 of those are cycle_type 2 as well.  Nothing named "Idle"
+# auto-plays anything.
+_AUTOPLAY_SEQUENCE = 'AutoPlay'
+_CYCLE_LOOP = 2
+
+# Oblivion sequence names that mean "ambient, plays by itself" and therefore
+# become AutoPlay.  Script-driven names are excluded -- those are reached
+# through the behaviour graph by their own name and must keep it.
+_AMBIENT_SEQUENCES = frozenset(('idle',))
+
 
 def collect_sequence_names(data):
     """NiControllerSequence names a script can reach via PlayAnimation().
@@ -2459,7 +2793,11 @@ def collect_sequence_names(data):
                 # state would make PlayAnimation() succeed on a dead sequence.
                 if not name or name in seen or not seq.num_controlled_blocks:
                     continue
-                if name.lower() not in _SCRIPT_DRIVEN_SEQUENCES:
+                # AutoPlay is not script-driven, but it still needs the graph:
+                # it is the animation graph manager that starts it, and 36/36
+                # vanilla AutoPlay meshes carry a BSBehaviorGraphExtraData.
+                if (name != _AUTOPLAY_SEQUENCE and
+                        name.lower() not in _SCRIPT_DRIVEN_SEQUENCES):
                     continue
                 seen.add(name)
                 names.append(name)
@@ -3415,6 +3753,22 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         # actually received (Lighting vs Effect number their variables
         # differently).  Must follow the geometry walk.
         _match_seq_shader_types(root)
+
+        # Oblivion's auto-started "Idle" sequence -> Skyrim's "AutoPlay" (loop),
+        # or the animation never starts.  Runs before collect_sequence_names so
+        # the behaviour graph is built from the final names.
+        _autoplay_ambient_sequences(root, stats)
+
+        # Nodes a sequence keeps invisible at t=0 must ship hidden: Skyrim only
+        # applies a sequence's keys while it plays, so mid-effect-only geometry
+        # otherwise renders from cell load (se11sheopooffx's black cone).
+        _apply_rest_visibility(root, stats)
+
+        # A shader controller that lives ONLY as a sequence entry drives
+        # nothing; vanilla always hangs it off the shader too (481/481).
+        # Runs after _match_seq_shader_types so the final controller object is
+        # the one that gets attached.
+        _attach_seq_shader_controllers(root, stats)
 
         # Hide NiPSysMeshEmitter SOURCE geometry.  These shapes exist only to
         # define where particles spawn and must never be drawn.  Oblivion hides

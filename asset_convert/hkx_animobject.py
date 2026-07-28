@@ -109,6 +109,10 @@ _INTERVAL = (
 
 _BLEND_DURATION = 0.0   # objects snap between sequences; no cross-fade
 
+# Vanilla's name for a self-playing ambient sequence.  The state machine starts
+# on it instead of the do-nothing Rest state (see _behavior_xml).
+_AUTOPLAY_SEQUENCE = 'AutoPlay'
+
 # Vanilla's fixed dummy bone name for single-bone animated objects
 # (clutter\beehive\characterassets\SingleBoneSkeleton.hkx uses exactly this).
 # The rig is a placeholder — the real motion lives in the NIF's
@@ -415,8 +419,16 @@ def _behavior_xml(graph_name: str, sequences: list) -> str:
         '<hkobject>\n\t<hkparam name="id">-1</hkparam>\n'
         '\t<hkparam name="payload">null</hkparam>\n</hkobject>'))
     sm.param('startStateChooser', 'null')
-    # Start on the Rest state, never on a motion sequence (see above).
-    sm.param('startStateId', rest_id)
+    # Start on the Rest state, never on a motion sequence (see above) -- UNLESS
+    # the mesh carries an AutoPlay sequence.  AutoPlay is vanilla's name for
+    # ambient animation that plays by itself with no script behind it (66
+    # meshes: atronach skins, dragon-priest mist, steam vents), so for those the
+    # graph MUST start on it or the effect sits frozen on its first frame --
+    # which is precisely the Rest-state behaviour the doors need.
+    _autoplay_id = next((i for i, s in enumerate(sequences)
+                         if s == _AUTOPLAY_SEQUENCE), None)
+    sm.param('startStateId',
+             rest_id if _autoplay_id is None else _autoplay_id)
     sm.param('returnToPreviousStateEventId', -1)
     sm.param('randomTransitionEventId', -1)
     sm.param('transitionToNextHigherStateEventId', -1)
