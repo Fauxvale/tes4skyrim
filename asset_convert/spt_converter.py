@@ -30,6 +30,7 @@ Usage (CLI):
 
 import io
 import os
+import re
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -313,10 +314,12 @@ def _make_collision(root, geo: TreeGeometry):
 
 
 def build_tree_nif(geo: TreeGeometry, name: str,
-                   bark_tex: str, bark_norm: str, leaf_tex: str) -> bytes:
+                   bark_tex: str, bark_norm: str, leaf_tex: str,
+                   tex_idx: dict | None = None) -> bytes:
     """Assemble the NIF from generated geometry.  Returns raw bytes."""
     if not _PYFFI:
         raise RuntimeError('pyffi not available')
+    tex_idx = tex_idx or {}
 
     root = NifFormat.BSLeafAnimNode()
     root.name = name.encode()
@@ -338,8 +341,16 @@ def build_tree_nif(geo: TreeGeometry, name: str,
                           geo.bark_colors, geo.bark_tris,
                           bark_tex, bark_norm)]
     for gi, g in enumerate(geo.leaf_groups):
-        tex = leaf_tex if g['texture'] == '__composite__' else \
-            LEAF_TEX_DIR + Path(g['texture'].replace('\\', '/')).stem.lower() + '.dds'
+        if g['texture'] == '__composite__':
+            tex = leaf_tex
+        else:
+            # Per-map group: the SPT names the artist's .tga, which is not
+            # always the shipped .dds.  Resolve through the texture index the
+            # same way the composite path does, so we never write a reference
+            # to a file that does not exist -- an unresolvable texture makes
+            # the leaves render untextured (dementiatree10's missing leaves).
+            stem = _match_tex_stem(g['texture'], tex_idx)
+            tex = _leaf_tex_path(stem, tex_idx) if stem is not None else leaf_tex
         if not tex:
             continue
         shapes.append(_make_shape(
@@ -367,15 +378,51 @@ def build_tree_nif(geo: TreeGeometry, name: str,
 # Conversion driver
 # ---------------------------------------------------------------------------
 
+def _match_tex_stem(cand: str, tex_idx: dict) -> str | None:
+    """Resolve an SPT texture reference to a stem that actually ships.
+
+    SPT files store the ARTIST'S source path (`C:\\Hope\\SE\\trees\\
+    MTreeLeaves02c.tga`), and the .tga that was authored is not always the
+    .dds that Bethesda shipped.  Two renamings show up in the Oblivion/SI
+    tree set, so try the literal stem first and then each of them:
+
+      * a trailing composite marker `c`  -- MTreeLeaves02c -> mtreeleaves02
+        (dementiatree01/04/10, dtreeleaves03c)
+      * a leaf-map VARIANT NUMBER that was collapsed when the maps were
+        merged into one shipped atlas -- TreeMS14CanvasLeaves01su ->
+        treems14canvasleavessu (treems14canvasfreesu)
+
+    Returns the matching key in tex_idx, or None when nothing ships.
+    """
+    if not cand:
+        return None
+    stem = Path(str(cand).replace('\\', '/')).stem.lower()
+    if stem in tex_idx:
+        return stem
+    if stem.endswith('c') and stem[:-1] in tex_idx:
+        return stem[:-1]
+    # Drop a LEAF-MAP VARIANT NUMBER: the digits that directly follow the
+    # word "leaves"/"needles" (…canvasleaves01su -> …canvasleavessu).  Anchor
+    # on that word rather than the first 2-digit run, or a model number in
+    # the middle of the name is eaten instead (TreeMS14… -> TreeMS…).
+    collapsed = re.sub(r'((?:leaves|needles))\d+', r'\1', stem, count=1)
+    if collapsed != stem and collapsed in tex_idx:
+        return collapsed
+    return None
+
+
+def _leaf_tex_path(stem: str, tex_idx: dict) -> str:
+    """Build the output texture path for an already-resolved stem."""
+    return f'textures\\tes4\\trees\\{tex_idx[stem]}\\{stem}.dds'.replace('\\\\', '\\')
+
+
 def _resolve_leaf_tex(tree: SptTree, icon: str, tex_idx: dict) -> str:
     """Pick the composite leaf texture path for a tree instance."""
     for cand in (icon, tree.composite_map,
                  tree.leaf_maps[0].texture if tree.leaf_maps else ''):
-        if not cand:
-            continue
-        stem = Path(str(cand).replace('\\', '/')).stem.lower()
-        if stem in tex_idx:
-            return f'textures\\tes4\\trees\\{tex_idx[stem]}\\{stem}.dds'.replace('\\\\', '\\')
+        stem = _match_tex_stem(cand, tex_idx)
+        if stem is not None:
+            return _leaf_tex_path(stem, tex_idx)
     return ''
 
 
@@ -394,7 +441,7 @@ def convert_one(spt_path: Path, out_path: Path, icon: str = '',
     leaf_tex = _resolve_leaf_tex(tree, icon, tex_idx)
 
     nif = build_tree_nif(geo, name or spt_path.stem, bark_tex,
-                         bark_norm, leaf_tex)
+                         bark_norm, leaf_tex, tex_idx)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(nif)
     return True
