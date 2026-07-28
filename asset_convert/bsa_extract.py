@@ -116,6 +116,22 @@ _EXTRA_BSA_BASES = {
     "nehrim": ["N", "L"],
 }
 
+# GOTY Oblivion.esm has Shivering Isles MERGED INTO IT: every SI record lives
+# in the master, but the SI assets stayed in "DLCShiveringIsles - *.bsa" and
+# DLCShiveringIsles.esp is left as an 85-byte header-only stub. So Oblivion.esm
+# must extract the SI BSAs too, or its own SI records resolve to no mesh —
+# OBND falls back to the STAT type default (100 units, under
+# LOD_SIZE_THRESHOLD) so no SI static is ever flagged Visible-When-Distant and
+# SEWorld renders with no distant objects, and the 8 SI grasses count as
+# "missing" in the grass step.
+#
+# Keyed off Oblivion.esm ONLY. Converting DLCShiveringIsles.esp itself still
+# extracts just its own BSAs via the normal stem probe, so the assets are not
+# duplicated into both outputs.
+_MERGED_DLC_BSA_BASES = {
+    "oblivion": ["DLCShiveringIsles"],
+}
+
 
 def _get_bsa_files(data_path, source_file):
     """Determine which BSA files to extract for a given source plugin.
@@ -132,8 +148,14 @@ def _get_bsa_files(data_path, source_file):
     data_dir = Path(data_path)
     stem = Path(source_file).stem  # e.g. "Oblivion", "Knights", "Nehrim"
 
-    # Probe the plugin stem plus any hardcoded extra bases (e.g. Nehrim → N, L).
-    bases = [stem] + _EXTRA_BSA_BASES.get(stem.lower(), [])
+    # Probe the plugin stem, any hardcoded extra bases (e.g. Nehrim → N, L),
+    # and the BSAs of a DLC merged into this plugin (GOTY Oblivion.esm owns
+    # every Shivering Isles record, so it must also read
+    # "DLCShiveringIsles - *.bsa" to get those records' meshes/textures).
+    # Non-existent BSAs are skipped by _try(), so a non-GOTY install that
+    # lacks them is unaffected.
+    bases = ([stem] + _EXTRA_BSA_BASES.get(stem.lower(), [])
+             + _MERGED_DLC_BSA_BASES.get(stem.lower(), []))
 
     candidates = []
     seen = set()
