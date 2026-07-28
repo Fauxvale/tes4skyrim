@@ -29,6 +29,15 @@ Major Issues for V1:
 
 	11 - There is a second, independent bug in the same fragment worth fixing regardless: SetActorValue("Aggression", 10) is rejected by the engine ("attempt made to set illegal value") for Renault, Glenroy, and Baurus at TES4_QF_Charactergen.psc:362-364. Skyrim's Aggression is a 0-3 tier, not Oblivion's 0-100, so all three calls silently no-op and the Blades never become aggressive. That won't unstick the door, but it will suppress the fight even once stage 23 lands.
 		
+	12 - Morroblivion Mesh Issues:
+		streetlightu01.nif is incorrectly positioned
+		activeudeubedu09.nif is spinning through the air
+		activeudeubedu05.nif is incorrectly positioned
+		containudeutableu01.nif is on its side
+		furnushrineurilmsu01.nif is on its side
+		containuchestusmallu02.nif is moving through the air
+		tikitorch.nif is spinning through the air
+		Also last 3 game crashes
 Later Issues:
 
 	2 - Refine creature conversion further. Speed is still a bit off

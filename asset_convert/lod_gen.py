@@ -660,7 +660,7 @@ def run_lodgen(lodgen_input: Path, output_dir: Path) -> bool:
 
 def generate_lod(esm_path: Path, output_dir: Path,
                  worldspace_edid: str = 'Tamriel',
-                 master_dirs=None) -> bool:
+                 master_dirs=None, master_texture_dirs=None) -> bool:
     """
     Full LOD generation pipeline:
       1. Write LODSettings/<worldspace>.lod
@@ -677,6 +677,12 @@ def generate_lod(esm_path: Path, output_dir: Path,
         master_dirs:       Converted output dirs of this plugin's masters.
                            Anything they already ship LOD for is skipped, so
                            an override plugin bakes only what IT introduces.
+                           Only set when a MASTER owns the worldspace.
+        master_texture_dirs: Converted output dirs of this plugin's masters,
+                           always. A plugin regularly places a master's models
+                           in its OWN worldspace, and their textures exist only
+                           in the master's output; the .bto tiles baked here
+                           still reference them, so they are copied in.
 
     Returns True on success.
     """
@@ -766,15 +772,33 @@ def generate_lod(esm_path: Path, output_dir: Path,
             print(f"  Removed {len(stale)} stale .bto tiles")
         ok = run_lodgen(lodgen_txt, output_dir)
 
-    # Fill in any LOD texture the .bto files reference but that does not exist
-    # (atlas normal maps).  No copying: .bto refs are full paths, already valid.
-    _fill_missing_lod_textures(objects_dir, output_dir / 'textures')
+    # Fill in any LOD texture the .bto files reference but that does not exist:
+    # atlas normal maps (synthesized) and any diffuse that lives only in a
+    # master's output because this plugin baked the master's models into its LOD.
+    _fill_missing_lod_textures(
+        objects_dir, _textures_root(output_dir),
+        master_tex_roots=[_textures_root(Path(d))
+                          for d in (master_texture_dirs or master_dirs or [])])
 
     if ok:
         print(f"[LOD] Object LOD generation complete.")
     else:
         print(f"[LOD] LOD generation finished with warnings.")
     return ok
+
+
+def _textures_root(plugin_out_dir: Path) -> Path:
+    """The plugin's textures directory, whatever case it was created with.
+
+    Different stages have created 'textures' and 'Textures' (Morrowind_ob has
+    the capitalised one, Oblivion.esm the lowercase), and this lookup also runs
+    on case-sensitive filesystems, so probe rather than assume.
+    """
+    for name in ('textures', 'Textures'):
+        p = plugin_out_dir / name
+        if p.is_dir():
+            return p
+    return plugin_out_dir / 'textures'
 
 
 _BTO_TEX_RE = _re.compile(rb'[A-Za-z0-9_\\/ .-]{3,200}?\.dds', _re.IGNORECASE)
@@ -798,14 +822,21 @@ def _bto_texture_refs(bto_dir: Path) -> set:
     return refs
 
 
-def _fill_missing_lod_textures(bto_dir: Path, tex_root: Path):
+def _fill_missing_lod_textures(bto_dir: Path, tex_root: Path,
+                               master_tex_roots=None):
     """Create the LOD textures the .bto tiles reference but that don't exist.
 
-    In practice these are only NORMAL maps: LODGen writes each atlas diffuse
+    Mostly these are NORMAL maps: LODGen writes each atlas diffuse
     (<name>_a.dds) but no matching atlas normal (<name>_a_n.dds), and object LOD
     renders unlit against a missing _n.  Each one is written at the exact path
     the .bto asks for, built from the atlas's source normal when there is one
     (single-texture atlas) and otherwise a flat normal sized to the diffuse.
+
+    A plugin can also bake a MASTER's models into its own LOD (Morrowind_ob
+    places Oblivion architecture in its worldspace), and those diffuse textures
+    live only in the master's output — 117 of them, which would render as
+    untextured LOD.  They are copied in from the master, since this plugin's
+    .bto tiles are what reference them.
     """
     missing = sorted(r for r in _bto_texture_refs(bto_dir)
                      if not (tex_root / r).exists())
@@ -813,19 +844,45 @@ def _fill_missing_lod_textures(bto_dir: Path, tex_root: Path):
         return
 
     synth = 0
+    from_master = 0
     unresolved = []
     for rel in missing:
         dest = tex_root / rel
         if not rel.endswith('_n.dds'):
+            # Diffuse (or any non-normal) the master already converted.
+            src = next((mr / rel for mr in (master_tex_roots or [])
+                        if (mr / rel).exists()), None)
+            if src is not None:
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest)
+                    from_master += 1
+                    continue
+                except Exception:
+                    pass
             unresolved.append(rel)
             continue
         stem = rel[:-len('_n.dds')]              # 'tes4\...\lcstone01_a'
         # An atlas ('..._a') borrows the normal of the texture it was built from.
         base = stem[:-2] if stem.endswith('_a') else stem
-        src_normal = tex_root / f'{base}_n.dds'
-        diffuse = tex_root / f'{stem}.dds'
+
+        # Look in this plugin's textures first, then any master's — a master's
+        # model baked into our LOD keeps its textures in the master's output,
+        # and using its real normal beats falling back to a flat one.
+        def _find(name):
+            p = tex_root / name
+            if p.exists():
+                return p
+            for mr in (master_tex_roots or []):
+                q = mr / name
+                if q.exists():
+                    return q
+            return p          # non-existent local path (callers test .exists())
+
+        src_normal = _find(f'{base}_n.dds')
+        diffuse = _find(f'{stem}.dds')
         if not diffuse.exists():
-            diffuse = tex_root / f'{base}.dds'
+            diffuse = _find(f'{base}.dds')
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
             if src_normal.exists() and src_normal != dest:
@@ -836,6 +893,9 @@ def _fill_missing_lod_textures(bto_dir: Path, tex_root: Path):
         except Exception:
             unresolved.append(rel)
 
+    if from_master:
+        print(f"  Copied {from_master} object-LOD texture(s) from a master's "
+              f"output (this plugin bakes the master's models into its LOD).")
     if synth:
         print(f"  Synthesized {synth} object-LOD normal maps.")
     if unresolved:

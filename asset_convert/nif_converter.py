@@ -549,15 +549,33 @@ def _convert_furniture_markers(markers, root):
 
 
 def _rewrite_tex_path(raw_bytes):
-    """Prepend tes4\\ to a texture path that doesn't already have it."""
-    path = raw_bytes.decode('utf-8', errors='replace')
+    """Prepend tes4\\ to a texture path that doesn't already have it.
+
+    Oblivion NIFs use both separators, sometimes in the same file, so
+    normalise to backslash FIRST — testing only for 'textures\\' let a
+    forward-slash 'textures/lowres/foo.dds' fall through to the else branch and
+    come out as 'Textures\\tes4\\textures/lowres/foo.dds', a path that resolves
+    to nothing (the LOD tiles then reference 100 textures that do not exist).
+
+    'textures\\lowres\\' is an Oblivion _far.nif authoring convention for
+    low-resolution LOD copies (pyffi ships a spell that writes exactly this
+    prefix, documented "used mainly for making _far.nifs"). We do not ship a
+    lowres tree — the converted textures live at the normal path — so the
+    segment is dropped and the reference resolves to the real texture.
+    """
+    path = raw_bytes.decode('utf-8', errors='replace').replace('/', '\\')
     low = path.lower()
-    # Oblivion paths start with "Textures\" — insert "tes4\" after that prefix
-    if low.startswith('textures\\') and '\\tes4\\' not in low:
-        path = path[:9] + 'tes4\\' + path[9:]
-    elif not low.startswith('textures\\'):
-        path = 'Textures\\tes4\\' + path
-    return path
+
+    if low.startswith('textures\\'):
+        rest = path[len('textures\\'):]
+    else:
+        rest = path
+    if rest.lower().startswith('lowres\\'):
+        rest = rest[len('lowres\\'):]
+
+    if rest.lower().startswith('tes4\\'):
+        return 'Textures\\' + rest
+    return 'Textures\\tes4\\' + rest
 
 
 def _norm_tex_ref(raw):

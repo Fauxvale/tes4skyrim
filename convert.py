@@ -608,6 +608,17 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
                 return m_esm, [m_dir]
         return None, []
 
+    # A plugin routinely places its MASTERS' models in its own worldspace
+    # (Morrowind_ob uses Oblivion architecture), and those models' textures were
+    # converted into the master's output only. The .bto tiles this plugin bakes
+    # still reference them, so the master's textures are a lookup fallback for
+    # every worldspace — independent of `_records_esm`, which only reports a
+    # master when the master also owns the WORLDSPACE.
+    master_asset_dirs = [out_root / m
+                         for m in _tes4_master_names(SCRIPT_DIR / "export"
+                                                     / file_name)
+                         if (out_root / m).is_dir()]
+
     all_ok = True
     for worldspace_edid in worldspaces:
         rec_esm, extra_assets = _records_esm(worldspace_edid)
@@ -623,6 +634,7 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
             output_dir=output_dir,
             worldspace_edid=worldspace_edid,
             master_dirs=extra_assets,
+            master_texture_dirs=master_asset_dirs,
         )
 
         # Terrain LOD: heightmap .btr tiles + composited landscape-texture
