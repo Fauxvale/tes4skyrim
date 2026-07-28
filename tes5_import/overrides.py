@@ -284,7 +284,7 @@ def emit_nested_overrides(records: list, writer: PluginWriter) -> tuple:
 
 
 def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
-                           writer: PluginWriter, label: str) -> None:
+                           writer: PluginWriter, label: str) -> list:
     """Emit overrides for record types that live inside GRUP hierarchies.
 
     Used for CELL/WRLD/REFR/ACHR/ACRE/LAND (the cell tree) and DIAL/INFO (the
@@ -301,6 +301,12 @@ def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
     (278 total). The master's other references stay visible because ONAM (built
     by the writer at save time) tells the engine to keep loading a cell's
     temporary children on demand even though the cell record is overridden.
+
+    Returns the records that are NEW to this plugin and sit in its OWN
+    hierarchy rather than the master's. A master-dependent plugin can carry a
+    whole world of its own (Morroblivion lists Oblivion.esm as a master but
+    every one of its 387,813 world records is new), and those must be handed
+    back to the normal group builders — the override path cannot express them.
     """
     pending = []
     emitted_fids = set()
@@ -319,19 +325,21 @@ def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
                             ctx.master_index.group_path(ov.out_fid)))
             emitted_fids.add(ov.out_fid)
 
-    new_done, new_skipped = _attach_new_records(new_records, ctx, pending,
-                                                emitted_fids)
+    new_done, unattached = _attach_new_records(new_records, ctx, pending,
+                                               emitted_fids)
 
     emitted, orphaned = emit_nested_overrides(pending, writer)
     msg = (f"  {label} overrides: {emitted} emitted in the master's "
            f"group nesting, {dropped} unchanged")
     if new_done:
         msg += f", {new_done} NEW records nested under master parents"
-    if new_skipped:
-        msg += f", {new_skipped} NEW records SKIPPED (unresolvable parent)"
+    if unattached:
+        msg += (f", {len(unattached)} NEW records in this plugin's OWN "
+                f"hierarchy (built by the normal builders)")
     if orphaned:
         msg += f", {orphaned} SKIPPED (no master nesting)"
     print(msg)
+    return unattached
 
 
 # New (non-override) records inside GRUP trees: which export key names the
@@ -357,24 +365,30 @@ def _attach_new_records(new_records: list, ctx: OverrideContext,
     you copy a reference: the engine pairs a children GRUP with the record
     that precedes it, so the group cannot stand alone.
 
-    Records whose parent cannot be resolved in the master are counted and
-    reported by the caller — never silently dropped.
+    Returns (attached_count, unattached) where `unattached` is every record
+    whose parent is NOT the master's — those belong to this plugin's own
+    hierarchy and must be built by the normal group builders instead.
     """
     from .record_types.world import convert_ACHR, convert_REFR
     from .text_reader import get_formid, get_int
 
     done = 0
-    skipped = 0
+    unattached = []
     for sig, rec in new_records:
         parent_key = _NEW_NESTED_PARENT.get(sig)
         parent_src = (rec.get(parent_key) or '') if parent_key else ''
-        parent_out = master_output_formid(parent_src.upper(),
-                                          ctx.master_manifest)
-        parent_path = ctx.master_index.group_path(parent_out)
+        parent_out = (master_output_formid(parent_src.upper(),
+                                           ctx.master_manifest)
+                      if parent_key else 0)
+        parent_path = (ctx.master_index.group_path(parent_out)
+                       if parent_out else ())
         if not parent_key or not parent_path:
-            skipped += 1
-            print(f"    SKIPPED new {sig} {rec.get('FormID', '?')}: parent "
-                  f"{parent_src or '?'} not found in the master")
+            # NOT an error: the record's parent is this plugin's OWN, not the
+            # master's (Morroblivion declares Oblivion.esm as a master but its
+            # entire world — 387,813 CELL/REFR/LAND/PGRD records — is new).
+            # These belong to the normal group builders; dropping them here
+            # deleted every cell and reference in the game world.
+            unattached.append((sig, rec))
             continue
 
         try:
@@ -392,7 +406,6 @@ def _attach_new_records(new_records: list, ctx: OverrideContext,
                 label = struct.pack('<I', parent_out)
                 chain = ((6, label), (gtype, label))
         except Exception as e:
-            skipped += 1
             print(f"    SKIPPED new {sig} {rec.get('FormID', '?')}: "
                   f"conversion failed: {e}")
             continue
@@ -406,4 +419,4 @@ def _attach_new_records(new_records: list, ctx: OverrideContext,
         new_fid = get_formid(rec, 'FormID')
         pending.append((new_fid, record_bytes, parent_path + chain))
         done += 1
-    return done, skipped
+    return done, unattached

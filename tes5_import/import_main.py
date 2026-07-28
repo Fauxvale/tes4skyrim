@@ -759,11 +759,26 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # belongs to, and it reads an exterior cell's displayed name off that same
     # Location — Oblivion has neither, so build them here, before the cells are
     # written, since every cell needs an XLCN pointing at one.
-    # For a plugin with masters this is skipped: the master already built a
+    # For a pure PATCH plugin this is skipped: the master already built a
     # LCTN for every marker and cell, and its CELL records already point at
     # them. Building our own would duplicate all 265 and leave the overrides'
     # inherited XLCN pointing at the master's anyway.
-    if not ctx:
+    #
+    # But a master-dependent plugin that ships its OWN worldspace (Morroblivion)
+    # has cells the master never saw. Those need their own LCTNs or every
+    # exterior cell is unnamed and its map markers never become discoverable,
+    # so build locations whenever this plugin owns any new CELL/WRLD.
+    # Compare the RAW (unshifted) index byte: get_formid() would apply the
+    # load-order offset and put every plugin-owned record one index too high.
+    def _is_own_record(rec) -> bool:
+        try:
+            return (int(rec.get('FormID', '0'), 16) >> 24) >= num_tes4_masters
+        except (ValueError, TypeError):
+            return False
+
+    _owns_new_world = any(_is_own_record(r) for sig in ('CELL', 'WRLD')
+                          for r in by_type.get(sig, []))
+    if not ctx or _owns_new_world:
         set_cell_locations(*build_marker_locations(by_type, writer))
 
     # --- Phase 4: CELL/WRLD hierarchy (+ PGRD→NAVM navmeshes) ---
@@ -803,16 +818,38 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     land_cache = _precompute_land(by_type, export_dir)
     _phase_done('phase 4b LAND conversion')
 
+    world_sigs = ('CELL', 'WRLD', 'REFR', 'ACHR', 'ACRE', 'LAND', 'PGRD')
     if ctx:
         # A CELL's child GRUP REPLACES the master's — it is not merged (see
         # overrides.build_nested_overrides). LAND and PGRD ride along: LAND
         # overrides substitute into the master's converted LAND; PGRD has no
         # output record to patch (it becomes a generated NAVM) and is counted
         # as inexpressible rather than silently dropped.
-        build_nested_overrides(
-            by_type, ('CELL', 'WRLD', 'REFR', 'ACHR', 'ACRE', 'LAND', 'PGRD'),
-            ctx, writer, 'CELL/WRLD/REFR')
+        unattached = build_nested_overrides(
+            by_type, world_sigs, ctx, writer, 'CELL/WRLD/REFR')
         _phase_done('phase 4c/4d CELL+WRLD overrides')
+
+        # A master-dependent plugin may still own an entire world of its own.
+        # Morroblivion declares Oblivion.esm as a master purely to reference
+        # its records, yet all 387,813 of its CELL/REFR/LAND/PGRD records are
+        # NEW — they override nothing. The override path cannot express them
+        # (there is no master record to patch), so they were being dropped and
+        # the output shipped with no game world at all. Build them exactly as
+        # a master-less plugin would.
+        if unattached:
+            own = defaultdict(list)
+            for sig, rec in unattached:
+                own[sig].append(rec)
+            print(f"  Building this plugin's OWN cell hierarchy "
+                  f"({sum(len(v) for v in own.values())} records: "
+                  + ', '.join(f'{len(own[s])} {s}' for s in world_sigs
+                              if own.get(s)) + ")")
+            _build_cell_groups(own, writer, navm_metas, base_model_by_fid,
+                               door_fids, navm_cache, land_cache)
+            _phase_done('phase 4c own CELL groups')
+            _build_world_groups(own, writer, navm_metas, base_model_by_fid,
+                                door_fids, navm_cache, land_cache)
+            _phase_done('phase 4d own WRLD groups')
     else:
         _build_cell_groups(by_type, writer, navm_metas, base_model_by_fid,
                            door_fids, navm_cache, land_cache)
@@ -857,9 +894,25 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
         # regenerate DLBR/DLVW branches the master already has, and re-decide
         # which of the 71 skipped topics to drop. A translation only rewrites
         # response text, so emit flat overrides carrying exactly that.
-        build_nested_overrides(by_type, ('DIAL', 'INFO'), ctx, writer,
-                               'DIAL/INFO')
+        unattached_dial = build_nested_overrides(by_type, ('DIAL', 'INFO'),
+                                                 ctx, writer, 'DIAL/INFO')
         dialog_sge_fids = set()
+        # As with the cell tree: a plugin with a master can still add whole
+        # topics of its own (Morroblivion brings 4,035 new DIALs and their
+        # INFOs). Those have no master DIAL to override, so run the real
+        # dialogue pipeline over them instead of discarding them.
+        if unattached_dial:
+            own = defaultdict(list)
+            for sig, rec in unattached_dial:
+                own[sig].append(rec)
+            print(f"  Building this plugin's OWN dialogue "
+                  f"({len(own.get('DIAL', []))} DIAL, "
+                  f"{len(own.get('INFO', []))} INFO)")
+            dialog_sge_fids = build_dialog_groups(
+                own, writer, npc_to_vtyp, fid_to_edid=fid_to_edid, xref=xref,
+                well_known_props=_WELL_KNOWN_PROPERTIES, voice_map=voice_map,
+                unlock_plan=unlock_plan, unlock_globals=unlock_globals,
+                script_vars=_script_vars)
     else:
         dialog_sge_fids = build_dialog_groups(by_type, writer, npc_to_vtyp, fid_to_edid=fid_to_edid, xref=xref, well_known_props=_WELL_KNOWN_PROPERTIES, voice_map=voice_map, unlock_plan=unlock_plan, unlock_globals=unlock_globals, script_vars=_script_vars)
     sge_quest_fids |= dialog_sge_fids
