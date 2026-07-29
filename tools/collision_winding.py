@@ -135,6 +135,134 @@ def _scan(args):
     return None
 
 
+def _repair_soups(path):
+    """[(node, tris_hu, groups)] for every mesh collision, converter-side."""
+    from asset_convert import collision as C
+    from pyffi.formats.nif import NifFormat as NF
+    data = NF.Data()
+    with open(path, 'rb') as f:
+        data.read(f)
+    out = []
+    for root in data.roots:
+        for blk in root.tree():
+            obj = getattr(blk, 'collision_object', None)
+            body = getattr(obj, 'body', None) if obj else None
+            shape = getattr(body, 'shape', None) if body else None
+            if isinstance(shape, NF.bhkMoppBvTreeShape):
+                shape = shape.shape
+            if shape is None:
+                continue
+            soup = C._shape_tri_soup(shape)
+            if soup is None:
+                continue
+            tris = C._bake_body_transform_into_tris(body, soup[0])
+            out.append((blk, tris, C.shape_tri_groups(shape)))
+    return out
+
+
+def _floor_state(tris):
+    """(up, down) counts for the lowest near-horizontal band."""
+    if not tris:
+        return (0, 0)
+    lo = min(v[2] for t in tris for v in t)
+    up = down = 0
+    for t in tris:
+        n = _normal(*t)
+        if n is None or abs(n[2]) < _FLAT:
+            continue
+        if (sum(v[2] for v in t) / 3.0) - lo > 0.5:   # havok units
+            continue
+        if n[2] > 0:
+            up += 1
+        else:
+            down += 1
+    return (up, down)
+
+
+def _scan_regress(path):
+    """Does the shipped repair turn a walkable floor into a fall-through one?
+
+    This is the invariant that matters in-game.  Counting "triangles changed"
+    is misleading, because several vanilla meshes really are inconsistently
+    wound at the source (the SI bridges have 242 of 324 shared edges
+    disagreeing), so a changed triangle there is a repair, not damage.
+    """
+    from asset_convert import collision as C
+    try:
+        soups = _repair_soups(path)
+    except Exception:
+        return None
+    if not soups:
+        return None
+    broke = fixed = 0
+    for node, tris, groups in soups:
+        vis = C._visual_tri_soup(node)
+        rep, _n = C._repair_inverted_floors(list(tris), vis, groups)
+        (u0, d0), (u1, d1) = _floor_state(tris), _floor_state(rep)
+        if u0 and not d0 and d1 and not u1:
+            broke += 1
+        elif d0 and not u0 and u1 and not d1:
+            fixed += 1
+    return (path, fixed, broke)
+
+
+def _scan_ab(args):
+    """Exact A/B of the repair against the same mesh in another tree.
+
+    Nehrim and Morrowind_ob re-export assets Oblivion also ships, and the
+    vanilla file's winding is correct, so it is ground truth: match each
+    triangle by vertex set and compare cyclic order.  Reports recall (how
+    much of the real damage the repair fixes) and, critically, how many
+    already-correct triangles it breaks.
+    """
+    from asset_convert import collision as C
+    rel, src, dst = args
+    npath, opath = os.path.join(src, rel), os.path.join(dst, rel)
+    if not (os.path.exists(npath) and os.path.exists(opath)):
+        return None
+    try:
+        nsoups, osoups = _repair_soups(npath), _repair_soups(opath)
+    except Exception:
+        return None
+    if not nsoups or not osoups:
+        return None
+
+    def key(v):
+        return (round(v[0], 1), round(v[1], 1), round(v[2], 1))
+
+    def same(a, b):
+        return any((a[r], a[(r+1) % 3], a[(r+2) % 3]) == b for r in range(3))
+
+    ref = {}
+    for _n, tris, _g in osoups:
+        for t in tris:
+            ks = tuple(key(v) for v in t)
+            ref.setdefault(frozenset(ks), []).append(ks)
+
+    matched = bad = left = broke = 0
+    for node, tris, groups in nsoups:
+        vis = C._visual_tri_soup(node)
+        rep, _n = C._repair_inverted_floors(list(tris), vis, groups)
+        for before, after in zip(tris, rep):
+            kb = tuple(key(v) for v in before)
+            cands = ref.get(frozenset(kb))
+            if not cands:
+                continue
+            matched += 1
+            was_ok = any(same(kb, c) for c in cands)
+            ka = tuple(key(v) for v in after)
+            now_ok = any(same(ka, c) for c in cands)
+            if not was_ok:
+                bad += 1
+                if not now_ok:
+                    left += 1
+            elif not now_ok:
+                broke += 1
+    if not matched:
+        return None
+    return (rel, matched, bad, left, broke)
+
+
 def _scan_floor(args):
     """Orientation of the lowest near-horizontal surface (the floor).
 
@@ -179,6 +307,17 @@ def main():
                     help='report meshes whose lowest near-horizontal surface '
                          'faces DOWN (uniformly reversed floors, which the '
                          'default mixed-pair scan cannot detect)')
+    ap.add_argument('--floor-regress', action='store_true',
+                    help='run the SHIPPED repair and report floors it turns '
+                         'from walkable into fall-through (the in-game '
+                         'invariant; run this on any tree before shipping)')
+    ap.add_argument('--ab', metavar='REF_TREE',
+                    help='score the shipped repair against the same meshes in '
+                         'REF_TREE (e.g. export/Oblivion.esm/meshes), whose '
+                         'winding is ground truth.  Reports recall and how '
+                         'many correct triangles the repair breaks.')
+    ap.add_argument('--max', type=int, default=0,
+                    help='limit to the first N meshes')
     ap.add_argument('--top', type=int, default=25)
     ap.add_argument('--workers', type=int,
                     default=max(1, (os.cpu_count() or 2) - 1))
@@ -190,7 +329,60 @@ def main():
         files = [os.path.join(dp, fn)
                  for dp, _, fns in os.walk(a.root)
                  for fn in fns if fn.lower().endswith('.nif')]
+    if a.max:
+        files = files[:a.max]
     print(f"scanning {len(files)} NIFs ({'converted' if a.converted else 'source'} format)")
+
+    if a.ab:
+        base = a.root if os.path.isdir(a.root) else os.path.dirname(a.root)
+        # Both trees are addressed by the path relative to their meshes root.
+        src = base
+        while src and os.path.basename(src).lower() != 'meshes':
+            nxt = os.path.dirname(src)
+            if nxt == src:
+                src = base
+                break
+            src = nxt
+        rels = [(os.path.relpath(f, src).replace('\\', '/'), src, a.ab)
+                for f in files]
+        T = [0, 0, 0, 0, 0]
+        with ProcessPoolExecutor(max_workers=a.workers) as ex:
+            for r in ex.map(_scan_ab, rels, chunksize=4):
+                if r is None:
+                    continue
+                rel, m, bad, left, broke = r
+                T[0] += 1; T[1] += m; T[2] += bad; T[3] += left; T[4] += broke
+                if left or broke:
+                    print(f"  {rel}: tris={m} reversed={bad} "
+                          f"left={left} broke={broke}")
+        print(f"\n{T[0]} meshes scored against {a.ab}")
+        print(f"  triangles matched  : {T[1]}")
+        print(f"  reversed at source : {T[2]}")
+        if T[2]:
+            print(f"  still reversed     : {T[3]}   "
+                  f"(fixed {T[2]-T[3]}, {100*(T[2]-T[3])/T[2]:.1f}% recall)")
+        if T[1] > T[2]:
+            print(f"  BROKEN by repair   : {T[4]}   "
+                  f"({100*T[4]/(T[1]-T[2]):.2f}% of correct triangles)")
+        return
+
+    if a.floor_regress:
+        fixed = broke = 0
+        bad_files = []
+        with ProcessPoolExecutor(max_workers=a.workers) as ex:
+            for r in ex.map(_scan_regress, files, chunksize=4):
+                if r is None:
+                    continue
+                path, f_, b_ = r
+                fixed += f_
+                broke += b_
+                if b_:
+                    bad_files.append(path)
+        print(f"\nfall-through -> walkable (fixed)      : {fixed}")
+        print(f"walkable -> fall-through (REGRESSION) : {broke}")
+        for p in bad_files[:a.top]:
+            print(f"   REGRESSED {p}")
+        return
 
     if a.floor_orientation:
         bad, good, errors = [], 0, 0
