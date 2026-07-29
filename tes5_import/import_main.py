@@ -606,8 +606,11 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # wearables moved to a DOFT outfit and everything else left in CNTO
     # (see outfits.py). Classifying an item needs its record type and biped
     # slot, so index them before the actor converters run in Phase 1.
+    # A dependent plugin dresses its actors out of its MASTER's wardrobe, so the
+    # master's item records must be in the index too or every master-owned
+    # wearable is classified non-wearable and the actor gets no outfit at all.
     from .outfits import load_item_index
-    load_item_index(by_type)
+    load_item_index(by_type, ctx.master_export if ctx else None)
     _phase_done('phase 0 pre-scans')
 
     # --- Phase 1: Simple record types (flat top-level groups) ---

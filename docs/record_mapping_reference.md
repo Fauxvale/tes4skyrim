@@ -140,6 +140,18 @@ see the `oblivion-to-skyrim-dialog` skill.
   the guaranteed pants left ~75% of bandits bare-legged. Keep both; engine wears greaves when rolled,
   pants otherwise. The `NN` in Bethesda's list names (`...Greaves25`, `...Cuirass100`) is the equip
   probability. Trace any actor with `python -m tools.trace_outfit export/Oblivion.esm <EditorID>`.
+  **A plugin WITH MASTERS must index its masters' items too** (`load_item_index(by_type,
+  ctx.master_export)`): a dependent plugin dresses its actors out of its MASTER's wardrobe, so most
+  inventory entries name a record the plugin does not contain. DLCBattlehornCastle draws 155 of its 165
+  NPC inventory entries from Oblivion.esm; indexing only its own 45 records left every one of them
+  unclassifiable, so they fell to the non-wearable default, stayed in CNTO, and all 22 NPCs — knights,
+  captain, maid, cook — spawned with NO outfit at all (index 45 items/9 wearable → 8,501/1,609; 20/22
+  now dressed, the 2 without being a dog and a lich). Only the item signatures are indexed, never the
+  master's whole export: at ~1.17M records that is the difference between ~30k dicts and all of them
+  (and the navmesh phase then forks workers off this process — see the memory note in `load_item_index`).
+  The index keys on the low 24 bits, so the plugin's own records are loaded LAST and win. An override
+  plugin that only retitles NPCs is unaffected and must stay so: Translation.esp's 1,284 NPC overrides
+  keep the master's DOFT byte-identically, 0 lost.
 - **RACE** — Almost entirely restructured. Only basic data (height/weight/skill boosts/spells) can transfer.
 - **MGEF** — 4-char code system vs FormID system. Flag mapping is complex.
 - **ENCH/SPEL** — ENIT/SPIT completely restructured. Effects need MGEF FormID resolution.

@@ -3900,3 +3900,97 @@ class TestLandOverrides:
         rec = self._land(VHGT=self._vhgt(delta=2), VNML='00' * 3267)
         assert diff_records(rec, self._land(VHGT=self._vhgt(delta=2),
                                             VNML='00' * 3267)) == {}
+
+
+class TestOutfitIndexAcrossMasters(TestOutfitSplit):
+    """A dependent plugin dresses its actors out of its MASTER's wardrobe.
+
+    Inherits TestOutfitSplit's record builders. The item index used to be built
+    from the plugin's own records alone, so every inventory entry naming a
+    master record was unclassifiable, fell to the non-wearable default, and
+    stayed in CNTO — the actor got no outfit at all. DLCBattlehornCastle draws
+    155 of its 165 NPC inventory entries from Oblivion.esm, and all 22 of its
+    NPCs (knights, captain, maid, cook) stood around undressed in-game.
+    """
+
+    def _index_with_master(self, master_types=None, **types):
+        """Index the plugin's records plus a master export, as import does."""
+        from tes5_import.outfits import load_item_index
+        from tes5_import.text_reader import set_formid_index_offset
+        set_formid_index_offset(0)
+        master_export = {}
+        for recs in (master_types or {}).values():
+            for rec in recs:
+                master_export[rec['FormID'].upper()] = rec
+        load_item_index(types, master_export)
+
+    def test_master_owned_armor_reaches_the_outfit(self):
+        from tes5_import.outfits import split_inventory
+        # The wearables live in the MASTER; the plugin contains none of them.
+        self._index_with_master(master_types={'ARMO': [
+            self._armo('0002A17E', 'IronCuirass', self.BODY, value=100),
+            self._armo('0002A17F', 'IronGreaves', self.LEGS, value=90),
+        ]})
+
+        outfit, carried = split_inventory([(0x0002A17E, 1), (0x0002A17F, 1)])
+
+        assert sorted(outfit) == [0x0002A17E, 0x0002A17F], (
+            "master-owned armor was classified non-wearable and left in CNTO "
+            "— the actor spawns naked")
+        assert carried == []
+
+    def test_plugin_record_wins_over_the_masters_same_id(self):
+        """The plugin's own record overrides the master's at the same id."""
+        from tes5_import.outfits import split_inventory
+        # Master says this id is a potion (never wearable); the plugin's own
+        # export says it is armor. The plugin is authoritative.
+        self._index_with_master(
+            master_types={'ALCH': [{'Signature': 'ALCH',
+                                    'FormID': '0002A180'}]},
+            ARMO=[self._armo('0002A180', 'PluginCuirass', self.BODY)])
+
+        outfit, _carried = split_inventory([(0x0002A180, 1)])
+
+        assert outfit == [0x0002A180], (
+            "the plugin's own record must win — it is loaded last")
+
+    def test_master_leveled_list_resolves_through_master_leaves(self):
+        """An LVLI in the master whose leaves are also in the master."""
+        from tes5_import.outfits import split_inventory
+        self._index_with_master(master_types={
+            'ARMO': [self._armo('0002B001', 'LeatherCuirass', self.BODY)],
+            'LVLI': [self._lvli('0002B010', 'LL0Cuirass', ['0002B001'])],
+        })
+
+        outfit, carried = split_inventory([(0x0002B010, 1)])
+
+        assert outfit == [0x0002B010], (
+            'an all-armor master LVLI is outfit-eligible; unresolvable leaves '
+            'would have made it non-wearable and dropped the outfit')
+        assert carried == []
+
+    def test_master_loot_still_stays_in_the_inventory(self):
+        """Indexing the master must not sweep non-wearables into the outfit."""
+        from tes5_import.outfits import split_inventory
+        self._index_with_master(master_types={
+            'ARMO': [self._armo('0002C001', 'Cuirass', self.BODY)],
+            'ALCH': [{'Signature': 'ALCH', 'FormID': '0002C002'}],
+            'KEYM': [{'Signature': 'KEYM', 'FormID': '0002C003'}],
+        })
+
+        outfit, carried = split_inventory(
+            [(0x0002C001, 1), (0x0002C002, 3), (0x0002C003, 1)])
+
+        assert outfit == [0x0002C001]
+        assert sorted(carried) == [(0x0002C002, 3), (0x0002C003, 1)], (
+            'potions and keys in an outfit are what the CK rejects with '
+            '"contains non-armor objects"')
+
+    def test_no_master_export_behaves_as_before(self):
+        """A master's OWN run passes no master export and must be unaffected."""
+        from tes5_import.outfits import split_inventory
+        self._index(ARMO=[self._armo('0002D001', 'Cuirass', self.BODY)])
+
+        outfit, carried = split_inventory([(0x0002D001, 1)])
+
+        assert outfit == [0x0002D001] and carried == []

@@ -98,7 +98,7 @@ def _low(fid_str: str):
         return None
 
 
-def load_item_index(by_type: dict) -> None:
+def load_item_index(by_type: dict, master_export: dict = None) -> None:
     """Index every record an actor inventory can point at, so the actor
     converters can classify each CNTO entry by type and biped slot.
 
@@ -109,10 +109,41 @@ def load_item_index(by_type: dict) -> None:
     31 worker processes, the machine went to swap and the import appeared to
     hang at "Generating 8228 navmeshes". Anything not indexed is treated as
     non-wearable and stays in CNTO, which is the safe side of the split.
+
+    `master_export` is the MASTERS' export records ({FormID hex -> record},
+    OverrideContext.master_export) and is REQUIRED for a plugin with masters: a
+    dependent plugin dresses its actors out of its master's wardrobe, so most
+    inventory entries name a record the plugin does not contain.
+    DLCBattlehornCastle's NPCs draw 155 of their 165 inventory entries from
+    Oblivion.esm; with only the plugin's own 45 records indexed, every one of
+    those fell to the non-wearable default, stayed in CNTO, and the actors got
+    no outfit — all 22 NPCs, the knights included, stood around undressed.
+
+    The index is keyed on the low 24 bits, so a master record and a plugin
+    record with the same object id collide by design: the plugin's own records
+    are loaded LAST and win, which is what an override should do.
     """
     _ITEM_SIG.clear()
     _ITEM_REC.clear()
     _LVLI_WEARABLE.clear()
+
+    n_master = 0
+    if master_export:
+        # Filter by signature rather than walking every master record into the
+        # index: the masters' export is ~1.17M records and only the item types
+        # can ever appear in an inventory (same reasoning as `by_type` above,
+        # and here it is the difference between ~30k dicts and all of them).
+        for rec in master_export.values():
+            sig = rec.get('Signature')
+            if sig not in _INVENTORY_SIGS:
+                continue
+            fid = _low(rec.get('FormID', ''))
+            if fid is None:
+                continue
+            _ITEM_SIG[fid] = sig
+            if sig in _INSPECTED_SIGS:
+                _ITEM_REC[fid] = rec
+            n_master += 1
 
     for sig in _INVENTORY_SIGS:
         for rec in by_type.get(sig, []):
@@ -126,8 +157,12 @@ def load_item_index(by_type: dict) -> None:
                 _ITEM_REC[fid] = rec
 
     n_wear = sum(1 for s in _ITEM_SIG.values() if s in _WEARABLE_SIGS)
-    print(f'  Outfit index: {len(_ITEM_SIG)} items '
-          f'({n_wear} wearable, {len(by_type.get("LVLI", []))} leveled lists)')
+    n_lvli = sum(1 for s in _ITEM_SIG.values() if s == 'LVLI')
+    msg = (f'  Outfit index: {len(_ITEM_SIG)} items '
+           f'({n_wear} wearable, {n_lvli} leveled lists)')
+    if n_master:
+        msg += f' — {n_master} from master(s)'
+    print(msg)
 
 
 def _lvli_is_wearable(fid: int, depth: int = 0, path=()) -> bool:

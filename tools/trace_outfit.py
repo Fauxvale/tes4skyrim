@@ -6,17 +6,59 @@ every inventory line classified as outfit/carried, the biped slots each wearable
 claims, and — crucially — which wearables lost a slot-conflict and got demoted
 to carried loot (the "bandit with no pants" symptom).
 
+For a plugin WITH MASTERS the masters' exports must be indexed too, or every
+inventory entry naming a master record looks unclassifiable and the trace
+reports an empty outfit that the real converter would also have produced. The
+masters named in the export's _HEADER.txt are loaded automatically; use
+--no-masters to see the plugin-only view.
+
 Usage:
     python -m tools.trace_outfit export/Oblivion.esm BanditHighwayman04
     python -m tools.trace_outfit export/Oblivion.esm 000C1234
     python -m tools.trace_outfit export/Oblivion.esm Bandit --contains
+    python -m tools.trace_outfit export/DLCBattlehornCastle.esp Knight1
 """
 import argparse
+import os
 import sys
 
 from tes5_import.text_reader import parse_export_directory
 from tes5_import import outfits
 from tes5_import.text_reader import get_int
+
+
+def _load_master_export(export_dir: str) -> dict:
+    """The masters' export records, keyed by raw TES4 FormID.
+
+    Mirrors overrides.load_master_export so the trace indexes exactly what the
+    converter does. A dependent plugin dresses its actors out of its master's
+    wardrobe (DLCBattlehornCastle: 155 of 165 inventory entries), so without
+    this the trace shows every one of them as carried loot.
+    """
+    header = os.path.join(export_dir, '_HEADER.txt')
+    if not os.path.isfile(header):
+        return {}
+    names = []
+    with open(header, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.startswith('Master['):
+                _, _, val = line.partition('=')
+                if val.strip():
+                    names.append(val.strip())
+    root = os.path.dirname(os.path.normpath(export_dir))
+    out = {}
+    for name in names:
+        mdir = os.path.join(root, name)
+        if not os.path.isdir(mdir):
+            print(f'  WARNING: master export not found ({mdir}); '
+                  f'its items cannot be classified')
+            continue
+        print(f'  indexing master export: {name}')
+        for rec in parse_export_directory(mdir):
+            fid = rec.get('FormID')
+            if fid:
+                out[fid.upper()] = rec
+    return out
 
 # TES4 biped bit → human label (from constants.BIPED_SLOT_MAP).
 _SLOT_NAMES = {
@@ -46,6 +88,8 @@ def main() -> int:
     ap.add_argument('actor', help='EditorID or FormID (hex) of the NPC_/CREA')
     ap.add_argument('--contains', action='store_true',
                     help='match any actor whose EditorID contains ACTOR')
+    ap.add_argument('--no-masters', action='store_true',
+                    help="don't index the masters' exports (plugin-only view)")
     args = ap.parse_args()
 
     records = parse_export_directory(args.export_dir)
@@ -53,7 +97,9 @@ def main() -> int:
     for r in records:
         by_type.setdefault(r.get('Signature', ''), []).append(r)
 
-    outfits.load_item_index(by_type)
+    master_export = ({} if args.no_masters
+                     else _load_master_export(args.export_dir))
+    outfits.load_item_index(by_type, master_export)
 
     actors = by_type.get('NPC_', []) + by_type.get('CREA', [])
     key = args.actor.upper()
