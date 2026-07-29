@@ -3762,3 +3762,141 @@ class TestOwnedGroupAnchoring:
         _writer, _emitted, _orphaned, anchored = self._emit(records, {})
 
         assert anchored == 0, 'nothing to anchor with: no anchor is invented'
+
+
+class TestLandOverrides:
+    """A LAND override must carry the author's terrain, not the master's.
+
+    VNML/VHGT/VCLR have identical layout in TES4 and TES5, so convert_LAND
+    copies the hex blob straight through — which makes the authored value
+    directly substitutable. Before these mappings existed, every terrain edit
+    was reported as "no output mapping" and silently kept the master's terrain:
+    DLCBattlehornCastle authored VHGT on all 16 of its LAND overrides, so the
+    castle sat on Oblivion's untouched hillside.
+    """
+
+    _VHGT_PAYLOAD = 4 + 33 * 33          # float offset + 33x33 signed deltas
+
+    def _land(self, **over):
+        rec = {
+            'Signature': 'LAND',
+            'FormID': '00008EB7',
+            'RecordFlags': '0',
+            'DATA.Flags': '3',
+            'LayerCount': '0',
+        }
+        rec.update(over)
+        return rec
+
+    def _vhgt(self, offset_byte=0x40, delta=0, pad='000000'):
+        body = '%02x000000' % offset_byte + ('%02x' % (delta & 0xFF)) * 1089
+        return body + pad
+
+    def _subs(self, record):
+        out = []
+        off = 24
+        while off + 6 <= len(record):
+            sig = record[off:off + 4]
+            size = struct.unpack_from('<H', record, off + 4)[0]
+            out.append((sig, record[off + 6:off + 6 + size]))
+            off += 6 + size
+        return out
+
+    def _apply(self, master_rec, plugin_rec):
+        from tes5_import.export_diff import diff_records
+        from tes5_import.override_builder import apply_changes
+        from tes5_import.record_types.world import convert_LAND
+        base = convert_LAND(master_rec)
+        changes = diff_records(master_rec, plugin_rec)
+        out, applied, unmapped = apply_changes(base, changes, plugin_rec,
+                                               master_rec)
+        return out, changes, applied, unmapped
+
+    def test_authored_heights_replace_the_masters(self):
+        master = self._land(VHGT=self._vhgt(delta=0))
+        plugin = self._land(VHGT=self._vhgt(delta=5))
+
+        out, changes, _applied, unmapped = self._apply(master, plugin)
+
+        assert 'VHGT' in changes, 'the diff must see the terrain change'
+        assert unmapped == set(), f'VHGT must be mappable, got {unmapped}'
+        vhgt = dict(self._subs(out))[b'VHGT']
+        assert vhgt[4:4 + 1089] == b'\x05' * 1089, (
+            "the override kept the master's heights — the castle would sit on "
+            "the master's terrain")
+
+    def test_normals_and_colours_are_mapped(self):
+        master = self._land(VNML='00' * 3267, VCLR='11' * 3267)
+        plugin = self._land(VNML='7f' * 3267, VCLR='22' * 3267)
+
+        out, _changes, _applied, unmapped = self._apply(master, plugin)
+        subs = dict(self._subs(out))
+
+        assert unmapped == set()
+        assert subs[b'VNML'] == b'\x7f' * 3267
+        assert subs[b'VCLR'] == b'\x22' * 3267
+
+    def test_vhgt_trailing_pad_is_not_an_authored_change(self):
+        """The last 3 VHGT bytes are wbUnused(3) — uninitialised CS memory.
+
+        A census of 15,410 vanilla Skyrim.esm LAND records finds arbitrary junk
+        there (000000 is merely the most common of many values), so the engine
+        ignores them. Comparing them reported phantom VHGT changes on 6 of
+        DLCBattlehornCastle's 16 LAND overrides whose real terrain was
+        identical, emitting override records with no authored content.
+        """
+        from tes5_import.export_diff import diff_records
+        master = self._land(VHGT=self._vhgt(delta=3, pad='d21b02'))
+        plugin = self._land(VHGT=self._vhgt(delta=3, pad='000000'))
+
+        assert diff_records(master, plugin) == {}, (
+            'a pad-only difference must not count as an authored change')
+
+    def test_real_change_keeps_the_masters_pad(self):
+        """When terrain DID change, the master's unused bytes still survive."""
+        master = self._land(VHGT=self._vhgt(delta=0, pad='d21b02'))
+        plugin = self._land(VHGT=self._vhgt(delta=7, pad='000000'))
+
+        out, changes, _applied, unmapped = self._apply(master, plugin)
+
+        assert 'VHGT' in changes and unmapped == set()
+        vhgt = dict(self._subs(out))[b'VHGT']
+        assert vhgt[4:4 + 1089] == b'\x07' * 1089, 'authored heights applied'
+        assert vhgt[self._VHGT_PAYLOAD:] == bytes.fromhex('d21b02'), (
+            "the master's uninitialised pad must be preserved so the override "
+            'differs only where the author changed the terrain')
+
+    def test_layer_run_is_rebuilt_through_the_converters_own_builder(self):
+        """Layer[] changes replace the whole BTXT/ATXT/VTXT run.
+
+        The layer mapping is lossy and order-dependent (same-texture merge,
+        coverage sort, 6-alpha cap), so the override MUST reuse
+        build_land_layers rather than reimplement it.
+        """
+        master = self._land(**{
+            'LayerCount': '1',
+            'Layer[0].Type': 'BASE',
+            'Layer[0].BTXT.Texture': '00001111',
+            'Layer[0].BTXT.Quadrant': '0',
+        })
+        plugin = self._land(**{
+            'LayerCount': '1',
+            'Layer[0].Type': 'BASE',
+            'Layer[0].BTXT.Texture': '00002222',
+            'Layer[0].BTXT.Quadrant': '0',
+        })
+
+        out, changes, _applied, unmapped = self._apply(master, plugin)
+
+        assert 'Layer[]' in changes
+        assert unmapped == set(), f'Layer[] must be mappable, got {unmapped}'
+        btxt = dict(self._subs(out))[b'BTXT']
+        from tes5_import.text_reader import remap_formid
+        assert struct.unpack_from('<I', btxt)[0] == remap_formid(0x00002222), \
+            "the authored base texture must replace the master's"
+
+    def test_unchanged_land_is_dropped_entirely(self):
+        from tes5_import.export_diff import diff_records
+        rec = self._land(VHGT=self._vhgt(delta=2), VNML='00' * 3267)
+        assert diff_records(rec, self._land(VHGT=self._vhgt(delta=2),
+                                            VNML='00' * 3267)) == {}

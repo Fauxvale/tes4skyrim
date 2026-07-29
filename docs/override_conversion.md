@@ -134,6 +134,30 @@ from comparing two conversion runs.
   it masked (`export_diff._LIST_FIELD_NORMALIZERS`) or 58 quests report
   phantom Target[] changes. Expect more TES4 fields like this; the fix
   belongs in the DIFF, never the export (which stays a pure dump).
+- **LAND terrain overrides: VNML/VHGT/VCLR are hex blobs with IDENTICAL TES4
+  and TES5 layout**, so `convert_LAND` copies them straight through and the
+  authored value is directly substitutable — no re-derivation, no drift. They
+  had no `_REBUILDERS` entry at all, so every terrain edit was reported
+  "no output mapping" and kept the master's terrain: DLCBattlehornCastle
+  authored `VHGT` on all 16 of its LAND overrides (plus VNML×10, VCLR×8,
+  Layer[]×5) and the castle sat on Oblivion's untouched hillside. `Layer[]`
+  needs a `_RUN_REBUILDERS` entry instead — the whole BTXT/ATXT/VTXT run is
+  replaced through `world.build_land_layers` (extracted from `convert_LAND` for
+  exactly this). **Reuse that builder, never reimplement it**: the mapping is
+  lossy and order-dependent (same-texture merge, coverage sort, 6-alpha-per-
+  quadrant cap), so a second implementation would disagree with the master's
+  for layers the author never touched. Verified the extraction is pure —
+  4,000/4,000 master LAND records still convert byte-identically.
+  - **The last 3 bytes of VHGT are `wbUnused(3)`** (wbDefinitionsCommon.pas
+    `wbLandHeights`: `wbFloat Offset` + 33×33 `itS8` + `wbUnused(3)`). Vanilla
+    settles it: a census of 15,410 Skyrim.esm LAND records finds arbitrary junk
+    there — `000000` is merely the most common of many values (`3e9e23`,
+    `b57086`, `ea5b25` … each in the hundreds-to-thousands). Comparing them
+    reported phantom VHGT changes on 6 of the 16 whose real terrain was
+    identical, emitting override records with zero authored content. Normalised
+    in `export_diff._SCALAR_NORMALIZERS`, and `_Rebuild(keep_tail=3)` preserves
+    the MASTER's pad when the terrain genuinely did change, so an override
+    diverges only where the author sculpted.
 - **A NEW record nested in a master's GRUP tree** (Translation.esp injects a
   map-marker REFR into a Nehrim cell) is converted normally and placed under
   the master parent's children group; if the parent record isn't already

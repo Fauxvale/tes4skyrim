@@ -229,11 +229,42 @@ def _build_fltv(rec):
     return struct.pack('<f', get_float(rec, 'FLTV.Value'))
 
 
+def _build_land_hex(key):
+    """A LAND vertex-data subrecord: the export's raw hex, copied through.
+
+    VNML (normals), VHGT (heights) and VCLR (colours) have IDENTICAL layout in
+    TES4 and TES5, so convert_LAND copies the hex blob straight across. That
+    makes the authored value directly substitutable — no re-derivation, so no
+    drift. Terrain edits are the whole point of a castle mod regrading the
+    ground it stands on: DLCBattlehornCastle authors VHGT on all 16 of its LAND
+    overrides, and dropping them left the castle on the master's terrain.
+    """
+    def build(rec):
+        from .text_reader import get_str
+        hex_str = get_str(rec, key)
+        if not hex_str:
+            # The author cleared the subrecord (rare). Removing it is a real
+            # authored state, distinct from "we could not express it".
+            return None
+        try:
+            return bytes.fromhex(hex_str)
+        except ValueError:
+            return KEEP
+    return build
+
+
 class _Rebuild:
-    def __init__(self, sig: bytes, builder, anchors: tuple = ()):
+    def __init__(self, sig: bytes, builder, anchors: tuple = (),
+                 keep_tail: int = 0):
         self.sig = sig
         self.builder = builder
         self.anchors = anchors
+        # Trailing bytes of the MASTER's subrecord to preserve verbatim, for
+        # payloads that end in uninitialised CS memory (LAND VHGT's
+        # wbUnused(3)). The diff already ignores those bytes, so rewriting them
+        # would make the override differ from the master for no authored
+        # reason. Only applied when both sides are long enough.
+        self.keep_tail = keep_tail
 
 
 _RB_NPC_DNAM = _Rebuild(b'DNAM', _build_npc_dnam)
@@ -248,6 +279,20 @@ _RB_REFR_XOWN = _Rebuild(b'XOWN', _build_xown, (('after', b'XESP'),))
 _RB_MNAM = _Rebuild(b'MNAM', _build_mnam, (('after', b'DNAM'),))
 _RB_FLTV = _Rebuild(b'FLTV', _build_fltv, (('after', b'FNAM'),))
 _RB_SCRI_VMAD = _Rebuild(b'VMAD', _build_scri_vmad)
+# LAND vertex data, in the order convert_LAND emits it: DATA VNML VHGT VCLR,
+# then the BTXT/ATXT/VTXT layer run. Each anchors after the subrecord that
+# precedes it so a subrecord the master lacks is INSERTED in the right place
+# rather than appended past the layer run.
+_RB_LAND_VNML = _Rebuild(b'VNML', _build_land_hex('VNML'),
+                         (('after', b'DATA'),))
+_RB_LAND_VHGT = _Rebuild(b'VHGT', _build_land_hex('VHGT'),
+                         (('after', b'VNML'), ('after', b'DATA')),
+                         keep_tail=3)
+_RB_LAND_VCLR = _Rebuild(b'VCLR', _build_land_hex('VCLR'),
+                         (('after', b'VHGT'), ('after', b'VNML'),
+                          ('after', b'DATA')))
+_RB_LAND_DATA = _Rebuild(
+    b'DATA', lambda rec: struct.pack('<I', get_int(rec, 'DATA.Flags')))
 
 _XCLL_KEYS = tuple(
     f'XCLL.{f}' for f in (
@@ -284,6 +329,10 @@ _reg('ACRE', 'XOWN.Owner', _RB_REFR_XOWN)
 _reg('WRLD', ('MNAM.UsableDimX', 'MNAM.UsableDimY', 'MNAM.NWCellX',
               'MNAM.NWCellY', 'MNAM.SECellX', 'MNAM.SECellY'), _RB_MNAM)
 _reg('GLOB', 'FLTV.Value', _RB_FLTV)
+_reg('LAND', 'VNML', _RB_LAND_VNML)
+_reg('LAND', 'VHGT', _RB_LAND_VHGT)
+_reg('LAND', 'VCLR', _RB_LAND_VCLR)
+_reg('LAND', 'DATA.Flags', _RB_LAND_DATA)
 # Every type whose converter attaches object scripts via get_object_vmad
 # (record_types/common._common_header_subs + NPC_/CREA/STAT paths).
 for _scripted in ('ACTI', 'ALCH', 'APPA', 'ARMO', 'BOOK', 'CLOT', 'CONT',
@@ -453,6 +502,29 @@ def _rebuild_barter_gold(plugin_rec, master_rec, old_subs):
     return out
 
 
+def _rebuild_land_layers(plugin_rec, master_rec, old_subs):
+    """Replace the LAND texture-layer run from the plugin's own export.
+
+    Unlike the actor run rebuilders, there is nothing converter-ADDED to
+    preserve here: every BTXT/ATXT/VTXT comes from the export's Layer[] list,
+    so the author's list is the whole truth. The run is rebuilt wholesale
+    through convert_LAND's OWN builder (build_land_layers) because the mapping
+    is lossy — same-texture layers merge, alpha layers sort by coverage and cap
+    at 6 per quadrant — and a second implementation would disagree with the
+    master's for unchanged layers.
+    """
+    from .record_types.world import build_land_layers
+    blob = build_land_layers(plugin_rec)
+    out = []
+    off = 0
+    while off + 6 <= len(blob):
+        sig = blob[off:off + 4]
+        size = struct.unpack_from('<H', blob, off + 4)[0]
+        out.append((sig, blob[off + 6:off + 6 + size]))
+        off += 6 + size
+    return out
+
+
 class _RunRebuild:
     def __init__(self, family: tuple, builder, anchors: tuple):
         self.family = family        # sigs replaced as a unit
@@ -470,6 +542,13 @@ _RUN_PACKAGES = _RunRebuild((b'PKID',), _rebuild_packages,
 
 _RUN_BARTER_GOLD = _RunRebuild((b'COCT', b'CNTO'), _rebuild_barter_gold, ())
 
+# The whole layer run is replaced as a unit; it is the LAST thing in a LAND
+# record, so it anchors after the vertex data.
+_RUN_LAND_LAYERS = _RunRebuild(
+    (b'BTXT', b'ATXT', b'VTXT'), _rebuild_land_layers,
+    (('after', b'VCLR'), ('after', b'VHGT'), ('after', b'VNML'),
+     ('after', b'DATA')))
+
 _RUN_REBUILDERS = {
     ('NPC_', 'Item[]'): _RUN_INVENTORY,
     ('CREA', 'Item[]'): _RUN_INVENTORY,
@@ -480,6 +559,8 @@ _RUN_REBUILDERS = {
     ('CREA', 'AIPackage[]'): _RUN_PACKAGES,
     ('NPC_', 'ACBS.BarterGold'): _RUN_BARTER_GOLD,
     ('CREA', 'ACBS.BarterGold'): _RUN_BARTER_GOLD,
+    ('LAND', 'Layer[]'): _RUN_LAND_LAYERS,
+    ('LAND', 'LayerCount'): _RUN_LAND_LAYERS,
 }
 
 
@@ -644,6 +725,12 @@ def apply_changes(master_record: bytes, changes: dict,
             if idx is not None:
                 del out[idx]
         elif idx is not None:
+            tail = spec.keep_tail
+            if tail and len(payload) > tail and len(out[idx][1]) >= tail:
+                # Preserve the master's uninitialised trailing bytes (see
+                # _Rebuild.keep_tail) so the override differs only where the
+                # author actually changed the terrain.
+                payload = payload[:-tail] + out[idx][1][-tail:]
             out[idx] = (spec.sig, payload)
         else:
             _insert_at_anchor(out, spec.anchors, [(spec.sig, payload)])

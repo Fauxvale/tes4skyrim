@@ -652,6 +652,27 @@ def convert_LAND(rec: dict) -> bytes:
     if vclr_hex:
         subs += pack_subrecord('VCLR', bytes.fromhex(vclr_hex))
 
+    subs += build_land_layers(rec)
+
+    # VTEX is a TES4-only subrecord; TES5 LAND does not have it.
+    # Texture references are already encoded in BTXT/ATXT FormIDs above.
+
+    flags = get_int(rec, 'RecordFlags')
+    return pack_record('LAND', get_formid(rec, 'FormID'), flags, subs)
+
+
+def build_land_layers(rec: dict) -> bytes:
+    """The LAND texture-layer run: BTXT/ATXT/VTXT, in TES5 order.
+
+    Split out of convert_LAND so the override path can rebuild the whole run
+    from the PLUGIN's export when an author changes Layer[] (override_builder
+    _RUN_LAND_LAYERS). The merge/sort/cap below is lossy and order-dependent,
+    so an override MUST reuse this function rather than reimplement it — two
+    implementations would disagree and the terrain would re-texture itself on
+    every unrelated edit.
+    """
+    subs = b''
+
     # Layers (BTXT/ATXT/VTXT)
     # TES5 limit: max 6 alpha layers per quadrant (indices 0–5).
     # Strategy: two-pass approach.
@@ -717,11 +738,7 @@ def convert_LAND(rec: dict) -> bytes:
                     vtxt_data += struct.pack('<HHf', vpos, 0, opacity)
                 subs += pack_subrecord('VTXT', bytes(vtxt_data))
 
-    # VTEX is a TES4-only subrecord; TES5 LAND does not have it.
-    # Texture references are already encoded in BTXT/ATXT FormIDs above.
-
-    flags = get_int(rec, 'RecordFlags')
-    return pack_record('LAND', get_formid(rec, 'FormID'), flags, subs)
+    return subs
 
 
 def convert_REGN(rec: dict) -> bytes:

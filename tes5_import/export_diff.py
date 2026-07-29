@@ -60,6 +60,29 @@ _LIST_FIELD_NORMALIZERS = {
 }
 
 
+# LAND VHGT is `float Offset + 33*33 signed byte deltas + wbUnused(3)`
+# (wbDefinitionsCommon.pas wbLandHeights). Those last 3 bytes are uninitialised
+# CS memory, and vanilla proves the engine ignores them: a census of 15,410
+# Skyrim.esm LAND records finds arbitrary junk there (000000 is merely the most
+# common of many values — 3e9e23, b57086, ea5b25 ... each appear in the
+# hundreds-to-thousands). Comparing them reported phantom VHGT changes on 6 of
+# DLCBattlehornCastle's 16 LAND overrides whose real terrain was identical, and
+# rewriting them would gratuitously diverge from the master's bytes.
+_VHGT_PAYLOAD_NIBBLES = 2 * (4 + 33 * 33)
+
+
+def _strip_vhgt_pad(value: str) -> str:
+    if isinstance(value, str) and len(value) > _VHGT_PAYLOAD_NIBBLES:
+        return value[:_VHGT_PAYLOAD_NIBBLES]
+    return value
+
+
+# Scalar keys whose export value carries trailing uninitialised bytes.
+_SCALAR_NORMALIZERS = {
+    'VHGT': _strip_vhgt_pad,
+}
+
+
 def _split_indexed(record: dict) -> tuple:
     """Partition a record into (scalars, {list_name: {index: {field: value}}})."""
     scalars = {}
@@ -103,8 +126,12 @@ def diff_records(master_rec: dict, plugin_rec: dict) -> dict:
     for key in set(m_scalars) | set(p_scalars):
         if key in _IGNORED_KEYS or _is_count_key(key):
             continue
-        if m_scalars.get(key) != p_scalars.get(key):
-            changed[key] = p_scalars.get(key)
+        m_val, p_val = m_scalars.get(key), p_scalars.get(key)
+        fn = _SCALAR_NORMALIZERS.get(key)
+        if fn and fn(m_val) == fn(p_val):
+            continue
+        if m_val != p_val:
+            changed[key] = p_val
 
     for name in set(m_lists) | set(p_lists):
         m_entries = _list_as_multiset(name, m_lists.get(name, {}))
