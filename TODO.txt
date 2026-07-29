@@ -13,13 +13,9 @@ Major Issues for V1:
 
 	5 - Need new skyrim body mesh to actually work to allow leg skin to appear
 	
-	6 - If I join the fighter's guild by speaking to Azzan, but don't select "contract' and leave dialog. the next time I talk to him he is missing all topics but "rumors"
-
 	7 - Shops missing full inventory of items
 
 	8 - Crime system
-
-	9 - Repeat lines in charactergen. Stages will completely fail if certain lines are repeated (like valen dreth). Also should remove debug quest stages
 
 	10 - Script conversion: silent mis-conversions that compile but do nothing (see docs/papyrus_conversion_notes.md "Silent mis-conversion")
 		PlayIdle/PickIdle passes the raw TES4 IDLE EditorID into Debug.SendAnimationEvent - Skyrim has no such event so the idle never plays, nothing logged.

@@ -1,5 +1,5 @@
 """
-TES4 AutoConvert — GUI
+TES4 Auto-Convert — GUI
 
 Usage:
   python gui.py          # open GUI
@@ -439,7 +439,7 @@ def gui_main():
 
     # ── Root window ───────────────────────────────────────────────────────────
     root = tk.Tk()
-    root.title("TES4 AutoConvert")
+    root.title("TES4 Auto-Convert")
     root.geometry("1060x900")
     root.minsize(860, 680)
     root.configure(bg=CLR["bg"])
@@ -748,7 +748,7 @@ def gui_main():
         banner_label.image = banner_img  # keep a reference alive
         banner_label.pack(fill=tk.X)
     else:
-        ttk.Label(tf, text="TES4 AutoConvert", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(tf, text="TES4 Auto-Convert", style="Head.TLabel").pack(anchor="w")
         ttk.Label(tf, text="Oblivion to Skyrim SE converter",
                   style="PanelSub.TLabel").pack(anchor="w")
 
@@ -761,6 +761,7 @@ def gui_main():
     def _on_tes4_change(path):
         """Refresh plugin list when Oblivion data dir changes."""
         plugins = scan_plugins(path)
+        all_plugins[:] = plugins
         file_combo["values"] = plugins
         if plugins:
             # Prefer Oblivion.esm if present
@@ -772,6 +773,9 @@ def gui_main():
             file_var.set(preferred if preferred else plugins[0])
         else:
             file_var.set("")
+        # The old directory's pick is meaningless now; don't let focus-out
+        # snap the field back to a plugin that no longer exists.
+        last_valid[0] = file_var.get()
         _save_dir_to_config()
 
     _path_row(dir_frame, "Oblivion Data Directory", tes4_var,
@@ -782,9 +786,197 @@ def gui_main():
     pf.pack(fill=tk.X, padx=14, pady=(6, 0))
     ttk.Label(pf, text="Plugin File", style="PanelSub.TLabel").pack(anchor="w")
     initial_plugins = scan_plugins(tes4_path)
+    # Master list of every plugin in the data dir.  file_combo["values"] holds
+    # only what the current search text matches, so the unfiltered set has to
+    # live somewhere the filter can always restore from.
+    all_plugins = list(initial_plugins)
     file_combo = ttk.Combobox(pf, textvariable=file_var,
-                               values=initial_plugins, state="readonly", width=30)
+                               values=initial_plugins, width=30)
     file_combo.pack(fill=tk.X, pady=(2, 0))
+
+    # The last name the user actually committed to.  Typing a search scribbles
+    # over the entry text, so focus leaving mid-search has to fall back to this
+    # rather than stranding a half-typed fragment in the field.
+    last_valid = [file_var.get()]
+    # True while the entry text is a search fragment rather than a committed
+    # plugin name.  Set the moment the user starts typing, cleared on commit.
+    searching = [False]
+
+    _CB = str(file_combo)
+    _POPDOWN = f"ttk::combobox::PopdownWindow {_CB}"
+
+    def _tcl(script: str) -> str:
+        return file_combo.tk.eval(script)
+
+    def _list_is_open() -> bool:
+        try:
+            return bool(int(_tcl(f"winfo ismapped [{_POPDOWN}]")))
+        except tk.TclError:
+            return False
+
+    def _unhijack_listbox():
+        """Let the entry keep the keyboard while the dropdown stays posted.
+
+        Tk's stock listbox bindtag grabs focus on <Map> (`focus -force`) and, on
+        win32 only, cancels the popup on <FocusOut>.  Together those make "popup
+        open" and "entry typable" mutually exclusive.  Swapping in a private
+        bindtag that keeps only the selection bindings drops both behaviours;
+        the popdown's global grab is untouched, so clicking the list still
+        works.  Idempotent, and the popdown must already exist.
+        """
+        listbox = f"{_tcl(_POPDOWN)}.f.l"
+        tags = _tcl(f"bindtags {listbox}").split()
+        if "ComboboxListbox" not in tags:
+            return
+        _tcl("""
+            bind FilterComboListbox <ButtonRelease-1> {ttk::combobox::LBSelected %W}
+            bind FilterComboListbox <Return>          {ttk::combobox::LBSelected %W}
+            bind FilterComboListbox <Escape>          {ttk::combobox::LBCancel %W}
+            bind FilterComboListbox <Motion>          {ttk::combobox::LBHover %W %x %y}
+            bind FilterComboListbox <Destroy>         {ttk::combobox::LBCleanup %W}
+        """)
+        patched = ["FilterComboListbox" if t == "ComboboxListbox" else t
+                   for t in tags]
+        _tcl(f"bindtags {listbox} {{{' '.join(patched)}}}")
+
+    def _search_text() -> str:
+        """The text acting as the current search term.
+
+        Only text the user has actually typed counts.  A committed plugin name
+        sitting in the field is not a search, so the list opens unfiltered.
+        """
+        if not searching[0]:
+            return ""
+        try:
+            return file_combo.get()
+        except tk.TclError:
+            return ""
+
+    def _matches_for(typed: str) -> list:
+        typed = typed.strip().lower()
+        return [p for p in all_plugins if typed in p.lower()] if typed \
+            else list(all_plugins)
+
+    def _sync_values():
+        """Point -values at the current search text's matches.
+
+        Wired to -postcommand as well, because ttk::combobox::Post re-reads
+        -values via ConfigureListbox *after* running the postcommand — setting
+        the values any later in the cycle just gets overwritten.
+        """
+        file_combo["values"] = _matches_for(_search_text())
+
+    file_combo.configure(postcommand=_sync_values)
+
+    def _is_disabled() -> bool:
+        # Our handlers bypass ttk's own `instate disabled` guard, so the
+        # disabled state during a conversion run has to be honoured here.
+        return "disabled" in file_combo.state()
+
+    def _open_list():
+        """Post the dropdown and keep the caret in the entry so typing filters."""
+        if _is_disabled():
+            return
+        if not _list_is_open():
+            _tcl(f"ttk::combobox::Post {_CB}")
+        _unhijack_listbox()          # popdown now exists; strip the focus grab
+        file_combo.focus_force()     # take the keyboard back from the listbox
+
+    def _refresh_list():
+        """Re-filter, and push the new values into an already-posted listbox.
+
+        ConfigureListbox is what -postcommand's values normally flow through;
+        calling it directly repopulates the open popup without re-posting (a
+        re-post would bounce focus back to the listbox mid-word).
+        """
+        _sync_values()
+        if _list_is_open():
+            _tcl(f"ttk::combobox::ConfigureListbox {_CB}")
+            _tcl(f"ttk::combobox::PlacePopdown {_CB} [{_POPDOWN}]")
+
+    def _on_key(evt):
+        # Navigation/selection keys drive the dropdown itself — filtering on
+        # them would fight the listbox and reopen it after every pick.
+        if evt.keysym in ("Up", "Down", "Return", "Escape", "Tab",
+                          "Left", "Right", "Home", "End",
+                          "Shift_L", "Shift_R", "Control_L", "Control_R",
+                          "Alt_L", "Alt_R"):
+            return
+        # Any other keystroke means the field now holds a search fragment.
+        # <KeyRelease> fires after the entry text is updated, so filtering here
+        # sees what the user just typed.
+        searching[0] = True
+        _open_list()
+        _refresh_list()
+
+    def _on_click(_evt=None):
+        """Click the field: open the full dropdown, ready for typing.
+
+        The whole name is selected so the first keystroke replaces it rather
+        than appending to the plugin already there.
+        """
+        if _is_disabled():
+            return "break"
+        searching[0] = False          # a committed name isn't a search term
+        file_combo.selection_range(0, tk.END)
+        file_combo.icursor(tk.END)
+        _open_list()
+        _refresh_list()
+        return "break"  # suppress ttk's own Press handler (it would re-grab)
+
+    def _on_down(_evt=None):
+        _on_click()
+        return "break"
+
+    def _commit(name: str):
+        searching[0] = False
+        last_valid[0] = name
+        file_var.set(name)
+        file_combo["values"] = list(all_plugins)
+
+    def _on_selected(_evt=None):
+        _commit(file_var.get())
+        file_combo.selection_clear()
+
+    def _on_return(_evt=None):
+        """Enter commits the sole/first match, so a filtered search is keyboard-
+        completable without reaching for the mouse."""
+        matches = _matches_for(_search_text())
+        typed = file_combo.get().strip().lower()
+        exact = next((p for p in all_plugins if p.lower() == typed), None)
+        if exact:
+            _commit(exact)
+        elif matches:
+            _commit(matches[0])
+        if _list_is_open():
+            _tcl(f"ttk::combobox::Unpost {_CB}")
+        return "break"
+
+    def _on_escape(_evt=None):
+        if _list_is_open():
+            _tcl(f"ttk::combobox::Unpost {_CB}")
+        if last_valid[0]:
+            _commit(last_valid[0])
+        return "break"
+
+    def _on_focus_out(_evt=None):
+        # Focus bouncing to our own dropdown isn't the user leaving the field.
+        if _list_is_open():
+            return
+        # Commit an exact match, otherwise snap back to the last good name so
+        # the field never keeps a search fragment that isn't a real plugin.
+        typed = file_combo.get().strip()
+        exact = next((p for p in all_plugins if p.lower() == typed.lower()), None)
+        _commit(exact if exact else (last_valid[0] or ""))
+
+    file_combo.bind("<KeyRelease>", _on_key)
+    file_combo.bind("<Button-1>", _on_click)
+    file_combo.bind("<Down>", _on_down)
+    file_combo.bind("<Return>", _on_return)
+    file_combo.bind("<Escape>", _on_escape)
+    file_combo.bind("<<ComboboxSelected>>", _on_selected)
+    file_combo.bind("<FocusOut>", _on_focus_out)
+
     if initial_plugins and not file_var.get():
         # Prefer Oblivion.esm if present, otherwise pick the first plugin
         preferred = None
@@ -793,6 +985,10 @@ def gui_main():
                 preferred = p
                 break
         file_var.set(preferred if preferred else initial_plugins[0])
+
+    # Seed the fallback with whatever ended up selected above, so a focus-out
+    # before the first pick still has a real plugin name to snap back to.
+    last_valid[0] = file_var.get()
 
     _sep()
 
@@ -1205,7 +1401,7 @@ def gui_main():
         run_btn.configure(state="disabled" if state else "normal")
         cancel_btn.configure(state="normal" if state else "disabled",
                              text="Cancel")
-        file_combo.configure(state="disabled" if state else "readonly")
+        file_combo.configure(state="disabled" if state else "normal")
         if state:
             prog_bar.pack(fill=tk.X, padx=14, pady=(4, 0))
             prog_bar.start(12)
@@ -1261,6 +1457,14 @@ def gui_main():
         if not steps:
             messagebox.showwarning("No Steps",
                                    "Select at least one pipeline step.", parent=root)
+            return
+
+        # The plugin box is typable, so the text may not name a real plugin.
+        if all_plugins and fname not in all_plugins:
+            messagebox.showwarning(
+                "Unknown Plugin",
+                f"{fname!r} is not a plugin in the Oblivion data directory.\n"
+                "Pick one from the list.", parent=root)
             return
 
         # Collect selected mesh subdirs (None = all)
@@ -1407,7 +1611,7 @@ def _relaunch_windowless() -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TES4 AutoConvert GUI")
+    parser = argparse.ArgumentParser(description="TES4 Auto-Convert GUI")
     parser.add_argument("--cli", action="store_true",
                         help="Headless: forward remaining args to convert.py")
     args, extra = parser.parse_known_args()

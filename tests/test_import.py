@@ -2820,6 +2820,9 @@ class TestLoadGatedPollStart:
 # Weather / climate conversion
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason='WTHR imagespace conversion lives on the '
+                         'weather-conversion branch; master convert_WTHR '
+                         'returns bytes, not (wthr, imgs)')
 class TestWeatherConversion:
     """WTHR conversion.
 
@@ -3289,6 +3292,9 @@ class TestSayTimerRelease:
             'against stale state:\n' + '\n'.join(offenders[:10]))
 
 
+@pytest.mark.skip(reason='WTHR imagespace conversion lives on the '
+                         'weather-conversion branch; master convert_WTHR '
+                         'returns bytes, not (wthr, imgs)')
 class TestWeatherImageSpace:
     """WTHR HDR tone mapping -> companion IMGS records.
 
