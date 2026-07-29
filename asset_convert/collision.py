@@ -1,10 +1,15 @@
 import math
+import sys
 from collections import deque
+from pathlib import Path
 
 # Apply all PyFFI patches (time.clock fix, nif.xml condition fixes) before import
 from . import pyffi_monkey_patch as _patch  # noqa: F401
 
 from pyffi.formats.nif import NifFormat
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from collision_options import winding_fix_enabled  # noqa: E402
 
 from .cms_builder import build_cms_collision
 
@@ -352,9 +357,14 @@ def _repair_inverted_floors(tris, visual_tris=None, groups=None):
     scored 35.8% recall on the same corpus and left priorychapelinterior,
     skbridgesmall and rockgreatforest645lichen unwalkable.
 
+    Gated by the collision winding-fix toggle (see collision_options): the
+    damage this repairs is specific to plugins that re-export collision as
+    flattened triangle lists, so the repair is opt-in per plugin rather than
+    always-on.  Vanilla-authored collision skips it entirely.
+
     Returns (repaired_tris, n_flipped).
     """
-    if not tris:
+    if not tris or not winding_fix_enabled():
         return tris, 0
 
     # Weld to shared vertex indices so adjacency is discoverable.  The packed

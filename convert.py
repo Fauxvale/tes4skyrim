@@ -62,6 +62,11 @@ SCRIPT_DIR = Path(__file__).parent.resolve()  # TESConversion root
 # Suppress console windows when spawned from a console-less parent (pythonw/.pyw)
 from subprocess_flags import POPEN_FLAGS as _POPEN_FLAGS, configure_multiprocessing
 from worker_budget import worker_count
+from collision_options import (
+    WINDING_FIX_DEFAULT_PLUGINS,
+    WINDING_FIX_ENV_VAR,
+    default_for_plugin,
+)
 
 # multiprocessing.Pool workers (nif/lod conversion) must also inherit a hidden
 # console — configure before any pool is created.
@@ -241,12 +246,27 @@ def phase_extract(file_name: str, tes4_data: str, config: dict,
 # ===========================================================================
 
 def phase_assets(file_name: str, config: dict, output_dir: str = None,
-                 mesh_subdirs=None):
-    """Convert extracted NIF assets and copy textures to output (meshes only)."""
+                 mesh_subdirs=None, winding_fix=None):
+    """Convert extracted NIF assets and copy textures to output (meshes only).
+
+    `winding_fix` tri-states the collision winding repair: True/False force it,
+    None takes the per-plugin default for `file_name`.  The decision is pinned
+    into the environment because the repair runs inside multiprocessing mesh
+    workers, which inherit the environment but not this call's arguments.
+    """
     from asset_convert.asset_pipeline import convert_meshes
 
     extract_dir = str(SCRIPT_DIR / "export")
     out_dir     = output_dir or str(SCRIPT_DIR / "output")
+
+    if winding_fix is None:
+        winding_fix = default_for_plugin(file_name)
+        origin = "plugin default"
+    else:
+        origin = "requested"
+    os.environ[WINDING_FIX_ENV_VAR] = "1" if winding_fix else "0"
+    print(f"[{file_name}] Collision winding repair: "
+          f"{'ON' if winding_fix else 'OFF'} ({origin})")
 
     print(f"[{file_name}] Converting meshes (NIFs + textures)...")
     stats = convert_meshes(
@@ -867,6 +887,18 @@ def main():
                         help="Skyrim plugin filenames to generate a slot-44 "
                              "patch for (e.g. Skyrim.esm Dawnguard.esm). "
                              "Default: Skyrim.esm only.")
+    # Collision winding repair (asset_convert/collision.py). Tri-state: the flag
+    # forces it on, --no- forces it off, and unspecified (None) defers to the
+    # per-plugin default in collision_options, resolved separately for each file.
+    winding = parser.add_mutually_exclusive_group()
+    winding.add_argument("--collision-winding-fix", dest="collision_winding_fix",
+                         action="store_true", default=None,
+                         help="Rewind reversed collision triangles (fall-through-"
+                              "floor repair). Default: on only for "
+                              + ", ".join(sorted(WINDING_FIX_DEFAULT_PLUGINS)))
+    winding.add_argument("--no-collision-winding-fix", dest="collision_winding_fix",
+                         action="store_false", default=None,
+                         help="Disable the collision winding repair.")
 
     args = parser.parse_args()
 
@@ -952,7 +984,8 @@ def main():
         print("=" * 54)
         for fn in order:
             if not phase_assets(fn, config, output_dir=output_dir,
-                                mesh_subdirs=getattr(args, 'mesh_subdirs', None)):
+                                mesh_subdirs=getattr(args, 'mesh_subdirs', None),
+                                winding_fix=args.collision_winding_fix):
                 success = False
         print()
 

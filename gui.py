@@ -20,6 +20,10 @@ SCRIPT_DIR  = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / "conversion_config.json"
 
 from worker_budget import worker_count, cpu_total, WORKERS_ENV_VAR
+from collision_options import (
+    WINDING_FIX_DEFAULT_PLUGINS,
+    default_for_plugin as _winding_default,
+)
 
 # ── Pipeline steps ─────────────────────────────────────────────────────────
 # (key, cli_flag, label, description, default_on, needs_file)
@@ -543,6 +547,22 @@ def gui_main():
     # Skyrim patch-plugin state: list of (name, BooleanVar), all-on by default
     patch_plugin_vars = []
 
+    # Collision winding repair: defaults per plugin (on for the plugins measured
+    # to need it — see collision_options).  It tracks the plugin selector until
+    # the user ticks the box themselves, after which their choice is respected
+    # for the rest of the session rather than being silently overwritten.
+    winding_var = tk.BooleanVar(value=_winding_default(file_var.get()))
+    winding_user_set = {"v": False}
+
+    def _sync_winding_default(*_):
+        if not winding_user_set["v"]:
+            winding_var.set(_winding_default(file_var.get()))
+
+    def _on_winding_toggled():
+        winding_user_set["v"] = True
+
+    file_var.trace_add("write", _sync_winding_default)
+
     def _get_workers() -> int:
         """Current worker-count value, clamped to [1, cpu_max]."""
         try:
@@ -621,6 +641,55 @@ def gui_main():
         f.pack(fill=tk.X, padx=14, pady=(6, 2))
         ttk.Label(f, text=text, style="PanelSub.TLabel").pack(anchor="w")
         return f
+
+    def _attach_tooltip(widget, text: str, width: int = 340):
+        """Show `text` in a small dark popup while the cursor rests on `widget`.
+
+        A borderless Toplevel rather than a Frame: the sidebar is narrow, so the
+        popup has to be free to overhang the window edge.  It is created on
+        enter and destroyed on leave, so nothing lingers if the widget itself is
+        destroyed while the tip is up.
+        """
+        state = {"win": None, "after": None}
+
+        def _hide(*_):
+            if state["after"] is not None:
+                widget.after_cancel(state["after"])
+                state["after"] = None
+            if state["win"] is not None:
+                state["win"].destroy()
+                state["win"] = None
+
+        def _show():
+            state["after"] = None
+            if state["win"] is not None:
+                return
+            win = tk.Toplevel(widget)
+            win.wm_overrideredirect(True)   # no title bar / decorations
+            win.configure(bg=CLR["border"])
+            tk.Label(
+                win, text=text, justify="left", wraplength=width,
+                bg=CLR["log_bg"], fg=CLR["text"],
+                font=("Segoe UI", 9), padx=8, pady=6,
+            ).pack(padx=1, pady=1)       # 1px border via the parent's bg
+            # Below-right of the cursor, clamped so it stays on screen.
+            x = widget.winfo_pointerx() + 14
+            y = widget.winfo_pointery() + 18
+            win.update_idletasks()
+            sw = win.winfo_screenwidth()
+            if x + win.winfo_width() > sw:
+                x = max(0, sw - win.winfo_width() - 4)
+            win.wm_geometry(f"+{x}+{y}")
+            state["win"] = win
+
+        def _enter(_=None):
+            _hide()
+            state["after"] = widget.after(450, _show)  # brief hover delay
+
+        widget.bind("<Enter>", _enter, add="+")
+        widget.bind("<Leave>", _hide, add="+")
+        widget.bind("<Button-1>", _hide, add="+")
+        widget.bind("<Destroy>", _hide, add="+")
 
     def _path_row(parent, label_text: str, var: tk.StringVar,
                   browse_dir=True, on_change=None):
@@ -955,6 +1024,28 @@ def gui_main():
     mesh_toggle_lbl.pack(side=tk.LEFT, padx=(20, 0))
     mesh_toggle_lbl.bind("<Button-1>", lambda _: _open_mesh_subdir_panel())
 
+    # Collision winding repair toggle, sitting with the other Meshes sub-options.
+    _winding_row = ttk.Frame(sidebar, style="Panel.TFrame")
+    _winding_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_mesh_toggle_row)
+    _winding_chk = ttk.Checkbutton(_winding_row, text="Fix collision winding",
+                                   variable=winding_var,
+                                   command=_on_winding_toggled,
+                                   style="TCheckbutton")
+    _winding_chk.pack(side=tk.LEFT, padx=(20, 0))
+    _winding_hint = ttk.Label(_winding_row, text="repair inverted floors",
+                              style="PanelSub.TLabel")
+    _winding_hint.pack(side=tk.LEFT, padx=(6, 0))
+
+    _WINDING_TIP = (
+        "Fixes floors and walls you fall straight through.\n\n"
+        "Most mods don't need this. Turn it on only if you fall through "
+        "solid ground in game.\n\n"
+        "Switches on automatically for "
+        + ", ".join(sorted(WINDING_FIX_DEFAULT_PLUGINS)) + ", which need it."
+    )
+    _attach_tooltip(_winding_chk, _WINDING_TIP)
+    _attach_tooltip(_winding_hint, _WINDING_TIP)
+
     # Small link sitting just below the Patch Skyrim checkbox row
     _body_toggle_row = ttk.Frame(sidebar, style="Panel.TFrame")
     _body_toggle_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_body_step_row)
@@ -1114,6 +1205,11 @@ def gui_main():
             _log("  Cancelling — killing running processes...")
 
     # ── Run logic ─────────────────────────────────────────────────────────────
+    def _winding_flag() -> str:
+        """The explicit collision-winding flag matching the checkbox."""
+        return ("--collision-winding-fix" if winding_var.get()
+                else "--no-collision-winding-fix")
+
     def _build_cmd(step_key: str, fname: str, out_dir: str,
                    selected_subdirs=None, selected_patch_plugins=None) -> list:
         """Build the convert.py command for a single step."""
@@ -1124,8 +1220,12 @@ def gui_main():
             cmd += ["-f", fname]
         if out_dir:
             cmd += ["--output-dir", out_dir]
-        if step_key == "meshes" and selected_subdirs:
-            cmd += ["--mesh-subdirs"] + selected_subdirs
+        if step_key == "meshes":
+            if selected_subdirs:
+                cmd += ["--mesh-subdirs"] + selected_subdirs
+            # Always explicit: the checkbox is the user's answer, whether it
+            # came from the per-plugin default or from them ticking the box.
+            cmd.append(_winding_flag())
         if step_key == "modify_body_meshes" and selected_patch_plugins:
             cmd += ["--patch-plugins"] + selected_patch_plugins
         return cmd
@@ -1164,6 +1264,8 @@ def gui_main():
         _log(f"Workers: {_get_workers()} (of {cpu_max})")
         if selected_subdirs:
             _log(f"Mesh subdirs: {', '.join(selected_subdirs)}")
+        if "meshes" in steps:
+            _log(f"Collision winding fix: {'on' if winding_var.get() else 'off'}")
         if selected_patch_plugins is not None:
             _log(f"Patch plugins: {', '.join(selected_patch_plugins) or '(none)'}")
         _log("")
@@ -1196,7 +1298,7 @@ def gui_main():
                 if (active_set == default_set and fname
                         and not selected_subdirs and selected_patch_plugins is None):
                     cmd = [sys.executable, "-u", str(SCRIPT_DIR / "convert.py"),
-                           "-f", fname]
+                           "-f", fname, _winding_flag()]
                     if out_dir:
                         cmd += ["--output-dir", out_dir]
                     q.put(f"Running: {' '.join(cmd)}")
