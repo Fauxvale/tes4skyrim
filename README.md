@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/banner.svg" alt="TES4 Skyrim — Oblivion to Skyrim Conversion" width="720">
+  <img src="docs/banner.svg" alt="TES4 AutoConvert — Oblivion to Skyrim Conversion" width="720">
 </p>
 
 <p align="center">

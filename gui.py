@@ -1,5 +1,5 @@
 """
-TES4-to-TES5 Conversion Tool — GUI
+TES4 AutoConvert — GUI
 
 Usage:
   python gui.py          # open GUI
@@ -435,7 +435,7 @@ def gui_main():
 
     # ── Root window ───────────────────────────────────────────────────────────
     root = tk.Tk()
-    root.title("TES4Skyrim")
+    root.title("TES4 AutoConvert")
     root.geometry("1060x877")
     root.minsize(860, 680)
     root.configure(bg=CLR["bg"])
@@ -679,7 +679,7 @@ def gui_main():
         banner_label.image = banner_img  # keep a reference alive
         banner_label.pack(fill=tk.X)
     else:
-        ttk.Label(tf, text="TES4  ->  TES5", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(tf, text="TES4 AutoConvert", style="Head.TLabel").pack(anchor="w")
         ttk.Label(tf, text="Oblivion to Skyrim SE converter",
                   style="PanelSub.TLabel").pack(anchor="w")
 
@@ -1283,7 +1283,7 @@ def _relaunch_windowless() -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TES4->TES5 Converter GUI")
+    parser = argparse.ArgumentParser(description="TES4 AutoConvert GUI")
     parser.add_argument("--cli", action="store_true",
                         help="Headless: forward remaining args to convert.py")
     args, extra = parser.parse_known_args()
