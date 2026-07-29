@@ -6,15 +6,26 @@ collision as bhkPackedNiTriStripsShape triangle lists, and that flatten dropped
 the strip parity flip on odd-indexed triangles — so one half of a floor quad
 faces the wrong way and you fall through half the floor.
 
-This scans source NIFs (Oblivion or Nehrim format) for that signature: an
-up-facing and a down-facing near-horizontal triangle sharing an edge.  Vanilla
-Oblivion is essentially clean (~10 of 4199 dungeon+architecture meshes), so a
-run against an Oblivion tree is the control test for this detector.
+The default scan looks for that signature: an up-facing and a down-facing
+near-horizontal triangle sharing an edge.  Vanilla Oblivion is essentially
+clean (~10 of 4199 dungeon+architecture meshes), so a run against an Oblivion
+tree is the control test for this detector.
+
+IMPORTANT — the default scan has a blind spot.  It only fires on a MIXED pair,
+so a surface that is UNIFORMLY reversed reports zero: Morrowind_ob's
+inuhlaaluuroomuside.nif has an all-down-facing floor you fall straight through
+and scores 0 bad edge-pairs here.  Use --floor-orientation for that class, and
+do not read a clean default scan as "this mesh is fine".
+
+--floor-orientation reports the lowest near-horizontal surface in each mesh and
+whether it faces up (walkable) or down (fall-through), which catches uniformly
+reversed floors the pair test cannot see.
 
 Usage:
     python tools/collision_winding.py <nif_or_dir> [--workers N] [--top N]
     python tools/collision_winding.py export/Nehrim.esm/meshes/dungeons
     python tools/collision_winding.py <dir> --converted   # scan CMS output
+    python tools/collision_winding.py <dir> --floor-orientation
 
     # Control test — should report very few hits:
     python tools/collision_winding.py ../TESConversion/export/Oblivion.esm/meshes/dungeons
@@ -124,6 +135,39 @@ def _scan(args):
     return None
 
 
+def _scan_floor(args):
+    """Orientation of the lowest near-horizontal surface (the floor).
+
+    Catches uniformly-reversed floors, which _scan cannot see because they
+    produce no mixed up/down edge pair.  Returns (path, n_up, n_down) or None
+    when the mesh has no near-horizontal collision at all.
+    """
+    path, converted = args
+    try:
+        tris = _collision_tris(path, converted)
+    except Exception as exc:
+        return (path, -1, 0, repr(exc)[:60])
+    if not tris:
+        return None
+
+    lo = min(v[2] for t in tris for v in t)
+    band = 0.5 if converted else 5.0   # havok units vs game units
+    up = down = 0
+    for t in tris:
+        n = _normal(*t)
+        if n is None or abs(n[2]) < _FLAT:
+            continue
+        if (sum(v[2] for v in t) / 3.0) - lo > band:
+            continue
+        if n[2] > 0:
+            up += 1
+        else:
+            down += 1
+    if not up and not down:
+        return None
+    return (path, up, down, None)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -131,6 +175,10 @@ def main():
     ap.add_argument('--converted', action='store_true',
                     help='scan converted output (bhkCompressedMeshShape) '
                          'instead of TES4-format source')
+    ap.add_argument('--floor-orientation', action='store_true',
+                    help='report meshes whose lowest near-horizontal surface '
+                         'faces DOWN (uniformly reversed floors, which the '
+                         'default mixed-pair scan cannot detect)')
     ap.add_argument('--top', type=int, default=25)
     ap.add_argument('--workers', type=int,
                     default=max(1, (os.cpu_count() or 2) - 1))
@@ -143,6 +191,29 @@ def main():
                  for dp, _, fns in os.walk(a.root)
                  for fn in fns if fn.lower().endswith('.nif')]
     print(f"scanning {len(files)} NIFs ({'converted' if a.converted else 'source'} format)")
+
+    if a.floor_orientation:
+        bad, good, errors = [], 0, 0
+        payload = [(f, a.converted) for f in files]
+        with ProcessPoolExecutor(max_workers=a.workers) as ex:
+            for r in ex.map(_scan_floor, payload, chunksize=32):
+                if r is None:
+                    continue
+                if r[1] < 0:
+                    errors += 1
+                    continue
+                _, up, down, _ = r
+                if down and not up:
+                    bad.append(r)
+                elif up:
+                    good += 1
+        print(f"\nfloors facing DOWN (fall-through): {len(bad)}"
+              f"   walkable: {good}   unreadable: {errors}")
+        if bad:
+            print("\n   up  down  mesh")
+            for path, up, down, _ in bad[:a.top]:
+                print(f"  {up:4d}  {down:4d}  {path}")
+        return
 
     hits, errors = [], 0
     payload = [(f, a.converted) for f in files]

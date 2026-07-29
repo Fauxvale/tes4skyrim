@@ -179,45 +179,92 @@ def inverted_floor_flip_count():
     return _INVERTED_FLOOR_FLIPS[0]
 
 
-def _repair_inverted_floors(tris):
+def _full_face_normal(tri):
+    """Full normalised (x, y, z) face normal for a triangle of xyz tuples."""
+    return _face_normal(tri)
+
+
+def _visual_in_plane_says_inverted(i, normals, tris, vdata, centroid,
+                                   parallel, in_plane, co_located):
+    """True when a visual face lying IN this triangle's plane opposes it.
+
+    Stricter than the arbitration test: the visual face must be parallel AND
+    essentially coplanar (offset along the normal below `in_plane`), which is
+    what distinguishes a surface's own render skin from the far face of a thin
+    slab.  Returns False when nothing qualifies — this never guesses.
+    """
+    if not vdata:
+        return False
+    n = normals[i]
+    c = centroid(tris[i])
+    best, bd = None, co_located * co_located
+    for vc, vn in vdata:
+        if abs(n[0]*vn[0] + n[1]*vn[1] + n[2]*vn[2]) < parallel:
+            continue
+        dx, dy, dz = vc[0]-c[0], vc[1]-c[1], vc[2]-c[2]
+        if abs(n[0]*dx + n[1]*dy + n[2]*dz) > in_plane:
+            continue  # offset along the normal → a different surface
+        dd = dx*dx + dy*dy + dz*dz
+        if dd < bd:
+            bd, best = dd, vn
+    if best is None:
+        return False
+    return (n[0]*best[0] + n[1]*best[1] + n[2]*best[2]) < 0
+
+
+def _repair_inverted_floors(tris, visual_tris=None):
     """Flip collision triangles whose winding was reversed at the source.
 
-    Nehrim's meshes re-export collision as bhkPackedNiTriStripsShape triangle
-    lists, and the flatten dropped the parity flip on odd-indexed triangles of
-    the original strips.  The result is a floor quad with one up-facing and one
-    down-facing half.  Havok mesh collision is single-sided, so the inverted
-    half is walked straight through — the classic "I fall through half the
-    floor" symptom (priorychapelinterior, rfrmfloor and ~1000 others; vanilla
-    Oblivion has ~10, i.e. this is source corruption, not a conversion bug).
+    Havok mesh collision is single-sided: a face only blocks from the side its
+    normal points.  A surface wound backwards is walked straight through — the
+    classic "I fall through the floor" symptom.  Both Nehrim and Morrowind_ob
+    re-export collision as bhkPackedNiTriStripsShape triangle lists, and that
+    flatten loses the original strip parity, so triangles come out reversed.
 
-    Deliberately conservative — a triangle is flipped only when all of:
+    This uses two *decidable* signals instead of guessing from flatness and
+    neighbour votes (the old z-band heuristic, which scored only 24% recall
+    with real false positives when audited against Oblivion originals):
 
-      1. it is near-horizontal and DOWN-facing;
-      2. it shares an edge with exactly one other triangle, which is
-         near-horizontal and UP-facing (a split quad whose halves disagree);
-      3. the two normals align once the down-facing one is inverted, i.e. the
-         pair really is a single continuous surface and winding is the only
-         thing wrong (this admits sloped/organic cave floors that a flatness
-         test would miss, and rejects genuine creases);
-      4. its local z-band is not predominantly down-facing, so real ceilings
-         with a stray up-face are never "corrected" into holes.
+    SIGNAL A — coplanar contradiction (exact; no thresholds on orientation).
+        Two triangles that share an edge AND are coplanar are two halves of one
+        flat surface.  A flat surface cannot face two ways, so antiparallel
+        normals are a contradiction *in the data itself*.  Unlike the old rule
+        this is orientation-agnostic: it catches reversed walls, bevels and
+        ceilings, not just near-horizontal floors.
 
-    Everything else is left alone: a lone down-facing triangle is a perfectly
-    valid ceiling or overhang, and flipping it would create new holes.
-    Measured on the dungeon trees, this repairs 1570/2276 Nehrim meshes
-    (37.6k triangles) while touching only 38/2191 vanilla Oblivion meshes.
+    SIGNAL B — co-located visual face (ground truth for absolute direction).
+        The render mesh in the same NIF is authored by the artist and its
+        winding is correct by construction (a backwards visual face is
+        invisible and would have been caught in-game).  It is trusted ONLY
+        when a parallel visual face is genuinely co-located; otherwise we
+        abstain rather than match across a volume, which is what produced
+        bogus verdicts on arches and columns.
+
+    Signal B resolves which half of a Signal-A conflict is wrong, and on its
+    own catches surfaces that are *uniformly* reversed (no conflict to find) —
+    e.g. Morrowind_ob's inuhlaaluuroomuside, whose entire floor faces down and
+    which the old pair-based rule could not see at all.
+
+    Where both signals are mute the triangle is left alone: a lone down-facing
+    triangle is a perfectly valid ceiling or overhang, and flipping it would
+    create a new hole.
 
     Returns (repaired_tris, n_flipped).
     """
     if not tris:
         return tris, 0
 
-    normals = [_face_normal(t)[2] for t in tris]
+    normals = [_full_face_normal(t) for t in tris]
+
+    def centroid(t):
+        return (sum(v[0] for v in t) / 3.0,
+                sum(v[1] for v in t) / 3.0,
+                sum(v[2] for v in t) / 3.0)
 
     # Index triangles by undirected edge, keyed on quantised coordinates so
     # shared corners match despite float noise from the ×7 / havok rescales.
     def key(v):
-        return (round(v[0], 3), round(v[1], 3), round(v[2], 3))
+        return (round(v[0], 2), round(v[1], 2), round(v[2], 2))
 
     by_edge: dict = {}
     for i, (v0, v1, v2) in enumerate(tris):
@@ -225,73 +272,172 @@ def _repair_inverted_floors(tris):
         for e in ((k0, k1), (k1, k2), (k0, k2)):
             by_edge.setdefault(tuple(sorted(e)), []).append(i)
 
-    _FLAT = 0.85          # near-horizontal only; walls/ramps are never touched
-    _FLAT_BAND = 0.5      # z bucket (havok units) for grouping one surface
-    _SURFACE_AGREE = 0.9  # how closely the halves must align once un-inverted
+    # Distances are in HAVOK units (1 hu = 69.9904 game units), which is what
+    # the pipeline hands us — ~0.014 hu per game unit, so these are tight.
+    _ANTIPARALLEL = -0.95   # normals this opposed are a contradiction
+    _COPLANAR_D = 0.012     # max point-to-plane distance (~0.85 game units)
+    _PARALLEL = 0.95        # visual face must be this aligned to compare
+    _CO_LOCATED = 0.115     # ...and this close (~8 game units), or we abstain
+    _BEHIND_TOL = 0.021     # ...and not >1.5 game units behind our own face
+    _IN_PLANE = 0.0072      # standalone: <0.5 game units off our own plane
+    _VOTE_MARGIN = 3.0      # winning side must outweigh the other this much
 
-    flip = set()
+    # ---- Signal A: coplanar neighbours that disagree.
+    conflicts = []
     for idxs in by_edge.values():
         if len(idxs) != 2:
             continue
         i, j = idxs
         ni, nj = normals[i], normals[j]
-        # Exactly one up, one down, both near-horizontal.
-        if ni > _FLAT and nj < -_FLAT:
-            down = j
-        elif nj > _FLAT and ni < -_FLAT:
-            down = i
-        else:
+        if (ni[0]*nj[0] + ni[1]*nj[1] + ni[2]*nj[2]) > _ANTIPARALLEL:
+            continue  # a genuine crease — leave it alone
+        ci = centroid(tris[i])
+        # Coplanar test: every vertex of j must lie in i's plane.
+        if max(abs(ni[0]*(v[0]-ci[0]) + ni[1]*(v[1]-ci[1]) + ni[2]*(v[2]-ci[2]))
+               for v in tris[j]) > _COPLANAR_D:
             continue
-        # The two halves must be near-coplanar *with each other*.  A
-        # strip-parity flip inverts one half of a surface that was continuous,
-        # so once the bad half is flipped back the pair forms a smooth
-        # surface.  Compare the down-facing triangle's normal with the
-        # up-facing one INVERTED: if they then agree, the pair really is one
-        # surface and the winding is the only thing wrong.  A genuine crease
-        # (organic rock folding back on itself, a floor meeting a ceiling)
-        # fails this because the two faces point in substantially different
-        # directions even after the flip.  This is orientation-based rather
-        # than flatness-based, so it still repairs sloped/organic cave floors
-        # (cchasmfloordouble01a) that a flatness test would wrongly skip.
-        nu, nd = (i, j) if ni > 0 else (j, i)
-        fu = _face_normal(tris[nu])
-        fd = _face_normal(tris[nd])
-        # Dot of the up normal against the flipped-down normal.
-        agree = -(fu[0]*fd[0] + fu[1]*fd[1] + fu[2]*fd[2])
-        if agree < _SURFACE_AGREE:
+        conflicts.append((i, j))
+
+    # ---- Signal B: co-located visual reference.
+    vdata = []
+    if visual_tris:
+        for t in visual_tris:
+            n = _full_face_normal(t)
+            if n[0] or n[1] or n[2]:
+                vdata.append((centroid(t), n))
+
+    def visual_says_inverted(i):
+        """True/False from co-located visual faces, else None (abstain).
+
+        Uses a CONSENSUS of every nearby parallel visual face rather than the
+        single nearest one.  On a thin slab (altar tops, shelves, steps) the
+        far face of the slab is only a few units away and nearly parallel, so
+        a nearest-face match can pick the wrong side and invert the verdict.
+        Distance cannot separate those cases — measured on the Anvil set the
+        offset distributions of correct and incorrect nearest-face verdicts
+        are identical (median 1.0 vs 1.9 game units, same p90) — but the
+        wrong face is outvoted, because a real surface contributes many facets
+        and the opposing slab face contributes few.  When the vote is close we
+        abstain rather than risk punching a hole in good collision.
+        """
+        if not vdata:
+            return None
+        n = normals[i]
+        c = centroid(tris[i])
+        agree = oppose = 0
+        for vc, vn in vdata:
+            algn = n[0]*vn[0] + n[1]*vn[1] + n[2]*vn[2]
+            if abs(algn) < _PARALLEL:
+                continue
+            dd = ((c[0]-vc[0])**2 + (c[1]-vc[1])**2 + (c[2]-vc[2])**2)
+            if dd > _CO_LOCATED * _CO_LOCATED:
+                continue
+            # Ignore faces sitting BEHIND this one along its own normal: on a
+            # slab (a floor with a ceiling under it, a step, a shelf) the only
+            # visual faces in range can be the far side of the slab, which is
+            # antiparallel by construction and would unanimously — and wrongly
+            # — condemn a perfectly good floor.  Vanilla Oblivion's Anvil
+            # interiors do exactly this.  A face that genuinely describes this
+            # surface is level with it or in front of it, never behind.
+            if (n[0]*(vc[0]-c[0]) + n[1]*(vc[1]-c[1])
+                    + n[2]*(vc[2]-c[2])) < -_BEHIND_TOL:
+                continue
+            # Weight by proximity so the true surface dominates the vote.
+            w = 1.0 / (dd + 1e-9)
+            if algn > 0:
+                agree += w
+            else:
+                oppose += w
+        total = agree + oppose
+        if total <= 0:
+            return None  # abstain — never guess across a volume
+        if oppose > agree * _VOTE_MARGIN:
+            return True
+        if agree > oppose * _VOTE_MARGIN:
+            return False
+        return None      # too close to call
+
+    # The visual reference is used ONLY to arbitrate a Signal-A contradiction,
+    # never as a detector in its own right.  That restriction is what makes it
+    # safe.  Measured on vanilla Oblivion's Anvil interiors (which are correct
+    # and must come through untouched):
+    #
+    #     Signal A alone .................  0 meshes touched, 0 triangles
+    #     visual reference as a detector .. 11 meshes touched, 80 triangles,
+    #                                       23 of them already-correct floors
+    #
+    # The failure is structural, not a tuning problem: on a slab (floor with a
+    # ceiling beneath, step, shelf) the only visual faces near a collision face
+    # can belong to the far side of the slab, so the vote is unanimous and
+    # wrong.  Successive geometric filters (plane-offset rejection, proximity
+    # consensus, behind-face rejection) each reduced that error without
+    # removing it.  Requiring a Signal-A contradiction first eliminates it:
+    # there we already know one of two specific triangles is wrong, so the
+    # reference only has to say which — and if it cannot, we leave both alone.
+    in_conflict = {x for pair in conflicts for x in pair}
+
+    flip = set()
+    for (i, j) in conflicts:
+        vi, vj = visual_says_inverted(i), visual_says_inverted(j)
+        if vi is True and vj is not True:
+            flip.add(i)
+        elif vj is True and vi is not True:
+            flip.add(j)
+        elif vi is False and vj is None:
+            flip.add(j)
+        elif vj is False and vi is None:
+            flip.add(i)
+        # else: both agree or both mute — cannot tell which half is wrong;
+        # leave both rather than risk punching a hole.
+
+    # Uniformly-reversed surfaces produce no contradiction for Signal A to
+    # arbitrate — every triangle of the surface is wrong, so the halves agree
+    # with each other (Morrowind_ob's inuhlaaluuroomuside, whose whole floor
+    # faces down).  Only the visual reference can see those, so it is allowed
+    # to condemn a triangle on its own, but under a much stricter contract
+    # than the arbitration path: there must be a visual face essentially IN
+    # this triangle's own plane (not merely within the trust radius).  That
+    # requirement is what excludes the slab geometry which made an unrestricted
+    # detector flip 23 already-correct vanilla floors — on a slab the opposing
+    # face is offset along the normal by the slab's thickness and so is never
+    # in-plane, while a genuinely reversed surface has its own visual skin
+    # sitting exactly on it.
+    for i in range(len(tris)):
+        if i in flip or i in in_conflict:
             continue
-        flip.add(down)
+        if _visual_in_plane_says_inverted(i, normals, tris, vdata, centroid,
+                                          _PARALLEL, _IN_PLANE, _CO_LOCATED):
+            flip.add(i)
 
-    if not flip:
-        return tris, 0
+    # Propagate a decided verdict across a flat surface.  A large collision
+    # quad is split into triangles whose centroids can fall outside the trust
+    # radius of any visual facet, so one half of a floor gets judged and the
+    # other abstains — which would leave half a floor passable (Morrowind_ob's
+    # inuhlaaluuroomuside does exactly this).
+    #
+    # Strictly bounded: one hop, only from a triangle a Signal-A conflict
+    # already condemned, only onto a same-facing coplanar neighbour that is
+    # not itself part of any conflict.  An earlier unbounded version chained
+    # across surfaces and flipped 188 already-correct vanilla triangles.
+    for a in list(flip):
+        na = normals[a]
+        ca = centroid(tris[a])
+        for idxs in by_edge.values():
+            if len(idxs) != 2 or a not in idxs:
+                continue
+            b = idxs[0] if idxs[1] == a else idxs[1]
+            if b in flip or b in in_conflict:
+                continue  # already judged — never override
+            nb = normals[b]
+            # same-facing (not the antiparallel conflict case) …
+            if (na[0]*nb[0] + na[1]*nb[1] + na[2]*nb[2]) < _PARALLEL:
+                continue
+            # … and coplanar, so they really are one surface.
+            if max(abs(na[0]*(v[0]-ca[0]) + na[1]*(v[1]-ca[1])
+                       + na[2]*(v[2]-ca[2])) for v in tris[b]) > _COPLANAR_D:
+                continue
+            flip.add(b)
 
-    # Local consensus guard.  The rule above assumes the UP triangle is the
-    # correct one, which is false on a ceiling: there a lone stray UP face sits
-    # beside correctly DOWN-facing neighbours, and flipping the neighbours
-    # would destroy a good ceiling (Oblivion's crmfloorceilinghole01 does
-    # exactly this, and it holds a floor AND a ceiling so a whole-mesh ratio
-    # cannot separate them).  Judge each candidate against its own coplanar
-    # surface instead: gather the near-horizontal triangles sharing its z
-    # plane, and only flip when that surface is not predominantly down-facing.
-    # A strip-parity-corrupted floor alternates up/down (~50/50); a ceiling is
-    # overwhelmingly down, so its stray up-face never wins the vote.
-    planes: dict = {}
-    for i, nz in enumerate(normals):
-        if abs(nz) <= _FLAT:
-            continue
-        zc = sum(v[2] for v in tris[i]) / 3.0
-        planes.setdefault(round(zc / _FLAT_BAND), []).append(i)
-
-    def surface_is_ceiling(i):
-        zc = sum(v[2] for v in tris[i]) / 3.0
-        band = round(zc / _FLAT_BAND)
-        peers = planes.get(band, []) + planes.get(band - 1, []) + \
-            planes.get(band + 1, [])
-        up = sum(1 for j in peers if normals[j] > _FLAT)
-        down = sum(1 for j in peers if normals[j] < -_FLAT)
-        return down > up * 2
-
-    flip = {i for i in flip if not surface_is_ceiling(i)}
     if not flip:
         return tris, 0
 
@@ -452,6 +598,54 @@ def _shape_tri_soup(shape):
     return None
 
 
+def _visual_tri_soup(root, max_tris=20000):
+    """Render-mesh triangles under `root`, in Havok units to match collision.
+
+    Used as the orientation oracle by _repair_inverted_floors: the artist's
+    visual winding is correct by construction, so a collision face pointing
+    opposite a co-located visual face is reversed.  Returns [] when the node
+    has no render geometry (collision-only markers), which makes the repair
+    fall back to Signal A alone.
+
+    The scale MUST match _shape_tri_soup's output or the oracle silently does
+    nothing: render vertices are in game units, while the triangle soup is in
+    Skyrim havok units built from data already at 1/7 game-unit scale — hence
+    _HAVOK_SCALE / 7, not _HAVOK_SCALE.  (Getting this wrong put the visual
+    geometry 7× too large, so no face ever fell inside the trust radius and
+    every mesh came through unrepaired.)
+
+    Capped at max_tris because the oracle is a nearest-face search: highly
+    tessellated meshes would dominate conversion time for no extra accuracy.
+    """
+    scale = _HAVOK_SCALE / 7.0
+    if root is None:
+        return []
+    out = []
+    try:
+        for blk in root.tree():
+            if not isinstance(blk, NifFormat.NiTriBasedGeom):
+                continue
+            data = blk.data
+            if data is None:
+                continue
+            try:
+                m = blk.get_transform(root)
+                verts = []
+                for v in data.vertices:
+                    w = v * m
+                    verts.append((w.x * scale, w.y * scale, w.z * scale))
+                for (a, b, c) in data.get_triangles():
+                    if a != b and b != c and a != c:
+                        out.append((verts[a], verts[b], verts[c]))
+            except Exception:
+                continue
+            if len(out) > max_tris:
+                return []
+    except Exception:
+        return []
+    return out
+
+
 def _bake_body_transform_into_tris(rb, tris):
     """Fold a bhkRigidBodyT transform into the triangle soup (Skyrim hu).
 
@@ -603,7 +797,8 @@ def _rebuild_mesh_collision(rb, target_node):
         return 'drop'
 
     tris = _bake_body_transform_into_tris(rb, tris)
-    tris, n_flipped = _repair_inverted_floors(tris)
+    tris, n_flipped = _repair_inverted_floors(
+        tris, _visual_tri_soup(target_node))
     if n_flipped:
         _INVERTED_FLOOR_FLIPS[0] += n_flipped
     mopp = build_cms_collision(tris, sk_material, NifFormat)

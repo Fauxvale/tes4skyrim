@@ -344,13 +344,27 @@ Falling through floors in Nehrim (worst in caves) that are solid in Oblivion. **
   - `rfrmfloor.nif` (fort/cave tileset, used in hundreds of cells): Oblivion `(0,1,2)`+`(1,3,2)` UP; Nehrim `(0,1,2)` UP + `(1,2,3)` DOWN.
 - **Scale**: 1065/4485 Nehrim meshes vs 10/4199 vanilla Oblivion (~100×). Vanilla-Oblivion cleanliness is the control test for any detector here — if a scanner flags lots of Oblivion meshes, the scanner is wrong.
 - **Fix**: `_repair_inverted_floors()` in `asset_convert/collision.py`, called from `_rebuild_mesh_collision` after the body-transform bake (so triangles are in final orientation). Counter via `inverted_floor_flip_count()`.
-- **Guard design (each earned by a real false positive)**:
-  - Near-horizontal only (|nz|>0.85) — never touches walls/ramps.
-  - Edge must be shared by exactly 2 triangles, one UP one DOWN (a split quad).
-  - **Surface-agreement**: normals must align once the down one is inverted (dot > 0.9). *Do not use a flatness test instead* — `_QUAD_FLAT=0.999` looked reasonable but cut real repairs by 70% (38.4k→11.7k tris), because organic sloped cave floors like `cchasmfloordouble01a` have ~0.95 normals. Orientation-based, not flatness-based.
-  - **Local ceiling vote**: skip if the candidate's z-band is predominantly down-facing. Oblivion's `crmfloorceilinghole01` is a ceiling with one stray UP face; without this the repair flips the *good* neighbours and punches a hole. A whole-mesh ratio does NOT work (that file has both a floor and a ceiling) — the vote must be per z-band.
-- **Result**: 1570/2276 Nehrim dungeon meshes repaired (37.6k triangles), only 38/2191 Oblivion touched, 0 errors. Oblivion `priorychapelinterior` converts byte-identically with the pass on/off. Remaining Oblivion hits are organic rock where up/down interleave legitimately — left alone deliberately (thresholds can be loosened later if under-repair shows up in game).
 - **Verify**: A/B a mesh with `_repair_inverted_floors` monkeypatched to a no-op and compare output hashes; count up/down near-horizontal faces in the decoded CMS (`asset_convert.cms.decode_cms`) before/after.
+
+### Rewritten 2026-07-28 — the z-band heuristic was mostly wrong; not Nehrim-only
+Morrowind_ob's `inuhlaaluuroomuside.nif` floor is *uniformly* down-facing (all 6 near-horizontal faces down, no up-faces anywhere), so the old split-quad rule saw nothing to pair and left it entirely unrepaired. That prompted an audit with a **real oracle**.
+
+- **The oracle**: most Nehrim (not morrowind_ob) meshes are lightly-edited copies of an Oblivion mesh **at the same relative path**, and the re-export is what lost the strip parity. Identical vertices + opposite normal = proof of inversion. Match density is 70-100% with identical triangle counts, so this is ground truth, not inference. (Currently used only for *auditing* — wiring it into the converter is a possible future improvement.)
+- **Old code scored against that oracle** — the z-band heuristic was far worse than its docstring claimed:
+
+  | Tree | recall | false positives |
+  |---|---|---|
+  | Ayleid ruins | 24.1% (123/511) | 10 |
+  | Architecture | 13.5% (187/1386) | 117 |
+
+  So ~76-87% of genuine inversions were **missed**, and it also punched new holes. The "1570 meshes repaired" figure counted meshes touched, never correctness.
+- **New design — two signals, neither a threshold-on-flatness**:
+  1. **Coplanar contradiction (exact).** Two triangles sharing an edge *and* coplanar are halves of one flat surface; a flat surface cannot face two ways, so antiparallel normals are a contradiction in the data itself. Orientation-agnostic, so it sees reversed walls/bevels/ceilings, not just floors.
+  2. **Co-located visual face (ground truth for direction).** The render mesh in the same NIF is authored correctly by construction. Used to decide *which* half of a contradiction is wrong.
+- **The visual reference must NOT be used as a standalone detector without an in-plane requirement.** Measured on vanilla Oblivion's Anvil interiors (which are correct and must come through untouched): Signal 1 alone touched 0 meshes; the visual reference as a free detector touched 11/29 meshes and flipped 80 triangles, **23 of them already-correct up-facing floors** — i.e. it *created* the very fall-through bug. Cause is structural, not tuning: on a slab (floor with ceiling beneath, step, shelf) the only visual faces within range belong to the far side of the slab, so the vote is unanimous and wrong. Three successive geometric filters (plane-offset rejection, proximity-weighted consensus, behind-face rejection) each *reduced* the error without removing it. Fixes that do work: require a Signal-1 contradiction first (then the reference only picks a side), or for the standalone path require a visual face essentially **in the triangle's own plane** (`_IN_PLANE`, ~0.5 game units), which slab geometry can never satisfy.
+- **Scale trap (cost a whole build)**: `_visual_tri_soup` must scale render vertices by `_HAVOK_SCALE / 7.0`, matching `_shape_tri_soup`, **not** `_HAVOK_SCALE`. Getting this wrong makes the visual geometry 7× too large, no face ever falls inside the trust radius, and the repair silently does nothing — the unit test passes while every shipped mesh is unrepaired. Note `tools/collision_winding.py` reports game units (×7) while the pipeline works in Skyrim havok units; a harness comparing the two must convert.
+- **Result** (same oracle, same trees): Ayleid 51.5% recall / **0** FP; architecture 34.3% / 16 FP. Vanilla control: 0/29 architecture and 1/36 Ayleid meshes touched, **0 already-up-facing triangles flipped** in either. `inuhlaaluuroomuside` floor now converts walkable; its sibling `inuhlaaluuroomtuside` (already correct) is untouched. Recall is deliberately below 100% — every remaining miss is a case where neither signal can decide, and abstaining leaves a pre-existing hole rather than creating a new one.
+- **Still open**: ~half of genuine inversions are unrepaired. The Oblivion-original oracle is the obvious way to close that gap, since it is authoritative wherever a counterpart exists.
 
 ## `bhkPackedNiTriStripsShape` sub-shapes MOVED between formats — load CTD (SOLVED 2026-07-28)
 Three crashes in converted Morrowind_ob traced to one mesh, named directly in the crash log's stack strings (`inputFilePath: "data\MESHES\tes4\morro\i\inucaveuplant00.nif"`). Exception was `vmovntdq [rcx+0x40], ymm3` in VCRUNTIME140 (a `memcpy`) writing off the end of a heap page, with `bhkPackedNiTriStripsShape` + `bhkRigidBody` + `BSResource::LooseFileStream` on the stack — i.e. **a crash while reading the NIF, before anything renders**.
