@@ -440,7 +440,7 @@ def gui_main():
     # ── Root window ───────────────────────────────────────────────────────────
     root = tk.Tk()
     root.title("TES4 AutoConvert")
-    root.geometry("1060x877")
+    root.geometry("1060x900")
     root.minsize(860, 680)
     root.configure(bg=CLR["bg"])
     root.option_add("*Background", CLR["bg"])
@@ -881,8 +881,11 @@ def gui_main():
         # Card placed directly over the window, no overlay behind it
         card = tk.Frame(outer, bg=CLR["panel"],
                         highlightbackground=CLR["border"], highlightthickness=1)
+        _wheel_bound = []  # [bind_id] once a canvas is created below
 
         def _close():
+            if _wheel_bound:
+                card.unbind_all("<MouseWheel>")
             card.destroy()
 
         # Title row
@@ -905,9 +908,28 @@ def gui_main():
                      bg=CLR["panel"], fg=CLR["subtext"],
                      font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(0, 8))
         else:
+            list_frame = tk.Frame(card, bg=CLR["panel"])
+            list_frame.pack(fill=tk.BOTH, expand=True, padx=8)
+
+            canvas = tk.Canvas(list_frame, bg=CLR["panel"], highlightthickness=0,
+                               width=320, height=min(360, 22 * len(mesh_subdir_vars)))
+            vsb = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+            inner = tk.Frame(canvas, bg=CLR["panel"])
+            inner.bind("<Configure>",
+                      lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.create_window((0, 0), window=inner, anchor="nw")
+            canvas.configure(yscrollcommand=vsb.set)
+            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+            def _wheel(e):
+                canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+            card.bind_all("<MouseWheel>", _wheel)
+            _wheel_bound.append(True)
+
             for name, var in mesh_subdir_vars:
-                ttk.Checkbutton(card, text=name, variable=var,
-                                style="TCheckbutton").pack(anchor="w", padx=20, pady=1)
+                ttk.Checkbutton(inner, text=name, variable=var,
+                                style="TCheckbutton").pack(anchor="w", padx=12, pady=1)
 
         ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16, pady=8)
 
