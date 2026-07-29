@@ -493,6 +493,7 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
         except Exception as e:
             return (False, str(e))
 
+    all_errors: list[str] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_compile_one, psc): psc for psc in psc_files}
         for fut in as_completed(futures):
@@ -501,6 +502,7 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
                 ok_count += 1
             else:
                 err_count += 1
+                all_errors.append(f"{futures[fut].name}: {msg}")
                 if len(err_samples) < 10:
                     err_samples.append(f"  {futures[fut].name}: {msg}")
 
@@ -510,6 +512,17 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
         print(sample)
     if err_count > 10:
         print(f"  ... and {err_count - 10} more failures")
+    # The console list is capped at 10, which hid the long tail of real compile
+    # errors.  Always dump the complete list next to the scripts so a failing
+    # build can be worked through in full instead of ten at a time.
+    if all_errors:
+        log_path = script_out / "compile_errors.log"
+        try:
+            log_path.write_text("\n".join(sorted(all_errors)) + "\n",
+                                encoding="utf-8")
+            print(f"  full error list: {log_path}")
+        except OSError:
+            pass
     return ok_count > 0
 
 

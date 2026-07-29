@@ -28,6 +28,7 @@ def _new_scan_out() -> dict:
         'record_scri': {}, 'record_base': {}, 'record_type': {},
         'quest_edids': set(), 'npc_formids': set(),
         'mgef_shaders': {}, 'spell_effects': {},
+        'global_types': {},
     }
 
 
@@ -35,6 +36,7 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
     """Scan one record's KEY=VALUE lines into the partial result dicts."""
     formid = edid = scri = name_fid = None
     schr_type = None
+    glob_type = None
     mgef_shader = mgef_ench = None
     mgef_school = -1
     spel_effects: list[tuple[str, int]] = []
@@ -54,6 +56,8 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
                 schr_type = int(line[10:])
             except ValueError:
                 pass
+        elif sig == 'GLOB' and line.startswith('FNAM.Type='):
+            glob_type = line[10:].strip()
         elif sig == 'MGEF' and line.startswith('DATA.EffectShader='):
             mgef_shader = line[18:]
         elif sig == 'MGEF' and line.startswith('DATA.EnchantEffect='):
@@ -94,6 +98,8 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
     if name_fid and sig in ('ACHR', 'ACRE', 'REFR'):
         out['record_base'][formid] = name_fid
     out['record_type'][formid] = sig
+    if sig == 'GLOB' and edid and glob_type:
+        out['global_types'][edid.lower()] = glob_type
     if sig == 'QUST' and edid:
         out['quest_edids'].add(edid.lower())
     if sig in ('NPC_', 'CREA'):
@@ -175,6 +181,10 @@ class CrossRefGraph:
         # Used to convert IsSpellTarget into a HasMagicEffect check on the
         # spell's first converted (Skyrim) magic effect.
         self.spell_effects: dict[str, list[tuple[str, int]]] = {}
+        # GLOB EditorID (lower) -> TES4 FNAM type char ('s' short, 'l' long,
+        # 'f' float).  Decides whether a GetValue() read needs an `as Int`:
+        # truncating a float global silently breaks fractional comparisons.
+        self.global_types: dict[str, str] = {}
     def load_from_export(self, export_dir: str, workers: int = None):
         """Load cross-reference data from all export .txt files.
 
@@ -229,6 +239,7 @@ class CrossRefGraph:
         self.npc_formids.update(out['npc_formids'])
         self.mgef_shaders.update(out['mgef_shaders'])
         self.spell_effects.update(out['spell_effects'])
+        self.global_types.update(out['global_types'])
 
     def get_extends_class(self, script_formid: str) -> str:
         """Determine the Papyrus extends class for a script."""

@@ -92,6 +92,13 @@ TYPE_MAP = {
     'float': 'Float',
     'ref':   'ObjectReference',
     'reference': 'ObjectReference',
+    # OBSE types.  Without these the variable got NO declaration at all and
+    # every use was an undefined identifier (HMSfromFloat24h builds its return
+    # value in a `string_var sTime`).  Papyrus String is the direct equivalent;
+    # array_var has none, so it falls back to a String the script can at least
+    # declare and assign.
+    'string_var': 'String',
+    'array_var':  'String',
 }
 
 # Actor value name mapping (TES4 -> TES5)
@@ -655,6 +662,53 @@ FUNCTION_MAP = {
     'setpcfame':         (None,                False, None),  # Special handler
     'setpcinfamy':       (None,                False, None),  # Special handler
     'forceflee':         (None,                True,  None),  # Special handler
+    'flee':              (None,                True,  None),  # Special handler
+    'getattacked':       (None,                True,  None),  # Special handler
+    'positionworld':     (None,                True,  None),  # Special handler
+    'positioncell':      (None,                True,  None),  # Special handler
+    'skipanim':          (None,                True,  None),  # Special handler
+    'getpackagetarget':  (None,                True,  None),  # Special handler
+    'unlockachievement': (None,                False, None),  # Special handler
+    'setnumericinisetting': (None,             False, None),  # Special handler
+    'printtoconsole':    (None,                False, None),  # Special handler
+    'isinair':           (None,                True,  None),  # Special handler
+    'con_save':          (None,                False, None),  # Special handler
+    'con_savegame':      (None,                False, None),  # Special handler
+    'getcrosshairref':   (None,                False, None),  # Special handler
+    'getobjecttype':     (None,                True,  None),  # Special handler
+    'disablekey':         (None,                False, None),  # Special handler
+    'enablekey':          (None,                False, None),  # Special handler
+    'tapkey':             (None,                False, None),  # Special handler
+    'holdkey':            (None,                False, None),  # Special handler
+    'releasekey':         (None,                False, None),  # Special handler
+    'playback':           (None,                False, None),  # Special handler
+    'playbackalt':        (None,                False, None),  # Special handler
+    'disablecontrol':     (None,                False, None),  # Special handler
+    'enablecontrol':      (None,                False, None),  # Special handler
+    'tapcontrol':         (None,                False, None),  # Special handler
+    'getcontrol':         (None,                False, None),  # Special handler
+    'getaltcontrol':      (None,                False, None),  # Special handler
+    'getmousecontrol':    (None,                False, None),  # Special handler
+    'getmenuhastrait':    (None,                False, None),  # Special handler
+    'getmenufloatvalue':  (None,                False, None),  # Special handler
+    'getmenustringvalue': (None,                False, None),  # Special handler
+    'getitems':           (None,                False, None),  # Special handler
+    'isplayable2':        (None,                False, None),  # Special handler
+    'isplayable':         (None,                False, None),  # Special handler
+    'getfullgoldvalue':   (None,                False, None),  # Special handler
+    'getweaponskilltype': (None,                False, None),  # Special handler
+    'con_runmemorypass': (None,                False, None),  # Special handler
+    'getstringgamesetting': (None,             False, None),  # Special handler
+    'iskeypressed':      (None,                False, None),  # Special handler
+    'iskeypressed2':     (None,                False, None),  # Special handler
+    'iskeypressed3':     (None,                False, None),  # Special handler
+    'iscontrolpressed':  (None,                False, None),  # Special handler
+    'printc':            (None,                False, None),  # Special handler
+    'messageboxex':      (None,                False, None),  # Special handler
+    'messageex':         (None,                False, None),  # Special handler
+    'getnumericinisetting': (None,             False, None),  # Special handler
+    'getgamerestarted':  (None,                False, None),  # Special handler
+    'isplayermovingintonewspace': (None,       False, None),  # Special handler
     'setinvestmentgold': (None,                True,  None),  # no-op
     'setallvisible':     (None,                True,  None),  # no-op
     'getpcfame':         (None,                False, None),  # Special handler
@@ -691,6 +745,46 @@ _BARE_NO_EQUIV_COMMANDS = {
     'emcisbattleoverridden', 'emcismusiconhold', 'emcgetplaylist',
     'iscasting', 'hasflames', 'flameson', 'flamesoff', 'addflames',
     'removeflames', 'getplayerhaslastriddenhorse', 'getignorefriendlyhits',
+    # Read bare, mid-expression, with no same-named Papyrus form: without
+    # routing they survive as undefined identifiers and fail the whole script.
+    'flee', 'getattacked', 'skipanim', 'getpackagetarget',
+    'isinair', 'getstringgamesetting', 'getcrosshairref', 'getobjecttype',
+    'con_runmemorypass',
+    'disablekey', 'enablekey', 'tapkey', 'holdkey', 'releasekey', 'playback', 'playbackalt', 'disablecontrol', 'enablecontrol', 'tapcontrol',
+    'getcontrol', 'getaltcontrol', 'getmousecontrol', 'getmenuhastrait', 'getmenufloatvalue', 'getmenustringvalue', 'getitems', 'isplayable2', 'isplayable', 'getfullgoldvalue', 'getweaponskilltype',
+    'iskeypressed', 'iskeypressed2',
+    'iskeypressed3', 'iscontrolpressed',
+    'unlockachievement', 'getgamerestarted', 'isplayermovingintonewspace',
+}
+
+# TES4 `ref.` commands that take NO arguments.  Oblivion let the receiver be
+# written after a comma instead of a dot — `StopCombat, Player` and
+# `IsInCombat, Player == 1` mean exactly `Player.StopCombat` /
+# `Player.IsInCombat`.  Because the generic comma-stripping treats whatever
+# follows as an argument, these emitted `IsInCombat(Player)` ("function takes 0
+# parameters not 1") or dropped the token and acted on the wrong actor, so the
+# receiver has to be promoted for precisely this set.
+# Derived from the `ref.` rows with an empty argument column in
+# docs/skyrim_commands.md, intersected with FUNCTION_MAP.  (IsInCombat's
+# "Integer" column there is its RETURN type, not a parameter.)
+_ZERO_ARG_REF_FUNCTIONS = {
+    'addflames', 'clearownership', 'disablelinkedpathpoints',
+    'dispelallspells', 'enablelinkedpathpoints', 'evaluatepackage',
+    'getclothingvalue', 'getcombattarget', 'getcurrentaipackage',
+    'getcurrentaiprocedure', 'getdead', 'getdestroyed', 'getdisabled',
+    'getforcesneak', 'getgold', 'getignorefriendlyhits', 'getisalerted',
+    'getiscreature', 'getisplayablerace', 'getknockedstate', 'getlevel',
+    'getlocked', 'getlocklevel', 'getopenstate', 'getparentref',
+    'getrestrained', 'getscale', 'getsitting', 'getsleeping',
+    'gettalkedtopc', 'getweaponanimtype', 'hasflames', 'isactor',
+    'iscasting', 'isessential', 'isguard', 'isidleplaying',
+    'isindangerouswater', 'issneaking', 'isswimming', 'istalking',
+    'isweaponout', 'markfordelete', 'pickidle', 'removeflames', 'resetai',
+    'resetfalldamagetimer', 'stopcombat', 'stopcombatalarmonactor',
+    'stoplook',
+    # Same zero-argument shape; listed with a return type in the table.
+    'isincombat', 'getattacked', 'isdead', 'getlos', 'skipanim',
+    'getdisease', 'getalarmed', 'ismoving', 'isturning', 'getwantblocking',
 }
 
 # Functions that can ONLY be called on Actor (not ObjectReference)
@@ -735,7 +829,26 @@ _ACTOR_ONLY_FUNCTIONS = {
 _OBJREF_SHARED_FUNCTIONS = {
     'placeatme', 'getdistance', 'additem', 'removeitem', 'getitemcount',
     'removeallitems', 'setscale', 'getscale', 'say', 'saycustom', 'sayto',
-    'setalpha', 'getalpha', 'setcell', 'dispel', 'dispelspell',
+    'setalpha', 'getalpha', 'setcell',
+    # NOT dispel/dispelspell: Actor.psc declares `bool DispelSpell(Spell)` and
+    # ObjectReference has no such method, so listing them here suppressed the
+    # `as Actor` cast and left an ObjectReference receiver calling an undefined
+    # function (SERelmynaExperimentSpellScript).
+}
+
+# Methods declared on ObjectReference that a TES4 script calls BARE, relying on
+# the implicit "me".  ActiveMagicEffect and TopicInfo are not references, so an
+# unqualified `Disable()` / `GetLinkedRef()` in those scripts is an undefined
+# function at compile time — they must be routed onto the reference the effect
+# or topic acts upon.  Distinct from _ACTOR_ONLY_FUNCTIONS: these need the
+# receiver redirected but NOT an `as Actor` cast, since they are valid on any
+# reference.
+_OBJREF_IMPLICIT_SELF_FUNCTIONS = {
+    'disable', 'enable', 'getdisabled', 'isdisabled', 'delete',
+    'getlinkedref', 'getparentref', 'activate', 'reset',
+    'getparentcell', 'getpos', 'setpos', 'getangle', 'setangle',
+    'moveto', 'playgroup', 'playanimation', 'setopenstate',
+    'getitemcount', 'isininterior',
 }
 
 
@@ -853,6 +966,13 @@ def resolve_property_formid(xref, prop_name: str) -> str:
     fid = xref.edid_to_formid.get(low, '')
     if not fid and low.startswith('my'):
         fid = xref.edid_to_formid.get(low[2:], '')
+    # `<Name>Base` is the de-collided ActorBase property minted by
+    # _actor_base_property when the record's EditorID clashes
+    # case-insensitively with one of the script's own variables (MQ19Script has
+    # an `Int narel` alongside the NPC_ `Narel`).  Strip the suffix so the
+    # property still binds to the base record.
+    if not fid and len(low) > 4 and low.endswith('base'):
+        fid = xref.edid_to_formid.get(low[:-4], '')
     return fid
 
 

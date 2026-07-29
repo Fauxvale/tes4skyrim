@@ -56,6 +56,52 @@ Audited output carries only 2 `;TODO:` markers across 18,566 scripts, so marker
 counts measure honesty, not correctness — never treat a clean output scan as
 evidence the conversion is complete.
 
+### GameHour is FLOAT — never truncate a global read (2026-07-28)
+
+`GameHour` is FormID `0x00000038` in **both** games, and Skyrim declares it
+**float** (`GLOB.FNAM=102`), so `GetValue()` returns fractional hours — 23.9847,
+not 23. Oblivion mislabels it `short` in its own GLOB record but the engine still
+reports the fraction, which is why the bell/chime idiom works there:
+
+```
+if ( GameHour >= 23.98 ) || ( GameHour <= 0.02 )   ; the top of the hour
+```
+
+Emitting `GameHour.GetValue() as Int` truncated that, and every such window
+collapsed into an **always-true whole-hour test** (`23 >= 23.98` is false, but
+`0 <= 0.02` is true for all of hour 0). The guarded body then ran every frame:
+the Erodans-Kapelle chapel bell and Oblivion's `BellTowerScript` rang
+continuously instead of once on the hour. 157 comparisons across 7 scripts in
+both plugins.
+
+- `_global_read()` decides the cast from the GLOB's real `FNAM.Type` (now carried
+  by `CrossRefGraph.global_types`), plus an explicit `_FRACTIONAL_ENGINE_GLOBALS`
+  set for engine globals Oblivion mislabels. `TimeScale` really is short
+  (Skyrim `FNAM=115`) — do NOT add it.
+- Assignments into Int variables still get their cast from
+  `_coerce_float_to_int` (`GetValue` is in `_FLOAT_RETURNING_FUNCS`), so
+  `currenthour = GameHour` remains correct.
+- **General rule: a blanket cast on a global read is a silent behaviour change.**
+  Type the cast from the record, not from the call site.
+
+### Aggression/Confidence are ENUMS in TES5, not 0-100 (2026-07-28)
+
+TES4 stores the AI traits on a 0-100 scale; TES5 defines them as small enums
+(xEdit `wbDefinitionsCommon.pas`: `wbAggressionEnum` 0-3, `wbConfidenceEnum` 0-4,
+`wbAssistanceEnum` 0-2, Morality 0-3). `SetActorValue("Aggression", 100)` is
+**rejected outright** — the engine logs *"attempt made to set illegal value"* and
+leaves the trait **unchanged**, so every scripted "now turn hostile" beat
+silently did nothing. 160 such writes in Nehrim alone (94 of them `Aggression
+100`), 509 enum-AV writes across both plugins.
+
+`_scale_enum_av()` buckets literals onto the same thresholds the record-side
+converter uses (`tes5_import/record_types/actors.py`), so a scripted change lands
+on the tier the NPC's AIDT was converted to. Values already inside the enum range
+pass through untouched; non-literals are left alone. `ModActorValue` is
+deliberately NOT scaled — a delta on a 0-100 scale has no enum equivalent, and no
+such call exists in the source. Verify with
+`python tools/check_enum_actor_values.py <scripts/source>`.
+
 Two recurring shapes, both found in the animation handlers:
 
 - **Wrong target vocabulary.** The emitted call is valid Papyrus but the string
@@ -181,6 +227,77 @@ code and the in-game results, not the surrounding prose.
   `_pack_effects`); pure script-effect spells are detected via the importer's
   first filler effect, which keeps the dropped effect's duration for exactly
   this reason.
+
+## Reaching 100% compile (2026-07-28, 42 → 0 failures)
+
+Nehrim 2620/2620 and Oblivion 15959/15959 now compile. The failures clustered
+into a few generic causes, all fixed in the converter rather than per-script:
+
+- **Comma-form RECEIVER on a zero-arg command.** `StopCombat, Player` /
+  `IsInCombat, Player == 1` name the *receiver*, not an argument — the comma
+  spelling of `Player.StopCombat`. Treating it as an argument gave `IsInCombat(Player)`
+  ("function takes 0 parameters not 1") or dropped the token and acted on the
+  WRONG ACTOR. `_ZERO_ARG_REF_FUNCTIONS` (derived from the empty-argument `ref.`
+  rows of `docs/skyrim_commands.md`) drives the promotion. **When widening the
+  bool-comparison regex, keep the `\b` and the mandatory separator** — without
+  them `GetDead` matched the prefix of `GetDeadCount` and split off `Count` as an
+  argument across 28 scripts.
+- **A local variable may shadow `player`.** `StartCelleAufzugTriggerZone01Script`
+  declares `Short Player` as its own trigger flag; substituting the keyword gave
+  the un-assignable `Game.GetPlayer() = 1`. Locals win in a VALUE position but
+  never as a **receiver** (a Short has no methods) and never inside
+  `IsActionRef`, whose operand is always a reference — hence
+  `_convert_ref(..., as_receiver=True)`.
+- **Property names must key on the CANONICAL EditorID.** TES4 lookup is
+  case-insensitive, so `SetEssential Kornderbraumeister` refers to
+  `KornderBraumeister`; keying on the local spelling created a second
+  `_property_refs` entry differing only in case, and since Papyrus is also
+  case-insensitive the two declarations collided and the typed one lost.
+  Where the EditorID collides with one of the script's own variables (MQ19Script
+  has an `Int narel` beside the NPC_ `Narel`), `_actor_base_property()` mints a
+  `<Name>Base` property and `resolve_property_formid` strips the suffix to bind it.
+- **A mapped GLOBAL call takes no receiver.** `Player.DisablePlayerControls`
+  emitted `Game.GetPlayer().Game.DisablePlayerControls()`. Any `FUNCTION_MAP`
+  target starting `Game.`/`Utility.`/`Debug.`/`Math.` drops the TES4 receiver.
+- **`as` binds tighter than arithmetic.** A trailing `as Int` only types the whole
+  expression when no bare operator precedes it; `A - B.GetValue() as Int` is
+  `Float - Int`. Also: a plain Float→Int copy (`ihour = vtime`) needs the cast
+  just as much as an expression does, and OBSE `let` needs the same coercion
+  `set` already had.
+- **No-equivalent handlers must return a BARE literal.** These sit inside larger
+  conditions, where a trailing `;` comment swallows the rest of the line
+  (`If True  ;(False ;NE: ...)`). Push the note to `_line_comments` instead.
+- **Match no-equivalent FAMILIES by pattern, not by name.** Enumerating OBSE
+  commands one per build is how `disableKey` and `setMenuFloatValue` each survived
+  to fail alone. `con_*`, `get/setMenu*`, and the input family are prefix-matched,
+  and the bare-read router honours those prefixes without a `FUNCTION_MAP` entry.
+
+New native equivalents found (always check before declaring one absent):
+
+| TES4 / OBSE | Papyrus | Note |
+|---|---|---|
+| `GetDeadCount <base>` | `ActorBase.GetDeadCount()` | Exact match. Previously emitted a literal `0`, silently disabling **152 quest gates** (126 of them `== 1` checks that became `0 == 1`). |
+| `SetEssential` | `ActorBase.SetEssential(bool)` | On ActorBase, not Actor. |
+| `PositionWorld x y z ang ws` | `SetPosition` + `SetAngle` | No worldspace param; dropped. |
+| `ForceFlee` / `Flee` | `SetActorValue("Confidence", 0)` + `EvaluatePackage()` | Skyrim drives fleeing off Confidence — the engine's own mechanism. |
+| `GetAttacked` | `Actor.IsAlarmed() as Int` | |
+| `IsInAir` | `Actor.IsFlying() as Int` | |
+| `con_Save` | `Game.RequestSave()` | |
+| `DispelSpell` | `Actor.DispelSpell(Spell)` | Actor-only — must NOT sit in `_OBJREF_SHARED_FUNCTIONS`. |
+| `$var` (OBSE) | `(var as String)` | `$` is not even a legal Papyrus character. |
+| `string_var` / `array_var` | `String` | Missing from `TYPE_MAP`, so the variable got **no declaration at all**. |
+
+Genuinely absent (inert `;NE:`): OBSE UI/menu (`get/setMenu*`), raw input
+(`isKeyPressed*`, `disableKey`, `getControl`), console commands (`con_*`),
+INI access (`Set/GetNumericINISetting`), `getCrosshairRef`, `getObjectType`
+(Skyrim's form-type numbering differs entirely), `GetStringGameSetting` (Papyrus
+has only the numeric getters), `SkipAnim`, `getPackageTarget`, and
+`UnlockAchievement`. An OBSE `forEach … loop` suppresses its **whole body** — the
+body reads an iterator that cannot exist.
+
+A cross-script write to a variable the owner never declares
+(`AutoSaveQuest.ReadyForAutosave`, 3 scripts) is **dangling in the original mod**.
+Oblivion ignored it; Papyrus fails the whole file, so it is commented out.
 
 ## Syntax traps found via Nehrim (2026-07-20, 50.5% → 98.4% compile rate)
 

@@ -1446,3 +1446,140 @@ class TestFilterGuardTes4Type:
         conv._property_refs['CGAssassin01Ref'] = 'TES4_CGAssassinScript'
         guard = conv._block_filter_guard('onhit', 'CGAssassin01Ref')
         assert guard == 'akAggressor == CGAssassin01Ref'
+
+
+class TestGameHourFractional:
+    """GameHour is a FLOAT global in Skyrim (FormID 0x38, FNAM=102).
+
+    Truncating the read with `as Int` collapsed every hour-boundary window
+    (`>= 23.98 || <= 0.02`) into an always-true whole-hour test, so the guarded
+    body ran every frame — the Erodans-Kapelle chapel bell and Oblivion's
+    BellTowerScript rang continuously instead of once on the hour.
+    """
+
+    def test_gamehour_read_is_not_truncated(self, converter):
+        assert converter._convert_expression('GameHour', 'ObjectReference') \
+            == 'GameHour.GetValue()'
+
+    def test_hour_boundary_window_survives(self, converter):
+        out = converter._convert_expression(
+            '( GameHour >= 23.98 ) || ( GameHour <= 0.02 )', 'ObjectReference')
+        assert 'as Int' not in out
+        assert '23.98' in out and '0.02' in out
+
+    def test_integer_global_still_truncated(self, xref):
+        """A genuinely short global keeps its cast — only floats are exempt."""
+        xref.edid_to_formid['myshortglobal'] = '00099001'
+        xref.record_type['00099001'] = 'GLOB'
+        xref.formid_to_edid['00099001'] = 'MyShortGlobal'
+        xref.global_types['myshortglobal'] = 's'
+        conv = ScriptConverter(xref)
+        assert conv._convert_expression('MyShortGlobal', 'ObjectReference') \
+            == 'MyShortGlobal.GetValue() as Int'
+
+    def test_float_typed_global_not_truncated(self, xref):
+        xref.edid_to_formid['myfloatglobal'] = '00099002'
+        xref.record_type['00099002'] = 'GLOB'
+        xref.formid_to_edid['00099002'] = 'MyFloatGlobal'
+        xref.global_types['myfloatglobal'] = 'f'
+        conv = ScriptConverter(xref)
+        assert conv._convert_expression('MyFloatGlobal', 'ObjectReference') \
+            == 'MyFloatGlobal.GetValue()'
+
+
+class TestEnumActorValues:
+    """TES4 stores Aggression/Confidence on 0-100; TES5 defines them as small
+    enums (xEdit wbAggressionEnum 0-3, wbConfidenceEnum 0-4).  Writing the raw
+    TES4 number is rejected by the engine ("attempt made to set illegal
+    value") and leaves the trait UNCHANGED, so every scripted "turn hostile"
+    beat silently did nothing.
+    """
+
+    def test_aggression_100_becomes_tier(self, converter):
+        out = converter._convert_function_call(
+            'SetActorValue Aggression, 100', 'ObjectReference')
+        assert 'SetActorValue("Aggression", 2)' in out
+
+    def test_aggression_low_but_nonzero_still_initiates(self, converter):
+        out = converter._convert_function_call(
+            'SetActorValue Aggression, 10', 'ObjectReference')
+        assert 'SetActorValue("Aggression", 2)' in out
+
+    def test_in_range_value_passes_through(self, converter):
+        """An already-legal tier is a deliberate value, not re-bucketed."""
+        out = converter._convert_function_call(
+            'SetActorValue Aggression, 0', 'ObjectReference')
+        assert 'SetActorValue("Aggression", 0)' in out
+
+    def test_confidence_scaled(self, converter):
+        out = converter._convert_function_call(
+            'SetActorValue Confidence, 100', 'ObjectReference')
+        assert 'SetActorValue("Confidence", 3)' in out
+
+    def test_non_enum_actor_value_untouched(self, converter):
+        out = converter._convert_function_call(
+            'SetActorValue Health, 100', 'ObjectReference')
+        assert 'SetActorValue("Health", 100)' in out
+
+    def test_variable_operand_left_alone(self, converter):
+        """A non-literal cannot be bucketed at conversion time."""
+        conv_out = converter._convert_function_call(
+            'SetActorValue Aggression, myVar', 'ObjectReference')
+        assert 'myVar' in conv_out
+
+
+class TestZeroArgRefReceiver:
+    """Oblivion let the receiver of a zero-argument `ref.` command follow a
+    comma instead of a dot: `StopCombat, Player` means `Player.StopCombat`.
+    Treating it as an argument emitted `IsInCombat(Player)` ("function takes 0
+    parameters not 1") or dropped it and acted on the wrong actor.
+    """
+
+    def test_stopcombat_comma_receiver(self, converter):
+        out = converter._convert_function_call('StopCombat, Player', 'ObjectReference')
+        assert out == 'Game.GetPlayer().StopCombat()'
+
+    def test_isincombat_comma_receiver_in_comparison(self, converter):
+        out = converter._convert_expression('IsInCombat, Player == 1', 'ObjectReference')
+        assert out == 'Game.GetPlayer().IsInCombat()'
+
+    def test_getdeadcount_prefix_not_split(self, xref):
+        """`GetDead` must not match the prefix of `GetDeadCount`."""
+        xref.edid_to_formid['narel'] = '00099010'
+        xref.record_type['00099010'] = 'NPC_'
+        xref.formid_to_edid['00099010'] = 'Narel'
+        conv = ScriptConverter(xref)
+        out = conv._convert_expression('GetDeadCount Narel == 1', 'ObjectReference')
+        assert out == 'Narel.GetDeadCount() == 1'
+
+    def test_arg_taking_function_keeps_its_argument(self, xref):
+        """GetInFaction takes a real argument — it must NOT be promoted."""
+        xref.edid_to_formid['myfaction'] = '00099011'
+        xref.record_type['00099011'] = 'FACT'
+        xref.formid_to_edid['00099011'] = 'MyFaction'
+        conv = ScriptConverter(xref)
+        out = conv._convert_expression('GetInFaction, MyFaction == 1', 'ObjectReference')
+        assert 'MyFaction' in out and 'IsInFaction(' in out
+
+
+class TestLocalVariableShadowsPlayer:
+    """TES4 scripts may declare `Short Player` as their own flag
+    (StartCelleAufzugTriggerZone01Script does).  Rewriting that to
+    Game.GetPlayer() produced the un-assignable `Game.GetPlayer() = 1`.
+    """
+
+    def test_local_wins_in_value_position(self, converter):
+        converter._local_vars = {'player'}
+        converter._var_types = {'player': 'Int'}
+        assert converter._convert_ref('Player', 'ObjectReference') == 'Player'
+
+    def test_keyword_wins_as_receiver(self, converter):
+        """A Short has no methods, so `Player.GetDistance` is the keyword."""
+        converter._local_vars = {'player'}
+        converter._var_types = {'player': 'Int'}
+        assert converter._convert_ref('Player', 'ObjectReference',
+                                      as_receiver=True) == 'Game.GetPlayer()'
+
+    def test_keyword_used_when_no_local(self, converter):
+        assert converter._convert_ref('Player', 'ObjectReference') \
+            == 'Game.GetPlayer()'

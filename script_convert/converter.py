@@ -8,6 +8,7 @@ from script_convert.constants import (
     _PAPYRUS_RESERVED, FUNCTION_MAP, _BARE_BOOL_FUNCTIONS,
     _BARE_NO_EQUIV_COMMANDS,
     _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS,
+    _OBJREF_IMPLICIT_SELF_FUNCTIONS, _ZERO_ARG_REF_FUNCTIONS,
     _safe_property_name, _canonical_global, _record_type_to_papyrus,
     _record_type_to_base_papyrus, papyrus_script_name,
 )
@@ -172,6 +173,8 @@ class ScriptConverter:
         self._var_types: dict[str, str] = {}  # lower_name -> papyrus_type
         self._current_event: str = ''  # Current event header for context-aware conversion
         self._line_comments: list[str] = []  # Comments accumulated during expression conversion
+        # Nesting depth inside an OBSE `forEach … loop` block (body is inert).
+        self._in_foreach = 0
         self._udf_returns = False      # OBSE Function block uses SetFunctionValue
         self._udf_return_value = ''    # value staged by SetFunctionValue
         # Timers a Say() parked (see _say_seconds). They hold a large sentinel
@@ -432,6 +435,7 @@ class ScriptConverter:
         # recognised as a variable — instead of being compiled as that command —
         # if the ORIGINAL spelling is in this set.
         self._local_vars = set()
+        self._in_foreach = 0
         for v in variables:
             self._local_vars.add(v[1].lower())
             self._local_vars.add(_safe_property_name(v[1]).lower())
@@ -703,10 +707,25 @@ class ScriptConverter:
                     return 'Form'
                 return declared
 
-            sig = ', '.join(f'{_param_type(p)} {_safe_property_name(p)}'
+            _param_types = {p: _param_type(p) for p in udf_params}
+            sig = ', '.join(f'{_param_types[p]} {_safe_property_name(p)}'
                             for p in udf_params)
             rtype = 'Int ' if self._udf_returns else ''
             out.append(f'{rtype}Function {_UDF_NAME}({sig})')
+            # A parameter typed `Form` (the permissive fallback for a TES4 `ref`)
+            # cannot be passed where Papyrus declares a narrower type: AddSpell
+            # takes a Spell, and Form→Spell is a downcast the compiler refuses to
+            # make implicitly.  Insert the cast at the call sites in the body.
+            _needs_spell = re.compile(
+                r'\b((?:Add|Remove)Spell)\(\s*([A-Za-z_]\w*)\s*\)')
+            for _i, _conv in enumerate(udf_lines):
+                def _cast_spell(m, _pt=_param_types):
+                    arg = m.group(2)
+                    if _pt.get(arg, _pt.get(arg.lower(), '')) in (
+                            'Form', 'ObjectReference'):
+                        return f'{m.group(1)}({arg} as Spell)'
+                    return m.group(0)
+                udf_lines[_i] = _needs_spell.sub(_cast_spell, _conv)
             for converted in udf_lines:
                 out.append(f'  {converted}')
             if self._udf_returns:
@@ -994,6 +1013,56 @@ class ScriptConverter:
             out[var_start_idx + len(_var_info):
                 var_start_idx + len(_var_info)] = decls
 
+        # Post-process: a TES4 `ref` variable that is only ever assigned BASE
+        # FORMS of one kind is not an ObjectReference at all.  NQ15W02Turret01
+        # declares `ref SelectedSpell` and assigns SPEL records to it, which
+        # Papyrus rejects ("value with type Spell cannot be assigned to a
+        # variable with type ObjectReference").  Retype the declaration to the
+        # assigned form's own Papyrus type when every assignment agrees.
+        if _var_info and self.xref:
+            # Papyrus functions whose return type is not ObjectReference, so a
+            # TES4 `ref` variable holding one needs that type instead.
+            _RET_TYPES = {'getparentcell': 'Cell'}
+            _assigned: dict[str, set] = {}
+            for line in out:
+                am = re.match(r'^\s*(\w+)\s*=\s*(.+?)\s*(?:;.*)?$', line)
+                if not am:
+                    continue
+                vlow = am.group(1).lower()
+                val = am.group(2).strip()
+                # A call: take the type from the LAST method in the chain.
+                call_m = re.search(r'(\w+)\(\s*\)\s*$', val)
+                if call_m:
+                    ptype = _RET_TYPES.get(call_m.group(1).lower(), '')
+                    _assigned.setdefault(vlow, set()).add(ptype)
+                    continue
+                if not re.match(r'^\w+$', val):
+                    _assigned.setdefault(vlow, set()).add('')
+                    continue
+                fid = self.xref.edid_to_formid.get(val.lower(), '')
+                rtype = self.xref.record_type.get(fid, '') if fid else ''
+                # Only BASE records retype; a placed ref really is a reference.
+                ptype = (_record_type_to_base_papyrus(rtype)
+                         if rtype and rtype not in ('ACHR', 'ACRE', 'REFR')
+                         else '')
+                _assigned.setdefault(vlow, set()).add(ptype)
+            for idx in range(var_start_idx, var_start_idx + len(_var_info)):
+                if idx >= len(out):
+                    break
+                line = out[idx]
+                if 'ObjectReference Property ' not in line:
+                    continue
+                pname = line.split('Property ', 1)[1].split()[0]
+                types = _assigned.get(pname.lower(), set())
+                # Unanimous, non-empty, and not already ObjectReference/Form.
+                if len(types) == 1:
+                    only = next(iter(types))
+                    if only and only not in ('ObjectReference', 'Form'):
+                        out[idx] = line.replace('ObjectReference Property ',
+                                                f'{only} Property ', 1)
+                        self._var_types[pname.lower()] = only
+                        self._property_refs[pname] = only
+
         # Post-process: upgrade ObjectReference/Actor variables to more specific types
         # based on usage (Actor from actor-only functions, or script type from SCRO/xref)
         if _var_info and self._property_refs:
@@ -1280,8 +1349,8 @@ class ScriptConverter:
             low = stripped.lower()
             if low.startswith('scriptname ') or low.startswith('scn '):
                 continue
-            if re.match(r'^(short|long|int|float|ref|reference)\s+\w+', stripped, re.IGNORECASE):
-                m = re.match(r'^(short|long|int|float|ref|reference)\s+(\w+)', stripped, re.IGNORECASE)
+            if re.match(r'^(string_var|array_var|short|long|int|float|ref|reference)\s+\w+', stripped, re.IGNORECASE):
+                m = re.match(r'^(string_var|array_var|short|long|int|float|ref|reference)\s+(\w+)', stripped, re.IGNORECASE)
                 if m:
                     ptype = TYPE_MAP.get(m.group(1).lower(), 'Int')
                     vname = m.group(2)
@@ -1602,6 +1671,7 @@ class ScriptConverter:
         self._uses_getsecondspassed = False
         self._uses_timer = False
         self._local_vars = set()
+        self._in_foreach = 0
         self._var_renames = {}
         self._var_types = {}
         self._udf_returns = False
@@ -1713,7 +1783,7 @@ class ScriptConverter:
 
             # Variable declarations — TES4 vars are ALWAYS script-global,
             # even if declared inside a begin/end block
-            m = re.match(r'^(short|long|int|float|ref|reference)\s+(\w+)', stripped, re.IGNORECASE)
+            m = re.match(r'^(string_var|array_var|short|long|int|float|ref|reference)\s+(\w+)', stripped, re.IGNORECASE)
             if m:
                 vname_low = m.group(2).lower()
                 if vname_low not in _seen_vars:
@@ -1886,13 +1956,41 @@ class ScriptConverter:
         """Core line conversion logic (no inline-comment handling)."""
         low = stripped.lower()
 
+        # An OBSE `forEach <it> <- <container> … loop` block.  The iterator has no
+        # Papyrus equivalent, so the header no-ops — but the BODY reads that
+        # iterator, and left live it referenced an identifier that was never
+        # declared ("value with type String cannot be assigned to ...").  The loop
+        # cannot run at all without its iterator, so comment the whole block out.
+        if getattr(self, '_in_foreach', 0):
+            if low == 'loop' or low.startswith('loop '):
+                self._in_foreach -= 1
+                return f';{stripped}  ;NE: end of OBSE forEach block'
+            if low.startswith('foreach'):
+                self._in_foreach += 1
+            return f';{stripped}  ;NE: inside OBSE forEach block'
+        if low.startswith('foreach'):
+            self._in_foreach = getattr(self, '_in_foreach', 0) + 1
+            return (f';{stripped}  ;NE: OBSE forEach — no Papyrus iterator '
+                    f'equivalent')
+
         # Variable declarations inside blocks — already declared as Properties by _parse_source
-        var_m = re.match(r'^(short|long|int|float|ref|reference)\s+(\w+)', stripped, re.IGNORECASE)
+        var_m = re.match(r'^(string_var|array_var|short|long|int|float|ref|reference)\s+(\w+)', stripped, re.IGNORECASE)
         if var_m:
             # Variable already declared as a Property; skip the inline declaration
             return ''
 
         # set X to Y
+        # An OBSE ARRAY ELEMENT write (`let arDayNameEval[6] := ...`, and the
+        # `set` spelling).  array_var has no Papyrus equivalent, so there is no
+        # element to assign — _safe_property_name mangled the subscript into the
+        # identifier `arDayNameEval_6_`, which was then undefined.  Comment the
+        # line out and keep the rest of the script.
+        _elem_m = re.match(r'^(?:set|let)\s+(\w+)\s*\[[^\]]*\]\s*(?::|[-+*/])?=',
+                           stripped, re.IGNORECASE)
+        if _elem_m:
+            return (f';{stripped}  ;NE: OBSE array element write — array_var '
+                    f'has no Papyrus equivalent')
+
         set_m = re.match(r'^set\s+(\S+)\s+to\s+(.*)', stripped, re.IGNORECASE)
         if set_m:
             target = self._convert_ref(set_m.group(1), extends)
@@ -1926,6 +2024,15 @@ class ScriptConverter:
             # Can't assign to Self/GetTargetActor()/akSpeakerRef in Papyrus
             if target in ('Self', 'GetTargetActor()', 'akSpeakerRef'):
                 return f';{target} = {value}  ;cannot assign to Self in Papyrus'
+            # A cross-script write whose variable the owner script never
+            # declares is dangling in the ORIGINAL mod, not a conversion bug:
+            # three Nehrim scripts write `AutoSaveQuest.ReadyForAutosave`, which
+            # AutoSaveQuestScript does not define.  Oblivion silently ignored it;
+            # Papyrus fails the whole file ("field or property not found"), so
+            # comment it out and keep the rest of the script.
+            _dangling = self._dangling_cross_script_target(set_m.group(1))
+            if _dangling:
+                return f';{target} = {value}  ;{_dangling}'
             # akSpeakerRef is ObjectReference; cast when assigned to Actor-typed fields
             if extends == 'TopicInfo' and value == 'akSpeakerRef':
                 value = '(akSpeakerRef as Actor)'
@@ -2085,13 +2192,18 @@ class ScriptConverter:
             value = self._convert_expression(let_m.group(3), extends)
             op = let_m.group(2)
             if op and not value.lstrip().startswith(';TODO:'):
-                return f'{target} = {target} {op} {value}'
+                return (f'{target} = '
+                        f'{self._coerce_float_to_int(target, f"{target} {op} {value}")}')
             if value.lstrip().startswith(';TODO:'):
                 tgt_low_todo = target.lower().split('.')[-1]
                 tgt_type_todo = self._var_types.get(tgt_low_todo, '') or self._property_refs.get(target, self._property_refs.get(tgt_low_todo, ''))
                 dflt = 'None' if tgt_type_todo in ('ObjectReference', 'Actor', 'ActorBase') or tgt_type_todo.startswith('TES4_') else '0'
                 return f'{target} = {dflt}  {value}'
             value = self._fix_ref_zero(target, value)
+            # OBSE `let` assigns just like `set`, so it needs the SAME Float→Int
+            # coercion.  Without it `let i := value / 24` (i short, value float)
+            # emitted a bare Float assignment to an Int and the CK rejected it.
+            value = self._coerce_float_to_int(target, value)
             return f'{target} = {value}'
 
         # if / elseif — TES4 also writes `if((x))` with no space, which must not
@@ -2233,6 +2345,34 @@ class ScriptConverter:
             return expr
         return f'{expr} as {ptype}'
 
+    # Engine-owned globals that Oblivion declares `short` but that carry a
+    # genuine fractional value at runtime (and that Skyrim declares float).
+    # GameHour is 0x00000038 in both games; Oblivion's own bell scripts bracket
+    # the top of the hour with `>= X.98 / <= X.02` windows, which only ever
+    # match because the read is fractional.
+    # Deliberately NOT here: TimeScale (Skyrim FNAM=115, genuinely short) and
+    # GameDaysPassed — the latter IS float (FNAM=102) but its only bare use is
+    # the day-of-week idiom, which needs a whole number and emits its own cast.
+    _FRACTIONAL_ENGINE_GLOBALS = frozenset(('gamehour',))
+
+    def _global_read(self, safe: str) -> str:
+        """Emit a GlobalVariable read, casting to Int only when that is lossless.
+
+        A blanket `as Int` truncates float globals, which silently turns any
+        fractional comparison into a whole-number one.  For GameHour that
+        collapsed each `>= 23.98 || <= 0.02` hour-boundary window into an
+        always-true test, so the guarded body ran every single frame — the
+        Erodans-Kapelle chapel bell (and Oblivion's BellTowerScript) rang
+        continuously instead of once on the hour.
+        """
+        low = safe.lower()
+        gtype = ''
+        if self.xref:
+            gtype = self.xref.global_types.get(low, '')
+        if low in self._FRACTIONAL_ENGINE_GLOBALS or gtype == 'f':
+            return f'{safe}.GetValue()'
+        return f'{safe}.GetValue() as Int'
+
     def _coerce_float_to_int(self, target: str, value: str) -> str:
         """Add 'as Int' cast when assigning Float-returning function to Int variable."""
         tgt_low = target.lower().split('.')[-1]
@@ -2253,8 +2393,32 @@ class ScriptConverter:
         # (`gamedayspassed` -> `GameDaysPassed.GetValue() as Int`), and casting
         # that again produces `X as Int as Int`, which Papyrus cannot parse —
         # this was the single biggest CK compile error (1965 of them).
-        if re.search(r'\bas\s+Int\s*$', value, re.IGNORECASE):
-            return value
+        #
+        # But a trailing `as Int` only types the WHOLE expression when it is not
+        # sitting inside arithmetic: `as` binds tighter than the operators, so
+        # `GetBaseActorValue("Magicka") - X.GetValue() as Int` is
+        # `Float - Int` — still Float, and rejected on assignment to an Int.
+        # Only skip when the cast really does cover everything.
+        _tail_cast = re.search(r'\bas\s+Int\s*$', value, re.IGNORECASE)
+        if _tail_cast:
+            head = value[:_tail_cast.start()]
+            # Arithmetic outside any parenthesised group means the cast applies
+            # to the last operand only.
+            _depth = 0
+            _bare_op = False
+            for _ch in head:
+                if _ch == '(':
+                    _depth += 1
+                elif _ch == ')':
+                    _depth -= 1
+                elif _depth == 0 and _ch in '+-*/%':
+                    _bare_op = True
+                    break
+            if not _bare_op:
+                return value
+            # Drop the inner cast and wrap the whole expression instead, so the
+            # arithmetic happens in Float and the RESULT becomes the Int.
+            return f'({head.rstrip()}) as Int'
         if self._FLOAT_RETURNING_FUNCS.search(value):
             # Wrap in parens if expression contains arithmetic to prevent binding issues
             if re.search(r'[+\-*/]', value):
@@ -2263,15 +2427,25 @@ class ScriptConverter:
         # Also detect float literals in arithmetic (e.g. X * 0.8, -50 * 0.5)
         if re.search(r'\d+\.\d+', value):
             return f'({value}) as Int'
-        # Detect Float variables in arithmetic expressions (e.g. totalTime - timer / 60)
-        if re.search(r'[+\-*/]', value):
-            # Check if any identifier in the expression is a Float variable
-            for ident in re.findall(r'\b([a-zA-Z_]\w*)\b', value):
-                id_type = self._var_types.get(ident.lower(), '')
-                if not id_type:
-                    id_type = self._property_refs.get(ident, self._property_refs.get(ident.lower(), ''))
-                if id_type == 'Float':
-                    return f'({value}) as Int'
+        # Detect Float variables in the value — with OR without arithmetic.
+        # A plain Float-to-Int copy needs the cast just as much as an
+        # expression does: `ihour = vtime` (short = float) and
+        # `PositionX = (NullpunktKoordinateX)` were both rejected outright.
+        _float_ident = False
+        for ident in re.findall(r'\b([a-zA-Z_]\w*)\b', value):
+            id_type = self._var_types.get(ident.lower(), '')
+            if not id_type:
+                id_type = self._property_refs.get(
+                    ident, self._property_refs.get(ident.lower(), ''))
+            if id_type == 'Float':
+                _float_ident = True
+                break
+        if _float_ident:
+            # Parenthesise only when needed — `as` binds tighter than the
+            # arithmetic operators, so a bare operand needs no extra parens.
+            if re.search(r'[+\-*/]', value):
+                return f'({value}) as Int'
+            return f'{value} as Int'
         # Bool→Int coercion: functions like IsDetectedBy return Bool, TES4 assigns to Int
         if self._BOOL_RETURNING_FUNCS.search(value):
             return f'{value} as Int'
@@ -2400,7 +2574,18 @@ class ScriptConverter:
         # Quoted EditorID → property ref (TES4 allows quoting form names)
         if len(expr) > 2 and expr[0] == '"' and expr[-1] == '"':
             inner_name = expr[1:-1]
-            fid = self.xref.edid_to_formid.get(inner_name.lower(), '')
+            # A LOCAL VARIABLE may be quoted too: NQ15Turret01SCRIPT declares
+            # `ref TowerTargetRef` and then writes `GetDistance
+            # "TowerTargetRef"`.  There is no form by that name, so the quotes
+            # survived and Papyrus got a String where an ObjectReference was
+            # required.  Resolve the variable instead.
+            _inner_low = inner_name.lower()
+            if _inner_low in self._local_vars:
+                return self._var_renames.get(_inner_low, inner_name)
+            # `GetDistance "Player"` — the keyword quotes just as readily.
+            if _inner_low in ('player', 'playerref'):
+                return 'Game.GetPlayer()'
+            fid = self.xref.edid_to_formid.get(_inner_low, '')
             if fid:
                 rtype = self.xref.record_type.get(fid, '')
                 ptype = _record_type_to_papyrus(rtype)
@@ -2410,7 +2595,7 @@ class ScriptConverter:
                 safe = _safe_property_name(inner_name)
                 self._property_refs[safe] = ptype
                 if ptype == 'GlobalVariable':
-                    return f'{safe}.GetValue() as Int'
+                    return self._global_read(safe)
                 return safe
 
         # `"EditorID".Function ...` — TES4 let a quoted form name stand in for the
@@ -2450,6 +2635,23 @@ class ScriptConverter:
 
         expr = expr.replace('<>', '!=')
 
+        # An OBSE array element READ (`arMonthNameEval[GameMonth + 1]`).  There is
+        # no Papyrus array behind it — the variable converted to a plain String —
+        # so the subscript cannot be honoured.  Drop it and read the variable,
+        # which at least keeps the expression well-typed instead of emitting the
+        # mangled identifier `arMonthNameEval_GameMonth...`.
+        _arr_read = re.match(r'^(\w+)\s*\[[^\]]*\]$', expr)
+        if _arr_read and _arr_read.group(1).lower() in self._local_vars:
+            return self._var_renames.get(_arr_read.group(1).lower(),
+                                         _arr_read.group(1))
+
+        # OBSE's `$expr` sigil casts a number to a string, used to build display
+        # text (`let sTime := "0" + $ihour + ":"`).  Papyrus has no `$` — it is
+        # not even a legal character, so the whole script died with "Scanner
+        # error: invalid character `$`".  An explicit `as String` is the exact
+        # equivalent and keeps the concatenation well-typed.
+        expr = re.sub(r'\$([A-Za-z_]\w*)', r'(\1 as String)', expr)
+
         # Fix spaces around dots in method chains (e.g. "Player. GetItemCount" → "Player.GetItemCount")
         expr = re.sub(r'(\w)\.\s+(\w)', r'\1.\2', expr)
 
@@ -2476,14 +2678,29 @@ class ScriptConverter:
             r'GetInCell|GetInSameCell|GetIsSex|IsInFaction|IsEssential|IsInInterior|'
             r'GetIsCurrentPackage|IsOwner|GetTalkedToPCParam|GetTalkedToPC|'
             r'IsActorUsingATorch|IsRidingHorse')
+        # The function name must be followed by a WORD BOUNDARY and, when an
+        # argument follows, by a real separator (whitespace or the comma form).
+        # Making the separator optional let `GetDead` match the prefix of
+        # `GetDeadCount X == 1` and split off `Count` as an argument, emitting
+        # `IsDead(Count, X)` across 28 scripts.
         bool_comp_m = re.match(
-            r'^(?:(\w+)\.)?' + r'(' + _BOOL_FUNC_NAMES + r')(?:\s+(.+?))?\s*==\s*([01])\s*$',
+            r'^(?:(\w+)\.)?' + r'(' + _BOOL_FUNC_NAMES
+            + r')\b(?:(?:\s*,\s*|\s+)(.+?))?\s*==\s*([01])\s*$',
             expr, re.IGNORECASE)
         if bool_comp_m:
             ref_part = bool_comp_m.group(1)
             fname = bool_comp_m.group(2)
-            args_part = bool_comp_m.group(3) or ''
+            args_part = (bool_comp_m.group(3) or '').strip()
             bool_val = bool_comp_m.group(4)
+            # `IsInCombat, Player == 1` names the RECEIVER, not an argument — the
+            # comma form of `Player.IsInCombat`.  These bool commands take no
+            # parameters, so passing it through emitted `IsInCombat(Player)`
+            # ("function takes 0 parameters not 1").
+            if (not ref_part and args_part
+                    and fname.lower() in _ZERO_ARG_REF_FUNCTIONS
+                    and re.match(r'^[A-Za-z_]\w*$', args_part)):
+                ref_part = args_part
+                args_part = ''
             converted_call = self._emit_function(ref_part, fname, args_part, extends)
             # If function converted to TODO, propagate it
             if converted_call.lstrip().startswith(';TODO'):
@@ -2542,7 +2759,20 @@ class ScriptConverter:
                     return f'{ref}.GetCurrentPackage() {comp_m[1]} {safe}'
             lhs = self._convert_expression(comp_m[0], extends)
             op = comp_m[1]
-            rhs = self._convert_expression(comp_m[2], extends)
+            rhs_src = comp_m[2]
+            # A comparison RHS of `<reference> <number>` is a TES4 idiom where
+            # the reference token is redundant: Oblivion's parser reads the
+            # comparand as the trailing number and ignores the leading name.
+            # `GetDistance, Player <= Player 500` means `... <= 500`.  Keeping
+            # the token emitted `<= Game.GetPlayer() 500`, which is not an
+            # expression at all, so the whole script failed to compile.  Only a
+            # bare identifier followed by a lone numeric literal is stripped —
+            # anything with an operator between them is a real expression.
+            stray_m = re.match(r'^([A-Za-z_]\w*)\s+(-?\d+(?:\.\d+)?)$',
+                               rhs_src.strip())
+            if stray_m:
+                rhs_src = stray_m.group(2)
+            rhs = self._convert_expression(rhs_src, extends)
             # If LHS is entirely a TODO comment, propagate it
             if lhs.lstrip().startswith(';TODO'):
                 return lhs
@@ -2795,7 +3025,19 @@ class ScriptConverter:
                 return 'Utility.RandomInt(0, 99)'
             if bare_low in ('getcurrenttime', 'gamehour'):
                 self._property_refs['GameHour'] = 'GlobalVariable'
-                return 'GameHour.GetValue() as Int'
+                # NOT `as Int`.  GameHour (0x00000038) is the engine's own global
+                # in both games and Skyrim declares it float (FNAM=102), so
+                # GetValue() returns fractional hours — 23.9847, not 23.  The
+                # bell/chime idiom brackets the top of each hour with a ±0.02
+                # window (`GameHour >= 23.98 || GameHour <= 0.02`), and
+                # truncating collapses every such window into an always-true
+                # whole-hour test: `23 >= 23.98` is false but `0 <= 0.02` is
+                # true for all of hour 0, so the guarded body ran every frame.
+                # That made the Erodans-Kapelle bell (and Oblivion's
+                # BellTowerScript) ring on a continuous loop.  Assignments into
+                # Int variables still get their cast from _coerce_float_to_int,
+                # which already lists GetValue in _FLOAT_RETURNING_FUNCS.
+                return 'GameHour.GetValue()'
             if bare_low == 'getpcfame':
                 self._property_refs['TES4Fame'] = 'GlobalVariable'
                 return 'TES4Fame.GetValueInt()'
@@ -2877,6 +3119,14 @@ class ScriptConverter:
                 if entry and (entry[0] is not None
                               or bare_low in _BARE_NO_EQUIV_COMMANDS):
                     return self._emit_function(None, expr, '', extends)
+                # Prefix-matched no-equivalent families (OBSE menu/UI, console
+                # commands, array/string helpers).  These have handlers in
+                # _emit_function but deliberately no FUNCTION_MAP entry — one per
+                # variant would have to be added by hand, and every one missed
+                # becomes an undefined identifier at compile time.
+                if (re.match(r'^(?:get|set)menu\w*$', bare_low)
+                        or bare_low.startswith(('con_', 'ar_', 'sv_'))):
+                    return self._emit_function(None, expr, '', extends)
             # Check if it's a known EditorID -> property ref
             fid = self.xref.edid_to_formid.get(bare_low, '')
             if fid:
@@ -2886,14 +3136,38 @@ class ScriptConverter:
                 script_type = self.xref.get_record_script_type(expr)
                 if script_type:
                     ptype = script_type
-                safe = _safe_property_name(expr)
+                # Key the property on the CANONICAL EditorID, not the spelling
+                # this script happened to use.  TES4 name lookup is
+                # case-insensitive, so `SetEssential Kornderbraumeister` refers
+                # to `KornderBraumeister`; keying on the local spelling created a
+                # SECOND _property_refs entry differing only in case, and since
+                # Papyrus is also case-insensitive the two declarations
+                # collided — the type set by the caller (ActorBase) lost to the
+                # other entry, and the call became "undefined function".
+                canon = self.xref.formid_to_edid.get(fid, expr)
+                safe = _safe_property_name(canon)
                 self._property_refs[safe] = ptype
                 if ptype == 'GlobalVariable':
-                    return f'{safe}.GetValue() as Int'
+                    return self._global_read(safe)
                 return safe
 
-        # Terminal substitutions (applied last, after all function matching)
-        expr = re.sub(r'\bplayer\b', 'Game.GetPlayer()', expr, flags=re.IGNORECASE)
+        # Terminal substitutions (applied last, after all function matching).
+        # A LOCAL VARIABLE always wins over the `player` keyword — TES4 lets a
+        # script declare `Short Player` (StartCelleAufzugTriggerZone01Script
+        # does, as its own "has the player triggered me" flag), and rewriting
+        # that to `Game.GetPlayer()` produced the assignment
+        # `Game.GetPlayer() = 1` and the comparison
+        # `Game.GetPlayer() == 0`, i.e. the flag silently became the player
+        # actor.  Local variables take priority everywhere else in this
+        # converter; honour that here too.
+        # `PlayerRef` is the same keyword — TES4 scripts use both spellings
+        # interchangeably (`StartCombat PlayerRef`), and matching only `player`
+        # left it as an undefined identifier.
+        for _kw in ('playerref', 'player'):
+            if _kw in self._local_vars:
+                continue
+            expr = re.sub(rf'\b{_kw}\b', 'Game.GetPlayer()', expr,
+                          flags=re.IGNORECASE)
         # In AME/TopicInfo scripts, Self/GetSelf refers to the target actor
         if extends == 'ActiveMagicEffect':
             expr = re.sub(r'\bgetSelf\b', 'GetTargetActor()', expr, flags=re.IGNORECASE)
@@ -2937,10 +3211,24 @@ class ScriptConverter:
 
         return expr
 
-    def _convert_ref(self, name: str, extends: str) -> str:
-        """Convert an Oblivion reference name to Papyrus."""
+    def _convert_ref(self, name: str, extends: str, as_receiver: bool = False) -> str:
+        """Convert an Oblivion reference name to Papyrus.
+
+        `as_receiver` marks the name as the target of a method call.  A local
+        variable can shadow the `player` keyword in a VALUE position but never
+        as a receiver — a `Short` has no methods — so the keyword wins there.
+        """
         low = name.lower()
-        if low in ('player', 'playerref'):
+        # A declared local otherwise wins over the built-in keywords, including
+        # `player`.  StartCelleAufzugTriggerZone01Script declares `Short Player`
+        # as its own trigger flag; mapping that to Game.GetPlayer() turned
+        # `Set Player to 1` into the un-assignable `Game.GetPlayer() = 1`.
+        # (The same precedence is applied further down for EditorIDs.)
+        _is_player_kw = low in ('player', 'playerref')
+        if ((low in self._local_vars or low in self._var_types)
+                and not (as_receiver and _is_player_kw)):
+            return _safe_property_name(name)
+        if _is_player_kw:
             return 'Game.GetPlayer()'
         if low in ('getself', 'myself', 'self'):
             if extends == 'ActiveMagicEffect':
@@ -3018,7 +3306,13 @@ class ScriptConverter:
             if len(parts) > 1:
                 rest_str = parts[1].lstrip(', ')
                 if rest_str:
-                    rest = f', {self._convert_expression(rest_str, extends)}'
+                    is_set = func_name in ('setactorvalue', 'setav',
+                                           'forceactorvalue', 'forceav')
+                    scaled = self._scale_enum_av(sk_av, rest_str) if is_set else None
+                    if scaled is not None:
+                        rest = f', {scaled}'
+                    else:
+                        rest = f', {self._convert_expression(rest_str, extends)}'
             return f'"{sk_av}"{rest}'
 
         # Default: split on commas first, then whitespace within each part
@@ -3028,13 +3322,67 @@ class ScriptConverter:
         else:
             parts = args_str.split()
         converted = [self._convert_expression(p, extends) for p in parts]
+        # Note: the Form→Spell downcast that AddSpell/RemoveSpell need is applied
+        # where the UDF signature is emitted, because the parameter's type is not
+        # decided until after the body has been converted.
         return ', '.join(converted)
+
+    # Actor values that TES4 stores on a 0-100 scale but TES5 defines as a small
+    # ENUM (xEdit wbDefinitionsCommon.pas: wbAggressionEnum 0-3,
+    # wbConfidenceEnum 0-4, wbAssistanceEnum 0-2, wbMoodEnum 0-8, and Morality
+    # 0-3).  Writing the raw TES4 number is rejected outright by the engine —
+    # `SetActorValue("Aggression", 100)` logs "attempt made to set illegal
+    # value" and leaves the trait UNCHANGED, so every scripted "now turn
+    # hostile" beat silently did nothing.
+    # Value is the inclusive maximum for each trait.
+    _ENUM_ACTOR_VALUES = {
+        'aggression': 3, 'confidence': 4, 'assistance': 2,
+        'mood': 8, 'morality': 3,
+    }
+
+    def _scale_enum_av(self, sk_av: str, value_src: str):
+        """Map a TES4 0-100 trait value onto its TES5 enum tier.
+
+        Returns None when this is not an enum-valued actor value, or when the
+        operand is not a literal (a variable cannot be bucketed at conversion
+        time), so the caller falls back to normal expression conversion.
+        """
+        max_tier = self._ENUM_ACTOR_VALUES.get(sk_av.lower())
+        if max_tier is None:
+            return None
+        literal = value_src.strip().rstrip(',').strip()
+        if not re.match(r'^-?\d+(?:\.\d+)?$', literal):
+            return None
+        raw = float(literal)
+        # A value already inside the enum range is a deliberate Skyrim-style
+        # tier (or the TES4 default 0) — pass it through untouched rather than
+        # re-bucketing it and changing behaviour.
+        if 0 <= raw <= max_tier:
+            return str(int(raw))
+        if raw < 0:
+            return '0'
+        # Mirror the record-side thresholds in tes5_import/record_types/
+        # actors.py so a scripted change lands on the same tier the NPC's AIDT
+        # was converted to: <=5 never initiates, >=106 attacks everyone.
+        if sk_av.lower() == 'aggression':
+            tier = 0 if raw <= 5 else (3 if raw >= 106 else 2)
+        elif sk_av.lower() == 'confidence':
+            tier = 0 if raw < 30 else (3 if raw >= 70 else 2)
+        else:
+            # Generic 0-100 → 0..max_tier proportional bucket.
+            tier = int(round((min(raw, 100.0) / 100.0) * max_tier))
+        tier = max(0, min(max_tier, tier))
+        return str(tier)
 
     def _convert_function_call(self, line: str, extends: str) -> str:
         """Convert an Oblivion function call line to Papyrus."""
         stripped = line.strip()
-        # Fix space after dot in ref. function patterns (TES4 typo)
-        stripped = re.sub(r'(\w)\.\s+(\w)', r'\1.\2', stripped)
+        # Fix space after dot in ref. function patterns (TES4 typo).  The
+        # closing quote of a quoted receiver counts as the left-hand side —
+        # `"SomeRef". Disable` is legal TES4 and appears in Nehrim, and leaving
+        # the gap made the ref patterns below miss, so the call fell through to
+        # `Ref(., Disable())`.
+        stripped = re.sub(r'([\w"])\.\s+(\w)', r'\1.\2', stripped)
 
         # `"EditorID".Function args` — see the matching note in
         # _convert_expression.  Drop the quotes so the ref patterns below match.
@@ -3097,7 +3445,7 @@ class ScriptConverter:
                 if extends == 'TopicInfo':
                     return '(akSpeakerRef as Actor)'
             # Upgrade property type to Actor when used with actor-only functions
-            canon = self._convert_ref(ref_name, extends)
+            canon = self._convert_ref(ref_name, extends, as_receiver=True)
             if actor_func:
                 # akSpeakerRef is a fixed ObjectReference parameter; cast it rather than upgrading
                 if canon == 'akSpeakerRef':
@@ -3133,7 +3481,7 @@ class ScriptConverter:
                 return 'GetTargetActor()'
             if extends == 'TopicInfo':
                 return 'akSpeakerRef'
-        return self._convert_ref(ref_name, extends)
+        return self._convert_ref(ref_name, extends, as_receiver=True)
 
     def _bind_base_form_property(self, name: str) -> None:
         """Type `name` as the Papyrus type of the BASE record it names.
@@ -3148,6 +3496,62 @@ class ScriptConverter:
             rtype = self.xref.record_type.get(fid, '') if fid else ''
         self._property_refs[name] = _record_type_to_base_papyrus(rtype)
 
+    def _dangling_cross_script_target(self, raw_target: str) -> str:
+        """Return a reason string when `Owner.Var` names an undeclared variable.
+
+        Only fires when the owner resolves to a script whose variable list is
+        KNOWN and does not contain the name — an unresolved owner is left alone
+        so this never suppresses a legitimate assignment.
+        """
+        if '.' not in raw_target or not self.xref:
+            return ''
+        owner, _, var = raw_target.partition('.')
+        owner_low, var_low = owner.strip().lower(), var.strip().lower()
+        if not owner_low or not var_low:
+            return ''
+        # Resolve the owner EditorID to its attached script's variable table.
+        fid = self.xref.edid_to_formid.get(owner_low, '')
+        script_low = ''
+        if fid:
+            scri = self.xref.record_scri.get(fid, '')
+            if scri:
+                script_low = self.xref.script_formid_to_edid.get(scri, '').lower()
+        if not script_low and owner_low in self.xref.script_all_vars:
+            script_low = owner_low
+        if not script_low:
+            return ''
+        known = self.xref.script_all_vars.get(script_low)
+        if not known:
+            return ''
+        if var_low in known:
+            return ''
+        return (f'NE: {owner}.{var} is not declared in {script_low} '
+                f'(dangling in the original script)')
+
+    def _actor_base_property(self, name: str, extends: str) -> str:
+        """Bind `name` as an ActorBase property and return the property name.
+
+        Commands whose operand is an actor BASE record (GetDeadCount) need the
+        property typed ActorBase, which is where the method is declared.  The
+        name may collide case-insensitively with one of the script's own
+        variables — MQ19Script has both an `Int narel` flag and a reference to
+        the NPC_ `Narel` — and Papyrus is case-insensitive, so reusing the name
+        would either redeclare it or silently resolve to the local (which is
+        what made `Narel.GetDeadCount()` an undefined function).  Suffix the
+        property in that case.
+        """
+        canon = name
+        if self.xref:
+            fid = self.xref.edid_to_formid.get(name.lower(), '')
+            if fid:
+                canon = self.xref.formid_to_edid.get(fid, name)
+        prop = _safe_property_name(canon)
+        low = prop.lower()
+        if low in self._local_vars or low in self._var_types:
+            prop = f'{prop}Base'
+        self._property_refs[prop] = 'ActorBase'
+        return prop
+
     def _emit_function(self, ref_name: Optional[str], func_name: str,
                        args_str: str, extends: str) -> str:
         """Emit a converted function call."""
@@ -3159,7 +3563,21 @@ class ScriptConverter:
         # downstream expects it, so a stray leading comma ends up emitted inside
         # the generated argument list — `If (IsActionRef, Game.GetPlayer())`.
         # Strip it once, here, so every handler sees a clean argument string.
+        had_leading_comma = args_str.lstrip().startswith(',')
         args_str = args_str.lstrip().lstrip(',').lstrip()
+
+        # ...but for a command that takes NO arguments, the token after that
+        # comma is the RECEIVER, not an argument: Oblivion's `StopCombat,
+        # Player` / `IsInCombat, Player == 1` mean Player's combat state, the
+        # same as `Player.StopCombat`.  Treating it as an argument emitted
+        # `IsInCombat(Player)` ("function takes 0 parameters not 1") and
+        # `(Self as Actor).StopCombat()` — which silently acted on the wrong
+        # actor.  Promote it to the receiver when the call has none.
+        if (had_leading_comma and not ref_name and args_str
+                and fname_low in _ZERO_ARG_REF_FUNCTIONS
+                and re.match(r'^[A-Za-z_]\w*$', args_str.strip())):
+            ref_name = args_str.strip()
+            args_str = ''
 
         # --- Special case functions ---
 
@@ -3196,7 +3614,21 @@ class ScriptConverter:
             return self._get_action_ref_param()
 
         if fname_low == 'isactionref':
-            arg = self._convert_expression(args_str, extends) if args_str else ''
+            # The operand is always a REFERENCE, never a script variable, so the
+            # `player` keyword wins here even in a script that also declares a
+            # local called Player (StartCelleAufzugTriggerZone01Script does):
+            # `IsActionRef player` asks whether the ACTOR was the player, while
+            # its own `Player` short is a separate trigger flag.  Going through
+            # _convert_expression let the local-variable guard suppress the
+            # keyword and emitted `akActionRef == player`, comparing an
+            # ObjectReference against an Int.
+            arg = ''
+            if args_str:
+                _a = args_str.strip()
+                if _a.lower() in ('player', 'playerref'):
+                    arg = 'Game.GetPlayer()'
+                else:
+                    arg = self._convert_expression(_a, extends)
             return f'{self._get_action_ref_param()} == {arg}'
 
         # GetPos/GetAngle/GetStartingAngle: axis param -> GetPositionX/Y/Z or GetAngleX/Y/Z
@@ -3299,9 +3731,27 @@ class ScriptConverter:
         if fname_low == 'messagebox':
             return f'Debug.MessageBox({self._quote_msg(args_str)})'
 
+        # OBSE printf-style variants: a format string plus its arguments.
+        # printToConsole is a debug trace; MessageBoxEX is a player-facing box
+        # (its `|`-separated button list has no Papyrus equivalent, so only the
+        # message text survives — _format_string_call keeps the whole string,
+        # which is the closest faithful rendering without a UI menu).
+        if fname_low in ('printtoconsole', 'printc'):
+            return f'Debug.Trace({self._format_string_call(args_str, extends)})'
+        if fname_low in ('messageboxex', 'messageex'):
+            return f'Debug.MessageBox({self._format_string_call(args_str, extends)})'
+
         # --- Compound player.Function ---
+        # Functions with a dedicated handler further down must NOT be short-cut
+        # here: the compound entry routes args through _convert_args, which
+        # splits on commas only.  Oblivion writes `Player.PlaceAtMe SRMonster 1,
+        # 256, 1` — base and count separated by a SPACE — so comma-splitting
+        # yielded a first arg of `SRMonster 1` and emitted
+        # `PlaceAtMe(SRMonster 1, 256, 1)`, which does not parse.  The dedicated
+        # handler normalizes both separators and resolves the receiver itself.
+        _COMPOUND_HAS_OWN_HANDLER = ('placeatme',)
         compound = f'{ref_name}.{func_name}'.lower() if ref_name else ''
-        if compound in FUNCTION_MAP:
+        if compound in FUNCTION_MAP and fname_low not in _COMPOUND_HAS_OWN_HANDLER:
             entry = FUNCTION_MAP[compound]
             papyrus_func, _, note = entry
             if papyrus_func:
@@ -4036,22 +4486,220 @@ class ScriptConverter:
             return f'Game.GetGameSettingFloat("{setting}")'
 
         # GetDeadCount: TES4 counts how many actors of a BASE type are dead.
-        # Skyrim has no equivalent, and the operand is a base form, not a
-        # reference — so `.IsDead()` was wrong twice: it asks the wrong question
-        # and it returns Bool where TES4 returns an Int that callers do
-        # arithmetic on (`set ambushCount to getdeadcount X + 3`), which the CK
-        # rejects outright ("cannot add a bool to a int").
-        # Emit a typed Int so the surrounding arithmetic compiles, and flag it.
+        # Skyrim has the SAME function natively — ActorBase.GetDeadCount(),
+        # documented in ActorBase.psc as "Gets the number of actors of this type
+        # that have been killed".  The operand is a base form, so it binds as an
+        # ActorBase and the call converts exactly.
+        #
+        # This previously emitted a literal `0` on the belief that no equivalent
+        # existed, which silently disabled 152 quest gates across Nehrim (126 of
+        # them plain "is at least one dead" checks like `GetDeadCount X == 1`,
+        # which became `0 == 1`).
         if fname_low == 'getdeadcount':
-            if ref_name:
-                ref = self._resolve_objref_ref(ref_name, extends)
-                return f'(({ref}.IsDead()) as Int)'
             if args_str:
-                self._bind_base_form_property(args_str.strip())
+                name = args_str.strip().rstrip(',').strip()
+                target = self._actor_base_property(name, extends)
+                return f'{target}.GetDeadCount()'
+            if ref_name:
+                ref = self._convert_ref(ref_name, extends)
+                if re.match(r'^\w+$', ref):
+                    ref = self._actor_base_property(ref_name, extends)
+                    return f'{ref}.GetDeadCount()'
+                return f'({ref} as Actor).GetActorBase().GetDeadCount()'
             # A bare 0, NOT a trailing `;TODO` comment: this is an operand and
             # gets embedded mid-expression (`getdeadcount X + 3`), where a `;`
             # would comment out the rest of the line.
             return '0'
+
+        # PositionWorld x, y, z, angleZ, worldspace — teleport to absolute world
+        # coordinates.  Papyrus splits this into SetPosition + SetAngle (both on
+        # ObjectReference); there is no worldspace parameter, so that operand is
+        # dropped.  Emitted verbatim before, it was an undefined function and
+        # every mount-recall in TeleportRueckkehr failed to compile.
+        if fname_low in ('positionworld', 'positioncell'):
+            normalized = args_str.replace(',', ' ') if args_str else ''
+            parts = [p for p in normalized.split() if p]
+            ref = self._resolve_objref_ref(ref_name, extends)
+            if len(parts) >= 3:
+                x, y, z = (self._convert_expression(p, extends)
+                           for p in parts[:3])
+                out = f'{ref}.SetPosition({x}, {y}, {z})'
+                if len(parts) >= 4:
+                    ang = self._convert_expression(parts[3], extends)
+                    out += f'\n  {ref}.SetAngle(0.0, 0.0, {ang})'
+                return out
+            return f'; {func_name} {args_str or ""}  ;could not parse'
+
+        # SkipAnim: TES4 jumps an animating object straight to its end state.
+        # Papyrus has no per-frame skip; the closest faithful effect is to let
+        # the animation finish instantly, which PlayAnimation to the end state
+        # cannot express.  There is genuinely no equivalent, so no-op it rather
+        # than emit an undefined call that fails the whole script.
+        if fname_low == 'skipanim':
+            return f';NE: SkipAnim  ;no Papyrus equivalent'
+
+        # GetPackageTarget (OBSE): the current package's target reference.
+        # Skyrim exposes no such read.  Comparisons against it (`X.getPackageTarget
+        # == player`) previously emitted a property access that did not exist.
+        # SetNumericINISetting / GetNumericINISetting (OBSE): write/read a game
+        # INI key at runtime.  Papyrus has no INI access at all, so these become
+        # no-ops.  Nehrim uses them only to toggle the vanilla autosave-on-wait
+        # and on-travel settings, which its own autosave quest re-implements.
+        if fname_low == 'setnumericinisetting':
+            return f';NE: {func_name} {args_str or ""}  ;no Papyrus INI access'
+        if fname_low == 'getnumericinisetting':
+            self._line_comments.append(
+                ';NE: GetNumericINISetting has no Papyrus equivalent (read as 0)')
+            return '0'
+
+        # con_Save / Autosave / con_SaveGame: write a save.  Papyrus exposes
+        # Game.RequestSave() (a normal save) and Game.RequestAutoSave().  The
+        # TES4 argument is a save-slot NAME, which Papyrus does not accept, so it
+        # is dropped — the engine picks the slot.
+        # (`autosave` itself already maps to Game.RequestAutoSave via FUNCTION_MAP.)
+        if fname_low in ('con_save', 'con_savegame', 'savegame'):
+            return 'Game.RequestSave()'
+
+        # Every other OBSE `con_*` is a CONSOLE command invoked from script
+        # (con_RunMemoryPass, con_ToggleMenus, …).  Papyrus cannot run console
+        # commands, so the whole family no-ops.  Matched by PREFIX so a con_*
+        # command this file never saw does not fail the build later.
+        if fname_low.startswith('con_'):
+            return (f';NE: {func_name} {args_str or ""}'
+                    f'  ;OBSE console command, no Papyrus equivalent')
+
+        # OBSE reads with no vanilla-Papyrus counterpart at all: raw input
+        # bindings (getControl/getAltControl), UI introspection
+        # (getMenuHasTrait), and inventory/form queries whose return shape has no
+        # Skyrim analogue (getItems is an OBSE array, isPlayable2/
+        # getFullGoldValue/getWeaponSkillType are OBSE-only form reads).
+        # All are numeric/boolean in context, so 0 keeps the surrounding
+        # expression well-typed.  Bare literal — these sit inside conditions and
+        # arithmetic, where a trailing comment would eat the rest of the line.
+        if fname_low in ('getcontrol', 'getaltcontrol', 'getmousecontrol',
+                         'getitems', 'isplayable2', 'isplayable',
+                         'getfullgoldvalue', 'getweaponskilltype'):
+            self._line_comments.append(
+                f';NE: {func_name} has no Papyrus equivalent (read as 0)')
+            return '0'
+
+        # OBSE raw-INPUT control: disableKey/enableKey/tapKey/holdKey/playback and
+        # the isKeyPressed* readers.  Skyrim has no vanilla input API (it is
+        # SKSE-only), so the writers no-op and the readers return 0.  Kept as one
+        # family for the same reason as the menu commands above — enumerating them
+        # one build at a time is how `disableKey` survived to fail on its own.
+        if fname_low in ('disablekey', 'enablekey', 'tapkey', 'holdkey',
+                         'releasekey', 'playback', 'playbackalt',
+                         'disablecontrol', 'enablecontrol', 'tapcontrol'):
+            return (f';NE: {func_name} {args_str or ""}'
+                    f'  ;OBSE input command, no Papyrus equivalent')
+
+        # The whole OBSE MENU family (`get/setMenu*Value`, `getMenuHasTrait`, …)
+        # reaches into Oblivion's XML UI, which Skyrim does not have in any form.
+        # Matched by PATTERN rather than a name list so the *setters* and any
+        # variant this file never saw also no-op instead of failing a later build:
+        # the getters returned 0 while `setMenuFloatValue` stayed an undefined
+        # function, which is exactly the one-at-a-time failure mode to avoid.
+        if re.match(r'^(?:get|set)menu\w*$', fname_low):
+            if fname_low.startswith('set'):
+                return (f';NE: {func_name} {args_str or ""}'
+                        f'  ;OBSE menu/UI command, no Papyrus equivalent')
+            self._line_comments.append(
+                f';NE: {func_name} has no Papyrus equivalent (read as 0)')
+            return '0'
+
+        # getObjectType (OBSE): the numeric TES4 form-type code of a reference's
+        # base object.  Skyrim's form-type numbering is entirely different and
+        # Papyrus has no equivalent read, so comparisons against the TES4 codes
+        # could not be honoured even if it did.  Reads as 0 (a bare literal — it
+        # sits inside larger conditions).
+        if fname_low in ('getobjecttype', 'gettype'):
+            self._line_comments.append(
+                f';NE: {func_name} has no Papyrus equivalent (read as 0)')
+            return '0'
+
+        # getCrosshairRef (OBSE): the reference currently under the crosshair.
+        # Vanilla Papyrus has no such read (it is SKSE-only), so this resolves to
+        # None.  Callers compare it against refs, which simply never matches.
+        if fname_low in ('getcrosshairref', 'getcrosshairreference'):
+            self._line_comments.append(
+                ';NE: getCrosshairRef has no Papyrus equivalent (read as None)')
+            return 'None'
+
+        # IsInAir: TES4 "actor is off the ground".  Papyrus's nearest native read
+        # is Actor.IsFlying().  Cast to Int for the usual `== 0/1` comparisons.
+        if fname_low == 'isinair':
+            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            if ref == 'Self' and extends not in ('Actor',):
+                ref = '(Self as Actor)'
+            return f'({ref}.IsFlying() as Int)'
+
+        # GetStringGameSetting (OBSE): reads a STRING GMST.  Papyrus exposes only
+        # the numeric getters (Game.GetGameSettingFloat/Int), so there is no
+        # equivalent — return an empty string, which keeps the concatenation that
+        # consumes it well-typed.
+        if fname_low == 'getstringgamesetting':
+            self._line_comments.append(
+                ';NE: GetStringGameSetting has no Papyrus equivalent (read as "")')
+            return '""'
+
+        # isKeyPressed / isKeyPressed2 / isControlPressed (OBSE): raw input
+        # polling.  Papyrus has no key-state read outside SKSE, so these read as
+        # "not pressed".  A BARE 0 — the call sits inside a larger condition
+        # (`if isKeyPressed2 attackKey || isKeyPressed2 attackButton`) where a
+        # trailing comment would swallow the rest of the expression.
+        if fname_low in ('iskeypressed', 'iskeypressed2', 'iskeypressed3',
+                         'iscontrolpressed', 'isbuttonpressed'):
+            self._line_comments.append(
+                f';NE: {func_name} has no Papyrus equivalent (read as 0)')
+            return '0'
+
+        # Bare operand — see the note above about trailing comments.
+        if fname_low == 'getpackagetarget':
+            self._line_comments.append(
+                ';NE: getPackageTarget has no Papyrus equivalent (read as None)')
+            return 'None'
+
+        # UnlockAchievement (Nehrim's own Steam-achievement stub, 100 calls).
+        # Skyrim has no scriptable achievement API; drop it to a no-op comment
+        # so the surrounding quest logic still compiles and runs.
+        if fname_low == 'unlockachievement':
+            name = args_str.strip() if args_str else ''
+            return f';NE: UnlockAchievement {name}  ;no Papyrus equivalent'
+
+        # GetGameRestarted / IsPlayerMovingIntoNewSpace (OBSE): both report a
+        # one-off engine transition Skyrim does not expose.  False is the safe
+        # reading — the guarded body is a re-initialisation that is allowed to be
+        # skipped, and the alternative (an undefined identifier) kills the script.
+        # Return a BARE literal: this is an operand and gets embedded inside a
+        # larger condition, where a trailing `;` comment would swallow the rest
+        # of the expression (`If True  ;(False ;NE: ...)`).
+        if fname_low in ('getgamerestarted', 'isplayermovingintonewspace'):
+            self._line_comments.append(
+                f';NE: {func_name} has no Papyrus equivalent (read as 0)')
+            return '0'
+
+        # ForceFlee / Flee: "Forces a actor to flee" (UESP function index 407,
+        # both params optional and unused by Nehrim).  Skyrim has no Flee call —
+        # fleeing is driven by the Confidence actor value, so dropping the actor
+        # to Cowardly (0) and re-evaluating its package makes the engine itself
+        # break off combat.  That is the engine's own mechanism rather than a
+        # Papyrus approximation of running away.
+        if fname_low in ('flee', 'forceflee'):
+            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            if ref == 'Self' and extends not in ('Actor',):
+                ref = '(Self as Actor)'
+            return (f'{ref}.SetActorValue("Confidence", 0)\n'
+                    f'  {ref}.EvaluatePackage()')
+
+        # GetAttacked: TES4 zero-arg read of "has this actor been attacked".
+        # Skyrim's nearest native read is IsAlarmed() (the actor has registered
+        # a hostile act).  Cast to Int because TES4 callers compare it to 0/1.
+        if fname_low == 'getattacked':
+            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            if ref == 'Self' and extends not in ('Actor',):
+                ref = '(Self as Actor)'
+            return f'({ref}.IsAlarmed() as Int)'
 
         # ResetHealth: TES4 ResetHealth -> RestoreActorValue("Health", 9999)
         if fname_low == 'resethealth':
@@ -4456,8 +5104,18 @@ class ScriptConverter:
                 args = _DEFAULT_ARGS[fname_low]
             else:
                 args = self._convert_args(args_str, fname_low, extends) if args_str else ''
+            # A mapped name that is already a GLOBAL call (Game.X, Utility.X,
+            # Debug.X) is not a method, so a TES4 receiver has nowhere to go.
+            # `Player.DisablePlayerControls` emitted
+            # `Game.GetPlayer().Game.DisablePlayerControls()` — a property named
+            # `Game` on Actor, which does not exist.  Oblivion allowed the
+            # receiver on these player-global commands; Papyrus does not, and it
+            # carries no information (the target is always the player).
+            if ref_name and papyrus_func and re.match(
+                    r'^(?:Game|Utility|Debug|Math)\.', papyrus_func):
+                ref_name = None
             if ref_name:
-                ref = self._convert_ref(ref_name, extends)
+                ref = self._convert_ref(ref_name, extends, as_receiver=True)
                 papyrus_low = papyrus_func.lower() if papyrus_func else ''
                 is_actor_func = fname_low in _ACTOR_ONLY_FUNCTIONS or papyrus_low in _ACTOR_ONLY_FUNCTIONS
                 # ActiveMagicEffect Self doesn't have actor/objref methods
@@ -4489,6 +5147,14 @@ class ScriptConverter:
                         result = f'(Self as Actor).{papyrus_func}({args})'
                     else:
                         result = f'{papyrus_func}({args})'
+                elif (needs_self
+                      and fname_low in _OBJREF_IMPLICIT_SELF_FUNCTIONS
+                      and extends in ('ActiveMagicEffect', 'TopicInfo')):
+                    # ObjectReference method called bare inside a script whose
+                    # Self is not a reference — route it onto the reference the
+                    # effect/topic acts on, with no `as Actor` cast.
+                    result = (f'{self._resolve_objref_ref(None, extends)}'
+                              f'.{papyrus_func}({args})')
                 else:
                     result = f'{papyrus_func}({args})'
             return f'{result}  {note}' if note else result
@@ -4496,7 +5162,7 @@ class ScriptConverter:
         # --- Fallback: unknown function ---
         args = self._convert_args(args_str, fname_low, extends) if args_str else ''
         if ref_name:
-            ref = self._convert_ref(ref_name, extends)
+            ref = self._convert_ref(ref_name, extends, as_receiver=True)
             if fname_low in _ACTOR_ONLY_FUNCTIONS:
                 if ref == 'akSpeakerRef':
                     ref = f'(akSpeakerRef as Actor)'
@@ -4512,7 +5178,60 @@ class ScriptConverter:
                 return f'(akSpeakerRef as Actor).{func_name}({args})  ;TODO: Verify'
             if extends == 'ActiveMagicEffect':
                 return f'GetTargetActor().{func_name}({args})  ;TODO: Verify'
+        if (fname_low in _OBJREF_IMPLICIT_SELF_FUNCTIONS
+                and extends in ('ActiveMagicEffect', 'TopicInfo')):
+            ref = self._resolve_objref_ref(None, extends)
+            return f'{ref}.{func_name}({args})  ;TODO: Verify'
         return f'{func_name}({args})  ;TODO: Verify'
+
+    # An OBSE format specifier: %z (string_var), %g/%.Nf (number), %c, %x, %%.
+    _OBSE_FMT_RE = re.compile(r'%(?:%|[-+ #0]*\d*(?:\.\d+)?[a-zA-Z])')
+
+    def _format_string_call(self, args_str: str, extends: str) -> str:
+        """Convert an OBSE printf-style call into Papyrus concatenation.
+
+        `printToConsole "attack button == %.0f" attackButton` and
+        `MessageBoxEX "…%z…%g", a, b` pass a format string followed by its
+        arguments.  Papyrus has no formatting, so each specifier is replaced by
+        `+ (arg as String) +`.  Previously the arguments were emitted straight
+        after the string with no separator, which is not parseable at all
+        ("unexpected name `attackButton`").
+        """
+        s = args_str.strip().lstrip(',').strip()
+        if not s.startswith('"'):
+            return self._quote_msg(s)
+        end = s.find('"', 1)
+        if end < 0:
+            return self._quote_msg(s)
+        fmt = s[1:end]
+        rest = s[end + 1:].strip().lstrip(',').strip()
+        # Arguments are comma-separated, but the FIRST may be space-separated
+        # from the format string (`"…%.0f" attackButton`).
+        arg_srcs = [a.strip() for a in rest.split(',') if a.strip()] if rest else []
+        if len(arg_srcs) == 1 and ',' not in rest:
+            arg_srcs = [a for a in arg_srcs[0].split() if a]
+        args = [self._convert_expression(a, extends) for a in arg_srcs]
+
+        pieces: list[str] = []
+        last = 0
+        idx = 0
+        for m in self._OBSE_FMT_RE.finditer(fmt):
+            if m.group(0) == '%%':
+                continue
+            lit = fmt[last:m.start()]
+            if lit:
+                pieces.append(f'"{lit}"')
+            if idx < len(args):
+                pieces.append(f'({args[idx]} as String)')
+                idx += 1
+            last = m.end()
+        tail = fmt[last:]
+        if tail or not pieces:
+            pieces.append(f'"{tail}"')
+        # Any argument with no matching specifier still has to appear.
+        for extra in args[idx:]:
+            pieces.append(f'({extra} as String)')
+        return ' + '.join(pieces)
 
     def _quote_msg(self, args_str: str) -> str:
         """Quote a message argument if not already quoted.
