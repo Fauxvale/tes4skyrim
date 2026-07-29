@@ -2853,6 +2853,28 @@ def _add_animobject_bged(data, graph_file):
 # Armor / clothing NIF helpers
 # ---------------------------------------------------------------------------
 
+def _is_ground_model(nif_basename: str) -> bool:
+    """True if this filename is an armor/clothing ground (inventory) model.
+
+    Bethesda's convention is ``<item>_gnd.nif``, but assets that came through a
+    Morrowind->Oblivion conversion lost the separator: the Morroblivion naming
+    scheme rewrites '_' as 'u', so the same files land as ``<item>ugnd.nif``
+    (``cumurobeucommonu02ugnd.nif``).  Others drop the separator entirely after
+    a body-part word (``...shoegnd.nif``, ``...shirtgnd.nif``,
+    ``amuletcommon1gnd.nif``).
+
+    Matching the bare ``gnd`` suffix covers all three spellings.  A worn mesh
+    would have to genuinely end in the letters "gnd" to false-positive, which no
+    body slot or equipment word does.
+
+    Getting this wrong is not cosmetic: a ground model misread as worn armor
+    keeps a NiNode root instead of BSFadeNode (so it never collides and floats
+    where it was dropped), loses its BSInvMarker, and — when it is skinned — is
+    FK-retargeted onto the Skyrim biped, which mangles the mesh.
+    """
+    return nif_basename.endswith('gnd.nif')
+
+
 def _strip_gnd_skin(data):
     """Strip NiSkinInstance from _gnd ground-model files.
 
@@ -3240,7 +3262,7 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
 
     # --- Armor / clothing NIF fixups (before version upgrade) ---------------
     nif_basename = os.path.basename(src_path).lower()
-    _is_gnd = nif_basename.endswith('_gnd.nif')
+    _is_gnd = _is_ground_model(nif_basename)
     _in_armor_dir = 'armor' in src_path.lower().replace('\\', '/') or \
                     'clothes' in src_path.lower().replace('\\', '/')   # clothing
     _is_shield = 'shield' in nif_basename
@@ -4317,7 +4339,7 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # derives that from the same records the importer writes, so we only emit
     # files something actually references.
     _srcl = str(src_path).lower().replace('\\', '/')
-    _wearable = (not creature and not _srcl.endswith('_gnd.nif')
+    _wearable = (not creature and not _is_ground_model(_srcl.rsplit('/', 1)[-1])
                  and ('armor' in _srcl or 'clothes' in _srcl))
     if _wearable and wearable_plan is not None:
         from . import wearable_plan as _wp
