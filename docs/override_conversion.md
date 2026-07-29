@@ -52,6 +52,38 @@ from comparing two conversion runs.
 - **A record's children group must directly FOLLOW that record.** The engine
   reads `CELL, GRUP(6,cell), CELL, GRUP(6,cell), ...`; emitting all the records
   first and their groups afterwards pairs each group with the wrong cell.
+- **A type-1/6/7 GRUP is bound to its owner ONLY by physical adjacency, so an
+  unchanged owner must be pulled in as an ANCHOR.** xEdit states the rule
+  exactly (`TwbGroupRecord.InformPrevMainRecord`, wbImplementation.pas ~18023):
+
+      if (grStruct.grsGroupType in [1, 6, 7]) and Assigned(aPrevMainRecord)
+         and (aPrevMainRecord.FixedFormID.ToCardinal = GetGroupLabel) then
+
+  1 = world children (under WRLD), 6 = cell children (under CELL), 7 = topic
+  children (under DIAL). A group of one of those types that is NOT immediately
+  preceded by its owning record attaches to NOTHING, and every record inside it
+  is unreachable — **while the file still loads cleanly and still looks correct
+  in xEdit**, which is what made this silent. A plugin hits it whenever it
+  changes a container's CONTENTS but not the container itself: DLCBattlehornCastle
+  overrides Tamriel's exterior cells without touching `WRLD 0000003C`, so its
+  type-1 group stood alone and all 473 exterior cell/REFR overrides were dead;
+  Translation.esp had 958 orphans, 945 of them type-7 (it retitles INFOs under
+  DIALs it never edits). The fix is generic in `emit_nested_overrides`: for any
+  owned-type group whose owner this plugin does not emit at that level, the
+  owner's converted bytes are pulled from the master VERBATIM and written
+  immediately before the group — the same thing xEdit's copy-as-override does.
+  Anchoring only the type-6 case (the original code) leaves the WRLD case
+  broken. Gate every override plugin with `tools/esm_group_anchors.py`.
+- **The plugin's TES4 master NAMES come from the export `_HEADER.txt`, not the
+  source binary.** `convert.py` derives its master list from the binary in the
+  configured Oblivion data folder, but that file may not be there at all (a
+  Nehrim plugin against a Steam Oblivion install), so the list came back as
+  just `['Skyrim.esm']` while `_HEADER.txt` still correctly reported 1 TES4
+  master. Taking the count from one source and the names from the other made
+  `masters[len(masters) - count:]` slice the tail off `['Skyrim.esm']` and
+  demand a converted `output/Skyrim.esm/Skyrim.esm` — Translation.esp aborted
+  with "convert the master first: Skyrim.esm" and could not be built at all.
+  `import_main` now reconciles the two and trusts the header.
 - **NEVER synthesize an empty children group.** xEdit deletes them:
   `if Assigned(ChildGroup) and (ChildGroup.ElementCount < 1) then
   ChildGroup.Remove` (wbImplementation.pas ~5607).

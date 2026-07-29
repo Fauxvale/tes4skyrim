@@ -3603,3 +3603,162 @@ class TestPlayGroupTargetRouting:
     def test_self_call_in_object_script_still_plays_the_sequence(self):
         out = self._convert('playgroup forward 1', {})
         assert 'Self.PlayAnimation("Forward")' in out, out
+
+
+class TestOwnedGroupAnchoring:
+    """A type-1/6/7 GRUP must be preceded by the record that owns it.
+
+    xEdit's TwbGroupRecord.InformPrevMainRecord (wbImplementation.pas ~18023)
+    binds these groups to a record ONLY by physical adjacency:
+
+        grsGroupType in [1, 6, 7] and aPrevMainRecord.FixedFormID = GroupLabel
+
+    An unanchored group is attached to nothing, so every record inside it is
+    unreachable in-engine — the file still loads and the records still show up
+    in xEdit, which is what made this silent. DLCBattlehornCastle.esp emitted a
+    Tamriel type-1 world-children group with no WRLD record in front of it and
+    lost all 473 of its exterior cell/reference overrides.
+    """
+
+    class _Writer:
+        """Minimal PluginWriter stand-in capturing the raw top-level groups."""
+
+        def __init__(self):
+            self.groups = {}
+
+        def add_raw_group(self, group_sig, group_bytes):
+            self.groups[group_sig] = group_bytes
+
+    class _MasterIndex:
+        """Master stub: FormID -> record bytes, with a known group nesting."""
+
+        def __init__(self, records):
+            self._records = records
+
+        def record(self, formid):
+            return self._records.get(formid, b'')
+
+    @staticmethod
+    def _record(sig, formid):
+        return sig + struct.pack('<I', 0) + b'\x00' * 4 + \
+            struct.pack('<I', formid) + b'\x00' * 8
+
+    @staticmethod
+    def _orphans(blob):
+        """Owned groups in `blob` whose owner does not precede them."""
+        orphans = []
+
+        def walk(off, end):
+            prev = None
+            while off + 24 <= end:
+                sig = blob[off:off + 4]
+                size = struct.unpack_from('<I', blob, off + 4)[0]
+                if sig == b'GRUP':
+                    gtype = struct.unpack_from('<i', blob, off + 12)[0]
+                    label = blob[off + 8:off + 12]
+                    if gtype in (1, 6, 7):
+                        owner = struct.unpack('<I', label)[0]
+                        if prev != owner:
+                            orphans.append((gtype, owner))
+                    walk(off + 24, off + size)
+                    off += size
+                    prev = None
+                else:
+                    prev = struct.unpack_from('<I', blob, off + 12)[0]
+                    off += 24 + size
+        walk(0, len(blob))
+        return orphans
+
+    def _emit(self, records, master_records):
+        from tes5_import.overrides import emit_nested_overrides
+        writer = self._Writer()
+        emitted, orphaned, anchored = emit_nested_overrides(
+            records, writer, self._MasterIndex(master_records))
+        return writer, emitted, orphaned, anchored
+
+    def test_worldspace_children_group_gets_its_wrld_anchor(self):
+        """Overriding a master's exterior CELL without touching the WRLD."""
+        wrld_fid = 0x0100003C
+        cell_fid = 0x01007AC6
+        path = ((0, b'WRLD'), (1, struct.pack('<I', wrld_fid)),
+                (4, struct.pack('<hh', 0, -1)), (5, struct.pack('<hh', 2, -3)))
+        records = [(cell_fid, self._record(b'CELL', cell_fid), path)]
+        master = {wrld_fid: self._record(b'WRLD', wrld_fid)}
+
+        writer, _emitted, orphaned, anchored = self._emit(records, master)
+        blob = writer.groups['WRLD']
+
+        assert orphaned == 0
+        assert anchored == 1, 'the unchanged WRLD must be pulled in as an anchor'
+        assert self._orphans(blob) == [], (
+            'a type-1 group with no WRLD in front of it is attached to '
+            'nothing and the engine indexes none of its cells')
+        assert blob.index(struct.pack('<I', wrld_fid)) < blob.index(b'GRUP'), \
+            'the WRLD record must come BEFORE its children group'
+
+    def test_cell_children_group_gets_its_cell_anchor(self):
+        """Overriding a master's REFR without touching the parent CELL."""
+        cell_fid = 0x01007AC7
+        refr_fid = 0x0201AF4B
+        label = struct.pack('<I', cell_fid)
+        path = ((0, b'CELL'), (2, struct.pack('<i', 1)),
+                (3, struct.pack('<i', 11)), (6, label), (9, label))
+        records = [(refr_fid, self._record(b'REFR', refr_fid), path)]
+        master = {cell_fid: self._record(b'CELL', cell_fid)}
+
+        writer, _emitted, orphaned, anchored = self._emit(records, master)
+
+        assert orphaned == 0
+        assert anchored == 1
+        assert self._orphans(writer.groups['CELL']) == []
+
+    def test_topic_children_group_gets_its_dial_anchor(self):
+        """A new INFO under a master's unchanged DIAL."""
+        dial_fid = 0x011D8200
+        info_fid = 0x02001234
+        path = ((0, b'DIAL'), (7, struct.pack('<I', dial_fid)))
+        records = [(info_fid, self._record(b'INFO', info_fid), path)]
+        master = {dial_fid: self._record(b'DIAL', dial_fid)}
+
+        writer, _emitted, orphaned, anchored = self._emit(records, master)
+
+        assert orphaned == 0
+        assert anchored == 1
+        assert self._orphans(writer.groups['DIAL']) == []
+
+    def test_overridden_owner_is_not_duplicated(self):
+        """When the plugin overrides the owner too, no anchor is added."""
+        wrld_fid = 0x0100003C
+        cell_fid = 0x01007AC6
+        wrld_path = ((0, b'WRLD'),)
+        cell_path = wrld_path + ((1, struct.pack('<I', wrld_fid)),
+                                 (4, struct.pack('<hh', 0, -1)),
+                                 (5, struct.pack('<hh', 2, -3)))
+        # The plugin's OWN version of the WRLD (distinguishable from the
+        # master's by its trailing byte) must be the one that survives.
+        own_wrld = self._record(b'WRLD', wrld_fid) + b'\xAB'
+        records = [(wrld_fid, own_wrld, wrld_path),
+                   (cell_fid, self._record(b'CELL', cell_fid), cell_path)]
+        master = {wrld_fid: self._record(b'WRLD', wrld_fid)}
+
+        writer, _emitted, orphaned, anchored = self._emit(records, master)
+        blob = writer.groups['WRLD']
+
+        assert orphaned == 0
+        assert anchored == 0, 'the plugin overrides the WRLD; no anchor needed'
+        assert blob.count(struct.pack('<I', wrld_fid) + b'\x00' * 8) == 1, \
+            'the WRLD must appear exactly once, not once per anchor attempt'
+        assert b'\xAB' in blob, "the plugin's own WRLD must not be replaced"
+        assert self._orphans(blob) == []
+
+    def test_missing_master_record_leaves_the_group_unanchored(self):
+        """No master record to anchor with: reported, never faked."""
+        wrld_fid = 0x0100003C
+        cell_fid = 0x01007AC6
+        path = ((0, b'WRLD'), (1, struct.pack('<I', wrld_fid)),
+                (4, struct.pack('<hh', 0, -1)), (5, struct.pack('<hh', 2, -3)))
+        records = [(cell_fid, self._record(b'CELL', cell_fid), path)]
+
+        _writer, _emitted, _orphaned, anchored = self._emit(records, {})
+
+        assert anchored == 0, 'nothing to anchor with: no anchor is invented'

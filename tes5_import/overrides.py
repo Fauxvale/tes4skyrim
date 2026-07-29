@@ -209,7 +209,20 @@ class OverrideContext:
                 print(f"    {key}: {count}")
 
 
-def emit_nested_overrides(records: list, writer: PluginWriter) -> tuple:
+# GRUP types whose label is the FormID of the record that OWNS the group, and
+# which the engine binds to that record ONLY by physical adjacency: xEdit's
+# TwbGroupRecord.InformPrevMainRecord (wbImplementation.pas ~18023) attaches
+# the group to the previous record iff
+#     grsGroupType in [1, 6, 7] and aPrevMainRecord.FixedFormID = GroupLabel
+# 1 = world children (under WRLD), 6 = cell children (under CELL),
+# 7 = topic children (under DIAL). A group of one of these types that is NOT
+# immediately preceded by its owning record is attached to nothing, so every
+# record inside it is unreachable — as invisible as if it were never written.
+OWNED_GROUP_TYPES = frozenset({1, 6, 7})
+
+
+def emit_nested_overrides(records: list, writer: PluginWriter,
+                          master_index=None) -> tuple:
     """Write override records back into the master's exact GRUP nesting.
 
     A CELL is only reachable by the engine from inside its block/sub-block
@@ -222,9 +235,18 @@ def emit_nested_overrides(records: list, writer: PluginWriter) -> tuple:
     recomputed, so there is no block-number formula to get wrong, and a record
     the master nests unusually still lands where the engine expects it.
 
+    Every OWNED_GROUP_TYPES group must be preceded by its owning record. When
+    this plugin does not override that owner (it changed a worldspace's cells
+    but not the WRLD record, or a cell's references but not the CELL record),
+    the owner's converted bytes are pulled from `master_index` VERBATIM as an
+    anchor — the same thing xEdit's copy-as-override does. Without the anchor
+    the group stands alone and the engine indexes none of its contents: a
+    Tamriel type-1 group with no WRLD record in front of it silently discarded
+    all 473 of DLCBattlehornCastle's exterior overrides.
+
     `records` is [(output_formid, record_bytes, path), ...] where `path` is
     the ((grup_type, label_bytes), ...) nesting the record belongs in.
-    Returns (emitted_count, orphan_count).
+    Returns (emitted_count, orphan_count, anchored_count).
     """
     # Bucket the records by the exact GRUP path they belong in.
     by_path = {}
@@ -237,6 +259,26 @@ def emit_nested_overrides(records: list, writer: PluginWriter) -> tuple:
             continue
         by_path.setdefault(path, []).append(record_bytes)
 
+    # A record already being emitted at `prefix` serves as its own anchor.
+    emitted_at = {}
+    for path, bodies in by_path.items():
+        for body in bodies:
+            emitted_at.setdefault(path, set()).add(
+                struct.unpack_from('<I', body, 12)[0])
+
+    anchored = [0]
+
+    def anchor_for(path: tuple, fid: int) -> bytes:
+        """The owning record's bytes, pulled from the master if we lack it."""
+        if fid in emitted_at.get(path, ()):
+            return b''          # already emitted at this level
+        if master_index is None:
+            return b''
+        rec = master_index.record(fid)
+        if rec:
+            anchored[0] += 1
+        return rec
+
     def build(prefix: tuple, depth: int) -> bytes:
         """Serialize everything at `prefix`, recursing into deeper paths.
 
@@ -247,10 +289,11 @@ def emit_nested_overrides(records: list, writer: PluginWriter) -> tuple:
         """
         deeper = {p[:depth + 1] for p in by_path
                   if len(p) > depth and p[:depth] == prefix}
-        # A type-6 group belongs to the record whose FormID labels it.
+        # An owned group belongs to the record whose FormID labels it.
         owned = {struct.unpack('<I', child[depth][1])[0]: child
                  for child in deeper
-                 if child[depth][0] == 6 and len(child[depth][1]) == 4}
+                 if child[depth][0] in OWNED_GROUP_TYPES
+                 and len(child[depth][1]) == 4}
         body = b''
         for record_bytes in by_path.get(prefix, ()):
             body += record_bytes
@@ -259,18 +302,23 @@ def emit_nested_overrides(records: list, writer: PluginWriter) -> tuple:
             if child is not None:
                 inner = build(child, depth + 1)
                 if inner:
-                    body += pack_group(6, child[depth][1], inner)
+                    body += pack_group(child[depth][0], child[depth][1], inner)
 
-        # Everything else: blocks/sub-blocks, plus any type-6 whose owning
-        # record this plugin does not override (its parent cell is unchanged,
-        # but some of its references are).
+        # Everything else: blocks/sub-blocks, plus any owned group whose owning
+        # record this plugin does not override (its parent cell/worldspace is
+        # unchanged, but some of its contents are). Those need the owner pulled
+        # in from the master as an anchor, immediately before the group.
         rest = [c for c in deeper
-                if c[depth][0] != 6 or c in owned.values()]
+                if c[depth][0] not in OWNED_GROUP_TYPES or c in owned.values()]
         for child in sorted(rest,
                             key=lambda p: (p[depth][0], bytes(p[depth][1]))):
             inner = build(child, depth + 1)
-            if inner:
-                body += pack_group(child[depth][0], child[depth][1], inner)
+            if not inner:
+                continue
+            gtype, label = child[depth][0], child[depth][1]
+            if gtype in OWNED_GROUP_TYPES and len(label) == 4:
+                body += anchor_for(prefix, struct.unpack('<I', label)[0])
+            body += pack_group(gtype, label, inner)
         return body
 
     # Depth 0 is the top-level group itself; writer.add_raw_group wraps it.
@@ -280,7 +328,7 @@ def emit_nested_overrides(records: list, writer: PluginWriter) -> tuple:
         if body:
             writer.add_raw_group(top[1].decode('ascii', 'replace'), body)
 
-    return len(records) - orphans, orphans
+    return len(records) - orphans, orphans, anchored[0]
 
 
 def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
@@ -309,7 +357,6 @@ def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
     back to the normal group builders — the override path cannot express them.
     """
     pending = []
-    emitted_fids = set()
     new_records = []
     dropped = 0
     for sig in sigs:
@@ -323,14 +370,16 @@ def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
                 continue
             pending.append((ov.out_fid, ov.record_bytes,
                             ctx.master_index.group_path(ov.out_fid)))
-            emitted_fids.add(ov.out_fid)
 
-    new_done, unattached = _attach_new_records(new_records, ctx, pending,
-                                               emitted_fids)
+    new_done, unattached = _attach_new_records(new_records, ctx, pending)
 
-    emitted, orphaned = emit_nested_overrides(pending, writer)
+    emitted, orphaned, anchored = emit_nested_overrides(
+        pending, writer, ctx.master_index)
     msg = (f"  {label} overrides: {emitted} emitted in the master's "
            f"group nesting, {dropped} unchanged")
+    if anchored:
+        msg += (f", {anchored} unchanged parent record(s) pulled from the "
+                f"master to anchor their children group")
     if new_done:
         msg += f", {new_done} NEW records nested under master parents"
     if unattached:
@@ -353,17 +402,17 @@ _NEW_NESTED_PARENT = {
 
 
 def _attach_new_records(new_records: list, ctx: OverrideContext,
-                        pending: list, emitted_fids: set) -> tuple:
+                        pending: list) -> tuple:
     """Convert NEW records that live inside a MASTER's GRUP tree.
 
     A plugin can add its own references to a master's cell (Translation.esp
     injects a map-marker REFR) or its own INFO to a master's topic. They are
     new records — converted normally — but they must sit under the master
-    parent's children group or the engine never indexes them. When the parent
-    record itself is not already overridden, its converted bytes are pulled in
-    VERBATIM as an anchor, exactly like xEdit's "copy as override" does when
-    you copy a reference: the engine pairs a children GRUP with the record
-    that precedes it, so the group cannot stand alone.
+    parent's children group or the engine never indexes them. Anchoring that
+    group (pulling the unchanged parent's bytes in VERBATIM when this plugin
+    does not override it) is handled generically by emit_nested_overrides for
+    every type-1/6/7 group, so this function only has to place the record at
+    the right path.
 
     Returns (attached_count, unattached) where `unattached` is every record
     whose parent is NOT the master's — those belong to this plugin's own
@@ -410,12 +459,10 @@ def _attach_new_records(new_records: list, ctx: OverrideContext,
                   f"conversion failed: {e}")
             continue
 
-        if parent_out not in emitted_fids:
-            # Anchor: the parent record itself, byte-identical to the master.
-            pending.append((parent_out, ctx.master_index.record(parent_out),
-                            parent_path))
-            emitted_fids.add(parent_out)
-
+        # No anchor is added here: emit_nested_overrides pulls the owner of any
+        # type-1/6/7 group from the master when this plugin does not override
+        # it, so the parent CELL/DIAL is anchored by the same generic path that
+        # anchors an unchanged WRLD above a worldspace's cells.
         new_fid = get_formid(rec, 'FormID')
         pending.append((new_fid, record_bytes, parent_path + chain))
         done += 1

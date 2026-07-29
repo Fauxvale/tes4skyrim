@@ -181,17 +181,29 @@ def _create_vtyp_records(writer: PluginWriter):
         set_voice_type(race_edid, gender, fid)
 
 
-def _read_tes4_master_count(export_dir: str) -> int:
-    """Count Master[N]= lines in the export's _HEADER.txt (0 if absent)."""
+def _read_tes4_masters(export_dir: str) -> list:
+    """The plugin's TES4 master NAMES, from the export's _HEADER.txt.
+
+    The export header is the authority, not the source binary: the binary lives
+    in the configured Oblivion data folder and may simply not be there (a Nehrim
+    plugin against a Steam Oblivion install), in which case the caller's
+    binary-derived master list comes back EMPTY while the export still says the
+    plugin has masters. Trusting the count from one source and the names from
+    the other made `masters[len(masters) - count:]` slice off the tail of
+    ['Skyrim.esm'] and demand a converted `output/Skyrim.esm/Skyrim.esm` —
+    Translation.esp aborted with "convert the master first: Skyrim.esm".
+    """
     path = os.path.join(export_dir, '_HEADER.txt')
     if not os.path.isfile(path):
-        return 0
-    count = 0
+        return []
+    names = []
     with open(path, 'r', encoding='utf-8') as f:
         for line in f:
             if line.startswith('Master['):
-                count += 1
-    return count
+                _, _, val = line.partition('=')
+                if val.strip():
+                    names.append(val.strip())
+    return names
 
 
 def import_plugin(export_dir: str, output_path: str, masters: list = None,
@@ -249,7 +261,21 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # How many masters the file had in TES4. Everything at a load-order index
     # below this is an override of one of those masters; the plugin's own
     # records sit at exactly this index.
-    num_tes4_masters = _read_tes4_master_count(export_dir)
+    tes4_master_names = _read_tes4_masters(export_dir)
+    num_tes4_masters = len(tes4_master_names)
+    # Reconcile the caller's master list with the export header. The caller
+    # derives its list from the SOURCE BINARY, which may be missing from the
+    # configured data folder; the header always ships with the export. Whenever
+    # they disagree, the header's TES4 masters are appended so the trailing
+    # `num_tes4_masters` entries really are those masters.
+    if num_tes4_masters:
+        tail = masters[len(masters) - num_tes4_masters:]
+        if [n.lower() for n in tail] != [n.lower() for n in tes4_master_names]:
+            new_masters = [m for m in masters
+                           if m.lower() not in
+                           {n.lower() for n in tes4_master_names}]
+            masters = new_masters + tes4_master_names
+            print(f"  Masters (from export header): {', '.join(masters)}")
     ctx = None
     if num_tes4_masters:
         print(f"  TES4 masters: {num_tes4_masters} "
