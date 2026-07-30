@@ -296,6 +296,15 @@ def _door_threshold(refr, model_key):
     return (wx, wy, get_float(refr, 'PosZ'))
 
 
+def _finite_door_point(pt, rot_z):
+    """True if a door's threshold point is a usable finite coordinate."""
+    from .navmesh.world import _MAX_PLACEMENT
+    for v in pt:
+        if v is None or not math.isfinite(v) or abs(v) > _MAX_PLACEMENT:
+            return False
+    return rot_z is None or math.isfinite(rot_z)
+
+
 def _collect_doors(refr_recs, door_fids):
     """Return [(x, y, z, rot_z, ref_fid, is_teleport), ...] for door refs.
 
@@ -330,8 +339,15 @@ def _collect_doors(refr_recs, door_fids):
         if pt is None:
             pt = (get_float(refr, 'PosX'), get_float(refr, 'PosY'),
                   get_float(refr, 'PosZ'))
-        out.append((pt[0], pt[1], pt[2], get_float(refr, 'RotZ'),
-                    ref_fid, is_teleport))
+        rot_z = get_float(refr, 'RotZ')
+        # A door ref with a garbage/uninitialised position would force its base
+        # line into the mesh at an impossible coordinate, stretching the strip
+        # extents the native index buckets over (see navmesh/world.py
+        # _MAX_PLACEMENT -- Nehrim ships refs with PosY = 8.9e17). Such a door
+        # is nowhere near the pathgrid, so it cannot be linked anyway.
+        if not _finite_door_point(pt, rot_z):
+            continue
+        out.append((pt[0], pt[1], pt[2], rot_z, ref_fid, is_teleport))
     return out
 
 

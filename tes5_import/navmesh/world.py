@@ -26,6 +26,31 @@ _LAND_VERTS = 33
 _LAND_SPACING = _CELL_SIZE / (_LAND_VERTS - 1)   # 128.0
 _VHGT_UNIT = 8.0
 
+# Largest plausible magnitude for a placement coordinate, in game units.
+#
+# Oblivion's worldspaces span roughly +-2e5 units (a 4096-unit cell grid at
+# +-32 blocks), so 1e7 is ~50x the whole map and cannot be a real placement.
+#
+# This is NOT defensive padding -- Nehrim genuinely ships refs with garbage
+# floats where the CS never initialised the position: 17 REFRs across 10 base
+# objects carry PosY = 8.936455989415117e+17 (and PosX = 1.68e-36), e.g. REFR
+# 001E57C4 in cell 001E4FEC. Placing one stretches the cell's triangle soup to
+# 8.9e17 units wide, which blew the native TriGrid's dense bucket grid to 5.4e14
+# buckets -- a 4-billion-GB allocation whose std::bad_alloc aborted the pool
+# worker and failed the whole Nehrim import with a bare BrokenProcessPool.
+#
+# A ref this far out contributes nothing a navmesh could use (it is nowhere near
+# the pathgrid), so dropping its collision is exactly right; the ref itself is
+# still converted and written normally by the record path.
+_MAX_PLACEMENT = 1e7
+
+
+def _finite_placement(pos, scale):
+    """True if a REFR's placement can contribute usable collision geometry."""
+    if not np.all(np.isfinite(pos)) or not math.isfinite(scale):
+        return False
+    return bool(np.all(np.abs(pos) <= _MAX_PLACEMENT))
+
 
 def _rot_matrix(rx, ry, rz):
     """REFR placement rotation matrix (local mesh coords -> cell coords).
@@ -171,12 +196,18 @@ def gather_cell_geometry(refr_recs, base_model_by_fid, get_collision,
             continue
 
         scale = get_float(refr, 'XSCL.Scale', 1.0) or 1.0
-        rot = _rot_matrix(get_float(refr, 'RotX'),
-                          get_float(refr, 'RotY'),
-                          get_float(refr, 'RotZ'))
         pos = np.array([get_float(refr, 'PosX'),
                         get_float(refr, 'PosY'),
                         get_float(refr, 'PosZ')], dtype=np.float64)
+        # Garbage/uninitialised placements are dropped before they reach the
+        # native index -- see _MAX_PLACEMENT.
+        if not _finite_placement(pos, scale):
+            continue
+        rot = _rot_matrix(get_float(refr, 'RotX'),
+                          get_float(refr, 'RotY'),
+                          get_float(refr, 'RotZ'))
+        if not np.all(np.isfinite(rot)):
+            continue
 
         w = _place(soup.get('w'), rot, scale, pos)
         if w is not None and len(w):

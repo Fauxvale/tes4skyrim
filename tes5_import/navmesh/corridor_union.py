@@ -2118,8 +2118,25 @@ def _storey_groups(strips):
                     best = (key, gi)
             if best is not None:
                 out[best[1]].append(s)
+                # The group grew, so its cached footprint is now stale; a later
+                # door must be matched against the union INCLUDING this one.
+                try:
+                    group_polys[best[1]] = unary_union(
+                        [_ribbon_polygon(x) for x in out[best[1]]])
+                except Exception:
+                    group_polys[best[1]] = None
             else:
+                # A door that matched nothing becomes its own group. group_polys
+                # is indexed by the same `gi` as `out` in the loop above, so it
+                # MUST grow in step -- without this the next door's
+                # `group_polys[gi]` ran off the end (IndexError, which run_job
+                # swallowed into a silently missing navmesh; measured on Nehrim
+                # cells 012217C1 and 01193F44).
                 out.append([s])
+                try:
+                    group_polys.append(_ribbon_polygon(s))
+                except Exception:
+                    group_polys.append(None)
     return out or [list(strips)]
 
 

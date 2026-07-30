@@ -19,6 +19,11 @@ def init_worker(formid_offset: int, cell_loc: dict, grid_loc: dict,
                 world_loc: dict, world_names: dict, origin_shift: dict,
                 mesh_bounds_path: str, injected_formids: dict = None):
     """Pool initializer: replay parent-process module state into this child."""
+    # Join the parent's containment job so this worker cannot outlive a parent
+    # that dies without cleanup (crash / external kill). No-op off Windows.
+    from process_job import join_pool_job
+    join_pool_job()
+
     set_formid_index_offset(formid_offset)
     # Injected-record redirects are module state too: without them a worker
     # remaps an injected FormID into the master's range (see text_reader).

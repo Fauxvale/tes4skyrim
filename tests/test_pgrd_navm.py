@@ -378,3 +378,135 @@ def test_nvmi_mirrors_door_links():
 def test_navi_is_override_of_vanilla_singleton():
     from tes5_import.navi_builder import NAVI_SINGLETON_FID
     assert NAVI_SINGLETON_FID == 0x00012FB4
+
+
+class TestNativeGrowGuards:
+    """The native corridor-grow extension must never abort the process.
+
+    A C++ exception escaping the extension (its allocations sit inside
+    Py_BEGIN_ALLOW_THREADS) reaches std::terminate() and kills the interpreter
+    by abort(). In a process-pool worker that surfaced in the parent only as an
+    opaque BrokenProcessPool with no traceback -- and under pythonw.exe the
+    worker's stderr goes nowhere either, so nothing explained the failure.
+
+    Nehrim triggers it for real: 17 REFRs across 10 base objects carry an
+    uninitialised PosY of 8.936455989415117e+17, which stretched a cell's
+    triangle soup to 8.9e17 units and blew the dense bucket grid up to 5.4e14
+    buckets (a 4-billion-GB request).
+    """
+
+    def _stations(self, np):
+        # One march station: cx,cy,cz,dirx,diry,tanx,tany,lo,edge_index
+        return np.array([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, -1.0]],
+                        dtype=np.float64)
+
+    def _tri(self, np, y):
+        return np.array([[[0.0, y, 0.0], [10.0, y, 0.0], [0.0, y, 10.0]]],
+                        dtype=np.float64)
+
+    def test_absurd_extent_raises_instead_of_aborting(self):
+        """A garbage coordinate must raise ValueError, not abort the process."""
+        np = pytest.importorskip("numpy")
+        from tes5_import.navmesh import corridor_grow as cg
+
+        blocking = np.concatenate([self._tri(np, 0.0),
+                                   self._tri(np, 8.936455989415117e+17)])
+        with pytest.raises(ValueError):
+            cg._native.grow_strips(
+                blocking, None,
+                np.zeros((0, 2), dtype=np.float64),
+                np.zeros((0, 2), dtype=np.int32),
+                np.zeros(0, dtype=np.float64),
+                self._stations(np), cg._native_params())
+
+    def test_non_finite_coordinate_raises(self):
+        """NaN/Inf propagate through the extent maths, so reject them up front."""
+        np = pytest.importorskip("numpy")
+        from tes5_import.navmesh import corridor_grow as cg
+
+        for bad in (float('nan'), float('inf')):
+            blocking = np.concatenate([self._tri(np, 0.0), self._tri(np, bad)])
+            with pytest.raises(ValueError):
+                cg._native.grow_strips(
+                    blocking, None,
+                    np.zeros((0, 2), dtype=np.float64),
+                    np.zeros((0, 2), dtype=np.int32),
+                    np.zeros(0, dtype=np.float64),
+                    self._stations(np), cg._native_params())
+
+    def test_normal_soup_still_grows(self):
+        """The guards must not reject legitimate cell-sized geometry."""
+        np = pytest.importorskip("numpy")
+        from tes5_import.navmesh import corridor_grow as cg
+
+        # A 4096-unit exterior cell is 33x33 buckets -- far under the ceiling.
+        blocking = np.concatenate([self._tri(np, 0.0), self._tri(np, 4096.0)])
+        out = cg._native.grow_strips(
+            blocking, None,
+            np.zeros((0, 2), dtype=np.float64),
+            np.zeros((0, 2), dtype=np.int32),
+            np.zeros(0, dtype=np.float64),
+            self._stations(np), cg._native_params())
+        assert len(out) == 1
+        assert out[0] >= 0.0
+
+
+class TestPlacementSanity:
+    """Garbage REFR placements must be dropped before they reach the native code."""
+
+    def test_absurd_and_non_finite_placements_rejected(self):
+        np = pytest.importorskip("numpy")
+        from tes5_import.navmesh.world import (_finite_placement,
+                                              _MAX_PLACEMENT)
+
+        ok = np.array([100.0, -200.0, 30.0])
+        assert _finite_placement(ok, 1.0)
+        # Nehrim's real garbage value.
+        assert not _finite_placement(
+            np.array([1.68e-36, 8.936455989415117e+17, 0.0]), 1.0)
+        assert not _finite_placement(
+            np.array([0.0, float('nan'), 0.0]), 1.0)
+        assert not _finite_placement(
+            np.array([0.0, float('inf'), 0.0]), 1.0)
+        assert not _finite_placement(ok, float('nan'))
+        assert not _finite_placement(
+            np.array([_MAX_PLACEMENT * 2, 0.0, 0.0]), 1.0)
+
+
+class TestStoreyGroupsDoorGrouping:
+    """group_polys must stay index-aligned with the group list it mirrors."""
+
+    def test_unmatched_door_strips_do_not_desync_group_polys(self):
+        """A door that matches no group appends to `out`; group_polys must grow too.
+
+        Without that, the NEXT door's group_polys[gi] ran off the end and raised
+        IndexError -- which run_job swallowed, so the cell silently shipped with
+        no navmesh at all (measured on Nehrim cells 012217C1 and 01193F44).
+        """
+        pytest.importorskip("numpy")
+        pytest.importorskip("shapely")
+        from tes5_import.navmesh import corridor_union as cu
+
+        def ribbon(x, y, z, edge):
+            half = 20.0
+            return {
+                'edge': edge,
+                'a': (x, y, z), 'b': (x + 100.0, y, z),
+                'na': (x, y, z), 'nb': (x + 100.0, y, z),
+                'poly': [(x, y - half), (x + 100.0, y - half),
+                         (x + 100.0, y + half), (x, y + half)],
+            }
+
+        # The failure needs a specific ORDER. Door 1 matches nothing (far from
+        # the ribbon in plan), so it self-appends as a new group. Door 2 then
+        # OVERLAPS door 1 in plan and height, so the `enumerate(out)` scan
+        # reaches that newly-appended index and reads group_polys[gi] -- which,
+        # unless group_polys grew in step, is off the end of the list.
+        strips = [
+            ribbon(0.0, 0.0, 0.0, (0, 1)),              # real ribbon
+            ribbon(50000.0, 50000.0, 9000.0, (-1, -1)),  # door 1: no match
+            ribbon(50010.0, 50000.0, 9000.0, (-1, -1)),  # door 2: overlaps it
+        ]
+        groups = cu._storey_groups(strips)
+        placed = sum(len(g) for g in groups)
+        assert placed == len(strips), 'every strip must land in exactly one group'

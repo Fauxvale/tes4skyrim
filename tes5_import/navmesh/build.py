@@ -17,8 +17,10 @@ change it.
 """
 
 import logging
+import math
 
 from . import corridor
+from . import world
 
 _log = logging.getLogger(__name__)
 
@@ -40,11 +42,18 @@ def teleport_door_positions(refr_recs):
     for refr in refr_recs or ():
         if refr.get('XTEL.Door'):
             try:
-                out.append((float(refr.get('PosX')), float(refr.get('PosY')),
-                            float(refr.get('PosZ')),
-                            float(refr.get('RotZ') or 0.0), True))
+                x, y = float(refr.get('PosX')), float(refr.get('PosY'))
+                z = float(refr.get('PosZ'))
+                rz = float(refr.get('RotZ') or 0.0)
             except (TypeError, ValueError):
-                pass
+                continue
+            # float() happily parses NaN and 8.9e17, so range-check as well --
+            # see navmesh/world.py _MAX_PLACEMENT for why these exist.
+            if not all(math.isfinite(v) for v in (x, y, z, rz)):
+                continue
+            if max(abs(x), abs(y), abs(z)) > world._MAX_PLACEMENT:
+                continue
+            out.append((x, y, z, rz, True))
     return out
 
 

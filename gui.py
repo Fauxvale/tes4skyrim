@@ -285,8 +285,17 @@ def scan_mesh_subdirs(file_name: str) -> list:
 # On Windows, hide the console window that subprocess.Popen would otherwise
 # create when launched from a console-less process (pythonw / .pyw).
 from subprocess_flags import POPEN_FLAGS as _POPEN_FLAGS, configure_multiprocessing
+from process_job import create_pool_job
 
 configure_multiprocessing()
+
+# Contain the whole conversion in a Job Object owned by this GUI process. The
+# Cancel button (`_kill_process_tree`) only covers a *deliberate* stop; if the
+# GUI itself dies without cleanup — crash, Task Manager, window closed — the
+# kernel terminates convert.py and every pool worker with it. Without this, the
+# workers are console-less pythonw.exe processes that survive invisibly, holding
+# the export index in RAM and keeping handles open on output/ files.
+create_pool_job()
 
 
 def _kill_process_tree(proc):

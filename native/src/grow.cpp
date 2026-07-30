@@ -55,8 +55,32 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <new>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
+
+// Hard ceiling on the dense bucket grid a TriGrid may allocate.
+//
+// TriGrid indexes buckets DENSELY (counts/starts are nx*ny entries), so the
+// allocation is driven by the soup's XY *extent*, not its triangle count. A
+// single garbage vertex is therefore unbounded-allocation-shaped: Nehrim's
+// interior cell 011E4FEC ships refs with PosY = 8.936e17 (a real, exported
+// value), which put the extent at 8.9e17 units -> 5.4e14 buckets -> a 4-billion-
+// GB request. std::bad_alloc from inside Py_BEGIN_ALLOW_THREADS with no handler
+// anywhere in the extension called std::terminate(), so the pool worker died by
+// abort() with no Python traceback -- surfacing in the parent only as an opaque
+// BrokenProcessPool (see docs/performance_notes.md).
+//
+// 16M buckets is ~128 MB across counts+starts, and is orders of magnitude above
+// anything real: at the 128-unit bucket size a whole 4096-unit exterior cell is
+// 33x33 = 1,089 buckets, and 16M would be a soup ~512,000 units across -- more
+// than twice the width of the entire Tamriel worldspace. Exceeding it means the
+// input is corrupt, so the call raises ValueError rather than clamping: a
+// silently reduced grid would emit a wrong navmesh instead of a diagnosable
+// failure.
+static const long long kMaxBuckets = 16LL * 1024 * 1024;
 
 namespace {
 
@@ -73,7 +97,11 @@ struct TriGrid {
     double minx = 0.0, miny = 0.0, cell = 128.0;
     long long nx = 0, ny = 0;    // grid dimensions
     // CSR-style bucket index: starts[b]..starts[b+1] into `items`.
-    std::vector<int> starts, items;
+    // `starts` is 64-bit because total bucket membership (one triangle spans
+    // many buckets) overflowed a 32-bit accumulator; `items` holds triangle
+    // indices, which are bounded by the triangle count, so int is fine.
+    std::vector<long long> starts;
+    std::vector<int> items;
     size_t ntri = 0;
 
     void build(const double* tris, size_t n, double cellsize) {
@@ -84,6 +112,15 @@ struct TriGrid {
         x0.resize(n); x1.resize(n); y0.resize(n);
         y1.resize(n); z0.resize(n); z1.resize(n);
         double gminx = 1e300, gminy = 1e300, gmaxx = -1e300, gmaxy = -1e300;
+        // NaN/Inf must be rejected before the extent maths: they propagate
+        // through min/max, make (gmaxx-gminx)/cell non-finite, and the cast to
+        // long long is then undefined behaviour (observed as a garbage nx*ny
+        // that allocates until bad_alloc).
+        for (size_t i = 0; i < n * 9; ++i) {
+            if (!std::isfinite(vx[i]))
+                throw std::invalid_argument(
+                    "non-finite coordinate in triangle soup");
+        }
         for (size_t i = 0; i < n; ++i) {
             const double* t = &vx[i * 9];
             x0[i] = std::min(std::min(t[0], t[3]), t[6]);
@@ -96,15 +133,25 @@ struct TriGrid {
             gminy = std::min(gminy, y0[i]); gmaxy = std::max(gmaxy, y1[i]);
         }
         minx = gminx; miny = gminy;
-        nx = (long long)((gmaxx - gminx) / cell) + 1;
-        ny = (long long)((gmaxy - gminy) / cell) + 1;
+        const double spanx = (gmaxx - gminx) / cell;
+        const double spany = (gmaxy - gminy) / cell;
+        // Check the span in DOUBLE before casting: a span beyond long long's
+        // range makes the cast undefined behaviour, so the guard cannot be
+        // written on nx/ny after the fact.
+        if (spanx > (double)kMaxBuckets || spany > (double)kMaxBuckets ||
+            spanx * spany > (double)kMaxBuckets)
+            throw std::invalid_argument("triangle soup XY extent too large");
+        nx = (long long)spanx + 1;
+        ny = (long long)spany + 1;
         if (nx < 1) nx = 1;
         if (ny < 1) ny = 1;
+        if (nx * ny > kMaxBuckets)
+            throw std::invalid_argument("triangle soup XY extent too large");
 
         // Two-pass CSR build: count per bucket, prefix-sum, then fill.  A
         // dense array beats the Python dict-of-lists and keeps each bucket's
         // indices ASCENDING, which is what makes the visit order deterministic.
-        std::vector<int> counts((size_t)(nx * ny) + 1, 0);
+        std::vector<long long> counts((size_t)(nx * ny) + 1, 0);
         auto span = [&](size_t i, long long& a, long long& b,
                         long long& c, long long& d) {
             a = (long long)std::floor((x0[i] - minx) / cell);
@@ -122,14 +169,21 @@ struct TriGrid {
                 for (long long gy = c; gy <= d; ++gy)
                     counts[(size_t)(gy * nx + gx)]++;
         }
+        // `acc` is the total bucket-membership count: one triangle spanning a
+        // wide XY box lands in many buckets, so this is >> n and was an `int`
+        // -- it overflowed to negative on a large soup, and the following
+        // (size_t)acc turned that into a huge allocation and an out-of-bounds
+        // fill. 64-bit throughout, with an explicit check before the cast.
         starts.assign((size_t)(nx * ny) + 1, 0);
-        int acc = 0;
+        long long acc = 0;
         for (size_t b = 0; b < (size_t)(nx * ny); ++b) {
             starts[b] = acc; acc += counts[b];
         }
         starts[(size_t)(nx * ny)] = acc;
+        if (acc < 0)
+            throw std::invalid_argument("bucket membership count overflow");
         items.assign((size_t)acc, 0);
-        std::vector<int> cur(starts.begin(), starts.end() - 1);
+        std::vector<long long> cur(starts.begin(), starts.end() - 1);
         for (size_t i = 0; i < n; ++i) {
             long long a, b, c, d; span(i, a, b, c, d);
             for (long long gx = a; gx <= b; ++gx)
@@ -203,7 +257,7 @@ inline bool wall_hit(const TriGrid& g, double cx, double cy,
             const long long bx = gx + dx;
             if (bx < 0 || bx >= g.nx) continue;
             const size_t b = (size_t)(by * g.nx + bx);
-            for (int p = g.starts[b]; p < g.starts[b + 1]; ++p) {
+            for (long long p = g.starts[b]; p < g.starts[b + 1]; ++p) {
                 const int i = g.items[(size_t)p];
                 if (g.z1[(size_t)i] < z_lo || g.z0[(size_t)i] > z_hi) continue;
                 if (tri_hits_slab(&g.vx[(size_t)i * 9], cx, cy, ux, uy,
@@ -231,7 +285,7 @@ inline bool walk_sample(const TriGrid& g, double x, double y, double near_z,
             const long long bx = gx + dx;
             if (bx < 0 || bx >= g.nx) continue;
             const size_t b = (size_t)(by * g.nx + bx);
-            for (int p = g.starts[b]; p < g.starts[b + 1]; ++p) {
+            for (long long p = g.starts[b]; p < g.starts[b + 1]; ++p) {
                 const int i = g.items[(size_t)p];
                 const double* t = &g.vx[(size_t)i * 9];
                 const double ax = t[0], ay = t[1], az = t[2];
@@ -276,6 +330,13 @@ struct NeighbourField {
                 || i == j) continue;
             const double ax = nodes[(size_t)i * 2], ay = nodes[(size_t)i * 2 + 1];
             const double bx = nodes[(size_t)j * 2], by = nodes[(size_t)j * 2 + 1];
+            // A non-finite node makes the bucket span below non-finite and the
+            // insert loop unbounded. Skipping the edge (rather than throwing)
+            // matches how the rest of this builder treats unusable edges.
+            if (!std::isfinite(ax) || !std::isfinite(ay) ||
+                !std::isfinite(bx) || !std::isfinite(by) ||
+                !std::isfinite(node_z[i]) || !std::isfinite(node_z[j]))
+                continue;
             const double dx = bx - ax, dy = by - ay;
             const double ln = std::sqrt(dx * dx + dy * dy);
             if (ln < 1e-6) continue;
@@ -292,6 +353,14 @@ struct NeighbourField {
         minx = gminx; miny = gminy;
         for (size_t si = 0; si < segs.size(); ++si) {
             const Seg& s = segs[si];
+            // Bounded for the same reason as levels_at's strip grid: the map is
+            // sparse, so an oversized segment has no dense allocation to trip
+            // first and would just grow until memory ran out.
+            const double spanx = (std::max(s.ax, s.bx) - std::min(s.ax, s.bx)) / cell;
+            const double spany = (std::max(s.ay, s.by) - std::min(s.ay, s.by)) / cell;
+            if (spanx > (double)kMaxBuckets || spany > (double)kMaxBuckets ||
+                spanx * spany > (double)kMaxBuckets)
+                throw std::invalid_argument("pathgrid edge span too large");
             const long long gx0 = (long long)std::floor(
                 (std::min(s.ax, s.bx) - minx) / cell);
             const long long gx1 = (long long)std::floor(
@@ -477,29 +546,52 @@ PyObject* py_grow_strips(PyObject*, PyObject* args) {
 
     // Index building and the march are pure C on copied data -- no Python
     // objects are touched, so the GIL can be dropped for the whole run.
+    //
+    // EVERYTHING between the GIL macros MUST be inside the try. A C++ exception
+    // that escapes here cannot become a Python error (the GIL is not held) and
+    // there is no handler further out, so it reaches std::terminate() and the
+    // process dies by abort() -- in a pool worker that surfaces in the parent as
+    // an opaque BrokenProcessPool with no traceback, and under pythonw.exe the
+    // worker's stderr goes nowhere either. That is exactly how Nehrim's cell
+    // 011E4FEC (a garbage exported PosY of 8.9e17) killed the import.
+    // So: stash the message, reacquire the GIL, then raise normally.
+    std::string err;
     Py_BEGIN_ALLOW_THREADS
-    TriGrid wall, walk;
-    wall.build(blockp, nblock, 128.0);
-    if (walkp) walk.build(walkp, nwalk, 128.0);
-    NeighbourField field;
-    field.build(nodesp, nnodes, edgesp, nedges, nodezp);
+    try {
+        TriGrid wall, walk;
+        wall.build(blockp, nblock, 128.0);
+        if (walkp) walk.build(walkp, nwalk, 128.0);
+        NeighbourField field;
+        field.build(nodesp, nnodes, edgesp, nedges, nodezp);
 
-    for (size_t s = 0; s < nst; ++s) {
-        const double* r = &stp[s * 9];
-        const int ei = (int)r[8];
-        int ex_a = -1, ex_b = -1;
-        if (ei >= 0 && (size_t)ei < nedges) {
-            ex_a = edgesp[(size_t)ei * 2];
-            ex_b = edgesp[(size_t)ei * 2 + 1];
+        for (size_t s = 0; s < nst; ++s) {
+            const double* r = &stp[s * 9];
+            const int ei = (int)r[8];
+            int ex_a = -1, ex_b = -1;
+            if (ei >= 0 && (size_t)ei < nedges) {
+                ex_a = edgesp[(size_t)ei * 2];
+                ex_b = edgesp[(size_t)ei * 2 + 1];
+            }
+            outp[s] = grow_half_width(wall, walkp ? &walk : nullptr, field,
+                                      r[0], r[1], r[2], r[3], r[4], r[5], r[6],
+                                      ex_a, ex_b, r[7], P);
         }
-        outp[s] = grow_half_width(wall, walkp ? &walk : nullptr, field,
-                                  r[0], r[1], r[2], r[3], r[4], r[5], r[6],
-                                  ex_a, ex_b, r[7], P);
+    } catch (const std::bad_alloc&) {
+        err = "out of memory building the navmesh triangle index";
+    } catch (const std::exception& e) {
+        err = e.what();
+    } catch (...) {
+        err = "unknown error in grow_strips";
     }
     Py_END_ALLOW_THREADS
 
     Py_DECREF(a_block); Py_DECREF(a_nodes); Py_DECREF(a_nodez);
     Py_DECREF(a_st); Py_DECREF(a_edges); Py_XDECREF(a_walk);
+    if (!err.empty()) {
+        Py_DECREF(out);
+        PyErr_SetString(PyExc_ValueError, err.c_str());
+        return nullptr;
+    }
     return (PyObject*)out;
 }
 
@@ -577,6 +669,26 @@ PyObject* py_levels_at(PyObject*, PyObject* args) {
     const double* pp = (const double*)PyArray_DATA(a_p);
     const double* qp = (const double*)PyArray_DATA(a_q);
 
+    // Same contract as TriGrid::build: non-finite coordinates make the bucket
+    // spans below non-finite, the cast to long long undefined, and the
+    // push_back loop unbounded. Reject them here rather than allocating until
+    // bad_alloc aborts the process.
+    {
+        const npy_intp checks[3] = {PyArray_SIZE(a_s), PyArray_SIZE(a_p),
+                                    PyArray_SIZE(a_q)};
+        const double* datas[3] = {sp, pp, qp};
+        for (int c = 0; c < 3; ++c) {
+            for (npy_intp i = 0; i < checks[c]; ++i) {
+                if (!std::isfinite(datas[c][i])) {
+                    Py_DECREF(a_s); Py_DECREF(a_p); Py_DECREF(a_q);
+                    PyErr_SetString(PyExc_ValueError,
+                                    "non-finite coordinate in levels_at input");
+                    return nullptr;
+                }
+            }
+        }
+    }
+
     std::vector<Strip> strips(ns);
     for (size_t i = 0; i < ns; ++i) {
         const double* r = &sp[i * 11];
@@ -613,6 +725,19 @@ PyObject* py_levels_at(PyObject*, PyObject* args) {
     std::unordered_map<long long, std::vector<int>> grid;
     for (size_t i = 0; i < ns; ++i) {
         const Strip& S = strips[i];
+        // A single wildly-oversized strip would otherwise insert billions of
+        // buckets here (the map is sparse, so there is no dense allocation to
+        // trip first -- it just grows until memory runs out). Bound the span
+        // per strip; kMaxBuckets is orders of magnitude above any real ribbon.
+        const double spanx = (S.x1 - S.x0) / cell;
+        const double spany = (S.y1 - S.y0) / cell;
+        if (spanx < 0.0 || spany < 0.0 ||
+            spanx > (double)kMaxBuckets || spany > (double)kMaxBuckets ||
+            spanx * spany > (double)kMaxBuckets) {
+            Py_DECREF(a_s); Py_DECREF(a_p); Py_DECREF(a_q);
+            PyErr_SetString(PyExc_ValueError, "strip XY extent too large");
+            return nullptr;
+        }
         const long long bx0 = (long long)std::floor((S.x0 - gx0) / cell);
         const long long bx1 = (long long)std::floor((S.x1 - gx0) / cell);
         const long long by0 = (long long)std::floor((S.y0 - gy0) / cell);
@@ -624,7 +749,11 @@ PyObject* py_levels_at(PyObject*, PyObject* args) {
 
     // Results are gathered natively then converted to Python once at the end.
     std::vector<std::vector<double>> out(nq);
+    // Wrapped for the same reason as grow_strips: a throw with the GIL released
+    // and no handler reaches std::terminate() and aborts the whole worker.
+    std::string err;
     Py_BEGIN_ALLOW_THREADS
+    try {
     std::vector<double> zs;
     for (size_t n = 0; n < nq; ++n) {
         const double px = qp[n * 2], py = qp[n * 2 + 1];
@@ -685,7 +814,20 @@ PyObject* py_levels_at(PyObject*, PyObject* args) {
         }
         res.push_back(acc / cnt);
     }
+    } catch (const std::bad_alloc&) {
+        err = "out of memory in levels_at";
+    } catch (const std::exception& e) {
+        err = e.what();
+    } catch (...) {
+        err = "unknown error in levels_at";
+    }
     Py_END_ALLOW_THREADS
+
+    if (!err.empty()) {
+        Py_DECREF(a_s); Py_DECREF(a_p); Py_DECREF(a_q);
+        PyErr_SetString(PyExc_ValueError, err.c_str());
+        return nullptr;
+    }
 
     PyObject* pyout = PyList_New((Py_ssize_t)nq);
     if (pyout) {

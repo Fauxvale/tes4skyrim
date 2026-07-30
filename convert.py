@@ -61,6 +61,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()  # TESConversion root
 
 # Suppress console windows when spawned from a console-less parent (pythonw/.pyw)
 from subprocess_flags import POPEN_FLAGS as _POPEN_FLAGS, configure_multiprocessing
+from process_job import create_pool_job, describe_limit
 from worker_budget import worker_count
 from collision_options import (
     WINDING_FIX_DEFAULT_PLUGINS,
@@ -71,6 +72,14 @@ from collision_options import (
 # multiprocessing.Pool workers (nif/lod conversion) must also inherit a hidden
 # console — configure before any pool is created.
 configure_multiprocessing()
+
+# Put this process (and therefore every pool worker and helper .exe it spawns)
+# into a Windows Job Object. If this process dies WITHOUT cleanup — a crash, an
+# external kill, the console closed — the kernel terminates the whole job, so no
+# console-less pythonw.exe workers are left orphaned holding RAM and file
+# handles. Also caps committed memory job-wide. Must run before any pool or
+# subprocess is created; no-ops off Windows and never raises.
+create_pool_job()
 
 
 def load_config(config_path: str = None) -> dict:
@@ -917,6 +926,7 @@ def main():
     print(f"  Oblivion data : {tes4_data or '(not found)'}")
     print(f"  Skyrim SE data: {tes5_data or '(not found)'}")
     print(f"  Output dir    : {output_dir}")
+    print(f"  {describe_limit()}")
     print()
 
     # Files to process always come from -f/--files (CLI) or the GUI, which

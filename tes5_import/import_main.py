@@ -1436,6 +1436,23 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
             key, result = navm_worker.run_job(job)
             cache[key] = result
     else:
+        # Run the initializer ONCE IN THE PARENT before spawning workers.
+        #
+        # An exception inside a pool `initializer=` cannot be returned to the
+        # parent: the worker dies before it can report, so the parent sees only
+        # an opaque BrokenProcessPool with no traceback — and because
+        # subprocess_flags points multiprocessing at pythonw.exe, the worker's
+        # stderr goes nowhere either. asset_convert/book_inam.py already guards
+        # its pool this way for exactly this reason; this pool did not, which is
+        # why a failure here produced a log with no cause in it.
+        #
+        # disable_gc=False: the parent keeps its collector (it has the rest of
+        # the conversion to run); the pool's own copies pass True.
+        navm_worker.init_worker(base_model_by_fid, door_fids, collision_cache,
+                                formid_offset, geom_cache,
+                                get_injected_formids(), disable_gc=False,
+                                door_centers_cache=door_centers_cache)
+
         # chunksize amortises IPC over many small jobs.
         chunksize = max(1, len(jobs) // (n_workers * 8))
         with ProcessPoolExecutor(
@@ -1445,8 +1462,15 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
                           formid_offset, geom_cache,
                           get_injected_formids(), True, door_centers_cache),
                 max_tasks_per_child=500) as ex:
+            # buffersize bounds how many jobs are pickled and queued at once.
+            # Without it ex.map submits ALL of them up front — measured 400 MB
+            # of pickled payloads for Nehrim's 2929 jobs (largest single job
+            # 1.4 MB, so no individual payload is near any limit). Bounding it
+            # keeps the parent's queue flat; it did NOT fix the Nehrim
+            # BrokenProcessPool, so it is a tidiness change, not the cure.
             for key, result in ex.map(navm_worker.run_job, jobs,
-                                      chunksize=chunksize):
+                                      chunksize=chunksize,
+                                      buffersize=n_workers * chunksize * 4):
                 cache[key] = result
 
     hits = sum(1 for (_b, m) in cache.values()
@@ -1454,6 +1478,20 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
     print(f"    Navmesh generation: {len(jobs)} cells in "
           f"{time.time() - t0:.2f}s ({n_workers} workers, "
           f"{hits} geometry-cache hits)")
+
+    # Report per-cell failures HERE, in the parent. The workers cannot: they run
+    # under pythonw.exe, where stdout goes nowhere, so a cell that failed used to
+    # vanish silently and leave the plugin a navmesh short with nothing in the
+    # log to explain it.
+    failures = [(key, m) for key, (b, m) in cache.items()
+                if b is None and m and m.get('error')]
+    if failures:
+        print(f"    WARNING: {len(failures)} cells produced no navmesh:")
+        for (cell_fid, pgrd_fid), m in failures[:20]:
+            print(f"      cell {cell_fid:08X} pgrd {pgrd_fid:08X}: "
+                  f"{m['error']}")
+        if len(failures) > 20:
+            print(f"      ... and {len(failures) - 20} more")
     return cache
 
 

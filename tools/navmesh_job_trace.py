@@ -1,0 +1,168 @@
+"""Run navmesh (PGRD->NAVM) jobs by FormID, in-process, with real tracebacks.
+
+WHY THIS EXISTS (and why the other navmesh tools don't cover it)
+
+`tes5_import.navm_worker.run_job` deliberately catches per-cell errors so one bad
+cell cannot abort the 2,900-job pool, and the pool's workers run under
+`pythonw.exe` where stdout goes nowhere. So when the import reports
+
+    WARNING: 2 cells produced no navmesh:
+      cell 012217C1 pgrd 01221843: IndexError: list index out of range
+
+this is how you get the actual traceback: it calls `convert_PGRD` directly, in
+this process, for the cell you name.
+
+It also finds jobs that kill the interpreter outright. A C++ exception escaping
+the native extension aborts the process with no Python traceback at all, which in
+a pool worker surfaces only as an opaque `BrokenProcessPool`. With `--all`, each
+job's identity is flushed BEFORE the call, so a hard crash leaves the culprit as
+the last line printed (this is how Nehrim's cell 011E4FEC was found -- see
+docs/performance_notes.md).
+
+`tools/navmesh_cell_check.py` names cells by EditorID out of an audit index and
+checks CK rules; this takes the raw FormID straight from an error message and
+cares only about reproducing the failure.
+
+    # one cell, full traceback
+    python tools/navmesh_job_trace.py --plugin Nehrim.esm --cell 012217C1
+
+    # walk jobs in dispatch order to find one that hard-crashes
+    python tools/navmesh_job_trace.py --plugin Nehrim.esm --all --max 100
+
+    # only the jobs with no geometry-cache entry (the ones that recompute)
+    python tools/navmesh_job_trace.py --plugin Nehrim.esm --uncached --max 20
+"""
+
+import argparse
+import faulthandler
+import os
+import sys
+import time
+import traceback
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _load(export_dir, offset):
+    from tes5_import.text_reader import (parse_export_directory,
+                                         group_records_by_type,
+                                         set_formid_index_offset)
+    from tes5_import import import_main as im
+
+    set_formid_index_offset(offset)
+    print(f'parsing {export_dir} ...', flush=True)
+    t0 = time.time()
+    by_type = group_records_by_type(parse_export_directory(export_dir))
+    print(f'  parsed in {time.time() - t0:.1f}s', flush=True)
+
+    door_fids = im._build_door_fid_set(by_type)
+    base_model_by_fid = im._build_base_model_index(by_type)
+    jobs = im._gather_navm_jobs(by_type, door_fids)
+    # FormIDs are pre-assigned in the parent in the real run; any stable value
+    # works here since we are not writing a plugin.
+    for i, job in enumerate(jobs):
+        job['navm_fid'] = 0x01000000 + i
+    return im, by_type, door_fids, base_model_by_fid, jobs
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--plugin', default='Oblivion.esm',
+                    help='plugin name; export dir is export/<plugin>')
+    ap.add_argument('--export', help='explicit export dir (overrides --plugin)')
+    ap.add_argument('--cell', action='append', default=[],
+                    help='cell FormID hex (repeatable)')
+    ap.add_argument('--all', action='store_true',
+                    help='run jobs in dispatch order (finds hard crashes)')
+    ap.add_argument('--uncached', action='store_true',
+                    help='only jobs with no geometry-cache entry')
+    ap.add_argument('--start', type=int, default=0)
+    ap.add_argument('--max', type=int, default=50)
+    ap.add_argument('--offset', type=int, default=1,
+                    help='load-order FormID index offset (default 1)')
+    args = ap.parse_args()
+
+    if not (args.cell or args.all or args.uncached):
+        ap.error('pass --cell, --all, or --uncached')
+
+    export_dir = args.export or os.path.join('export', args.plugin)
+    if not os.path.isdir(export_dir):
+        ap.error(f'no such export dir: {export_dir}')
+
+    faulthandler.enable()
+    im, by_type, door_fids, base_model_by_fid, jobs = _load(export_dir,
+                                                            args.offset)
+    print(f'  {len(jobs)} navmesh jobs', flush=True)
+
+    collision_cache = os.path.join(export_dir, 'collision_cache.bin')
+    geom_cache = im._navmesh_geom_cache(collision_cache)
+    dcc = os.path.join(export_dir, 'door_centers_cache.json')
+
+    from tes5_import import navm_worker
+    from tes5_import.pgrd_to_navm import convert_PGRD
+
+    navm_worker.init_worker(
+        base_model_by_fid, door_fids, collision_cache, args.offset, geom_cache,
+        im.get_injected_formids(), disable_gc=False,
+        door_centers_cache=dcc if os.path.exists(dcc) else None)
+
+    # Select the jobs to run.
+    if args.cell:
+        want = {int(c, 16) for c in args.cell}
+        sel = [(i, j) for i, j in enumerate(jobs) if j['key'][0] in want]
+        missing = want - {j['key'][0] for _i, j in sel}
+        for m in sorted(missing):
+            print(f'  (no navmesh job for cell {m:08X})', flush=True)
+    else:
+        sel = list(enumerate(jobs))
+        if args.uncached:
+            if not geom_cache:
+                ap.error('--uncached needs a geometry cache '
+                         '(missing collision_cache.bin?)')
+            cache_dir, _tag = geom_cache
+            have = set(os.listdir(cache_dir))
+            sel = [(i, j) for i, j in sel
+                   if '%08X_%08X.pkl' % j['key'] not in have]
+            print(f'  {len(sel)} jobs have no geometry-cache entry', flush=True)
+        sel = sel[args.start:args.start + args.max]
+
+    print(f'\nrunning {len(sel)} job(s) in-process...', flush=True)
+    failed = 0
+    for i, job in sel:
+        cell, pgrd = job['key']
+        # Flushed BEFORE the call on purpose: if the native code aborts the
+        # process, this is the line that names the culprit.
+        print(f'  job[{i}] cell {cell:08X} pgrd {pgrd:08X} '
+              f'refrs={len(job["refr_recs"])} '
+              f'land={"Y" if job["land_rec"] is not None else "N"}', flush=True)
+        try:
+            nb, meta = convert_PGRD(
+                job['pgrd_rec'], land_rec=job['land_rec'],
+                cell_rec=job['cell_rec'], refr_recs=job['refr_recs'],
+                base_model_by_fid=base_model_by_fid, door_fids=door_fids,
+                navm_fid=job['navm_fid'], geom_cache=geom_cache,
+                extra_door_refrs=job.get('extra_door_refrs'))
+        except Exception:
+            failed += 1
+            traceback.print_exc()
+            sys.stdout.flush()
+            continue
+        if nb is None:
+            print('      -> no navmesh (no usable geometry)', flush=True)
+        else:
+            m = meta or {}
+            extra = []
+            if m.get('geom_cached'):
+                extra.append('geometry from cache')
+            if m.get('door_refs'):
+                extra.append(f'{len(m["door_refs"])} door links')
+            print(f'      -> {len(nb)} bytes'
+                  + (f' ({", ".join(extra)})' if extra else ''), flush=True)
+
+    print(f'\n{len(sel) - failed}/{len(sel)} ran without raising', flush=True)
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

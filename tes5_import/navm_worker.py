@@ -45,6 +45,12 @@ def init_worker(base_model_by_fid: dict, door_fids: set, collision_cache: str,
         navmesh is voxelized from.  Without it every cell has no geometry and
         produces no navmesh at all.
     """
+    # Join the parent's containment job so this worker cannot outlive a parent
+    # that dies without cleanup (crash / external kill). Cheap; no-op off
+    # Windows, and skipped harmlessly on the inline single-job path below.
+    from process_job import join_pool_job
+    join_pool_job()
+
     global _BASE_MODEL_BY_FID, _DOOR_FIDS, _GEOM_CACHE
     _BASE_MODEL_BY_FID = base_model_by_fid
     _DOOR_FIDS = door_fids
@@ -89,8 +95,12 @@ def init_worker(base_model_by_fid: dict, door_fids: set, collision_cache: str,
 def run_job(job: dict):
     """ProcessPool task: convert one PGRD to (navm_bytes, meta).
 
-    Errors are swallowed to (None, None) so a single bad cell can't abort the
-    whole ex.map batch (the message is prefixed so it's greppable in logs).
+    A failing cell must not abort the whole ex.map batch, so exceptions are
+    caught -- but the message is RETURNED, not printed. `multiprocessing` runs
+    workers under pythonw.exe (subprocess_flags.configure_multiprocessing), so a
+    worker's stdout goes nowhere and a printed error is invisible: a cell could
+    silently produce no navmesh with nothing in the log. The parent prints what
+    comes back instead (see import_main._precompute_navmeshes).
     """
     try:
         return job['key'], convert_PGRD(
@@ -105,5 +115,6 @@ def run_job(job: dict):
             extra_door_refrs=job.get('extra_door_refrs'),
         )
     except Exception as e:  # noqa: BLE001 — must not kill the pool
-        print(f"  ERROR generating navmesh for cell {job['key'][0]:08X}: {e}")
-        return job['key'], (None, None)
+        import traceback
+        return job['key'], (None, {'error': f'{type(e).__name__}: {e}',
+                                   'traceback': traceback.format_exc()})
