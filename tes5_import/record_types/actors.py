@@ -93,13 +93,72 @@ def _npc_skills_dnam(rec: dict) -> bytes:
             skill_vals[tes5_name] = max(skill_vals.get(tes5_name, 0), val)
     for i, skill_name in enumerate(TES5_SKILL_ORDER):
         dnam[i] = min(skill_vals.get(skill_name, 15), 255)
+    # DNAM offsets 36/38/40 are the engine's calculated Health/Magicka/Stamina
+    # CACHE, not authored stats — the real controls are ACBS.HealthOffset and
+    # ACBS.Magicka/StaminaOffset. Write the TES4 totals so the cache agrees with
+    # what the engine will compute from those offsets (it recomputes on load
+    # regardless). Magicka is Oblivion's SpellPoints; stamina is Fatigue.
     health = get_int(rec, 'DATA.Health', 50)
-    struct.pack_into('<H', dnam, 36, min(health, 65535))
-    intelligence = get_int(rec, 'DATA.Intelligence', 50)
-    struct.pack_into('<H', dnam, 38, min(intelligence, 65535))
-    strength = get_int(rec, 'DATA.Strength', 50)
-    struct.pack_into('<H', dnam, 40, min(strength, 65535))
+    struct.pack_into('<H', dnam, 36, max(0, min(health, 65535)))
+    magicka = get_int(rec, 'ACBS.SpellPoints', 0)
+    struct.pack_into('<H', dnam, 38, max(0, min(magicka, 65535)))
+    stamina = get_int(rec, 'ACBS.Fatigue', 100)
+    struct.pack_into('<H', dnam, 40, max(0, min(stamina, 65535)))
     return bytes(dnam)
+
+
+# Every playable/Dremora RACE that RACE_MAP targets ships Starting Health 50.0
+# (verified: all 11 target races in Skyrim.esm decode to 50.0/50.0/50.0), and the
+# engine derives an actor's max health as
+#     StartingHealth + HealthOffset + (Level - 1) * fNPCHealthLevelBonus
+# with fNPCHealthLevelBonus = 5.0 (Skyrim.esm GMST). ACBS.HealthOffset (int16 at
+# byte 20) is the AUTHORED control; DNAM.Health is only a cache the engine
+# recomputes — vanilla proves it is not a function of the record at all (52 groups
+# of NPCs with identical race/class/level/offset carry different DNAM.Health, e.g.
+# 55 / 51 / 0 / 20971), matching UESP's "otherwise seems to be random".
+#
+# TES4 DATA.Health is the actor's FINAL hit-point pool, already fully calculated.
+# So a faithful conversion pins the engine's result to that exact number by
+# solving for the offset rather than copying the pool into the cache field.
+TES5_RACE_BASE_HEALTH = 50
+# Single definition lives in creature_races (see the note there on import order).
+from ..creature_races import TES5_HEALTH_LEVEL_BONUS  # noqa: E402
+
+
+def _health_and_level(tes4_health: int, tes4_level: int, is_pc_level_mult: bool
+                      ) -> tuple:
+    """TES4 final health pool → (ACBS.HealthOffset, ACBS.Level) for an NPC.
+
+    Chosen so the engine's own calculation,
+        50 (race base) + HealthOffset + (Level-1) * fNPCHealthLevelBonus
+    reproduces the TES4 total exactly.
+
+    HealthOffset is int16, but a handful of TES4 actors (dev test dummies, story
+    bosses made effectively unkillable, the Player record) carry pools far past
+    32767. Rather than clamp — which would silently make an intended-invulnerable
+    actor killable — the surplus is spent through the Level term, whose per-level
+    bonus is the engine's own mechanism for exactly this. Level stays within the
+    U16 field, so the result is still a faithful total.
+
+    For PC-Level-Mult actors the level term tracks the player and is unknown at
+    author time, so only the fixed race base is removed; the actor then scales
+    with the player the way its TES4 PCLevelOffset counterpart did.
+    """
+    if is_pc_level_mult:
+        offset = tes4_health - TES5_RACE_BASE_HEALTH
+        return max(-32768, min(offset, 32767)), 1000
+
+    level = max(1, min(tes4_level, 65535))
+    offset = tes4_health - TES5_RACE_BASE_HEALTH - (level - 1) * TES5_HEALTH_LEVEL_BONUS
+    if offset > 32767:
+        # Raise Level so its bonus absorbs the surplus, then re-solve the
+        # remainder. Capped at the U16 field limit.
+        need = tes4_health - TES5_RACE_BASE_HEALTH - 32767
+        # Round the division UP: too few levels leaves the remainder above the
+        # int16 cap and the final clamp would silently lose it.
+        level = max(level, min(65535, -(-need // TES5_HEALTH_LEVEL_BONUS) + 1))
+        offset = tes4_health - TES5_RACE_BASE_HEALTH - (level - 1) * TES5_HEALTH_LEVEL_BONUS
+    return max(-32768, min(offset, 32767)), level
 
 
 def _npc_acbs(rec: dict) -> bytes:
@@ -118,14 +177,29 @@ def _npc_acbs(rec: dict) -> bytes:
     # TES4 PCLevelOffset: level is an additive offset from the player's level.
     # TES5 PCLevelMult: level is a fixed-point multiplier (1000 = 1.0×).
     # We can't map an offset directly to a multiplier so default to 1.0×.
-    tes5_level = 1000 if is_pc_level else max(1, level)
-    endurance = get_int(rec, 'DATA.Endurance', 50)
-    intelligence = get_int(rec, 'DATA.Intelligence', 50)
-    strength = get_int(rec, 'DATA.Strength', 50)
-    return struct.pack('<IhhhHHHhHhH',
-                       tes5_acbs_flags, intelligence, strength, tes5_level,
-                       min(calc_min * 2, 1000), min(calc_max * 2, 1000),
-                       100, 0, 0, endurance, 0)
+    # Faithful health: solve ACBS.HealthOffset so the engine reproduces the exact
+    # TES4 pool. See _health_and_level. Previously the offset slot wrote a
+    # hardcoded 0 and the raw pool went into the DNAM cache, so the authored
+    # control was empty and the level was copied across unmapped.
+    health_offset, tes5_level = _health_and_level(
+        get_int(rec, 'DATA.Health', 50), level, is_pc_level)
+    # Magicka/Stamina offsets are likewise deltas from the 50.0 race base. These
+    # two slots previously received raw Intelligence and Strength ATTRIBUTES,
+    # which are not pools at all; Oblivion's actual pools are SpellPoints (magicka)
+    # and Fatigue (stamina).
+    magicka_offset = max(-32768, min(
+        get_int(rec, 'ACBS.SpellPoints', 0) - TES5_RACE_BASE_HEALTH, 32767))
+    stamina_offset = max(-32768, min(
+        get_int(rec, 'ACBS.Fatigue', 100) - TES5_RACE_BASE_HEALTH, 32767))
+    # ACBS: Flags(I) MagickaOff(h) StaminaOff(h) Level(H) CalcMin(H) CalcMax(H)
+    #       SpeedMult(H) Disposition(h) TemplateFlags(H) HealthOffset(h)
+    #       BleedoutOverride(H)   — layout per xEdit wbDefinitionsTES5.
+    # CalcMin/CalcMax are a plain level band in BOTH games; the old `* 2` here
+    # doubled every NPC's level range and disagreed with the creature path.
+    return struct.pack('<IhhHHHHhHhH',
+                       tes5_acbs_flags, magicka_offset, stamina_offset, tes5_level,
+                       min(calc_min, 65535), min(calc_max, 65535),
+                       100, 0, 0, health_offset, 0)
 
 
 def _crea_acbs(rec: dict) -> bytes:
@@ -146,10 +220,17 @@ def _crea_acbs(rec: dict) -> bytes:
     # the 0.10 minimum. Since an offset can't be mapped to a multiplier, default
     # to 1.0x when the flag is set.  See _npc_acbs for the same handling.
     is_pc_level = bool(tes4_flags & 0x80)
-    tes5_level = 1000 if is_pc_level else max(1, level)
-    return struct.pack('<IhhhHHHhHhH',
+    from ..creature_races import creature_capped_level
+    tes5_level = creature_capped_level(rec)
+    # A creature's generated RACE is SHARED across every CREA with the same mesh
+    # folder, so it carries only a flat base and this per-record offset carries
+    # the creature's whole TES4 pool. See creature_health_offset.
+    from ..creature_races import creature_health_offset
+    health_offset = creature_health_offset(rec)
+    return struct.pack('<IhhHHHHhHhH',
                        tes5_flags, 0, 0, tes5_level,
-                       calc_min, calc_max, 100, 0, 0, 0, 0)
+                       min(calc_min, 65535), min(calc_max, 65535),
+                       100, 0, 0, health_offset, 0)
 
 
 def _npc_aidt(rec: dict, is_creature: bool = False) -> bytes:
@@ -878,12 +959,15 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
     for i, skill_name in enumerate(TES5_SKILL_ORDER):
         dnam[i] = min(skill_defaults.get(skill_name, 15), 255)
 
+    # DNAM 36/38/40 is the engine's calculated Health/Magicka/Stamina CACHE (see
+    # _npc_skills_dnam). Slots 38/40 previously took raw Intelligence/Strength
+    # attributes; the real pools are SpellPoints and Fatigue.
     health = get_int(rec, 'DATA.Health', 50)
-    struct.pack_into('<H', dnam, 36, min(health, 65535))
-    cr_int = get_int(rec, 'DATA.Intelligence', 50)
-    struct.pack_into('<H', dnam, 38, min(cr_int, 65535))
-    cr_str = get_int(rec, 'DATA.Strength', 50)
-    struct.pack_into('<H', dnam, 40, min(cr_str, 65535))
+    struct.pack_into('<H', dnam, 36, max(0, min(health, 65535)))
+    magicka = get_int(rec, 'ACBS.SpellPoints', 0)
+    struct.pack_into('<H', dnam, 38, max(0, min(magicka, 65535)))
+    stamina = get_int(rec, 'ACBS.Fatigue', 100)
+    struct.pack_into('<H', dnam, 40, max(0, min(stamina, 65535)))
     subs += pack_subrecord('DNAM', bytes(dnam))
 
     # ZNAM — combat style (CSTY is skipped; use vanilla styles).

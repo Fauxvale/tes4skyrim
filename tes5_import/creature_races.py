@@ -38,6 +38,11 @@ from .writer import (pack_record, pack_subrecord, pack_string_subrecord,
                      pack_formid_subrecord, pack_obnd)
 from .text_reader import get_formid, get_int, get_str
 
+# GMST fNPCHealthLevelBonus (Skyrim.esm) — health the engine grants per level
+# above 1. Defined here rather than imported from record_types.actors because
+# actors.py imports this module, and a module-level import back would cycle.
+TES5_HEALTH_LEVEL_BONUS = 5
+
 # ---------------------------------------------------------------------------
 # Vanilla template constants (Skyrim.esm DogRace chain, byte-verified)
 # ---------------------------------------------------------------------------
@@ -138,10 +143,87 @@ def get_creature_race(fid_low24: int):
     return entry[0] if entry else None
 
 
+# A generated creature RACE is SHARED by every CREA that maps to the same mesh
+# folder + body set (`made[key]` in build_creature_races), so it cannot carry any
+# one creature's health. It therefore uses the same flat base every vanilla
+# playable race uses, and each creature's whole pool lives in its own
+# per-record ACBS.HealthOffset. An earlier version wrote the first creature's
+# pool into the shared race and left the offset at 0, which gave every other
+# creature sharing that race the wrong health (measured: 345 Nehrim actors, e.g.
+# all three StartCelleTroll variants at 15 HP instead of 450).
+CREATURE_RACE_BASE_HEALTH = 50.0
+
+
+def creature_race_health(rec: dict) -> float:
+    """Starting Health for a CREA's generated RACE — a flat shared base.
+
+    See CREATURE_RACE_BASE_HEALTH: the race is shared, so per-creature health
+    must not go here. `creature_health_offset` carries it instead.
+    """
+    return CREATURE_RACE_BASE_HEALTH
+
+
+def creature_health_offset(rec: dict) -> int:
+    """ACBS.HealthOffset for a CREA — carries the creature's whole TES4 pool.
+
+    Solved so the engine's own sum,
+        RACE.StartingHealth + HealthOffset + (Level-1)*fNPCHealthLevelBonus,
+    lands exactly on TES4 DATA.Health. This is per-record, so creatures sharing a
+    generated race still each get their own health.
+
+    A TES4 pool of 0 is pinned dead: those are intentional corpse props (52 in
+    Nehrim, 45 in Oblivion) that ship dead in Oblivion too, including the
+    PC-Level-Mult ones whose runtime level term would otherwise revive them.
+    """
+    health = get_int(rec, 'DATA.Health', 50)
+    if health <= 0:
+        return -32768
+    base = CREATURE_RACE_BASE_HEALTH
+    if get_int(rec, 'ACBS.Flags') & 0x80:
+        # PC Level Mult: the level term is a runtime multiplier, not authored.
+        return max(-32768, min(int(health - base), 32767))
+    level_term = (creature_capped_level(rec) - 1) * TES5_HEALTH_LEVEL_BONUS
+    return max(-32768, min(int(health - base - level_term), 32767))
+
+
+def creature_capped_level(rec: dict) -> int:
+    """ACBS.Level for a CREA, lowered when its level term is unrepresentable.
+
+    The engine's per-level bonus is what makes a very high level unusable: at
+    level 32,767 the term is 163,830, which no int16 offset can cancel. Such a
+    level is meaningless in Skyrim anyway (vanilla's highest NPC is level 100),
+    so it is reduced to the highest value whose term the offset CAN cancel,
+    keeping the resulting health pool exactly faithful.
+    """
+    level = max(1, min(get_int(rec, 'ACBS.Level', 1), 65535))
+    if get_int(rec, 'ACBS.Flags') & 0x80:
+        return 1000
+    health = get_int(rec, 'DATA.Health', 50)
+    surplus = health - CREATURE_RACE_BASE_HEALTH
+    # Lower bound: the offset must be able to cancel the level term.
+    max_level = int((surplus + 32768) // TES5_HEALTH_LEVEL_BONUS) + 1
+    level = max(1, min(level, max_level))
+    if surplus > 32767:
+        # Too much health for the int16 offset alone (Nehrim ships 15 such
+        # creatures, up to 65,200 HP). RAISE the level so its per-level bonus —
+        # the engine's own mechanism — absorbs the surplus, exactly as
+        # _health_and_level does for NPCs. Rounded up so the remainder still
+        # fits, and capped at the U16 field.
+        need = surplus - 32767
+        level = max(level, min(65535, -(-need // TES5_HEALTH_LEVEL_BONUS) + 1))
+    return level
+
+
 def _race_data(rec: dict) -> bytes:
-    """The 164-byte RACE DATA: DogRace template with CREA stat patches."""
+    """The 164-byte RACE DATA: DogRace template with CREA stat patches.
+
+    Starting Health is the flat CREATURE_RACE_BASE_HEALTH, NOT this creature's
+    pool: the race is shared by every CREA with the same mesh folder and body
+    set, so per-creature health belongs in ACBS.HealthOffset instead (see
+    creature_health_offset).
+    """
     data = bytearray(_RACE_DATA_TEMPLATE)
-    struct.pack_into('<f', data, 36, float(get_int(rec, 'DATA.Health', 50)))
+    struct.pack_into('<f', data, 36, float(creature_race_health(rec)))
     struct.pack_into('<f', data, 40,
                      float(get_int(rec, 'ACBS.SpellPoints', 0)))
     struct.pack_into('<f', data, 44, float(get_int(rec, 'ACBS.Fatigue', 100)))

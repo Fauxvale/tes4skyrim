@@ -406,9 +406,9 @@ def _dec_npc_acbs(data: bytes) -> list:
     calc_max      = struct.unpack_from('<H', data, 12)[0]
     speed_mult    = struct.unpack_from('<H', data, 14)[0]
     disp_base     = struct.unpack_from('<h', data, 16)[0]
-    health_off    = struct.unpack_from('<H', data, 18)[0]
-    bleedout_ovr  = struct.unpack_from('<H', data, 20)[0]
-    outfit_item   = struct.unpack_from('<H', data, 22)[0]
+    template_flgs = struct.unpack_from('<H', data, 18)[0]
+    health_off    = struct.unpack_from('<h', data, 20)[0]
+    bleedout_ovr  = struct.unpack_from('<H', data, 22)[0]
     return [
         f'ACBS.Flags=0x{flags:08X}',
         f'ACBS.MagickaOffset={magicka_off}',
@@ -418,9 +418,9 @@ def _dec_npc_acbs(data: bytes) -> list:
         f'ACBS.CalcMax={calc_max}',
         f'ACBS.SpeedMult={speed_mult}',
         f'ACBS.DispositionBase={disp_base}',
+        f'ACBS.TemplateFlags=0x{template_flgs:04X}',
         f'ACBS.HealthOffset={health_off}',
         f'ACBS.BleedoutOverride={bleedout_ovr}',
-        f'ACBS.OutfitItem={outfit_item}',
     ]
 
 

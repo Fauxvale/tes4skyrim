@@ -272,8 +272,47 @@ Playable Oblivion races map directly to Skyrim equivalents by EditorID:
 
 ### NPC_ Conversion (from Skyblivion)
 - **ACBS Flags**: Only keep compatible bits ($01+$02+$08+$10+$80+$4000). Force autocalc stats for creatures.
-- **Level**: PC Level Mult formula = `1 + obLevel / 20`. CalcMin doubled, CalcMax doubled (default max=100).
-- **ACBS Offsets**: Health=Endurance, Magicka=Intelligence, Stamina=Strength (from TES4 Attributes).
+- **Level**: fixed levels carry across unchanged (TES4 and TES5 both store a plain
+  level). PC-Level-Offset actors (TES4 flag 0x80) become PC Level Mult 1000
+  (=1.0x): an additive offset has no multiplier equivalent. **CalcMin/CalcMax are
+  NOT doubled** — they are a plain level band in both games. (The old `* 2` was
+  real code in `_npc_acbs`; it doubled every NPC's level range and disagreed with
+  the creature path, which never doubled.)
+- **Health / Magicka / Stamina — the authored control is `ACBS.*Offset`, not DNAM.**
+  The engine computes an actor's pool as
+  `RACE.StartingHealth + ACBS.HealthOffset + (Level-1) * fNPCHealthLevelBonus`,
+  with `fNPCHealthLevelBonus = 5.0` (Skyrim.esm GMST) and all 11 mapped playable
+  /Dremora races at `StartingHealth = 50.0`.
+  `DNAM.Health/Magicka/Stamina` (offsets 36/38/40) are only the engine's
+  *calculated cache* — vanilla proves they are not a function of the record at
+  all: 52 groups of NPCs with identical race/class/level/offset carry different
+  DNAM.Health (55 / 51 / 0 / 20971), matching UESP's "otherwise seems to be
+  random". TES4 `DATA.Health` is by contrast a FINAL, fully-calculated pool.
+  So conversion **solves for the offset** that reproduces the TES4 total exactly
+  (`_health_and_level` in `record_types/actors.py`) rather than copying the pool
+  into the cache field. Verified against the BUILT esm with
+  `tools/actor_health_audit.py`: **Oblivion 100.0% exact (1,413/1,413), Nehrim
+  99.9% (2,224/2,227)**, zero spawn-dead actors.
+  - **Creatures use the same flat 50 base.** A generated creature RACE is
+    **shared** by every CREA with the same mesh folder + body set (`made[key]` in
+    `build_creature_races`), so it must NOT carry any one creature's health —
+    doing that gave every other creature on that race the first one's HP
+    (measured: 345 Nehrim actors, e.g. all three StartCelleTroll variants at 15 HP
+    instead of 450). Per-creature health lives entirely in the per-record
+    `ACBS.HealthOffset` (`creature_health_offset`). Creatures that get no
+    generated race fall back to a vanilla Skyrim race, which has the same 50 base,
+    so one formula covers both.
+  - Zero-health TES4 creatures are **intentional corpse props** (52 Nehrim, 45
+    Oblivion) and are pinned dead with offset `-32768`, including the
+    PC-Level-Mult ones whose runtime level term would otherwise revive them.
+  - The int16 offset cannot express the handful of TES4 actors above ~32k HP (dev
+    test dummies, story-boss invulnerability sentinels, the Player record). The
+    surplus is spent through the Level term instead of clamping, so they stay
+    effectively unkillable; only 3 actors (1,000,000 and 9,999,999 HP) exceed even
+    the combined ~360k ceiling, which is still 59x the toughest real enemy.
+  - Magicka/Stamina offsets come from TES4 `ACBS.SpellPoints` and `ACBS.Fatigue`
+    (the actual pools). They previously received raw **Intelligence** and
+    **Strength** attributes, which are not pools at all.
 - **AI Thresholds**:
   - Aggression: 0-39→Unaggressive(0), 40-69→Aggressive(1), 70+→Very Aggressive(2)
   - Confidence: 0-29→Cowardly(0), 30-69→Average(2), 70+→Brave(3)

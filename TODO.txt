@@ -44,8 +44,6 @@ Later Issues:
 
 	7 - Fix walking up stairs
 
-	8 - NPC levels / health is inordinately high!
-
 	9 - Arrows are held at an invisible location behind the arrow when nocking, and can't be picked up after shooting
 
 	10 - Some converted books (scrolls) are using the wrong Skyrim base mesh
