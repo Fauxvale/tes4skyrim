@@ -1307,10 +1307,27 @@ class TestSingletonFixes:
         assert 'TES4Polyfill.HasVampireFed()' in result
 
     def test_setfactionreaction_mixed_separators(self, converter):
+        # Must NOT emit SetReaction: that writes the XNAM 'Modifier' field,
+        # which Skyrim ignores (1,035 of 1,036 vanilla relations store 0).
+        # Combat is gated on the Group Combat Reaction enum, written by
+        # SetAlly/SetEnemy.
         result = converter._convert_line(
             'setfactionreaction FacA, FacB 20', 'ObjectReference')
-        assert 'FacA.SetReaction(FacB, 20)' in result
+        assert 'FacA.SetAlly(FacB, true, true)' in result
+        assert 'SetReaction' not in result
         assert ';TODO' not in result
+
+    def test_setfactionreaction_negative_makes_enemy(self, converter):
+        result = converter._convert_line(
+            'setfactionreaction FacA FacB -100', 'ObjectReference')
+        assert 'FacA.SetEnemy(FacB, false, false)' in result
+
+    def test_setfactionreaction_variable_amount_branches(self, converter):
+        """A non-literal amount still has to reach a real enum tier."""
+        result = converter._convert_line(
+            'setfactionreaction FacA FacB someVar', 'ObjectReference')
+        assert 'SetEnemy' in result and 'SetAlly' in result
+        assert 'SetReaction' not in result
 
     def test_pushactoraway(self, converter):
         converter._property_refs['MarkerRef'] = 'ObjectReference'
@@ -1512,9 +1529,19 @@ class TestEnumActorValues:
         assert 'SetActorValue("Aggression", 0)' in out
 
     def test_confidence_scaled(self, converter):
+        """Oblivion 100 = fearless → Foolhardy (4), the only tier that never
+        flees.  Mapping it to Brave (3) left actors with a nonzero flee score
+        and made them run away constantly."""
         out = converter._convert_function_call(
             'SetActorValue Confidence, 100', 'ObjectReference')
-        assert 'SetActorValue("Confidence", 3)' in out
+        assert 'SetActorValue("Confidence", 4)' in out
+
+    def test_confidence_tiers_span_full_range(self, converter):
+        """Must mirror _convert_aidt: all five tiers are reachable."""
+        for raw, tier in ((100, 4), (75, 3), (50, 2), (20, 1), (5, 0)):
+            out = converter._convert_function_call(
+                f'SetActorValue Confidence, {raw}', 'ObjectReference')
+            assert f'SetActorValue("Confidence", {tier})' in out, (raw, out)
 
     def test_non_enum_actor_value_untouched(self, converter):
         out = converter._convert_function_call(

@@ -611,6 +611,14 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # wearable is classified non-wearable and the actor gets no outfit at all.
     from .outfits import load_item_index
     load_item_index(by_type, ctx.master_export if ctx else None)
+
+    # Aggression conversion needs each faction's reaction toward the player:
+    # TES4 gates combat on disposition (Personality + faction reactions) vs
+    # aggression, so without this index every actor falls back to Personality
+    # alone and tame creatures read as hostile. See _npc_aidt in
+    # record_types/actors.py.
+    from .record_types.actors import load_faction_player_reactions
+    load_faction_player_reactions(by_type)
     _phase_done('phase 0 pre-scans')
 
     # --- Phase 1: Simple record types (flat top-level groups) ---

@@ -4000,3 +4000,107 @@ class TestOutfitIndexAcrossMasters(TestOutfitSplit):
         outfit, carried = split_inventory([(0x0002D001, 1)])
 
         assert outfit == [0x0002D001] and carried == []
+
+
+class TestAidtConfidenceTiers:
+    """TES4 confidence is a 0-100 scalar; TES5 wants a 0-4 tier.
+
+    xEdit wbConfidenceEnum: 0 Cowardly, 1 Cautious, 2 Average, 3 Brave,
+    4 Foolhardy.  Only Foolhardy never flees.  The original mapping
+    (`<30 -> 0, >=70 -> 3, else 2`) never produced tier 1 or tier 4, so
+    Oblivion's most common "fearless" value 100 landed on Brave and actors
+    kept running away.  Vanilla Skyrim's own 5,118 NPC_ records are
+    292/90/1730/393/2613 across the five tiers.
+    """
+
+    @staticmethod
+    def _conf(raw):
+        from tes5_import.record_types.actors import _npc_aidt
+        rec = {'AIDT.Aggression': '5', 'AIDT.Confidence': str(raw),
+               'AIDT.Responsibility': '50', 'DATA.Personality': '50'}
+        return _npc_aidt(rec)[1]
+
+    def test_fearless_maps_to_foolhardy(self):
+        assert self._conf(100) == 4
+
+    def test_all_five_tiers_reachable(self):
+        got = {self._conf(v) for v in range(0, 101)}
+        assert got == {0, 1, 2, 3, 4}, f'unreachable tiers: {got}'
+
+    def test_tier_is_monotonic_in_confidence(self):
+        tiers = [self._conf(v) for v in range(0, 101)]
+        assert tiers == sorted(tiers), 'more confidence must never mean more fleeing'
+
+    def test_oblivion_default_50_is_average(self):
+        """50 is Oblivion's engine default and must not read as cowardly."""
+        assert self._conf(50) == 2
+
+    def test_timid_still_flees(self):
+        assert self._conf(0) == 0
+        assert self._conf(5) == 0
+
+
+class TestAggressionTierTargeting:
+    """Aggression is "which reaction tier do I attack", not "how nasty am I".
+
+    UESP Skyrim:NPCs#Aggression: "Together with the faction relationship combat
+    modifier this governs whether the NPC initiates combat" — 1 attacks enemies
+    on sight, 2 attacks enemies AND NEUTRALS (the player) on sight.
+
+    UESP Oblivion:Animals draws the matching TES4 line for the dogs that broke
+    this: randomly generated dogs "are Bandit or marauder dogs ... hostile
+    towards you, ALTHOUGH THEY WILL NOT NECESSARILY ATTACK ON SIGHT", while
+    "the other dogs in the game are all pets of townspeople and are friendly".
+    """
+
+    PREY_FID = '0005D556'
+
+    def setup_method(self):
+        from tes5_import.record_types.actors import load_faction_player_reactions
+        load_faction_player_reactions({'FACT': [
+            {'FormID': self.PREY_FID, 'EditorID': 'Prey', 'RelationCount': '0'},
+        ]})
+
+    @staticmethod
+    def _aggr(aggression, personality, factions=()):
+        from tes5_import.record_types.actors import _npc_aidt
+        rec = {'AIDT.Aggression': str(aggression), 'AIDT.Confidence': '50',
+               'AIDT.Responsibility': '50', 'DATA.Personality': str(personality),
+               'FactionCount': str(len(factions))}
+        for i, f in enumerate(factions):
+            rec[f'Faction[{i}].FormID'] = f
+        return _npc_aidt(rec, is_creature=True)[0]
+
+    def test_marauder_pet_dog_not_hostile_on_sight(self):
+        """Nehrim's Benno: aggr=30, Personality=10, Marauder+Bandit factions.
+
+        Oblivion's own CreatureDog is byte-identical, so this is the general
+        case, not a Nehrim quirk. Must be tier 1, never tier 2.
+        """
+        assert self._aggr(30, 10) == 1
+
+    def test_predators_still_attack_on_sight(self):
+        """Wolves/bears/lions/trolls must stay tier 2 or the wild goes passive."""
+        for aggr in (45, 50, 60, 70, 80, 100):
+            assert self._aggr(aggr, 10) == 2, aggr
+
+    def test_prey_faction_never_attacks_on_sight(self):
+        """Horses and deer carry aggression 100 but are harmless.
+
+        Aggression alone cannot exclude them — this is why the Prey term is
+        required rather than a threshold.
+        """
+        assert self._aggr(100, 50, [self.PREY_FID]) == 1   # horse
+        assert self._aggr(100, 10, [self.PREY_FID]) == 1   # deer
+
+    def test_prey_beats_aggression(self):
+        """Same aggression, opposite outcome, decided purely by faction."""
+        assert self._aggr(100, 10) == 2
+        assert self._aggr(100, 10, [self.PREY_FID]) == 1
+
+    def test_harmless_low_aggression_never_initiates(self):
+        assert self._aggr(5, 10) == 0    # sheep
+        assert self._aggr(0, 10) == 0
+
+    def test_frenzied_still_maps(self):
+        assert self._aggr(106, 50) == 3

@@ -3367,12 +3367,65 @@ class ScriptConverter:
         if sk_av.lower() == 'aggression':
             tier = 0 if raw <= 5 else (3 if raw >= 106 else 2)
         elif sk_av.lower() == 'confidence':
-            tier = 0 if raw < 30 else (3 if raw >= 70 else 2)
+            # Mirror _convert_aidt in tes5_import/record_types/actors.py: only
+            # tier 4 (Foolhardy) never flees, and Oblivion's 100 means fearless.
+            if raw >= 100:
+                tier = 4
+            elif raw >= 70:
+                tier = 3
+            elif raw >= 40:
+                tier = 2
+            elif raw >= 15:
+                tier = 1
+            else:
+                tier = 0
         else:
             # Generic 0-100 → 0..max_tier proportional bucket.
             tier = int(round((min(raw, 100.0) / 100.0) * max_tier))
         tier = max(0, min(max_tier, tier))
         return str(tier)
+
+    def _faction_reaction_call(self, f1: str, f2: str, amount_src: str,
+                               is_mod: bool, extends: str):
+        """Map a TES4 faction disposition amount onto SetEnemy/SetAlly.
+
+        TES4 dispositions run -100..+100.  Skyrim only stores a four-value
+        Group Combat Reaction, so the amount is bucketed onto the tier that
+        preserves the intent:
+
+            <= -50   Enemy    (`setfactionreaction X Y -100` = "now hate them")
+            <  0     Neutral  (a mild grudge is not open warfare)
+            == 0     Neutral  (explicitly clearing a relation)
+            <  50    Friend   (mild warmth)
+            >= 50    Ally
+
+        Returns None when the amount is not a literal, so the caller can emit a
+        runtime branch instead.  ModFactionReaction shifts an existing value we
+        cannot read at conversion time, so only its SIGN is honoured — that is
+        the part vanilla scripts actually depend on.
+        """
+        literal = amount_src.strip().rstrip(',').strip()
+        if not re.match(r'^-?\d+(?:\.\d+)?$', literal):
+            return None
+        amount = float(literal)
+        if is_mod:
+            # A relative nudge: treat any negative shift as souring the
+            # relation and any positive one as improving it.
+            if amount < 0:
+                return f'{f1}.SetEnemy({f2}, false, false)'
+            if amount > 0:
+                return f'{f1}.SetAlly({f2}, true, true)'
+            return f';{f1}.ModReaction({f2}, 0)  ;no-op'
+        if amount <= -50:
+            return f'{f1}.SetEnemy({f2}, false, false)'
+        if amount < 0:
+            # Neutral: SetEnemy with the "self is neutral to other" bool set.
+            return f'{f1}.SetEnemy({f2}, true, true)'
+        if amount == 0:
+            return f'{f1}.SetEnemy({f2}, true, true)'
+        if amount < 50:
+            return f'{f1}.SetAlly({f2}, true, true)'
+        return f'{f1}.SetAlly({f2}, false, false)'
 
     def _convert_function_call(self, line: str, extends: str) -> str:
         """Convert an Oblivion function call line to Papyrus."""
@@ -4457,8 +4510,31 @@ class ScriptConverter:
             force = self._convert_expression(parts[1], extends) if len(parts) > 1 else '1.0'
             return f'{ref}.PushActorAway({target}, {force})'
 
-        # SetFactionReaction/ModFactionReaction: TES4 setfactionreaction f1 f2 val
-        # -> Papyrus f1.SetReaction(f2, val)
+        # SetFactionReaction/ModFactionReaction: TES4 `setfactionreaction f1 f2 val`
+        # where val is a -100..+100 DISPOSITION modifier.
+        #
+        # This must NOT become `f1.SetReaction(f2, val)`.  Faction.SetReaction
+        # writes the XNAM 'Modifier' field, which Skyrim no longer reads: a
+        # census of Skyrim.esm's 1,036 XNAM relations found 1,035 with
+        # Modifier == 0 — the engine gates combat purely on the separate
+        # 'Group Combat Reaction' ENUM (xEdit wbFactionRelations: 0=Neutral,
+        # 1=Enemy, 2=Ally, 3=Friend), which vanilla exercises across all four
+        # values (348/316/302/69).  So every converted `setfactionreaction
+        # ... -100` wrote a dead field and left the factions NEUTRAL.
+        #
+        # The natives that DO write that enum are SetEnemy/SetAlly (both
+        # present in the SSE binary alongside SetReaction).  Their bool
+        # arguments pick the softer tier of each pair:
+        #   SetEnemy(other, selfNeutralToOther, otherNeutralToSelf)  → Enemy/Neutral
+        #   SetAlly (other, selfFriendToOther,  otherFriendToSelf)   → Ally/Friend
+        # TES4's call is ONE-WAY (f1's feelings about f2), so only the first
+        # bool is driven and the second is left false, matching the vanilla
+        # asymmetric-relation pattern.
+        #
+        # This is what broke CharacterGen: stage 23 raises the Mythic Dawn vs
+        # Blades/Emperor hostility with setfactionreaction, and because the
+        # write was inert the assassins never turned on the Blades — leaving
+        # the player as the only valid target in the room.
         if fname_low in ('setfactionreaction', 'modfactionreaction'):
             # TES4 accepts any mix of commas and spaces between the three args
             parts = [p.strip() for p in
@@ -4467,13 +4543,23 @@ class ScriptConverter:
             if len(parts) >= 3:
                 f1 = self._convert_expression(parts[0], extends)
                 f2 = self._convert_expression(parts[1], extends)
-                val = self._convert_expression(parts[2], extends)
                 self._property_refs[parts[0].strip()] = 'Faction'
                 self._property_refs[parts[1].strip()] = 'Faction'
-                papyrus_fn = 'SetReaction' if fname_low == 'setfactionreaction' else 'ModReaction'
-                return f'{f1}.{papyrus_fn}({f2}, {val})'
+                call = self._faction_reaction_call(f1, f2, parts[2],
+                                                   is_mod=(fname_low == 'modfactionreaction'),
+                                                   extends=extends)
+                if call is not None:
+                    return call
+                # Non-literal amount: bucket at runtime so a scripted variable
+                # still lands on a real enum tier instead of a dead modifier.
+                val = self._convert_expression(parts[2], extends)
+                return (f'if ({val}) < 0\n'
+                        f'  {f1}.SetEnemy({f2}, false, false)\n'
+                        f'else\n'
+                        f'  {f1}.SetAlly({f2}, true, true)\n'
+                        f'endif')
             # Fallback: not enough args
-            return f';TODO: {func_name} {args_str}  ;needs faction1.SetReaction(faction2, val)'
+            return f';TODO: {func_name} {args_str}  ;needs faction1.SetEnemy/SetAlly(faction2)'
 
         # GetGameSetting/getgs: arg is GMST name → quoted string
         if fname_low in ('getgamesetting', 'getgs'):

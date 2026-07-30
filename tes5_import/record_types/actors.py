@@ -233,6 +233,95 @@ def _crea_acbs(rec: dict) -> bytes:
                        100, 0, 0, health_offset, 0)
 
 
+# fid_low24 → that faction's Relation disposition toward PlayerFaction.
+# Populated by load_faction_player_reactions() in Phase 0, before any actor
+# converter runs.  Empty is a safe default: _player_disposition() then falls
+# back to Personality alone, which is the TES4 base disposition.
+_FACTION_PLAYER_DISP = {}
+
+# TES4 PlayerFaction. Same FormID in Oblivion.esm and Nehrim.esm (a Nehrim
+# record, being a plugin over the same master layout, keeps the id).
+_PLAYER_FACTION_FID = 0x0001DBCD
+
+
+def load_faction_player_reactions(by_type: dict) -> None:
+    """Index each FACT's disposition modifier toward the player faction.
+
+    TES4 starting disposition is NOT just Personality — UESP Oblivion:Disposition
+    lists the terms as "base disposition is equal to the NPC's Personality
+    score", then "faction reactions further modify disposition", and notes that
+    "enemies are programmed to have negative dispositions towards you".  The
+    faction term is the one that actually separates a wolf from a horse, so it
+    has to be read from the data rather than guessed.
+    """
+    _FACTION_PLAYER_DISP.clear()
+    _PREY_FACTIONS.clear()
+    for rec in by_type.get('FACT', []):
+        fid = get_formid(rec, 'FormID') & 0xFFFFFF
+        # Match on EditorID, not FormID: a plugin that defines its own prey
+        # faction gets the same treatment as vanilla's 0005D556.
+        edid = (get_str(rec, 'EditorID') or '').lower()
+        if 'prey' in edid:
+            _PREY_FACTIONS.add(fid)
+        n = get_int(rec, 'RelationCount')
+        for i in range(n):
+            other = get_formid(rec, f'Relation[{i}].Faction') & 0xFFFFFF
+            if other == (_PLAYER_FACTION_FID & 0xFFFFFF):
+                _FACTION_PLAYER_DISP[fid] = get_int(
+                    rec, f'Relation[{i}].Disposition')
+                break
+
+
+# fid_low24 of every faction whose EditorID marks its members as prey.
+# Populated alongside _FACTION_PLAYER_DISP.
+_PREY_FACTIONS = set()
+
+# Player's starting Personality.  UESP Oblivion:Disposition: base disposition is
+# the actor's Personality, then "for every 4 points of Personality that the
+# player has above the NPC's, disposition increases by 1 point".  40 is the
+# mid-range starting value across races/classes.
+_PLAYER_PERSONALITY = 40
+
+# How decisively an actor must want to attack before it earns tier 2.
+# margin = (aggression - 5) - disposition.  Measured over Oblivion's creatures:
+# known predators cluster at a median margin of 48, while tame animals sit at
+# -47.  Nehrim's Benno — a marauder-template pet dog — scores just 8, which is
+# what separates "hostile in principle" from "attacks you on sight".
+_ONSIGHT_MARGIN = 10
+
+
+def _is_prey(rec: dict) -> bool:
+    """True when this actor belongs to a prey faction.
+
+    Prey is the vanilla marker for "harmless": Oblivion's 43 Prey members are
+    all horses, deer and sheep, and several carry aggression 100 — the same
+    value as the nastiest predators — so aggression alone cannot exclude them.
+    UESP Oblivion:Animals confirms deer "are not aggressive" despite that.
+    """
+    for i in range(get_int(rec, 'FactionCount')):
+        if (get_formid(rec, f'Faction[{i}].FormID') & 0xFFFFFF) in _PREY_FACTIONS:
+            return True
+    return False
+
+
+def _player_disposition(rec: dict, pers: int) -> int:
+    """Estimate this actor's TES4 starting disposition toward the player.
+
+    Personality is the base; every faction the actor belongs to contributes its
+    own reaction toward PlayerFaction.  TES4 sums the faction modifiers, so a
+    creature in two hostile factions is more hostile than one in a single
+    faction — matching the in-game behaviour the formula describes.
+    """
+    disp = pers
+    for i in range(get_int(rec, 'FactionCount')):
+        fid = get_formid(rec, f'Faction[{i}].FormID') & 0xFFFFFF
+        disp += _FACTION_PLAYER_DISP.get(fid, 0)
+    # Player-Personality term: +1 disposition per 4 points the player's
+    # Personality exceeds the actor's (UESP Oblivion:Disposition).
+    disp += (_PLAYER_PERSONALITY - pers) // 4
+    return disp
+
+
 def _npc_aidt(rec: dict, is_creature: bool = False) -> bytes:
     """Build TES5 AIDT subrecord (20 bytes).
 
@@ -272,32 +361,106 @@ def _npc_aidt(rec: dict, is_creature: bool = False) -> bytes:
     #   actor merely RETALIATES when hit), 2 "VeryAggressive" attacks Neutrals on
     #   sight too, 3 "Frenzied" attacks everyone incl. allies.
     #
-    # So the faithful tier is: does the TES4 actor attack the (neutral) player
-    # ON SIGHT? If yes it needs tier 2, because our converter does not rebuild
-    # the TES4 predator/prey faction-reaction network that would make the player
-    # an Enemy and let tier 1 suffice; if it only attacks once provoked it is
-    # tier 1; aggression<=5 is tier 0; >=106 is tier 3.
+    # THE KEY POINT: aggression is not "how hostile is this actor", it is "WHICH
+    # REACTION TIER does it attack".  Who it is hostile TO lives in the faction
+    # graph, in BOTH games.  UESP Skyrim:NPCs#Aggression states it directly:
+    # "Together with the FACTION RELATIONSHIP COMBAT MODIFIER this governs
+    # whether the NPC initiates combat", and defines
+    #   0 Unaggressive  attacks nobody unless provoked
+    #   1 Aggressive    attacks ENEMIES on sight
+    #   2 VeryAggressive attacks enemies AND NEUTRAL on sight
+    #   3 Frenzied      attacks anybody on sight
+    # The player is a NEUTRAL to anyone with no relation to PlayerFaction, so
+    # tier 2 is the line between "hunts its faction enemies" and "hunts you".
     #
-    # disposition estimate: NPCs default NEUTRAL to a stranger (disp ≈
-    # Personality). CREATURES are the player's enemy by default — vanilla puts
-    # them in CreatureFaction/Prey which carry negative relations to the player
-    # — so their effective disposition sits an enemy-reaction penalty below
-    # Personality. That penalty is the missing reaction term (NOT a type
-    # shortcut): without it a marginal predator like the FGC01Rats hunt lion
-    # (aggr=10, Personality=10) reads disp 10 !< 5 and never hunts, while the
-    # basement lion (aggr=70) works — exactly the reported bug.
-    ENEMY_REACTION = 40  # TES4 predator/prey→player reaction, negative-disposition side
-    disp = pers - ENEMY_REACTION if is_creature else pers
+    # TES4 expresses the same thing per-target: attack when
+    # disposition(actor→target) < aggression - 5, where disposition is
+    # Personality plus the FACTION reactions toward that specific target
+    # (UESP Oblivion:Disposition).  Worked through for Nehrim's Benno, a dog in
+    # MarauderFaction + BanditFaction with aggr=30, Personality=10:
+    #
+    #   Benno → a bandit : 10 + (-100) = -90 < 25   → attacks   (Enemy)
+    #   Benno → player   : 10 +     0  =  10        → no faction relation at all
+    #
+    # MarauderFaction and BanditFaction relate ONLY to each other (-100) and to
+    # CreatureFaction (+20); NEITHER has any relation to PlayerFaction.  Benno
+    # is aggressive toward MARAUDERS, not toward you — and Oblivion's own
+    # CreatureDog carries byte-identical data, which is why UESP lists Dog under
+    # "Aggressive Animals" while the dog still never mauls the player on sight.
+    #
+    # That is the whole bug: collapsing a per-target rule onto one global tier
+    # and then resolving it against the player.  Any actor whose hostility is
+    # expressed purely as faction relations must land on tier 1 — the faction
+    # graph (converted faithfully into XNAM Group Combat Reaction) then does the
+    # targeting exactly as it does in vanilla Skyrim, whose own horses, deer,
+    # elk, cows, goats, foxes and sabre cats are ALL Aggression 0 for the same
+    # reason.
+    #
+    # NOTE: gating tier 2 on "does a faction make the player an enemy" was tried
+    # and is WRONG.  Oblivion's wolves/bears/trolls/mountain lions sit in
+    # CreatureFaction, which has no PlayerFaction relation either, so that rule
+    # dropped every predator to tier 1 and made the wilderness passive.  Skyrim
+    # separates these two cases with AIDT's Aggro Radius fields (EncWolf is
+    # Aggression 0 but carries aggroRadiusBehavior=1, attack radius 1500) —
+    # fields TES4's AIDT does not have at all (xEdit wbDefinitionsTES4: AIDT is
+    # Aggression/Confidence/Energy/Responsibility/Services/Teaches/MaxTraining
+    # only).  The discriminator therefore has to be reconstructed; see
+    # _predator_attack_radius below.
+    # The rule below is calibrated, not guessed.  UESP Oblivion:Animals draws
+    # the exact distinction we need for the dogs: randomly generated dogs "are
+    # Bandit or marauder dogs ... that are hostile towards you, ALTHOUGH THEY
+    # WILL NOT NECESSARILY ATTACK ON SIGHT", while "the other dogs in the game
+    # are all pets of townspeople and are friendly".  "Hostile but not on sight"
+    # is precisely TES5 tier 1; "on sight" is tier 2.
+    #
+    # Two terms decide it:
+    #   * Prey membership — vanilla's marker for harmless.  Its 43 members are
+    #     horses, deer and sheep, several at aggression 100, so no aggression
+    #     threshold can exclude them (this is what broke earlier attempts).
+    #   * The attack MARGIN, (aggr-5) - disposition: how decisively the TES4
+    #     rule fires.  Measured across Oblivion's creatures, known predators
+    #     have a median margin of 48 and tame animals -47, while Benno scores
+    #     just 8 — hostile in principle, not a threat on sight.
+    disp = _player_disposition(rec, pers)
     if aggr <= 5:
-        tes5_aggr = 0
+        tes5_aggr = 0   # never initiates (0 will not even defend itself)
     elif aggr >= 106:
-        tes5_aggr = 3
-    elif disp < aggr - 5:
-        tes5_aggr = 2   # attacks the neutral player on sight
+        tes5_aggr = 3   # Frenzied — attacks everyone, even allies
+    elif not _is_prey(rec) and (aggr - 5) - disp >= _ONSIGHT_MARGIN:
+        tes5_aggr = 2   # decisively hostile: attacks the player on sight
     else:
-        tes5_aggr = 1   # peaceful until provoked, then retaliates
-    # TES4 confidence → TES5 tier
-    tes5_conf = 0 if conf < 30 else (3 if conf >= 70 else 2)
+        tes5_aggr = 1   # attacks its faction enemies; not the player on sight
+    # TES4 confidence (0-100 scalar) → TES5 confidence TIER.
+    #
+    # Both engines feed confidence into fAIFleeConfBase/fAIFleeConfMult to score
+    # "should I run away", but TES4 supplies a 0-100 number while TES5 supplies
+    # one of five tiers (xEdit wbConfidenceEnum: 0 Cowardly, 1 Cautious,
+    # 2 Average, 3 Brave, 4 Foolhardy).  Only tier 4 never flees.
+    #
+    # The old mapping was `<30 → 0, >=70 → 3, else 2`, which never emitted tier
+    # 1 or tier 4 at all and capped the whole top of the range at Brave.  That
+    # is why converted actors fled constantly: Oblivion's "fearless" value 100
+    # is by far the most common setting (1,567 of 3,396 exported actors) and it
+    # was landing on Brave, which still has a nonzero flee score, instead of
+    # Foolhardy.  Vanilla Skyrim leans the opposite way — of 5,118 NPC_ records
+    # the distribution is 292/90/1730/393/2613, i.e. Foolhardy is the single
+    # most common tier and more than half of all NPCs sit at 3 or 4.
+    #
+    # Anchoring on the values Oblivion actually uses (100 = fearless, 75-95 =
+    # brave, 50 = the engine default "average", 5-25 = timid, 0 = flees on
+    # sight) reproduces a vanilla-shaped spread.  Must stay in sync with
+    # _scale_enum_av in script_convert/converter.py, which buckets scripted
+    # `setav confidence N` onto the same tiers.
+    if conf >= 100:
+        tes5_conf = 4   # Foolhardy — never flees
+    elif conf >= 70:
+        tes5_conf = 3   # Brave
+    elif conf >= 40:
+        tes5_conf = 2   # Average
+    elif conf >= 15:
+        tes5_conf = 1   # Cautious
+    else:
+        tes5_conf = 0   # Cowardly
     # TES4 responsibility → TES5 morality (inverted: high resp = no crime)
     tes5_moral = 3 if resp >= 80 else (2 if resp >= 50 else (1 if resp >= 30 else 0))
     # Assistance: low responsibility → helps nobody
