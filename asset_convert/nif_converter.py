@@ -102,6 +102,11 @@ def _pyffi_capture_init() -> None:
     Called as a multiprocessing.Pool initializer (once per worker) and
     directly before single-worker processing.
     """
+    # Join the parent's containment job so this worker cannot outlive a parent
+    # that dies without cleanup (crash / external kill). No-op off Windows.
+    from process_job import join_pool_job
+    join_pool_job()
+
     global _worker_warn_log
     _worker_warn_log = []
     pyffi_log = _logging.getLogger('pyffi')
