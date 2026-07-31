@@ -366,6 +366,9 @@ def _mesh_exists(path: str, output_meshes_dir: Path) -> bool:
 # header read per unique mesh.
 _NIF_ROOT_SAFE_CACHE = {}
 
+# Distinguishes "not yet computed" from a cached "this base yields no LOD".
+_MISSING = object()
+
 
 def _lod_mesh_is_safe(path: str, output_meshes_dir: Path) -> bool:
     """False if this mesh's root block would crash LODGen's NiNode cast."""
@@ -411,7 +414,40 @@ def _obnd_max_dim(stat: dict) -> float:
     return float(max(x2 - x1, y2 - y1, z2 - z1))
 
 
-def _lod_meshes_for(stat: dict, output_meshes_dir: Path):
+def _import_master_mesh(rel: str, output_meshes_dir: Path,
+                        master_meshes) -> bool:
+    """Copy a mesh from a master's output into this plugin's, if needed.
+
+    LODGen resolves every listed mesh under the SINGLE PathData root it is
+    given, so a mesh that only exists in the master's tree cannot merely be
+    referenced — listing it makes LODGen abort with "file not found" and bake
+    no tiles at all. An override plugin that rebuilds a whole tile needs the
+    master's tree/rock/building LOD meshes, so they are imported here.
+
+    Returns True when the mesh is available in this plugin's tree afterwards.
+    """
+    if not rel:
+        return False
+    if _mesh_exists(rel, output_meshes_dir):
+        return True
+    r = rel.lower().replace('/', '\\').lstrip('\\')
+    if r.startswith('meshes\\'):
+        r = r[len('meshes\\'):]
+    for mdir in (master_meshes or []):
+        src = Path(mdir) / r
+        if not src.exists():
+            continue
+        dst = output_meshes_dir / r
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            return True
+        except OSError:
+            return False
+    return False
+
+
+def _lod_meshes_for(stat: dict, output_meshes_dir: Path, master_meshes=None):
     """
     Return (lod4, lod8, lod16) mesh paths for a stat record.
 
@@ -421,6 +457,10 @@ def _lod_meshes_for(stat: dict, output_meshes_dir: Path):
       to matter at level-8 distances (_LOD8_MIN_SIZE).
     - World-map objects (0x10000000) additionally get lod16 so LODGenx64
       bakes tiles for the far ring / world-map view.
+
+    `master_meshes` lets an override plugin rebuilding a whole tile use LOD
+    meshes that were only generated into a MASTER's output; each one found is
+    copied into this plugin's tree so LODGen can resolve it.
     """
     lod4  = stat.get('lod4', '')
     lod8  = stat.get('lod8', '')
@@ -434,7 +474,7 @@ def _lod_meshes_for(stat: dict, output_meshes_dir: Path):
         return '', '', ''
 
     far = _far_nif_path(model)
-    if not _mesh_exists(far, output_meshes_dir):
+    if not _import_master_mesh(far, output_meshes_dir, master_meshes):
         return '', '', ''
 
     from .lod_far_gen import is_tree_model, _tier_path, _TIER8, _TIER16
@@ -445,10 +485,12 @@ def _lod_meshes_for(stat: dict, output_meshes_dir: Path):
     lod8_mesh = lod16_mesh = ''
     if _obnd_max_dim(stat) >= _LOD8_MIN_SIZE:
         far8 = str(_tier_path(Path(far), _TIER8['suffix']))
-        lod8_mesh = far8 if _mesh_exists(far8, output_meshes_dir) else far
+        lod8_mesh = (far8 if _import_master_mesh(far8, output_meshes_dir,
+                                                 master_meshes) else far)
     if flags & 0x10000000:
         far16 = str(_tier_path(Path(far), _TIER16['suffix']))
-        lod16_mesh = far16 if _mesh_exists(far16, output_meshes_dir) else far
+        lod16_mesh = (far16 if _import_master_mesh(far16, output_meshes_dir,
+                                                   master_meshes) else far)
     return far, lod8_mesh, lod16_mesh
 
 
@@ -468,7 +510,7 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
                        worldspace_edid: str,
                        _parsed=None,
                        cell_sw: tuple = None,
-                       master_dirs=None) -> Path:
+                       master_dirs=None, replace_tiles=False) -> Path:
     """
     Parse the converted ESM and write the LODGen input text file.
 
@@ -478,6 +520,13 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
     LOD run already baked it, and re-baking it would have this plugin ship a
     duplicate copy of the master's entire object LOD to gain the handful of
     objects it actually introduces.
+
+    `replace_tiles` turns that off. When this plugin REPLACES whole tiles
+    (because it changed cells the master also covers), the tile it writes is
+    the only one the engine loads for those cells, so it must contain the
+    master's objects as well — otherwise every tree, rock and building in the
+    rebuilt tiles disappears. The two modes are mutually exclusive: skip the
+    master's objects only when shipping tiles ALONGSIDE the master's.
 
     Returns path to the written file, or None if no LOD refs found.
     """
@@ -526,6 +575,11 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
     # Collect exterior REFR records in this worldspace whose base is a STAT/ACTI/etc.
     lines = []
     skipped_unsafe = set()
+    # Per-BASE memo. Tamriel has 180,702 LOD references but only ~900 distinct
+    # bases, and resolving a base's LOD tiers stats several files while
+    # screening its meshes fully parses them. Doing that per REFERENCE instead
+    # of per base is what made this loop appear to hang.
+    base_cache = {}
 
     for ref in refs:
         # Must be in our worldspace
@@ -547,25 +601,44 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
         stat_is_lod = bool(stat_flags_val & (_FLAG_DISTANT_LOD | _FLAG_WORLD_MAP))
         if not stat_is_lod:
             continue
-        # Already covered by a master's own LOD run — don't re-bake it.
-        if any(_mesh_exists(_far_nif_path(model), m) for m in master_meshes):
+        # Resolve this BASE once (see base_cache): which LOD meshes it uses,
+        # whether they are safe for LODGen, and whether a master already
+        # covers it.
+        #
+        # That last skip is only valid when this plugin ships tiles ALONGSIDE
+        # the master's. When it REPLACES whole tiles (replace_tiles), the tile
+        # it writes is the only one the engine loads for those cells, so it
+        # must contain the master's objects too — skipping them deleted every
+        # tree, rock and building from the rebuilt tiles (74 KB against the
+        # master's 9.8 MB).
+        base_entry = base_cache.get(base_fid, _MISSING)
+        if base_entry is _MISSING:
+            base_entry = None
+            skip = (not replace_tiles
+                    and any(_mesh_exists(_far_nif_path(model), m)
+                            for m in master_meshes))
+            if not skip:
+                lod4, lod8, lod16 = _lod_meshes_for(
+                    stat, output_meshes_dir, master_meshes)
+                if lod4 or lod8 or lod16:
+                    # One mesh LODGen cannot parse aborts the whole
+                    # worldspace, so screen each listed mesh (and the full
+                    # model it falls back to) up front.
+                    unsafe = [m for m in (model, lod4, lod8, lod16)
+                              if m and not _lod_mesh_is_safe(
+                                  m, output_meshes_dir)]
+                    if unsafe:
+                        for m in unsafe:
+                            skipped_unsafe.add(_normalize(m))
+                    else:
+                        stat_edid = stat.get('edid', f'{base_fid:08X}')
+                        base_entry = (
+                            f"{stat_edid}\t{stat_flags_val:08X}\t\t"
+                            f"{_normalize(model)}\t{_normalize(lod4)}\t"
+                            f"{_normalize(lod8)}\t{_normalize(lod16)}")
+            base_cache[base_fid] = base_entry
+        if base_entry is None:
             continue
-
-        lod4, lod8, lod16 = _lod_meshes_for(stat, output_meshes_dir)
-        if not (lod4 or lod8 or lod16):
-            continue
-        # One mesh LODGen cannot parse aborts the whole worldspace, so screen
-        # each listed mesh (and the full model it falls back to) up front.
-        unsafe = [m for m in (model, lod4, lod8, lod16)
-                  if m and not _lod_mesh_is_safe(m, output_meshes_dir)]
-        if unsafe:
-            for m in unsafe:
-                skipped_unsafe.add(_normalize(m))
-            continue
-        mat = ''
-        stat_edid   = stat.get('edid', f'{base_fid:08X}')
-        stat_flags  = f"{stat_flags_val:08X}"
-        base_entry  = f"{stat_edid}\t{stat_flags}\t{mat}\t{_normalize(model)}\t{_normalize(lod4)}\t{_normalize(lod8)}\t{_normalize(lod16)}"
 
         # Reference line
         ref_fid   = f"{ref['form_id']:08X}"
@@ -801,7 +874,8 @@ def generate_lod(esm_path: Path, output_dir: Path,
     lodgen_txt = write_lodgen_input(esm_path, output_dir, edid,
                                     _parsed=(worldspaces, cells, stats, refs),
                                     cell_sw=(eff_sw_x, eff_sw_y),
-                                    master_dirs=master_dirs)
+                                    master_dirs=master_dirs,
+                                    replace_tiles=bool(only_cells))
     ok = False
     if lodgen_txt:
         # Remove stale tiles first: LODGen only rewrites tiles that still have
