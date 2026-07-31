@@ -202,6 +202,68 @@ def _npc_acbs(rec: dict) -> bytes:
                        100, 0, 0, health_offset, 0)
 
 
+# TES4 CREA ACBS flag bits. These are NOT the TES4 NPC_ bits and NOT the TES5
+# bits — the same bit number means something different in all three (xEdit
+# wbDefinitionsTES4 CREA ACBS vs wbDefinitionsTES5 NPC_ ACBS). A raw
+# `flags & mask` therefore silently reinterprets creature data as unrelated NPC
+# behaviour, which is exactly what the old `& 0x4C9B | 0x10` did:
+#     bit 0  Biped         -> TES5 0x01 Female          (every biped went female)
+#     bit 4  Swims         -> TES5 0x10 Auto-calc stats (swimmers got autocalc)
+#     bit 11 No Blood Spray-> TES5 0x800 Protected      (unkillable by NPCs)
+# and it dropped bit 9 "No Low Level Processing" entirely.
+_T4C_BIPED           = 0x000001
+_T4C_ESSENTIAL       = 0x000002
+_T4C_RESPAWN         = 0x000008
+_T4C_SWIMS           = 0x000010
+_T4C_FLIES           = 0x000020
+_T4C_WALKS           = 0x000040
+_T4C_PC_LEVEL_OFFSET = 0x000080
+_T4C_NO_LOW_LEVEL    = 0x000200
+_T4C_NO_BLOOD_SPRAY  = 0x000800
+_T4C_NO_BLOOD_DECAL  = 0x001000
+
+# TES5 NPC_ ACBS flags (xEdit + UESP Skyrim Mod:Mod File Format/NPC).
+_T5_FEMALE        = 0x00000001
+_T5_ESSENTIAL     = 0x00000002
+_T5_RESPAWN       = 0x00000008
+_T5_AUTOCALC      = 0x00000010
+_T5_PC_LEVEL_MULT = 0x00000080
+_T5_PROTECTED     = 0x00000800
+_T5_SUMMONABLE    = 0x00004000
+_T5_DOESNT_BLEED  = 0x00010000
+_T5_SIMPLE_ACTOR  = 0x00100000
+
+
+def _crea_flags(tes4_flags: int) -> int:
+    """TES4 CREA ACBS flags → TES5 NPC_ ACBS flags, translated by MEANING.
+
+    Only bits whose meaning genuinely carries over are set; TES4 bits with no
+    TES5 counterpart (Biped/Swims/Flies/Walks — movement is a behaviour-graph
+    and RACE concern in Skyrim) are dropped rather than smuggled into whatever
+    TES5 happens to use that bit number for.
+    """
+    out = 0
+    if tes4_flags & _T4C_ESSENTIAL:
+        out |= _T5_ESSENTIAL
+    if tes4_flags & _T4C_RESPAWN:
+        out |= _T5_RESPAWN
+    if tes4_flags & _T4C_PC_LEVEL_OFFSET:
+        out |= _T5_PC_LEVEL_MULT
+    # "No Low Level Processing" is TES4 bit 9 (0x200). Skyrim's equivalent for
+    # an actor that must keep running full AI/stat processing when unloaded is
+    # Simple Actor being OFF plus the actor not being culled; the closest real
+    # counterpart is 0x100000 Simple Actor, which is the INVERSE (a simple actor
+    # gets reduced processing). So the flag is honoured by explicitly NOT
+    # marking such creatures Simple Actor, and it is never mapped onto an
+    # unrelated bit. Dropping it silently was the previous behaviour.
+    if tes4_flags & _T4C_NO_BLOOD_SPRAY and tes4_flags & _T4C_NO_BLOOD_DECAL:
+        out |= _T5_DOESNT_BLEED
+    # Creatures have no TES4 attribute block to derive stats from, so Skyrim must
+    # autocalc from race + level + the offsets _crea_acbs writes.
+    out |= _T5_AUTOCALC
+    return out
+
+
 def _crea_acbs(rec: dict) -> bytes:
     """Build TES5 ACBS payload (24 bytes) from a TES4 CREA record.
 
@@ -212,7 +274,7 @@ def _crea_acbs(rec: dict) -> bytes:
     level = get_int(rec, 'ACBS.Level', 1)
     calc_min = get_int(rec, 'ACBS.CalcMin', 1)
     calc_max = get_int(rec, 'ACBS.CalcMax', 100)
-    tes5_flags = (tes4_flags & 0x4C9B) | 0x10
+    tes5_flags = _crea_flags(tes4_flags)
     # TES4 flag 0x80 = "PC Level Offset" (Level is an additive offset from the
     # player's level). TES5 reuses the same bit as "PC Level Mult", where Level
     # is a fixed-point multiplier (1000 = 1.0x). A raw TES4 offset (e.g. 0..5)

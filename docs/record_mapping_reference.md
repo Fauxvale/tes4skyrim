@@ -184,6 +184,40 @@ TES5 NPC_ DNAM stores skills as arrays. The correct xEdit paths are:
 - `DNAM\Skill Values\TwoHanded`, `Marksman`, `Block`, `Smithing`, `HeavyArmor`, `LightArmor`, `Pickpocket`, `Lockpicking`, `Sneak`, `Alchemy`, `Speechcraft`, `Alteration`, `Conjuration`, `Destruction`, `Illusion`, `Restoration`, `Enchanting`
 - Plus `DNAM\Health`, `DNAM\Magicka`, `DNAM\Stamina` (U16 each)
 
+### LVLN shell NPC_ DNAM must not be zero (fixed 2026-07-30)
+
+**Symptom:** most animals in converted Nehrim (river crabs, boar, deer,
+chickens, pigs) keeled over dead the instant the cell loaded. Spawning the
+*same base record* from the console produced a healthy animal, and the actor's
+health pool audited clean (`tools/actor_health_audit.py`: 0 SPAWN-DEAD, 99.9%
+exact) — so health, ACBS flags, the generated RACE and the behaviour project
+were all exonerated.
+
+**Discriminator:** every dying animal was placed through a generated
+`<list>_Lvl` template shell (TES4 `REFR → LVLC` becomes
+`ACHR → NPC_ shell → TPLT → LVLN`, see `tes5_import/leveled_actors.py`), while
+every confirmed survivor — sheep `1A1963`, pack mule `206C73` — was a
+hand-placed `ACHR` pointing **straight at its base NPC_**. `placeatme` on the
+base likewise never goes through the shell, which is exactly why the console
+test looked fine. Note that sheep and pig are indistinguishable on every other
+axis (identical 45-bone project, 14 clips, same speeds, same `ACBS.Flags=840`),
+so only the placement path explains the split.
+
+**Cause:** `_build_shell` wrote `pack_subrecord('DNAM', bytes(52))`. DNAM
+offsets 36/38/40 are the cached derived Health/Magicka/Stamina; a zero Health
+cache spawns the actor at 0 HP and it dies on load. `Use Stats` in
+`TemplateFlags` does not save it — the placed reference still comes up seeded
+from the shell's own cached pool.
+
+**Vanilla census (the decisive evidence):** of Skyrim.esm's 508 NPC_ shells
+whose `TPLT` is an LVLN, **zero** write Health=0. Minimum is 47; the dominant
+triple is 55/37/49 (Health 379/508, Magicka and Stamina 370/508). The shell now
+writes exactly that. The template supplies the real pools at spawn, so this only
+needs to be a sane non-zero seed, not any particular creature's stats.
+
+**Rule:** a template shell's Required subrecords may be neutral, but never
+*zero* for a field the engine caches and reads before template resolution.
+
 ## Actor Value / Skill Mapping
 
 | TES4 Skill (Index) | TES5 Skill (Index) | Notes |

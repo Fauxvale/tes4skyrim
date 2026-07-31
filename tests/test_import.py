@@ -4104,3 +4104,55 @@ class TestAggressionTierTargeting:
 
     def test_frenzied_still_maps(self):
         assert self._aggr(106, 50) == 3
+
+
+class TestLeveledActorShellDNAM:
+    """A placed leveled creature's shell NPC_ must not cache a zero health pool.
+
+    TES4 `REFR -> LVLC` becomes `ACHR -> NPC_ shell -> TPLT -> LVLN`. DNAM
+    offsets 36/38/40 are the cached derived Health/Magicka/Stamina; the engine
+    seeds the placed reference from them before template resolution, so a zero
+    Health cache spawns the actor at 0 HP and it dies the instant its cell
+    loads. That was the 2026-07-30 "all the animals keel over on load" bug —
+    chickens/pigs/boar/deer/river crabs are placed through these shells, while
+    hand-placed sheep and pack mules (direct ACHR -> base NPC_) were fine, and
+    console `placeatme` on the base bypassed the shell entirely.
+
+    Vanilla census: of Skyrim.esm's 508 shells whose TPLT is an LVLN, ZERO
+    write Health=0 (minimum 47, dominant triple 55/37/49).
+    """
+
+    def _dnam(self):
+        from tes5_import.leveled_actors import _shell_dnam
+        return _shell_dnam()
+
+    def test_dnam_is_52_bytes(self):
+        assert len(self._dnam()) == 52
+
+    def test_health_is_never_zero(self):
+        """The regression itself: a 0 health cache = dead on load."""
+        health, _magicka, _stamina = struct.unpack_from('<HHH', self._dnam(), 36)
+        assert health > 0
+
+    def test_pools_match_the_vanilla_dominant_triple(self):
+        assert struct.unpack_from('<HHH', self._dnam(), 36) == (55, 37, 49)
+
+    def test_health_within_vanilla_observed_range(self):
+        """Vanilla shells never go below 47."""
+        health = struct.unpack_from('<H', self._dnam(), 36)[0]
+        assert health >= 47
+
+    def test_skills_stay_zero(self):
+        """Only the pool cache is seeded; skills are still inherited."""
+        assert self._dnam()[:36] == bytes(36)
+
+    def test_built_shell_carries_the_nonzero_dnam(self):
+        """End-to-end: the packed NPC_ record, not just the helper."""
+        from tes5_import.leveled_actors import _build_shell
+        rec = _build_shell(0x00123456, 0x00654321, 0x00013746, 'TestList_Lvl')
+        idx = rec.find(b'DNAM')
+        assert idx != -1
+        size = struct.unpack_from('<H', rec, idx + 4)[0]
+        assert size == 52
+        body = rec[idx + 6:idx + 6 + size]
+        assert struct.unpack_from('<HHH', body, 36) == (55, 37, 49)

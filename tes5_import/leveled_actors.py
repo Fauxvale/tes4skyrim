@@ -50,6 +50,35 @@ _NAM8_SOUND_LEVEL = 1           # Normal
 # Inherited via Use AI Data, but the subrecord is Required so it must be here.
 _SHELL_AIDT = bytes.fromhex('0004320000000000000000000000000000000000')
 
+# NPC_ DNAM "Player Skills" (wbDefinitionsTES5.pas): 18 skill values + 18 skill
+# offsets (36 bytes), then the CACHED derived pools — Health(U16) @36,
+# Magicka(U16) @38, Stamina(U16) @40 — then unused(2), far-away model distance
+# (float), geared-up weapons(U8), unused(3).  52 bytes total.
+#
+# This cache must NOT be left at zero.  The engine seeds an actor's actual
+# values from the base record's own DNAM when the reference is created; Use
+# Stats makes the TEMPLATE supply the ACBS offsets/level, but the placed actor
+# still comes up with the cached pool it read here.  A zero Health cache means
+# the actor spawns at 0 HP and dies the instant its cell loads — which is why
+# every leveled-placed animal (chicken/pig/boar/deer/mudcrab/river crab) keeled
+# over on load while the very same base record spawned healthy from the console
+# (`placeatme` on the base NPC_ never goes through the shell) and hand-placed
+# animals (sheep, pack mule — direct ACHR→NPC_) were fine.
+#
+# Vanilla census, 508 Skyrim.esm shells whose TPLT is an LVLN: ZERO write
+# Health=0; the minimum is 47 and the dominant triple is 55/37/49 (379/508
+# Health, 370/508 Magicka and Stamina).  Those are the values used here — the
+# template's real pools override them at spawn, so this only has to be a sane
+# non-zero seed rather than any particular creature's stats.
+_SHELL_HEALTH, _SHELL_MAGICKA, _SHELL_STAMINA = 55, 37, 49
+
+
+def _shell_dnam() -> bytes:
+    """52-byte DNAM for a template shell: zero skills, non-zero pool cache."""
+    return (bytes(36)
+            + struct.pack('<HHH', _SHELL_HEALTH, _SHELL_MAGICKA, _SHELL_STAMINA)
+            + bytes(10))
+
 
 def _shell_acbs() -> bytes:
     """NPC_ ACBS (24 bytes) for a template shell.
@@ -134,7 +163,7 @@ def _build_shell(shell_fid: int, lvln_fid: int, race_fid: int,
     subs += pack_subrecord('AIDT', _SHELL_AIDT)
     subs += pack_formid_subrecord('CNAM', _CLAS_DEFAULT)
     subs += pack_subrecord('DATA', b'')
-    subs += pack_subrecord('DNAM', bytes(52))
+    subs += pack_subrecord('DNAM', _shell_dnam())
     subs += pack_subrecord('NAM5', struct.pack('<H', 0xFF))
     subs += pack_subrecord('NAM6', struct.pack('<f', 1.0))
     subs += pack_subrecord('NAM7', struct.pack('<f', 1.0))

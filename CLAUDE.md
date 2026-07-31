@@ -81,7 +81,7 @@ caching, skipped record types, the export text format, and the directory layout.
    — this is the GOG/AE build and is **NOT DRM-packed**, so it disassembles
    statically. (Only the *Steam* copy is encrypted, `.text` entropy 8.00 — don't
    confuse the two and conclude the exe is unreadable.) Crash logs from the Steam
-   build map across via the Address Library (stable ID → per-build RVA).
+   build map across via the Address Library (stable ID → per-build RVA). Don't be wary of dissassembly. It doesn't have to be the last resort!
 2. The Oblivion/Nehrim install at `D:\Other Games\Nehrim At Fate's Edge\Data`.
 3. xEdit source at `references/xEdit` — `Core/` documents the binary structure of
    every record type. This is the first stop for any format question. Or if working with meshes, go to the Nifskope source at `references/Nifskope`
