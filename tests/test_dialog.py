@@ -28,6 +28,7 @@ from tes5_import.dialog_conditions import (
     convert_ctda,
     convert_ctda_list,
     has_positive_getisid,
+    needs_origin_gate,
     read_getisid_fids,
 )
 from tes5_import.dialog_converter import (
@@ -1116,6 +1117,87 @@ class TestAddTopicUnlocks:
             assert struct.pack('<I', globals_map['TES4Unlock_ratsTOPIC']) in vmad
         finally:
             set_formid_index_offset(0)
+
+
+class TestOriginGate:
+    """Cross-plugin dialogue containment.
+
+    Two converted plugins loaded together (Oblivion.esm + Nehrim.esm) share the
+    whole condition namespace: Skyrim arbitrates dialogue across every loaded
+    file, not per-plugin. A line is only scoped to its own plugin if some
+    condition POSITIVELY names a form that plugin owns.
+    """
+
+    @staticmethod
+    def _ctda(func, operator=0x00, comp=1.0, param1=0x00A082,
+              run_on_target=False):
+        type_byte = operator | (0x02 if run_on_target else 0x00)
+        return (bytes([type_byte, 0, 0, 0]) + struct.pack('<f', comp)
+                + struct.pack('<H', func) + bytes(2)
+                + struct.pack('<I', param1) + bytes(4)).hex()
+
+    def test_run_on_target_pin_does_not_scope_the_speaker(self):
+        """A Target-side test is about the LISTENER, not who is talking.
+
+        `GetIsID(PlayerRef)[Target] == 1` just means "the addressee is the
+        player" — true of every conversation. Oblivion attaches it to greeting
+        and rumour lines; counting it as a pin left 55 INFOs reachable by any
+        actor in the load order.
+        """
+        rec = {'Condition[0].Raw': self._ctda(72, param1=0x00000007,
+                                              run_on_target=True)}
+        assert needs_origin_gate(rec)
+
+    def test_subject_side_pin_still_scopes(self):
+        """The same function on the SUBJECT does scope, and must stay ungated."""
+        rec = {'Condition[0].Raw': self._ctda(72, run_on_target=False)}
+        assert not needs_origin_gate(rec)
+
+    def test_positive_identity_pin_needs_no_gate(self):
+        """A positive test on a plugin-owned form excludes foreign actors.
+
+        GetIsClass(68) counts: CLAS records are converted into the plugin at
+        its own load-order index and the param takes the ordinary load-order
+        remap, unlike GetIsRace whose param is rewritten to a vanilla race.
+        """
+        # GetIsClass / GetInFaction / GetIsID / GetFactionRank
+        for func in (68, 71, 72, 73):
+            rec = {'Condition[0].Raw': self._ctda(func)}
+            assert not needs_origin_gate(rec), f'func {func} should count as pinned'
+
+    def test_negated_identity_is_an_exclusion_not_an_audience(self):
+        """GetIsID(X) == 0 means "anyone EXCEPT X" — it scopes nothing.
+
+        Oblivion's Rumors channel (INFOGENERAL, 1854 lines) is built almost
+        entirely this way. Treating it as pinned let 395 rumour lines reach
+        Nehrim NPCs, which is what showed up in-game as the Oblivion Rumors
+        topic on a Nehrim NPC.
+        """
+        assert needs_origin_gate({'Condition[0].Raw': self._ctda(72, comp=0.0)})
+        assert needs_origin_gate({'Condition[0].Raw': self._ctda(72, 0x20, 1.0)})
+        assert needs_origin_gate({'Condition[0].Raw': self._ctda(71, comp=0.0)})
+
+    def test_race_and_cell_do_not_scope_across_plugins(self):
+        """These do not resolve to a form this plugin uniquely owns.
+
+        GetIsRace's param is rewritten to a VANILLA Skyrim race every converted
+        plugin's NPCs share, so "GenericImperial" means every Imperial in the
+        load order. Race was Oblivion's plugin boundary only because Oblivion
+        was the only file loaded. GetInCell's param is a cell name, not an
+        owned form reference.
+        """
+        for func in (67, 69):              # GetInCell / GetIsRace
+            rec = {'Condition[0].Raw': self._ctda(func)}
+            assert needs_origin_gate(rec), f'func {func} must not count as pinned'
+
+    def test_unconditioned_line_is_gated(self):
+        assert needs_origin_gate({})
+
+    def test_one_positive_pin_anywhere_is_enough(self):
+        """An exclusion alongside a real pin still leaves the line scoped."""
+        rec = {'Condition[0].Raw': self._ctda(72, comp=0.0),
+               'Condition[1].Raw': self._ctda(72, comp=1.0)}
+        assert not needs_origin_gate(rec)
 
 
 if __name__ == '__main__':

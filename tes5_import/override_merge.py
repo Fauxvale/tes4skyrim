@@ -89,6 +89,30 @@ class MasterIndex:
         _, off, size = entry
         return self._data[off:off + size]
 
+    def find_by_edid(self, signature: bytes, edid: str) -> int:
+        """FormID of the master's record with this signature + EditorID (0 if none).
+
+        For SYNTHETIC records the master minted with no TES4 source, so the
+        companion manifest (keyed by source FormID) cannot name them — the
+        generic dialogue quest is the case that matters. EDID is always the
+        first subrecord of the records this is used for, so this stops at the
+        first one rather than parsing the whole body.
+        """
+        want = edid.encode('ascii', 'replace')
+        for fid, (sig, off, size) in self._offsets.items():
+            if sig != signature:
+                continue
+            # Compressed bodies start with a u32 decompressed size, not EDID.
+            if struct.unpack_from('<I', self._data, off + 8)[0] & 0x00040000:
+                continue
+            body = self._data[off + _HEADER_SIZE:off + size]
+            if len(body) < 6 or body[:4] != b'EDID':
+                continue
+            ln = struct.unpack_from('<H', body, 4)[0]
+            if body[6:6 + ln].rstrip(b'\0') == want:
+                return fid
+        return 0
+
 
 class ChainedMasterIndex:
     """Several converted masters queried in load order (last one wins).
@@ -127,6 +151,14 @@ class ChainedMasterIndex:
     def group_path(self, formid: int) -> tuple:
         idx = self._find(formid)
         return idx.group_path(formid) if idx else ()
+
+    def find_by_edid(self, signature: bytes, edid: str) -> int:
+        """Later masters win, matching load order."""
+        for idx in reversed(self._indices):
+            fid = idx.find_by_edid(signature, edid)
+            if fid:
+                return fid
+        return 0
 
 
 class MissingMasterOutputError(RuntimeError):

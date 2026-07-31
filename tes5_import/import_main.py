@@ -385,8 +385,23 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # plugin duplicates master content — 27 spurious VTYP, 35 GLOB, 27 FACT —
     # and the duplicates then compete with the originals the overrides use.
     _step_t = time.time()
+    from .record_types.actors import (create_origin_faction,
+                                      reset_origin_faction)
+    reset_origin_faction()
     if not ctx:
         _create_vtyp_records(writer)
+
+        # Plugin-origin marker faction. ROOT MASTERS ONLY (no TES4 masters of
+        # their own): every actor this file defines joins it, and dialogue that
+        # names no plugin-scoped audience is gated on it, so two converted
+        # plugins loaded together (Oblivion.esm + Nehrim.esm) can't trade
+        # guard/crime/directions/rumour lines. A plugin WITH masters
+        # deliberately skips this — it must stay free to extend and override
+        # its master's dialogue the way an Oblivion DLC does, and its actors
+        # are already members through the master records it inherits.
+        _origin_fact = create_origin_faction(writer)
+        print(f"  Plugin-origin faction: {_origin_fact:08X} "
+              f"(TES4PluginOriginFaction)")
 
         # --- Phase 0a: TES4-specific globals/factions for converted scripts ---
         _create_tes4_special_records(writer)
@@ -962,7 +977,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                 own, writer, npc_to_vtyp, fid_to_edid=fid_to_edid, xref=xref,
                 well_known_props=_WELL_KNOWN_PROPERTIES, voice_map=voice_map,
                 unlock_plan=unlock_plan, unlock_globals=unlock_globals,
-                script_vars=_script_vars)
+                script_vars=_script_vars, master_index=ctx.master_index)
     else:
         dialog_sge_fids = build_dialog_groups(by_type, writer, npc_to_vtyp, fid_to_edid=fid_to_edid, xref=xref, well_known_props=_WELL_KNOWN_PROPERTIES, voice_map=voice_map, unlock_plan=unlock_plan, unlock_globals=unlock_globals, script_vars=_script_vars)
     sge_quest_fids |= dialog_sge_fids

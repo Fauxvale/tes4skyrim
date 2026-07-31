@@ -70,6 +70,7 @@ from .dialog_conditions import (
     convert_ctda_list_with_strings,
     has_any_conditions,
     has_audience_condition,
+    needs_origin_gate,
     read_func_param_fids,
     read_getisid_fids,
     shared_state_conditions,
@@ -1601,12 +1602,27 @@ def build_npc_to_vtyp_map(by_type: dict, num_new_masters: int) -> dict:
 # Main dialogue group builder
 # ===========================================================================
 
-def _make_generic_quest(writer, edid: str, full: str) -> int:
+def _make_generic_quest(writer, edid: str, full: str,
+                        master_index=None) -> int:
     """Create a StartGameEnabled synthetic dialogue quest; return its FormID.
 
     Owns orphan/generic bark topics. Flags 0x0011 (StartGameEnabled +
     StartsEnabled), priority 0, form-version 0. Must be listed in the .seq file
-    to actually run from a new game."""
+    to actually run from a new game.
+
+    When a MASTER already defines this quest, reuse its FormID instead of
+    minting a second one. Both would be StartGameEnabled and own topics of the
+    same subtype, so the engine's one-bark-topic-per-quest arbitration would
+    pick between two rival containers — DLCBattlehornCastle and Morrowind_ob
+    each shipped a duplicate TES4DialogueGeneric competing with Oblivion's.
+    The quest is synthetic (no TES4 source record), so the companion manifest
+    cannot name it and it is resolved by EditorID.
+    """
+    if master_index is not None:
+        existing = master_index.find_by_edid(b'QUST', edid)
+        if existing:
+            print(f"    reusing master's {edid} ({existing:08X})")
+            return existing
     fid = writer.alloc_formid()
     q = pack_string_subrecord('EDID', edid)
     q += pack_string_subrecord('FULL', full)
@@ -1623,7 +1639,8 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
                         voice_map: dict = None,
                         unlock_plan: dict = None,
                         unlock_globals: dict = None,
-                        script_vars: dict = None) -> set:
+                        script_vars: dict = None,
+                        master_index=None) -> set:
     """Build the DIAL/INFO/DLBR/DLVW hierarchy with original-quest ownership.
 
     Returns the set of quest FormIDs that must go in the .seq file (the
@@ -1645,7 +1662,12 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
 
     # --- Synthetic generic dialogue quest (owns orphan conversation topics) ---
     generic_quest_fid = _make_generic_quest(writer, 'TES4DialogueGeneric',
-                                            'TES4 Generic Dialogue')
+                                            'TES4 Generic Dialogue',
+                                            master_index=master_index)
+    # A quest REUSED from a master is already started by the master's .seq;
+    # re-listing it here would start the master's quest from this plugin.
+    generic_is_ours = not (master_index is not None
+                           and generic_quest_fid in master_index)
     # Per-source-DIAL synthetic quests for the quest-less INFOs of bark topics.
     # Skyrim honors only one bark topic per subtype per quest, so GREETING and
     # HELLO (both HELO) cannot both dump their quest-less lines into one shared
@@ -1946,7 +1968,7 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
 
     # Synthetic quests that must run from a new game (in the .seq file): the
     # generic conversation-topic quest + the per-subtype generic bark quests.
-    return {generic_quest_fid} | bark_sge
+    return ({generic_quest_fid} if generic_is_ours else set()) | bark_sge
 
 
 def read_getisid_fids_for_topic(child_infos: list) -> set:
@@ -2561,5 +2583,21 @@ def _build_injected_ctdas(info_rec, is_bark, npc_to_vtyp, topic_vtyps,
     if quest_gate_bytes:
         stats['quest_gated'] += 1
 
-    return (quest_gate_bytes + unlock_gate_bytes + state_bytes + voice_bytes
-            + id_bytes + sib_bytes)
+    # Plugin-origin gate. A single AND-ed GetInFaction, placed FIRST so it can
+    # never be swallowed by a following OR-chain, and left on RunOn=Subject so
+    # it tests the SPEAKER (on Target it would test the player, who is in no
+    # plugin's origin faction, and every gated line would die).
+    #
+    # Only for lines that positively name no plugin-owned audience themselves.
+    # Read from the actors module (per-run global, set only for root masters)
+    # rather than threaded through _build_one_topic's already-long signature.
+    from .record_types.actors import get_origin_faction_fid
+    origin_faction_fid = get_origin_faction_fid()
+    origin_bytes = b''
+    if origin_faction_fid and needs_origin_gate(info_rec):
+        origin_bytes = build_or_chain(FUNC_GET_IN_FACTION,
+                                      [origin_faction_fid])
+        stats['origin_gated'] = stats.get('origin_gated', 0) + 1
+
+    return (origin_bytes + quest_gate_bytes + unlock_gate_bytes + state_bytes
+            + voice_bytes + id_bytes + sib_bytes)

@@ -622,6 +622,86 @@ def has_any_conditions(rec: dict) -> bool:
 # is not an audience restriction.
 _AUDIENCE_FUNCS = frozenset({67, 68, 69, 71, 72, 73})
 
+# The subset of _AUDIENCE_FUNCS whose parameter is a form THIS PLUGIN owns, so
+# the condition cannot pass for an actor belonging to a different converted
+# plugin: GetInFaction(71), GetIsID(72), GetFactionRank(73), GetIsClass(68).
+#
+# CLAS records ARE converted into the output plugin (192 in Oblivion, 30 in
+# Nehrim, every one at the plugin's own load-order index), and func 68 takes
+# the ordinary load-order remap, so its param stays plugin-owned and a foreign
+# actor can never match it.
+#
+# The other two do NOT scope across plugins, even though they scope perfectly
+# well inside one:
+#   * GetIsRace(69)  — _map_race_param rewrites the param to a VANILLA SKYRIM
+#     race (0x000131F0 Imperial, ...), which every converted plugin's NPCs
+#     share.  In Oblivion race WAS the plugin boundary because only Oblivion
+#     existed; after conversion "GenericImperial" means every Imperial in the
+#     whole load order, Nehrim's included.  RACE is the one audience function
+#     with a vanilla-remap step, which is exactly why it stops scoping.
+#   * GetInCell(67)  — a cell name, not an owned form reference.
+_PLUGIN_SCOPED_AUDIENCE_FUNCS = frozenset({68, 71, 72, 73})
+
+
+def _condition_tests(rec: dict):
+    """Yield (func_idx, operator, comp_value, run_on_target) per TES4 condition."""
+    i = 0
+    while True:
+        raw_hex = rec.get(f'Condition[{i}].Raw')
+        if raw_hex is None:
+            break
+        i += 1
+        if not raw_hex or len(raw_hex) < 24:
+            continue
+        try:
+            raw = bytes.fromhex(raw_hex)
+            yield (struct.unpack_from('<H', raw, 8)[0],   # function
+                   raw[0] & 0xF0,                        # comparison operator
+                   struct.unpack_from('<f', raw, 4)[0],  # compare value
+                   bool(raw[0] & CTDA_RUN_ON_TARGET))
+        except (ValueError, struct.error):
+            continue
+
+
+def _asserts_membership(operator: int, comp_value: float) -> bool:
+    """True if this comparison ASSERTS membership rather than denying it.
+
+    Same rule as read_getisid_fids(positive_only=True): the "is this NPC"
+    form is exactly `== 1.0`. Everything else — `== 0` / `!= 1` ("anyone
+    EXCEPT this one") and the ordering comparisons — leaves the audience open
+    and cannot scope a line to this plugin's actors.
+    """
+    return operator == 0x00 and comp_value == 1.0
+
+
+def needs_origin_gate(rec: dict) -> bool:
+    """True if this INFO can be reached by an actor from a DIFFERENT plugin.
+
+    A line is safely scoped only by a condition that POSITIVELY names a form
+    this plugin owns AND evaluates against the SPEAKER. Three traps, each
+    measured against the real Oblivion/Nehrim exports:
+
+      * Race/cell gates look like an audience but don't resolve to a form this
+        plugin uniquely owns — GetIsRace's param is rewritten to a vanilla
+        Skyrim race every converted plugin shares. This is the measured cause
+        of Oblivion guard/crime/directions lines playing on Nehrim NPCs.
+      * A NEGATIVE membership test is an exclusion, not an audience. Oblivion's
+        Rumors channel (INFOGENERAL, 1854 lines) is built almost entirely from
+        `GetIsID(SomeNPC) == 0` — "any speaker other than X". Counting that as
+        pinned left 395 rumour lines (plus 77 with no conditions at all)
+        reaching Nehrim NPCs — the Oblivion Rumors topic seen in-game on a
+        Nehrim NPC.
+      * A RunOn=Target test is about the LISTENER, not the speaker.
+        `GetIsID(PlayerRef)[Target] == 1` means "the addressee is the player",
+        which every conversation satisfies and which says nothing about who is
+        talking. Counting it as a pin left 55 greeting/rumour/guard lines open
+        to any actor in the load order.
+    """
+    return not any(f in _PLUGIN_SCOPED_AUDIENCE_FUNCS
+                   and _asserts_membership(op, cv)
+                   and not run_on_target
+                   for f, op, cv, run_on_target in _condition_tests(rec))
+
 
 # Condition functions that express a WORLD-STATE precondition for a topic
 # rather than an audience: quest stage/running/completed and the player's

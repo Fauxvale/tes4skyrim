@@ -589,6 +589,47 @@ _merchant_marker_faction_fid = 0
 # merchandise instead of just the NPC's carried items.
 _merchant_faction_by_npc: dict[int, int] = {}
 
+# "Belongs to this converted plugin" marker faction. Every actor this file
+# defines joins it, and dialogue that states no plugin-scoped audience of its
+# own is gated on it (see dialog_conditions.needs_origin_gate).
+#
+# Without it, two converted plugins loaded together cross-talk: Oblivion's
+# guard/crime/directions/rumour lines are scoped only by GetIsRace (or by a
+# NEGATIVE GetIsID), and conversion rewrites GetIsRace to a VANILLA Skyrim race
+# every plugin shares, so Nehrim NPCs passed them. Race was Oblivion's plugin
+# boundary only because Oblivion was the only file loaded.
+#
+# ONLY a root master (no TES4 masters of its own) creates and applies this.
+# A DLC/plugin must stay ungated so it can extend and override its master's
+# dialogue exactly as it does in Oblivion — its own actors are already members
+# via the master's NPC records it inherits or overrides.
+_origin_faction_fid = 0
+
+
+def get_origin_faction_fid() -> int:
+    """The plugin-origin marker FACT, or 0 when this file isn't gated."""
+    return _origin_faction_fid
+
+
+def create_origin_faction(writer) -> int:
+    """Create the plugin-origin marker faction. Root masters only.
+
+    A plain membership marker: no flags, no relations, no vendor data, so it
+    can never affect crime, combat reaction, or the barter menu.
+    """
+    global _origin_faction_fid
+    _origin_faction_fid = writer.alloc_formid()
+    subs = pack_string_subrecord('EDID', 'TES4PluginOriginFaction')
+    subs += pack_subrecord('DATA', struct.pack('<I', 0))
+    writer.add_record('FACT', pack_record('FACT', _origin_faction_fid, 0, subs))
+    return _origin_faction_fid
+
+
+def reset_origin_faction() -> None:
+    """Clear origin-faction state (per-run isolation for tests/batch runs)."""
+    global _origin_faction_fid
+    _origin_faction_fid = 0
+
 
 def _keywords_for_services(services: int) -> list[int]:
     """Return unique sorted Skyrim KYWD FormIDs for a TES4 services bitmask."""
@@ -951,6 +992,12 @@ def convert_NPC_(rec: dict, writer=None) -> bytes:
         subs += pack_subrecord('SNAM', struct.pack('<IbBBB',
                                                    _trainer_faction_fid, 0, 0, 0, 0))
 
+    # SNAM — Plugin-origin marker (root masters only). Keeps this file's
+    # unscoped dialogue off another converted plugin's actors.
+    if _origin_faction_fid:
+        subs += pack_subrecord('SNAM', struct.pack('<IbBBB',
+                                                   _origin_faction_fid, 0, 0, 0, 0))
+
     # INAM — Death item
     inam = get_formid(rec, 'INAM.DeathItem')
     if inam:
@@ -1099,6 +1146,11 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
     for vfid in crea_vendor_fids:
         subs += pack_subrecord('SNAM', struct.pack('<IbBBB', vfid, 0, 0, 0, 0))
     crea_vendor_fid = crea_vendor_fids[0] if crea_vendor_fids else 0
+
+    # Plugin-origin marker (root masters only) — see convert_NPC_.
+    if _origin_faction_fid:
+        subs += pack_subrecord('SNAM', struct.pack('<IbBBB',
+                                                   _origin_faction_fid, 0, 0, 0, 0))
 
     # Death item
     inam = get_formid(rec, 'INAM.DeathItem')
