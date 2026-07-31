@@ -211,7 +211,12 @@ def creature_capped_level(rec: dict) -> int:
         # fits, and capped at the U16 field.
         need = surplus - 32767
         level = max(level, min(65535, -(-need // TES5_HEALTH_LEVEL_BONUS) + 1))
-    return level
+    # ACBS.Level is a U16 struct field. CREATURE_RACE_BASE_HEALTH is a float
+    # (it is packed as <f into RACE DATA), so surplus — and every level derived
+    # from it above — is a float too, which struct.pack rejects with "required
+    # argument is not an integer". Only creatures needing the raise-level branch
+    # (health surplus > 32767) ever hit it, which is why it went unnoticed.
+    return int(level)
 
 
 def _race_data(rec: dict) -> bytes:
