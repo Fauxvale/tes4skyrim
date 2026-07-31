@@ -2133,12 +2133,30 @@ def scale_constraint_pivots(data):
 def _offset_collision_shape_verts(co, ox, oy, oz):
     """Add (ox, oy, oz) game-unit offset to all collision shape vertices.
 
-    In Oblivion bhkNiTriStripsShape the vertices are stored at game-unit scale
-    (×7 Havok units).  Adding the game-unit offset here bakes a child NiNode's
-    world-space translation into the shape so the collision stays in the correct
-    position after the node is hoisted to the root.
+    Bakes a child NiNode's world-space translation into the shape so the
+    collision stays in the correct position after the node is hoisted to the
+    root (which sits at the origin).
 
-    Traverses: bhkCollisionObject → body → shape → (bhkMoppBvTreeShape →) bhkNiTriStripsShape
+    BOTH mesh shape types must be handled, and they store vertices at
+    DIFFERENT scales:
+
+      * bhkNiTriStripsShape      — game units (×7 Havok units) → add as-is.
+      * bhkPackedNiTriStripsShape — 1/7 game units (i.e. Oblivion Havok
+        units) → the offset must be divided by 7 first.
+
+    Handling only the strips case silently dropped the offset for every
+    packed-shape mesh, leaving its collision centred on the origin while the
+    visual mesh sat elsewhere.  Battlehorn's stackstairsmid02b is the case in
+    point: a `collisionStackBalconyMid02b` node at Z=+394.5 whose collision
+    came through at z[-332.8..332.8] instead of z[61.7..727.3] — the shape
+    ends up half a storey low, which on a stair/balcony wedge reads in-game
+    as the collision being flipped upside-down.  Its sibling
+    stackbalconymid02.nif has the identical node offset but ships a
+    bhkNiTriStripsShape, so it was always converted correctly — the pair is
+    the A/B that isolates the shape type as the discriminator.
+
+    Traverses: bhkCollisionObject → body → shape → (bhkMoppBvTreeShape →)
+    bhkNiTriStripsShape | bhkPackedNiTriStripsShape
     """
     rb = getattr(co, 'body', None)
     if rb is None:
@@ -2147,15 +2165,30 @@ def _offset_collision_shape_verts(co, ox, oy, oz):
     # Unwrap bhkMoppBvTreeShape to get at the inner shape
     if shape is not None and isinstance(shape, NifFormat.bhkMoppBvTreeShape):
         shape = shape.shape
-    if shape is None or not isinstance(shape, NifFormat.bhkNiTriStripsShape):
+    if shape is None:
         return
-    for sd in shape.strips_data:
-        if sd is None:
-            continue
-        for v in sd.vertices:
-            v.x += ox
-            v.y += oy
-            v.z += oz
+
+    if isinstance(shape, NifFormat.bhkNiTriStripsShape):
+        for sd in shape.strips_data:
+            if sd is None:
+                continue
+            for v in sd.vertices:
+                v.x += ox
+                v.y += oy
+                v.z += oz
+        return
+
+    if isinstance(shape, NifFormat.bhkPackedNiTriStripsShape):
+        data = getattr(shape, 'data', None)
+        if data is None:
+            return
+        sx = ox / _OB_GAME_UNITS_PER_HAVOK
+        sy = oy / _OB_GAME_UNITS_PER_HAVOK
+        sz = oz / _OB_GAME_UNITS_PER_HAVOK
+        for v in data.vertices:
+            v.x += sx
+            v.y += sy
+            v.z += sz
 
 
 _OB_GAME_UNITS_PER_HAVOK = 7.0  # Oblivion: 1 Havok unit = 7 game units
