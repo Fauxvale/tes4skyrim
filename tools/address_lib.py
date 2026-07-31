@@ -14,7 +14,10 @@ conclusion drawn from it is fiction.
 Format: SKSE64 Address Library v2 ("database version 2"), little-endian.
 
 Usage:
-    # translate a crash-log frame to the GOG (disassemblable) build
+    # translate an ENTIRE crash log's call stack in one shot (start here)
+    python tools/address_lib.py --log "path/to/crash-....log"
+
+    # translate a single crash-log frame to the GOG (disassemblable) build
     python tools/address_lib.py --id 107327 --to 1.6.659 --offset 0x3A0
 
     # which stable ID owns a raw RVA in a given build?
@@ -27,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import struct
 import sys
 from pathlib import Path
@@ -89,29 +93,56 @@ class Reader:
         return v
 
 
-def _read_value(r: Reader, width: int) -> int:
-    """Read a value whose byte-width is encoded in the control nibble."""
-    if width == 0:
-        return r.u8()
-    if width == 1:
-        return r.u16()
-    if width == 2:
-        return r.u32()
-    raise ValueError(f"bad value width {width}")
-
-
 def load(path: Path) -> dict[int, int]:
-    """Parse a versionlib v2 database into {stable_id: rva}."""
+    """Parse a versionlib v2 database into {stable_id: rva}.
+
+    Format (per CommonLibSSE ``REL::IDDB::unpack_file``): each entry starts with
+    one control byte split into two nibbles -- the LOW nibble selects how the
+    stable id is encoded, the HIGH nibble how the offset is.  Both nibbles use
+    the same kind table:
+
+        0 = absolute u64      4 = prev + u16
+        1 = prev + 1          5 = prev - u16
+        2 = prev + u8         6 = absolute u16
+        3 = prev - u8         7 = absolute u32
+
+    Note kinds 6 and 7 are u16/u32 -- reading them as u64 desyncs the whole
+    stream, since every entry is delta-coded against the previous one.
+
+    Bit 3 of the HIGH nibble (0x80 in the control byte) is the pointer-size
+    flag: the *previous* offset is divided by ptr_size before the delta is
+    applied, and the result multiplied back afterwards.  It is not a plain
+    "multiply the delta" scale -- that yields wrong RVAs for kinds 0/6/7.
+    """
     r = Reader(path.read_bytes())
     fmt = r.i32()
     if fmt != 2:
         raise SystemExit(f"{path.name}: unsupported database format {fmt} (expected 2)")
 
-    ver = [r.i32() for _ in range(4)]
+    [r.i32() for _ in range(4)]  # build version quad
     name_len = r.i32()
     r.string(name_len)
     ptr_size = r.i32()
     count = r.i32()
+
+    def read_kind(kind: int, prev: int) -> int:
+        if kind == 0:
+            return r.u64()
+        if kind == 1:
+            return prev + 1
+        if kind == 2:
+            return prev + r.u8()
+        if kind == 3:
+            return prev - r.u8()
+        if kind == 4:
+            return prev + r.u16()
+        if kind == 5:
+            return prev - r.u16()
+        if kind == 6:
+            return r.u16()
+        if kind == 7:
+            return r.u32()
+        raise ValueError(f"bad kind {kind}")
 
     out: dict[int, int] = {}
     prev_id = 0
@@ -119,57 +150,71 @@ def load(path: Path) -> dict[int, int]:
 
     for _ in range(count):
         ctl = r.u8()
-        id_kind = ctl & 0x07  # low 3 bits: how the stable id is encoded
-        off_kind = (ctl >> 3) & 0x07  # next 3 bits: how the offset is encoded
-        # bit 6 (0x40): offset value is pre-divided by ptr_size
+        lo = ctl & 0x0F
+        hi = (ctl >> 4) & 0x0F
 
-        if id_kind == 0:
-            cur_id = r.u64()
-        elif id_kind == 1:
-            cur_id = prev_id + 1
-        elif id_kind == 2:
-            cur_id = prev_id + r.u8()
-        elif id_kind == 3:
-            cur_id = prev_id - r.u8()
-        elif id_kind == 4:
-            cur_id = prev_id + r.u16()
-        elif id_kind == 5:
-            cur_id = prev_id - r.u16()
-        elif id_kind == 6:
-            cur_id = r.u32()
-        elif id_kind == 7:
-            cur_id = r.u64()
-        else:
-            raise ValueError("unreachable")
+        cur_id = read_kind(lo, prev_id)
 
-        # Bit 6 means the *delta* forms are expressed in pointer-size units.
-        # Absolute forms (0, 6, 7) are always raw byte offsets.
-        scale = ptr_size if (ctl & 0x40) else 1
-
-        if off_kind == 0:
-            cur_off = r.u64()
-        elif off_kind == 1:
-            cur_off = prev_off + scale
-        elif off_kind == 2:
-            cur_off = prev_off + r.u8() * scale
-        elif off_kind == 3:
-            cur_off = prev_off - r.u8() * scale
-        elif off_kind == 4:
-            cur_off = prev_off + r.u16() * scale
-        elif off_kind == 5:
-            cur_off = prev_off - r.u16() * scale
-        elif off_kind == 6:
-            cur_off = r.u32()
-        elif off_kind == 7:
-            cur_off = r.u64()
-        else:
-            raise ValueError("unreachable")
+        scaled = bool(hi & 0x08)
+        base = (prev_off // ptr_size) if scaled else prev_off
+        cur_off = read_kind(hi & 0x07, base)
+        if scaled:
+            cur_off *= ptr_size
 
         out[cur_id] = cur_off
         prev_id = cur_id
         prev_off = cur_off
 
+    if r.p != len(r.d):
+        raise SystemExit(
+            f"{path.name}: parsed {len(out)} entries but consumed {r.p} of "
+            f"{len(r.d)} bytes -- the stream desynced, results are unusable"
+        )
+
     return out
+
+
+FRAME_RE = re.compile(r"->\s*(\d+)\+0x([0-9A-Fa-f]+)")
+
+
+def translate_log(path: Path, src: str, dst: str, extra_dir: str | None) -> int:
+    """Translate every '-> <id>+0x<off>' frame in a crash log into dst-build RVAs.
+
+    Crash logs come from the Steam build; this prints the matching GOG RVAs so the
+    whole call stack can be disassembled without hand-translating each frame.
+    """
+    text = path.read_text(errors="replace")
+    frames: list[tuple[int, int]] = []
+    seen = set()
+    for m in FRAME_RE.finditer(text):
+        key = (int(m.group(1)), int(m.group(2), 16))
+        if key not in seen:
+            seen.add(key)
+            frames.append(key)
+
+    if not frames:
+        print(f"no '-> <id>+0x<offset>' frames found in {path.name}")
+        return 1
+
+    src_db = load(find_versionlib(src, extra_dir))
+    dst_db = load(find_versionlib(dst, extra_dir))
+
+    print(f"{path.name}: {len(frames)} unique frames  ({src} -> {dst})\n")
+    print(f"{'ID':>8}  {'offset':>8}  {src + ' RVA':>14}  {dst + ' RVA':>14}")
+    for sid, off in frames:
+        s = src_db.get(sid)
+        d = dst_db.get(sid)
+        s_txt = f"{s + off:#x}" if s is not None else "-"
+        d_txt = f"{d + off:#x}" if d is not None else "(not in build)"
+        print(f"{sid:>8}  {off:>#8x}  {s_txt:>14}  {d_txt:>14}")
+
+    print(
+        "\ndisassemble any of the above with:\n"
+        "  python tools/skyrim_disasm.py "
+        '--exe "D:\\Other Games\\Skyrim Anniversary Edition\\SkyrimSE.exe" '
+        "--disasm <RVA> --count 200"
+    )
+    return 0
 
 
 def owning_id(db: dict[int, int], rva: int) -> tuple[int, int] | None:
@@ -206,10 +251,17 @@ def main() -> int:
         help="byte offset inside the function (from a crash frame's '+0xNNN')",
     )
     ap.add_argument("--dir", help="extra directory to search for versionlib bins")
+    ap.add_argument(
+        "--log",
+        help="translate every frame in a CrashLoggerSSE .log into --to build RVAs",
+    )
     args = ap.parse_args()
 
+    if args.log:
+        return translate_log(Path(args.log), args.src, args.dst, args.dir)
+
     if args.id is None and args.rva is None:
-        ap.error("need --id or --rva")
+        ap.error("need --id, --rva, or --log")
 
     src_db = load(find_versionlib(args.src, args.dir))
     sid = args.id
