@@ -23,7 +23,8 @@ from concurrent.futures import ProcessPoolExecutor
 from .constants import (AMBIENT_GMST_OVERRIDES, IMPORT_DISPATCH, SKIP_TYPES,
                         TYPE_MAP)
 from .master_manifest import write_manifest
-from .overrides import (OverrideContext, build_nested_overrides,
+from .overrides import (DELETED_FLAG as OVERRIDE_DELETED_FLAG,
+                        OverrideContext, build_nested_overrides,
                         detect_injected_records)
 from .magic_effects import set_tes4_effect_names
 from .dialog_converter import (
@@ -304,6 +305,26 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
 
     # Parse all records
     all_records = parse_export_directory(export_dir)
+    # A record the author DELETED and that is this plugin's OWN (not an
+    # override of a master's) is pure bloat: there is nothing to remove, so
+    # converting it would emit a live record the author had thrown away. The
+    # export carries it as an empty stub, so it would also convert to a
+    # contentless REFR with no NAME. Overrides are NOT filtered here — a
+    # deleted override is meaningful and OverrideContext.build turns it into a
+    # proper deletion stub (see overrides.make_deleted_record).
+    if all_records:
+        keep = []
+        dropped_deleted = 0
+        for rec in all_records:
+            if (int(rec.get('RecordFlags') or 0) & OVERRIDE_DELETED_FLAG
+                    and (ctx is None or ctx.master_record(rec) is None)):
+                dropped_deleted += 1
+                continue
+            keep.append(rec)
+        if dropped_deleted:
+            print(f"  Dropped {dropped_deleted} record(s) the author deleted "
+                  f"and that this plugin itself defines")
+            all_records = keep
     by_type = group_records_by_type(all_records)
 
     t1 = time.time()
@@ -742,6 +763,13 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                     if ov.record_bytes:
                         writer.add_record('SOUN', ov.record_bytes)
                         converted += 1
+                        # Volume and falloff live on the SNDR companion, not on
+                        # the SOUN, so an authored attenuation change has to
+                        # override the MASTER's SNDR as well — otherwise the
+                        # sound keeps the master's loudness.
+                        sndr_ov = ctx.build_soun_companion(rec, writer)
+                        if sndr_ov:
+                            writer.add_record('SNDR', sndr_ov)
                     continue
                 soun_bytes, sndr_bytes, sndr_fid = convert_SOUN(rec, writer)
                 writer.add_record('SOUN', soun_bytes)

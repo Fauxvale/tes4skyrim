@@ -22,7 +22,9 @@ from collections import Counter, namedtuple
 
 from .export_diff import diff_records
 from .master_manifest import load_master_manifests
-from .override_builder import RECONVERT_KEYS, apply_changes
+from .override_builder import (_HEADER_SIZE, RECONVERT_KEYS, apply_changes,
+                               rebuild_sndr_override, soun_companion_changes,
+                               split_subrecords)
 from .override_merge import load_master_index
 from .text_reader import parse_export_directory, remap_formid
 from .writer import PluginWriter, pack_group
@@ -33,8 +35,21 @@ from .writer import PluginWriter, pack_group
 # never silently dropped.
 OVERRIDE_UNMAPPABLE_TYPES = frozenset({'PGRD', 'ROAD'})
 
+# Record header flag bit 5. Both games use it, and the meaning is the same:
+# the author DELETED this record. xEdit treats bit 5 as 'Deleted' for every
+# signature (wbFlagsList's aDeleted branch, Core/wbInterface.pas:5874).
+#
+# A deleted override is an empty stub — FormID and flags only, with every
+# subrecord stripped. That shape has to be recognised BEFORE the field diff
+# runs, because a field-by-field comparison reads all those absent subrecords
+# as authored changes: DLCBattlehornCastle deletes 74 references, and the diff
+# reported them as 74 XSCL.Scale + 73 NAME "edits" with no mapping, so all 74
+# shipped ALIVE at the master's position.
+DELETED_FLAG = 0x20
+
 Override = namedtuple('Override', ['status', 'out_fid', 'record_bytes'])
-# status: 'emitted' | 'unchanged' | 'no-base' | 'no-path' | 'reconvert'
+# status: 'emitted' | 'deleted' | 'unchanged' | 'no-base' | 'no-path'
+#         | 'reconvert'
 
 
 def load_master_export(export_dir: str) -> dict:
@@ -68,6 +83,37 @@ def load_master_export(export_dir: str) -> dict:
             if fid:
                 out[fid.upper()] = rec
     return out
+
+
+def make_deleted_record(base: bytes) -> bytes:
+    """The master's record restated as a DELETED override.
+
+    Shape verified by census against the vanilla record-deleting masters
+    (Update/Dawnguard/HearthFires/Dragonborn, 612 deleted records):
+
+      * a deleted REFR/ACHR keeps ONLY its NAME subrecord — 532 of the 612 are
+        exactly `NAME(4) = base object`, dataSize 10. It is not a bare header;
+        the engine still wants to know what the reference was.
+      * everything else (NAVM and the handful of deleted STAT/NPC_/SPEL/IDLE)
+        carries an EMPTY body, dataSize 0.
+
+    In both cases the Deleted flag is set and every other subrecord is
+    dropped. Keeping the master's full body with only the flag added is NOT
+    what vanilla does and leaves the engine loading a record it is being told
+    to remove.
+    """
+    if len(base) < _HEADER_SIZE:
+        return base
+    flags = struct.unpack_from('<I', base, 8)[0] | DELETED_FLAG
+    # Preserve NAME for reference records, matching vanilla's shape.
+    body = b''
+    if base[:4] in (b'REFR', b'ACHR', b'ACRE'):
+        for sig, payload in split_subrecords(base):
+            if sig == b'NAME':
+                body = sig + struct.pack('<H', len(payload)) + payload
+                break
+    return (base[:4] + struct.pack('<II', len(body), flags)
+            + base[12:_HEADER_SIZE] + body)
 
 
 def master_output_formid(src_fid: str, master_manifest) -> int:
@@ -172,6 +218,18 @@ class OverrideContext:
             self.stats['no-base'] += 1
             return Override('no-base', out_fid, b'')
 
+        if int(rec.get('RecordFlags') or 0) & DELETED_FLAG:
+            # The author DELETED this record. Deletion is expressed by the
+            # header flag, not by the field diff — the plugin's record is an
+            # empty stub, so diffing it against the master reports every
+            # subrecord the master has as an unmappable "change" and the
+            # record ships alive. Emit the master's header with the flag set
+            # and NO body, which is exactly what the deleting plugin itself
+            # ships and what the engine reads as "remove this reference".
+            self.stats['deleted'] += 1
+            return Override('deleted', out_fid,
+                            make_deleted_record(base))
+
         changes = diff_records(master_rec, rec)
         if not changes:
             # An override that changes nothing is pure bloat.
@@ -195,8 +253,35 @@ class OverrideContext:
         self.stats['emitted'] += 1
         return Override('emitted', out_fid, record_bytes)
 
+    def build_soun_companion(self, rec: dict, writer) -> bytes:
+        """Override of the master's SNDR when a SOUN's volume/falloff changed.
+
+        Returns b'' when nothing sound-related was authored (the master's SNDR
+        already says the right thing) or when the master's companion cannot be
+        located. The SNDR keeps the MASTER's FormID, so every SOUN already
+        pointing at it — including this override's own SDSC — still resolves.
+        """
+        master_rec = self.master_record(rec)
+        if master_rec is None:
+            return b''
+        changes = diff_records(master_rec, rec)
+        if not soun_companion_changes(changes):
+            return b''
+        src_fid = (rec.get('FormID') or '').upper()
+        for fid in self.master_manifest.companions(src_fid):
+            base = self.master_index.record(fid)
+            if base[:4] == b'SNDR':
+                out = rebuild_sndr_override(base, rec, writer)
+                if out:
+                    self.stats['soun-companion'] += 1
+                    for key in changes:
+                        self.unmapped_keys.pop(key, None)
+                return out
+        return b''
+
     def report(self):
         print(f"  Overrides: {self.stats['emitted']} emitted, "
+              f"{self.stats['deleted']} deleted by the author, "
               f"{self.stats['reconverted']} reconverted (effect-list change), "
               f"{self.stats['unchanged']} unchanged (dropped), "
               f"{self.stats['no-base']} without a converted master record, "
@@ -365,7 +450,10 @@ def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
             if ov is None:
                 new_records.append((sig, rec))
                 continue
-            if ov.status != 'emitted':
+            # 'deleted' carries real bytes (the author's deletion) and must be
+            # shipped in the master's nesting exactly like an edit — dropping
+            # it would leave the master's reference alive in-game.
+            if ov.status not in ('emitted', 'deleted'):
                 dropped += 1
                 continue
             pending.append((ov.out_fid, ov.record_bytes,

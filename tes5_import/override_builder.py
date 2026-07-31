@@ -10,23 +10,33 @@ the master. That is the property that makes this robust: a field we never touch
 cannot drift, so there is no class of "our pass re-derived it differently" bug
 to guard against with heuristics.
 
-Authored changes are applied three ways, in order of preference:
+Authored changes are applied by running the record's OWN converter over the
+plugin's export and substituting the subrecords that differ from the same
+converter's output for the master (generic_substitutions). That is the general
+case and it is exact — the bytes are what a full conversion of the plugin's
+record would have produced, because it is that conversion.
+
+Four narrower mechanisms take precedence where they apply:
 
 1. String substitution (_STRING_SUBRECORD & friends) — translated text copied
    straight into the corresponding subrecord.
-2. Subrecord rebuild (_REBUILDERS) — the changed field feeds a TES5 subrecord
-   the converter derives (XCLL, ACBS, DNAM, BOD2, ...). The SAME builder
-   function the converter uses is re-run against the PLUGIN's export record
-   and the whole subrecord is substituted. This cannot drift: fields the
-   author didn't touch are identical in both exports, so the rebuilt bytes
-   match the master's for everything but the authored change.
-3. Explicitly inexpressible (_INEXPRESSIBLE) — the converter provably drops
-   the TES4 field (TES5 has no counterpart), so the change is a no-op and is
-   counted as applied rather than reported as noise.
+2. Subrecord rebuild (_REBUILDERS) and in-place patchers (_PATCHERS) — for
+   fields whose output subrecord depends on state a PLUGIN run does not have:
+   alias indices, vendor factions, the object-script plan. Re-converting the
+   whole record there would discard what only the master's run knew, so just
+   the authored field is rebuilt or patched.
+3. Run rebuilds (_RUN_REBUILDERS) — a whole family of repeated subrecords
+   (inventory, spells, packages, quest objectives) regenerated as a unit.
+4. Explicitly inexpressible (_INEXPRESSIBLE) — TES5 has no counterpart for
+   the TES4 field, verified against the xEdit record definition, so the change
+   is genuinely a no-op rather than something we failed to carry.
 
-An export key none of those cover is reported by the caller rather than
-guessed at. The master's value stays, and the run prints a summary, so a
-missing mapping is visible instead of silent.
+A record DELETED by the author is not a field change at all and is handled
+before any of this — see overrides.make_deleted_record.
+
+An export key none of these can express is reported by the caller rather than
+guessed at, and the run prints a summary, so a gap is visible instead of
+silent.
 """
 
 import struct
@@ -106,6 +116,20 @@ _INEXPRESSIBLE = frozenset({
     ('NPC_', 'DATA.Speed'),
     ('NPC_', 'DATA.Agility'),
     ('NPC_', 'DATA.Personality'),
+    # A TES4 DIAL's QSTI list is a DERIVED back-reference — the set of quests
+    # owning an INFO under this topic — which the CS recomputes per file. TES5
+    # has no counterpart: its DIAL carries a single QNAM quest owner, and
+    # dialog_converter keys topic ownership off each INFO's OWN QSTI.Quest
+    # (never the DIAL's list). So a plugin adding its own quest's INFOs to
+    # GREETING rewrites this list without authoring anything the output can
+    # hold; the INFOs it added carry the real change.
+    ('DIAL', 'Quest[]'),
+    # TES4 chains a topic's responses with PNAM ('Previous INFO'). TES5's INFO
+    # has NO such field (wbDefinitionsTES5 INFO: EDID VMAD DATA ENAM ... — no
+    # PNAM anywhere); Skyrim orders responses by their physical position in the
+    # topic's GRUP instead, which the override path already preserves by
+    # keeping the master's nesting. So re-pointing the chain is a no-op.
+    ('INFO', 'PNAM.PrevInfo'),
 })
 
 # TES4 NPC_ skill fields — all feed the DNAM rebuild (_npc_skills_dnam).
@@ -356,6 +380,135 @@ RECONVERT_KEYS = frozenset({
 
 
 # --------------------------------------------------------------------------
+# The PRIMARY path: convert BOTH exports and substitute what differs.
+#
+# This is how an authored change SHOULD be applied. Run the record's OWN
+# converter — the very function that produced the master's bytes — over the
+# master's export and over the plugin's, diff the two results
+# subrecord-by-subrecord, and substitute exactly the ones that differ. The
+# result is what a full conversion of the plugin's record would have produced
+# for that field, because it IS that conversion.
+#
+# It is exact, not approximate, for the same reason the whole override model
+# is: both sides run the SAME converter in the SAME process, so a field the
+# author did not touch produces identical bytes and is never substituted. Only
+# genuinely authored differences survive the diff. It also self-maintains — a
+# converter that starts emitting a new subrecord is covered automatically,
+# with no registry entry to forget.
+#
+# The hand-written specs above are the EXCEPTIONS, and they take precedence
+# only where this cannot run: a converter needing state a plugin pass does not
+# have (alias indices, vendor factions, the object-script plan). Those specs
+# are second implementations of a converter's logic and can drift from it;
+# this cannot.
+# --------------------------------------------------------------------------
+
+# Signatures whose converter takes extra run-state (a writer to mint companion
+# records, an alias/package context). Calling them with that state absent would
+# either crash or silently emit a record shorn of its companions, so they are
+# excluded from the generic path and rely on the explicit specs above.
+_NO_GENERIC_CONVERT = frozenset({
+    'SOUN',   # attenuation/volume live in the companion SNDR, needs writer
+    'PACK',   # PTDA/PLDT alias indices come from PackContext
+    'QUST',   # alias indices + VMAD bindings are allocated per run
+    'DIAL',   # topic keying is derived across the whole INFO set
+    'INFO',
+    'CELL',   # emitted as pre-built GRUP bytes, not via the dispatch table
+    'WRLD',
+    'LAND',
+})
+
+
+def _converted_subrecords(rec: dict):
+    """{sig: [payloads]} from running this record's own converter, or None."""
+    from .constants import IMPORT_DISPATCH
+    sig = rec.get('Signature')
+    fn = IMPORT_DISPATCH.get(sig)
+    if fn is None:
+        return None
+    try:
+        out = fn(rec)
+    except Exception:
+        # A converter that cannot run on this record tells us nothing; the
+        # caller falls back to reporting the key as unmapped.
+        return None
+    if isinstance(out, tuple):
+        out = out[0]
+    if not isinstance(out, (bytes, bytearray)):
+        return None
+    subs = split_subrecords(bytes(out))
+    if not subs:
+        return None
+    grouped = {}
+    for s, payload in subs:
+        grouped.setdefault(s, []).append(payload)
+    return grouped
+
+
+# SOUN's volume/falloff data does NOT live on the SOUN record — it lives on
+# the companion SNDR (BNAM static attenuation) and the SOPM that SNDR's ONAM
+# points at (min/max distance). An override that reuses the master's SOUN
+# therefore has to override the master's SNDR too, or an authored attenuation
+# change silently keeps the master's loudness.
+_SOUN_COMPANION_KEYS = frozenset({
+    'SNDX.StaticAttenuation', 'SNDD.StaticAttenuation',
+    'SNDX.MinAttDist', 'SNDD.MinAttDist',
+    'SNDX.MaxAttDist', 'SNDD.MaxAttDist',
+    'SNDX.FreqAdj', 'SNDD.FreqAdj', 'SNDX.Flags', 'SNDD.Flags',
+})
+
+
+def soun_companion_changes(changes: dict) -> bool:
+    """True when a SOUN's authored change belongs on its SNDR companion."""
+    return any(k in _SOUN_COMPANION_KEYS for k in changes)
+
+
+def rebuild_sndr_override(master_sndr: bytes, plugin_rec: dict,
+                          writer) -> bytes:
+    """The master's SNDR with this plugin's authored sound values applied.
+
+    convert_SOUN is re-run on the PLUGIN's export to get correctly-derived
+    BNAM/LNAM/ONAM bytes, and only those are substituted into the master's
+    SNDR — the record keeps the master's FormID and EDID so everything already
+    pointing at it still resolves. ONAM is included because the falloff
+    distances live on the SOPM it references; re-running the converter mints
+    (or reuses, via the writer's SOPM cache) a model for the authored
+    distances the same way a fresh conversion would.
+    """
+    from .record_types.dialog_misc import convert_SOUN
+    _soun, sndr_bytes, _fid = convert_SOUN(plugin_rec, writer)
+    if not sndr_bytes:
+        return b''
+    fresh = {sig: payload for sig, payload in split_subrecords(sndr_bytes)}
+    out = []
+    for sig, payload in split_subrecords(master_sndr):
+        if sig in (b'BNAM', b'LNAM', b'ONAM') and sig in fresh:
+            payload = fresh[sig]
+        out.append((sig, payload))
+    return join_subrecords(master_sndr[:_HEADER_SIZE], out)
+
+
+def generic_substitutions(plugin_rec: dict, master_rec: dict):
+    """Subrecords that differ between the two exports' own conversions.
+
+    Returns {sig: [payloads]} to substitute wholesale (the full run of that
+    signature, so repeated subrecords stay consistent), or None when the
+    record's converter cannot be run standalone.
+    """
+    if plugin_rec.get('Signature') in _NO_GENERIC_CONVERT:
+        return None
+    p_subs = _converted_subrecords(plugin_rec)
+    if p_subs is None:
+        return None
+    m_subs = _converted_subrecords(master_rec)
+    if m_subs is None:
+        return None
+    return {sig: p_subs.get(sig, [])
+            for sig in set(p_subs) | set(m_subs)
+            if p_subs.get(sig) != m_subs.get(sig)}
+
+
+# --------------------------------------------------------------------------
 # In-place patchers: change specific bytes of an EXISTING subrecord, for
 # fields whose siblings in the same subrecord the converter derives from
 # state this run doesn't have (placement shifts, vendor gold, ...).
@@ -381,6 +534,39 @@ def _patch_spit_cost(old, rec):
     return bytes(buf)
 
 
+def _patch_pkdt_flags(old, rec):
+    """Authored PKDT.Flags, through the converter's own flag mapping.
+
+    Only the flag u32 and the preferred-speed byte are rewritten. The rest of
+    the master's PKDT (package type, interrupt override/flags) is left alone
+    because those come from run state a plugin conversion does not have —
+    convert_PACK picks them from PackContext (is this package quest-gated?
+    what signature is its target?) and from the force-greet/activate special
+    cases. Re-deriving the whole subrecord here would silently downgrade a
+    force-greet's 0xFEFF interrupts to the 0x0000 default.
+    """
+    from .pack_converter import convert_flags, T5_PREFERRED_SPEED
+    if len(old) < 8:
+        return old
+    buf = bytearray(old)
+    # Preserve the master's quest-gating decision: it cleared Once Per Day iff
+    # the package is quest-gated, which is state this run cannot recompute.
+    old_flags = struct.unpack_from('<I', old, 0)[0]
+    flags, speed = convert_flags(get_int(rec, 'PKDT.Flags'),
+                                 get_int(rec, 'PKDT.Type', -1))
+    from .pack_converter import T5_ONCE_PER_DAY
+    if not (old_flags & T5_ONCE_PER_DAY):
+        flags &= ~T5_ONCE_PER_DAY
+    # The master's speed opt-in wins when the author did not change the
+    # always-run bit, so a force-greet keeps its vanilla run speed.
+    if not (flags & T5_PREFERRED_SPEED):
+        speed = old[6]
+        flags |= old_flags & T5_PREFERRED_SPEED
+    struct.pack_into('<I', buf, 0, flags)
+    buf[6] = speed
+    return bytes(buf)
+
+
 # REFR/ACHR DATA: 6 floats (pos xyz, rot xyz). Only the CHANGED coordinate is
 # patched so the master's furniture-origin Z compensation survives on the
 # untouched axes. (A changed Z on a marker-bearing model would lose the shift;
@@ -399,6 +585,7 @@ for _sig in ('REFR', 'ACHR', 'ACRE'):
     for _key, (_out, _fn) in _PLACEMENT_PATCHERS.items():
         _PATCHERS[(_sig, _key)] = (_out.encode(), _fn)
 _PATCHERS[('SPEL', 'SPIT.Cost')] = (b'SPIT', _patch_spit_cost)
+_PATCHERS[('PACK', 'PKDT.Flags')] = (b'PKDT', _patch_pkdt_flags)
 
 
 # --------------------------------------------------------------------------
@@ -525,6 +712,99 @@ def _rebuild_land_layers(plugin_rec, master_rec, old_subs):
     return out
 
 
+def _rebuild_qust_targets(plugin_rec, master_rec, old_subs):
+    """New QOBJ/FNAM/NNAM/QSTA run for an authored QUST Target[] change.
+
+    Oblivion's QSTA conditions are GetStage gates saying WHEN a marker is live;
+    convert_QUST resolves them at build time and hangs each target on the
+    objectives where the gate holds (see _target_live_at_stage). Changing a
+    target's conditions therefore changes which objective carries which
+    marker — nothing a byte patch can express.
+
+    The whole objective run is regenerated from the plugin's export, and it is
+    deterministic to do so: an alias id is just the ordinal of the target's
+    first appearance in the Target list, a pure function of the export, and the
+    journal text comes from the same Stage[] entries. The reference ALIASes
+    those ids point at are the master's, and this rebuild does not touch them —
+    only which objective references which alias.
+    """
+    from .dialog_converter import _target_live_at_stage, _pc_stage_texts
+    from .text_reader import get_str
+
+    alias_by_fid = {}
+    targets = []
+    t = 0
+    while f'Target[{t}].FormID' in plugin_rec:
+        tfid = get_formid(plugin_rec, f'Target[{t}].FormID')
+        if tfid:
+            alias_id = alias_by_fid.setdefault(tfid, len(alias_by_fid))
+            tflags = get_int(plugin_rec, f'Target[{t}].Flags') & 0x01
+            raws = []
+            k = 0
+            while True:
+                raw = plugin_rec.get(f'Target[{t}].Condition[{k}].Raw')
+                if raw is None:
+                    break
+                raws.append(raw)
+                k += 1
+            targets.append((alias_id, tflags, raws))
+        t += 1
+
+    # The master's alias ids must stay authoritative: this plugin's target list
+    # may order refs differently, and the ALIAS records it points at are the
+    # master's. Re-map through the MASTER's ordering wherever the ref is known.
+    master_alias = {}
+    t = 0
+    while f'Target[{t}].FormID' in master_rec:
+        tfid = get_formid(master_rec, f'Target[{t}].FormID')
+        if tfid:
+            master_alias.setdefault(tfid, len(master_alias))
+        t += 1
+    plugin_fids = {aid: fid for fid, aid in alias_by_fid.items()}
+    remapped = []
+    for alias_id, tflags, raws in targets:
+        fid = plugin_fids.get(alias_id)
+        mapped = master_alias.get(fid)
+        if mapped is None:
+            # A target the master does not have has no alias to point at;
+            # emitting an out-of-range index would dangle.
+            continue
+        remapped.append((mapped, tflags, raws))
+
+    out = []
+    seen_stages = set()
+    i = 0
+    while f'Stage[{i}].Index' in plugin_rec:
+        stage_idx = get_int(plugin_rec, f'Stage[{i}].Index')
+        if stage_idx in seen_stages:
+            i += 1
+            continue
+        log_count = get_int(plugin_rec, f'Stage[{i}].LogCount')
+        texts = (_pc_stage_texts(
+            [get_str(plugin_rec, f'Stage[{i}].Log[{j}].Text')
+             for j in range(log_count)])
+            if log_count > 0
+            else [get_str(plugin_rec, f'Stage[{i}].LogEntry')])
+        txt = next((x for x in texts if x), None)
+        if not txt:
+            i += 1
+            continue
+        seen_stages.add(stage_idx)
+        out.append((b'QOBJ', struct.pack('<H', stage_idx)))
+        out.append((b'FNAM', struct.pack('<I', 0)))
+        out.append((b'NNAM', _encode_string(txt)))
+        emitted = set()
+        for alias_id, tflags, raws in remapped:
+            if alias_id in emitted:
+                continue
+            if not _target_live_at_stage(raws, stage_idx):
+                continue
+            emitted.add(alias_id)
+            out.append((b'QSTA', struct.pack('<iB3x', alias_id, tflags)))
+        i += 1
+    return out
+
+
 class _RunRebuild:
     def __init__(self, family: tuple, builder, anchors: tuple):
         self.family = family        # sigs replaced as a unit
@@ -549,7 +829,14 @@ _RUN_LAND_LAYERS = _RunRebuild(
     (('after', b'VCLR'), ('after', b'VHGT'), ('after', b'VNML'),
      ('after', b'DATA')))
 
+# The objective run sits after the quest's stage data (INDX/QSDT/CNAM) and
+# before the ALIAS block convert_QUST writes next.
+_RUN_QUST_TARGETS = _RunRebuild(
+    (b'QOBJ', b'FNAM', b'NNAM', b'QSTA'), _rebuild_qust_targets,
+    (('after', b'CNAM'), ('after', b'DNAM')))
+
 _RUN_REBUILDERS = {
+    ('QUST', 'Target[]'): _RUN_QUST_TARGETS,
     ('NPC_', 'Item[]'): _RUN_INVENTORY,
     ('CREA', 'Item[]'): _RUN_INVENTORY,
     ('CONT', 'Item[]'): _RUN_INVENTORY,
@@ -599,6 +886,7 @@ def apply_changes(master_record: bytes, changes: dict,
 
     pending = {}
     indexed = {}
+    generic = set()    # keys with no explicit mapping -> convert-and-diff
     rebuilds = []      # unique _Rebuild specs to run
     rebuild_keys = {}  # spec -> originating export keys (for KEEP reporting)
     patchers = []      # (out_sig, fn, key)
@@ -609,6 +897,11 @@ def apply_changes(master_record: bytes, changes: dict,
             continue
         if ((sig_name, key) in _INEXPRESSIBLE
                 or ('*', key) in _INEXPRESSIBLE):
+            applied.add(key)
+            continue
+        if sig_name == 'SOUN' and key in _SOUN_COMPANION_KEYS:
+            # Applied to the master's SNDR companion instead of this record —
+            # see OverrideContext.build_soun_companion.
             applied.add(key)
             continue
         specs = _REBUILDERS.get((sig_name, key))
@@ -663,11 +956,26 @@ def apply_changes(master_record: bytes, changes: dict,
             continue
         sub_sig = _STRING_SUBRECORD.get(key)
         if sub_sig is None:
-            unmapped.add(key)
+            generic.add(key)
             continue
         pending[sub_sig] = _encode_string(value)
 
-    if not (pending or indexed or rebuilds or patchers or runs):
+    # Every key without a special-case spec is converted properly: run the
+    # record's own converter over both exports and substitute whatever the
+    # author's edit actually changed in the output. A key is only reported
+    # unmapped when the converter cannot run standalone at all — never
+    # because we settled for the master's value.
+    substitutions = {}
+    if generic:
+        substitutions = generic_substitutions(plugin_export, master_export)
+        if substitutions is None:
+            unmapped |= generic
+            substitutions = {}
+        else:
+            applied |= generic
+
+    if not (pending or indexed or rebuilds or patchers or runs
+            or substitutions):
         return master_record, applied, unmapped
 
     subs = split_subrecords(master_record)
@@ -757,4 +1065,38 @@ def apply_changes(master_record: bytes, changes: dict,
             else:
                 _insert_at_anchor(out, run.anchors, new_run)
 
+    # Generic substitutions, last and lowest-precedence: an explicit spec that
+    # already rewrote a signature knows more about this run's state than a
+    # standalone conversion does, so it is never overwritten here.
+    if substitutions:
+        claimed = ({spec.sig for spec in rebuilds}
+                   | {s for s, _fn, _k in patchers}
+                   | {s for run in runs for s in run.family}
+                   | set(pending) | set(indexed))
+        out = _apply_generic(out, substitutions, claimed)
+
     return join_subrecords(master_record[:_HEADER_SIZE], out), applied, unmapped
+
+
+def _apply_generic(out: list, substitutions: dict, claimed: set) -> list:
+    """Substitute whole subrecord runs from a convert-and-diff result.
+
+    Each signature is replaced as a UNIT (all occurrences at the position of
+    the first) so repeated subrecords cannot end up half-master, half-plugin.
+    A signature the plugin's conversion drops entirely is removed; one the
+    master's lacks is appended in the converter's own emission order.
+    """
+    result = []
+    done = set()
+    for sig, payload in out:
+        if sig in claimed or sig not in substitutions:
+            result.append((sig, payload))
+            continue
+        if sig in done:
+            continue          # folded into the run written at first occurrence
+        done.add(sig)
+        result.extend((sig, p) for p in substitutions[sig])
+    for sig, payloads in substitutions.items():
+        if sig not in done and sig not in claimed:
+            result.extend((sig, p) for p in payloads)
+    return result

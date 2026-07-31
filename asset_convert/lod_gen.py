@@ -660,7 +660,8 @@ def run_lodgen(lodgen_input: Path, output_dir: Path) -> bool:
 
 def generate_lod(esm_path: Path, output_dir: Path,
                  worldspace_edid: str = 'Tamriel',
-                 master_dirs=None, master_texture_dirs=None) -> bool:
+                 master_dirs=None, master_texture_dirs=None,
+                 overlay_paths=None, only_cells=None) -> bool:
     """
     Full LOD generation pipeline:
       1. Write LODSettings/<worldspace>.lod
@@ -670,7 +671,14 @@ def generate_lod(esm_path: Path, output_dir: Path,
     Args:
         esm_path:          Path to the converted .esm/.esp holding the WRLD/
                            CELL/REFR records. For an OVERRIDE plugin this is
-                           the MASTER's output, not the plugin's own.
+                           the MASTER's output, not the plugin's own — the
+                           plugin's records arrive via `overlay_paths`.
+        overlay_paths:     Plugins applied ON TOP of esm_path, in load order.
+                           References merge by FormID so a moved, rescaled or
+                           deleted REFR REPLACES the master's entry instead of
+                           being drawn twice.
+        only_cells:        Restrict output to tiles covering these (x, y)
+                           cells; None means the whole worldspace.
         output_dir:        Output dir owning the assets and receiving the
                            generated LOD (contains meshes/, textures/, …).
         worldspace_edid:   Editor ID of the worldspace to generate LOD for
@@ -691,6 +699,39 @@ def generate_lod(esm_path: Path, output_dir: Path,
     # Parse ESM once; reuse data for both LODSettings and LODGen input
     print(f"  Parsing ESM: {esm_path.name}")
     worldspaces, cells, stats, refs = _parse_esm(esm_path)
+
+    # Apply override plugins on top, in load order. References merge BY FORMID
+    # so a plugin that moved, rescaled or re-based one of the master's objects
+    # replaces it rather than adding a second copy at the old spot, and a
+    # DELETED override (header flag 0x20) removes it from LOD entirely — the
+    # object is gone in-game, so a distant copy of it would be a floating
+    # ghost. STAT/CELL/worldspace tables merge by key the same way.
+    for ov_path in (overlay_paths or []):
+        ov_path = Path(ov_path)
+        print(f"  Applying override plugin: {ov_path.name}")
+        o_wrld, o_cells, o_stats, o_refs = _parse_esm(ov_path)
+        worldspaces.update(o_wrld)
+        cells.update(o_cells)
+        stats.update(o_stats)
+        by_fid = {r['form_id']: i for i, r in enumerate(refs)}
+        added = replaced = removed = 0
+        for r in o_refs:
+            idx = by_fid.get(r['form_id'])
+            if r['flags'] & 0x20:          # deleted by the author
+                if idx is not None:
+                    refs[idx] = None
+                    removed += 1
+                continue
+            if idx is None:
+                by_fid[r['form_id']] = len(refs)
+                refs.append(r)
+                added += 1
+            else:
+                refs[idx] = r
+                replaced += 1
+        refs = [r for r in refs if r is not None]
+        print(f"    references: {added} added, {replaced} replaced, "
+              f"{removed} deleted")
 
     wrld_fid  = None
     wrld_info = None
@@ -772,6 +813,16 @@ def generate_lod(esm_path: Path, output_dir: Path,
             print(f"  Removed {len(stale)} stale .bto tiles")
         ok = run_lodgen(lodgen_txt, output_dir)
 
+    # An override plugin ships only the tiles its edits touch. LODGen has no
+    # per-tile switch and bakes the whole worldspace in one pass, so the
+    # unaffected tiles are pruned here instead. They are byte-for-byte what the
+    # master already ships, so keeping them would only duplicate the master's
+    # LOD and enlarge the plugin for no visual difference.
+    if only_cells:
+        kept = _prune_unaffected_tiles(objects_dir, '.bto', only_cells)
+        print(f"  Kept {kept} .bto tile(s) covering the changed cells; "
+              f"the rest are the master's and were pruned")
+
     # Fill in any LOD texture the .bto files reference but that does not exist:
     # atlas normal maps (synthesized) and any diffuse that lives only in a
     # master's output because this plugin baked the master's models into its LOD.
@@ -785,6 +836,32 @@ def generate_lod(esm_path: Path, output_dir: Path,
     else:
         print(f"[LOD] LOD generation finished with warnings.")
     return ok
+
+
+def _prune_unaffected_tiles(tile_dir: Path, suffix: str, only_cells) -> int:
+    """Delete LOD tiles that cover none of `only_cells`. Returns the kept count.
+
+    Tiles are named `<worldspace>.<level>.<x>.<y><suffix>`, where (x, y) is the
+    tile's SW cell corner and it spans `level` cells in each direction. A tile
+    is kept when ANY cell it composites was changed — an edit near a tile
+    boundary changes the neighbouring tile's edge too, so overlap (not just the
+    edited cell's own tile) is the right test.
+    """
+    only = set(only_cells)
+    kept = 0
+    for tile in list(tile_dir.glob(f'*{suffix}')):
+        parts = tile.name[:-len(suffix)].split('.')
+        try:
+            level, tx, ty = int(parts[-3]), int(parts[-2]), int(parts[-1])
+        except (ValueError, IndexError):
+            kept += 1          # unrecognised name: never delete blind
+            continue
+        if any((tx + dx, ty + dy) in only
+               for dy in range(level) for dx in range(level)):
+            kept += 1
+        else:
+            tile.unlink()
+    return kept
 
 
 def _textures_root(plugin_out_dir: Path) -> Path:

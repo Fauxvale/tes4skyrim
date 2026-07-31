@@ -193,12 +193,20 @@ def decode_land_layers(body: bytes) -> dict:
 _TEX_CACHE = {}
 
 
-def _load_texture_rgb(rel_path: str, tex_root: Path, size: int = 64):
+def _load_texture_rgb(rel_path: str, tex_root, size: int = 64):
     """Load a landscape .dds as an (size,size,3) uint8 RGB tile, cached.
+
+    `tex_root` is a directory OR a sequence of directories searched in order.
+    An override plugin converts none of the master's landscape textures into
+    its own output, so its roots are (own, master...) — searching only its own
+    made every lookup miss, and the neutral-grey result below painted whole
+    tiles flat instead of the real landscape.
 
     Returns a neutral grey tile if the texture can't be found/decoded.
     """
-    key = (rel_path.lower(), size)
+    roots = ([tex_root] if isinstance(tex_root, (str, Path))
+             else list(tex_root))
+    key = (rel_path.lower(), size, tuple(str(r) for r in roots))
     if key in _TEX_CACHE:
         return _TEX_CACHE[key]
 
@@ -207,12 +215,15 @@ def _load_texture_rgb(rel_path: str, tex_root: Path, size: int = 64):
         rp = rel_path.replace('/', '\\').lstrip('\\')
         if rp.lower().startswith('textures\\'):
             rp = rp[len('textures\\'):]
-        fpath = tex_root / rp
-        if fpath.exists():
+        for root in roots:
+            fpath = Path(root) / rp
+            if not fpath.exists():
+                continue
             try:
                 from PIL import Image
                 im = Image.open(fpath).convert('RGB').resize((size, size), Image.LANCZOS)
                 img = np.asarray(im, dtype=np.uint8)
+                break
             except Exception:
                 img = None
 

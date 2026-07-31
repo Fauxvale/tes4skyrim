@@ -4,6 +4,8 @@ For every record in a plugin's export that overrides a master record, this
 reports what happens to it on the override path WITHOUT running a conversion:
 
   - emitted:      diff found authored changes and every change has a mapping
+  - deleted:      the author DELETED the record (header flag 0x20); shipped as
+                  a deletion stub so the master's record is removed in-game
   - partial:      emitted, but some authored changes have no mapping (listed)
   - unchanged:    authorially identical to the master (correctly dropped)
   - no-base:      the master's conversion has no record to override (dropped)
@@ -23,7 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tes5_import.export_diff import diff_records
 from tes5_import.master_manifest import load_master_manifests
 from tes5_import.override_merge import load_master_index
-from tes5_import.overrides import (load_master_export, master_output_formid,
+from tes5_import.overrides import (DELETED_FLAG, load_master_export,
+                                   master_output_formid,
                                    OVERRIDE_UNMAPPABLE_TYPES)
 from tes5_import.override_builder import RECONVERT_KEYS, apply_changes
 from tes5_import.constants import IMPORT_DISPATCH, SKIP_TYPES
@@ -82,6 +85,12 @@ def main():
             if not base:
                 stats[sig]['no-base'] += 1
                 continue
+            if int(rec.get('RecordFlags') or 0) & DELETED_FLAG:
+                # Deletion is a header flag, not a field change (see
+                # overrides.make_deleted_record) — count it before the diff,
+                # which would read the empty stub as unmappable edits.
+                stats[sig]['deleted'] += 1
+                continue
             changes = diff_records(master_rec, rec)
             if not changes:
                 stats[sig]['unchanged'] += 1
@@ -104,8 +113,8 @@ def main():
             else:
                 stats[sig]['emitted'] += 1
 
-    outcomes = ['emitted', 'partial', 'reconvert', 'unchanged', 'no-base',
-                'no-path', 'skipped-type', 'new']
+    outcomes = ['emitted', 'deleted', 'partial', 'reconvert', 'unchanged',
+                'no-base', 'no-path', 'skipped-type', 'new']
     print(f"{'type':<6}" + ''.join(f'{o:>14}' for o in outcomes))
     totals = Counter()
     for sig in sorted(stats):

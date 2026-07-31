@@ -17,12 +17,6 @@ Major Issues for V1:
 
 	8 - Crime system
 
-	10 - Script conversion: silent mis-conversions that compile but do nothing (see docs/papyrus_conversion_notes.md "Silent mis-conversion")
-		PlayIdle/PickIdle passes the raw TES4 IDLE EditorID into Debug.SendAnimationEvent - Skyrim has no such event so the idle never plays, nothing logged.
-		Same handler still uses the unconditional actor assumption that PlayGroup was just fixed for; needs the get_base_signature() treatment so animated objects get PlayAnimation instead.
-		Six no-op'd commands exist natively in Skyrim: AddAchievement (59 sites), PlayBink (5), SendTrespassAlarm (2), SetPublic (1), AttachAshPile, GetCurrentPackage. SetCellPublicFlag (100 sites) is the same Cell flag as SetPublic.
-		Output has only 2 ;TODO markers across 18,566 scripts - marker counts measure honesty not correctness, so audit against references/skse64-master/scripts/vanilla rather than scanning output for markers.
-
 	12 - InUHlaaluUroomuside.nif has floor collision that is inverted. likely due to the nehrim fix for some reverse-facing collision normals
 	13 - Meshes not animating:
 		palacefont01.nif

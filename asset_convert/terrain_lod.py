@@ -194,6 +194,88 @@ def _master_names(export_dir: Path):
     return names
 
 
+def changed_lod_cells(plugin_esm: Path, master_esm: Path,
+                      worldspace_edid: str) -> set:
+    """Grid cells an override plugin changes the LOD appearance of.
+
+    A cell qualifies when the plugin ships a LAND record for it (terrain
+    regraded — the tearing case) or any REFR (distant objects added, moved,
+    scaled or DELETED). The plugin's own CELL records usually carry no XCLC,
+    so grid coordinates are resolved from the MASTER, which is the only place
+    they exist.
+
+    Returns an empty set when the plugin changes nothing in this worldspace,
+    which the caller reads as "the master's LOD is already correct — skip".
+    """
+    coords = {}
+    _scan_cell_coords(Path(master_esm), coords)
+    _scan_cell_coords(Path(plugin_esm), coords)
+
+    raw = Path(plugin_esm).read_bytes()
+    n = len(raw)
+    target = _find_worldspace_fid(raw, n, worldspace_edid)
+    changed = set()
+
+    def scan(start, end, cur_cell, cur_wrld):
+        p = start
+        while p < end and p + 24 <= n:
+            sig = raw[p:p + 4]
+            size = struct.unpack_from('<I', raw, p + 4)[0]
+            if sig == b'GRUP':
+                g_size = struct.unpack_from('<I', raw, p + 4)[0]
+                g_type = struct.unpack_from('<I', raw, p + 12)[0]
+                label = raw[p + 8:p + 12]
+                nxt_cell, nxt_wrld = cur_cell, cur_wrld
+                if g_type == 1:
+                    nxt_wrld = struct.unpack_from('<I', label)[0]
+                elif g_type == 6:
+                    nxt_cell = struct.unpack_from('<I', label)[0]
+                scan(p + 24, p + g_size, nxt_cell, nxt_wrld)
+                p += g_size
+                continue
+            fid = struct.unpack_from('<I', raw, p + 12)[0]
+            if sig == b'CELL':
+                cur_cell = fid
+            elif sig in (b'LAND', b'REFR'):
+                if target is None or cur_wrld == target:
+                    c = coords.get(cur_cell)
+                    if c is not None:
+                        changed.add(c)
+            p += 24 + size
+
+    scan(24 + struct.unpack_from('<I', raw, 4)[0], n, 0, 0)
+    return changed
+
+
+def _scan_cell_coords(esm_path: Path, coords: dict):
+    """Collect {cell FormID -> (x, y)} from every CELL carrying XCLC."""
+    raw = esm_path.read_bytes()
+    n = len(raw)
+    p = 24 + struct.unpack_from('<I', raw, 4)[0]
+    stack = [(p, n)]
+    while stack:
+        p, end = stack.pop()
+        while p < end and p + 24 <= n:
+            sig = raw[p:p + 4]
+            size = struct.unpack_from('<I', raw, p + 4)[0]
+            if sig == b'GRUP':
+                stack.append((p + 24, p + size))
+                p += size
+                continue
+            if sig == b'CELL':
+                fid = struct.unpack_from('<I', raw, p + 12)[0]
+                body = raw[p + 24:p + 24 + size]
+                o = 0
+                while o + 6 <= len(body):
+                    s2 = body[o:o + 4]
+                    sz = struct.unpack_from('<H', body, o + 4)[0]
+                    if s2 == b'XCLC' and sz >= 8:
+                        coords[fid] = struct.unpack_from('<ii', body, o + 6)
+                        break
+                    o += 6 + sz
+            p += 24 + size
+
+
 def shipped_lod_worldspaces(export_dir: Path):
     """Return the worldspace EditorIDs the SOURCE game shipped distant-LOD for.
 
@@ -271,8 +353,16 @@ def shipped_lod_worldspaces(export_dir: Path):
     return result
 
 
-def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel'):
+def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel',
+                        overlay_paths=None):
     """Parse LAND + CELL water data for one worldspace from the output ESM.
+
+    `overlay_paths` are plugins to apply ON TOP, in load order. Everything is
+    keyed by grid coordinate, so a later file's LAND for a cell simply replaces
+    the earlier one — which is exactly override semantics. This is what lets an
+    override plugin's regraded terrain reach LOD: DLCBattlehornCastle rewrites
+    VHGT on 10 Tamriel cells, and reading only the master left distant terrain
+    showing the ORIGINAL ground while the loaded cells showed the new ground.
 
     Returns (lands, cell_water, default_water_height):
       lands:      (cell_x, cell_y) -> {heights: ndarray(33,33 float32),
@@ -282,19 +372,36 @@ def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel'):
                   height is the cell XCLW override; None = use worldspace default
       default_water_height: WRLD DNAM default water height (0.0 if absent)
     """
-    raw = esm_path.read_bytes()
-    n   = len(raw)
     lands = {}
     cell_water = {}
     wrld_water = {'default': None}
+    cell_coords = {}       # cell FormID -> (x, y), shared across load order
+    for _path in [esm_path] + list(overlay_paths or []):
+        _scan_land_file(Path(_path), worldspace_edid, lands, cell_water,
+                        wrld_water, cell_coords)
+    default_wh = (wrld_water['default']
+                  if wrld_water['default'] is not None else 0.0)
+    return lands, cell_water, default_wh
+
+
+def _scan_land_file(esm_path: Path, worldspace_edid: str,
+                    lands: dict, cell_water: dict, wrld_water: dict,
+                    cell_coords: dict):
+    """Scan one plugin's LAND/CELL/WRLD data into the shared accumulators.
+
+    A CELL record an override plugin ships carries only the fields its author
+    changed, so its XCLC grid coords may be absent. Coordinates are therefore
+    resolved against the coords already learned from earlier files in load
+    order before falling back to this file's own.
+    """
+    raw = esm_path.read_bytes()
+    n   = len(raw)
 
     # We need CELL grid coords alongside each LAND.
     # Strategy: track current CELL grid coords via a lightweight group scanner.
     # Group type 6  = cell children group (label = cell FormID).
     # Group type 1  = world children group (label = parent WRLD FormID).
     # We only collect LAND records that belong to the target worldspace.
-
-    cell_coords = {}   # form_id → (x, y)
 
     # Find target worldspace FormID first (fast linear scan)
     target_wrld_fid = _find_worldspace_fid(raw, n, worldspace_edid)
@@ -357,7 +464,16 @@ def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel'):
                         gx = struct.unpack_from('<i', xclc, 0)[0]
                         gy = struct.unpack_from('<i', xclc, 4)[0]
                         cell_coords[fid] = (gx, gy)
-                        cur_cell_fid = fid
+                    else:
+                        # An OVERRIDE plugin's CELL carries only the fields its
+                        # author changed, so XCLC is usually absent. Its grid
+                        # coords are the master's, already learned earlier in
+                        # load order. Without this the record would leave
+                        # cur_cell_fid pointing at the PREVIOUS cell and its
+                        # child LAND would be written to the wrong coordinate.
+                        gx, gy = cell_coords.get(fid, (None, None))
+                    cur_cell_fid = fid
+                    if gx is not None:
                         if target_wrld_fid is None or cur_wrld_fid == target_wrld_fid:
                             # DATA bit 0x02 = Has Water; XCLW = height override
                             data = _sub(body, 'DATA')
@@ -370,7 +486,13 @@ def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel'):
                                 v = struct.unpack_from('<f', xclw)[0]
                                 if -1e9 < v < 1e9:   # exclude "default" sentinels
                                     wh = v
-                            cell_water[(gx, gy)] = (bool(flags & 0x02), wh)
+                            if data is None and (gx, gy) in cell_water:
+                                # Override CELL that says nothing about water:
+                                # keep what the master established rather than
+                                # resetting the cell to "no water".
+                                pass
+                            else:
+                                cell_water[(gx, gy)] = (bool(flags & 0x02), wh)
                 elif sig == 'WRLD':
                     if target_wrld_fid is not None and fid == target_wrld_fid:
                         dnam = _sub(body, 'DNAM')
@@ -389,8 +511,6 @@ def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel'):
     # Skip TES4/TES5 file header
     hdr_size = struct.unpack_from('<I', raw, 4)[0]
     scan(24 + hdr_size, n, 0, 0)
-    default_wh = wrld_water['default'] if wrld_water['default'] is not None else 0.0
-    return lands, cell_water, default_wh
 
 
 def _decode_land(body, _sub):
@@ -1367,7 +1487,11 @@ def _worker_init(lands, mesh_dir_s, tex_dir_s, ltex_map, tex_root_s,
     _worker_mesh_dir   = Path(mesh_dir_s)
     _worker_tex_dir    = Path(tex_dir_s)
     _worker_ltex_map   = ltex_map
-    _worker_tex_root   = Path(tex_root_s)
+    # A list of roots (own output first, then masters'); _load_texture_rgb
+    # searches them in order.
+    _worker_tex_root   = ([Path(p) for p in tex_root_s]
+                          if isinstance(tex_root_s, (list, tuple))
+                          else Path(tex_root_s))
     _worker_cell_water = cell_water
     _worker_default_wh = default_wh
 
@@ -1419,7 +1543,10 @@ def _process_tile(args):
 # ---------------------------------------------------------------------------
 
 def generate_terrain_lod(esm_path: Path, output_dir: Path,
-                         worldspace_edid: str = 'TES4Tamriel') -> bool:
+                         worldspace_edid: str = 'TES4Tamriel',
+                         overlay_paths=None,
+                         only_cells=None,
+                         extra_texture_roots=None) -> bool:
     """Generate terrain LOD (.btr + .dds) for all cells in the worldspace.
 
     Tile generation is parallelised across (cpu_count - 2) processes.
@@ -1428,6 +1555,22 @@ def generate_terrain_lod(esm_path: Path, output_dir: Path,
         esm_path:        Path to the converted ESM.
         output_dir:      Per-plugin output directory (output/Oblivion.esm/).
         worldspace_edid: EditorID of the worldspace.
+        overlay_paths:   Plugins applied on top of `esm_path` in load order.
+                         An override plugin's own LAND records must be here or
+                         its regraded terrain never reaches LOD.
+        extra_texture_roots: Additional textures/ roots searched when a
+                         landscape texture is not in this plugin's own output.
+                         An override plugin converts none of the master's
+                         landscape textures, so without the master's root here
+                         every diffuse lookup misses and the tiles composite
+                         to flat grey.
+        only_cells:      Restrict output to tiles COVERING these (x, y) cells.
+                         An override plugin regenerates just the tiles its
+                         edits touch; every other tile the master already
+                         built is still correct, so re-baking (and shipping) a
+                         whole worldspace of identical tiles is waste. The
+                         heightmap is still parsed worldspace-wide, because a
+                         tile at the edit's edge composites neighbouring cells.
 
     Returns True on success.
     """
@@ -1441,8 +1584,11 @@ def generate_terrain_lod(esm_path: Path, output_dir: Path,
         print("  ERROR: pyffi not available")
         return False
 
-    print(f"\n[TerrainLOD] Parsing LAND records from {esm_path.name}...")
-    lands, cell_water, default_wh = _parse_land_records(esm_path, worldspace_edid)
+    srcs = ', '.join([esm_path.name] + [Path(p).name
+                                        for p in (overlay_paths or [])])
+    print(f"\n[TerrainLOD] Parsing LAND records from {srcs}...")
+    lands, cell_water, default_wh = _parse_land_records(
+        esm_path, worldspace_edid, overlay_paths)
     if not lands:
         print("  No LAND records found.")
         return False
@@ -1463,10 +1609,19 @@ def generate_terrain_lod(esm_path: Path, output_dir: Path,
     tex_dir.mkdir(parents=True, exist_ok=True)
 
     # Resolve LTEX FormID -> landscape diffuse/normal .dds for the compositor.
+    # Overlays are merged on top so an LTEX the PLUGIN adds or re-points wins
+    # over the master's, exactly like the LAND records above.
     from .terrain_lod_textures import build_ltex_texture_map
     ltex_map = build_ltex_texture_map(esm_path)
-    tex_root = output_dir / 'textures'
-    print(f"  Resolved {len(ltex_map)} LTEX landscape textures.")
+    for ov in (overlay_paths or []):
+        ltex_map.update(build_ltex_texture_map(Path(ov)))
+    # Texture lookup roots, searched in order: this plugin's own output first,
+    # then its masters'. The master's root is what makes an override plugin's
+    # tiles composite the REAL landscape instead of flat grey.
+    tex_roots = [output_dir / 'textures']
+    tex_roots += [Path(r) for r in (extra_texture_roots or [])]
+    print(f"  Resolved {len(ltex_map)} LTEX landscape textures "
+          f"across {len(tex_roots)} texture root(s).")
 
     n_workers = worker_count()
     print(f"  Using {n_workers} worker process(es).")
@@ -1490,10 +1645,20 @@ def generate_terrain_lod(esm_path: Path, output_dir: Path,
         n_level = 0
         for ty in range(ty_start, ty_end, level):
             for tx in range(tx_start, tx_end, level):
-                if any((tx + cx, ty + cy) in lands
-                       for cy in range(level) for cx in range(level)):
-                    work.append((tx, ty, level, worldspace_edid))
-                    n_level += 1
+                cells = [(tx + cx, ty + cy)
+                         for cy in range(level) for cx in range(level)]
+                if not any(c in lands for c in cells):
+                    continue
+                # An override plugin ships only the tiles its edits touch. A
+                # tile counts as touched when ANY cell it composites was
+                # changed — an edit at a tile boundary alters the neighbouring
+                # tile's edge too, so testing coverage (not just the edited
+                # cell's own tile) is what keeps the seams matching.
+                if only_cells is not None and not any(c in only_cells
+                                                      for c in cells):
+                    continue
+                work.append((tx, ty, level, worldspace_edid))
+                n_level += 1
         print(f"  LOD {level}: {n_level} tiles queued")
 
     if not work:
@@ -1508,8 +1673,8 @@ def generate_terrain_lod(esm_path: Path, output_dir: Path,
     with ProcessPoolExecutor(
         max_workers=n_workers,
         initializer=_worker_init,
-        initargs=(lands, str(mesh_dir), str(tex_dir), ltex_map, str(tex_root),
-                  cell_water, default_wh),
+        initargs=(lands, str(mesh_dir), str(tex_dir), ltex_map,
+                  [str(r) for r in tex_roots], cell_water, default_wh),
     ) as pool:
         # chunksize=1: tiles differ in cost by ~20x, so batching would hand one
         # worker a run of expensive tiles and undo the ordering above.

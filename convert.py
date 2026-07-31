@@ -580,16 +580,36 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
     That mirrors vanilla precisely and skips child worldspaces (Anvil, Bravil,
     the IC districts, …) which render inside their parent's LOD grid.
     """
-    from asset_convert.lod_gen import generate_lod
+    from asset_convert.lod_gen import (generate_lod,
+                                       _textures_root as _lod_textures_root)
     from asset_convert.terrain_lod import (generate_terrain_lod,
                                            shipped_lod_worldspaces,
                                            detect_terrain_worldspaces,
+                                           changed_lod_cells,
                                            _master_names as _tes4_master_names,
+                                           _parse_land_records as _terrain_parse_land,
                                            _find_worldspace_fid)
 
     def _esm_defines_worldspace(path, edid):
         raw = path.read_bytes()
         return _find_worldspace_fid(raw, len(raw), edid) is not None
+
+    def _worldspace_land_count(path, edid):
+        """How many of this worldspace's LAND records the file actually holds.
+
+        Containing a WRLD record is NOT the same as owning the worldspace: an
+        override plugin ships a WRLD override (and DLCBattlehornCastle ships
+        10 LAND overrides) while the other ~14,700 LAND records — and every
+        landscape texture — live in the master. Routing on the WRLD record
+        alone made the plugin its own record source, so terrain LOD was baked
+        from 10 isolated cells with no surrounding terrain and no LTEX
+        textures. The bulk of the terrain is what decides.
+        """
+        try:
+            lands, _cw, _dw = _terrain_parse_land(Path(path), edid)
+            return len(lands)
+        except Exception:
+            return 0
 
     out_root   = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
     output_dir = out_root / file_name
@@ -639,15 +659,28 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
     # returned alongside so anything the master's own LOD run already covers
     # is skipped rather than duplicated here.
     def _records_esm(edid):
-        if _esm_defines_worldspace(esm_path, edid):
-            return esm_path, []
+        own = (_worldspace_land_count(esm_path, edid)
+               if _esm_defines_worldspace(esm_path, edid) else -1)
+        best = None
         for master in _tes4_master_names(SCRIPT_DIR / "export" / file_name):
             m_dir = out_root / master
             m_esm = m_dir / master
-            if m_esm.exists() and _esm_defines_worldspace(m_esm, edid):
-                print(f"[{file_name}] Worldspace '{edid}' is defined by master "
-                      f"'{master}'; sourcing its records from there")
-                return m_esm, [m_dir]
+            if not (m_esm.exists() and _esm_defines_worldspace(m_esm, edid)):
+                continue
+            n = _worldspace_land_count(m_esm, edid)
+            if best is None or n > best[0]:
+                best = (n, m_esm, m_dir, master)
+        # Whoever holds the BULK of the terrain owns the records; this plugin
+        # only wins when no master has more. An override plugin ships a WRLD
+        # override and a handful of LAND records, so counting records rather
+        # than presence is what keeps the master the source.
+        if best is not None and best[0] > own:
+            print(f"[{file_name}] Worldspace '{edid}': {best[3]} holds "
+                  f"{best[0]} LAND records vs this plugin's {max(own, 0)}; "
+                  f"sourcing records from the master")
+            return best[1], [best[2]]
+        if own >= 0:
+            return esm_path, []
         return None, []
 
     # A plugin routinely places its MASTERS' models in its own worldspace
@@ -669,6 +702,26 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
                   f"{esm_path.name} or any converted master; skipping its LOD")
             continue
 
+        # When the worldspace belongs to a MASTER, rec_esm is the master's
+        # output and this plugin's own records are an OVERLAY on top of it.
+        # Without that overlay the plugin's authored terrain and references
+        # never reach LOD: DLCBattlehornCastle regrades 10 Tamriel cells, and
+        # building LOD from the master alone left distant terrain showing the
+        # ORIGINAL ground beside the castle's new ground — one visibly ruined
+        # quadrant. Only the tiles the plugin actually touches are rebuilt;
+        # every other tile the master already generated is still correct.
+        overlays = []
+        only_cells = None
+        if rec_esm != esm_path:
+            overlays = [esm_path]
+            only_cells = changed_lod_cells(esm_path, rec_esm, worldspace_edid)
+            if not only_cells:
+                print(f"[{file_name}] No LOD-affecting changes in "
+                      f"'{worldspace_edid}'; master's LOD already correct")
+                continue
+            print(f"[{file_name}] {len(only_cells)} cell(s) changed in "
+                  f"'{worldspace_edid}'; rebuilding only the tiles they touch")
+
         print(f"[{file_name}] Generating object LOD "
               f"(worldspace: {worldspace_edid})...")
         ok = generate_lod(
@@ -677,6 +730,8 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
             worldspace_edid=worldspace_edid,
             master_dirs=extra_assets,
             master_texture_dirs=master_asset_dirs,
+            overlay_paths=overlays,
+            only_cells=only_cells,
         )
 
         # Terrain LOD: heightmap .btr tiles + composited landscape-texture
@@ -687,6 +742,13 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
             esm_path=rec_esm,
             output_dir=output_dir,
             worldspace_edid=worldspace_edid,
+            overlay_paths=overlays,
+            only_cells=only_cells,
+            # The master's landscape textures: an override plugin converts
+            # none of them into its own output, and without this every
+            # diffuse lookup misses and the tiles composite to flat grey.
+            extra_texture_roots=[_lod_textures_root(Path(d))
+                                 for d in master_asset_dirs],
         )
         all_ok = all_ok and ok and ok_terrain
 
