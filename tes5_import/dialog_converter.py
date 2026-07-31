@@ -45,6 +45,7 @@ import struct
 from collections import defaultdict
 
 from .text_reader import get_formid_index_offset, remap_formid
+from .constants import ENGINE_GLOBAL_FORMIDS
 from .writer import pack_group
 from .record_types.common import (
     get_formid,
@@ -136,6 +137,12 @@ def _collect_scro_properties(rec: dict, fid_to_edid: dict, prefix: str = '') -> 
         if safe.lower() in seen:
             continue
         seen.add(safe.lower())
+        # Engine globals are shared with Skyrim at the same FormID and are not
+        # re-emitted, so they must not be shifted into our index — see
+        # object_scripts.ENGINE_GLOBAL_FORMIDS.
+        if edid.lower() in ENGINE_GLOBAL_FORMIDS:
+            props[safe] = ENGINE_GLOBAL_FORMIDS[edid.lower()]
+            continue
         remapped = get_formid(rec, key)
         if remapped:
             props[safe] = remapped
@@ -1136,6 +1143,11 @@ def _build_info_script_properties(result_script: str, xref) -> dict:
         low = prop_edid.lower()
         if low in ('player', 'playerref'):
             props[prop_edid] = _PLAYER_FORMID
+            continue
+        # Engine globals keep their vanilla FormID — see
+        # object_scripts.ENGINE_GLOBAL_FORMIDS.
+        if low in ENGINE_GLOBAL_FORMIDS:
+            props[prop_edid] = ENGINE_GLOBAL_FORMIDS[low]
             continue
         fid_hex = resolve_property_formid(xref, prop_edid)
         if not fid_hex:

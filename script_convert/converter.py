@@ -167,6 +167,7 @@ class ScriptConverter:
         self._has_menumode = False
         self._has_scripteffectupdate = False
         self._uses_getsecondspassed = False
+        self._uses_hour_window = False
         self._uses_timer = False
         self._local_vars = set()
         self._var_renames: dict[str, str] = {}  # orig_lower -> safe_name
@@ -470,6 +471,12 @@ class ScriptConverter:
         self._prescan_parked_timers(source)
         self._uses_getsecondspassed = 'getsecondspassed' in source_low
         self._uses_timer = bool(re.search(r'\btimer\b', source_low))
+        # A chime/bell script: a top-of-the-hour GameHour window latched by a
+        # countdown.  Its negative sentinel is a real-seconds value tuned
+        # against the author's TimeScale and has to be rescaled to ours, or the
+        # latch expires while the window is still open and the sound repeats.
+        # See _scaled_debounce_seconds.
+        self._uses_hour_window = bool(self._GAMEHOUR_WINDOW_RE.search(source))
         self._has_gamemode = any(b[0] == 'gamemode' for b in blocks)
         self._has_menumode = any(b[0] == 'menumode' for b in blocks)
         self._has_scripteffectupdate = any(b[0] == 'scripteffectupdate' for b in blocks)
@@ -1669,6 +1676,7 @@ class ScriptConverter:
         self._has_menumode = False
         self._has_scripteffectupdate = False
         self._uses_getsecondspassed = False
+        self._uses_hour_window = False
         self._uses_timer = False
         self._local_vars = set()
         self._in_foreach = 0
@@ -2212,6 +2220,7 @@ class ScriptConverter:
         if if_m:
             keyword = 'If' if if_m.group(1).lower() == 'if' else 'ElseIf'
             condition = self._convert_expression(if_m.group(2), extends)
+            condition = self._rescale_hour_window_latch(condition)
             # If the condition converted entirely to a ;TODO comment, keep the
             # block structure valid by using True as placeholder
             if condition.lstrip().startswith(';TODO:'):
@@ -2344,6 +2353,85 @@ class ScriptConverter:
         if re.search(rf'\bas\s+{ptype}\s*$', expr, re.IGNORECASE):
             return expr
         return f'{expr} as {ptype}'
+
+    # The hour-boundary guard these scripts use: `GameHour >= X.98` /
+    # `GameHour <= X.02`, i.e. a window HALF_WINDOW_GAME_HOURS wide either
+    # side of the top of the hour.
+    _HOUR_WINDOW_GAME_HOURS = 0.04
+    # Both games ship GLOB 0x3A TimeScale = 30 by default, and every vanilla
+    # Oblivion chime script is tuned against that.
+    _DEFAULT_TIMESCALE = 30.0
+    _GAMEHOUR_WINDOW_RE = re.compile(
+        r'\bGameHour\b\s*(?:>=|<=)\s*\d+\.\d+', re.IGNORECASE)
+
+    def _timescale(self) -> float:
+        """The plugin's own TimeScale (GLOB 0x3A), or the vanilla default."""
+        if self.xref:
+            val = self.xref.global_values.get('timescale')
+            if val and val > 0:
+                return float(val)
+        return self._DEFAULT_TIMESCALE
+
+    def _scaled_debounce_seconds(self, seconds: float) -> float:
+        """Widen a chime script's real-seconds debounce to outlast its window.
+
+        The bell/chime idiom is a one-shot latch: a `GameHour` window at the
+        top of the hour sets `soundplaying = 1`, and a countdown holds the
+        latch until it passes a negative sentinel.  The window is measured in
+        GAME hours but the sentinel in REAL seconds, so the two only stay in
+        step at the TimeScale the author used.
+
+        At Oblivion's TimeScale 30 a 0.04-game-hour window is 4.8 real
+        seconds, which the stock -5 sentinel just outlasts — the latch clears
+        after the window has closed and the bell rings once.  Nehrim ships
+        TimeScale 10, stretching the same window to 14.4 real seconds: the
+        latch expires twice while GameHour is STILL inside it, and each
+        expiry re-fires the sound.  That is the chapel bell ringing on
+        repeat, and it is not a Papyrus artifact — Oblivion's own interpreter
+        does the same thing at TimeScale 10.
+
+        Scale the sentinel by TimeScale so the latch always outlasts its
+        window, keeping the authored value whenever it is already long enough
+        (so vanilla Oblivion output is unchanged).
+        """
+        needed = self._HOUR_WINDOW_GAME_HOURS * 3600.0 / self._timescale()
+        if seconds > needed:
+            # The authored sentinel already outlasts the window (this is the
+            # vanilla-Oblivion case: 5s latch vs a 4.8s window).  Leave it
+            # exactly as written so TimeScale-30 output is byte-identical.
+            return seconds
+        # Otherwise clear the window with a margin, so neither a coarse update
+        # tick nor float slop can land the expiry back inside it.
+        return needed * 1.25
+
+    # `timer <= -5` — the chime latch's expiry test.  The sentinel is negative
+    # because the countdown runs past zero; its magnitude is how many REAL
+    # seconds the latch holds.
+    _LATCH_EXPIRY_RE = re.compile(
+        r'^(?P<head>.*?\b\w[\w.]*\s*<=\s*)-(?P<secs>\d+(?:\.\d+)?)(?P<tail>\s*\)?\s*)$')
+
+    def _rescale_hour_window_latch(self, condition: str) -> str:
+        """Rescale a chime latch's expiry sentinel for this plugin's TimeScale.
+
+        Only touches scripts that actually use the top-of-the-hour GameHour
+        window (`_uses_hour_window`), so ordinary timers keep their authored
+        durations.  See _scaled_debounce_seconds for why this is needed.
+        """
+        if not self._uses_hour_window:
+            return condition
+        m = self._LATCH_EXPIRY_RE.match(condition)
+        if not m:
+            return condition
+        authored = float(m.group('secs'))
+        scaled = self._scaled_debounce_seconds(authored)
+        if abs(scaled - authored) < 0.05:
+            return condition
+        self._line_comments.append(
+            f';NE: chime latch widened {authored:g}s -> {scaled:.3g}s for '
+            f'TimeScale {self._timescale():g} (window is '
+            f'{self._HOUR_WINDOW_GAME_HOURS * 3600.0 / self._timescale():.3g}s '
+            f'of real time)')
+        return f"{m.group('head')}-{scaled:.3g}{m.group('tail')}"
 
     # Engine-owned globals that Oblivion declares `short` but that carry a
     # genuine fractional value at runtime (and that Skyrim declares float).

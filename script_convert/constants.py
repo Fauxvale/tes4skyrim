@@ -24,7 +24,15 @@ BLOCK_MAP = {
     'onload':             ('Event OnLoad()', 'EndEvent'),
     'onreset':            ('Event OnReset()', 'EndEvent'),
     'onsell':             ('Event OnSell(Actor akSeller)', 'EndEvent'),
-    'ontrigger':          ('Event OnTriggerEnter(ObjectReference akActionRef)', 'EndEvent'),
+    # TES4 `Begin OnTrigger` runs EVERY FRAME an object is inside the volume,
+    # not once on entry — Nehrim's Magieverbot (magic-ban) scripts count 25 and
+    # 100 *executions* in it, which is only meaningful under repeat semantics.
+    # Skyrim keeps the same three-way split (all three are distinct engine
+    # events in SkyrimSE.exe): OnTrigger = "trigger is tripped", sent
+    # repeatedly while inside; OnTriggerEnter/Leave are the edges.  Mapping
+    # OnTrigger -> OnTriggerEnter froze every such state machine on its first
+    # state, which left the Erothin bell latch stuck and re-ringing.
+    'ontrigger':          ('Event OnTrigger(ObjectReference akActionRef)', 'EndEvent'),
     'ontriggerenter':     ('Event OnTriggerEnter(ObjectReference akActionRef)', 'EndEvent'),
     'ontriggerleave':     ('Event OnTriggerLeave(ObjectReference akActionRef)', 'EndEvent'),
     'onmagiceffectapply': ('Event OnMagicEffectApply(ObjectReference akCaster, MagicEffect akEffect)', 'EndEvent'),
@@ -33,8 +41,12 @@ BLOCK_MAP = {
     'onpackagedone':      ('Event OnPackageEnd(Package akOldPackage)', 'EndEvent'),
     'onpackageend':       ('Event OnPackageEnd(Package akOldPackage)', 'EndEvent'),
     'onpackagechange':    ('Event OnPackageChange(Package akOldPackage)', 'EndEvent'),
-    'ontriggeractor':     ('Event OnTriggerEnter(ObjectReference akActionRef)', 'EndEvent'),
-    'ontriggermob':       ('Event OnTriggerEnter(ObjectReference akActionRef)', 'EndEvent'),
+    # OnTriggerActor/OnTriggerMob differ from OnTrigger only in WHAT trips them
+    # (any actor / any creature), not in edge-vs-repeat — they are per-frame
+    # too, so they take the repeating event as well.  Skyrim has no
+    # actor-vs-creature split, so the filter is left to the block body.
+    'ontriggeractor':     ('Event OnTrigger(ObjectReference akActionRef)', 'EndEvent'),
+    'ontriggermob':       ('Event OnTrigger(ObjectReference akActionRef)', 'EndEvent'),
     'onmagiceffecthit':   ('Event OnMagicEffectApply(ObjectReference akCaster, MagicEffect akEffect)', 'EndEvent'),
     'onactorequip':       ('Event OnEquipped(Actor akActor)', 'EndEvent'),
     # OnAlarm (actor noticed a crime/attack) has no Papyrus event; entering

@@ -1352,9 +1352,13 @@ def convert_CLAS(rec: dict, *, override_fid: int = 0, override_edid: str = '',
 
 
 # TES4 globals whose names collide with Skyrim engine globals. Script
-# references to these are canonicalized to the vanilla forms by
-# script_convert (_GLOBAL_CANONICAL), so emitting our own copies would only
-# create duplicate EditorIDs.
+# Skyrim already ships these at the SAME FormIDs Oblivion uses, so emitting our
+# own copies would only create duplicate EditorIDs.  VMAD properties that name
+# them are bound UNSHIFTED via constants.ENGINE_GLOBAL_FORMIDS — dropping the
+# record is only half the contract, and for a long time it was the only half
+# that existed, which left every such property bound to a nonexistent form.
+# (An earlier comment here credited script_convert._GLOBAL_CANONICAL with
+# fixing the references; it does not — it only canonicalizes the NAME.)
 _ENGINE_GLOBALS = {'gamehour', 'gamedayspassed', 'gameday', 'gamemonth',
                    'gameyear', 'timescale'}
 

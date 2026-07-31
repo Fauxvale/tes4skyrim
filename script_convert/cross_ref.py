@@ -28,7 +28,7 @@ def _new_scan_out() -> dict:
         'record_scri': {}, 'record_base': {}, 'record_type': {},
         'quest_edids': set(), 'npc_formids': set(),
         'mgef_shaders': {}, 'spell_effects': {},
-        'global_types': {},
+        'global_types': {}, 'global_values': {},
     }
 
 
@@ -37,6 +37,7 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
     formid = edid = scri = name_fid = None
     schr_type = None
     glob_type = None
+    glob_value = None
     mgef_shader = mgef_ench = None
     mgef_school = -1
     spel_effects: list[tuple[str, int]] = []
@@ -58,6 +59,11 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
                 pass
         elif sig == 'GLOB' and line.startswith('FNAM.Type='):
             glob_type = line[10:].strip()
+        elif sig == 'GLOB' and line.startswith('FLTV.Value='):
+            try:
+                glob_value = float(line[11:])
+            except ValueError:
+                pass
         elif sig == 'MGEF' and line.startswith('DATA.EffectShader='):
             mgef_shader = line[18:]
         elif sig == 'MGEF' and line.startswith('DATA.EnchantEffect='):
@@ -100,6 +106,8 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
     out['record_type'][formid] = sig
     if sig == 'GLOB' and edid and glob_type:
         out['global_types'][edid.lower()] = glob_type
+    if sig == 'GLOB' and edid and glob_value is not None:
+        out['global_values'][edid.lower()] = glob_value
     if sig == 'QUST' and edid:
         out['quest_edids'].add(edid.lower())
     if sig in ('NPC_', 'CREA'):
@@ -185,6 +193,12 @@ class CrossRefGraph:
         # 'f' float).  Decides whether a GetValue() read needs an `as Int`:
         # truncating a float global silently breaks fractional comparisons.
         self.global_types: dict[str, str] = {}
+        # GLOB EditorID (lower) -> FLTV value as authored by the plugin.
+        # Needed because several TES4 timing idioms hardcode a REAL-SECONDS
+        # constant that the author tuned against their own TimeScale (see
+        # _scaled_debounce_seconds in converter.py).  Nehrim ships TimeScale
+        # 10, Oblivion 30, so the same script means different things in each.
+        self.global_values: dict[str, float] = {}
     def load_from_export(self, export_dir: str, workers: int = None):
         """Load cross-reference data from all export .txt files.
 
@@ -240,6 +254,7 @@ class CrossRefGraph:
         self.mgef_shaders.update(out['mgef_shaders'])
         self.spell_effects.update(out['spell_effects'])
         self.global_types.update(out['global_types'])
+        self.global_values.update(out['global_values'])
 
     def get_extends_class(self, script_formid: str) -> str:
         """Determine the Papyrus extends class for a script."""

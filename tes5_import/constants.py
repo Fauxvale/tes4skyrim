@@ -26,6 +26,27 @@ CONVERT_CLIMATE = False
 # Oblivion race EditorID → Skyrim race FormID (from skyrim_overrides)
 from .skyrim_overrides import DEFAULT_RACE, RACE_MAP
 
+# Engine-owned globals, keyed by lowercase EditorID.  Skyrim ships these at the
+# SAME FormIDs Oblivion uses (GameYear 0x35 ... TimeScale 0x3A — verified
+# against both GLOB dumps), and convert_GLOB deliberately does NOT re-emit them,
+# so there is no record of our own for a VMAD property to bind to.  Like Player
+# (0x14) they must therefore stay UNSHIFTED: running them through the
+# load-order remap produced e.g. `1A000038`, a form that does not exist, and
+# the property silently bound to None.  `GameHour.GetValue()` then returned 0.0
+# forever — which sits inside every `GameHour <= 0.02` hour-boundary window, so
+# Nehrim's chapel bell re-fired on a permanent loop.  Confirmed in
+# Papyrus.0.log:
+#   "Property Gamehour ... cannot be bound because <nullptr form> (1A000038)
+#    is not the right type", then "Cannot call GetValue() on a None object".
+ENGINE_GLOBAL_FORMIDS = {
+    'gameyear':       0x35,
+    'gamemonth':      0x36,
+    'gameday':        0x37,
+    'gamehour':       0x38,
+    'gamedayspassed': 0x39,
+    'timescale':      0x3A,
+}
+
 # TES4 biped slot bit → TES5 biped slot bit (BOD2 first person flags)
 BIPED_SLOT_MAP = {
     0: 0,    # Head → 30-Head
@@ -383,7 +404,8 @@ def _init_dispatch():
         # GLOB is NOT skipped: converted scripts bind GlobalVariable properties
         # to TES4 globals (TES4Fame, quest counters...), which read None if the
         # records don't exist. convert_GLOB drops the engine-time globals
-        # (GameHour etc.) whose references are canonicalized to vanilla forms.
+        # (GameHour etc.); properties naming those bind unshifted to Skyrim's
+        # own forms via ENGINE_GLOBAL_FORMIDS above.
         # CLMT is skipped unless CONVERT_CLIMATE is set — see the flag at the
         # top of this file.  When enabled it is the ONLY path to the converted
         # WTHR records (weather is reached via WRLD -> CNAM -> CLMT -> WLST,

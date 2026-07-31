@@ -26,6 +26,7 @@ from script_convert.constants import (_safe_property_name, papyrus_script_name,
                                       resolve_property_formid)
 from script_convert.pipeline import build_vmad_object_script
 from .text_reader import parse_export_file, get_formid_index_offset, remap_formid
+from .constants import ENGINE_GLOBAL_FORMIDS
 
 # Papyrus property types that are literal-valued (not bound to a FormID).
 _VALUE_TYPES = {'Int', 'Float', 'Bool'}
@@ -352,6 +353,9 @@ def _resolve_props(sctx: str, edid: str, extends: str, xref,
         low = pname.lower()
         if low in ('player', 'playerref'):
             obj_props[safe] = _PLAYER_FORMID
+            continue
+        if low in ENGINE_GLOBAL_FORMIDS:
+            obj_props[safe] = ENGINE_GLOBAL_FORMIDS[low]
             continue
         fid_hex = resolve_property_formid(xref, pname)
         if not fid_hex:

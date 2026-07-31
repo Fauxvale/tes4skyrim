@@ -84,6 +84,137 @@ both plugins.
 - **General rule: a blanket cast on a global read is a silent behaviour change.**
   Type the cast from the record, not from the call site.
 
+### The chime latch is REAL seconds vs a GAME-hour window (2026-07-30)
+
+The `as Int` fix above was necessary but **not sufficient** — the bell still rang
+on repeat in Nehrim. The guard was fixed; the *latch* was not.
+
+The idiom is a one-shot latch. The GameHour window sets `soundplaying = 1`, and a
+countdown holds the latch until it passes a negative sentinel:
+
+```
+if ( soundplaying == 1 )
+    set timer to ( timer - GetSecondsPassed )
+    if ( timer <= -5 )              ; REAL seconds
+        set soundplaying to 0
+```
+
+The window is measured in **game hours**; the sentinel in **real seconds**. The
+two only stay in step at the TimeScale the author used:
+
+| TimeScale | 1 game hour | 0.04gh window | 5s latch | rings/hour |
+|---|---|---|---|---|
+| 30 (Oblivion) | 120s | **4.8s** | outlasts it | 1 ✓ |
+| 10 (**Nehrim**) | 360s | **14.4s** | expires 2× *inside* the window | 3 ✗ |
+| 5 | 720s | 28.8s | expires 5× inside | 6 ✗ |
+
+Nehrim ships `TimeScale = 10` (GLOB `0x3A`; Oblivion ships 30), so the latch
+clears while `GameHour` is *still* inside the window and immediately re-fires.
+**This is not a Papyrus artifact** — Oblivion's own interpreter rings 3× per hour
+at TimeScale 10. The scripts were only ever correct at the author's TimeScale.
+
+- `_scaled_debounce_seconds()` widens the sentinel to `window * 1.25` whenever
+  the authored value no longer outlasts the window, and **returns it untouched
+  when it already does** — so TimeScale-30 output is byte-identical (verified:
+  `TES4_BellTowerScript.psc` diffs clean, 0 Oblivion scripts widened).
+- Gated on `_uses_hour_window` (the `GameHour >= X.98` idiom) so ordinary timers
+  keep their authored durations; `_LATCH_EXPIRY_RE` only matches a `<= -N`
+  sentinel, never `<= 0` or a `>=` test.
+- `CrossRefGraph.global_values` now carries GLOB `FLTV` values, so the converter
+  can read the plugin's *own* TimeScale rather than assuming 30.
+- Measured with `temp/bell_sim.py`: Nehrim 3.0 -> 1.0 rings/game-hour, Oblivion
+  unchanged at 1.0.
+- **General rule: a TES4 constant in real seconds that gates on game time is
+  only valid at the author's TimeScale.** Scale it, don't copy it.
+- **This was NOT the cause of the reported "bells on infinite repeat."** It is a
+  real defect and the fix stands, but the chapel bell had a separate cause — see
+  the next section. Do not re-litigate the latch when a bell repeats.
+
+### `Begin OnTrigger` is PER-FRAME, not on-entry (2026-07-30)
+
+The chapel bell that "tolls ~12 times, breaks briefly, then tolls again forever"
+is **not** `SoundZoneKapelleGlockenScript` at all, and not a sound-record loop
+(`SNDX.Flags=0`, emitted `LNAM=00000000` — verified in the built ESM).
+
+Two facts have to land together:
+
+1. **`fx\nehrim\kapelleglocke.wav` is 15.46 s long and contains a full peal of
+   ~12 tolls.** "12 tolls" is ONE `Play()` call, not twelve. Measure the asset
+   before treating a count of anything as a loop count.
+2. The bell is rung by nine `Magieverbot*` (magic-ban) scripts, not the chapel
+   script — `AAKapelleGlocken` is referenced by **10** Nehrim scripts. It is an
+   *alarm* bell for casting inside Erothin's no-magic zone.
+
+Those scripts are `Begin OnTrigger Player` blocks, and **TES4 runs an
+`OnTrigger` block every frame the object is inside the volume.** The block's own
+code proves it: it counts `frame >= 25` and `frame >= 100` *executions* as a
+cooldown. Converting it to Papyrus `OnTriggerEnter` — which fires once, on entry
+— froze the state machine on `counter == 1`, so the 100-frame cooldown never
+ran and the alarm re-fired on every re-evaluation.
+
+- Skyrim keeps the same three-way split, and all three are distinct engine
+  events (`OnTrigger`, `OnTriggerEnter`, `OnTriggerLeave` each appear once,
+  NUL-terminated, in `SkyrimSE.exe`). `ObjectReference.psc` documents
+  `OnTrigger` as "a trigger is tripped" versus "volume is entered/left".
+- `TES4_BLOCK_MAP` now sends `ontrigger`, `ontriggeractor` and `ontriggermob`
+  to `Event OnTrigger`. The latter two differ only in *what* trips them, not in
+  edge-vs-repeat; Skyrim has no actor/creature split, so that filter stays in
+  the body.
+- Scope: **504 blocks** (Nehrim 317, Oblivion 187); 79 of them keep a
+  per-execution counter and were therefore hard-frozen. Verified no script
+  declares two blocks that would now collide into a duplicate `Event OnTrigger`
+  (0 in both plugins), and both plugins compile clean.
+- **General rule: check whether a TES4 block is edge-triggered or per-frame
+  before picking the Papyrus event.** A body that counts its own executions is
+  proof of per-frame.
+- This is a real defect and the fix stands, but it was **not** the cause of the
+  looping chapel bell either. See below.
+
+### Engine globals must bind UNSHIFTED (2026-07-30) — the actual bell bug
+
+**Root cause of the endlessly-looping chapel bell**, found in `Papyrus.0.log`
+after two wrong theories (the TimeScale latch and `OnTrigger`, both above):
+
+```
+error: Property Gamehour on script TES4_SoundZoneKapelleGlockenScript
+attached to (1A20DD0F) cannot be bound because <nullptr form> (1A000038)
+is not the right type
+error: Cannot call GetValue() on a None object, aborting function call
+	[ (1A20DD0F)].TES4_SoundZoneKapelleGlockenScript.OnUpdate()
+```
+
+`convert_GLOB` deliberately drops the engine-owned globals (`GameHour`,
+`TimeScale`, …) because Skyrim already ships them — and at the **same FormIDs
+Oblivion uses** (`GameYear 0x35` … `TimeScale 0x3A`, verified in both GLOB
+dumps). But the VMAD property binders still ran those FormIDs through the
+load-order remap, producing `1A000038` — a form that does not exist. The
+property bound to **None**, so `GameHour.GetValue()` returned **0.0 forever**,
+which is permanently inside every `GameHour <= 0.02` hour-boundary window. The
+bell re-fired on a continuous loop.
+
+The `constants.py` comment claimed these references "are canonicalized to the
+vanilla forms by script_convert (`_GLOBAL_CANONICAL`)". That was **false** —
+`_GLOBAL_CANONICAL` only canonicalizes the *name*; nothing ever fixed the
+FormID, and `_ENGINE_GLOBALS` had exactly one use (dropping the record). A
+documented mechanism that does not exist in the source is worse than none.
+
+- `constants.ENGINE_GLOBAL_FORMIDS` maps the six engine globals to their vanilla
+  FormIDs. All three VMAD binders now bind them unshifted, exactly like Player
+  (`0x14`): `object_scripts._resolve_props`,
+  `dialog_converter._build_info_script_properties`, and
+  `dialog_converter._collect_scro_properties` (the SCRO path shifted them too).
+- Scope: **338 bindings** repaired (Nehrim 113, Oblivion 225); 0 remain shifted
+  in either plugin.
+- **Why "~12 chimes" is not a bug**: `fx\nehrim\kapelleglocke.wav` is a 15.46 s
+  recording of exactly 12 evenly-spaced strikes (1.24 s apart, measured). Nehrim
+  has only one bell asset and the script never counts hours — it plays the same
+  12-strike file at every hour. That is vanilla Nehrim behaviour, not a
+  conversion artifact. Making it strike the hour would be a redesign.
+- **General rule: any FormID shared with the engine must skip the load-order
+  remap.** Player was special-cased; the globals were not. When a property reads
+  None in-game, check the Papyrus log for the binding error *first* — it names
+  the exact FormID and costs one grep, versus days of modelling script logic.
+
 ### Aggression/Confidence are ENUMS in TES5, not 0-100 (2026-07-28)
 
 TES4 stores the AI traits on a 0-100 scale; TES5 defines them as small enums
