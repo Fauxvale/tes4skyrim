@@ -5,7 +5,8 @@ import re
 from pathlib import Path
 
 from script_convert.constants import (
-    papyrus_script_name, _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS)
+    papyrus_script_name, _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS,
+    PLAYER_ALIAS_EXTENDS)
 from tes5_import.text_reader import parse_export_file, unescape_value
 from worker_budget import worker_count
 
@@ -311,15 +312,35 @@ class CrossRefGraph:
         # to `NoActivationScript`, which Oblivion puts on both a DOOR and an
         # NPC_.  `Actor extends ObjectReference`, so the shared base binds to
         # both and every inherited event still resolves.
-        sigs = {self.record_type.get(rec_fid, '')
-                for rec_fid, scri_fid in self.record_scri.items()
-                if scri_fid == script_formid}
+        attached = [rec_fid for rec_fid, scri_fid in self.record_scri.items()
+                    if scri_fid == script_formid]
+        sigs = {self.record_type.get(rec_fid, '') for rec_fid in attached}
         if 'QUST' in sigs:
             return 'Quest'
+
+        # A script attached ONLY to the player's base NPC_ (0x00000007) cannot
+        # run there in Skyrim — the acting player is PlayerRef 0x14 (signature
+        # PLYR), whose base is Skyrim's own 0x07, never our shifted copy.  The
+        # importer rehosts it on a start-game-enabled quest's PlayerRef alias
+        # (tes5_import.object_scripts.build_player_alias_plan), so it must be
+        # emitted against that alias's base type.  Only when the player base is
+        # its SOLE attachment: a script shared with real NPCs still has to bind
+        # to them as an Actor.
+        if attached and all(self._is_player_base(f) for f in attached):
+            return PLAYER_ALIAS_EXTENDS
+
         if sigs & {'NPC_', 'CREA'} and not (sigs - {'NPC_', 'CREA'}):
             return 'Actor'
 
         return 'ObjectReference'
+
+    @staticmethod
+    def _is_player_base(rec_fid: str) -> bool:
+        """True for the player's base NPC_ record (TES4 FormID 0x00000007)."""
+        try:
+            return (int(rec_fid, 16) & 0x00FFFFFF) == 0x07
+        except (TypeError, ValueError):
+            return False
 
     # TES4 magic-school enum -> the EFSH each school's enchantment glow uses.
     # Fallback for MGEFs with neither an EffectShader nor an EnchantEffect
@@ -515,6 +536,14 @@ class CrossRefGraph:
         base record to find the attached script.
         Returns '' if the record has no attached script."""
         low = name.lower()
+        # `player`/`playerref` is a converter KEYWORD emitted as
+        # `Game.GetPlayer()`, never a bound property — so it must never take a
+        # script type, even though the player's base NPC_ has EditorID "Player"
+        # and CAN carry a SCRI (Nehrim's GlobalplayerScript).  Typing it made
+        # every caller declare `TES4_GlobalplayerScript Property Player`, which
+        # then failed to convert to ObjectReference at each use.
+        if low in ('player', 'playerref'):
+            return ''
         fid = self.edid_to_formid.get(low, '')
         if not fid:
             return ''

@@ -784,3 +784,77 @@ Oblivion ignored it; Papyrus fails the whole file, so it is commented out.
 Reference events (`OnPackageEnd`, `OnActivate`) never fire on a base NPC_ VMAD —
 they must be relocated to the placed ACHR. This was the CharacterGen stage-10
 stall.
+
+### A script on the PLAYER base needs a quest alias (2026-08-01)
+
+Oblivion let a plugin script the player by attaching a SCPT to the player's base
+`NPC_ 0x00000007`. **Skyrim has no equivalent binding**, and the relocation above
+cannot help: it walks ACHR/ACRE, and the player has no ACHR — `PlayerRef 0x14` is
+engine-created and its record signature is **PLYR**, not ACHR, so a plugin cannot
+author an override of it. PlayerRef's base is *Skyrim's own* `0x07`; our shifted
+copy (`0x01000007`) is a record nothing ever instantiates, so a VMAD there is
+inert.
+
+Vanilla's mechanism for "code that runs on the player forever" is a
+start-game-enabled quest holding a reference alias forced to `0x14`, with the
+script on that **alias** — `JailQuestPlayerScript`, `TutorialPlayerScript`; 71
+Skyrim.esm quests force an alias to `0x14`, and the vanilla `Player` NPC_ carries
+no VMAD at all. The converter now mints `TES4PlayerScripts` for this
+(`object_scripts.build_player_alias_plan` →
+`dialog_converter._make_player_script_quest`), lists it in the `.seq`, and emits
+the script as `extends ReferenceAlias`, routing every implicit-self call through
+`GetReference()` / `GetActorReference()` (`Self` there is the alias, so
+`Self as Actor` is a cast the compiler rejects).
+
+Vanilla Oblivion attaches nothing to the player base, so this only ever surfaced
+on Nehrim — where `GlobalplayerScript` holds the **entire** XP / level /
+learning-point / gold economy *and* the only `SetStage MQ00 1`, which is what
+starts the main quest. Without it the intro never began and no character levelled.
+
+Two consequences worth remembering:
+
+- **The player is never a script-typed property.** `player`/`playerref` is a
+  converter keyword emitted as `Game.GetPlayer()`. Because the player base has
+  EditorID `Player` *and* can carry a SCRI, both `_add_scro_ref` (which skipped
+  only `0x14`, not `0x07`) and `get_record_script_type` typed it as the attached
+  script — so 242 Nehrim scripts declared
+  `TES4_GlobalplayerScript Property Player` and then failed to convert it to
+  `ObjectReference` at every `X.GetDistance(Player)` / `MoveTo(Player)`.
+- **A property typed as the attached script is not an Actor.** `_add_scro_ref`
+  deliberately prefers the script type so cross-script variable reads work, so
+  actor-only calls on such a property must be **cast at the call site**
+  (`(KreoRef as Actor).EvaluatePackage()`) rather than retyped — and likewise for
+  arguments of the four functions whose Papyrus signature declares an `Actor`
+  (`_ACTOR_ARG_FUNCTIONS`: `StartCombat`, `IsHostileToActor`,
+  `GetRelationshipRank`, `SetRelationshipRank`).
+
+### Quoted EditorIDs — the `_MQ01Tate_` property (2026-08-01)
+
+Oblivion's parser accepts quotes around any EditorID and Nehrim's authors use
+them constantly (**173 sites**: `SetStage "MQ01Tate" 20`, `GetStage "NQ00Karick"`,
+`StartQuest "NQ05"`, `AddScriptPackage "..."`). `_safe_property_name` maps
+`[^\w]` to `_`, so `"MQ01Tate"` became the property `_MQ01Tate_` while the *same
+script's* unquoted `GetStage MQ01Tate` became `MQ01Tate`. Only the unquoted
+spelling matches an EditorID, so only it was bound in the VMAD — `_MQ01Tate_`
+stayed **None** and every `_MQ01Tate_.SetStage(...)` threw at runtime.
+
+The damage was structural, not cosmetic: MQ01Tate could never advance past stage
+15, so it never reached stage 40 — the only thing that runs `SetStage MQ01 1` —
+and MQ00's completion stage 65 (behind an INFO owned by MQ01) was unreachable
+too. `_safe_property_name` now strips a wrapping quote pair, and
+`_convert_line` unquotes the dotted member form (`"NQ16"."NQ16CountBooksVar"`,
+which previously emitted un-parseable Papyrus because the assignment target and
+its value took different code paths). Genuine string literals are untouched.
+
+### `AdvancePCLevel` → the Level actor value (2026-08-01)
+
+Vanilla `Game.psc` (from `Data/Scripts.zip`) has **no level setter** —
+`Game.SetPlayerLevel` exists only in mod-supplied headers, so it will not
+compile against the shipped set. `Game.GetPlayer().ModActorValue("Level", 1)` is
+the equivalent the base game does offer. Nehrim drives its whole custom level-up
+through `AdvancePCLevel` (`GlobaltagebuchScript`'s journal menu), so leaving it
+unmapped pinned the player at level 1 forever.
+
+> Check `Data/Scripts.zip`, not `Data/Scripts/Source/`, when asking whether a
+> Papyrus native exists: the latter is where mods install their own headers, and
+> in this install its `Game.psc` is 454 lines against vanilla's 266.

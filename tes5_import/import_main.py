@@ -1264,6 +1264,18 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     else:
         dialog_sge_fids = build_dialog_groups(by_type, writer, npc_to_vtyp, fid_to_edid=fid_to_edid, xref=xref, well_known_props=_WELL_KNOWN_PROPERTIES, voice_map=voice_map, unlock_plan=unlock_plan, unlock_globals=unlock_globals, script_vars=_script_vars)
     sge_quest_fids |= dialog_sge_fids
+
+    # A TES4 script attached to the PLAYER BASE record needs a start-game
+    # quest with a PlayerRef alias to run from (see
+    # dialog_converter._make_player_script_quest).  Built here, not inside the
+    # dialogue pass: it is independent of DIAL/INFO, and build_dialog_groups
+    # returns early for a plugin that has no dialogue at all.
+    from .dialog_converter import _make_player_script_quest
+    player_quest_fid = _make_player_script_quest(
+        writer, master_index=(ctx.master_index if ctx else None))
+    if player_quest_fid and not (ctx and ctx.master_index is not None
+                                 and player_quest_fid in ctx.master_index):
+        sge_quest_fids.add(player_quest_fid)
     # ForceGreet packages name the topic they open (PDTO), but the per-quest
     # GREETING topics only exist now (Phase 5), long after PACK was written in
     # Phase 3b2. Patch the placeholder in the packed bytes rather than reorder

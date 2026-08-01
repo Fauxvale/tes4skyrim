@@ -1245,8 +1245,19 @@ def _write_report(output_dir: str, stats: dict):
                 f.write(f'  ... and {len(stats["errors"]) - 100} more\n')
 
 
-# Player FormID — skip when pre-loading SCRO refs
-_PLAYER_FORMID = '00000014'
+# The player, in both spellings a TES4 SCRO can carry — skipped when
+# pre-loading SCRO refs, because `player`/`playerref` is a KEYWORD the converter
+# emits as `Game.GetPlayer()`, never a bound property.
+#
+# 0x14 is PlayerRef (the placed reference); 0x07 is the player's base NPC_, and
+# a script that writes `Player.AddItem` lists THAT one.  Only 0x14 was skipped,
+# so 0x07 fell through to the generic path and was typed by whatever script the
+# plugin attaches to the player base — giving every caller a property
+# `TES4_GlobalplayerScript Property Player` that then failed to convert to
+# ObjectReference at each `X.GetDistance(Player)` / `MoveTo(Player)` call site
+# (242 Nehrim scripts).  Vanilla Oblivion attaches no script to the player base,
+# which is why this only ever surfaced on Nehrim.
+_PLAYER_FORMIDS = frozenset({'00000014', '00000007'})
 
 
 def _preload_scro_refs(conv: 'ScriptConverter', rec: dict, xref: CrossRefGraph):
@@ -1276,7 +1287,7 @@ def _preload_stage_scro_refs(conv: 'ScriptConverter', rec: dict, xref: CrossRefG
 
 def _add_scro_ref(conv: 'ScriptConverter', fid: str, xref: CrossRefGraph):
     """Add a single SCRO FormID as a property ref on the converter."""
-    if fid == _PLAYER_FORMID:
+    if fid in _PLAYER_FORMIDS:
         return
     edid = xref.formid_to_edid.get(fid)
     if not edid:
@@ -1321,7 +1332,9 @@ def _add_scro_ref(conv: 'ScriptConverter', fid: str, xref: CrossRefGraph):
 
 def build_vmad_quest_fragments(quest_edid: str, stage_fragments: list[tuple[int, int]],
                                property_values: dict = None,
-                               attached_script: tuple = None) -> bytes:
+                               attached_script: tuple = None,
+                               alias_scripts: list = None,
+                               quest_fid: int = 0) -> bytes:
     """Build VMAD binary for a QUST record with stage script fragments and/or
     an attached quest script.
 
@@ -1335,6 +1348,14 @@ def build_vmad_quest_fragments(quest_edid: str, stage_fragments: list[tuple[int,
             fragment script's properties
         attached_script: optional (script_name, {prop: formid}) for the
             converted TES4 quest script (SCRI) to attach alongside
+        alias_scripts: optional [(alias_id, [(script_name, {prop: formid})])]
+            binding scripts to this quest's reference aliases (how vanilla
+            hosts player-side logic — JailQuestPlayerScript on JailQuest's
+            alias 15, TutorialPlayerScript on TutorialEnchanting's alias 5).
+        quest_fid: this quest's own output FormID.  The alias entry's
+            ScriptPropertyObject names the QUEST, not the alias target —
+            verified against Skyrim.esm, where every alias group's formID is
+            the owning QUST's.
 
     Returns VMAD binary data.
     """
@@ -1385,8 +1406,28 @@ def build_vmad_quest_fragments(quest_edid: str, stage_fragments: list[tuple[int,
     # is the real reason converted quests showed a journal objective but never a
     # marker.  Verified against Skyrim.esm: vanilla QUST VMADs end with exactly
     # these two bytes (e.g. DBSideContract03's 643-byte VMAD parses to 643/643
-    # only once the trailing count is read).  We attach no alias scripts, so 0.
-    buf += struct.pack('<h', 0)
+    # only once the trailing count is read).
+    #
+    # Each entry (xEdit wbArrayS('Aliases', ...), byte layout confirmed by
+    # parsing JailQuest / TutorialEnchanting / MQSkyHavenSparring out of
+    # Skyrim.esm):
+    #   ScriptPropertyObject  U16 unused, S16 aliasID, U32 formID (the QUEST's)
+    #   S16 Version, S16 ObjectFormat
+    #   S16 script count, then that many ordinary script entries
+    alias_scripts = alias_scripts or []
+    buf += struct.pack('<h', len(alias_scripts))
+    for alias_id, scripts in alias_scripts:
+        buf += struct.pack('<HhI', 0, alias_id, quest_fid)
+        buf += struct.pack('<hh', 5, 2)          # version=5, objectFormat=2
+        buf += struct.pack('<h', len(scripts))
+        for sname, props in scripts:
+            buf += _pack_wstring(sname)
+            buf += struct.pack('<B', 0)          # flags=0
+            buf += struct.pack('<H', len(props))
+            for pname, fid in props.items():
+                buf += _pack_wstring(pname)
+                buf += struct.pack('<BB', 1, 1)  # type=Object, status=Edited
+                buf += struct.pack('<HhI', 0, -1, fid)
 
     return bytes(buf)
 

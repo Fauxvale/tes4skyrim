@@ -13,6 +13,7 @@ from pathlib import Path
 from tools.tes5_esm_reader import read_tes5_file, _get, _all, _zstring
 from tools.quest_walkthrough import (
     Ctda, parse_ctdas, and_groups, parse_vmad, parse_qust_fragments,
+    parse_qust_alias_scripts,
     parse_info_fragments, parse_psc, extract_actions, PscInfo, _OPS,
     _BARK_SNAMS, _P1_FORMID_FUNCS,
     F_GETQUESTRUNNING, F_GETSTAGE, F_GETSTAGEDONE, F_GETISID,
@@ -27,6 +28,19 @@ _PARSE_TYPES = frozenset({
     # script-capable object types (object-script VMAD attachments)
     'ACTI', 'ALCH', 'ARMO', 'BOOK', 'CONT', 'DOOR', 'FLOR', 'FURN', 'INGR',
     'KEYM', 'LIGH', 'MISC', 'WEAP', 'APPA', 'SLGM', 'AMMO', 'SCRL',
+    # PLACED references.  The importer MOVES an actor script off the base
+    # NPC_/CREA onto its ACHR whenever the script handles a reference-only
+    # event or a package condition reads its variables
+    # (object_scripts._relocate_actor_scripts_to_refs) — so for those the ACHR
+    # is the only record carrying the VMAD.  Without ACHR here every relocated
+    # script read as "attached to NOTHING" (MQ00ShocktrollScript,
+    # MQ01CelebroDeadScript01, SchattenrufAlptraumTrollScript ... in Nehrim).
+    'ACHR', 'REFR',
+    # MGEF: a TES4 Script-archetype magic effect (SCHR.Type 256) becomes a
+    # Skyrim MGEF carrying the converted script as its VMAD
+    # (object_scripts.build_magic_effect_script_plan), so spell scripts that
+    # drive quest stages live here (SpellMQ00Merzul01Script sets MQ00 45).
+    'MGEF',
 })
 
 
@@ -150,6 +164,10 @@ class Tes5Data:
             try:
                 scripts, tail = parse_vmad(vm.data)
                 frags = parse_qust_fragments(tail)
+                # Scripts bound to the quest's reference ALIASES run exactly
+                # like quest-attached ones; count them as attached or a
+                # player-alias script reads as "attached to NOTHING".
+                scripts = scripts + parse_qust_alias_scripts(tail)
             except (ValueError, struct.error, IndexError):
                 pass
         edid = _zstring(e.data) if e else ''

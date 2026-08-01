@@ -139,6 +139,32 @@ The emulator previously ignored INFO DATA entirely, so Say Once, Random, and
 Goodbye were invisible to it. It now parses the subrecord with this layout and
 exposes `say_once`, `is_random`, `is_goodbye`, and `reset_ticks`.
 
+## DIAL.QNAM is a hard runtime gate; TES4's QSTI is not (2026-08-01)
+
+Skyrim evaluates a topic's INFOs only while its **owning quest (QNAM) is
+running**. Oblivion's QSTI list is an organisational grouping the engine never
+gates on, so a TES4 topic filed under a quest that nothing ever starts still
+worked — and converts into a permanently dead topic.
+
+Nehrim ships exactly this: `MQ01Topic01` ("show Aratornias the letter") is filed
+under the vestigial 3-stage `MQ01`, and its INFO holds the only
+`SetStage MQ00 65` — MQ00's completion stage. Faithfully copying `Quest[0]` made
+the intro quest uncompletable.
+
+`build_dialog_groups` therefore computes the set of quests that can ever run
+(start-game-enabled, or named by a `StartQuest`/`SetStage` anywhere in the
+plugin's scripts, quest stage result scripts, or INFO result scripts) and owns a
+topic by its original quest **only when that quest is in the set**; otherwise it
+falls back to the always-running generic quest, exactly as a multi-quest topic
+does. The analysis is skipped entirely when the plugin has no SCPT records — a
+starter can only be found in a script, so with none every non-SGE quest would
+look unstartable and the per-quest gating would be lost wholesale.
+
+`Quest.SetStage` counts as a starter: vanilla `Quest.psc` documents it as
+*"latent and will wait for the quest to start up before returning (if it needed
+to be started)"*, so it starts a stopped quest. Censused on Skyrim.esm, 0 of
+15,037 vanilla DIALs point QNAM at a non-existent quest.
+
 ## Re-deriving any of this
 
 `tools/skyrim_disasm.py` locates classes and disassembles, and

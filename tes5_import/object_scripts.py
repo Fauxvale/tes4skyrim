@@ -23,7 +23,8 @@ import re
 
 from script_convert.converter import ScriptConverter
 from script_convert.constants import (_safe_property_name, papyrus_script_name,
-                                      resolve_property_formid)
+                                      resolve_property_formid,
+                                      PLAYER_ALIAS_EXTENDS)
 from script_convert.pipeline import build_vmad_object_script
 from .text_reader import parse_export_file, get_formid_index_offset, remap_formid
 from .constants import ENGINE_GLOBAL_FORMIDS
@@ -66,6 +67,18 @@ _OBJECT_VMAD: dict[int, bytes] = {}
 # splices the script into the quest's VMAD alongside the QF fragment script.
 _QUEST_SCRIPT: dict[int, tuple] = {}
 
+# [(script_name, {prop: formid}), ...] for TES4 scripts attached to the PLAYER
+# BASE record (NPC_ 0x00000007).  Filled by build_player_alias_plan(); consumed
+# by dialog_converter._make_player_script_quest, which hosts them on a
+# start-game-enabled quest's PlayerRef reference alias.  See
+# script_convert.constants.PLAYER_ALIAS_EXTENDS for why the base record itself
+# cannot carry them.
+_PLAYER_ALIAS_SCRIPTS: list[tuple] = []
+
+# TES4 FormID of the player's base NPC_ record.  Oblivion and Skyrim both
+# hardcode it; a plugin scripting the player attaches its SCPT here.
+_PLAYER_BASE_FORMID = 0x07
+
 
 def get_object_vmad(record_fid: int) -> bytes:
     """Packed VMAD subrecord for a record's attached object script (b'' if none)."""
@@ -75,6 +88,11 @@ def get_object_vmad(record_fid: int) -> bytes:
 def get_quest_script(record_fid: int):
     """(script_name, props) for a QUST's converted TES4 quest script, or None."""
     return _QUEST_SCRIPT.get(record_fid)
+
+
+def get_player_alias_scripts() -> list:
+    """[(script_name, props)] to host on a quest's PlayerRef alias."""
+    return list(_PLAYER_ALIAS_SCRIPTS)
 
 
 def _remap(fid: int, offset: int) -> int:
@@ -224,9 +242,17 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
             if not rec_fid_str:
                 continue
             try:
-                rec_fid = _remap(int(rec_fid_str, 16), offset)
+                raw_fid = int(rec_fid_str, 16)
             except ValueError:
                 continue
+            # The PLAYER base carries no VMAD: our shifted copy of NPC_ 0x07 is
+            # a record no actor ever instantiates (the acting player is
+            # PlayerRef 0x14, whose base is Skyrim's own 0x07), so a script
+            # bound here is inert.  It is rehosted on a quest's PlayerRef alias
+            # by build_player_alias_plan below.
+            if sig == 'NPC_' and (raw_fid & 0x00FFFFFF) == _PLAYER_BASE_FORMID:
+                continue
+            rec_fid = _remap(raw_fid, offset)
 
             edid, sctx, extends = scpt_by_fid[scri]
             script_name = papyrus_script_name(edid or f'Script_{scri}')
@@ -245,11 +271,67 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
                 'VMAD', build_vmad_object_script(script_name, obj_props))
             count += 1
 
+    n_player = build_player_alias_plan(by_type, xref, fid_to_edid)
+    if n_player:
+        print(f"  Player-base scripts rehosted on a PlayerRef quest alias: "
+              f"{n_player}")
+
     n_moved = _relocate_actor_scripts_to_refs(by_type, offset)
     if n_moved:
         print(f"  Actor scripts relocated to placed refs (reference events / "
               f"GetVMScriptVariable package gates): {n_moved}")
     return count
+
+
+def build_player_alias_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
+    """Plan the rehosting of PLAYER-BASE scripts onto a PlayerRef quest alias.
+
+    Oblivion let a plugin script the player by attaching a SCPT to the player's
+    base NPC_ record (0x00000007).  Nehrim relies on this completely: its
+    GlobalplayerScript holds the whole XP/level/learning-point/gold economy AND
+    the `SetStage MQ00 1` that is the ONLY thing that starts the main quest, so
+    losing it means the intro never begins and no character ever levels.
+
+    Skyrim cannot honour that attachment.  The acting player is PlayerRef 0x14,
+    whose record signature is PLYR — not ACHR, so a plugin cannot author an
+    override of it and there is no placed reference to relocate onto (which is
+    why _relocate_actor_scripts_to_refs, walking ACHR/ACRE, never sees this
+    case).  PlayerRef's base is Skyrim's OWN Player 0x07; the converted
+    plugin's copy is shifted into our index (0x01000007) and is a dead record
+    nothing instantiates.
+
+    Vanilla's mechanism for "code that runs on the player forever" is a
+    start-game-enabled quest holding a reference alias forced to 0x14 — 71
+    Skyrim.esm quests do exactly this.  The script rides that alias, so it is
+    emitted as `extends ReferenceAlias` (see PLAYER_ALIAS_EXTENDS) and every
+    implicit-self call routes through GetReference()/GetActorReference().
+
+    Returns the number of scripts planned.
+    """
+    _PLAYER_ALIAS_SCRIPTS.clear()
+    offset = get_formid_index_offset()
+    scpt_by_fid = _collect_scpts(by_type, xref)
+
+    for rec in by_type.get('NPC_', []):
+        try:
+            if (int(rec.get('FormID', ''), 16)
+                    & 0x00FFFFFF) != _PLAYER_BASE_FORMID:
+                continue
+        except ValueError:
+            continue
+        scri = rec.get('SCRI', '')
+        if not scri or scri not in scpt_by_fid:
+            continue
+        edid, sctx, _extends = scpt_by_fid[scri]
+        script_name = papyrus_script_name(edid or f'Script_{scri}')
+        try:
+            props = _resolve_props(sctx, edid, PLAYER_ALIAS_EXTENDS, xref,
+                                   fid_to_edid, offset)
+        except Exception:
+            props = {}
+        _PLAYER_ALIAS_SCRIPTS.append((script_name, props))
+
+    return len(_PLAYER_ALIAS_SCRIPTS)
 
 
 # Reference-only events, per the vanilla Papyrus base classes (Scripts.zip):

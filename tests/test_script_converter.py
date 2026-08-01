@@ -21,6 +21,7 @@ from script_convert.constants import (
     PAPYRUS_MAX_SCRIPT_NAME,
     papyrus_script_name,
     _safe_property_name,
+    PLAYER_ALIAS_EXTENDS,
 )
 from script_convert.pipeline import (
     _sanitize_name,
@@ -2194,3 +2195,116 @@ class TestResetFallDamageTimerIsPaired:
             'U', 'scn U\nbegin scripteffectfinish\n  Return\nend\n',
             'ActiveMagicEffect', 'U')
         assert 'RestoreFallDamage' not in other
+
+
+class TestQuotedEditorIds:
+    """Oblivion's parser accepts quotes around any EditorID, and Nehrim's
+    authors use them constantly (173 sites).  Left in, the property sanitiser
+    turned each quote into an underscore, so `SetStage "MQ01Tate" 20` produced
+    the property `_MQ01Tate_` while the SAME script's unquoted
+    `GetStage MQ01Tate` produced `MQ01Tate`.  Only the unquoted spelling
+    matches an EditorID, so only it was bound in the VMAD — `_MQ01Tate_` stayed
+    None and every `_MQ01Tate_.SetStage(...)` threw.  MQ01Tate was stranded at
+    stage 15, never reaching the stage 40 that is the only thing starting MQ01,
+    so MQ00 could never complete either.
+    """
+
+    @pytest.fixture
+    def converter(self):
+        return ScriptConverter(CrossRefGraph())
+
+    def test_quoted_and_unquoted_name_the_same_property(self, converter):
+        quoted = converter._convert_line('SetStage "MQ01Tate" 20', 'Quest')
+        bare = converter._convert_line('SetStage MQ01Tate 20', 'Quest')
+        assert quoted == bare == 'MQ01Tate.SetStage(20)'
+
+    @pytest.mark.parametrize('line,expected', [
+        ('if ( GetStage "MQ01Tate" == 15 )', 'If (MQ01Tate.GetStage() == 15)'),
+        ('StartQuest "NQ05"', 'NQ05.Start()'),
+        ('StopQuest "Charactergen"', 'Charactergen.Stop()'),
+    ])
+    def test_quest_commands_unquote(self, converter, line, expected):
+        assert converter._convert_line(line, 'Quest') == expected
+
+    def test_dotted_member_access_unquotes_both_sides(self, converter):
+        # 1AlmanachDerBeschwoerungSCN: the assignment TARGET went through
+        # _convert_ref (mangling the quotes) while the VALUE went through
+        # _convert_expression (leaving them), emitting un-parseable Papyrus.
+        out = converter._convert_line(
+            'Set "NQ16"."NQ16CountBooksVar" to "NQ16"."NQ16CountBooksVar" +1',
+            'Quest')
+        assert out == 'NQ16.NQ16CountBooksVar = NQ16.NQ16CountBooksVar + 1'
+        assert '"' not in out
+
+    @pytest.mark.parametrize('line', [
+        'Message "Ihr habt den Erfolg verdient!"',
+        'MessageBox "Ihr habt Punkte erhalten."',
+    ])
+    def test_real_string_literals_keep_their_quotes(self, converter, line):
+        assert '"' in converter._convert_line(line, 'Quest')
+
+    def test_safe_property_name_strips_wrapping_quotes(self):
+        assert _safe_property_name('"MQ01Tate"') == _safe_property_name('MQ01Tate')
+
+
+class TestPlayerBaseScriptRidesAQuestAlias:
+    """A TES4 script on the player's BASE record (NPC_ 0x07) cannot run there
+    in Skyrim: the acting player is PlayerRef 0x14 (signature PLYR, so a plugin
+    cannot override it), whose base is Skyrim's OWN 0x07 — never the converted
+    plugin's shifted copy.  Vanilla hosts player-side logic on a quest's
+    PlayerRef reference alias (JailQuestPlayerScript, TutorialPlayerScript;
+    71 Skyrim.esm quests force an alias to 0x14), so the script is emitted
+    against that alias's base type.  Nehrim's GlobalplayerScript holds the whole
+    XP economy AND the only `SetStage MQ00 1`, which starts the main quest.
+    """
+
+    _SRC = ('scn GlobalplayerScript\n'
+            'short StartQuest\n'
+            'begin gamemode\n'
+            '  if ( StartQuest == 0 )\n'
+            '    SetStage MQ00 1\n'
+            '    set StartQuest to -1\n'
+            '  endif\n'
+            '  set foo to GetLevel\n'
+            'end\n')
+
+    @pytest.fixture
+    def out(self):
+        return ScriptConverter(CrossRefGraph()).convert_standalone(
+            'GlobalplayerScript', self._SRC, PLAYER_ALIAS_EXTENDS,
+            'GlobalplayerScript')
+
+    def test_extends_reference_alias(self, out):
+        assert out.splitlines()[0].startswith(
+            f'ScriptName TES4_GlobalplayerScript extends {PLAYER_ALIAS_EXTENDS}')
+
+    def test_the_stage_call_survives(self, out):
+        assert 'MQ00.SetStage(1)' in out
+
+    def test_no_self_as_actor_cast(self, out):
+        """`Self` is the ReferenceAlias, so the cast the compiler rejects must
+        never be emitted; the alias's filled reference is the subject."""
+        assert 'Self as Actor' not in out
+        assert 'GetActorReference().GetLevel()' in out
+
+    def test_poll_is_not_load_gated(self, out):
+        """The player is always loaded, so the update loop registers
+        unconditionally — an Is3DLoaded() gate is for placed objects."""
+        assert 'Is3DLoaded' not in out
+        assert 'RegisterForSingleUpdate' in out
+
+
+class TestPlayerIsNeverAScriptTypedProperty:
+    """`player`/`playerref` is a converter keyword emitted as
+    `Game.GetPlayer()`, never a bound property — even though the player's base
+    NPC_ has EditorID "Player" and CAN carry a SCRI.  Typing it made every
+    caller declare `TES4_GlobalplayerScript Property Player`, which then failed
+    to convert to ObjectReference at each use (242 Nehrim scripts)."""
+
+    def test_get_record_script_type_ignores_the_player(self):
+        xref = CrossRefGraph()
+        xref.edid_to_formid['player'] = '00000007'
+        xref.record_scri['00000007'] = '00004E1A'
+        xref.script_formid_to_edid['00004E1A'] = 'GlobalplayerScript'
+        assert xref.get_record_script_type('Player') == ''
+        assert xref.get_record_script_type('PlayerRef') == ''

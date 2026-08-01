@@ -130,8 +130,18 @@ def parse_vmad(data: bytes):
     pos = 0
     version, objfmt = struct.unpack_from('<HH', data, 0)
     pos = 4
-    nscripts = struct.unpack_from('<H', data, pos)[0]
-    pos += 2
+    scripts, pos = _parse_vmad_scripts(data, pos, '<H')
+    return scripts, data[pos:]
+
+
+def _parse_vmad_scripts(data: bytes, pos: int, count_fmt: str):
+    """Parse a counted array of VMAD script entries → ([(name, props)], pos).
+
+    `count_fmt` is the struct format of the leading count: '<H' for the
+    top-level Scripts array, '<h' for the per-alias Alias Scripts array.
+    """
+    nscripts = struct.unpack_from(count_fmt, data, pos)[0]
+    pos += struct.calcsize(count_fmt)
     scripts = []
     for _ in range(nscripts):
         name, pos = _wstring(data, pos)
@@ -162,7 +172,43 @@ def parse_vmad(data: bytes):
             else:
                 raise ValueError(f'unsupported VMAD prop type {ptype}')
         scripts.append((name, props))
-    return scripts, data[pos:]
+    return scripts, pos
+
+
+def parse_qust_alias_scripts(tail: bytes):
+    """Scripts bound to a QUST's reference ALIASES → [(name, props)].
+
+    The Aliases array closes a QUST VMAD, after the fragment section
+    (xEdit wbVMADFragmentedQUST).  Each entry is:
+        ScriptPropertyObject  u16 unused, i16 aliasID, u32 formID
+        i16 Version, i16 ObjectFormat
+        i16 script count, then that many ordinary script entries
+
+    A script hosted here is genuinely attached and running — this is how
+    vanilla binds player-side logic (JailQuestPlayerScript) and how the
+    converter rehosts a TES4 player-base script (TES4PlayerScripts).  Without
+    reading it the walkthrough reported those scripts as "attached to NOTHING".
+    """
+    if not tail:
+        return []
+    pos = 1  # extra-bind version
+    count = struct.unpack_from('<H', tail, pos)[0]
+    pos += 2
+    _fn, pos = _wstring(tail, pos)
+    for _ in range(count):            # skip the stage fragments
+        pos += 9
+        _s, pos = _wstring(tail, pos)
+        _f, pos = _wstring(tail, pos)
+    if pos + 2 > len(tail):
+        return []
+    nalias = struct.unpack_from('<h', tail, pos)[0]
+    pos += 2
+    out = []
+    for _ in range(nalias):
+        pos += 8 + 4                 # ScriptPropertyObject + version/objfmt
+        scripts, pos = _parse_vmad_scripts(tail, pos, '<h')
+        out.extend(scripts)
+    return out
 
 
 def parse_qust_fragments(tail: bytes):

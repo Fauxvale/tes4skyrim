@@ -8,15 +8,22 @@ from script_convert.constants import (
     _PAPYRUS_RESERVED, FUNCTION_MAP, _BARE_BOOL_FUNCTIONS,
     _BARE_NO_EQUIV_COMMANDS,
     _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS, _ACTORBASE_ARG_FUNCTIONS,
+    _ACTOR_ARG_FUNCTIONS,
     _OBJREF_IMPLICIT_SELF_FUNCTIONS, _ZERO_ARG_REF_FUNCTIONS,
     _safe_property_name, _canonical_global, _record_type_to_papyrus,
     _record_type_to_base_papyrus, papyrus_script_name,
     TES4_MURDER_BOUNTY, TES4_ASSAULT_BOUNTY, TES4_STEAL_BOUNTY,
+    PLAYER_ALIAS_EXTENDS,
 )
 from script_convert.cross_ref import CrossRefGraph
 
 
 _COND_LINE_RE = re.compile(r'^(\s*(?:If|ElseIf)\s+)(.*)$', re.IGNORECASE)
+
+# A whole name wrapped in Oblivion's optional quotes: `"MQ01Tate"`.  Anchored,
+# so it only ever strips a quoted IDENTIFIER handed to _convert_ref — never a
+# string literal, which contains spaces/punctuation and reaches other handlers.
+_QUOTED_NAME_RE = re.compile(r'^"([A-Za-z_]\w*)"$')
 # TES4 reads of "is the player sleeping right now" (the MenuMode sleep idiom)
 _SLEEP_READ_RE = re.compile(r'\b(?:ispcsleeping|isplayersleeping|getpcissleeping)\b',
                             re.IGNORECASE)
@@ -1065,6 +1072,15 @@ class ScriptConverter:
 
         # Apply shared post-processing (TES4-only functions, type mismatches, etc.)
         out = self._postprocess_lines(out)
+
+        # A PlayerAlias script's `Self` is a ReferenceAlias, so `Self as Actor`
+        # is a cast the compiler rejects outright and a bare `Self` passed where
+        # an ObjectReference is wanted is the wrong object.  Every emitter above
+        # routes these correctly, but the paths are many and one missed site
+        # fails the whole script to compile — so normalise here as a backstop.
+        if extends == PLAYER_ALIAS_EXTENDS:
+            out = [self._PLAYER_ALIAS_SELF_RE.sub('GetActorReference()', ln)
+                   for ln in out]
 
         # Post-process: retype ObjectReference variables that are only used as integers
         # TES4 'ref' type was general-purpose; scripts often used ref vars as int flags
@@ -2336,6 +2352,8 @@ class ScriptConverter:
         # Clear accumulated expression-level comments before conversion
         self._line_comments.clear()
 
+        stripped = self._unquote_identifiers(stripped)
+
         result = self._convert_line_inner(stripped, extends)
 
         # Append any accumulated expression-level comments (from no-op functions)
@@ -2351,6 +2369,30 @@ class ScriptConverter:
         if inline_comment and not result.lstrip().startswith(';'):
             return result + inline_comment
         return result
+
+    # A quoted EditorID used as a REFERENCE, i.e. one side of a `.` member
+    # access: `"NQ16"."NQ16CountBooksVar"`, `"NQ16".Var`, `Ref."Var"`.
+    # Oblivion's parser accepts quotes around any EditorID, and Nehrim's authors
+    # use them constantly.  Only the dotted form is unquoted here: a bare
+    # `"text"` elsewhere on the line is a real string literal (a Message, a
+    # PlaySound EditorID that the sound handlers already dequote themselves),
+    # and stripping those would corrupt every message in the plugin.
+    _QUOTED_MEMBER_RE = re.compile(r'"([A-Za-z_]\w*)"(?=\s*\.)|(?<=\.)\s*"([A-Za-z_]\w*)"')
+
+    @classmethod
+    def _unquote_identifiers(cls, line: str) -> str:
+        """Strip Oblivion's optional quotes from a dotted EditorID reference.
+
+        `Set "NQ16"."NQ16CountBooksVar" to "NQ16"."NQ16CountBooksVar" +1`
+        (1AlmanachDerBeschwoerungSCN) reached the emitter with the quotes still
+        on: the assignment TARGET went through _convert_ref, which mangled them
+        into `_NQ16_._NQ16CountBooksVar_`, while the VALUE went through
+        _convert_expression, which left them alone and emitted the un-parseable
+        `NQ16."NQ16CountBooksVar" + 1`.  Normalising once, here, fixes both
+        sides and every other path that reads the line.
+        """
+        return cls._QUOTED_MEMBER_RE.sub(
+            lambda m: m.group(1) or m.group(2), line)
 
     def _convert_line_inner(self, stripped: str, extends: str) -> str:
         """Core line conversion logic (no inline-comment handling)."""
@@ -3777,6 +3819,18 @@ class ScriptConverter:
         variable can shadow the `player` keyword in a VALUE position but never
         as a receiver — a `Short` has no methods — so the keyword wins there.
         """
+        # Oblivion's parser accepts quotes around any EditorID, and Nehrim's
+        # authors use them constantly (173 sites: `SetStage "MQ01Tate" 20`,
+        # `GetStage "NQ00Karick"`, `StartQuest "NQ05"`,
+        # `AddScriptPackage "..."`).  The quotes reached the property namer,
+        # which turned each `"` into `_` — so `"MQ01Tate"` became the property
+        # `_MQ01Tate_` while the same script's UNQUOTED `GetStage MQ01Tate`
+        # became `MQ01Tate`.  Only the unquoted spelling matched an EditorID,
+        # so only it was bound in the VMAD; `_MQ01Tate_` stayed None and every
+        # `_MQ01Tate_.SetStage(...)` threw at runtime.  That stranded MQ01Tate
+        # at stage 15 — it could never reach stage 40, which is the only thing
+        # that starts MQ01, so MQ00 could never be completed either.
+        name = _QUOTED_NAME_RE.sub(r'\1', name.strip())
         low = name.lower()
         # A declared local otherwise wins over the built-in keywords, including
         # `player`.  StartCelleAufzugTriggerZone01Script declares `Short Player`
@@ -3794,6 +3848,8 @@ class ScriptConverter:
                 return 'GetTargetActor()'
             if extends == 'TopicInfo':
                 return 'akSpeakerRef'
+            if extends == PLAYER_ALIAS_EXTENDS:
+                return 'GetReference()'
             return 'Self'
 
         # Known TES4 globals -> property
@@ -3894,6 +3950,17 @@ class ScriptConverter:
         else:
             parts = args_str.split()
         converted = [self._convert_expression(p, extends) for p in parts]
+        # A property typed as the SCRIPT attached to the record it names (see
+        # _add_scro_ref) is not an Actor, so passing it where the Papyrus
+        # signature wants one does not compile — `StartCombat(NQ05Soldat01nRef)`
+        # with that property typed TES4_NQ05NOActivationScript.  The bound
+        # object IS an actor, so cast at the call site rather than retyping the
+        # property, which the cross-script variable reads still need.
+        if func_name in _ACTOR_ARG_FUNCTIONS:
+            converted = [
+                f'({c} as Actor)'
+                if self._property_refs.get(c, '').startswith('TES4_') else c
+                for c in converted]
         # Note: the Form→Spell downcast that AddSpell/RemoveSpell need is applied
         # where the UDF signature is emitted, because the parameter's type is not
         # decided until after the body has been converted.
@@ -4144,11 +4211,18 @@ class ScriptConverter:
 
     def _resolve_self_ref(self, ref_name, extends, actor_func=False):
         """Resolve the reference for a function call.
-        
+
         For ActiveMagicEffect scripts, bare (no ref) or Self-prefixed actor/objref
         functions need GetTargetActor() instead of Self.
         For TopicInfo scripts, bare actor functions need akSpeakerRef.
+        For PlayerAlias scripts (a TES4 script attached to the Player BASE
+        record, rehosted on a quest's PlayerRef alias — see
+        object_scripts._build_player_alias_plan) Self is a ReferenceAlias, not
+        an actor, so the implicit subject is the alias's filled reference.
         """
+        if extends == PLAYER_ALIAS_EXTENDS and (
+                not ref_name or ref_name.lower() in ('self', 'myself', 'getself')):
+            return 'GetActorReference()' if actor_func else 'GetReference()'
         if ref_name:
             ref_low = ref_name.lower()
             # Self in ActiveMagicEffect/TopicInfo should redirect actor functions
@@ -4171,6 +4245,17 @@ class ScriptConverter:
                 if cur == 'ObjectReference' or (
                         cur == '' and self._is_bindable_property(canon)):
                     self._property_refs[canon] = 'Actor'
+                elif cur.startswith('TES4_'):
+                    # The property is typed as the SCRIPT attached to the record
+                    # it names (_add_scro_ref prefers that so cross-script
+                    # variable reads work).  That type is not an Actor, so an
+                    # actor-only call on it does not compile — but the object it
+                    # binds to IS one, so cast at the call site rather than
+                    # retyping the property and breaking the variable reads.
+                    # (`KreoRef.EvaluatePackage()`, `MelvinTotRef.SetGhost()`,
+                    # `NQ05Soldat01Ref.StartCombat()` — all actors carrying a
+                    # converted script.)
+                    return f'({canon} as Actor)'
             return canon
         if actor_func:
             if extends == 'ActiveMagicEffect':
@@ -4178,6 +4263,21 @@ class ScriptConverter:
             if extends == 'TopicInfo':
                 return '(akSpeakerRef as Actor)'
         return 'Self'
+
+    # `(Self as Actor)` / `Self as Actor` inside a PlayerAlias script.  Matches
+    # the parenthesised and bare forms; a bare `Self` on its own is left alone
+    # (assigning the alias itself to an alias-typed property is legitimate).
+    _PLAYER_ALIAS_SELF_RE = re.compile(
+        r'\(\s*Self\s+as\s+Actor\s*\)|\bSelf\s+as\s+Actor\b', re.IGNORECASE)
+
+    @staticmethod
+    def _implicit_self(extends: str) -> str:
+        """What a bare, receiver-less call acts on in this script's base type.
+
+        `Self` everywhere except a PlayerAlias script, whose Self is the
+        ReferenceAlias rather than the reference it fills.
+        """
+        return 'GetReference()' if extends == PLAYER_ALIAS_EXTENDS else 'Self'
 
     def _resolve_objref_ref(self, ref_name, extends) -> str:
         """Resolve the reference for an ObjectReference-typed function call.
@@ -4193,12 +4293,16 @@ class ScriptConverter:
                 return 'GetTargetActor()'
             if extends == 'TopicInfo':
                 return 'akSpeakerRef'
+            if extends == PLAYER_ALIAS_EXTENDS:
+                return 'GetReference()'
             return 'Self'
         if ref_name.lower() in ('self', 'myself', 'getself'):
             if extends == 'ActiveMagicEffect':
                 return 'GetTargetActor()'
             if extends == 'TopicInfo':
                 return 'akSpeakerRef'
+            if extends == PLAYER_ALIAS_EXTENDS:
+                return 'GetReference()'
         return self._convert_ref(ref_name, extends, as_receiver=True)
 
     def _bind_base_form_property(self, name: str) -> None:
@@ -4321,6 +4425,8 @@ class ScriptConverter:
                 return 'GetTargetActor()'
             if extends == 'TopicInfo':
                 return 'akSpeakerRef'
+            if extends == PLAYER_ALIAS_EXTENDS:
+                return 'GetReference()'
             return 'Self'
 
         if fname_low == 'getpcissex':
@@ -4623,7 +4729,8 @@ class ScriptConverter:
                 self._property_refs[raw] = 'Sound'
             if fname_low == 'playsound':
                 return f'{arg}.Play(Game.GetPlayer())'
-            ref = self._resolve_self_ref(ref_name, extends) if ref_name else 'Self'
+            ref = self._resolve_self_ref(ref_name, extends) if ref_name \
+                else self._implicit_self(extends)
             return f'{arg}.Play({ref})'
         if fname_low == 'stopsound':
             self._line_comments.append(';NE: StopSound has no Papyrus equivalent')
@@ -4793,6 +4900,16 @@ class ScriptConverter:
             if ref == 'Self' and extends not in ('Actor',):
                 ref = '(Self as Actor)'
             return f'TES4Polyfill.GetIsCreature({ref})'
+
+        # AdvancePCLevel: raise the player exactly one level.  Skyrim's vanilla
+        # Game.psc (Scripts.zip) has NO level setter — Game.SetPlayerLevel is a
+        # mod-supplied extension, absent from the shipped headers — so the
+        # writable Level actor value is the equivalent the base game does offer.
+        # Nehrim drives its whole custom level-up through this call
+        # (GlobaltagebuchScript's journal menu), so leaving it unmapped left the
+        # player permanently at level 1.
+        if fname_low == 'advancepclevel':
+            return 'Game.GetPlayer().ModActorValue("Level", 1)'
 
         # HasVampireFed: Skyrim's PlayerVampireQuestScript.VampireStatus is 1
         # exactly while the vampire has recently fed.
@@ -5951,7 +6068,8 @@ class ScriptConverter:
                 seq = anim_name.capitalize()
                 # PlayAnimation is an ObjectReference method, so an explicit
                 # ref plays on THAT object, not on Self.
-                obj = self._resolve_objref_ref(ref_name, extends) if ref_name else 'Self'
+                obj = self._resolve_objref_ref(ref_name, extends) if ref_name \
+                    else self._implicit_self(extends)
                 return f'{obj}.PlayAnimation("{seq}")'
             # Map common Oblivion animation groups to Skyrim behavior events
             _anim_map = {
@@ -6223,6 +6341,12 @@ class ScriptConverter:
                             ref = f'({ref} as Actor)'
                         elif cur == '' and self._is_bindable_property(ref):
                             self._property_refs[ref] = 'Actor'
+                        elif cur.startswith('TES4_'):
+                            # Typed as the SCRIPT attached to the record it
+                            # names (see _resolve_self_ref for the full note):
+                            # cast at the call site so the cross-script variable
+                            # reads that need that type keep working.
+                            ref = f'({ref} as Actor)'
                 result = f'{ref}.{papyrus_func}({args})'
             else:
                 # No ref — infer implicit target based on script context
@@ -6232,6 +6356,10 @@ class ScriptConverter:
                         result = f'(akSpeakerRef as Actor).{papyrus_func}({args})'
                     elif extends == 'ActiveMagicEffect':
                         result = f'GetTargetActor().{papyrus_func}({args})'
+                    elif extends == PLAYER_ALIAS_EXTENDS:
+                        # Self is the ReferenceAlias, not an actor; the alias's
+                        # filled reference (the player) is the subject.
+                        result = f'GetActorReference().{papyrus_func}({args})'
                     elif extends != 'Actor' and event_actor:
                         # Inside an event that hands us the actor it is about
                         # (`OnEquipped(Actor akActor)`), TES4's implicit subject
@@ -6246,7 +6374,8 @@ class ScriptConverter:
                         result = f'{papyrus_func}({args})'
                 elif (needs_self
                       and fname_low in _OBJREF_IMPLICIT_SELF_FUNCTIONS
-                      and extends in ('ActiveMagicEffect', 'TopicInfo')):
+                      and extends in ('ActiveMagicEffect', 'TopicInfo',
+                                      PLAYER_ALIAS_EXTENDS)):
                     # ObjectReference method called bare inside a script whose
                     # Self is not a reference — route it onto the reference the
                     # effect/topic acts on, with no `as Actor` cast.
@@ -6275,8 +6404,11 @@ class ScriptConverter:
                 return f'(akSpeakerRef as Actor).{func_name}({args})  ;TODO: Verify'
             if extends == 'ActiveMagicEffect':
                 return f'GetTargetActor().{func_name}({args})  ;TODO: Verify'
+            if extends == PLAYER_ALIAS_EXTENDS:
+                return f'GetActorReference().{func_name}({args})  ;TODO: Verify'
         if (fname_low in _OBJREF_IMPLICIT_SELF_FUNCTIONS
-                and extends in ('ActiveMagicEffect', 'TopicInfo')):
+                and extends in ('ActiveMagicEffect', 'TopicInfo',
+                                PLAYER_ALIAS_EXTENDS)):
             ref = self._resolve_objref_ref(None, extends)
             return f'{ref}.{func_name}({args})  ;TODO: Verify'
         return f'{func_name}({args})  ;TODO: Verify'

@@ -92,6 +92,13 @@ _EMPTY_DIAL_FIDS: set = set()
 # by import_main._write_lip_text via get_lip_texts().
 _lip_texts: dict = {}
 
+# Remapped FormIDs of quests that can ever RUN (start-game-enabled, or named by
+# some StartQuest/SetStage in the plugin).  A DIAL may only be owned by one of
+# these: Skyrim's QNAM is a hard runtime gate, so a topic owned by a quest
+# nothing starts is permanently unreachable.  Filled at the top of
+# build_dialog_groups, read by _build_one_topic.
+_startable_quests: set = set()
+
 
 def get_lip_texts() -> dict:
     """Return the {(info_fid24, resp_num): text} map from the last
@@ -1633,6 +1640,61 @@ def _make_generic_quest(writer, edid: str, full: str,
     return fid
 
 
+def _make_player_script_quest(writer, master_index=None) -> int:
+    """Host the TES4 PLAYER-BASE scripts on a start-game-enabled quest.
+
+    Oblivion let a plugin script the player by attaching a SCPT to the player's
+    base NPC_ (0x00000007); Skyrim has no equivalent binding (see
+    tes5_import.object_scripts.build_player_alias_plan for why the base record
+    is a dead end).  Vanilla's mechanism is a quest holding a reference alias
+    forced to PlayerRef 0x14 with the script on that alias — JailQuest's
+    JailQuestPlayerScript and TutorialEnchanting's TutorialPlayerScript are
+    exactly this shape, and 71 Skyrim.esm quests force an alias to 0x14.
+
+    Returns the quest FormID, or 0 when the plugin has no player-base script.
+    """
+    from script_convert.pipeline import build_vmad_quest_fragments
+    from .object_scripts import get_player_alias_scripts
+
+    scripts = get_player_alias_scripts()
+    if not scripts:
+        return 0
+
+    edid = 'TES4PlayerScripts'
+    if master_index is not None:
+        existing = master_index.find_by_edid(b'QUST', edid)
+        if existing:
+            print(f"    reusing master's {edid} ({existing:08X})")
+            return existing
+
+    fid = writer.alloc_formid()
+    alias_id = 0
+    # Skyrim subrecord order is EDID VMAD FULL DNAM — unanimous across all 912
+    # vanilla QUSTs that carry a VMAD.
+    q = pack_string_subrecord('EDID', edid)
+    q += pack_subrecord('VMAD', build_vmad_quest_fragments(
+        edid, [], None, None,
+        alias_scripts=[(alias_id, scripts)], quest_fid=fid))
+    q += pack_string_subrecord('FULL', 'TES4 Player Scripts')
+    # Flags 0x0011 = StartGameEnabled + StartsEnabled; priority 0.
+    q += pack_subrecord('DNAM', struct.pack('<HBBII', 0x0011, 0, 0, 0, 0))
+    q += pack_subrecord('NEXT', b'')
+    q += pack_uint32_subrecord('ANAM', alias_id + 1)   # Next Alias ID
+    # The PlayerRef alias itself.  Same shape convert_QUST writes for forced-ref
+    # aliases; PlayerRef always fills, but Optional (0x0002) keeps a fill
+    # failure from taking the whole quest down with it.
+    q += pack_uint32_subrecord('ALST', alias_id)
+    q += pack_string_subrecord('ALID', 'Player')
+    q += pack_uint32_subrecord('FNAM', 0x00000292)
+    q += pack_formid_subrecord('ALFR', 0x00000014)
+    q += pack_formid_subrecord('VTCK', 0)
+    q += pack_subrecord('ALED', b'')
+    writer.add_record('QUST', pack_record('QUST', fid, 0, q))
+    names = ', '.join(s for s, _ in scripts)
+    print(f"    player-base scripts hosted on {edid} alias 'Player': {names}")
+    return fid
+
+
 def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
                         fid_to_edid: dict = None, xref=None,
                         well_known_props: dict = None,
@@ -1699,6 +1761,48 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
     sge_quest_fids = {get_formid(r, 'FormID') for r in by_type.get('QUST', [])
                       if (get_int(r, 'DATA.Flags') & 0x01)
                       and get_formid(r, 'FormID')}
+
+    # Quests that can ever RUN: start-game-enabled, or named by some
+    # `StartQuest`/`SetStage` anywhere in the plugin.  Needed because Skyrim's
+    # DIAL.QNAM is a hard runtime gate — the engine only evaluates a topic's
+    # INFOs while its owning quest runs — whereas Oblivion's QSTI list is just
+    # an organisational grouping the engine never gates on.  So a TES4 topic
+    # filed under a quest that nothing starts still worked in Oblivion and
+    # becomes permanently dead here.  Nehrim ships exactly that: MQ01Topic01
+    # ("show Aratornias the letter") is filed under the vestigial 3-stage MQ01,
+    # which no script or stage ever starts — and its INFO holds the only
+    # `SetStage MQ00 65`, MQ00's completion stage, so the intro quest could
+    # never finish.
+    _startable = set(sge_quest_fids)
+    _start_re = re.compile(r'\b(?:startquest|setstage)\s+"?([A-Za-z_]\w*)"?',
+                           re.IGNORECASE)
+    _qfid_by_edid = {get_str(r, 'EditorID', '').lower(): get_formid(r, 'FormID')
+                     for r in by_type.get('QUST', []) if get_str(r, 'EditorID')}
+
+    def _harvest(text):
+        for m in _start_re.finditer(text or ''):
+            f = _qfid_by_edid.get(m.group(1).lower())
+            if f:
+                _startable.add(f)
+
+    for r in by_type.get('SCPT', []):
+        _harvest(r.get('SCTX', ''))
+    for r in by_type.get('QUST', []):
+        for k, v in r.items():
+            if k.endswith('ResultScript'):
+                _harvest(v if isinstance(v, str) else '')
+    for r in by_type.get('INFO', []):
+        _harvest(r.get('ResultScript', ''))
+
+    _startable_quests.clear()
+    # Only trust the analysis when there was something to analyse.  A starter
+    # can only be FOUND in a script, so with no SCPT records every non-SGE
+    # quest would look unstartable and every one of its topics would be
+    # rerouted to the generic quest — losing exactly the per-quest gating the
+    # ownership rule exists to preserve.  An empty set means "unknown", and
+    # _build_one_topic then keeps the original quest, as before.
+    if by_type.get('SCPT'):
+        _startable_quests.update(_startable)
 
     # Quest EDID lookup (remapped FormID space) for voice filename prefixes.
     quest_edid_by_fid = {get_formid(r, 'FormID'): get_str(r, 'EditorID', '')
@@ -2066,9 +2170,18 @@ def _build_one_topic(dial_rec, info_by_dial, writer, offset,
     # quests) has no single faithful owner — Skyrim would gate every INFO by
     # whichever quest we picked — so it is owned by the always-running generic
     # quest and each INFO is gated on its own quest below.
+    #
+    # ...but only when that quest can ever RUN.  Oblivion's QSTI is an
+    # organisational grouping the engine never gates on, so a topic filed under
+    # a quest nothing starts still worked there; Skyrim's QNAM is a hard
+    # runtime gate, so the same topic would be permanently dead.  Those fall
+    # back to the always-running generic quest, exactly like a shared topic.
+    # (Nehrim's MQ01Topic01 is filed under the vestigial MQ01, and its INFO
+    # holds the only `SetStage MQ00 65` — MQ00's completion stage.)
     orig_quest_fid = get_formid(dial_rec, 'Quest[0]')
     quest_count = get_int(dial_rec, 'QuestCount')
-    if orig_quest_fid and quest_count <= 1:
+    if (orig_quest_fid and quest_count <= 1
+            and (not _startable_quests or orig_quest_fid in _startable_quests)):
         owner_qfid = orig_quest_fid
     else:
         owner_qfid = generic_quest_fid

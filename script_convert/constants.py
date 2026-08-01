@@ -8,6 +8,20 @@ import re
 # Constants
 # ===========================================================================
 
+# Papyrus base class for a TES4 script attached to the PLAYER BASE record
+# (NPC_ 0x00000007).  Oblivion let a plugin script the player that way -- Nehrim
+# puts its whole XP/level/gold system AND `SetStage MQ00 1` (the intro's only
+# starter) there.  Skyrim cannot: the acting player is PlayerRef 0x14, whose
+# signature is PLYR (not ACHR, so a plugin cannot author an override of it), and
+# its base is Skyrim's own Player 0x07 -- never the converted plugin's shifted
+# copy, which no actor ever instantiates.  Vanilla's mechanism for "code that
+# runs on the player forever" is a start-game-enabled quest holding a reference
+# alias forced to 0x14 (71 vanilla QUSTs do exactly this); the script rides that
+# alias.  `Self` there is the ReferenceAlias, so every implicit-self call is
+# routed through GetReference()/GetActorReference() -- see
+# ScriptConverter._implicit_self and tes5_import.object_scripts.
+PLAYER_ALIAS_EXTENDS = 'ReferenceAlias'
+
 # Oblivion block type -> Papyrus event mapping
 # (event_signature, end_keyword)
 BLOCK_MAP = {
@@ -896,6 +910,23 @@ _ACTORBASE_ARG_FUNCTIONS = {
     'saa', 'setactoralpha', 'gaa', 'getactoralpha',
 }
 
+# TES4 functions whose Papyrus signature declares an **Actor** parameter, taken
+# from the vanilla headers in Data/Scripts.zip:
+#   Actor.StartCombat(Actor akTarget)
+#   Actor.IsHostileToActor(Actor akActor)
+#   Actor.GetRelationshipRank(Actor akOther)
+#   Actor.SetRelationshipRank(Actor akOther, int aiRank)
+# An argument typed as the SCRIPT attached to the record it names (see
+# pipeline._add_scro_ref) has to be cast at the call site for these, or the
+# checker rejects it — `StartCombat(NQ05Soldat01nRef)` in
+# NQ05StartCombatTrigBoxScript.  SetLookAt/Say/GetDistance are deliberately
+# ABSENT: their parameters are ObjectReference, which a script-typed property
+# converts to implicitly.
+_ACTOR_ARG_FUNCTIONS = {
+    'startcombat', 'ishostiletoactor',
+    'getrelationshiprank', 'setrelationshiprank',
+}
+
 # Methods declared on ObjectReference that a TES4 script calls BARE, relying on
 # the implicit "me".  ActiveMagicEffect and TopicInfo are not references, so an
 # unqualified `Disable()` / `GetLinkedRef()` in those scripts is an undefined
@@ -991,6 +1022,19 @@ def papyrus_script_name(edid: str, prefix: str = 'TES4_') -> str:
 
 def _safe_property_name(name: str) -> str:
     """Return a Papyrus-safe property name, renaming reserved words."""
+    # Oblivion's parser accepts quotes around any EditorID and Nehrim's authors
+    # use them constantly (173 sites: `SetStage "MQ01Tate" 20`,
+    # `GetStage "NQ00Karick"`, `StartQuest "NQ05"`, `AddScriptPackage "..."`).
+    # Left in, the `[^\w]` pass below turns each quote into an underscore, so
+    # `"MQ01Tate"` became the property `_MQ01Tate_` while the SAME script's
+    # unquoted `GetStage MQ01Tate` became `MQ01Tate`.  Only the unquoted
+    # spelling matches an EditorID, so only it was bound in the VMAD —
+    # `_MQ01Tate_` stayed None and every `_MQ01Tate_.SetStage(...)` threw.
+    # MQ01Tate was stranded at stage 15, never reaching the stage 40 that is
+    # the only thing that starts MQ01, so MQ00 could never complete either.
+    name = name.strip()
+    if len(name) > 1 and name[0] == '"' and name[-1] == '"':
+        name = name[1:-1]
     safe = re.sub(r'[^\w]', '_', name)
     safe = re.sub(r'^\d+', '', safe)
     if not safe:

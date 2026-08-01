@@ -1202,3 +1202,72 @@ class TestOriginGate:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])
+
+
+class TestPlayerScriptQuest:
+    """A TES4 script attached to the player's BASE record is rehosted on a
+    start-game-enabled quest holding a reference alias forced to PlayerRef
+    (0x00000014) — the mechanism 71 vanilla Skyrim quests use, and the only one
+    available: the acting player is PlayerRef, whose signature is PLYR (a
+    plugin cannot author an override) and whose base is Skyrim's own 0x07,
+    never the converted plugin's shifted copy."""
+
+    def _fake_plan(self, scripts):
+        from tes5_import import object_scripts
+        object_scripts._PLAYER_ALIAS_SCRIPTS.clear()
+        object_scripts._PLAYER_ALIAS_SCRIPTS.extend(scripts)
+
+    def test_no_quest_when_no_player_script(self):
+        from tes5_import.dialog_converter import _make_player_script_quest
+        self._fake_plan([])
+        writer = _FakeWriter()
+        assert _make_player_script_quest(writer) == 0
+        assert writer.records == []
+
+    def test_quest_is_sge_with_a_playerref_alias(self):
+        from tes5_import.dialog_converter import _make_player_script_quest
+        self._fake_plan([('TES4_GlobalplayerScript', {})])
+        writer = _FakeWriter()
+        fid = _make_player_script_quest(writer)
+        assert fid
+        sig, rec = writer.records[0]
+        assert sig == 'QUST'
+        body = rec[24:]
+        # StartGameEnabled (0x0001) so the .seq file starts it on a new game.
+        dnam = _find_subrecord(rec, b'DNAM')
+        assert struct.unpack_from('<H', dnam, 0)[0] & 0x01
+        # The alias is forced onto PlayerRef itself.
+        assert struct.unpack('<I', _find_subrecord(rec, b'ALFR'))[0] == 0x00000014
+        assert _find_subrecord(rec, b'ALID').rstrip(b'\x00') == b'Player'
+        assert struct.unpack('<I', _find_subrecord(rec, b'ALST'))[0] == 0
+        # Next Alias ID must account for the one we just wrote.
+        assert struct.unpack('<I', _find_subrecord(rec, b'ANAM'))[0] == 1
+
+    def test_subrecord_order_matches_vanilla(self):
+        """EDID VMAD FULL DNAM — unanimous across all 912 vanilla QUSTs that
+        carry a VMAD."""
+        from tes5_import.dialog_converter import _make_player_script_quest
+        self._fake_plan([('TES4_GlobalplayerScript', {})])
+        writer = _FakeWriter()
+        _make_player_script_quest(writer)
+        rec = writer.records[0][1]
+        order = [rec[i:i + 4] for i in range(24, len(rec))
+                 if rec[i:i + 4] in (b'EDID', b'VMAD', b'FULL', b'DNAM')]
+        assert order[:4] == [b'EDID', b'VMAD', b'FULL', b'DNAM']
+
+    def test_script_is_bound_to_the_alias_not_the_quest(self):
+        """Vanilla puts the script in the VMAD's Aliases array (verified by
+        parsing JailQuest / TutorialEnchanting out of Skyrim.esm), so the
+        top-level Scripts array stays empty."""
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), '..', 'tools'))
+        from tools.quest_walkthrough import parse_vmad, parse_qust_alias_scripts
+        from tes5_import.dialog_converter import _make_player_script_quest
+        self._fake_plan([('TES4_GlobalplayerScript', {})])
+        writer = _FakeWriter()
+        fid = _make_player_script_quest(writer)
+        vmad = _find_subrecord(writer.records[0][1], b'VMAD')
+        top, tail = parse_vmad(vmad)
+        assert top == []
+        alias_scripts = parse_qust_alias_scripts(tail)
+        assert [n for n, _p in alias_scripts] == ['TES4_GlobalplayerScript']
