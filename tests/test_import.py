@@ -2184,6 +2184,69 @@ class TestCKWarningFixes:
         convert_ENCH(rec, writer=writer)
         assert len(writer._top_groups['MGEF']) == 1
 
+    def test_aimed_ench_using_converted_mgef_reaches_a_projectile(self):
+        # The crash this pins: an Aimed ENCH whose effects all have a null
+        # MGEF Projectile is an UNCONDITIONAL null-deref, not just a dud cast.
+        # MagicItem::GetCostliestEffectItem skips every projectile-less effect
+        # when delivery == Aimed and returns null; the combat-AI item rating
+        # function then does `mov rdi,[rax+0xC8]` with no null check.
+        # (Nehrim "Stab des Frosts" / EnStaffFrostDamage + FRDG, 2026-08-01.)
+        #
+        # The older test above exercises the VANILLA-alias fallback because it
+        # never registers converted MGEFs.  This one registers them, which is
+        # the normal path since convert_MGEF landed, and is what shipped broken.
+        from tes5_import import magic_effects
+        from tes5_import.record_types.equipment import convert_ENCH
+        from tes5_import.record_types.magic import (convert_MGEF,
+                                                    register_mgef_formids)
+        magic_effects.set_tes4_effect_names([])
+        # FRDG exactly as Nehrim/Oblivion export it: Destruction, Frost resist,
+        # Hostile|Detrimental|Target.
+        mgef = {'Signature': 'MGEF', 'FormID': '0000187B', 'RecordFlags': '0',
+                'EditorID': 'FRDG', 'FULL': 'Frost Damage',
+                'DATA.Flags': str(0x00000001 | 0x00000004 | 0x00000040),
+                'DATA.BaseCost': '1.0', 'DATA.School': '2',
+                'DATA.ResistValue': '62'}
+        register_mgef_formids([mgef])
+
+        writer = PluginWriter(masters=['Skyrim.esm'])
+        writer.next_object_id = 0x01100000
+        rec = {'Signature': 'ENCH', 'FormID': '0000C211', 'RecordFlags': '0',
+               'EditorID': 'EnStaffFrostDamage', 'ENIT.Type': '1',
+               'ENIT.Charge': '62', 'ENIT.Cost': '62', 'ENIT.Flags': '1',
+               'EffectCount': '1', 'Effect[0].EFID': 'FRDG',
+               'Effect[0].Type': 'Target', 'Effect[0].Magnitude': '40',
+               'Effect[0].Area': '0', 'Effect[0].Duration': '0',
+               'Effect[0].ActorValue': '8'}
+        out = convert_ENCH(rec, writer=writer)
+
+        enit = _find_subrecord(out, b'ENIT')
+        assert struct.unpack_from('<I', enit, 16)[0] == 2, 'expected Aimed'
+        efid = struct.unpack('<I', _find_subrecord(out, b'EFID'))[0]
+
+        # The effect must resolve to our converted MGEF, and that MGEF's DATA
+        # must carry a projectile.
+        assert magic_effects.has_projectile(efid), \
+            'aimed ENCH reaches no projectile — engine null-derefs on it'
+        data = _find_subrecord(convert_MGEF(mgef), b'DATA')
+        assert struct.unpack_from('<I', data, 84)[0] == 2      # delivery Aimed
+        # Frost + Destruction + fire-and-forget -> FrostIcicleProjectile01,
+        # the projectile vanilla uses for that exact combination.
+        assert struct.unpack_from('<I', data, 72)[0] == 0x0002F774
+
+    def test_non_aimed_mgef_keeps_null_projectile(self):
+        # Only Aimed/Target-Location deliveries fly a projectile; vanilla
+        # leaves Self and Contact null far more often than not, so the fix
+        # must not blanket-assign one.
+        from tes5_import.record_types.magic import convert_MGEF
+        rec = {'Signature': 'MGEF', 'FormID': '00001234', 'RecordFlags': '0',
+               'EditorID': 'REHE', 'FULL': 'Restore Health',
+               'DATA.Flags': str(0x00000010),   # Self only
+               'DATA.BaseCost': '1.0', 'DATA.School': '5'}
+        data = _find_subrecord(convert_MGEF(rec), b'DATA')
+        assert struct.unpack_from('<I', data, 84)[0] == 0      # delivery Self
+        assert struct.unpack_from('<I', data, 72)[0] == 0      # no projectile
+
     def test_leveled_list_drops_null_entries(self):
         rec = {'Signature': 'LVLI', 'FormID': '00001234', 'RecordFlags': '0',
                'EditorID': 'TestList', 'LVLD.ChanceNone': '0',

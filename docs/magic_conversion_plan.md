@@ -303,15 +303,66 @@ filler; dump a converted summon MGEF and diff its DATA field-by-field against
    must match.
 4. Complete the `EFSH` DATA beyond offset 44.
 
-### Phase 3 — Projectiles and delivery
+### Phase 3 — Projectiles and delivery — DONE 2026-08-01 (projectile half)
 
-With real MGEFs, the aimed-variant hack in `magic_effects.py` becomes
-unnecessary for effects we author: set `Delivery`/`Casting Type` and a
-`Projectile` directly from the TES4 flags and `DATA.ProjectileSpeed`. That
-needs a **`PROJ` writer** (and ideally `EXPL` for area effects, which the
-current pipeline ignores entirely — TES4 `Area` is packed into EFIT but no
-explosion is ever created). Retire `aimed_variant` once every aimed item's own
-effects carry a projectile.
+**An Aimed magic item with no projectile is a HARD CRASH, not a dud cast.**
+This was written up as a cosmetic problem ("the item casts NOTHING in game",
+`magic_effects.py`'s module docstring, and the CK's "is AIMED but has no Magic
+Effects with Projectiles assigned" warning). It is not. Traced through the GOG
+1.6.659 exe from a real crash log (Nehrim, `EnStaffFrostDamage` + `FRDG`):
+
+```
+MagicItem::GetCostliestEffectItem            0x10c9f0
+    GetDelivery()  = EnchantmentItem vtable +0x2b8 -> mov eax,[rcx+0xa0]
+    when delivery == 2 (Aimed), SKIPS every effect whose
+    EffectSetting+0xC8 (the MGEF Projectile) is null          0x10ca7c
+    -> with every effect skipped it returns NULL
+combat-AI item rating fn                     0x7fb6c0
+    calls the above for any Aimed ENCH/SPEL, then
+    mov rdi, [rax+0xC8]     <-- no null check                 0x7fb83e
+    -> EXCEPTION_ACCESS_VIOLATION reading 0x00000000000000C8
+```
+
+So the game dies the moment an actor's combat AI rates such an item — nothing
+to do with the player ever casting it.
+
+**Vanilla census (`references/Skyrim.esm`), zero exceptions:** 43/43 Aimed
+`ENCH` and 264/264 Aimed `SPEL` reach a projectile through at least one effect.
+Individual *effects* may lack one (23 MGEFs do) — those are always secondary
+effects riding alongside a primary that supplies one — so **the invariant is
+per item, not per effect.**
+
+Two defects, both fixed:
+
+1. `_build_data` never wrote `_O_PROJECTILE` (offset 72) at all. It now resolves
+   one for Aimed/Target-Location deliveries the way vanilla picks them: **resist
+   type (element) first, then magic school, with cast type selecting the
+   Fire-and-Forget vs Concentration variant** (`_resolve_projectile`). Self,
+   Contact and Target Actor still get 0, as vanilla mostly does.
+   `HealFakeProjectile` (`0x00012FDC`) is the fallback — vanilla's own
+   "needs a projectile but has no visual" stand-in, used by 31 of its MGEFs.
+2. `magic_effects.has_projectile()` could not see the converter's own MGEFs.
+   Its comment claimed "the only other fids flowing through effect lists are
+   variants this module generated" — false since `convert_MGEF` landed, when our
+   own records became the *normal* answer from `_resolve_mgef`. It returned
+   False for them, then `aimed_variant()` returned 0 (our FormIDs aren't in
+   `VANILLA_MGEF_DATA` either), so the guard silently did nothing. It now
+   consults `magic.emitted_projectile()`.
+
+Ordering trap: Phase 1 converts record types **alphabetically**, so `ENCH` runs
+before `MGEF`. The registry is therefore populated in `register_mgef_formids()`
+(Phase 0), not as a side effect of `convert_MGEF`.
+
+Measured after the fix, in the built ESMs: Oblivion 332 Aimed ENCH + 330 Aimed
+SPEL, Nehrim 366 + 263 — **1,291 records that all previously carried a null
+projectile, now 0 exceptions.** Projectiles are assigned selectively (159/349
+Nehrim MGEFs, 161/323 Oblivion), not blanket-applied.
+
+Still open in this phase: a **`PROJ` writer** so effects fly their own TES4
+`DATA.ProjectileSpeed` art rather than borrowing a vanilla bolt, and `EXPL` for
+area effects (TES4 `Area` is packed into EFIT but no explosion is ever created).
+`aimed_variant` still covers effects that resolve to a *vanilla* projectile-less
+MGEF, so it cannot be retired yet.
 
 ### Phase 4 — Script effects (`SEFF`) — DONE 2026-07-31 (with Phase 1)
 

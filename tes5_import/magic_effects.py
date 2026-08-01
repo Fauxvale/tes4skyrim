@@ -4,9 +4,13 @@ Skyrim ships no fire-and-forget/aimed MGEF for plain value modifiers (Restore
 Health on target, Damage Attribute, Weakness to X, Cure ...), so the mapping
 tables resolve those TES4 effect codes to Alch*/self-delivery effects.  That is
 fine for potions and touch spells, but an AIMED magic item whose effects all
-lack a projectile cannot fire: the engine takes the projectile to launch from
-the item's effects, and with none found the cast does nothing (CK: "Magic Item
-... is AIMED but has no Magic Effects with Projectiles assigned", 369 items).
+lack a projectile is a HARD CRASH — not merely a dud cast, which is what this
+docstring used to claim and what the CK warning ("Magic Item ... is AIMED but
+has no Magic Effects with Projectiles assigned", 369 items) implies.
+MagicItem::GetCostliestEffectItem skips every projectile-less effect when the
+delivery is Aimed and returns null; the combat-AI item rating function then
+dereferences that null.  Full exe trace and the vanilla census in
+docs/magic_conversion_plan.md, Phase 3.
 
 Fix: when an aimed ENCH/SPEL/SCRL ends up with no projectile-bearing effect,
 synthesize ONE companion MGEF here — a clone of the vanilla effect the primary
@@ -65,11 +69,23 @@ def set_tes4_effect_names(mgef_records: list) -> None:
 
 
 def has_projectile(mgef_fid: int) -> bool:
-    """True if the vanilla MGEF launches a projectile (or is one of ours)."""
+    """True if the MGEF launches a projectile.
+
+    Three sources, because effect lists mix all three:
+      * MGEFs the converter emitted for this plugin — since convert_MGEF
+        landed these are the NORMAL answer from _resolve_mgef, and they are
+        neither vanilla nor in _cache.  Treating them as projectile-less (the
+        old behaviour) made this check useless for almost every record;
+      * aimed clones this module generated, which always carry one;
+      * vanilla Skyrim effects, read from the baked DATA table.
+    """
+    from .record_types.magic import emitted_projectile, is_emitted_mgef
+
+    if is_emitted_mgef(mgef_fid):
+        return emitted_projectile(mgef_fid) != 0
+
     entry = VANILLA_MGEF_DATA.get(mgef_fid)
     if entry is None:
-        # Not a vanilla effect — the only other fids flowing through effect
-        # lists are variants this module generated, which all carry one.
         return mgef_fid in _cache.values()
     data = bytes.fromhex(entry[1])
     return struct.unpack_from('<I', data, _OFF_PROJECTILE)[0] != 0

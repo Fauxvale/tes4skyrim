@@ -553,6 +553,126 @@ def _delivery_and_cast(t4_flags: int) -> tuple:
     return 1, 0           # Fire and Forget, Self
 
 
+# --- Projectile resolution ------------------------------------------------
+# An Aimed magic item MUST reach a non-null Projectile through at least one of
+# its effects or the engine null-derefs.  The chain, read out of the GOG 1.6.659
+# exe (crash frames translated by tools/address_lib.py):
+#
+#   MagicItem::GetCostliestEffectItem  (0x10c9f0)
+#       calls GetDelivery (EnchantmentItem vtable +0x2b8 -> `mov eax,[rcx+0xa0]`)
+#       and, when delivery == 2 (Aimed), SKIPS every effect whose
+#       EffectSetting+0xC8 (the MGEF Projectile) is null (0x10ca7c).
+#       With every effect skipped it returns null.
+#   The combat-AI item rating function (0x7fb6c0, crash at 0x7fb83e) calls it
+#       for any ENCH/SPEL with delivery Aimed and does `mov rdi,[rax+0xC8]`
+#       with NO null check -> EXCEPTION_ACCESS_VIOLATION reading 0xC8.
+#
+# So the crash is unconditional: any Aimed enchantment/spell whose effects all
+# have Projectile=0 kills the game the moment an actor's combat AI rates it.
+# (Repro: Nehrim "Stab des Frosts" / EnStaffFrostDamage, effect FRDG.)
+#
+# Vanilla census (references/Skyrim.esm) confirms the invariant with zero
+# exceptions: 43/43 Aimed ENCH and 264/264 Aimed SPEL reach a projectile.
+# Individual *effects* may have none (23 MGEFs do) — those are always secondary
+# effects riding alongside a primary that supplies one — so the requirement is
+# enforced per item, not per effect.
+#
+# The FormIDs below are Skyrim.esm PROJ records, chosen the way vanilla chooses
+# them: the resist type (element) decides first, then the magic school, and the
+# cast type selects the Fire-and-Forget vs Concentration variant.
+# HealFakeProjectile is vanilla's own "this effect needs a projectile but has no
+# visual of its own" stand-in (31 MGEFs use it), which makes it the right
+# fallback rather than an invented record.
+_PROJ_HEAL_FAKE = 0x00012FDC      # HealFakeProjectile — visual-less default
+_PROJ_FIREBOLT = 0x00012E84       # FireboltProjectile01
+_PROJ_FLAMES = 0x00012FCF         # FlamesProjectile (concentration)
+_PROJ_FROST_ICICLE = 0x0002F774   # FrostIcicleProjectile01
+_PROJ_FROST_SPRAY = 0x00018123    # FrostSprayProjectile01 (concentration)
+_PROJ_SHOCK_BOLT = 0x00058E9C     # ShockBoltAim
+_PROJ_SHOCK_CONC = 0x00034190     # ShockBoltConAim (concentration)
+_PROJ_ABSORB_BEAM = 0x000ABEFD    # AbsorbBeam01 — magic-resisted / absorb
+_PROJ_SPIDER_SPIT = 0x0004600A    # SpiderSpitProjectile — poison
+_PROJ_ILLUSION = 0x0007331D       # Illusion01Projectile — beneficial illusion
+_PROJ_ILLUSION_NEG = 0x00074796   # IllusionNeg01Projectile — hostile illusion
+_PROJ_REANIMATE = 0x00075348      # ReanimateProjectile — conjuration
+_PROJ_TURN_UNDEAD = 0x0004BE35    # TurnUndeadProjectile — restoration
+_PROJ_PARALYZE = 0x0006EBC8       # ParalyzeProjectile — alteration
+
+# (resist actor value) -> (fire-and-forget projectile, concentration projectile).
+# Keyed on the same TES5 resist AV _build_data writes at _O_RESIST_VALUE, so an
+# effect's element picks its own projectile exactly as vanilla does.
+_PROJ_BY_RESIST = {
+    AV_RESIST_FIRE: (_PROJ_FIREBOLT, _PROJ_FLAMES),
+    AV_RESIST_FROST: (_PROJ_FROST_ICICLE, _PROJ_FROST_SPRAY),
+    AV_RESIST_SHOCK: (_PROJ_SHOCK_BOLT, _PROJ_SHOCK_CONC),
+    AV_RESIST_MAGIC: (_PROJ_ABSORB_BEAM, _PROJ_ABSORB_BEAM),
+    AV_POISON_RESIST: (_PROJ_SPIDER_SPIT, _PROJ_SPIDER_SPIT),
+}
+
+# (magic school actor value) -> (fire-and-forget, concentration), used when the
+# effect names no resist type.  Destruction with no element falls back to the
+# neutral projectile rather than inventing one.
+_PROJ_BY_SCHOOL = {
+    AV_ALTERATION: (_PROJ_PARALYZE, _PROJ_PARALYZE),
+    AV_CONJURATION: (_PROJ_REANIMATE, _PROJ_REANIMATE),
+    AV_RESTORATION: (_PROJ_TURN_UNDEAD, _PROJ_TURN_UNDEAD),
+}
+
+
+# {output MGEF FormID: projectile FormID} for every MGEF this module emits.
+# equipment._pack_effects consults it (through magic_effects.has_projectile) to
+# decide whether an Aimed item already reaches a projectile; without it the
+# converter's own effects are invisible to that check and every Aimed item made
+# of them ships with the null-deref described above.
+_emitted_projectiles: dict = {}
+
+
+def register_emitted_projectile(fid: int, projectile: int) -> None:
+    """Record the projectile written into one emitted MGEF's DATA."""
+    if fid:
+        _emitted_projectiles[fid] = projectile
+
+
+def emitted_projectile(fid: int) -> int:
+    """Projectile of an MGEF this module emitted (0 if none / not ours)."""
+    return _emitted_projectiles.get(fid, 0)
+
+
+def is_emitted_mgef(fid: int) -> bool:
+    """True when ``fid`` is an MGEF this converter emitted."""
+    return fid in _emitted_projectiles
+
+
+def _resolve_projectile(delivery: int, cast_type: int, school: int,
+                        resist: int, hostile: bool) -> int:
+    """Projectile FormID for an MGEF, or 0 when the delivery needs none.
+
+    Only Aimed (2) and Target Location (4) deliveries fly a projectile; Self,
+    Contact and Target Actor resolve on the target directly, and vanilla leaves
+    those null far more often than not.  Aimed is the delivery that crashes
+    without one, so that is where a projectile is mandatory.
+    """
+    if delivery not in (2, 4):
+        return 0
+
+    conc = 1 if cast_type == 2 else 0
+
+    pair = _PROJ_BY_RESIST.get(resist)
+    if pair is not None:
+        return pair[conc]
+
+    if school == AV_ILLUSION:
+        # Illusion splits on intent, not element: vanilla uses the "Neg" variant
+        # for hostile effects (fear/frenzy) and the plain one for calm/courage.
+        return _PROJ_ILLUSION_NEG if hostile else _PROJ_ILLUSION
+
+    pair = _PROJ_BY_SCHOOL.get(school)
+    if pair is not None:
+        return pair[conc]
+
+    return _PROJ_HEAL_FAKE
+
+
 # --- AssocItem resolution -------------------------------------------------
 # The converter needs to turn a TES4 AssocItem FormID into the FormID of the
 # record type Skyrim's archetype expects.  Two cases need the whole-plugin
@@ -640,8 +760,16 @@ def _build_data(rec: dict, code: str, archetype: int, actor_value: int,
     # TES4 writes 0xFFFFFFFF for "no resistance"; anything else is an Oblivion
     # actor-value index naming the resist stat.
     resist_raw = get_int(rec, 'DATA.ResistValue', 0xFFFFFFFF)
-    struct.pack_into('<i', data, _O_RESIST_VALUE,
-                     TES4_RESIST_AV_TO_TES5.get(resist_raw, AV_NONE))
+    resist = TES4_RESIST_AV_TO_TES5.get(resist_raw, AV_NONE)
+    struct.pack_into('<i', data, _O_RESIST_VALUE, resist)
+
+    # Projectile — mandatory for Aimed delivery.  Oblivion has no equivalent
+    # field (the cast art was a raw mesh path), but Skyrim's combat AI
+    # dereferences it without a null check, so an Aimed effect that leaves it 0
+    # crashes the game.  See _resolve_projectile for the exe trace.
+    struct.pack_into('<I', data, _O_PROJECTILE,
+                     _resolve_projectile(delivery, cast_type, school, resist,
+                                         bool(t4_flags & T4_HOSTILE)))
 
     # Counter Effect Count MUST equal the number of ESCE subrecords or the CK
     # reads garbage counter slots.
@@ -693,6 +821,9 @@ def convert_MGEF(rec: dict, writer=None) -> bytes:
     base_av = entry[1] if entry and entry[1] != DERIVE_AV else AV_NONE
 
     counters = _counter_effect_fids(rec)
+    # The projectile in this DATA was already registered by
+    # register_mgef_formids (Phase 0) — ENCH converts before MGEF, so the
+    # registry cannot wait until here.
     subs += pack_subrecord('DATA', _build_data(rec, code, archetype,
                                                base_av, len(counters)))
     for fid in counters:
@@ -786,8 +917,10 @@ def build_av_variants(mgef_records: list, effect_records: list, writer) -> int:
             # what Oblivion's own item cards showed.
             subs += pack_string_subrecord('FULL', _variant_name(full, name))
         # Variants carry no ESCE of their own (the count must then be 0).
-        subs += pack_subrecord('DATA', _build_data(src, code, archetype,
-                                                   tes5_av, 0))
+        data = _build_data(src, code, archetype, tes5_av, 0)
+        subs += pack_subrecord('DATA', data)
+        register_emitted_projectile(
+            fid, struct.unpack_from('<I', data, _O_PROJECTILE)[0])
         desc = get_str(src, 'DESC')
         if desc:
             subs += pack_string_subrecord('DNAM', desc)
@@ -882,8 +1015,18 @@ def build_seff_variants(mgef_records: list, effect_records: list, writer,
         delivery = {'Touch': 1, 'Target': 2}.get(etype, 0)
         struct.pack_into('<I', data, _O_DELIVERY, delivery)
         struct.pack_into('<I', data, _O_CASTING_TYPE, 1)   # Fire and Forget
+        # The delivery just changed, so the projectile _build_data picked for
+        # SEFF's own advertised delivery no longer applies — recompute it, or a
+        # Target-delivery script effect ships Aimed with a null projectile.
+        projectile = _resolve_projectile(
+            delivery, 1,
+            struct.unpack_from('<i', data, _O_MAGIC_SKILL)[0],
+            struct.unpack_from('<i', data, _O_RESIST_VALUE)[0],
+            bool(struct.unpack_from('<I', data, _O_FLAGS)[0] & F_HOSTILE))
+        struct.pack_into('<I', data, _O_PROJECTILE, projectile)
         subs += pack_subrecord('DATA', bytes(data))
 
+        register_emitted_projectile(fid, projectile)
         writer.add_record('MGEF', pack_record('MGEF', fid, 0, subs))
         _seff_variants[(scpt, etype)] = fid
         written += 1
@@ -902,12 +1045,34 @@ _code_to_fid: dict = {}
 
 
 def register_mgef_formids(mgef_records: list) -> None:
-    """Index {effect code: output FormID} from the export's MGEF records."""
+    """Index {effect code: output FormID} from the export's MGEF records.
+
+    Also pre-computes each base MGEF's projectile.  Phase 1 converts record
+    types in alphabetical order, so ENCH runs BEFORE MGEF — registering the
+    projectile as a side effect of convert_MGEF would leave the registry empty
+    for exactly the record type that crashes without it.  Both passes derive
+    the value from the same _build_data inputs, so they cannot disagree.
+    """
     _code_to_fid.clear()
+    # Runs once before the MGEF pass, so this is where the per-plugin
+    # projectile registry is reset.
+    _emitted_projectiles.clear()
     for rec in mgef_records:
         code = get_str(rec, 'EditorID')
-        if code:
-            _code_to_fid[code] = get_formid(rec, 'FormID')
+        if not code:
+            continue
+        fid = get_formid(rec, 'FormID')
+        _code_to_fid[code] = fid
+
+        t4_flags = get_int(rec, 'DATA.Flags')
+        cast_type, delivery = _delivery_and_cast(t4_flags)
+        school = SCHOOL_OVERRIDES.get(
+            code, SCHOOL_TO_AV.get(get_int(rec, 'DATA.School', -1), AV_NONE))
+        resist = TES4_RESIST_AV_TO_TES5.get(
+            get_int(rec, 'DATA.ResistValue', 0xFFFFFFFF), AV_NONE)
+        register_emitted_projectile(
+            fid, _resolve_projectile(delivery, cast_type, school, resist,
+                                     bool(t4_flags & T4_HOSTILE)))
 
 
 def get_mgef_formid(code: str, effect_av: int = -1) -> int:
