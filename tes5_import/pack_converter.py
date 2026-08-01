@@ -364,14 +364,41 @@ def convert_flags(t4_flags: int, pack_type: int,
         speed = SPEED_RUN
         flags |= T5_PREFERRED_SPEED
 
-    if t4_flags & T4_DEFENSIVE_COMBAT:
-        flags |= T5_IGNORE_COMBAT
+    # TES4 "Defensive Combat" is NOT TES5 "Ignore Combat" — they occupy the same
+    # bit (20) but mean opposite things, and mapping one onto the other told
+    # every Oblivion bodyguard to stand still and be killed.
+    #
+    #   TES4 Defensive Combat : do not START fights, but DO fight back.
+    #   TES5 Ignore Combat    : take no part in combat at all.
+    #
+    # UESP's Oblivion "The Killing Field" talk page describes the TES4 flag's
+    # own symptom exactly — "the brothers won't attack the goblins unless
+    # provoked... one just stands there... remove [defensive combat]" — and the
+    # TES5 flag is what the "Horses Ignore Combat" mod uses to make a horse a
+    # passive bystander ("everything else still attacks the horse").
+    #
+    # This was CharacterGen's ambush: `CGGlenroyDefendEmperorAmbushA` — the
+    # package whose entire job is to DEFEND the Emperor — carries Defensive
+    # Combat, so the converted guards drew their swords and then watched the
+    # assassins kill Renault and each other.  All four packages the Blades run
+    # during the ambush (DefendEmperorAmbushA / BladesWaitToMove / ToMarkerF /
+    # AccompanyEmperorToC) had the flag.
+    #
+    # Skyrim has no Defensive Combat equivalent (Skyrim Mod:Mod File Format/PACK
+    # lists no such flag), and it does not need one: an actor's aggression tier
+    # already decides whether it initiates, and every actor retaliates when
+    # attacked.  TES5's default IS TES4's Defensive Combat, so the correct
+    # conversion is to drop the bit.  Setting Ignore Combat instead is actively
+    # harmful — vanilla reserves it for actors who must stay OUT of a scripted
+    # fight (horses, MQ101 stand-still archers, CWFinaleEnemyLeaderWaitFor-
+    # Execution), never for a bodyguard.  388 of 7,209 TES4 packages set the
+    # TES4 bit, so this suppressed combat well beyond CharacterGen.
 
     # TES4 "lock doors at start/end" has no TES5 flag — the Sleep template owns
     # door-locking as a procedure input instead.  Dropped deliberately.
-    # TES4 armor-unequipped / allow-falls / no-idle-anims: no TES5
-    # counterpart.  Dropped.  Use-horse IS honored — it becomes the template
-    # "Ride Horse?" input in _choose().
+    # TES4 defensive-combat / armor-unequipped / allow-falls / no-idle-anims:
+    # no TES5 counterpart.  Dropped.  Use-horse IS honored — it becomes the
+    # template "Ride Horse?" input in _choose().
 
     if pack_type == T4_AMBUSH and hostile_ambush:
         # Wait hidden, weapon out, don't call for help.  NOT applied to an

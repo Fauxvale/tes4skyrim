@@ -1308,21 +1308,49 @@ def convert_FACT(rec: dict) -> bytes:
     if full:
         subs += pack_string_subrecord('FULL', full)
 
-    # Relations
+    # Relations → XNAM: Faction(FormID) Modifier(S32) GroupCombatReaction(U32)
+    #
+    # The enum is xEdit wbFactionRelations (wbDefinitionsCommon):
+    #   0 Neutral, 1 Enemy, 2 ALLY, 3 FRIEND
+    # Ally and Friend were previously swapped here (3 written for Ally, 2 for
+    # Friend).  Confirmed two ways: the xEdit definition above, and a census of
+    # Skyrim.esm where 160 of 200 faction SELF-relations use 2 — a faction is
+    # Ally to itself, never merely Friend.
+    #
+    # Why the swap was a live bug and not cosmetic: Ally is the tier that makes
+    # members ASSIST each other into combat (UESP Skyrim:Factions — reaction
+    # combines with aggression and ASSISTANCE to decide who joins a fight).
+    # Oblivion's CG data has BladesCG → MythicDawnCG at +100, which in TES4 is
+    # only a disposition bonus ("these people like each other"); TES4 starts the
+    # intro fight with StartCombat, not with the faction graph.  Converted with
+    # the swap, that +100 became Ally, so the Emperor's guards assisted the
+    # Mythic Dawn and turned on the player — who is a Neutral — instead of on
+    # the assassins.
+    #
+    # Reaction thresholds also tightened: TES4 dispositions are a 0-100 SCALAR
+    # that shifts how much an actor likes a target, whereas TES5's Ally is a
+    # hard "fight alongside them" contract.  Reserving Ally for a faction's
+    # relation to ITSELF (Oblivion's universal idiom for "we are one group",
+    # 147 of 660 relations) keeps the assist graph vanilla-shaped; a positive
+    # relation to a DIFFERENT faction means "friendly", which is Friend.  This
+    # is what stops any converted plugin from silently wiring bystanders into
+    # someone else's fight.
+    self_fid = get_formid(rec, 'FormID')
     rc = get_int(rec, 'RelationCount')
     for i in range(rc):
         fid = get_formid(rec, f'Relation[{i}].Faction')
         disp = get_int(rec, f'Relation[{i}].Disposition')
-        # Convert disposition → combat reaction
         if disp <= -50:
-            reaction = 1    # Enemy
-        elif disp >= 100:
-            reaction = 3    # Ally
+            reaction = 1                        # Enemy
         elif disp >= 50:
-            reaction = 2    # Friend
+            # Ally only for the self-relation; cross-faction goodwill is Friend.
+            reaction = 2 if fid == self_fid else 3
         else:
-            reaction = 0    # Neutral
-        subs += pack_subrecord('XNAM', struct.pack('<IiI', fid, disp, reaction))
+            reaction = 0                        # Neutral
+        # Modifier is 0 in 1035 of 1036 vanilla Skyrim relations — the TES4
+        # disposition scalar has no meaning in TES5 and the reaction enum
+        # carries the whole signal, so writing it here was noise.
+        subs += pack_subrecord('XNAM', struct.pack('<IiI', fid, 0, reaction))
 
     # DATA — Flags.  The two games number these differently, so the old
     # straight passthrough mis-landed every bit: TES4 bit 1 is "Evil" but TES5

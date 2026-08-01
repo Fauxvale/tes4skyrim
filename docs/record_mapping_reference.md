@@ -385,7 +385,36 @@ U32, so `DATA.Flags` was silently absent from **all 476** Oblivion.esm factions
   scripts pass to `Get`/`SetPCFaction{Murder,Attack,Steal}`. Oblivion.esm → 6.
   The old "Evil → all crime flags" line set the ***Ignore* Crimes** bits
   (7-11, 13, 16), the exact opposite of the intent, and never set Track Crime.
-- **Relation Disposition → Combat Reaction**: ≤-50→Enemy(1), =100→Ally(3), ≥50→Friend(2), else→Neutral(0)
+**XNAM Relations** — `Faction(FormID) Modifier(S32) GroupCombatReaction(U32)`, 12 bytes.
+
+The enum is **`0 Neutral, 1 Enemy, 2 Ally, 3 Friend`** (xEdit `wbFactionRelations`
+in `wbDefinitionsCommon`). **Ally is 2 and Friend is 3** — these were swapped in
+the converter until 2026-07-31. Confirmed twice: the xEdit definition, and a
+census of Skyrim.esm where **160 of 200 faction SELF-relations use 2** (a faction
+is Ally to itself, never merely Friend).
+
+- **Modifier is always 0.** 1,035 of Skyrim.esm's 1,036 XNAM relations write 0
+  there. TES4's -100..+100 disposition scalar has no meaning in TES5; the
+  reaction enum carries the entire signal. Writing the disposition into that
+  field was noise the engine ignores.
+- **Disposition → Reaction**: ≤-50 → Enemy(1); ≥50 → **Ally(2) only for a
+  faction's relation to ITSELF, otherwise Friend(3)**; else Neutral(0).
+
+**Why Ally is reserved for the self-relation.** A TES4 disposition is a 0-100
+scalar meaning "likes them more" — it never obliges anyone to fight. TES5's Ally
+is a hard contract: reaction combines with aggression and **assistance** to
+decide who joins a fight (UESP `Skyrim:Factions`). Oblivion's CG data has
+`BladesCG → MythicDawnCG` at **+100**, purely a disposition bonus — TES4 starts
+the intro ambush with `StartCombat`, not through the faction graph. Converted as
+Ally, that edge made the Emperor's guards **assist the Mythic Dawn and turn on
+the player** (a Neutral) instead of on the assassins. Oblivion.esm has 171
+cross-faction positive relations that would each wire a similar assist edge.
+Self-relations (147) are the legitimate case and match vanilla's idiom.
+
+`script_convert`'s `setfactionreaction`/`modfactionreaction` path
+(`_faction_reaction_call`) follows the same rule: positive amounts stop at
+Friend (`SetAlly(f2, true, true)`) and never reach Ally, since that function
+always names two *different* factions.
 
 **CRVA layout** (xEdit; verified byte-for-byte against Skyrim.esm's
 `WERoad12HorsemanFaction` = `0101 E803 2800 0500 1900 0000 0000003F 6400 E803`):

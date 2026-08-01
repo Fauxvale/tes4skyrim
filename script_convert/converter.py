@@ -3830,7 +3830,45 @@ class ScriptConverter:
         # actors.py so a scripted change lands on the same tier the NPC's AIDT
         # was converted to: <=5 never initiates, >=106 attacks everyone.
         if sk_av.lower() == 'aggression':
-            tier = 0 if raw <= 5 else (3 if raw >= 106 else 2)
+            # TES4 aggression is only half of a PER-TARGET rule: an actor
+            # attacks a target when disposition(actor->target) < aggression - 5
+            # (UESP Oblivion:Aggression).  TES5 aggression is a GLOBAL tier
+            # naming which reaction class it attacks, so the TES4 number cannot
+            # be read on its own — the disposition it has to beat decides the
+            # tier.
+            #
+            # Collapsing everything from 6..105 onto tier 2 was wrong because
+            # tier 2 is "attacks enemies AND NEUTRALS on sight", and the player
+            # is a Neutral to most factions.  CharacterGen stage 22 does
+            # `GlenroyRef.setav aggression 10` purely so the Emperor's guards
+            # will fight the assassins; 10 only beats a disposition below 5,
+            # and the guards' disposition toward the player is ~47, so in
+            # Oblivion they never turn on you.  Converted to tier 2 they
+            # attacked the player on sight from stage 22 onward.  UESP names
+            # this exact failure: "a guard would attack the whole town if their
+            # aggression were sufficiently raised".
+            #
+            # _ONSIGHT_AGGRESSION is the aggression needed to beat an ordinary
+            # NPC disposition and so genuinely mean "hostile to bystanders".
+            # It matches the record path's margin test, which subtracts
+            # disposition before it will grant tier 2: there, a default actor
+            # (disposition ~= Personality 50) needs (aggr-5) - 50 >= 10, i.e.
+            # aggression >= 65.  Values below that are Oblivion's "defend
+            # yourself / join this specific fight" idiom and belong on tier 1,
+            # which attacks declared Enemies only and leaves Neutrals alone —
+            # the faction graph then picks the actual opponent, exactly as the
+            # TES4 rule did.  Census of the 227 scripted calls in Oblivion.esm:
+            # 38 land on 0, 76 on tier 1 (10/20/25/30/40/50), 113 on tier 2+
+            # (90/100 = the real "now attack anyone" beats).
+            _ONSIGHT_AGGRESSION = 65
+            if raw <= 5:
+                tier = 0
+            elif raw >= 106:
+                tier = 3
+            elif raw >= _ONSIGHT_AGGRESSION:
+                tier = 2
+            else:
+                tier = 1
         elif sk_av.lower() == 'confidence':
             # Mirror _convert_aidt in tes5_import/record_types/actors.py: only
             # tier 4 (Foolhardy) never flees, and Oblivion's 100 means fearless.
@@ -3861,8 +3899,17 @@ class ScriptConverter:
             <= -50   Enemy    (`setfactionreaction X Y -100` = "now hate them")
             <  0     Neutral  (a mild grudge is not open warfare)
             == 0     Neutral  (explicitly clearing a relation)
-            <  50    Friend   (mild warmth)
-            >= 50    Ally
+            >  0     Friend   (goodwill between two DIFFERENT factions)
+
+        Positive amounts stop at Friend and never reach Ally.  A TES4
+        disposition is a 0-100 scalar meaning "likes them more"; TES5's Ally is
+        a hard contract that makes members ASSIST each other into combat (UESP
+        Skyrim:Factions — reaction combines with aggression and assistance to
+        decide who joins a fight).  Since `setfactionreaction` always names two
+        DIFFERENT factions, promoting its positive amounts to Ally wired
+        bystanders into other people's fights.  Ally is reserved for a
+        faction's relation to itself, which only the FACT record path emits
+        (see convert_FACT in tes5_import/record_types/actors.py).
 
         Returns None when the amount is not a literal, so the caller can emit a
         runtime branch instead.  ModFactionReaction shifts an existing value we
@@ -3883,14 +3930,10 @@ class ScriptConverter:
             return f';{f1}.ModReaction({f2}, 0)  ;no-op'
         if amount <= -50:
             return f'{f1}.SetEnemy({f2}, false, false)'
-        if amount < 0:
+        if amount <= 0:
             # Neutral: SetEnemy with the "self is neutral to other" bool set.
             return f'{f1}.SetEnemy({f2}, true, true)'
-        if amount == 0:
-            return f'{f1}.SetEnemy({f2}, true, true)'
-        if amount < 50:
-            return f'{f1}.SetAlly({f2}, true, true)'
-        return f'{f1}.SetAlly({f2}, false, false)'
+        return f'{f1}.SetAlly({f2}, true, true)'
 
     def _convert_function_call(self, line: str, extends: str) -> str:
         """Convert an Oblivion function call line to Papyrus."""

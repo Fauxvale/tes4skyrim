@@ -441,6 +441,43 @@ deliberately NOT scaled — a delta on a 0-100 scale has no enum equivalent, and
 such call exists in the source. Verify with
 `python tools/check_enum_actor_values.py <scripts/source>`.
 
+#### Aggression must not collapse 6..105 onto tier 2 (fixed 2026-07-31)
+
+**TES4 aggression is only half of a PER-TARGET rule**; TES5's is a GLOBAL tier.
+UESP `Oblivion:Aggression`: an actor attacks a target when
+`disposition(actor→target) < aggression - 5`, so ≤5 never attacks and ≥106
+attacks anyone regardless of disposition. TES5 instead names *which reaction
+class* the actor attacks (UESP `Skyrim:NPCs#Aggression`): 0 nobody, 1 Enemies,
+**2 Enemies AND NEUTRALS**, 3 everyone.
+
+The old rule was `0 if raw <= 5 else (3 if raw >= 106 else 2)` — everything from
+6 to 105 became tier 2. **The player is a Neutral to most factions**, so any
+scripted "wake up and join this fight" turned the actor hostile to the player.
+
+CharacterGen stage 22 is the case that exposed it: `GlenroyRef.setav aggression
+10` exists so the Emperor's guards respond to the Mythic Dawn ambush. In Oblivion
+10 only beats a disposition below 5, and the guards' disposition toward the
+player is ≈47, so they never turn on you. Converted to tier 2 they attacked the
+player from stage 22 onward — the exact failure UESP describes: *"a guard would
+attack the whole town if their aggression were sufficiently raised."*
+
+The threshold is `_ONSIGHT_AGGRESSION = 65`, matching the record path's margin
+test (a default actor with disposition ≈ Personality 50 needs `(aggr-5) - 50 >=
+10`, i.e. aggression ≥ 65 before it earns tier 2):
+
+| TES4 `setav aggression` | tier | meaning |
+|---|---|---|
+| ≤ 5 | 0 | never initiates |
+| 6 – 64 | **1** | attacks declared Enemies only — the faction graph picks the opponent |
+| 65 – 105 | 2 | attacks Neutrals on sight too |
+| ≥ 106 | 3 | Frenzied |
+
+Census of the 227 scripted calls in Oblivion.esm: 38 → tier 0, **78 → tier 1**
+(values 10/20/25/30/40/50, previously all tier 2), 111 → tier 2 (70/80/90/100,
+the genuine "now attack anyone" beats). Keep this table in step with
+`_npc_aidt` in `tes5_import/record_types/actors.py`, which applies the same rule
+to base records but subtracts disposition explicitly.
+
 Two recurring shapes, both found in the animation handlers:
 
 - **Wrong target vocabulary.** The emitted call is valid Papyrus but the string

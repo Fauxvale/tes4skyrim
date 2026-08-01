@@ -1517,10 +1517,45 @@ class TestEnumActorValues:
             'SetActorValue Aggression, 100', 'ObjectReference')
         assert 'SetActorValue("Aggression", 2)' in out
 
-    def test_aggression_low_but_nonzero_still_initiates(self, converter):
+    def test_low_aggression_fights_enemies_not_bystanders(self, converter):
+        """`setav aggression 10` must NOT become "attack neutrals on sight".
+
+        TES4 aggression is half of a per-target rule — attack when
+        disposition(actor->target) < aggression - 5 (UESP Oblivion:Aggression).
+        10 only beats a disposition below 5, so it means "join this specific
+        fight", not "turn on bystanders". TES5 tier 2 attacks Neutrals, and the
+        player is a Neutral to most factions, so 10 -> 2 made converted guards
+        hostile to the player.
+
+        This is CharacterGen stage 22: the Emperor's guards get
+        `setav aggression 10` so they respond to the Mythic Dawn ambush, and
+        their disposition toward the player is ~47. Landing them on tier 2 made
+        them attack the player from stage 22 on. UESP names the failure mode
+        directly: "a guard would attack the whole town if their aggression were
+        sufficiently raised."
+        """
         out = converter._convert_function_call(
             'SetActorValue Aggression, 10', 'ObjectReference')
-        assert 'SetActorValue("Aggression", 2)' in out
+        assert 'SetActorValue("Aggression", 1)' in out
+
+    def test_high_aggression_still_attacks_on_sight(self, converter):
+        """The real "now attack anyone" beats (90/100) must keep tier 2."""
+        for value in (70, 90, 100):
+            out = converter._convert_function_call(
+                f'SetActorValue Aggression, {value}', 'ObjectReference')
+            assert 'SetActorValue("Aggression", 2)' in out, value
+
+    def test_aggression_five_never_initiates(self, converter):
+        """<=5 is Oblivion's "never attack" floor."""
+        out = converter._convert_function_call(
+            'SetActorValue Aggression, 5', 'ObjectReference')
+        assert 'SetActorValue("Aggression", 0)' in out
+
+    def test_frenzy_range_attacks_everyone(self, converter):
+        """>=106 is Frenzy: attacks anyone, including allies."""
+        out = converter._convert_function_call(
+            'SetActorValue Aggression, 110', 'ObjectReference')
+        assert 'SetActorValue("Aggression", 3)' in out
 
     def test_in_range_value_passes_through(self, converter):
         """An already-legal tier is a deliberate value, not re-bucketed."""

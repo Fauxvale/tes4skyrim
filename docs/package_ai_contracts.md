@@ -87,6 +87,48 @@ targetless ambushes keep HoldPosition. The `AmbushPlayer`-named ones (Staada,
 Thadon, Ruma) are also scripted confrontations that TALK first, so the
 player-target test is the right discriminator, not the EditorID.
 
+## Defensive Combat is NOT Ignore Combat (fixed 2026-07-31)
+
+**TES4 `Defensive Combat` and TES5 `Ignore Combat` occupy the same bit (20) and
+mean opposite things.** xEdit `wbPackageFlags` (`wbDefinitionsCommon.pas:7635`)
+spells it out: bit 20 is `Armor Unequipped` in TES4 / `Ignore Combat` in TES5,
+while TES4's Defensive Combat is bit 22.
+
+| Flag | Meaning |
+|---|---|
+| TES4 Defensive Combat | Do not **start** fights — but **do fight back** |
+| TES5 Ignore Combat | Take **no part in combat at all** |
+
+Mapping one onto the other told every Oblivion bodyguard to stand still and be
+killed. This was CharacterGen's ambush: `CGGlenroyDefendEmperorAmbushA` — the
+package whose entire job is defending the Emperor — carries Defensive Combat, so
+the converted Blades drew their swords, then watched the assassin kill Renault
+and attack the others without ever striking back. All four packages the Blades
+run during the ambush had the flag (`DefendEmperorAmbushA`, `BladesWaitToMove`,
+`ToMarkerF`, `AccompanyEmperorToC`).
+
+Both sources describe the two behaviours precisely. UESP's Oblivion *The Killing
+Field* talk page names the TES4 flag's own symptom — *"the brothers won't attack
+the goblins unless provoked… one just stands there… remove [defensive combat]"* —
+and the TES5 flag is what the "Horses Ignore Combat" mod uses to make a horse a
+passive bystander (*"everything else still attacks the horse"*).
+
+**Skyrim has no Defensive Combat equivalent and needs none** (Skyrim Mod:Mod File
+Format/PACK lists no such flag): the aggression tier already decides whether an
+actor initiates, and every actor retaliates when attacked. **TES5's default IS
+TES4's Defensive Combat**, so the correct conversion is to DROP the bit. Setting
+Ignore Combat is actively harmful — vanilla reserves it (576/5,961 packages) for
+actors who must stay OUT of a scripted fight: horses, the MQ101 stand-still
+archers, `CWFinaleEnemyLeaderWaitForExecution`, `pelagiusHoldPosSleepIgnoreCombat`
+— never for a bodyguard. 388 of 7,209 TES4 packages set the TES4 bit, so this
+suppressed combat well beyond CharacterGen; the converted plugin now writes
+Ignore Combat on **zero** packages.
+
+Related: the guards also needed the scripted-aggression fix (see
+[papyrus_conversion_notes.md](papyrus_conversion_notes.md), "Aggression must not
+collapse 6..105 onto tier 2"). Both were required — aggression governs whether
+they pick a target, this flag governs whether they may fight at all.
+
 ## Force greet is a package, not a Papyrus call
 
 **Skyrim has NO Papyrus "walk over and talk to the player" call — a FORCE GREET

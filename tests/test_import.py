@@ -4179,6 +4179,84 @@ class TestAggressionTierTargeting:
         assert self._aggr(106, 50) == 3
 
 
+class TestFactionRelationReaction:
+    """XNAM Group Combat Reaction: 0 Neutral, 1 Enemy, 2 ALLY, 3 FRIEND.
+
+    Ally and Friend were swapped until 2026-07-31. Confirmed by xEdit
+    `wbFactionRelations` (wbDefinitionsCommon) and by Skyrim.esm, where 160 of
+    200 faction SELF-relations use 2 — a faction is Ally to itself.
+
+    Ally is the tier that makes members ASSIST each other into combat, so it is
+    reserved for the self-relation. A TES4 disposition is only a 0-100 "likes
+    them" scalar: Oblivion's CharacterGen data has BladesCG -> MythicDawnCG at
+    +100 while starting the ambush with StartCombat, so converting that edge to
+    Ally made the Emperor's guards assist the Mythic Dawn and attack the player.
+    """
+
+    BLADES_CG = 0x0001EE1E
+    MYTHIC_DAWN_CG = 0x00014A20
+    EMPEROR = 0x000150BC
+
+    def _fact(self, self_fid, relations):
+        """Convert one FACT and return {target_fid: (modifier, reaction)}."""
+        import struct
+        from tes5_import.record_types.actors import convert_FACT
+
+        rec = {'FormID': f'{self_fid:08X}', 'EditorID': 'TestFaction',
+               'RelationCount': str(len(relations))}
+        for i, (fid, disp) in enumerate(relations):
+            rec[f'Relation[{i}].Faction'] = f'{fid:08X}'
+            rec[f'Relation[{i}].Disposition'] = str(disp)
+
+        raw = convert_FACT(rec)
+        out = {}
+        body = raw[24:]
+        j = 0
+        while j + 6 <= len(body):
+            sig = body[j:j + 4]
+            size = struct.unpack_from('<H', body, j + 4)[0]
+            if sig == b'XNAM' and size == 12:
+                fid, mod, react = struct.unpack_from('<IiI', body, j + 6)
+                out[fid & 0xFFFFFF] = (mod, react)
+            j += 6 + size
+        return out
+
+    def test_self_relation_is_ally_enum_2(self):
+        rel = self._fact(self.BLADES_CG, [(self.BLADES_CG, 50)])
+        assert rel[self.BLADES_CG][1] == 2
+
+    def test_cross_faction_goodwill_is_friend_not_ally(self):
+        """+100 to ANOTHER faction is warmth, never an assist contract."""
+        rel = self._fact(self.BLADES_CG, [(self.MYTHIC_DAWN_CG, 100)])
+        assert rel[self.MYTHIC_DAWN_CG][1] == 3
+
+    def test_chargen_guards_do_not_ally_with_the_assassins(self):
+        """The regression itself: BladesCG must not be Ally to MythicDawnCG."""
+        rel = self._fact(self.BLADES_CG, [
+            (self.MYTHIC_DAWN_CG, 100),
+            (self.EMPEROR, 50),
+            (self.BLADES_CG, 50),
+        ])
+        assert rel[self.MYTHIC_DAWN_CG][1] != 2
+        assert rel[self.BLADES_CG][1] == 2
+
+    def test_emperor_faction_still_fights_the_assassins(self):
+        """The fix must not pacify the guards: -100 stays Enemy."""
+        rel = self._fact(self.EMPEROR, [(self.MYTHIC_DAWN_CG, -100)])
+        assert rel[self.MYTHIC_DAWN_CG][1] == 1
+
+    def test_mild_disposition_is_neutral(self):
+        rel = self._fact(self.MYTHIC_DAWN_CG, [(0x0001DBCD, 10)])
+        assert rel[0x0001DBCD][1] == 0
+
+    def test_modifier_is_always_zero(self):
+        """1035 of Skyrim.esm's 1036 XNAMs write Modifier 0; the enum carries all."""
+        rel = self._fact(self.BLADES_CG, [
+            (self.MYTHIC_DAWN_CG, 100), (self.EMPEROR, -100), (0x0001DBCD, 10),
+        ])
+        assert all(mod == 0 for mod, _ in rel.values())
+
+
 class TestLeveledActorShellDNAM:
     """A placed leveled creature's shell NPC_ must not cache a zero health pool.
 
