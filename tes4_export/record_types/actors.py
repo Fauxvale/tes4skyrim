@@ -277,9 +277,14 @@ def export_FACT(rec: Record) -> list:
                 lines.append(f"Relation[{i}].Faction={get_formid_str(fid)}")
                 lines.append(f"Relation[{i}].Disposition={disp}")
 
+    # TES4 FACT DATA is a single U8 (xEdit wbDefinitionsTES4: Hidden from
+    # Player / Evil / Special Combat) — measured at exactly 1 byte in all 204
+    # Nehrim.esm factions.  The old `>= 4` guard with a U32 unpack therefore
+    # never fired, silently dropping the flags for every faction in every
+    # plugin.
     data = get_subrecord(rec, "DATA")
-    if data and len(data.data) >= 4:
-        lines.append(f"DATA.Flags={struct.unpack_from('<I', data.data, 0)[0]}")
+    if data and len(data.data) >= 1:
+        lines.append(f"DATA.Flags={data.data[0]}")
 
     # CNAM - Crime Gold Multiplier
     emit_float(lines, "CNAM.CrimeGold", get_subrecord(rec, "CNAM"))

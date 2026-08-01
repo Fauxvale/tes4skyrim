@@ -1610,3 +1610,468 @@ class TestLocalVariableShadowsPlayer:
     def test_keyword_used_when_no_local(self, converter):
         assert converter._convert_ref('Player', 'ObjectReference') \
             == 'Game.GetPlayer()'
+
+
+class TestEarlyReturnKeepsPolling:
+    """TES4 `return` ends only THIS FRAME's GameMode pass — the script runs
+    again next frame.  Papyrus OnUpdate is one-shot and self-rescheduling, so a
+    Return that skips the trailing RegisterForSingleUpdate stops the script for
+    the rest of the game.  115 such Returns existed across 96 scripts;
+    MG05RockScript fires one shock bolt per tick and used `return` to serialize
+    six, so it fired exactly one bolt ever.
+    """
+
+    SRC = """Scriptname TestEarlyReturn
+short foo
+begin gamemode
+if ( foo == 0 )
+    return
+endif
+set foo to 1
+End
+"""
+
+    def test_quest_script_rearms_before_return(self, converter):
+        out = converter.convert_standalone('T', self.SRC, 'Quest', 'T')
+        body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
+        # Drop the !IsRunning() guard, whose Return already re-registered.
+        body = body.split('EndIf', 1)[1]
+        idx = body.index('Return')
+        assert 'RegisterForSingleUpdate(0.5)' in body[:idx], \
+            'early Return must re-arm the poll first'
+
+    def test_object_script_uses_the_is3dloaded_form(self, converter):
+        """An object/actor script's poll is MEANT to stop on unload, so the
+        re-register must carry the same Is3DLoaded() gate the fall-through
+        path uses — not an unconditional call that would keep ticking."""
+        out = converter.convert_standalone('T', self.SRC, 'ObjectReference',
+                                           'T')
+        body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
+        idx = body.index('Return')
+        before = body[:idx]
+        assert 'Is3DLoaded()' in before
+        assert 'RegisterForSingleUpdate(0.5)' in before
+
+    def test_value_returning_function_untouched(self, converter):
+        """`Return <value>` belongs to an OBSE user function, not a GameMode
+        early-out, and must not have a poll re-arm spliced in front of it."""
+        converter._udf_returns = True
+        assert converter._convert_line('return', 'Quest') == 'Return 0'
+
+
+class TestJailIsNotExpulsion:
+    """`IsPlayerInJail` (TES4 opcode 0x10AB) means "is the player serving a jail
+    sentence".  All four spellings emitted
+    TES4CyrodiilCrimeFaction.IsPlayerExpelled() — an unrelated question that is
+    never true, since nothing expels the player from the synthesized crime
+    faction.  Skyrim has the exact native: vanilla Actor.psc declares
+    `bool Function IsArrested() native`, "Is this actor currently arrested?".
+
+    TG00FindThievesGuildScript's stage 10 is the entry point of the whole
+    Thieves Guild questline and was gated on this.
+    """
+
+    @pytest.mark.parametrize('spelling', [
+        'IsPlayerInJail', 'GetPlayerInJail', 'IsPlayerInPrison', 'SentToJail',
+    ])
+    def test_maps_to_isarrested(self, converter, spelling):
+        out = converter._convert_expression(spelling, 'Quest')
+        assert out == 'Game.GetPlayer().IsArrested()'
+        assert 'Expelled' not in out
+
+    def test_does_not_register_a_crime_faction_property(self, converter):
+        converter._convert_expression('IsPlayerInJail', 'Quest')
+        assert 'TES4CyrodiilCrimeFaction' not in converter.get_property_refs()
+
+
+class TestScriptAddTopicOpensTheGate:
+    """A script `AddTopic X` is the THIRD reveal route for Oblivion's topic
+    visibility model, alongside INFO fragments and quest stages.  It emitted an
+    inert comment, so 19 gated topics lost that route — including TGGrayFox,
+    whose reveal is reading the wanted poster / the mysterious note.
+    """
+
+    def test_gated_topic_emits_the_setvalue(self, converter):
+        converter.topic_unlock_globals = {'tggrayfox': 'TES4Unlock_TGGrayFox'}
+        out = converter._convert_line('AddTopic TGGrayFox', 'ObjectReference')
+        assert out == 'TES4Unlock_TGGrayFox.SetValue(1)'
+        assert converter.get_property_refs()['TES4Unlock_TGGrayFox'] \
+            == 'GlobalVariable'
+
+    def test_ungated_topic_stays_inert(self, converter):
+        """An ungated topic is already visible and has no global to set."""
+        converter.topic_unlock_globals = {}
+        converter._line_comments = []
+        out = converter._convert_line('AddTopic SomeUngatedTopic',
+                                      'ObjectReference')
+        assert 'SetValue' not in out
+        assert 'TES4Unlock_' not in str(converter.get_property_refs())
+
+
+class TestBareMenuModeRuns:
+    """A BARE `begin MenuMode` (no menu id) is time-and-inventory bookkeeping
+    that Oblivion runs on the frames where GameMode does NOT — wait/sleep and
+    inventory.  Commenting it out deleted real logic: MelisandeScript's body
+    holds the ONLY `set MS40.cureready to 1` in the plugin, so MS40's
+    vampirism cure could never be handed over.  Menu-ID blocks (the MQ01
+    stage-blowout case) must still stay inert.
+    """
+
+    BARE = """Scriptname TestBareMenu
+short flag
+begin gamemode
+set flag to 1
+End
+begin MenuMode
+set flag to 2
+End
+"""
+
+    WITH_ID = """Scriptname TestMenuId
+short flag
+begin gamemode
+set flag to 1
+End
+begin MenuMode 1014
+set flag to 2
+End
+"""
+
+    SLEEP = """Scriptname TestSleepMenu
+short flag
+begin gamemode
+set flag to 1
+End
+begin MenuMode
+if ( isPCSleeping == 1 )
+    set flag to 2
+endif
+End
+"""
+
+    def test_bare_body_runs_in_the_update_loop(self, converter):
+        out = converter.convert_standalone('T', self.BARE, 'Quest', 'T')
+        body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
+        assert 'flag = 2' in body, 'bare MenuMode body must execute'
+        assert 'NOT executed' not in out
+
+    def test_menu_id_body_stays_inert(self, converter):
+        out = converter.convert_standalone('T', self.WITH_ID, 'Quest', 'T')
+        assert 'NOT executed' in out
+        body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
+        assert 'flag = 2' not in body
+
+    def test_sleep_idiom_still_routes_to_onsleepstart(self, converter):
+        """The isPCSleeping exception must keep its own route, not be
+        swallowed by the new bare-block merge."""
+        out = converter.convert_standalone('T', self.SLEEP, 'Quest', 'T')
+        assert 'TES4_MenuModeSleepBody' in out
+        assert 'Event OnSleepStart' in out
+        body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
+        assert 'flag = 2' not in body
+
+
+class TestIsPCAMurdererIsNotZero:
+    """IsPCAMurderer takes NO arguments, so it is always read bare — the bare
+    fallback returned the literal 0 and the real handler was unreachable dead
+    code.  DarkBrotherhoodScript's site is the ONLY trigger for the entire
+    Dark Brotherhood questline, so `If 0 == 1` meant it could never begin.
+    """
+
+    def test_bare_read_asks_the_crime_faction(self, converter):
+        out = converter._convert_line('if IsPCAMurderer == 1', 'Quest')
+        assert '0 == 1' not in out
+        assert 'GetCrimeGoldViolent()' in out
+        assert converter.get_property_refs()['TES4CyrodiilCrimeFaction'] \
+            == 'Faction'
+
+    def test_uses_the_murder_band_not_any_violence(self, converter):
+        """`> 0` is R4-1's ASSAULT test — it would make the player a murderer
+        for a bar brawl.  Murder is the 1000-gold band."""
+        from script_convert.constants import TES4_MURDER_BOUNTY
+        out = converter._convert_line('if IsPCAMurderer == 1', 'Quest')
+        assert f'>= {TES4_MURDER_BOUNTY}' in out
+
+
+class TestGetDetectionLevelIsDetection:
+    """GetDetectionLevel has the same shape as GetDetected (opcode 0x10B4, 1
+    Actor param, "Actor Reference" receiver) and every one of the plugin's 56
+    sites is a threshold test (>=2, >=3, ==3) — never a numeric read.  It was
+    a flat 0, killing all 7 of Dark04Execution's guard-aggro triggers among
+    others.
+    """
+
+    def test_receiver_and_argument_swap(self, converter):
+        """`Player` converts to Game.GetPlayer(); what matters is that the
+        TARGET became the receiver and the OBSERVER the argument."""
+        out = converter._convert_line(
+            'if GuardRef.GetDetectionLevel Player == 3', 'Quest')
+        assert '.IsDetectedBy(GuardRef)' in out, \
+            'observer/target must swap, as for GetDetected'
+        assert 'GuardRef.IsDetectedBy' not in out
+
+    def test_threshold_is_rescaled_to_the_tes4_range(self, converter):
+        """`true as Int` is 1, so a raw Bool would make every `>= 2` / `>= 3`
+        site permanently false — trading one dead form for another."""
+        for op, num in (('==', 3), ('>=', 2), ('>=', 3)):
+            out = converter._convert_line(
+                f'if GuardRef.GetDetectionLevel Player {op} {num}', 'Quest')
+            assert '* 3)' in out, f'{op} {num} must be rescaled'
+
+    def test_undetected_fails_every_threshold(self):
+        """0 must fail ==3, >=2 and >=3; 3 must satisfy all three."""
+        for detected, expected in ((False, False), (True, True)):
+            val = (1 if detected else 0) * 3
+            assert ((val == 3) is expected)
+            assert ((val >= 2) is expected)
+            assert ((val >= 3) is expected)
+
+
+class TestPlaySoundPropertyIsNotQuoted:
+    """Vanilla writes the EditorID quoted (`PlaySound "AMBBaenlinDeath"`).
+    Registering the RAW argument kept the quotes, and _safe_property_name
+    turned each into an underscore — declaring a second, never-referenced
+    `Sound Property _X_ Auto` beside the real one (75 across 23 files).
+    """
+
+    def test_quoted_editorid_registers_the_stripped_name(self, converter):
+        out = converter._convert_line('PlaySound "AMBBaenlinDeath"', 'Quest')
+        props = converter.get_property_refs()
+        assert 'AMBBaenlinDeath' in props
+        assert not [p for p in props if p.startswith('_') and p.endswith('_')]
+        assert 'AMBBaenlinDeath.Play(' in out
+
+    def test_unquoted_editorid_still_works(self, converter):
+        out = converter._convert_line('PlaySound AMBBaenlinMiss', 'Quest')
+        assert 'AMBBaenlinMiss' in converter.get_property_refs()
+        assert 'AMBBaenlinMiss.Play(' in out
+
+
+class TestInferExtendsDoesNotBreakBinding:
+    """Papyrus binds a script to a form only when the declared base type
+    matches, so an `extends Actor` script on a WEAP/ACTI/CONT/DOOR is rejected
+    outright ("Unable to bind script X because their base types do not match")
+    and never runs.  `_infer_extends` upgraded 88 non-actor scripts that way;
+    67 were logged as unbindable in-game.  Four distinct causes, one per test.
+    """
+
+    def test_objectreference_shared_call_does_not_upgrade(self):
+        # `GetDistance` is declared on ObjectReference, not just Actor — it is
+        # in `_OBJREF_SHARED_FUNCTIONS` for exactly this reason.  It upgraded
+        # 101 scripts, `GoblinHeadScript` (on GoblinShamanStaff, a WEAP) among
+        # them.
+        src = 'scn X\n\nbegin gamemode\n\tif getdistance SomeMarker > 500\n\tendif\nend'
+        assert ScriptConverter._infer_extends(src, 'ObjectReference') == 'ObjectReference'
+
+    def test_comment_and_string_text_does_not_upgrade(self):
+        # `DAMalacathStatueScript` ("...not kill them!"), `SE09AltarScript`
+        # (";StartCombat to get the scene rolling"), `ICUmbacanoExitDoorScript`
+        # ("; evp the post guards").
+        for src in ('scn X\n\nbegin gamemode\n\tMessageBox "do not kill them!"\nend',
+                    'scn X\n\nbegin gamemode\n\t;StartCombat to get it rolling\nend',
+                    'scn X\n\nbegin gamemode\n\t; evp the post guards\nend'):
+            assert ScriptConverter._infer_extends(src, 'ObjectReference') == 'ObjectReference'
+
+    def test_local_named_like_an_actor_function_does_not_upgrade(self):
+        # `MS05DreamworldAmuletScript` declares `short isEquipped`; reading or
+        # assigning it is not a call.
+        src = ('scn X\n\nshort isEquipped\n\nbegin gamemode\n'
+               '\tif isEquipped == 1\n\tendif\nend')
+        assert ScriptConverter._infer_extends(src, 'ObjectReference') == 'ObjectReference'
+
+    def test_actor_event_body_does_not_upgrade(self):
+        # `OnEquipped(Actor akActor)` supplies the subject itself, so an
+        # actor-only call inside it says nothing about the script's own type —
+        # the `MGBloodwormHelmScript*` helms ride on ARMO records.
+        src = ('scn X\n\nBegin OnEquip Player\n\taddspell SomeSpell\nEnd\n'
+               'Begin OnUnequip Player\n\tremovespell SomeSpell\nEnd')
+        assert ScriptConverter._infer_extends(src, 'ObjectReference') == 'ObjectReference'
+
+    def test_a_genuine_self_acting_actor_call_still_upgrades(self):
+        # The upgrade must still fire for its real purpose: `SEShambles2`'s
+        # bare `getdead`, `DAPeryiteIlvelScript`'s `setghost`.
+        for src in ('scn X\n\nbegin gamemode\n\tif getdead == 1\n\tendif\nend',
+                    'scn X\n\nbegin gamemode\n\tsetghost 1\nend'):
+            assert ScriptConverter._infer_extends(src, 'ObjectReference') == 'Actor'
+
+
+class TestBareActorCallUsesTheEventActor:
+    """Inside an event that hands us the actor it is about, TES4's implicit
+    subject for an actor-only call is THAT actor, not the item.  The helms'
+    bare `addspell` is cast on the WEARER; `(Self as Actor)` on an ARMO is
+    None, so the helm's whole effect was silently lost.
+    """
+
+    def test_bare_addspell_in_onequipped_targets_akactor(self, converter):
+        converter._current_event = 'Event OnEquipped(Actor akActor)'
+        out = converter._convert_line('addspell MG15BloodWormHelm25',
+                                      'ObjectReference')
+        assert out.strip().startswith('akActor.AddSpell(')
+
+    def test_bare_call_outside_an_actor_event_still_casts_self(self, converter):
+        converter._current_event = 'Event OnUpdate()'
+        out = converter._convert_line('addspell MG15BloodWormHelm25',
+                                      'ObjectReference')
+        assert '(Self as Actor).AddSpell(' in out
+
+
+class TestSharedScriptUsesTheCommonBaseType:
+    """A script attached to BOTH an actor and a non-actor record cannot be
+    `Actor` — Papyrus would refuse to bind the non-actor copies.  Oblivion puts
+    `NoActivationScript` on a DOOR and an NPC_; scanning for the first actor
+    attachment and returning early left every DOOR copy unbound, so the empty
+    `OnActivate` that BLOCKS activation never ran on the doors.
+    """
+
+    def _graph(self, attachments):
+        from script_convert.cross_ref import CrossRefGraph
+        g = CrossRefGraph()
+        g.script_formid_to_type['00000001'] = 0
+        for i, sig in enumerate(attachments):
+            rec = f'0000A{i:03d}'
+            g.record_type[rec] = sig
+            g.record_scri[rec] = '00000001'
+        return g
+
+    def test_actor_and_door_share_objectreference(self):
+        g = self._graph(['NPC_', 'DOOR'])
+        assert g.get_extends_class('00000001') == 'ObjectReference'
+
+    def test_actor_only_still_extends_actor(self):
+        g = self._graph(['NPC_', 'CREA'])
+        assert g.get_extends_class('00000001') == 'Actor'
+
+    def test_non_actor_only_stays_objectreference(self):
+        g = self._graph(['DOOR', 'ACTI'])
+        assert g.get_extends_class('00000001') == 'ObjectReference'
+
+
+class TestGetCurrentAIPackageNumeric:
+    """R9-1: `GetCurrentAIPackage == <n>` compared a package TYPE code.
+
+    Skyrim's Actor.GetCurrentPackage() returns the Package form and neither
+    vanilla Package.psc nor SKSE exposes its type, so the numeric comparison
+    was flattened to the literal 0 — `If (0 == 5)` killed MG17's whole flee
+    sequence.  The set of packages an actor can run is fixed at conversion
+    time by its own AIPackage list, so the test is reconstructed as a
+    disjunction over that actor's packages of the requested type.
+    """
+
+    def _graph(self):
+        from script_convert.cross_ref import CrossRefGraph
+        g = CrossRefGraph()
+        # Two Wander (5) packages and one Travel (6) on one actor.
+        for fid, edid, ptype in (('0000B001', 'WanderA', 5),
+                                 ('0000B002', 'WanderB', 5),
+                                 ('0000B003', 'TravelA', 6)):
+            g.record_type[fid] = 'PACK'
+            g.formid_to_edid[fid] = edid
+            g.edid_to_formid[edid.lower()] = fid
+            g.pack_type[fid] = ptype
+        g.record_type['0000A001'] = 'NPC_'
+        g.formid_to_edid['0000A001'] = 'Guard'
+        g.edid_to_formid['guard'] = '0000A001'
+        g.actor_packages['0000A001'] = ['0000B001', '0000B002', '0000B003']
+        # A placed reference onto that base, to exercise the NAME chain.
+        g.record_type['0000C001'] = 'ACHR'
+        g.formid_to_edid['0000C001'] = 'GuardRef'
+        g.edid_to_formid['guardref'] = '0000C001'
+        g.record_base['0000C001'] = '0000A001'
+        return g
+
+    def test_wander_expands_to_the_actors_wander_packages(self):
+        g = self._graph()
+        assert g.get_actor_packages_of_type('Guard', 5) == ['WanderA', 'WanderB']
+
+    def test_travel_picks_only_the_travel_package(self):
+        g = self._graph()
+        assert g.get_actor_packages_of_type('Guard', 6) == ['TravelA']
+
+    def test_placed_reference_follows_the_name_chain(self):
+        g = self._graph()
+        assert g.get_actor_packages_of_type('GuardRef', 5) == ['WanderA', 'WanderB']
+
+    def test_unknown_actor_returns_empty_so_caller_keeps_the_noop(self):
+        g = self._graph()
+        assert g.get_actor_packages_of_type('NoSuchActor', 5) == []
+        assert g.get_actor_packages_of_type('Guard', 9) == []
+
+    def test_bare_call_resolves_through_the_owning_script(self):
+        g = self._graph()
+        g.script_formid_to_edid['0000D001'] = 'GuardScript'
+        g.record_scri['0000A001'] = '0000D001'
+        assert g.get_script_owner_packages_of_type('GuardScript', 5) == [
+            'WanderA', 'WanderB']
+
+    def test_equality_emits_an_or_chain(self):
+        conv = ScriptConverter(self._graph())
+        out = conv.convert_standalone(
+            'T', 'scn T\nbegin gamemode\nif Guard.GetCurrentAIPackage == 5\n'
+            'set x to 1\nendif\nend', 'Quest', 'T')
+        assert 'GetCurrentPackage() == WanderA' in out
+        assert 'GetCurrentPackage() == WanderB' in out
+        assert '||' in out
+        assert '0 == 5' not in out
+
+    def test_inequality_emits_an_and_chain(self):
+        conv = ScriptConverter(self._graph())
+        out = conv.convert_standalone(
+            'T', 'scn T\nbegin gamemode\nif Guard.GetCurrentAIPackage != 5\n'
+            'set x to 1\nendif\nend', 'Quest', 'T')
+        assert 'GetCurrentPackage() != WanderA' in out
+        assert 'GetCurrentPackage() != WanderB' in out
+        assert '&&' in out
+
+    def test_a_pack_editorid_comparand_still_converts_directly(self):
+        conv = ScriptConverter(self._graph())
+        out = conv.convert_standalone(
+            'T', 'scn T\nbegin gamemode\nif Guard.GetCurrentAIPackage == WanderA\n'
+            'set x to 1\nendif\nend', 'Quest', 'T')
+        assert 'GetCurrentPackage() == WanderA' in out
+        assert '||' not in out
+
+
+class TestPlayerControlsShadow:
+    """R9-2: GetPlayerControlsDisabled was the literal 0.
+
+    Skyrim has both WRITERS as natives but no getter.  Flattening the read was
+    not inert: MG18Script polls it to sequence Mannimarco's confrontation, so
+    `== 1` was permanently false (he never spoke) while `== 0` was permanently
+    true (he attacked at once).  The writers now shadow the state into the
+    synthesized TES4ControlsDisabled global and the read returns it.
+    """
+
+    def test_read_returns_the_global(self, converter):
+        out = converter.convert_standalone(
+            'T', 'scn T\nbegin gamemode\nif GetPlayerControlsDisabled == 1\n'
+            'set x to 1\nendif\nend', 'Quest', 'T')
+        assert 'TES4ControlsDisabled.GetValue() == 1' in out
+        assert '0 == 1' not in out
+
+    def test_disable_writes_the_shadow(self, converter):
+        out = converter.convert_standalone(
+            'T', 'scn T\nbegin gamemode\nDisablePlayerControls\nend', 'Quest', 'T')
+        assert 'Game.DisablePlayerControls()' in out
+        assert 'TES4ControlsDisabled.SetValue(1)' in out
+
+    def test_enable_clears_the_shadow(self, converter):
+        out = converter.convert_standalone(
+            'T', 'scn T\nbegin gamemode\nEnablePlayerControls\nend', 'Quest', 'T')
+        assert 'Game.EnablePlayerControls()' in out
+        assert 'TES4ControlsDisabled.SetValue(0)' in out
+
+    def test_writer_declares_the_property_even_without_a_read(self, converter):
+        # The only reader (MG18Script) is a DIFFERENT script from the two
+        # writers, so the shadow must not be gated on a same-script read.
+        out = converter.convert_standalone(
+            'T', 'scn T\nbegin gamemode\nDisablePlayerControls\nend', 'Quest', 'T')
+        assert 'GlobalVariable Property TES4ControlsDisabled Auto' in out
+
+    def test_a_trailing_source_comment_does_not_strand_the_shadow(self, converter):
+        out = converter.convert_standalone(
+            'T', 'scn T\nbegin gamemode\nDisablePlayerControls ; cutscene\nend',
+            'Quest', 'T')
+        lines = [ln.strip() for ln in out.splitlines()]
+        i = next(i for i, ln in enumerate(lines)
+                 if ln.startswith('Game.DisablePlayerControls()'))
+        assert lines[i + 1] == 'TES4ControlsDisabled.SetValue(1)'

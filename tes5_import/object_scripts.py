@@ -345,6 +345,10 @@ def _resolve_props(sctx: str, edid: str, extends: str, xref,
     name = _safe_property_name(edid or 'Script')
     conv.convert_standalone(name, sctx, extends, edid)
 
+    # Lazy (circular: import_main imports this module).
+    from .import_main import get_well_known_properties
+    well_known = get_well_known_properties()
+
     obj_props: dict[str, int] = {}
     for pname, ptype in conv.get_property_refs().items():
         if ptype in _VALUE_TYPES:
@@ -356,6 +360,24 @@ def _resolve_props(sctx: str, edid: str, extends: str, xref,
             continue
         if low in ENGINE_GLOBAL_FORMIDS:
             obj_props[safe] = ENGINE_GLOBAL_FORMIDS[low]
+            continue
+        # SYNTHESIZED records (TES4Fame/TES4Infamy/TES4GoldFenced/
+        # TES4CyrodiilCrimeFaction/TES4Unlock_*) stand in for TES4 concepts
+        # Skyrim has no record for, so they exist only in the OUTPUT and are
+        # absent from xref.edid_to_formid — which is built from the TES4
+        # export. resolve_property_formid() therefore misses every one, and the
+        # property was silently left unbound (None at runtime).
+        #
+        # The dialogue and quest VMAD builders already inject the same registry
+        # (`well_known_props`), so QF_/TIF_ fragments bound correctly and only
+        # OBJECT scripts were affected — which is why this survived the round-2
+        # verification that counted the 4,762 dialogue bindings.
+        #
+        # It is not cosmetic: TGStolenGoodsScript is the Thieves Guild rank
+        # driver and all ten of its gates read `TES4GoldFenced.GetValue()`, so
+        # a None property threw on the first tick and no TG rank ever advanced.
+        if pname in well_known:
+            obj_props[safe] = well_known[pname]
             continue
         fid_hex = resolve_property_formid(xref, pname)
         if not fid_hex:

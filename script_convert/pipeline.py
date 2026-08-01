@@ -41,7 +41,7 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
                         stage_reveals, say_durations=None,
                         say_timer_owners=None, topic_by_dial=None,
                         beat_fields_by_owner=None, quest_script_vars=None,
-                        quest_edid_by_fid=None):
+                        quest_edid_by_fid=None, topic_unlock_globals=None):
     _WORKER_CTX.update(xref=xref, output_dir=output_dir,
                        info_reveals=info_reveals,
                        service_topics=service_topics,
@@ -56,6 +56,9 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
     ScriptConverter.beat_fields_by_owner = beat_fields_by_owner or {}
     # Per-topic timer target + any deliberate beat, applied by the End fragment.
     ScriptConverter.say_timer_owners = say_timer_owners or {}
+    # DIAL EditorID -> unlock global, so a script `AddTopic X` opens the same
+    # gate the INFO/QUST fragments do.
+    ScriptConverter.topic_unlock_globals = topic_unlock_globals or {}
 
 
 def _script_worker_run(job):
@@ -221,10 +224,28 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
                          (r.get('EditorID') or '')
                          for r in by_type.get('QUST', [])
                          if r.get('FormID')}
+
+    # `AddTopic X` in a SCRIPT body is the third reveal route (alongside INFO
+    # fragments and quest stages), so it needs the gated topic's global by
+    # EditorID. Keyed off the same unlock_plan the other two use, so all three
+    # set the identical global the importer binds.
+    topic_unlock_globals = {}
+    for d in by_type.get('DIAL', []):
+        edid = (d.get('EditorID') or '').lower()
+        if not edid:
+            continue
+        try:
+            fid24 = int(d.get('FormID', '0'), 16) & 0xFFFFFF
+        except (TypeError, ValueError):
+            continue
+        gname = unlock_plan['gated'].get(fid24)
+        if gname:
+            topic_unlock_globals[edid] = gname
+
     initargs = (xref, output_dir, info_reveals, service_topics,
                 unlock_plan['stage_reveals'], say_durations,
                 say_timer_owners, topic_by_dial, beat_fields_by_owner,
-                quest_script_vars, quest_edid_by_fid)
+                quest_script_vars, quest_edid_by_fid, topic_unlock_globals)
     if workers <= 1 or len(jobs) <= 2:
         _script_worker_init(*initargs)
         for job in jobs:
@@ -907,6 +928,11 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             out_lines.append('EndFunction')
             out_lines.append('')
 
+            # GetInCell prefix-family helpers the fragment body calls by name.
+            # Only a scripted INFO has a converter (and therefore a body).
+            if has_script:
+                out_lines.extend(conv.get_cell_family_helpers())
+
             papyrus = '\n'.join(out_lines)
             out_path = os.path.join(output_dir, f'{script_name}.psc')
             with open(out_path, 'w', encoding='utf-8') as f:
@@ -1166,7 +1192,13 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
                     else:
                         merged[key] = (pname, ptype)
                 insert_idx = 2  # After ScriptName + blank line
-                declared = set()
+                # quest_globals above already declared the stage-reveal unlock
+                # globals. The converter ALSO registers them now that a script
+                # `AddTopic X` emits TES4Unlock_X.SetValue(1), and a stage whose
+                # result script contains that AddTopic is reached by both paths
+                # — so without this seed the same name is declared twice
+                # ("property with `TES4Unlock_...` name already exists").
+                declared = {g.lower() for g in quest_globals}
                 count = 0
                 for pname, ptype in sorted(merged.values(), key=lambda x: x[0].lower()):
                     safe = _safe_property_name(pname)
@@ -1176,6 +1208,9 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
                     out_lines.insert(insert_idx + count, f'{ptype} Property {safe} Auto')
                     count += 1
                 out_lines.insert(insert_idx + count, '')
+
+            # GetInCell prefix-family helpers the stage bodies call by name.
+            out_lines.extend(conv.get_cell_family_helpers())
 
             papyrus = '\n'.join(out_lines)
             out_path = os.path.join(output_dir, f'{script_name}.psc')

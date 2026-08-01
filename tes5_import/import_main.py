@@ -81,6 +81,17 @@ from worker_budget import worker_count  # noqa: E402
 _WELL_KNOWN_PROPERTIES: dict[str, int] = {}   # populated by _create_tes4_special_records
 
 
+def get_well_known_properties() -> dict:
+    """Synthesized property name -> output FormID.
+
+    Accessor rather than a direct import so object_scripts can bind these
+    without a circular import. Built in the MAIN process (phase 0/0b) and read
+    by the object-script plan, which is also main-process, so no worker ever
+    sees an empty copy.
+    """
+    return _WELL_KNOWN_PROPERTIES
+
+
 def _create_tes4_special_records(writer: PluginWriter):
     """Create globals and factions needed by converted Papyrus scripts.
 
@@ -106,20 +117,65 @@ def _create_tes4_special_records(writer: PluginWriter):
     writer.add_record('GLOB', pack_record('GLOB', infamy_fid, 0, infamy_subs))
     _WELL_KNOWN_PROPERTIES['TES4Infamy'] = infamy_fid
 
-    # TES4CyrodiilCrimeFaction — Faction with crime flags
+    # TES4GoldFenced — GlobalVariable (Float, initial 0.0).
+    # Oblivion's GetAmountSoldStolen/ModAmountSoldStolen track the GOLD VALUE of
+    # stolen goods fenced (the Thieves Guild INFOs literally print
+    # "Amount fenced: %.0f gold").  Skyrim keeps the counter only as a condition
+    # function — there is no Papyrus native and no matching entry in the stat
+    # table — so converted scripts back it with this global.  Reusing the
+    # vanilla "Items Stolen" stat would be wrong twice over: it counts items
+    # rather than gold, and the engine bumps it on every theft, so the TG rank
+    # gates would trip without ever visiting a fence.
+    fenced_fid = writer.alloc_formid()
+    fenced_subs = pack_string_subrecord('EDID', 'TES4GoldFenced')
+    fenced_subs += pack_subrecord('FNAM', struct.pack('<B', ord('f')))
+    fenced_subs += pack_subrecord('FLTV', struct.pack('<f', 0.0))
+    writer.add_record('GLOB', pack_record('GLOB', fenced_fid, 0, fenced_subs))
+    _WELL_KNOWN_PROPERTIES['TES4GoldFenced'] = fenced_fid
+
+    # TES4ControlsDisabled — GlobalVariable (Short, initial 0).
+    # Oblivion's GetPlayerControlsDisabled has no Papyrus native (checked
+    # vanilla Game.psc and SKSE — only the Disable/Enable writers exist), and
+    # flattening the read to 0 is not neutral: it makes `== 1` permanently
+    # false AND `== 0` permanently true, so a script that polls the state gets
+    # both halves of its own sequencing wrong.  The converter owns both
+    # writers, so the state is shadowed here: Game.DisablePlayerControls() and
+    # Game.EnablePlayerControls() each also write this global, and the read
+    # returns it.
+    ctrl_fid = writer.alloc_formid()
+    ctrl_subs = pack_string_subrecord('EDID', 'TES4ControlsDisabled')
+    ctrl_subs += pack_subrecord('FNAM', struct.pack('<B', ord('s')))
+    ctrl_subs += pack_subrecord('FLTV', struct.pack('<f', 0.0))
+    writer.add_record('GLOB', pack_record('GLOB', ctrl_fid, 0, ctrl_subs))
+    _WELL_KNOWN_PROPERTIES['TES4ControlsDisabled'] = ctrl_fid
+
+    # TES4CyrodiilCrimeFaction — stands in for Oblivion's single global crime
+    # faction, and is the receiver for most converted GetPCExpelled /
+    # GotoJail / crime calls, so it has to be a REAL crime faction.
+    #
+    # It previously set CanBeOwner plus bits 7-11/13/16, which are Skyrim's
+    # *Ignore* Crimes flags — the opposite of the intent (xEdit decodes the old
+    # 0x0001AF80 as "IgnoreKills") — and never set Track Crime, without which
+    # the engine accumulates no crime gold at all.  Its CRVA also used the wrong
+    # struct layout and left every crime worth 0.  See convert_FACT in
+    # record_types/actors.py for the layout and the vanilla-census amounts.
     crime_fid = writer.alloc_formid()
     crime_subs = pack_string_subrecord('EDID', 'TES4CyrodiilCrimeFaction')
     crime_subs += pack_string_subrecord('FULL', 'Cyrodiil Crime Faction')
-    # DATA: CanBeOwner(0x8000) + all crime flags
-    crime_flags = 0x8000 | 0x0080 | 0x0100 | 0x0200 | 0x0400 | 0x0800 | 0x2000 | 0x10000
-    crime_subs += pack_subrecord('DATA', struct.pack('<I', crime_flags))
-    # CRVA — Crime Values (defaults)
-    crime_subs += pack_subrecord('CRVA', struct.pack('<HHHHIfI', 0, 0, 0, 0, 0, 1.0, 0))
+    # DATA: Can Be Owner (bit 15) + Track Crime (bit 6)
+    crime_subs += pack_subrecord('DATA', struct.pack('<I', 0x8000 | 0x0040))
+    # CRVA — vanilla crime values (murder=1000, assault=40, trespass=5,
+    # pickpocket=25, steal x1.0, escape=100), matching all 14 real Skyrim
+    # crime factions.
+    crime_subs += pack_subrecord(
+        'CRVA', struct.pack('<BBHHHHHfHH', 1, 1, 1000, 40, 5, 25, 0, 1.0, 100, 0))
     writer.add_record('FACT', pack_record('FACT', crime_fid, 0, crime_subs))
     _WELL_KNOWN_PROPERTIES['TES4CyrodiilCrimeFaction'] = crime_fid
 
     print(f"  Created TES4 special records: "
           f"TES4Fame={fame_fid:08X}, TES4Infamy={infamy_fid:08X}, "
+          f"TES4GoldFenced={fenced_fid:08X}, "
+          f"TES4ControlsDisabled={ctrl_fid:08X}, "
           f"TES4CyrodiilCrimeFaction={crime_fid:08X}")
 
 
@@ -447,9 +503,32 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     from .dialog_unlocks import build_unlock_plan, create_unlock_globals
     unlock_plan = build_unlock_plan(by_type)
     unlock_globals = create_unlock_globals(writer, unlock_plan)
+
+    # A script `AddTopic X` is the third reveal route alongside INFO fragments
+    # and quest stages, and script_convert now emits the same
+    # `TES4Unlock_<topic>.SetValue(1)` for it. Two things have to hold here or
+    # that property binds to nothing:
+    #   * the converter pass this module runs (object/quest VMAD property
+    #     resolution) must see the SAME topic->global map the script pipeline
+    #     used, or it resolves a different property set than the .psc declares;
+    #   * the global must be resolvable by name, which _WELL_KNOWN_PROPERTIES
+    #     does for the synthesized records that have no TES4 counterpart
+    #     (the TES4Fame/TES4GoldFenced pattern).
+    from script_convert.converter import ScriptConverter as _SC
+    _SC.topic_unlock_globals = {
+        (d.get('EditorID') or '').lower(): gname
+        for d in by_type.get('DIAL', [])
+        if (d.get('EditorID') or '')
+        for gname in [unlock_plan['gated'].get(
+            int(d.get('FormID', '0'), 16) & 0xFFFFFF)]
+        if gname
+    }
+    _WELL_KNOWN_PROPERTIES.update(unlock_globals)
+
     print(f"  AddTopic unlocks: {len(unlock_globals)} gated topics, "
           f"{len(unlock_plan['info_reveals'])} revealer INFOs, "
-          f"{len(unlock_plan['stage_reveals'])} revealer quest stages")
+          f"{len(unlock_plan['stage_reveals'])} revealer quest stages, "
+          f"{len(_SC.topic_unlock_globals)} topic->global names for scripts")
     _step_done('addtopic unlock plan')
 
     # --- Phase 0b2: Build FormID → EditorID map for VMAD property resolution ---
@@ -504,6 +583,30 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
             xref.record_scri[fid_str] = scri
         if sig in ('NPC_', 'CREA'):
             xref.npc_formids.add(fid_str)
+            # AIPackage list + PKDT.Type back the reconstruction of TES4's
+            # `GetCurrentAIPackage == <type>` (see cross_ref.pack_type).  This
+            # graph is hand-built rather than loaded via load_from_export, so
+            # anything the CLI scan collects must be mirrored here or the
+            # converter takes a DIFFERENT branch inside the import than it did
+            # when the .psc was written — and the VMAD ends up missing exactly
+            # the properties the compiled script reads.
+            packs = []
+            i = 0
+            while True:
+                p = rec.get(f'AIPackage[{i}]', '')
+                if not p:
+                    break
+                packs.append(p)
+                i += 1
+            if packs:
+                xref.actor_packages[fid_str] = packs
+        if sig == 'PACK':
+            pkdt = rec.get('PKDT.Type')
+            if pkdt is not None:
+                try:
+                    xref.pack_type[fid_str] = int(pkdt)
+                except ValueError:
+                    pass
         if sig in ('ACHR', 'ACRE', 'REFR'):
             name_fid = rec.get('NAME', '')
             if name_fid:

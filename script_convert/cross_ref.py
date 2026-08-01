@@ -4,7 +4,8 @@ import os
 import re
 from pathlib import Path
 
-from script_convert.constants import papyrus_script_name
+from script_convert.constants import (
+    papyrus_script_name, _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS)
 from tes5_import.text_reader import parse_export_file, unescape_value
 from worker_budget import worker_count
 
@@ -29,6 +30,7 @@ def _new_scan_out() -> dict:
         'quest_edids': set(), 'npc_formids': set(),
         'mgef_shaders': {}, 'spell_effects': {},
         'global_types': {}, 'global_values': {},
+        'pack_type': {}, 'actor_packages': {},
     }
 
 
@@ -41,6 +43,8 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
     mgef_shader = mgef_ench = None
     mgef_school = -1
     spel_effects: list[tuple[str, int]] = []
+    pkdt_type = None
+    ai_packages: list[str] = []
 
     for line in lines:
         line = line.rstrip()
@@ -73,6 +77,15 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
                 mgef_school = int(line[12:])
             except ValueError:
                 pass
+        elif sig == 'PACK' and line.startswith('PKDT.Type='):
+            try:
+                pkdt_type = int(line[10:])
+            except ValueError:
+                pass
+        elif sig in ('NPC_', 'CREA') and line.startswith('AIPackage['):
+            m = re.match(r'AIPackage\[\d+\]=(\w+)', line)
+            if m:
+                ai_packages.append(m.group(1))
         elif sig == 'SPEL' and line.startswith('Effect['):
             m = re.match(r'Effect\[(\d+)\]\.(EFID|ActorValue)=(.*)', line)
             if m:
@@ -112,6 +125,10 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
         out['quest_edids'].add(edid.lower())
     if sig in ('NPC_', 'CREA'):
         out['npc_formids'].add(formid)
+        if ai_packages:
+            out['actor_packages'][formid] = ai_packages
+    if sig == 'PACK' and pkdt_type is not None:
+        out['pack_type'][formid] = pkdt_type
     if sig == 'MGEF' and edid:
         out['mgef_shaders'][edid.lower()] = (
             mgef_shader or '', mgef_ench or '', mgef_school)
@@ -182,6 +199,12 @@ class CrossRefGraph:
         self.cross_script_vars: dict[str, set[str]] = {}
         # Per-script ALL variable declarations: script_name_lower -> dict(var_low -> type_str)
         self.script_all_vars: dict[str, dict[str, str]] = {}
+        # Per-script `ref` variables the script itself uses as an ACTOR, i.e. it
+        # calls an Actor-only method on them (`myRef.startcombat`).  Those are
+        # the only remote ref vars a writer may downcast with `as Actor`; a ref
+        # var that only ever holds a marker (MQ16OblivionGate1Script's
+        # mySpawnMarker) stays ObjectReference and the cast would null it out.
+        self.script_actor_vars: dict[str, set[str]] = {}
         # MGEF EditorID (lower) -> (EffectShader fid, EnchantEffect fid, school int)
         # Used to convert pme/PlayMagicEffectVisuals into EffectShader.Play().
         self.mgef_shaders: dict[str, tuple[str, str, int]] = {}
@@ -199,6 +222,18 @@ class CrossRefGraph:
         # _scaled_debounce_seconds in converter.py).  Nehrim ships TimeScale
         # 10, Oblivion 30, so the same script means different things in each.
         self.global_values: dict[str, float] = {}
+        # PACK FormID -> PKDT.Type (0 Find, 1 Follow, 2 Escort, 3 Eat,
+        # 4 Sleep, 5 Wander, 6 Travel, 7 Accompany, 8 Use Item At, 9 Ambush,
+        # 10 Flee Not Combat, 11 Cast Magic — xEdit wbPackageTypeEnum).
+        # TES4 `GetCurrentAIPackage` returns this code; Skyrim's
+        # Actor.GetCurrentPackage() returns the Package form instead and no
+        # Papyrus native exposes a package's type, so a numeric comparison is
+        # reconstructed as a disjunction over the actor's own packages of that
+        # type (get_actor_packages_of_type).
+        self.pack_type: dict[str, int] = {}
+        # NPC_/CREA FormID -> [PACK FormID, ...] in AIPackage[n] order.
+        self.actor_packages: dict[str, list] = {}
+
     def load_from_export(self, export_dir: str, workers: int = None):
         """Load cross-reference data from all export .txt files.
 
@@ -255,6 +290,8 @@ class CrossRefGraph:
         self.spell_effects.update(out['spell_effects'])
         self.global_types.update(out['global_types'])
         self.global_values.update(out['global_values'])
+        self.pack_type.update(out['pack_type'])
+        self.actor_packages.update(out['actor_packages'])
 
     def get_extends_class(self, script_formid: str) -> str:
         """Determine the Papyrus extends class for a script."""
@@ -265,14 +302,22 @@ class CrossRefGraph:
         if schr_type == 256:
             return 'ActiveMagicEffect'
 
-        # Type 0: check if attached to NPC_/CREA -> Actor
-        for rec_fid, scri_fid in self.record_scri.items():
-            if scri_fid == script_formid:
-                rec_sig = self.record_type.get(rec_fid, '')
-                if rec_sig in ('NPC_', 'CREA'):
-                    return 'Actor'
-                if rec_sig == 'QUST':
-                    return 'Quest'
+        # Type 0: the base type must be one EVERY attaching record can bind.
+        # Papyrus refuses a script whose declared base does not match the form
+        # ("Unable to bind script X because their base types do not match"), so
+        # a script shared between an actor and a non-actor record cannot be
+        # `Actor` — the non-actor copies would silently never attach.  Scanning
+        # for the FIRST actor attachment and returning early did exactly that
+        # to `NoActivationScript`, which Oblivion puts on both a DOOR and an
+        # NPC_.  `Actor extends ObjectReference`, so the shared base binds to
+        # both and every inherited event still resolves.
+        sigs = {self.record_type.get(rec_fid, '')
+                for rec_fid, scri_fid in self.record_scri.items()
+                if scri_fid == script_formid}
+        if 'QUST' in sigs:
+            return 'Quest'
+        if sigs & {'NPC_', 'CREA'} and not (sigs - {'NPC_', 'CREA'}):
+            return 'Actor'
 
         return 'ObjectReference'
 
@@ -352,6 +397,100 @@ class CrossRefGraph:
             return 'Quest'
         return papyrus_script_name(script_edid)
 
+    def get_cell_family(self, cell_name: str) -> list:
+        """CELL EditorIDs that TES4 `GetInCell <cell_name>` matches.
+
+        TES4 matches GetInCell by EditorID PREFIX, not by identity, so
+        `GetInCell Chorrol` is true in all 86 cells whose EditorID starts with
+        "Chorrol" (ChorrolCastle, ChorrolMagesGuild, ...).  Oblivion leans on
+        this hard: 62 CELL records exist purely as the named anchor for a
+        family and hold no refs at all, several saying so outright
+        (`FULL=Dummy cell for GetInCell`).  Those anchors are cells the player
+        can never stand in, so translating the call as a single equality
+        against the named cell yields a condition that is permanently false.
+
+        Returns the matching EditorIDs (original case), the exact-name match
+        first so a single-cell result keeps its identity.  Empty if unknown.
+        """
+        low = cell_name.lower()
+        fids = self.record_type
+        out = []
+        for edid_low, fid in self.edid_to_formid.items():
+            if not edid_low.startswith(low):
+                continue
+            if fids.get(fid, '') != 'CELL':
+                continue
+            out.append(self.formid_to_edid.get(fid, ''))
+        out = [e for e in out if e]
+        out.sort(key=lambda e: (e.lower() != low, e.lower()))
+        return out
+
+    def get_script_owner_packages_of_type(self, script_edid: str,
+                                          pkg_type: int) -> list:
+        """Same as get_actor_packages_of_type for a BARE (self) call.
+
+        A bare `GetCurrentAIPackage` runs on whatever actor the script is
+        attached to, so the owner is found by walking SCRI back to the
+        NPC_/CREA that names this script.  When the script is attached to more
+        than one actor the union is returned: the test must be true whenever
+        ANY of them is running a package of that type, and the disjunction the
+        caller emits is exactly that.
+        """
+        want = script_edid.lower()
+        script_fid = ''
+        for fid, edid in self.script_formid_to_edid.items():
+            if edid.lower() == want:
+                script_fid = fid
+                break
+        if not script_fid:
+            return []
+        out = []
+        for actor_fid, scri in self.record_scri.items():
+            if scri != script_fid or actor_fid not in self.actor_packages:
+                continue
+            for pack_fid in self.actor_packages[actor_fid]:
+                if self.pack_type.get(pack_fid) != pkg_type:
+                    continue
+                edid = self.formid_to_edid.get(pack_fid, '')
+                if edid and edid not in out:
+                    out.append(edid)
+        return out
+
+    def get_actor_packages_of_type(self, actor_name: str, pkg_type: int) -> list:
+        """PACK EditorIDs of `actor_name`'s own packages whose PKDT.Type matches.
+
+        TES4 `GetCurrentAIPackage` returns the running package's TYPE code;
+        Skyrim's `Actor.GetCurrentPackage()` returns the Package form and
+        neither vanilla `Package.psc` nor SKSE exposes its type, so the numeric
+        comparison has no direct equivalent.  It is reconstructed instead: the
+        set of packages an actor can be running is fixed at conversion time by
+        its own AIPackage list, so `x.GetCurrentAIPackage == 5` becomes an
+        equality against each of x's Wander packages, OR'd together.
+
+        Scoping to the actor's OWN list is what makes this tractable — the
+        plugin has 1,820 Wander packages overall but the affected actors carry
+        between one and three apiece.
+
+        `actor_name` may name the base NPC_/CREA or a placed ACHR/ACRE, which
+        is followed through NAME.  Returns [] when the actor or its packages
+        are unknown, which keeps the caller on the old no-op path.
+        """
+        fid = self.edid_to_formid.get(actor_name.lower(), '')
+        if not fid:
+            return []
+        if fid not in self.actor_packages:
+            base = self.record_base.get(fid, '')
+            if base:
+                fid = base
+        out = []
+        for pack_fid in self.actor_packages.get(fid, ()):
+            if self.pack_type.get(pack_fid) != pkg_type:
+                continue
+            edid = self.formid_to_edid.get(pack_fid, '')
+            if edid:
+                out.append(edid)
+        return out
+
     def get_base_signature(self, name: str) -> str:
         """Record signature a name ultimately refers to ('ACTI', 'NPC_', ...).
 
@@ -407,7 +546,20 @@ class CrossRefGraph:
         _TES4_TO_PAPYRUS_TYPE = {'short': 'Int', 'long': 'Int', 'float': 'Float', 'ref': 'ObjectReference'}
         script_ref_vars: dict[str, set[str]] = {}
         script_all_vars: dict[str, dict[str, str]] = {}
+        script_actor_vars: dict[str, set[str]] = {}
         script_sources: dict[str, str] = {}
+        # `<refvar>.<actorOnlyFunc>` anywhere in a script proves that ref var
+        # holds an Actor in that script's own view.  _ACTOR_ONLY_FUNCTIONS is
+        # not sound on its own — it lists several methods that ObjectReference
+        # also declares (PlaceAtMe, GetDistance, Say, ...), collected in
+        # _OBJREF_SHARED_FUNCTIONS for exactly this reason.  Without subtracting
+        # them, a pure marker var like MQ16OblivionGate1Script.mySpawnMarker,
+        # whose only use is `mySpawnMarker.placeatme`, reads as an Actor.
+        _actor_only = sorted(_ACTOR_ONLY_FUNCTIONS - _OBJREF_SHARED_FUNCTIONS)
+        _actor_call_re = re.compile(
+            r'(\w+)\s*\.\s*(?:' +
+            '|'.join(re.escape(f) for f in _actor_only) +
+            r')(?:\s|$|\()', re.IGNORECASE)
 
         for rec in records:
             edid = rec.get('EditorID', '')
@@ -430,12 +582,18 @@ class CrossRefGraph:
                     all_vars[vname] = _TES4_TO_PAPYRUS_TYPE.get(vtype, 'Int')
             if ref_vars:
                 script_ref_vars[scn_low] = ref_vars
+                actor_used = {m.group(1).lower()
+                              for m in _actor_call_re.finditer(sctx)}
+                actor_used &= ref_vars
+                if actor_used:
+                    script_actor_vars[scn_low] = actor_used
             if all_vars:
                 script_all_vars[scn_low] = all_vars
 
         # Persist for cross-script type lookups
         self.script_ref_vars = script_ref_vars
         self.script_all_vars = script_all_vars
+        self.script_actor_vars = script_actor_vars
 
         if not script_ref_vars:
             return

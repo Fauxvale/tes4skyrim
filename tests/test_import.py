@@ -3163,6 +3163,13 @@ class TestSayTimerRelease:
       2. The fragment was only generated/attached for an INFO that HAD a result
          script, but 87% of the INFOs under a parked topic (5,450 of 6,248)
          have none. Those lines parked the timer forever.
+
+    The emitted order (script_convert/pipeline.py, `_write_info_fragments`)
+    satisfies three constraints at once, each traced to an in-game failure:
+    counter step, then release, then the rest of the body — all inside the
+    sequence gate — plus an unconditional release after the gate for the
+    rejected path. The release is idempotent, so the accepted path running it
+    twice is harmless.
     """
 
     def _owners(self):
@@ -3207,66 +3214,132 @@ class TestSayTimerRelease:
             if any('; line ended' in ln for ln in lines):
                 yield fn, lines
 
-    def test_release_is_unconditional(self):
-        """The release must sit OUTSIDE the sequence gate.
+    @staticmethod
+    def _gate_depth(lines):
+        """Yield (line, depth) with depth>0 inside a sequence gate."""
+        import re
+        depth = 0
+        for ln in lines:
+            if "still this line's turn" in ln:
+                yield ln, depth
+                depth += 1
+            elif re.match(r'\s*EndIf\b', ln, re.IGNORECASE) and depth:
+                depth -= 1
+                yield ln, depth
+            else:
+                yield ln, depth
 
-        A line whose turn has passed still has to free the timer. Moving the
-        release inside the `still this line's turn` gate stopped CharacterGen
-        dead at `FRAG 00032B0A cnt=8 needs 7 accepted=False`: quest stage 12
-        re-seeded convCount while line 7 was still playing, the fragment was
-        rejected, and nothing ever cleared convTimer.
+    def test_release_is_reachable_on_the_rejected_path(self):
+        """A gated fragment must ALSO release OUTSIDE the gate.
+
+        A line whose turn has passed still has to free the timer. With the
+        release only inside the `still this line's turn` gate, CharacterGen
+        stopped dead at `FRAG 00032B0A cnt=8 needs 7 accepted=False`: quest
+        stage 12 re-seeded convCount while line 7 was still playing, the
+        fragment was rejected, and nothing ever cleared convTimer.
+
+        The gated copy is NOT a defect — constraint 3 requires a release before
+        the body's SetStage, and the write is idempotent. What matters is that
+        an unconditional one exists too.
+        """
+        offenders = []
+        checked = 0
+        for fn, lines in self._fragments():
+            if not any("still this line's turn" in ln for ln in lines):
+                continue
+            checked += 1
+            if not any('; line ended' in ln and d == 0
+                       for ln, d in self._gate_depth(lines)):
+                offenders.append(fn)
+        assert checked, 'expected some gated fragments to release a say timer'
+        assert not offenders, (
+            'these gated fragments release the timer ONLY inside the sequence '
+            'gate, so a rejected line never frees it and the conversation '
+            'stalls:\n' + '\n'.join(offenders[:10]))
+
+    def test_counter_step_precedes_the_release(self):
+        """Inside the gate, the counter closes before the timer frees.
+
+        The owning script's poll guard is `speaker == N && convTimer <= 0` and
+        the gate is `convCount == K`. Releasing the timer while the COUNTER
+        still reads K lets the owner re-Say the same line (`RENAULT FIRE
+        cnt=15` twice), which re-arms the timer. Stepping the counter first
+        closes the gate against that re-fire.
+        """
+        import re
+        # The step the gate tests: `<c> = <c> + n`, not any convCount write.
+        step_pat = re.compile(
+            r'^\s*(\S*convCount)\s*=\s*\1\s*[-+]', re.IGNORECASE)
+        offenders = []
+        checked = 0
+        for fn, lines in self._fragments():
+            gated = [ln for ln, d in self._gate_depth(lines) if d > 0]
+            rel = next((i for i, ln in enumerate(gated)
+                        if '; line ended' in ln), None)
+            step = next((i for i, ln in enumerate(gated)
+                         if step_pat.match(ln)), None)
+            if rel is None or step is None:
+                continue
+            checked += 1
+            if step > rel:
+                offenders.append(f'{fn}: {gated[step].strip()}')
+        assert checked, 'expected some gated fragments to step a counter'
+        assert not offenders, (
+            'these fragments step the sequence counter AFTER releasing the '
+            'timer, so the owning script re-fires the same line:\n'
+            + '\n'.join(offenders[:10]))
+
+    def test_release_precedes_setstage_in_the_body(self):
+        """The timer must already be free when the body's SetStage runs.
+
+        SetStage executes that stage's fragment INLINE and those call
+        `EvaluatePackage()`, which arbitrates against whatever is committed at
+        that instant. With convTimer still 7.63 the engine picked
+        CGRenoteOpenSecretDoor and kicked it back to CGRenoteWalkToMarkerB in
+        the same second — a race on engine latency that worked one run and
+        failed the next.
+
+        A SetStage on some OTHER quest shares no state with the timer's owner,
+        so only same-owner calls are constrained (see `_setstage_on_owner`).
         """
         import re
         offenders = []
         checked = 0
         for fn, lines in self._fragments():
+            rel = next((i for i, ln in enumerate(lines)
+                        if '; line ended' in ln), None)
+            if rel is None:
+                continue
+            # `<owner>.convTimer = ...` or `(x as Script).convtimer = ...`
+            m = re.search(r'([\w.)]+)\.convtimer\s*=', lines[rel],
+                          re.IGNORECASE)
+            if not m:
+                continue
+            owner = m.group(1).lower()
+            same = re.compile(r'^\s*' + re.escape(owner) + r'\.SetStage\s*\(',
+                              re.IGNORECASE)
+            first = next((i for i, ln in enumerate(lines)
+                          if same.match(ln)), None)
+            if first is None:
+                continue
             checked += 1
-            depth = 0
-            for ln in lines:
-                if "still this line's turn" in ln:
-                    depth += 1
-                elif re.match(r'\s*EndIf\b', ln, re.IGNORECASE) and depth:
-                    depth -= 1
-                elif '; line ended' in ln and depth > 0:
-                    offenders.append(fn)
-                    break
-        assert checked, 'expected some fragments to release a say timer'
+            if rel > first:
+                offenders.append(f'{fn}: {lines[first].strip()}')
+        assert checked, (
+            'expected some fragments to SetStage on the timer\'s own quest')
         assert not offenders, (
-            'these fragments release the timer INSIDE the sequence gate, so a '
-            'rejected line never frees it and the conversation stalls:\n'
-            + '\n'.join(offenders[:10]))
-
-    def test_nothing_advances_the_sequence_after_the_release(self):
-        """The release must be the LAST thing the fragment does.
-
-        It re-opens the owning script's poll guard, and the body advances the
-        state that guard reads. Releasing first re-fires the same line —
-        observed as `RENAULT FIRE cnt=15` twice, whose re-Say re-armed the
-        timer.
-        """
-        import re
-        advances = re.compile(
-            r'SetStage\(|convCount|\.speaker\s*=|\.target\s*=')
-        offenders = []
-        for fn, lines in self._fragments():
-            rel = [i for i, ln in enumerate(lines) if '; line ended' in ln]
-            for r in rel:
-                after = [ln for ln in lines[r + 1:] if advances.search(ln)]
-                if after:
-                    offenders.append(f'{fn}: {after[0].strip()}')
-                    break
-        assert not offenders, (
-            'these fragments advance the sequence AFTER releasing the timer, '
-            'so the owning script re-fires the same line:\n'
-            + '\n'.join(offenders[:10]))
+            'these fragments call SetStage before releasing the timer, so the '
+            'stage fragment\'s EvaluatePackage() arbitrates against an armed '
+            'convTimer:\n' + '\n'.join(offenders[:10]))
 
     def test_state_writes_precede_setstage_within_the_body(self):
         """Inside the body, speaker/target/counter land before any SetStage.
 
         SetStage runs that stage's fragment INLINE and those call
         `EvaluatePackage()`, which arbitrates against whatever is committed at
-        that instant. This is ordering WITHIN the gate only — the release
-        itself stays outside and last (see the two tests above).
+        that instant. This is ordering WITHIN the gate only — the release lands
+        earlier still, and is repeated unconditionally after the gate (see the
+        three tests above).
         """
         import re
         setstage = re.compile(r'^\s*(\w[\w.]*)\.SetStage\s*\(', re.IGNORECASE)

@@ -50,6 +50,8 @@ Later Issues:
 
 	15 - NPCS don't say quips anymore (preferable to always quipping)
 
+	16 - Speed up child LOD gen and add menu option
+
 Minor Issues:
 
 	1 -	Override gold with skyrim gold

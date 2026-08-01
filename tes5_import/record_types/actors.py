@@ -1,5 +1,6 @@
 """Actor/NPC converters: NPC_, CREA, FACT, EYES, HAIR, CLAS, GLOB, GMST, leveled lists."""
 
+import re
 import struct
 
 from ..constants import DEFAULT_RACE, RACE_MAP, TES4_SKILL_TO_TES5, TES5_SKILL_ORDER
@@ -306,6 +307,35 @@ _FACTION_PLAYER_DISP = {}
 _PLAYER_FACTION_FID = 0x0001DBCD
 
 
+# Lowercased EditorIDs of every faction this plugin's scripts treat as a crime
+# faction — i.e. that appears as the argument of a Get/SetPCFaction{Murder,
+# Attack,Steal} call.  Populated by _load_crime_factions() in Phase 0.
+TES4_CRIME_FACTIONS: set = set()
+
+# Oblivion's crime functions read per-faction flags the engine maintains for any
+# faction the player can offend; there is no TES4 "this is a crime faction" flag
+# to carry across.  Skyrim instead requires Track Crime (DATA bit 6) plus
+# nonzero CRVA amounts before it will accumulate crime gold at all, so the set
+# has to be derived.  Scanning the scripts is the generic way to do it: whatever
+# faction a plugin actually tests is by definition one whose crimes it tracks.
+_CRIME_FN_RE = re.compile(
+    r'\b(?:get|set)pcfaction(?:murder|attack|steal)\s+([A-Za-z0-9_]+)', re.I)
+
+
+def _load_crime_factions(by_type: dict) -> None:
+    """Collect faction EditorIDs used by the plugin's crime-flag script calls."""
+    TES4_CRIME_FACTIONS.clear()
+    for sig in ('SCPT', 'INFO', 'QUST'):
+        for rec in by_type.get(sig, []):
+            for key, val in rec.items():
+                if not isinstance(val, str) or 'pcfaction' not in val.lower():
+                    continue
+                # SCTX arrives with \r\n still escaped; the regex only needs the
+                # function name and its first argument, so no unescaping needed.
+                for m in _CRIME_FN_RE.finditer(val):
+                    TES4_CRIME_FACTIONS.add(m.group(1).lower())
+
+
 def load_faction_player_reactions(by_type: dict) -> None:
     """Index each FACT's disposition modifier toward the player faction.
 
@@ -315,9 +345,13 @@ def load_faction_player_reactions(by_type: dict) -> None:
     "enemies are programmed to have negative dispositions towards you".  The
     faction term is the one that actually separates a wolf from a horse, so it
     has to be read from the data rather than guessed.
+
+    Also indexes which factions the plugin's scripts treat as crime factions
+    (see _load_crime_factions).
     """
     _FACTION_PLAYER_DISP.clear()
     _PREY_FACTIONS.clear()
+    _load_crime_factions(by_type)
     for rec in by_type.get('FACT', []):
         fid = get_formid(rec, 'FormID') & 0xFFFFFF
         # Match on EditorID, not FormID: a plugin that defines its own prey
@@ -1290,17 +1324,57 @@ def convert_FACT(rec: dict) -> bytes:
             reaction = 0    # Neutral
         subs += pack_subrecord('XNAM', struct.pack('<IiI', fid, disp, reaction))
 
-    # DATA — Flags
+    # DATA — Flags.  The two games number these differently, so the old
+    # straight passthrough mis-landed every bit: TES4 bit 1 is "Evil" but TES5
+    # bit 1 is "Special Combat", and TES4 bit 2 (Special Combat) became TES5
+    # bit 2 (unused).  Bit meanings per xEdit wbDefinitionsTES4/TES5:
+    #   TES4 (U8):  0 Hidden from Player, 1 Evil, 2 Special Combat
+    #   TES5 (U32): 0 Hidden From NPC, 1 Special Combat, 6 Track Crime,
+    #               7-11/13/16 Ignore Crimes: *, 12 Crime Gold Use Defaults,
+    #               14 Vendor, 15 Can Be Owner
     tes4_flags = get_int(rec, 'DATA.Flags')
-    tes5_flags = tes4_flags | 0x8000  # Can Be Owner always set
-    # Evil flag → Crime flags
-    if tes4_flags & 0x02:
-        tes5_flags |= 0x0080 | 0x0100 | 0x0200 | 0x0400 | 0x0800 | 0x2000 | 0x10000
+    tes5_flags = 0x8000                       # Can Be Owner — always set
+    if tes4_flags & 0x01:                     # Hidden from Player
+        tes5_flags |= 0x0001                  #   → Hidden From NPC
+    if tes4_flags & 0x04:                     # Special Combat
+        tes5_flags |= 0x0002                  #   → Special Combat
+
+    # Crime tracking.  The old code set the *Ignore* Crimes bits (7-11, 13, 16)
+    # off the Evil flag, which is the exact opposite of the intent — it told the
+    # engine to ignore murder, assault, stealing, trespass and pickpocket — and
+    # it never set Track Crime (bit 6) on anything.  Oblivion has no per-faction
+    # crime-tracking flag: its crime system is driven by the GetPCFaction*
+    # family, which the engine maintains for any faction the player can offend.
+    # A faction is a crime faction here when converted scripts actually test it.
+    if (edid or '').lower() in TES4_CRIME_FACTIONS:
+        tes5_flags |= 0x0040                  # Track Crime
     subs += pack_subrecord('DATA', struct.pack('<I', tes5_flags))
 
-    # CNAM → CRVA (Crime Values)
+    # CNAM → CRVA (Crime Values).  Layout per xEdit wbDefinitionsTES5 and
+    # verified byte-for-byte against Skyrim.esm's WERoad12HorsemanFaction
+    # (0101 E803 2800 0500 1900 0000 0000003F 6400 E803):
+    #   Arrest U8, Attack On Sight U8, Murder U16, Assault U16, Trespass U16,
+    #   Pickpocket U16, Unknown U16, Steal Multiplier Float, Escape U16,
+    #   Werewolf U16.  The old '<HHHHIfI' packing was the same 20 bytes but
+    #   misaligned every field: the leading U16 swallowed both U8 booleans, so
+    #   no converted crime faction ever arrested, and murder/assault/trespass/
+    #   pickpocket were all left at 0 — meaning GetCrimeGoldViolent() and
+    #   GetCrimeGoldNonViolent() returned 0 forever and every converted
+    #   crime-flag test was permanently false.
+    #
+    # Amounts follow the vanilla census: all 14 real Skyrim crime factions use
+    # exactly murder=1000, assault=40, trespass=5, pickpocket=25, escape=100.
+    # The 25x murder/assault gap is what lets converted scripts tell the two
+    # apart (see TES4_HasFactionMurder in the script converter).  Werewolf is
+    # left 0: a converted Oblivion plugin has no werewolf crime.
     crime_gold = get_float(rec, 'CNAM.CrimeGold', 1.0)
-    crva = struct.pack('<HHHHIfI', 0, 0, 0, 0, 0, crime_gold, 0)
+    is_crime_faction = bool(tes5_flags & 0x0040)   # Track Crime (xEdit bit 6)
+    if is_crime_faction:
+        crva = struct.pack('<BBHHHHHfHH', 1, 1, 1000, 40, 5, 25, 0,
+                           crime_gold, 100, 0)
+    else:
+        crva = struct.pack('<BBHHHHHfHH', 1, 1, 0, 0, 0, 0, 0,
+                           crime_gold, 0, 0)
     subs += pack_subrecord('CRVA', crva)
 
     return pack_record('FACT', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)

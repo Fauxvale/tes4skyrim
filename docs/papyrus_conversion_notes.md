@@ -56,6 +56,76 @@ Audited output carries only 2 `;TODO:` markers across 18,566 scripts, so marker
 counts measure honesty, not correctness — never treat a clean output scan as
 evidence the conversion is complete.
 
+### The two stages build DIFFERENT CrossRefGraphs (2026-07-31)
+
+A conversion decision that depends on the graph can come out **differently in
+the script stage than in the import stage**, because they do not share a graph:
+
+| Stage | Writes | Builds its graph via |
+|---|---|---|
+| `--scripts-only` | the `.psc` / `.pex` | `CrossRefGraph.load_from_export()` (the parallel scan) |
+| `--import-only` | the **VMAD property bindings** | hand-rolled loop over `all_records` in `import_main` |
+
+`_resolve_props` re-runs the *whole converter* over the source to learn which
+properties to bind. If the import's hand-built graph is missing a field the
+scan collects, the converter takes a different branch there — and you get a
+`.psc` that reads properties the VMAD never declares. They are `None` at
+runtime: **as dead as whatever they replaced, while looking fixed in the
+source.**
+
+Found via R9-1 (`GetCurrentAIPackage`): the new `pack_type`/`actor_packages`
+indexes existed only in the scan, so `TES4_MG17Script.psc` referenced six
+`Package` properties and its VMAD declared 25 properties, none of them packages.
+
+**Rule: anything added to `_scan_record_lines` must be mirrored into
+`import_main`'s hand-built graph.** Verify with `tools/vmad_probe.py <esm>
+<script> --props` — compare the bound set against the `.psc` declarations, and
+never assume a correct-looking `.psc` means the binding happened.
+
+### `extends` must be a base type EVERY attaching record can bind (2026-07-31)
+
+The quietest failure in the pipeline so far. Papyrus binds a script to a form
+only when the declared base type matches; a mismatch is rejected outright and
+**nothing in the script runs** — no events, no poll, no properties:
+
+```
+error: Unable to bind script TES4_GoblinHeadScript to (1A08564B)
+       because their base types do not match
+```
+
+It is invisible to every static check. `Actor extends ObjectReference`, so an
+`extends Actor` script on a WEAP/ACTI/CONT/DOOR still **compiles cleanly** —
+all 15,959 compiles passed while 67 scripts were dead in-game. The only place
+it shows up is the Papyrus log.
+
+Two independent sources of a wrong base type, both fixed in round 7 of the
+quest-script audit ([quest_script_conversion_audit.md](quest_script_conversion_audit.md), R7-1):
+
+* **`_infer_extends` overriding a correct answer.** `get_extends_class` derives
+  the type from the attaching record's signature and is right; the bare-call
+  pre-scan then upgraded 88 non-actor scripts to `Actor`. Its function set
+  shared 14 entries with `_OBJREF_SHARED_FUNCTIONS` (`GetDistance` alone hit
+  101 scripts), it matched inside comments and string literals, it matched
+  locals *named* like functions, and it matched actor-only calls inside
+  `OnEquipped`-style events whose subject is the passed-in actor, not the item.
+* **A script shared between an actor and a non-actor record.**
+  `NoActivationScript` sits on both a DOOR and an NPC_. The scan returned on
+  the first actor attachment, so every DOOR copy was unbound — and its empty
+  `OnActivate`, which exists purely to *consume* the activation, never ran.
+  The base type must now be one all attachments can bind.
+
+Rules that follow:
+
+* **Never widen `extends` for convenience.** It is not a cosmetic type change;
+  it decides whether the script exists at runtime.
+* **`_ACTOR_ONLY_FUNCTIONS` is not a sound test for "is this an actor".** It
+  lists methods `ObjectReference` also declares — that is why
+  `_OBJREF_SHARED_FUNCTIONS` exists (see also R3-5's `PlaceAtMe` trap). Any
+  new consumer of it must subtract that set.
+* **Read the Papyrus log for bind errors after a script-side change.**
+  `grep -c "Unable to bind script"` is a one-line health check that no amount
+  of compiling or record inspection replaces.
+
 ### GameHour is FLOAT — never truncate a global read (2026-07-28)
 
 `GameHour` is FormID `0x00000038` in **both** games, and Skyrim declares it
@@ -214,6 +284,144 @@ documented mechanism that does not exist in the source is worse than none.
   remap.** Player was special-cased; the globals were not. When a property reads
   None in-game, check the Papyrus log for the binding error *first* — it names
   the exact FormID and costs one grep, versus days of modelling script logic.
+
+### Synthesized records were unbound on object scripts (2026-07-31)
+
+Same failure mode as the engine-globals bug above — a property binding to
+**None** — from the opposite cause, and it survived that fix because it lives on
+a different code path.
+
+The converter mints properties for records that exist only in the OUTPUT:
+`TES4Fame`, `TES4Infamy`, `TES4GoldFenced`, `TES4CyrodiilCrimeFaction`, and the
+`TES4Unlock_*` topic gates. `object_scripts._resolve_props` binds properties
+through `resolve_property_formid()` → `xref.edid_to_formid`, which is built
+**from the TES4 export** and therefore can never contain a synthesized record.
+Every one silently resolved to nothing.
+
+Only the **object-script** binder was affected: `dialog_converter` already
+injects the same registry as `well_known_props`, so `QF_*`/`TIF_*` fragments
+bound correctly — which is why a verification counting the 4,762 *dialogue*
+bindings reported all-clear while every object script was broken.
+
+- `import_main.get_well_known_properties()` exposes the registry (an accessor,
+  not a direct import, because `import_main` imports `object_scripts`).
+  `_resolve_props` consults it before falling through to the EditorID lookup.
+- Worst case found: `TGStolenGoodsScript`, the **Thieves Guild rank driver** —
+  all ten of its gates read `TES4GoldFenced.GetValue()`, so a None property
+  threw on the first tick and no TG rank ever advanced.
+- **General rule: a record the importer synthesizes needs an explicit binding
+  route in EVERY VMAD binder.** The export-derived EditorID map cannot see it.
+  Check with `python tools/vmad_probe.py <esm> <script> --props` — a property the
+  `.psc` declares but the probe does not list is unbound.
+
+### An early `return` killed the OnUpdate poll (2026-07-31)
+
+TES4 `return` ends only **this frame's** `GameMode` pass; the script runs again
+next frame. The converted `OnUpdate` is one-shot and self-rescheduling, so a
+`Return` that falls past the trailing `RegisterForSingleUpdate` stops the script
+**for the rest of the game**.
+
+`if GetStage X < N / return` is a standard Oblivion early-out, so this was
+widespread: **115 Returns across 96 scripts**, including quest drivers
+(`MG01`/`MG02`/`MG05`/`MG06`/`MG08`/`MG12`/`MG17`/`MG18`, `MQ16Script`,
+`MS04`/`MS09`/`MS14`). `MG05RockScript` fires one shock bolt per tick and uses
+`return` to serialize six — it fired exactly one bolt, ever.
+
+`_reregister_before_returns()` re-arms the poll before every bare `Return` in an
+emitted GameMode body, using the same form the fall-through path uses:
+`Is3DLoaded()`-gated for object/actor scripts (whose poll is *meant* to stop on
+unload), unconditional otherwise. A value-returning `Return <x>` (OBSE user
+function) is not matched. The emitter's own `!IsRunning()` guard already
+re-registered before its Return and is untouched.
+
+### `begin MenuMode` — the BARE form is not the menu-ID form (2026-07-31)
+
+The two spellings look alike and behave completely differently, and conflating
+them costs real quest logic in one direction or a stage blowout in the other.
+
+* **`begin MenuMode <id>`** fires only while that one menu is open (1014 =
+  lockpicking, 1030 = class menu, 1002 = inventory). Skyrim has no per-menu
+  hook, so these **must not run**: MQ01's id'd blocks `setstage MQ01 70`/`84`
+  unconditionally, and merging them into the poll blew the tutorial's whole
+  stage machine on the first tick, then hit stage 100's `stopquest MQ01`.
+* **`begin MenuMode`** (bare) fires on *every* menu frame. Censused over
+  Oblivion.esm, **not one of the 20 bare blocks is a menu-specific trigger** —
+  they are all time-and-inventory bookkeeping that runs on the frames where
+  GameMode does *not*, i.e. wait/sleep and the inventory screen. Several say so
+  in their own comments (`ErthorScript`: *"contingency if player is
+  waiting/resting"*; `SE02OrcCaptainScript` guards on `isTimePassing`).
+
+Dropping the bare bodies deleted the **only** writer of two quest flags:
+`MelisandeScript`'s `set MS40.cureready to 1` (so MS40's vampirism cure could
+never be handed over) and `Dark09RetirementScript`'s `set GotFinger to 1`. Also
+lost: the 7 innkeeper rent timers, 195 lines of SE37 item checks, and
+`GandredhelScript`'s topic reveal.
+
+The faithful conversion is to **merge a bare, non-sleep MenuMode body into the
+GameMode poll** at its source position — in Oblivion the pair together covered
+every frame, so one always-running pass reproduces the union rather than half of
+it. `_has_gamemode` must account for it too, or a script whose only block is a
+bare MenuMode (`SE42Script`, `DAOghmaInfiniumScript`) gets no loop at all.
+
+Two exceptions keep their own routes: the `isPCSleeping` idiom becomes
+`OnSleepStart`/`OnSleepStop`, and menu-ID blocks stay commented.
+
+Before merging, check the bodies are safe on an ordinary frame. All 20 are
+idempotent state machines gated by their own doonce/stage variables; the one
+that genuinely reads a menu (`DAOghmaInfiniumScript`'s `getbuttonpressed`)
+already resolves to `-1`, so no branch matches. Where a body is duplicated in
+both blocks (the `Publican*` rent counter), running both in one pass still
+advances the hour once — the first copy rewrites `renthour` to `GameHour`, so
+the second's `(renthour + 1) < GameHour` is false.
+
+### A "no equivalent → 0" fallback can shadow a working handler (2026-07-31)
+
+`_convert_expression` keeps a list of argument-less commands that have no Skyrim
+equivalent and returns the literal `'0'` for them. Two entries on that list
+**also had real handlers** in `_emit_function` — and because those commands take
+no arguments they are *always* read bare, so the fallback always won and the
+handler was unreachable dead code.
+
+* **`IsPCAMurderer`** → `If 0 == 1`. `DarkBrotherhoodScript`'s site is the sole
+  trigger for the entire Dark Brotherhood questline, so Lucien Lachance never
+  appeared and `Dark01Knife` never started.
+* **`GetDetectionLevel`** → 56 dead threshold tests, including all 7 of
+  `Dark04ExecutionScript`'s guard-aggro triggers and the Dark Sanctuary
+  assassins' reaction to the player.
+
+The lesson generalises: **before adding a command to a "no equivalent" list,
+grep for an existing handler**, and before trusting one that is already there,
+check whether the command's arity lets the handler be reached at all. A flat `0`
+is invisible — it compiles, it never warns, and the call site quietly becomes a
+constant.
+
+When flattening *is* right, it must still be justified by how call sites read
+the value. `GetDetectionLevel` was defensible only if scripts read the level
+numerically; censused over the plugin, **not one of the 56 sites does** — every
+one is `>= 2`, `>= 3` or `== 3`, i.e. "is the target detected", which
+`IsDetectedBy` answers exactly.
+
+### A Bool cannot carry a multi-valued TES4 threshold (2026-07-31)
+
+Mapping `GetDetectionLevel` onto `IsDetectedBy` is only half the fix, and the
+missing half fails *silently*. Papyrus rejects a bare `Bool >= 2` outright
+(*"cannot relatively compare variables of type bool"*), so the generic
+`_BOOL_CMP_RE` pass wraps it as `(... as Int) >= 2` — and **`true as Int` is 1**.
+That compiles cleanly and is permanently false, so a naive mapping trades one
+dead form for another while looking like a fix.
+
+TES4 detection levels run 0 (unnoticed) to 3 (fully detected), so the emission
+scales the Bool to the source's own top value:
+
+```papyrus
+((target.IsDetectedBy(observer) as Int) * 3)
+```
+
+0 or 3 satisfies every threshold the plugin uses (`== 3`, `>= 2`, `>= 3`)
+exactly when detected and never otherwise. **Whenever a TES4 function with a
+range wider than 0/1 is mapped onto a Papyrus Bool, rescale to the source's
+range** — do not let the generic `as Int` cast decide, because it collapses the
+range to 0/1 and quietly kills every threshold above 1.
 
 ### Aggression/Confidence are ENUMS in TES5, not 0-100 (2026-07-28)
 

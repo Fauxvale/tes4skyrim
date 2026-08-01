@@ -7,10 +7,11 @@ from script_convert.constants import (
     BLOCK_MAP, BLOCK_FILTER_PARAM, TYPE_MAP, ACTOR_VALUE_MAP, KNOWN_GLOBALS,
     _PAPYRUS_RESERVED, FUNCTION_MAP, _BARE_BOOL_FUNCTIONS,
     _BARE_NO_EQUIV_COMMANDS,
-    _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS,
+    _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS, _ACTORBASE_ARG_FUNCTIONS,
     _OBJREF_IMPLICIT_SELF_FUNCTIONS, _ZERO_ARG_REF_FUNCTIONS,
     _safe_property_name, _canonical_global, _record_type_to_papyrus,
     _record_type_to_base_papyrus, papyrus_script_name,
+    TES4_MURDER_BOUNTY, TES4_ASSAULT_BOUNTY, TES4_STEAL_BOUNTY,
 )
 from script_convert.cross_ref import CrossRefGraph
 
@@ -160,9 +161,18 @@ class ScriptConverter:
     # line; the End fragment applies it once the line has actually finished.
     say_timer_owners: dict = {}
 
+    # DIAL EditorID (lower) -> `TES4Unlock_<topic>` GlobalVariable name, from
+    # tes5_import.dialog_unlocks.build_unlock_plan. Populated once per run by
+    # the pipeline. `AddTopic X` on a GATED topic opens that topic's gate, the
+    # same SetValue(1) the INFO/QUST fragments emit — see _NO_OP_FUNCS for why
+    # an ungated topic stays an inert comment.
+    topic_unlock_globals: dict = {}
+
     def __init__(self, xref: CrossRefGraph):
         self.xref = xref
         self._property_refs: dict[str, str] = {}
+        # GetInCell prefix families needing a generated helper: name -> cells.
+        self._cell_families: dict[str, list] = {}
         self._has_gamemode = False
         self._has_menumode = False
         self._has_scripteffectupdate = False
@@ -187,6 +197,9 @@ class ScriptConverter:
         # declared on THIS script (only those whose owner is this script; a
         # `Quest.field` beat is declared by the quest's own converted script).
         self._say_beat_targets: set = set()
+        # EditorID of the SCPT being converted.  Needed to resolve a BARE
+        # `GetCurrentAIPackage` back to the actor that attaches this script.
+        self._current_script_edid: str = ''
 
     _SAY_TOPIC_RE = re.compile(r'\.?Say\(\s*([A-Za-z_]\w*)')
 
@@ -408,11 +421,74 @@ class ScriptConverter:
 
     @staticmethod
     def _infer_extends(source: str, extends: str) -> str:
-        """Pre-scan source for bare Actor-only function calls; upgrade extends."""
+        """Pre-scan source for bare Actor-only function calls; upgrade extends.
+
+        `_ACTOR_ONLY_FUNCTIONS` is NOT sound for this question — 14 of its
+        entries are declared on `ObjectReference` too (`GetDistance`, `AddItem`,
+        `GetItemCount`, `Say`, `PlaceAtMe`, `SetScale`, ...), which is exactly
+        why `_OBJREF_SHARED_FUNCTIONS` exists and why the call-site cast at
+        `_emit_function` already subtracts it.  Here the set must be subtracted
+        as well: an upgrade is not a cosmetic type widening but a hard runtime
+        failure.  Papyrus binds a script to a form only when the declared base
+        type matches, so an `extends Actor` script on a WEAP/ACTI/CONT/DOOR is
+        rejected outright — *"Unable to bind script X because their base types
+        do not match"* — and never runs at all.  A bare `GetDistance` upgraded
+        88 non-actor scripts that way, 67 of which the last in-game run logged
+        as unbindable (`GoblinHeadScript` on `GoblinShamanStaff`, every
+        `Dark*DeadDropScript`, the Daedric statue scripts, the Publican inn
+        triggers).  `get_extends_class` already answers this correctly from the
+        attaching record's signature, so only a genuinely Actor-only call may
+        override it.
+
+        The scan must also see CODE ONLY.  Run over the raw source it matched
+        prose — `MessageBox "…not kill them!"` (`DAMalacathStatueScript`),
+        `; evp the post guards` (`ICUmbacanoExitDoorScript`),
+        `;StartCombat to get the scene rolling` (`SE09AltarScript`) — and each
+        of those upgraded a DOOR/ACTI script into an unbindable one.  Comments
+        and string literals are therefore stripped per line first.
+
+        Finally, a function whose TES4 form names its target as an ARGUMENT
+        (`GetDeadCount JesanRilian`, `SetEssential SEMuurine 0`) says nothing
+        about the calling script's own type — both are `ActorBase` methods in
+        Skyrim, not `Actor` ones — so they are excluded from the scan.
+        """
+        code_lines = []
+        locals_declared = set()
+        in_actor_event = False
+        for line in source.split('\n'):
+            code, _ = _split_trailing_comment(line)
+            code = re.sub(r'"[^"]*"', '""', code)
+            begin = re.match(r'\s*begin\s+(\w+)', code, re.IGNORECASE)
+            if begin:
+                # A block whose Papyrus event HANDS US the actor
+                # (`OnEquipped(Actor akActor)`) supplies the implicit subject
+                # itself, so an actor-only call inside it says nothing about
+                # the script's own type — the `MGBloodwormHelmScript*` helms
+                # ride on ARMO records.  Their bodies are emitted against
+                # `akActor` (see `_current_event_actor_param`).
+                in_actor_event = (BLOCK_FILTER_PARAM.get(begin.group(1).lower(),
+                                                         ('', ''))[1] == 'Actor')
+            elif re.match(r'\s*end\s*$', code, re.IGNORECASE):
+                in_actor_event = False
+            decl = re.match(r'\s*(short|long|int|float|ref)\s+(\w+)\s*$', code,
+                            re.IGNORECASE)
+            if decl:
+                # A TES4 local may be NAMED like an Actor function
+                # (`MS05DreamworldAmuletScript`'s `short isEquipped`); reading
+                # or assigning it is not a call and must not upgrade the type.
+                locals_declared.add(decl.group(2).lower())
+                continue
+            if not in_actor_event:
+                code_lines.append(code)
+        code = '\n'.join(code_lines)
         for func in _ACTOR_ONLY_FUNCTIONS:
+            if (func in _OBJREF_SHARED_FUNCTIONS
+                    or func in _ACTORBASE_ARG_FUNCTIONS
+                    or func in locals_declared):
+                continue
             # Match bare calls (not preceded by '.') anywhere in source
             if re.search(r'(?<!\.)(?<!\w)' + re.escape(func) + r'(?:\s|$|\()',
-                         source, re.IGNORECASE):
+                         code, re.IGNORECASE):
                 return 'Actor'
         return extends
 
@@ -422,6 +498,7 @@ class ScriptConverter:
         saved_refs = dict(self._property_refs)
         self._reset()
         self._property_refs = saved_refs
+        self._current_script_edid = editor_id or name
 
         # Pre-scan: if script uses Actor-only functions on self (no ref prefix),
         # upgrade extends to Actor
@@ -477,7 +554,14 @@ class ScriptConverter:
         # latch expires while the window is still open and the sound repeats.
         # See _scaled_debounce_seconds.
         self._uses_hour_window = bool(self._GAMEHOUR_WINDOW_RE.search(source))
-        self._has_gamemode = any(b[0] == 'gamemode' for b in blocks)
+        # A bare `begin MenuMode` is merged into the GameMode poll (see the
+        # block loop below), so it needs the OnUpdate loop emitted even when the
+        # script has no GameMode block of its own.
+        self._has_gamemode = any(
+            b[0] == 'gamemode'
+            or (b[0] == 'menumode' and not str(b[1] or '').strip()
+                and not any(_SLEEP_READ_RE.search(l) for l in b[2]))
+            for b in blocks)
         self._has_menumode = any(b[0] == 'menumode' for b in blocks)
         self._has_scripteffectupdate = any(b[0] == 'scripteffectupdate' for b in blocks)
 
@@ -599,11 +683,36 @@ class ScriptConverter:
             # two observable "frames" of a Skyrim sleep) with a script-managed
             # TES4_PCSleeping flag standing in for isPCSleeping.  Menu-id
             # blocks and non-sleep bare blocks stay commented (below).
+            # SECOND EXCEPTION — a bare `begin MenuMode` that does NOT read
+            # isPCSleeping.  The blowout above was caused entirely by the
+            # menu-ID form: all five MQ01 blocks carry an id (1, 1002, 1014,
+            # 1023, 1030), and censused over the corpus not one bare block is
+            # a menu-specific trigger.  What the 20 bare bodies actually are is
+            # time-and-inventory bookkeeping that Oblivion runs on the frames
+            # where GameMode does NOT run — the wait/sleep and inventory
+            # frames.  Several say so in their own comments (ErthorScript:
+            # "contingency if player is waiting/resting"; SE02OrcCaptainScript
+            # guards on `isTimePassing`), and the innkeeper rent timers
+            # (7 near-identical Publican* scripts) can only ever advance while
+            # a menu is open.  Dropping them silently deletes that logic:
+            # MelisandeScript's body holds the ONLY `set MS40.cureready to 1`
+            # in the whole plugin, so MS40's vampirism cure could never be
+            # handed over, and Dark09RetirementScript's holds the only
+            # `set GotFinger to 1`.
+            #
+            # Merging them into the GameMode poll is the faithful conversion:
+            # in Oblivion the pair (GameMode + bare MenuMode) together covered
+            # every frame, so a single always-running pass reproduces the union
+            # rather than half of it.  Running one of these bodies on a
+            # non-menu frame is harmless — they are all idempotent state
+            # machines guarded by their own doonce/stage variables.
             if block_type == 'menumode':
                 is_bare = not str(block_filter or '').strip()
                 reads_sleep = any(_SLEEP_READ_RE.search(l) for l in block_lines)
                 if is_bare and reads_sleep:
                     sleep_menumode_blocks.append(block_lines)
+                elif is_bare:
+                    gamemode_body.extend(block_lines)
                 else:
                     menumode_blocks.append((block_filter, block_lines))
                 continue
@@ -778,9 +887,20 @@ class ScriptConverter:
                 out.append(f'    RegisterForSingleUpdate({interval})')
                 out.append('    Return')
                 out.append('  EndIf')
+            body_start = len(out)
             for bline in gamemode_body:
                 converted = self._convert_line(bline, extends)
                 out.append(f'  {converted}')
+            # An early `return` in the body must NOT kill the polling loop.
+            # TES4 `return` ends only THIS FRAME's GameMode pass — the script
+            # runs again next frame. Papyrus OnUpdate is one-shot and
+            # self-rescheduling, so a Return that skips the trailing
+            # RegisterForSingleUpdate stops the script for the rest of the game.
+            # The `if GetStage X < 10 / return` early-out is a standard Oblivion
+            # idiom, so this silently disabled quest drivers the moment they
+            # took the guard once (MG01/MG02/MG05/MG06/MG08/MG12/MG17/MG18...).
+            self._reregister_before_returns(out, body_start, interval,
+                                            load_gated)
             if load_gated:
                 # Only keep ticking while still loaded (OnCellDetach clears it).
                 out.append('  If (Is3DLoaded())')
@@ -1334,7 +1454,38 @@ class ScriptConverter:
             for i, pl in enumerate(prop_lines):
                 out.insert(insert_idx + i, pl)
 
+        out.extend(self._emit_cell_family_helpers())
         return '\n'.join(out)
+
+    def _emit_cell_family_helpers(self) -> list:
+        """Helper functions for the GetInCell prefix families used by a script.
+
+        TES4 matches GetInCell on an EditorID prefix, so one call can mean "in
+        any of these 86 cells" — see the GetInCell handler in _emit_function.
+        """
+        if not self._cell_families:
+            return []
+        lines = ['']
+        for key, cells in sorted(self._cell_families.values(),
+                                 key=lambda kv: kv[0].lower()):
+            lines.append(
+                f'; TES4 `GetInCell {key}` matched {len(cells)} cells by '
+                f'EditorID prefix.')
+            lines.append(
+                f'Bool Function TES4_IsIn{key}(ObjectReference akRef)')
+            # `parent` is taken in this scope (the CK compiler rejects it with
+            # "function variable parent already defined"), hence the prefix.
+            lines.append('  Cell TES4_parentCell = akRef.GetParentCell()')
+            # Papyrus has no line-continuation, and a several-hundred-term
+            # expression on one line is unreadable, so test-and-return instead.
+            for c in cells:
+                lines.append(f'  If TES4_parentCell == {c}')
+                lines.append('    Return true')
+                lines.append('  EndIf')
+            lines.append('  Return false')
+            lines.append('EndFunction')
+            lines.append('')
+        return lines
 
     def convert_fragment(self, source: str, extends: str = 'Quest') -> list[str]:
         """Convert a script fragment body (not a full script).
@@ -1342,9 +1493,14 @@ class ScriptConverter:
         Returns list of converted lines (indented for function body).
         Preserves _property_refs across calls (quest fragments share a converter).
         """
-        # Reset conversion state but preserve accumulated property_refs
+        # Reset conversion state but preserve accumulated property_refs and the
+        # GetInCell families they go with — the caller emits both AFTER all
+        # fragments are converted, so a reset here would drop the helper a
+        # fragment body already called (undefined function TES4_IsIn...).
         saved_refs = dict(self._property_refs)
+        saved_families = dict(self._cell_families)
         self._reset()
+        self._cell_families = saved_families
         self._property_refs = saved_refs
         lines = source.replace('\r\n', '\n').replace('\r', '\n').split('\n')
         result = []
@@ -1375,6 +1531,48 @@ class ScriptConverter:
 
     def _postprocess_lines(self, lines: list[str]) -> list[str]:
         """Shared post-processing for both standalone and fragment scripts."""
+        # Oblivion's measure-then-deliver idiom speaks a line ONCE:
+        #     Set InfoLength to ArmandRef.Say TG01Armand1     ; returns duration
+        #     ArmandRef.SayTo Player TG01Armand1              ; delivers to listener
+        # Both TES4 functions speak, so the author's pair relies on the engine
+        # collapsing them; converted literally it became two identical
+        # `ref.Say(topic)` calls in a row and every such line played TWICE
+        # (Armand's whole TG01 briefing, the SE07A Sheogorath/Thadon endgame,
+        # SE03's chamber chatter — 92 pairs in all).  The SayTo carries the
+        # listener, so it is the one to keep; drop the measuring Say, whose
+        # only real output — the timer charge on the preceding line — stays.
+        # The measuring half arrives as a timer-charge line with the Say glued on
+        # after an embedded newline ("t = 9.25  ;line length\n  ref.Say(topic)"),
+        # so flatten to real lines before pairing them up.
+        _say_call_re = re.compile(r'^(\s*)(\S+\.Say\((?:[^()]*)\))\s*$')
+        _flat = []
+        for line in lines:
+            _flat.extend(line.split('\n')) if '\n' in line else _flat.append(line)
+        # The delivery is usually the next line, but the author may slip a
+        # Look/SetLookAt between the two halves (SE07A's Sheogorath/Thadon
+        # exchange), so scan a short window.  Stop at anything that changes
+        # control flow or re-arms the timer, so two Says that genuinely belong
+        # to different beats are never collapsed.
+        _dedup_window = 3
+        _stop_re = re.compile(
+            r'^\s*(If|ElseIf|Else|EndIf|While|EndWhile|Return|'
+            r'Event|EndEvent|Function|EndFunction)\b|;line length',
+            re.IGNORECASE)
+        _skip = set()
+        for idx, line in enumerate(_flat):
+            m = _say_call_re.match(line)
+            if not m:
+                continue
+            for j in range(idx + 1, min(idx + 1 + _dedup_window, len(_flat))):
+                if _stop_re.match(_flat[j]):
+                    break
+                nxt = _say_call_re.match(_flat[j])
+                if nxt and nxt.group(2) == m.group(2):
+                    # Same speaker+topic again: `idx` is the measuring half of
+                    # the measure-then-deliver pair.  Drop it, keep `j`.
+                    _skip.add(idx)
+                    break
+        lines = [l for i, l in enumerate(_flat) if i not in _skip]
         # Fix akActionRef used in events that don't define it
         # TES4 scripts could use GetActionRef across blocks; Papyrus scopes params to events
         _event_re2 = re.compile(r'^\s*Event\s+(\w+)', re.IGNORECASE)
@@ -1647,7 +1845,49 @@ class ScriptConverter:
             code, sep, comment = lines[idx].partition(';')
             if sep and comment.startswith('/'):
                 lines[idx] = f'{code}; {comment}'
+
+        lines = self._shadow_controls_writes(lines)
         return lines
+
+    _CONTROLS_WRITE_RE = re.compile(
+        r'^(\s*)Game\.(Disable|Enable)PlayerControls\(\)\s*(;.*)?$')
+
+    def _shadow_controls_writes(self, lines: list) -> list:
+        """Mirror every Game.{Disable,Enable}PlayerControls() into a global.
+
+        Skyrim has both writers as natives but no getter, so TES4's
+        GetPlayerControlsDisabled is read back from TES4ControlsDisabled (see
+        _create_tes4_special_records).  The shadow write is spliced here rather
+        than returned from the call handler because a trailing source comment
+        is appended to whatever that handler returns, which would strand a
+        second line behind it.
+
+        EVERY writer is shadowed, not just those in a script that also reads:
+        in MG18 — the only reader in the plugin — the writers live in two
+        SEPARATE magic-effect scripts (MG18MannimarcoSpellScript1/2), so a
+        same-script gate would shadow nothing at all.
+        """
+        out = []
+        touched = False
+        for line in lines:
+            out.append(line)
+            m = self._CONTROLS_WRITE_RE.match(line)
+            if m:
+                val = 1 if m.group(2) == 'Disable' else 0
+                out.append(f'{m.group(1)}TES4ControlsDisabled.SetValue({val})')
+                touched = True
+        if touched:
+            self._property_refs['TES4ControlsDisabled'] = 'GlobalVariable'
+        return out
+
+    def get_cell_family_helpers(self) -> list:
+        """Helper functions for the GetInCell families used so far.
+
+        Fragment callers (QUST stage / INFO scripts) assemble their own file, so
+        they must append these once every fragment body has been converted —
+        the bodies call them by name.
+        """
+        return self._emit_cell_family_helpers()
 
     def get_property_refs(self) -> dict[str, str]:
         """Get accumulated external property references.
@@ -1666,12 +1906,28 @@ class ScriptConverter:
         """
         return dict(self._property_refs)
 
+    def _register_cell_family(self, name: str, cells: list) -> str:
+        """Record a GetInCell prefix family and return its helper's name.
+
+        See the GetInCell handler in _emit_function for why a family exists at
+        all.  Helpers are keyed case-insensitively so `Chorrol` and `chorrol`
+        (both appear in vanilla scripts) share one function.
+        """
+        key = _safe_property_name(name)
+        existing = self._cell_families.get(key.lower())
+        if existing is None:
+            self._cell_families[key.lower()] = (key, list(cells))
+        else:
+            key = existing[0]
+        return f'TES4_IsIn{key}'
+
     # -----------------------------------------------------------------------
     # Private
     # -----------------------------------------------------------------------
 
     def _reset(self):
         self._property_refs = {}
+        self._cell_families = {}
         self._has_gamemode = False
         self._has_menumode = False
         self._has_scripteffectupdate = False
@@ -1684,6 +1940,7 @@ class ScriptConverter:
         self._var_types = {}
         self._udf_returns = False
         self._udf_return_value = ''
+        self._current_script_edid = ''
 
     @staticmethod
     def _balance_if_endif(lines: list[str]) -> list[str]:
@@ -1759,6 +2016,34 @@ class ScriptConverter:
                     in_dead_zone = True
             result.append(line)
         return result
+
+    # A bare `Return` on its own line (optionally trailed by a comment). A
+    # value-returning Return belongs to an OBSE user function, not a GameMode
+    # early-out, and must be left alone.
+    _BARE_RETURN_RE = re.compile(r'^(\s*)Return\s*(;.*)?$', re.IGNORECASE)
+
+    def _reregister_before_returns(self, out: list, start: int, interval: str,
+                                   load_gated: bool) -> None:
+        """Re-arm the OnUpdate poll before every early Return in `out[start:]`.
+
+        Emits the SAME re-register the fall-through path uses, so a body that
+        returns early keeps ticking exactly like one that runs to the end:
+        `Is3DLoaded()`-gated for object/actor scripts (whose poll is meant to
+        stop on unload), unconditional otherwise.
+        """
+        i = start
+        while i < len(out):
+            m = self._BARE_RETURN_RE.match(out[i])
+            if m:
+                indent = m.group(1)
+                if load_gated:
+                    out[i:i] = [f'{indent}If (Is3DLoaded())',
+                                f'{indent}  RegisterForSingleUpdate({interval})',
+                                f'{indent}EndIf']
+                else:
+                    out[i:i] = [f'{indent}RegisterForSingleUpdate({interval})']
+                i += 3 if load_gated else 1
+            i += 1
 
     def _get_update_interval(self) -> str:
         if self._uses_getsecondspassed:
@@ -2439,8 +2724,14 @@ class ScriptConverter:
     # the top of the hour with `>= X.98 / <= X.02` windows, which only ever
     # match because the read is fractional.
     # Deliberately NOT here: TimeScale (Skyrim FNAM=115, genuinely short) and
-    # GameDaysPassed — the latter IS float (FNAM=102) but its only bare use is
-    # the day-of-week idiom, which needs a whole number and emits its own cast.
+    # GameDaysPassed.  Skyrim declares GameDaysPassed float (FNAM=102, Ord('f')
+    # per xEdit's GLOB definition), but OBLIVION declares it Short
+    # (GLOB 00000039, FNAM.Type=s), so the source scripts only ever saw whole
+    # days and the `as Int` truncation is what REPRODUCES their behaviour.  That
+    # matters beyond the day-of-week idiom: 72 lines across 28 scripts compare
+    # it against script floats, several by exact equality
+    # (MS39Script: `GameDaysPassed == (CurrentDay + 1)`), which only ever
+    # matched in Oblivion because both sides were whole numbers.
     _FRACTIONAL_ENGINE_GLOBALS = frozenset(('gamehour',))
 
     def _global_read(self, safe: str) -> str:
@@ -2594,9 +2885,17 @@ class ScriptConverter:
                 remote_script = owner_type[5:].lower()
                 remote_vars = self.xref.script_all_vars.get(remote_script, {})
                 remote_type = remote_vars.get(parts[1].lower(), '')
-                # Remote ref vars may be upgraded to Actor by post-processing
-                # on the target script. Add cast preemptively for safety.
-                if remote_type == 'ObjectReference':
+                # A remote `ref` var is only declared Actor when the remote
+                # script itself calls an Actor-only method on it.  Casting
+                # unconditionally "for safety" was unsafe in the other
+                # direction: MQ16 assigns two static markers into
+                # MQ16OblivionGate1Script.mySpawnMarker, which that script only
+                # ever calls PlaceAtMe on, so it stays ObjectReference — and
+                # `marker as Actor` fails the downcast and stores None, leaving
+                # both endgame Oblivion gates spawning nothing.
+                if (remote_type == 'ObjectReference'
+                        and parts[1].lower() in self.xref.script_actor_vars.get(
+                            remote_script, ())):
                     return f'{value} as Actor'
         return value
 
@@ -2830,8 +3129,6 @@ class ScriptConverter:
         if comp_m:
             # GetCurrentAIPackage compared against a PACK EditorID: vanilla
             # Papyrus has Actor.GetCurrentPackage(), so this converts exactly.
-            # Numeric comparands are TES4 package-TYPE codes with no Skyrim
-            # equivalent — those fall through to the usual no-op handling.
             pkg_m = re.match(r'^(?:(\w+)\.)?(?:getcurrentaipackage|getcurrentpackage)$',
                              comp_m[0], re.IGNORECASE)
             if pkg_m and comp_m[1] in ('==', '!=') and self.xref:
@@ -2845,6 +3142,31 @@ class ScriptConverter:
                     safe = _safe_property_name(cand)
                     self._property_refs[safe] = 'Package'
                     return f'{ref}.GetCurrentPackage() {comp_m[1]} {safe}'
+                # A NUMERIC comparand is a TES4 package-TYPE code (5 Wander,
+                # 6 Travel, ... — xEdit wbPackageTypeEnum).  Skyrim exposes no
+                # way to read a Package's type from Papyrus, but the set of
+                # packages an actor can be running is fixed at conversion time
+                # by its own AIPackage list, so the type test is reconstructed
+                # as an equality against each of that actor's packages of the
+                # requested type.  Falls through to the `0` no-op when the
+                # actor or its package list cannot be resolved, which is the
+                # old behaviour.
+                if re.fullmatch(r'\d+', cand):
+                    packs = self._packages_of_type(pkg_m.group(1), int(cand))
+                    if packs:
+                        ref = self._resolve_self_ref(pkg_m.group(1), extends,
+                                                     actor_func=True)
+                        if ref == 'Self' and extends not in ('Actor',):
+                            ref = '(Self as Actor)'
+                        join = ' || ' if comp_m[1] == '==' else ' && '
+                        terms = []
+                        for p in packs:
+                            safe = _safe_property_name(p)
+                            self._property_refs[safe] = 'Package'
+                            terms.append(f'{ref}.GetCurrentPackage() '
+                                         f'{comp_m[1]} {safe}')
+                        body = join.join(terms)
+                        return body if len(terms) == 1 else f'({body})'
             lhs = self._convert_expression(comp_m[0], extends)
             op = comp_m[1]
             rhs_src = comp_m[2]
@@ -2899,16 +3221,38 @@ class ScriptConverter:
                     is_ref = self._is_ref_typed_access(rhs.strip())
                 if is_ref:
                     lhs = 'None'
-            # ObjectReference variable in numeric comparison (<, <=, >, >=) with a number:
-            # TES4 undeclared variables default to 0; name collision with a form reference
-            if op in ('<', '<=', '>', '>=') and re.match(r'^-?\d+(\.\d+)?$', rhs.strip()):
+            # ObjectReference variable in numeric comparison (<, <=, >, >=) with a
+            # number: TES4 undeclared variables default to 0, so this is the
+            # name-collision-with-a-form case.
+            #
+            # It must NOT swallow the null-check shapes.  `ref > 0` / `ref >= 1`
+            # / `ref <= 0` is Oblivion's standard "is this ref set" idiom and is
+            # handled by the block below (and by the `== 0` block above), but
+            # this ran FIRST and flattened the whole left side to the literal 0
+            # — which both killed the test and dropped the operator behind an
+            # inline comment, emitting `If combattarget != Player && 0`.  All 8
+            # occurrences in Oblivion.esm were null checks, none a collision:
+            # MQ04's `elseif speaker > 0` is the entire Cloud Ruler conversation
+            # driver (Martin/Jauffre/Cyrus never spoke a line), MQ09's
+            # `elseif restrainedRef > 0` releases the first ghost blade, and
+            # CGEmperorScript's `combattarget > 0` gates the Blades' call for
+            # help when someone other than the player attacks the Emperor.
+            _is_null_check_shape = (
+                (op in ('>', '>=') and rhs.strip() in ('0', '1'))
+                or (op == '<=' and rhs.strip() == '0'))
+            if (op in ('<', '<=', '>', '>=')
+                    and re.match(r'^-?\d+(\.\d+)?$', rhs.strip())
+                    and not _is_null_check_shape):
                 lhs_var = lhs.strip().lower().split('.')[-1]
                 lhs_raw = lhs.strip().split('.')[-1]
                 lhs_type = self._var_types.get(lhs_var, '') or self._property_refs.get(lhs_raw, self._property_refs.get(lhs_var, ''))
                 if lhs_type == 'ObjectReference':
                     lhs = '0  ;undeclared TES4 var'
-            # ref > 0 / ref >= 1 → ref != None (null check pattern for ref types)
-            if rhs.strip() in ('0', '1') and op in ('>', '>='):
+            # ref > 0 / ref >= 1 → ref != None, and ref <= 0 → ref == None
+            # (null-check patterns for ref types).  TES4 refs coerce to 0 when
+            # unset, so scripts test them with ordering operators.
+            if (rhs.strip() in ('0', '1') and op in ('>', '>=')) or \
+                    (rhs.strip() == '0' and op == '<='):
                 lhs_var = lhs.strip().lower().split('.')[-1]
                 lhs_raw = lhs.strip().split('.')[-1]
                 lhs_type = self._var_types.get(lhs_var, '') or self._property_refs.get(lhs_raw, self._property_refs.get(lhs_var, ''))
@@ -2920,7 +3264,7 @@ class ScriptConverter:
                     if self.xref and self.xref.is_remote_ref_var(parts[0], parts[1]):
                         is_ref = True
                 if is_ref:
-                    return f'{lhs} != None'
+                    return f'{lhs} == None' if op == '<=' else f'{lhs} != None'
             # TES4 boolean comparison: (comparison_expr) == 1 → comparison_expr
             # In TES4, comparisons return 0/1 so "== 1" checks truth, "== 0" checks false
             if op in ('==', '!=') and rhs.strip() in ('0', '1'):
@@ -3132,9 +3476,9 @@ class ScriptConverter:
             if bare_low in ('getpcinfamy', 'getinfame'):
                 self._property_refs['TES4Infamy'] = 'GlobalVariable'
                 return 'TES4Infamy.GetValueInt()'
-            if bare_low in ('isplayerinprison', 'getplayerinjail', 'isplayerinjail'):
-                self._property_refs['TES4CyrodiilCrimeFaction'] = 'Faction'
-                return 'TES4CyrodiilCrimeFaction.IsPlayerExpelled()'
+            if bare_low in ('isplayerinprison', 'getplayerinjail', 'isplayerinjail',
+                            'senttojail'):
+                return 'Game.GetPlayer().IsArrested()'
             if bare_low in ('getpcissleeping', 'ispcsleeping', 'isplayersleeping'):
                 # Inside a sleep-idiom MenuMode body the read means "is this a
                 # sleep frame" — that's the script-managed flag.  Elsewhere
@@ -3157,6 +3501,11 @@ class ScriptConverter:
                 return 'TES4CyrodiilCrimeFaction.GetCrimeGold()'
             if bare_low in ('getdisposition',):
                 return '50'
+            # Only the ARGUMENT-LESS spelling lands here, and with no target
+            # named there is nothing to ask IsDetectedBy about (same reasoning
+            # as IsActorDetected).  The real one-argument form — which is what
+            # all 56 sites in the plugin use — is handled in _emit_function and
+            # maps onto IsDetectedBy.
             if bare_low == 'getdetectionlevel':
                 return '0'
             # Bare GetContainer means "the container I am in".  Skyrim has no
@@ -3173,19 +3522,34 @@ class ScriptConverter:
                 if actor_param:
                     return actor_param
                 return _GETCONTAINER_MARKER
+            # "Is the player a murderer" takes NO arguments, so it is ALWAYS
+            # read bare — which meant this fallback ran every time and the real
+            # handler in _emit_function was unreachable dead code.  Both sites
+            # became the literal `If 0 == 1`: DarkBrotherhoodScript's is the
+            # ONLY trigger for the entire Dark Brotherhood questline (it starts
+            # Dark01Knife and enables Lucien Lachance after the player's first
+            # murder), so the questline could never begin.  Route it to the
+            # same crime-gold reconstruction the handler uses — the R4-1 rule,
+            # where a violent bounty at or above the vanilla murder price is
+            # what distinguishes a killing from an assault.
+            if bare_low in ('ispcamurderer', 'ispcanmurderer',
+                            'getpcismurderer'):
+                self._property_refs['TES4CyrodiilCrimeFaction'] = 'Faction'
+                return (f'(TES4CyrodiilCrimeFaction.GetCrimeGoldViolent() '
+                        f'>= {TES4_MURDER_BOUNTY})')
             if bare_low in ('getisalerted', 'israining', 'menumode',
                             'istimepassing', 'getplayerinseworld',
                             'getcurrentaiprocedure', 'getcurrentaipackage',
                             'getiscurrentpackage', 'isidleplaying',
                             'getbookread', 'gettalkedtopc',
                             'getcrimeknown', 'getstartingpos',
-                            'getplayercontrolsdisabled', 'getisplayerbirthsign',
+                            'getisplayerbirthsign',
                             'hasbeenpickedup', 'getweatherpercent',
                             'getgameloaded', 'hasvariable', 'getownership',
                             'isonguard', 'isindangerouswater',
                             'getarmorrating', 'isspelltarget', 'isswimming',
                             'isactor', 'getspellcount',
-                            'getrestrained', 'ispcamurderer', 'getpcismurderer',
+                            'getrestrained',
                             'getpcfactionattack', 'getpcfactionsteal',
                             'getpcfactionmurder'):
                 return '0'
@@ -3390,6 +3754,19 @@ class ScriptConverter:
             parts = args_str.split(None, 1)
             av_name = parts[0].rstrip(',').strip('"\'')
             sk_av = ACTOR_VALUE_MAP.get(av_name.lower(), av_name)
+            # Oblivion's single Encumbrance AV is TWO AVs in Skyrim: the current
+            # carried weight is InventoryWeight (index 31), the maximum is
+            # CarryWeight (index 32).  TES4 splits them the modified-vs-base way
+            # (`getav` = what you carry now, `getbaseav` = Strength x 5), so the
+            # over-encumbered idiom is
+            #     player.getav encumbrance > player.getbaseav encumbrance
+            # — MQ01's stage 75/78 tutorial, whose own text reads "your CURRENT
+            # encumbrance exceeds the MAXIMUM you can carry".  Mapping both
+            # sides to CarryWeight compared the cap against itself, so the test
+            # was never true and neither tutorial stage could fire.
+            if av_name.lower() == 'encumbrance' and func_name in (
+                    'getactorvalue', 'getav'):
+                sk_av = 'InventoryWeight'
             rest = ''
             if len(parts) > 1:
                 rest_str = parts[1].lstrip(', ')
@@ -3570,6 +3947,51 @@ class ScriptConverter:
         # Fallback: akActionRef (may be undefined, but most common case)
         return 'akActionRef'
 
+    # Papyrus locals/parameters that are already actors — calling an actor-only
+    # function on one must never mint a property for it.
+    _NON_PROPERTY_REFS = frozenset({
+        'self', 'akspeakerref', 'akactionref', 'akactor', 'aktarget',
+        'akcaster', 'aksource', 'akaggressor', 'akdestination',
+        'game.getplayer()', 'gettargetactor()', 'getactorreference()',
+        'getcasteractor()', 'getowningquest()',
+    })
+
+    def _is_bindable_property(self, ref: str) -> bool:
+        """True when `ref` is a bare identifier worth recording as Actor-typed.
+
+        The receiver reaching the actor-only cast below is already CONVERTED, so
+        it can be an expression (`Game.GetPlayer()`), a cast (`(x as Actor)`) or
+        a fixed event parameter.  Registering one of those as a property ref put
+        it through _safe_property_name and emitted a mangled, never-referenced
+        declaration — `Actor Property Game_GetPlayer__ Auto` appeared in 511
+        scripts, bound to nothing.
+
+        Script-local variables DO belong here even though they never become VMAD
+        properties: _property_refs is also what marks a local as Actor-typed, so
+        it drives the `as Actor` downcast and the variable's declared type
+        (AmuletofKings' `TempRef.UnequipItem`).  Excluding them broke 73 scripts.
+        """
+        if not ref or not re.match(r'^[A-Za-z_]\w*$', ref):
+            return False
+        return ref.lower() not in self._NON_PROPERTY_REFS
+
+    def _packages_of_type(self, ref_name: str, pkg_type: int) -> list:
+        """PACK EditorIDs backing a `GetCurrentAIPackage == <type>` test.
+
+        A named receiver resolves through that record's own AIPackage list; a
+        bare call runs on whatever actor attaches the script being converted,
+        so it resolves through SCRI instead.  Empty when nothing resolves,
+        which leaves the caller on the pre-existing no-op path.
+        """
+        if not self.xref:
+            return []
+        if ref_name and ref_name.lower() not in ('self', 'myself', 'getself'):
+            return self.xref.get_actor_packages_of_type(ref_name, pkg_type)
+        if self._current_script_edid:
+            return self.xref.get_script_owner_packages_of_type(
+                self._current_script_edid, pkg_type)
+        return []
+
     def _resolve_self_ref(self, ref_name, extends, actor_func=False):
         """Resolve the reference for a function call.
         
@@ -3592,7 +4014,12 @@ class ScriptConverter:
                 if canon == 'akSpeakerRef':
                     return '(akSpeakerRef as Actor)'
                 cur = self._property_refs.get(canon, '')
-                if cur in ('', 'ObjectReference'):
+                # Upgrading an existing ObjectReference entry is always right;
+                # creating a NEW one is only right for a bare identifier (see
+                # _is_bindable_property — `Game.GetPlayer()` must not become a
+                # mangled `Game_GetPlayer__` property).
+                if cur == 'ObjectReference' or (
+                        cur == '' and self._is_bindable_property(canon)):
                     self._property_refs[canon] = 'Actor'
             return canon
         if actor_func:
@@ -3866,11 +4293,23 @@ class ScriptConverter:
                         'isquestcompleted': 'IsCompleted'}[fname_low]
             return f'{quest_ref}.{papyrus}()'
 
-        # Message/MessageBox
-        if fname_low == 'message':
-            return f'Debug.Notification({self._quote_msg(args_str)})'
-        if fname_low == 'messagebox':
-            return f'Debug.MessageBox({self._quote_msg(args_str)})'
+        # Message/MessageBox.  Vanilla TES4 uses the same printf convention as
+        # the OBSE variants below — `Message "%.0f seconds to close Great
+        # Gate!", remainingSec` — so a format string with arguments has to go
+        # through the same concatenation helper.  _quote_msg keeps only the
+        # first quoted string, which printed the specifier LITERALLY to the
+        # player: MQ14's Great Gate countdown read "%.0f seconds to close Great
+        # Gate!", and so did the bounty, the Dawnfang kill count and the Bruma
+        # statue's year.  86 call sites (16 SCPT + 70 INFO).
+        if fname_low in ('message', 'messagebox'):
+            papyrus = ('Debug.Notification' if fname_low == 'message'
+                       else 'Debug.MessageBox')
+            s = args_str.strip().lstrip(',').strip() if args_str else ''
+            if s.startswith('"'):
+                end = s.find('"', 1)
+                if end >= 0 and self._OBSE_FMT_RE.search(s[1:end]):
+                    return f'{papyrus}({self._format_message(s, extends)})'
+            return f'{papyrus}({self._quote_msg(args_str)})'
 
         # OBSE printf-style variants: a format string plus its arguments.
         # printToConsole is a debug trace; MessageBoxEX is a player-facing box
@@ -3900,13 +4339,19 @@ class ScriptConverter:
                 result = f'{papyrus_func}({args})'
                 return f'{result}  {note}' if note else result
 
-        # GetPCExpelled / SetPCExpelled: faction arg
-        # Skyrim has no Expel/IsExpelled — use faction rank manipulation
+        # GetPCExpelled / SetPCExpelled: faction arg.
+        # Skyrim has the exact natives on both sides — vanilla Faction.psc
+        # declares `bool Function IsPlayerExpelled()` and
+        # `Function SetPlayerExpelled(bool abIsExpelled = true)`.  The reader
+        # used to test `GetFactionRank(...) < 0` instead, which was asymmetric
+        # with the setter below: SetPlayerExpelled sets the engine's expelled
+        # flag and never touches rank, so nothing ever drove the rank negative
+        # and every GetPCExpelled read was permanently false.
         if fname_low in ('getpcexpelled', 'ispcexpelled'):
             faction = self._convert_expression(args_str, extends) if args_str else 'None'
             if args_str:
                 self._property_refs[args_str.strip()] = 'Faction'
-            return f'(Game.GetPlayer().GetFactionRank({faction}) < 0)'
+            return f'{faction}.IsPlayerExpelled()'
         if fname_low == 'setpcexpelled':
             # `SetPCExpelled Faction, 1` — Oblivion allowed a comma between the
             # args, and splitting on whitespace leaves it glued to the faction
@@ -3945,12 +4390,20 @@ class ScriptConverter:
         if fname_low in ('payfine', 'payfinethief'):
             self._property_refs['TES4CyrodiilCrimeFaction'] = 'Faction'
             return 'TES4CyrodiilCrimeFaction.PlayerPayCrimeGold(false, false)'
-        if fname_low in ('isplayerinjail', 'getplayerinjail', 'isplayerinprison'):
-            self._property_refs['TES4CyrodiilCrimeFaction'] = 'Faction'
-            return 'TES4CyrodiilCrimeFaction.IsPlayerExpelled()'
-        if fname_low in ('senttojail',):
-            self._property_refs['TES4CyrodiilCrimeFaction'] = 'Faction'
-            return 'TES4CyrodiilCrimeFaction.IsPlayerExpelled()'
+        # "Is the player serving a jail sentence" — NOT faction expulsion, which
+        # is what all four spellings used to emit. Skyrim has the exact native:
+        # vanilla Actor.psc declares `bool Function IsArrested() native`,
+        # documented "Is this actor currently arrested?" (the condition-function
+        # form is GetArrestedState, index 656).
+        #
+        # All 9 TES4 sites are jail mechanics — the prison cell doors, the
+        # Leyawiin jailor, Amusei (whom you meet in a cell), the tutorial's
+        # prison start, and TG00FindThievesGuildScript, whose stage 10 is the
+        # ENTRY POINT of the Thieves Guild questline. Expulsion is never set on
+        # TES4CyrodiilCrimeFaction for the player, so every one read false.
+        if fname_low in ('isplayerinjail', 'getplayerinjail', 'isplayerinprison',
+                         'senttojail'):
+            return 'Game.GetPlayer().IsArrested()'
 
         # Fame/Infamy → GlobalVariable
         if fname_low in ('getpcfame',):
@@ -3982,11 +4435,14 @@ class ScriptConverter:
                 arg = f'{arg} as Int'
             return f'TES4Infamy.SetValueInt({arg})'
 
-        # Weather functions.  Oblivion WTHR records are NOT converted (WTHR is in
-        # skipTypes), so any weather FormID we bound would dangle — and pushing a
-        # dangling/foreign weather into Skyrim's sky system divides-by-zero in the
-        # weather update and hard-crashes.  There is no faithful Skyrim target, so
-        # neutralize the override rather than emit a call on a bad reference.
+        # Weather functions are a deliberate NO-OP: weather conversion is broken
+        # and is currently skipped.  CONVERT_CLIMATE is False, so the CLMT chain
+        # (WRLD -> CNAM -> CLMT -> WLST) that is the only route to a weather is
+        # never written, and Cyrodiil renders under Skyrim's default climate.
+        # Forcing an unreachable weather into Skyrim's sky system divides-by-zero
+        # in the weather update and hard-crashes, so neutralize the override
+        # rather than emit a call.  Keep this a no-op until weather conversion
+        # itself is fixed.
         if fname_low in ('forceweather', 'fw', 'setweather', 'sw'):
             arg = args_str.strip() if args_str else ''
             return f';NE: {fname_low} {arg} (Oblivion weather not converted)'
@@ -4001,16 +4457,22 @@ class ScriptConverter:
                 self._property_refs[args_str.strip()] = 'Weather'
             return f'(Weather.GetCurrentWeather() == {arg})'
 
-        # Sound functions
-        if fname_low == 'playsound':
-            arg = self._convert_expression(args_str.strip(), extends) if args_str else 'None'
-            if args_str and args_str.strip():
-                self._property_refs[args_str.strip()] = 'Sound'
-            return f'{arg}.Play(Game.GetPlayer())'
-        if fname_low == 'playsound3d':
-            arg = self._convert_expression(args_str.strip(), extends) if args_str else 'None'
-            if args_str and args_str.strip():
-                self._property_refs[args_str.strip()] = 'Sound'
+        # Sound functions.  Vanilla writes the EditorID QUOTED
+        # (`PlaySound "AMBBaenlinDeath"`), and the property must be registered
+        # under the name that is actually EMITTED — _convert_expression strips
+        # the quotes, but registering the raw argument kept them, and
+        # _safe_property_name turned each quote into an underscore.  That
+        # declared a second, never-referenced `Sound Property _X_ Auto`
+        # alongside the real one: 75 dead properties across 23 files, none of
+        # them bindable (no record is named `"X"` with quotes).  Same class of
+        # artifact as the Game_GetPlayer__ properties fixed in round 2.
+        if fname_low in ('playsound', 'playsound3d'):
+            raw = (args_str.strip() if args_str else '').strip('"\'')
+            arg = self._convert_expression(raw, extends) if raw else 'None'
+            if raw:
+                self._property_refs[raw] = 'Sound'
+            if fname_low == 'playsound':
+                return f'{arg}.Play(Game.GetPlayer())'
             ref = self._resolve_self_ref(ref_name, extends) if ref_name else 'Self'
             return f'{arg}.Play({ref})'
         if fname_low == 'stopsound':
@@ -4221,10 +4683,18 @@ class ScriptConverter:
             val_conv = self._convert_expression(val, extends)
             return f'TES4Polyfill.SetActorRefraction({ref}, {val_conv})'
 
-        # StopCombatAlarmOnActor / SCAOnActor / SCA
+        # StopCombatAlarmOnActor / SCAOnActor / SCA.
+        # NOT StopCombat: that "removes this actor from combat" (ends the
+        # actor's OWN aggression), whereas SCAOnActor "stops all combat and
+        # alarms AGAINST this actor" — the opposite direction.  Skyrim has the
+        # exact native, Actor.StopCombatAlarm().  With StopCombat the whole
+        # point of the call was lost: `player.SCAOnActor` is the idiom for
+        # calming a mob that is attacking the player (Dark19Whispers uses it to
+        # hold the player still through the Night Mother's speech), and
+        # stopping only the player's own aggression left everyone still hostile.
         if fname_low in ('scaonactor', 'sca', 'stopcombatalarmonactor'):
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
-            return f'{ref}.StopCombat()'
+            return f'{ref}.StopCombatAlarm()'
 
         # ShowMap → marker.AddToMap(true)
         if fname_low == 'showmap':
@@ -4236,7 +4706,17 @@ class ScriptConverter:
                 return f'{safe}.AddToMap(true)'
             return 'Self.AddToMap(true)'
 
-        # Disposition (removed in Skyrim)
+        # Disposition (removed in Skyrim).  A full -100 drop is Oblivion's
+        # "make them hostile" idiom, so it becomes StartCombat.
+        #
+        # DIRECTION MATTERS.  TES4's signature is
+        #     <actor>.ModDisposition <target> <value>
+        # and it changes the CALLING actor's disposition toward the target — so
+        # `UngolimRef.ModDisposition player -100` means Ungolim now hates the
+        # player and Ungolim is the aggressor.  Emitting
+        # `<target>.StartCombat(<ref>)` inverted that and made the PLAYER attack
+        # Ungolim, which in Dark16Kiss framed the player for the murder the
+        # quest wanted Ungolim to commit.  The aggressor is the ref.
         if fname_low == 'moddisposition':
             parts = [p.strip() for p in (args_str.replace(',', ' ').split() if args_str else [])]
             if len(parts) >= 2:
@@ -4249,7 +4729,7 @@ class ScriptConverter:
                         if cur in ('', 'ObjectReference'):
                             self._property_refs[tgt_key] = 'Actor'
                         ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
-                        return f'{target}.StartCombat({ref})'
+                        return f'{ref}.StartCombat({target})'
                 except (ValueError, IndexError):
                     pass
             self._line_comments.append(f';NE: ModDisposition')
@@ -4293,9 +4773,16 @@ class ScriptConverter:
                 topic = self._convert_expression(topic_str, extends)
                 self._property_refs[topic_str] = 'Topic'
                 return f'{ref}.Say({topic})'
-            # No topic — TES4 falls back to greeting AI; nothing to say here.
-            self._line_comments.append(';NE: StartConversation (no topic)')
-            return '0'
+            # No topic.  Per UESP's function table the Topic argument is
+            # explicitly "(Optional)", and omitting it makes the engine open the
+            # conversation on the greeting — which is a real, resolvable topic
+            # (DIAL GREETING, 000000C8) rather than "nothing to say".  Dropping
+            # these silenced 64 call sites, all of them the standard
+            # `<npc>.StartConversation Player` walk-up beat: FGC01's Pinarus
+            # after the mountain lions, and 63 more.  Say(GREETING) is the same
+            # routing the 3-argument form already uses.
+            self._property_refs['GREETING'] = 'Topic'
+            return f'{ref}.Say(GREETING)'
 
         # Wait → no-op (TES4 Wait is a package instruction, not a time delay)
         if fname_low == 'wait':
@@ -4330,37 +4817,61 @@ class ScriptConverter:
                 return f'{ref}.SetActorValue("SpeedMult", 150.0)'
             return f'{ref}.SetActorValue("SpeedMult", 100.0)'
 
-        # Faction crime tracking
-        if fname_low in ('setpcfactionmurder', 'setpcfactionattack'):
+        # Faction crime tracking.  TES4 keeps three independent per-faction
+        # booleans (Murder, Attack, Steal); every call site in Oblivion.esm
+        # reads them as `== 1` and writes them only as `0` (the engine is what
+        # sets them).  Skyrim exposes no Papyrus native for any of the three —
+        # it keeps GetPCFactionMurder/Attack only as condition functions — so
+        # they are reconstructed from the crime-gold split, which IS reachable:
+        #
+        #   Steal  → GetCrimeGoldNonViolent() > 0
+        #   Attack → violent gold in the assault band (0 < gold < murder)
+        #   Murder → violent gold at or above the murder bounty
+        #
+        # The murder/assault threshold is what makes the last two separable.
+        # Census of Skyrim.esm: all 14 real crime factions use exactly
+        # murder=1000, assault=40 in CRVA, a 25x gap, and the importer writes
+        # those same vanilla amounts for every converted crime faction.
+        #
+        # Mapping both Murder and Attack onto a bare GetCrimeGoldViolent() (the
+        # previous behaviour) made them indistinguishable, so any script testing
+        # both — FGExpulsionScript's Blackwood chain, TGCastOut, both
+        # MGExpulsion scripts — had its murder branch shadowed by the attack
+        # branch that precedes it, and `== 1` meant "exactly 1 gold of bounty",
+        # which no crime ever produces.
+        if fname_low in ('setpcfactionmurder', 'setpcfactionattack',
+                         'setpcfactionsteal'):
             parts = [p.strip() for p in (args_str.replace(',', ' ').split() if args_str else [])]
-            if parts:
-                faction = self._convert_expression(parts[0], extends)
-                self._property_refs[parts[0].strip()] = 'Faction'
-                val = parts[1] if len(parts) > 1 else '1'
-                if val in ('0', '0.0'):
-                    return f'{faction}.SetCrimeGoldViolent(0)'
-                return f'{faction}.SetCrimeGoldViolent(1000)'
-            return ';NE: SetPCFactionMurder missing faction arg'
-        if fname_low == 'setpcfactionsteal':
-            parts = [p.strip() for p in (args_str.replace(',', ' ').split() if args_str else [])]
-            if parts:
-                faction = self._convert_expression(parts[0], extends)
-                self._property_refs[parts[0].strip()] = 'Faction'
-                val = parts[1] if len(parts) > 1 else '1'
-                if val in ('0', '0.0'):
-                    return f'{faction}.SetCrimeGold(0)'
-                return f'{faction}.SetCrimeGold(100)'
-            return ';NE: SetPCFactionSteal missing faction arg'
-        if fname_low in ('getpcfactionmurder', 'getpcfactionattack'):
+            if not parts:
+                return f';NE: {fname} missing faction arg'
+            faction = self._convert_expression(parts[0], extends)
+            self._property_refs[parts[0].strip()] = 'Faction'
+            val = parts[1] if len(parts) > 1 else '1'
+            violent = fname_low != 'setpcfactionsteal'
+            setter = 'SetCrimeGoldViolent' if violent else 'SetCrimeGold'
+            if val in ('0', '0.0'):
+                return f'{faction}.{setter}(0)'
+            # Writing the flag true means "make this crime stand": raise the
+            # bounty into the matching band.  Murder must clear the threshold;
+            # assault and theft sit below it.
+            amount = {'setpcfactionmurder': TES4_MURDER_BOUNTY,
+                      'setpcfactionattack': TES4_ASSAULT_BOUNTY}.get(
+                          fname_low, TES4_STEAL_BOUNTY)
+            return f'{faction}.{setter}({amount})'
+
+        if fname_low in ('getpcfactionmurder', 'getpcfactionattack',
+                         'getpcfactionsteal'):
             arg = self._convert_expression(args_str.strip(), extends) if args_str else 'None'
             if args_str and args_str.strip():
                 self._property_refs[args_str.strip()] = 'Faction'
-            return f'{arg}.GetCrimeGoldViolent()'
-        if fname_low == 'getpcfactionsteal':
-            arg = self._convert_expression(args_str.strip(), extends) if args_str else 'None'
-            if args_str and args_str.strip():
-                self._property_refs[args_str.strip()] = 'Faction'
-            return f'{arg}.GetCrimeGoldNonViolent()'
+            if fname_low == 'getpcfactionsteal':
+                return f'({arg}.GetCrimeGoldNonViolent() > 0) as Int'
+            if fname_low == 'getpcfactionmurder':
+                return (f'({arg}.GetCrimeGoldViolent() >= '
+                        f'{TES4_MURDER_BOUNTY}) as Int')
+            # Attack: violent bounty that is NOT big enough to be a murder.
+            return (f'({arg}.GetCrimeGoldViolent() > 0 && '
+                    f'{arg}.GetCrimeGoldViolent() < {TES4_MURDER_BOUNTY}) as Int')
 
         # GetIsReference → equality check
         if fname_low == 'getisreference':
@@ -4369,7 +4880,30 @@ class ScriptConverter:
             return f'{ref} == {arg}'
 
         # GetInWorldSpace → WorldSpace comparison
-        if fname_low in ('getinworldspace', 'getplayerinseworld'):
+        # GetPlayerInSEWorld takes NO argument and asks whether the player is
+        # anywhere in the Shivering Isles — exteriors AND interiors.  It stays
+        # the literal 0 (the bare-read fallback), deliberately:
+        #
+        #   * The exterior half is trivially reconstructible
+        #     (GetWorldSpace() against the SE* worldspaces) but the interior
+        #     half is not.  An SI interior cell has NO worldspace, carries no
+        #     distinguishing climate/music (measured: SI interiors use the same
+        #     music types as Cyrodiil's), and the door graph does not separate
+        #     the two worlds — the SI<->Cyrodiil gate is a legitimate edge, so
+        #     a flood fill from the SE worldspaces reaches 1,407 Cyrodiil
+        #     interiors.  There is no sound generic invariant to key on.
+        #   * Reconstructing only the exterior half would be WORSE than the
+        #     no-op.  Censused over the plugin, 11 of the 16 sites test
+        #     `== 0` — they are suppression guards (Lucien Lachance's sleep
+        #     visit, the Gray Cowl's bounty transfer, the tutorial's jail
+        #     hint), for which a constant 0 is the RIGHT answer everywhere in
+        #     Cyrodiil.  An exterior-only test would flip all 11 to false the
+        #     moment the player stepped into an SI interior.
+        #
+        # The 5 `== 1` sites do lose their behaviour; 4 of them are in SI spell
+        # scripts that do not run anyway (no MGEF carries a VMAD — see the
+        # audit's known gaps).
+        if fname_low == 'getinworldspace':
             arg = self._convert_expression(args_str.strip(), extends) if args_str else 'None'
             if args_str and args_str.strip():
                 self._property_refs[args_str.strip()] = 'WorldSpace'
@@ -4378,20 +4912,87 @@ class ScriptConverter:
                 return f'{ref}.GetWorldSpace() == {arg}'
             return f'Game.GetPlayer().GetWorldSpace() == {arg}'
 
-        # ModAmountSoldStolen
+        # ModAmountSoldStolen — adds GOLD to the "amount fenced" counter, which
+        # Skyrim exposes only as a condition function.  Backed by the synthesized
+        # TES4GoldFenced global (see _create_tes4_special_records); NOT the
+        # vanilla "Items Stolen" stat, which counts items and is driven by the
+        # engine on every theft.
         if fname_low == 'modamountsoldstolen':
             arg = self._convert_expression(args_str.strip(), extends) if args_str else '1'
-            return f'Game.IncrementStat("Items Stolen", {arg})'
+            self._property_refs['TES4GoldFenced'] = 'GlobalVariable'
+            return f'TES4GoldFenced.Mod({self._cast(arg, "Float")})'
 
         # Reset → ref.Reset()
         if fname_low == 'reset':
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
             return f'{ref}.Reset()'
 
-        # GetDetectionLevel → approximate
+        # GetDetectionLevel has the SAME shape as GetDetected — per UESP's
+        # function table (opcode 0x10B4, 1 param Actor, "Actor Reference"
+        # receiver) it is `<observer>.GetDetectionLevel <target>` — so it gets
+        # the same receiver/argument swap onto IsDetectedBy.
+        #
+        # It used to be a flat `0`, which turned every call site into a
+        # permanently-false threshold test.  That is safe only if scripts read
+        # the level numerically; censused over the plugin, NOT ONE does.  All
+        # 56 sites are `>= 2`, `>= 3` or `== 3` — pure "is the target
+        # detected" questions, which is exactly what IsDetectedBy answers.
+        # The dead tests gated real behaviour: all 7 of Dark04Execution's
+        # guard-aggro triggers, the Dark Sanctuary assassins' reaction to the
+        # player, Baenlin's and Gromm's murder-witness checks, and the bandit
+        # sentries' challenge.
+        #
+        # The threshold must be RESCALED, not just wrapped.  TES4 levels run
+        # 0=unnoticed .. 3=fully detected, but IsDetectedBy is a Bool, and the
+        # generic `_BOOL_CMP_RE` pass wraps a Bool meeting a number as
+        # `(... as Int) <op> N` — where `true as Int` is 1.  Left alone, the
+        # `>= 2` and `>= 3` sites (the majority: DarkVicenteScript, the Dark
+        # Sanctuary assassins, the SE guards) would compile but be permanently
+        # FALSE, trading one dead form for another.  `== 3` would break the
+        # same way.  Scaling the Bool to TES4's own top level yields 0 or 3,
+        # which satisfies every threshold the plugin actually uses (>=2, >=3,
+        # ==3) exactly when the target is detected and never otherwise.
+        # Verified with the CK compiler: a bare `Bool >= 2` is rejected
+        # outright ("cannot relatively compare variables of type bool"), so
+        # the cast has to be explicit here anyway.
         if fname_low == 'getdetectionlevel':
-            self._line_comments.append(';NE: GetDetectionLevel')
+            observer = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            arg = args_str.strip() if args_str else ''
+            target = self._convert_expression(arg, extends) if arg else 'Game.GetPlayer()'
+            for key in (target, observer):
+                if re.match(r'^[A-Za-z_]\w*$', key or ''):
+                    if self._property_refs.get(key, '') in ('', 'ObjectReference'):
+                        self._property_refs[key] = 'Actor'
+            return f'(({target}.IsDetectedBy({observer}) as Int) * 3)'
+
+        # IsActorDetected takes no argument — "am I detected by ANYONE".  Skyrim
+        # only offers IsDetectedBy(specificActor), so there is nothing to call.
+        # Emitting IsDetectedBy with the default player arg produced
+        # `Game.GetPlayer().IsDetectedBy(Game.GetPlayer())` (always true).
+        if fname_low == 'isactordetected':
+            self._line_comments.append(';NE: IsActorDetected (no Skyrim equivalent)')
             return '0'
+
+        # GetDetected is the OBSERVER's question; IsDetectedBy is the TARGET's.
+        # TES4: `<observer>.GetDetected <target>` — "does the observer detect the
+        # target" (Morrowind's shared doc for the function: the argument is the
+        # "target NPC used to check if the SOURCE actor can detect them").
+        # Skyrim: `<target>.IsDetectedBy(<observer>)` — vanilla Actor.psc reads
+        # "returns if THIS actor is detected by the other one".
+        # So receiver and argument must SWAP.  Mapping them positionally made
+        # every call ask the mirror-image question: CharGenQuest's
+        # `GlenroyRef.getdetected player` (has Glenroy spotted the player, which
+        # advances the Ambush-B stage) became "has the player spotted Glenroy",
+        # true the moment the player looks down the corridor.
+        if fname_low == 'getdetected':
+            observer = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            arg = args_str.strip() if args_str else ''
+            target = self._convert_expression(arg, extends) if arg else 'Game.GetPlayer()'
+            for key in (target, observer):
+                if re.match(r'^[A-Za-z_]\w*$', key or ''):
+                    if self._property_refs.get(key, '') in ('', 'ObjectReference'):
+                        self._property_refs[key] = 'Actor'
+            return f'{target}.IsDetectedBy({observer})'
 
         # SetActorFullName → no-op (SKSE required for SetDisplayName)
         if fname_low == 'setactorfullname':
@@ -4477,10 +5078,15 @@ class ScriptConverter:
             self._line_comments.append(';NE: SetLevel')
             return '0'
 
-        # IsPCAMurderer / GetPCIsMurderer
+        # IsPCAMurderer / GetPCIsMurderer.  Must match the bare-read branch in
+        # _convert_expression exactly (these take no arguments, so that branch
+        # is the one that actually fires).  `> 0` was R4-1's *Attack* test —
+        # any violent bounty at all — which would have made the player a
+        # "murderer" for a bar brawl; murder is the 1000-gold band.
         if fname_low in ('ispcamurderer', 'ispcanmurderer', 'getpcismurderer'):
             self._property_refs['TES4CyrodiilCrimeFaction'] = 'Faction'
-            return '(TES4CyrodiilCrimeFaction.GetCrimeGoldViolent() > 0)'
+            return (f'(TES4CyrodiilCrimeFaction.GetCrimeGoldViolent() '
+                    f'>= {TES4_MURDER_BOUNTY})')
 
         # SetForceSneaking
         if fname_low in ('setforcesneak',):
@@ -4494,8 +5100,19 @@ class ScriptConverter:
                 self._property_refs[args_str.strip()] = 'Faction'
             return f'{arg}.SetPlayerExpelled(true)'
 
-        # SetDoorDefaultOpen → SetOpen
-        if fname_low in ('setdoordefaultopen', 'opendoor'):
+        # SetDoorDefaultOpen → SetOpen.  The argument is a BOOLEAN, not a flag
+        # to be ignored: per UESP's function table (opcode 0x10D8, 1 Integer)
+        # "a value of 1 will make the door open by default", so 0 CLOSES it.
+        # Hardcoding SetOpen(true) inverted the `0` form — MQ16's endgame
+        # `ICPalaceElderCouncilMainDoor.SetDoorDefaultOpen 0`, the line whose own
+        # comment reads "close Elder Council door", flung it open instead.
+        # `OpenDoor` takes no argument and always opens.
+        if fname_low == 'setdoordefaultopen':
+            ref = self._resolve_self_ref(ref_name, extends)
+            arg = args_str.strip().rstrip(',').strip() if args_str else '1'
+            opened = 'false' if arg in ('0', '0.0', 'false') else 'true'
+            return f'{ref}.SetOpen({opened})'
+        if fname_low == 'opendoor':
             ref = self._resolve_self_ref(ref_name, extends)
             return f'{ref}.SetOpen(true)'
         if fname_low == 'closedoor':
@@ -4526,9 +5143,38 @@ class ScriptConverter:
             self._line_comments.append(';NE: ResetFallDamageTimer')
             return '0'
 
+        # AddTopic on a GATED topic opens that topic's unlock gate.
+        #
+        # Skyrim has no AddTopic, so the visibility model is re-expressed as one
+        # `TES4Unlock_<topic>` global per explicitly-added topic (see
+        # tes5_import/dialog_unlocks.py). INFO and quest-stage fragments already
+        # emit the SetValue; a script AddTopic is the THIRD reveal route and
+        # reveals the topic exactly the same way, so it emits the same call.
+        #
+        # Load-bearing rather than cosmetic: TGReadWantedPoster and
+        # TG00MysteriousNoteScript are how the player first learns of the Gray
+        # Fox, MS45DarMaDiary is finding Dar Ma's diary, DAMephalaUlfgarScript
+        # is Ulfgar's death. Dropped, each of those reveals waited on some later
+        # quest stage or unrelated line instead.
+        #
+        # An UNGATED topic (never explicitly added anywhere, or bark-revealed —
+        # both deliberately ungated by the plan) has no global to set and is
+        # already visible, so it falls through to the no-op below.
+        if fname_low == 'addtopic':
+            topic_arg = (args_str or '').strip().strip(',').split()
+            gname = None
+            if topic_arg:
+                gname = (self.topic_unlock_globals or {}).get(
+                    topic_arg[0].strip().strip('"').lower())
+            if gname:
+                self._property_refs.setdefault(gname, 'GlobalVariable')
+                return f'{gname}.SetValue(1)'
+            self._line_comments.append(f';NE: {func_name} (topic not gated)')
+            return '0'
+
         # Comprehensive no-ops (functions with no meaningful Skyrim equivalent)
         _NO_OP_FUNCS = {
-            'addtopic', 'removetopic', 'refreshtopiclist', 'setquestobject',
+            'removetopic', 'refreshtopiclist', 'setquestobject',
             'setcellpublicflag', 'disablelinkedpathpoints', 'enablelinkedpathpoints',
             'addachievement', 'closecurrentobliviongate', 'forcecloseobliviongate',
             'closeobliviongate', 'setignorefriendlyhits', 'setsceneiscomplex',
@@ -4543,7 +5189,7 @@ class ScriptConverter:
             'getisalerted', 'getcrimeknown', 'isidleplaying',
             'iscurrentfurnitureref', 'iscurrentfurnitureobj',
             'getbookread', 'isonguard', 'isindangerouswater',
-            'getplayercontrolsdisabled', 'getstartingpos',
+            'getstartingpos',
             'getcurrentaiprocedure', 'getcurrentaipackage', 'getcurrentpackage',
             'getiscurrentpackage', 'hasvariable', 'hasbeenpickedup',
             'ispcanmurderer', 'gettalkedtopc', 'gettalkedtopcp',
@@ -4891,8 +5537,34 @@ class ScriptConverter:
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
             return f'{ref}.ClearLookAt()'
 
-        # GetAmountSoldStolen / GetPCMiscStat: -> Game.QueryStat("Items Stolen")
-        if fname_low in ('getamountsoldstolen', 'getpcmiscstat'):
+        # GetAmountSoldStolen: gold fenced, paired with ModAmountSoldStolen above.
+        if fname_low == 'getamountsoldstolen':
+            self._property_refs['TES4GoldFenced'] = 'GlobalVariable'
+            return 'TES4GoldFenced.GetValue()'
+
+        # Player-controls state.  Skyrim exposes the two WRITERS as natives
+        # (Game.DisablePlayerControls/EnablePlayerControls) but no getter, so
+        # the writers also shadow the state into a synthesized global and the
+        # read returns that.  Flattening the read to 0 was actively wrong
+        # rather than merely inert: MG18Script polls it three times to sequence
+        # Mannimarco's confrontation, and a constant 0 made the force-greet
+        # branch (`== 1`) permanently false while the combat branch (`== 0`)
+        # fired immediately — so Mannimarco never spoke and attacked at once.
+        if fname_low in ('getplayercontrolsdisabled',
+                         'getplayercontrolsdisabled_'):
+            self._property_refs['TES4ControlsDisabled'] = 'GlobalVariable'
+            return 'TES4ControlsDisabled.GetValue()'
+        # The two writers stay single-expression (a trailing source comment is
+        # appended to whatever they return, so a second line here would be
+        # orphaned behind it); the shadow write is spliced in as its own line
+        # by _shadow_controls_writes during post-processing.
+        if fname_low in ('disableplayercontrols', 'enableplayercontrols'):
+            self._property_refs['TES4ControlsDisabled'] = 'GlobalVariable'
+            verb = 'Disable' if fname_low.startswith('disable') else 'Enable'
+            return f'Game.{verb}PlayerControls()'
+
+        # GetPCMiscStat: genuine stat query, named by its argument.
+        if fname_low == 'getpcmiscstat':
             stat = args_str.strip().strip('"') if args_str else 'Items Stolen'
             return f'Game.QueryStat("{stat}")'
 
@@ -4916,19 +5588,22 @@ class ScriptConverter:
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
             return f'{ref}.GetRace()'
 
-        # Expel: ref.Expel(faction) -> Game.GetPlayer().SetFactionRank(faction, -1)
+        # Expel: ref.Expel(faction) -> faction.SetPlayerExpelled(true).
+        # Must write the same flag IsPlayerExpelled() reads; the old rank -1
+        # write was invisible to every expelled test.
         if fname_low == 'expel':
             arg = self._convert_expression(args_str.strip(), extends) if args_str else 'None'
             if args_str:
                 self._property_refs[args_str.strip()] = 'Faction'
-            return f'Game.GetPlayer().SetFactionRank({arg}, -1)  ;TODO: Expel mapped to faction rank -1'
+            return f'{arg}.SetPlayerExpelled(true)'
 
-        # IsExpelled/IsPCExpelled/GetPCExpelled: check faction rank < 0
+        # IsExpelled/IsPCExpelled/GetPCExpelled — see the GetPCExpelled handler
+        # above; Faction.IsPlayerExpelled() is the exact native.
         if fname_low in ('isexpelled', 'ispcexpelled', 'getpcexpelled'):
             arg = self._convert_expression(args_str.strip(), extends) if args_str else 'None'
             if args_str:
                 self._property_refs[args_str.strip()] = 'Faction'
-            return f'(Game.GetPlayer().GetFactionRank({arg}) < 0)'
+            return f'{arg}.IsPlayerExpelled()'
 
         # IsInInterior: ref.IsInInterior -> ref.GetParentCell().IsInterior()
         if fname_low == 'isininterior':
@@ -4993,12 +5668,32 @@ class ScriptConverter:
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
             return f'{ref} == {arg}'
 
-        # GetInCell: ref.GetInCell CellEditorID -> ref.GetParentCell() == cellRef
+        # GetInCell: TES4 matches the argument as an EditorID PREFIX, so
+        # `GetInCell Chorrol` is true in all 86 cells named Chorrol* — the whole
+        # city, interiors and exteriors.  Oblivion relies on this: 62 CELL
+        # records exist only as the named anchor of such a family and contain no
+        # refs at all (`FULL=Dummy cell for GetInCell`).  Translating the call as
+        # a single equality against that anchor gave a condition the player can
+        # never satisfy, silently killing 167 of the 396 GetInCell calls (MQ02's
+        # Chorrol/Weynon Priory stage advances among them).  Expand the family
+        # into an OR-chain over its member cells instead.
         if fname_low == 'getincell':
             arg = args_str.strip().strip('"') if args_str else 'None'
-            self._property_refs[arg] = 'Cell'
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
-            return f'{ref}.GetParentCell() == {arg}'
+            family = self.xref.get_cell_family(arg) if self.xref else []
+            # Fall back to the literal name when the index knows nothing.
+            if not family:
+                family = [arg]
+            for cell in family:
+                self._property_refs[cell] = 'Cell'
+            if len(family) == 1:
+                return f'{ref}.GetParentCell() == {family[0]}'
+            # Families run to hundreds of cells ("IC" covers 431), far too many
+            # to inline at every call site, so emit one helper per family and
+            # call it.  The helper compares against a Cell[] built once, which
+            # also evaluates GetParentCell() a single time.
+            helper = self._register_cell_family(arg, family)
+            return f'{helper}({ref})'
 
         # GetInSameCell: ref.GetInSameCell otherRef -> ref.GetParentCell() == otherRef.GetParentCell()
         if fname_low in ('getinsamecell', 'getinsamecellas'):
@@ -5162,9 +5857,27 @@ class ScriptConverter:
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
             return f'{ref}.PlaceAtMe({ref}.GetActorBase())'
 
-        # WakeUpPC -> Game.GetPlayer().RestoreActorValue("Health", 0)
+        # WakeUpPC kicks the player OUT OF SLEEP.  It does not move them, change
+        # the camera, or play an animation — the old mapping to
+        # Game.ForceThirdPerson() did none of the right things.
+        #
+        # Skyrim genuinely has no equivalent: no native in Game/Debug/Actor/
+        # ObjectReference ends an active sleep, and SKSE registers none either
+        # (grepped every NativeFunction in references/skse64-master).  Vanilla's
+        # closest case, the Dark Brotherhood abduction, does not wake the player
+        # with a function — it runs its whole sequence inside OnSleepStart.
+        #
+        # That is exactly where our converted body already runs: all 5 TES4 call
+        # sites sit in a MenuMode block reading isPCSleeping, which this
+        # converter routes into OnSleepStart/OnSleepStop.  So the surrounding
+        # code the script wanted to run on waking DOES run, at the right moment;
+        # only the "cut the sleep short" part has no target.  Emitting a no-op
+        # keeps that faithful and visible instead of inventing a side effect the
+        # original never had.
         if fname_low == 'wakeuppc':
-            return 'Game.ForceThirdPerson()'
+            self._line_comments.append(
+                ';NE: WakeUpPC (no Skyrim equivalent; body runs in OnSleepStart)')
+            return '0'
 
         # IsExpelled: faction arg -> faction rank check
         if fname_low == 'isexpelled':
@@ -5307,16 +6020,25 @@ class ScriptConverter:
                         cur = self._property_refs.get(ref, '')
                         if cur == 'ObjectReference':
                             ref = f'({ref} as Actor)'
-                        elif cur in ('',):
+                        elif cur == '' and self._is_bindable_property(ref):
                             self._property_refs[ref] = 'Actor'
                 result = f'{ref}.{papyrus_func}({args})'
             else:
                 # No ref — infer implicit target based on script context
                 if needs_self and fname_low in _ACTOR_ONLY_FUNCTIONS:
+                    event_actor = self._current_event_actor_param()
                     if extends == 'TopicInfo':
                         result = f'(akSpeakerRef as Actor).{papyrus_func}({args})'
                     elif extends == 'ActiveMagicEffect':
                         result = f'GetTargetActor().{papyrus_func}({args})'
+                    elif extends != 'Actor' and event_actor:
+                        # Inside an event that hands us the actor it is about
+                        # (`OnEquipped(Actor akActor)`), TES4's implicit subject
+                        # for an actor-only call is that actor, not the item.
+                        # `MGBloodwormHelmScript*`'s bare `addspell` is cast on
+                        # the WEARER; `(Self as Actor)` on an ARMO is None, so
+                        # the helm's whole effect was silently lost.
+                        result = f'{event_actor}.{papyrus_func}({args})'
                     elif extends not in ('Actor',):
                         result = f'(Self as Actor).{papyrus_func}({args})'
                     else:
@@ -5344,7 +6066,7 @@ class ScriptConverter:
                     cur = self._property_refs.get(ref, '')
                     if cur == 'ObjectReference':
                         ref = f'({ref} as Actor)'
-                    elif cur in ('',):
+                    elif cur == '' and self._is_bindable_property(ref):
                         self._property_refs[ref] = 'Actor'
             return f'{ref}.{func_name}({args})  ;TODO: Verify'
         if fname_low in _ACTOR_ONLY_FUNCTIONS:
@@ -5359,7 +6081,11 @@ class ScriptConverter:
         return f'{func_name}({args})  ;TODO: Verify'
 
     # An OBSE format specifier: %z (string_var), %g/%.Nf (number), %c, %x, %%.
-    _OBSE_FMT_RE = re.compile(r'%(?:%|[-+ #0]*\d*(?:\.\d+)?[a-zA-Z])')
+    # The precision digits are optional on BOTH sides of the dot: authors write
+    # `%0.f` as often as `%.0f` (XPKnotboneFactionFixerSCRIPT) and the engine
+    # accepts it, so requiring a digit after the dot missed those and left the
+    # specifier printing literally.
+    _OBSE_FMT_RE = re.compile(r'%(?:%|[-+ #0]*\d*(?:\.\d*)?[a-zA-Z])')
 
     def _format_string_call(self, args_str: str, extends: str) -> str:
         """Convert an OBSE printf-style call into Papyrus concatenation.
@@ -5392,12 +6118,17 @@ class ScriptConverter:
         for m in self._OBSE_FMT_RE.finditer(fmt):
             if m.group(0) == '%%':
                 continue
+            if idx >= len(args):
+                # No argument left to fill this specifier, so it is not one:
+                # `%` also appears as an ordinary character ("100% done", where
+                # the regex sees "% d").  Consuming it swallowed the following
+                # letter and split the sentence.  Leave the text untouched.
+                continue
             lit = fmt[last:m.start()]
             if lit:
                 pieces.append(f'"{lit}"')
-            if idx < len(args):
-                pieces.append(f'({args[idx]} as String)')
-                idx += 1
+            pieces.append(f'({args[idx]} as String)')
+            idx += 1
             last = m.end()
         tail = fmt[last:]
         if tail or not pieces:
@@ -5406,6 +6137,34 @@ class ScriptConverter:
         for extra in args[idx:]:
             pieces.append(f'({extra} as String)')
         return ' + '.join(pieces)
+
+    def _format_message(self, s: str, extends: str) -> str:
+        """Format a vanilla Message/MessageBox call.
+
+        Same printf model as _format_string_call, with one TES4-only wrinkle:
+        `Message` takes an optional trailing DISPLAY TIME after the format
+        arguments (`message "Rank %.0f Fireball", SpellRank, 10` shows one
+        value for 10 seconds).  Papyrus's Debug.Notification has no duration,
+        and _format_string_call appends every unconsumed argument to the text —
+        which would print "Rank 3 Fireball10".  So surplus numeric literals
+        beyond the specifier count are dropped rather than concatenated.
+        """
+        end = s.find('"', 1)
+        fmt = s[1:end]
+        rest = s[end + 1:].strip().lstrip(',').strip()
+        n_spec = len([m for m in self._OBSE_FMT_RE.finditer(fmt)
+                      if m.group(0) != '%%'])
+        arg_srcs = [a.strip() for a in rest.split(',') if a.strip()] if rest else []
+        if len(arg_srcs) == 1 and ',' not in rest:
+            arg_srcs = [a for a in arg_srcs[0].split() if a]
+        # Drop trailing bare numeric literals that have no specifier to fill.
+        while (len(arg_srcs) > n_spec and arg_srcs
+                and re.match(r'^-?\d+(?:\.\d+)?$', arg_srcs[-1])):
+            arg_srcs.pop()
+        rebuilt = f'"{fmt}"'
+        if arg_srcs:
+            rebuilt += ', ' + ', '.join(arg_srcs)
+        return self._format_string_call(rebuilt, extends)
 
     def _quote_msg(self, args_str: str) -> str:
         """Quote a message argument if not already quoted.

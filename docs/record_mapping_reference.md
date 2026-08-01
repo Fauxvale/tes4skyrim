@@ -46,7 +46,7 @@ see the `oblivion-to-skyrim-dialog` skill.
 | EFSH | EFSH | DATA structure differs. |
 | ENCH | ENCH | **ENIT completely restructured**: 16B→36B. Type enum changes (0-3 → 6/0xC). Add OBND. New fields: Cast Type, Target Type, Charge Time, Base Enchantment. |
 | EYES | EYES | Minor changes. |
-| FACT | FACT | DATA flags differ slightly. Crime data: CNAM→CRVA. |
+| FACT | FACT | DATA is U8 in TES4 / U32 in TES5 and the bits are **renumbered**. Crime data: CNAM→CRVA (`<BBHHHHHfHH`). See FACT Conversion below. |
 | FLOR | FLOR | Add OBND. Minor changes. |
 | FURN | FURN | Add OBND. Furniture markers restructured (FNMK was a U32 bitmask; TES5 uses entry-based system with FNPR). |
 | GLOB | GLOB | Identical. |
@@ -367,9 +367,46 @@ Playable Oblivion races map directly to Skyrim equivalents by EditorID:
 - **ENCH Flags**: Only keep No Auto Calc ($08→$01)
 
 ### FACT Conversion
-- **Evil flag** ($02) → all crime flags ($0080+$0100+$0200+$0400+$0800+$2000+$10000 = Assault/Murder/Trespass/Pickpocket/Steal/Werewolf/Attack on Sight)
-- **Can Be Owner** ($8000) set on all factions
+
+**TES4 `DATA` is one U8, not a U32.** xEdit `wbDefinitionsTES4`: bit 0 Hidden
+from Player, bit 1 Evil, bit 2 Special Combat. Measured at exactly 1 byte in all
+204 Nehrim.esm factions. The exporter used to guard on `len >= 4` and unpack a
+U32, so `DATA.Flags` was silently absent from **all 476** Oblivion.esm factions
+(fixed 2026-07-31).
+
+- **Flag bits are renumbered between the games** — do NOT pass them through.
+  TES4 bit 1 is *Evil* but TES5 bit 1 is *Special Combat*.
+  Mapping: TES4 bit 0 → TES5 bit 0 (Hidden From NPC); TES4 bit 2 → TES5 bit 1
+  (Special Combat).
+- **Can Be Owner** ($8000) set on all factions.
+- **Track Crime** ($40, xEdit bit 6) — Skyrim requires it before the engine
+  accumulates any crime gold. Oblivion has no equivalent flag, so the set is
+  derived in Phase 0 (`_load_crime_factions`) from the factions the plugin's own
+  scripts pass to `Get`/`SetPCFaction{Murder,Attack,Steal}`. Oblivion.esm → 6.
+  The old "Evil → all crime flags" line set the ***Ignore* Crimes** bits
+  (7-11, 13, 16), the exact opposite of the intent, and never set Track Crime.
 - **Relation Disposition → Combat Reaction**: ≤-50→Enemy(1), =100→Ally(3), ≥50→Friend(2), else→Neutral(0)
+
+**CRVA layout** (xEdit; verified byte-for-byte against Skyrim.esm's
+`WERoad12HorsemanFaction` = `0101 E803 2800 0500 1900 0000 0000003F 6400 E803`):
+
+```
+Arrest U8, Attack On Sight U8, Murder U16, Assault U16, Trespass U16,
+Pickpocket U16, Unknown U16, Steal Multiplier Float, Escape U16, Werewolf U16
+```
+
+`'<BBHHHHHfHH'`, 20 bytes. The old `'<HHHHIfI'` packing was the same *size* so it
+never errored, but misaligned every field — the leading U16 swallowed both U8
+booleans (no converted crime faction ever arrested) and left every crime amount
+at 0, so `GetCrimeGoldViolent()`/`GetCrimeGoldNonViolent()` returned 0 forever.
+
+Amounts follow the vanilla census — **all 14** real Skyrim crime factions use
+exactly murder=1000, assault=40, trespass=5, pickpocket=25, escape=100. The 25x
+murder/assault gap is what lets converted scripts tell TES4's `GetPCFactionMurder`
+and `GetPCFactionAttack` apart (see
+[quest_script_conversion_audit.md](quest_script_conversion_audit.md) R4-1);
+`script_convert/constants.py` holds the matching thresholds, so the two sides
+must stay in step. CNAM.CrimeGold carries across as the Steal Multiplier.
 
 ### ALCH Conversion
 - **Food Detection**: Flag $02 (food) → set food flag + ITMPotionUse sound ($000CAF94) + VendorItemFood keyword

@@ -25,6 +25,18 @@ DUMP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 NS = '{http://www.mediawiki.org/xml/export-0.11/}'
 
 
+def _reconfigure_stdout():
+    """The wiki text is full of arrows, dashes and accented names, and the
+    Windows console defaults to cp1252 — printing any of them raised
+    UnicodeEncodeError and killed the search mid-result.  Force UTF-8 and
+    replace anything the terminal still cannot render."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError):
+            pass
+
+
 def _pages(path):
     """Yield (title, text) streaming, clearing elements as we go."""
     ns = None
@@ -52,6 +64,7 @@ def main():
     ap.add_argument('--context', type=int, default=2)
     ap.add_argument('--limit', type=int, default=40)
     args = ap.parse_args()
+    _reconfigure_stdout()
 
     if not os.path.exists(args.dump):
         sys.exit(f'dump not found: {args.dump}')

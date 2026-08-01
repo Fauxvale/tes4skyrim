@@ -208,6 +208,17 @@ _PAPYRUS_RESERVED = {
     'length', 'scriptname', 'next',
 } | _load_papyrus_script_names()
 
+# Crime bounties used to reconstruct TES4's three per-faction crime booleans
+# (GetPCFactionMurder / Attack / Steal) from Skyrim's crime-gold split, which is
+# the only part of the system Papyrus can reach.  These are the vanilla CRVA
+# amounts: every one of Skyrim.esm's 14 real crime factions uses exactly
+# murder=1000, assault=40, and the steal multiplier applies to item value.  The
+# importer writes the same numbers into every converted crime faction's CRVA
+# (tes5_import/record_types/actors.py), so the two sides must stay in step.
+TES4_MURDER_BOUNTY = 1000
+TES4_ASSAULT_BOUNTY = 40
+TES4_STEAL_BOUNTY = 100
+
 # Comprehensive function mapping
 # key: lowercased oblivion function name
 # value: (papyrus_expression, needs_self, note_or_none)
@@ -284,8 +295,20 @@ FUNCTION_MAP = {
     'stopcombat':        ('StopCombat',        True,  None),
     'getisid':           (None,                True,  None),  # Special handler in _emit_function
     'getisrace':         (None,                True,  None),  # Special handler in _emit_function
-    'isactordetected':   ('IsDetectedBy',      True,  None),
-    'getdetected':       ('IsDetectedBy',      True,  None),
+    # IsActorDetected takes NO argument (UESP opcode 0x10B5, 0 params): "is this
+    # actor detected by ANYONE".  GetDetected takes 1 Actor and asks the
+    # OPPOSITE question from Skyrim's IsDetectedBy: `<observer>.GetDetected
+    # <target>` is "does the observer detect the target", while
+    # `<target>.IsDetectedBy(<observer>)` is "is the target detected by the
+    # observer".  Mapping IsActorDetected to IsDetectedBy made the argument-less
+    # form default to the player (`player.IsActorDetected` →
+    # Game.GetPlayer().IsDetectedBy(Game.GetPlayer()), the player detecting
+    # itself); mapping GetDetected positionally kept receiver and argument in
+    # place and asked the mirror-image question.  Both now have special handlers
+    # in _emit_function: IsActorDetected is a no-op (Skyrim has no "detected by
+    # anyone" primitive, like GetDetectionLevel), GetDetected swaps the two refs.
+    'isactordetected':   (None,                True,  None),
+    'getdetected':       (None,                True,  None),  # Special handler in _emit_function
     'getincell':         (None,                True,  None),  # Special handler in _emit_function
     'getinsamecell':     (None,                True,  None),  # Special handler in _emit_function
     'getissex':          (None,                True,  None),  # Special handler
@@ -322,7 +345,9 @@ FUNCTION_MAP = {
     # --- AI ---
     'evp':               ('EvaluatePackage',   True,  None),
     'evaluatepackage':   ('EvaluatePackage',   True,  None),
-    'setforcerun':       ('SetDontMove',       True,  None),
+    # setforcerun has a dedicated handler (SpeedMult); deliberately NOT mapped
+    # here.  It carried ('SetDontMove', ...) — the exact inverse of "force this
+    # actor to run" — which was unreachable only because the handler runs first.
     'setforcewalk':      (None,                True,  None),  # no-op
     'wait':              (None,                False, None),  # Special handler
 
@@ -350,7 +375,7 @@ FUNCTION_MAP = {
     'getpcinfaction':    ('Game.GetPlayer().IsInFaction', False, None),
     'ispcrace':          (None,                False, None),  # Special handler
     'getrandompercent':  ('Utility.RandomInt',  False, None),
-    'getamountsoldstolen': ('Game.QueryStat',  False, None),
+    'getamountsoldstolen': (None,              False, None),  # Special handler (TES4GoldFenced)
     'showracemenu':      ('Game.ShowRaceMenu', False, None),
     'showdialogsubtitles':(None,               False, None),  # Special handler (no-op)
     'getlevel':          ('GetLevel',           True,  None),
@@ -637,7 +662,7 @@ FUNCTION_MAP = {
     'isactor':           (None,                True,  None),  # no-op
     'israining':         (None,                False, None),  # no-op
     'isindangerouswater':(None,                True,  None),  # no-op
-    'getplayercontrolsdisabled': (None,        False, None),  # no-op
+    'getplayercontrolsdisabled': (None,        False, None),  # Special handler (TES4ControlsDisabled)
     'getisplayerbirthsign': (None,             False, None),  # no-op
     'isplayerinjail':    (None,                False, None),  # Special handler
     'getpcfactionattack':(None,                False, None),  # Special handler
@@ -657,7 +682,7 @@ FUNCTION_MAP = {
     'setactorrefraction':(None,                True,  None),  # Special handler (alpha fade)
     'setdisplayname':    (None,                True,  None),  # Special handler
     'getcontainer':      (None,                True,  None),  # Special handler
-    'stopcombatalarmonactor': ('StopCombat',   True,  None),
+    'stopcombatalarmonactor': (None,           True,  None),  # Special handler (StopCombatAlarm)
     'essentialdeathreload': (None,             False, None),  # no-op
     'setallreachable':   (None,                True,  None),  # no-op
     'getdestroyed': ('IsDisabled',          True,  ';approximate - GetDestroyed not in Skyrim'),
@@ -760,6 +785,11 @@ _BARE_NO_EQUIV_COMMANDS = {
     # Read bare, mid-expression, with no same-named Papyrus form: without
     # routing they survive as undefined identifiers and fail the whole script.
     'flee', 'getattacked', 'skipanim', 'getpackagetarget',
+    'getamountsoldstolen',
+    # Takes no arguments, so it is ALWAYS read bare — without routing, the
+    # fallback list won and the special handler (TES4ControlsDisabled) was
+    # unreachable dead code.  Same trap as ispcamurderer (R6-2).
+    'getplayercontrolsdisabled',
     'isinair', 'getstringgamesetting', 'getcrosshairref', 'getobjecttype',
     'con_runmemorypass',
     'disablekey', 'enablekey', 'tapkey', 'holdkey', 'releasekey', 'playback', 'playbackalt', 'disablecontrol', 'enablecontrol', 'tapcontrol',
@@ -846,6 +876,24 @@ _OBJREF_SHARED_FUNCTIONS = {
     # ObjectReference has no such method, so listing them here suppressed the
     # `as Actor` cast and left an ObjectReference receiver calling an undefined
     # function (SERelmynaExperimentSpellScript).
+}
+
+# TES4 functions that name their target as an ARGUMENT rather than acting on the
+# calling reference (`GetDeadCount JesanRilian`, `SetEssential SEMuurine 0`).
+# Skyrim declares both on `ActorBase`, not `Actor`, so a bare occurrence says
+# nothing about the enclosing script's own base type.  Used ONLY to keep
+# `_infer_extends` from upgrading an ACTI/DOOR script to `extends Actor`, which
+# the engine then refuses to bind ("base types do not match").  They stay in
+# `_ACTOR_ONLY_FUNCTIONS` because the call-site emitter still needs the cast.
+_ACTORBASE_ARG_FUNCTIONS = {
+    'getdeadcount', 'setessential',
+    # `saa`/`SetActorAlpha` is Actor-only in Skyrim, but Oblivion lets any
+    # reference call it and simply does nothing off an actor — `SE32GhostObject`
+    # rides on INGR/KEYM items.  Upgrading on its account made the script
+    # unbindable and lost the `pms` shader beside it; the call site already
+    # degrades the bare form to `(Self as Actor).SetAlpha(...)`, which compiles
+    # and is the same no-op TES4 gave it.
+    'saa', 'setactoralpha', 'gaa', 'getactoralpha',
 }
 
 # Methods declared on ObjectReference that a TES4 script calls BARE, relying on
