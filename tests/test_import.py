@@ -2045,6 +2045,38 @@ class TestCKWarningFixes:
         pkdt = build_pkdt(0, SPEED_RUN, interrupt=0xFEFF)
         assert struct.unpack('<IBBBBHH', pkdt)[5] == 0xFEFF
 
+    def test_defensive_combat_is_not_ignore_combat(self):
+        """TES4 Defensive Combat must NOT become TES5 Ignore Combat.
+
+        Both sit on bit 20 but mean opposite things:
+          TES4 Defensive Combat -> do not START fights, but DO fight back
+          TES5 Ignore Combat    -> take no part in combat at all
+
+        Mapping one onto the other told every Oblivion bodyguard to stand
+        still and be killed. CharacterGen's `CGGlenroyDefendEmperorAmbushA` —
+        the package whose whole job is defending the Emperor — carries the TES4
+        flag, so the converted Blades drew their swords and then watched the
+        assassins kill Renault unopposed.
+
+        Skyrim has no Defensive Combat equivalent and needs none: the
+        aggression tier decides whether an actor initiates, and everyone
+        retaliates when attacked. TES5's default IS TES4 Defensive Combat, so
+        the bit is dropped. 388 of 7,209 TES4 packages set it.
+        """
+        from tes5_import.pack_converter import (convert_flags,
+                                                T4_DEFENSIVE_COMBAT,
+                                                T5_IGNORE_COMBAT, T4_ALWAYS_RUN)
+        flags, _ = convert_flags(T4_DEFENSIVE_COMBAT, 6, True)
+        assert not (flags & T5_IGNORE_COMBAT), \
+            'Defensive Combat became Ignore Combat — bodyguards will not fight'
+        # The real CGGlenroyDefendEmperorAmbushA value (AlwaysRun|Defensive).
+        flags, speed = convert_flags(0x00402000, 6, True)
+        assert not (flags & T5_IGNORE_COMBAT)
+        assert flags & 0x00002000, 'AlwaysRun must still map to Preferred Speed'
+        # Unrelated flags on the same package are unaffected.
+        flags, _ = convert_flags(T4_ALWAYS_RUN, 6, True)
+        assert not (flags & T5_IGNORE_COMBAT)
+
     def test_spel_cast_type_fire_and_forget(self):
         from tes5_import.record_types.equipment import convert_SPEL
         rec = {'Signature': 'SPEL', 'FormID': '00001234', 'RecordFlags': '0',
@@ -3611,6 +3643,223 @@ class TestVanillaMgefDataSize:
         finally:
             magic_effects.VANILLA_MGEF_DATA[0x00012F03] = original
             magic_effects._cache.clear()
+
+
+class TestMgefConversion:
+    """MGEF is a CONVERTED record type, not an alias to a vanilla effect.
+
+    It used to be in SKIP_TYPES, with every effect on every SPEL/ENCH/ALCH/
+    INGR/SGST re-pointed at a vanilla Skyrim MGEF through a flat 4-char code
+    table.  A flat table cannot express an effect PARAMETERISED BY A FORMID
+    the source record carries, so all 33 summons and every bound weapon/armor
+    were dropped: 796 effects lost and 382 records gutted to zero-magnitude
+    filler across Oblivion.esm alone.
+    """
+
+    def test_mgef_is_dispatched_not_skipped(self):
+        from tes5_import.constants import IMPORT_DISPATCH, SKIP_TYPES
+        assert 'MGEF' not in SKIP_TYPES
+        assert 'MGEF' in IMPORT_DISPATCH
+
+    def test_every_source_effect_code_has_an_archetype(self):
+        """A code with no table entry silently becomes a Value Modifier.
+
+        Validated against the EXPORT, never against a plausible-looking name:
+        17 of the old alias table's 100 keys were codes no Oblivion or Nehrim
+        record uses, so the summons looked mapped and contributed nothing.
+        """
+        import glob
+        import re
+        from tes5_import.record_types.magic import EFFECT_ARCHETYPES
+
+        root = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), 'export')
+        codes = set()
+        for path in glob.glob(os.path.join(root, '*', 'MGEF.txt')):
+            with open(path, encoding='utf-8', errors='replace') as f:
+                codes |= set(re.findall(r'^EditorID=(\S+)', f.read(), re.M))
+        if not codes:
+            pytest.skip('no MGEF export available')
+
+        missing = sorted(codes - set(EFFECT_ARCHETYPES))
+        assert not missing, (
+            f'{len(missing)} source effect codes have no archetype and would '
+            f'default to Value Modifier: {" ".join(missing)}')
+
+        phantom = sorted(set(EFFECT_ARCHETYPES) - codes)
+        assert not phantom, (
+            f'{len(phantom)} table keys match no MGEF in any export — dead '
+            f'coverage that can never fire: {" ".join(phantom)}')
+
+    def test_data_is_a_full_152_byte_struct(self):
+        from tes5_import.record_types.magic import MGEF_DATA_SIZE, convert_MGEF
+        rec = {'FormID': '00001857', 'EditorID': 'BWSW', 'FULL': 'Bound Sword',
+               'DATA.Flags': '76562', 'DATA.School': '1',
+               'DATA.ResistValue': '4294967295', 'DATA.BaseCost': '1.0'}
+        data = _find_subrecord(convert_MGEF(rec), b'DATA')
+        assert len(data) == MGEF_DATA_SIZE
+
+    def test_assoc_item_only_written_for_archetypes_that_read_it(self):
+        """`wbMGEFAssocItemDecider` reads Assoc. Item for 10 archetypes only.
+
+        A creature FormID under a value-modifier archetype is meaningless, and
+        xEdit flags it — so it must be dropped rather than written blind.
+        """
+        from tes5_import.record_types import magic
+
+        magic.set_assoc_item_index({}, {0x01001234: 'CREA'})
+        # Summon Creature (18) reads it...
+        assert magic._resolve_assoc_item(
+            0x01001234, magic.A_SUMMON_CREATURE, magic.T4_USE_CREATURE) == 0x01001234
+        # ...a plain Value Modifier does not.
+        assert magic._resolve_assoc_item(
+            0x01001234, magic.A_VALUE_MODIFIER, magic.T4_USE_CREATURE) == 0
+
+    def test_summon_of_a_leveled_list_resolves_to_a_concrete_actor(self):
+        """Skyrim's Summon Creature takes an NPC_, never an LVLN.
+
+        Two Oblivion summons (Z004 Flesh Atronach, Z011 Wabba) name an LVLC,
+        which converts to an LVLN — a type the archetype rejects, so the
+        list's first entry stands in or the spell summons nothing.
+        """
+        from tes5_import.record_types import magic
+
+        magic.set_assoc_item_index({0x0100AAAA: 0x0100BBBB},
+                                   {0x0100AAAA: 'LVLC', 0x0100BBBB: 'CREA'})
+        assert magic._resolve_assoc_item(
+            0x0100AAAA, magic.A_SUMMON_CREATURE,
+            magic.T4_USE_CREATURE) == 0x0100BBBB
+
+    def test_counter_effect_count_matches_the_esce_array(self):
+        """DATA offset 20 must equal the ESCE count or the CK reads garbage."""
+        import struct as _s
+        from tes5_import.record_types import magic
+
+        magic.register_mgef_formids([
+            {'EditorID': 'DSPL', 'FormID': '00001234'},
+            {'EditorID': 'CUDI', 'FormID': '00001235'},
+        ])
+        rec = {'FormID': '00001863', 'EditorID': 'CALM', 'DATA.School': '3',
+               'DATA.Flags': '0', 'CounterEffects': '2',
+               'ESCE[0]': 'DSPL', 'ESCE[1]': 'CUDI'}
+        blob = magic.convert_MGEF(rec)
+        data = _find_subrecord(blob, b'DATA')
+        assert _s.unpack_from('<H', data, 20)[0] == blob.count(b'ESCE') == 2
+
+    def test_attribute_effects_get_a_per_actor_value_variant(self):
+        """One TES4 DGAT is Damage Strength on one spell, Damage Endurance on
+        the next — the AV lives in the ITEM's EFIT.  Skyrim moved it onto the
+        MGEF, so a single converted DGAT could only ever damage one stat.
+        """
+        import struct as _s
+        from tes5_import.record_types import magic
+
+        class _Writer:
+            def __init__(self):
+                self.fid = 0x01000000
+                self.records = []
+
+            def alloc_formid(self):
+                self.fid += 1
+                return self.fid
+
+            def add_record(self, rec_type, data):
+                self.records.append((rec_type, data))
+
+        writer = _Writer()
+        mgefs = [{'EditorID': 'DGAT', 'FormID': '00001863',
+                  'FULL': 'Damage Attribute', 'DATA.School': '2',
+                  'DATA.Flags': '0'}]
+        effects = [
+            {'EffectCount': '1', 'Effect[0].EFID': 'DGAT',
+             'Effect[0].ActorValue': '0'},    # Strength
+            {'EffectCount': '1', 'Effect[0].EFID': 'DGAT',
+             'Effect[0].ActorValue': '5'},    # Endurance
+        ]
+        assert magic.build_av_variants(mgefs, effects, writer) == 2
+
+        strength = magic.get_mgef_formid('DGAT', 0)
+        endurance = magic.get_mgef_formid('DGAT', 5)
+        assert strength and endurance and strength != endurance
+
+        avs = {}
+        for _, blob in writer.records:
+            data = _find_subrecord(blob, b'DATA')
+            avs[_s.unpack_from('<I', blob, 12)[0]] = \
+                _s.unpack_from('<i', data, 68)[0]
+        assert avs[strength] == magic.AV_CARRY_WEIGHT
+        assert avs[endurance] == magic.AV_HEALTH
+
+
+class TestEnchantedBookIsAScroll:
+    """A TES4 BOOK carrying an ENAM is a SCROLL, and Skyrim's BOOK has NO
+    field for an object effect.
+
+    Converting one to a BOOK produced a blank page that could never be cast —
+    503 of them across Oblivion, Nehrim and Morrowind_ob, the Scroll of
+    Icarian Flight among them.  Skyrim's record for this is SCRL, which
+    carries its effects directly rather than through an enchantment link.
+    """
+
+    def test_enchanted_book_converts_to_scrl_with_the_ench_effects(self):
+        from tes5_import.record_types import equipment, magic
+
+        magic.register_mgef_formids([{'EditorID': 'REHE',
+                                      'FormID': '00001234'}])
+        equipment.set_ench_index([{
+            'FormID': '000402B1', 'Signature': 'ENCH', 'ENIT.Cost': '350',
+            'EffectCount': '1', 'Effect[0].EFID': 'REHE',
+            'Effect[0].Type': 'Self', 'Effect[0].Magnitude': '25',
+            'Effect[0].Duration': '7', 'Effect[0].ActorValue': '-1',
+        }])
+        blob = equipment.convert_BOOK({
+            'FormID': '0018022C', 'EditorID': 'ScrollOfHealing',
+            'FULL': 'Scroll of Healing', 'ENAM': '000402B1',
+            'DATA.Flags': '1', 'DATA.Value': '119', 'DATA.Weight': '0.2',
+        })
+        assert blob[:4] == b'SCRL', 'an enchanted book must become a scroll'
+        # CastType 3 = Scroll, matching every vanilla SCRL.
+        assert struct.unpack_from('<I', _find_subrecord(blob, b'SPIT'), 16)[0] == 3
+        # The payload came from the ENCH, not from the (effect-less) book.
+        assert b'EFID' in blob
+
+    def test_plain_book_stays_a_book(self):
+        from tes5_import.record_types import equipment
+
+        equipment.set_ench_index([])
+        blob = equipment.convert_BOOK({
+            'FormID': '0018022D', 'EditorID': 'PlainBook',
+            'FULL': 'A Book', 'DATA.Value': '10', 'DATA.Weight': '1.0',
+        })
+        assert blob[:4] == b'BOOK'
+
+
+class TestEfitFieldOrder:
+    """TES5 EFIT is Magnitude, AREA, DURATION (xEdit wbEFIT).
+
+    The dump tool had the last two labelled the other way round, which made
+    every converted spell look like its duration and area were swapped.
+    Settled by census: all 427 vanilla ALCH effects write 0 at offset 4 and
+    30/60/300/720 at offset 8 — potion durations in seconds, and potions have
+    no area.
+    """
+
+    def test_writer_packs_area_before_duration(self):
+        from tes5_import.record_types import equipment, magic
+
+        magic.register_mgef_formids([{'EditorID': 'REHE',
+                                      'FormID': '00001234'}])
+        blob = equipment.convert_SPEL({
+            'FormID': '0000ABCD', 'EditorID': 'TestHeal',
+            'SPIT.Cost': '10', 'SPIT.Type': '0',
+            'EffectCount': '1', 'Effect[0].EFID': 'REHE',
+            'Effect[0].Magnitude': '25', 'Effect[0].Area': '3',
+            'Effect[0].Duration': '120', 'Effect[0].ActorValue': '-1',
+        })
+        efit = _find_subrecord(blob, b'EFIT')
+        assert struct.unpack_from('<f', efit, 0)[0] == pytest.approx(25.0)
+        assert struct.unpack_from('<I', efit, 4)[0] == 3      # Area
+        assert struct.unpack_from('<I', efit, 8)[0] == 120    # Duration
 
 
 class TestPlayGroupTargetRouting:

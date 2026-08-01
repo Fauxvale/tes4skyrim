@@ -92,6 +92,98 @@ def get_well_known_properties() -> dict:
     return _WELL_KNOWN_PROPERTIES
 
 
+# Record types an MGEF Assoc. Item can name, plus LVLC for summon indirection.
+_ASSOC_ITEM_SIGS = ('CREA', 'NPC_', 'WEAP', 'ARMO', 'CLOT', 'LIGH', 'LVLC')
+
+
+def _mgef_records_with_masters(by_type: dict, ctx) -> list:
+    """Every MGEF this plugin can reference: its own, plus its masters'.
+
+    A dependent plugin normally defines no magic effects and points its items
+    at the master's — so the effect index must include them, exactly as the
+    outfit index includes the master's wardrobe.  The plugin's own records are
+    appended LAST so an override of a master effect wins.
+    """
+    own = by_type.get('MGEF', [])
+    if not ctx or not getattr(ctx, 'master_export', None):
+        return own
+    from_master = [rec for rec in ctx.master_export.values()
+                   if rec.get('Signature') == 'MGEF']
+    own_codes = {rec.get('EditorID') for rec in own}
+    return [r for r in from_master
+            if r.get('EditorID') not in own_codes] + own
+
+
+def _build_assoc_item_index(by_type: dict, ctx=None) -> tuple:
+    """(lvlc_first_entry, formid_signature) for MGEF Assoc. Item resolution.
+
+    Skyrim's magic-effect archetypes are typed about what their Assoc. Item may
+    be (`wbMGEFAssocItemDecider`): Summon Creature takes an NPC_, Bound Weapon
+    a WEAP or ARMO.  Oblivion's MGEF just stores a FormID and says which KIND
+    it is in its flags, so the converter has to look the target up to know
+    whether it survives the type check.
+
+    Two summon effects in Oblivion point at an LVLC (leveled creature list),
+    which converts to an LVLN — a type Summon Creature does NOT accept.  Their
+    first list entry stands in so the spell still summons something.
+
+    The masters' records are indexed too: a dependent plugin's effects name
+    the master's creatures, not its own.
+
+    Returns ({lvlc out-FormID: first entry out-FormID}, {out-FormID: TES4 sig}).
+    """
+    sigs = {}
+    lvlc_recs = []
+
+    sources = []
+    if ctx and getattr(ctx, 'master_export', None):
+        sources.append(r for r in ctx.master_export.values()
+                       if r.get('Signature') in _ASSOC_ITEM_SIGS)
+    # The plugin's own records go LAST so an override wins the FormID.
+    sources.append(r for sig in _ASSOC_ITEM_SIGS for r in by_type.get(sig, []))
+
+    for source in sources:
+        for rec in source:
+            fid = get_formid(rec, 'FormID')
+            if not fid:
+                continue
+            sig = rec.get('Signature')
+            sigs[fid] = sig
+            if sig == 'LVLC':
+                lvlc_recs.append((fid, rec))
+
+    lvlc_first = {}
+    for fid, rec in lvlc_recs:
+        # Lowest-level entry: the one an unleveled summon would produce first.
+        best = None
+        for i in range(get_int(rec, 'EntryCount')):
+            entry = get_formid(rec, f'Entry[{i}].FormID')
+            if not entry:
+                continue
+            level = get_int(rec, f'Entry[{i}].Level', 1)
+            if best is None or level < best[0]:
+                best = (level, entry)
+        if best:
+            lvlc_first[fid] = best[1]
+
+    # A leveled list may nest another leveled list; follow the chain so the
+    # answer is always a concrete creature, never an LVLN the archetype
+    # rejects.  Bounded by the list count so a self-referential list (which
+    # Oblivion permits and the CS never validated) cannot spin.
+    for fid in list(lvlc_first):
+        target = lvlc_first[fid]
+        for _ in range(len(lvlc_first)):
+            if sigs.get(target) != 'LVLC':
+                break
+            nxt = lvlc_first.get(target)
+            if not nxt or nxt == target:
+                break
+            target = nxt
+        lvlc_first[fid] = target if sigs.get(target) != 'LVLC' else 0
+
+    return lvlc_first, sigs
+
+
 def _create_tes4_special_records(writer: PluginWriter):
     """Create globals and factions needed by converted Papyrus scripts.
 
@@ -632,6 +724,57 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     print(f"  Quest scripts: planned {n_qust_scripts} SCRI attachments for QUST VMADs")
     _step_done('object/quest script plans')
 
+    # --- Phase 0b2: Magic effects -----------------------------------------
+    # MGEF is now a converted record type, so every SPEL/ENCH/ALCH/INGR/SGST
+    # effect points at an effect of OUR OWN rather than at a vanilla Skyrim
+    # lookalike.  Three things have to exist before those records convert:
+    #
+    #   * {effect code -> our MGEF FormID}, so an effect can find its record
+    #     and a counter effect (ESCE) can resolve a 4-char code to a FormID;
+    #   * the AssocItem index — Skyrim's Summon Creature takes an NPC_ and
+    #     Bound Weapon a WEAP/ARMO, so the converter has to know what each
+    #     TES4 AssocItem FormID actually points at (and resolve an LVLC summon
+    #     to a concrete creature, which the archetype cannot reference);
+    #   * the per-actor-value and per-script MGEF variants, because Oblivion
+    #     parameterises one effect record by data the ITEM carries (Damage
+    #     Attribute's attribute, a script effect's script) while Skyrim keeps
+    #     both on the MGEF.
+    from .record_types.magic import (build_av_variants, build_seff_variants,
+                                     register_mgef_formids,
+                                     set_assoc_item_index)
+    from .object_scripts import build_magic_effect_script_plan
+
+    # A DEPENDENT plugin usually defines no MGEF at all — Morrowind_ob.esm has
+    # none, yet 109 of its items carry script effects — so the effect table has
+    # to come from the MASTER's export the same way the wardrobe index does
+    # (see outfits.load_item_index).  Without it every effect on every item in
+    # such a plugin resolves to nothing and the item converts to filler.
+    _mgefs = _mgef_records_with_masters(by_type, ctx)
+    register_mgef_formids(_mgefs)
+    set_assoc_item_index(*_build_assoc_item_index(by_type, ctx))
+
+    _effect_recs = [r for sig in ('SPEL', 'ENCH', 'ALCH', 'INGR', 'SGST')
+                    for r in by_type.get(sig, [])]
+    n_av = build_av_variants(_mgefs, _effect_recs, writer)
+    n_mescript = build_magic_effect_script_plan(by_type, xref, fid_to_edid)
+    n_seff = build_seff_variants(_mgefs, _effect_recs, writer,
+                                 {f'{k:08X}': v for k, v in fid_to_edid.items()})
+    # An enchanted TES4 BOOK is a scroll, and Skyrim's SCRL carries its effects
+    # directly rather than through an enchantment link — so convert_BOOK needs
+    # to read the ENCH its ENAM names.  The masters' enchantments are indexed
+    # too: a dependent plugin's scrolls usually name one of theirs.
+    from .record_types.equipment import set_ench_index
+    _enchs = list(by_type.get('ENCH', []))
+    if ctx and getattr(ctx, 'master_export', None):
+        _enchs = [r for r in ctx.master_export.values()
+                  if r.get('Signature') == 'ENCH'] + _enchs
+    set_ench_index(_enchs)
+
+    print(f"  Magic effects: {len(_mgefs)} MGEF + {n_av} per-actor-value "
+          f"variants + {n_seff} script variants ({n_mescript} effect scripts); "
+          f"{len(_enchs)} ENCH indexed for enchanted-book scrolls")
+    _step_done('magic effect plans')
+
     # --- Phase 0c: Create vendor factions for merchant NPCs, plus the
     # trainer faction + per-trainer CLAS clones for the training service ---
     if not ctx:
@@ -820,7 +963,16 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                     record_bytes = converter(rec, writer=writer)
                 else:
                     record_bytes = converter(rec)
-            writer.add_record(target_sig, record_bytes)
+            # A converter may retarget PER RECORD, not just per signature:
+            # a TES4 BOOK carrying an enchantment is a scroll, and Skyrim's
+            # BOOK has no field for an object effect, so convert_BOOK emits a
+            # SCRL for those and a BOOK for the rest.  The packed record's own
+            # 4-byte signature is the authority on which group it belongs in —
+            # filing a SCRL under the BOOK group makes the engine read it as a
+            # BOOK and the scroll silently reverts to unusable paper.
+            writer.add_record(record_bytes[:4].decode('ascii', 'replace')
+                              if record_bytes else target_sig,
+                              record_bytes)
             converted += 1
         except Exception as e:
             edid = get_str(rec, 'EditorID', '?')

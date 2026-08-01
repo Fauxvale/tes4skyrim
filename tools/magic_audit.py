@@ -29,6 +29,11 @@ from tes5_import.skyrim_overrides import (  # noqa: E402
     MGEF_AV_CODE_TO_SKYRIM,
     MGEF_CODE_TO_SKYRIM,
 )
+from tes5_import.record_types.magic import (  # noqa: E402
+    ARCHETYPE_ASSOC_KIND,
+    EFFECT_ARCHETYPES,
+    get_archetype,
+)
 from tes5_import.vanilla_mgef_data import VANILLA_MGEF_DATA  # noqa: E402
 
 EFFECT_RECORD_TYPES = ('SPEL', 'ENCH', 'ALCH', 'INGR', 'SGST', 'LVSP')
@@ -66,6 +71,18 @@ MGEF_FLAGS = {
 SCHOOLS = {0: 'Alteration', 1: 'Conjuration', 2: 'Destruction',
            3: 'Illusion', 4: 'Mysticism', 5: 'Restoration'}
 
+# TES5 MGEF archetypes (xEdit wbDefinitionsTES5.pas wbMGEFType) — only the ones
+# this converter emits are named; the rest print as their number.
+ARCHETYPE_NAMES = {
+    0: 'ValueModifier', 1: 'Script', 2: 'Dispel', 3: 'CureDisease',
+    4: 'Absorb', 5: 'DualValueModifier', 6: 'Calm', 7: 'Demoralize',
+    8: 'Frenzy', 10: 'CommandSummoned', 11: 'Invisibility', 12: 'Light',
+    15: 'Lock', 16: 'Open', 17: 'BoundWeapon', 18: 'SummonCreature',
+    19: 'DetectLife', 20: 'Telekinesis', 21: 'Paralysis', 22: 'Reanimate',
+    23: 'SoulTrap', 24: 'TurnUndead', 27: 'CureParalysis', 29: 'CurePoison',
+    34: 'PeakValueModifier', 35: 'Cloak', 38: 'Rally',
+}
+
 
 def _load(export_dir, sig):
     path = os.path.join(export_dir, f'{sig}.txt')
@@ -87,13 +104,51 @@ def _fid(rec, key):
 
 
 def resolve(code, av=-1):
-    """Mirror tes5_import.record_types.equipment._resolve_mgef."""
+    """Non-zero when the converter has an MGEF for this effect.
+
+    Since MGEF became a converted record type the plugin emits its OWN magic
+    effect for every code its export defines, so coverage is "the archetype
+    table names this code" — the flat vanilla-alias table only still answers
+    for a plugin whose MGEFs were never exported.  (It used to be the only
+    path, which is why 71 of 145 Oblivion effects were dropped.)
+    """
+    if code in EFFECT_ARCHETYPES:
+        return 1
     per_av = MGEF_AV_CODE_TO_SKYRIM.get(code)
     if per_av is not None:
         fid = per_av.get(av)
         if fid:
             return fid
     return MGEF_CODE_TO_SKYRIM.get(code, 0)
+
+
+def _all_export_codes():
+    """Every effect code ANY export defines — the real test for a dead key."""
+    root = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), 'export')
+    codes = set()
+    if not os.path.isdir(root):
+        return codes
+    for name in os.listdir(root):
+        codes |= {_get(r, 'EditorID')
+                  for r in _load(os.path.join(root, name), 'MGEF')}
+    codes.discard('')
+    return codes
+
+
+def phantom_keys(export_dir):
+    """Table keys matching no MGEF in the export — coverage that cannot fire.
+
+    17 of the old alias table's 100 entries were codes no Oblivion or Nehrim
+    record uses (BACT, SMFL, TNUN...), so the summons looked mapped while the
+    real codes fell through to 0.
+    """
+    src = {_get(r, 'EditorID') for r in _load(export_dir, 'MGEF')}
+    if not src:
+        return set(), set()
+    tables = set(EFFECT_ARCHETYPES) | set(MGEF_CODE_TO_SKYRIM) \
+        | set(MGEF_AV_CODE_TO_SKYRIM)
+    return tables - src, src - set(EFFECT_ARCHETYPES)
 
 
 def audit_mgef(export_dir):
@@ -125,6 +180,14 @@ def audit_mgef(export_dir):
             'base_cost': float(_get(rec, 'DATA.BaseCost', '0') or 0),
             'mapped': resolve(code),
             'per_av': code in MGEF_AV_CODE_TO_SKYRIM,
+            'archetype': get_archetype(code) if code in EFFECT_ARCHETYPES else None,
+            # An AssocItem the chosen archetype does not read is DISCARDED:
+            # wbMGEFAssocItemDecider only reads it for Light/Bound/Summon/
+            # Guide/Cloak/Werewolf/EnhanceWeapon/Hazard/PeakMod.
+            'assoc_kept': bool(
+                _fid(rec, 'DATA.AssocItem')
+                and get_archetype(code) in ARCHETYPE_ASSOC_KIND
+                and code in EFFECT_ARCHETYPES),
         })
     return rows
 
@@ -188,42 +251,55 @@ def main():
 
     mapped = [r for r in rows if r['mapped'] or r['per_av']]
     unmapped = [r for r in rows if not (r['mapped'] or r['per_av'])]
-    distinct_targets = {r['mapped'] for r in rows if r['mapped']}
+    own = [r for r in rows if r['archetype'] is not None]
 
     print(f'=== MGEF coverage: {args.export_dir} ===')
     print(f'  source MGEF records          : {len(rows)}')
-    print(f'  mapped to a vanilla Skyrim MGEF: {len(mapped)}')
+    print(f'  converted as our OWN MGEF    : {len(own)}')
+    print(f'  falls back to a vanilla alias: {len(mapped) - len(own)}')
     print(f'  unmapped (effect DROPPED)    : {len(unmapped)}')
-    print(f'  distinct Skyrim targets used : {len(distinct_targets)}'
-          f'  ({len(rows)} source effects collapse onto {len(distinct_targets)})')
     print(f'  vanilla DATA blobs available : {len(VANILLA_MGEF_DATA)}')
 
-    # Assets lost: everything the source MGEF carries that has no destination.
+    # A key no plugin uses is dead coverage.  Judge that across ALL exports,
+    # not this one: the table is shared, and Nehrim authors 16 effect codes
+    # (BA01-BA10, BW09/BW10, DISE, DUMY, RSWD, Z020) that Oblivion never uses.
+    phantom, no_archetype = phantom_keys(args.export_dir)
+    global_phantom = phantom - _all_export_codes()
+    print(f'  keys unused by THIS plugin   : {len(phantom)}')
+    print(f'  PHANTOM keys (no export uses them): {len(global_phantom)}'
+          + (f'  {" ".join(sorted(global_phantom))}' if global_phantom else ''))
+    if no_archetype:
+        print(f'  codes with NO archetype entry: {len(no_archetype)}'
+              f'  {" ".join(sorted(no_archetype))}')
+
+    # Per-archetype breakdown: what the source effects actually became.
+    by_arch = Counter(r['archetype'] for r in own)
+    print('\n=== archetypes emitted ===')
+    for arch, n in sorted(by_arch.items()):
+        codes = sorted(r['code'] for r in own if r['archetype'] == arch)
+        print(f'  {arch:2d} {ARCHETYPE_NAMES.get(arch, "?"):22s} {n:3d}  '
+              f'{" ".join(codes[:10])}{" ..." if len(codes) > 10 else ""}')
+
+    # Source data and whether it now has a destination.
     with_model = [r for r in rows if r['model']]
     with_shader = [r for r in rows if r['shader'] or r['ench_shader']]
     with_snd = [r for r in rows if r['cast_snd'] or r['bolt_snd']
                 or r['hit_snd'] or r['area_snd']]
     with_assoc = [r for r in rows if r['assoc']]
+    kept_assoc = [r for r in rows if r['assoc_kept']]
     with_light = [r for r in rows if r['light']]
     with_counters = [r for r in rows if r['counters']]
-    print('\n=== source data with no destination (per MGEF) ===')
-    print(f'  Model.MODL (cast art)        : {len(with_model)}')
-    print(f'  EffectShader/EnchantEffect   : {len(with_shader)}')
-    print(f'  sounds (cast/bolt/hit/area)  : {len(with_snd)}')
-    print(f'  AssocItem (summon/bound tgt) : {len(with_assoc)}')
-    print(f'  Light                        : {len(with_light)}')
-    print(f'  counter effects (ESCE)       : {len(with_counters)}')
-
-    # Collapse pressure: which Skyrim MGEF absorbs the most source effects.
-    collapse = Counter(r['mapped'] for r in rows if r['mapped'])
-    print('\n=== worst collapses (source effects -> one Skyrim MGEF) ===')
-    vanilla_name = {f: e[0] for f, e in VANILLA_MGEF_DATA.items()}
-    for fid, n in collapse.most_common(10):
-        if n < 2:
-            continue
-        codes = [r['code'] for r in rows if r['mapped'] == fid]
-        print(f'  {vanilla_name.get(fid, hex(fid)):32s} <- {n:2d}  '
-              f'{" ".join(sorted(codes)[:12])}')
+    print('\n=== per-MGEF source data ===')
+    print(f'  Model.MODL (cast art)        : {len(with_model):3d}  '
+          f'DROPPED (needs the ARTO writer, Phase 2)')
+    print(f'  EffectShader/EnchantEffect   : {len(with_shader):3d}  '
+          f'converted (EFSH -> Hit/Enchant Shader)')
+    print(f'  sounds (cast/bolt/hit/area)  : {len(with_snd):3d}  '
+          f'DROPPED (needs SNDD, Phase 2)')
+    print(f'  AssocItem (summon/bound tgt) : {len(with_assoc):3d}  '
+          f'{len(kept_assoc)} kept (the rest name an archetype that ignores it)')
+    print(f'  Light                        : {len(with_light):3d}  converted')
+    print(f'  counter effects (ESCE)       : {len(with_counters):3d}  converted')
 
     if unmapped:
         print(f'\n=== unmapped MGEFs ({len(unmapped)}) — effects silently dropped ===')

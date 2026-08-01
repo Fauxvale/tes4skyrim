@@ -1,0 +1,932 @@
+"""MGEF — Magic Effect.
+
+Oblivion's magic system is a fixed table of ~145 engine-known effect codes;
+Skyrim's is open, and every effect is an authored MGEF record whose *Archtype*
+selects one of 47 engine classes (`ValueModifierEffect`, `SummonCreatureEffect`,
+`BoundItemEffect`, `OpenEffect`, ... — all present as RTTI classes with real
+vtables in SkyrimSE.exe, including the four archetypes vanilla Skyrim.esm never
+uses: 2 Dispel, 15 Lock, 16 Open, 24 Turn Undead).
+
+Before this module MGEF was in SKIP_TYPES and every effect on every
+SPEL/ENCH/ALCH/INGR/SGST was re-pointed at a vanilla Skyrim MGEF through a flat
+4-char code table.  That works for value modifiers (Restore Health →
+AlchRestoreHealth) and fails completely for effects parameterised by a FormID
+the source record carries — all 33 summons, the bound weapons/armor — which
+were dropped, gutting 382 records into zero-magnitude filler.
+
+Emitting real MGEFs makes those convertible: the archetype carries the
+behaviour and `Assoc. Item` carries the converted CREA/WEAP/ARMO.
+
+Layout: TES5 MGEF DATA is 152 bytes, FormVersion 44.  Field offsets from
+xEdit `wbDefinitionsTES5.pas` wbMGEFData, byte-verified against
+references/Skyrim.esm/MGEF.txt (950 records).
+
+TES5 record order: EDID VMAD FULL MDOB KSIZ/KWDA DATA ESCE* SNDD DNAM CTDA
+"""
+
+import struct
+
+from ..text_reader import get_float, get_formid, get_int, get_str
+from ..writer import (
+    pack_formid_subrecord,
+    pack_record,
+    pack_string_subrecord,
+    pack_subrecord,
+)
+
+# --- TES5 MGEF DATA offsets (152 bytes) -----------------------------------
+MGEF_DATA_SIZE = 152
+
+_O_FLAGS = 0
+_O_BASE_COST = 4
+_O_ASSOC_ITEM = 8
+_O_MAGIC_SKILL = 12
+_O_RESIST_VALUE = 16
+_O_COUNTER_COUNT = 20          # u16 + 2 unused
+_O_CASTING_LIGHT = 24
+_O_TAPER_WEIGHT = 28
+_O_HIT_SHADER = 32
+_O_ENCHANT_SHADER = 36
+_O_MIN_SKILL = 40
+_O_SPELLMAKING_AREA = 44
+_O_SPELLMAKING_TIME = 48
+_O_TAPER_CURVE = 52
+_O_TAPER_DURATION = 56
+_O_SECOND_AV_WEIGHT = 60
+_O_ARCHETYPE = 64
+_O_ACTOR_VALUE = 68
+_O_PROJECTILE = 72
+_O_EXPLOSION = 76
+_O_CASTING_TYPE = 80
+_O_DELIVERY = 84
+_O_SECOND_AV = 88
+_O_CASTING_ART = 92
+_O_HIT_EFFECT_ART = 96
+_O_IMPACT_DATA = 100
+_O_SKILL_USAGE_MULT = 104
+_O_DUAL_CAST_ART = 108
+_O_DUAL_CAST_SCALE = 112
+_O_ENCHANT_ART = 116
+_O_HIT_VISUALS = 120
+_O_ENCHANT_VISUALS = 124
+_O_EQUIP_ABILITY = 128
+_O_IMAGE_SPACE_MOD = 132
+_O_PERK_TO_APPLY = 136
+_O_CASTING_SOUND_LEVEL = 140
+_O_AI_SCORE = 144
+_O_AI_DELAY = 148
+
+# --- TES5 MGEF DATA.Flags -------------------------------------------------
+F_HOSTILE = 0x00000001
+F_RECOVER = 0x00000002
+F_DETRIMENTAL = 0x00000004
+F_NO_HIT_EVENT = 0x00000010
+F_NO_DURATION = 0x00000200
+F_NO_MAGNITUDE = 0x00000400
+F_NO_AREA = 0x00000800
+F_FX_PERSIST = 0x00001000
+F_HIDE_IN_UI = 0x00008000
+F_NO_RECAST = 0x00020000
+F_POWER_AFFECTS_MAGNITUDE = 0x00200000
+F_POWER_AFFECTS_DURATION = 0x00400000
+F_PAINLESS = 0x04000000
+F_NO_HIT_EFFECT = 0x08000000
+F_NO_DEATH_DISPEL = 0x10000000
+
+# --- TES4 MGEF DATA.Flags (tes4_export/record_types/equipment.py) ---------
+T4_HOSTILE = 0x00000001
+T4_RECOVER = 0x00000002
+T4_DETRIMENTAL = 0x00000004
+T4_MAGNITUDE_PERCENT = 0x00000008
+T4_SELF = 0x00000010
+T4_TOUCH = 0x00000020
+T4_TARGET = 0x00000040
+T4_NO_DURATION = 0x00000080
+T4_NO_MAGNITUDE = 0x00000100
+T4_NO_AREA = 0x00000200
+T4_FX_PERSIST = 0x00000400
+T4_SPELLMAKING = 0x00000800
+T4_ENCHANTING = 0x00001000
+T4_NO_INGREDIENT = 0x00002000
+T4_USE_WEAPON = 0x00010000
+T4_USE_ARMOR = 0x00020000
+T4_USE_CREATURE = 0x00040000
+T4_USE_SKILL = 0x00080000
+T4_USE_ATTRIBUTE = 0x00100000
+T4_USE_ACTOR_VALUE = 0x01000000
+T4_SPRAY_PROJECTILE = 0x02000000
+T4_BOLT_PROJECTILE = 0x04000000
+T4_NO_HIT_EFFECT = 0x08000000
+T4_PERSIST_ON_DEATH = 0x10000000
+T4_FOG_PROJECTILE = 0x40000000
+
+# --- TES5 archetypes we emit ---------------------------------------------
+A_VALUE_MODIFIER = 0
+A_SCRIPT = 1
+A_DISPEL = 2
+A_CURE_DISEASE = 3
+A_ABSORB = 4
+A_DUAL_VALUE_MODIFIER = 5
+A_CALM = 6
+A_DEMORALIZE = 7
+A_FRENZY = 8
+A_COMMAND_SUMMONED = 10
+A_INVISIBILITY = 11
+A_LIGHT = 12
+A_LOCK = 15
+A_OPEN = 16
+A_BOUND_WEAPON = 17
+A_SUMMON_CREATURE = 18
+A_DETECT_LIFE = 19
+A_TELEKINESIS = 20
+A_PARALYSIS = 21
+A_REANIMATE = 22
+A_SOUL_TRAP = 23
+A_TURN_UNDEAD = 24
+A_CURE_PARALYSIS = 27
+A_CURE_POISON = 29
+A_PEAK_VALUE_MODIFIER = 34
+A_CLOAK = 35
+A_RALLY = 38
+
+# Archetypes whose Assoc. Item the engine reads (wbMGEFAssocItemDecider).
+# Writing a FormID under any OTHER archetype is meaningless, and xEdit flags
+# it, so the field is zeroed unless the archetype is in this map.  The value
+# is the record type the engine expects there.
+ARCHETYPE_ASSOC_KIND = {
+    A_LIGHT: 'LIGH',
+    A_BOUND_WEAPON: 'ITEM',        # WEAP or ARMO
+    A_SUMMON_CREATURE: 'NPC_',
+    25: 'HAZD',                    # Guide
+    A_PEAK_VALUE_MODIFIER: 'KYWD',
+    A_CLOAK: 'SPEL',
+    36: 'RACE',                    # Werewolf
+    39: 'ENCH',                    # Enhance Weapon
+    40: 'HAZD',                    # Spawn Hazard
+    46: 'RACE',                    # Vampire Lord
+}
+
+# --- TES5 actor values (xEdit wbActorValueEnum) --------------------------
+AV_NONE = -1
+AV_ONE_HANDED = 6
+AV_TWO_HANDED = 7
+AV_ARCHERY = 8
+AV_BLOCK = 9
+AV_SMITHING = 10
+AV_HEAVY_ARMOR = 11
+AV_LIGHT_ARMOR = 12
+AV_PICKPOCKET = 13
+AV_LOCKPICKING = 14
+AV_SNEAK = 15
+AV_ALCHEMY = 16
+AV_SPEECH = 17
+AV_ALTERATION = 18
+AV_CONJURATION = 19
+AV_DESTRUCTION = 20
+AV_ILLUSION = 21
+AV_RESTORATION = 22
+AV_ENCHANTING = 23
+AV_HEALTH = 24
+AV_MAGICKA = 25
+AV_STAMINA = 26
+AV_HEAL_RATE = 27
+AV_MAGICKA_RATE = 28
+AV_STAMINA_RATE = 29
+AV_SPEED_MULT = 30
+AV_CARRY_WEIGHT = 32
+AV_CRITICAL_CHANCE = 33
+AV_MELEE_DAMAGE = 34
+AV_UNARMED_DAMAGE = 35
+AV_DAMAGE_RESIST = 39
+AV_POISON_RESIST = 40
+AV_RESIST_FIRE = 41
+AV_RESIST_SHOCK = 42
+AV_RESIST_FROST = 43
+AV_RESIST_MAGIC = 44
+AV_RESIST_DISEASE = 45
+AV_PARALYSIS = 53
+AV_INVISIBILITY = 54
+AV_NIGHT_EYE = 55
+AV_DETECT_LIFE_RANGE = 56
+AV_WATER_BREATHING = 57
+AV_WATER_WALKING = 58
+
+# TES4 magic school (DATA.School) → TES5 skill actor value.
+# Mysticism has no Skyrim counterpart; Oblivion's mysticism effects (Dispel,
+# Detect Life, Soul Trap, Telekinesis, Reflect, Spell Absorption) are split in
+# Skyrim between Alteration and Conjuration.  Alteration is the closer home for
+# the majority (Detect Life and Telekinesis are literally Alteration spells in
+# Skyrim), so the school folds there and the handful that belong elsewhere are
+# overridden per-code in EFFECT_ARCHETYPES below.
+SCHOOL_TO_AV = {
+    0: AV_ALTERATION,
+    1: AV_CONJURATION,
+    2: AV_DESTRUCTION,
+    3: AV_ILLUSION,
+    4: AV_ALTERATION,     # Mysticism → Alteration
+    5: AV_RESTORATION,
+}
+
+# TES4 attribute index (EFIT ActorValue when UseAttribute is set) → TES5 AV.
+# Oblivion's eight attributes have no direct Skyrim analogue; each maps to the
+# derived stat it governed.  Strength drove carry weight and melee damage;
+# Intelligence magicka; Willpower magicka regen; Agility/Speed stamina and
+# movement; Endurance health; Personality barter (→ Speech); Luck crit.
+ATTRIBUTE_TO_AV = {
+    0: AV_CARRY_WEIGHT,    # Strength
+    1: AV_MAGICKA,         # Intelligence
+    2: AV_MAGICKA_RATE,    # Willpower
+    3: AV_STAMINA,         # Agility
+    4: AV_SPEED_MULT,      # Speed
+    5: AV_HEALTH,          # Endurance
+    6: AV_SPEECH,          # Personality
+    7: AV_CRITICAL_CHANCE,  # Luck
+}
+
+# TES4 skill index (12..32, EFIT ActorValue when UseSkill is set) → TES5 AV.
+SKILL_TO_AV = {
+    12: AV_SMITHING,       # Armorer
+    13: AV_STAMINA,        # Athletics (no Skyrim skill)
+    14: AV_ONE_HANDED,     # Blade
+    15: AV_BLOCK,          # Block
+    16: AV_TWO_HANDED,     # Blunt
+    17: AV_UNARMED_DAMAGE,  # Hand to Hand
+    18: AV_HEAVY_ARMOR,    # Heavy Armor
+    19: AV_ALCHEMY,        # Alchemy
+    20: AV_ALTERATION,     # Alteration
+    21: AV_CONJURATION,    # Conjuration
+    22: AV_DESTRUCTION,    # Destruction
+    23: AV_ILLUSION,       # Illusion
+    24: AV_ALTERATION,     # Mysticism → Alteration
+    25: AV_RESTORATION,    # Restoration
+    26: AV_STAMINA,        # Acrobatics (no Skyrim skill)
+    27: AV_LIGHT_ARMOR,    # Light Armor
+    28: AV_ARCHERY,        # Marksman
+    29: AV_SPEECH,         # Mercantile
+    30: AV_LOCKPICKING,    # Security
+    31: AV_SNEAK,          # Sneak
+    32: AV_SPEECH,         # Speechcraft
+}
+
+# TES4 ResistValue is an Oblivion actor-value index naming the resistance that
+# opposes this effect.  Only the handful Skyrim also has are meaningful.
+TES4_RESIST_AV_TO_TES5 = {
+    61: AV_RESIST_FIRE,      # ResistFire
+    62: AV_RESIST_FROST,     # ResistFrost
+    63: AV_RESIST_DISEASE,   # ResistDisease
+    64: AV_RESIST_MAGIC,     # ResistMagic
+    66: AV_PARALYSIS,        # ResistParalysis → Paralysis AV
+    67: AV_POISON_RESIST,    # ResistPoison
+    68: AV_RESIST_SHOCK,     # ResistShock
+}
+
+
+# ---------------------------------------------------------------------------
+# TES4 effect code → (archetype, actor value)
+#
+# `None` for the actor value means "derive it from the effect's own EFIT
+# ActorValue" (the attribute/skill-targeted families) — resolved per-effect in
+# resolve_actor_value(), because the SAME MGEF (e.g. DGAT Damage Attribute) is
+# used with a different attribute by every spell that carries it.
+#
+# EVERY key here is validated against export/*/MGEF.txt by
+# tests/test_import.py::TestMgefArchetypeTable — a plausible 4-char code that
+# no Oblivion or Nehrim record uses is a bug, not coverage (17 of the old
+# vanilla-alias table's 100 entries were exactly that).
+# ---------------------------------------------------------------------------
+DERIVE_AV = 'derive'
+
+EFFECT_ARCHETYPES = {
+    # -- Summons: AssocItem is the creature ---------------------------------
+    # Z001-Z020 plus the named daedra/undead codes.  All carry UseCreature and
+    # an AssocItem resolving to a CREA (33), NPC_ (4) or LVLC (2).
+    **{code: (A_SUMMON_CREATURE, AV_NONE) for code in (
+        'Z001', 'Z002', 'Z003', 'Z004', 'Z005', 'Z006', 'Z007', 'Z008',
+        'Z009', 'Z010', 'Z011', 'Z012', 'Z013', 'Z014', 'Z015', 'Z016',
+        'Z017', 'Z018', 'Z019', 'Z020',
+        'ZCLA', 'ZDAE', 'ZDRE', 'ZDRL', 'ZFIA', 'ZFRA', 'ZGHO', 'ZHDZ',
+        'ZLIC', 'ZSCA', 'ZSKA', 'ZSKC', 'ZSKE', 'ZSKH', 'ZSPD', 'ZSTA',
+        'ZWRA', 'ZWRL', 'ZXIV', 'ZZOM',
+    )},
+
+    # -- Bound weapons and armor: AssocItem is the WEAP/ARMO ----------------
+    # Archetype 17 covers both (wbMGEFAssocItemDecider accepts [WEAP, ARMO]);
+    # the engine equips whatever the item is for the effect's duration.
+    **{code: (A_BOUND_WEAPON, AV_NONE) for code in (
+        'BWAX', 'BWBO', 'BWDA', 'BWMA', 'BWSW',
+        'BW01', 'BW02', 'BW03', 'BW04', 'BW05', 'BW06', 'BW07', 'BW08',
+        'BW09', 'BW10',
+        'BABO', 'BACU', 'BAGA', 'BAGR', 'BAHE', 'BASH',
+        'BA01', 'BA02', 'BA03', 'BA04', 'BA05', 'BA06', 'BA07', 'BA08',
+        'BA09', 'BA10',
+        'MYHL', 'MYTH',
+    )},
+
+    # -- Alteration ---------------------------------------------------------
+    'BRDN': (A_VALUE_MODIFIER, AV_CARRY_WEIGHT),     # Burden (detrimental)
+    'FTHR': (A_VALUE_MODIFIER, AV_CARRY_WEIGHT),     # Feather
+    'FISH': (A_CLOAK, AV_NONE),                      # Fire Shield
+    'FRSH': (A_CLOAK, AV_NONE),                      # Frost Shield
+    'LISH': (A_CLOAK, AV_NONE),                      # Shock Shield
+    'SHLD': (A_VALUE_MODIFIER, AV_DAMAGE_RESIST),    # Shield
+    'LOCK': (A_LOCK, AV_NONE),
+    'OPEN': (A_OPEN, AV_NONE),
+    'WABR': (A_PEAK_VALUE_MODIFIER, AV_WATER_BREATHING),
+    'WAWA': (A_PEAK_VALUE_MODIFIER, AV_WATER_WALKING),
+
+    # -- Conjuration --------------------------------------------------------
+    'REAN': (A_REANIMATE, AV_NONE),
+    'TURN': (A_TURN_UNDEAD, AV_NONE),
+
+    # -- Destruction: damage / drain ----------------------------------------
+    # Damage is a one-shot subtraction (Value Modifier); Drain is a temporary
+    # reduction that restores when the effect ends — Skyrim expresses that as
+    # Peak Value Modifier, which tracks and reverses its own contribution.
+    'DGHE': (A_VALUE_MODIFIER, AV_HEALTH),
+    'DGFA': (A_VALUE_MODIFIER, AV_STAMINA),
+    'DGSP': (A_VALUE_MODIFIER, AV_MAGICKA),
+    'DGAT': (A_VALUE_MODIFIER, DERIVE_AV),
+    'DRHE': (A_PEAK_VALUE_MODIFIER, AV_HEALTH),
+    'DRFA': (A_PEAK_VALUE_MODIFIER, AV_STAMINA),
+    'DRSP': (A_PEAK_VALUE_MODIFIER, AV_MAGICKA),
+    'DRAT': (A_PEAK_VALUE_MODIFIER, DERIVE_AV),
+    'DRSK': (A_PEAK_VALUE_MODIFIER, DERIVE_AV),
+    'FIDG': (A_VALUE_MODIFIER, AV_HEALTH),
+    'FRDG': (A_VALUE_MODIFIER, AV_HEALTH),
+    'SHDG': (A_VALUE_MODIFIER, AV_HEALTH),
+    'SUDG': (A_VALUE_MODIFIER, AV_HEALTH),
+    'POSN': (A_VALUE_MODIFIER, AV_HEALTH),
+    'DISE': (A_VALUE_MODIFIER, AV_HEALTH),
+    'DUMY': (A_VALUE_MODIFIER, AV_HEALTH),
+    # Disintegrate Armor/Weapon degraded equipment condition — Skyrim has no
+    # item condition at all, so the closest surviving meaning is the combat
+    # consequence: less armor rating / less melee damage while it lasts.
+    'DIAR': (A_PEAK_VALUE_MODIFIER, AV_DAMAGE_RESIST),
+    'DIWE': (A_PEAK_VALUE_MODIFIER, AV_MELEE_DAMAGE),
+    # Stunted Magicka suppressed regeneration entirely.
+    'STMA': (A_PEAK_VALUE_MODIFIER, AV_MAGICKA_RATE),
+    'VAMP': (A_PEAK_VALUE_MODIFIER, AV_HEALTH),
+
+    # -- Destruction: weaknesses (negative resistance) ----------------------
+    'WKFI': (A_PEAK_VALUE_MODIFIER, AV_RESIST_FIRE),
+    'WKFR': (A_PEAK_VALUE_MODIFIER, AV_RESIST_FROST),
+    'WKSH': (A_PEAK_VALUE_MODIFIER, AV_RESIST_SHOCK),
+    'WKMA': (A_PEAK_VALUE_MODIFIER, AV_RESIST_MAGIC),
+    'WKPO': (A_PEAK_VALUE_MODIFIER, AV_POISON_RESIST),
+    'WKDI': (A_PEAK_VALUE_MODIFIER, AV_RESIST_DISEASE),
+    'WKNW': (A_PEAK_VALUE_MODIFIER, AV_DAMAGE_RESIST),
+
+    # -- Illusion -----------------------------------------------------------
+    'CALM': (A_CALM, AV_NONE),
+    'CHRM': (A_CALM, AV_NONE),          # Charm raised disposition → pacify
+    'DEMO': (A_DEMORALIZE, AV_NONE),
+    'FRNZ': (A_FRENZY, AV_NONE),
+    'RALY': (A_RALLY, AV_NONE),
+    'COCR': (A_COMMAND_SUMMONED, AV_NONE),
+    'COHU': (A_COMMAND_SUMMONED, AV_NONE),
+    'INVI': (A_PEAK_VALUE_MODIFIER, AV_INVISIBILITY),
+    'CHML': (A_PEAK_VALUE_MODIFIER, AV_INVISIBILITY),
+    'LGHT': (A_LIGHT, AV_NONE),
+    'NEYE': (A_PEAK_VALUE_MODIFIER, AV_NIGHT_EYE),
+    'DARK': (A_PEAK_VALUE_MODIFIER, AV_NIGHT_EYE),
+    'PARA': (A_PARALYSIS, AV_PARALYSIS),
+    # Silence blocked spellcasting. Skyrim has no silence archetype; draining
+    # magicka to nothing is the closest engine-native equivalent.
+    'SLNC': (A_PEAK_VALUE_MODIFIER, AV_MAGICKA),
+
+    # -- Mysticism ----------------------------------------------------------
+    'DSPL': (A_DISPEL, AV_NONE),
+    'DTCT': (A_DETECT_LIFE, AV_DETECT_LIFE_RANGE),
+    'TELE': (A_TELEKINESIS, AV_NONE),
+    'STRP': (A_SOUL_TRAP, AV_NONE),
+    'SABS': (A_PEAK_VALUE_MODIFIER, AV_RESIST_MAGIC),
+    'RFLC': (A_PEAK_VALUE_MODIFIER, AV_RESIST_MAGIC),
+    'REDG': (A_PEAK_VALUE_MODIFIER, AV_DAMAGE_RESIST),
+
+    # -- Restoration: restore / fortify / absorb ----------------------------
+    'REHE': (A_VALUE_MODIFIER, AV_HEALTH),
+    'REFA': (A_VALUE_MODIFIER, AV_STAMINA),
+    'RESP': (A_VALUE_MODIFIER, AV_MAGICKA),
+    'REAT': (A_VALUE_MODIFIER, DERIVE_AV),
+    'FOHE': (A_PEAK_VALUE_MODIFIER, AV_HEALTH),
+    'FOFA': (A_PEAK_VALUE_MODIFIER, AV_STAMINA),
+    'FOSP': (A_PEAK_VALUE_MODIFIER, AV_MAGICKA),
+    'FOMM': (A_PEAK_VALUE_MODIFIER, AV_MAGICKA),
+    'FOAT': (A_PEAK_VALUE_MODIFIER, DERIVE_AV),
+    'FOSK': (A_PEAK_VALUE_MODIFIER, DERIVE_AV),
+    'ABHE': (A_ABSORB, AV_HEALTH),
+    'ABFA': (A_ABSORB, AV_STAMINA),
+    'ABSP': (A_ABSORB, AV_MAGICKA),
+    'ABAT': (A_ABSORB, DERIVE_AV),
+    'ABSK': (A_ABSORB, DERIVE_AV),
+
+    # -- Restoration: resistances and cures ---------------------------------
+    'RSFI': (A_PEAK_VALUE_MODIFIER, AV_RESIST_FIRE),
+    'RSFR': (A_PEAK_VALUE_MODIFIER, AV_RESIST_FROST),
+    'RSSH': (A_PEAK_VALUE_MODIFIER, AV_RESIST_SHOCK),
+    'RSMA': (A_PEAK_VALUE_MODIFIER, AV_RESIST_MAGIC),
+    'RSPO': (A_PEAK_VALUE_MODIFIER, AV_POISON_RESIST),
+    'RSDI': (A_PEAK_VALUE_MODIFIER, AV_RESIST_DISEASE),
+    'RSNW': (A_PEAK_VALUE_MODIFIER, AV_DAMAGE_RESIST),
+    'RSPA': (A_PEAK_VALUE_MODIFIER, AV_PARALYSIS),
+    'RSWD': (A_PEAK_VALUE_MODIFIER, AV_RESIST_MAGIC),
+    'CUDI': (A_CURE_DISEASE, AV_NONE),
+    'CUPO': (A_CURE_POISON, AV_NONE),
+    'CUPA': (A_CURE_PARALYSIS, AV_NONE),
+
+    # -- Script effect ------------------------------------------------------
+    # Archetype 1 needs a VMAD carrying a Papyrus ActiveMagicEffect script to
+    # do anything; until Phase 4 attaches one the effect still fires, still
+    # holds its duration, and still answers HasMagicEffect — which is what the
+    # converted IsSpellTarget polling looks for.
+    'SEFF': (A_SCRIPT, AV_NONE),
+}
+
+# Effects whose TES4 school is misleading once the archetype is chosen.
+# (Oblivion filed Turn Undead under Conjuration and Burden under Alteration;
+# Skyrim's equivalents live in different schools.)
+SCHOOL_OVERRIDES = {
+    'TURN': AV_RESTORATION,   # Turn Undead is Restoration in Skyrim
+    'STRP': AV_CONJURATION,   # Soul Trap is Conjuration in Skyrim
+    'DSPL': AV_RESTORATION,   # Dispel: Restoration's counter to magic
+    'REAN': AV_CONJURATION,
+}
+
+# Effects that must not be castable on their own — Oblivion uses them purely as
+# information markers on items (no Self/Touch/Target flag set), and letting the
+# player see them in the magic menu shows junk entries.
+_MARKER_CODES = frozenset({'POSN', 'DISE', 'DUMY', 'VAMP', 'DARK'})
+
+
+def resolve_actor_value(code: str, effect_av: int) -> int:
+    """TES5 actor value for an effect instance.
+
+    ``effect_av`` is the per-effect EFIT ActorValue from the owning
+    SPEL/ENCH/ALCH record — the attribute or skill the effect targets.  For
+    codes marked DERIVE_AV in EFFECT_ARCHETYPES it decides the AV entirely
+    (DGAT+Strength and DGAT+Endurance are different effects in Skyrim); for
+    every other code the table's fixed AV wins.
+    """
+    entry = EFFECT_ARCHETYPES.get(code)
+    if entry is None:
+        return AV_NONE
+    av = entry[1]
+    if av != DERIVE_AV:
+        return av
+    if effect_av is None or effect_av < 0:
+        return AV_NONE
+    if effect_av >= 12:
+        return SKILL_TO_AV.get(effect_av, AV_NONE)
+    return ATTRIBUTE_TO_AV.get(effect_av, AV_NONE)
+
+
+def get_archetype(code: str) -> int:
+    """TES5 archetype for a TES4 effect code (Value Modifier if unknown)."""
+    entry = EFFECT_ARCHETYPES.get(code)
+    return entry[0] if entry else A_VALUE_MODIFIER
+
+
+def is_known_code(code: str) -> bool:
+    return code in EFFECT_ARCHETYPES
+
+
+def _convert_flags(t4: int, code: str, archetype: int) -> int:
+    """TES4 MGEF DATA.Flags → TES5 MGEF DATA.Flags.
+
+    The bit meanings diverge from bit 3 onward (TES4 0x8 is Magnitude Is
+    Percent; TES5 0x8 is Snap to Navmesh), so this is a translation, never a
+    mask-and-copy.  The TES4 Self/Touch/Target bits are NOT flags in TES5 —
+    they become the Delivery field — and the Spellmaking/Enchanting/
+    UseWeapon/UseArmor/UseCreature/UseSkill/UseAttribute bits describe how the
+    CS editor treated the effect, which TES5 encodes in the archetype instead.
+    """
+    out = 0
+    if t4 & T4_HOSTILE:
+        out |= F_HOSTILE
+    if t4 & T4_RECOVER:
+        out |= F_RECOVER
+    if t4 & T4_DETRIMENTAL:
+        out |= F_DETRIMENTAL
+    if t4 & T4_NO_DURATION:
+        out |= F_NO_DURATION
+    if t4 & T4_NO_MAGNITUDE:
+        out |= F_NO_MAGNITUDE
+    if t4 & T4_NO_AREA:
+        out |= F_NO_AREA
+    if t4 & T4_FX_PERSIST:
+        out |= F_FX_PERSIST
+    if t4 & T4_NO_HIT_EFFECT:
+        out |= F_NO_HIT_EFFECT
+    if t4 & T4_PERSIST_ON_DEATH:
+        out |= F_NO_DEATH_DISPEL
+
+    # Archetypes the engine drives entirely from the archetype class carry no
+    # meaningful magnitude/area; vanilla sets the suppression bits so the item
+    # card doesn't print "0 points".
+    if archetype in (A_SUMMON_CREATURE, A_BOUND_WEAPON, A_LIGHT, A_CLOAK,
+                     A_TELEKINESIS, A_OPEN, A_LOCK, A_DISPEL,
+                     A_CURE_DISEASE, A_CURE_POISON, A_CURE_PARALYSIS):
+        out |= F_NO_MAGNITUDE | F_NO_AREA
+
+    # Information-only markers must never surface in the magic menu.
+    if code in _MARKER_CODES:
+        out |= F_HIDE_IN_UI
+
+    return out
+
+
+def _delivery_and_cast(t4_flags: int) -> tuple:
+    """(casting type, delivery) from the TES4 Self/Touch/Target flags.
+
+    wbCastEnum:     0 Constant Effect, 1 Fire and Forget, 2 Concentration, 3 Scroll
+    wbDeliveryEnum: 0 Self, 1 Contact (touch), 2 Aimed, 3 Target Actor, 4 Target Location
+
+    An Oblivion MGEF advertises *every* delivery it supports; the item that
+    carries it picks one.  Skyrim's MGEF commits to a single delivery, so the
+    most specific one the effect allows wins — Target beats Touch beats Self,
+    matching what the spells that use the effect overwhelmingly do.
+    """
+    if t4_flags & T4_TARGET:
+        return 1, 2       # Fire and Forget, Aimed
+    if t4_flags & T4_TOUCH:
+        return 1, 1       # Fire and Forget, Contact
+    return 1, 0           # Fire and Forget, Self
+
+
+# --- AssocItem resolution -------------------------------------------------
+# The converter needs to turn a TES4 AssocItem FormID into the FormID of the
+# record type Skyrim's archetype expects.  Two cases need the whole-plugin
+# view rather than the single MGEF record:
+#   * summon targets that point at an LVLC (leveled creature list) — Skyrim's
+#     Summon Creature takes an NPC_, so the list's first entry stands in;
+#   * confirming a bound-item target really is a WEAP/ARMO.
+# import_main registers the index before the MGEF pass runs.
+_lvlc_first_entry: dict = {}
+_known_sigs: dict = {}
+
+
+def set_assoc_item_index(lvlc_first: dict, formid_sigs: dict) -> None:
+    """Register plugin-wide FormID information for AssocItem resolution.
+
+    ``lvlc_first``   {output LVLC FormID: output FormID of its first entry}
+    ``formid_sigs``  {output FormID: TES4 signature} for the types that can be
+                     an AssocItem (CREA, NPC_, WEAP, ARMO, CLOT, LIGH, LVLC).
+    """
+    _lvlc_first_entry.clear()
+    _lvlc_first_entry.update(lvlc_first)
+    _known_sigs.clear()
+    _known_sigs.update(formid_sigs)
+
+
+def _resolve_assoc_item(fid: int, archetype: int, t4_flags: int) -> int:
+    """AssocItem FormID for an archetype, or 0 when the archetype ignores it.
+
+    Writing a creature FormID under a value-modifier archetype is meaningless
+    (wbMGEFAssocItemDecider returns "Unused"), so anything not in
+    ARCHETYPE_ASSOC_KIND is dropped rather than written blind.
+    """
+    kind = ARCHETYPE_ASSOC_KIND.get(archetype)
+    if not kind or not fid:
+        return 0
+
+    sig = _known_sigs.get(fid)
+
+    if kind == 'NPC_':
+        # Summons: a CREA converts to NPC_, an NPC_ stays one.  An LVLC becomes
+        # an LVLN, which the Summon Creature archetype does not accept — use
+        # the list's first entry so the spell still summons something.
+        if sig == 'LVLC':
+            return _lvlc_first_entry.get(fid, 0)
+        if sig in ('CREA', 'NPC_'):
+            return fid
+        # Unknown signature: trust the TES4 UseCreature flag rather than
+        # dropping a summon whose target lives in a master we did not index.
+        return fid if t4_flags & T4_USE_CREATURE else 0
+
+    if kind == 'ITEM':
+        # Bound weapon/armor: WEAP stays WEAP, ARMO and CLOT both become ARMO.
+        if sig in ('WEAP', 'ARMO', 'CLOT'):
+            return fid
+        return fid if t4_flags & (T4_USE_WEAPON | T4_USE_ARMOR) else 0
+
+    if kind == 'LIGH':
+        return fid if sig == 'LIGH' else 0
+
+    # HAZD/KYWD/SPEL/RACE/ENCH archetypes are never produced by this converter.
+    return 0
+
+
+def _build_data(rec: dict, code: str, archetype: int, actor_value: int,
+                counter_count: int) -> bytes:
+    """The 152-byte TES5 MGEF DATA for one effect.
+
+    Shared by the primary record and its per-actor-value variants, which differ
+    only in the Actor Value field (offset 68).
+    """
+    t4_flags = get_int(rec, 'DATA.Flags')
+    cast_type, delivery = _delivery_and_cast(t4_flags)
+
+    data = bytearray(MGEF_DATA_SIZE)
+    struct.pack_into('<I', data, _O_FLAGS, _convert_flags(t4_flags, code, archetype))
+    struct.pack_into('<f', data, _O_BASE_COST, get_float(rec, 'DATA.BaseCost'))
+    struct.pack_into('<I', data, _O_ASSOC_ITEM,
+                     _resolve_assoc_item(get_formid(rec, 'DATA.AssocItem'),
+                                         archetype, t4_flags))
+
+    school = SCHOOL_OVERRIDES.get(
+        code, SCHOOL_TO_AV.get(get_int(rec, 'DATA.School', -1), AV_NONE))
+    struct.pack_into('<i', data, _O_MAGIC_SKILL, school)
+
+    # TES4 writes 0xFFFFFFFF for "no resistance"; anything else is an Oblivion
+    # actor-value index naming the resist stat.
+    resist_raw = get_int(rec, 'DATA.ResistValue', 0xFFFFFFFF)
+    struct.pack_into('<i', data, _O_RESIST_VALUE,
+                     TES4_RESIST_AV_TO_TES5.get(resist_raw, AV_NONE))
+
+    # Counter Effect Count MUST equal the number of ESCE subrecords or the CK
+    # reads garbage counter slots.
+    struct.pack_into('<H', data, _O_COUNTER_COUNT, counter_count)
+
+    struct.pack_into('<I', data, _O_CASTING_LIGHT, get_formid(rec, 'DATA.Light'))
+    struct.pack_into('<I', data, _O_HIT_SHADER, get_formid(rec, 'DATA.EffectShader'))
+    struct.pack_into('<I', data, _O_ENCHANT_SHADER, get_formid(rec, 'DATA.EnchantEffect'))
+    struct.pack_into('<f', data, _O_SPELLMAKING_TIME, 0.5)
+    struct.pack_into('<I', data, _O_ARCHETYPE, archetype)
+    struct.pack_into('<i', data, _O_ACTOR_VALUE, actor_value)
+    struct.pack_into('<I', data, _O_CASTING_TYPE, cast_type)
+    struct.pack_into('<I', data, _O_DELIVERY, delivery)
+    struct.pack_into('<i', data, _O_SECOND_AV, AV_NONE)
+    # Every vanilla MGEF writes 1.0 here; 0.0 makes dual-casting collapse the
+    # effect to nothing.
+    struct.pack_into('<f', data, _O_DUAL_CAST_SCALE, 1.0)
+    return bytes(data)
+
+
+def convert_MGEF(rec: dict, writer=None) -> bytes:
+    """MGEF — Magic Effect.
+
+    TES5 order: EDID VMAD FULL MDOB KSIZ/KWDA DATA ESCE* SNDD DNAM CTDA
+    """
+    from ..object_scripts import get_object_vmad
+
+    code = get_str(rec, 'EditorID')
+    subs = b''
+    if code:
+        subs += pack_string_subrecord('EDID', code)
+    subs += get_object_vmad(get_formid(rec, 'FormID'))
+
+    full = get_str(rec, 'FULL')
+    if full:
+        subs += pack_string_subrecord('FULL', full)
+
+    # MDOB — the menu display object, i.e. the effect's art in the magic menu.
+    # Oblivion's Model.MODL is the cast art, which Skyrim keeps in an ARTO
+    # (Phase 2); pointing MDOB at a raw mesh path is not possible, so it is
+    # left absent until the ARTO writer lands.
+
+    archetype = get_archetype(code)
+    # An attribute/skill-targeted effect has no single actor value of its own
+    # — the AV comes from whichever spell carries it, which is what the
+    # per-AV variants below exist for.  The base record keeps None so a
+    # variant is always what an item actually references.
+    entry = EFFECT_ARCHETYPES.get(code)
+    base_av = entry[1] if entry and entry[1] != DERIVE_AV else AV_NONE
+
+    counters = _counter_effect_fids(rec)
+    subs += pack_subrecord('DATA', _build_data(rec, code, archetype,
+                                               base_av, len(counters)))
+    for fid in counters:
+        subs += pack_formid_subrecord('ESCE', fid)
+
+    desc = get_str(rec, 'DESC')
+    if desc:
+        subs += pack_string_subrecord('DNAM', desc)
+
+    return pack_record('MGEF', get_formid(rec, 'FormID'),
+                       get_int(rec, 'RecordFlags'), subs)
+
+
+# ---------------------------------------------------------------------------
+# Per-actor-value variants
+#
+# Oblivion parameterises one MGEF by the attribute or skill each *effect*
+# names: a single `DGAT` record is Damage Strength on one spell and Damage
+# Endurance on the next, because the AV lives in the item's EFIT, not in the
+# MGEF.  Skyrim moved the actor value INTO the MGEF, so a single converted
+# DGAT could only ever damage one stat.
+#
+# Fix: emit one MGEF per (code, actor value) pair the plugin actually uses —
+# ~100 extra records for Oblivion, the same for Nehrim — and point each
+# effect at the variant matching its own EFIT ActorValue.  The base record
+# stays as the AV-less fallback for an effect whose AV we cannot map.
+# ---------------------------------------------------------------------------
+
+# TES4 attribute index → display name, for the variant's FULL/EDID.
+_ATTR_NAMES = {
+    0: 'Strength', 1: 'Intelligence', 2: 'Willpower', 3: 'Agility',
+    4: 'Speed', 5: 'Endurance', 6: 'Personality', 7: 'Luck',
+}
+_SKILL_NAMES = {
+    12: 'Armorer', 13: 'Athletics', 14: 'Blade', 15: 'Block', 16: 'Blunt',
+    17: 'HandToHand', 18: 'HeavyArmor', 19: 'Alchemy', 20: 'Alteration',
+    21: 'Conjuration', 22: 'Destruction', 23: 'Illusion', 24: 'Mysticism',
+    25: 'Restoration', 26: 'Acrobatics', 27: 'LightArmor', 28: 'Marksman',
+    29: 'Mercantile', 30: 'Security', 31: 'Sneak', 32: 'Speechcraft',
+}
+
+# (code, tes4 av) -> output FormID of the emitted variant.
+_av_variants: dict = {}
+
+
+def build_av_variants(mgef_records: list, effect_records: list, writer) -> int:
+    """Emit one MGEF per (DERIVE_AV code, actor value) the plugin uses.
+
+    ``effect_records`` is every record carrying EFID/EFIT pairs (SPEL, ENCH,
+    ALCH, INGR, SGST); scanning them is what tells us which pairs exist.
+    Returns the number of variants written.
+    """
+    _av_variants.clear()
+    if writer is None:
+        return 0
+
+    by_code = {}
+    for rec in mgef_records:
+        code = get_str(rec, 'EditorID')
+        if code and EFFECT_ARCHETYPES.get(code, (None, None))[1] == DERIVE_AV:
+            by_code[code] = rec
+    if not by_code:
+        return 0
+
+    # Collect the (code, av) pairs in a deterministic order: the output ESM
+    # must stay byte-reproducible, so FormIDs cannot depend on dict iteration
+    # of a parallel scan.
+    wanted = set()
+    for rec in effect_records:
+        for i in range(get_int(rec, 'EffectCount')):
+            code = get_str(rec, f'Effect[{i}].EFID')
+            if code in by_code:
+                wanted.add((code, get_int(rec, f'Effect[{i}].ActorValue', -1)))
+
+    written = 0
+    for code, av in sorted(wanted):
+        tes5_av = resolve_actor_value(code, av)
+        if tes5_av == AV_NONE:
+            continue          # unmappable AV — the base record stands in
+        src = by_code[code]
+        name = _ATTR_NAMES.get(av) or _SKILL_NAMES.get(av)
+        if not name:
+            continue
+        archetype = get_archetype(code)
+        fid = writer.alloc_formid()
+
+        subs = pack_string_subrecord('EDID', f'TES4{code}{name}')
+        full = get_str(src, 'FULL')
+        if full:
+            # "Damage Attribute" + Strength -> "Damage Strength", which is
+            # what Oblivion's own item cards showed.
+            subs += pack_string_subrecord('FULL', _variant_name(full, name))
+        # Variants carry no ESCE of their own (the count must then be 0).
+        subs += pack_subrecord('DATA', _build_data(src, code, archetype,
+                                                   tes5_av, 0))
+        desc = get_str(src, 'DESC')
+        if desc:
+            subs += pack_string_subrecord('DNAM', desc)
+        writer.add_record('MGEF', pack_record('MGEF', fid, 0, subs))
+        _av_variants[(code, av)] = fid
+        written += 1
+    return written
+
+
+def _variant_name(base_full: str, stat_name: str) -> str:
+    """"Damage Attribute" + "Strength" -> "Damage Strength"."""
+    for tail in (' Attribute', ' Skill'):
+        if base_full.endswith(tail):
+            return f'{base_full[:-len(tail)]} {stat_name}'
+    return f'{base_full} ({stat_name})'
+
+
+def get_av_variant(code: str, effect_av: int) -> int:
+    """FormID of the per-AV MGEF variant for one effect instance (0 if none)."""
+    return _av_variants.get((code, effect_av), 0)
+
+
+# ---------------------------------------------------------------------------
+# Script-effect (SEFF) variants
+#
+# Oblivion attaches the script to the EFFECT, not the MGEF: the single `SEFF`
+# record is a different script on every item, named by the owning record's
+# `ScriptEffect[i].FormID`.  Skyrim moved the script onto the MGEF (archetype 1
+# Script + a VMAD holding an ActiveMagicEffect), so one MGEF is emitted per
+# distinct script and each effect points at the one carrying its own.
+#
+# Without this, SEFF was the single most-dropped code in the game (143 uses in
+# Oblivion, 176 in Nehrim) and every script-effect item — the Scroll of Icarian
+# Flight among them — converted to an inert filler.
+# ---------------------------------------------------------------------------
+
+# TES4 SCPT FormID (raw hex string) -> output FormID of its MGEF.
+_seff_variants: dict = {}
+
+
+def build_seff_variants(mgef_records: list, effect_records: list, writer,
+                        fid_to_edid: dict = None) -> int:
+    """Emit one Script-archetype MGEF per distinct TES4 magic-effect script."""
+    _seff_variants.clear()
+    if writer is None:
+        return 0
+
+    from ..object_scripts import get_magic_effect_vmad
+
+    seff = next((r for r in mgef_records
+                 if get_str(r, 'EditorID') == 'SEFF'), None)
+    if seff is None:
+        return 0
+
+    # (script fid, the effect's TES4 delivery) — an Oblivion script effect can
+    # be Self on one spell and Target on another, and Skyrim's delivery lives
+    # on the MGEF, so the pair is what identifies a variant.
+    wanted = {}
+    for rec in effect_records:
+        for i in range(get_int(rec, 'EffectCount')):
+            if get_str(rec, f'Effect[{i}].EFID') != 'SEFF':
+                continue
+            scpt = get_str(rec, f'ScriptEffect[{i}].FormID')
+            if not scpt:
+                continue
+            etype = get_str(rec, f'Effect[{i}].Type')
+            wanted.setdefault((scpt, etype), None)
+
+    fid_to_edid = fid_to_edid or {}
+    written = 0
+    # Sorted so FormID allocation is deterministic — the output ESM must stay
+    # byte-reproducible (docs/performance_notes.md).
+    for scpt, etype in sorted(wanted):
+        vmad = get_magic_effect_vmad(scpt)
+        if not vmad:
+            # No converted script — the plain SEFF record still stands in, so
+            # the effect keeps its duration and HasMagicEffect still answers.
+            continue
+        fid = writer.alloc_formid()
+        name = fid_to_edid.get(scpt, scpt)
+
+        subs = pack_string_subrecord('EDID', f'TES4SEFF{name}{etype or "Self"}')
+        subs += vmad
+        full = get_str(seff, 'FULL')
+        if full:
+            subs += pack_string_subrecord('FULL', full)
+
+        # The script drives everything, so the DATA is the SEFF record's own
+        # with the archetype forced to 1 and the delivery taken from THIS
+        # effect rather than from the MGEF's advertised flag set.
+        data = bytearray(_build_data(seff, 'SEFF', A_SCRIPT, AV_NONE, 0))
+        delivery = {'Touch': 1, 'Target': 2}.get(etype, 0)
+        struct.pack_into('<I', data, _O_DELIVERY, delivery)
+        struct.pack_into('<I', data, _O_CASTING_TYPE, 1)   # Fire and Forget
+        subs += pack_subrecord('DATA', bytes(data))
+
+        writer.add_record('MGEF', pack_record('MGEF', fid, 0, subs))
+        _seff_variants[(scpt, etype)] = fid
+        written += 1
+    return written
+
+
+def get_seff_variant(scpt_fid: str, effect_type: str) -> int:
+    """FormID of the Script MGEF carrying one effect's script (0 if none)."""
+    return _seff_variants.get((scpt_fid, effect_type), 0)
+
+
+# TES4 effect code → this plugin's MGEF FormID (output space).  Filled by
+# register_mgef_formids() before the MGEF pass so ESCE can turn a counter
+# effect's 4-char code into the FormID of the record we emit for it.
+_code_to_fid: dict = {}
+
+
+def register_mgef_formids(mgef_records: list) -> None:
+    """Index {effect code: output FormID} from the export's MGEF records."""
+    _code_to_fid.clear()
+    for rec in mgef_records:
+        code = get_str(rec, 'EditorID')
+        if code:
+            _code_to_fid[code] = get_formid(rec, 'FormID')
+
+
+def get_mgef_formid(code: str, effect_av: int = -1) -> int:
+    """Output FormID of the MGEF to use for one effect instance.
+
+    Prefers the per-actor-value variant when the code is attribute/skill
+    targeted; falls back to the plugin's base MGEF for that code.
+    """
+    variant = _av_variants.get((code, effect_av))
+    if variant:
+        return variant
+    return _code_to_fid.get(code, 0)
+
+
+def _counter_effect_fids(rec: dict) -> list:
+    """ESCE targets as output FormIDs, dropping codes with no MGEF of ours."""
+    out = []
+    for i in range(get_int(rec, 'CounterEffects')):
+        fid = _code_to_fid.get(get_str(rec, f'ESCE[{i}]'))
+        if fid and fid not in out:
+            out.append(fid)
+    return out

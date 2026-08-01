@@ -730,12 +730,18 @@ def _dec_magic_effect(lines: list, subs: list, idx: int, prefix: str):
         if sub.type == 'EFID' and len(sub.data) == 4:
             lines.append(f'{prefix}.EFID={_fid(sub.data)}')
         elif sub.type == 'EFIT' and len(sub.data) >= 12:
+            # TES5 EFIT is Magnitude, AREA, DURATION (xEdit wbEFIT).  These two
+            # were labelled the other way round, which made every dump of a
+            # converted spell look like its duration and area were swapped.
+            # Settled by census: all 427 vanilla ALCH effects write 0 at
+            # offset 4 and 30/60/300/720 at offset 8 — potion durations in
+            # seconds, and potions have no area.
             mag = struct.unpack_from('<f', sub.data, 0)[0]
-            dur = struct.unpack_from('<I', sub.data, 4)[0]
-            area= struct.unpack_from('<I', sub.data, 8)[0]
+            area = struct.unpack_from('<I', sub.data, 4)[0]
+            dur = struct.unpack_from('<I', sub.data, 8)[0]
             lines.append(f'{prefix}.Magnitude={mag:.4f}')
-            lines.append(f'{prefix}.Duration={dur}')
             lines.append(f'{prefix}.Area={area}')
+            lines.append(f'{prefix}.Duration={dur}')
 
 
 def _dec_fact_data(data: bytes) -> list:
@@ -1355,11 +1361,12 @@ def _decode_effects(rec: TES5Record) -> list:
             if i + 1 < len(subs) and subs[i + 1].type == 'EFIT':
                 efit = subs[i + 1].data
                 if len(efit) >= 12:
+                    # Magnitude, AREA, DURATION — see _dec_magic_effect.
                     mag  = struct.unpack_from('<f', efit,  0)[0]
-                    dur  = struct.unpack_from('<I', efit,  4)[0]
-                    area = struct.unpack_from('<I', efit,  8)[0]
+                    area = struct.unpack_from('<I', efit,  4)[0]
+                    dur  = struct.unpack_from('<I', efit,  8)[0]
                     lines += [f'{prefix}.Magnitude={mag:.4f}',
-                               f'{prefix}.Duration={dur}', f'{prefix}.Area={area}']
+                               f'{prefix}.Area={area}', f'{prefix}.Duration={dur}']
                 i += 2
             else:
                 i += 1

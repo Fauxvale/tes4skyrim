@@ -847,15 +847,11 @@ MGEF_CODE_TO_SKYRIM = {
     'LOCK': 0,                     # Lock — no equivalent
     'OPEN': 0,                     # Open — no equivalent
     'SHLD': 0x00051B15,            # Shield → ArmorFFSelf0
-    'WBUA': 0x0003AC2D,            # Water Breathing → AlchWaterbreathing
-    'WKFW': 0x00073F2D,            # Weakness to Fire → AlchWeaknessFire
     'WKFR': 0x00073F2E,            # Weakness to Frost → AlchWeaknessFrost
-    'WKSK': 0x00073F2F,            # Weakness to Shock → AlchWeaknessShock
     'WKMA': 0x00073F51,            # Weakness to Magic → AlchWeaknessMagic
     'WKPO': 0x00090042,            # Weakness to Poison → AlchWeaknessPoison
     # -- Conjuration --
     'BABO': 0x00051B15,            # Bound Boots → ArmorFFSelf0 (armor buff)
-    'BACT': 0x00051B15,            # Bound Cuirass → ArmorFFSelf0 (armor buff)
     'BAGA': 0x00051B15,            # Bound Gauntlets → ArmorFFSelf0 (armor buff)
     'BAGR': 0x00051B15,            # Bound Greaves → ArmorFFSelf0 (armor buff)
     'BAHE': 0x00051B15,            # Bound Helmet → ArmorFFSelf0 (armor buff)
@@ -865,18 +861,6 @@ MGEF_CODE_TO_SKYRIM = {
     'BWDA': 0x0001CE9F,            # Bound Dagger → BoundSwordFFSelf
     'BWMA': 0x0001CE9F,            # Bound Mace → BoundSwordFFSelf (closest)
     'REAN': 0x00065BD6,            # Reanimate → ReanimateFFAimed0
-    'SMAC': 0x000640B4,            # Summon Ancestor → SummonFamiliar
-    'SMBO': 0x000640B4,            # Summon Bear → SummonFamiliar
-    'SMCL': 0x000640B4,            # Summon Clannfear → SummonFamiliar
-    'SMDM': 0x0010DDED,            # Summon Dremora → SummonDremoraLord
-    'SMFL': 0x0001CEAA,            # Summon Flame Atronach → SummonFlameAtronach
-    'SMFR': 0x0001CEAB,            # Summon Frost Atronach → SummonFrostAtronach
-    'SMGH': 0x000640B4,            # Summon Ghost → SummonFamiliar
-    'SMLI': 0x000640B4,            # Summon Lich → SummonFamiliar
-    'SMSK': 0x000640B4,            # Summon Skeleton → SummonFamiliar
-    'SMSP': 0x0001CEAC,            # Summon Storm Atronach → SummonStormAtronach
-    'SMZB': 0x000640B4,            # Summon Zombie → SummonFamiliar
-    'TNUN': 0x0004B145,            # Turn Undead → TurnUndeadFFAimed25
     # -- Destruction --
     'DGAT': 0x0003A2C6,            # Damage Attribute → per-attribute (see MGEF_AV_CODE_TO_SKYRIM)
     'DGFA': 0x0003A2C6,            # Damage Fatigue → AlchDamageStamina
@@ -939,7 +923,6 @@ MGEF_CODE_TO_SKYRIM = {
     'STRP': 0x0004DBA3,            # Soul Trap → SoulTrapFFActor
     'SUDG': 0x000ED096,            # Sun Damage → AbVampireSunDamage01
     'RFLC': 0x00108A41,            # Reflect Spell → PerkReflectBlows (closest)
-    'RFDG': 0,                     # Reflect Damage — no equivalent
     'REDG': 0,                     # Reflect Damage → no equivalent
     'DSPL': 0,                     # Dispel → no equivalent
     'DTCT': 0x0001EA74,            # Detect Life → DetectLifeFriendInteriorConcSelf

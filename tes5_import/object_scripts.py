@@ -135,6 +135,57 @@ def build_quest_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
     return len(_QUEST_SCRIPT)
 
 
+# TES4 SCPT FormID (raw hex string) -> packed VMAD for a Script-archetype MGEF.
+# Filled by build_magic_effect_script_plan(); read by record_types/magic.py
+# when it emits the per-script SEFF variants.
+_MAGIC_EFFECT_VMAD: dict[str, bytes] = {}
+
+
+def get_magic_effect_vmad(scpt_fid: str) -> bytes:
+    """Packed VMAD for a TES4 magic-effect script (b'' when there is none)."""
+    return _MAGIC_EFFECT_VMAD.get(scpt_fid, b'')
+
+
+def build_magic_effect_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
+    """Resolve every magic-effect script (SCHR.Type 256) to a packed VMAD.
+
+    A TES4 `SEFF` effect names its script per EFFECT — `ScriptEffect[i].FormID`
+    on the owning SPEL/ENCH/ALCH — not on the MGEF, so the same SEFF record is
+    a different script on every item that uses it.  Skyrim moved the script
+    onto the MGEF (archetype 1 Script + a VMAD carrying an ActiveMagicEffect),
+    so record_types/magic.py emits one MGEF per distinct script and needs the
+    VMAD for each here, where the property-resolution machinery lives.
+
+    Returns the number of scripts that produced a VMAD.
+    """
+    _MAGIC_EFFECT_VMAD.clear()
+    offset = get_formid_index_offset()
+    scpt_by_fid = _collect_scpts(by_type, xref)
+
+    # Only the scripts actually referenced by an effect are worth resolving —
+    # _resolve_props re-runs the whole converter per script.
+    wanted = set()
+    for sig in ('SPEL', 'ENCH', 'ALCH', 'INGR', 'SGST'):
+        for rec in by_type.get(sig, []):
+            for i in range(int(rec.get('EffectCount', 0) or 0)):
+                fid = rec.get(f'ScriptEffect[{i}].FormID', '')
+                if fid and fid in scpt_by_fid:
+                    wanted.add(fid)
+
+    from .writer import pack_subrecord
+    for scpt_fid in sorted(wanted):
+        edid, sctx, extends = scpt_by_fid[scpt_fid]
+        script_name = papyrus_script_name(edid or f'Script_{scpt_fid}')
+        try:
+            props = _resolve_props(sctx, edid, extends, xref, fid_to_edid, offset)
+        except Exception:
+            props = {}
+        _MAGIC_EFFECT_VMAD[scpt_fid] = pack_subrecord(
+            'VMAD', build_vmad_object_script(script_name, props))
+
+    return len(_MAGIC_EFFECT_VMAD)
+
+
 def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
     """Compute and cache the VMAD for every object record with an attached SCPT.
 

@@ -45,18 +45,59 @@ from .common import (
 )
 
 
-def _resolve_mgef(code: str, actor_value: int = -1) -> int:
-    """Map a TES4 4-char magic effect code to a Skyrim MGEF FormID.
+def _resolve_mgef(code: str, actor_value: int = -1, script_fid: str = '',
+                  effect_type: str = '') -> int:
+    """Map one TES4 effect instance to the MGEF FormID it should reference.
 
-    Attribute/skill-targeted effects (DRAT, FOSK, ...) resolve through the
-    effect's ActorValue; everything else uses the flat code table.
+    Since the MGEF converter landed, the plugin emits its OWN magic effect for
+    every TES4 code, so that is the first and normal answer.  Three lookups,
+    most specific first:
+
+    1. A **script-effect variant** — SEFF names its script per effect, and
+       Skyrim keeps the script on the MGEF, so each distinct script has its own
+       record (see magic.build_seff_variants).
+    2. A **per-actor-value variant** — DGAT/FOSK/... are parameterised by the
+       effect's own ActorValue, which Skyrim moved into the MGEF.
+    3. The plugin's plain MGEF for the code.
+
+    The vanilla-alias tables remain only as a fallback for a plugin whose MGEF
+    records were not exported (an override plugin that redefines no effects),
+    where there is no record of ours to point at.
     """
-    per_av = MGEF_AV_CODE_TO_SKYRIM.get(code)
-    if per_av is not None:
-        fid = per_av.get(actor_value)
+    from .magic import get_mgef_formid, get_seff_variant
+
+    if code == 'SEFF' and script_fid:
+        fid = get_seff_variant(script_fid, effect_type)
         if fid:
             return fid
+
+    fid = get_mgef_formid(code, actor_value)
+    if fid:
+        return fid
+
+    per_av = MGEF_AV_CODE_TO_SKYRIM.get(code)
+    if per_av is not None:
+        vanilla = per_av.get(actor_value)
+        if vanilla:
+            return vanilla
     return MGEF_CODE_TO_SKYRIM.get(code, 0)
+
+
+# TES4 ENCH records by raw FormID (uppercase hex), for the enchanted-book →
+# scroll conversion: Skyrim's SCRL carries its effects DIRECTLY, so a book
+# whose ENAM names an enchantment needs that enchantment's effect list copied
+# onto it.  Registered by import_main before the record pass; includes the
+# masters' enchantments, since a dependent plugin's scrolls usually name one.
+_ENCH_BY_FID: dict = {}
+
+
+def set_ench_index(ench_records) -> None:
+    """Index TES4 ENCH records by raw FormID for enchanted-book conversion."""
+    _ENCH_BY_FID.clear()
+    for rec in ench_records:
+        fid = (rec.get('FormID') or '').upper()
+        if fid:
+            _ENCH_BY_FID[fid] = rec
 
 
 # Harmless zero-magnitude filler effects used when a record would otherwise
@@ -87,7 +128,10 @@ def _pack_effects(rec: dict, count_key: str = 'EffectCount', pad_to: int = 0,
             break
         code = get_str(rec, f'Effect[{i}].EFID')
         av = get_int(rec, f'Effect[{i}].ActorValue', -1)
-        mgef_fid = _resolve_mgef(code, av) if code else 0
+        mgef_fid = _resolve_mgef(
+            code, av,
+            get_str(rec, f'ScriptEffect[{i}].FormID'),
+            get_str(rec, f'Effect[{i}].Type')) if code else 0
         if not mgef_fid:
             dropped_dur = max(dropped_dur, get_int(rec, f'Effect[{i}].Duration'))
             continue
@@ -611,6 +655,22 @@ def _remap_font_tag(m: re.Match) -> str:
 
 
 def convert_BOOK(rec: dict, writer=None) -> bytes:
+    """BOOK — or SCRL when the book carries an enchantment.
+
+    A TES4 book with an ENAM is a SCROLL: reading it casts the enchantment and
+    consumes the paper.  Skyrim's BOOK record has NO field for an object
+    effect, so converting one to a BOOK produces a blank page that can never be
+    cast — 503 of them across Oblivion, Nehrim and Morrowind_ob, the Scroll of
+    Icarian Flight among them.  Skyrim's own record for this is SCRL, which
+    carries the effects directly, so those route there instead.  (The caller
+    files the record by the signature these bytes actually carry.)
+    """
+    ench = _ENCH_BY_FID.get((rec.get('ENAM') or '').upper())
+    if ench is not None:
+        subs = _build_scrl(rec, ench, get_int(ench, 'ENIT.Cost'), writer)
+        return pack_record('SCRL', get_formid(rec, 'FormID'),
+                           get_int(rec, 'RecordFlags'), subs)
+
     # TES5 BOOK field order: EDID OBND FULL MODL DESC DATA INAM CNAM
     subs = _common_header_subs(rec, obnd_sig='BOOK')
     model = get_str(rec, 'Model.MODL')
@@ -864,10 +924,17 @@ def convert_INGR(rec: dict) -> bytes:
     return pack_record('INGR', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
 
-def convert_SGST(rec: dict, writer=None) -> bytes:
-    """Sigil Stone → SCRL (Scroll, closest equivalent).
+def _build_scrl(rec: dict, effect_src: dict, cost: int = 0,
+                writer=None) -> bytes:
+    """Pack a TES5 SCRL (Scroll).
 
-    TES5 SCRL order: EDID OBND FULL KSIZ KWDA DESC MODL DATA SPIT EFID/EFIT
+    TES5 SCRL order: EDID OBND FULL KSIZ KWDA MDOB ETYP DESC MODL DATA SPIT
+    EFID/EFIT (xEdit wbRecord(SCRL); verified against Skyrim.esm's
+    MGR21ScrollMagicka).
+
+    ``rec`` supplies the item (name, model, value, weight); ``effect_src`` the
+    magic payload.  They are the SAME record for a sigil stone but differ for
+    an enchanted book, whose effects live on the ENCH its ENAM names.
     """
     subs = _common_header_subs(rec, obnd_sig='SCRL')
 
@@ -894,18 +961,29 @@ def convert_SGST(rec: dict, writer=None) -> bytes:
     # SPIT — same 36-byte layout as SPEL. CastType 3 = Scroll (matches every
     # vanilla SCRL); Delivery from the first effect like SPEL.
     target_type = 0
-    first_effect_type = get_str(rec, 'Effect[0].Type')
+    first_effect_type = get_str(effect_src, 'Effect[0].Type')
     if first_effect_type == 'Touch':
         target_type = 1
     elif first_effect_type == 'Target':
         target_type = 2
-    spit = struct.pack('<IIIfIIff4x', 0, 0, 0, 0.0, 3, target_type, 0.0, 0.0)
+    spit = struct.pack('<IIIfIIff4x', cost, 0, 0, 0.0, 3, target_type, 0.0, 0.0)
     subs += pack_subrecord('SPIT', spit)
 
-    # Effects — a sigil stone's effects were what it enchanted with in TES4;
-    # as a scroll they become its cast payload. Without them the record is a
-    # dead item (CK: "Magic Item ... has no effects defined", one per stone).
-    subs += _pack_effects(rec, delivery=target_type, writer=writer)
+    # A scroll carries its effects DIRECTLY — SCRL has no field for an object
+    # effect, so an enchanted book's ENCH payload is copied in here.  Without
+    # them the record is a dead item (CK: "Magic Item ... has no effects
+    # defined").
+    subs += _pack_effects(effect_src, delivery=target_type, writer=writer)
+    return subs
+
+
+def convert_SGST(rec: dict, writer=None) -> bytes:
+    """Sigil Stone → SCRL (Scroll, closest equivalent).
+
+    A sigil stone's effects were what it enchanted with in TES4; as a scroll
+    they become its cast payload.
+    """
+    subs = _build_scrl(rec, rec, writer=writer)
 
     return pack_record('SCRL', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 

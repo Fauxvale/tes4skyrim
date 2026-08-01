@@ -2110,3 +2110,87 @@ class TestPlayerControlsShadow:
         i = next(i for i, ln in enumerate(lines)
                  if ln.startswith('Game.DisablePlayerControls()'))
         assert lines[i + 1] == 'TES4ControlsDisabled.SetValue(1)'
+
+
+# ===========================================================================
+# Runtime game-setting writes (OBSE SetNumericGameSetting) and fall damage
+#
+# Skyrim has vanilla Papyrus GMST *readers* but no writer — SKSE's
+# Game.SetGameSettingFloat does NOT compile against the vanilla headers this
+# pipeline builds with (verified against papyrus.exe: "undefined function
+# SetGameSettingFloat", while the getter resolves).  So the settings that have
+# a per-actor equivalent go through Actor.ForceActorValue instead.
+# ===========================================================================
+
+class TestRuntimeGameSettingWrites:
+    _SRC = ('scn T\nfloat orig\n'
+            'begin scripteffectstart\n'
+            '  set orig to GetGameSetting fJumpHeightMin\n'
+            '  SetNumericGameSetting fJumpHeightMin 9000\n'
+            'end\n')
+
+    def test_write_becomes_an_actor_value(self, converter):
+        out = converter.convert_standalone(
+            'T', self._SRC, 'ActiveMagicEffect', 'T')
+        assert 'akTarget.ForceActorValue("JumpingBonus", 9000)' in out
+        # SKSE-only, does not compile against vanilla headers.
+        assert 'SetGameSettingFloat' not in out
+
+    def test_read_uses_the_same_channel_as_the_write(self, converter):
+        """The save/restore pattern these scripts use ("remember the old
+        value, set a new one, put it back") reads back a number the write
+        never changed if the getter still goes to the global GMST."""
+        out = converter.convert_standalone(
+            'T', self._SRC, 'ActiveMagicEffect', 'T')
+        assert 'akTarget.GetActorValue("JumpingBonus")' in out
+        assert 'Game.GetGameSettingFloat("fJumpHeightMin")' not in out
+
+    def test_a_setting_with_no_actor_value_keeps_a_visible_marker(self, converter):
+        """A call that silently does nothing is the dangerous conversion; a
+        marker is the healthy failure (docs/papyrus_conversion_notes.md)."""
+        out = converter.convert_standalone(
+            'T', 'scn T\nbegin gamemode\nSetNumericGameSetting fNoSuchSetting 5\nend',
+            'Quest', 'T')
+        assert ';TODO' in out and 'fNoSuchSetting' in out
+
+
+class TestResetFallDamageTimerIsPaired:
+    """ResetFallDamageTimer applies a lasting actor value, so it MUST be undone
+    when the effect ends.
+
+    A no-op on one half of a paired on/off command is a latent soft-lock, not a
+    cosmetic gap — here it would leave the actor permanently damage-resistant.
+    """
+
+    _SRC = ('scn T\n'
+            'begin scripteffectupdate\n  ResetFallDamageTimer\nend\n'
+            'begin scripteffectfinish\n  Return\nend\n')
+
+    def test_suppression_is_emitted(self, converter):
+        out = converter.convert_standalone(
+            'T', self._SRC, 'ActiveMagicEffect', 'T')
+        assert 'TES4Polyfill.SuppressFallDamage(' in out
+
+    def test_restore_lands_in_the_teardown_event(self, converter):
+        out = converter.convert_standalone(
+            'T', self._SRC, 'ActiveMagicEffect', 'T')
+        lines = [ln.strip() for ln in out.splitlines()]
+        start = lines.index('Event OnEffectFinish(Actor akTarget, Actor akCaster)')
+        end = lines.index('EndEvent', start)
+        assert any('TES4Polyfill.RestoreFallDamage(akTarget)' in ln
+                   for ln in lines[start:end])
+
+    def test_restore_is_synthesized_when_there_is_no_teardown_block(self, converter):
+        out = converter.convert_standalone(
+            'T', 'scn T\nbegin scripteffectupdate\n  ResetFallDamageTimer\nend\n',
+            'ActiveMagicEffect', 'T')
+        assert 'Event OnEffectFinish(' in out
+        assert 'TES4Polyfill.RestoreFallDamage(akTarget)' in out
+
+    def test_the_flag_does_not_leak_between_scripts(self, converter):
+        """The converter instance is reused across every SCPT in a job."""
+        converter.convert_standalone('T', self._SRC, 'ActiveMagicEffect', 'T')
+        other = converter.convert_standalone(
+            'U', 'scn U\nbegin scripteffectfinish\n  Return\nend\n',
+            'ActiveMagicEffect', 'U')
+        assert 'RestoreFallDamage' not in other

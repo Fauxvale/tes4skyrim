@@ -1,18 +1,31 @@
 # Magic Conversion: Analysis and Path to Completion
 
-Status as of 2026-07-25. Measured with `python tools/magic_audit.py export/<Plugin>`
+Status as of 2026-07-31. Measured with `python tools/magic_audit.py export/<Plugin>`
 (written alongside this doc; re-run it after every change in this area).
 
-## Summary
+**Phase 1 is DONE (2026-07-31).** `MGEF` is a converted record type
+(`tes5_import/record_types/magic.py`); the numbers below are the *before*
+picture, kept because they are what the remaining phases are measured against.
+Current state:
 
-`MGEF` is in `SKIP_TYPES` (`tes5_import/constants.py:358`). Because no magic
-effect is ever converted, every effect on every SPEL/ENCH/ALCH/INGR/SGST is
-re-pointed at a **vanilla Skyrim MGEF** through a flat 4-char code table
-(`MGEF_CODE_TO_SKYRIM` / `MGEF_AV_CODE_TO_SKYRIM` in `skyrim_overrides.py`),
-and anything the table cannot name is **silently dropped**
-(`_pack_effects`, `record_types/equipment.py:68`).
+| | Oblivion.esm | Nehrim.esm |
+|---|---|---|
+| source MGEF records | 145 | 149 |
+| converted as our own MGEF | **145** | **149** |
+| unmapped → effect dropped | **0** | **0** |
+| records losing ALL effects → filler | **0** | **0** |
+| phantom table keys (no export uses them) | **0** | **0** |
 
-Measured fallout:
+## The problem Phase 1 solved
+
+`MGEF` was in `SKIP_TYPES`. Because no magic effect was ever converted, every
+effect on every SPEL/ENCH/ALCH/INGR/SGST was re-pointed at a **vanilla Skyrim
+MGEF** through a flat 4-char code table (`MGEF_CODE_TO_SKYRIM` /
+`MGEF_AV_CODE_TO_SKYRIM` in `skyrim_overrides.py`), and anything the table
+could not name was **silently dropped** (`_pack_effects`,
+`record_types/equipment.py`).
+
+Measured fallout, before the fix:
 
 | | Oblivion.esm | Nehrim.esm |
 |---|---|---|
@@ -24,10 +37,10 @@ Measured fallout:
 | SPEL effects dropped | 375 / 1856 (20.2%) | 274 / 1138 (24.1%) |
 | ENCH effects dropped | 298 / 2411 (12.4%) | 246 / 2745 (9.0%) |
 
-382 Oblivion records (201 SPEL, 154 ENCH, 22 ALCH, 5 INGR) convert to a
-zero-magnitude `AlchRestoreHealth` filler — they exist, they are castable, and
-they do nothing. **330 NPC spell-list entries point at one of the 201 gutted
-spells.** Every summon spell in the game is in that set.
+382 Oblivion records (201 SPEL, 154 ENCH, 22 ALCH, 5 INGR) converted to a
+zero-magnitude `AlchRestoreHealth` filler — they existed, they were castable,
+and they did nothing. **330 NPC spell-list entries pointed at one of the 201
+gutted spells.** Every summon spell in the game was in that set.
 
 The one thing that is *not* a gap: the summon/bound targets are all real
 records this pipeline already converts — of 118 MGEFs carrying an `AssocItem`,
@@ -124,8 +137,9 @@ populated only through offset 44 (flags, fill colour, 6 fill-alpha floats) and
 zeroes the rest.
 
 Supporting record types with **no writer at all**: `ARTO`, `RFCT`, `IPDS`,
-`EXPL`, `PROJ`, `HAZD`, `SCRL`. `ARTO` (art object) is what Skyrim uses for
+`EXPL`, `PROJ`, `HAZD`. `ARTO` (art object) is what Skyrim uses for
 casting/hit art — it is the destination for those 141 `Model.MODL` paths.
+(`SCRL` gained one in Phase 1: sigil stones and enchanted books both write it.)
 
 ## Path to complete conversion
 
@@ -160,11 +174,82 @@ Re-truncating the dump reproduces the original bug and the generator now exits
 
 Immediate benefit: the aimed-variant clones stop shipping a malformed DATA.
 
-### Phase 1 — Convert MGEF as a real record type
+### Phase 1 — Convert MGEF as a real record type — DONE 2026-07-31
 
-Remove `'MGEF'` from `SKIP_TYPES` and add a `convert_MGEF` in a new
-`tes5_import/record_types/magic.py`. Emit `EDID`, `FULL`, `MDOB`, `DATA` (152
-bytes, FormVersion 44), `ESCE` array, `SNDD`, `DNAM`.
+`'MGEF'` is out of `SKIP_TYPES`; `convert_MGEF` lives in
+`tes5_import/record_types/magic.py` and emits `EDID`, `VMAD`, `FULL`,
+`DATA` (152 bytes, FormVersion 44), the `ESCE` array and `DNAM`.
+
+What actually shipped, beyond the sketch below:
+
+1. **Archetype table, validated against the export.** `EFFECT_ARCHETYPES` maps
+   all **161 codes** any export defines (Oblivion 145, Nehrim 149,
+   Morrowind_ob's masters, the DLCs) to a `(archetype, actor value)` pair. Zero
+   missing, zero phantom — enforced by
+   `tests/test_import.py::TestMgefConversion::test_every_source_effect_code_has_an_archetype`,
+   which reads `export/*/MGEF.txt` rather than trusting a name. The 17 phantom
+   keys are deleted from `MGEF_CODE_TO_SKYRIM`, which now survives only as the
+   fallback for a plugin whose MGEFs were never exported.
+
+2. **Per-actor-value variants.** Oblivion parameterises one MGEF by the
+   attribute or skill each *effect* names — a single `DGAT` is Damage Strength
+   on one spell and Damage Endurance on the next, because the AV lives in the
+   item's EFIT. Skyrim moved the AV **onto the MGEF**, so a single converted
+   `DGAT` could only ever damage one stat. `build_av_variants()` emits one MGEF
+   per `(code, actor value)` pair the plugin actually uses (**100 for Oblivion,
+   100 for Nehrim**) covering 1,897 effect uses across 8 codes, and names them
+   what the item card said: "Damage Strength", not "Damage Attribute".
+
+3. **Script-effect (`SEFF`) variants — Phase 4, brought forward.** `SEFF` was
+   the single most-dropped code (143 uses in Oblivion, 176 in Nehrim) and it
+   had to land here, because a TES4 script effect names its script **per
+   effect** (`ScriptEffect[i].FormID` on the owning record), not on the MGEF.
+   `build_seff_variants()` emits one archetype-1 MGEF per distinct
+   `(script, delivery)` pair with the converted `ActiveMagicEffect` attached as
+   a `VMAD` — **78 for Oblivion, 100 for Nehrim, 34 for Morrowind_ob**. The
+   VMADs come from `object_scripts.build_magic_effect_script_plan()`, which is
+   where the property-resolution machinery already lives.
+
+4. **AssocItem is type-checked, not copied.** `wbMGEFAssocItemDecider` reads
+   Assoc. Item for **10 archetypes only**, and each expects a specific record
+   type — Summon Creature an `NPC_`, Bound Weapon a `WEAP`/`ARMO`. The
+   converter resolves the TES4 FormID through a plugin-wide index
+   (`_build_assoc_item_index`, masters included) and drops it under any other
+   archetype rather than writing a meaningless FormID. Two Oblivion summons
+   point at an **LVLC**, which converts to an `LVLN` the archetype rejects, so
+   the list's lowest-level entry stands in (chased transitively through nested
+   lists).
+
+5. **Dependent plugins read the master's effects.** A plugin like
+   Morrowind_ob.esm defines **no MGEF at all** yet has 109 items carrying
+   script effects. The effect index, the AssocItem index and the ENCH index all
+   merge `ctx.master_export` the same way the outfit index does — without it
+   every effect in such a plugin resolved to nothing.
+
+Two defects surfaced while verifying and were fixed in the same pass:
+
+- **Enchanted books were unusable paper.** A TES4 BOOK carrying an `ENAM` is a
+  scroll, and Skyrim's BOOK record has **no field for an object effect** — so
+  **503 scrolls** across the three plugins (307 Oblivion, 62 Nehrim, 134
+  Morrowind_ob) converted to blank books that could never be cast, the Scroll
+  of Icarian Flight among them. `convert_BOOK` now emits a **`SCRL`** for those,
+  copying the ENCH's effect list onto it (SCRL carries its effects directly),
+  and `import_main` files each record by the signature its own bytes carry
+  rather than by a per-signature `TYPE_MAP` entry.
+- **`tools/tes5_esm_reader.py` had EFIT Area/Duration swapped**, which made
+  every dump of a converted spell look wrong. TES5 EFIT is Magnitude, **Area**,
+  **Duration** (xEdit `wbEFIT`); settled by census — all **427 vanilla ALCH
+  effects** write 0 at offset 4 and 30/60/300/720 at offset 8, which are potion
+  durations, and potions have no area. The writer was always correct.
+
+**Archetype legality.** Vanilla Skyrim.esm never uses archetypes 2 (Dispel),
+15 (Lock), 16 (Open) or 24 (Turn Undead), so a census cannot license them.
+They are legal anyway: `DispelEffect`, `LockEffect`, `OpenEffect` and
+`TurnUndeadEffect` are all present in SkyrimSE.exe as RTTI classes with real
+vtables and constructors (read via `tools/skyrim_disasm.py --find Effect`
+against the GOG build). Don't "fix" them back to a value modifier.
+
+Original field-derivation sketch, still accurate:
 
 Field derivation (TES4 offsets from `tes4_export/record_types/equipment.py:219`,
 TES5 from `wbDefinitionsTES5.pas:8195`):
@@ -228,28 +313,84 @@ current pipeline ignores entirely — TES4 `Area` is packed into EFIT but no
 explosion is ever created). Retire `aimed_variant` once every aimed item's own
 effects carry a projectile.
 
-### Phase 4 — Script effects (`SEFF`)
+### Phase 4 — Script effects (`SEFF`) — DONE 2026-07-31 (with Phase 1)
 
-The single most-used dropped code: **143 uses in Oblivion, 176 in Nehrim**.
-Today it maps to 0, so a script-effect spell converts to an inert filler that
-merely holds the original duration so `HasMagicEffectByID` polling still sees
-it (`_pack_effects`, the `filler_dur` path).
+The single most-used dropped code — **143 uses in Oblivion, 176 in Nehrim** —
+used to map to 0, so a script-effect spell converted to an inert filler that
+merely held the original duration so `HasMagicEffectByID` polling still saw it.
 
-Skyrim's `1 Script` archetype plus a `VMAD` on the MGEF is the real
-destination, and the script converter already exists. This is the natural
-follow-on once Phase 1 lands: emit archetype 1 and attach the converted
-Papyrus fragment, rather than discarding the effect and faking its duration.
+Done as part of Phase 1 because it could not be separated from it: a TES4
+script effect names its script **per effect**, so archetype 1 forces one MGEF
+per distinct script (see Phase 1 item 3). `build_seff_variants()` emits them
+with the converted `ActiveMagicEffect` attached as a VMAD.
+
+Two script-side gaps had to be closed for these to be more than inert records
+(both found by tracing the Scroll of Icarian Flight end to end):
+
+- **`SetNumericGameSetting` was unconverted** — it fell through as a bare call
+  that did not compile. SKSE's `Game.SetGameSettingFloat` is the literal
+  counterpart but **does not compile against the vanilla headers this pipeline
+  builds with** (verified directly against `papyrus.exe`: "undefined function
+  `SetGameSettingFloat`", while the *getter* resolves fine). So the settings
+  with a per-actor equivalent go through `Actor.ForceActorValue` instead
+  (`_GMST_TO_ACTOR_VALUE` in `script_convert/converter.py`), and the *getter*
+  is routed to the same channel — otherwise the save/restore idiom these
+  scripts use reads back a number the write never changed. Anything with no
+  actor-value equivalent keeps a `;TODO` marker rather than a call that
+  silently does nothing.
+  - **`fJumpHeightMax` does not exist in Skyrim** (only `fJumpHeightMin`) —
+    confirmed against both Skyrim.esm's GMST records and the SkyrimSE.exe
+    settings strings. Scripts that set both are writing one real setting and
+    one Oblivion dropped.
+- **`ResetFallDamageTimer` was a no-op** on one half of a paired on/off
+  command — the latent soft-lock in
+  [papyrus_conversion_notes.md](papyrus_conversion_notes.md). Skyrim keeps the
+  console command (opcode 4404) but binds no Papyrus equivalent, and
+  `fJumpFallHeightMin` has readers but no vanilla writer. It now calls
+  `TES4Polyfill.SuppressFallDamage()`, and the converter **injects the paired
+  `RestoreFallDamage()` into the teardown event** (synthesizing an
+  `OnEffectFinish` when the script has none), so the resistance cannot outlive
+  the effect. `SetGhost`/`SetInvulnerable` were rejected: they suppress ALL
+  damage, so a levitation scroll would grant temporary immortality — a worse
+  defect than the one being fixed.
 
 ### Phase 5 — Cleanup
 
-Remove the filler-effect machinery and the `_FILLER_EFFECTS` padding once no
-record loses all its effects; keep the INGR `pad_to=4` requirement.
+No record loses all its effects any more (audit: 0 for both plugins), so the
+`_FILLER_EFFECTS` machinery in `record_types/equipment.py` is now dead weight
+for its original purpose. It is **deliberately left in place**: it is still the
+only thing standing between a null `EFID` and an inventory-menu crash if a
+future plugin uses an effect code no export has seen, and INGR still needs
+`pad_to=4` regardless. Delete the `filler_dur` duration-faking path — that one
+existed only so a dropped `SEFF` still answered `HasMagicEffectByID`, and SEFF
+is no longer dropped.
+
+Also still open: `magic_effects.aimed_variant()` should retire once Phase 3
+gives every aimed item's own effects a projectile (its clones are now the only
+consumer of `vanilla_mgef_data.py`).
 
 ## Rules for working in this area
 
-- **Validate every effect code against `export/*/MGEF.txt`.** 17 of 100
-  existing entries are codes no Oblivion or Nehrim record uses. A plausible-
-  looking 4-char code is not evidence.
+- **Validate every effect code against `export/*/MGEF.txt`.** 17 of the old
+  alias table's 100 entries were codes no Oblivion or Nehrim record uses. A
+  plausible-looking 4-char code is not evidence. A regression test now enforces
+  this in both directions (nothing missing, nothing phantom).
+- **A vanilla census cannot license an archetype.** Skyrim.esm uses only 39 of
+  the 47 archetypes; the ones it skips (Dispel, Lock, Open, Turn Undead) are
+  still fully implemented engine classes. Check the exe's RTTI before assuming
+  an unused enum value is dead.
+- **`Assoc. Item` is typed by archetype and the target must be re-checked, not
+  copied.** A CREA converts to an NPC_ (fine for Summon Creature) but an LVLC
+  converts to an LVLN, which that archetype rejects.
+- **A dependent plugin usually defines NO magic effects.** Every index in this
+  area (effects, AssocItem targets, enchantments) must merge
+  `ctx.master_export`, exactly like the outfit wardrobe index.
+- **Skyrim has vanilla Papyrus GMST readers but NO writer.** `Game.GetGameSetting*`
+  compiles; `Game.SetGameSetting*` is SKSE-only and this pipeline builds against
+  vanilla headers. Route a runtime setting write through the actor value it
+  changes, and route the matching READ through the same channel.
+- **TES5 EFIT is Magnitude, Area, Duration** — in that order. All 427 vanilla
+  ALCH effects put the potion duration at offset 8.
 - **A hand-built TES5 MGEF DATA is 152 bytes, FormVersion 44.** Verified
   against both `wbDefinitionsTES5.pas:8195` and the Skyrim.esm dump.
 - **`Counter Effect Count` (offset 20) must equal the number of `ESCE`

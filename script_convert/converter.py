@@ -184,6 +184,12 @@ class ScriptConverter:
         self._var_types: dict[str, str] = {}  # lower_name -> papyrus_type
         self._current_event: str = ''  # Current event header for context-aware conversion
         self._line_comments: list[str] = []  # Comments accumulated during expression conversion
+        # True once this script emitted TES4Polyfill.SuppressFallDamage() (the
+        # ResetFallDamageTimer conversion).  It raises a GLOBAL game setting,
+        # so the effect-finish path must put it back or fall damage stays off
+        # for the rest of the save — the paired on/off trap in
+        # docs/papyrus_conversion_notes.md.
+        self._suppressed_fall_damage = False
         # Nesting depth inside an OBSE `forEach … loop` block (body is inert).
         self._in_foreach = 0
         self._udf_returns = False      # OBSE Function block uses SetFunctionValue
@@ -1038,6 +1044,18 @@ class ScriptConverter:
                         out.append('  RegisterForSleep()')
                     out.append('EndEvent')
                     out.append('')
+
+        # TES4Polyfill.SuppressFallDamage() (the ResetFallDamageTimer
+        # conversion) applies a lasting actor value, so a script that called it
+        # must undo it when the effect ends or the actor keeps the damage
+        # resistance for the rest of the save — the paired on/off trap in
+        # docs/papyrus_conversion_notes.md.
+        #
+        # Runs HERE, not next to the block loop: the synthesized OnInit/OnUpdate
+        # events are appended after that loop, and the teardown event has to be
+        # in `out` already for the restore to land inside it.
+        if self._suppressed_fall_damage:
+            out = self._append_fall_damage_restore(out, extends)
 
         # Balance If/EndIf within event blocks (some TES4 scripts have extra EndIf)
         out = self._balance_if_endif(out)
@@ -1941,6 +1959,10 @@ class ScriptConverter:
         self._udf_returns = False
         self._udf_return_value = ''
         self._current_script_edid = ''
+        # Must clear per script: the converter instance is reused across every
+        # SCPT in a job, and a leaked True would append a RestoreFallDamage to
+        # an unrelated script's teardown event.
+        self._suppressed_fall_damage = False
 
     @staticmethod
     def _balance_if_endif(lines: list[str]) -> list[str]:
@@ -2132,6 +2154,91 @@ class ScriptConverter:
         ev = self._current_event or ''
         m = re.search(r'\bActor\s+(ak\w+)', ev)
         return m.group(1) if m else ''
+
+    # TES4 GMSTs a script writes at runtime → the Skyrim ACTOR VALUE that
+    # produces the same observable change on the actor.  Skyrim has no vanilla
+    # Papyrus GMST *writer* (only readers), so a global setting cannot be
+    # changed without SKSE; every one of these settings does, however, have a
+    # per-actor equivalent the engine already reads.
+    #
+    # Names verified against Skyrim.esm's AVIF records and the actor-value
+    # table in SkyrimSE.exe.  Note fJumpHeightMax does NOT exist in Skyrim at
+    # all (only fJumpHeightMin) — scripts that set both are writing one real
+    # setting and one that Oblivion had and Skyrim dropped.
+    _GMST_TO_ACTOR_VALUE = {
+        'fjumpheightmin':      'JumpingBonus',
+        'fjumpheightmax':      'JumpingBonus',
+        'fmoverunmult':        'SpeedMult',
+        'fmovecharwalkmin':    'SpeedMult',
+        'fmovecharwalkmax':    'SpeedMult',
+        'fmoverunathleticsmult': 'SpeedMult',
+    }
+
+    def _gamesetting_write(self, setting: str, value: str, extends: str) -> str:
+        """A runtime GMST write, re-expressed as the actor value it changes."""
+        av = self._GMST_TO_ACTOR_VALUE.get(setting.lower())
+        if not av:
+            return (f';TODO: SetNumericGameSetting {setting} {value}  '
+                    f';no vanilla Papyrus GMST writer and no actor-value '
+                    f'equivalent (SKSE Game.SetGameSetting* would be needed)')
+        # ForceActorValue, not ModActorValue: the TES4 call SETS the value
+        # outright, and a script that writes the same setting on every update
+        # would otherwise stack the modifier without bound.
+        target = self._actor_target_for_gamesetting(extends)
+        return f'{target}.ForceActorValue("{av}", {value})'
+
+    def _actor_target_for_gamesetting(self, extends: str) -> str:
+        """The actor a runtime game-setting write should apply to.
+
+        These settings were GLOBAL in Oblivion, so every script that writes one
+        is changing the world for whoever is affected — in practice the player,
+        which is who casts the scroll or wears the ring.  A magic-effect script
+        has a real target parameter and uses it; anything else applies to the
+        player, matching the global's practical scope.
+        """
+        if extends == 'ActiveMagicEffect':
+            param = self._current_event_actor_param()
+            if param:
+                return param
+        return 'Game.GetPlayer()'
+
+    _FALL_RESTORE = 'TES4Polyfill.RestoreFallDamage()'
+
+    def _append_fall_damage_restore(self, out: list, extends: str) -> list:
+        """Pair every SuppressFallDamage() with a restore when the effect ends.
+
+        `TES4Polyfill.SuppressFallDamage()` (the ResetFallDamageTimer
+        conversion) writes fJumpFallHeightMin, a GLOBAL game setting.  Oblivion
+        needed no teardown because ResetFallDamageTimer only cleared a
+        per-actor accumulator; leaving the Skyrim equivalent set would disable
+        fall damage permanently.
+
+        The restore goes in whichever teardown event the script already has —
+        OnEffectFinish for a magic-effect script, otherwise OnUpdate's exit —
+        and a fresh OnEffectFinish is synthesized when the script has none.
+        """
+        idx = next((i for i, line in enumerate(out)
+                    if line.startswith('Event OnEffectFinish(')), None)
+
+        if idx is not None:
+            # Restore the SAME actor the suppression applied to, which is the
+            # teardown event's own target parameter.
+            m = re.search(r'\bActor\s+(ak\w+)', out[idx])
+            actor = m.group(1) if m else ''
+            end = next((i for i in range(idx + 1, len(out))
+                        if out[i] == 'EndEvent'), None)
+            if end is not None:
+                out.insert(end, f'  TES4Polyfill.RestoreFallDamage({actor})')
+                return out
+
+        # No teardown event at all: an ActiveMagicEffect always gets one, so
+        # synthesize it rather than leaving the suppression permanent.
+        if extends == 'ActiveMagicEffect':
+            out.append('Event OnEffectFinish(Actor akTarget, Actor akCaster)')
+            out.append('  TES4Polyfill.RestoreFallDamage(akTarget)')
+            out.append('EndEvent')
+            out.append('')
+        return out
 
     def _block_filter_guard(self, block_type: str,
                             block_filter: str) -> 'str | None':
@@ -5181,10 +5288,28 @@ class ScriptConverter:
             self._line_comments.append(';NE: SetRigidBodyMass')
             return '0'
 
-        # ResetFallDamageTimer → no-op
+        # ResetFallDamageTimer (OBSE) cleared the accumulated fall distance so
+        # the next landing did no damage.  Skyrim has the console command
+        # (opcode 4404) but exposes no Papyrus binding for it, so the faithful
+        # substitute is the GMST the fall-damage formula actually reads:
+        #
+        #   damage = ((height - fJumpFallHeightMin) * fJumpFallHeightMult)
+        #            ^ fJumpFallHeightExponent
+        #
+        # (Skyrim:Damage, verified against the GMSTs in Skyrim.esm —
+        # fJumpFallHeightMin defaults to 600.)  Pushing the threshold beyond
+        # any reachable fall makes the landing survivable, which is the whole
+        # observable behaviour of the OBSE call.  The scripts that use it
+        # (Icarian Flight and friends) call it every update while an effect
+        # runs and stop when the effect ends, so the raise is scoped the same
+        # way — TES4Polyfill restores the original on release.
         if fname_low == 'resetfalldamagetimer':
-            self._line_comments.append(';NE: ResetFallDamageTimer')
-            return '0'
+            self._suppressed_fall_damage = True
+            # OnUpdate has no actor parameter, so the polyfill's None default
+            # (the player) covers the common case; a handler that DOES name an
+            # actor targets that one.
+            return (f'TES4Polyfill.SuppressFallDamage('
+                    f'{self._current_event_actor_param()})')
 
         # AddTopic on a GATED topic opens that topic's unlock gate.
         #
@@ -5341,12 +5466,45 @@ class ScriptConverter:
         # GetGameSetting/getgs: arg is GMST name → quoted string
         if fname_low in ('getgamesetting', 'getgs'):
             setting = args_str.strip().strip('"') if args_str else 'fUnknown'
+            # A setting this converter WRITES through an actor value must also
+            # be READ through it, or the save/restore pattern these scripts use
+            # ("remember the old value, set a new one, put it back") reads the
+            # untouched global and restores a number the write never changed.
+            av = self._GMST_TO_ACTOR_VALUE.get(setting.lower())
+            if av:
+                target = self._actor_target_for_gamesetting(extends)
+                return f'{target}.GetActorValue("{av}")'
             # Use Int/Float/String variant based on naming convention (i=int, f=float, s=string)
             if setting.startswith('i'):
                 return f'Game.GetGameSettingInt("{setting}")'
             elif setting.startswith('s'):
                 return f'Game.GetGameSettingString("{setting}")'
             return f'Game.GetGameSettingFloat("{setting}")'
+
+        # SetNumericGameSetting / SetGameSetting (OBSE): write a GMST at
+        # runtime.  SKSE's Game.SetGameSettingFloat is the literal counterpart,
+        # but it does NOT compile against the vanilla headers this pipeline
+        # builds with (verified: "undefined function SetGameSettingFloat",
+        # while the *getter* resolves), and requiring SKSE to build is not an
+        # option.  So the settings that have a per-actor ACTOR VALUE equivalent
+        # go through Actor.ModActorValue — a vanilla native that produces the
+        # same observable change on the player, scoped to the actor instead of
+        # the whole game, which is what these scripts actually want.
+        #
+        # Anything without an actor-value equivalent keeps a visible marker
+        # rather than a call that silently does nothing.
+        if fname_low in ('setnumericgamesetting', 'setgamesetting',
+                         'setnumericgamesettingfloat'):
+            # TES4 accepts any mix of commas and spaces between the two args.
+            parts = [p.strip() for p in
+                     (args_str.replace(',', ' ').split(None, 1) if args_str else [])
+                     if p.strip()]
+            if len(parts) >= 2:
+                setting = parts[0].strip().strip('"')
+                value = self._convert_expression(parts[1].strip().lstrip(','),
+                                                 extends)
+                return self._gamesetting_write(setting, value, extends)
+            return f';TODO: {func_name} {args_str}  ;needs a setting name and value'
 
         # GetDeadCount: TES4 counts how many actors of a BASE type are dead.
         # Skyrim has the SAME function natively — ActorBase.GetDeadCount(),

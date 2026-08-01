@@ -284,6 +284,7 @@ def _init_dispatch():
         convert_SPEL,
         convert_WEAP,
     )
+    from .record_types.magic import convert_MGEF
     from .record_types.items import (
         convert_ACTI,
         convert_ANIO,
@@ -335,6 +336,7 @@ def _init_dispatch():
         'CLOT': convert_CLOT,
         'AMMO': convert_AMMO,
         'BOOK': convert_BOOK,
+        'MGEF': convert_MGEF,
         'ENCH': convert_ENCH,
         'SPEL': convert_SPEL,
         'ALCH': convert_ALCH,
@@ -397,7 +399,11 @@ def _init_dispatch():
         'SKIL',   # Hardcoded in TES5
         'BSGN',   # Birthsigns → no equivalent
         'RACE',   # NPCs map to Skyrim races
-        'MGEF',   # Magic Effect -> Completely restructured
+        # MGEF is CONVERTED (record_types/magic.py).  It used to be skipped,
+        # with every effect re-pointed at a vanilla Skyrim MGEF through a flat
+        # code table — which cannot express an effect parameterised by a
+        # FormID the source carries, so all 33 summons and every bound
+        # weapon/armor were dropped and 382 records became inert filler.
         'CSTY',   # Combat Style -> Completely restructured
         'IDLE',   # Animation system different
         'GMST',   # Game settings differ between TES4/TES5
