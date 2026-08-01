@@ -48,6 +48,47 @@ the original state. Audit the partner call before accepting either.
   player controls disabled. 97 scripts across the game use SetAlert, most in
   talking scenes (MQ13/MQ14 Bruma, SE06 battle, MS13), not fights.
 
+- **`ResetFallDamageTimer` (2026-07-31)** was a `;NE:` no-op with no "on" half
+  at all, so a levitation/flight effect converted to a spell that dropped the
+  player to their death. Skyrim keeps the console command (opcode 4404) but
+  binds no Papyrus equivalent, and `fJumpFallHeightMin` has readers but no
+  vanilla writer. It now calls `TES4Polyfill.SuppressFallDamage()`, and the
+  converter **injects the paired `RestoreFallDamage()` into the teardown
+  event** — synthesizing an `OnEffectFinish` when the script has none, so the
+  suppression can never outlive the effect. The injection is a post-pass run
+  after the synthesized `OnInit`/`OnUpdate` are appended, because TES4 does not
+  order its blocks and the teardown event must already be in the output for the
+  restore to land inside it. `SetGhost`/`SetInvulnerable` were rejected as the
+  mechanism: both suppress ALL damage, so the scroll would grant temporary
+  immortality — a worse defect than the one being fixed.
+
+## Skyrim has GMST readers but no GMST writer (2026-07-31)
+
+`Game.GetGameSettingFloat/Int/String` are vanilla natives. **`Game.SetGameSetting*`
+is SKSE-only and does NOT compile against the vanilla headers this pipeline
+builds with** — verified directly against `papyrus.exe`: a script calling the
+setter fails with "undefined function `SetGameSettingFloat`" on the same line
+the getter resolves fine.
+
+So OBSE's `SetNumericGameSetting` cannot convert literally. The settings that
+have a per-actor equivalent go through `Actor.ForceActorValue` instead
+(`_GMST_TO_ACTOR_VALUE` in `script_convert/converter.py`) — same observable
+change, scoped to the actor rather than the world, which is what these scripts
+actually want. Two rules fall out:
+
+- **The READ must use the same channel as the WRITE.** These scripts all use the
+  save/restore idiom ("remember the old value, set a new one, put it back"); if
+  the getter still goes to the global GMST it reads back a number the write
+  never changed, and the restore writes garbage. `GetGameSetting` is redirected
+  to `GetActorValue` for exactly the settings in the table.
+- **`fJumpHeightMax` does not exist in Skyrim** — only `fJumpHeightMin`.
+  Confirmed against both Skyrim.esm's GMST records and the SkyrimSE.exe settings
+  strings. A TES4 script that sets both is writing one real setting and one
+  Oblivion had that Skyrim dropped; the second write is a harmless no-op.
+
+Settings with no actor-value equivalent keep a `;TODO` marker — a call that
+compiles and silently does nothing is the dangerous outcome, not the honest one.
+
 ## Silent mis-conversion — the unmarked loss
 
 **A `;NE:`/`;TODO:` marker is the HEALTHY failure. The dangerous conversions are

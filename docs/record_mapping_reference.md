@@ -32,7 +32,7 @@ see the `oblivion-to-skyrim-dialog` skill.
 | ANIO | ANIO | Minor changes. |
 | APPA | MISC | No apparatus in TES5. Convert to MISC. |
 | ARMO | ARMO | **Major changes**: BMDT(4B)→BOD2(8B), 16→32 biped slots. Armor models move to ARMA records. ARMO references ARMA via MODL array. No direct mesh on ARMO. Add OBND, RNAM (race), keywords. |
-| BOOK | BOOK | Add OBND. DATA restructured. Skill teaching uses TES5 skill enum. TES4 Scroll flag (0x01) → DATA.Type 255 (Note/Scroll). **INAM (Inventory Art STAT) is mandatory — BookMenu null-derefs (in-game crash) when a book without INAM is read.** But pointing INAM at a vanilla stand-in shows the default Skyrim cover, so we synthesise a per-book `InvArt_<edid>` STAT wrapping the book's own converted mesh. CNAM (Description string) present-but-empty like vanilla. Book text (DESC) HTML: Skyrim Scaleform only knows **named fonts** (`<font face='$SkyrimBooks'>`, `$HandwrittenFont`, `$DaedricFont`) — Oblivion's numeric `<font face=N>` resolves to no font and renders NO text (map 1/2/3→$SkyrimBooks, 4→$DaedricFont, 5→$HandwrittenFont); IMG src needs `img://textures/tes4/menus/<path>` (Oblivion srcs are relative to Textures\Menus\). |
+| BOOK | BOOK **or SCRL** | A book carrying an **ENAM is a SCROLL**, and Skyrim's BOOK has no field for an object effect — so those emit a `SCRL` with the ENCH's effect list copied onto it (503 across Oblivion/Nehrim/Morrowind_ob were converting to blank, uncastable paper). `import_main` files each record by the signature its own bytes carry, so one converter can retarget per record. The rest: add OBND, DATA restructured, skill teaching uses the TES5 skill enum. `DATA.Type` is always 0 — the CK lists 255 = Note/Scroll but all 821 vanilla BOOKs write 0, so 255 is engine-untested. **INAM (Inventory Art STAT) is mandatory — BookMenu null-derefs (in-game crash) when a book without INAM is read.** But pointing INAM at a vanilla stand-in shows the default Skyrim cover, so we synthesise a per-book `InvArt_<edid>` STAT wrapping the book's own converted mesh. CNAM (Description string) present-but-empty like vanilla. Book text (DESC) HTML: Skyrim Scaleform only knows **named fonts** (`<font face='$SkyrimBooks'>`, `$HandwrittenFont`, `$DaedricFont`) — Oblivion's numeric `<font face=N>` resolves to no font and renders NO text (map 1/2/3→$SkyrimBooks, 4→$DaedricFont, 5→$HandwrittenFont); IMG src needs `img://textures/tes4/menus/<path>` (Oblivion srcs are relative to Textures\Menus\). |
 | BSGN | *(none)* | Birthsigns don't exist. Spells should go to Race records or Standing Stones. Exported as BSGN_SPELLS for reference. |
 | CELL | CELL | DATA: U8→U16 flags. Lighting (XCLL) expanded. New: LTMP (lighting template), XLCN (location), XCAS (acoustic space), XCMO (music type). |
 | CLAS | CLAS | Simplified in TES5. No attributes/skills. Only Flags, Teaches, MaxTraining. |
@@ -64,7 +64,7 @@ see the `oblivion-to-skyrim-dialog` skill.
 | LVLC | LVLN | Leveled Creature → Leveled NPC. Same entry format (LVLO). |
 | LVLI | LVLI | Same entry format. Minor flag differences. |
 | LVSP | LVSP | Same entry format. |
-| MGEF | MGEF | **Major restructuring**: TES4 uses 4-char codes (OBME), FormID-based effects (EFID/EFIT). TES5 MGEF has completely different DATA struct. Magic school → skill enum. |
+| MGEF | MGEF | **Converted since 2026-07-31** (`record_types/magic.py`) — was in SKIP_TYPES, which cost 796 dropped effects and 382 filler records. TES4's 4-char code picks a TES5 **Archtype** (152-byte DATA, FormVersion 44); the code table covers all 161 codes any export defines. Extra MGEFs are emitted per **actor value** (one TES4 `DGAT` is Damage Strength on one spell and Damage Endurance on the next — Skyrim moved the AV onto the MGEF) and per **script** (a TES4 `SEFF` names its script per-effect; archetype 1 + VMAD). `Assoc. Item` is written only for the 10 archetypes that read it, and its target is re-type-checked. See [magic_conversion_plan.md](magic_conversion_plan.md). |
 | MISC | MISC | Add OBND. Minor changes. |
 | NPC_ | NPC_ | **Massive restructuring**: ACBS different fields. DATA(33B)→empty marker. Skills/stats→DNAM(52+B). Hair→PNAM(HDPT array). Voice→VTCK(VTYP). Outfits→DOFT/SOFT(OTFT). Perks new. Template system new. Add OBND, keywords. |
 | PACK | PACK | **Completely incompatible**: TES4 type-based (Find/Follow/Escort/Eat/Sleep). TES5 procedure-tree based. Must create skeleton records. |
@@ -78,7 +78,7 @@ see the `oblivion-to-skyrim-dialog` skill.
 | ROAD | *(skip)* | Roads replaced by NavMesh. |
 | SBSP | STAT | Subspace has no equivalent. Export as STAT. |
 | SCPT | *(skip)* | Scripts must be rewritten in Papyrus. Source exported for reference. |
-| SGST | SCRL | Sigil Stone → Scroll (closest equivalent). |
+| SGST | SCRL | Sigil Stone → Scroll (closest equivalent). Shares `_build_scrl` with the enchanted-book path (see BOOK). |
 | SKIL | *(skip)* | Skills hardcoded in TES5. Exported for reference. |
 | SLGM | SLGM | Add OBND. Minor changes. |
 | SOUN | SOUN + SNDR | TES5 splits sound into SOUN (marker) + SNDR (Sound Descriptor with actual data). |
@@ -153,7 +153,6 @@ see the `oblivion-to-skyrim-dialog` skill.
   plugin that only retitles NPCs is unaffected and must stay so: Translation.esp's 1,284 NPC overrides
   keep the master's DOFT byte-identically, 0 lost.
 - **RACE** — Almost entirely restructured. Only basic data (height/weight/skill boosts/spells) can transfer.
-- **MGEF** — 4-char code system vs FormID system. Flag mapping is complex.
 - **ENCH/SPEL** — ENIT/SPIT completely restructured. Effects need MGEF FormID resolution.
 - **ARMO/CLOT** — Missing ARMA records means armor won't render in-game.
 
@@ -447,13 +446,26 @@ must stay in step. CNAM.CrimeGold carries across as the Steal Multiplier.
   when a menu builds the item card → instant CTD on opening inventory with the
   item (crash log: `(AlchemyItem*)` in RCX + `InventoryMenu`). Applies to ALCH,
   INGR, ENCH, SPEL, SCRL alike.
-- `_pack_effects()` (tes5_import/record_types/equipment.py) drops effects whose
-  TES4 code has no Skyrim mapping and guarantees ≥1 real effect (INGR: exactly 4)
-  by padding with zero-magnitude AlchRestore* fillers.
-- Attribute/skill-targeted codes (DRAT/DGAT/FOAT/REAT/ABAT/FOSK) resolve through
-  the effect's ActorValue via `MGEF_AV_CODE_TO_SKYRIM` (skyrim_overrides.py):
-  e.g. Drain Endurance → AlchDamageHealth, Fortify Personality → AlchFortifyBarter,
-  Fortify Blade → AlchFortifyOneHanded. Flat `MGEF_CODE_TO_SKYRIM` is the fallback.
+- `_resolve_mgef()` (tes5_import/record_types/equipment.py) tries three lookups,
+  most specific first — **since MGEF became a converted record type, the normal
+  answer is an effect of OUR OWN**, not a vanilla lookalike:
+  1. **script-effect variant** — `SEFF` names its script per effect, and Skyrim
+     keeps the script on the MGEF, so each distinct script has its own record;
+  2. **per-actor-value variant** — DGAT/DRAT/FOAT/REAT/ABAT/ABSK/DRSK/FOSK are
+     parameterised by the effect's own ActorValue, which Skyrim moved into the
+     MGEF (so "Damage Attribute" becomes a real "Damage Strength" record);
+  3. the plugin's plain MGEF for the code.
+  `MGEF_AV_CODE_TO_SKYRIM` / `MGEF_CODE_TO_SKYRIM` (skyrim_overrides.py) survive
+  only as the fallback for a plugin whose MGEFs were never exported. Its 17
+  phantom keys — codes no export uses — are deleted.
+- `_pack_effects()` still guarantees ≥1 real effect (INGR: exactly 4) by padding
+  with zero-magnitude AlchRestore* fillers. As of Phase 1 **no record actually
+  reaches that path** (audit: 0 filler records for both plugins); it stays as the
+  guard against a future plugin using an unseen code.
+- **TES5 EFIT is Magnitude, Area, Duration** — offset 4 is Area, offset 8 is
+  Duration (xEdit `wbEFIT`; all 427 vanilla ALCH effects put the potion duration
+  at offset 8 and 0 at offset 4). `tools/tes5_esm_reader.py` had the two labels
+  swapped until 2026-07-31, which made every dump of a converted spell look wrong.
 - **TES5 INGR ENIT is 8 bytes** (s32 value + u32 flags), NOT the 20-byte ALCH
   layout (xEdit wbDefinitionsTES5 INGR).
 
