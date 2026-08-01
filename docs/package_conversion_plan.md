@@ -177,8 +177,8 @@ every field we need (`PKDT.Flags/Type/Format`, `PSDT.*`, `PLDT.Type/Location/Rad
 | 6 Travel | 1,924 | `Travel` | **exact** — same procedure |
 | 5 Wander | 1,820 | `Sandbox` | **exact** — TES4 Wander = wander/sit/idle in a radius, which is what Sandbox does |
 | 3 Eat | 829 | `Eat` | **exact** — dedicated tree w/ Acquire+Find-chair |
-| 8 UseItemAt | 751 | `SitTarget` / `Travel` | **partial** — see §2.1 |
-| 0 Find | 741 | `Travel` + `SitTarget`/`Sandbox` | **partial** — see §2.1 |
+| 8 UseItemAt | 751 | `SitTarget` / `Activate` / `Travel` | **partial** — see §2.1, §3.2 |
+| 0 Find | 741 | `Activate` / `ForceGreet` / `Sandbox` | **partial** — see §2.1, §3.2 |
 | 4 Sleep | 725 | `Sleep` | **exact** — dedicated tree w/ bed-find + LockDoors |
 | 1 Follow | 208 | `Follow` | **exact** |
 | 9 Ambush | 80 | `HoldPosition` + Weapon Drawn / No Combat Alert | **close** |
@@ -293,11 +293,41 @@ re-expressed in Skyrim's vocabulary.
   Find→Acquire→Sandbox chain does the food-seeking; `PSDT` carries the mealtime.
 - **Sleep (4)** → `Sleep` template. `PLDT` → *Sleep Location*. Template finds the
   bed and locks doors; `PSDT` carries bedtime and duration.
-- **Find (0)** → `Travel` to `PLDT`, then Sandbox at destination. (Object-location
+- **Find (0)** → `Activate` when `PTDT` names a specific **ACTI/DOOR/CONT** ref
+  (see "operate the thing" below); `ForceGreet` when it names the player;
+  otherwise `Travel` to `PLDT`, then Sandbox at destination. (Object-location
   tail is dropped — see §2.1.)
 - **UseItemAt (8)** → `SitTarget` when the `PTDT` target is furniture (chair/bed/
-  bench, incl. object-type targets → *Chairs* ObjectList); otherwise `Travel` +
-  Sandbox with Special Furniture allowed.
+  bench, incl. object-type targets → *Chairs* ObjectList); `Activate` for any
+  other specific ref; otherwise `Travel` + Sandbox with Special Furniture
+  allowed.
+
+#### "Operate the thing": Find/UseItemAt at an activator
+
+Both TES4 types are *seek-then-use* procedures, and Skyrim has no standalone
+equivalent — the seek half looks like Travel, but the **use** half is the whole
+point, because the target object's `OnActivate` script is what advances the
+quest. Routing these to Sandbox leaves the actor standing inert beside the
+object forever; worse, this idiom usually carries **no `PLDT` at all**, so the
+Sandbox gets an empty location and the actor does not even walk over.
+
+Skyrim expresses exactly this with the **`Activate` template (`00019B2D`)** —
+24 vanilla instances, e.g. `MQ101HadvarOpenGate2`, `MS02BorkulOpenDoorPackage`,
+`TG08AKarliahOpenGatePackage`, `MQ203DelphineLightRightSconce`.
+
+`pack_converter._operate_target()` is the single decision point for both types:
+target must be `PTDT.Type == 0` (specific ref), not the player, and the base
+signature decides — UseItemAt takes anything **non-furniture**, Find takes
+`ACTI`/`DOOR`/`CONT` only. It also drives the PKDT choice (vanilla speed +
+`0xFFFF` interrupts), so the actor can break off its schedule to do the job.
+
+Census of Oblivion's 741 Find packages by target: 230 `NPC_` (a greet — must
+stay Sandbox), 123 no `PTDT`, 101 `STAT` (markers — Sandbox), 84+70 object-type
+targets, 73 player (ForceGreet), and **24 `ACTI`/`DOOR`/`CONT`** — the operate
+set. Getting this wrong stalls scripted sequences with no error and no log
+line: `CGRatAmbushAPushBricks` (rat → `CGCrumbleWall01REF`) meant the
+CharacterGen wall never crumbled, `setstage MQ01 24` never ran, and the
+tutorial rats never turned hostile no matter how long the player waited.
 - **Follow (1)** → `Follow`, `PTDA` = target, `Accompany?=0`.
 - **Accompany (7)** → `Follow`, `Accompany?=1` — Skyrim models Accompany as a
   Follow input, so this is exact, not an approximation.

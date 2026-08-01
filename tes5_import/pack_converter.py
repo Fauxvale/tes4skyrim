@@ -168,6 +168,42 @@ DEFAULT_INTERRUPT = 0x0000
 # UseItemAt target is "sit-like".
 FURNITURE_SIGS = frozenset({'FURN', 'CHAI', 'BED '})
 
+# Base types that an actor OPERATES rather than approaches: a lever, switch,
+# crumbling wall, or door.  A TES4 package aimed at one of these means "go and
+# activate that thing", and the thing's own OnActivate script is what advances
+# the quest — so it must become a TES5 Activate template, never a Sandbox.
+OPERABLE_SIGS = frozenset({'ACTI', 'DOOR', 'CONT'})
+
+
+def _operate_target(rec: dict, ctx: 'PackContext') -> bool:
+    """True when this package's target is a specific ref the actor must ACTIVATE.
+
+    Covers both TES4 idioms that mean "go operate that object":
+      * UseItemAt (type 8) at a non-furniture ref  — Renault at the prison wall
+        switch, CharacterGen stage 18.
+      * Find (type 0) at an ACTI/DOOR/CONT ref     — the CharacterGen rats at
+        CGCrumbleWall01REF (CGRatAmbushAPushBricks), SE32PullLever,
+        MS92BlackBrugoOpenSwitch, SE06GSWardenUnlockMainDoor, and 20 others.
+
+    Oblivion's "Find" is a seek-then-use procedure; Skyrim has no standalone
+    equivalent, and sandboxing these left the actor inert next to the object so
+    the object's OnActivate script never ran and the quest stalled forever.
+    """
+    if get_int(rec, 'PTDT.Type', -1) != 0:
+        return False
+    target = get_formid(rec, 'PTDT.Target')
+    if not target or target == PLAYER_FID:
+        return False
+    sig = ctx.base_sig_of(target)
+    if not sig:
+        return False
+    ptype = get_int(rec, 'PKDT.Type', -1)
+    if ptype == T4_USEITEMAT:
+        return sig not in FURNITURE_SIGS
+    if ptype == T4_FIND:
+        return sig in OPERABLE_SIGS
+    return False
+
 
 def _f32(v: float) -> bytes:
     return struct.pack('<f', float(v))
@@ -714,8 +750,7 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
             # ACTI PrisonSecretWallSwitch01).  Only real furniture sits.
             # The map is keyed on the RAW TES4 id (low 24 bits are identical
             # either way, so the remapped value keys it correctly too).
-            sig = ctx.base_sig_of(get_formid(rec, 'PTDT.Target'))
-            if sig and sig not in FURNITURE_SIGS:
+            if _operate_target(rec, ctx):
                 i = Inputs(ACTIVATE)
                 i.set('target', tgt)
                 return i
@@ -745,6 +780,17 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
             if radius > 0:
                 i.set('forcegreet_distance',
                       _location(0, PLAYER_FID, int(radius)))
+            return i
+        # "Find" a lever/switch/door/container means GO AND OPERATE IT — the
+        # object's own OnActivate script is the point of the package.  24 of
+        # Oblivion's Find packages are this idiom; sandboxing them left the
+        # actor standing inert beside the object forever.  CharacterGen's
+        # CGRatAmbushAPushBricks (rat -> CGCrumbleWall01REF) is the visible
+        # case: the wall never crumbled and MQ01 never reached stage 24, so
+        # the rats never turned hostile.
+        if _operate_target(rec, ctx):
+            i = Inputs(ACTIVATE)
+            i.set('target', tgt)
             return i
         # Otherwise: travel to the location, then sandbox there.  The "locate
         # this object" tail has no TES5 standalone equivalent.
@@ -794,12 +840,7 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
     # at vanilla's pace and with vanilla's interrupt authorisation, or the actor
     # dawdles / can never break off to do the thing.  Both were measured from
     # real instances: MS05InductionForcegreet and CWEscapeCitySceneActivateDoor.
-    is_activate = (ptype == T4_USEITEMAT
-                   and get_int(rec, 'PTDT.Type', -1) == 0
-                   and get_formid(rec, 'PTDT.Target')
-                   and ctx.base_sig_of(get_formid(rec, 'PTDT.Target'))
-                   not in FURNITURE_SIGS
-                   and ctx.base_sig_of(get_formid(rec, 'PTDT.Target')))
+    is_activate = _operate_target(rec, ctx)
     if is_forcegreet:
         # Copy vanilla's force-greet PKDT exactly (MS05InductionForcegreet):
         # no flags, speed 2 (run), and interrupt flags 0xFEFF.  The interrupts

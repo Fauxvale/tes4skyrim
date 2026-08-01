@@ -2045,6 +2045,56 @@ class TestCKWarningFixes:
         pkdt = build_pkdt(0, SPEED_RUN, interrupt=0xFEFF)
         assert struct.unpack('<IBBBBHH', pkdt)[5] == 0xFEFF
 
+    def test_find_at_operable_object_becomes_activate(self):
+        """A TES4 "Find" aimed at a lever/switch/door means GO OPERATE IT.
+
+        Oblivion's Find is a seek-*then-use* procedure. Skyrim has no
+        standalone equivalent, so these were falling through to Sandbox — and
+        because this idiom carries no PLDT, the Sandbox had an EMPTY location:
+        the actor stood inert beside the object forever and the object's
+        OnActivate script never ran.
+
+        CharacterGen is the visible case. `CGRatAmbushAPushBricks` is a Find
+        at CGCrumbleWall01REF (base ACTI). The rat is supposed to push the
+        bricks down, which fires CGCrumbleWall01SCRIPT.OnActivate ->
+        `setstage MQ01 24` -> the rats turn hostile. With the Sandbox the wall
+        never crumbled and the rats never became hostile, no matter how long
+        the player waited, and the tutorial dead-ended.
+
+        Skyrim expresses exactly this with the Activate template (00019B2D):
+        24 vanilla instances, including MQ101HadvarOpenGate2,
+        MS02BorkulOpenDoorPackage and TG08AKarliahOpenGatePackage.
+
+        24 Oblivion Find packages target an ACTI/DOOR/CONT ref this way.
+        Find at an NPC (230 packages) is a greet, not an operate, and must
+        keep sandboxing.
+        """
+        from tes5_import.pack_converter import _choose, PackContext, T4_FIND
+        from tes5_import.pack_templates import ACTIVATE, SANDBOX
+
+        rec = {'Signature': 'PACK', 'FormID': '0007303D',
+               'EditorID': 'CGRatAmbushAPushBricks',
+               'PKDT.Type': str(T4_FIND), 'PKDT.Flags': '8196',
+               'PTDT.Type': '0', 'PTDT.Target': '0003E31C',
+               'PTDT.Count': '200'}
+        ctx = PackContext(ref_base_sig={0x03E31C: 'ACTI'})
+        inp = _choose(rec, ctx, 0x0007303D)
+        assert inp.t is ACTIVATE, \
+            'rat sandboxes instead of pushing the wall; MQ01 never reaches 24'
+        # the wall ref must actually reach the Target slot
+        target = inp.values[ACTIVATE.slot('target')]
+        assert struct.unpack('<iIi', target)[1] == 0x0003E31C
+
+        # a door is the same idiom (SE06GSWardenUnlockMainDoor)
+        door = dict(rec, **{'PTDT.Target': '0001AAAA'})
+        assert _choose(door, PackContext(ref_base_sig={0x01AAAA: 'DOOR'}),
+                       0x0007303E).t is ACTIVATE
+
+        # ...but Find at an ACTOR is a greet and must NOT become Activate
+        npc = dict(rec, **{'PTDT.Target': '00023E71'})
+        assert _choose(npc, PackContext(ref_base_sig={0x023E71: 'NPC_'}),
+                       0x0007303F).t is SANDBOX
+
     def test_defensive_combat_is_not_ignore_combat(self):
         """TES4 Defensive Combat must NOT become TES5 Ignore Combat.
 
