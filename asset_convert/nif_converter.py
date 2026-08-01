@@ -663,6 +663,35 @@ def _extract_inline_tangents(ed, nv):
     return binormals, tangents
 
 
+def _clamp_uv_sets(ts_data):
+    """Reduce geometry data to the single UV set Skyrim reads.
+
+    On disk the u16 "BS Data Flags" packs the UV-set COUNT in its low 6 bits
+    (PyFFI exposes that half as num_uv_sets and bit 12 as extra_vectors_flags).
+    That count is the only thing telling the engine how many TexCoord arrays
+    follow the vertex colours, so a mesh that stores 2 sets while
+    BSLightingShaderProperty binds 1 leaves the engine's vertex buffer a whole
+    array short: the copy runs past the end of the allocation and faults on a
+    non-temporal store (vmovntdq) at the next page boundary.
+
+    Oblivion authors the extra set for detail/overlay passes that Skyrim has no
+    slot for; set 0 is the diffuse UVs every shader samples, so the surplus is
+    dropped rather than remapped.  Census: 2,233 vanilla shapes carry 0 or 1 UV
+    sets and NEVER 2.
+    """
+    n = int(getattr(ts_data, 'num_uv_sets', 0) or 0)
+    if n <= 1:
+        return 0
+    keep = list(ts_data.uv_sets[0]) if len(ts_data.uv_sets) else []
+    ts_data.num_uv_sets = 1
+    ts_data.uv_sets.update_size()
+    if keep and len(ts_data.uv_sets):
+        for dst, src in zip(ts_data.uv_sets[0], keep):
+            dst.u = src.u
+            dst.v = src.v
+    return n - 1
+
+
 def _set_tangents(ts_data, bitangents, tangents):
     """Write inline tangents/bitangents into NiTriShapeData.
 
@@ -699,8 +728,13 @@ def _strip_dead_geometry_controllers(geom):
     ctrl = getattr(geom, 'controller', None)
     while ctrl is not None:
         nxt = getattr(ctrl, 'next_controller', None)
+        # NiUVController has NO RTTI in SkyrimSE.exe — NiStream cannot build it
+        # and a link to the slot yields a non-NiObject pointer (CTD on load).
+        # Its curves are re-emitted as shader float controllers by
+        # _collect_uv_ctrls, which must run BEFORE this strip.
         if isinstance(ctrl, (NifFormat.NiGeomMorpherController,
-                             NifFormat.NiMaterialColorController)):
+                             NifFormat.NiMaterialColorController,
+                             NifFormat.NiUVController)):
             # Unlink this controller from the chain.
             if prev is None:
                 geom.controller = nxt
@@ -895,6 +929,72 @@ def _collect_tex_transform_ctrls(props):
     return out
 
 
+# NiUVData.uv_groups is a fixed 4-entry array in this order.  The values are
+# the same UV offset/scale curves NiTextureTransformController carries, so they
+# reuse _TEX_TRANSFORM_VARS via the equivalent TT_* operation.
+_UV_GROUP_OPS = (_TT_TRANSLATE_U, _TT_TRANSLATE_V, _TT_SCALE_U, _TT_SCALE_V)
+
+
+class _SyntheticTexTransform:
+    """Adapter making a NiUVController group look like a NiTextureTransformController.
+
+    _attach_tex_transform_ctrls only reads operation/flags/frequency/phase/
+    start_time/stop_time off the source, so a small stand-in is enough and
+    avoids duplicating the emit logic.
+    """
+
+    def __init__(self, src, operation):
+        self.operation = operation
+        self.flags = int(getattr(src, 'flags', 0))
+        self.frequency = getattr(src, 'frequency', 1.0) or 1.0
+        self.phase = getattr(src, 'phase', 0.0)
+        self.start_time = src.start_time
+        self.stop_time = src.stop_time
+
+
+def _collect_uv_ctrls(geom):
+    """Harvest animated NiUVControllers from a geometry node's controller chain.
+
+    NiUVController is Oblivion's UV-scroll animation (Morrowind's Ghostfence
+    shimmer, ex_gg_fence*).  **SkyrimSE.exe has no NiUVController RTTI at all**
+    — searching its RTTI for "NiUV" returns only NiUVData — so NiStream cannot
+    construct the block, and a link to that slot hands NiPointer a non-NiObject
+    pointer: the engine then does `lock cmpxchg` on a "refcount" inside
+    read-only .rdata and takes an access violation while loading the mesh.
+
+    The curve itself survives: NiUVData.uv_groups holds the same U/V offset and
+    scale key groups a NiTextureTransformController would, so each populated
+    group becomes one BS*ShaderPropertyFloatController, exactly as the
+    NiTextureTransformController path does.  Returns (source, NiFloatData)
+    tuples for _attach_tex_transform_ctrls.
+    """
+    out = []
+    ctrl = getattr(geom, 'controller', None)
+    while ctrl is not None:
+        nxt = getattr(ctrl, 'next_controller', None)
+        if isinstance(ctrl, NifFormat.NiUVController):
+            data = getattr(ctrl, 'data', None)
+            groups = list(getattr(data, 'uv_groups', []) or []) if data else []
+            for gi, group in enumerate(groups[:len(_UV_GROUP_OPS)]):
+                # A single key is a constant, not an animation.
+                if group is None or group.num_keys < 2:
+                    continue
+                fdata = NifFormat.NiFloatData()
+                fdata.data.num_keys = group.num_keys
+                fdata.data.interpolation = group.interpolation
+                fdata.data.keys.update_size()
+                for dst, src_key in zip(fdata.data.keys, group.keys):
+                    dst.time = src_key.time
+                    dst.value = src_key.value
+                    for extra in ('forward', 'backward'):
+                        if hasattr(dst, extra) and hasattr(src_key, extra):
+                            setattr(dst, extra, getattr(src_key, extra))
+                out.append((_SyntheticTexTransform(ctrl, _UV_GROUP_OPS[gi]),
+                            fdata))
+        ctrl = nxt
+    return out
+
+
 def _attach_tex_transform_ctrls(shader, harvested):
     """Re-emit harvested texture transforms as a Skyrim shader controller chain.
 
@@ -987,6 +1087,11 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     NiTriStrips with controllers are NOT converted to NiTriShape (the controller
     still references the original node by block index; converting breaks the NIF).
     """
+    # NiUVController lives on the geometry controller chain and is stripped
+    # below, so its UV curves must be harvested first (re-emitted as shader
+    # float controllers alongside the NiTexturingProperty ones).
+    uv_transforms = _collect_uv_ctrls(strips_or_shape)
+
     # Drop Skyrim-incompatible geometry controllers (morph/material-color) first,
     # so strips that were only kept as strips because of a dead morpher can
     # convert to NiTriShape.
@@ -1039,6 +1144,18 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     if hasattr(ts.data, 'extra_vectors_flags'):
         ts.data.extra_vectors_flags = 0
 
+    # Skyrim reads ONE UV set.  On disk these share a u16 "BS Data Flags" whose
+    # low 6 bits are the UV-set count (PyFFI splits it into num_uv_sets +
+    # extra_vectors_flags); the count is the ONLY thing telling the engine how
+    # many TexCoord arrays follow, so a file storing 2 sets while the shader
+    # binds 1 overruns the vertex buffer it sized -- a non-temporal memcpy off
+    # the end of the allocation (vmovntdq, CTD on cell load).  Oblivion authors
+    # a second set for detail/overlay passes that Skyrim has no slot for.
+    # Census: 2,233 vanilla shapes are 0 or 1 UV sets, NEVER 2.
+    dropped_uv = _clamp_uv_sets(ts.data)
+    if dropped_uv and stats is not None:
+        stats['uv_sets_dropped'] = stats.get('uv_sets_dropped', 0) + dropped_uv
+
     # Inject inline tangents from NiBinaryExtraData if available
     if tangents is not None and hasattr(ts.data, 'tangents'):
         _set_tangents(ts.data, bitangents, tangents)
@@ -1062,6 +1179,11 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     # (waterfalls, lava, Oblivion gates, sunbeams).  Harvest BEFORE the old
     # properties are cleared below; re-attached to the Skyrim shader further down.
     tex_transforms = _collect_tex_transform_ctrls(src.properties)
+    # NiUVController carries the same UV curves on the GEOMETRY chain instead of
+    # on NiTexturingProperty (Ghostfence).  Harvested above, before
+    # _strip_dead_geometry_controllers removed it — the block type is unknown to
+    # Skyrim and crashes NiStream if left in the file.
+    tex_transforms += uv_transforms
 
     for prop in src.properties:
         if isinstance(prop, NifFormat.NiTexturingProperty):
@@ -1731,6 +1853,33 @@ def _palette_lookup(raw, offset):
     return raw[offset:end] if end >= 0 else raw[offset:]
 
 
+def _bind_shader_ctrl_target(ctrl, shader):
+    """Point a BS*ShaderProperty*Controller at the shader property it drives.
+
+    NiTimeController.Target is a NON-optional back-pointer for this family:
+    every one of the vanilla BS*ShaderProperty{Color,Float}Controllers sampled
+    names its own shader block (Lighting controllers -> BSLightingShaderProperty,
+    Effect -> BSEffectShaderProperty; 15/15, 0 nulls).  The Oblivion source
+    controllers (NiMaterialColorController / NiAlphaController /
+    NiTextureTransformController) target the NiTriShape's *property list*, which
+    has no Skyrim counterpart, so the rebuilt controller was left with a NULL
+    target -- the engine dereferences it while loading the shader property and
+    faults.
+    """
+    if ctrl is None or shader is None:
+        return
+    cn = ctrl.__class__.__name__
+    if 'ShaderProperty' not in cn or 'Controller' not in cn:
+        return
+    # Lighting controllers must not be bound to an Effect shader (or vice
+    # versa) -- the controlled-variable enums differ between the two.
+    want = ('BSEffectShaderProperty' if cn.startswith('BSEffectShaderProperty')
+            else 'BSLightingShaderProperty')
+    if shader.__class__.__name__ != want:
+        return
+    ctrl.target = shader
+
+
 def _match_seq_shader_types(root):
     """Make each retargeted UV controller match its target node's shader.
 
@@ -1743,6 +1892,7 @@ def _match_seq_shader_types(root):
     engine unable to bind the animation.
     """
     shader_of = {}
+    shader_block_of = {}
     for blk in root.tree():
         nm = getattr(blk, 'name', None)
         if not nm:
@@ -1753,6 +1903,7 @@ def _match_seq_shader_types(root):
             cn = pr.__class__.__name__
             if cn in ('BSEffectShaderProperty', 'BSLightingShaderProperty'):
                 shader_of[bytes(nm)] = cn
+                shader_block_of[bytes(nm)] = pr
 
     def _copy_timing(dst, src):
         dst.flags = src.flags
@@ -1778,6 +1929,9 @@ def _match_seq_shader_types(root):
             if not name:
                 name = _palette_lookup(raw, getattr(cb, 'node_name_offset', None))
             if shader_of.get(name) != 'BSEffectShaderProperty':
+                # Stays on the Lighting shader; still needs its target bound
+                # (see _bind_shader_ctrl_targets for why NULL is fatal).
+                _bind_shader_ctrl_target(ctrl, shader_block_of.get(name))
                 continue
 
             op = getattr(ctrl, '_tt_operation', None)
@@ -1799,6 +1953,98 @@ def _match_seq_shader_types(root):
                 eff.type_of_controlled_color = _SHADER_COLOR_EMISSIVE[1]
                 cb.controller = eff
                 cb.controller_type = b'BSEffectShaderPropertyColorController'
+            else:
+                _bind_shader_ctrl_target(ctrl, shader_block_of.get(name))
+                continue
+            _bind_shader_ctrl_target(cb.controller, shader_block_of.get(name))
+
+    _retarget_geometry_suffix_entries(root)
+
+
+def _retarget_geometry_suffix_entries(root):
+    """Bind sequence entries that name geometry as "<node>:<index>".
+
+    Oblivion's exporter names a node's geometry children either as
+    "Tri <parent> <index>" (a real block name) or, inside a NiControllerSequence
+    string palette, as "<parent>:<index>".  morroblivionchandilier01's Idle
+    sequence uses BOTH conventions at once:
+
+        node='CandleSkinny01:0'          NiMaterialColorController   (emissive)
+        node='CandleSkinny01'            NiTransformController
+        node='CandleSkinny01 NonAccum'   NiTransformController
+
+    The last two name real NiNodes, so the palette is NOT stale -- only the
+    ":0" form needs translating.  It means "geometry child 0 of CandleSkinny01",
+    which after conversion is the shape carrying the BSLightingShaderProperty.
+
+    Binding matters because Skyrim dereferences NiTimeController.Target while
+    loading the shader property (vanilla: 0 NULL targets), so an unbound
+    shader controller is a CTD.  Deleting the entry is NOT an acceptable fix:
+    it costs the chandelier its emissive flicker, and emptying a sequence
+    strands its NiControllerManager with zero sequences -- which the engine
+    also dereferences (vanilla ships no manager with 0 sequences).
+    """
+    for blk in root.tree():
+        if not isinstance(blk, NifFormat.NiControllerSequence):
+            continue
+        raw = _palette_bytes(getattr(blk, 'string_palette', None))
+        for cb in blk.controlled_blocks:
+            ctrl = cb.controller
+            cn = ctrl.__class__.__name__ if ctrl is not None else ''
+            if 'ShaderProperty' not in cn or 'Controller' not in cn:
+                continue
+            if getattr(ctrl, 'target', None) is not None:
+                continue
+            name = bytes(getattr(cb, 'node_name', b'') or b'')
+            if not name:
+                name = _palette_lookup(raw, getattr(cb, 'node_name_offset', None))
+            shader = _resolve_geometry_suffix(root, name)
+            if shader is None:
+                continue
+            _bind_shader_ctrl_target(ctrl, shader)
+            # The entry must name a block that exists in the output, or the
+            # engine cannot re-bind it at run time.
+            owner = getattr(shader, '_owner_name', None)
+            if owner:
+                cb.node_name = owner
+
+
+def _resolve_geometry_suffix(root, name):
+    """Map a "<node>:<index>" palette name onto that node's Nth shader."""
+    if not name or b':' not in name:
+        return None
+    parent, _, idx = name.rpartition(b':')
+    try:
+        want = int(idx)
+    except ValueError:
+        return None
+
+    # Collect the geometry under `parent`, in tree order, and take the Nth.
+    target = None
+    for blk in root.tree():
+        if bytes(getattr(blk, 'name', b'') or b'') == parent:
+            target = blk
+            break
+    if target is None:
+        return None
+
+    geoms = []
+    for blk in target.tree():
+        if not isinstance(blk, NifFormat.NiTriBasedGeom):
+            continue
+        for pr in getattr(blk, 'bs_properties', []) or []:
+            if pr is None:
+                continue
+            if pr.__class__.__name__ in ('BSLightingShaderProperty',
+                                         'BSEffectShaderProperty'):
+                geoms.append((blk, pr))
+                break
+    if want >= len(geoms):
+        return None
+    node, shader = geoms[want]
+    # Remember the real block name so the sequence entry can point at it.
+    shader._owner_name = bytes(getattr(node, 'name', b'') or b'')
+    return shader
 
 
 # ---------------------------------------------------------------------------

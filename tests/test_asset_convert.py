@@ -2266,6 +2266,311 @@ class TestControllerComputeScaledTime:
 
 
 # ---------------------------------------------------------------------------
+# Shader-property controller targets (NULL target = CTD on cell load)
+# ---------------------------------------------------------------------------
+
+_MW_EXPORT_MESHES = Path('export/Morrowind_ob.esm/meshes')
+# Cloned from a candle without rebuilding its NiControllerSequence string
+# palette, so the sequence animates "CandleSkinny01:0" while the geometry is
+# "Tri Tri Light_Com_Chandelier_01 2 N".  Placed 7x in the Seyda Neen Census
+# and Excise Office, which is where it crashed.
+_STALE_PALETTE_SAMPLE = 'morroblivion/lights/morroblivionchandilier01.nif'
+
+
+class TestShaderControllerTarget:
+    """BS*ShaderProperty*Controller.Target must name its shader block.
+
+    Vanilla census: 15/15 such controllers point at their own shader property
+    (Lighting -> BSLightingShaderProperty, Effect -> BSEffectShaderProperty),
+    0 nulls.  Skyrim dereferences Target while loading the shader property, so
+    a NULL is an access violation on cell load rather than a dead animation.
+    """
+
+    def _shader_ctrls(self, data):
+        return [b for b in data.blocks
+                if 'ShaderProperty' in type(b).__name__
+                and 'Controller' in type(b).__name__]
+
+    @pytest.mark.skipif(not _MW_EXPORT_MESHES.exists(),
+                        reason='Morrowind export meshes not available')
+    def test_stale_palette_entry_does_not_emit_null_target(self, tmp_path):
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+
+        src = _MW_EXPORT_MESHES / _STALE_PALETTE_SAMPLE
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+
+        # The source must actually exhibit the defect, or the test proves
+        # nothing: its sequence must name a node the mesh does not contain.
+        src_data = NF.Data()
+        with open(str(src), 'rb') as f:
+            src_data.read(f)
+        node_names = {bytes(getattr(b, 'name', b'') or b'')
+                      for b in src_data.blocks}
+        palettes = [b.string_palette for b in src_data.blocks
+                    if isinstance(b, NF.NiControllerSequence)
+                    and b.string_palette is not None]
+        assert palettes, 'sample has no string palette — test is stale'
+        pal = bytes(palettes[0].palette.palette)
+        # The colour controller targets "CandleSkinny01:0", which — unlike the
+        # bare "CandleSkinny01" NiNode carrying the transform tracks — is not a
+        # node in this mesh at all, so no shader can ever be found for it.
+        assert b'CandleSkinny01:0' in pal, \
+            'sample palette changed — test is stale'
+        assert b'CandleSkinny01:0' not in node_names, \
+            'sample no longer has a dangling palette name — test is stale'
+
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+
+        dst_data = NF.Data()
+        with open(str(dst), 'rb') as f:
+            dst_data.read(f)
+
+        ctrls = self._shader_ctrls(dst_data)
+        nulls = [type(c).__name__ for c in ctrls if c.target is None]
+        assert not nulls, f'NULL-target shader controllers emitted: {nulls}'
+
+        # FAITHFUL CONVERSION: the emissive flicker must SURVIVE.  Deleting the
+        # entry was the earlier (wrong) fix -- it cost the chandelier its
+        # animation and stranded the manager with 0 sequences, which the engine
+        # dereferences just the same (vanilla ships no 0-sequence manager).
+        assert ctrls, 'emissive animation was dropped instead of retargeted'
+
+        empty = [bytes(b.name) for b in dst_data.blocks
+                 if isinstance(b, NF.NiControllerSequence)
+                 and b.num_controlled_blocks == 0]
+        assert not empty, f'empty sequences left in file: {empty}'
+        for mgr in dst_data.blocks:
+            if isinstance(mgr, NF.NiControllerManager):
+                assert mgr.num_controller_sequences > 0, \
+                    'NiControllerManager left with 0 sequences (engine derefs it)'
+                assert all(s is not None for s in mgr.controller_sequences), \
+                    'manager references a dropped sequence'
+
+        # The curve itself must come across unchanged (5 keys, 0 -> 3s loop).
+        src_keys = []
+        for b in src_data.blocks:
+            if isinstance(b, NF.NiControllerSequence):
+                for cb in b.controlled_blocks:
+                    it = cb.interpolator
+                    if it is not None and type(it).__name__ == 'NiPoint3Interpolator':
+                        src_keys = [(round(k.time, 4),
+                                     (round(k.value.x, 4), round(k.value.y, 4),
+                                      round(k.value.z, 4)))
+                                    for k in it.data.data.keys]
+        assert src_keys, 'source has no colour curve — test is stale'
+        got_keys = []
+        for c in ctrls:
+            it = c.interpolator
+            if it is not None and getattr(it, 'data', None) is not None:
+                got_keys = [(round(k.time, 4),
+                             (round(k.value.x, 4), round(k.value.y, 4),
+                              round(k.value.z, 4)))
+                            for k in it.data.data.keys]
+        assert got_keys == src_keys, \
+            f'colour curve changed: {src_keys} -> {got_keys}'
+
+        # The entry must name a block that exists, or the engine cannot bind it.
+        names = {bytes(getattr(b, 'name', b'') or b'') for b in dst_data.blocks}
+        for b in dst_data.blocks:
+            if not isinstance(b, NF.NiControllerSequence):
+                continue
+            for cb in b.controlled_blocks:
+                nm = bytes(cb.node_name or b'')
+                if nm:
+                    assert nm in names, \
+                        f'sequence entry names a missing node: {nm!r}'
+
+    @pytest.mark.skipif(not _MW_EXPORT_MESHES.exists(),
+                        reason='Morrowind export meshes not available')
+    @pytest.mark.parametrize('sample', [
+        'morro/x/exuvivecuwaterfallu03.nif',   # scrolling UV (valid animation)
+        'morro/i/inulavau512.nif',
+    ])
+    def test_resolvable_controllers_keep_animation_and_bind(self, tmp_path, sample):
+        """A controller whose node DOES resolve is bound, never dropped."""
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+
+        src = _MW_EXPORT_MESHES / sample
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+
+        dst_data = NF.Data()
+        with open(str(dst), 'rb') as f:
+            dst_data.read(f)
+
+        ctrls = self._shader_ctrls(dst_data)
+        assert ctrls, 'shader animation was dropped entirely'
+        for c in ctrls:
+            assert c.target is not None, \
+                f'{type(c).__name__} left unbound'
+            want = ('BSEffectShaderProperty'
+                    if type(c).__name__.startswith('BSEffectShaderProperty')
+                    else 'BSLightingShaderProperty')
+            assert type(c.target).__name__ == want, \
+                f'{type(c).__name__} bound to {type(c.target).__name__}'
+
+
+class TestUVSetClamp:
+    """Skyrim reads ONE UV set; a second one overruns the engine's vertex buffer.
+
+    On disk the u16 "BS Data Flags" packs the UV-set count in its low 6 bits,
+    and that count is the only thing telling the engine how many TexCoord
+    arrays follow.  A mesh storing 2 sets while the shader binds 1 leaves the
+    buffer an array short -> non-temporal memcpy past the allocation (vmovntdq)
+    -> CTD on cell load.  Vanilla census: 2,233 shapes, 0 or 1 sets, never 2.
+    """
+
+    _SAMPLE = 'morro/f/FurnUComUTableU05.nif'   # Seyda Neen Census Office table
+
+    @pytest.mark.skipif(not _MW_EXPORT_MESHES.exists(),
+                        reason='Morrowind export meshes not available')
+    def test_second_uv_set_is_dropped(self, tmp_path):
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+
+        src = _MW_EXPORT_MESHES / self._SAMPLE
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+
+        # Source must actually carry 2 UV sets or the test proves nothing.
+        src_data = NF.Data()
+        with open(str(src), 'rb') as f:
+            src_data.read(f)
+        multi = [b for b in src_data.blocks
+                 if type(b).__name__ in ('NiTriShapeData', 'NiTriStripsData')
+                 and int(getattr(b, 'num_uv_sets', 0) or 0) > 1]
+        assert multi, 'sample has no multi-UV geometry — test is stale'
+
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+
+        dst_data = NF.Data()
+        with open(str(dst), 'rb') as f:
+            dst_data.read(f)
+
+        for b in dst_data.blocks:
+            if type(b).__name__ not in ('NiTriShapeData', 'NiTriStripsData'):
+                continue
+            n = int(getattr(b, 'num_uv_sets', 0) or 0)
+            assert n <= 1, f'{n} UV sets survived conversion'
+            # The count and the stored arrays must agree, or the engine reads
+            # a different number of arrays than the file holds.
+            assert len(b.uv_sets) == n, \
+                f'num_uv_sets={n} but {len(b.uv_sets)} arrays stored'
+            for uvs in b.uv_sets:
+                assert len(uvs) == b.num_vertices, \
+                    'UV array length != vertex count'
+
+    @pytest.mark.skipif(not _MW_EXPORT_MESHES.exists(),
+                        reason='Morrowind export meshes not available')
+    def test_kept_uv_set_is_the_diffuse_one(self, tmp_path):
+        """Set 0 (what every shader samples) is the one retained."""
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+
+        src = _MW_EXPORT_MESHES / self._SAMPLE
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        src_data = NF.Data()
+        with open(str(src), 'rb') as f:
+            src_data.read(f)
+        want = {}
+        for i, b in enumerate(src_data.blocks):
+            if (type(b).__name__ in ('NiTriShapeData', 'NiTriStripsData')
+                    and int(getattr(b, 'num_uv_sets', 0) or 0) > 1):
+                want[b.num_vertices] = [(k.u, k.v) for k in b.uv_sets[0][:8]]
+
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+        dst_data = NF.Data()
+        with open(str(dst), 'rb') as f:
+            dst_data.read(f)
+
+        checked = 0
+        for b in dst_data.blocks:
+            if type(b).__name__ not in ('NiTriShapeData', 'NiTriStripsData'):
+                continue
+            if b.num_vertices not in want or not len(b.uv_sets):
+                continue
+            got = [(k.u, k.v) for k in b.uv_sets[0][:8]]
+            assert got == want[b.num_vertices], \
+                'retained UV set is not the original set 0'
+            checked += 1
+        assert checked, 'no converted shape matched the source shapes'
+
+
+class TestNiUVControllerConversion:
+    """NiUVController has NO RTTI in SkyrimSE.exe — the engine cannot build it.
+
+    NiStream constructs blocks by type name; an unknown type leaves a slot the
+    engine then treats as a NiObject, so `lock cmpxchg` on its "refcount" lands
+    in read-only .rdata => access violation on mesh load.  The UV curves
+    themselves survive as BS*ShaderPropertyFloatControllers.
+    """
+
+    _SAMPLE = 'morro/x/exuggufenceu01.nif'   # Ghostfence shimmer
+
+    @pytest.mark.skipif(not _MW_EXPORT_MESHES.exists(),
+                        reason='Morrowind export meshes not available')
+    def test_niuvcontroller_is_removed_and_curve_preserved(self, tmp_path):
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+
+        src = _MW_EXPORT_MESHES / self._SAMPLE
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+
+        # Source must actually carry the defect, or the test proves nothing.
+        src_data = NF.Data()
+        with open(str(src), 'rb') as f:
+            src_data.read(f)
+        src_uv = [b for b in src_data.blocks
+                  if type(b).__name__ == 'NiUVController']
+        assert src_uv, 'sample has no NiUVController — test is stale'
+
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+
+        dst_data = NF.Data()
+        with open(str(dst), 'rb') as f:
+            dst_data.read(f)
+
+        names = [type(b).__name__ for b in dst_data.blocks]
+        assert 'NiUVController' not in names, \
+            'NiUVController survived conversion — engine cannot construct it'
+        assert 'NiUVData' not in names, 'orphaned NiUVData left behind'
+
+        # The animation must be re-emitted, not merely deleted.
+        ctrls = [b for b in dst_data.blocks
+                 if type(b).__name__.endswith('ShaderPropertyFloatController')]
+        assert ctrls, 'UV animation was dropped instead of converted'
+        # U Offset = 20 and V Offset = 22 on the Lighting shader.
+        got = {c.type_of_controlled_variable for c in ctrls}
+        assert got & {20, 22}, f'unexpected controlled variables: {got}'
+        for c in ctrls:
+            assert c.target is not None, 'converted controller left unbound'
+            assert c.interpolator is not None
+            assert c.interpolator.data.data.num_keys >= 2, \
+                'curve keys lost in translation'
+
+
+# ---------------------------------------------------------------------------
 # Animated-object behaviour graphs (BGED -> hkx project)
 # ---------------------------------------------------------------------------
 
