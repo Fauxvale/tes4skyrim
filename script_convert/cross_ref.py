@@ -23,6 +23,47 @@ _SCAN_SKIP_SIGS = {'LAND', 'PGRD', 'ROAD'}
 _SCAN_CHUNK_BYTES = 16 * 1024 * 1024
 
 
+def master_names(export_dir) -> list:
+    """The TES4 master file names listed in an export's _HEADER.txt."""
+    header = Path(export_dir) / '_HEADER.txt'
+    if not header.is_file():
+        return []
+    names = []
+    for line in header.read_text(encoding='utf-8',
+                                 errors='replace').splitlines():
+        if line.startswith('Master['):
+            _, _, val = line.partition('=')
+            val = val.strip()
+            if val:
+                names.append(val)
+    return names
+
+
+def _export_dirs_with_masters(export_dir: str) -> list:
+    """`export_dir` preceded by its masters' export dirs, deepest first.
+
+    Masters come FIRST so the last-wins merge lets an overriding plugin's own
+    version of a record win.  The walk is transitive (a plugin's master may
+    itself have masters) and cycle-safe; masters with no export directory are
+    skipped silently, which degrades to the old single-directory behaviour.
+    """
+    root = Path(export_dir)
+    ordered: list = []
+    seen: set = set()
+
+    def visit(d: Path):
+        key = str(d).lower()
+        if key in seen or not d.is_dir():
+            return
+        seen.add(key)
+        for name in master_names(d):
+            visit(d.parent / name)
+        ordered.append(str(d))
+
+    visit(root)
+    return ordered
+
+
 def _new_scan_out() -> dict:
     return {
         'formid_to_edid': {}, 'edid_to_formid': {},
@@ -238,6 +279,15 @@ class CrossRefGraph:
     def load_from_export(self, export_dir: str, workers: int = None):
         """Load cross-reference data from all export .txt files.
 
+        An OVERRIDE plugin's own export holds only the records it authors, so
+        every EditorID it merely *references* — the GLOBs, quests and refs that
+        live in its masters — is absent.  Unresolvable names fall through
+        `_convert_ref` as bare identifiers with no property declared, which the
+        compiler rejects ("undefined identifier `SetGewitter`").  So the
+        masters' exports are scanned too, TRANSITIVELY and MASTERS FIRST: the
+        merge is last-wins, and a plugin that overrides a master's record must
+        be the version this graph reports.
+
         The scan is pure-Python line matching over ~2 GB of text, so files are
         split into byte ranges (record-boundary aligned, same contract as
         text_reader.parse_file_range) and scanned across a process pool.
@@ -246,20 +296,21 @@ class CrossRefGraph:
             return
 
         jobs = []
-        for fname in sorted(os.listdir(export_dir)):
-            if not fname.endswith('.txt'):
-                continue
-            sig = fname[:-4]
-            if sig in _SCAN_SKIP_SIGS:
-                continue
-            fpath = os.path.join(export_dir, fname)
-            try:
-                size = os.path.getsize(fpath)
-            except OSError:
-                continue
-            for start in range(0, size, _SCAN_CHUNK_BYTES):
-                jobs.append((fpath, sig,
-                             start, min(start + _SCAN_CHUNK_BYTES, size)))
+        for d in _export_dirs_with_masters(export_dir):
+            for fname in sorted(os.listdir(d)):
+                if not fname.endswith('.txt'):
+                    continue
+                sig = fname[:-4]
+                if sig in _SCAN_SKIP_SIGS:
+                    continue
+                fpath = os.path.join(d, fname)
+                try:
+                    size = os.path.getsize(fpath)
+                except OSError:
+                    continue
+                for start in range(0, size, _SCAN_CHUNK_BYTES):
+                    jobs.append((fpath, sig,
+                                 start, min(start + _SCAN_CHUNK_BYTES, size)))
 
         if workers is None:
             workers = worker_count()
@@ -566,8 +617,20 @@ class CrossRefGraph:
         TES4 'ref' type can hold both references and integers.  When a ref
         variable is only ever assigned/compared with numeric literals across
         ALL scripts that touch it, it should be typed Int in Papyrus.
+
+        The masters' SCPT sources are scanned alongside the plugin's own, for
+        the same reason load_from_export scans their records: an override
+        plugin's script reaching into a MASTER's script variable
+        (`SomeMasterQuest.someVar`) can only be typed if that script's
+        declarations are known here.  Masters first — a plugin that overrides a
+        master's SCPT must be the source that wins.
         """
-        records = parse_export_file(scpt_path)
+        export_dir = os.path.dirname(scpt_path)
+        records = []
+        for d in _export_dirs_with_masters(export_dir):
+            p = os.path.join(d, os.path.basename(scpt_path))
+            if os.path.isfile(p):
+                records.extend(parse_export_file(p))
 
         # Phase A: collect variable declarations per script
         _decl_re = re.compile(r'^\s*ref\s+(\w+)', re.IGNORECASE)
@@ -736,8 +799,11 @@ class CrossRefGraph:
         for scn_low, sctx in script_sources.items():
             _scan_text_for_cross_access(sctx)
 
-        # Scan INFO result scripts and QUST stage scripts for cross-script access
-        export_dir = os.path.dirname(scpt_path)
+        # Scan THIS plugin's INFO result scripts and QUST stage scripts for
+        # cross-script access.  Unlike the SCPT scan above this is a pure union
+        # (it only ADDS names that must become Properties), and a master's own
+        # INFO/QUST fragments are emitted by the master's own conversion run,
+        # so the masters' copies are deliberately not scanned here.
         for extra_file, field_name in [('INFO.txt', 'ResultScript'), ('QUST.txt', 'SCTX')]:
             extra_path = os.path.join(export_dir, extra_file)
             if not os.path.isfile(extra_path):

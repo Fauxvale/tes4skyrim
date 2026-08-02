@@ -309,6 +309,7 @@ FUNCTION_MAP = {
     'stopcombat':        ('StopCombat',        True,  None),
     'getisid':           (None,                True,  None),  # Special handler in _emit_function
     'getisrace':         (None,                True,  None),  # Special handler in _emit_function
+    'getisclass':        (None,                True,  None),  # Special handler in _emit_function
     # IsActorDetected takes NO argument (UESP opcode 0x10B5, 0 params): "is this
     # actor detected by ANYONE".  GetDetected takes 1 Actor and asks the
     # OPPOSITE question from Skyrim's IsDetectedBy: `<observer>.GetDetected
@@ -518,6 +519,10 @@ FUNCTION_MAP = {
     'playbink':          (None,                False, None),  # no-op
     'sendtrespassalarm': (None,               True,  None),  # no-op
     'getpcisrace':       (None,                False, None),  # Special handler
+    'getpcisclass':      (None,                False, None),  # Special handler
+    # OBSE string_var builder; Papyrus String is the literal.  Special handler
+    # in _emit_function — the inert ar_/sv_ catch-all would leave it undefined.
+    'sv_construct':      (None,                False, None),
     'getinfame':         (None,                False, None),  # Special handler
     'getpcinfamy':       (None,                False, None),  # Special handler
     'getpcfame':         (None,                False, None),  # Special handler

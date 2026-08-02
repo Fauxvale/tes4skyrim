@@ -2921,11 +2921,26 @@ class TestActorScriptOnPlacedRef:
         name in a comment, moving records that had no reason to leave the base.
         """
         from tes5_import.object_scripts import _script_uses_reference_event
-        assert not _script_uses_reference_event('begin GameMode\nset x to 1\nend')
         assert not _script_uses_reference_event('; comment mentioning onhit behaviour')
         assert not _script_uses_reference_event('begin MenuMode 1027')
         # not an actor event, and must not match on the 'onhit' substring
         assert not _script_uses_reference_event('begin OnMagicEffectHit')
+
+    def test_gamemode_block_forces_relocation(self):
+        """A bare GameMode block must move to the ACHR as well.
+
+        TES4 delivers GameMode everywhere, so it looks base-safe — but the
+        converter compiles it into an OnUpdate poll whose only starters are
+        OnCellAttach/OnLoad/OnInit, gated on ShouldRunGameMode(Self).  Those are
+        ObjectReference members, so on a base NPC_ the poll never starts and the
+        whole block is dead code.  Morroblivion's CATDestinationSorter (the
+        Jo'Tesh/Kisimba world transport) is pure GameMode with no bare
+        self-reference call, so it triggered neither other reason and silently
+        never ran.
+        """
+        from tes5_import.object_scripts import _script_uses_reference_event
+        assert _script_uses_reference_event('begin GameMode\nset x to 1\nend')
+        assert _script_uses_reference_event('scn X\r\nbegin gamemode\r\nend')
 
     def test_bare_self_reference_call_forces_relocation(self):
         """A bare `enable`/`moveto`/... acts on the calling REFERENCE.
@@ -4371,6 +4386,67 @@ class TestLandOverrides:
         rec = self._land(VHGT=self._vhgt(delta=2), VNML='00' * 3267)
         assert diff_records(rec, self._land(VHGT=self._vhgt(delta=2),
                                             VNML='00' * 3267)) == {}
+
+
+class TestQuestObjectiveOverrideText:
+    """A translation plugin must retranslate the OBJECTIVE, not just the log.
+
+    Skyrim's journal displays the objective (NNAM); the stage log entry (CNAM)
+    is the collapsed history. Both derive from one TES4 field
+    (`Stage[].Log[].Text`), and mapping that key to CNAM alone left every
+    objective holding the master's language — 83 of Translation.esp's 84
+    quests shipped English CNAM beside German NNAM.
+    """
+
+    def _quest(self, text, full):
+        return {
+            'Signature': 'QUST', 'FormID': '0000E6F3', 'RecordFlags': '0',
+            'EditorID': 'NQ00Merre', 'FULL': full,
+            'DATA.Flags': '1', 'DATA.Priority': '70',
+            'StageCount': '1',
+            'Stage[0].Index': '5', 'Stage[0].LogCount': '1',
+            'Stage[0].Log[0].Flags': '0', 'Stage[0].Log[0].Text': text,
+        }
+
+    def _subs(self, record):
+        out = []
+        off = 24
+        while off + 6 <= len(record):
+            sig = record[off:off + 4]
+            size = struct.unpack_from('<H', record, off + 6 - 2)[0]
+            out.append((sig, record[off + 6:off + 6 + size]))
+            off += 6 + size
+        return out
+
+    def test_objective_text_is_retranslated(self):
+        from tes5_import.export_diff import diff_records
+        from tes5_import.override_builder import apply_changes
+        from tes5_import.dialog_converter import convert_QUST
+
+        master = self._quest('Merre Quest Ratten', 'Arbeit in der Mine')
+        plugin = self._quest("Merre's Rat Quest", 'Work in the Mine')
+
+        base = convert_QUST(master)
+        changes = diff_records(master, plugin)
+        assert 'Stage[]' in changes
+
+        out, _applied, unmapped = apply_changes(base, changes, plugin, master)
+        assert unmapped == set(), f'Stage[] must be mappable, got {unmapped}'
+
+        subs = dict(self._subs(out))
+        assert subs[b'CNAM'] == b"Merre's Rat Quest\x00"
+        assert subs[b'NNAM'] == b"Merre's Rat Quest\x00", \
+            'the journal objective must carry the plugin\'s translation'
+
+    def test_derivation_matches_the_converter(self):
+        """The helper must yield exactly the NNAMs convert_QUST emits."""
+        from tes5_import.dialog_converter import (convert_QUST,
+                                                  quest_objective_texts)
+        rec = self._quest('Some journal line', 'A Quest')
+        emitted = [v for s, v in self._subs(convert_QUST(rec)) if s == b'NNAM']
+        derived = quest_objective_texts(rec)
+        assert len(emitted) == len(derived)
+        assert emitted[0] == derived[0].encode() + b'\x00'
 
 
 class TestOutfitIndexAcrossMasters(TestOutfitSplit):

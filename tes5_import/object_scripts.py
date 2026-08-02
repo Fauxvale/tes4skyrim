@@ -348,6 +348,17 @@ _TES4_REFERENCE_EVENTS = frozenset({
     'onpackagedone', 'onpackagestart', 'onpackagechange',
     'onactivate', 'ondeath', 'onhit', 'onalarm', 'onstartcombat',
     'onload', 'onequip', 'onunequip', 'onadd', 'ondrop', 'onsell',
+    # `gamemode` is not itself an engine event, but the converter compiles it
+    # into an OnUpdate poll started by OnCellAttach/OnCellDetach/OnLoad and
+    # gated on TES4Polyfill.ShouldRunGameMode(Self) — every one of which is an
+    # ObjectReference member.  On a base NPC_ VMAD `Self` is an ActorBase, so
+    # the events never fire, the gate's Is3DLoaded()/GetParentCell() have no
+    # reference to answer for, and the poll never starts: the whole block is
+    # dead.  Morroblivion's CATDestinationSorter (the Jo'Tesh/Kisimba world
+    # transport) is pure GameMode and triggered neither of the other two
+    # reasons, so it rode the base record and never ran.  Same root cause as
+    # the OnPackageEnd case below — the poll just hides it one layer deeper.
+    'gamemode',
 })
 
 
@@ -426,6 +437,12 @@ def _relocate_actor_scripts_to_refs(by_type: dict, offset: int) -> int:
        sequences on package completion — CharacterGen sets stage 12 from
        Renote's ``OnPackageEnd``, so the chain stopped at stage 10 and the
        Emperor/guards had no ``GetStage ==`` package to select at all.
+
+       A bare ``GameMode`` block counts here too, even though TES4 delivers it
+       everywhere: the converter compiles it into an OnUpdate poll whose only
+       starters are OnCellAttach/OnLoad/OnInit, gated on
+       ``ShouldRunGameMode(Self)``.  Those are ObjectReference members, so on a
+       base record the poll never starts and the block is dead code.
 
     3. SELF-REFERENCE CALLS have no target on a base record.  A bare ``enable``
        / ``moveto`` / ``startcombat`` acts on the calling REFERENCE; an

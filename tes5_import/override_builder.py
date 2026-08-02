@@ -71,6 +71,21 @@ _NESTED_STRING_SUBRECORD = {
     'Stage[]': ('Stage', 'Log', 'Text', b'CNAM'),
 }
 
+# Indexed subrecord runs whose values are DERIVED from the plugin's export
+# rather than read straight out of a field, keyed by the export key that
+# changed. `Stage[].Log[].Text` feeds TWO output runs: the stage log entries
+# (CNAM, handled above) and the quest OBJECTIVES (NNAM) — and Skyrim's journal
+# displays the objective, not the log entry. Mapping the key to CNAM alone left
+# every objective holding the master's text, so a translation plugin's quests
+# still read in the master's language in-game: 83 of Translation.esp's 84
+# quests had English CNAM and German NNAM.
+#
+# The deriving function is convert_QUST's own, so the objective sequence here
+# cannot drift from the one the master's record was built with.
+_DERIVED_INDEXED_SUBRECORD = {
+    ('QUST', 'Stage[]'): (b'NNAM', 'quest_objective_texts'),
+}
+
 # Keys that are genuinely not representable in the output record and are
 # deliberately ignored rather than reported as unmapped. These describe the
 # TES4 script system, which the converter re-implements as Papyrus VMAD from
@@ -934,6 +949,15 @@ def apply_changes(master_record: bytes, changes: dict,
                         plugin_export[f'{outer}[{i}].{inner}[{j}].{field}'])
                     j += 1
                 i += 1
+            # The same source field may also feed a DERIVED run (Stage[] text
+            # drives the objectives' NNAM as well as the log's CNAM).
+            derived = _DERIVED_INDEXED_SUBRECORD.get((sig_name, key))
+            if derived is not None:
+                d_sig, fn_name = derived
+                from . import dialog_converter
+                d_values = getattr(dialog_converter, fn_name)(plugin_export)
+                if d_values:
+                    indexed[d_sig] = d_values
             if values:
                 indexed[sub_sig] = values
                 applied.add(key)

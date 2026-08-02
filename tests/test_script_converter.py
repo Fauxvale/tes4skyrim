@@ -127,6 +127,64 @@ class TestCrossRefGraph:
         assert xref.script_formid_to_edid['00054321'] == 'MyScript'
         assert xref.script_formid_to_type['00054321'] == 1
 
+    def test_load_from_export_includes_masters(self, tmp_path):
+        """An override plugin resolves EditorIDs owned by its MASTER.
+
+        Translation.esp authors no GLOBs but 430 of its scripts read Nehrim's
+        (SetGewitter, VarTrapMine); without the master's records the names are
+        emitted as bare identifiers and the compiler rejects them.
+        """
+        master = tmp_path / 'Master.esm'
+        master.mkdir()
+        (master / 'GLOB.txt').write_text(
+            '---RECORD_BEGIN---\n'
+            'Signature=GLOB\n'
+            'FormID=00020A0F\n'
+            'EditorID=SetGewitter\n'
+            'FNAM.Type=s\n'
+            'FLTV.Value=0.0\n'
+            '---RECORD_END---\n'
+        )
+        plugin = tmp_path / 'Plugin.esp'
+        plugin.mkdir()
+        (plugin / '_HEADER.txt').write_text('Master[0]=Master.esm\n')
+
+        xref = CrossRefGraph()
+        xref.load_from_export(str(plugin))
+        assert xref.edid_to_formid['setgewitter'] == '00020A0F'
+        assert xref.record_type['00020A0F'] == 'GLOB'
+        assert xref.global_types['setgewitter'] == 's'
+
+    def test_plugin_record_overrides_master(self, tmp_path):
+        """Masters are scanned FIRST so the plugin's own version wins."""
+        master = tmp_path / 'Master.esm'
+        master.mkdir()
+        (master / 'GLOB.txt').write_text(
+            '---RECORD_BEGIN---\n'
+            'Signature=GLOB\n'
+            'FormID=00001111\n'
+            'EditorID=SharedGlobal\n'
+            'FNAM.Type=s\n'
+            'FLTV.Value=1.0\n'
+            '---RECORD_END---\n'
+        )
+        plugin = tmp_path / 'Plugin.esp'
+        plugin.mkdir()
+        (plugin / '_HEADER.txt').write_text('Master[0]=Master.esm\n')
+        (plugin / 'GLOB.txt').write_text(
+            '---RECORD_BEGIN---\n'
+            'Signature=GLOB\n'
+            'FormID=00001111\n'
+            'EditorID=SharedGlobal\n'
+            'FNAM.Type=f\n'
+            'FLTV.Value=7.0\n'
+            '---RECORD_END---\n'
+        )
+        xref = CrossRefGraph()
+        xref.load_from_export(str(plugin))
+        assert xref.global_types['sharedglobal'] == 'f'
+        assert xref.global_values['sharedglobal'] == 7.0
+
 
 # ===========================================================================
 # Expression conversion tests
@@ -2341,3 +2399,89 @@ class TestPlayerIsNeverAScriptTypedProperty:
         xref.script_formid_to_edid['00004E1A'] = 'GlobalplayerScript'
         assert xref.get_record_script_type('Player') == ''
         assert xref.get_record_script_type('PlayerRef') == ''
+
+
+
+class TestGetIsClassReadsTheActorBase:
+    """GetPCIsClass/GetIsClass were absent from FUNCTION_MAP entirely, so the
+    call survived untranslated and Papyrus parsed `GetPCIsClass
+    CharactergenClass` as a bare name after a name — a syntax error that failed
+    the WHOLE script.  Morroblivion's fbmwChargenQuestScript is the site, and
+    the Chargen-and-Transport start menu imports it, so the compile failure
+    took the Imperial City transport NPC down with it.
+
+    Skyrim reads the class off the ActorBase (`ActorBase.GetClass()`); Actor has
+    no GetClass() of its own.
+    """
+
+    def test_bare_player_read_converts(self, converter):
+        out = converter._convert_line('if GetPCIsClass CharactergenClass', 'Quest')
+        assert 'GetPCIsClass' not in out
+        assert 'Game.GetPlayer().GetActorBase().GetClass() == CharactergenClass' in out
+
+    def test_compared_form_converts(self, converter):
+        out = converter._convert_line('if GetPCIsClass CharactergenClass == 0', 'Quest')
+        assert 'GetPCIsClass' not in out
+        assert 'GetActorBase().GetClass() == CharactergenClass' in out
+
+    def test_explicit_ref_goes_through_the_actor_base(self, converter):
+        out = converter._convert_line('if ActorRef.GetIsClass Warrior == 1', 'Quest')
+        assert 'GetIsClass' not in out
+        assert 'GetActorBase().GetClass() == Warrior' in out
+
+    def test_argument_is_typed_class(self, converter):
+        converter._convert_line('if GetPCIsClass CharactergenClass', 'Quest')
+        assert converter.get_property_refs()['CharactergenClass'] == 'Class'
+
+
+class TestSvConstructIsAStringLiteral:
+    """sv_Construct is the one OBSE string command with an exact Papyrus
+    equivalent — it builds a string_var from a literal, and Papyrus String IS
+    that literal.  It fell through to the inert ar_/sv_ catch-all, so
+    `quizQuestion = sv_Construct "..."` survived as an undefined identifier and
+    failed the whole script: Morroblivion's fbmwChargenQuestScript (the class
+    quiz), which the Chargen-and-Transport start menu imports.
+    """
+
+    def test_literal_passes_through(self, converter):
+        out = converter._convert_line('set q to sv_Construct "Hello there."', 'Quest')
+        assert 'sv_Construct' not in out
+        assert '"Hello there."' in out
+
+    def test_destruct_stays_a_no_op(self, converter):
+        """Papyrus strings are garbage-collected — there is nothing to free."""
+        out = converter._convert_line('set q to sv_Destruct', 'Quest')
+        assert 'NE: sv_Destruct' in out
+
+
+class TestMoveToBindsItsDestination:
+    """MoveTo's destination is a PLACED REFERENCE that nothing else in the
+    script necessarily declares, so the call has to register it as a property.
+
+    `player.moveto` is a COMPOUND FUNCTION_MAP entry, so the `Player.`-prefixed
+    form short-cut past the dedicated handler and emitted a bare identifier no
+    property backed — the compiler then rejected the whole script.  A plain
+    `ref.MoveTo` looked fine, which hid it.  Morroblivion's
+    CATChargenAndTransport is the site (`Player.MoveTo CGPlayerStartMarker1`).
+    """
+
+    def test_player_prefixed_form_binds_the_target(self, converter):
+        out = converter._convert_line('Player.MoveTo CGPlayerStartMarker1', 'Quest')
+        assert out == 'Game.GetPlayer().MoveTo(CGPlayerStartMarker1)'
+        assert converter.get_property_refs()['CGPlayerStartMarker1'] == 'ObjectReference'
+
+    def test_explicit_ref_form_binds_the_target(self, converter):
+        out = converter._convert_line('fbmwfargothref.moveto mwCGFargothStartMarker', 'Quest')
+        assert converter.get_property_refs()['mwCGFargothStartMarker'] == 'ObjectReference'
+
+    def test_space_separated_offsets_survive(self, converter):
+        """Oblivion writes the offsets space-separated; comma-splitting glued
+        them onto the target name and the call did not parse."""
+        out = converter._convert_line('ref.MoveTo SomeMarker 0 100 0', 'Quest')
+        assert out == 'ref.MoveTo(SomeMarker, 0, 100, 0)'
+
+    def test_player_target_is_not_a_property(self, converter):
+        """`player` is a converter keyword, never a bound property."""
+        out = converter._convert_line('Player.MoveTo Player', 'Quest')
+        assert out == 'Game.GetPlayer().MoveTo(Game.GetPlayer())'
+        assert 'Player' not in converter.get_property_refs()

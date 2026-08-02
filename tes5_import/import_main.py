@@ -646,7 +646,18 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # Without this, properties like FightersGuild stay unbound (None at runtime).
     from script_convert.cross_ref import CrossRefGraph
     xref = CrossRefGraph()
-    for rec in all_records:
+    # An OVERRIDE plugin's own export holds only the records it authors, so the
+    # EditorIDs it merely REFERENCES (a master's GLOBs, quests and refs) are
+    # absent.  The CLI scan (load_from_export) walks the masters' exports for
+    # exactly this reason, and per the mirroring contract noted below this
+    # graph must see the same records or the converter takes a different branch
+    # here than it did when the .psc was written.  Masters FIRST: the plugin's
+    # own records are applied second and overwrite them, so an overriding
+    # record is the version this graph reports.
+    _xref_sources = [ctx.master_export.values()] if (
+        ctx and getattr(ctx, 'master_export', None)) else []
+    _xref_sources.append(all_records)
+    for rec in [r for src in _xref_sources for r in src]:
         fid_str = rec.get('FormID', '')
         edid_str = rec.get('EditorID', '')
         sig = rec.get('Signature', '')

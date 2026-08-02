@@ -482,6 +482,22 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
 
     script_out.mkdir(parents=True, exist_ok=True)
 
+    # An override plugin's scripts declare properties typed as the MASTER's
+    # converted scripts (`TES4_NQ16Script Property ...`), because the record
+    # they name carries that master's SCRI.  Those .psc live in the master's
+    # own output, so without them on the header path the compiler reports
+    # "undefined type" — 198 of Translation.esp's scripts. They are headers
+    # only: the master's own run compiles and ships the .pex.
+    from script_convert.cross_ref import master_names
+    master_src_dirs = []
+    for m in master_names(SCRIPT_DIR / "export" / file_name):
+        d = out_root / m / "scripts" / "source"
+        if d.is_dir():
+            master_src_dirs.append(d)
+        else:
+            print(f"[{file_name}] WARNING: master scripts not found ({d}); "
+                  f"scripts referencing {m}'s script types will not compile")
+
     psc_files = sorted(script_src.glob("*.psc"))
     psc_count = len(psc_files)
     print(f"[{file_name}] Compiling {psc_count} Papyrus scripts...")
@@ -508,6 +524,8 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
             "-h", str(skyrim_headers),
             "-h", str(script_src),   # other scripts as headers
         ]
+        for d in master_src_dirs:
+            c += ["-h", str(d)]     # the masters' converted script types
         try:
             r = subprocess.run(c, capture_output=True, text=True,
                                timeout=60, cwd=str(SCRIPT_DIR), **_POPEN_FLAGS)
@@ -544,12 +562,20 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
     # The console list is capped at 10, which hid the long tail of real compile
     # errors.  Always dump the complete list next to the scripts so a failing
     # build can be worked through in full instead of ten at a time.
+    log_path = script_out / "compile_errors.log"
     if all_errors:
-        log_path = script_out / "compile_errors.log"
         try:
             log_path.write_text("\n".join(sorted(all_errors)) + "\n",
                                 encoding="utf-8")
             print(f"  full error list: {log_path}")
+        except OSError:
+            pass
+    else:
+        # A clean build must REMOVE the previous run's log.  Leaving it behind
+        # made a green build look red: the log outlives the failure it describes
+        # and the next reader trusts it over the console summary.
+        try:
+            log_path.unlink(missing_ok=True)
         except OSError:
             pass
     return ok_count > 0

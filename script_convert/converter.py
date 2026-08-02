@@ -3227,6 +3227,7 @@ class ScriptConverter:
             r'IsActionRef|GetDead|IsDead|IsInCombat|IsSneaking|IsWeaponOut|IsSwimming|'
             r'IsGhost|GetLocked|IsEnabled|HasSpell|GetInFaction|GetQuestRunning|GetStageDone|'
             r'GetDetected|IsActorDetected|GetIsID|GetIsRace|GetPCIsRace|GetIsRef|'
+            r'GetPCIsClass|GetIsClass|'
             r'GetInCell|GetInSameCell|GetIsSex|IsInFaction|IsEssential|IsInInterior|'
             r'GetIsCurrentPackage|IsOwner|GetTalkedToPCParam|GetTalkedToPC|'
             r'IsActorUsingATorch|IsRidingHorse')
@@ -4601,7 +4602,15 @@ class ScriptConverter:
         # yielded a first arg of `SRMonster 1` and emitted
         # `PlaceAtMe(SRMonster 1, 256, 1)`, which does not parse.  The dedicated
         # handler normalizes both separators and resolves the receiver itself.
-        _COMPOUND_HAS_OWN_HANDLER = ('placeatme',)
+        # moveto/movetomarker have the SAME two problems as placeatme, plus a
+        # third: the compound path never registers the destination as a property,
+        # so `Player.MoveTo <marker>` emitted a bare identifier that nothing
+        # declared and the compiler rejected the whole script.  (Oblivion writes
+        # the offsets space-separated too — `MoveTo marker 0 100 0`.)  Only the
+        # `player.`-prefixed form took this path, which is why a plain
+        # `ref.MoveTo` looked fine while Morroblivion's CATChargenAndTransport
+        # failed on `Player.MoveTo CGPlayerStartMarker1`.
+        _COMPOUND_HAS_OWN_HANDLER = ('placeatme', 'moveto', 'movetomarker')
         compound = f'{ref_name}.{func_name}'.lower() if ref_name else ''
         if compound in FUNCTION_MAP and fname_low not in _COMPOUND_HAS_OWN_HANDLER:
             entry = FUNCTION_MAP[compound]
@@ -4802,6 +4811,25 @@ class ScriptConverter:
             self._line_comments.append(
                 ';NE: GetIgnoreFriendlyHits — Skyrim exposes only the setter')
             return '0'
+
+        # sv_Construct is the ONE OBSE string command with an exact Papyrus
+        # equivalent: it builds a string_var from a literal, and Papyrus String
+        # IS that literal.  Falling through to the inert ar_/sv_ catch-all below
+        # left `quizQuestion = sv_Construct "..."` in the output as an undefined
+        # identifier, which failed the whole script — Morroblivion's
+        # fbmwChargenQuestScript (the class quiz) is the site, and the
+        # Chargen-and-Transport start menu imports it, so the Imperial City
+        # transport NPC went down with it.  sv_Destruct stays a no-op: Papyrus
+        # strings are garbage-collected, so there is nothing to free.
+        if fname_low == 'sv_construct':
+            arg = args_str.strip()
+            if not arg:
+                return '""'
+            # A bare quoted literal passes straight through; anything else is an
+            # expression (a format string plus args) the caller already handles.
+            if arg.startswith('"') and arg.endswith('"') and arg.count('"') == 2:
+                return arg
+            return self._convert_expression(arg, extends)
 
         # OBSE arrays and string-variables (ar_Construct/ar_Null/sv_Destruct,
         # `forEach x <- container`).  Papyrus has real arrays and strings but no
@@ -5996,6 +6024,21 @@ class ScriptConverter:
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
             return f'{ref}.GetRace() == {arg}'
 
+        # GetIsClass / GetPCIsClass: the CLAS argument is a Class form, and
+        # Skyrim reads it off the ActorBase, not the reference — Actor has no
+        # GetClass().  Left untranslated, `GetPCIsClass CharactergenClass`
+        # parsed as a bare name after a name and killed the whole script
+        # (Morroblivion's chargen quest script, which the Chargen-and-Transport
+        # start menu imports, so the transport NPCs went with it).
+        if fname_low in ('getisclass', 'getpcisclass'):
+            arg = self._convert_expression(args_str.strip(), extends) if args_str else 'None'
+            if args_str:
+                self._property_refs[args_str.strip()] = 'Class'
+            if fname_low == 'getpcisclass':
+                return f'Game.GetPlayer().GetActorBase().GetClass() == {arg}'
+            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            return f'({ref} as Actor).GetActorBase().GetClass() == {arg}'
+
         # GetIsRef: ref.GetIsRef otherRef -> ref == otherRef
         if fname_low == 'getisref':
             arg = self._convert_expression(args_str.strip(), extends) if args_str else 'None'
@@ -6166,6 +6209,18 @@ class ScriptConverter:
             normalized = args_str.replace(',', ' ') if args_str else ''
             parts = [p.strip() for p in normalized.split() if p.strip()]
             target = self._convert_expression(parts[0], extends) if parts else 'None'
+            # The destination is a PLACED REFERENCE, and nothing else in the
+            # script necessarily declares it.  Without registering it here the
+            # call emitted a bare identifier that no property backed, and the
+            # compiler rejected the whole script — Morroblivion's
+            # CATChargenAndTransport dies on `Player.MoveTo CGPlayerStartMarker1`
+            # (a typo in the mod: the SCRO table binds only CGPlayerStartMarker,
+            # so Oblivion silently no-opped it, but Papyrus will not compile an
+            # undefined name).  Register only a plain identifier: an already
+            # converted expression (Game.GetPlayer(), a local, a literal) is not
+            # a property and must not be declared as one.
+            if parts and re.fullmatch(r'\w+', parts[0]) and target == parts[0]:
+                self._property_refs.setdefault(parts[0], 'ObjectReference')
             offsets = ', '.join(parts[1:4]) if len(parts) > 1 else ''
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
             if offsets:

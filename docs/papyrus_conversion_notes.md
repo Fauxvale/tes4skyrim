@@ -442,6 +442,48 @@ numerically; censused over the plugin, **not one of the 56 sites does** — ever
 one is `>= 2`, `>= 3` or `== 3`, i.e. "is the target detected", which
 `IsDetectedBy` answers exactly.
 
+### A compound `player.X` entry can shadow a handler too (2026-08-02)
+
+Same family as above, different mechanism. `_emit_function` short-cuts any
+`ref.func` whose **compound** key (`player.moveto`) exists in `FUNCTION_MAP`,
+returning before the dedicated handler further down. `_COMPOUND_HAS_OWN_HANDLER`
+exempts commands that need the handler; only `placeatme` was listed.
+
+`moveto` needed the exemption for three reasons:
+
+1. The compound path routes args through `_convert_args`, which **splits on
+   commas only** — Oblivion writes the offsets space-separated
+   (`MoveTo marker 0 100 0`), so they glued onto the target name.
+2. It never registers the destination as a property. The call then emitted a
+   bare identifier that nothing declared, and the compiler rejected the **whole
+   script**.
+3. Only the `Player.`-prefixed form took that path, so a plain `ref.MoveTo`
+   looked correct — which is exactly what hid the bug.
+
+MoveTo's destination is a placed reference, so the handler now types it
+`ObjectReference` (and skips `player`, a converter keyword that is never a
+property, and any already-converted expression).
+
+**Morroblivion symptom:** `CATChargenAndTransport` failed on
+`Player.MoveTo CGPlayerStartMarker1`. Note the mod's own typo — no such marker
+exists; the SCRO table binds only `CGPlayerStartMarker`, because Oblivion's
+compiler treated the trailing `1` as MoveTo's optional offset argument. Oblivion
+silently no-ops an unresolved target; Papyrus will not compile an undefined
+name, so **one dead line in the mod took down the whole start-menu script**, and
+with it the Imperial City transport.
+
+### `GetIsClass` / `GetPCIsClass` read the ActorBase (2026-08-02)
+
+Both were **absent from `FUNCTION_MAP` entirely**, so the call survived
+untranslated and Papyrus parsed `GetPCIsClass CharactergenClass` as a bare name
+after a name — a syntax error that failed the whole script. Skyrim reads the
+class off the ActorBase (`ActorBase.GetClass()`); `Actor` has no `GetClass()`.
+The CLAS argument types as `Class`.
+
+Site: Morroblivion's `fbmwChargenQuestScript` (the class quiz), which the
+Chargen-and-Transport start menu imports — so the failure propagated to the
+transport NPCs.
+
 ### A Bool cannot carry a multi-valued TES4 threshold (2026-07-31)
 
 Mapping `GetDetectionLevel` onto `IsDetectedBy` is only half the fix, and the
@@ -537,7 +579,6 @@ Two recurring shapes, both found in the animation handlers:
   `NPC_`/`CREA`/`ACHR`/`ACRE` as actors; unknown targets keep the behavior event,
   which is inert on an object but never corrupts an actor's graph. `PlayIdle`
   still uses the old `actor_func=True` assumption and needs the same treatment.
-
 **Census the no-op lists against the real API, not against intuition.** Six
 entries in `_NO_OP_FUNCS`/`_BARE_NO_EQUIV_COMMANDS` exist natively in Skyrim:
 `AddAchievement` (59 call sites), `PlayBink` (5), `SendTrespassAlarm` (2),
@@ -776,8 +817,14 @@ Oblivion ignored it; Papyrus fails the whole file, so it is commented out.
 - **OBSE `IsCasting` maps NATIVELY** — `GetAnimationVariableBool("bIsCastingRight"
   /"bIsCastingLeft")`, no SKSE needed. Check for a native equivalent before
   declaring a function unconvertible.
+- **`sv_Construct` is the ONE OBSE string command with an exact equivalent**: it
+  builds a `string_var` from a literal, and a Papyrus `String` *is* that literal,
+  so `set q to sv_Construct "text"` → `q = "text"`. It used to fall through to
+  the inert `ar_`/`sv_` catch-all below, which left an undefined identifier and
+  failed the whole script (2026-08-02). `sv_Destruct` stays a no-op — Papyrus
+  strings are garbage-collected, so there is nothing to free.
 - No Papyrus equivalent, emitted inert with `;NE:` — OBSE arrays/strings (`ar_*`,
-  `sv_*`, `forEach`), path-based music (`StreamMusic` and Nehrim's bundled `emc*`
+  the rest of `sv_*`, `forEach`), path-based music (`StreamMusic` and Nehrim's bundled `emc*`
   plugin; Skyrim music is MusicType-based), `GetPlayerHasLastRiddenHorse`,
   `HasFlames`/`AddFlames`/`RemoveFlames`, `PositionCell` (Papyrus `MoveTo` takes
   a reference, not cell coordinates), `GetIgnoreFriendlyHits` (Skyrim exposes
@@ -833,6 +880,29 @@ troll and then talk to the player, never appeared in the start cell
 reference event, so it stayed on the base NPC_ (bug 1), and its poll was
 3D-gated, so it could not have run anyway (bug 2). Both had to be fixed for him
 to spawn.
+
+### A bare GameMode block also forces relocation (2026-08-02)
+
+The two triggers above still missed a whole class: an actor script that is
+**nothing but a `GameMode` block making explicit `Other.Method()` calls**. It
+declares no reference event and makes no bare self-call, so neither reason
+fired and it rode the base NPC_ — where it is dead code, because the converter
+compiles `GameMode` into an OnUpdate poll whose only starters are
+`OnCellAttach` / `OnCellDetach` / `OnLoad` / `OnInit`, all gated on
+`TES4Polyfill.ShouldRunGameMode(Self)`. Every one of those is an
+`ObjectReference` member; on a base VMAD `Self` is an `ActorBase`, so the events
+never fire, the gate has no reference to answer for, and the poll never starts.
+
+`gamemode` is therefore in `_TES4_REFERENCE_EVENTS` now. It is not an engine
+reference event — it is there because *our own* lowering of it is
+reference-only.
+
+**Morroblivion symptom:** `CATDestinationSorter`, the script driving the
+Cyrodiil↔Vvardenfell world transport, is pure GameMode polling a global
+(`CATDestinationCode`) and calling `Player.MoveTo(marker)`. Attached to the
+base NPC_ of both ferrymen (Kisimba in the Imperial City, Jo'Tesh in Seyda
+Neen), it never ran: the player paid 1000 gold, the dialogue fragment set the
+destination code, and nothing ever moved them.
 
 ### A script on the PLAYER base needs a quest alias (2026-08-01)
 

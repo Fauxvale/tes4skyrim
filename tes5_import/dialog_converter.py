@@ -647,6 +647,37 @@ def _pc_stage_texts(texts: list) -> list:
     return [_expand_control_tokens(t) if t else t for t in texts]
 
 
+def quest_objective_texts(rec: dict) -> list:
+    """The NNAM journal text of each objective convert_QUST emits, in order.
+
+    Skyrim shows the OBJECTIVE (NNAM) in the journal, not the stage log entry
+    (CNAM), but both are derived from the same TES4 `Stage[].Log[].Text`. The
+    override builder needs this exact sequence to retranslate NNAM, so the
+    derivation lives here and both callers share it — reimplementing it in the
+    override spec is how the two drift apart.
+
+    One objective per stage index that has journal text, first non-empty log
+    entry winning, duplicate stage indices skipped.
+    """
+    out = []
+    seen_stages = set()
+    for i in range(get_int(rec, 'StageCount')):
+        stage_idx = get_int(rec, f'Stage[{i}].Index')
+        if stage_idx in seen_stages:
+            continue
+        log_count = get_int(rec, f'Stage[{i}].LogCount')
+        texts = (_pc_stage_texts([get_str(rec, f'Stage[{i}].Log[{j}].Text')
+                                  for j in range(log_count)])
+                 if log_count > 0
+                 else [get_str(rec, f'Stage[{i}].LogEntry')])
+        txt = next((x for x in texts if x), None)
+        if not txt:
+            continue
+        seen_stages.add(stage_idx)
+        out.append(txt)
+    return out
+
+
 def convert_QUST(rec: dict, fid_to_edid: dict = None,
                  well_known_props: dict = None,
                  unlock_plan: dict = None,

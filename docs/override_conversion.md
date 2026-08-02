@@ -193,3 +193,67 @@ from comparing two conversion runs.
 - Verify with: zero non-text diffs vs the master (only FULL/NAM1/DESC/CNAM/NNAM
   should differ), zero dangling refs, zero records at undefined master ids, and
   every override nested exactly as the master nests it.
+
+## Scripts: the masters' export is part of the identifier namespace
+
+An override plugin's own export holds **only the records it authors**. Every
+EditorID it merely *references* — the master's GLOBs, quests, refs and SCPTs —
+is absent, so anything that resolves names against a single export directory
+silently fails to find them. Three places need the masters, and all three are
+last-wins merges that must scan **masters FIRST** so the plugin's own version of
+an overridden record wins:
+
+- `CrossRefGraph.load_from_export()` walks `_HEADER.txt` `Master[n]=` entries
+  transitively (`_export_dirs_with_masters`). Without it an unresolved name
+  falls out of `_convert_ref` as a bare identifier with no property declared,
+  and the compiler rejects it: `undefined identifier \`SetGewitter\``. This was
+  **430 of Translation.esp's 981 scripts** — Nehrim owns every `Set*`/`Var*`
+  global they read.
+- `build_ref_as_int_map()` scans the masters' `SCPT.txt` alongside the plugin's,
+  so a script reaching into a master's script variable can be typed. (Its
+  INFO/QUST cross-access scan stays plugin-only — that one is a pure union of
+  names that must become Properties, and the master's own fragments are emitted
+  by the master's own run.)
+- **`import_main`'s hand-built `CrossRefGraph` must mirror the CLI scan**, which
+  is why it now folds in `ctx.master_export`. If the two graphs disagree the
+  converter takes a different branch inside the import than it did when the
+  `.psc` was written, and the VMAD ends up missing exactly the properties the
+  compiled script reads.
+
+Separately, `phase_compile` passes each master's
+`output/<Master>/scripts/source` as an extra `-h` header directory. An override
+plugin's scripts declare properties typed as the **master's** converted scripts
+(`TES4_NQ16Script Property ...`) because the record they name carries that
+master's SCRI; those `.psc` live in the master's output. Header-only — the
+master's own run compiles and ships the `.pex`. This was the remaining 198
+failures, all `undefined type`.
+
+Net effect on Translation.esp: 551/981 compiled → **981/981**. FormIDs need no
+special handling: `remap_formid` already gives an override its master's shifted
+index, so `SetGewitter` binds to `01020A0F` (Nehrim's `00020A0F` at index 01).
+
+## One TES4 field can feed TWO output subrecord runs
+
+`Stage[].Log[].Text` is the only journal text a TES4 quest has, and
+`convert_QUST` writes it **twice**: once as the stage log entry (`CNAM`) and
+once as the quest objective (`NNAM`, via `quest_objective_texts`). **Skyrim's
+journal displays the OBJECTIVE**, so an override spec that maps the key to
+`CNAM` alone produces a record whose visible text is still the master's — for a
+translation plugin, quests that read German in-game while the export, the diff
+and the CNAM run were all correctly English. 83 of Translation.esp's 84 quests.
+
+The trap is that nothing looks wrong at any single checkpoint: the plugin's
+export has the translation, `diff_records` reports `Stage[]`, the nested spec
+fires, and `CNAM` is substituted correctly. Only the *second* derived run is
+missing. When auditing an override spec, ask what ELSE the converter derives
+from that field, not just where the field is copied.
+
+`_DERIVED_INDEXED_SUBRECORD` covers this: it maps `(sig, key)` to an output
+signature plus **the converter's own deriving function**, so the objective
+sequence cannot drift from the one the master's record was built with. The
+count must match the master's run exactly (verified: 84/84) or the per-
+occurrence substitution misaligns.
+
+Note a legitimately unchanged entry is not a bug — Nehrim's NQ09 is still
+German in Translation.esp itself, so keeping the master's value there is
+correct.
