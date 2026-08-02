@@ -3916,6 +3916,20 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                         if obj_entry.av_object is old_root:
                             obj_entry.av_object = root
 
+            # Fix NiSkinInstance.skeleton_root -- the same dangling-back-
+            # reference class as the controllers above.  A skinned shape names
+            # the node its bone transforms are relative to; on a self-skinned
+            # clutter mesh (rope, chain, banner, hanging bucket) that node IS
+            # the root.  old_root is no longer in the tree, so PyFFI writes the
+            # link as null (-1), and Skyrim cannot resolve the skin's frame of
+            # reference -- the shape renders as the red missing-geometry
+            # marker.  Symptom seen on dungeons\chargen\ropebucket01.nif, whose
+            # two BucketRope shapes are skinned to the c_BucketBone chain.
+            for blk in root.tree():
+                si = getattr(blk, 'skin_instance', None)
+                if si is not None and si.skeleton_root is old_root:
+                    si.skeleton_root = root
+
         elif type(root).__name__ == 'NiNode' and _is_worn_armor:
             # Worn armor: keep NiNode root but update flags and clear properties.
             root.flags = NIF_FLAGS
@@ -4255,6 +4269,47 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
             if _r is not None and _get_prn_bone(_r) == 'WeaponBow':
                 stats['bow_rig_shapes'] = add_bow_rig(data, _bow_string_masks)
                 break
+
+    # --- NiSkinPartition strip-format safety net ---------------------------
+    # A NiSkinPartition can store its geometry as either STRIPS or TRIANGLES.
+    # Oblivion writes strips; Skyrim's renderer reads the partition (not the
+    # NiTriShapeData) to draw a skinned shape, and a strip-format partition
+    # gives it no triangles at all — the shape renders as the red
+    # missing-geometry marker.  Census: 678/678 vanilla skin partitions across
+    # 350 sampled meshes store TRIANGLES, zero store strips.
+    #
+    # The strips->triangles conversion in _walk_node rebuilds NiTriShapeData
+    # but does NOT touch the partition, and the two regeneration passes above
+    # are gated on mesh CATEGORY (creature / worn armor).  Anything else that
+    # happens to be skinned — self-skinned clutter (rope, chain, banner,
+    # hanging bucket), effect meshes, odd creature parts outside the creature
+    # path — kept its Oblivion strip partition and broke.  Found via
+    # dungeons\chargen\ropebucket01.nif (red triangle in game); a sweep of 500
+    # converted meshes found 93 such partitions across 6+ unrelated meshes, so
+    # this is a general class, not one file.
+    #
+    # Runs after every category-specific pass: those set up bones/bind poses
+    # and regenerate correctly on their own, and this leaves their triangle
+    # partitions alone.  It only rewrites what is still in strip format.
+    for root in data.roots:
+        if root is None:
+            continue
+        for block in list(root.tree()):
+            if not isinstance(block, (NifFormat.NiTriShape,
+                                      NifFormat.NiTriStrips)):
+                continue
+            skin = getattr(block, 'skin_instance', None)
+            if skin is None or skin.skin_partition is None:
+                continue
+            if not any(pb.num_strips > 0
+                       for pb in skin.skin_partition.skin_partition_blocks):
+                continue
+            from .skin_retarget import _regen_skin_partition
+            geom_name = bytes(block.name).rstrip(b'\x00').decode(
+                'latin-1', errors='replace')
+            _regen_skin_partition(block, skin, geom_name)
+            stats['skin_partitions_destripified'] = \
+                stats.get('skin_partitions_destripified', 0) + 1
 
     # --- BSInvMarker finalize: per-mesh inventory orientation ---------------
     # Weapons and shields sit in Skyrim's normalized attachment frames (Prn
