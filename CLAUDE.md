@@ -163,6 +163,16 @@ theories externally first.
   `--prune-textures-only`, `--pack-zip-only`. Report what you built and any
   failures verbatim; if a stage genuinely cannot be run, say which and why rather
   than staying silent.
+- **NEVER START A BUILD UNTIL YOU ARE SURE THE FIX IS CORRECT.** Finish every
+  edit, run the targeted tests, and re-read your own diff FIRST.
+- **A FULL `--meshes-only` REBUILD IS LONG AND EXPENSIVE (~20,000 meshes, many
+  minutes at 100% CPU). Never launch one lightly.** Rebuild ONLY the meshes your
+  change actually affects. Ressrve the full stage for changes that genuinely touch every mesh, and say so when you run one.
+- **Never run two CPU-saturating jobs at once.** While a build is running, do not
+  start pytest, a mesh sweep, or a second build — they fight for every core, both
+  take longer, and the machine becomes unusable. Wait for the completion
+  notification, then run the next thing. While waiting, WAIT — don't burn tokens
+  on filler work.
 - **While iterating on a repeated failure, don't write tests, update docs, or ANYTHING until
   the fix is CONFIRMED in-game.** Each round trip costs the user a full
   build-and-play cycle, so spend it on the diagnosis and the candidate fix only.
