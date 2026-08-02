@@ -208,6 +208,14 @@ SHIELD_INV_MARKER_ROT_Y = 0
 SHIELD_INV_MARKER_ROT_Z = 0
 SHIELD_INV_MARKER_ZOOM  = 1.0
 
+# Torch: same orientation as the shield but pulled back slightly; sourced from
+# vanilla meshes\weapons\torch\torch.nif.  A torch shares the SHIELD attach
+# NODE (off-hand) but is NOT a shield — it gets no shield attach transform.
+TORCH_INV_MARKER_ROT_X = 4712
+TORCH_INV_MARKER_ROT_Y = 0
+TORCH_INV_MARKER_ROT_Z = 0
+TORCH_INV_MARKER_ZOOM  = 0.82
+
 # Armor ground models (_gnd): rot_x ≈ 90° (upright); sourced from vanilla cuirassgnd.nif
 ARMOR_GND_INV_MARKER_ROT_X = 1570
 ARMOR_GND_INV_MARKER_ROT_Y = 0

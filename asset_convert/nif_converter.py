@@ -55,6 +55,10 @@ from .skyrim_overrides import (
     SHIELD_INV_MARKER_ROT_Y,
     SHIELD_INV_MARKER_ROT_Z,
     SHIELD_INV_MARKER_ZOOM,
+    TORCH_INV_MARKER_ROT_X,
+    TORCH_INV_MARKER_ROT_Y,
+    TORCH_INV_MARKER_ROT_Z,
+    TORCH_INV_MARKER_ZOOM,
     WEAPON_INV_MARKER_ROT_X,
     WEAPON_INV_MARKER_ROT_Y,
     WEAPON_INV_MARKER_ROT_Z,
@@ -317,7 +321,13 @@ _PRN_REMAP: dict[str, str] = {
     'Quiver':      'QUIVER',        # arrow quivers
     'Weapon':      'Weapon',        # already valid (keeps as-is)
     'Shield':      'SHIELD',        # shields
-    'Torch':       'NPC L MagicNode [LMag]',
+    # Skyrim carries the torch in the OFF-HAND, on the shield node: vanilla
+    # meshes\weapons\torch\torch.nif ships Prn='SHIELD' (the static sconce
+    # torches under clutter\ carry no Prn at all -- they are placed world
+    # objects).  'NPC L MagicNode [LMag]' is the spell-CAST node: its axes
+    # point outward from the open palm, so a torch attached there renders
+    # rotated ~90deg with the flame off to the left.
+    'Torch':       'SHIELD',
     # Shields: Oblivion uses the forearm bone; Skyrim has a dedicated SHIELD node
     'Bip01 L ForearmTwist': 'SHIELD',
     # Helmets: Oblivion attaches helmets to 'Bip01 Head'; Skyrim uses 'NPC Head [Head]'
@@ -3783,6 +3793,38 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                             fade.rotation.m_11 = -1.0; fade.rotation.m_12 =  0.0; fade.rotation.m_13 = 0.0
                             fade.rotation.m_21 =  0.0; fade.rotation.m_22 =  1.0; fade.rotation.m_23 = 0.0
                             fade.rotation.m_31 =  0.0; fade.rotation.m_32 =  0.0; fade.rotation.m_33 = -1.0
+
+                    elif remapped == 'SHIELD' and prn_val == 'Torch':
+                        # A TORCH also hangs off the SHIELD node (Skyrim carries
+                        # it in the off-hand), but it is NOT a shield and must
+                        # NOT get the shield attach transform below.
+                        #
+                        # That transform exists because Oblivion straps a shield
+                        # to 'Bip01 L ForearmTwist' while Skyrim glues the root
+                        # to the SHIELD bone at the hand grip — the two attach
+                        # frames differ, so the geometry has to be remapped.
+                        # A torch has no such mismatch: it is authored at the
+                        # grip in BOTH games.  Vanilla
+                        # meshes\weapons\torch\torch.nif is identity rotation,
+                        # zero translation, geometry at identity.  Applying the
+                        # shield transform threw it ~65deg off with a -20.5
+                        # forearm-strap offset (in-game: torch at a completely
+                        # wrong orientation).
+                        #
+                        # The torch still needs its own BSInvMarker: SHIELD is
+                        # in _EQUIPPED_PRN_VALUES, so the per-mesh inventory
+                        # pass skips it and it would otherwise ship none.
+                        # Vanilla torch.nif: rot (4712, 0, 0), zoom 0.82 —
+                        # same orientation as a shield, slightly pulled back.
+                        inv = NifFormat.BSInvMarker()
+                        inv.name = b'INV'
+                        inv.rotation_x = TORCH_INV_MARKER_ROT_X
+                        inv.rotation_y = TORCH_INV_MARKER_ROT_Y
+                        inv.rotation_z = TORCH_INV_MARKER_ROT_Z
+                        inv.zoom = TORCH_INV_MARKER_ZOOM
+                        fade.num_extra_data_list += 1
+                        fade.extra_data_list.update_size()
+                        fade.extra_data_list[fade.num_extra_data_list - 1] = inv
 
                     elif remapped == 'SHIELD':
                         # Shield BSInvMarker for inventory display (match vanilla ironshield.nif)

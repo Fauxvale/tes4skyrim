@@ -106,7 +106,7 @@ theories externally first.
 - **NEVER `git stash` / `git stash pop`** in this repository.
 - **NEVER `git commit` or `git push`.** The user commits after in-game testing.
 - **NEVER `git add` / `git rm`** (staging, including staged deletions). Use plain
-  `rm`. `git reset` destroys the user's own staging.
+  `rm`. `git reset` destroys the user's own staging. The ONLY exception is an EXPLICIT instruction from the user
 - **NEVER go snooping in the live, heavily-modded SSE install.** It is full of
   other mods' assets, so nothing you find there tells you anything about this
   converter. In particular: **never inspect it to check whether your changes were
@@ -168,6 +168,7 @@ theories externally first.
 - **A FULL `--meshes-only` REBUILD IS LONG AND EXPENSIVE (~20,000 meshes, many
   minutes at 100% CPU). Never launch one lightly.** Rebuild ONLY the meshes your
   change actually affects. Ressrve the full stage for changes that genuinely touch every mesh, and say so when you run one.
+- **Build the mesh the user named, in the PLUGIN the user named** If they say a mesh is a Nehrim issue, rebuild it under `Nehrim.esm` even if there is a same-named mesh under `Oblivion.esm`
 - **Never run two CPU-saturating jobs at once.** While a build is running, do not
   start pytest, a mesh sweep, or a second build — they fight for every core, both
   take longer, and the machine becomes unusable. Wait for the completion
