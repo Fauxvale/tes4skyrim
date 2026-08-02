@@ -224,6 +224,35 @@ Every one was invisible to structural inspection **and to NifSkope, which render
 - **Bow bend rig (`asset_convert/bow_rig.py`)**: converted bows get the exact vanilla 7-bone chain (Bow_MidBone → Lo/Up chains → StringBones; locals lifted from vanilla steelbow.nif — the rig is the animation contract, BowProject.hkx clips store absolute local bone transforms) + BGED `Weapons\Bow\BowProject.hkx` + BSXFlags Animated bit (0x08). Geometry is skinned with plain NiSkinInstance (vanilla bows never use BSDismember) using the measured vanilla weight profile (Mid→B1 crossfade |y| 4-16, B1→B2 20-36, tips ~58/42 B2/StringBone; string = SB1↔SB2 lerp). String verts are identified from the Oblivion NiGeomMorpherController draw morph (string moves ~28 units vs limb ~7-10; capture BEFORE controllers are stripped) — verified on all 8 vanilla Oblivion bows.
 - **SLSF1_Skinned (shader_flags_1 bit 0x02) is mandatory on the bow shape's BSLightingShaderProperty** — without it the renderer never applies bone deforms: the bow renders frozen in bind pose while the graph animates the bones (string never draws, limbs never bend). Shader conversion runs before the rig exists, so `add_bow_rig` sets the flag itself after skinning (vanilla steelbow SF1=0x82400383 has it set).
 
+## NIF torch Prn — Skyrim carries the torch on the SHIELD node (SOLVED 2026-08-01)
+- Oblivion `Prn='Torch'` → **`'SHIELD'`**, not `'NPC L MagicNode [LMag]'`.
+- Skyrim holds the torch in the off-hand: vanilla `meshes\weapons\torch\torch.nif`
+  ships `Prn='SHIELD'` (and lives under `weapons\`, not `lights\`). The static
+  sconce torches under `clutter\common\` carry **no Prn at all** — they are
+  placed world objects, so they are not evidence for the carried case.
+- `NPC L MagicNode [LMag]` is the spell-**cast** node; its axes point outward
+  from the open palm, so a torch parented there renders rotated ~90° with the
+  flame sticking out to the left. Weapons were unaffected because they route
+  through the `Weapon*` nodes, which is why this looked torch-specific.
+- **Sharing the SHIELD node does NOT make it a shield.** The `remapped ==
+  'SHIELD'` branch must be split on the ORIGINAL `prn_val`: a torch takes
+  **no shield attach transform**. That transform exists only because Oblivion
+  straps a shield to `Bip01 L ForearmTwist` while Skyrim glues the root to the
+  SHIELD bone at the grip — a torch is authored at the grip in both games, so
+  remapping frames throws it ~65° off with a -20.5 forearm-strap offset. This
+  was the second, separate cause of "torch orientation completely wrong": the
+  Prn was right, the geometry transform was not.
+- Vanilla `torch.nif` is identity rotation, zero translation, geometry at
+  identity; flame at +Y (`TorchFire` y≈28.96), matching the converted
+  `FlameNode1` y=27 / `AttachLight` y=35.
+- Torch **does** still need its own BSInvMarker: `SHIELD` is in
+  `_EQUIPPED_PRN_VALUES`, so the per-mesh inventory pass skips it and it would
+  otherwise ship none. Vanilla values rot (4712, 0, 0) **zoom 0.82** (shield is
+  the same rotation but zoom 1.0) → `TORCH_INV_MARKER_*` in `skyrim_overrides.py`.
+- Verified against `references/Skyrim Meshes` — **not** the SSE BSAs, which are
+  off-limits (see CLAUDE.md); `asset_convert/skyrim_assets.py` is for the
+  runtime pipeline only, never for "what does vanilla do here?" debugging.
+
 ## NIF shield conversion
 - Shields use BSFadeNode root + Prn='SHIELD' (same as weapons, NOT NiNode like worn armor)
 - **Orientation fix**: Oblivion shields are modeled with thin (face-normal) axis along Y. Skyrim's SHIELD bone expects it along Z. A +90° rotation around X is applied to the BSFadeNode root. Root rotation baking wraps this in an inner NiNode.
@@ -442,6 +471,61 @@ PyFFI reports **every unreferenced block** as a root, not just scene-graph roots
 
 ## NIF NiDefaultAVObjectPalette fixup
 - After converting NiTriStrips→NiTriShape, NiDefaultAVObjectPalette entries still reference old blocks. Must update `av_object` references using a block_map (old id → new block). Without this fix, PyFFI writes "NiTriStrips block is missing from the nif tree" warnings and the animation palette has stale references.
+
+## Skinned shape = red triangle: NiSkinPartition still in STRIP format (SOLVED 2026-08-01)
+**This is the actual cause of the `ropebucket01.nif` red triangle.** (The
+`skeleton_root` fix below is a real defect and was fixed in the same pass, but
+it did NOT fix the red triangle — don't stop there again.)
+
+- A `NiSkinPartition` stores geometry as **either strips or triangles**.
+  Oblivion writes strips. Skyrim's renderer draws a skinned shape from the
+  **partition**, not from `NiTriShapeData` — a strip-format partition hands it
+  no triangles and the shape renders as the red missing-geometry marker.
+- **Census: 678/678 vanilla skin partitions across 350 sampled meshes store
+  TRIANGLES. Zero store strips.**
+- The strips→triangles pass in `_walk_node` rebuilds `NiTriShapeData` but
+  **does not touch the partition**. The two `_regen_skin_partition` passes that
+  would fix it are gated on mesh **category**: `creature and has_skin`, and
+  worn armor (`_in_armor_dir`). Anything else that happens to be skinned kept
+  its Oblivion strip partition — self-skinned clutter (rope, chain, banner,
+  hanging bucket), effect meshes, creature parts outside the creature path.
+- **Not one file:** a sweep of 500 converted meshes found **93 strip-format
+  partitions across 6+ unrelated meshes** (`roothavok05`, `parachuteclosed`,
+  `refractioneffect`, `thornelemental`, `sloftarantulafuzzyredknee`,
+  `handrberskir`).
+- **Fix:** a category-independent safety net after all the category passes —
+  regenerate any partition still reporting `num_strips > 0`. Existing passes
+  are untouched (they already emit triangles). Counter:
+  `stats['skin_partitions_destripified']`.
+- **Diagnostic:** `pb.num_strips > 0` / `len(pb.triangles) == 0` on any
+  `skin_partition_block`. Checking the shape's `NiTriShapeData` is NOT enough —
+  it looks perfectly healthy while the partition is broken.
+
+## Dangling back-references to `old_root` after NiNode→BSFadeNode (skin case SOLVED 2026-08-01)
+The root swap in `nif_converter.py` builds a **new** BSFadeNode and drops the
+original NiNode out of the tree. Every block still pointing at `old_root` is
+then unreachable, and PyFFI silently writes that link as null (-1). The fixup
+block after the swap must retarget *all* of them — it already handled
+`NiTimeController.target`, `.extra_targets`, and `NiDefaultAVObjectPalette`, but
+**not `NiSkinInstance.skeleton_root`**.
+
+- **Symptom:** none observed in-game on its own. This was initially blamed for
+  the ropebucket red triangle; fixing it changed nothing, and the real cause was
+  the strip-format skin partition above. It is still a genuine broken link
+  (source `skeleton_root = RopeBucket01`, output `None`) and worth fixing, but
+  do not treat a dangling `skeleton_root` as an explanation for a red triangle.
+- **Who it hits:** self-skinned *clutter*, i.e. a mesh whose bones live in its
+  own tree rather than on the character skeleton — rope, chain, banner, hanging
+  bucket. Found on `dungeons\chargen\ropebucket01.nif`, whose two `BucketRope:*`
+  shapes are skinned to the internal `c_BucketBone00..07` chain with
+  `skeleton_root` = the root node. Worn armor is immune because it keeps a
+  NiNode root (no swap happens).
+- **Detection:** dump source vs output and compare — source has
+  `skeleton_root = RopeBucket01`, broken output has `None`.
+- Note the shapes here are already `NiTriShape` in the source, so
+  `get_interchangeable_tri_shape()` is *not* involved. (That method does
+  `deepcopy` the skin instance, which would orphan the same links for a skinned
+  *NiTriStrips* — no such mesh has been observed yet, but it is the same trap.)
 
 ## NIF furniture marker conversion (rewritten 2026-07 — fixed backwards/floating NPCs)
 - Oblivion: `BSFurnitureMarker` (NiExtraData) with FurniturePosition using `orientation` (ushort, milliradians), `position_ref_1`/`position_ref_2` (byte, always equal in practice)

@@ -1,13 +1,22 @@
 """Vanilla Skyrim asset lookup with automatic BSA extraction.
 
-Mesh conversion must never resolve through the references/ folder: that is a
-comparison/analysis tree only, not part of the pipeline.  Any vanilla Skyrim
-file the conversion needs (body/hands/feet meshes for skin splicing, the book
-reading templates, ...) is resolved through this module:
+THIS MODULE IS FOR THE RUNTIME PIPELINE ONLY -- i.e. code that must ship a
+vanilla Skyrim file into the converted output (body/hands/feet meshes for skin
+splicing, the book reading templates, ...).  Such code must never resolve
+through references/, because references/ is a comparison tree that is not
+guaranteed to be present.  For those callers the search order is:
 
     1. export/skyrim_assets/<rel>           (cache of prior BSA extractions)
     2. the game's own SSE BSA archives      (auto-detected via registry),
        extracted on demand and cached in 1.
+
+DO NOT USE THIS MODULE TO ANSWER "what does vanilla do here?" WHILE DEBUGGING.
+That is the exact opposite rule: CLAUDE.md forbids reading the live SSE install
+for anything but Papyrus logs and Skyrim.esm, and forbids digging through
+SSE-format assets/BSAs at all.  For investigation, read `references/Skyrim
+Meshes` and the `references/Skyrim.esm` dump instead -- they exist precisely so
+no one has to touch the install.  A cache miss here is NOT permission to go
+hunting through the archives for the right path; go to references/.
 
 BSA-sourced files are SSE-format; read them with asset_convert.sse_nif
 (pyffi Patch 8 + BSTriShape->NiTriShape conversion).
