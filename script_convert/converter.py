@@ -916,7 +916,7 @@ class ScriptConverter:
                                             load_gated)
             if load_gated:
                 # Only keep ticking while still loaded (OnCellDetach clears it).
-                out.append('  If (Is3DLoaded())')
+                out.append(f'  If ({self._GAMEMODE_GATE})')
                 out.append(f'    RegisterForSingleUpdate({interval})')
                 out.append('  EndIf')
             else:
@@ -1008,11 +1008,20 @@ class ScriptConverter:
                 # standing still: her package waits on `startconv == 1`, which
                 # only her GameMode body ever sets.
                 #
-                # Gating on Is3DLoaded() keeps the anti-storm property that
-                # motivated dropping OnInit here: it is true ONLY for references
-                # currently in an attached cell, so this cannot re-create the
-                # "every scripted object in the game starts ticking at load"
-                # failure — an unconditional OnInit register is what did that.
+                # Gating on TES4Polyfill.ShouldRunGameMode() keeps the
+                # anti-storm property that motivated dropping OnInit here: it is
+                # true ONLY for references whose parent cell is currently
+                # attached, so this cannot re-create the "every scripted object
+                # in the game starts ticking at load" failure — an unconditional
+                # OnInit register is what did that.
+                #
+                # It deliberately does NOT test Is3DLoaded() alone.  An
+                # initially-disabled reference has no 3D, so a 3D-gated poll can
+                # never start — and on 200 Nehrim refs the poll body is the only
+                # thing that ever calls Enable() on that same reference, an
+                # unbreakable deadlock (see ShouldRunGameMode's own comment).
+                # Oblivion ran GameMode for every ref in an active cell,
+                # disabled ones included; cell attachment is that rule.
                 #
                 # But OnInit ALONE is not enough once the script lives on the
                 # placed reference (which reference events like OnPackageEnd
@@ -1033,7 +1042,7 @@ class ScriptConverter:
                     out.append('')
                 if not any(b[0] == 'oninit' for b in blocks):
                     out.append('Event OnInit()')
-                    out.append('  If (Is3DLoaded())')
+                    out.append(f'  If ({self._GAMEMODE_GATE})')
                     if needs_oninit_update:
                         out.append(f'    RegisterForSingleUpdate({interval})')
                     if needs_sleep_reg:
@@ -2060,14 +2069,21 @@ class ScriptConverter:
     # early-out, and must be left alone.
     _BARE_RETURN_RE = re.compile(r'^(\s*)Return\s*(;.*)?$', re.IGNORECASE)
 
+    # The condition under which a placed reference's TES4 `begin GameMode` body
+    # would run, used at every site that arms the OnUpdate poll for an
+    # object/actor script.  NOT Is3DLoaded() — that is false for an
+    # initially-disabled reference and deadlocks the self-enable idiom.  See
+    # TES4Polyfill.ShouldRunGameMode().
+    _GAMEMODE_GATE = 'TES4Polyfill.ShouldRunGameMode(Self)'
+
     def _reregister_before_returns(self, out: list, start: int, interval: str,
                                    load_gated: bool) -> None:
         """Re-arm the OnUpdate poll before every early Return in `out[start:]`.
 
         Emits the SAME re-register the fall-through path uses, so a body that
         returns early keeps ticking exactly like one that runs to the end:
-        `Is3DLoaded()`-gated for object/actor scripts (whose poll is meant to
-        stop on unload), unconditional otherwise.
+        `ShouldRunGameMode()`-gated for object/actor scripts (whose poll is meant
+        to stop on unload), unconditional otherwise.
         """
         i = start
         while i < len(out):
@@ -2075,7 +2091,7 @@ class ScriptConverter:
             if m:
                 indent = m.group(1)
                 if load_gated:
-                    out[i:i] = [f'{indent}If (Is3DLoaded())',
+                    out[i:i] = [f'{indent}If ({self._GAMEMODE_GATE})',
                                 f'{indent}  RegisterForSingleUpdate({interval})',
                                 f'{indent}EndIf']
                 else:

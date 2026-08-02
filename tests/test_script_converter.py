@@ -392,7 +392,7 @@ End
         assert 'Event OnCellAttach()' in result
         assert 'Event OnCellDetach()' in result
         # The OnUpdate re-registration only continues while still loaded.
-        assert 'Is3DLoaded()' in result
+        assert 'TES4Polyfill.ShouldRunGameMode(Self)' in result
 
     def test_gamemode_loop_starts_when_already_loaded(self, converter):
         """OnCellAttach alone is not enough to start a GameMode poll.
@@ -404,10 +404,16 @@ End
         which is what left Arielle (MG04Restore) standing still: her travel
         package waits on `startconv == 1`, and only her GameMode body sets it.
 
-        The OnInit start MUST stay gated on Is3DLoaded(), which is true only for
-        references currently in an attached cell.  An UNCONDITIONAL OnInit
-        register is what once made every scripted object in the game tick at
-        load and flooded the engine — that must not come back.
+        The OnInit start MUST stay gated on TES4Polyfill.ShouldRunGameMode(),
+        which is true only for references whose parent cell is currently
+        attached.  An UNCONDITIONAL OnInit register is what once made every
+        scripted object in the game tick at load and flooded the engine — that
+        must not come back.
+
+        The gate deliberately is NOT Is3DLoaded() alone: a disabled reference
+        has no 3D, so that form could never start the poll on one — and the poll
+        body is routinely the only thing that ever calls Enable() on that same
+        reference (Celebro, the Nehrim intro companion, never appeared).
         """
         source = """ScriptName UpdateScript
 
@@ -420,9 +426,35 @@ End
         assert 'Event OnInit()' in result, \
             'a GameMode poll must also start for an already-loaded reference'
         init = result.split('Event OnInit()', 1)[1].split('EndEvent', 1)[0]
-        assert 'Is3DLoaded()' in init, \
-            'OnInit registration must be gated on Is3DLoaded (anti-storm)'
+        assert 'TES4Polyfill.ShouldRunGameMode(Self)' in init, \
+            'OnInit registration must be gated on cell attachment (anti-storm)'
         assert 'RegisterForSingleUpdate' in init
+
+    def test_disabled_ref_can_still_start_its_own_poll(self, converter):
+        """The self-enable idiom must not deadlock.
+
+        Oblivion's standard scripted entrance is an initially-disabled placement
+        whose OWN GameMode block enables it on a cue.  A poll gated on
+        Is3DLoaded() can never start on such a reference (no 3D while disabled),
+        so the Enable() that would give it 3D never runs — an unbreakable
+        deadlock that stranded 200 Nehrim refs, Celebro (the intro companion)
+        among them.  The gate must therefore test cell attachment, which is true
+        for a disabled reference.
+        """
+        source = """ScriptName EnableScript
+
+Begin GameMode
+  if ( GetStage MQ00 == 5 )
+    enable
+  endif
+End
+"""
+        result = converter.convert_standalone('EnableScript', source,
+                                              'ObjectReference', 'EnableScript')
+        init = result.split('Event OnInit()', 1)[1].split('EndEvent', 1)[0]
+        assert 'TES4Polyfill.ShouldRunGameMode(Self)' in init
+        # The bare `Is3DLoaded()` form is what deadlocked; it must not return.
+        assert 'If (Is3DLoaded())' not in result
 
     def test_gamemode_oninit_not_duplicated(self, converter):
         """A script with its own OnInit must not get a second one."""
@@ -1676,16 +1708,17 @@ End
         assert 'RegisterForSingleUpdate(0.5)' in body[:idx], \
             'early Return must re-arm the poll first'
 
-    def test_object_script_uses_the_is3dloaded_form(self, converter):
+    def test_object_script_uses_the_load_gated_form(self, converter):
         """An object/actor script's poll is MEANT to stop on unload, so the
-        re-register must carry the same Is3DLoaded() gate the fall-through
-        path uses — not an unconditional call that would keep ticking."""
+        re-register must carry the same ShouldRunGameMode() gate the
+        fall-through path uses — not an unconditional call that would keep
+        ticking."""
         out = converter.convert_standalone('T', self.SRC, 'ObjectReference',
                                            'T')
         body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
         idx = body.index('Return')
         before = body[:idx]
-        assert 'Is3DLoaded()' in before
+        assert 'TES4Polyfill.ShouldRunGameMode(Self)' in before
         assert 'RegisterForSingleUpdate(0.5)' in before
 
     def test_value_returning_function_untouched(self, converter):

@@ -26,7 +26,8 @@ from script_convert.constants import (_safe_property_name, papyrus_script_name,
                                       resolve_property_formid,
                                       PLAYER_ALIAS_EXTENDS)
 from script_convert.pipeline import build_vmad_object_script
-from .text_reader import parse_export_file, get_formid_index_offset, remap_formid
+from .text_reader import (parse_export_file, get_formid_index_offset,
+                          remap_formid, unescape_value)
 from .constants import ENGINE_GLOBAL_FORMIDS
 
 # Papyrus property types that are literal-valued (not bound to a FormID).
@@ -279,6 +280,7 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
     n_moved = _relocate_actor_scripts_to_refs(by_type, offset)
     if n_moved:
         print(f"  Actor scripts relocated to placed refs (reference events / "
+              f"self-ref calls / "
               f"GetVMScriptVariable package gates): {n_moved}")
     return count
 
@@ -352,6 +354,45 @@ _TES4_REFERENCE_EVENTS = frozenset({
 _BEGIN_BLOCK_RE = re.compile(r'(?:^|[\r\n;])\s*begin\s+(\w+)', re.IGNORECASE)
 
 
+# Functions that act on the CALLING REFERENCE when written bare (no `ref.`
+# prefix).  On a base ActorBase there is no reference for them to act on, so a
+# base-attached script calling these is inert no matter which event drives it.
+#
+# `enable` is the load-bearing one: Oblivion's standard idiom for a scripted
+# entrance is an initially-disabled placement whose OWN GameMode block enables
+# it on a cue (`if GetStage MQ00 == 5 / enable`).  Left on the base, the call
+# has no target and the actor never appears — that is exactly why Celebro, the
+# Nehrim intro companion, was missing from the start cell.
+_TES4_SELF_REF_FUNCS = frozenset({
+    'enable', 'disable', 'moveto', 'startcombat', 'stopcombat',
+    'kill', 'resurrect', 'playgroup', 'setalert', 'evp',
+    'addscriptpackage', 'removescriptpackage',
+})
+
+# A bare call: start of line (after optional whitespace) and NOT preceded by a
+# `.`, which would make it someone else's method (`CelebroRef.Disable`).
+_BARE_CALL_RE = re.compile(r'(?:^|\n)[^\S\n]*(\w+)\b', re.MULTILINE)
+
+
+def _script_uses_self_reference_call(sctx: str) -> bool:
+    """True when a TES4 script calls a reference function on ITSELF (bare, no
+    ``ref.`` prefix).
+
+    Such a script only functions when attached to a placed reference; on the
+    base record the call has no reference to act on.  Comment lines are skipped
+    so a commented-out ``;evp`` does not trigger a move.
+    """
+    text = unescape_value(sctx)
+    for m in _BARE_CALL_RE.finditer(text):
+        line = text[m.start():text.find('\n', m.start()) if
+                    text.find('\n', m.start()) != -1 else len(text)]
+        if line.lstrip().startswith(';'):
+            continue
+        if m.group(1).lower() in _TES4_SELF_REF_FUNCS:
+            return True
+    return False
+
+
 def _script_uses_reference_event(sctx: str) -> bool:
     """True when a TES4 script DECLARES an event the engine delivers only to a
     placed reference.
@@ -367,7 +408,7 @@ def _script_uses_reference_event(sctx: str) -> bool:
 def _relocate_actor_scripts_to_refs(by_type: dict, offset: int) -> int:
     """Move an actor's script VMAD from the base NPC_/CREA to its placed ACHR.
 
-    Two independent reasons an actor script MUST live on the reference:
+    Three independent reasons an actor script MUST live on the reference:
 
     1. ``GetVMScriptVariable(ref, "::var_var")`` reads the property off a
        script attached to the *reference named in param1* (the ACHR), not off
@@ -385,6 +426,15 @@ def _relocate_actor_scripts_to_refs(by_type: dict, offset: int) -> int:
        sequences on package completion — CharacterGen sets stage 12 from
        Renote's ``OnPackageEnd``, so the chain stopped at stage 10 and the
        Emperor/guards had no ``GetStage ==`` package to select at all.
+
+    3. SELF-REFERENCE CALLS have no target on a base record.  A bare ``enable``
+       / ``moveto`` / ``startcombat`` acts on the calling REFERENCE; an
+       ActorBase is not one, so the call does nothing.  Oblivion's standard
+       scripted-entrance idiom is an initially-disabled placement whose own
+       GameMode block enables it on a cue, which makes this the difference
+       between the actor appearing and never existing — Celebro, the Nehrim
+       intro companion, was absent from the start cell for exactly this reason
+       (``MQ00CelebroScript``: ``if GetStage MQ00 == 5 / enable``).
 
     Vanilla does exactly this split: instance-identified logic lives on the
     ACHR (masterAmbushScript, 464 placements), while generic per-actor
@@ -409,7 +459,8 @@ def _relocate_actor_scripts_to_refs(by_type: dict, offset: int) -> int:
     for sig in ('NPC_', 'CREA'):
         for rec in by_type.get(sig, []):
             src = scpt_src.get(rec.get('SCRI', ''), '')
-            if src and _script_uses_reference_event(src):
+            if src and (_script_uses_reference_event(src)
+                        or _script_uses_self_reference_call(src)):
                 try:
                     event_bases.add(int(rec.get('FormID', ''), 16) & 0x00FFFFFF)
                 except ValueError:

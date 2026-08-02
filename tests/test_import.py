@@ -2927,6 +2927,36 @@ class TestActorScriptOnPlacedRef:
         # not an actor event, and must not match on the 'onhit' substring
         assert not _script_uses_reference_event('begin OnMagicEffectHit')
 
+    def test_bare_self_reference_call_forces_relocation(self):
+        """A bare `enable`/`moveto`/... acts on the calling REFERENCE.
+
+        An ActorBase is not a reference, so on the base record the call does
+        nothing at all.  Oblivion's scripted-entrance idiom is an
+        initially-disabled placement whose own GameMode block enables it, which
+        makes this the difference between the actor appearing and never
+        existing — Celebro, the Nehrim intro companion, was absent from the
+        start cell because MQ00CelebroScript (`if GetStage MQ00 == 5 / enable`)
+        declares no reference event and so was left on the base NPC_.
+        """
+        from tes5_import.object_scripts import _script_uses_self_reference_call
+        assert _script_uses_self_reference_call(
+            'scn X\\r\\nbegin GameMode\\r\\nif ( GetStage MQ00 == 5 )'
+            '\\r\\n\\tenable\\r\\nendif\\r\\nend')
+        assert _script_uses_self_reference_call(
+            'begin GameMode\\r\\n\\tMoveTo MQ00TrollMarker\\r\\nend')
+
+    def test_other_refs_calls_do_not_force_relocation(self):
+        """Only BARE calls count.  `CelebroRef.Disable` targets someone else and
+        works fine from the base; a commented-out `;evp` is not a call at all.
+        """
+        from tes5_import.object_scripts import _script_uses_self_reference_call
+        assert not _script_uses_self_reference_call(
+            'begin OnActivate\\r\\n\\tCelebroRef.Disable\\r\\n\\tActivate\\r\\nend')
+        assert not _script_uses_self_reference_call(
+            'scn X\\r\\nbegin GameMode\\r\\n;evp\\r\\nend')
+        assert not _script_uses_self_reference_call(
+            'begin GameMode\\r\\n\\tset x to 1\\r\\nend')
+
 
 class TestLoadGatedPollStart:
     """A load-gated update loop must start from OnLoad, not OnInit alone.

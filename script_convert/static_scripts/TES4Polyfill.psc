@@ -23,6 +23,33 @@ Bool Function IsInSameCell(ObjectReference akRef1, ObjectReference akRef2) Globa
   Return akRef1.GetParentCell() == akRef2.GetParentCell()
 EndFunction
 
+; True while a TES4 `begin GameMode` block on this placed reference would run.
+;
+; Is3DLoaded() alone is WRONG here: an initially-disabled reference (record flag
+; 0x800) has no 3D, so an Is3DLoaded()-gated poll can never start — and the poll
+; body is frequently the only thing that ever calls Enable() on that very
+; reference.  That deadlock is unbreakable: the script that enables the ref only
+; runs once the ref is enabled.  It stranded 200 placed refs in Nehrim, Celebro
+; (the intro companion, MQ00CelebroScript `if GetStage MQ00 == 5 / enable`)
+; among them, so the intro NPC never appeared at all.
+;
+; Oblivion's own rule is cell-scoped, not 3D-scoped: GameMode ran for every ref
+; in an active cell, disabled ones included — which is exactly how the vanilla
+; self-enable idiom works.  So test parent-cell attachment, which is true for a
+; disabled ref and false for anything outside the active grid.  That preserves
+; the anti-storm property the 3D gate was introduced for (references in detached
+; cells still never tick); it only stops treating "invisible" as "not there".
+Bool Function ShouldRunGameMode(ObjectReference akRef) Global
+  If (akRef == None)
+    Return False
+  EndIf
+  If (akRef.Is3DLoaded())
+    Return True
+  EndIf
+  Cell parentCell = akRef.GetParentCell()
+  Return parentCell && parentCell.IsAttached()
+EndFunction
+
 ; ==========================================================================
 ; Actor Value Mapping (TES4 AV names → TES5 AV names)
 ; ==========================================================================

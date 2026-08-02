@@ -567,8 +567,12 @@ an inert comment. `ModDisposition` (414) is a genuine engine removal, with the
 - `GetSecondsPassed` substitutes `_get_update_interval()` (must equal the
   RegisterForSingleUpdate arg or timers run off-rate).
 - Converted GameMode loops must not only start on cell attach — an
-  already-loaded actor never ticks. They start from an `Is3DLoaded`-gated
-  `OnInit`.
+  already-loaded actor never ticks. They start from an `OnInit` gated on
+  `TES4Polyfill.ShouldRunGameMode(Self)`.
+- **That gate is cell attachment, NOT `Is3DLoaded()`** (2026-08-01). A disabled
+  reference has no 3D, so a 3D-gated poll can never start on one — and the poll
+  body is routinely the only thing that ever calls `Enable()` on that same
+  reference. See "The self-enable deadlock" below.
 
 ### Say() timers
 
@@ -784,6 +788,51 @@ Oblivion ignored it; Papyrus fails the whole file, so it is commented out.
 Reference events (`OnPackageEnd`, `OnActivate`) never fire on a base NPC_ VMAD —
 they must be relocated to the placed ACHR. This was the CharacterGen stage-10
 stall.
+
+### Bare self-reference calls also force relocation (2026-08-01)
+
+`_relocate_actor_scripts_to_refs` originally moved a script for two reasons: a
+`GetVMScriptVariable` package gate, or a `begin <reference-event>` declaration.
+There is a **third**: a script that calls a reference function on *itself* with
+no `ref.` prefix — `enable`, `disable`, `moveto`, `startcombat`, `playgroup`,
+`evp`, … An ActorBase is not a reference, so on the base record these calls have
+nothing to act on and do nothing at all, whatever event drives them.
+
+This matters because Oblivion's standard scripted-entrance idiom is an
+**initially-disabled placement (record flag 0x800) whose OWN GameMode block
+enables it on a cue**. `_script_uses_self_reference_call` now detects the bare
+call (skipping comment lines, so a commented-out `;evp` does not trigger a move,
+and requiring no `.` prefix so `CelebroRef.Disable` — someone *else's* method,
+which works fine from the base — does not either).
+
+### The self-enable deadlock (2026-08-01)
+
+The same idiom hit a second, independent bug in the poll gate. The chain:
+
+1. The ref is initially disabled → **no 3D**.
+2. `OnLoad` / `OnCellAttach` need 3D or a cell *transition*; a ref already
+   sitting in the player's starting cell gets neither.
+3. The `OnInit` fallback was gated on `Is3DLoaded()` → **false while disabled**.
+4. So the poll never starts, `Enable()` never runs, the ref never gets 3D.
+
+The script that enables the reference only runs once the reference is enabled —
+unbreakable. **200 placed refs in Nehrim** were stranded this way (Kim/MQ04,
+Erik/NQ01, the MQ20 paladins, MQ31 batteries, MQ33 mirages, sound zones).
+
+The fix is `TES4Polyfill.ShouldRunGameMode(akRef)`: 3D-loaded **or** parent cell
+attached. Oblivion's own rule was cell-scoped, not 3D-scoped — GameMode ran for
+every ref in an active cell, disabled ones included, which is precisely what
+makes the self-enable idiom work. Cell attachment preserves the anti-storm
+property the 3D gate was introduced for (refs in detached cells still never
+tick); it only stops treating "invisible" as "not there".
+
+**Nehrim intro symptom:** Celebro, the companion who is supposed to attack a
+troll and then talk to the player, never appeared in the start cell
+(`StartCelle`, 0x00000B9B). `MQ00CelebroScript` is nothing but
+`begin GameMode / if ( GetStage MQ00 == 5 ) / enable / endif` — it declared no
+reference event, so it stayed on the base NPC_ (bug 1), and its poll was
+3D-gated, so it could not have run anyway (bug 2). Both had to be fixed for him
+to spawn.
 
 ### A script on the PLAYER base needs a quest alias (2026-08-01)
 
