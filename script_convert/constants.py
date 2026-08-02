@@ -383,6 +383,142 @@ FUNCTION_MAP = {
     'showmessage':       ('Debug.MessageBox',   False, None),
     'getbuttonpressed':  (None,                False, None),  # Special handler
 
+    # --- Math (OBSE) ---
+    # OBSE writes these with a bare whitespace operand (`set x to sin angleZ`),
+    # which is why they reached the Papyrus parser unconverted as "no viable
+    # alternative at input 'sin'".  Papyrus exposes the same set as globals on
+    # Math.psc, and BOTH engines take/return DEGREES, so no unit conversion is
+    # needed.  `exp`/`log` have no Papyrus native — see _EXP_POLYFILL below.
+    'sin':               ('Math.sin',           False, None),
+    'cos':               ('Math.cos',           False, None),
+    'tan':               ('Math.tan',           False, None),
+    'asin':              ('Math.asin',          False, None),
+    'acos':              ('Math.acos',          False, None),
+    'atan':              ('Math.atan',          False, None),
+    'sqrt':              ('Math.sqrt',          False, None),
+    'pow':               ('Math.pow',           False, None),
+    'abs':               ('Math.abs',           False, None),
+    'floor':             ('Math.Floor',         False, None),
+    'ceil':              ('Math.Ceiling',       False, None),
+    'exp':               ('TES4Polyfill.Exp',   False, None),
+    'log':               ('TES4Polyfill.Log',   False, None),
+
+    # --- OBSE "NS"/silent variants ---
+    # The OBSE `...NS` forms differ from the vanilla command ONLY in suppressing
+    # the pickup/spell sound and the "item added" message.  Papyrus's plain
+    # calls take an abSilent argument for exactly that, so these are the same
+    # command, not a missing feature.
+    'additemns':         ('AddItem',           True,  None),
+    'removeitemns':      ('RemoveItem',        True,  None),
+    'addspellns':        ('AddSpell',          True,  None),
+    'removespellns':     ('RemoveSpell',       True,  None),
+    'equipitemsilent':   ('EquipItem',         True,  None),
+    'equipitemns':       ('EquipItem',         True,  None),
+    'unequipitemns':     ('UnequipItem',       True,  None),
+    # OBSE aliases that only widen the vanilla command's argument types.
+    'modav2':            ('ModActorValue',     True,  None),
+    'modactorvalue2':    ('ModActorValue',     True,  None),
+    'getav2':            ('GetActorValue',     True,  None),
+    'setav2':            ('SetActorValue',     True,  None),
+    'setcurrenthealth':  (None,                True,  None),  # Special handler
+    'rand':              ('Utility.RandomFloat', False, None),
+    'islocked':          ('IsLocked',          True,  None),
+    'getequippedobject': ('GetEquippedWeapon', True,  None),
+    # TES4 `LoopGroup <group>` plays an idle animation on repeat;
+    # PlayGamebryoAnimation is Skyrim's own looping Gamebryo-animation call.
+    'loopgroup':         ('PlayGamebryoAnimation', True, None),
+    # OBSE `IsOnGround` is the complement of Skyrim's IsFlying: both engines
+    # only distinguish "supported by the ground" from "not".
+    'isonground':        (None,                False, None),  # Special handler
+    'getglobalvalue':    (None,                False, None),  # Special handler
+    'setglobalvalue':    (None,                False, None),  # Special handler
+    # OBSE `IsModLoaded "Foo.esp"` — Morrowind_ob guards every Oblivion XP
+    # hand-off with it.  Game.GetFormFromFile returns None for an unloaded
+    # file, which answers the same question in vanilla Papyrus.
+    'ismodloaded':       ('TES4Polyfill.IsModLoaded', False, None),
+    # Written bare as `ref.GetRace == Argonian`, so without a FUNCTION_MAP entry
+    # the ref.Func branch treated it as PROPERTY access and emitted
+    # `ActorRef.GetRace` with no parens ("field or property `GetRace` not
+    # found").  Actor.psc has the real native.
+    'getrace':           ('GetRace',           True,  None),
+    # No vanilla Papyrus equivalent — see _OBSE_NO_EQUIV_COMMANDS.
+    'isunderwater':      (None,                True,  None),  # Special handler
+    'getvampire':        (None,                True,  None),  # Special handler
+    'getweapontype':     (None,                True,  None),  # Special handler
+    'iswaiting':         (None,                True,  None),  # Special handler
+    'getnumfollowers':   (None,                True,  None),  # Special handler
+    'getnthfollower':    (None,                True,  None),  # Special handler
+    'getspells':         (None,                True,  None),  # Special handler
+    'setattackdamage':   (None,                True,  None),  # Special handler
+    'togglespecialanim': (None,                True,  None),  # Special handler
+    'setavmod':          (None,                True,  None),  # Special handler
+    'starttimer':        (None,                False, None),  # Special handler
+    'getmodlocaldata':   (None,                False, None),  # Special handler
+    'setaltcontrol':     (None,                False, None),  # Special handler
+    'equipitem2':        ('EquipItem',         True,  None),
+    # TES4 `UncompleteQuest` reopens a finished quest; Quest.Reset() is the
+    # Papyrus call that returns a quest to its un-run state.
+    'uncompletequest':   (None,                True,  None),  # Special handler
+    # OBSE file/plugin probes and god-mode read: no VANILLA Papyrus equivalent
+    # (GetGodMode exists only in third-party SKSE plugins, not Game.psc).
+    'fileexists':        (None,                False, None),  # Special handler
+    'getgodmode':        (None,                False, None),  # Special handler
+    'getplayerbirthsign': (None,               False, None),  # Special handler
+    # Same question as IsModLoaded — route to the same polyfill.
+    'isplugininstalled': ('TES4Polyfill.IsModLoaded', False, None),
+    # OBSE `print`/`printc` write to the console log; Debug.Trace is Papyrus's
+    # own log write, which is the same capability.
+    'print':             ('Debug.Trace',       False, None),
+
+    # --- OBSE commands with no VANILLA Papyrus equivalent (neutralised) ---
+    # Each has been checked against Actor/ObjectReference/Game/Form/Utility and
+    # exists in none of them.  Several are reachable via SKSE — see
+    # docs/skse_conversion_audit.md — and neutralising is only the current
+    # behaviour, not a judgement that SKSE is off the table.
+    'preloadmagiceffect': (None,               False, None),  # Special handler
+    'closeallmenus':     (None,                False, None),  # Special handler
+    'setmodelpath':      (None,                False, None),  # Special handler
+    'getmodelpath':      (None,                False, None),  # Special handler
+    'setlowlevelprocessing': (None,            False, None),  # Special handler
+    'setharvested':      (None,                False, None),  # Special handler
+    'selectplayerspell': (None,                False, None),  # Special handler
+    'setquestitem':      (None,                False, None),  # Special handler
+    'setpcamurderer':    (None,                False, None),  # Special handler
+    'setcellwaterheight': (None,               False, None),  # Special handler
+    'setstringinisetting': (None,              False, None),  # Special handler
+    'setstringgamesettingex': (None,           False, None),  # Special handler
+    'getobseversion':    (None,                False, None),  # Special handler
+    'getformfrommod':    (None,                False, None),  # Special handler
+    'getfirstref':       (None,                False, None),  # Special handler
+    'getnextref':        (None,                False, None),  # Special handler
+    'getaltcontrol2':    (None,                False, None),  # Special handler
+    'sifh':              (None,                True,  None),  # SetIgnoreFriendlyHits alias
+    'equipme':           (None,                True,  None),  # Special handler
+    'modavmod':          (None,                True,  None),  # Special handler
+    'getvelocity':       (None,                True,  None),  # Special handler
+    'setvelocity':       (None,                True,  None),  # Special handler
+
+    # --- Camera / 3D refresh (OBSE) ---
+    # `ToggleFirstPerson 0/1` forces the camera into third/first person.  Skyrim
+    # splits it into two argument-free globals, so the argument picks which —
+    # handled in _emit_function (the bare form toggles, which has no global).
+    'togglefirstperson': (None,                False, None),  # Special handler
+    # Vanilla Papyrus can FORCE a camera mode but cannot QUERY one
+    # (Game.psc has ForceFirstPerson/ForceThirdPerson and nothing else;
+    # GetCameraState is SKSE).  Every caller here guards a model-refresh, and
+    # Skyrim's own model-swap script for the same job — DLC1PlayerVampire-
+    # ChangeScript, which re-skins the player exactly like the werewolf swap —
+    # just calls Game.ForceThirdPerson() unconditionally rather than testing.
+    # So the test is reported False and the refresh path always runs, matching
+    # vanilla behaviour instead of inventing a query that does not exist.
+    'isthirdperson':     (None, False, None),  # Special handler
+    # OBSE `ref.Update3D` rebuilds a reference's 3D after its model changed
+    # (Morrowind_ob calls it through fbmwUpdate3D after a werewolf model swap).
+    # Papyrus has no direct call — QueueNiNodeUpdate is SKSE — but the engine's
+    # own refresh idiom is a disable/enable cycle, which tears down and rebuilds
+    # exactly the same 3D.
+    'update3d':          (None,                False, None),  # Special handler
+
     # --- Game State ---
     'getgamesetting':    ('Game.GetGameSettingFloat', False, None),
     'getgs':             ('Game.GetGameSettingFloat', False, None),
@@ -591,8 +727,11 @@ FUNCTION_MAP = {
     'stoplooking':       ('ClearLookAt',       True,  None),
 
     # --- Display/Name ---
-    'getdisplayname':    ('GetDisplayName',    True,  None),
-    'getname':           ('GetDisplayName',    True,  None),
+    # GetDisplayName is SKSE, not vanilla — Form.psc/ObjectReference.psc/
+    # Actor.psc have no name accessor at all, so these emitted a call that does
+    # not exist.  Neutralised via _OBSE_NO_EQUIV_COMMANDS (special handler).
+    'getdisplayname':    (None,                True,  None),  # Special handler
+    'getname':           (None,                True,  None),  # Special handler
 
     # --- Travel ---
     'movetomyeditorlocation': ('MoveToMyEditorLocation', True, None),
@@ -700,6 +839,7 @@ FUNCTION_MAP = {
     'offerhorse':        (None,                True,  None),  # no-op
     'setactorrefraction':(None,                True,  None),  # Special handler (alpha fade)
     'setdisplayname':    (None,                True,  None),  # Special handler
+    'setname':           (None,                True,  None),  # Special handler
     'getcontainer':      (None,                True,  None),  # Special handler
     'stopcombatalarmonactor': (None,           True,  None),  # Special handler (StopCombatAlarm)
     'essentialdeathreload': (None,             False, None),  # no-op
@@ -755,6 +895,11 @@ FUNCTION_MAP = {
     'getweaponskilltype': (None,                False, None),  # Special handler
     'con_runmemorypass': (None,                False, None),  # Special handler
     'getstringgamesetting': (None,             False, None),  # Special handler
+    'getlocalgravity':   (None,                False, None),  # Special handler
+    'seteventhandler':   (None,                False, None),  # Special handler
+    'removeeventhandler': (None,               False, None),  # Special handler
+    'runscriptline':     (None,                False, None),  # Special handler
+    'runbatchscript':    (None,                False, None),  # Special handler
     'iskeypressed':      (None,                False, None),  # Special handler
     'iskeypressed2':     (None,                False, None),  # Special handler
     'iskeypressed3':     (None,                False, None),  # Special handler
@@ -794,6 +939,27 @@ _BARE_BOOL_FUNCTIONS = {
 # they survive into the output as undefined identifiers. _emit_function holds
 # their special handlers (path-based music has no Skyrim API; the emc* family
 # is matched there by prefix) and the ;NE no-op fallback.
+# OBSE / TES4-only commands neutralised wholesale by _emit_function.  Verified
+# absent from vanilla Papyrus (Actor/ObjectReference/Form/Game/Utility).  Some
+# of these DO have an SKSE equivalent (see docs/skse_conversion_audit.md) — they
+# are neutralised here only because nothing targets SKSE yet, not because SKSE
+# is ruled out.  Anything moved onto an SKSE native should come off this list.
+_OBSE_NO_EQUIV_COMMANDS = {
+    'preloadmagiceffect', 'closeallmenus', 'setmodelpath', 'getmodelpath',
+    'setlowlevelprocessing', 'setharvested', 'selectplayerspell',
+    'setquestitem', 'setpcamurderer', 'setcellwaterheight',
+    'setstringinisetting', 'setstringgamesettingex', 'getobseversion',
+    'getformfrommod', 'getfirstref', 'getnextref', 'getaltcontrol2',
+    'sifh', 'equipme', 'modavmod',
+    'getvelocity', 'setvelocity',
+    'isunderwater', 'getvampire', 'getweapontype', 'iswaiting',
+    'getnumfollowers', 'getnthfollower', 'getspells', 'getdisplayname',
+    'setattackdamage', 'togglespecialanim', 'setavmod', 'starttimer',
+    'getmodlocaldata', 'setaltcontrol',
+    'fileexists', 'getgodmode', 'getplayerbirthsign',
+    'getdisplayname', 'getname',
+}
+
 _BARE_NO_EQUIV_COMMANDS = {
     'streammusic',
     'emcplaytrack', 'emcmusicstop', 'emcmusicresume', 'emcmusicnexttrack',
@@ -816,7 +982,11 @@ _BARE_NO_EQUIV_COMMANDS = {
     'iskeypressed', 'iskeypressed2',
     'iskeypressed3', 'iscontrolpressed',
     'unlockachievement', 'getgamerestarted', 'isplayermovingintonewspace',
-}
+    # OBSE event registration / console execution — no Papyrus equivalent
+    # (see _emit_function).
+    'seteventhandler', 'removeeventhandler',
+    'runscriptline', 'runbatchscript',
+} | _OBSE_NO_EQUIV_COMMANDS
 
 # TES4 `ref.` commands that take NO arguments.  Oblivion let the receiver be
 # written after a comma instead of a dot — `StopCombat, Player` and

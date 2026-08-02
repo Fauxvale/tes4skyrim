@@ -6,7 +6,7 @@ from typing import Optional
 from script_convert.constants import (
     BLOCK_MAP, BLOCK_FILTER_PARAM, TYPE_MAP, ACTOR_VALUE_MAP, KNOWN_GLOBALS,
     _PAPYRUS_RESERVED, FUNCTION_MAP, _BARE_BOOL_FUNCTIONS,
-    _BARE_NO_EQUIV_COMMANDS,
+    _BARE_NO_EQUIV_COMMANDS, _OBSE_NO_EQUIV_COMMANDS,
     _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS, _ACTORBASE_ARG_FUNCTIONS,
     _ACTOR_ARG_FUNCTIONS,
     _OBJREF_IMPLICIT_SELF_FUNCTIONS, _ZERO_ARG_REF_FUNCTIONS,
@@ -70,6 +70,90 @@ def _split_udf_params(block_filter: str) -> list[str]:
     if inner.endswith('}'):
         inner = inner[:-1]
     return [p for p in re.split(r'[,\s]+', inner.strip()) if p]
+
+
+def _split_obse_args(rest: str) -> list[str]:
+    """Split the argument tail of an OBSE `Call <Script> ...` invocation.
+
+    Mirrors _split_udf_params on the CALL side: OBSE accepts commas, whitespace,
+    or a mix (`Call Foo 10, 1, -1` / `Call JDLevitate 1 0`).  Splitting is
+    suppressed inside parentheses, brackets and string literals so a compound
+    argument stays one argument — `Call Foo (a + b) 2` is two args, not four,
+    and `Call Foo "x, y" 1` keeps the comma inside the string.
+
+    Whitespace only separates when it is NOT joining an arithmetic expression.
+    Nehrim writes `Call GlobalScriptExpGained 30 * ( x - y ), 1, 1, -1`, where
+    `30 * (...)` is ONE argument spelled with spaces around the operator; naive
+    whitespace splitting emitted `TES4Call(30, *, (...), 1, 1, -1)` and a bare
+    `*` is not an expression.  A comma is always a real separator, so the mixed
+    form still parses correctly.
+    """
+    # Operators that bind their two operands into a single argument.  A `-` is
+    # deliberately NOT here: it is far more often a unary sign on a separate
+    # argument (`Call Foo 1 -1`) than a spaced-out subtraction, and the comma
+    # form covers the subtraction case unambiguously.
+    _BINARY_OPS = {'*', '/', '+', '%', '&&', '||', '==', '!=', '<', '>',
+                   '<=', '>=', '&', '|'}
+
+    raw: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    in_str = False
+    for ch in rest.strip():
+        if in_str:
+            buf.append(ch)
+            if ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            buf.append(ch)
+        elif ch in '([':
+            depth += 1
+            buf.append(ch)
+        elif ch in ')]':
+            depth -= 1
+            buf.append(ch)
+        elif depth == 0 and ch == ',':
+            raw.append(''.join(buf))
+            buf = []
+            raw.append(',')          # keep hard separators visible below
+        elif depth == 0 and ch.isspace():
+            if buf:
+                raw.append(''.join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        raw.append(''.join(buf))
+
+    # Re-join whitespace-separated tokens across binary operators.
+    tokens = [t for t in raw if t.strip() or t == ',']
+    args: list[str] = []
+    cur: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == ',':
+            if cur:
+                args.append(' '.join(cur))
+                cur = []
+            i += 1
+            continue
+        if tok in _BINARY_OPS and cur and i + 1 < len(tokens) and tokens[i + 1] != ',':
+            # `a * b` — operator plus its right operand belong to the current arg
+            cur.append(tok)
+            cur.append(tokens[i + 1])
+            i += 2
+            continue
+        if cur:
+            args.append(' '.join(cur))
+        cur = [tok]
+        i += 1
+    if cur:
+        args.append(' '.join(cur))
+    return [a for a in (x.strip() for x in args) if a]
+
 
 # Placeholder for a bare TES4 `GetContainer` that is not inside an equip event.
 # Papyrus cannot walk from an item to its container, so the expression has no
@@ -2677,6 +2761,20 @@ class ScriptConverter:
                 return f'{keyword} True  {condition}'
             return f'{keyword} {condition}'
 
+        # OBSE `while (cond) ... loop` — Papyrus spells the same construct
+        # `While (cond) ... EndWhile`.  Without this the keyword fell through to
+        # the generic call path and emitted `while((index,  < , numFollowers))`,
+        # taking down the file and everything that imports it.  The `(?=\()`
+        # branch matches the no-space form `while(x)` the same way `if` does.
+        while_m = re.match(r'^while(?:\s+|(?=\())\s*(.*)', stripped, re.IGNORECASE)
+        if while_m:
+            condition = self._convert_expression(while_m.group(1), extends)
+            if condition.lstrip().startswith(';TODO:'):
+                return f'While True  {condition}'
+            return f'While {condition}'
+        if low == 'loop' or low == 'endwhile':
+            return 'EndWhile'
+
         if low == 'else':
             return 'Else'
         # TES4 allows "else <condition>" as equivalent to "elseif <condition>"
@@ -3520,6 +3618,18 @@ class ScriptConverter:
                     'closecurrentobliviongate', 'isinfaction', 'call'):
                 return self._emit_function(None, func_in_expr.group(1),
                                            func_in_expr.group(2).strip(), extends)
+            # Prefix-matched no-equivalent families, mirroring the bare-command
+            # path below.  These have handlers in _emit_function but deliberately
+            # no FUNCTION_MAP entry, so WITH arguments they matched nothing here
+            # and survived verbatim into the output: `sv_compare
+            # "Characters\_male\skeleton.nif" modelpath` reached the Papyrus
+            # lexer, where the Windows path separators read as string escapes
+            # ("mismatched character '\' expecting '\"'") and took down every
+            # script that imported the file too.
+            if (re.match(r'^(?:get|set)menu\w*$', fname)
+                    or fname.startswith(('con_', 'ar_', 'sv_'))):
+                return self._emit_function(None, func_in_expr.group(1),
+                                           func_in_expr.group(2).strip(), extends)
 
         # Handle ref.Func in expressions (only if no parens yet — avoid re-matching)
         # Require ref to start with a letter (not digit) to avoid matching floats like 0.5
@@ -3745,6 +3855,28 @@ class ScriptConverter:
                 if (re.match(r'^(?:get|set)menu\w*$', bare_low)
                         or bare_low.startswith(('con_', 'ar_', 'sv_'))):
                     return self._emit_function(None, expr, '', extends)
+            # A TES4 script may name a form by its RAW FORMID instead of an
+            # EditorID — `additem 0000000f 500` is how Morrowind_ob's INFO
+            # result scripts hand out gold.  Papyrus has no bare-hex literal, so
+            # the token survived as an undefined identifier ("missing RPAREN at
+            # 'f'").  Resolve it to the canonical EditorID and fall through to
+            # the normal property path, which types it and declares it like any
+            # other named form.
+            # TES4 scripts write the ID with the leading zeroes of the load-order
+            # byte trimmed as often as not (`additem 00000F` alongside `additem
+            # 0000000F`), so accept 6-8 digits and zero-pad to the 8-char key the
+            # export uses.  6 is the floor because that is a full 24-bit object
+            # index; fewer digits would start matching ordinary numeric literals.
+            # A pure-DECIMAL run (`100000`) is an ordinary numeric literal and
+            # must not be reinterpreted as hex, so require at least one A-F
+            # digit or a leading zero — both of which a decimal literal in these
+            # scripts never has, and every real FormID here does.
+            if (re.fullmatch(r'[0-9A-Fa-f]{6,8}', expr)
+                    and (not expr.isdigit() or expr.startswith('0'))):
+                edid = self.xref.formid_to_edid.get(expr.upper().zfill(8), '')
+                if edid:
+                    bare_low = edid.lower()
+                    expr = edid
             # Check if it's a known EditorID -> property ref
             fid = self.xref.edid_to_formid.get(bare_low, '')
             if fid:
@@ -3927,9 +4059,14 @@ class ScriptConverter:
             return ''
 
         # Actor value functions: first arg is AV name -> quoted string
+        # The OBSE `...2` aliases take the same (AV name, value) arguments as the
+        # vanilla commands they map onto, so they must quote the AV name here
+        # too — without them `modAV2 Health 300` emitted an unquoted `Health`
+        # ("undefined identifier `Health`").
         av_funcs = {'getactorvalue', 'setactorvalue', 'modactorvalue', 'forceactorvalue',
                      'getav', 'setav', 'modav', 'forceav', 'getbaseactorvalue', 'getbaseav',
-                     'modpcskill', 'advancepcskill'}
+                     'modpcskill', 'advancepcskill',
+                     'modav2', 'modactorvalue2', 'getav2', 'setav2'}
         if func_name in av_funcs:
             parts = args_str.split(None, 1)
             av_name = parts[0].rstrip(',').strip('"\'')
@@ -4421,19 +4558,37 @@ class ScriptConverter:
         # --- Special case functions ---
 
         # OBSE `Call <ScriptName> arg1, arg2, ...` — invoke a user-defined
-        # function.  The first argument is separated from the script name by
-        # WHITESPACE, the remainder by commas (`Call Foo 10, 1, -1`), which is
-        # why the raw text never parsed as a Papyrus call.  The callee is a
-        # script, so it is reached through a property typed as that script; the
-        # function itself is emitted as `<Script>.TES4Call(...)`.
+        # function.  The callee is a script, so it is reached through a property
+        # typed as that script; the function itself is emitted as
+        # `<Script>.TES4Call(...)`.
+        #
+        # OBSE accepts WHITESPACE, commas, or a mix as the argument separator:
+        # `Call Foo 10, 1, -1` and `Call JDLevitate 1 0` and `Call
+        # mwTransportFollowersFunc travelMarker 0 100 0` are all legal.  Splitting
+        # the tail on commas alone left the whitespace-separated form glued into
+        # one token and emitted `JDLevitate.TES4Call(1 0)`, which the Papyrus
+        # parser rejects with "extraneous input '0' expecting RPAREN" — 487
+        # Morrowind_ob scripts failed on exactly this.
         if fname_low == 'call' and args_str:
             head, _, rest = args_str.strip().partition(' ')
             target = head.strip().rstrip(',')
             if target:
-                script_type = papyrus_script_name(target)
-                prop = _safe_property_name(target)
+                # Key the property on the CANONICAL EditorID, not the spelling
+                # this call happened to use.  TES4 name lookup is
+                # case-insensitive, so `Call fbmwbmWerewolfManageControlPC` and
+                # the record's own `fbmwBMWerewolfManageControlPC` are the same
+                # script — but keying on the local spelling created a SECOND
+                # _property_refs entry differing only in case, and since Papyrus
+                # is case-insensitive the two declarations collided: the generic
+                # ObjectReference typing won and `.TES4Call()` became "undefined
+                # function" on a property that has it.  (Same trap as the named
+                # -form path below.)
+                fid = self.xref.edid_to_formid.get(target.lower(), '')
+                canon = self.xref.formid_to_edid.get(fid, target) if fid else target
+                script_type = papyrus_script_name(canon)
+                prop = _safe_property_name(canon)
                 self._property_refs[prop] = script_type
-                args = [a.strip() for a in rest.split(',') if a.strip()] if rest.strip() else []
+                args = _split_obse_args(rest)
                 conv = ', '.join(self._convert_expression(a, extends) for a in args)
                 return f'{prop}.{_UDF_NAME}({conv})'
 
@@ -4471,6 +4626,18 @@ class ScriptConverter:
                 else:
                     arg = self._convert_expression(_a, extends)
             return f'{self._get_action_ref_param()} == {arg}'
+
+        # OBSE `GetLocalGravity <axis>` — the per-axis gravity vector acting on
+        # the calling reference.  Papyrus exposes no gravity accessor at all
+        # (the value lives in the `fGravity` INI setting, which is present in
+        # BOTH engines and reachable from neither script language), so the
+        # literal constant IS the faithful translation: gravity in Skyrim is a
+        # world constant that points straight down, so X and Y are always 0 and
+        # only Z carries the magnitude.  Emitted as a signed value to match
+        # OBSE, whose callers subtract it as a downward acceleration.
+        if fname_low == 'getlocalgravity':
+            axis = args_str.strip().upper() if args_str else 'Z'
+            return '-9.81' if axis == 'Z' else '0.0'
 
         # GetPos/GetAngle/GetStartingAngle: axis param -> GetPositionX/Y/Z or GetAngleX/Y/Z
         if fname_low in ('getpos', 'getangle', 'getstartingangle'):
@@ -4830,6 +4997,125 @@ class ScriptConverter:
             if arg.startswith('"') and arg.endswith('"') and arg.count('"') == 2:
                 return arg
             return self._convert_expression(arg, extends)
+
+        # OBSE `GetGlobalValue <Global>` / `SetGlobalValue <Global> <value>` read
+        # and write a global by NAME rather than by direct reference.  Papyrus
+        # reaches a global through a property of type GlobalVariable, which the
+        # normal named-form path already builds — so resolve the operand the same
+        # way any other global reference is resolved.  Left unmapped, the operand
+        # stayed a bare name and broke the enclosing expression ("unexpected name
+        # `fbmwbmclawcost`"), taking the werewolf script family down with it.
+        if fname_low in ('getglobalvalue', 'setglobalvalue'):
+            parts = _split_obse_args(args_str)
+            if parts:
+                gname = parts[0].strip()
+                safe = _safe_property_name(gname)
+                self._property_refs[safe] = 'GlobalVariable'
+                if fname_low == 'getglobalvalue':
+                    return self._global_read(safe)
+                val = (self._convert_expression(parts[1], extends)
+                       if len(parts) > 1 else '0')
+                return f'{safe}.SetValue({val})'
+
+        # OBSE / TES4-only commands with no VANILLA Papyrus equivalent.  Each was
+        # checked against Actor.psc, ObjectReference.psc, Form.psc, Game.psc and
+        # Utility.psc and exists in none of them.  Some are available through
+        # SKSE (docs/skse_conversion_audit.md); nothing here targets SKSE today,
+        # so they are neutralised for now.  Neutralise rather than emit: an
+        # unknown name is a hard compile error that takes down the whole file
+        # AND every script that imports it, whereas an inert 0 keeps the rest of
+        # the script working.
+        if fname_low in _OBSE_NO_EQUIV_COMMANDS:
+            orig = f'{func_name} {args_str}'.strip()
+            self._line_comments.append(
+                f';NE: {func_name} — no Papyrus equivalent ({orig})')
+            return '0'
+
+        # OBSE `SetCurrentHealth <value>` takes only the value — the actor value
+        # is implicit in the name, so it cannot map straight onto SetActorValue
+        # (which would swallow the number as the AV NAME and set nothing).
+        if fname_low == 'setcurrenthealth':
+            ref = self._convert_ref(ref_name, extends) if ref_name else 'Self'
+            val = (self._convert_expression(args_str.strip(), extends)
+                   if args_str.strip() else '0')
+            return f'{ref}.SetActorValue("Health", {val})'
+
+        # OBSE `IsOnGround` is the complement of Skyrim's IsFlying.  The negation
+        # has to wrap the WHOLE call, not ride in the function name: a plain
+        # `('!IsFlying', True)` map entry emitted `myActor.!IsFlying()`, which is
+        # not Papyrus.
+        if fname_low == 'isonground':
+            ref = self._convert_ref(ref_name, extends) if ref_name else 'Self'
+            return f'!({ref}.IsFlying())'
+
+        # TES4 `UncompleteQuest <Quest>` reopens a finished quest, naming the
+        # quest as an ARGUMENT.  Papyrus spells it as a method on the quest
+        # itself, so the argument has to become the receiver — mapping it
+        # straight onto Reset emitted `Reset(fbmwEBBone)` ("function takes 0
+        # parameters not 1").
+        if fname_low == 'uncompletequest':
+            target = args_str.strip()
+            if target:
+                return f'{self._convert_ref(target, extends)}.Reset()'
+            ref = self._convert_ref(ref_name, extends) if ref_name else 'Self'
+            return f'{ref}.Reset()'
+
+        # `ref.Update3D` / `ref.IsThirdPerson` — written as RECEIVER methods, so
+        # both must consume the receiver rather than be emitted after a dot
+        # (`ActorRef.TES4Polyfill.Update3D()` / `ActorRef.False()` are not
+        # Papyrus).  The receiver becomes the polyfill's argument; with no
+        # receiver the call is on the player, which is the only actor whose
+        # camera or first-person model these commands can concern.
+        if fname_low == 'update3d':
+            target = (self._convert_ref(ref_name, extends) if ref_name
+                      else (args_str.strip() and
+                            self._convert_expression(args_str.strip(), extends))
+                      or 'Game.GetPlayer()')
+            return f'TES4Polyfill.Update3D({target})'
+        if fname_low == 'isthirdperson':
+            # See the FUNCTION_MAP note: vanilla Papyrus can force a camera mode
+            # but not read one, and Skyrim's own model-swap script refreshes
+            # unconditionally, so the guard reports False and the refresh runs.
+            return 'False'
+
+        # `ToggleFirstPerson <0|1>` — Oblivion's one command with an argument is
+        # two argument-free globals in Skyrim.  0 forces THIRD person, 1 forces
+        # first; the bare form (no argument) is a true toggle, which Papyrus
+        # cannot express because it cannot read the current mode, so it takes
+        # the third-person branch (the mode every caller here is refreshing in).
+        if fname_low == 'togglefirstperson':
+            arg = args_str.strip()
+            return ('Game.ForceFirstPerson()' if arg == '1'
+                    else 'Game.ForceThirdPerson()')
+
+        # OBSE `runScriptLine "<console command>"` compiles and runs a console
+        # command at runtime.  Papyrus cannot execute the console at all, and
+        # Morrowind_ob uses it exclusively to poke the OPTIONAL ObXP mod's
+        # globals ("set ObXPMain.interOpGainedXP to 100") — a mod that is not
+        # part of the conversion, so there is no target to write even in
+        # principle.  Neutralise: the payload is a quoted console line
+        # containing OBSE's `%q` escaped-quote token and apostrophes, which as
+        # emitted broke the Papyrus string literal it was pasted into.
+        if fname_low in ('runscriptline', 'runbatchscript'):
+            orig = f'{func_name} {args_str}'.strip()
+            self._line_comments.append(
+                f';NE: {func_name} — OBSE console execution, no Papyrus '
+                f'equivalent ({orig})')
+            return '0'
+
+        # OBSE `SetEventHandler "OnDeath" <script> "object"::Player` registers a
+        # script as a callback for an engine event.  Papyrus has no registration
+        # API of this shape — an event is bound by DECLARING it (`Event
+        # OnDeath()`) on a script attached to the form — so there is no
+        # call-for-call translation.  Neutralise rather than emit: the argument
+        # syntax carries OBSE's `::` type-tag operator, which is not Papyrus
+        # syntax at all and fails the parse of every script that imports this one.
+        if fname_low in ('seteventhandler', 'removeeventhandler'):
+            orig = f'{func_name} {args_str}'.strip()
+            self._line_comments.append(
+                f';NE: {func_name} — OBSE event registration; Papyrus binds '
+                f'events by declaring them on the attached script ({orig})')
+            return '0'
 
         # OBSE arrays and string-variables (ar_Construct/ar_Null/sv_Destruct,
         # `forEach x <- container`).  Papyrus has real arrays and strings but no
@@ -5309,8 +5595,10 @@ class ScriptConverter:
         if fname_low == 'setactorfullname':
             self._line_comments.append(';NE: SetActorFullName')
             return '0'
-        if fname_low == 'setdisplayname':
-            self._line_comments.append(';NE: SetDisplayName')
+        # SetName is the same capability as SetDisplayName (both rename a form)
+        # and neither exists in vanilla Papyrus — Form.psc has no name setter.
+        if fname_low in ('setdisplayname', 'setname'):
+            self._line_comments.append(f';NE: {func_name}')
             return '0'
 
         # SetCellFullName no-op

@@ -401,3 +401,78 @@ EndFunction
 Float Function GetCurrentTime() Global
   Return Utility.GetCurrentGameTime()
 EndFunction
+
+; ==========================================================================
+; Math
+; ==========================================================================
+
+; OBSE's `exp`/`log` have no Papyrus native (Math.psc ships sin/cos/tan/asin/
+; acos/atan/sqrt/pow/abs/Floor/Ceiling and nothing else), so they are built on
+; Math.pow here.  Morrowind_ob's levitation code is the heavy user: its damping
+; term is `set dampNorm to exp dampExp`, evaluated every frame.
+Float Function Exp(Float afValue) Global
+  Return Math.pow(2.718281828, afValue)
+EndFunction
+
+; Natural log via the change-of-base identity ln(x) = log2(x) / log2(e).
+; Papyrus has no log of any base either, so log2 is computed by binary
+; decomposition: pull out the integer power of two, then refine the fraction.
+Float Function Log(Float afValue) Global
+  If afValue <= 0.0
+    Return 0.0  ; ln is undefined for x <= 0; callers treat 0 as "no contribution"
+  EndIf
+  Float x = afValue
+  Float log2 = 0.0
+  While x >= 2.0
+    x /= 2.0
+    log2 += 1.0
+  EndWhile
+  While x < 1.0
+    x *= 2.0
+    log2 -= 1.0
+  EndWhile
+  ; x is now in [1,2): refine 16 fractional bits of log2(x).
+  Float frac = 0.5
+  Int i = 0
+  While i < 16
+    x *= x
+    If x >= 2.0
+      x /= 2.0
+      log2 += frac
+    EndIf
+    frac /= 2.0
+    i += 1
+  EndWhile
+  Return log2 / 1.442695041  ; 1/ln(2)
+EndFunction
+
+; ==========================================================================
+; 3D / Model refresh
+; ==========================================================================
+
+; OBSE `ref.Update3D` rebuilds a reference's 3D after its model changed —
+; Morrowind_ob calls it through the fbmwUpdate3D helper after swapping the
+; player's skeleton for the werewolf one.  Papyrus has no direct equivalent
+; (QueueNiNodeUpdate is SKSE), but disable/enable tears the 3D down and
+; rebuilds it, which is what the call is for.  The reference must be re-enabled
+; even if it was already disabled — callers only ever use this on visible
+; actors, and leaving one disabled would delete it from the world.
+Function Update3D(ObjectReference akRef) Global
+  If akRef == None
+    Return
+  EndIf
+  akRef.Disable()
+  akRef.Enable()
+EndFunction
+
+; ==========================================================================
+; Plugin detection
+; ==========================================================================
+
+; OBSE `IsModLoaded "Foo.esp"` asks whether a plugin is in the load order.
+; Vanilla Papyrus has no direct query, but Game.GetFormFromFile returns None
+; for a file that is not loaded, so asking it for the plugin's own header
+; record (0x00000000 in that file's local space) answers the same question.
+Bool Function IsModLoaded(String asPlugin) Global
+  Return Game.GetFormFromFile(0x00000000, asPlugin) != None
+EndFunction

@@ -12,7 +12,7 @@ from script_convert.constants import (_PAPYRUS_RESERVED, _RECORD_TYPE_PAPYRUS, _
                                      _sanitize_name, _safe_property_name, _canonical_global,
                                      _record_type_to_papyrus, papyrus_script_name,
                                      PAPYRUS_MAX_SCRIPT_NAME)
-from script_convert.cross_ref import CrossRefGraph
+from script_convert.cross_ref import CrossRefGraph, master_names
 from script_convert.converter import ScriptConverter
 
 
@@ -109,13 +109,26 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
 
     # Deploy static scripts (TES4Polyfill + shared service-menu fragments) so
     # they compile alongside the generated ones.
-    static_dir = os.path.join(os.path.dirname(__file__), 'static_scripts')
-    if os.path.isdir(static_dir):
-        import shutil
-        for name in os.listdir(static_dir):
-            if name.endswith('.psc'):
-                shutil.copy2(os.path.join(static_dir, name),
-                             os.path.join(output_dir, name))
+    #
+    # ONLY a masterless plugin (Oblivion.esm, Nehrim.esm) owns these. They are
+    # plugin-independent — TES4Polyfill is Hidden with none but Global
+    # functions, and the two service fragments are stateless TopicInfos — so a
+    # dependent plugin shipping its own copy just duplicates the master's
+    # .psc/.pex under the same script name, and whichever loads last wins.
+    # Dependents still CALL them: the generated bodies reference
+    # `TES4Polyfill.*` and INFO VMADs name the service fragments, both of
+    # which resolve to the master's shipped copy (phase_compile puts every
+    # master's source dir on the -h header path).
+    if master_names(export_dir):
+        print('  Static scripts: skipped (owned by this plugin\'s master)')
+    else:
+        static_dir = os.path.join(os.path.dirname(__file__), 'static_scripts')
+        if os.path.isdir(static_dir):
+            import shutil
+            for name in os.listdir(static_dir):
+                if name.endswith('.psc'):
+                    shutil.copy2(os.path.join(static_dir, name),
+                                 os.path.join(output_dir, name))
 
     # Phase 1: Build cross-reference graph
     print('  Building cross-reference graph...')
@@ -841,7 +854,25 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                     otype = xref.get_quest_script_type(owner_prop)
                     out_lines.append(f'{otype} Property {safe_owner} Auto')
             if prop_refs:
+                # Merge case-variant keys, most specific type wins — the same
+                # rule the QUST-stage and standalone emitters already apply.
+                # Without it this site declared whichever spelling sorted first:
+                # _preload_scro_refs types a QUST SCRO as the generic `Quest`,
+                # then _convert_ref adds the specific TES4_<script> type, and if
+                # the two EditorID spellings differ in case they land under
+                # different keys.  The generic one won and every cross-script
+                # variable read through it failed ("field or property StartTimer
+                # not found" on a plain Quest).
+                _merged: dict[str, tuple[str, str]] = {}
                 for pname, ptype in sorted(prop_refs.items()):
+                    key = _safe_property_name(pname).lower()
+                    if key in _merged:
+                        _, ex_type = _merged[key]
+                        if ex_type == 'Quest' and ptype != 'Quest':
+                            _merged[key] = (pname, ptype)
+                    else:
+                        _merged[key] = (pname, ptype)
+                for pname, ptype in sorted(_merged.values(), key=lambda x: x[0].lower()):
                     safe = _safe_property_name(pname)
                     if safe.lower() in declared:
                         continue
