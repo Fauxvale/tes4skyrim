@@ -57,6 +57,18 @@ SAY_LINE_SECONDS = 3.0
 # and `Call <ScriptName> args` names the SCRIPT, never the function.
 _UDF_NAME = 'TES4Call'
 
+# TES4 animation groups that Oblivion's break-apart props are driven with.  A
+# breakaway piece is a keyframed body with real mass and `Unyielding = 1`: the
+# clip only creaks it off its mounting and Havok drops it once the clip ends.
+# Skyrim keyframed bodies never fall, so these groups get an explicit
+# SetMotionType(Motion_Dynamic) release (TES4Polyfill.ReleaseBreakaway), which
+# is inert on every other animated object because those convert to mass-0
+# bodies.  `Unequip` is the group the whole family uses (mwallplankbreakaway01,
+# IDCrumbleWall01, AlcazarCrumbleWallRef, BergklosterBelagertMauerZerbrechen),
+# and it is the only group in the census that ever breaks a prop apart, so the
+# release stays scoped to it.
+_BREAKAWAY_ANIM_GROUPS = frozenset(('unequip',))
+
 
 def _split_udf_params(block_filter: str) -> list[str]:
     """Parameter names from an OBSE `begin Function{...}` header.
@@ -5413,6 +5425,13 @@ class ScriptConverter:
             ref = self._resolve_self_ref(ref_name, extends)
             return f'{ref}.MoveTo({ref})'
 
+        # GetDestroyed → destruction stage > 0.  Skyrim has no native bool
+        # reader for the destroyed state, but GetCurrentDestructionStage() is
+        # native and a destroyed ref always sits above stage 0.
+        if fname_low == 'getdestroyed':
+            ref = self._resolve_self_ref(ref_name, extends)
+            return f'({ref}.GetCurrentDestructionStage() > 0)'
+
         # ClearOwnership
         if fname_low == 'clearownership':
             ref = self._resolve_self_ref(ref_name, extends)
@@ -6439,6 +6458,27 @@ class ScriptConverter:
                 # ref plays on THAT object, not on Self.
                 obj = self._resolve_objref_ref(ref_name, extends) if ref_name \
                     else self._implicit_self(extends)
+                # BREAKAWAY release.  Oblivion authors break-apart props
+                # (mwallplankbreakaway01's planks, IDCrumbleWall01's bricks) as
+                # keyframed bodies with real mass and `Unyielding = 1`: the clip
+                # only creaks them off their mounting -- 15.19 deg and ZERO
+                # translation keys for the planks -- and the pieces DETACH AND
+                # FALL under Havok once it finishes.  Skyrim keyframed bodies
+                # never yield to gravity, so the converted planks hung in the
+                # half-broken pose forever.
+                #
+                # The release is native: SetMotionType(Motion_Dynamic) after the
+                # clip has run.  It is emitted for the break-apart groups only,
+                # and it is INERT on anything that is not a breakaway piece --
+                # every other animated object converts to a mass-0 keyframed
+                # body, which has infinite effective mass and cannot fall even
+                # once it is dynamic.  So doors, gates and portcullises driven
+                # by these same groups are unaffected.  (Shipping the planks
+                # dynamic in the NIF instead was wrong: they dropped the instant
+                # the cell loaded, before the clip ever played.)
+                if anim_name.lower() in _BREAKAWAY_ANIM_GROUPS:
+                    return (f'{obj}.PlayAnimation("{seq}")\n'
+                            f'  TES4Polyfill.ReleaseBreakaway({obj})')
                 return f'{obj}.PlayAnimation("{seq}")'
             # Map common Oblivion animation groups to Skyrim behavior events
             _anim_map = {

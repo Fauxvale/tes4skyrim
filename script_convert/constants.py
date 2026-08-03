@@ -288,10 +288,14 @@ FUNCTION_MAP = {
     'delete':            ('Delete',            True,  None),
     'markfordelete':     ('Delete',            True,  None),
     'placeatme':         ('PlaceAtMe',         True,  None),
-    # TES4 SetDestroyed marks the ref destroyed but keeps it VISIBLE (the
-    # tripwire stays as a snapped rope).  Disable() made objects vanish on
-    # trigger; BlockActivation just stops further use like TES4 intended.
-    'setdestroyed': ('BlockActivation',     True,  None),
+    # TES4 SetDestroyed drives the ENGINE destruction system: the ref switches
+    # to its destroyed state — geometry breaks apart and collision drops — while
+    # staying present in the world.  Skyrim keeps the same system and exposes it
+    # natively as ObjectReference.SetDestroyed(bool) (vanilla ObjectReference.psc
+    # line 541; command 4300 / opcode 0x10CC).  An earlier mapping to
+    # BlockActivation only suppressed re-activation and never broke anything,
+    # which is why breakaway planks and tripwires animated but stayed solid.
+    'setdestroyed': ('SetDestroyed',       True,  None),
 
     # --- Actor State ---
     'kill':              ('Kill',              True,  None),
@@ -844,7 +848,10 @@ FUNCTION_MAP = {
     'stopcombatalarmonactor': (None,           True,  None),  # Special handler (StopCombatAlarm)
     'essentialdeathreload': (None,             False, None),  # no-op
     'setallreachable':   (None,                True,  None),  # no-op
-    'getdestroyed': ('IsDisabled',          True,  ';approximate - GetDestroyed not in Skyrim'),
+    # No native bool reader for the destroyed state, but the destruction STAGE
+    # is native: stage > 0 means the ref has been destroyed.  IsDisabled() was
+    # unrelated (a destroyed ref is still enabled) and always returned false.
+    'getdestroyed':      (None,                True,  None),  # Special handler
     'setclass':          (None,                True,  None),  # no-op
     'setdoordefaultopen':(None,                True,  None),  # Special handler
     'setrestrained':     (None,                True,  None),  # Special handler
@@ -975,6 +982,9 @@ _BARE_NO_EQUIV_COMMANDS = {
     # fallback list won and the special handler (TES4ControlsDisabled) was
     # unreachable dead code.  Same trap as ispcamurderer (R6-2).
     'getplayercontrolsdisabled',
+    # Zero-argument state read, so it is always bare: routed here so the
+    # GetCurrentDestructionStage() handler is reachable.
+    'getdestroyed',
     'isinair', 'getstringgamesetting', 'getcrosshairref', 'getobjecttype',
     'con_runmemorypass',
     'disablekey', 'enablekey', 'tapkey', 'holdkey', 'releasekey', 'playback', 'playbackalt', 'disablecontrol', 'enablecontrol', 'tapcontrol',

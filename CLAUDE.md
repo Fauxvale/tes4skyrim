@@ -72,6 +72,7 @@ caching, skipped record types, the export text format, and the directory layout.
 - When building test scripts, always output as they go so that if the time goes past the hard 120 second timeout limit you still get some output. When running the real pipeline and not a test script this limit doesn't apply. For example when you are done with your work and rebuilding.
 - **LISTEN CAREFULLY to EXACTLY what the user's prompt says**. Seek to understand any implementation ideas instead of using your pre-conceived notions
 - If you need to continue iterating on an idea with only marginal improvments in some areas and regressions in another, your idea is likely incorrect and you need to find another one
+- **Look for the AUTHORED indicator** If you need to resort to heuristics, your approach is most likely incorrect. Remember, everything in the original plugin works for a reason
 
 ### Verifying your work
 
@@ -106,7 +107,7 @@ theories externally first.
 - **NEVER `git stash` / `git stash pop`** in this repository.
 - **NEVER `git commit` or `git push`.** The user commits after in-game testing.
 - **NEVER `git add` / `git rm`** (staging, including staged deletions). Use plain
-  `rm`. `git reset` destroys the user's own staging. The ONLY exception is an EXPLICIT instruction from the user
+  `rm`. `git reset` destroys the user's own staging. The ONLY exception is an EXPLICIT instruction from the user. Even in this case, never use -A. Only stage files you worked on or files the user asked you to stage.
 - **NEVER go snooping in the live, heavily-modded SSE install.** It is full of
   other mods' assets, so nothing you find there tells you anything about this
   converter. In particular: **never inspect it to check whether your changes were

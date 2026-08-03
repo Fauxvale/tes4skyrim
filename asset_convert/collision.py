@@ -1530,6 +1530,46 @@ def _node_is_animated(node, actual_root):
     return _name_of(node) in names
 
 
+# Oblivion collision layer 10 = OL_PROPS, the DYNAMIC clutter layer (barrels,
+# cups -- everything Havok simulates and lets fall).  It is the authored
+# indicator that separates a piece meant to break off and drop from one whose
+# animation performs the whole motion: the artist picks the layer in the
+# exporter, so this is a statement of intent, not a measurement.
+#
+# Census of every ms=6 + animated + mass>0 body across both plugins (44 meshes):
+#   layer 10 OL_PROPS   -> falls: mwallplankbreakaway01, idcrumblewall01,
+#                          cpbrick01-15, cpgenericbrick01-03, cplog01/02,
+#                          artrapbridgecrumble, roperock01, rfpitbridgetrap
+#   layer 2/3           -> self-actuating, MUST stay keyframed: prisoncellgate01,
+#                          cgprisoncellgate01, icbastioncellgate01, argate01,
+#                          rfwportcullis01(+door), arpitstairs01/03,
+#                          arenclosedcircle01, dreamstairs01
+#   layer 14 OL_TRAP    -> swinging traps, keyframed: ctrapcavein01,
+#                          ctraplogs01, cprollingrock01, artrapchannelspikes01
+# Gates swing and portcullises slide precisely because they are NOT on the
+# props layer; nothing on layer 10 is expected to hold a pose against gravity.
+_OL_PROPS = 10
+
+
+def _node_is_breakaway(node, actual_root, rb):
+    """True if this animated node is a piece that breaks off and falls.
+
+    Oblivion authors breakaway props (mwallplankbreakaway01's planks,
+    IDCrumbleWall01's bricks) as ms=6 bodies with real mass on OL_PROPS: the
+    sequence only creaks them off their mounting and Havok does the rest.
+    Converting them to keyframed/mass-0 pins them in the half-broken pose
+    forever.  Gates and portcullises are also ms=6 with mass, but they sit on
+    the anim-static/clutter layers and must keep following their clip exactly.
+    """
+    if not _node_is_animated(node, actual_root):
+        return False
+    for attr in ('havok_col_filter', 'havok_col_filter_copy'):
+        hf = getattr(rb, attr, None)
+        if hf is not None and int(getattr(hf, 'layer', -1)) == _OL_PROPS:
+            return True
+    return False
+
+
 def _convert_blend_collision(node, coll_obj):
     """Convert a bhkBlendCollisionObject on a creature-skeleton bone.
 
@@ -1678,10 +1718,34 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
     #     STATIC with mass 0.  Vanilla chain/noose/trap anchors are ALWAYS
     #     static mass-0 bodies (NooseRopePiece01 root, trapmace Base01),
     #     never keyframed.
-    keyframed_body = rb.motion_system == 6 and _node_is_animated(node, actual_root)
+    #  4. BREAKAWAY pieces (mwallplankbreakaway01's 8 planks, IDCrumbleWall01's
+    #     bricks): ms=6 bodies with real mass whose clip only creaks them off
+    #     their mounting -- 15.19 deg and ZERO translation keys for the planks
+    #     -- because the visible break is HAVOK taking over and letting the
+    #     pieces detach and FALL.  Forcing those onto the plain keyframed path
+    #     (which also zeroes the mass) pinned them forever: the clip played, the
+    #     planks tilted, and then hung in the half-broken pose as a solid wall.
+    #     Gates/portcullises are also ms=6 with mass but sit on the anim-static
+    #     layers, so the authored OL_PROPS layer separates the two.
+    #
+    #     A breakaway piece still ships KEYFRAMED, exactly like Oblivion's
+    #     `Unyielding = 1` (all 8 planks; the root is Unyielding 0 / mass 0):
+    #     the body is HELD, following the clip, and only becomes dynamic when
+    #     the animation ends.  Shipping it dynamic instead made the planks drop
+    #     the instant the cell loaded, before the clip ever played.  What the
+    #     breakaway flag changes is that the piece KEEPS ITS MASS, so the
+    #     script-side release (ObjectReference.SetMotionType(Motion_Dynamic))
+    #     hands Havok a body that can actually fall -- a mass-0 body would just
+    #     hang there.  See script_convert PlayGroup handling.
+    breakaway_body = (rb.motion_system == 6 and rb.mass > 0
+                      and _node_is_breakaway(node, actual_root, rb))
+    keyframed_body = (rb.motion_system == 6
+                      and _node_is_animated(node, actual_root))
     if rb.motion_system == 6 and not keyframed_body:
         if rb.mass > 0 and rb.num_constraints > 0:
             pass                    # case 2: falls into the dynamic branch
+        elif breakaway_body:
+            pass                    # case 4: keep the mass, fall into dynamic
         else:
             rb.mass = 0.0           # case 3: falls into the static branch
 
@@ -1727,10 +1791,16 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
         # authored crumble-wall bricks / breakaway planks on OL_PROPS (10),
         # which _remap_world_filter passes through unchanged — those were the
         # meshes whose sequences played without any visible motion.
-        for _hf in (getattr(rb, 'havok_col_filter', None),
-                    getattr(rb, 'havok_col_filter_copy', None)):
-            if _hf is not None:
-                _hf.layer = 2  # SKYL_ANIMSTATIC
+        # A breakaway piece keeps SKYL_PROPS (10): once the clip ends the script
+        # releases it to Motion_Dynamic and it has to collide and settle as
+        # ordinary debris, which layer 2 ANIMSTATIC does not do.  Vanilla
+        # breakableboard01 ships its falling Piece01/Piece02 on layer 10 for
+        # exactly this reason (its fixed Anchors sit on layer 0).
+        if not breakaway_body:
+            for _hf in (getattr(rb, 'havok_col_filter', None),
+                        getattr(rb, 'havok_col_filter_copy', None)):
+                if _hf is not None:
+                    _hf.layer = 2  # SKYL_ANIMSTATIC
         rb.friction         = 0.50
         rb.restitution      = 0.40
         rb.linear_damping   = 0.0996
@@ -1838,7 +1908,10 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
     # the collision compound (see nif_conversion_notes.md, 2026-08-01).  Down
     # here nothing dispatches on mass any more, so the only bytes that change
     # are the mass field itself.
-    if keyframed_body:
+    # ...EXCEPT a breakaway piece, which is keyframed only until its clip ends.
+    # It must keep the authored mass so the script-side
+    # SetMotionType(Motion_Dynamic) release drops a body Havok can simulate.
+    if keyframed_body and not breakaway_body:
         rb.mass = 0.0
 
 def convert_all_collisions(node, actual_root=None, keep_blend=False):

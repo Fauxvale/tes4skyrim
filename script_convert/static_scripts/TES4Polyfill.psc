@@ -476,3 +476,41 @@ EndFunction
 Bool Function IsModLoaded(String asPlugin) Global
   Return Game.GetFormFromFile(0x00000000, asPlugin) != None
 EndFunction
+
+; ==========================================================================
+; Breakaway props
+; ==========================================================================
+
+; Oblivion authors break-apart props (mwallplankbreakaway01's planks,
+; IDCrumbleWall01's bricks) as KEYFRAMED bodies that carry real mass and
+; `Unyielding = 1`.  The animation only creaks the pieces off their mounting --
+; the planks rotate 15.19 degrees and have ZERO translation keys -- and the
+; visible break is HAVOK taking over: the pieces detach and fall.
+;
+; Skyrim keyframed bodies never yield to gravity, so a straight conversion left
+; the planks hanging in the half-broken pose forever.  Shipping them dynamic in
+; the NIF instead was also wrong -- they dropped the moment the cell loaded,
+; before the clip had played.  So the mesh keeps them keyframed (held, following
+; the clip, exactly like Unyielding) and the release happens HERE, once the clip
+; has run.
+;
+; The wait covers the clip.  Converted breakaway `Unequip` sequences run 0.033s
+; to 3.8s (median 0.033; only 4 of 27 exceed 0.5s), and Papyrus cannot query a
+; Gamebryo sequence's length -- PlayAnimationAndWait never returns for a
+; BGSGamebryoSequenceGenerator state, and the graph declares no `end` event to
+; wait on.  One second covers every clip but the 3.8s outlier while still
+; reading as "it gave way, then it fell".
+;
+; Inert on anything that is not a breakaway piece: every other animated object
+; converts to a mass-0 keyframed body, and a mass-0 body has infinite effective
+; mass, so going dynamic cannot make it fall.  Doors, gates and portcullises
+; driven by the same animation group are unaffected.
+Function ReleaseBreakaway(ObjectReference akRef) Global
+  If akRef == None
+    Return
+  EndIf
+  Utility.Wait(1.0)
+  ; Motion_Dynamic = 1.  abAllowActivate must be true or the body stays asleep
+  ; and never starts simulating.
+  akRef.SetMotionType(1, true)
+EndFunction
