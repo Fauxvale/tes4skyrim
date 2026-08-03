@@ -1092,20 +1092,18 @@ class ScriptConverter:
                 # standing still: her package waits on `startconv == 1`, which
                 # only her GameMode body ever sets.
                 #
-                # Gating on TES4Polyfill.ShouldRunGameMode() keeps the
-                # anti-storm property that motivated dropping OnInit here: it is
-                # true ONLY for references whose parent cell is currently
-                # attached, so this cannot re-create the "every scripted object
-                # in the game starts ticking at load" failure — an unconditional
-                # OnInit register is what did that.
+                # Gating on Is3DLoaded() keeps the anti-storm property that
+                # motivated dropping OnInit here: it is true ONLY for references
+                # that are actually loaded, so this cannot re-create the "every
+                # scripted object in the game starts ticking at load" failure —
+                # an unconditional OnInit register is what did that.
                 #
-                # It deliberately does NOT test Is3DLoaded() alone.  An
-                # initially-disabled reference has no 3D, so a 3D-gated poll can
-                # never start — and on 200 Nehrim refs the poll body is the only
-                # thing that ever calls Enable() on that same reference, an
-                # unbreakable deadlock (see ShouldRunGameMode's own comment).
-                # Oblivion ran GameMode for every ref in an active cell,
-                # disabled ones included; cell attachment is that rule.
+                # KNOWN GAP (re-opened deliberately): an initially-disabled
+                # reference has no 3D, so a 3D-gated poll never starts, and on
+                # ~200 Nehrim refs the poll body is the only thing that ever
+                # calls Enable() on that same reference.  The cell-attachment
+                # gate that fixed this (TES4Polyfill.ShouldRunGameMode) broke
+                # CharacterGen and was reverted; see _GAMEMODE_GATE.
                 #
                 # But OnInit ALONE is not enough once the script lives on the
                 # placed reference (which reference events like OnPackageEnd
@@ -2173,10 +2171,16 @@ class ScriptConverter:
 
     # The condition under which a placed reference's TES4 `begin GameMode` body
     # would run, used at every site that arms the OnUpdate poll for an
-    # object/actor script.  NOT Is3DLoaded() — that is false for an
-    # initially-disabled reference and deadlocks the self-enable idiom.  See
-    # TES4Polyfill.ShouldRunGameMode().
-    _GAMEMODE_GATE = 'TES4Polyfill.ShouldRunGameMode(Self)'
+    # object/actor script.
+    #
+    # REVERTED to Is3DLoaded() while a CharacterGen regression is bisected:
+    # Valen Dreth stopped moving to his taunt marker and stopped delivering his
+    # first lines after the cell-attachment gate landed.  The self-enable
+    # deadlock the cell gate was introduced to fix (Nehrim's Celebro, ~200
+    # disabled refs) is REAL and is re-opened by this revert — see
+    # TES4Polyfill.ShouldRunGameMode(), which is still shipped and unused.
+    # Do not re-apply the cell gate without re-testing CharacterGen in-game.
+    _GAMEMODE_GATE = 'Is3DLoaded()'
 
     def _reregister_before_returns(self, out: list, start: int, interval: str,
                                    load_gated: bool) -> None:
@@ -2184,8 +2188,8 @@ class ScriptConverter:
 
         Emits the SAME re-register the fall-through path uses, so a body that
         returns early keeps ticking exactly like one that runs to the end:
-        `ShouldRunGameMode()`-gated for object/actor scripts (whose poll is meant
-        to stop on unload), unconditional otherwise.
+        `Is3DLoaded()`-gated for object/actor scripts (whose poll is meant to
+        stop on unload), unconditional otherwise.
         """
         i = start
         while i < len(out):
