@@ -1700,6 +1700,24 @@ class ScriptConverter:
                     _skip.add(idx)
                     break
         lines = [l for i, l in enumerate(_flat) if i not in _skip]
+        # Consecutive PlayGroups on the SAME reference (Nehrim MQ23's loose
+        # planks: Forward / Backward / Unequip in one frame) are left as plain
+        # PlayAnimation calls: the last event wins and the object snaps to the
+        # final clip.  That mirrors Oblivion's own queue-depth-1 PlayGroup
+        # semantics (a newly queued group replaces the pending one), and it is
+        # what Nehrim itself authors for the start-cell planks (Unequip only).
+        #
+        # Chaining them with PlayAnimationAndWait("<seq>", "end") was tried and
+        # is WRONG: the wait event never fires for a BGSGamebryoSequenceGenerator
+        # state.  Vanilla proof — every gamebryo-sequence object script
+        # (norsarcophagustopanim01script, dunsolitudejailopencelldoor, the
+        # Solitude jail wall scene) uses plain PlayAnimation with a state
+        # debounce and NEVER PlayAnimationAndWait; the scripts that do wait
+        # (sarcophagusskulllock01script "alldone", dunlabyanimateontrig "done")
+        # drive NATIVE-hkx objects whose events are havok annotations, which a
+        # gamebryo NIF sequence does not have.  The wait would block the
+        # calling thread forever (OnTrigger on MQ23's planks: the second plank
+        # set's PlayAnimation would never run).
         # Fix akActionRef used in events that don't define it
         # TES4 scripts could use GetActionRef across blocks; Papyrus scopes params to events
         _event_re2 = re.compile(r'^\s*Event\s+(\w+)', re.IGNORECASE)

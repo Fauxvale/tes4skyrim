@@ -1555,8 +1555,33 @@ def _process_controller_manager(node, palette):
                     seq.num_controlled_blocks -= 1
                     continue
 
-            # Morph controllers have no Skyrim equivalent -- drop them.
+            # Morph controllers do not exist in Skyrim (the SSE exe has no
+            # NiGeomMorpherController RTTI class at all; vanilla ships 0) --
+            # the entry must go.  But the morph IS the visible effect for a
+            # whole family of Oblivion meshes (ctrigtripwire01's wire snap,
+            # se01waitingroomwalls, the forming Oblivion gate), so harvest
+            # everything _emulate_morphs needs to rebuild it as a baked
+            # target shape + NiVisController swap, then drop the entry.
             if isinstance(blk.controller, NifFormat.NiGeomMorpherController):
+                _seen = getattr(node, '_morph_cb_seen', None)
+                if _seen is None:
+                    _seen = node._morph_cb_seen = {}
+                _k = (id(seq), bytes(node_name))
+                _ordinal = _seen.get(_k, 0)
+                _seen[_k] = _ordinal + 1
+                if getattr(blk.interpolator, 'data', None) is not None:
+                    _swaps = getattr(node, '_morph_swaps', None)
+                    if _swaps is None:
+                        _swaps = node._morph_swaps = []
+                    _swaps.append({
+                        'seq': seq,
+                        'shape': bytes(node_name),
+                        'frame': bytes(_resolve_name(blk, seq, 'variable_2')
+                                       or b''),
+                        'ordinal': _ordinal,
+                        'interp': blk.interpolator,
+                        'morpher': blk.controller,
+                    })
                 seq.controlled_blocks.pop(key)
                 seq.num_controlled_blocks -= 1
                 continue
@@ -1968,7 +1993,440 @@ def _match_seq_shader_types(root):
                 continue
             _bind_shader_ctrl_target(cb.controller, shader_block_of.get(name))
 
+    _normalize_shader_cb_strings(root)
     _retarget_geometry_suffix_entries(root)
+
+
+def _normalize_shader_cb_strings(root):
+    """Stamp vanilla controlled-block ID strings on converted shader controllers.
+
+    The engine resolves a sequence's controlled block at activation time BY
+    STRING: on node <node_name> find the property whose class is
+    <property_type>, then its controller of class <controller_type>, using
+    <variable_1> (Controller ID) to pick the channel.  The rewrites above swap
+    the controller block and controller_type but the entry keeps Oblivion's
+    strings — property_type 'NiTexturingProperty' (a class that no longer
+    exists in the file) and controller IDs like '0-0-TT_TRANSLATE_V'.  The
+    lookup fails silently and the interpolator is never applied: palacefont01's
+    fountain water shipped with a correct V-Offset curve that never played.
+
+    Vanilla convention (beehive01, blackpool, dweastrolabehub01 — every
+    BS*ShaderProperty*Controller entry sampled):
+        property_type = the shader property's class name
+        variable_1    = str(type_of_controlled_variable/color), e.g. '8', '11'
+        variable_2    = ''
+    """
+    for blk in root.tree():
+        if not isinstance(blk, NifFormat.NiControllerSequence):
+            continue
+        for cb in blk.controlled_blocks:
+            ctrl = cb.controller
+            if ctrl is None:
+                continue
+            cn = ctrl.__class__.__name__
+            if not (cn.startswith(('BSEffectShaderProperty',
+                                   'BSLightingShaderProperty'))
+                    and cn.endswith('Controller')):
+                continue
+            cb.property_type = (
+                b'BSEffectShaderProperty' if cn.startswith('BSEffectShaderProperty')
+                else b'BSLightingShaderProperty')
+            cb.controller_type = cn.encode('ascii')
+            var = getattr(ctrl, 'type_of_controlled_variable',
+                          getattr(ctrl, 'type_of_controlled_color', None))
+            cb.variable_1 = (b'' if var is None else str(int(var)).encode('ascii'))
+            cb.variable_2 = b''
+
+
+def _all_attr_names(cls):
+    """Attribute names of a PyFFI struct class INCLUDING inherited ones.
+
+    `_attrs` is per-class only — NiTriStripsData._attrs holds just num_strips/
+    strip_lengths/points, while the vertices live on NiTriBasedGeomData.
+    Walk the MRO base-first so counts still precede their arrays.
+    """
+    names = []
+    for klass in reversed(cls.__mro__):
+        for a in klass.__dict__.get('_attrs', ()):
+            if a.name not in names:
+                names.append(a.name)
+    return names
+
+
+def _copy_block_fields(src, dst):
+    """Field-by-field copy of a PyFFI block (scalars, compounds, arrays).
+
+    Counts are declared before their arrays, so a single in-order pass with
+    update_size() at each array keeps dimensions valid.  Reference-typed
+    fields are copied as POINTERS (shared blocks); the caller overrides the
+    ones the clone must own (data, controller, collision).
+    """
+    from pyffi.object_models.xml.array import Array as _Arr
+
+    def _copy_value(sv, dv, setter):
+        if isinstance(dv, _Arr):
+            if hasattr(dv, 'update_size'):
+                try:
+                    dv.update_size()
+                except Exception:
+                    pass
+            for i in range(min(len(sv), len(dv))):
+                _copy_value(sv[i], dv[i],
+                            lambda v, _dv=dv, _i=i: _dv.__setitem__(_i, v))
+        elif hasattr(dv, '_attrs'):                          # compound
+            for name in _all_attr_names(type(dv)):
+                try:
+                    _copy_value(getattr(sv, name), getattr(dv, name),
+                                lambda v, _dv=dv, _n=name: setattr(_dv, _n, v))
+                except Exception:
+                    pass
+        else:
+            try:
+                setter(sv)
+            except Exception:
+                pass
+
+    for name in _all_attr_names(type(dst)):
+        try:
+            sv = getattr(src, name)
+            dv = getattr(dst, name)
+        except Exception:
+            continue
+        if isinstance(dv, _Arr) or hasattr(dv, '_attrs'):
+            _copy_value(sv, dv, lambda v, _n=name: setattr(dst, _n, v))
+        else:
+            try:
+                setattr(dst, name, sv)
+            except Exception:
+                pass
+
+
+def _morph_weight_curve(interp):
+    """(time, value) list of a morph target's weight keys, or []."""
+    data = getattr(interp, 'data', None)
+    kg = getattr(data, 'data', None)
+    keys = getattr(kg, 'keys', None)
+    if not keys:
+        return []
+    return [(k.time, k.value) for k in keys]
+
+
+def _vis_toggle_times(curve):
+    """Times at which a weight curve crosses 0.5, plus the initial state.
+
+    Returns (initially_on, [t0, t1, ...]) — each t toggles the state.
+    """
+    if not curve:
+        return False, []
+    on = curve[0][1] >= 0.5
+    times = []
+    state = on
+    for (t0, v0), (t1, v1) in zip(curve, curve[1:]):
+        nxt = v1 >= 0.5
+        if nxt != state:
+            # linear crossing inside the segment
+            if v1 != v0:
+                tc = t0 + (0.5 - v0) * (t1 - t0) / (v1 - v0)
+            else:
+                tc = t1
+            times.append(max(t0, min(tc, t1)))
+            state = nxt
+    return on, times
+
+
+# NiBlendInterpolator.Flags bit 0 is "Manager Controlled".  nif.xml makes the
+# next SEVEN fields (Interp Count, Single Index, High Priority, Next High
+# Priority, Single Time, High Weights Sum, Next High Weights Sum) conditional on
+# that bit being CLEAR, so a manager-driven interpolator is 7 bytes and a
+# free-standing one is 15.  Vanilla is unanimous that these are manager-driven:
+# 8779/8779 NiBlend*Interpolator blocks across Skyrim's meshes store Flags=1 and
+# Array Size=2 (2688 bool, 5520 float, 571 point3).
+#
+# PyFFI 2.2.3 models this block WRONG -- it declares 'unknown_short' +
+# 'unknown_int' + 'bool_value' where the real layout is byte Flags, byte Array
+# Size, float Weight Threshold, byte Value.  These are NOT padding (the usual
+# reason to leave unknown_* alone); they are real named fields PyFFI failed to
+# describe, so they must be written explicitly:
+#     unknown_short = 0x0201  -> Flags=0x01 (low byte), Array Size=0x02 (high)
+#     unknown_int   = 0.0f    -> Weight Threshold
+# Leaving them 0 emits Flags=0, which tells the engine to read 15 bytes out of a
+# 7-byte block: it runs into the next block and AddRefs whatever it finds.  That
+# is the `lock inc [rax+0x08]` CTD on entering Vilverin, where rax's high half
+# was 0xBF800000 -- the -1.0f default of the Single Time field it never had.
+_BLEND_INTERP_FLAGS_ARRAYSIZE = 0x0201
+
+
+def _init_blend_interpolator(blend):
+    """Give a synthesized NiBlend*Interpolator vanilla's manager-driven header."""
+    blend.unknown_short = _BLEND_INTERP_FLAGS_ARRAYSIZE
+    blend.unknown_int = 0          # Weight Threshold 0.0f
+    return blend
+
+
+_BLEND_INTERP_TYPES = tuple(
+    t for t in (getattr(NifFormat, n, None) for n in (
+        'NiBlendBoolInterpolator', 'NiBlendFloatInterpolator',
+        'NiBlendPoint3Interpolator', 'NiBlendTransformInterpolator',
+        'NiBlendColorInterpolator')) if t is not None)
+
+
+def _normalize_blend_interpolators(root, stats=None):
+    """Force every NiBlend*Interpolator to vanilla's manager-driven header.
+
+    Blocks COPIED from an Oblivion source hit the same trap as synthesized ones:
+    PyFFI reads them under the old version's layout and rewrites them under
+    Skyrim's, and because its schema calls these fields 'unknown_short' /
+    'unknown_int' rather than Flags / Array Size / Weight Threshold, the flags do
+    not survive the round trip.  The result is Flags=0, which promises the engine
+    seven trailing fields that the 7-byte block does not contain -- see
+    _init_blend_interpolator for the full mechanism and the crash it caused.
+
+    Every one of these interpolators is owned by a NiControllerManager sequence
+    in both games, so manager-controlled is not merely the vanilla-common case,
+    it is the correct description of the object.  Vanilla agrees 8779/8779.
+    """
+    fixed = 0
+    if not _BLEND_INTERP_TYPES:
+        return fixed
+    for blk in root.tree():
+        if not isinstance(blk, _BLEND_INTERP_TYPES):
+            continue
+        if getattr(blk, 'unknown_short', None) != _BLEND_INTERP_FLAGS_ARRAYSIZE:
+            blk.unknown_short = _BLEND_INTERP_FLAGS_ARRAYSIZE
+            blk.unknown_int = 0
+            fixed += 1
+    if fixed and stats is not None:
+        stats['blend_interp_fixed'] = stats.get('blend_interp_fixed', 0) + fixed
+    return fixed
+
+
+def _emulate_morphs(root, stats=None):
+    """Rebuild dropped NiGeomMorpherController animation as shape swaps.
+
+    Skyrim's engine has no morph-controller class (RTTI absent from the SSE
+    exe, 0 vanilla uses), so a converted sequence cannot morph vertices.  What
+    it CAN do is toggle visibility: for every animated morph target harvested
+    by _process_controller_manager, bake the target's vertex positions into a
+    hidden sibling copy of the shape and add NiVisController entries to the
+    sequence that swap base -> target when the weight curve crosses 0.5.
+    The wire of ctrigtripwire01 visibly snaps again; the smooth crossfade of
+    slow morphs degrades to a cut, which is the closest the engine gets.
+
+    Vanilla structure copied exactly from sldjailwallcollapse01: node carries
+    NiVisController (flags 108, NiBlendBoolInterpolator bool_value=2), the
+    sequence entry carries NiBoolInterpolator + NiBoolData step keys,
+    controller_type 'NiVisController', empty property/variable strings.
+
+    The keys MUST be CONST_KEY (5), never LINEAR (1) -- see _add_vis_cb.
+    """
+    swaps = []
+    for blk in root.tree():
+        got = getattr(blk, '_morph_swaps', None)
+        if got:
+            swaps.extend(got)
+    if not swaps:
+        return
+
+    geoms = {}
+    parents = {}
+    for blk in root.tree():
+        if isinstance(blk, NifFormat.NiNode):
+            for ch in blk.children:
+                if isinstance(ch, NifFormat.NiTriBasedGeom):
+                    geoms[bytes(ch.name)] = ch
+                    parents[id(ch)] = blk
+
+    mgr = root.controller
+    pal = (mgr.object_palette
+           if isinstance(mgr, NifFormat.NiControllerManager) else None)
+
+    def _palette_add(obj):
+        if pal is None:
+            return
+        pal.num_objs += 1
+        pal.objs.update_size()
+        entry = pal.objs[pal.num_objs - 1]
+        entry.name = bytes(obj.name)
+        entry.av_object = obj
+
+    def _vis_controller(geom):
+        ctrl = geom.controller
+        while ctrl is not None:
+            if isinstance(ctrl, NifFormat.NiVisController):
+                return ctrl
+            ctrl = ctrl.next_controller
+        ctrl = NifFormat.NiVisController()
+        ctrl.flags = 108           # ACTIVE | CLAMP | Compute Scaled Time
+        ctrl.frequency = 1.0
+        ctrl.phase = 0.0
+        ctrl.start_time = 0.0
+        ctrl.stop_time = 0.0
+        blend = NifFormat.NiBlendBoolInterpolator()
+        _init_blend_interpolator(blend)
+        blend.bool_value = 2       # vanilla's "no authored value" sentinel
+        ctrl.interpolator = blend
+        ctrl.target = geom
+        ctrl.next_controller = geom.controller
+        geom.controller = ctrl
+        return ctrl
+
+    def _add_vis_cb(seq, geom, initially_on, toggles):
+        bd = NifFormat.NiBoolData()
+        kg = bd.data
+        times = [0.0] + [t for t in toggles if t > 0.0]
+        values = []
+        state = initially_on
+        # value at each emitted key; the 0.0 key carries the initial state
+        values.append(1 if state else 0)
+        for _ in times[1:]:
+            state = not state
+            values.append(1 if state else 0)
+        # CONST_KEY (step).  nif.xml calls type 5 "Step function.  Used for
+        # visibility keys in NiBoolData", and the census agrees absolutely:
+        # 3449/3449 vanilla Skyrim NiBoolData and 1296/1296 Oblivion source
+        # NiBoolData store 5.  LINEAR (1) appears in neither game, and writing
+        # it crashed the engine inside NiBoolData::Load while streaming
+        # ctrigtripwire01 (Vilverin).  A bool has no meaningful interpolant,
+        # so step is also the only type that expresses these keys correctly.
+        kg.interpolation = 5
+        kg.num_keys = len(times)
+        kg.keys.update_size()
+        for i, (t, v) in enumerate(zip(times, values)):
+            kg.keys[i].time = t
+            kg.keys[i].value = v
+        ip = NifFormat.NiBoolInterpolator()
+        ip.bool_value = bool(values[0])
+        ip.data = bd
+        ctrl = _vis_controller(geom)
+        ctrl.stop_time = max(ctrl.stop_time, seq.stop_time)
+        seq.num_controlled_blocks += 1
+        seq.controlled_blocks.update_size()
+        cb = seq.controlled_blocks[seq.num_controlled_blocks - 1]
+        cb.interpolator = ip
+        cb.controller = ctrl
+        if hasattr(cb, 'priority'):
+            cb.priority = 0
+        cb.node_name = bytes(geom.name)
+        cb.property_type = b''
+        cb.controller_type = b'NiVisController'
+        cb.variable_1 = b''
+        cb.variable_2 = b''
+        # Palette offsets were resolved into the string fields long before
+        # this point; make sure stale-looking offsets can never re-resolve.
+        for off in ('node_name_offset', 'property_type_offset',
+                    'controller_type_offset', 'variable_1_offset',
+                    'variable_2_offset'):
+            if hasattr(cb, off):
+                try:
+                    setattr(cb, off, -1)
+                except Exception:
+                    pass
+
+    made = {}          # (shape_name, morph_index) -> clone block
+    base_toggles = {}  # (id(seq), shape_name) -> list of clone curves
+
+    for entry in swaps:
+        name = entry['shape']
+        geom = geoms.get(name)
+        if geom is None:
+            continue
+        morpher = entry['morpher']
+        md = getattr(morpher, 'data', None)
+        morphs = getattr(md, 'morphs', None)
+        if md is None or morphs is None or len(morphs) == 0:
+            continue
+        idx = entry['ordinal']
+        # Prefer a frame-name match when the format stores one.
+        frame = entry['frame']
+        if frame:
+            for i in range(len(morphs)):
+                fn = getattr(morphs[i], 'frame_name', None)
+                if fn is not None and bytes(fn) == frame:
+                    idx = i
+                    break
+        if idx <= 0 or idx >= len(morphs):
+            continue               # base target: visibility derived below
+        gdata = geom.data
+        nverts = getattr(gdata, 'num_vertices', 0)
+        vectors = morphs[idx].vectors
+        if len(vectors) != nverts or nverts == 0:
+            continue
+
+        curve = _morph_weight_curve(entry['interp'])
+        on, toggles = _vis_toggle_times(curve)
+        if not on and not toggles:
+            continue               # never reaches 0.5: no visible effect
+
+        key = (name, idx)
+        clone = made.get(key)
+        if clone is None:
+            clone = geom.__class__()
+            _copy_block_fields(geom, clone)
+            cdata = gdata.__class__()
+            _copy_block_fields(gdata, cdata)
+            relative = bool(getattr(md, 'relative_targets', 1))
+            for i in range(nverts):
+                v = cdata.vertices[i]
+                d = vectors[i]
+                if relative:
+                    v.x += d.x
+                    v.y += d.y
+                    v.z += d.z
+                else:
+                    v.x, v.y, v.z = d.x, d.y, d.z
+            try:
+                cdata.update_center_radius()
+            except Exception:
+                pass
+            clone.data = cdata
+            suffix = frame if frame else str(idx).encode('ascii')
+            clone.name = bytes(name) + b'Mrph' + suffix
+            clone.controller = None
+            clone.collision_object = None
+            clone.flags = int(geom.flags) | 0x01     # hidden at rest
+            parent = parents.get(id(geom))
+            if parent is not None:
+                parent.add_child(clone)
+            _palette_add(clone)
+            made[key] = clone
+
+        seq = entry['seq']
+        _add_vis_cb(seq, clone, on, toggles)
+        base_toggles.setdefault((id(seq), name), []).append(curve)
+
+    # Base shape: visible exactly while NO target weight is >= 0.5.
+    seq_by_id = {id(e['seq']): e['seq'] for e in swaps}
+    for (sid, name), curves in base_toggles.items():
+        geom = geoms.get(name)
+        seq = seq_by_id.get(sid)
+        if geom is None or seq is None:
+            continue
+        cut = sorted({t for c in curves for t in _vis_toggle_times(c)[1]})
+        # evaluate combined state per interval
+        def _any_on(t):
+            for c in curves:
+                v = None
+                for (t0, v0), (t1, v1) in zip(c, c[1:]):
+                    if t0 <= t <= t1:
+                        v = v0 + (v1 - v0) * ((t - t0) / (t1 - t0)
+                                              if t1 > t0 else 0.0)
+                        break
+                if v is None and c:
+                    v = c[0][1] if t <= c[0][0] else c[-1][1]
+                if v is not None and v >= 0.5:
+                    return True
+            return False
+        probes = [0.0] + cut
+        states = []
+        for i, t in enumerate(probes):
+            nxt = cut[i] if i < len(cut) else (t + 0.001)
+            mid = (t + nxt) / 2 if nxt > t else t
+            states.append(not _any_on(mid))
+        toggles = [cut[i] for i in range(len(cut))
+                   if states[i + 1] != states[i]]
+        _add_vis_cb(seq, geom, states[0], toggles)
+    if stats is not None:
+        stats['morph_swaps'] = stats.get('morph_swaps', 0) + len(made)
 
 
 def _retarget_geometry_suffix_entries(root):
@@ -2958,6 +3416,36 @@ def _resolve_palette_strings(data):
 _CTLR_COMPUTE_SCALED_TIME = 0x40
 
 
+_TES4_SOUND_KEY = re.compile(rb'^sound:\s*(\S+)\s*$', re.IGNORECASE)
+
+
+def _convert_sound_text_keys(data):
+    """Rewrite Oblivion sequence sound keys to Skyrim's convention.
+
+    Oblivion text keys say `sound: <SOUN EDID>`; the SSE exe's text-key
+    keyword table (strings at RVA 0x162fd50: `SoundPlay`, `SoundPlayAt`,
+    `SoundStop`, `SoundRelease`) has no such prefix, so every converted
+    sequence played silently.  Skyrim's form is `SoundPlay.<SNDR EDID>`
+    (vanilla sldjailwallcollapse01 keys `SoundPlay.DRSStoneWallJailCollapse`,
+    a Skyrim.esm SNDR editor id).  The importer emits each TES4 SOUN's
+    companion descriptor as `TES4_<EDID>_SNDR` (dialog_misc.convert_SOUN),
+    which the engine's editor-id lookup resolves regardless of plugin.
+    """
+    n = 0
+    for root in data.roots:
+        if root is None:
+            continue
+        for block in root.tree():
+            if not isinstance(block, NifFormat.NiTextKeyExtraData):
+                continue
+            for key in block.text_keys:
+                m = _TES4_SOUND_KEY.match(bytes(key.value))
+                if m:
+                    key.value = b'SoundPlay.TES4_' + m.group(1) + b'_SNDR'
+                    n += 1
+    return n
+
+
 def _fix_controller_flags(data):
     """Set "Compute Scaled Time" on every NiTimeController (Skyrim requirement).
 
@@ -3511,6 +3999,10 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
     # ignored — leaving every node_name as b''.  Skyrim uses node_name to look
     # up animation targets; empty names → null → crash on NIF load.
     _resolve_palette_strings(data)
+
+    # Oblivion `sound: X` text keys are dead in Skyrim; rewrite to
+    # SoundPlay.TES4_X_SNDR (the importer's SNDR editor-id convention).
+    _convert_sound_text_keys(data)
 
     # Oblivion never sets NiTimeController "Compute Scaled Time" (0x40); Skyrim
     # requires it or a PlayAnimation()'d sequence binds but never advances.
@@ -4083,6 +4575,12 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         # differently).  Must follow the geometry walk.
         _match_seq_shader_types(root)
 
+        # Rebuild dropped NiGeomMorpherController animation (Skyrim has no
+        # morph class) as baked target shapes + NiVisController swaps.  Must
+        # follow the geometry walk (clones copy CONVERTED shapes/shaders) and
+        # precede _apply_rest_visibility / sequence-name collection.
+        _emulate_morphs(root, stats)
+
         # Oblivion's auto-started "Idle" sequence -> Skyrim's "AutoPlay" (loop),
         # or the animation never starts.  Runs before collect_sequence_names so
         # the behaviour graph is built from the final names.
@@ -4098,6 +4596,11 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         # Runs after _match_seq_shader_types so the final controller object is
         # the one that gets attached.
         _attach_seq_shader_controllers(root, stats)
+
+        # Stamp vanilla's manager-driven header onto every blend interpolator,
+        # whether synthesized here or copied from the source.  Must follow every
+        # pass that can create or replace one.
+        _normalize_blend_interpolators(root, stats)
 
         # Hide NiPSysMeshEmitter SOURCE geometry.  These shapes exist only to
         # define where particles spawn and must never be drawn.  Oblivion hides

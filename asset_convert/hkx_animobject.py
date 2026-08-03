@@ -306,6 +306,16 @@ def _behavior_xml(graph_name: str, sequences: list) -> str:
         """
         rows = [(eid[s], j) for j, s in enumerate(sequences)
                 if j != exclude_state]
+        if not rows and exclude_state is not None:
+            # A SINGLE-sequence object (IDCrumbleWall01's only sequence is
+            # `Unequip`) has no "other" sequence to reach, so the exclusion
+            # empties the array and the state ships transitions=null -- the
+            # exact dead end this docstring warns about.  The exclusion only
+            # exists to stop a repeated event restarting the sequence mid-play;
+            # a dead end is strictly worse, because the object can then never be
+            # re-played at all (OnReset and every repeat activation were inert).
+            # Keep the self-transition in that case.
+            rows = [(eid[sequences[exclude_state]], exclude_state)]
         if not rows:
             return 'null'
         arr = pf.add('hkbStateMachineTransitionInfoArray')

@@ -2850,15 +2850,21 @@ class TestAnimObjectBehaviorGraph:
         assert f'<hkparam name="startStateId">{rest_id}</hkparam>' in xml, \
             'must start on the Rest state, not on a motion sequence'
 
-        # Every state, Rest included, owns a real transition array.
-        states = re.findall(
-            r'class="hkbStateMachineStateInfo".*?'
-            r'<hkparam name="transitions">([^<]*)</hkparam>.*?'
-            r'<hkparam name="name">([^<]*)</hkparam>', xml, re.S)
-        assert states, 'no states parsed — emitter shape changed'
-        for transitions, name in states:
-            assert transitions.strip() != 'null', \
-                f'state {name!r} has no transitions — it is a dead end'
+        # Every state, Rest included, owns a real transition array — at EVERY
+        # sequence count.  A ONE-sequence object is the trap: "every OTHER
+        # sequence" is the empty set there, so a state built that way emits
+        # transitions=null and can never be re-entered.
+        for n in (1, 2, 3):
+            xml_n = _behavior_xml('wall', ['Forward', 'Backward',
+                                           'Unequip'][:n])
+            states = re.findall(
+                r'class="hkbStateMachineStateInfo".*?'
+                r'<hkparam name="transitions">([^<]*)</hkparam>.*?'
+                r'<hkparam name="name">([^<]*)</hkparam>', xml_n, re.S)
+            assert states, 'no states parsed — emitter shape changed'
+            for transitions, name in states:
+                assert transitions.strip() != 'null',                     (f'[{n} seq] state {name!r} has no transitions — it is a '
+                     f'dead end and can never be re-entered')
 
     def test_skeleton_has_one_pose_per_bone(self):
         """1 bone + 0 reference poses = null deref when a sequence binds.

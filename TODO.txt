@@ -2,7 +2,7 @@ Major Issues for V1:
 	1 - Iterate on quest and dialog conversion until everything is playable startin with Oblivion Main Quest
 
 	2 - Havok feels off. Items don't move like they should. Specifically, there seems to be too much inertia on small items, like I'm dragging a heavy object when it is something as small as a cup, Animated signs will get stuck in a position after swinging a bit, defying gravicty
-		ctrigtripwire01.nif also break when walked over, and prisoncellchains01.nif doesn't properly swing (this is most likely because it is a static and not an activator).
+		ctrigtripwire01.nif also fails to break when walked over
 
 	3 - Navmesh refinement
 		ensure corridors connect pathgrid islands + other connectivity issues
@@ -21,6 +21,8 @@ Major Issues for V1:
 	13 - Meshes not animating:
 		palacefont01.nif
 		se01waitingrooomwalls.nif
+
+		prisonsecretwall01.nif
 
 Later Issues:
 

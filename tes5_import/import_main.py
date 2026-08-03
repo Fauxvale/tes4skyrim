@@ -964,7 +964,12 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
             ov = ctx.build(rec, sig) if ctx else None
             if ov is not None and ov.status != 'reconvert':
                 if ov.record_bytes:
-                    writer.add_record(target_sig, ov.record_bytes)
+                    # Same authority rule as below: the packed record's own
+                    # signature picks the group (a master's STAT may have been
+                    # retyped to MSTT, a BOOK to SCRL).
+                    writer.add_record(
+                        ov.record_bytes[:4].decode('ascii', 'replace'),
+                        ov.record_bytes)
                     converted += 1
                 continue
 

@@ -83,7 +83,7 @@ see the `oblivion-to-skyrim-dialog` skill.
 | SLGM | SLGM | Add OBND. Minor changes. |
 | SOUN | SOUN + SNDR | TES5 splits sound into SOUN (marker) + SNDR (Sound Descriptor with actual data). |
 | SPEL | SPEL | **SPIT restructured**: 16B→36B. New fields: Cast Type, Target Type, Cast Duration, Range, Half-cost Perk. Add OBND, keywords. |
-| STAT | STAT | Add OBND. Minor changes. |
+| STAT | STAT **or MSTT** | Add OBND. A STAT whose CONVERTED mesh is a constrained dynamic havok island (mass>0 body + any bhk constraint; flag bit 0 in the mesh-bounds cache's optional 7th element, computed by `collision_extract.physics_flags_from_data`) is written as **MSTT** (`EDID OBND MODL DATA:u8=0`) — Skyrim never simulates constrained bodies on a STAT reference (PrisonCellChains01 hung rigid); vanilla routes all such content through MSTT (every swinging inn sign) or ACTI (bone alarm). 18 records retype on Oblivion.esm (chains, chain dolls, punching bags, hanging lamps, root havok pieces). FormID unchanged; `import_main` files records by their own signature. |
 | TREE | TREE | CNAM restructured. |
 | WATR | WATR | DATA→DNAM. Completely different water properties structure. |
 | WEAP | WEAP | **DATA restructured**: 32B→10B. Type moves to DNAM. Massive DNAM struct (~100B). CRDT (critical data) new. Add OBND, keywords. |

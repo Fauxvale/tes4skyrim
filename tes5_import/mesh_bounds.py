@@ -27,8 +27,12 @@ from typing import Dict, Optional, Tuple
 
 OBNDTuple = Tuple[int, int, int, int, int, int]
 
-# Module-level cache populated by load_mesh_bounds().
+# Module-level caches populated by load_mesh_bounds().
 _MESH_BOUNDS: Dict[str, OBNDTuple] = {}
+# Optional 7th element of a cache entry: physics flags from
+# asset_convert.collision_extract.physics_flags_from_data (bit 0 =
+# constrained dynamic island -> the record must be MSTT, not STAT).
+_MESH_PHYSICS: Dict[str, int] = {}
 
 
 def load_mesh_bounds(cache_path: str, quiet: bool = False) -> int:
@@ -41,7 +45,7 @@ def load_mesh_bounds(cache_path: str, quiet: bool = False) -> int:
     each call this once in their pool initializer and would otherwise spam one
     line per worker.
     """
-    global _MESH_BOUNDS
+    global _MESH_BOUNDS, _MESH_PHYSICS
     if not os.path.exists(cache_path):
         if not quiet:
             print(f"  Mesh bounds: cache not found ({cache_path}), using type defaults")
@@ -49,7 +53,8 @@ def load_mesh_bounds(cache_path: str, quiet: bool = False) -> int:
     try:
         with open(cache_path, encoding='utf-8') as fh:
             raw = json.load(fh)
-        _MESH_BOUNDS = {k: tuple(v) for k, v in raw.items()}
+        _MESH_BOUNDS = {k: tuple(v[:6]) for k, v in raw.items()}
+        _MESH_PHYSICS = {k: int(v[6]) for k, v in raw.items() if len(v) > 6}
         if not quiet:
             print(f"  Mesh bounds: loaded {len(_MESH_BOUNDS)} entries from cache")
         return len(_MESH_BOUNDS)
@@ -66,3 +71,13 @@ def get_mesh_obnd(path_key: str) -> Optional[OBNDTuple]:
     output directory root (e.g. ``"tes4/furniture/chairnoble01.nif"``).
     """
     return _MESH_BOUNDS.get(path_key)
+
+
+def get_mesh_physics_flags(path_key: str) -> int:
+    """Physics flags for *path_key* (0 if unknown).
+
+    Bit 0: the converted NIF is a constrained dynamic havok island (swinging
+    chains/signs).  Skyrim never simulates those on a STAT reference — the
+    base record must be written as MSTT (see items.convert_STAT).
+    """
+    return _MESH_PHYSICS.get(path_key, 0)

@@ -116,6 +116,65 @@ def uv_set_counts(fp):
         yield i, cls, bs_flags & 0x3F, nv
 
 
+def bool_key_types(fp):
+    """Yield (block index, interpolation, num_keys) per NiBoolData block.
+
+    NiBoolData is a bare KeyGroup<byte>: u32 Num Keys, then (only when Num Keys
+    is non-zero) a u32 KeyType, then Num Keys * {float Time, byte Value}.  The
+    engine wants CONST_KEY (5) here -- nif.xml calls 5 "Step function.  Used
+    for visibility keys in NiBoolData", 3449/3449 vanilla Skyrim and 1296/1296
+    Oblivion source blocks store 5, and writing LINEAR (1) crashed the engine
+    inside NiBoolData::Load (ctrigtripwire01, Vilverin).
+    """
+    with open(fp, 'rb') as fh:
+        raw = fh.read()
+    h = parse_header(raw)
+    off = h['hdr_end']
+    for i in range(h['nb']):
+        cls = h['types'][h['tidx'][i]]
+        size = h['sizes'][i]
+        blk = raw[off:off + size]
+        off += size
+        if cls != 'NiBoolData':
+            continue
+        try:
+            nk = ru32(blk, 0)
+            if nk == 0:
+                continue
+            yield i, ru32(blk, 4), nk
+        except Exception:
+            continue
+
+
+BLEND_INTERP = ('NiBlendBoolInterpolator', 'NiBlendFloatInterpolator',
+                'NiBlendPoint3Interpolator', 'NiBlendTransformInterpolator',
+                'NiBlendColorInterpolator')
+
+
+def blend_interp_flags(fp):
+    """Yield (block index, class, flags, array_size) per NiBlend*Interpolator.
+
+    NiBlendInterpolator starts with byte Flags then byte Array Size.  Flags bit
+    0 is "Manager Controlled"; when it is CLEAR, nif.xml appends seven more
+    fields, so the engine reads 15 bytes instead of 7.  Vanilla writes Flags=1
+    and Array Size=2 in 8779/8779 blocks -- anything else makes the engine read
+    past the end of the block and AddRef whatever follows (the Vilverin
+    `lock inc [rax+0x08]` CTD).
+    """
+    with open(fp, 'rb') as fh:
+        raw = fh.read()
+    h = parse_header(raw)
+    off = h['hdr_end']
+    for i in range(h['nb']):
+        cls = h['types'][h['tidx'][i]]
+        size = h['sizes'][i]
+        blk = raw[off:off + size]
+        off += size
+        if cls not in BLEND_INTERP or size < 2:
+            continue
+        yield i, cls, blk[0], blk[1]
+
+
 def rtti_names(exe):
     """Set of class names with RTTI type descriptors in the executable."""
     pe = pefile.PE(exe, fast_load=True)
@@ -170,6 +229,10 @@ def main():
     owners = collections.defaultdict(list)
     uv_hist = collections.Counter()
     uv_bad = []
+    key_hist = collections.Counter()
+    key_bad = []
+    blend_hist = collections.Counter()
+    blend_bad = []
     for i, fp in enumerate(files):
         if i and i % 1000 == 0:
             print('  ...%d' % i, flush=True)
@@ -186,6 +249,20 @@ def main():
                 uv_hist[n_uv] += 1
                 if n_uv > 1:
                     uv_bad.append((fp, bi, cls, n_uv, nv))
+        except Exception:
+            pass
+        try:
+            for bi, ktype, nk in bool_key_types(fp):
+                key_hist[ktype] += 1
+                if ktype != 5:
+                    key_bad.append((fp, bi, ktype, nk))
+        except Exception:
+            pass
+        try:
+            for bi, cls, bflags, asize in blend_interp_flags(fp):
+                blend_hist[(bflags, asize)] += 1
+                if not bflags & 1:
+                    blend_bad.append((fp, bi, cls, bflags, asize))
         except Exception:
             pass
 
@@ -220,6 +297,42 @@ def main():
                   % (fp, bi, cls, n_uv, nv), flush=True)
     else:
         print('OK - no geometry block declares more than one UV set.',
+              flush=True)
+
+    print('\nNiBoolData key types: %s'
+          % dict(sorted(key_hist.items())), flush=True)
+    if key_bad:
+        rc = 1
+        print('  *** %d NiBoolData blocks are not CONST_KEY (5) - visibility'
+              ' keys must be a step function, and the engine crashes in'
+              ' NiBoolData::Load otherwise' % len(key_bad), flush=True)
+        seen = set()
+        for fp, bi, ktype, nk in key_bad:
+            if fp in seen:
+                continue
+            seen.add(fp)
+            print('        %s  block[%d] interpolation=%d num_keys=%d'
+                  % (fp, bi, ktype, nk), flush=True)
+    else:
+        print('OK - every NiBoolData uses CONST_KEY step interpolation.',
+              flush=True)
+
+    print('\nNiBlend*Interpolator (flags, array_size): %s'
+          % dict(sorted(blend_hist.items())), flush=True)
+    if blend_bad:
+        rc = 1
+        print('  *** %d blend interpolators have Manager Controlled CLEAR -'
+              ' the engine then reads 15 bytes from a 7-byte block and'
+              ' AddRefs past the end (CTD)' % len(blend_bad), flush=True)
+        seen = set()
+        for fp, bi, cls, bflags, asize in blend_bad:
+            if fp in seen:
+                continue
+            seen.add(fp)
+            print('        %s  block[%d] %s flags=%d array_size=%d'
+                  % (fp, bi, cls, bflags, asize), flush=True)
+    else:
+        print('OK - every blend interpolator is manager-controlled.',
               flush=True)
 
     return rc

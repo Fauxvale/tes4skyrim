@@ -1717,6 +1717,20 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
         # synchronise the node's transform updates with physics.
         if hasattr(node, 'flags'):
             node.flags = NIF_FLAGS | 0x80  # 0x008E = 142
+        # Layer MUST be 2 SKYL_ANIMSTATIC.  Census: every vanilla keyframed
+        # body is layer 2 (farmhouseanimdoor01, rtirongate01, orcdoor01,
+        # riftenkeepdoor01 ×2, mrkmarketstalldoor01, rifrmsmbasewallgrate01,
+        # rifrmsmsecretcabinetdoor01 ×2, farmbtrapdoor01,
+        # sldjailwallcollapse01 — 11/11, zero exceptions), and our one
+        # in-game-confirmed working animated object (prisonSecretWall01,
+        # source-authored OL_ANIM_STATIC) also ships layer 2.  Oblivion
+        # authored crumble-wall bricks / breakaway planks on OL_PROPS (10),
+        # which _remap_world_filter passes through unchanged — those were the
+        # meshes whose sequences played without any visible motion.
+        for _hf in (getattr(rb, 'havok_col_filter', None),
+                    getattr(rb, 'havok_col_filter_copy', None)):
+            if _hf is not None:
+                _hf.layer = 2  # SKYL_ANIMSTATIC
         rb.friction         = 0.50
         rb.restitution      = 0.40
         rb.linear_damping   = 0.0996
@@ -1813,6 +1827,19 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
         decomposed = _decompose_clutter_hull(node, rb.shape)
         if decomposed is not None:
             rb.shape = decomposed
+
+    # Keyframed bodies carry mass 0 — vanilla census 11/11, zero exceptions
+    # (Havok keyframed motion has infinite effective mass; the field is
+    # convention, but it is the one remaining field where broken converted
+    # animated objects diverged from both vanilla and the in-game-confirmed
+    # prisonSecretWall01).  This write MUST stay at the very end of the
+    # function: an earlier attempt assigned it inside the keyframed branch,
+    # which flipped the mass-keyed decompose gate above and silently rebuilt
+    # the collision compound (see nif_conversion_notes.md, 2026-08-01).  Down
+    # here nothing dispatches on mass any more, so the only bytes that change
+    # are the mass field itself.
+    if keyframed_body:
+        rb.mass = 0.0
 
 def convert_all_collisions(node, actual_root=None, keep_blend=False):
     """Recursively convert collision objects on every node in the entire tree.

@@ -90,9 +90,171 @@ The `-ExtractAssets` flag triggers BSA extraction and mesh conversion:
 - Key differences from static collision in Skyrim:
   - bhkCollisionObject.flags = 137 (0x89 = ACTIVE | D_ANIMATED | bit 7)
   - bhkRigidBody.motion_system = 4 (MO_SYS_KEYFRAMED)
+  - **bhkRigidBody.mass = 0 AND filter layer = 2 SKYL_ANIMSTATIC** (see below)
   - bhkRigidBody.quality_type = 1 (MO_QUAL_FIXED)
   - bhkRigidBody.unknown_byte = 10 (broadphase type for animated)
   - NiNode flags |= 0x80 (selective update sync for physics)
+
+### Keyframed bodies: layer 2 ANIMSTATIC + mass 0 (2026-08-02, PENDING in-game confirmation)
+
+**History, kept honest.** The earlier note here ("mass 0 is MANDATORY,
+implemented") was wrong twice over: (a) the mass write was never in the shipped
+code — the attempted `rb.mass = 0.0` inside the keyframed branch changed which
+downstream shape path ran (hull decomposition keys on `mass > 0`), collapsed
+the collision compound, and was reverted, so **the in-game test that "mass
+changed nothing" tested a broken build, not the theory**; (b) the two
+"real causes" it then blamed (adjacent `PlayGroup`s cancelling; one-sequence
+hold-state dead end) were both fixed and the planks still failed in-game
+(2026-08-02: "begins to animate, stops suddenly, doesn't finish" — so the
+event DOES reach the graph and the sequence starts; something reclaims the
+nodes mid-clip). Do not cite either as the mechanism again.
+
+**The discriminator the earlier session missed is the collision filter
+LAYER.** Census of every vanilla motion_system=4 body found
+(`farmhouseanimdoor01`, `farmbtrapdoor01`, `rtirongate01`, `orcdoor01`,
+`riftenkeepdoor01` ×2, `mrkmarketstalldoor01`, `rifrmsmbasewallgrate01`,
+`rifrmsmsecretcabinetdoor01` ×2, `sldjailwallcollapse01`): **layer 2
+SKYL_ANIMSTATIC and mass exactly 0.0, no exceptions.** Our one in-game-working
+animated object (`prisonSecretWall01`, source-authored OL_ANIM_STATIC + mass 0)
+also ships layer 2 / mass 0. The broken ones shipped **layer 10 PROPS**
+(Oblivion authored the bricks/planks on OL_PROPS, which the 0-18 identity
+remap passes through) with mass 40/100:
+- `mwallplankbreakaway01` (Oblivion + Nehrim) — 8 planks × mass 40, layer 10
+- `IDCrumbleWall01` (ImperialDungeon01) — 13 bricks × mass 100, layer 10
+
+Fix in `_convert_collision`: the keyframed branch forces layer 2 on both
+filters; mass is zeroed at the very END of the function (after the mass-keyed
+decompose gate), so the only bytes that change are the two fields themselves —
+verified by structural diff (block graph identical; prisonSecretWall01
+unchanged in every field). Multiple keyframed bodies per NIF is vanilla-legal
+(`riftenkeepdoor01` ships two).
+
+Note `sldjailwallcollapse01`'s own pattern for multi-piece collapses: ONE
+keyframed mass-0 helper body (`ColHelper01`) and NO collision on the 22
+animated pieces — vanilla never gives each piece its own body. We keep
+per-piece keyframed bodies (faithful to the source collision), normalized to
+the vanilla per-body contract.
+
+### Every state needs a real transitions array — including at ONE sequence (2026-08-01)
+
+`_transitions(exclude_state=i)` gives each motion state "every OTHER sequence",
+so a repeated event cannot restart a sequence mid-play. For a **one-sequence**
+object that set is EMPTY and the emitter writes `transitions=null` — the exact
+dead end the Rest-state comment warns about. `IDCrumbleWall01`'s only sequence
+is `Unequip`, so once it played it could never be re-entered and `OnReset` was
+inert. Fix: when the exclusion would empty the array, keep the self-transition.
+2- and 3-sequence graphs are byte-identical to before, so the working
+`prisonSecretWall01` is unaffected.
+
+The regression test now runs at 1, 2 and 3 sequences — it only covered the
+2-sequence case, which is why this shipped.
+
+### Sequence controlled-block ID strings are the ENGINE'S LOOKUP KEY (2026-08-02)
+
+The engine resolves each controlled block at sequence activation BY STRING: on
+node `<node_name>` find the property whose class is `<property_type>`, then its
+controller of class `<controller_type>`, disambiguated by `<variable_1>`.  Our
+shader-controller rewrites swapped the controller block + `controller_type` but
+left Oblivion's strings — `property_type='NiTexturingProperty'` (a class that
+no longer exists in the file) and `variable_1='0-0-TT_TRANSLATE_V'` — so the
+lookup failed silently and the interpolator never drove the shader:
+palacefont01's fountain shipped a correct V-offset curve that never played.
+Vanilla convention (beehive01, blackpool, dweastrolabehub01, every entry
+sampled): `property_type` = shader class name, `variable_1` =
+`str(type_of_controlled_variable/color)` (`'8'`, `'11'`, …), `variable_2` = `''`.
+Fixed generically in `_normalize_shader_cb_strings` (runs at the end of
+`_match_seq_shader_types`).  PSys controlled-block strings were already
+vanilla-identical (`var1='NiPSysBoxEmitter:0'`, `var2='BirthRate'`) — leave.
+
+### NiGeomMorpherController does not exist in Skyrim — emulate as a vis swap (2026-08-02)
+
+The SSE exe has NO `NiGeomMorpherController` RTTI class (only the orphaned
+`NiMorphData` remains) and vanilla ships 0 uses, so morph entries HAD to be
+dropped — but the morph IS the visible effect for 18 Oblivion meshes
+(ctrigtripwire01's wire snap, se01waitingroomwalls, obliviongate_forming,
+gnarlspawner…).  `_emulate_morphs` (fed by a harvest at the drop site in
+`_process_controller_manager`) bakes each animated morph target into a hidden
+sibling copy of the shape (relative_targets → base verts + deltas) and adds
+NiVisController entries that swap base → target where the weight curve crosses
+0.5.  Structure copied exactly from vanilla sldjailwallcollapse01: node carries
+NiVisController flags=108 + NiBlendBoolInterpolator(bool_value=2); the sequence
+entry carries NiBoolInterpolator + NiBoolData step keys, `controller_type
+'NiVisController'`, empty property/variable strings; clones are appended to the
+manager's NiDefaultAVObjectPalette.  Smooth crossfades degrade to a cut — the
+closest this engine gets.
+
+**The NiBoolData keys MUST be `CONST_KEY` (5), never `LINEAR` (1).**  The first
+cut of `_emulate_morphs` wrote 1 under a comment claiming that was what vanilla
+stores; it is not, and it CTD'd on entering Vilverin — an access violation at
+`0x0` (a null call target) inside `NiBoolData::Load` with the NIF still on the
+stack, `RSI/R14 = NiBoolData*`, `inputFilePath: ctrigtripwire01.nif`.  The
+census is absolute in both directions: **3449/3449 vanilla Skyrim NiBoolData
+and 1296/1296 Oblivion source NiBoolData store 5**, and `nif [version].xml`
+documents type 5 as "Step function.  Used for visibility keys in NiBoolData".
+The two types are byte-identical on disk (`{float time, byte value}`), so the
+file round-trips through PyFFI and NifSkope cleanly and nothing but the engine
+notices — which is why `tools/nif_block_type_audit.py` now checks it (check 3).
+A bool has no meaningful interpolant anyway, so step is also the only type that
+expresses these keys correctly.  This was never Vilverin-specific: it affected
+30 meshes across both plugins, including the Oblivion gates, the Night Mother
+statue, and Nehrim's lockpicking tumblers.
+
+### NiBlendInterpolator must be Manager Controlled (2026-08-02)
+
+Fixing the key type above moved the Vilverin CTD one block later, to
+`lock inc [rax+0x08]` — an AddRef — with `RDI = NiVisController*` and
+`rax = 0xBF800000421BED50`.  That high half is `-1.0f`, i.e. **float data being
+dereferenced as a pointer**, which is the signature of a block read at the wrong
+length.
+
+`NiBlendInterpolator.Flags` bit 0 is **Manager Controlled**.  nif.xml makes the
+next SEVEN fields (Interp Count, Single Index, High Priority, Next High
+Priority, Single Time, High Weights Sum, Next High Weights Sum) conditional on
+that bit being **clear** — so a manager-driven block is 7 bytes and a
+free-standing one is 15.  We were writing `Flags=0` into a 7-byte block, so the
+engine read 15 bytes, ran into the following block, and AddRef'd whatever it
+found.  `Single Time` defaults to `-1.0f`, which is precisely the `0xBF800000`
+in the faulting address.
+
+Vanilla is unanimous: **8779/8779 `NiBlend*Interpolator` blocks store Flags=1,
+Array Size=2** (2688 bool, 5520 float, 571 point3).
+
+The underlying cause is a **PyFFI 2.2.3 broken layout** (cf. NiPSysData): it
+models this block as `unknown_short` + `unknown_int` + `bool_value` instead of
+`byte Flags, byte Array Size, float Weight Threshold, byte Value`.  So
+`unknown_short = 0x0201` IS `Flags=1, ArraySize=2`.  These are **not padding** —
+the usual "never touch unknown_*" rule does not apply, because they are real
+named fields PyFFI failed to describe.  Critically this hits blocks **copied**
+from Oblivion as well as synthesized ones: PyFFI reads them under the old
+version's layout and rewrites them under Skyrim's, and the flags do not survive.
+`_normalize_blend_interpolators` therefore stamps the header onto every blend
+interpolator in the tree after all controller passes, and
+`tools/nif_block_type_audit.py` checks it (check 4).  261 blocks across 26
+Oblivion meshes were affected — gates, magic effects, creatures and the enemy
+health bar, not just the morph-swap meshes.
+
+### Oblivion `sound:` text keys are dead in Skyrim (2026-08-02)
+
+The exe's text-key keyword table (strings at RVA 0x162fd50: `SoundPlay`,
+`SoundPlayAt`, `SoundStop`, `SoundRelease`) has no `sound:` prefix; vanilla
+keys look like `SoundPlay.DRSStoneWallJailCollapse` where the suffix is a SNDR
+EDITOR ID.  `_convert_sound_text_keys` rewrites `sound: X` →
+`SoundPlay.TES4_X_SNDR`, matching the importer's SNDR EDID convention
+(`dialog_misc.convert_SOUN`), so converted sequences regain their sounds.
+
+### PlayGroup chains: NEVER convert to PlayAnimationAndWait (2026-08-02)
+
+`PlayAnimationAndWait("<seq>", "<event>")` waits on a BEHAVIOR-GRAPH event.  A
+BGSGamebryoSequenceGenerator state has no completion event and NIF text keys
+are not delivered as anim events — vanilla proof: every gamebryo-sequence
+object script (norsarcophagustopanim01script, dunsolitudejailopencelldoor, the
+Solitude jail-wall scene) uses plain `PlayAnimation` with a state debounce and
+never waits; the scripts that DO wait (`sarcophagusskulllock01script`
+"alldone", `dunlabyanimateontrig` "done") drive native-hkx objects whose
+events are havok annotations.  The wait blocks its thread forever.  Consecutive
+same-frame PlayGroups therefore stay plain `PlayAnimation` calls (last event
+wins — which also matches Oblivion's own queue-depth-1 PlayGroup semantics).
+
 - BSXFlags must have bit 0 set (ANIMATED) → value 139 (0x8B) for animated meshes. Detect via NiControllerManager on root.
 - Animation data: NiControllerSequence StringPalette offsets MUST be resolved BEFORE version upgrade (UV2=11→83). After upgrade, PyFFI switches to direct-string mode and offsets are ignored → empty node_name → crash.
 - **EVERY `NiTimeController` needs "Compute Scaled Time" (flags bit 6, 0x40) or a `PlayAnimation()`d sequence NEVER MOVES — the CharacterGen secret-wall fix (2026-07-26, `_fix_controller_flags`)**: `nif.xml` `TimeControllerFlags` declares bit 6 `default="true"`, and Oblivion's engine computed scaled time unconditionally without ever writing the bit — every controller in the Chargen secret-wall/switch NIFs stores 12 / 40 / 44, always 0x40 **clear**. Skyrim reads the flag: the sequence binds its targets, `ObjectReference.PlayAnimation("Forward")` returns success and logs **no Papyrus error**, but scaled time never advances so the object sits on frame 0 forever. Symptom was maximally misleading — the quest stage said the wall had opened (the switch fired, `secretDoor` flipped 0→1, the timer ran; all visible in the `TES4CharGen` user log) while the wall physically stayed shut. Census: across 62 vanilla animated door/activator meshes (Windhelm animated secret doors, Nordic animated doors, Dwemer doors, Labyrinthian panel, Winterhold anim door) **157/157 `NiMultiTargetTransformController` have flags=108 (0x6C)** and every other controller — `NiTransformController`, `NiControllerManager`, `NiVisController`, `NiFloatExtraDataController` — has **76 (0x4C)**; both set 0x40, and 108 vs our 44 differs *only* in this bit. Fix ORs 0x40 into every `NiTimeController` in the tree before the version upgrade, so activators/doors/traps/levers are all covered. This generalizes the emitter-controller rule below (which had it only for `NiPSysEmitterCtlr`/`NiPSysUpdateCtlr`) and the `0x48` already hardcoded on the flip-book `BSEffectShaderPropertyFloatController`.
@@ -449,7 +611,7 @@ Besides the non-T rotation root cause above, the "chains/traps look right but ne
 2. **Collision-filter layer remap** (`_remap_world_filter`): Oblivion layers 0-18 equal Skyrim's, but 19+ diverge and Oblivion authored world props on ragdoll bone layers (cellchain01 anchor = 42 OL_L_FOOT → Skyrim PATHPICK = raycast-only, NO collision). Body-part layers 33-57 → 10 SKYL_PROPS (vanilla trapmace links' layer); pick layers shift +15; stairs 19→31, char controller 20→30, avoid box 21→34.
 3. **Filter flags/part byte + group must be zeroed** on world objects: Oblivion chains ship 0x80|partnum ("Linked Group" bit 7 + biped part); vanilla Skyrim constrained props ship 0 and rely on runtime per-reference group assignment. Biped part numbers only mean anything on layer 8/32/33.
 4. **Oblivion MO_SYS_KEYFRAMED (6) is a THREE-WAY split** (this took three in-game test rounds to get right — both simpler rules made things worse):
-   - node driven by animation (`_node_is_animated`: sequence controlled-blocks, NiMultiTargetTransformController extra targets, or a transform controller on the node) → Skyrim KEYFRAMED (ms 4, quality 1, collObj 137, node flag |0x80). Gate leaves (mass=100, no constraints, Open/Close sequences) — treating gates as dynamic made them "fall off their hinges" (they have NO hinge constraints; they swing by animation).
+   - node driven by animation (`_node_is_animated`: sequence controlled-blocks, NiMultiTargetTransformController extra targets, or a transform controller on the node) → Skyrim KEYFRAMED (ms 4, quality 1, collObj 137, node flag |0x80, **mass forced to 0**). Gate leaves (mass=100, no constraints, Open/Close sequences) — treating gates as dynamic made them "fall off their hinges" (they have NO hinge constraints; they swing by animation). **The mass-0 forcing is mandatory**: a keyframed body with non-zero mass is an active simulated island, so physics overwrites the animated transform every step and the object never visibly moves even though the sequence plays normally (vanilla: 11/11 keyframed bodies are mass 0). See "A keyframed body MUST have mass 0" above.
    - mass>0 AND owns a constraint → DYNAMIC. Oblivion marks entire swinging traps keyframed ("Unyielding=1" links) because ITS engine holds traps rigid until the trap script enables havok; Skyrim's trapmace01 ships the same links DYNAMIC (ms 3, quality 4). Keyframing them = trap welded solid.
    - everything else (constrained-island anchors cellchain01/cellChainMiddle mass=100, unyielding props) → STATIC with mass forced to 0. Vanilla chain/noose/trap anchors are ALWAYS static mass-0 bodies (NooseRopePiece01 root, trapmace Base01), NEVER keyframed — a keyframed body with anim flags on a non-animated object flips the engine into the baked path and the whole compound (all its dynamic children included) acts welded solid.
 - **Trigger phantoms are SUPPORTED by Skyrim** — do NOT strip `bhkSPCollisionObject`/`bhkSimpleShapePhantom`: vanilla ships 31 under meshes/traps alone (tripwire, pressure plates, bear trap), always collObj flags=129 + layer 12 TRIGGER. Convert the inner shape (×0.1 + material) and keep. Stripping them killed every Oblivion trigger volume (tripwire never fired).

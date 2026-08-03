@@ -3,6 +3,7 @@
 import struct
 
 from ..constants import LOD_SIZE_THRESHOLD, WORLD_MAP_SIZE_THRESHOLD
+from ..mesh_bounds import get_mesh_physics_flags
 from .common import (
     VENDOR_KYWD,
     _common_header_subs,
@@ -26,7 +27,16 @@ from .common import (
 
 
 def convert_STAT(rec: dict) -> bytes:
-    """Convert STAT record, deriving LOD/world-map flags from mesh bounding box size."""
+    """Convert STAT record, deriving LOD/world-map flags from mesh bounding box size.
+
+    A STAT whose converted mesh is a constrained dynamic havok island
+    (swinging chains, hanging cages) is written as MSTT instead: Skyrim never
+    simulates constrained bodies on a STAT reference, so PrisonCellChains01
+    hung completely rigid.  Vanilla routes ALL such content through MSTT
+    (every swinging inn sign, e.g. SignBraidwoodInn01, MSTT DATA=0) or ACTI
+    (TrapBoneAlarmHavok01).  The FormID is unchanged, so placed REFRs keep
+    resolving.
+    """
     flags = get_int(rec, 'RecordFlags')
     # Resolve OBND from converted mesh bounds (or type default as fallback).
     bounds = _resolve_obnd(rec, 'STAT')
@@ -40,6 +50,12 @@ def convert_STAT(rec: dict) -> bytes:
     path = get_str(rec, 'Model.MODL')
     if path:
         subs += pack_string_subrecord('MODL', _prefix_path(path))
+        key = _prefix_path(path).lower().replace('\\', '/')
+        if get_mesh_physics_flags(key) & 1:
+            # MSTT layout (xEdit + Skyrim.esm): EDID OBND [FULL] MODL DATA
+            # [SNAM]; DATA is a REQUIRED u8 — 0 on the swinging signs.
+            subs += pack_uint8_subrecord('DATA', 0)
+            return pack_record('MSTT', get_formid(rec, 'FormID'), flags, subs)
     return pack_record('STAT', get_formid(rec, 'FormID'), flags, subs)
 
 

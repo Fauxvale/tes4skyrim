@@ -335,6 +335,38 @@ def bounds_from_data(data):
     )
 
 
+def physics_flags_from_data(data) -> int:
+    """Physics facts the IMPORTER needs about a converted mesh, as bit flags.
+
+    bit 0 — constrained dynamic island: the mesh contains at least one
+    simulated (mass > 0) rigid body AND at least one bhk constraint block.
+    Skyrim only simulates such content on MSTT/ACTI references — a STAT
+    reference leaves the whole compound frozen (Oblivion's PrisonCellChains01
+    is a STAT; every vanilla swinging sign is MSTT, the bone-alarm is ACTI).
+    The constraint is checked file-wide, not per-body, because chain links
+    routinely carry mass with ncons=0 and hang off an anchor's constraint
+    (vanilla trapbonealarmhavok01 stores its bhkBallSocketConstraintChain on
+    the static peg, not on the swinging bones).
+
+    Shipped as the OPTIONAL 7th element of a bounds-cache entry; absent means
+    0, so pre-existing 6-element caches stay readable.
+    """
+    has_dynamic = False
+    has_constraint = False
+    for block in data.blocks:
+        cls = type(block).__name__
+        if cls in ('bhkRigidBody', 'bhkRigidBodyT'):
+            if getattr(block, 'mass', 0) > 0:
+                has_dynamic = True
+            if getattr(block, 'num_constraints', 0) > 0:
+                has_constraint = True
+        elif cls.startswith('bhk') and 'Constraint' in cls:
+            has_constraint = True
+        if has_dynamic and has_constraint:
+            return 1
+    return 0
+
+
 def _worker(args: tuple):
     """Collision only (kept for `python -m asset_convert.collision_extract`)."""
     nif_path, rel_key = args
@@ -360,6 +392,13 @@ def _worker_both(args: tuple):
         bounds = bounds_from_data(data)
     except Exception:
         bounds = None
+    if bounds is not None:
+        try:
+            phys = physics_flags_from_data(data)
+        except Exception:
+            phys = 0
+        if phys:
+            bounds = bounds + (phys,)
     try:
         col = collision_from_data(data)
     except Exception:
