@@ -367,6 +367,284 @@ def physics_flags_from_data(data) -> int:
     return 0
 
 
+def _tri_shape_points(shape):
+    """Vertices of a bhk triangle-mesh collision shape, in shape space.
+
+    bhkPackedNiTriStripsShape keeps them in a shared hkPackedNiTriStripsData;
+    bhkNiTriStripsShape keeps a list of NiTriStripsData.  Both are scaled by the
+    shape's own `scale` where present.
+    """
+    pts = []
+    data = getattr(shape, 'data', None)
+    if data is not None and hasattr(data, 'vertices'):
+        for v in data.vertices:
+            pts.append((v.x, v.y, v.z))
+    for sd in (getattr(shape, 'strips_data', None) or ()):
+        if getattr(sd, 'has_vertices', True):
+            for v in sd.vertices:
+                pts.append((v.x, v.y, v.z))
+    if not pts:
+        return pts
+    # bhkPackedNiTriStripsShape stores vertices already in havok units; the
+    # per-shape scale (when it is a vector) applies on top.
+    sc = getattr(shape, 'scale', None)
+    if sc is not None and hasattr(sc, 'x'):
+        sx, sy, sz = sc.x or 1.0, sc.y or 1.0, sc.z or 1.0
+        if (sx, sy, sz) != (1.0, 1.0, 1.0):
+            pts = [(p[0] * sx, p[1] * sy, p[2] * sz) for p in pts]
+    return pts
+
+
+def _unwrap_shapes(shape, depth=0):
+    """Yield the leaf collision shapes inside wrappers and containers.
+
+    bhkMoppBvTreeShape / bhkConvexTransformShape wrap ONE shape; bhkListShape
+    holds SEVERAL (the prison cell gates ship as a list of bars).  A door whose
+    shape is a container yielded nothing before, which made it look like a
+    trapdoor and dropped the door entirely.
+    """
+    if shape is None or depth > 6:
+        return
+    name = type(shape).__name__
+    if name in ('bhkMoppBvTreeShape', 'bhkConvexTransformShape',
+                'bhkTransformShape'):
+        yield from _unwrap_shapes(getattr(shape, 'shape', None), depth + 1)
+        return
+    if name == 'bhkListShape':
+        for sub in (getattr(shape, 'sub_shapes', None) or ()):
+            yield from _unwrap_shapes(sub, depth + 1)
+        return
+    yield shape
+
+
+def _shape_points(shape):
+    """Vertices of one leaf collision shape, in shape space, or None."""
+    name = type(shape).__name__
+    if name == 'bhkBoxShape':
+        d = shape.dimensions
+        return [(sx * d.x, sy * d.y, sz * d.z)
+                for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
+    if name == 'bhkConvexVerticesShape':
+        return [(v.x, v.y, v.z) for v in shape.vertices] or None
+    if name in ('bhkNiTriStripsShape', 'bhkPackedNiTriStripsShape'):
+        return _tri_shape_points(shape) or None
+    if name == 'bhkCompressedMeshShape':
+        # The converted doors ship CMS (Skyrim's format) -- 85 vanilla door
+        # models arrive here, including every Cheydinhal/Bravil/Leyawiin and
+        # castle-tower door.  Reuse the existing decoder.
+        cms_data = getattr(shape, 'data', None)
+        if cms_data is None:
+            return None
+        try:
+            from .cms import decode_cms
+            return [v for _key, tri in decode_cms(cms_data) for v in tri] or None
+        except Exception:
+            return None
+    return None
+
+
+def _pal_name(sp, off):
+    """Resolve a NiStringPalette offset to a node name, or None."""
+    if sp is None or off is None or off < 0:
+        return None
+    try:
+        pal = sp.palette.palette
+    except AttributeError:
+        return None
+    if isinstance(pal, str):
+        pal = pal.encode('latin1')
+    end = pal.find(b'\x00', off)
+    return pal[off:end if end >= 0 else None].decode('ascii', 'replace')
+
+
+def _mat_mul(A, B):
+    return [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)]
+            for i in range(3)]
+
+
+def _quat_mat(w, x, y, z):
+    return [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+
+
+def _euler_xyz_mat(ax, ay, az):
+    import math as _m
+    cx, sx = _m.cos(ax), _m.sin(ax)
+    cy, sy = _m.cos(ay), _m.sin(ay)
+    cz, sz = _m.cos(az), _m.sin(az)
+    Rx = [[1, 0, 0], [0, cx, -sx], [0, sx, cx]]
+    Ry = [[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]
+    Rz = [[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]
+    return _mat_mul(_mat_mul(Rx, Ry), Rz)
+
+
+def _close_pose_overrides(data):
+    """{node name: (R|None, T|None, keyed)} from the 'Close' sequence.
+
+    Each controlled node's local transform in the fully-CLOSED pose: the FINAL
+    key values of its interpolator's data (XYZ rotation groups or quaternion
+    keys, plus translation keys), else the interpolator's direct transform
+    when finite.  `keyed` is True only when real key data exists — that is
+    what distinguishes the moving door leaf from a statically-retargeted
+    frame piece.
+    """
+    seq = None
+    for b in data.blocks:
+        if type(b).__name__ != 'NiControllerSequence':
+            continue
+        nm = b.name
+        if isinstance(nm, bytes):
+            nm = nm.decode('ascii', 'replace')
+        if nm.lower() == 'close':
+            seq = b
+            break
+    if seq is None:
+        return {}
+    out = {}
+    for cb in (getattr(seq, 'controlled_blocks', None) or []):
+        nn = _pal_name(getattr(cb, 'string_palette', None),
+                       getattr(cb, 'node_name_offset', None))
+        itp = getattr(cb, 'interpolator', None)
+        if not nn or itp is None:
+            continue
+        R = T = None
+        keyed = False
+        dt = getattr(itp, 'translation', None)
+        if dt is not None and abs(dt.x) < 1e30:
+            T = [dt.x, dt.y, dt.z]
+        dr = getattr(itp, 'rotation', None)
+        if dr is not None and abs(getattr(dr, 'w', 3e38)) < 1e30:
+            R = _quat_mat(dr.w, dr.x, dr.y, dr.z)
+        d = getattr(itp, 'data', None)
+        if d is not None:
+            if int(getattr(d, 'rotation_type', 0) or 0) == 4:
+                angs = []
+                got = False
+                for g in d.xyz_rotations:
+                    ks = getattr(g, 'keys', None) or []
+                    got = got or bool(len(ks))
+                    angs.append(float(ks[-1].value) if len(ks) else 0.0)
+                if got:
+                    # An all-zero final rotation is still a CLOSED pose (the
+                    # leaf swings back to identity) — key data existing is
+                    # what marks the node as the moving door.
+                    R = _euler_xyz_mat(*angs)
+                    keyed = True
+            else:
+                qk = getattr(d, 'quaternion_keys', None) or []
+                if len(qk):
+                    q = qk[-1].value
+                    R = _quat_mat(q.w, q.x, q.y, q.z)
+                    keyed = True
+            tks = getattr(d.translations, 'keys', None) or []
+            if len(tks):
+                v = tks[-1].value
+                T = [v.x, v.y, v.z]
+                keyed = True
+        if R is not None or T is not None:
+            out[nn] = (R, T, keyed)
+    return out
+
+
+def door_closed_geometry(data):
+    """Doorway as ('X'|'Y', width, centre_x, centre_y, z_min) — WORLD units.
+
+    Reads the ORIGINAL Oblivion NIF's render graph at the CLOSED pose: the
+    'Close' controller sequence's final key values override each animated
+    node's local transform, then the union bbox of the shapes under the KEYED
+    nodes — the door leaf/leaves themselves — gives the doorway span, its
+    centre relative to the REFR pivot, and the slab's base height.
+
+    This is the AUTHORED closed door, which no static measurement recovers:
+    idgate01's two leaves are STORED mid-open (bbox nowhere near the doorway)
+    and swing 90 degrees on 'Close'; the converted collision (previous source
+    for this cache) additionally baked the leaf transforms wrong, which is
+    what rotated and offset the CharacterGen pen gate's Door Triangle.
+
+    Frames, arches and static fence sections carry no keys, so they never
+    widen the doorway (idgate01's fixed side grates span 269u; its keyed
+    leaves close to 133u).  A model with no Close sequence measures all its
+    shapes at rest pose — plain static doors are stored closed.
+
+    Returns None when the closed union is thin in Z (a trapdoor/hatch: swings
+    about a horizontal axis, no vertical threshold line exists).
+    """
+    ovr = _close_pose_overrides(data)
+    shapes = []                              # (keyed, lo3, hi3)
+
+    ident = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+
+    def walk(node, R, T, s, keyed):
+        name = getattr(node, 'name', b'')
+        if isinstance(name, bytes):
+            name = name.decode('ascii', 'replace')
+        o = ovr.get(name)
+        my_keyed = keyed or bool(o and o[2])
+        if o and o[0] is not None:
+            lr = o[0]
+        else:
+            m = getattr(node, 'rotation', None)
+            lr = ([[m.m_11, m.m_12, m.m_13],
+                   [m.m_21, m.m_22, m.m_23],
+                   [m.m_31, m.m_32, m.m_33]] if m is not None else ident)
+        if o and o[1] is not None:
+            lt = o[1]
+        else:
+            tr = getattr(node, 'translation', None)
+            lt = [tr.x, tr.y, tr.z] if tr is not None else [0.0, 0.0, 0.0]
+        ls = getattr(node, 'scale', 1.0) or 1.0
+        Tw = [R[i][0] * lt[0] * s + R[i][1] * lt[1] * s
+              + R[i][2] * lt[2] * s + T[i] for i in range(3)]
+        Rw = _mat_mul(R, lr)
+        sw = s * ls
+        ln = type(node).__name__
+        if ln in ('NiTriShape', 'NiTriStrips') \
+                and getattr(node, 'data', None) is not None:
+            vs = node.data.vertices
+            if len(vs):
+                lo = [1e30] * 3
+                hi = [-1e30] * 3
+                for v in vs:
+                    q = (v.x * sw, v.y * sw, v.z * sw)
+                    for i in range(3):
+                        p = (Rw[i][0] * q[0] + Rw[i][1] * q[1]
+                             + Rw[i][2] * q[2] + Tw[i])
+                        if p < lo[i]:
+                            lo[i] = p
+                        if p > hi[i]:
+                            hi[i] = p
+                shapes.append((my_keyed, lo, hi))
+        for ch in (getattr(node, 'children', None) or []):
+            if ch is not None:
+                walk(ch, Rw, Tw, sw, my_keyed)
+
+    for r in data.roots:
+        try:
+            walk(r, ident, [0.0, 0.0, 0.0], 1.0, False)
+        except Exception:
+            continue
+    if not shapes:
+        return None
+    pick = [sh for sh in shapes if sh[0]] or shapes
+    lo = [min(sh[1][i] for sh in pick) for i in range(3)]
+    hi = [max(sh[2][i] for sh in pick) for i in range(3)]
+    ex, ey, ez = hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]
+    if max(ex, ey) <= 1e-9:
+        return None
+    # Thin in Z => swings about a HORIZONTAL axis (trapdoor, hatch, grate,
+    # display case, manhole cover).  No vertical-axis threshold line exists,
+    # so the caller must skip it rather than lay a door quad in a made-up
+    # direction.
+    if ez < max(ex, ey) * 0.5:
+        return None
+    axis = 'Y' if ey > ex else 'X'
+    return (axis, max(ex, ey),
+            0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), lo[2])
+
+
 def _worker(args: tuple):
     """Collision only (kept for `python -m asset_convert.collision_extract`)."""
     nif_path, rel_key = args
@@ -382,6 +660,11 @@ def _worker_both(args: tuple):
     The whole point of the merged scan: bounds and collision each cost ~15-30 ms
     of analysis on top of a ~174 ms parse, so parsing once and running both
     nearly halves the combined phase.
+
+    NOTE: the door axis/centre cache is NOT produced here any more — the scan
+    reads CONVERTED meshes, and door geometry must come from the ORIGINAL
+    NIF's Close-sequence pose (see door_closed_geometry).  It is built by
+    tools/build_door_axis_cache.py from the export meshes.
     """
     nif_path, rel_key = args
     try:
@@ -545,6 +828,11 @@ def scan_mesh_data(mesh_dir: str, collision_cache: str, bounds_cache: str,
     os.makedirs(os.path.dirname(os.path.abspath(bounds_cache)), exist_ok=True)
     with open(bounds_cache, 'w', encoding='utf-8') as fh:
         json.dump({k: list(v) for k, v in bnd_results.items()}, fh)
+
+    # NOTE: door_panel_axis_cache.json is NOT written here — door geometry
+    # must come from the ORIGINAL NIF's Close-sequence pose, and this scan
+    # reads the converted output meshes.  Run tools/build_door_axis_cache.py
+    # (reads export/<plugin>/meshes) to build it.
 
     return len(col_results), len(bnd_results)
 

@@ -265,6 +265,796 @@ def _distance_to(s, px, py):
     return math.hypot(px - (ax + dx * t), py - (ay + dy * t))
 
 
+def attach_door_triangles(verts, tris, pending):
+    """Add the reserved door triangles to the FINISHED 3D mesh.
+
+    Called once, after every cleanup pass, so nothing downstream can split or
+    drop them.  Each corner snaps to the nearest existing vertex within
+    ATTACH_R so the triangle shares real edges with the surrounding mesh
+    (NVNM adjacency links only across shared edges); a corner with no
+    neighbour mints a new vertex at the reserved position, lifted to the
+    height of the mesh around it.
+    """
+    if not pending:
+        return verts, tris
+    # The BASE endpoints must land exactly on the door line, so they snap only
+    # to a vertex practically on top of them; the apex may snap further, since
+    # sharing an existing interior vertex is what gives the triangle real
+    # shared edges with the mesh around it.
+    ATTACH_R_BASE = 2.0
+    # When no vertex sits exactly on a base corner, the corner usually STILL
+    # exists — decimation collapsed the wedge's hole-ring corner into a nearby
+    # boundary vertex (measured on Arvena's upstairs door: corners moved 7.8
+    # and 10.1u inboard), and that survivor keeps the ring's edge structure to
+    # the apex.  Pull it BACK to the exact corner instead of minting a
+    # duplicate beside it: the door triangle regains its full width and
+    # inherits the survivor's shared edges in one move.
+    ATTACH_R_BASE_PULL = 16.0
+    # 12, not 8: measured on ImperialDungeon01's upper-hall door, whose apex
+    # landed 8.2u from the mesh vertex it belonged on and minted a duplicate
+    # instead — the door triangle then shared no edge and hung as an island.
+    ATTACH_R_APEX = 12.0
+    verts = [tuple(float(c) for c in v) for v in verts]
+    tris = [tuple(int(i) for i in t) for t in tris]
+
+    cell = max(ATTACH_R_APEX, 1.0)
+    grid = {}
+    for i, v in enumerate(verts):
+        grid.setdefault((int(v[0] // cell), int(v[1] // cell)), []).append(i)
+
+    def _near(x, y, r, z=None):
+        """Existing vertex within r of (x, y) AND on the same storey as z.
+
+        The Z gate is what keeps a door corner on its own floor: matching in
+        plan alone let a corner in a multi-storey building snap to the floor
+        above or below, and the resulting triangle spanned the storeys.
+        """
+        best = None
+        gx, gy = int(x // cell), int(y // cell)
+        for ddx in (-1, 0, 1):
+            for ddy in (-1, 0, 1):
+                for i in grid.get((gx + ddx, gy + ddy), ()):
+                    if z is not None and abs(verts[i][2] - z) > STOREY_GAP_Z:
+                        continue
+                    d = (verts[i][0] - x) ** 2 + (verts[i][1] - y) ** 2
+                    if d <= r * r and (best is None or d < best[0]):
+                        best = (d, i)
+        return best[1] if best else None
+
+    def _height(x, y, z=None):
+        """Height of the mesh near (x, y) ON THIS STOREY."""
+        if z is not None:
+            return z
+        best = None
+        gx, gy = int(x // cell), int(y // cell)
+        for ddx in (-2, -1, 0, 1, 2):
+            for ddy in (-2, -1, 0, 1, 2):
+                for i in grid.get((gx + ddx, gy + ddy), ()):
+                    d = (verts[i][0] - x) ** 2 + (verts[i][1] - y) ** 2
+                    if best is None or d < best[0]:
+                        best = (d, verts[i][2])
+        return best[1] if best else 0.0
+
+    existing = {tuple(sorted(int(i) for i in t)) for t in tris}
+    # Per-edge use counts over the CURRENT mesh, kept up to date as door
+    # triangles and gap fills are appended.  A door triangle that shares no
+    # EDGE with the mesh is a dead island however many vertices it shares —
+    # NVNM adjacency links only across shared edges.
+    edge_use = {}
+
+    def _count_edges(t, delta=1):
+        for k in range(3):
+            p, q = int(t[k]), int(t[(k + 1) % 3])
+            e = (p, q) if p < q else (q, p)
+            edge_use[e] = edge_use.get(e, 0) + delta
+
+    for t in tris:
+        _count_edges(t)
+
+    door_keys = []
+    added = 0
+    # ONE TRIANGLE PER DOOR LINE.  The same door can be reserved by two sheets
+    # that both border the threshold; attaching both puts two triangles on the
+    # same door line and breaks the guarantee.  Key on the base line.
+    seen_lines = {}
+
+    def _attach_one(entry, allow_bridge):
+        """Attach one pending door triangle.
+
+        Returns False when the door was withdrawn or had nothing to attach
+        to — retriable: a second pass can succeed once NEIGHBOURING doors
+        attached (the pen's teleport door bridges to the pen gate's carved
+        triangle).  True means done (attached, or legitimately skipped).
+        """
+        nonlocal added
+        p0, p1, apex = entry[0], entry[1], entry[2]
+        storey_z = entry[3] if len(entry) > 3 else None
+        idx = []
+        minted = 0
+        for (x, y), r, is_base in ((p0, ATTACH_R_BASE, True),
+                                   (p1, ATTACH_R_BASE, True),
+                                   (apex, ATTACH_R_APEX, False)):
+            i = _near(x, y, r, storey_z)
+            if i is None and is_base:
+                # Pull a decimation-displaced ring corner back to the exact
+                # base corner (see ATTACH_R_BASE_PULL above).
+                i = _near(x, y, ATTACH_R_BASE_PULL, storey_z)
+                if i is not None:
+                    verts[i] = (float(x), float(y), verts[i][2])
+                    grid.setdefault((int(x // cell), int(y // cell)),
+                                    []).append(i)
+            if i is None:
+                i = len(verts)
+                verts.append((float(x), float(y), _height(x, y, storey_z)))
+                grid.setdefault((int(x // cell), int(y // cell)),
+                                []).append(i)
+                minted += 1
+            idx.append(i)
+        a, b, c = idx
+        # A triangle whose corners are ALL new shares no vertex with the mesh,
+        # so it lands as its own component and the doorway is unreachable
+        # (ImperialDungeon01's right-hand door came out as a lone 1-triangle
+        # island).  Retry those corners with the wide radius so the triangle
+        # attaches to the surrounding ground.
+        if minted == 3:
+            wide = [_near(x, y, ATTACH_R_APEX * 4.0, storey_z)
+                    for (x, y) in (p0, p1, apex)]
+            if all(i is None for i in wide):
+                # NOTHING to attach to: this door's corridor was never built
+                # (the pathgrid does not reach it), so the triangle would land
+                # as a lone island — an unreachable scrap, which is worse than
+                # no door triangle.  Drop the vertices just minted and skip.
+                del verts[len(verts) - 3:]
+                return False
+            idx = []
+            for (x, y), i in zip((p0, p1, apex), wide):
+                if i is None:
+                    i = len(verts)
+                    verts.append((float(x), float(y), _height(x, y, storey_z)))
+                    grid.setdefault((int(x // cell), int(y // cell)),
+                                    []).append(i)
+                idx.append(i)
+            a, b, c = idx
+        if a == b or b == c or a == c:
+            return True
+        # The hole was cut in 2D but the mesh is welded in 3D, so a corner may
+        # have snapped onto geometry that already covers this footprint.  A
+        # duplicate triangle over the same ground reads as OPPOSITE_NORMALS to
+        # the CK rules, so skip when the exact triangle is already present.
+        key = tuple(sorted((a, b, c)))
+        if key in existing:
+            return True
+        existing.add(key)
+        # Match the surrounding winding (CCW in plan); a backwards door
+        # triangle reads as downfacing to the CK rules and to the engine.
+        cross = ((p1[0] - p0[0]) * (apex[1] - p0[1])
+                 - (apex[0] - p0[0]) * (p1[1] - p0[1]))
+        # ONE TRIANGLE PER DOOR LINE PER STOREY.  Two sheets that both border
+        # a threshold each reserve it, which would put two triangles on the
+        # same line; but a door line repeated at a genuinely different HEIGHT
+        # is a different storey's doorway and must keep its own triangle.
+        line_key = (round(p0[0], 1), round(p0[1], 1),
+                    round(p1[0], 1), round(p1[1], 1))
+        z_here = verts[a][2]
+        prev_z = seen_lines.get(line_key)
+        if prev_z is not None and abs(prev_z - z_here) <= STOREY_GAP_Z:
+            return True
+        seen_lines[line_key] = z_here
+        # DE-STACK.  The triangulation keeps any Delaunay triangle with >=50%
+        # of its area inside the polygon, so ground OVERLAPPING the reserved
+        # wedge survives the cut.  If such a triangle already gives one of the
+        # door triangle's edges two users, appending on top makes the edge
+        # 3-shared — and _compute_adjacency links only edges shared by exactly
+        # two triangles, so the whole doorway DISCONNECTS (measured on
+        # ImperialDungeon01's upper-hall door: mesh tris 35+1489 both used the
+        # wedge side, the door triangle made it 3-shared, and the door hung as
+        # a 1-triangle island).  Drop, per saturated edge, the user that
+        # overlaps the door wedge most; the door triangle takes its place.
+        sat = [(p, q) for (p, q) in ((a, b), (b, c), (a, c))
+               if edge_use.get((min(p, q), max(p, q)), 0) >= 2]
+        if sat:
+            from shapely.geometry import Polygon as _SP
+            try:
+                door_poly = _SP([(verts[i][0], verts[i][1])
+                                 for i in (a, b, c)])
+            except Exception:
+                door_poly = None
+            if door_poly is None or not door_poly.is_valid \
+                    or door_poly.area < 1.0:
+                return True
+            drop = set()
+            ok = True
+            for (p, q) in sat:
+                users = [ti for ti, tt in enumerate(tris)
+                         if p in tt and q in tt and ti not in drop]
+                best_drop, best_ov = None, 0.0
+                for ti in users:
+                    try:
+                        tp = _SP([(verts[i][0], verts[i][1])
+                                  for i in tris[ti]])
+                        ov = tp.intersection(door_poly).area
+                    except Exception:
+                        ov = 0.0
+                    if ov > best_ov:
+                        best_ov, best_drop = ov, ti
+                if best_drop is None or best_ov <= 1.0:
+                    # No user genuinely overlaps the wedge: this saturated
+                    # edge is real double-sided ground.  Adding the door
+                    # triangle would still 3-share it, so skip this door —
+                    # the doorway is already meshed and _build_door_links
+                    # falls back to the containing triangle.
+                    ok = False
+                    break
+                drop.add(best_drop)
+            if not ok:
+                return True
+            for ti in sorted(drop, reverse=True):
+                _count_edges(tris[ti], -1)
+                existing.discard(tuple(sorted(int(i) for i in tris[ti])))
+                del tris[ti]
+        # Does the door triangle share an EDGE with the mesh as it stands?
+        shared = any(edge_use.get((min(p, q), max(p, q)), 0) > 0
+                     for (p, q) in ((a, b), (b, c), (a, c)))
+        door_tri = (a, b, c) if cross > 0 else (a, c, b)
+        tris.append(door_tri)
+        _count_edges(door_tri)
+        door_keys.append((a, b, c))
+        added += 1
+        if not shared:
+            # EDGE-ISOLATED door triangle: all three corners snapped to real
+            # mesh vertices (or minted beside them), yet no mesh triangle uses
+            # any PAIR of them, so the door is its own component — measured on
+            # ImperialDungeon01's ambush-room door, whose surrounding Delaunay
+            # bridged the reserved wedge's corners through OTHER vertices and
+            # left a void strip along the wedge sides.  Stitch it in: walk the
+            # mesh's open-edge boundary from one corner of a door-tri edge to
+            # the other and fan-fill that strip (or, when the boundary runs
+            # collinearly along a side edge, split the door triangle at the
+            # T-junction vertices), so real edges are shared on both sides.
+            fills, repl = _stitch_isolated_tri(verts, tris, edge_use,
+                                               door_tri, existing,
+                                               base=(a, b))
+            if repl is not None:
+                _count_edges(door_tri, -1)
+                existing.discard(tuple(sorted(door_tri)))
+                tris.pop()
+                for ftri in repl:
+                    tris.append(ftri)
+                    _count_edges(ftri)
+                    existing.add(tuple(sorted(ftri)))
+            elif not fills:
+                # LAST RESORT — APEX BRIDGE.  The apex snapped onto a real
+                # mesh vertex, but both base corners minted far from any mesh:
+                # the corridor stops short of the doorway and the quad's thin
+                # crumbs were eaten by the cleanup passes (measured on the
+                # CharacterGen assassins' room door, whose room ribbon ends
+                # 43u west of the threshold — the boundary chain is 75u+ from
+                # the base corners, beyond the stitch's jump radius).  Bridge
+                # each base corner to the mesh THROUGH the apex: a triangle
+                # (apex, corner, w) per corner, where w is an open-edge
+                # neighbour of the apex — it shares edge apex-w with the mesh
+                # and edge apex-corner with the door triangle, so the doorway
+                # is edge-connected on both sides.
+                fills = _apex_bridges(verts, tris, edge_use, (a, b), c,
+                                      existing)
+                if not fills:
+                    # CARVE: the doorway region is covered by ordinary mesh
+                    # the reservation never cut (another sheet, or the wedge's
+                    # ring slivers died at the Delaunay area filter).  Rebuild
+                    # that patch around the wedge so the door triangle gets
+                    # real shared edges (see _carve_door).
+                    carved = _carve_door(verts, tris, edge_use, existing,
+                                         door_tri, storey_z)
+                    if carved is not None:
+                        removed, repl_tris = carved
+                        for ti in reversed(removed):
+                            _count_edges(tris[ti], -1)
+                            existing.discard(tuple(sorted(int(i)
+                                                          for i in tris[ti])))
+                            del tris[ti]
+                        for ftri in repl_tris:
+                            tris.append(ftri)
+                            _count_edges(ftri)
+                            existing.add(tuple(sorted(ftri)))
+                        fills = []      # fall through to the base-edge fan
+                    # DOOR-TO-DOOR BRIDGE (retry pass only): a room with
+                    # doors but no pathgrid of its own — the CharacterGen
+                    # pen — keeps nothing but its door triangles, so connect
+                    # this one to the NEAREST other door triangle with a
+                    # 2-triangle strip and the room is traversable door to
+                    # door.
+                    bridged = False
+                    if allow_bridge:
+                        bfs = _door_to_door_bridge(verts, tris, edge_use,
+                                                   existing, door_keys,
+                                                   (a, b, c), storey_z)
+                        if bfs:
+                            for ftri in bfs:
+                                tris.append(ftri)
+                                _count_edges(ftri)
+                                existing.add(tuple(sorted(ftri)))
+                            bridged = True
+                            fills = []  # fall through to the base-edge fan
+                    if not bridged:
+                        # Nothing could connect it.  An unreachable 1-triangle
+                        # island is worse than no reserved triangle at all —
+                        # withdraw it and let _build_door_links fall back to
+                        # the containing mesh triangle, which IS connected
+                        # (measured: AnvilFG's and ChorrolFG's rear doors,
+                        # whose thresholds sit on ground the boundary chain
+                        # never reaches).
+                        _count_edges(door_tri, -1)
+                        existing.discard(tuple(sorted(door_tri)))
+                        tris.pop()
+                        door_keys.pop()
+                        added -= 1
+                        del seen_lines[line_key]
+                        return False
+            for fill in fills:
+                tris.append(fill)
+                _count_edges(fill)
+                existing.add(tuple(sorted(fill)))
+
+        # THE BASE EDGE MUST CONNECT BOTH FACES.  Where the pathgrid runs
+        # THROUGH the doorway, walkable ground exists on both sides of the
+        # base line; the wedge is only ever cut on the apex side, so the far
+        # face's triangulation is not constrained to the base edge and can
+        # end up merely point-touching a base corner — measured on Pinarus's
+        # upstairs bedroom door, whose landing met the door triangle only at
+        # one vertex and the upstairs floor fell into two components.  When
+        # the base edge has no second user, fan the far face's open boundary
+        # onto it so the doorway carries adjacency across.
+        eb = (min(a, b), max(a, b))
+        if edge_use.get(eb, 0) == 1:
+            bfills, _ = _stitch_isolated_tri(verts, tris, edge_use, door_tri,
+                                             existing, base=(a, b),
+                                             only_edges=[(a, b, c)])
+            for fill in bfills:
+                tris.append(fill)
+                _count_edges(fill)
+                existing.add(tuple(sorted(fill)))
+        return True
+
+    # TWO PASSES: a door with nothing to attach to on the first pass can
+    # succeed on the second once its neighbours attached.
+    remaining = [e for e in pending if not _attach_one(e, False)]
+    for e in remaining:
+        _attach_one(e, True)
+
+    # NOTE: no neighbour-splitting here.  An earlier version split mesh
+    # triangles against the door corners to force shared edges, but it matched
+    # in XY only and happily split a triangle on ANOTHER STOREY -- fanning 13
+    # storey-spanning triangles across ChorrolFightersGuild's three floors
+    # (worst dz 434u).  The reserved hole already leaves the door's own edges
+    # on the boundary, so the surrounding mesh meets it without any splitting.
+    return verts, tris
+
+
+def _carve_door(verts, tris, edge_use, existing, door_tri, storey_z):
+    """LAST-RESORT reservation on the FINISHED mesh: carve the wedge out.
+
+    When the pipeline's reservation never reached the final mesh (the wedge's
+    ring slivers died at the Delaunay area filter, or ANOTHER sheet's ordinary
+    ground covers the doorway uncut), the appended door triangle floats over
+    existing triangles sharing nothing.  Carve locally: remove every
+    same-storey triangle genuinely overlapping the wedge, retriangulate the
+    removed region MINUS the wedge from its own vertices (boundary edges to
+    the kept mesh and the wedge's three edges forced back via
+    _recover_constraints), and the door triangle ends up sharing real edges
+    on every side.  Returns the replacement triangles, or None when nothing
+    overlaps (a true no-mesh doorway — the caller withdraws as before).
+
+    All replacement corners are EXISTING vertices (the removed triangles' own
+    plus the door triangle's three), so heights and welds are inherited, and
+    the storey gate keeps a stacked floor above/below untouched.
+    """
+    from shapely.geometry import Polygon as _SP
+    from shapely.ops import unary_union as _uu
+
+    a, b, c = door_tri[0], door_tri[1], door_tri[2]
+    ids = sorted(set(int(i) for i in door_tri))
+    try:
+        wedge = _SP([(verts[i][0], verts[i][1]) for i in (a, b, c)])
+    except Exception:
+        return None
+    if not wedge.is_valid or wedge.area < 1.0:
+        return None
+    wa = wedge.area
+    minx, miny, maxx, maxy = wedge.bounds
+    cand = []
+    for ti, t in enumerate(tris):
+        if sorted(set(int(i) for i in t)) == ids:
+            continue                     # the door triangle itself
+        pts = [verts[int(i)] for i in t]
+        if storey_z is not None and any(
+                abs(p[2] - storey_z) > STOREY_GAP_Z for p in pts):
+            continue
+        if (max(p[0] for p in pts) < minx or min(p[0] for p in pts) > maxx
+                or max(p[1] for p in pts) < miny
+                or min(p[1] for p in pts) > maxy):
+            continue
+        try:
+            tp = _SP([(p[0], p[1]) for p in pts])
+            ov = tp.intersection(wedge).area
+        except Exception:
+            continue
+        if ov > max(1.0, 0.01 * wa) or ov > 0.4 * max(tp.area, 1e-6):
+            cand.append((ti, tp))
+    if not cand:
+        return None
+    try:
+        region = _uu([tp for (_ti, tp) in cand])
+        cut = region.difference(wedge)
+    except Exception:
+        return None
+
+    # Vertex set: the removed triangles' corners + the door triangle's.
+    vset = sorted({int(i) for (ti, _tp) in cand for i in tris[ti]} | set(ids))
+    if len(vset) < 3:
+        return None
+    # Boundary edges to the KEPT mesh: every edge of a removed triangle whose
+    # other user survives.  These must come back as edges or the carve tears
+    # the surrounding mesh into T-junctions.
+    removed = {ti for (ti, _tp) in cand}
+    anchor = []
+    for (ti, _tp) in cand:
+        t = tris[ti]
+        for k in range(3):
+            p, q = int(t[k]), int(t[(k + 1) % 3])
+            e = (min(p, q), max(p, q))
+            if edge_use.get(e, 0) >= 2:
+                # shared with something; with another removed tri?
+                others = [tj for (tj, _t2) in cand if tj != ti
+                          and p in tris[tj] and q in tris[tj]]
+                if not others:
+                    anchor.append((p, q))
+
+    import numpy as _np
+    from scipy.spatial import Delaunay as _DT
+    arr = _np.asarray([[verts[i][0], verts[i][1]] for i in vset], float)
+    try:
+        dt = _DT(arr)
+    except Exception:
+        return None
+    from shapely.geometry import Point as _Pt
+    out = []
+    for (i0, i1, i2) in dt.simplices:
+        g0, g1, g2 = vset[i0], vset[i1], vset[i2]
+        if sorted((g0, g1, g2)) == ids:
+            continue
+        cx = (arr[i0][0] + arr[i1][0] + arr[i2][0]) / 3.0
+        cy = (arr[i0][1] + arr[i1][1] + arr[i2][1]) / 3.0
+        if not cut.buffer(0.5).contains(_Pt(cx, cy)):
+            continue
+        if tuple(sorted((g0, g1, g2))) in existing:
+            continue
+        out.append((g0, g1, g2))
+    # Force the kept-mesh boundary edges and the wedge's own edges.
+    segs = [((verts[p][0], verts[p][1]), (verts[q][0], verts[q][1]))
+            for (p, q) in anchor]
+    segs += [((verts[p][0], verts[p][1]), (verts[q][0], verts[q][1]))
+             for (p, q) in ((a, b), (b, c), (c, a))]
+    if out and segs:
+        sub_verts = [list(verts[i][:2]) for i in vset]
+        remap = {g: k for k, g in enumerate(vset)}
+        sub_tris = [(remap[g0], remap[g1], remap[g2])
+                    for (g0, g1, g2) in out]
+        rv, rt = _recover_constraints(sub_verts, sub_tris, segs)
+        if len(rv) == len(sub_verts):    # no new vertices minted: safe map
+            out = [(vset[i0], vset[i1], vset[i2]) for (i0, i1, i2) in rt]
+    if not out:
+        return None
+    # CCW in plan.
+    fixed = []
+    for (g0, g1, g2) in out:
+        v0, v1, v2 = verts[g0], verts[g1], verts[g2]
+        cr = ((v1[0] - v0[0]) * (v2[1] - v0[1])
+              - (v2[0] - v0[0]) * (v1[1] - v0[1]))
+        if abs(cr) < 0.5:
+            continue
+        fixed.append((g0, g1, g2) if cr > 0 else (g0, g2, g1))
+    if not fixed:
+        return None
+    return (sorted(removed), fixed)
+
+
+def _door_to_door_bridge(verts, tris, edge_use, existing, door_keys,
+                         door_tri, storey_z):
+    """Strip of two triangles from a stranded door triangle to the nearest
+    other DOOR triangle on the same storey.
+
+    (c, a2, b2) shares the other door's base edge; (a, c, a2) shares this
+    door's side edge a-c and the strip's own c-a2 — so the pair is fully
+    edge-connected and a doorway-only room (the CharacterGen pen) becomes
+    traversable door to door.  Returns [] when no other door triangle is
+    within DOOR_BRIDGE_R.
+    """
+    DOOR_BRIDGE_R = 384.0
+    a, b, c = door_tri
+    cx = sum(verts[i][0] for i in door_tri) / 3.0
+    cy = sum(verts[i][1] for i in door_tri) / 3.0
+    best = None
+    for other in door_keys:
+        if set(other) == set(door_tri):
+            continue
+        if tuple(sorted(other)) not in existing:
+            continue                     # replaced/withdrawn since
+        ox = sum(verts[i][0] for i in other) / 3.0
+        oy = sum(verts[i][1] for i in other) / 3.0
+        oz = sum(verts[i][2] for i in other) / 3.0
+        if storey_z is not None and abs(oz - storey_z) > STOREY_GAP_Z:
+            continue
+        d = math.hypot(ox - cx, oy - cy)
+        if d > DOOR_BRIDGE_R:
+            continue
+        if best is None or d < best[0]:
+            best = (d, other)
+    if best is None:
+        return []
+    a2, b2, _c2 = best[1]
+    out = []
+    for tri in ((c, a2, b2), (a, c, a2)):
+        v0, v1, v2 = verts[tri[0]], verts[tri[1]], verts[tri[2]]
+        cr = ((v1[0] - v0[0]) * (v2[1] - v0[1])
+              - (v2[0] - v0[0]) * (v1[1] - v0[1]))
+        if abs(cr) < 1.0:
+            return []
+        t = tri if cr > 0 else (tri[0], tri[2], tri[1])
+        if tuple(sorted(t)) in existing:
+            return []
+        out.append(t)
+    return out
+
+
+def _apex_bridges(verts, tris, edge_use, base_pair, apex, existing):
+    """Bridge triangles (apex, corner, w) hooking a stranded door triangle in.
+
+    Used when the door triangle's ONLY real mesh vertex is its apex: for each
+    base corner, pick the apex's open-edge (use==1) neighbour nearest that
+    corner and lay one triangle across.  Each bridge shares a real mesh edge
+    (apex-w) and a door-triangle side edge (apex-corner).  Returns [] when the
+    apex has no open edges on the door's storey — the caller withdraws then.
+    """
+    BRIDGE_MAX_XY = 192.0
+    az = verts[apex][2]
+    va = verts[apex]
+    nbrs = []
+    for (p, q), n in edge_use.items():
+        if n != 1:
+            continue
+        w = q if p == apex else (p if q == apex else None)
+        if w is None or w in base_pair:
+            continue
+        if abs(verts[w][2] - az) > STOREY_GAP_Z:
+            continue
+        if math.hypot(verts[w][0] - va[0], verts[w][1] - va[1]) \
+                > BRIDGE_MAX_XY:
+            continue
+        nbrs.append(w)
+    if not nbrs:
+        return []
+    out = []
+    used = set()
+    for corner in base_pair:
+        vc = verts[corner]
+        # Each bridge must take its OWN neighbour: two bridges sharing one w
+        # both use edge (apex, w), driving it to 3 users — and a 3-shared
+        # edge disconnects under _compute_adjacency, turning the door + both
+        # bridges into a 3-triangle island (measured on Pinarus's basement
+        # door).  One bridge alone already carries connectivity.
+        cands = [i for i in nbrs if i not in used]
+        if not cands:
+            break
+        w = min(cands, key=lambda i: (verts[i][0] - vc[0]) ** 2
+                + (verts[i][1] - vc[1]) ** 2)
+        vw = verts[w]
+        cross = ((vc[0] - va[0]) * (vw[1] - va[1])
+                 - (vw[0] - va[0]) * (vc[1] - va[1]))
+        if abs(cross) < 1.0:
+            continue
+        t = (apex, corner, w) if cross > 0 else (apex, w, corner)
+        if tuple(sorted(t)) in existing:
+            continue
+        used.add(w)
+        out.append(t)
+    return out
+
+
+def _stitch_isolated_tri(verts, tris, edge_use, door_tri, existing,
+                         base=None, only_edges=None):
+    """Connect an edge-isolated door triangle to the surrounding mesh.
+
+    Returns (fills, replacement):
+      * fills — extra triangles filling the void strip between one of the door
+        triangle's edges and the mesh's open boundary (empty when none found);
+      * replacement — when the mesh boundary runs COLLINEARLY along a door-tri
+        side edge (a T-junction), the door triangle itself must be split at
+        those vertices; this is the list of sub-triangles to swap in for it
+        (None otherwise).  The base line (`base`, the threshold edge) is never
+        split — the sub-triangle carrying it keeps the full doorway width.
+
+    For each edge (P, Q) of the door triangle, look for a short chain of OPEN
+    mesh edges (used by exactly one triangle) leading from P to Q on the far
+    side of that edge from the triangle's third corner.  Such a chain is the
+    mesh boundary detouring around the reserved wedge; the area between it and
+    the door edge is the void strip the Delaunay dropped.  Fan triangles
+    (P, w_i, w_i+1) fill it: each shares a chain edge with the mesh, and the
+    last shares the full edge with the door triangle.  Every check is
+    conservative; an unfixable door stays as it was.
+    """
+    import math as _m
+    a, b, c = door_tri
+    z0 = sum(verts[i][2] for i in door_tri) / 3.0
+    cx = sum(verts[i][0] for i in door_tri) / 3.0
+    cy = sum(verts[i][1] for i in door_tri) / 3.0
+    # The search box must contain the door triangle's own corners with room to
+    # spare — a fixed 96 was smaller than half of a 194u-wide door's base, so
+    # its corners fell outside the box and the BFS could never leave them.
+    R = max(96.0, 64.0 + max(_m.hypot(verts[i][0] - cx, verts[i][1] - cy)
+                             for i in door_tri))
+    MAX_HOPS = 5
+
+    # Open edges near the door triangle, on its storey.
+    near_v = {}
+    for i, v in enumerate(verts):
+        if (abs(v[0] - cx) <= R and abs(v[1] - cy) <= R
+                and abs(v[2] - z0) <= STOREY_GAP_Z):
+            near_v[i] = v
+    # The door triangle is already appended, so its OWN three edges are open
+    # too — leave them out of the graph or the BFS "reaches" the far corner
+    # through the door triangle itself and reports a trivial 1-hop chain.
+    own = {(min(p, q), max(p, q))
+           for (p, q) in ((a, b), (b, c), (a, c))}
+    adjacency = {}
+    for (p, q), n in edge_use.items():
+        if n != 1 or (p, q) in own:
+            continue
+        if p not in near_v or q not in near_v:
+            continue
+        adjacency.setdefault(p, []).append(q)
+        adjacency.setdefault(q, []).append(p)
+    for vs in adjacency.values():
+        vs.sort()                       # deterministic walk order
+
+    def _side(px, py, qx, qy, x, y):
+        return (qx - px) * (y - py) - (qy - py) * (x - px)
+
+    fills = []
+    JUMP_R = 64.0
+    for (P, Q, O) in (only_edges or ((a, b, c), (b, c, a), (c, a, b))):
+        vp, vq, vo = verts[P], verts[Q], verts[O]
+        o_side = _side(vp[0], vp[1], vq[0], vq[1], vo[0], vo[1])
+        if abs(o_side) < 1e-6:
+            continue
+        # BFS shortest open-edge chain P -> Q whose interior vertices all lie
+        # on the OPPOSITE side of P-Q from O (outside the door triangle).
+        # P itself may have NO open edges (a minted base corner whose ground
+        # the wedge cut consumed) — seed the walk with every boundary vertex
+        # within JUMP_R of P on the valid side, as a virtual first hop; the
+        # fan triangle across that hop still shares its CHAIN edge with the
+        # mesh, which is what carries connectivity.
+        prev = {P: None}
+        queue = [(0, P)]
+        for w in adjacency:
+            if w in (P, Q, O) or w in prev:
+                continue
+            vw = verts[w]
+            if _m.hypot(vw[0] - vp[0], vw[1] - vp[1]) > JUMP_R:
+                continue
+            s = _side(vp[0], vp[1], vq[0], vq[1], vw[0], vw[1])
+            if s * o_side > 0:
+                continue
+            prev[w] = P
+            queue.append((1, w))
+        found = False
+        while queue:
+            hops, u = queue.pop(0)
+            if u == Q:
+                found = True
+                break
+            if hops >= MAX_HOPS:
+                continue
+            for w in adjacency.get(u, ()):
+                if w in prev:
+                    continue
+                if w != Q:
+                    vw = verts[w]
+                    s = _side(vp[0], vp[1], vq[0], vq[1], vw[0], vw[1])
+                    if s * o_side > 0:
+                        continue        # inside the door triangle's half-plane
+                prev[w] = u
+                queue.append((hops + 1, w))
+        if not found:
+            continue
+        chain = []
+        u = Q
+        while u is not None:
+            chain.append(u)
+            u = prev[u]
+        chain.reverse()                 # P ... Q
+        if len(chain) < 3:
+            continue                    # direct edge would already be shared
+
+        # COLLINEAR chain: the mesh boundary runs ALONG this door-tri edge,
+        # subdivided at T-junction vertices (measured on ImperialDungeon01's
+        # east exit: boundary v197-v89-v87 lies exactly on the wedge side).
+        # There is no strip to fill — instead split the door triangle's edge
+        # at those vertices so both sides share real edges.  Never the base.
+        interior = chain[1:-1]
+
+        def _off_line(w):
+            vw = verts[w]
+            dx, dy = vq[0] - vp[0], vq[1] - vp[1]
+            L = _m.hypot(dx, dy)
+            if L < 1e-9:
+                return 1e9
+            return abs((vw[0] - vp[0]) * dy - (vw[1] - vp[1]) * dx) / L
+
+        if all(_off_line(w) <= 2.0 for w in interior):
+            if base is not None and {P, Q} == set(base):
+                continue                # the threshold edge stays whole
+            ws = sorted(interior,
+                        key=lambda w: ((verts[w][0] - vp[0]) ** 2
+                                       + (verts[w][1] - vp[1]) ** 2))
+            pts_chain = [P] + ws + [Q]
+            repl = []
+            okr = True
+            for u0, u1 in zip(pts_chain, pts_chain[1:]):
+                vu, vw = verts[u0], verts[u1]
+                cr = ((vw[0] - vu[0]) * (vo[1] - vu[1])
+                      - (vo[0] - vu[0]) * (vw[1] - vu[1]))
+                if abs(cr) < 1.0:
+                    okr = False
+                    break
+                repl.append((u0, u1, O) if cr > 0 else (u0, O, u1))
+            if okr and repl:
+                return [], repl
+            continue
+
+        # Fan from P; require consistent (non-degenerate) winding throughout.
+        cand = []
+        ok = True
+        for w0, w1 in zip(chain[1:-1], chain[2:]):
+            v0, v1 = verts[w0], verts[w1]
+            cross = ((v0[0] - vp[0]) * (v1[1] - vp[1])
+                     - (v1[0] - vp[0]) * (v0[1] - vp[1]))
+            if abs(cross) < 1.0:
+                ok = False
+                break
+            t = (P, w0, w1) if cross > 0 else (P, w1, w0)
+            if tuple(sorted(t)) in existing:
+                ok = False
+                break
+            cand.append(t)
+        if ok and cand:
+            fills.extend(cand)
+            break                       # one edge-connection suffices
+    return fills, None
+
+
+
+
+def _door_edge_on_part(edge, part, tol=2.0):
+    """Does this door base line belong to `part` (inside OR on its outline)?
+
+    The threshold edge of a door footprint is part of the union BOUNDARY, so a
+    strict interior test silently drops it and the door never gets its forced
+    edge.  Accept the edge when its midpoint is within the polygon or within
+    `tol` of its boundary — the FULL boundary, holes included: a doorway in
+    the middle of a floor plate lies on an INTERIOR ring (Arvena's upstairs
+    door base sat on a hole of its sheet, 137u from the exterior ring, so the
+    exterior-only test never claimed it and the door lost its reservation).
+    """
+    from shapely.geometry import Point
+    mx = 0.5 * (edge[0][0] + edge[1][0])
+    my = 0.5 * (edge[0][1] + edge[1][1])
+    p = Point(mx, my)
+    try:
+        return part.contains(p) or part.boundary.distance(p) <= tol
+    except Exception:
+        return False
+
+
 def _point_in_poly(px, py, poly):
     inside = False
     n = len(poly)
@@ -306,11 +1096,13 @@ def _triangulate(poly, target_edge, fixed_edges=None, steep_seeds=None):
          every hole exactly (a ring of corridors around an obstacle keeps its
          hole) without a constrained triangulator.
 
-    `fixed_edges` is a list of (p0, p1) 2D segments that MUST appear as a
-    triangle edge — the door base lines.  Their endpoints are inserted as
-    Steiner points and no interior sample is placed near the segment, so the
-    Delaunay naturally forms a triangle with that long edge (Skyrim's door
-    triangle).
+    `fixed_edges` is a list of (p0, p1, apex) door triangles — base line plus
+    the analytically fixed apex (corridor_doors computes it: full doorway
+    width, fixed depth, on the pathgrid's side).  Each is reserved out of the
+    polygon before triangulation and stitched back in afterwards; the base
+    endpoints are also inserted as Steiner points and no interior sample is
+    placed near the base line, so the surrounding mesh meets the door triangle
+    edge-to-edge.
 
     `steep_seeds` is a list of (x, y) points along STEEP ribbon centrelines
     (stairs, ramps).  A uniform target_edge triangle on a staircase climbs more
@@ -318,12 +1110,105 @@ def _triangulate(poly, target_edge, fixed_edges=None, steep_seeds=None):
     emission — the whole stair vanishes.  These seeds are forced in at a fine
     spacing so the stair keeps short, gently-climbing triangles that survive.
     """
-    from shapely.geometry import Point
+    from shapely.geometry import Point, Polygon as _ShPoly
     from shapely.prepared import prep
 
     ext = list(poly.exterior.coords)[:-1]
     if len(ext) < 3:
         return [], []
+
+    # RESERVE THE DOOR TRIANGLE.  Vanilla marks a door with ONE triangle whose
+    # long edge is the whole doorway.  Every attempt to coax that out of the
+    # Delaunay failed the same way: the door line is on the union BOUNDARY, so
+    # the ribbon's own outline corners land on it and split it into 3-4 pieces,
+    # and no amount of seeding, keep-out or constraint recovery can remove a
+    # corner that is already baked into the polygon.
+    #
+    # So the region is CUT OUT of the polygon before triangulation — the
+    # triangulator fills around it as if it were a hole, cannot subdivide what
+    # it never sees — and the single door triangle is stitched back in
+    # afterwards.  The wedge's shape is FIXED by corridor_doors (full doorway
+    # base, deterministic depth, apex on the pathgrid's side): the reservation
+    # never moves, shrinks or flips it.  A wedge that severs the sheet is
+    # allowed — the MultiPolygon branch below triangulates every significant
+    # piece, and the door triangle itself (base edge on one piece, apex on the
+    # other, welded back in attach_door_triangles) is what reconnects them.
+    # The old guard that SKIPPED reserving such a door instead demoted it to
+    # whatever sliver the fallback containing-triangle link happened to find.
+    door_tris_out = []
+    reserved = []
+    for e in (fixed_edges or ()):
+        if len(e) < 3 or e[2] is None:
+            continue
+        p0, p1, apex = e[0], e[1], e[2]
+        tri = _ShPoly([p0, p1, apex])
+        if not tri.is_valid or tri.area < 1.0:
+            continue
+        reserved.append(tri)
+        # Carry the door's storey height when known: a wedge that consumes
+        # its whole part (below) emits no mesh of its own, so the pending
+        # entry cannot be height-tagged from emitted vertices later.
+        door_z = e[3] if len(e) > 3 and e[3] is not None else None
+        entry = (tuple(p0), tuple(p1), tuple(apex))
+        door_tris_out.append(entry if door_z is None
+                             else entry + (float(door_z),))
+    if reserved:
+        try:
+            cut = poly
+            for r in reserved:
+                cut = cut.difference(r)
+            if cut.geom_type == 'GeometryCollection':
+                from shapely.ops import unary_union as _uu
+                gs = [g for g in cut.geoms if g.geom_type == 'Polygon']
+                cut = _uu(gs) if gs else cut
+            if cut.is_empty or cut.geom_type not in ('Polygon', 'MultiPolygon'):
+                # The wedges consumed the whole part: this part WAS the
+                # doorway apron, and the door triangles replace its ground.
+                # (Falling back to plain triangulation instead put ordinary
+                # mesh back over the doorway and the door lost its triangle —
+                # Arvena's front door, whose downstairs sheet fragment is
+                # smaller than the door wedge itself.)
+                PENDING_DOOR_TRIS.extend(door_tris_out)
+                return [], []
+            elif cut.geom_type == 'Polygon':
+                poly = cut
+                ext = list(poly.exterior.coords)[:-1]
+                if len(ext) < 3:
+                    PENDING_DOOR_TRIS.extend(door_tris_out)
+                    return [], []
+            else:
+                # Cutting the door wedges can split the sheet into several
+                # pieces (a door in a narrow passage separates the two sides).
+                # Every SIGNIFICANT piece is real ground and must be
+                # triangulated — keeping only the largest silently deleted the
+                # rest of the room.  Pieces under SPLIT_TINY_AREA are the
+                # aprons the wedge cut severed (ribbon extension beyond a
+                # teleport door's threshold); the door triangle replaces that
+                # ground, and keeping the apron leaves a permanent island.
+                parts = [g for g in cut.geoms if g.geom_type == 'Polygon'
+                         and g.area >= SPLIT_TINY_AREA]
+                if not parts:
+                    # EVERY remaining piece is small: this part is mostly the
+                    # doorway itself (Arvena's front-door sheet fragment is
+                    # barely bigger than its own wedge).  The crumbs around
+                    # the wedge are what the door triangle attaches to —
+                    # dropping them left it nothing to share an edge with and
+                    # the attach withdrew it.
+                    parts = [g for g in cut.geoms if g.geom_type == 'Polygon'
+                             and g.area >= 1.0]
+                out_v, out_t = [], []
+                for part in parts:
+                    pv, pt = _triangulate(part, target_edge,
+                                          fixed_edges=None,
+                                          steep_seeds=steep_seeds)
+                    base = len(out_v)
+                    out_v.extend(pv)
+                    out_t.extend((a + base, b + base, c + base)
+                                 for (a, b, c) in pt)
+                PENDING_DOOR_TRIS.extend(door_tris_out)
+                return out_v, out_t
+        except Exception:
+            reserved, door_tris_out = [], []
 
     # A coarse spatial hash of accepted points, so a candidate can be rejected
     # when it crowds an existing one — this Poisson-disk guard is what keeps the
@@ -359,6 +1244,40 @@ def _triangulate(poly, target_edge, fixed_edges=None, steep_seeds=None):
                              []).append((x, y))
         pts.append((x, y))
 
+    # THE DOOR BASE LINE IS ON THE OUTLINE.  The door quad's threshold edge is
+    # part of the union boundary, so the densify loop below would drop samples
+    # ALONG it and chop the one big door triangle into pieces — measured on the
+    # CharacterGen assassins' cell door, whose 115u base line came out as a
+    # 26.8u + 21.6u pair and left a 571-unit scrap as the Door Triangle (every
+    # vanilla door triangle is >= 992).  Densification is therefore suppressed
+    # on any boundary segment lying along a door base line; the line keeps its
+    # two endpoints and nothing in between, which is exactly what makes the
+    # Delaunay span it with a single triangle.
+    fixed_edges = fixed_edges or []
+    door_guard = []
+    for e in fixed_edges:
+        p0, p1 = e[0], e[1]
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        dl = math.hypot(dx, dy)
+        if dl > 1e-9:
+            door_guard.append((p0, p1, dx / dl, dy / dl, dl))
+
+    def _on_door_line(x0, y0, x1, y1):
+        """True if this boundary segment runs ALONG a door base line."""
+        for (q0, _q1, ux, uy, dl) in door_guard:
+            ok = True
+            for (px, py) in ((x0, y0), (x1, y1),
+                             (0.5 * (x0 + x1), 0.5 * (y0 + y1))):
+                vx, vy = px - q0[0], py - q0[1]
+                t = vx * ux + vy * uy
+                perp = abs(-vx * uy + vy * ux)
+                if perp > 4.0 or not (-4.0 <= t <= dl + 4.0):
+                    ok = False
+                    break
+            if ok:
+                return True
+        return False
+
     # 1. boundary vertices + densified boundary samples.  Corners are FORCED
     #    (they define the outline); interpolated samples yield to spacing so a
     #    short edge does not seed a cluster of near-coincident points.
@@ -368,6 +1287,8 @@ def _triangulate(poly, target_edge, fixed_edges=None, steep_seeds=None):
             x0, y0 = coords[i]
             x1, y1 = coords[i + 1]
             add(x0, y0, force=True)
+            if _on_door_line(x0, y0, x1, y1):
+                continue                     # keep the threshold as ONE edge
             seg = math.hypot(x1 - x0, y1 - y0)
             n = int(seg // target_edge)
             for s in range(1, n + 1):
@@ -375,13 +1296,18 @@ def _triangulate(poly, target_edge, fixed_edges=None, steep_seeds=None):
                 add(x0 + (x1 - x0) * f, y0 + (y1 - y0) * f,
                     min_dist=target_edge * 0.5)
 
-    # 2. door-base endpoints, forced (they must survive to make the door edge)
-    fixed_edges = fixed_edges or []
+    # 2. door-base endpoints, forced (they must survive to make the door edge).
+    #    When the door region was reserved, its three corners are now on the
+    #    polygon's boundary and must be forced in so the surrounding mesh meets
+    #    the door triangle exactly, sharing edges instead of T-junctioning.
     fixed_pts = []
-    for (p0, p1) in fixed_edges:
+    for e in fixed_edges:
+        p0, p1 = e[0], e[1]
         add(p0[0], p0[1], force=True)
         add(p1[0], p1[1], force=True)
         fixed_pts.append((p0, p1))
+    for d in door_tris_out:
+        add(d[2][0], d[2][1], force=True)       # the wedge apex
 
     # 3. ribbon centreline seeds.  Steep (stair) seeds are FORCED in at their
     #    fine spacing; flat centreline seeds YIELD to the Poisson spacing, so
@@ -413,14 +1339,23 @@ def _triangulate(poly, target_edge, fixed_edges=None, steep_seeds=None):
     dy = target_edge * math.sqrt(3.0) / 2.0
     row = 0
     y = miny + dy * 0.5
+    # Keep-out around a door base line, so no lattice point lands close enough
+    # to split the door triangle.  Scaled to the DOOR, not to target_edge: a
+    # 115u threshold needs more clearance than a 64u one, and a fixed radius
+    # let a lattice point sit just off a wide door and halve its triangle.
     keepout2 = (target_edge * 0.75) ** 2
+    door_keepout = []
+    for (p0, p1) in fixed_pts:
+        half = 0.5 * math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+        door_keepout.append(max(keepout2, (half * 0.9) ** 2))
     while y < maxy:
         off = 0.0 if (row % 2 == 0) else target_edge * 0.5
         x = minx + off + target_edge * 0.25
         while x < maxx:
             if pp.contains(Point(x, y)):
-                near_fixed = any(_seg_dist2(x, y, p0, p1) < keepout2
-                                 for (p0, p1) in fixed_pts)
+                near_fixed = any(_seg_dist2(x, y, p0, p1) < ko
+                                 for (p0, p1), ko in zip(fixed_pts,
+                                                         door_keepout))
                 if not near_fixed:
                     add(x, y, min_dist=target_edge * 0.6)
             x += target_edge
@@ -475,8 +1410,23 @@ def _triangulate(poly, target_edge, fixed_edges=None, steep_seeds=None):
     # constraint explicitly, which keeps the door inside the ONE triangulation
     # (so it still shares edges with its neighbours) while making its long side a
     # real edge.
-    if fixed_pts:
-        verts, tris = _recover_constraints(verts, tris, fixed_pts)
+    PENDING_DOOR_TRIS.extend(door_tris_out)
+    # A door whose triangle was RESERVED (cut out) needs no recovery — the
+    # hole's outline is the constraint.  But a door whose reservation failed
+    # (_door_apex found no room, or the cut would have split the sheet) still
+    # needs its base line recovered as a real edge, or the fallback Door
+    # Triangle is whatever sliver happens to contain the threshold.  The old
+    # all-or-nothing gate skipped recovery for EVERY door as soon as ONE door
+    # in the part was reserved.
+    reserved_bases = {(tuple(d[0]), tuple(d[1])) for d in door_tris_out}
+    unreserved = [(p0, p1) for (p0, p1) in fixed_pts
+                  if (tuple(p0), tuple(p1)) not in reserved_bases]
+    if unreserved:
+        verts, tris = _recover_constraints(verts, tris, unreserved)
+    # The door triangles are NOT added here.  The hole stays open for every
+    # pass that follows -- weld, t-junctions, node merge, cleanup -- so each of
+    # them simply sees the doorway as mesh boundary and has nothing to split,
+    # weld or drop.  build_corridors adds the triangles back at the very end.
     return verts, tris
 
 
@@ -758,6 +1708,18 @@ def wall_cuts(blocking, z_lo, z_hi):
         return None
 
 
+# A wedge-cut piece SMALLER than this is an apron/sliver, not severed
+# corridor: every teleport door has a thin apron of ribbon extension beyond
+# its threshold (the exit side), so counting it as a disconnection meant NO
+# teleport door ever got a reserved triangle — 158737's Door Triangle came out
+# as the 534-unit apron sliver (vanilla min 992).  A real severed room or
+# corridor piece is far larger.
+SPLIT_TINY_AREA = 2000.0
+
+# Door triangles reserved out of the mesh, added back after ALL cleanup.
+PENDING_DOOR_TRIS = []
+
+
 def build_union_mesh(strips, extra_strips=None, door_edges=None,
                      cell_bounds=None, wall_cut=None):
     """Union the corridor ribbons per storey and retriangulate.
@@ -866,6 +1828,8 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
     # by a Z threshold: a flight has no single height, so it is walked from ribbon
     # to ribbon (see _storey_groups) and stays attached to both the floor it
     # leaves and the floor it reaches.
+    _door_claimed = set()        # door_edges indices already reserved
+    PENDING_DOOR_TRIS.clear()
     sheets = _split_plan_overlaps(_storey_groups(strips))
     # SHARED NODE POINTS.  A pathgrid node where two sheets meet is the one place
     # they MUST connect — it is the top or bottom of a staircase.  Measured on
@@ -1075,10 +2039,42 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
         for part in gparts:
             if not isinstance(part, Polygon) or part.area < 1.0:
                 continue
-            fixed = [e for e in door_edges
-                     if _point_in_poly(0.5 * (e[0][0] + e[1][0]),
-                                       0.5 * (e[0][1] + e[1][1]),
-                                       list(part.exterior.coords)[:-1])]
+            # A door base line belongs to this part when it lies inside it OR
+            # ON ITS OUTLINE — the threshold edge of a door quad IS part of the
+            # union boundary, so a strict interior test rejected it and the
+            # constraint never reached the triangulation at all.  That is what
+            # left the CharacterGen assassins' 115u cell door as a 571-unit
+            # scrap (every vanilla door triangle is >= 992): unprotected, the
+            # boundary densify chopped its base line into 26.8u + 21.6u pieces.
+            # Each door belongs to exactly ONE part.  The tolerant on-outline
+            # test above can match a door line in several sheets that meet at
+            # the threshold; reserving it more than once produces duplicate,
+            # overlapping door triangles that then collide in the weld.
+            fixed = []
+            for ei, e in enumerate(door_edges):
+                if ei in _door_claimed:
+                    continue
+                if not _door_edge_on_part(e, part):
+                    continue
+                # STOREY GATE.  Parts are 2D, so where two floors stack in
+                # plan BOTH pass the containment test and iteration order
+                # decided the claim: Arvena's upstairs bedroom door was
+                # claimed by the sheet that only covers that spot DOWNSTAIRS,
+                # its wedge was cut from ground that does not span the
+                # doorway at that height, and the door triangle came back
+                # unattachable and was withdrawn.  The door knows its storey
+                # (the corridor its quad bridges to); require this sheet to
+                # actually have a surface at that height under the door.
+                if len(e) > 3 and e[3] is not None:
+                    mx = 0.5 * (e[0][0] + e[1][0])
+                    my = 0.5 * (e[0][1] + e[1][1])
+                    lv = _levels_at(group, mx, my)
+                    if lv and not any(abs(q - e[3]) <= STOREY_GAP_Z
+                                      for q in lv):
+                        continue        # another storey's part
+                _door_claimed.add(ei)
+                fixed.append(e)
+            _pending_mark = len(PENDING_DOOR_TRIS)
             v2, t2 = _triangulate(part, params.TRI_TARGET_EDGE,
                                   fixed_edges=fixed, steep_seeds=gseeds)
             if not t2:
@@ -1086,7 +2082,32 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
             # Levels come from THIS storey's ribbons only, so a corner cannot
             # pick up the other floor's height.
             levels = _levels_batch(group, v2)
+            # THE DOOR APEX HAS NO RIBBON UNDER IT.  Its triangle is reserved
+            # out of the union (a hole), so no corridor covers that point and
+            # _levels_at returns nothing for it.  _emit_surfaces then drops any
+            # triangle whose corners do not all share a surface, which silently
+            # deleted 4 of every 5 reserved door triangles — the protection
+            # passes downstream never saw them because they never existed.
+            #
+            # The apex stands on the same ground as its own door line, so it
+            # inherits the levels of the two base endpoints.
+            _apply_door_apex_levels(v2, levels, fixed)
             v3, t3 = _emit_surfaces(v2, t2, levels)
+            # Tag the door triangles THIS SHEET reserved with the height of the
+            # ground they sit on.  attach_door_triangles must then snap their
+            # corners to vertices on the SAME STOREY: matching in XY alone let
+            # a corner grab a vertex on the floor above or below, fanning huge
+            # vertical triangles between all three storeys of
+            # ChorrolFightersGuild.
+            if v3 and len(PENDING_DOOR_TRIS) > _pending_mark:
+                for _n in range(_pending_mark, len(PENDING_DOOR_TRIS)):
+                    _e = PENDING_DOOR_TRIS[_n]
+                    if len(_e) != 3:
+                        continue
+                    _ax, _ay = _e[2]
+                    _bz = min(v3, key=lambda q: (q[0] - _ax) ** 2
+                              + (q[1] - _ay) ** 2)[2]
+                    PENDING_DOOR_TRIS[_n] = _e + (float(_bz),)
             base = len(verts)
             verts.extend(v3)
             tris.extend((a + base, b + base, c + base) for (a, b, c) in t3)
@@ -1507,6 +2528,7 @@ def _weld_sheets(verts, tris):
     # MAX_CLIMB (34) so nothing an actor could not step over is fused.
     WELD_R = 16.0
     cell = WELD_R
+
     grid = {}
     remap = [0] * len(verts)
     out = []
@@ -2138,6 +3160,68 @@ def _storey_groups(strips):
                 except Exception:
                     group_polys.append(None)
     return out or [list(strips)]
+
+
+def _apply_door_apex_levels(v2, levels, door_edges):
+    """Give each reserved door triangle's APEX the levels of its base line.
+
+    The apex sits inside the reserved hole, so nothing covers it and it has no
+    level of its own; without this it is dropped by _emit_surfaces along with
+    the whole door triangle.
+    """
+    if not door_edges:
+        return
+    idx = {}
+    for i, p in enumerate(v2):
+        idx.setdefault((round(p[0], 3), round(p[1], 3)), i)
+    for e in door_edges:
+        p0, p1 = e[0], e[1]
+        door_z = e[3] if len(e) > 3 and e[3] is not None else None
+        i0 = idx.get((round(p0[0], 3), round(p0[1], 3)))
+        i1 = idx.get((round(p1[0], 3), round(p1[1], 3)))
+        if i0 is None or i1 is None:
+            continue
+        # A doorway can be WIDER than the corridor ribbon crossing it, so a
+        # base endpoint may stand on ground no strip covers (Arvena's
+        # upstairs door: base corners at x=-368/-272, the crossing ribbon only
+        # spans -360..-280) — it then has no level, is dropped by
+        # _emit_surfaces, and the whole door triangle goes with it.  The door
+        # knows its own storey; seed the endpoints with it.
+        if door_z is not None:
+            for ii in (i0, i1):
+                if not any(abs(q - door_z) <= SAME_SURFACE_Z
+                           for q in levels[ii]):
+                    levels[ii] = sorted(set(list(levels[ii])
+                                            + [float(door_z)]))
+        base_lv = sorted(set(list(levels[i0]) + list(levels[i1])))
+        if not base_lv:
+            continue
+        # The corners the door introduces must land on the DOOR's storey, not
+        # on every storey the base endpoints touch (a base endpoint shared
+        # with a stacked floor carries both heights).
+        lv_door = [q for q in base_lv
+                   if door_z is None or abs(q - door_z) <= STOREY_GAP_Z]
+        lv_door = lv_door or base_lv
+        # The apex is known exactly (the analytic wedge corner) — give it the
+        # door's levels directly when nothing covers it.
+        reach = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+        if len(e) > 2 and e[2] is not None:
+            ia = idx.get((round(e[2][0], 3), round(e[2][1], 3)))
+            if ia is not None and not levels[ia]:
+                levels[ia] = list(lv_door)
+            reach = max(reach, math.hypot(
+                e[2][0] - 0.5 * (p0[0] + p1[0]),
+                e[2][1] - 0.5 * (p0[1] + p1[1])) + 4.0)
+        # Any other level-less vertex near this base line was introduced by
+        # the reservation (a hole-outline corner) and stands on the same
+        # ground as the base.
+        mx = 0.5 * (p0[0] + p1[0])
+        my = 0.5 * (p0[1] + p1[1])
+        for i, p in enumerate(v2):
+            if levels[i]:
+                continue
+            if math.hypot(p[0] - mx, p[1] - my) <= reach:
+                levels[i] = list(lv_door)
 
 
 def _emit_surfaces(v2, t2, levels):

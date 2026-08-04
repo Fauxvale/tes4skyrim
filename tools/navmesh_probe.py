@@ -218,8 +218,8 @@ def load_cell(export_dir, cell_arg, load_collision=True):
     from tes5_import.pgrd_to_navm import _collect_doors, load_door_centroids
     load_door_centroids(os.path.join(export_dir, 'door_centers_cache.json'),
                         quiet=True)
-    doors = [(x, y, z, r, tp)
-             for (x, y, z, r, _f, tp) in _collect_doors(refrs, door_fids)]
+    doors = [(x, y, z, r, tp, w)
+             for (x, y, z, r, _f, tp, w) in _collect_doors(refrs, door_fids)]
 
     is_ext = bool(cell.get('ParentWRLD') and
                   cell.get('ParentWRLD') != '00000000')

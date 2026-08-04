@@ -50,6 +50,7 @@ from script_convert.pipeline import build_vmad_object_script
 
 PLUGIN_NAME = 'TESGameSelect.esp'
 SCRIPT_NAME = 'TESGameSelectQuest'
+MQ101_SCRIPT_NAME = 'TESGameSelectMQ101'
 
 # This plugin's own FormIDs (mod index is assigned by load order at runtime;
 # 0x01 here is the placeholder the engine rewrites, matching how every ESP is
@@ -60,6 +61,32 @@ FID_GLOB_NEHRIM       = 0x01000802
 FID_GLOB_MORROBLIVION = 0x01000803
 FID_MESG              = 0x01000810
 FID_QUST              = 0x01000820
+
+# --- Vanilla Skyrim.esm forms we override or reference -----------------------
+# MQ101 "Unbound", the opening. We OVERRIDE this record: the only point where a
+# new game can be diverted cleanly is its stage-0 fragment, which runs before
+# the cart ride starts. A separate quest that stops MQ101 afterwards leaves the
+# player bound and mid-scene (see TESGameSelectMQ101.psc).
+FID_MQ101 = 0x0003372B
+# Skyrim's own empty interior holding cell and the XMarker inside it. Reusing
+# these means no cell authoring, and the player waits somewhere genuinely blank
+# instead of inside the moving cart.
+FID_HOLDING_CELL_MARKER = 0x001037F2   # WIDeadBodyCleanupCellMarker
+FID_GAMEHOUR            = 0x00000038   # GameHour (Skyrim.esm GLOB)
+
+# The fragment the takeover REPLACES: stage 0, log entry 0 — vanilla points it
+# at QF_MQ101_0003372B.Fragment_2 (`GameHour.SetValue(7); SetStage(10)`), and
+# its QSDT condition GetGlobalValue(MQQuickstart) == 0 makes it the real
+# new-game path (entries 1-4 are the ==1..4 debug quickstarts). Retargeting it
+# means nothing of the opening runs until the player has chosen; an APPENDED
+# unconditional entry — the previous design — ran ALONGSIDE Fragment_2, so
+# stage 10 still fired: title credits, cart-roll audio, and a tug-of-war over
+# the player. Vanilla stage 0 must still have exactly 5 entries or the layout
+# has drifted and the takeover would replace the wrong one.
+MQ101_TAKEOVER_STAGE = 0
+MQ101_TAKEOVER_LOG_ENTRY = 0
+MQ101_VANILLA_STAGE0_ENTRIES = 5
+MQ101_VANILLA_FRAGMENT_SCRIPT = 'QF_MQ101_0003372B'
 
 # QUST DNAM flags: StartGameEnabled (0x01) | StartsEnabled (0x10).
 SGE_FLAGS = 0x0011
@@ -133,10 +160,12 @@ def build_mesg() -> bytes:
 
 
 def build_qust() -> bytes:
-    """Start-Game-Enabled, script-only quest carrying the selector script.
+    """The selector quest: script-only, no stages, no aliases, no objectives.
 
-    No stages, no aliases, no objectives: the script does everything from
-    OnInit. Priority 0 — this quest arbitrates nothing, it just runs once.
+    NOT Start Game Enabled. It is started and driven by the MQ101 takeover
+    fragment, which runs exactly once at stage 0 of a new game. Relying on
+    OnInit instead is what made the menu appear twice — OnInit fires again
+    whenever the quest restarts or is re-added to a save.
     """
     vmad = build_vmad_object_script(
         SCRIPT_NAME,
@@ -152,7 +181,7 @@ def build_qust() -> bytes:
     subs += pack_subrecord('VMAD', vmad)
     subs += pack_string_subrecord('FULL', 'Threads of Prophecy')
     # DNAM: Flags(U16) Priority(U8) FormVer(U8) Unknown(U32) Type(U32)
-    subs += pack_subrecord('DNAM', struct.pack('<HBBII', SGE_FLAGS, 0, 0, 0,
+    subs += pack_subrecord('DNAM', struct.pack('<HBBII', 0, 0, 0, 0,
                                                QUEST_TYPE_NONE))
     subs += pack_subrecord('NEXT', b'')
     # ANAM (next alias id) is written even with no aliases — vanilla always
@@ -161,11 +190,178 @@ def build_qust() -> bytes:
     return pack_record('QUST', FID_QUST, 0, subs)
 
 
-def build_plugin() -> bytes:
+def build_mq101_override(skyrim_esm: str) -> bytes:
+    """Override vanilla MQ101 with the stage-0 takeover.
+
+    Everything about the record is preserved verbatim except the VMAD, where
+    two edits are made (see _splice_mq101_vmad): our script is appended to the
+    attached-scripts array, and the stage-0 / log-entry-0 fragment — vanilla's
+    real new-game path — is retargeted from QF_MQ101_0003372B.Fragment_2 to
+    TESGameSelectMQ101.RunTakeover. No log entry is added or removed: the
+    retargeted entry keeps its GetGlobalValue(MQQuickstart) == 0 condition, so
+    debug quickstarts (1-4) bypass the takeover exactly as they bypass
+    Fragment_2.
+
+    Reading the vanilla record rather than authoring one from scratch matters:
+    MQ101 is ~23 KB of aliases, stages and conditions, and dropping any of it
+    would break the opening for anyone who picks Skyrim.
+    """
+    from tools.tes5_esm_reader import read_tes5_file
+    _hdr, recs, _loc = read_tes5_file(skyrim_esm)
+    src = next((r for r in recs if r.type == 'QUST' and r.form_id == FID_MQ101),
+               None)
+    if src is None:
+        raise SystemExit(f'MQ101 ({FID_MQ101:08X}) not found in {skyrim_esm}')
+
+    out = b''
+    stage_index = None
+    stage0_entries = 0
+
+    for sub in src.subrecords:
+        if sub.type == 'VMAD':
+            out += pack_subrecord('VMAD', _splice_mq101_vmad(sub.data))
+            continue
+        if sub.type == 'INDX':
+            stage_index = struct.unpack_from('<H', sub.data, 0)[0]
+        if sub.type == 'QSDT' and stage_index == MQ101_TAKEOVER_STAGE:
+            stage0_entries += 1
+        out += pack_subrecord(sub.type, sub.data)
+
+    if stage0_entries != MQ101_VANILLA_STAGE0_ENTRIES:
+        raise SystemExit(
+            f'MQ101 stage 0 has {stage0_entries} log entries, expected '
+            f'{MQ101_VANILLA_STAGE0_ENTRIES}. The stage layout has drifted — '
+            f're-check which entry is the real new-game path against the '
+            f'installed Skyrim.esm.')
+
+    return pack_record('QUST', FID_MQ101, src.flags, out)
+
+
+def _splice_mq101_vmad(vmad: bytes) -> bytes:
+    """Append our script and retarget the stage-0/log-0 fragment to it.
+
+    The QUST VMAD layout is: version, objectFormat, scripts[], then a Script
+    Fragments struct (extra-bind version, fragment count, filename, fragments[]),
+    then an Aliases array. Everything but the retargeted entry must be carried
+    through untouched — MQ101 has 54 aliases and 158 other fragments, and
+    dropping any of them would break the whole opening.
+    """
+    version, obj_format, script_count = struct.unpack_from('<HHH', vmad, 0)
+    pos = 6
+    for _ in range(script_count):
+        pos = _skip_script_entry(vmad, pos)
+    scripts_end = pos
+
+    # Script Fragments header
+    extra_version = struct.unpack_from('<b', vmad, pos)[0]
+    frag_count = struct.unpack_from('<H', vmad, pos + 1)[0]
+    pos += 3
+    fname_len = struct.unpack_from('<H', vmad, pos)[0]
+    file_name = vmad[pos + 2:pos + 2 + fname_len]
+    pos += 2 + fname_len
+
+    frags = b''
+    retargeted = False
+    for _ in range(frag_count):
+        entry_start = pos
+        stage, log, unknown = struct.unpack_from('<IIB', vmad, pos)
+        pos += 9
+        name_end = _skip_wstring(vmad, pos)        # ScriptName
+        script_name = vmad[pos + 2:name_end].decode('utf-8')
+        pos = _skip_wstring(vmad, name_end)        # FragmentName
+        if (stage, log) == (MQ101_TAKEOVER_STAGE, MQ101_TAKEOVER_LOG_ENTRY):
+            if script_name != MQ101_VANILLA_FRAGMENT_SCRIPT:
+                raise SystemExit(
+                    f'MQ101 stage 0 / log 0 fragment belongs to '
+                    f'{script_name!r}, expected '
+                    f'{MQ101_VANILLA_FRAGMENT_SCRIPT!r} — another mod or a '
+                    f'game update changed the record; refusing to retarget.')
+            frags += (struct.pack('<IIB', stage, log, unknown)
+                      + _pack_wstring(MQ101_SCRIPT_NAME)
+                      + _pack_wstring('RunTakeover'))
+            retargeted = True
+        else:
+            frags += vmad[entry_start:pos]
+    aliases_tail = vmad[pos:]                      # Aliases array, verbatim
+
+    if not retargeted:
+        raise SystemExit('MQ101 stage-0/log-0 fragment not found; cannot '
+                         'install takeover')
+
+    our_script = _pack_script_entry(MQ101_SCRIPT_NAME, {
+        'Selector':          FID_QUST,
+        'HoldingCellMarker': FID_HOLDING_CELL_MARKER,
+        'GameHour':          FID_GAMEHOUR,
+    })
+
+    return (struct.pack('<HHH', version, obj_format, script_count + 1)
+            + vmad[6:scripts_end]
+            + our_script
+            + struct.pack('<b', extra_version)
+            + struct.pack('<H', frag_count)
+            + struct.pack('<H', fname_len) + file_name
+            + frags
+            + aliases_tail)
+
+
+def _skip_wstring(data: bytes, pos: int) -> int:
+    return pos + 2 + struct.unpack_from('<H', data, pos)[0]
+
+
+def _skip_script_entry(data: bytes, pos: int) -> int:
+    """Skip one script entry (name, flags, properties) in objectFormat 2."""
+    pos = _skip_wstring(data, pos)
+    pos += 1                                        # flags
+    prop_count = struct.unpack_from('<H', data, pos)[0]
+    pos += 2
+    for _ in range(prop_count):
+        pos = _skip_wstring(data, pos)              # property name
+        prop_type = data[pos]
+        pos += 2                                    # type + status
+        pos = _skip_property_value(data, pos, prop_type)
+    return pos
+
+
+def _skip_property_value(data: bytes, pos: int, prop_type: int) -> int:
+    if prop_type == 1:                              # Object
+        return pos + 8
+    if prop_type == 2:                              # String
+        return _skip_wstring(data, pos)
+    if prop_type in (3, 4):                         # Int32 / Float
+        return pos + 4
+    if prop_type == 5:                              # Bool
+        return pos + 1
+    if prop_type >= 11:                             # arrays of the above
+        count = struct.unpack_from('<I', data, pos)[0]
+        pos += 4
+        element = prop_type - 10
+        for _ in range(count):
+            pos = _skip_property_value(data, pos, element)
+        return pos
+    raise ValueError(f'unhandled VMAD property type {prop_type}')
+
+
+def _pack_wstring(text: str) -> bytes:
+    raw = text.encode('utf-8')
+    return struct.pack('<H', len(raw)) + raw
+
+
+def _pack_script_entry(name: str, object_props: dict) -> bytes:
+    """One attached-script entry: name, flags, Object-typed properties."""
+    out = _pack_wstring(name) + struct.pack('<B', 0)
+    out += struct.pack('<H', len(object_props))
+    for prop_name, fid in object_props.items():
+        out += _pack_wstring(prop_name)
+        out += struct.pack('<BB', 1, 1)             # type=Object, status=Edited
+        out += struct.pack('<HhI', 0, -1, fid)
+    return out
+
+
+def build_plugin(skyrim_esm: str) -> bytes:
     groups = [
         pack_top_group('GLOB', b''.join(build_glob(f, e) for f, e in GLOBALS)),
         pack_top_group('MESG', build_mesg()),
-        pack_top_group('QUST', build_qust()),
+        pack_top_group('QUST', build_qust() + build_mq101_override(skyrim_esm)),
     ]
     # HEDR count = records + GRUPs, matching vanilla Skyrim.esm and the main
     # writer. An undercount here is not cosmetic: the engine walks the file by
@@ -182,19 +378,23 @@ def build_plugin() -> bytes:
 
 
 def write_seq(outdir: str):
-    """Start-Game-Enabled quests in an ESP only actually start when the plugin
-    ships a .seq file listing them — a loose file under Data/seq/, never inside
-    a BSA."""
+    """No Start-Game-Enabled quests, so the .seq is empty.
+
+    The selector is driven by the MQ101 stage-0 fragment, not by SGE. A .seq is
+    still written (empty) so a stale one from an earlier build — which listed
+    the selector as SGE and let it also fire from OnInit, the second source of
+    the double menu — cannot survive an upgrade in place.
+    """
     seq_dir = os.path.join(outdir, 'seq')
     os.makedirs(seq_dir, exist_ok=True)
     path = os.path.join(seq_dir, os.path.splitext(PLUGIN_NAME)[0] + '.seq')
     with open(path, 'wb') as f:
-        f.write(struct.pack('<I', FID_QUST))
+        f.write(b'')
     return path
 
 
-def compile_script(outdir: str) -> bool:
-    """Compile TESGameSelectQuest.psc against the Skyrim SE headers."""
+def compile_scripts(outdir: str) -> bool:
+    """Compile both plugin scripts against the Skyrim SE headers."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from convert import _find_skyrim_source_scripts
     headers = _find_skyrim_source_scripts()
@@ -211,20 +411,24 @@ def compile_script(outdir: str) -> bool:
         print(f'  ERROR: Papyrus compiler not found at {compiler}')
         return False
 
-    psc = os.path.join(src_dir, SCRIPT_NAME + '.psc')
-    # -nocache: the compiler keys its cache on source content alone, so an
-    # unchanged file silently produces no .pex without it.
-    cmd = [compiler, 'compile', '-nocache', '-i', psc, '-o', out_dir,
-           '-h', headers, '-h', src_dir]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=90, cwd=root)
-    out = (r.stdout or '') + (r.stderr or '')
-    pex = os.path.join(out_dir, SCRIPT_NAME + '.pex')
-    if r.returncode != 0 or not os.path.isfile(pex):
-        print('  COMPILE FAILED:')
-        print('   ', out.strip().replace('\n', '\n    '))
-        return False
-    print(f'  compiled {SCRIPT_NAME}.pex ({os.path.getsize(pex)} bytes)')
-    return True
+    ok = True
+    for name in (SCRIPT_NAME, MQ101_SCRIPT_NAME):
+        psc = os.path.join(src_dir, name + '.psc')
+        # -nocache: the compiler keys its cache on source content alone, so an
+        # unchanged file silently produces no .pex without it.
+        cmd = [compiler, 'compile', '-nocache', '-i', psc, '-o', out_dir,
+               '-h', headers, '-h', src_dir]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90,
+                           cwd=root)
+        out = (r.stdout or '') + (r.stderr or '')
+        pex = os.path.join(out_dir, name + '.pex')
+        if r.returncode != 0 or not os.path.isfile(pex):
+            print(f'  COMPILE FAILED ({name}):')
+            print('   ', out.strip().replace('\n', '\n    '))
+            ok = False
+            continue
+        print(f'  compiled {name}.pex ({os.path.getsize(pex)} bytes)')
+    return ok
 
 
 def main():
@@ -236,38 +440,57 @@ def main():
                          'output/TESGameSelect)')
     ap.add_argument('--no-compile', action='store_true',
                     help='Skip Papyrus compilation (plugin only)')
+    ap.add_argument('--skyrim-esm', default=None,
+                    help='Path to Skyrim.esm, whose MQ101 record is overridden '
+                         '(default: auto-detected from the installed game)')
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     outdir = args.outdir if os.path.isabs(args.outdir) else os.path.join(root, args.outdir)
     os.makedirs(outdir, exist_ok=True)
 
-    # Stage the hand-written script source into the output tree so the shipped
+    skyrim_esm = args.skyrim_esm
+    if not skyrim_esm:
+        from convert import find_game_path
+        data_path = find_game_path('skyrimse')
+        if not data_path:
+            print('  ERROR: Skyrim SE install not found; pass --skyrim-esm')
+            return 1
+        skyrim_esm = os.path.join(data_path, 'Skyrim.esm')
+    if not os.path.isfile(skyrim_esm):
+        print(f'  ERROR: Skyrim.esm not found at {skyrim_esm}')
+        return 1
+
+    # Stage the hand-written script sources into the output tree so the shipped
     # folder is a complete, self-contained Data folder.
-    src_master = os.path.join(root, 'TESGameSelect', 'scripts', 'source',
-                              SCRIPT_NAME + '.psc')
     src_dir = os.path.join(outdir, 'scripts', 'source')
     os.makedirs(src_dir, exist_ok=True)
-    shutil.copyfile(src_master, os.path.join(src_dir, SCRIPT_NAME + '.psc'))
+    for name in (SCRIPT_NAME, MQ101_SCRIPT_NAME):
+        shutil.copyfile(
+            os.path.join(root, 'TESGameSelect', 'scripts', 'source',
+                         name + '.psc'),
+            os.path.join(src_dir, name + '.psc'))
 
-    data, count = build_plugin()
+    print(f'Reading MQ101 from {skyrim_esm} ...')
+    data, count = build_plugin(skyrim_esm)
     esp_path = os.path.join(outdir, PLUGIN_NAME)
     with open(esp_path, 'wb') as f:
         f.write(data)
     print(f'Wrote {esp_path} ({len(data)} bytes, HEDR numRecords={count})')
 
     seq = write_seq(outdir)
-    print(f'Wrote {seq}')
+    print(f'Wrote {seq} (empty — no Start-Game-Enabled quests)')
 
     ok = True
     if not args.no_compile:
-        ok = compile_script(outdir)
+        ok = compile_scripts(outdir)
 
     print('\nShip the contents of this folder as a Data folder:')
     print(f'  {PLUGIN_NAME}')
     print(f'  seq\\{os.path.splitext(PLUGIN_NAME)[0]}.seq')
-    print(f'  scripts\\{SCRIPT_NAME}.pex')
-    print(f'  scripts\\source\\{SCRIPT_NAME}.psc')
+    for name in (SCRIPT_NAME, MQ101_SCRIPT_NAME):
+        print(f'  scripts\\{name}.pex')
+        print(f'  scripts\\source\\{name}.psc')
     return 0 if ok else 1
 
 

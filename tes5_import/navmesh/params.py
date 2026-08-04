@@ -182,11 +182,52 @@ ISLAND_EDGE_MARGIN = 48.0
 # ribbon's own vertices always qualify.
 ISLAND_PGRD_RADIUS = 48.0
 
+# --- Island bridging (drop-downs) -------------------------------------------------
+# Oblivion had no pathgrid edge for a DROP: a balcony and the floor below it are
+# two disconnected pathgrid islands, and the actor simply steps off.  The
+# navmesh reproduces the pathgrid faithfully, islands included, so those two
+# storeys arrive as separate components and an NPC pathing between them has no
+# route -- it walks into the wall/door and stops.  (CharacterGen's Ambush A: the
+# assassins' holding cell teleports onto a mezzanine they are meant to DROP from
+# into the ambush room; mezzanine and room floor were separate components, so
+# CGAssassinsAmbushA4 could never complete and the ambush never fired.)
+#
+# The fix bridges two components that all but touch in plan but are separated in
+# Z.  Both sides must ALREADY be separate components, so genuinely-connected
+# storeys (stairs, ramps) are never candidates -- they are one component and
+# never enter this pass.
+#
+# Horizontal reach, the drop window, and the bridge constants themselves are
+# defined AFTER RIBBON_HALF_WIDTH (below), because the reach is derived from
+# the ribbon width rather than hand-fitted.
+
 # --- Corridor ribbons (Phase 1, corridor.py) --------------------------------------
 # Half-width of the flat ribbon laid down each pathgrid edge.  ~80u total sits
 # inside a standard ~110u Oblivion doorway with clearance for the jambs; wide
 # enough for a Skyrim NPC's path radius.  Phase 2 will grow this out to walls.
 RIBBON_HALF_WIDTH = 40.0
+
+# --- Island bridging reach (see the ISLAND_BRIDGE block above) --------------------
+# Matched between BOUNDARY EDGE PAIRS, not single vertices, so the threshold has
+# to cover the length of a ribbon edge: two components can sit directly above one
+# another and still have their nearest edge ENDPOINTS a full edge apart, purely
+# because of where the triangulation put vertices.
+#
+# One ribbon WIDTH, not a hand-fitted constant.  A lip that overhangs the floor
+# below is within a corridor's width of it by construction, while "across the
+# room" is many widths away.  An earlier value fitted to a single measured cell
+# (33u) silently stopped bridging the moment the door-quad fix reshaped that
+# cell's mezzanine to 58u -- which is exactly why this is derived from the
+# ribbon geometry instead.
+ISLAND_BRIDGE_XY = 2.0 * RIBBON_HALF_WIDTH
+# Vertical drop the bridge may span.  A one-storey fall; Skyrim NPCs take this
+# routinely and Oblivion's design relies on it (the Ambush A mezzanine is 192u
+# above the room floor).  More than this would weld a tower's storeys together.
+ISLAND_BRIDGE_MAX_DROP = 220.0
+# Below MAX_CLIMB the two sides are a step apart, not a storey -- ordinary
+# adjacency, not a drop, and not this pass's business.
+ISLAND_BRIDGE_MIN_DROP = MAX_CLIMB
+
 # Spacing of cross-sections along an edge, so a long edge is several quads and
 # the ribbon can follow the pathgrid line's slope in Z rather than one flat
 # quad bridging the whole span.

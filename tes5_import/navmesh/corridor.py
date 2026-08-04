@@ -480,12 +480,15 @@ def _simplify(pts, tol):
 
 def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
                     land_rec=None, origin_x=0.0, origin_y=0.0, doors=None):
-    """Phase-1 corridor navmesh for one cell.  Returns (verts, tris) lists.
+    """Phase-1 corridor navmesh for one cell: (verts, tris, ledges) lists.
 
-    doors: [(x, y, z, rot_z, is_teleport), ...] pivot-corrected door centres.
+    doors: [(x, y, z, rot_z, is_teleport, width), ...] pivot-corrected door
+        centres; width is the measured doorway span in world units.
+    ledges: [(upper_tri, lower_tri, drop), ...] drop-down pairs between
+        disconnected storeys, for NVNM Ledge Up/Down edge links.
     """
     if not nodes or not edges:
-        return [], []
+        return [], [], []
 
     walkable, blocking, land_walk = world.gather_cell_geometry(
         refr_recs or [], base_model_by_fid or {}, get_collision,
@@ -560,32 +563,56 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     # wall crossings, not fewer).  Per-storey handling is needed instead.
     wall_cut = None
 
-    door_list = [(x, y, z, r, tp) for (x, y, z, r, tp) in (doors or ())]
+    door_list = [(x, y, z, r, tp, w) for (x, y, z, r, tp, w) in (doors or ())]
     door_strips = []
     door_edges = []
+    door_pins = []
     if door_list:
         rv, rt = corridor_union.build_union_mesh(corridors,
                                                  cell_bounds=cell_clip,
                                                  wall_cut=wall_cut)
         if rt:
             for fp in corridor_doors.door_footprints(rv, rt, door_list,
-                                                     wall_hit=wall_hit):
+                                                     wall_hit=wall_hit,
+                                                     nodes=nodes,
+                                                     pg_edges=edges):
                 door_strips.append(corridor_union._poly_strip(fp['poly'],
                                                               fp['z']))
-                door_edges.append(fp['base'])
+                # Far-side quads (interior doors) carry no base constraint —
+                # they are plain ground; ONE Door Triangle per door, on the
+                # primary side.  The entry is (base0, base1, apex, storey_z):
+                # the door triangle's exact shape, fixed by corridor_doors,
+                # plus the height of the corridor it bridges to so the claim
+                # in build_union_mesh can pick the right SHEET (two stacked
+                # floors both pass a 2D containment test).
+                if fp['base'] is not None:
+                    door_edges.append((fp['base'][0], fp['base'][1],
+                                       fp['apex'], fp['z']))
+                    # PIN the wedge's ring through the cleanup passes: base
+                    # corners, base midpoint and apex.  Where a door is wider
+                    # than the ribbon crossing it, the ground beside the
+                    # reserved wedge is thin crumb geometry that decimation
+                    # eats — taking the hole-ring vertices with it, so the
+                    # attach found nothing within snap range and withdrew the
+                    # door triangle (measured on the CharacterGen pen gate).
+                    (b0, b1), apex, fz = fp['base'], fp['apex'], fp['z']
+                    door_pins.extend((
+                        (b0[0], b0[1], fz), (b1[0], b1[1], fz),
+                        (0.5 * (b0[0] + b1[0]), 0.5 * (b0[1] + b1[1]), fz),
+                        (apex[0], apex[1], fz)))
 
     verts, tris = corridor_union.build_union_mesh(
         corridors, extra_strips=door_strips, door_edges=door_edges,
         cell_bounds=cell_clip, wall_cut=wall_cut)
     if not tris:
-        return [], []
+        return [], [], []
 
     cs = params.CS_EXTERIOR if land_rec is not None else params.CS
     # For dropping unreachable fringe scraps, a component is KEPT when it can
     # reach another cell — via a door, or (exterior) by touching the cell
     # border where a worldspace edge-link continues it.  Pass the door centres
     # and, for an exterior cell, its world-space bounds.
-    door_xy = [(x, y, z) for (x, y, z, r, tp) in door_list]
+    door_xy = [(x, y, z) for (x, y, z, r, tp, w) in door_list]
     cell_bounds = None
     if land_rec is not None:
         cell_bounds = (origin_x, origin_y, origin_x + 4096.0, origin_y + 4096.0)
@@ -598,7 +625,7 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     # steep ribbon through decimation and mark a component as pathgrid-carrying
     # so the island pass can never drop it (the pathgrid asserts an actor walks
     # there, so that ground is reachable by definition).
-    pin_xy = list(door_xy)
+    pin_xy = list(door_xy) + door_pins
     for (i, j) in edges:
         if i >= len(nodes) or j >= len(nodes) or i == j:
             continue
@@ -612,9 +639,79 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
                            nodes[i][1] + (nodes[j][1] - nodes[i][1]) * f,
                            node_z[i] + (node_z[j] - node_z[i]) * f))
 
-    verts, tris = corridor_clean.finalize(verts, tris, cs=cs,
-                                          doors=door_xy, cell_bounds=cell_bounds,
-                                          pin_xy=pin_xy)
+    verts, tris, ledge_marks = corridor_clean.finalize(
+        verts, tris, cs=cs, doors=door_xy, cell_bounds=cell_bounds,
+        pin_xy=pin_xy, door_pins=door_pins)
 
-    return ([tuple(float(c) for c in v) for v in verts],
-            [tuple(int(i) for i in t) for t in tris])
+    verts = [tuple(float(c) for c in v) for v in verts]
+    tris = [tuple(int(i) for i in t) for t in tris]
+
+    # ADD THE DOOR TRIANGLES BACK, LAST.  They were cut out of the polygon
+    # before triangulation, so every pass above -- Delaunay, the 3D weld, the
+    # T-junction split, the pathgrid-node merge, make-manifold, the island cull
+    # -- saw the doorway as plain mesh boundary and had nothing there to split,
+    # weld or drop.  Adding them only now is what makes "one triangle per door,
+    # its long side the full width of the doorway" a guarantee rather than
+    # something the cleanup passes might survive.
+    if corridor_union.PENDING_DOOR_TRIS:
+        verts, tris = corridor_union.attach_door_triangles(
+            verts, tris, corridor_union.PENDING_DOOR_TRIS)
+
+    # DROP ATTACH-ERA SCRAPS.  The island cull ran inside finalize, BEFORE the
+    # door attach; de-stacking there can orphan a mesh triangle whose only
+    # edge-neighbours were removed, leaving 1-2 triangle specks the engine can
+    # never route onto (measured: one each in Pinarus, ChorrolFG, AnvilFG).
+    # A speck that carries a door's threshold is kept — it IS that door's
+    # triangle and the door link needs it.
+    comps = corridor_clean.components([list(map(int, t)) for t in tris])
+    if len(comps) > 1:
+        drop = set()
+        for comp in comps:
+            if len(comp) > 2:
+                continue
+            has_door = False
+            for ti in comp:
+                a, b, c = (verts[i] for i in tris[ti])
+                for (px, py, pz) in door_xy:
+                    d = ((b[1] - c[1]) * (a[0] - c[0])
+                         + (c[0] - b[0]) * (a[1] - c[1]))
+                    if abs(d) < 1e-9:
+                        continue
+                    l0 = ((b[1] - c[1]) * (px - c[0])
+                          + (c[0] - b[0]) * (py - c[1])) / d
+                    l1 = ((c[1] - a[1]) * (px - c[0])
+                          + (a[0] - c[0]) * (py - c[1])) / d
+                    l2 = 1.0 - l0 - l1
+                    if l0 >= -0.05 and l1 >= -0.05 and l2 >= -0.05 \
+                            and abs(l0 * a[2] + l1 * b[2] + l2 * c[2]
+                                    - pz) <= 128.0:
+                        has_door = True
+                        break
+                if has_door:
+                    break
+            if not has_door:
+                drop.update(comp)
+        if drop:
+            tris = [t for ti, t in enumerate(tris) if ti not in drop]
+
+    # NORMALISE WINDING.  The mesh is a heightfield, so every triangle must be
+    # CCW in plan (Z-normal up); the engine and the CK's DOWNFACING rule both
+    # read a CW triangle as a downward-facing surface.  Edge collapses in
+    # decimation (and the weld) can flip a triangle's plan winding — measured
+    # two CW triangles in ImperialDungeon01 once the far-side door quads
+    # reshaped the local triangulation.  Orientation is a per-triangle
+    # property; flipping is always safe here.
+    tris = [((t[0], t[2], t[1])
+             if ((verts[t[1]][0] - verts[t[0]][0])
+                 * (verts[t[2]][1] - verts[t[0]][1])
+                 - (verts[t[2]][0] - verts[t[0]][0])
+                 * (verts[t[1]][1] - verts[t[0]][1])) < 0 else t)
+            for t in tris]
+
+    # Resolve drop-down pairs to FINAL triangle indices only now — the attach
+    # can both append (door + stitch fills) and remove (de-stacked overlap)
+    # triangles, so any index resolved earlier would be stale.
+    ledges = corridor_clean._resolve_ledges(verts, tris, ledge_marks)
+
+    return (verts, tris,
+            [(int(a), int(b), float(d)) for (a, b, d) in ledges])

@@ -165,11 +165,21 @@ def render(export_dir, cell_arg, out_path, size, focus=None, span=None,
     # Doors: cyan diamond + threshold line (teleport doors get a white core),
     # so door-quad placement is checkable against the door itself.
     import math as _m
-    for (x, y, _z, rz, is_tp) in ctx.get('doors') or ():
+    for dr in ctx.get('doors') or ():
+        x, y, _z, rz, is_tp = dr[0], dr[1], dr[2], dr[3], dr[4]
+        width = dr[5] if len(dr) > 5 else 0.0
         p = px(x, y)
-        tx, ty = _m.cos(rz), _m.sin(rz)
-        a = px(x - 48 * tx, y - 48 * ty)
-        b = px(x + 48 * tx, y + 48 * ty)
+        # The THRESHOLD runs ALONG the door's local +Y, not its facing: a door
+        # panel is thin through the opening and wide across it (impdundoor01 is
+        # 5.6u in local X, 115.3u in local Y).  Drawing the line along
+        # (cos rz, sin rz) — the FACING — rendered every door 90 degrees from
+        # its real opening.  Same convention as corridor_doors.py's base line.
+        # The line is drawn at the door's REAL measured width so a quad that
+        # fails to span its doorway is visible here.
+        tx, ty = _m.sin(rz), _m.cos(rz)
+        half = 0.5 * width if width else 48.0
+        a = px(x - half * tx, y - half * ty)
+        b = px(x + half * tx, y + half * ty)
         d.line([a, b], fill=(60, 230, 255, 230), width=2)
         d.ellipse([p[0] - 4, p[1] - 4, p[0] + 4, p[1] + 4],
                   fill=(255, 255, 255) if is_tp else (60, 230, 255))

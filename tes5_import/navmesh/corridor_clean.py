@@ -112,7 +112,7 @@ def _make_manifold(verts, tris):
 
 
 def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None,
-             pin_xy=None):
+             pin_xy=None, door_pins=None):
     """V1 cleanup: drop degenerate triangles, guarantee manifold, compact.
 
     corridor_union already produces ONE connected, non-overlapping surface (the
@@ -134,10 +134,30 @@ def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None,
     # Only DOORS pin the decimator: a collapse at a threshold kills the Door
     # Triangle.  (pin_xy carries every pathgrid sample and is used by the island
     # pass below; pinning all of it would disable decimation everywhere.)
+    # door_pins carries the reserved wedges' RING points (base corners, base
+    # midpoint, apex) — decimation collapsing those left the attach nothing to
+    # snap the door triangle to where the doorway outreaches its ribbon.
     verts, tris = decimate(verts, tris,
-                           pinned_xy=[(d[0], d[1]) for d in (doors or ())])
+                           pinned_xy=[(d[0], d[1]) for d in (doors or ())]
+                           + [(p[0], p[1]) for p in (door_pins or ())])
+    # Find drop-down storeys BEFORE the island cull: a mezzanine an actor is
+    # meant to step off is a legitimate component and must not be culled as a
+    # stray scrap.  These become NVNM Ledge Up/Down EDGE LINKS (Skyrim's own
+    # drop-down mechanism), not bridging geometry — see find_ledge_links.
+    ledge_pairs = find_ledge_links(verts, tris)
+    # Identify each ledge triangle by its CENTROID, not its index: the passes
+    # below drop and reorder both triangles and vertices, so an index captured
+    # now is meaningless afterwards.  The centroid survives all of them.
+    ledge_marks = [(_centroid(verts, tris[hi]), _centroid(verts, tris[lo]),
+                    drop) for (hi, lo, drop) in ledge_pairs]
+    tris = _make_manifold(verts, tris)
     tris = _drop_unreachable_islands(verts, tris, doors, cell_bounds, pin_xy)
-    return _compact(verts, tris)
+    verts, tris = _compact(verts, tris)
+    # Ledge MARKS (centroids), not indices: build_corridors still appends the
+    # door triangles (attach_door_triangles) after this, and de-stacking there
+    # can remove triangles, which would shift any index resolved here.  The
+    # caller resolves marks to final indices with _resolve_ledges LAST.
+    return verts, tris, ledge_marks
 
 
 def decimate(verts, tris, pinned_xy=None):
@@ -457,6 +477,142 @@ def edge_adjacency(tris):
             adj[ti][si] = tj
             adj[tj][sj] = ti
     return adj
+
+
+def _boundary_edges(tris, comp):
+    """Open edges (no neighbour) of one component, as (a, b) vertex indices."""
+    owners = {}
+    for ti in comp:
+        t = tris[ti]
+        for k in range(3):
+            a, b = int(t[k]), int(t[(k + 1) % 3])
+            key = (a, b) if a < b else (b, a)
+            owners[key] = owners.get(key, 0) + 1
+    return [e for e, n in owners.items() if n == 1]
+
+
+def _centroid(verts, tri):
+    a, b, c = verts[tri[0]], verts[tri[1]], verts[tri[2]]
+    return ((a[0] + b[0] + c[0]) / 3.0,
+            (a[1] + b[1] + c[1]) / 3.0,
+            (a[2] + b[2] + c[2]) / 3.0)
+
+
+def _resolve_ledges(verts, tris, marks, tol=1.0):
+    """Map centroid-marked ledge pairs back to FINAL triangle indices.
+
+    A pair is dropped when either of its triangles did not survive the cull —
+    a link to a triangle that no longer exists is worse than no link.
+    """
+    if not marks or len(tris) == 0:
+        return []
+    cents = [_centroid(verts, t) for t in tris]
+    tol2 = tol * tol
+
+    def _find(mark):
+        best = None
+        for i, c in enumerate(cents):
+            d = ((c[0] - mark[0]) ** 2 + (c[1] - mark[1]) ** 2
+                 + (c[2] - mark[2]) ** 2)
+            if d <= tol2 and (best is None or d < best[0]):
+                best = (d, i)
+        return best[1] if best else None
+
+    out = []
+    for (hi_mark, lo_mark, drop) in marks:
+        hi = _find(hi_mark)
+        lo = _find(lo_mark)
+        if hi is not None and lo is not None and hi != lo:
+            out.append((hi, lo, drop))
+    return out
+
+
+def find_ledge_links(verts, tris):
+    """Find DROP-DOWNs between components: [(tri_hi, tri_lo, drop), ...].
+
+    Oblivion expressed a drop-down as two disconnected pathgrid islands — the
+    actor steps off a ledge, and there is no pathgrid edge for that.  The
+    navmesh mirrors the pathgrid, so those storeys arrive as separate
+    components and an NPC pathing across has no route.
+
+    Skyrim's own mechanism for this is an NVNM **Edge Link** of type
+    `Ledge Down` (2) from the upper triangle and `Ledge Up` (1) from the lower
+    one — NOT geometry.  Vanilla Skyrim.esm carries 476 Ledge Down and 467
+    Ledge Up links across 3,000 navmeshes (near-symmetric pairs), and zero
+    bridging triangles: an actor DROPS through empty space, so inventing
+    walkable ground across the lip both lets NPCs walk on air and, because the
+    quad is near-vertical, breeds downfacing/opposite-normal triangles.
+
+    This only DETECTS the pairs; `pgrd_to_navm` writes the links.  Both sides
+    must ALREADY be separate components, which is what keeps it safe: stairs,
+    ramps and genuinely-connected storeys are one component and never reach
+    here.  A pair qualifies only when its boundaries come within
+    ISLAND_BRIDGE_XY in plan AND are separated by a drop between
+    ISLAND_BRIDGE_MIN_DROP and ISLAND_BRIDGE_MAX_DROP, so a fall the actor
+    cannot survive is left alone.
+    """
+    if len(tris) == 0:
+        return []
+    tris = [list(map(int, t)) for t in tris]
+    comps = components(tris)
+    if len(comps) < 2:
+        return []
+
+    # triangle index -> component index, so a boundary edge names its triangle
+    tri_comp = {}
+    for ci, comp in enumerate(comps):
+        for ti in comp:
+            tri_comp[ti] = ci
+
+    def _edge_tri(ti_set, a, b):
+        """The triangle in this component owning boundary edge (a, b)."""
+        for ti in ti_set:
+            t = tris[ti]
+            for k in range(3):
+                if {t[k], t[(k + 1) % 3]} == {a, b}:
+                    return ti
+        return None
+
+    bounds = [_boundary_edges(tris, c) for c in comps]
+    out = []
+    paired = set()
+    for i in range(len(comps)):
+        for j in range(i + 1, len(comps)):
+            best = None
+            for (a1, b1) in bounds[i]:
+                p1, q1 = verts[a1], verts[b1]
+                for (a2, b2) in bounds[j]:
+                    p2, q2 = verts[a2], verts[b2]
+                    dxy = max(math.hypot(p1[0] - p2[0], p1[1] - p2[1]),
+                              math.hypot(q1[0] - q2[0], q1[1] - q2[1]))
+                    if dxy > params.ISLAND_BRIDGE_XY:
+                        continue
+                    z1 = 0.5 * (p1[2] + q1[2])
+                    z2 = 0.5 * (p2[2] + q2[2])
+                    drop = abs(z1 - z2)
+                    if not (params.ISLAND_BRIDGE_MIN_DROP <= drop
+                            <= params.ISLAND_BRIDGE_MAX_DROP):
+                        continue
+                    if best is None or dxy < best[0]:
+                        best = (dxy, (a1, b1), (a2, b2), z1, z2, drop)
+            if best is None:
+                continue
+            _dxy, (a1, b1), (a2, b2), z1, z2, drop = best
+            t1 = _edge_tri(comps[i], a1, b1)
+            t2 = _edge_tri(comps[j], a2, b2)
+            if t1 is None or t2 is None:
+                continue
+            key = (min(i, j), max(i, j))
+            if key in paired:
+                continue
+            paired.add(key)
+            # (upper triangle, lower triangle, drop) — the caller writes
+            # Ledge Down on the upper and Ledge Up on the lower.
+            if z1 >= z2:
+                out.append((t1, t2, drop))
+            else:
+                out.append((t2, t1, drop))
+    return out
 
 
 def components(tris):

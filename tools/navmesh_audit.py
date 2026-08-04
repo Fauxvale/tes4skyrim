@@ -30,7 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import build, params  # noqa: E402
-from tes5_import.pgrd_to_navm import _collect_doors  # noqa: E402
+from tes5_import.pgrd_to_navm import (_collect_doors,  # noqa: E402
+                                      load_door_centroids)
 from tes5_import.text_reader import (  # noqa: E402
     parse_export_directory, group_records_by_type, get_float, get_int, get_str,
 )
@@ -269,6 +270,12 @@ def main():
 
     # Parsing the export is ~78s single-threaded (1.1M records) and dwarfs the
     # actual navmesh work, so the slices we need are cached to disk and reused.
+    # Door panel centroids + threshold axis/width.  Without this _collect_doors
+    # returns raw hinge positions with the default orientation and width 0, so
+    # the audit would grade doors the pipeline never builds.
+    load_door_centroids(os.path.join(a.export, 'door_centers_cache.json'),
+                        quiet=True)
+
     cache = os.path.join(a.export, 'audit_index3.pkl')
     if os.path.exists(cache) and not a.reindex:
         with open(cache, 'rb') as fh:
@@ -294,8 +301,18 @@ def main():
                         for p in by_type.get('PGRD', [])}
         land_by_cell = {(ld.get('ParentCELL') or '').upper(): ld
                         for ld in by_type.get('LAND', [])}
-        door_fids = {int(d['FormID'], 16) & 0xFFFFFF
-                     for d in by_type.get('DOOR', []) if d.get('FormID')}
+        # MAP (not a set): fid -> model key, matching
+        # import_main._build_door_fid_set.  A bare set makes _collect_doors take
+        # its legacy membership-only path, which skips panel centring AND the
+        # per-model threshold axis/width — so every debug tool measured doors
+        # with width 0 and the default orientation while the real pipeline used
+        # the measured ones.
+        door_fids = {}
+        for d in by_type.get('DOOR', []):
+            f = d.get('FormID')
+            m = get_str(d, 'Model.MODL') or get_str(d, 'MODL')
+            if f and m:
+                door_fids[int(f, 16) & 0xFFFFFF] = _model_key(m)
         cells = by_type.get('CELL', [])
 
         with open(cache, 'wb') as fh:
@@ -338,8 +355,8 @@ def main():
         if _is_exterior(c) and not name:
             name = 'ext_%d_%d' % (gx, gy)
         refrs = refr_by_cell.get(fid, [])
-        doors = [(x, y, z, r, tp)
-                 for (x, y, z, r, _f, tp) in _collect_doors(refrs, door_fids)]
+        doors = [(x, y, z, r, tp, w)
+                 for (x, y, z, r, _f, tp, w) in _collect_doors(refrs, door_fids)]
         jobs.append(((name or fid)[:34],
                      refrs, nodes, edges, land, gx, gy, doors))
 

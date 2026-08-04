@@ -50,6 +50,30 @@ _GRID_LOCATION: dict = {}
 # WRLD FormID -> LCTN FormID, the catch-all location for that worldspace.
 _WORLD_LOCATION: dict = {}
 
+# Door REFR FormID -> (NAVM FormID, triangle index), the reference side of a
+# navmesh door link.  Populated from the navmesh metas once every mesh exists
+# (Phase 4a) and read by convert_REFR to emit XNDP.  See set_door_navmesh_links.
+_DOOR_NAVMESH_LINK: dict = {}
+
+
+def set_door_navmesh_links(door_links: dict):
+    """Register door REFR -> (NAVM, triangle) for XNDP emission.
+
+    NVNM's own Door Triangles and NAVI's NVMI Door Links both say "this
+    navmesh triangle is a doorway", but neither lets the engine go the other
+    way — from the DOOR REFERENCE an actor is pathing towards, to the navmesh
+    triangle it must stand on.  That direction is XNDP on the REFR, and it is
+    what BSPathingDoor is built from.  Without it a teleport door is not a
+    pathing node: the actor has no route through it and simply never leaves the
+    room, even though every package, alias and condition is correct.
+
+    Vanilla invariant: 1,705 of 1,722 Skyrim.esm teleport-door REFRs (99.0%)
+    carry XNDP, and 1,705 of the 1,706 XNDP records in the file are teleport
+    doors — the subrecord is essentially the teleport-door navmesh binding.
+    """
+    _DOOR_NAVMESH_LINK.clear()
+    _DOOR_NAVMESH_LINK.update(door_links or {})
+
 
 def set_cell_locations(cell_to_location: dict,
                        grid_to_location: dict = None,
@@ -537,6 +561,16 @@ def convert_REFR(rec: dict) -> bytes:
         # marker to the Location the player discovers.  396/397 vanilla map
         # markers carry MapMarkerRefType here.
         subs += pack_formid_subrecord('XLRT', SKYRIM_MAP_MARKER_LCRT)
+
+    # XNDP — Navmesh Door Link: the navmesh triangle this door stands on.
+    # Emitted last, immediately before DATA, which is where all 1,706 vanilla
+    # XNDP records sit (after XLOC/XOWN/XLRT/XSCL).  Struct: Navmesh FormID(4)
+    # + Triangle s16 + 2 unused.
+    door_link = _DOOR_NAVMESH_LINK.get(get_formid(rec, 'FormID'))
+    if door_link:
+        navm_fid, tri_index = door_link
+        subs += pack_subrecord('XNDP', struct.pack('<Ihxx', navm_fid,
+                                                   tri_index))
 
     # Position/Rotation (DATA)
     px = get_float(rec, 'PosX')
