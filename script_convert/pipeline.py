@@ -123,10 +123,27 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
     # `TES4Polyfill.*` and INFO VMADs name the service fragments, both of
     # which resolve to the master's shipped copy (phase_compile puts every
     # master's source dir on the -h header path).
+    static_dir = os.path.join(os.path.dirname(__file__), 'static_scripts')
     if master_names(export_dir):
         print('  Static scripts: skipped (owned by this plugin\'s master)')
+        # Remove copies an older (pre-skip) build left in this plugin's
+        # output. They are poison twice over: the stale .psc shadows the
+        # master's fresh copy on the compile header path (Translation.esp's
+        # Aug-1 TES4Polyfill had no ReleaseBreakaway, so every script calling
+        # it failed to compile), and the stale .pex ships under the same
+        # script name as the master's — whichever loads last wins in-game.
+        if os.path.isdir(static_dir):
+            for name in os.listdir(static_dir):
+                if not name.endswith('.psc'):
+                    continue
+                stale_psc = os.path.join(output_dir, name)
+                stale_pex = os.path.join(os.path.dirname(output_dir),
+                                         name[:-4] + '.pex')
+                for stale in (stale_psc, stale_pex):
+                    if os.path.isfile(stale):
+                        os.remove(stale)
+                        print(f'    removed stale master-owned copy: {stale}')
     else:
-        static_dir = os.path.join(os.path.dirname(__file__), 'static_scripts')
         if os.path.isdir(static_dir):
             import shutil
             for name in os.listdir(static_dir):

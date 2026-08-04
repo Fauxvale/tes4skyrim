@@ -1226,6 +1226,20 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     from .navm_edge_links import build_edge_links
     build_edge_links(navm_cache)
 
+    # Split multi-component INTERIOR meshes into one NAVM per component.  The
+    # engine only joins navmeshes through a door when the two sides are
+    # DIFFERENT NAVM records (vanilla: all 5 same-cell teleport-door pairs
+    # with XNDP live on two meshes); a door pair inside one mesh is never a
+    # portal, so the CharacterGen assassins could not leave their holding
+    # room however correct XNDP/NVNM/NVMI were.  Must run after
+    # build_edge_links (final triangle indices) and before the XNDP
+    # collection below (it moves doors onto the component meshes).
+    from .navm_split import split_disconnected_interiors
+    n_split = split_disconnected_interiors(navm_cache, writer)
+    if n_split:
+        print(f"  Navmesh split: {n_split} interior meshes split into "
+              f"per-component NAVMs")
+
     # The REFR side of every navmesh door link.  NVNM (door triangles) and NAVI
     # (NVMI door links) both point navmesh -> door; XNDP is the only thing that
     # points door -> navmesh triangle, and that is the direction the engine
@@ -2021,6 +2035,10 @@ def _build_cell_groups(by_type: dict, writer: PluginWriter,
                             temporary.append(navm_bytes)
                             navm_metas.append(meta)
                             converted += 1
+                            for xb, xm in meta.get('extra_navms', ()):
+                                temporary.append(xb)
+                                navm_metas.append(xm)
+                                converted += 1
                     if temporary:
                         children_parts.append(pack_group(9, struct.pack('<I', cell_fid), b''.join(temporary)))
 
@@ -2266,6 +2284,10 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
                                     temporary.append(navm_bytes)
                                     navm_metas.append(meta)
                                     converted += 1
+                                    for xb, xm in meta.get('extra_navms', ()):
+                                        temporary.append(xb)
+                                        navm_metas.append(xm)
+                                        converted += 1
                             if temporary:
                                 cell_children.append(pack_group(9, struct.pack('<I', cell_fid), b''.join(temporary)))
 
