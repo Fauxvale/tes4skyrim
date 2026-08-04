@@ -41,7 +41,8 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
                         stage_reveals, say_durations=None,
                         say_timer_owners=None, topic_by_dial=None,
                         beat_fields_by_owner=None, quest_script_vars=None,
-                        quest_edid_by_fid=None, topic_unlock_globals=None):
+                        quest_edid_by_fid=None, topic_unlock_globals=None,
+                        message_menus=None):
     _WORKER_CTX.update(xref=xref, output_dir=output_dir,
                        info_reveals=info_reveals,
                        service_topics=service_topics,
@@ -59,6 +60,9 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
     # DIAL EditorID -> unlock global, so a script `AddTopic X` opens the same
     # gate the INFO/QUST fragments do.
     ScriptConverter.topic_unlock_globals = topic_unlock_globals or {}
+    # script EditorID -> button-MessageBox MESG plan; the importer writes the
+    # records this makes the converter reference (message_menus.py).
+    ScriptConverter.message_menus = message_menus or {}
 
 
 def _script_worker_run(job):
@@ -255,10 +259,20 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
         if gname:
             topic_unlock_globals[edid] = gname
 
+    # Button-MessageBox plan — the SAME analysis the importer runs to author
+    # the MESG records, so the Message properties emitted here bind to them.
+    from .message_menus import build_message_plan
+    message_menus = build_message_plan(by_type.get('SCPT', []))
+    if message_menus:
+        n_sites = sum(len(v) for v in message_menus.values())
+        print(f'    Button menus: {n_sites} MessageBox sites in '
+              f'{len(message_menus)} scripts')
+
     initargs = (xref, output_dir, info_reveals, service_topics,
                 unlock_plan['stage_reveals'], say_durations,
                 say_timer_owners, topic_by_dial, beat_fields_by_owner,
-                quest_script_vars, quest_edid_by_fid, topic_unlock_globals)
+                quest_script_vars, quest_edid_by_fid, topic_unlock_globals,
+                message_menus)
     if workers <= 1 or len(jobs) <= 2:
         _script_worker_init(*initargs)
         for job in jobs:

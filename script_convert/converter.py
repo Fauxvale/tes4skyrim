@@ -271,6 +271,12 @@ class ScriptConverter:
     # an ungated topic stays an inert comment.
     topic_unlock_globals: dict = {}
 
+    # script EditorID (lower) -> [(mesg_edid, text, buttons)], from
+    # script_convert.message_menus.build_message_plan. Populated once per run
+    # by the pipeline AND the importer from the same analysis, so the Message
+    # properties the .psc declares are exactly the MESG records the ESM ships.
+    message_menus: dict = {}
+
     def __init__(self, xref: CrossRefGraph):
         self.xref = xref
         self._property_refs: dict[str, str] = {}
@@ -293,6 +299,9 @@ class ScriptConverter:
         # for the rest of the save — the paired on/off trap in
         # docs/papyrus_conversion_notes.md.
         self._suppressed_fall_damage = False
+        # Button-MessageBox state (see message_menus.py).
+        self._msgbox_used = set()
+        self._uses_msg_buttons = False
         # Nesting depth inside an OBSE `forEach … loop` block (body is inert).
         self._in_foreach = 0
         self._udf_returns = False      # OBSE Function block uses SetFunctionValue
@@ -1592,7 +1601,52 @@ class ScriptConverter:
                 out.insert(insert_idx + i, pl)
 
         out.extend(self._emit_cell_family_helpers())
+        out.extend(self._emit_button_helpers())
         return '\n'.join(out)
+
+    def _mesg_for_box(self, text, buttons) -> str:
+        """The planned MESG EDID for a button-MessageBox call site, matched by
+        content (blocks can convert out of source order — MenuMode merges into
+        the GameMode poll — so positional matching would misnumber duplicate
+        texts). Returns '' when this context has no plan (fragments) or the
+        site is not in it."""
+        plan = self.message_menus.get((self._current_script_edid or '').lower())
+        if not plan:
+            return ''
+        for name, ptext, pbuttons in plan:
+            if name in self._msgbox_used:
+                continue
+            if ptext == text and list(pbuttons) == list(buttons):
+                self._msgbox_used.add(name)
+                return name
+        return ''
+
+    def _emit_button_helpers(self) -> list:
+        """The shared state behind the button-MessageBox conversion: Show()
+        writes the clicked index here, and the converted GetButtonPressed
+        reads it back through the consumer — once, then -1 again, which is
+        TES4's own contract and what keeps every `if button == N` poll from
+        re-firing forever on a stale index."""
+        if not getattr(self, '_uses_msg_buttons', False):
+            return []
+        return [
+            '',
+            'Int TES4_MsgButton = -1',
+            '',
+            '; Displaying a box resets the pressed state (TES4: GetButtonPressed',
+            '; reads -1 from display until the click), then Show() parks this',
+            '; thread on the box and its return lands in TES4_MsgButton.',
+            'Int Function TES4_ShowMsg(Message TES4_akMsg)',
+            '  TES4_MsgButton = -1',
+            '  Return TES4_akMsg.Show()',
+            'EndFunction',
+            '',
+            'Int Function TES4_TakeMsgButton()',
+            '  Int TES4_taken = TES4_MsgButton',
+            '  TES4_MsgButton = -1',
+            '  Return TES4_taken',
+            'EndFunction',
+        ]
 
     def _emit_cell_family_helpers(self) -> list:
         """Helper functions for the GetInCell prefix families used by a script.
@@ -2100,6 +2154,10 @@ class ScriptConverter:
         # SCPT in a job, and a leaked True would append a RestoreFallDamage to
         # an unrelated script's teardown event.
         self._suppressed_fall_damage = False
+        # Button-MessageBox state (see message_menus.py): MESG names already
+        # matched to a call site this script, and whether the helpers are due.
+        self._msgbox_used = set()
+        self._uses_msg_buttons = False
 
     @staticmethod
     def _balance_if_endif(lines: list[str]) -> list[str]:
@@ -3805,6 +3863,17 @@ class ScriptConverter:
                 return 'IsDisabled()'
             # Handle bare function references that need special handling
             if bare_low == 'getbuttonpressed':
+                # A script that shows a button MessageBox of its own reads the
+                # clicked index back through the consume-on-read helper (TES4
+                # returns it once, then -1). A script that never shows one is
+                # polling a box some OTHER script displayed — cross-script
+                # GetButtonPressed was global in TES4 — and keeps the dead -1
+                # rather than being silently miswired to its own (nonexistent)
+                # state.
+                if self.message_menus.get(
+                        (self._current_script_edid or '').lower()):
+                    self._uses_msg_buttons = True
+                    return 'TES4_TakeMsgButton()'
                 return '-1'
             if bare_low in ('getcrimegold',):
                 self._property_refs['TES4CyrodiilCrimeFaction'] = 'Faction'
@@ -4776,6 +4845,22 @@ class ScriptConverter:
         # Gate!", and so did the bounty, the Dawnfang kill count and the Bruma
         # statue's year.  86 call sites (16 SCPT + 70 INFO).
         if fname_low in ('message', 'messagebox'):
+            # A MessageBox WITH buttons becomes an authored MESG's Show():
+            # Show() parks this thread on the box and returns the clicked
+            # index, which TES4_TakeMsgButton() then hands to the script's
+            # GetButtonPressed poll exactly once (see message_menus.py — the
+            # importer writes the MESG records this property binds to).
+            if fname_low == 'messagebox':
+                from .message_menus import parse_button_box
+                parsed = parse_button_box(args_str or '')
+                if parsed:
+                    mesg = self._mesg_for_box(*parsed)
+                    if mesg:
+                        self._property_refs[mesg] = 'Message'
+                        self._uses_msg_buttons = True
+                        return f'TES4_MsgButton = TES4_ShowMsg({mesg})'
+                    # No planned MESG (a fragment context, or plan drift):
+                    # fall through — the text-only box is still shown.
             papyrus = ('Debug.Notification' if fname_low == 'message'
                        else 'Debug.MessageBox')
             s = args_str.strip().lstrip(',').strip() if args_str else ''
@@ -6636,8 +6721,12 @@ class ScriptConverter:
             self._line_comments.append(';NE: GetBookRead')
             return '0'
 
-        # ShowClassMenu, ShowBirthSignMenu etc - no-ops
-        if fname_low in ('showclassmenu', 'showbirthsignmenu', 'showracemenu'):
+        # ShowClassMenu / ShowBirthSignMenu — Skyrim has no class or birthsign
+        # system, so these stay no-ops. ShowRaceMenu is NOT here: Skyrim has
+        # Game.ShowRaceMenu() and FUNCTION_MAP carries the mapping — the TES4
+        # chargen "revise your character" doors (CGSewerExitScript, Morroblivion's
+        # census exit) depend on it actually opening.
+        if fname_low in ('showclassmenu', 'showbirthsignmenu'):
             self._line_comments.append(f';NE: {func_name}')
             return '0'
 

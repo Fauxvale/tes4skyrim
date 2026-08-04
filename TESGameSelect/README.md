@@ -3,7 +3,7 @@
 A small, redistributable Skyrim SE plugin. When you start a **new game**, it
 detects which converted TES games are installed and asks which one you want to
 play. Picking one hands control to that game's own character generation; picking
-Skyrim leaves the vanilla Helgen opening completely untouched.
+Skyrim runs the vanilla Helgen opening exactly as shipped.
 
 Supported starts:
 
@@ -22,40 +22,97 @@ Copy these into your `Data` folder (or install the folder as a mod):
 
 ```
 TESGameSelect.esp
-seq\TESGameSelect.seq
 scripts\TESGameSelectQuest.pex
-scripts\source\TESGameSelectQuest.psc   (source, optional)
+scripts\TESGameSelectMQ101.pex
+scripts\source\*.psc                    (source, optional)
+seq\TESGameSelect.seq                   (empty, see below)
 ```
 
-Enable `TESGameSelect.esp`. Load order does not matter — it declares only
-`Skyrim.esm` as a master and finds everything else at runtime.
+Enable `TESGameSelect.esp`. It declares only `Skyrim.esm` as a master and finds
+everything else at runtime, so any subset of the games works in any order.
 
-**`seq\TESGameSelect.seq` is required.** A Start-Game-Enabled quest in an `.esp`
-does not actually start without its `.seq` file, and it must stay a loose file —
-it is read from `Data\seq\`, never from inside a BSA.
+**Load order:** this plugin overrides Skyrim's opening quest `MQ101`, so it is
+incompatible with other alternate-start mods (Live Another Life, Skyrim Unbound,
+Alternate Perspective) — they all edit the same record, and only the last one
+loaded wins. Use one at a time.
+
+The shipped `.seq` is intentionally **empty**: this plugin has no
+Start-Game-Enabled quests. It is included so that upgrading over an older build
+overwrites that build's non-empty `.seq`.
 
 No SKSE required.
 
 ## How it works
 
-* The quest is Start Game Enabled, so `OnInit` runs once at the start of a new
-  game. It waits a few seconds for the vanilla opening to settle, then shows the
-  menu.
-* Detection uses `Game.GetFormFromFile()`, which returns `None` when a plugin is
-  not loaded. That is why the plugin needs no masters and works with any subset
-  of the games in any order.
-* The menu is a single MESG with all four buttons. Each converted game's button
-  carries a `GetGlobalValue(...) == 1` condition, set from the detection pass, so
-  absent games are not drawn. Skyrim's button is unconditional, so the menu can
-  never appear with nothing to click.
-* A hidden button does **not** renumber the others — `Message.Show()` returns the
-  button's own index. (Vanilla's `dunMiddenHandSculptureSCRIPT` relies on the
-  same behaviour.) So the returned index is directly the game id.
-* Choosing a converted game stops `MQ101` ("Unbound"), clears the opening's
-  latched controls-disabled / in-chargen state, moves the player to that game's
-  start marker, and sets its chargen quest to the stage its original author wrote
-  as "the game begins here". Everything after that is the original game's own
-  script.
+Vanilla MQ101 stage 0 has five log entries, each conditioned on
+`GetGlobalValue(MQQuickstart) == 0..4`. Entry 0 (`== 0`) is the real new-game
+path, and its fragment — `QF_MQ101_0003372B.Fragment_2` — is the entire launch
+of the opening: `GameHour.SetValue(7); SetStage(10)`. Stage 10 then does
+everything else (equips the prisoner outfit, moves the player into the cart,
+plays the title sequence and the cart audio, starts the scene).
+
+This plugin **retargets that one fragment** at `TESGameSelectMQ101.RunTakeover`.
+Nothing else about the record changes — every other fragment, all 54 aliases
+and every log entry survive byte-identical, and the `MQQuickstart` condition
+still routes debug quickstarts around the takeover.
+
+> Earlier builds *appended* an unconditional sixth entry instead. That entry
+> ran **alongside** Fragment_2, so stage 10 still fired: the title credits
+> played, the cart audio rolled on, and the opening scene fought the handoff
+> over the player — with the menu shown twice around the load screen for good
+> measure. Retargeting means nothing of the opening runs until you have chosen.
+
+The takeover, in order:
+
+1. Controls off, saving off, and the player is parked in Skyrim's own empty
+   holding cell (`WIDeadBodyCleanupCell`). The menu is deferred until the
+   player's 3D is loaded — a `Message.Show()` issued during the initial load
+   is drawn over the main menu, bashed by the load screen, and drawn again
+   after it (the "popup appears twice" bug).
+2. Installed games are detected with `Game.GetFormFromFile()`, which returns
+   `None` when a plugin is not loaded. That is why the plugin needs no masters.
+3. The menu is a single MESG with all four buttons. Each converted game's
+   button carries a `GetGlobalValue(...) == 1` condition, set from the
+   detection pass, so absent games are not drawn. Skyrim's button is
+   unconditional, so the menu can never appear with nothing to click. A hidden
+   button does **not** renumber the others — `Message.Show()` returns the
+   button's own index (vanilla's `dunMiddenHandSculptureSCRIPT` relies on the
+   same behaviour), so the returned index is directly the game id.
+4. Controls and the chargen state are restored to engine defaults, then:
+   **Skyrim:** Fragment_2's two lines are replayed verbatim and stage 10 runs
+   the opening as if this plugin had never existed (stage 10 moves the player
+   into position itself).
+   **Converted game:** the player's inventory is cleared (vanilla's own
+   `RemoveAllItems` idiom from stage 10) and replaced with that game's real
+   starting equipment, the player is moved to the game's start marker, its
+   chargen quest is set to the stage its original author wrote as "the game
+   begins here", the race menu is shown (the TES4 engine popped it
+   automatically on a new game; Skyrim only shows it when a script asks — the
+   name prompt follows it on a fresh character), and **MQ101 is stopped**.
+   Stage 10 never ran, so there is nothing to undo — no cart, no Helgen, and
+   the Skyrim main quest can never advance (MQ102 is only started by MQ101's
+   own later stages).
+
+### Starting equipment
+
+The TES4 player base record's own inventory, worn:
+
+| Game | Equipment |
+|---|---|
+| Oblivion | Sack Cloth Shirt / Pants / Sandals + Wrist Irons (`Oblivion.esm` NPC 00000007) |
+| Nehrim | Flickweste, Geschnürte Lederhose, Jägermokassins, plus torch, Tagebuch and the anonymous MQ00 note (`Nehrim.esm` NPC 00000007) |
+| Vvardenfell | Oblivion's set — Morroblivion does not override the player record, so a TES4 Morroblivion prisoner inherited its master file's |
+
+### Why not just stop MQ101 afterwards
+
+The obvious design — a Start-Game-Enabled quest that waits, then calls
+`MQ101.Stop()` — does not work, and was the first version of this plugin. By the
+time such a quest runs, Skyrim's opening has already executed: the player is
+bound in `PrisonerCuffsPlayer` (stopping the quest does not remove it), and
+MQ101's packages and scene keep repositioning the player, so `MoveTo` strands
+them. `OnInit` on such a quest also fires more than once, which showed the menu
+twice. Retargeting the stage-0 fragment avoids all of it by never letting the
+opening start.
 
 ## Configuring
 
@@ -69,7 +126,9 @@ plugins.
 | `OblivionChargenID` / `OblivionStartMarkerID` / `OblivionChargenStage` | `0002466E` / `00032AB5` / `5` |
 | `NehrimChargenID` / `NehrimStartMarkerID` / `NehrimMainQuestID` / `NehrimChargenStage` | `0002466E` / `00000D33` / `00000811` / `5` |
 | `MorroChargenID` / `MorroStartMarkerID` / `MorroChargenStage` | `00F0A28C` / `00F0A278` / `1` |
-| `StartupDelay` | `3.0` seconds |
+| `OblivionWristIronsID` / `OblivionShirtID` / `OblivionPantsID` / `OblivionShoesID` | `000BE335` / `00027319` / `00027318` / `0002731A` |
+| `NehrimShirtID` / `NehrimPantsID` / `NehrimShoesID` | `0002ECAD` / `000229AB` / `0001C82B` |
+| `NehrimTorchID` / `NehrimDiaryID` / `NehrimNoteID` | `00000D49` / `00000B96` / `00000AED` |
 
 FormIDs are the low 24 bits — the id *within that plugin's own file*, which is
 what `GetFormFromFile` takes, so the load-order byte is irrelevant.
@@ -81,5 +140,7 @@ python tools/make_game_select_esp.py          # -> output/TESGameSelect/
 python -m pytest tests/test_game_select_esp.py -v
 ```
 
-The script source of record is `TESGameSelect/scripts/source/TESGameSelectQuest.psc`;
-the build copies it into the output tree and compiles it.
+The script sources of record are
+`TESGameSelect/scripts/source/TESGameSelectQuest.psc` and
+`TESGameSelectMQ101.psc`; the build copies them into the output tree and
+compiles them.

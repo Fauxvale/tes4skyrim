@@ -1346,8 +1346,14 @@ keep `CarryWeight`. All 4 call sites are in MQ01.
   that entry before touching this mapping.
 * **MQ01's MenuMode tutorial blocks preserved as comments.** Every message inside
   them is commented out in the TES4 original too, so nothing executable is lost.
-* **`set button to getbuttonpressed` → `button = -1`.** No message box is ever
-  shown, so no button can be pressed; -1 is the correct "nothing pressed".
+* **`set button to getbuttonpressed` → `button = -1`.** *(Superseded
+  2026-08-03: button MessageBoxes now become authored MESG records and the
+  poll reads a consume-once shadow of `Show()`'s return — see "Button
+  MessageBoxes become authored MESG records" in papyrus_conversion_notes.md.
+  The original rationale here — "no message box is ever shown" — was wrong
+  for the door scripts whose box gated progression: CGSewerExitScript's
+  dead `button == 3` branch was the only path to MQ01 stage 88, so the
+  sewer exit could never be taken.)*
 
 ## Known gaps (round 3, not fixed here)
 
