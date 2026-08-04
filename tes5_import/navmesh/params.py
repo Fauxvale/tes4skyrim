@@ -61,8 +61,10 @@ MAX_ASPECT = 4.0
 # metric alone lets through "one side way shorter than the others" triangles:
 # a 16u voxel edge with two ~100u edges scores aspect ~3 (its area is healthy)
 # yet reads as an obvious needle radiating from a wall corner.  No move may
-# create a triangle whose edges differ by more than this factor.
-MAX_EDGE_RATIO = 4.0
+# create a triangle whose edges differ by more than this factor.  2.0 is the
+# shape CONTRACT: the long side of a triangle may not exceed twice its short
+# side — near-equilateral is what NPC pathfinding wants.
+MAX_EDGE_RATIO = 2.0
 # Simplification rounds (collapse + flip + smooth per round).  Converges fast;
 # rounds after the third change little.
 SIMPLIFY_PASSES = 4
@@ -227,6 +229,12 @@ ISLAND_BRIDGE_MAX_DROP = 220.0
 # Below MAX_CLIMB the two sides are a step apart, not a storey -- ordinary
 # adjacency, not a drop, and not this pass's business.
 ISLAND_BRIDGE_MIN_DROP = MAX_CLIMB
+# Ledge links emitted along ONE lip (component pair).  Vanilla puts a link on
+# several triangles along a balcony edge (half of Skyrim.esm's mesh->target
+# ledge pairs carry 2-12+ links) so an actor drops from wherever it reaches
+# the lip; a single link forced every actor through one small triangle and
+# most simply stopped at the edge.
+LEDGE_LINKS_PER_PAIR = 8
 
 # Spacing of cross-sections along an edge, so a long edge is several quads and
 # the ribbon can follow the pathgrid line's slope in Z rather than one flat
@@ -337,10 +345,11 @@ RIBBON_GROW_DISC_RAYS = 16
 # the outline, flips nothing, and does not worsen the local edge ratio, so this
 # can only improve shape and never changes coverage.  ~0.4 * TRI_TARGET_EDGE:
 # short enough that a real feature edge survives, long enough to eat the slivers.
-DECIMATE_MIN_EDGE = 0.0
-# Passes.  Each round re-derives the boundary and re-sorts candidates; the mesh
-# converges in a couple of rounds.
-DECIMATE_ROUNDS = 3
+DECIMATE_MIN_EDGE = 51.0
+# Passes.  Each round re-derives the boundary and re-sorts candidates.  Five,
+# not three: sawtooth removal converges tooth by tooth — cutting a convex
+# tooth re-derives the outline and only then exposes the next collapse.
+DECIMATE_ROUNDS = 5
 # How far the OUTLINE may move when a boundary vertex is decimated away: the
 # vertex's distance from the chord between its two boundary neighbours.  The
 # outline is the wall standoff, so this is deliberately small — straight runs of
@@ -348,11 +357,44 @@ DECIMATE_ROUNDS = 3
 # cannot cut through a wall.  Freezing the outline entirely (tol 0) left 17-21%
 # sliver triangles; this recovers the decimation without the corner-cutting.
 DECIMATE_OUTLINE_TOL = 6.0
-# Vertices within this of a door threshold are PINNED — never collapsed.  A
-# decimated door corner destroys the Door Triangle and the doorway goes dead in
-# the engine (no cross-cell/room pathing through it).  Comfortably covers the
-# door quad (DOOR_QUAD_HALF_WIDTH 48 / HALF_DEPTH 32).
-DECIMATE_PIN_RADIUS = 80.0
+# SAWTOOTH removal: a boundary vertex that juts OUTWARD (convex — its removal
+# can only SHRINK the mesh, never push it through a wall) may be cut even when
+# it deviates more than DECIMATE_OUTLINE_TOL from its neighbours' chord, up to
+# this deviation.  This is what turns a zigzag union outline into a clean
+# polygon: the teeth are cut off inward, real concave corners (which removal
+# would EXPAND across) are never touched.  Bounded by DECIMATE_MAX_AREA_LOSS.
+DECIMATE_SAWTOOTH_DEV = 32.0
+# Total plan area the sawtooth cuts may remove, as a fraction of the mesh's
+# area at decimation start.  "Only a minor area reduction along the periphery."
+DECIMATE_MAX_AREA_LOSS = 0.10
+
+# --- Peripheral sliver cull (corridor_clean.cull_boundary_slivers) -----------
+# After decimation and flips, whatever badly-shaped triangles remain sit on
+# the OUTLINE where the union's shape simply does not admit a good triangle.
+# Those "little bits around the outside" are removed outright — the mesh
+# gives up a fringe sliver rather than carry a needle an actor cannot use.
+# A boundary triangle is culled when its edge ratio exceeds the shape
+# contract AND it is small, or when it is smaller than the hard area floor.
+CULL_SLIVER_RATIO = 2.0
+CULL_SLIVER_MAX_AREA = 1500.0
+# Hard minimum triangle area: below this a triangle covers no usable ground.
+# ~a quarter of an equilateral triangle at DECIMATE_MIN_EDGE side length.
+MIN_TRI_AREA = 300.0
+# Total area the sliver cull may remove, as a fraction of the mesh — the cull
+# trims the periphery, it must never eat into real coverage.
+CULL_SLIVER_AREA_FRAC = 0.05
+# Vertices within this of a door wedge RING POINT (base corners, base
+# midpoint, apex — the Door Triangle's own corners) are PINNED — never
+# collapsed.  A decimated door corner destroys the Door Triangle and the
+# doorway goes dead in the engine.  Tight, because the ring coordinates are
+# EXACT mesh vertices: the old 80u blanket around the whole threshold also
+# froze every sliver in the doorway's neighbourhood, which no collapse or
+# cull could then remove (measured on Pinarus: area-3 MICRO triangles parked
+# beside a door forever).
+DECIMATE_PIN_RADIUS = 8.0
+# Vertices within this of a door CENTRE are pinned as a fallback for doors
+# that carry no wedge ring (withdrawn/interior-side quads).
+DECIMATE_PIN_CENTER_RADIUS = 24.0
 # Lower bound: a rail never grows NARROWER than this half-width even if a wall or
 # a neighbour centerline is closer, so a corridor squeezed between two close
 # obstacles still carries a walkable strip (the Phase-1 width was unconditional).

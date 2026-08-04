@@ -73,6 +73,7 @@ caching, skipped record types, the export text format, and the directory layout.
 - **LISTEN CAREFULLY to EXACTLY what the user's prompt says**. Seek to understand any implementation ideas instead of using your pre-conceived notions
 - If you need to continue iterating on an idea with only marginal improvments in some areas and regressions in another, your idea is likely incorrect and you need to find another one
 - **Look for the AUTHORED indicator** If you need to resort to heuristics, your approach is most likely incorrect. Remember, everything in the original plugin works for a reason
+- **Pay close attention to performance** This needs to run quickly on a modest PC. If your new code makes a step run significantly slower than it did before you **MUST optimize**. Python first optimizations, and then native C++ if necessary.
 
 ### Verifying your work
 

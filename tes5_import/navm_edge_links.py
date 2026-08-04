@@ -341,15 +341,33 @@ def _extract_nvnm(navm_bytes: bytes):
     before = b''
     blob = None
     after = b''
+    # XXXX protocol: a 4-byte XXXX subrecord carries the REAL size of the
+    # following subrecord, whose own length field is 0.  Without this, an
+    # NVNM past 65,535 bytes read as empty and the whole mesh silently
+    # skipped edge linking — invisible while meshes were small, but the
+    # interior-lattice triangulation pushed 119 exterior meshes past the
+    # limit and they all shipped as cross-cell islands.
+    xxxx_chunk = b''
+    override = None
     while p < len(body) - 5:
         sig = body[p:p + 4]
         ln = struct.unpack_from('<H', body, p + 4)[0]
-        chunk = body[p:p + 6 + ln]
+        if sig == b'XXXX' and ln == 4:
+            override = struct.unpack_from('<I', body, p + 6)[0]
+            xxxx_chunk = body[p:p + 6 + ln]
+            p += 6 + ln
+            continue
+        real = ln if override is None else override
+        override = None
+        chunk = body[p:p + 6 + real]
         if sig == b'NVNM' and blob is None:
-            blob = body[p + 6:p + 6 + ln]
+            # pack_subrecord re-emits the XXXX prefix on write, so the one we
+            # consumed is deliberately dropped here.
+            blob = body[p + 6:p + 6 + real]
         elif blob is None:
-            before += chunk
+            before += xxxx_chunk + chunk
         else:
-            after += chunk
-        p += 6 + ln
+            after += xxxx_chunk + chunk
+        xxxx_chunk = b''
+        p += 6 + real
     return blob, before, after

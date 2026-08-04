@@ -888,7 +888,14 @@ def convert_PGRD(rec: dict, writer=None,
         return None, None
 
     point_count = get_int(rec, 'DATA.PointCount', 0)
-    if point_count < 2:
+    if point_count < 1:
+        return None, None
+    if point_count < 2 and get_int(rec, 'InterCellCount', 0) <= 0:
+        # A single node with no in-cell edge AND no PGRI link can never make
+        # a ribbon.  A single node WITH PGRI links can: the synthetic exit
+        # edges (below) lay cross-seam stubs — 53 exterior cells shipped with
+        # no navmesh at all under the old `< 2` gate, leaving holes in the
+        # cross-cell network exactly where a road crosses a cell corner.
         return None, None
 
     # ---- Points + degrees ----
@@ -900,8 +907,10 @@ def convert_PGRD(rec: dict, writer=None,
                        get_float(rec, f'Point[{i}].Y'),
                        get_float(rec, f'Point[{i}].Z')))
         degrees.append(get_int(rec, f'Point[{i}].Connections', 0))
-    if len(points) < 2:
+    if not points:
         return None, None
+    if len(points) < 2 and get_int(rec, 'InterCellCount', 0) <= 0:
+        return None, None       # same PGRI exception as the gate above
 
     n = len(points)
 

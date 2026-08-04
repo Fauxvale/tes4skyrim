@@ -72,10 +72,10 @@ def _surface_sampler(walkable):
             for gy in range(gy0, gy1 + 1):
                 grid.setdefault((gx, gy), []).append(i)
 
-    def sample(x, y, near_z):
+    def _heights(x, y):
         gx = int((x - minx) // cell)
         gy = int((y - miny) // cell)
-        best = None
+        out = []
         for i in grid.get((gx, gy), ()):
             a, b, c = W[i]
             d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
@@ -86,11 +86,26 @@ def _surface_sampler(walkable):
             l2 = 1.0 - l0 - l1
             if l0 < -0.02 or l1 < -0.02 or l2 < -0.02:
                 continue
-            z = l0 * a[2] + l1 * b[2] + l2 * c[2]
+            out.append(l0 * a[2] + l1 * b[2] + l2 * c[2])
+        return out
+
+    def sample(x, y, near_z):
+        best = None
+        for z in _heights(x, y):
             if best is None or abs(z - near_z) < abs(best - near_z):
                 best = z
         return best
 
+    def layers(x, y):
+        """Every distinct walkable height at (x, y), ascending (2u dedupe)."""
+        zs = sorted(_heights(x, y))
+        out = []
+        for z in zs:
+            if not out or z - out[-1] > 2.0:
+                out.append(z)
+        return out
+
+    sample.layers = layers
     return sample
 
 
@@ -233,9 +248,106 @@ def _plan_stations(nodes, edges, node_z, degree, grow):
     return st, plan, extra_edges
 
 
+def _surface_profile(sample, pa, pb):
+    """Height profile along a STEEP edge's centreline, following the real
+    walkable surface the way an actor walks it.
+
+    The pathgrid draws a straight chord from node to node, but a real
+    staircase rarely descends along the whole chord: Pinarus's flight starts
+    ~90u east of its top node, so the chord ran 39u BELOW the actual landing
+    there, the stair ribbon reported z=30 where the real floor is 68.6, and
+    the union emitted a near-vertical triangle joining the two fictions.
+    (tools/navmesh_tri_check measured the same chord error as +46/-49u float
+    over the whole flight.)
+
+    The path is found as a shortest path over the WALKABLE LAYERS along the
+    line — at each 16u station the candidate heights are every walkable
+    surface there (within the edge's own z range), a transition between
+    stations may climb at most one step, and the path must START at the near
+    node's height and END at the far node's.  The end constraint is what
+    selects the treads: a greedy walk anchored on the previous height was
+    tried first and simply followed the GROUND FLOOR that continues UNDER the
+    flight (nearest-layer at every step), ending 260u below the far node with
+    a cliff at the anchor — the flight is the only layer path that actually
+    arrives at the far node.  Returns None (caller keeps the chord) when no
+    such path exists.
+
+    NOTE this is NOT the reverted "re-fit the line to collision" experiment
+    (_height_on's docstring): that changed the flight's overall angle.  The
+    profile keeps both endpoints and the plan line; it only replaces the
+    straight-line INTERPOLATION between them with the measured surface.
+    """
+    layers = getattr(sample, 'layers', None)
+    if layers is None:
+        return None
+    ax, ay, az = pa
+    bx, by, bz = pb
+    run = math.hypot(bx - ax, by - ay)
+    if run < 32.0:
+        return None
+    n = max(2, int(run // 16.0))
+    lo = min(az, bz) - params.MAX_CLIMB
+    hi = max(az, bz) + params.MAX_CLIMB
+    stations = []
+    for s in range(n + 1):
+        t = s / n
+        x = ax + (bx - ax) * t
+        y = ay + (by - ay) * t
+        chord = az + (bz - az) * t
+        cand = [z for z in layers(x, y) if lo <= z <= hi]
+        if not cand:
+            cand = [chord]      # collision gap: bridge on the chord
+        stations.append((x, y, cand))
+
+    INF = float('inf')
+    step = params.MAX_CLIMB
+    costs = [[(abs(z - az) if abs(z - az) <= step else INF)
+              for z in stations[0][2]]]
+    back = []
+    for s in range(1, n + 1):
+        cand = stations[s][2]
+        prev_c = costs[-1]
+        prev_z = stations[s - 1][2]
+        row = [INF] * len(cand)
+        bk = [0] * len(cand)
+        for i, z in enumerate(cand):
+            for j, zp in enumerate(prev_z):
+                if prev_c[j] == INF:
+                    continue
+                d = abs(z - zp)
+                if d > step:
+                    continue
+                c = prev_c[j] + d
+                if c < row[i]:
+                    row[i] = c
+                    bk[i] = j
+        costs.append(row)
+        back.append(bk)
+
+    best = None
+    for i, z in enumerate(stations[n][2]):
+        if costs[n][i] == INF or abs(z - bz) > step:
+            continue
+        key = (abs(z - bz), costs[n][i], i)
+        if best is None or key < best:
+            best = key
+    if best is None:
+        return None                         # no layer path reaches the node
+    idx = best[2]
+    zs = [0.0] * (n + 1)
+    for s in range(n, -1, -1):
+        zs[s] = stations[s][2][idx]
+        if s > 0:
+            idx = back[s - 1][idx]
+    pts = [(stations[s][0], stations[s][1], zs[s]) for s in range(n + 1)]
+    pts[0] = (ax, ay, az)
+    pts[-1] = (bx, by, bz)
+    return pts
+
+
 def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
                            walk_probe=None, field=None,
-                           blocking=None, walkable=None):
+                           blocking=None, walkable=None, sample=None):
     """One corridor per pathgrid edge.  Returns a list of dicts, each:
 
         {'edge': (i, j),
@@ -377,6 +489,13 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
             # plain corridor: it has to present a mouth comparable to the landing
             # it joins, or the two meet only at the landing's corners.
             strip['half'] = (params.RIBBON_STAIR_HALF_WIDTH if steep else half)
+            # A steep edge's heights follow the REAL treads, not the chord —
+            # see _surface_profile.  Only steep edges need it: a flat edge's
+            # chord IS its surface.
+            if steep and sample is not None:
+                prof = _surface_profile(sample, pa, pb)
+                if prof:
+                    strip['prof'] = prof
             strips.append(strip)
             continue
 
@@ -537,7 +656,8 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     # stays one storey with the floors it joins while two floors stacked in plan
     # view are unioned separately and never flattened together.
     corridors = _build_corridor_strips(nodes, edges, node_z,
-                                       blocking=blocking, walkable=walkable)
+                                       blocking=blocking, walkable=walkable,
+                                       sample=sample)
 
     # Exterior meshes are clipped to their own cell rectangle so a cross-seam
     # ribbon (built from a PGRI InterCell link, which reaches into the neighbour

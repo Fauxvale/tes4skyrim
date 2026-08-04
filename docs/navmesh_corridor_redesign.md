@@ -544,3 +544,116 @@ because the stair polygon is a narrow band in plan. Fixing this needs work in
 triangle spanning > MAX_CLIMB shatters ChorrolFG into `[153,124,123,123,12]` and
 Pinarus into `[128,107,57]`. Those triangles ARE the only floor-to-floor
 connection — they must be SUBDIVIDED into walkable steps, never removed.
+
+---
+
+## The triangle-quality contract (2026-08-04)
+
+The author's explicit brief: **triangles MUST be close to equilateral** — the
+long side no more than ~2x the short side, plus a minimum triangle area — with
+sawtooth outlines simplified inward and the leftover "little bits around the
+outside simply removed."  Implemented as a pipeline of guarded passes; every
+one preserves the two hard invariants (no overlapping same-surface triangles,
+no disconnection the pathgrid contradicts).
+
+### Where the shape comes from
+
+1. **Interior hex lattice** (`corridor_union._hex_refine`).  GEOS's
+   constrained Delaunay uses only the polygon's own vertices, so any region
+   wider than one triangle triangulates as a fan of slivers — no post-collapse
+   can fix that, because the vertices to break the fans do not exist.  A hex
+   lattice at `TRI_TARGET_EDGE` spacing is inserted point-by-point into the
+   CDT (containing-triangle 3-fan split; each point kept 0.45×spacing clear of
+   existing vertices and of the boundary), then `_flip2d` restores local
+   shape.  Lattice anchored on the part's own bounds — deterministic.
+2. **Ratio-improving diagonal flips** (`corridor_union._flip2d` in 2D at
+   triangulation time, `corridor_clean._flip_pass` in 3D during decimation).
+   A flip moves no vertex, so outline and coverage cannot change.  Guards:
+   strict ratio improvement, quad convexity via signed areas, z-span of the
+   new diagonal, door triangles (all corners pinned) untouched, and — learned
+   the hard way — **never flip onto a diagonal that already exists as an edge
+   elsewhere**: folded storeys reuse vertices, the duplicate edge is
+   non-manifold, and `_make_manifold` later rips whole regions out.
+3. **Decimation shape ceiling** `MAX_EDGE_RATIO = 2.0`: no collapse may push
+   any triangle past the 2× contract (or past the worst ratio already
+   present).
+4. **Sawtooth cuts** (decimate boundary rule): a *convex* outline vertex —
+   one whose removal can only SHRINK the mesh — may be cut with deviation up
+   to `DECIMATE_SAWTOOTH_DEV` (32u), budgeted by `DECIMATE_MAX_AREA_LOSS`
+   (10%).  Concave vertices never move (their removal would extend the mesh
+   outward, i.e. through a wall).  Exterior-seam vertices only ever collapse
+   collinearly, so cross-cell stitching is untouched.
+5. **Peripheral sliver cull** (`corridor_clean.cull_boundary_slivers`): a
+   boundary triangle with ratio > `CULL_SLIVER_RATIO` and area <
+   `CULL_SLIVER_MAX_AREA`, or below `MIN_TRI_AREA`, is removed outright —
+   unless it touches a door pin, contains a pathgrid sample, lies on the
+   cell seam, or its neighbours would lose each other (bounded BFS).
+6. **Door pins are TIGHT** (`DECIMATE_PIN_RADIUS` 8u around the wedge ring
+   points, 24u around door centres).  The old 80u blanket froze every sliver
+   near a doorway beyond repair (area-3 MICRO triangles parked forever).
+
+Measured on the reference cells: edge-ratio p50 1.56–1.85, p90 2.3–3.1;
+needles (>3.0) 3–12% (they are the protected minority: pathgrid-carrying
+strips, connectivity bridges, genuinely thin corridors).
+
+### The overlap/connectivity repairs that made it safe
+
+The quality passes exposed a series of latent defects; the fixes are load
+bearing and each encodes a measured failure:
+
+* **Same-emission weld = provisional, checked, reverted** (`_weld_sheets`):
+  a sideways weld that creates any overlap is undone (an outright ban broke
+  ImperialDungeon05's connectivity; the unchecked weld created Pinarus's
+  stair-bottom overlaps).
+* **Junction strips are clipped to the junction disc** (`_clip_strip_near`),
+  and the clip measures from the NODE's projection, not the segment end
+  (stair ribbons extend 48u past their nodes).  Handing over the whole strip
+  leaked its heights across everything it passes under → phantom duplicate
+  floors.
+* **Steep edges carry a tread-following height profile**
+  (`corridor._surface_profile`, mirrored natively in `grow.cpp
+  py_levels_at`): a DP over walkable collision layers along the line,
+  constrained to start/end at the node heights.  The end constraint is what
+  selects the treads over the floor that continues under the flight.
+* **`_merge_at_pathgrid_nodes` welds ONE closest cross-component pair per
+  junction, capped at `RIBBON_HALF_WIDTH`**, in a disc widened by one ribbon
+  width, and runs BEFORE the stitch.  The old whole-band weld deleted every
+  triangle that fit inside the node disc (lattice-sized triangles all do).
+* **`_stitch_shared_nodes`** fuses coincident vertices each round (post-weld
+  passes mint identical positions under different indices), bridges with an
+  overlap guard (relaxed to a 250u² sliver tolerance only for junctions
+  nothing else could join), and slope-based dz guards (a bridge may climb
+  with its plan run; only height without run is a wall).  It is re-run at
+  the END of `finalize` — decimation can land two components' vertices on
+  the same position, invisible to everything upstream.
+* **`_destack`**: same-surface stacked duplicates (two triangles covering
+  the same plan area within 40u of height) that survive the claim are
+  removed, smaller first, connectivity-guarded.
+* **`_drop_walls`**: triangles steeper than `WALL_SLOPE_COS` (55°) removed
+  when their neighbours stay connected without them — never at emission
+  time, which tore caves apart.
+* **Decimation topology guards**: the standard link condition, plus
+  boundary-pair collapses only along an OUTLINE edge (collapsing across a
+  thin neck pinches the sheet and sheds vertex-attached scraps).
+
+State on the 10 reference cells (2026-08-04): component invariant 9/10 OK
+(Moranda02 at 2 components — its historical defect, previously 3–4 — with an
+85u genuine hole in one tunnel), overlaps 0 everywhere except two mutually
+load-bearing bridge pairs in a BarrenCave throat.
+
+### XXXX-oversized NVNMs and the edge linker (2026-08-04)
+
+The lattice pushed ~119 exterior meshes past the 65,535-byte subrecord limit,
+so their NVNMs are written under the XXXX size-override protocol.
+`navm_edge_links._extract_nvnm` did not speak XXXX and read those NVNMs as
+EMPTY — every oversized mesh silently skipped cross-cell edge linking (the
+"6504 → 6385 exterior navmeshes" drop in the build log; the meshes themselves
+were present and fine).  The walker now honours XXXX; `pack_subrecord`
+re-emits it on write.  Any new consumer that walks raw NAVM subrecords MUST
+handle XXXX — `navm_split._decode_record` and `navi_builder` already do.
+
+Known pre-existing gap (not from this work): 53 exterior cells whose pathgrid
+is a single node with only PGRI (cross-seam) links get no navmesh job at all
+(`_gather_navm_jobs` requires in-cell edges); `build_navmesh` produces a valid
+ribbon for them when invoked directly, so the fix is to gate jobs on
+"edges OR PGRI links".

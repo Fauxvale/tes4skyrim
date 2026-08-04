@@ -7,7 +7,6 @@ Major Issues for V1:
 	3 - Navmesh refinement
 		ensure corridors connect pathgrid islands + other connectivity issues
 		allow growth even on slopes
-		some are missing a triangle sliver on either side of the guaranteed triangle
 
 	4 - Fix CK Loading (not sure why it doesn't finish)
 
