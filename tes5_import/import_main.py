@@ -874,7 +874,8 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # convert_CREA then points RNAM at the generated race; NPC_ humanoids
     # keep the Skyrim playable-race override system.
     from .creature_races import build_creature_races
-    build_creature_races(by_type, writer, export_dir)
+    build_creature_races(by_type, writer, export_dir,
+                         ctx.master_export if ctx else None)
     _step_done('creature races')
 
     # --- Phase 0g: plan AI packages -------------------------------------

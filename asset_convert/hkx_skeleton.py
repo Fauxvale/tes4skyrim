@@ -48,6 +48,29 @@ ROOT_BONE_NAME = 'NPC Root [Root]'
 # all 32 Oblivion.esm creatures: 31x Bip01, 1x Bip02, nothing else.
 BONE_RENAMES = {'Bip01': ROOT_BONE_NAME, 'Bip02': ROOT_BONE_NAME}
 
+# Equipment attachment nodes.  The engine finds an actor's equip points by
+# HARD-CODED NODE NAME (strings in SkyrimSE.exe: 'WEAPON', 'SHIELD', 'QUIVER',
+# 'WeaponBack', 'WeaponSword', ...) and Oblivion spells them differently, so a
+# converted creature rig had no node the engine recognised: armed creatures
+# (goblins, dremora, skeletons) carried weapons they could never draw.
+#
+# Oblivion's rig already has the right STRUCTURE — 'Weapon' parented to the
+# right hand, 'Torch' to the left, 'Quiver' to the spine (goblin skeleton.nif)
+# — so renaming in place preserves parenting and bind transforms; only the
+# label the engine looks up changes.
+#
+# Skyrim carries the torch on the off-hand SHIELD node (the same remap
+# nif_converter._PRN_REMAP already applies to Oblivion torch/shield meshes, so
+# the mesh's Prn and the skeleton node agree).  Humanoid NPCs are unaffected:
+# they are retargeted onto Skyrim's own skeleton, which already has these nodes.
+ATTACH_RENAMES = {
+    'Weapon': 'WEAPON',
+    'Torch': 'SHIELD',
+    'Quiver': 'QUIVER',
+    'Shield': 'SHIELD',
+}
+BONE_RENAMES.update(ATTACH_RENAMES)
+
 
 @dataclass
 class Bone:

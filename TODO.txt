@@ -5,10 +5,11 @@ Major Issues for V1:
 		ctrigtripwire01.nif also fails to break when walked over
 
 	3 - Navmesh refinement
-		ensure corridors connect pathgrid islands + other connectivity issues
+		ensure corridors connect pathgrid islands
 		allow growth even on slopes
 		trim triangles along edges
 		fix slim corridors
+		fix occasional crack (vilvern near entrance)
 
 	4 - Fix CK Loading (not sure why it doesn't finish)
 
@@ -26,33 +27,29 @@ Major Issues for V1:
 
 Later Issues:
 
-	2 - Refine creature conversion further. Speed is still a bit off
+	1 - Refine creature conversion further. Speed is still a bit off
 	
-	3 - Convert weathers
+	2 - Convert weathers
 
-	4 - Goblins don't properly hold weapons
+	3 - Missing greeting voice lines (like Hello)
 
-	5 - Missing greeting voice lines (like Hello)
+	4 - Allow running process on zip (mod)
 
-	6 - Allow running process on zip (mod)
+	5 - Fix walking up stairs
 
-	7 - Fix walking up stairs
+	6 - Arrows are held at an invisible location behind the arrow when nocking, and can't be picked up after shooting
 
-	9 - Arrows are held at an invisible location behind the arrow when nocking, and can't be picked up after shooting
+	7 - Some converted books (scrolls) are using the wrong Skyrim base mesh
 
-	10 - Some converted books (scrolls) are using the wrong Skyrim base mesh
+	8 - Restore Oblivion's NPC-to-NPC conversations (dropped, see docs/ambient_dialogue_channel_plan.md)
 
-	11 - Nehrim script TODOs Use skse_conversion_audit
+	9 - Magic and Spell Conversion including effects (see magic conversion md)
 
-	12 - Restore Oblivion's NPC-to-NPC conversations (dropped, see docs/ambient_dialogue_channel_plan.md)
+	10 - Make horses rideable
 
-	13 - Magic and Spell Conversion including effects (see magic conversion md)
+	11 - NPCS don't say quips anymore (preferable to always quipping)
 
-	14 - Make horses rideable
-
-	15 - NPCS don't say quips anymore (preferable to always quipping)
-
-	16 - Speed up child LOD gen and add menu option
+	12 - Speed up child LOD gen and add menu option
 
 Minor Issues:
 
@@ -83,32 +80,5 @@ Minor Issues:
 	13 - Taskbar and app icon
 
 	14 - Cleanup output log and update colors
-
-	15 - Improve inverted collision. Nehrim specifically can use an Oblivion "Oracle" to improve the baseline.
 	
-	16 - Missing location topics (Anvil)
-
-	17 - Override plugins: authored changes with no output mapping (keep the master value silently).
-		Audit any plugin with: python tools/override_audit.py export/<Plugin>
-		These are fields a plugin author CHANGED that override_builder cannot express, so the
-		master value ships instead. Each needs a _REBUILDERS entry (or _INEXPRESSIBLE if the
-		converter provably drops the field). The converter DOES emit XSCL/NAME/XESP already,
-		so those three are just missing a mapping, not missing a feature.
-
-		DLCBattlehornCastle.esp (166 changes / 9 keys):
-			XSCL.Scale             74   REFR scale - resized statics/clutter ship at master size
-			NAME                   73   REFR base-object swap - the ref still points at the old base
-			PKDT.Flags              5   PACK behaviour flags
-			XESP.Reference          4   REFR enable-parent target
-			XESP.Flags              4   REFR enable-parent flags (opposite-of-parent)
-			Quest[]                 3   INFO/PACK quest list
-			PNAM.PrevInfo           1   INFO ordering within its topic
-			SNDX.StaticAttenuation  1   SOUN attenuation
-			SNDX.MaxAttDist         1   SOUN max attenuation distance
-
-		Morrowind_ob.esm (5 changes / 2 keys):
-			Quest[]                 3
-			Model.MODL              2   model path swap on an overridden record
-
-		Translation.esp (1 change / 1 key):
-			Target[]                1   QUST target list
+	15 - Missing location topics (Anvil)

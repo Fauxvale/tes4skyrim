@@ -34,14 +34,26 @@ _skyrim_data = None
 
 
 def set_skyrim_data(path):
-    """Explicitly set the SSE Data folder (overrides registry detection)."""
+    """Explicitly set the SSE Data folder (overrides registry detection).
+
+    PIPELINE USE ONLY -- see the module docstring. Pointing this at the live
+    install to go looking at vanilla assets is the forbidden use.
+    """
     global _skyrim_data_override, _skyrim_data_cached
     _skyrim_data_override = str(path) if path else None
     _skyrim_data_cached = False
 
 
 def find_skyrim_data():
-    """SSE Data folder: explicit override, else Windows registry."""
+    """SSE Data folder: explicit override, else Windows registry.
+
+    PIPELINE USE ONLY. This returns the path to the LIVE, heavily-modded SSE
+    install. Do NOT use it to go looking at vanilla assets, to check whether a
+    build deployed, or to answer "what does vanilla do here?" -- CLAUDE.md
+    allows that folder for Papyrus logs and Skyrim.esm ONLY. For investigation
+    use `references/Skyrim Meshes`, the `references/Skyrim.esm` dump,
+    `references/nifskope` and `references/nif [version].xml`.
+    """
     global _skyrim_data_cached, _skyrim_data
     if _skyrim_data_cached:
         return _skyrim_data
@@ -71,6 +83,11 @@ def find_skyrim_data():
 def _bsa_globs_for(rel):
     """BSA name patterns that may hold this file, in search order.
 
+    PIPELINE USE ONLY. Widening these patterns to hunt for a file you want to
+    LOOK AT is the forbidden use -- SSE-format assets/BSAs are off-limits for
+    investigation (CLAUDE.md). If a lookup misses, the answer is in
+    `references/`, not in another archive.
+
     Behaviour graphs and animations live under `meshes\\` but ship in
     `Skyrim - Animations.bsa`, NOT the mesh archives — so a .hkx lookup has to
     try both or it silently returns None (which is what hid the animated-
@@ -88,6 +105,21 @@ def _bsa_globs_for(rel):
 
 def get_asset_bytes(rel):
     """Return the bytes of a vanilla Skyrim file, or None.
+
+    PIPELINE USE ONLY -- call this when the converter must SHIP a vanilla file
+    into output/.  It is not a research tool: answering "how does vanilla author
+    X?" by pulling assets out of the SSE BSAs is forbidden (CLAUDE.md), and if
+    what comes back will not survive a parse, that is the rule telling you to go
+    to references/, not a problem to work around.
+
+    **A parse failure here is the guardrail. Do not engineer past it.**
+    Recorded failure (2026-08-05): a session pulled the vanilla draugr/human
+    `skeleton.nif` from the BSAs to survey weapon attachment nodes, hit pyffi's
+    block-size error on their bhkRigidBody/bhkCapsuleShape layouts, and
+    hand-rolled a bespoke NIF header parser to read them anyway. Three rules
+    broken at once: SSE assets were off-limits for investigation to begin with,
+    `references/nifskope` + `references/nif [version].xml` are the sanctioned
+    answer for NIF structure questions, and `tools/` was never checked first.
 
     rel: data-relative path, e.g. r'meshes\\actors\\character\\character
     assets\\malebody_0.nif'.  Search order: extraction cache, then game BSAs
@@ -126,6 +158,11 @@ def get_asset_bytes(rel):
 
 
 def get_body_nif_bytes(basename):
-    """Vanilla character-asset NIF (malebody_0.nif etc.) as bytes, or None."""
+    """Vanilla character-asset NIF (malebody_0.nif etc.) as bytes, or None.
+
+    PIPELINE USE ONLY -- this exists so skin splicing can ship a vanilla body
+    mesh into output/. Do NOT call it to inspect how a vanilla mesh is built;
+    read `references/Skyrim Meshes` instead (see get_asset_bytes).
+    """
     return get_asset_bytes(
         'meshes\\actors\\character\\character assets\\' + basename)

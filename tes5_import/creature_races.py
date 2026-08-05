@@ -101,8 +101,52 @@ _NAM4_IMPACT_MAT = 0x0005A28F
 _NAM5_IMPACT_SET = 0x000A956F
 _ONAM_OPEN_SND = 0x000A5013
 _LNAM_CLOSE_SND = 0x000A5014
-_VNAM_EQUIP_FLAGS = 0xFFFFE001
-_QNAM_UNARMED = 0x00013F42
+# RACE VNAM 'Equipment Flags' — which weapon classes this race may EQUIP.
+# Bit 0 Hand To Hand, 1 1H Sword, 2 1H Dagger, 3 1H Axe, 4 1H Mace,
+# 5 2H Sword, 6 2H Axe, 7 Bow, 8 Staff, 9 Spell, 10 Shield, 11 Torch,
+# 12 Crossbow (wbDefinitionsTES5.pas:9510).  The engine refuses to equip a
+# class whose bit is clear, so this is a hard gate in front of the actor's
+# inventory — not a hint.
+#
+# The template value below is DogRace's: hand-to-hand ONLY.  Every generated
+# creature race inherited it, which is why armed creatures (goblins, dremora,
+# skeletons) carried their weapons but fought bare-handed — the weapon was in
+# CNTO and combat AI wanted it, but the race forbade the equip.  Weapon-using
+# vanilla creature races set the bits they need instead: FalmerRace FFFFEE8B,
+# DraugrRace/SkeletonRace FFFFE6FF, NordRace FFFFFFFF.
+#
+# Bits 13+ are set in every vanilla race (the high FFFFE… pattern is universal,
+# including DogRace), so they carry over unchanged and only the low 13 vary.
+_VNAM_BASE = 0xFFFFE000          # the always-set high bits, no weapon class
+_VNAM_HAND_TO_HAND = 1 << 0
+_VNAM_SPELL = 1 << 9
+_VNAM_SHIELD = 1 << 10
+_VNAM_TORCH = 1 << 11
+
+# TES4 WEAP DATA.Type → the VNAM bit that lets the race equip it.
+# (wbDefinitionsTES4 WEAP: 0 Blade1H, 1 Blade2H, 2 Blunt1H, 3 Blunt2H,
+# 4 Staff, 5 Bow.)  Oblivion has no separate dagger/axe/mace class, so a 1H
+# blade opens Sword+Dagger and 1H blunt opens Axe+Mace — the converted WEAP
+# records pick one of those Skyrim types per weapon, and the race must permit
+# whichever the converter chose or that weapon alone stays unequipped.
+_TES4_WEAP_TYPE_VNAM = {
+    0: (1 << 1) | (1 << 2),      # Blade 1H  → 1H Sword + 1H Dagger
+    1: (1 << 5) | (1 << 6),      # Blade 2H  → 2H Sword + 2H Axe
+    2: (1 << 3) | (1 << 4),      # Blunt 1H  → 1H Axe + 1H Mace
+    3: (1 << 5) | (1 << 6),      # Blunt 2H  → 2H Sword + 2H Axe
+    4: 1 << 8,                   # Staff
+    5: (1 << 7) | (1 << 12),     # Bow       → Bow + Crossbow
+}
+
+# EQUP equip slots (Skyrim.esm EQUP dump).  A race lists the slots it can fill;
+# DogRace names only RightHand, so even with the VNAM bits set an armed
+# creature had nowhere to put a shield or an off-hand weapon.  Weapon-using
+# vanilla creature races name both hands (+Voice/Potion), so armed creatures
+# get the same set.
+_QNAM_UNARMED = 0x00013F42       # RightHand
+_QNAM_LEFT_HAND = 0x00013F43
+_QNAM_VOICE = 0x00025BEE
+_QNAM_POTION = 0x00035698
 _KW_ANIMAL = 0x00013798
 _KW_UNDEAD = 0x00013796
 _KW_DAEDRA = 0x00013797
@@ -219,6 +263,127 @@ def creature_capped_level(rec: dict) -> int:
     return int(level)
 
 
+# Built by build_creature_races from this plugin (+ its masters'): the item
+# graph a CREA inventory can reach.  Phase 0f runs BEFORE outfits.load_item_index
+# (Phase 0i), so the race builder cannot use that index and keeps its own —
+# it only needs weapon/armor types, not the outfit slot machinery.
+_WEAP_TYPE = {}      # fid_low24 → TES4 WEAP DATA.Type
+_ARMOR_FIDS = set()  # fid_low24 of ARMO records (shield detection)
+_SHIELD_FIDS = set() # fid_low24 of ARMO records occupying the shield slot
+_LVLI_REC = {}       # fid_low24 → LVLI record dict
+
+# TES4 ARMO BMDT biped slot bits (wbDefinitionsTES4.pas:1326-1341).
+# Shield is bit 13 and Torch bit 14 — NOT bit 9, which is 'Weapon'.
+_TES4_BIPED_SHIELD = 1 << 13
+_TES4_BIPED_TORCH = 1 << 14
+
+_MAX_LVLI_DEPTH = 8
+
+
+def load_creature_item_index(by_type: dict, master_export: dict = None) -> None:
+    """Index WEAP/ARMO/LVLI so a CREA's equipment classes can be determined.
+
+    Mirrors outfits.load_item_index's masters-first ordering: a dependent
+    plugin arms its creatures out of its master's armoury, so without the
+    masters' records most inventory entries resolve to nothing and the
+    creature's race would be built as unarmed.
+    """
+    _WEAP_TYPE.clear()
+    _ARMOR_FIDS.clear()
+    _SHIELD_FIDS.clear()
+    _LVLI_REC.clear()
+
+    def _add(rec):
+        sig = rec.get('Signature')
+        if sig not in ('WEAP', 'ARMO', 'LVLI'):
+            return
+        try:
+            fid = int(rec.get('FormID', ''), 16) & 0x00FFFFFF
+        except (ValueError, TypeError):
+            return
+        if sig == 'WEAP':
+            _WEAP_TYPE[fid] = get_int(rec, 'DATA.Type')
+        elif sig == 'ARMO':
+            _ARMOR_FIDS.add(fid)
+            if get_int(rec, 'BMDT.BipedFlags') & (_TES4_BIPED_SHIELD
+                                                  | _TES4_BIPED_TORCH):
+                _SHIELD_FIDS.add(fid)
+        else:
+            _LVLI_REC[fid] = rec
+
+    if master_export:
+        for rec in master_export.values():
+            _add(rec)
+    # This plugin's own records are indexed LAST so an override wins.
+    for sig in ('WEAP', 'ARMO', 'LVLI'):
+        for rec in by_type.get(sig, []):
+            _add(rec)
+
+
+def _item_vnam_bits(fid: int, depth: int = 0, path=()) -> int:
+    """VNAM equipment bits every item this inventory entry can yield needs.
+
+    A leveled list contributes the UNION of its leaves': the engine rolls one
+    at spawn, and whichever it picks must be equippable, so the race has to
+    permit them all.
+    """
+    fid &= 0x00FFFFFF
+    if fid in path or depth > _MAX_LVLI_DEPTH:
+        return 0
+    wtype = _WEAP_TYPE.get(fid)
+    if wtype is not None:
+        return _TES4_WEAP_TYPE_VNAM.get(wtype, 0)
+    if fid in _SHIELD_FIDS:
+        return _VNAM_SHIELD
+    if fid in _ARMOR_FIDS:
+        return 0                 # ordinary armor needs no equipment flag
+    rec = _LVLI_REC.get(fid)
+    if rec is None:
+        return 0
+    sub_path = path + (fid,)
+    bits = 0
+    for i in range(get_int(rec, 'EntryCount')):
+        try:
+            entry = int(rec.get(f'Entry[{i}].FormID', ''), 16)
+        except (ValueError, TypeError):
+            continue
+        bits |= _item_vnam_bits(entry, depth + 1, sub_path)
+    return bits
+
+
+def _creature_equip_flags(recs: list) -> int:
+    """VNAM 'Equipment Flags' for a generated race, from what its creatures
+    actually carry.
+
+    A generated race is SHARED by every CREA with the same mesh folder and body
+    set, so the flags are the union over all of them — a race must permit
+    whatever any of its creatures was authored to wield (goblin berserkers,
+    warlords and shamans share one skeleton but carry blades, bows and staffs
+    respectively).
+
+    Hand-to-hand is always allowed — every creature can attack unarmed, and
+    that is the one bit even DogRace sets.  Spell is added only when a creature
+    sharing the race actually knows one: TES4 grants spells through SPLO rather
+    than an inventory item, so the inventory alone never reveals it.  Vanilla
+    splits the same way (census of 99 Skyrim.esm races: 60 set the Spell bit,
+    31 are exactly FFFFE001 with neither spells nor weapons).
+    """
+    bits = _VNAM_HAND_TO_HAND
+    for rec in recs:
+        if get_int(rec, 'SpellCount'):
+            bits |= _VNAM_SPELL
+        for i in range(get_int(rec, 'ItemCount')):
+            try:
+                fid = int(rec.get(f'Item[{i}].FormID', ''), 16)
+            except (ValueError, TypeError):
+                continue
+            bits |= _item_vnam_bits(fid)
+    # A creature that can hold a shield can hold a torch on the same node.
+    if bits & _VNAM_SHIELD:
+        bits |= _VNAM_TORCH
+    return _VNAM_BASE | bits
+
+
 def _race_data(rec: dict) -> bytes:
     """The 164-byte RACE DATA: DogRace template with CREA stat patches.
 
@@ -247,7 +412,8 @@ def _atkd(damage_mult: float = 1.0) -> bytes:
 
 
 def _build_race(writer, rec, folder: str, bodies: list, proj: dict,
-                race_fid: int, skin_fid: int, edid: str, full: str) -> None:
+                race_fid: int, skin_fid: int, edid: str, full: str,
+                vnam_flags: int = None) -> None:
     subs = b''
     subs += pack_string_subrecord('EDID', edid)
     subs += pack_string_subrecord('FULL', full)
@@ -307,8 +473,21 @@ def _build_race(writer, rec, folder: str, bodies: list, proj: dict,
     # for exactly this reason, so a single BODY slot is all that's needed.
     for slot in range(32):
         subs += pack_subrecord('NAME', b'BODY\x00' if slot == 2 else b'\x00')
-    subs += pack_subrecord('VNAM', struct.pack('<I', _VNAM_EQUIP_FLAGS))
-    subs += pack_formid_subrecord('QNAM', _QNAM_UNARMED)
+    if vnam_flags is None:
+        vnam_flags = _VNAM_BASE | _VNAM_HAND_TO_HAND | _VNAM_SPELL
+    subs += pack_subrecord('VNAM', struct.pack('<I', vnam_flags))
+    # Equip slots. An unarmed race needs only the right hand (DogRace); a race
+    # that may hold a weapon needs somewhere to put it, and the off-hand too
+    # for a shield/torch/dual wield — an armed creature whose race named only
+    # RightHand still could not equip, because the slot list gates the equip
+    # alongside VNAM. Weapon-using vanilla creature races (DraugrRace,
+    # SkeletonRace) name RightHand+LeftHand+Voice+Potion, so armed converted
+    # creatures get the same four.
+    armed = vnam_flags & ~(_VNAM_BASE | _VNAM_HAND_TO_HAND | _VNAM_SPELL)
+    slots = ([_QNAM_UNARMED, _QNAM_LEFT_HAND, _QNAM_VOICE, _QNAM_POTION]
+             if armed else [_QNAM_UNARMED])
+    for slot in slots:
+        subs += pack_formid_subrecord('QNAM', slot)
     subs += pack_formid_subrecord('UNES', _QNAM_UNARMED)
 
     writer.add_record('RACE', pack_record('RACE', race_fid, 0, subs))
@@ -422,12 +601,14 @@ def _load_projects(export_dir: str) -> dict:
     return merged
 
 
-def build_creature_races(by_type: dict, writer, export_dir: str) -> None:
+def build_creature_races(by_type: dict, writer, export_dir: str,
+                         master_export: dict = None) -> None:
     """Phase 0f: one generated RACE + skin ARMO/ARMA per unique
     (creature folder, body-part set) among CREA records with a converted
     project. Populates the crea→race map used by convert_CREA."""
     global _PROJECTS
     _CREA_RACE_MAP.clear()
+    load_creature_item_index(by_type, master_export)
 
     _PROJECTS = _load_projects(export_dir)
     if not _PROJECTS:
@@ -453,16 +634,7 @@ def build_creature_races(by_type: dict, writer, export_dir: str) -> None:
             folder_speed[f] = max(folder_speed.get(f, 0),
                                   get_int(rec, 'DATA.Speed', 0))
 
-    made = {}
-    movt_folders = set()
-    n_races = 0
-    for rec in by_type.get('CREA', []):
-        folder = _folder_of(rec)
-        proj = _PROJECTS.get(folder)
-        if proj is None:
-            continue
-        fid = get_formid(rec, 'FormID') & 0x00FFFFFF
-
+    def _bodies_of(rec, proj):
         # The creature pipeline merged each CREA's NIFZ part set into ONE
         # whole-animal NIF and ships the exact set→file mapping as body_map
         # ('|'.join(lowercase nifz) → merged filename), so dog/wolf/
@@ -473,10 +645,39 @@ def build_creature_races(by_type: dict, writer, export_dir: str) -> None:
         nifz = [p for p in nifz if p.endswith('.nif')]
         merged = (proj.get('body_map') or {}).get('|'.join(nifz))
         if merged:
-            bodies = [merged]
-        elif proj['bodies']:
-            bodies = [proj['bodies'][0]]   # fallback: folder's first merged NIF
-        else:
+            return [merged]
+        if proj['bodies']:
+            return [proj['bodies'][0]]   # fallback: folder's first merged NIF
+        return None
+
+    # A generated race is SHARED by every CREA with the same (folder, bodies),
+    # so its equipment flags must be the union over all of them — computed in a
+    # pre-pass because the race is written on the FIRST record it sees, before
+    # the rest of the group has been walked.
+    race_recs = {}
+    for rec in by_type.get('CREA', []):
+        folder = _folder_of(rec)
+        proj = _PROJECTS.get(folder)
+        if proj is None:
+            continue
+        bodies = _bodies_of(rec, proj)
+        if bodies is None:
+            continue
+        race_recs.setdefault((folder, tuple(bodies)), []).append(rec)
+
+    made = {}
+    movt_folders = set()
+    n_races = 0
+    n_armed = 0
+    for rec in by_type.get('CREA', []):
+        folder = _folder_of(rec)
+        proj = _PROJECTS.get(folder)
+        if proj is None:
+            continue
+        fid = get_formid(rec, 'FormID') & 0x00FFFFFF
+
+        bodies = _bodies_of(rec, proj)
+        if bodies is None:
             continue
 
         if folder not in movt_folders:
@@ -495,8 +696,12 @@ def build_creature_races(by_type: dict, writer, export_dir: str) -> None:
             edid = get_str(rec, 'EditorID') or folder
             edid_base = ''.join(c for c in edid if c.isalnum()) or folder
             full = get_str(rec, 'FULL') or edid
+            vnam = _creature_equip_flags(race_recs.get(key, [rec]))
+            if vnam & ~(_VNAM_BASE | _VNAM_HAND_TO_HAND | _VNAM_SPELL):
+                n_armed += 1
             _build_race(writer, rec, folder, bodies, proj,
-                        race_fid, skin_fid, f'TES4{edid_base}Race', full)
+                        race_fid, skin_fid, f'TES4{edid_base}Race', full,
+                        vnam_flags=vnam)
             _build_skin(writer, folder, bodies, race_fid, skin_fid,
                         edid_base)
             made[key] = race_fid
@@ -504,5 +709,6 @@ def build_creature_races(by_type: dict, writer, export_dir: str) -> None:
         _CREA_RACE_MAP[fid] = (made[key], folder)
 
     print(f'  Creature races: {n_races} generated '
-          f'({len(_CREA_RACE_MAP)} CREA records mapped, '
+          f'({n_armed} weapon-capable, '
+          f'{len(_CREA_RACE_MAP)} CREA records mapped, '
           f'{len(_PROJECTS)} converted projects)')

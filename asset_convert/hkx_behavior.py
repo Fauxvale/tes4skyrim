@@ -96,6 +96,34 @@ SINGLE_PLAY = {
     'Death': (['death', 'dies'], 'deathStart', None),
 }
 
+# Weapon draw/sheathe. The engine moves a weapon from its sheath node
+# (Prn=WeaponMace etc.) into the hand (WEAPON) as part of playing the EQUIP
+# animation — it is the graph, not the record, that arms an actor. Vanilla
+# proves the point: the weapon-using creature graphs carry equip states and
+# iRightHandType (draugrbehavior 436KB, falmerbehavior 276KB), while the
+# bare-handed ones do not (wolfbehavior 7KB, chaurusbehavior 98KB). Our
+# generated graph had weaponDraw/weaponSheathe EVENTS but no equip STATE, so
+# nothing ever reparented the weapon: it stayed on the sheath node — or, before
+# those nodes existed, on the actor root, sliding around at the creature's feet.
+#
+# Oblivion ships the source clips per weapon class (goblin: onehandequip,
+# bowequip, staffequip, handtohandequip + unequip pairs), and ck-cmd's TES4
+# analyzer catalogues exactly these names (ConvertNif.cpp:6054-6180), so the
+# mapping is authored data rather than a guess.
+#
+# 'hand type' is the iRightHandType value the engine sets for that weapon class
+# (from the vanilla behavior expressions: 7 = bow/ranged is called out
+# explicitly in falmerbehavior's bAllowRotation guard, 0 = empty/hand-to-hand).
+EQUIP_STANCES = {
+    # state suffix -> (equip kf names, unequip kf names, hand types)
+    'H2H':   (['handtohandequip', 'equip'],
+              ['handtohandunequip', 'unequip'], (0,)),
+    'OneH':  (['onehandequip'], ['onehandunequip'], (1, 2, 3, 4)),
+    'TwoH':  (['twohandequip'], ['twohandunequip'], (5, 6)),
+    'Bow':   (['bowequip'], ['bowunequip'], (7,)),
+    'Staff': (['staffequip'], ['staffunequip'], (8,)),
+}
+
 
 def classify_clips(creature_dir: str) -> dict:
     """Scan an Oblivion creature folder into the v1 graph's clip roles.
@@ -110,7 +138,7 @@ def classify_clips(creature_dir: str) -> dict:
                 creature_dir, fn)
 
     out = {'idle': None, 'locomotion': {}, 'attacks': [], 'single': {},
-           'extra': [], 'run': None}
+           'extra': [], 'run': None, 'equip': {}}
     used = set()
     for cand in IDLE_CANDIDATES:
         if cand in kfs:
@@ -137,6 +165,21 @@ def classify_clips(creature_dir: str) -> dict:
                 out['single'][state] = kfs[n]
                 used.add(n)
                 break
+    # Weapon draw/sheathe clips, per weapon class (see EQUIP_STANCES). Claimed
+    # BEFORE the attack sweep below: 'handtohandattackequip' contains 'attack'
+    # and would otherwise be mistaken for an attack clip.
+    for stance, (eq_names, uneq_names, _types) in EQUIP_STANCES.items():
+        eq = next((kfs[n] for n in eq_names if n in kfs and n not in used),
+                  None)
+        if eq is None:
+            continue
+        uneq = next((kfs[n] for n in uneq_names if n in kfs and n not in used),
+                    None)
+        out['equip'][stance] = (eq, uneq)
+        used.add(os.path.splitext(os.path.basename(eq))[0].lower())
+        if uneq:
+            used.add(os.path.splitext(os.path.basename(uneq))[0].lower())
+
     for name, path in kfs.items():
         if name in used:
             continue
@@ -191,6 +234,16 @@ def state_defs(clips: dict) -> list:
     for kf, evt in zip(clips['attacks'], build_attack_events(clips)):
         defs.append((f'Attack_{_clip_state_name(kf)}', kf, False, evt,
                      'returnToDefault'))
+    # Equip/unequip: single-play, entered on the engine's weaponDraw/
+    # weaponSheathe. The clip END fires the reply the combat controller waits
+    # for (weaponDraw once armed / weaponSheathe once stowed) so the actor is
+    # cleared to attack; see EQUIP_STANCES.
+    for stance, (eq, uneq) in sorted(clips.get('equip', {}).items()):
+        defs.append((f'Equip_{stance}', eq, False,
+                     f'equipStart_{stance}', 'weaponDraw'))
+        if uneq:
+            defs.append((f'Unequip_{stance}', uneq, False,
+                         f'unequipStart_{stance}', 'weaponSheathe'))
     return defs
 
 
@@ -418,6 +471,14 @@ ENGINE_VARIABLES = [
     ('iCharacterSelector', 'INT32', 0), ('iCombatStance', 'INT32', 0),
     ('IsAttacking', 'BOOL', 0), ('IsAttackReady', 'BOOL', 1),
     ('bEquipOK', 'BOOL', 1),
+    # Weapon-class state the ENGINE writes when it equips something, and which
+    # the equip state machine switches on. Vanilla weapon-using creature graphs
+    # declare these (draugr/falmer) and bare-handed ones do not (wolf/chaurus);
+    # ck-cmd's TES4 variable template lists them too (ConvertNif.cpp:6634-6638).
+    # Without them the engine has no way to tell the graph WHICH draw animation
+    # to play, so the weapon never leaves its sheath node.
+    ('iRightHandType', 'INT32', 0), ('iLeftHandType', 'INT32', 0),
+    ('iEquippedItemState', 'INT32', 0), ('IsUnequipping', 'BOOL', 0),
     ('IsRecoiling', 'BOOL', 0), ('IsStaggering', 'BOOL', 0),
     ('IsBleedingOut', 'BOOL', 0), ('IsBashing', 'BOOL', 0),
     ('bAnimationDriven', 'BOOL', 0), ('bAllowRotation', 'BOOL', 0),
@@ -489,6 +550,15 @@ def build_behavior_xml(behavior_name: str, clips: dict,
               'SoundPlay', 'preHitFrame', 'HitFrame', 'FootFront', 'FootBack']
     attack_events = build_attack_events(clips)
     events += attack_events
+    # One enter-event per equip/unequip state (see EQUIP_STANCES); the root
+    # wildcard routes weaponDraw/weaponSheathe to whichever matches the
+    # engine-set iRightHandType.
+    equip_events = []
+    for stance in sorted(clips.get('equip', {})):
+        equip_events.append(f'equipStart_{stance}')
+        if clips['equip'][stance][1]:
+            equip_events.append(f'unequipStart_{stance}')
+    events += equip_events
     eid = {n: i for i, n in enumerate(events)}
 
     if not clips['idle']:
@@ -817,6 +887,55 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         default_trans.append((eid[evt], next_id, _F_LOCAL))
         next_id += 1
 
+    # Equip / unequip states. The engine sends weaponDraw when it wants the
+    # actor armed; the expression modifier below translates that into the
+    # per-class equipStart_* event matching the engine-set iRightHandType, and
+    # the clip's END trigger replies weaponDraw so the combat controller knows
+    # the actor is ready. Sheathing is the mirror image.
+    equip_dispatch = []
+    for stance, (eq, uneq) in sorted(clips.get('equip', {}).items()):
+        hand_types = EQUIP_STANCES[stance][2]
+        for kind, kf, reply in (('equip', eq, 'weaponDraw'),
+                                ('unequip', uneq, 'weaponSheathe')):
+            if kf is None:
+                continue
+            st_name = f'{kind.capitalize()}_{stance}'
+            evt = f'{kind}Start_{stance}'
+            clip = _clip(st_name, kf, False, _clip_triggers(st_name, reply))
+            root_states_inner.append(_state(
+                next_id, f'{st_name}State', clip.ref,
+                transitions=[(eid['returnToDefault'], 0, _F_LOCAL)]))
+            root_wilds.append((eid[evt], next_id, _F_WILD))
+            next_id += 1
+            equip_dispatch.append((kind, evt, hand_types))
+
+    equip_eem = None
+    if equip_dispatch:
+        # weaponDraw/weaponSheathe -> the class-specific enter event. Guarded on
+        # iRightHandType so a bow draw plays bowequip and a mace draw plays
+        # onehandequip; the H2H entry (hand type 0) doubles as the fallback.
+        exprs = []
+        for kind, evt, hand_types in equip_dispatch:
+            src = 'weaponDraw' if kind == 'equip' else 'weaponSheathe'
+            cond = ' || '.join(f'(iRightHandType == {t})' for t in hand_types)
+            exprs.append(f'{evt} if (({src}) && ({cond}))')
+        arr = pf.add('hkbExpressionDataArray')
+        arr.param_raw('expressionsData', '\n'.join(
+            '<hkobject>\n'
+            f'\t<hkparam name="expression">{e}</hkparam>\n'
+            '\t<hkparam name="assignmentVariableIndex">-1</hkparam>\n'
+            '\t<hkparam name="assignmentEventIndex">-1</hkparam>\n'
+            '\t<hkparam name="eventMode">EVENT_MODE_SEND_ON_FALSE_TO_TRUE'
+            '</hkparam>\n'
+            '</hkobject>' for e in exprs), numelements=len(exprs))
+        eem = pf.add('hkbEvaluateExpressionModifier')
+        eem.param('variableBindingSet', 'null')
+        eem.param('userData', 2)
+        eem.param('name', 'EquipDispatch_EEM')
+        eem.param('enable', True)
+        eem.param('expressions', arr.ref)
+        equip_eem = eem
+
     default_state = _state(0, 'DefaultState', default_sm.ref,
                            transitions=default_trans or None)
     root_states_inner.insert(0, default_state)
@@ -934,8 +1053,11 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     mod_list.param('userData', 1)
     mod_list.param('name', 'RootModifierList')
     mod_list.param('enable', True)
-    mod_list.param_array('modifiers', [stop_combat.ref, start_combat.ref,
-                                       sampler.ref])
+    # EquipDispatch must run alongside the combat pair: it turns the engine's
+    # weaponDraw/weaponSheathe into the per-weapon-class equip event.
+    mod_list.param_array('modifiers',
+                         [stop_combat.ref, start_combat.ref, sampler.ref]
+                         + ([equip_eem.ref] if equip_eem is not None else []))
 
     mod_gen = pf.add('hkbModifierGenerator')
     mod_gen.param('variableBindingSet', 'null')
@@ -1201,8 +1323,15 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
             'duration': float(clip.duration),
             'looping': looping,
             'end_event': end_evt,
-            'sounds': [float(t) for t, s in clip.text_keys
-                       if s.strip().lower().startswith('sound')],
+            # Oblivion 'sound: <SOUN EDID>' text keys.  The EDID must survive:
+            # Skyrim's trigger is 'SoundPlay.<SNDR EDID>' and the engine
+            # resolves that name at playback (nif_converter
+            # ._convert_sound_text_keys does the same rewrite for NIF
+            # sequences).  Keeping only the timestamp emitted a bare
+            # 'SoundPlay' naming no descriptor, which plays nothing.
+            'sounds': [(float(t), s.strip().split(':', 1)[1].strip())
+                       for t, s in clip.text_keys
+                       if s.strip().lower().startswith('sound:')],
             # Oblivion 'Hit' text keys → HitFrame triggers (damage contract)
             'hits': [float(t) for t, s in clip.text_keys
                      if s.strip().lower() == 'hit'],
@@ -1268,7 +1397,7 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
                 'name': cnm, 'stem': stem, 'anim': base['anim'],
                 'duration': base['duration'], 'looping': True,
                 'end_event': None, 'rate': rate,
-                'sounds': [t / rate for t in base['sounds']],
+                'sounds': [(t / rate, s) for t, s in base['sounds']],
                 'hits': [],
             }
             clip_meta.append(entry)

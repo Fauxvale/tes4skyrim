@@ -799,6 +799,97 @@ def _prune_orphan_roots(data):
     return removed
 
 
+# Equip/sheath nodes Skyrim looks up by hard-coded name, and where each one
+# hangs on a vanilla weapon-using creature rig (Draugr skeleton.nif node order:
+# WeaponAxe/Sword/Mace sit by the pelvis, WeaponBack/Bow/QUIVER after the left
+# pauldron on the upper spine, WEAPON under the right hand, SHIELD under the
+# left).
+#
+# Oblivion rigs have only three attachment points — Weapon, Torch, Quiver —
+# which the BONE_RENAMES pass turns into WEAPON/SHIELD/QUIVER.  The per-type
+# SHEATH nodes have no Oblivion counterpart at all, so the converted rig simply
+# lacked them: a converted weapon carries Prn=WeaponMace (the sheathed node,
+# which is what vanilla Skyrim weapon meshes use), the engine could not find a
+# node by that name, and the mesh fell back to the actor root — the weapon
+# visibly slid around at the creature's feet instead of sitting in its hand,
+# and no draw animation could ever reparent it.
+#
+# 'anchor' is the node to hang it under, in preference order (the first that
+# exists on this rig wins); 'source' is the node whose LOCAL transform is
+# copied, so the new node lands somewhere sensible for a rig of any size
+# rather than at a hardcoded human offset.
+_CREATURE_EQUIP_NODES = (
+    # name,           anchors (first match wins),               source
+    ('WeaponSword',  ('Bip01 Pelvis', 'Bip01 Spine'),           'WEAPON'),
+    ('WeaponDagger', ('Bip01 Pelvis', 'Bip01 Spine'),           'WEAPON'),
+    ('WeaponAxe',    ('Bip01 Pelvis', 'Bip01 Spine'),           'WEAPON'),
+    ('WeaponMace',   ('Bip01 Pelvis', 'Bip01 Spine'),           'WEAPON'),
+    ('WeaponBack',   ('Bip01 Spine2', 'Bip01 Spine1',
+                      'Bip01 Spine'),                           'QUIVER'),
+    ('WeaponBow',    ('Bip01 Spine2', 'Bip01 Spine1',
+                      'Bip01 Spine'),                           'QUIVER'),
+    ('WeaponStaff',  ('Bip01 Spine2', 'Bip01 Spine1',
+                      'Bip01 Spine'),                           'QUIVER'),
+)
+
+# Spell-cast nodes. Vanilla rigs carry one per hand plus a body-centre node;
+# without them a casting creature's effect art has nowhere to attach.
+_CREATURE_MAGIC_NODES = (
+    ('NPC L MagicNode [LMag]', ('Bip01 L Hand',),               'SHIELD'),
+    ('NPC R MagicNode [RMag]', ('Bip01 R Hand',),               'WEAPON'),
+    ('MagicEffectsNode',       ('Bip01 Spine', 'Bip01 Spine1'), None),
+)
+
+
+def _add_creature_equip_nodes(data):
+    """Give a converted creature rig the equip/sheath nodes Skyrim expects.
+
+    Returns the number of nodes added.  Runs AFTER the BONE_RENAMES pass so the
+    renamed WEAPON/SHIELD/QUIVER nodes are available as transform sources, and
+    is a no-op for any node the rig already has (so re-running is safe and a rig
+    that legitimately ships one keeps its own).
+    """
+    added = 0
+    for root in data.roots:
+        if root is None:
+            continue
+        by_name, parent_of = {}, {}
+        for block in root.tree():
+            if not isinstance(block, NifFormat.NiNode):
+                continue
+            by_name.setdefault(
+                bytes(block.name).rstrip(b'\x00').decode(
+                    'cp1252', 'replace'), block)
+            for child in block.children or []:
+                if isinstance(child, NifFormat.NiNode):
+                    parent_of[id(child)] = block
+
+        for name, anchors, source in (_CREATURE_EQUIP_NODES
+                                      + _CREATURE_MAGIC_NODES):
+            if name in by_name:
+                continue
+            parent = next((by_name[a] for a in anchors if a in by_name), None)
+            if parent is None:
+                continue
+            node = NifFormat.NiNode()
+            node.name = name.encode('latin-1')
+            # Copy a sibling attachment point's local transform where we have
+            # one; otherwise sit at the anchor's origin.  Either way the node
+            # is scaled to THIS creature, not to a human.
+            src = by_name.get(source) if source else None
+            if src is not None and parent_of.get(id(src)) is parent:
+                node.translation.x = src.translation.x
+                node.translation.y = src.translation.y
+                node.translation.z = src.translation.z
+                node.rotation = src.rotation
+            node.scale = 1.0
+            node.flags = parent.flags
+            parent.add_child(node)
+            by_name[name] = node
+            added += 1
+    return added
+
+
 def _strip_creature_bone_controllers(data):
     """Remove Oblivion-runtime controllers from creature NIF node chains.
 
@@ -1541,19 +1632,39 @@ def _process_controller_manager(node, palette):
                 seq.num_controlled_blocks -= 1
                 continue
 
-            # NiTransformInterpolator with empty data → remove the block.
-            # These are placeholder accumulation-root blocks (or other no-op blocks)
-            # that have no keyframe data.  In Skyrim they would cause the engine to
-            # snap the target node to the interpolator's stored rotation/translation
-            # even though no animation was intended, potentially repositioning parts
-            # of the object incorrectly.  Just remove the block; do NOT zero the
-            # target node's NIF-space transform (that is its correct rest pose).
+            # NiTransformInterpolator with empty data → KEEP the entry, but
+            # neutralise it the way vanilla does.
+            #
+            # Deleting these was wrong.  The snapping concern is real (a
+            # dataless interpolator whose stored transform is a real value
+            # would yank the node there), but vanilla's answer is a SENTINEL,
+            # not removal: `volunruudleftswordanimated`'s LeftLockDoor /
+            # LeftRingParentDoor entries keep a real translation and store
+            # rotation + scale as -FLT_MAX (-3.4028235e38), which tells the
+            # engine "this channel has no value, leave the node alone".
+            # Census of vanilla animated doors/traps: 12 dataless transform
+            # entries are KEPT (96 have data), and 123/123 sequences have at
+            # least one controlled block — vanilla ships NO empty sequence.
+            #
+            # Removal emptied whole sequences: ctrapswingmacelong01 and
+            # ctrapswingmaceshort01's `Unequip` went 2 entries -> 0.  A
+            # sequence with nothing to bind never runs, so its TEXT KEYS never
+            # fire — which is why the swinging traps made no sound.  (Their
+            # visible motion is Havok, not the clip, so the empty sequence was
+            # invisible until the sound went missing.)  ctraplogs01 3->1,
+            # ctrigpressureplate01 3->1, ctrigtripwire01 6->3.
+            #
+            # The root-named entry is still dropped above: 0 vanilla sequences
+            # target their own root node.
             if isinstance(blk.interpolator, NifFormat.NiTransformInterpolator):
                 interp = blk.interpolator
                 if interp.data is None:
-                    seq.controlled_blocks.pop(key)
-                    seq.num_controlled_blocks -= 1
-                    continue
+                    _NO_VALUE = -3.4028234663852886e+38
+                    interp.rotation.w = _NO_VALUE
+                    interp.rotation.x = _NO_VALUE
+                    interp.rotation.y = _NO_VALUE
+                    interp.rotation.z = _NO_VALUE
+                    interp.scale = _NO_VALUE
 
             # Morph controllers do not exist in Skyrim (the SSE exe has no
             # NiGeomMorpherController RTTI class at all; vanilla ships 0) --
@@ -4068,6 +4179,14 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                 key = bytes(nm).rstrip(b'\x00')
                 if key in renames:
                     block.name = renames[key]
+
+        # Skyrim needs a node per weapon TYPE for the sheathed position, on top
+        # of the three Oblivion attachment points renamed above — a converted
+        # weapon's Prn names one of those (Prn=WeaponMace etc.) and without the
+        # node the mesh attaches to the actor root and slides around at its
+        # feet.  Only meaningful on the skeleton, which is the only creature
+        # NIF carrying the rig.
+        _add_creature_equip_nodes(data)
 
     if creature and not has_skin:
         # Rigid Prn-attached creature parts (heads, eyes, tails): bake node
