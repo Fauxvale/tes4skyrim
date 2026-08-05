@@ -49,6 +49,12 @@ caching, skipped record types, the export text format, and the directory layout.
   traced to navmesh, condition params, package data, and behavior graphs in turn.
   Confirm the mechanism before fixing; a plausible story that explains the symptom
   is not yet a diagnosis.
+- <a id="master-blindness"></a>**IF THE PLUGIN HAS MASTERS, SUSPECT MASTER-EXPORT
+  BLINDNESS FIRST.** Morrowind_ob and the ESPs depend on Oblivion.esm (Nehrim and
+  Oblivion are standalone). The recurring defect: an import phase indexes only
+  `by_type` — the CURRENT plugin's export — and never consults
+  `ctx.master_export`, so an actor's master-owned packages, items, scripts or
+  refs resolve to nothing and the feature silently dies.
 - Don't preserve backwards compatibility. Delete code that is no longer used.
 - Keep files under ~1000 lines; split by responsibility when one grows.
 - <a id="tools-first"></a>**CHECK `tools/` BEFORE BUILDING ANYTHING BESPOKE.**

@@ -273,14 +273,55 @@ interpolator in the tree after all controller passes, and
 Oblivion meshes were affected — gates, magic effects, creatures and the enemy
 health bar, not just the morph-swap meshes.
 
-### Oblivion `sound:` text keys are dead in Skyrim (2026-08-02)
+### Oblivion `sound:` text keys are NATIVE in Skyrim — never rewrite them (2026-08-05)
 
-The exe's text-key keyword table (strings at RVA 0x162fd50: `SoundPlay`,
-`SoundPlayAt`, `SoundStop`, `SoundRelease`) has no `sound:` prefix; vanilla
-keys look like `SoundPlay.DRSStoneWallJailCollapse` where the suffix is a SNDR
-EDITOR ID.  `_convert_sound_text_keys` rewrites `sound: X` →
-`SoundPlay.TES4_X_SNDR`, matching the importer's SNDR EDID convention
-(`dialog_misc.convert_SOUN`), so converted sequences regain their sounds.
+**This section previously said the opposite.  The rewrite it described silenced
+244 Oblivion meshes** — every animated gate, portcullis and prison door — and
+was reverted after the user reported StoneWallGateDoor01 losing its iron creak.
+Confirmed fixed in-game 2026-08-05.
+
+SkyrimSE keeps Gamebryo's own text-key sound handler.  At `0x1401db723` (GOG
+build) it compares the key against the literal **`"Sound: "`** (`r8d = 7`) with
+**`_strnicmp`, which is CASE-INSENSITIVE**, so Oblivion's lowercase `sound: X`
+matches, and it plays whatever follows those 7 characters (`lea rcx, [rbx + 7]`
+at `0x1401db890`).  The same handler also accepts `"Enum: StopSounds "`.  Both
+literals sit at file offsets `0x1635f50` / `0x168d0ec`.
+
+**The trap:** the earlier pass searched the exe for lowercase `sound:`, found
+nothing, and concluded the keyword did not exist.  The string is capitalised.
+Case-fold before concluding a string is absent from the exe.
+
+`SoundPlay.<SNDR EDID>` is a DIFFERENT, non-interchangeable channel: it is
+matched against a behaviour graph's declared event-name table, so it only works
+on meshes that have one (38 of the 39 vanilla meshes using it carry
+`BSBehaviorGraphExtraData`).  Converted doors deliberately have **no** graph —
+attaching one to an Open/Close door CTDs it on cell load — so the rewritten key
+matched nothing and was dropped.  Creature/actor sounds still correctly use
+`SoundPlay.` because they DO go through a graph (`hkx_behavior.py`).
+
+`_convert_sound_text_keys` is therefore a documented no-op returning 0.
+
+### DOOR sound records: SNAM/ANAM must name an SNDR (2026-08-05)
+
+Separate defect found in the same investigation.  TES5 `DOOR` SNAM (open) /
+ANAM (close) / BNAM (loop) reference a sound **descriptor**, not a SOUN — xEdit
+declares `wbFormIDCk(SNAM, 'Sound - Open', [SNDR])`, and all 90 sounded vanilla
+Skyrim DOORs agree (WRDragonSideDoor01's SNAM `0005AFC9` is the SNDR
+`DRSWoodImperialDouble01OpenSD`).  The converter was writing the TES4 SOUN id,
+so all 417 sounded Oblivion doors held a wrong-typed reference.
+
+DOORs are written in import Phase 1, before Phase 3 mints the descriptors, so
+`convert_DOOR` stores the SOUN id as a placeholder and
+`items.patch_door_sounds` resolves it afterwards — the same approach
+`actors.patch_actor_sounds` uses for CSDI.  Allocating descriptor ids earlier
+would shift every other generated FormID.
+
+Oblivion also lets a door's sound live ONLY in the mesh (the record has no
+SNAM/ANAM at all — StoneWallGateDoor01 and 57 other doors).  Skyrim's record
+channel is what vanilla relies on, so `asset_convert/door_sounds.py` reads the
+model's `Open`/`Close` sequence text keys and `items.load_door_model_sounds`
+lifts those names onto SNAM/ANAM.  The sequence NAME decides the slot, so the
+NIF is parsed rather than byte-scanned.
 
 ### PlayGroup chains: NEVER convert to PlayAnimationAndWait (2026-08-02)
 

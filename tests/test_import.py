@@ -714,6 +714,127 @@ class TestConverters:
         self._check_record(result, 'DOOR')
 
 
+class TestDoorSounds:
+    """DOOR SNAM/ANAM/BNAM must name an SNDR, not the TES4 SOUN.
+
+    xEdit: wbFormIDCk(SNAM, 'Sound - Open', [SNDR]); Skyrim.esm agrees —
+    WRDragonSideDoor01's SNAM 0005AFC9 is the SNDR DRSWoodImperialDouble01OpenSD.
+    Doors are written in Phase 1, before the descriptors exist, so the SOUN id
+    is a placeholder that patch_door_sounds resolves.
+    """
+
+    @staticmethod
+    def _slots(blob):
+        out = {}
+        pos = 24
+        assert struct.unpack_from('<I', blob, 4)[0] == len(blob) - 24
+        while pos + 6 <= len(blob):
+            sig = blob[pos:pos + 4]
+            size = struct.unpack_from('<H', blob, pos + 4)[0]
+            if sig in (b'SNAM', b'ANAM', b'BNAM') and size == 4:
+                out[sig.decode()] = struct.unpack_from('<I', blob, pos + 6)[0]
+            pos += 6 + size
+        return out
+
+    @staticmethod
+    def _door(edid, **slots):
+        from tes5_import.record_types.common import (pack_formid_subrecord,
+                                                     pack_string_subrecord,
+                                                     pack_uint8_subrecord)
+        subs = pack_string_subrecord('EDID', edid)
+        for sig in ('SNAM', 'ANAM', 'BNAM'):
+            if slots.get(sig):
+                subs += pack_formid_subrecord(sig, slots[sig])
+        subs += pack_uint8_subrecord('FNAM', 0)
+        return pack_record('DOOR', 0x01000001, 0, subs)
+
+    class _Writer:
+        def __init__(self, records):
+            self._top_groups = {'DOOR': records}
+
+    def test_slots_resolve_to_descriptors(self):
+        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types.items import patch_door_sounds
+        dialog_misc.reset_sound_descriptors()
+        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        dialog_misc.record_sndr_for_soun(0x0105C424, 0x01190F01)
+        w = self._Writer([self._door('D', SNAM=0x0105C423, ANAM=0x0105C424)])
+        assert patch_door_sounds(w, {0x05C423, 0x05C424}) == 1
+        assert self._slots(w._top_groups['DOOR'][0]) == {
+            'SNAM': 0x01190F00, 'ANAM': 0x01190F01}
+
+    def test_slot_without_descriptor_is_dropped(self):
+        """A SOUN with no FNAM mints no SNDR; a slot pointing at the SOUN
+        would be a wrong-typed reference, so it goes."""
+        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types.items import patch_door_sounds
+        dialog_misc.reset_sound_descriptors()
+        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        w = self._Writer([self._door('D', SNAM=0x0105C423, BNAM=0x0105C425)])
+        assert patch_door_sounds(w, {0x05C423, 0x05C425}) == 1
+        assert self._slots(w._top_groups['DOOR'][0]) == {'SNAM': 0x01190F00}
+
+    def test_master_override_slots_untouched(self):
+        """An override build's DOOR group also holds the master's records,
+        whose slots already name the MASTER's SNDRs. Rewriting or dropping
+        those would strip door sound out of every dependent plugin."""
+        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types.items import patch_door_sounds
+        dialog_misc.reset_sound_descriptors()
+        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        w = self._Writer([self._door('M', SNAM=0x00190AAA, ANAM=0x00190AAB)])
+        assert patch_door_sounds(w, {0x05C423}) == 0
+        assert self._slots(w._top_groups['DOOR'][0]) == {
+            'SNAM': 0x00190AAA, 'ANAM': 0x00190AAB}
+
+    def test_patch_is_idempotent(self):
+        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types.items import patch_door_sounds
+        dialog_misc.reset_sound_descriptors()
+        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        w = self._Writer([self._door('D', SNAM=0x0105C423)])
+        assert patch_door_sounds(w, {0x05C423}) == 1
+        first = w._top_groups['DOOR'][0]
+        assert patch_door_sounds(w, {0x05C423}) == 0
+        assert w._top_groups['DOOR'][0] == first
+
+    def test_mesh_authored_sound_fills_empty_slots(self):
+        """Oblivion accepts a door's sound on the record OR as `sound:` text
+        keys in the model; Skyrim has only the record. StoneWallGateDoor01's
+        DOOR records carry no SNAM/ANAM at all — the gate creak lives entirely
+        in the NIF — so without the mesh fallback they convert silent."""
+        from tes5_import.record_types import items
+        rec = {'Signature': 'DOOR', 'FormID': '0002595F', 'RecordFlags': '0',
+               'EditorID': 'StoneWallGateDoor01', 'FULL': 'Wooden Gate',
+               'Model.MODL': 'Architecture\\StoneWall\\StoneWallGateDoor01.NIF'}
+        items._DOOR_MODEL_SOUNDS.clear()
+        items._DOOR_MODEL_SOUNDS[
+            'architecture/stonewall/stonewallgatedoor01.nif'] = {
+                'open': 0x0105C423, 'close': 0x0105C424}
+        try:
+            slots = self._slots(items.convert_DOOR(rec))
+        finally:
+            items._DOOR_MODEL_SOUNDS.clear()
+        assert slots == {'SNAM': 0x0105C423, 'ANAM': 0x0105C424}
+
+    def test_record_sound_wins_over_mesh(self):
+        """The record is the authored value where both exist."""
+        from tes5_import.record_types import items
+        rec = {'Signature': 'DOOR', 'FormID': '0002595F', 'RecordFlags': '0',
+               'EditorID': 'D', 'SNAM.Open': '0105C400',
+               'Model.MODL': 'Architecture\\StoneWall\\StoneWallGateDoor01.NIF'}
+        items._DOOR_MODEL_SOUNDS.clear()
+        items._DOOR_MODEL_SOUNDS[
+            'architecture/stonewall/stonewallgatedoor01.nif'] = {
+                'open': 0x0105C423, 'close': 0x0105C424}
+        try:
+            slots = self._slots(items.convert_DOOR(rec))
+        finally:
+            items._DOOR_MODEL_SOUNDS.clear()
+        assert slots['SNAM'] == 0x0105C400
+        assert slots['ANAM'] == 0x0105C424
+
+
 # ---------------------------------------------------------------------------
 # Integration test: Full pipeline on synthetic data
 # ---------------------------------------------------------------------------

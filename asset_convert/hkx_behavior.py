@@ -1324,11 +1324,13 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
             'looping': looping,
             'end_event': end_evt,
             # Oblivion 'sound: <SOUN EDID>' text keys.  The EDID must survive:
-            # Skyrim's trigger is 'SoundPlay.<SNDR EDID>' and the engine
-            # resolves that name at playback (nif_converter
-            # ._convert_sound_text_keys does the same rewrite for NIF
-            # sequences).  Keeping only the timestamp emitted a bare
-            # 'SoundPlay' naming no descriptor, which plays nothing.
+            # a behaviour-graph trigger is 'SoundPlay.<SNDR EDID>' and the
+            # engine resolves that name at playback.  Keeping only the
+            # timestamp emitted a bare 'SoundPlay' naming no descriptor, which
+            # plays nothing.
+            # This is the GRAPH channel and is unrelated to plain NIF sequence
+            # text keys: those stay in Oblivion's 'sound: X' form, which the
+            # engine handles natively (nif_converter._convert_sound_text_keys).
             'sounds': [(float(t), s.strip().split(':', 1)[1].strip())
                        for t, s in clip.text_keys
                        if s.strip().lower().startswith('sound:')],

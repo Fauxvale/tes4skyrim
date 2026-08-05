@@ -987,6 +987,14 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     load_furniture_models(os.path.join(export_dir, 'meshes'), by_type)
     _step_done('furniture seats')
 
+    # --- Phase 0e2: Door open/close sounds authored in the MESH -----------
+    # Oblivion accepts a door's sound on the record OR as `sound:` text keys
+    # in the model; Skyrim only has the record, so the mesh-authored names get
+    # lifted onto SNAM/ANAM here (asset_convert/door_sounds.py).
+    from .record_types.items import load_door_model_sounds
+    load_door_model_sounds(os.path.join(export_dir, 'meshes'), by_type)
+    _step_done('door mesh sounds')
+
     # --- Phase 0f: Generated creature RACE/ARMA/ARMO chains ---
     # One race per unique (creature folder, body-part set) among CREA records
     # whose folder was converted by the creature pipeline (creatures step).
@@ -1557,6 +1565,14 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     n_snd = patch_actor_sounds(writer)
     if n_snd:
         print(f"  Actor sound descriptors bound: {n_snd} actors")
+    # DOOR SNAM/ANAM/BNAM hold TES4 SOUN ids for the same reason (Phase 1 runs
+    # before the descriptors exist) — TES5 wants the SNDR there.
+    from .record_types.items import patch_door_sounds
+    n_dsnd = patch_door_sounds(
+        writer,
+        {get_formid(r, 'FormID') & 0x00FFFFFF for r in by_type.get('SOUN', [])})
+    if n_dsnd:
+        print(f"  Door sound descriptors bound: {n_dsnd} doors")
     # Creature voice types: allocated LAST so no other generated FormID moves,
     # then patched into the already-written creature actors and races.
     from .creature_races import (build_creature_voice_types,

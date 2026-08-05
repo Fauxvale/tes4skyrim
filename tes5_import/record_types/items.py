@@ -86,16 +86,180 @@ def convert_KEYM(rec: dict) -> bytes:
     return _simple_object(rec, 'KEYM', extra_subs=extra)
 
 
+# Normalised TES4 model path -> {'open'/'close'/'loop': TES4 SOUN FormID}, for
+# doors whose open/close sound is authored in the MESH rather than on the
+# record.  Populated by load_door_model_sounds() in import Phase 0.
+_DOOR_MODEL_SOUNDS: dict = {}
+
+
+def _door_model_key(modl: str) -> str:
+    return modl.lower().replace('\\', '/').lstrip('/')
+
+
+def load_door_model_sounds(meshes_dir, by_type) -> int:
+    """Resolve every DOOR model's authored `sound:` text keys to SOUN FormIDs.
+
+    meshes_dir: <export_dir>/meshes (source Oblivion NIFs from BSA extraction).
+
+    Oblivion doors take their audio from the record's SNAM/ANAM OR from
+    `sound: <SOUN EditorID>` keys on the model's Open/Close sequences; Skyrim
+    has only the record channel, so the mesh-authored names have to be lifted
+    onto it or those doors convert silent (see asset_convert.door_sounds).
+
+    The EditorID is resolved against this plugin's own SOUN records, so an
+    unknown name simply yields no sound rather than a dangling reference.
+    Returns the number of models that contributed a sound.
+    """
+    import os
+    _DOOR_MODEL_SOUNDS.clear()
+    doors = by_type.get('DOOR', [])
+    if not doors:
+        return 0
+    try:
+        from asset_convert.door_sounds import scan_door_models
+    except ImportError as exc:
+        print(f"  Door sounds: asset_convert unavailable ({exc}), skipping")
+        return 0
+    if not os.path.isdir(meshes_dir):
+        print(f"  Door sounds: meshes dir not found ({meshes_dir}), skipping")
+        return 0
+
+    # Only doors that need the fallback are worth parsing: a record naming its
+    # own open AND close sound already has everything TES5 can express.
+    wanted = set()
+    for rec in doors:
+        modl = get_str(rec, 'Model.MODL')
+        if not modl:
+            continue
+        if get_formid(rec, 'SNAM.Open') and get_formid(rec, 'ANAM.Close'):
+            continue
+        wanted.add(_door_model_key(modl))
+    if not wanted:
+        return 0
+
+    found, errors = scan_door_models(meshes_dir, wanted)
+    for key, err in errors:
+        print(f"  Door sounds: failed to read {key}: {err}")
+
+    soun_by_edid = {}
+    for rec in by_type.get('SOUN', []):
+        edid = get_str(rec, 'EditorID')
+        if edid:
+            soun_by_edid[edid.lower()] = get_formid(rec, 'FormID')
+
+    resolved = 0
+    unknown = set()
+    for key, slots in found.items():
+        mapped = {}
+        for slot, edid in slots.items():
+            fid = soun_by_edid.get(edid.lower())
+            if fid:
+                mapped[slot] = fid
+            else:
+                unknown.add(edid)
+        if mapped:
+            _DOOR_MODEL_SOUNDS[key] = mapped
+            resolved += 1
+    if unknown:
+        print(f"  Door sounds: {len(unknown)} mesh sound name(s) match no SOUN "
+              f"(e.g. {sorted(unknown)[0]})")
+    print(f"  Door sounds: {resolved} door model(s) supply open/close sound "
+          f"from the mesh")
+    return resolved
+
+
+def _door_model_sounds(rec: dict) -> dict:
+    """{slot: TES4 SOUN FormID} authored in this DOOR's model (may be empty)."""
+    modl = get_str(rec, 'Model.MODL')
+    if not modl:
+        return {}
+    return _DOOR_MODEL_SOUNDS.get(_door_model_key(modl), {})
+
+
+def patch_door_sounds(writer, own_soun_ids=None) -> int:
+    """Rewrite every DOOR SNAM/ANAM/BNAM from its TES4 SOUN id to the SNDR.
+
+    TES5 DOOR sound slots reference a sound DESCRIPTOR (xEdit:
+    `wbFormIDCk(SNAM, 'Sound - Open', [SNDR])`; confirmed against Skyrim.esm,
+    where WRDragonSideDoor01's SNAM 0005AFC9 is the SNDR
+    DRSWoodImperialDouble01OpenSD).  DOORs are written in Phase 1, long before
+    Phase 3 creates the descriptors, so convert_DOOR stores the SOUN id and
+    this resolves it — the same placeholder-then-patch approach
+    actors.patch_actor_sounds uses for CSDI.
+
+    *own_soun_ids* is the low-24 id set of the SOUN records THIS plugin
+    converts, and it is what makes the pass safe on an override build: the
+    DOOR group there also holds the master's already-converted records, whose
+    slots hold the MASTER's SNDR ids.  Those are not this run's placeholders,
+    so anything outside the set is left exactly as it is — the alternative
+    (treating an unmappable value as dead) would silently strip the master's
+    door sounds out of every dependent plugin.
+
+    A slot that IS one of this run's placeholders but whose SOUN produced no
+    descriptor is dropped, rather than left pointing at a record of the wrong
+    type.
+    """
+    from .dialog_misc import sndr_map
+    mapping = sndr_map()
+    if not mapping:
+        return 0
+    own = own_soun_ids if own_soun_ids is not None else set(mapping)
+    records = writer._top_groups.get('DOOR') or []
+    slots = (b'SNAM', b'ANAM', b'BNAM')
+    patched = 0
+    for i, blob in enumerate(records):
+        if not any(sig in blob for sig in slots):
+            continue
+        out = bytearray(blob[:24])
+        pos = 24
+        changed = False
+        while pos + 6 <= len(blob):
+            sig = blob[pos:pos + 4]
+            size = struct.unpack_from('<H', blob, pos + 4)[0]
+            chunk = blob[pos:pos + 6 + size]
+            pos += 6 + size
+            if sig in slots and size == 4:
+                soun = struct.unpack_from('<I', chunk, 6)[0]
+                if (soun & 0x00FFFFFF) not in own:
+                    out += chunk          # not ours to resolve — leave alone
+                    continue
+                sndr = mapping.get(soun & 0x00FFFFFF, 0)
+                if sndr != soun:
+                    changed = True
+                if sndr:
+                    out += chunk[:6] + struct.pack('<I', sndr)
+                continue           # no descriptor -> drop the slot entirely
+            out += chunk
+        if not changed:
+            continue
+        struct.pack_into('<I', out, 4, len(out) - 24)   # data size
+        records[i] = bytes(out)
+        patched += 1
+    return patched
+
+
 def convert_DOOR(rec: dict) -> bytes:
     extra = b''
-    # TES5 DOOR has SNAM (open)/ ANAM (close)/ BNAM (loop)
-    snam = get_formid(rec, 'SNAM.Open')
+    # TES5 DOOR has SNAM (open) / ANAM (close) / BNAM (loop), and xEdit plus
+    # every one of the 90 sounded vanilla Skyrim DOORs agree that all three
+    # point at an SNDR — NOT at the SOUN the TES4 record names.  The
+    # descriptors do not exist yet (Phase 3 mints them), so the TES4 SOUN id
+    # goes in as a placeholder and patch_door_sounds() resolves it, exactly as
+    # actors do for CSDI.  Allocating the descriptor id here instead would
+    # shift every other generated FormID (see dialog_misc._SNDR_FOR_SOUN).
+    #
+    # A door whose sound lives only in its MESH (`sound: X` text keys on the
+    # Open/Close sequences — Oblivion honours both channels, Skyrim only the
+    # record) falls back to the model's authored names.  Without this the
+    # gate doors, whose TES4 records carry no SNAM/ANAM at all, are silent.
+    mesh = _door_model_sounds(rec)
+    snam = get_formid(rec, 'SNAM.Open') or mesh.get('open', 0)
     if snam:
         extra += pack_formid_subrecord('SNAM', snam)
-    anam = get_formid(rec, 'ANAM.Close')
+    anam = get_formid(rec, 'ANAM.Close') or mesh.get('close', 0)
     if anam:
         extra += pack_formid_subrecord('ANAM', anam)
-    bnam = get_formid(rec, 'BNAM.Loop')
+    bnam = get_formid(rec, 'BNAM.Loop') or mesh.get('loop', 0)
     if bnam:
         extra += pack_formid_subrecord('BNAM', bnam)
     fnam = get_int(rec, 'FNAM.Flags', -1)

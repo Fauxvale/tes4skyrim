@@ -3531,30 +3531,37 @@ _TES4_SOUND_KEY = re.compile(rb'^sound:\s*(\S+)\s*$', re.IGNORECASE)
 
 
 def _convert_sound_text_keys(data):
-    """Rewrite Oblivion sequence sound keys to Skyrim's convention.
+    """Leave Oblivion's `sound: <EDID>` sequence text keys ALONE.
 
-    Oblivion text keys say `sound: <SOUN EDID>`; the SSE exe's text-key
-    keyword table (strings at RVA 0x162fd50: `SoundPlay`, `SoundPlayAt`,
-    `SoundStop`, `SoundRelease`) has no such prefix, so every converted
-    sequence played silently.  Skyrim's form is `SoundPlay.<SNDR EDID>`
-    (vanilla sldjailwallcollapse01 keys `SoundPlay.DRSStoneWallJailCollapse`,
-    a Skyrim.esm SNDR editor id).  The importer emits each TES4 SOUN's
-    companion descriptor as `TES4_<EDID>_SNDR` (dialog_misc.convert_SOUN),
-    which the engine's editor-id lookup resolves regardless of plugin.
+    DO NOT "modernise" these to `SoundPlay.<SNDR EDID>`.  That rewrite was
+    made here on 2026-08-02 and it SILENCED every animated door and gate that
+    had been working (StoneWallGateDoor01's iron creak, the portcullises, the
+    prison gates) — building the mesh at the parent commit and diffing showed
+    the text key was the ONLY difference in the whole file.
+
+    The premise was wrong in both halves:
+
+    1. **Skyrim DOES understand Oblivion's form.**  The Gamebryo text-key
+       handler at `0x1401db723` (GOG SkyrimSE.exe) compares the key against
+       the literal `"Sound: "` (`r8d = 7`) via `_strnicmp` — CASE-INSENSITIVE,
+       so lowercase `sound:` matches — and plays whatever follows those 7
+       characters (`lea rcx, [rbx + 7]` at `0x1401db890`).  The same handler
+       also takes `"Enum: StopSounds "`.  These strings live at file offsets
+       `0x1635f50` / `0x168d0ec`; searching only for lowercase `sound:` is
+       what made an earlier pass conclude the engine had no such keyword.
+
+    2. **`SoundPlay.` is the BEHAVIOR-GRAPH channel, not the NIF one.**  It is
+       matched against the graph's declared event-name table, so it needs an
+       hkx behavior graph to route through — 38 of the 39 vanilla meshes using
+       a `SoundPlay.<name>` key carry `BSBehaviorGraphExtraData`.  Converted
+       doors deliberately have NO graph (attaching one to an Open/Close door
+       CTDs it on cell load — see docs/nif_conversion_notes.md), so the
+       rewritten key matched nothing and was dropped.
+
+    Kept as a no-op returning 0 so the call site stays explicit about the
+    decision rather than looking like an omission.
     """
-    n = 0
-    for root in data.roots:
-        if root is None:
-            continue
-        for block in root.tree():
-            if not isinstance(block, NifFormat.NiTextKeyExtraData):
-                continue
-            for key in block.text_keys:
-                m = _TES4_SOUND_KEY.match(bytes(key.value))
-                if m:
-                    key.value = b'SoundPlay.TES4_' + m.group(1) + b'_SNDR'
-                    n += 1
-    return n
+    return 0
 
 
 def _fix_controller_flags(data):
@@ -4111,8 +4118,8 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
     # up animation targets; empty names → null → crash on NIF load.
     _resolve_palette_strings(data)
 
-    # Oblivion `sound: X` text keys are dead in Skyrim; rewrite to
-    # SoundPlay.TES4_X_SNDR (the importer's SNDR editor-id convention).
+    # Oblivion `sound: X` text keys are NATIVE in Skyrim too and must survive
+    # verbatim — rewriting them to SoundPlay.* silenced every animated gate.
     _convert_sound_text_keys(data)
 
     # Oblivion never sets NiTimeController "Compute Scaled Time" (0x40); Skyrim
