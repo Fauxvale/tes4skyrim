@@ -978,8 +978,26 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             # A polled-conversation line whose turn has already passed (a quest
             # stage re-seeded the counter mid-line) must apply NOTHING, or its
             # `counter + 1` overshoots the re-seeded value. See _sequence_gate.
-            if seq_gate and body_lines:
-                counter, rest = _split_counter_step(body_lines, seq_gate)
+            #
+            # ONLY when THIS fragment owns the handoff, i.e. its own body steps
+            # the counter the gate tests (`convCount = convCount + 1`).  That
+            # step is the AUTHORED marker of a sequencer: the counter advances
+            # when the line ENDS, so re-asserting its value at End time is a
+            # true "is it still my turn?" check.
+            #
+            # When the QUEST SCRIPT advances the variable instead, it does so
+            # as it STARTS each line (`set waittimer to X.SayTo ...` then
+            # `set JiubSpeak to 3`).  Oblivion's SayTo was synchronous so the
+            # value still matched when the result script ran; Skyrim's Say() is
+            # async, so by the time the End fragment fires the variable has
+            # ALREADY advanced and the gate can never be true.  Gating there
+            # silently discards the whole body: Morroblivion's Jiub set
+            # `Guard01Stage = 1` inside an `If JiubSpeak == 2` that was 3 by
+            # then, so the guard never got his move package and never walked
+            # to the player (log: FRAG 01F8E969 fires, Guard01Stage stays 0).
+            counter_step, rest_body = _split_counter_step(body_lines, seq_gate)
+            if seq_gate and body_lines and counter_step:
+                counter, rest = counter_step, rest_body
                 out_lines.append(f'  If {seq_gate}  ; still this line\'s turn')
                 out_lines.extend('  ' + b for b in counter)
                 out_lines.extend('  ' + r for r in release)

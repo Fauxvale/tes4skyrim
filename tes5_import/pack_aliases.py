@@ -49,7 +49,7 @@ PLAYER_FID = 0x00000014
 REF_TARGET_TYPES = frozenset({0, 1, 2, 7, 8, 9, 11})
 
 
-def build_script_var_map(by_type: dict) -> dict:
+def build_script_var_map(by_type: dict, master_export: dict = None) -> dict:
     """ref_fid -> {var_index: var_name} for every scripted actor/object.
 
     A TES4 GetScriptVariable condition stores the variable's *script-local
@@ -60,10 +60,36 @@ def build_script_var_map(by_type: dict) -> dict:
 
     Chain: condition names a REFR -> the REFR's base NPC_/CREA/ACTI -> its SCRI
     -> the SCPT's Variable[i].Index/.Name.
+
+    `master_export` is the MASTERS' export records and is REQUIRED for a plugin
+    with masters: any link in that chain may live in the master (a plugin REFR
+    of a master base, or a master script), and a break anywhere leaves the
+    condition without a variable NAME, so it emits no CIS2 and can never pass.
+
+    Keys stay LOW-24 on purpose.  The only consumer is
+    dialog_conditions._convert_script_var_ctda, which looks up a CTDA's param1
+    — a RAW TES4 FormID with no load-order offset applied — so it masks to the
+    low 24 bits.  Keying this map on the remapped fid instead makes every
+    GetScriptVariable/GetQuestVariable condition miss, which silently un-gates
+    all of them (Jiub repeats his first line, wrong quests fire).
+
+    Master records are yielded BEFORE the plugin's own so that, with the
+    original last-duplicate-wins assignment preserved, a plugin record still
+    overrides the master's.  (Using setdefault instead flips precedence to
+    first-wins among the plugin's OWN duplicates — many refs share a base and
+    many bases share a script — which silently re-gates conditions: DAAzura
+    started at game load and its followers packaged onto the player.)
     """
+    def _recs(sig):
+        if master_export:
+            for r in master_export.values():
+                if r.get('Signature') == sig:
+                    yield r
+        yield from by_type.get(sig, [])
+
     # 1. SCPT fid -> {index: name}
     script_vars = {}
-    for rec in by_type.get('SCPT', []):
+    for rec in _recs('SCPT'):
         sfid = get_formid(rec, 'FormID') & 0x00FFFFFF
         n = get_int(rec, 'VariableCount')
         table = {}
@@ -78,7 +104,7 @@ def build_script_var_map(by_type: dict) -> dict:
     # 2. base record fid -> its script's variable table
     base_vars = {}
     for sig in ('NPC_', 'CREA', 'ACTI', 'CONT', 'DOOR', 'QUST'):
-        for rec in by_type.get(sig, []):
+        for rec in _recs(sig):
             scri = get_formid(rec, 'SCRI') & 0x00FFFFFF
             if scri in script_vars:
                 base_vars[get_formid(rec, 'FormID') & 0x00FFFFFF] = \
@@ -87,7 +113,7 @@ def build_script_var_map(by_type: dict) -> dict:
     # 3. REFR/ACHR/ACRE fid -> base's table (conditions name the *reference*)
     out = dict(base_vars)
     for sig in ('REFR', 'ACHR', 'ACRE'):
-        for rec in by_type.get(sig, []):
+        for rec in _recs(sig):
             base = get_formid(rec, 'NAME') & 0x00FFFFFF
             table = base_vars.get(base)
             if table:

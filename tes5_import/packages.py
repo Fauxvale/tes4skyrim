@@ -36,23 +36,46 @@ _PACK_TYPES = {}
 _QUEST_PACKAGES = set()
 
 
-def load_package_types(by_type: dict) -> None:
-    """Phase 0g: index the TES4 PACK records by PKDT.Type."""
+def load_package_types(by_type: dict, master_export: dict = None) -> None:
+    """Phase 0g: index the TES4 PACK records by PKDT.Type.
+
+    `master_export` is the MASTERS' export records ({FormID hex -> record},
+    OverrideContext.master_export) and is REQUIRED for a plugin with masters:
+    an actor in a dependent plugin routinely carries MASTER-owned packages
+    (Morrowind_ob's chargen guard ends on Oblivion.esm's
+    aaaDefaultStayAtCurrentLocation).  Indexing only the current plugin leaves
+    every such package with type -1, so it can be neither classified nor
+    correctly ordered against the actor's own.
+
+    Keys are the REMAPPED FormID, matching `PackagePlan.owner_quest` and the
+    actor's converted AIPackage list (both come from get_formid()).
+    """
     from .text_reader import get_formid
     _PACK_TYPES.clear()
-    for rec in by_type.get('PACK', []):
-        try:
-            fid = get_formid(rec, 'FormID') & 0x00FFFFFF
-        except ValueError:
-            continue
-        _PACK_TYPES[fid] = get_int(rec, 'PKDT.Type', -1)
-    print(f'  Package types: {len(_PACK_TYPES)} TES4 packages indexed')
+    sources = [by_type.get('PACK', [])]
+    if master_export:
+        sources.append([r for r in master_export.values()
+                        if r.get('Signature') == 'PACK'])
+    n_master = 0
+    for i, src in enumerate(sources):
+        for rec in src:
+            try:
+                fid = get_formid(rec, 'FormID')
+            except ValueError:
+                continue
+            # The plugin's own record wins when it overrides a master's.
+            if i and fid in _PACK_TYPES:
+                continue
+            _PACK_TYPES[fid] = get_int(rec, 'PKDT.Type', -1)
+            n_master += i
+    print(f'  Package types: {len(_PACK_TYPES)} TES4 packages indexed'
+          + (f' ({n_master} from masters)' if n_master else ''))
 
 
 def set_quest_packages(pack_fids) -> None:
     """Register the packages that are attached via QUST aliases."""
     _QUEST_PACKAGES.clear()
-    _QUEST_PACKAGES.update(f & 0x00FFFFFF for f in pack_fids)
+    _QUEST_PACKAGES.update(pack_fids)
 
 
 def npc_packages(pack_fids) -> list:
@@ -61,6 +84,9 @@ def npc_packages(pack_fids) -> list:
     Quest packages are filtered out — they reach the actor through the quest's
     reference alias (ALPC).  Leaving them here as well would let a quest package
     run outside its quest.
+
+    Compared on the full remapped FormID: masking to the low 24 bits made a
+    MASTER-owned package collide with a same-low-24 plugin quest package and be
+    dropped from the actor's schedule entirely.
     """
-    return [f for f in pack_fids
-            if f and (f & 0x00FFFFFF) not in _QUEST_PACKAGES]
+    return [f for f in pack_fids if f and f not in _QUEST_PACKAGES]

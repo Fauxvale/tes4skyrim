@@ -1020,9 +1020,10 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     from .pack_aliases import (PackagePlan, build_script_var_map,
                                build_scriptvar_owner_map)
     from .packages import load_package_types
-    load_package_types(by_type)
+    _master_export = ctx.master_export if ctx else None
+    load_package_types(by_type, _master_export)
 
-    _script_vars = build_script_var_map(by_type)
+    _script_vars = build_script_var_map(by_type, _master_export)
     _sv_owner = build_scriptvar_owner_map(by_type, fid_to_edid)
     pack_plan = PackagePlan()
     pack_plan.build(by_type,
