@@ -166,7 +166,7 @@ def _split_by_slope(tris):
 
 def gather_cell_geometry(refr_recs, base_model_by_fid, get_collision,
                          land_rec=None, origin_x=0.0, origin_y=0.0,
-                         split_land=False):
+                         split_land=False, skip_bases=None):
     """Return (walkable, blocking) float64 (N,3,3) world-space triangle arrays.
 
     get_collision is the cache accessor (injected so workers can bind their own
@@ -176,9 +176,22 @@ def gather_cell_geometry(refr_recs, base_model_by_fid, get_collision,
     the LAND terrain separate so the caller can send it down the vectorized
     grid-rasterizer path (it is a regular grid of large triangles, and the
     generic scalar rasterizer spends most of an exterior cell's build time on it).
+
+    skip_bases: low-24 base FormIDs whose refs contribute no BLOCKING
+    collision — DOOR panels.  A door is a thing an actor OPENS, never a wall:
+    vanilla navmesh runs under every door, and treating the panel as blocking
+    walls off the corridor wherever the panel happens to be parked (measured
+    on Pinarus's upstairs ANIMATED door, whose at-rest panel sits 47u from
+    its threshold ACROSS the passage — the ribbon pinched to nothing and the
+    doorway was unwalkable).  Their WALKABLE faces are kept: a trapdoor or
+    platform door IS the floor the pathgrid walks on (measured on
+    ImperialDungeon01 nodes 243-248, whose whole junction stands on a flat
+    door piece — excluding it wholesale deleted the floor).
     """
     walk_parts = []
     block_parts = []
+    door_walk_parts = []
+    skip_bases = skip_bases or ()
 
     for refr in refr_recs or []:
         name = refr.get('NAME')
@@ -188,6 +201,7 @@ def gather_cell_geometry(refr_recs, base_model_by_fid, get_collision,
             base_low = int(name, 16) & 0x00FFFFFF
         except ValueError:
             continue
+        is_door = base_low in skip_bases
         key = base_model_by_fid.get(base_low)
         if not key:
             continue
@@ -210,9 +224,19 @@ def gather_cell_geometry(refr_recs, base_model_by_fid, get_collision,
             continue
 
         w = _place(soup.get('w'), rot, scale, pos)
+        b = _place(soup.get('b'), rot, scale, pos)
+        if is_door:
+            # A door contributes its placed FLAT faces only (a platform/
+            # trapdoor door IS floor, whatever the cache's local-space class
+            # says — gates are authored upright and laid flat by rotation),
+            # and never anything steep: the panel is opened, not walked
+            # around.  The slope re-split below does the classification.
+            for part in (w, b):
+                if part is not None and len(part):
+                    door_walk_parts.append(part)
+            continue
         if w is not None and len(w):
             walk_parts.append(w)
-        b = _place(soup.get('b'), rot, scale, pos)
         if b is not None and len(b):
             block_parts.append(b)
 
@@ -225,6 +249,14 @@ def gather_cell_geometry(refr_recs, base_model_by_fid, get_collision,
         walk_parts = [rw] if rw is not None and len(rw) else []
         if rb is not None and len(rb):
             block_parts.append(rb)
+    # Door walkable faces: keep the floor-like pieces, DISCARD the steep ones
+    # rather than demoting them to blocking (a vertical panel's edge sliver
+    # would wall the doorway right back up).
+    if door_walk_parts:
+        placed = np.concatenate(door_walk_parts, axis=0)
+        rw, _rb = _split_by_slope(placed)
+        if rw is not None and len(rw):
+            walk_parts.append(rw)
 
     land_walk = np.zeros((0, 3, 3))
     if land_rec is not None:

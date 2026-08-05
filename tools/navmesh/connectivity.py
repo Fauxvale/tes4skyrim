@@ -22,9 +22,9 @@ Binary facts this encodes (verified against Skyrim.esm, 15,949/15,949 clean):
 Vanilla baseline: 84% of exterior navmeshes carry edge links (194,744 total).
 
 Usage:
-    python tools/navmesh_connectivity.py output/Oblivion.esm/Oblivion.esm
-    python tools/navmesh_connectivity.py <esm> --ref <Skyrim.esm>
-    python tools/navmesh_connectivity.py <esm> --cell -48,-7    # one grid cell
+    python tools/navmesh/connectivity.py output/Oblivion.esm/Oblivion.esm
+    python tools/navmesh/connectivity.py <esm> --ref <Skyrim.esm>
+    python tools/navmesh/connectivity.py <esm> --cell -48,-7    # one grid cell
 """
 
 import argparse

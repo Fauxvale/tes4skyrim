@@ -46,6 +46,11 @@ import numpy as np
 
 from . import corridor_grow, params, world
 
+# Trim node-disc rays at stair nodes so the FLAT disc never rides out over a
+# descending flight (see the disc loop in _build_corridor_strips).  Module
+# flag so diagnostics can A/B it.
+DISC_RAY_TRIM = True
+
 
 # ---------------------------------------------------------------------------
 # Walkable surface sampler (the only collision query Phase 1 needs)
@@ -534,18 +539,67 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
     # — a right-angle junction leaves a square bite out of the mesh.  The disc
     # rays were marched in the same batch; close each fan into a polygon here.
     if widths is not None:
+        # STEEP ribbons, for the disc clip below.  A disc is FLAT at its node's
+        # height, but nothing stops its rays marching out OVER a flight of
+        # stairs: the first MAX_CLIMB of drop is legitimately walkable, and
+        # beyond that the treads below are walkable collision, not a wall, so
+        # the ray never terminates.  The flat disc then covers ground 40u+
+        # above the real surface, the level lookup answers BOTH heights there,
+        # and emission bridges them with a near-vertical triangle (measured at
+        # the top of ImperialDungeon01's prison staircase: disc level 513.8
+        # hanging over stair ground at 457-474).
+        steep_strips = []
+        for s in strips:
+            if s.get('len', 0.0) < 1e-6:
+                continue
+            if (abs(s['nb'][2] - s['na'][2]) / s['len']
+                    > params.RIBBON_GROW_MAX_SLOPE):
+                steep_strips.append(s)
         nrays = params.RIBBON_GROW_DISC_RAYS
+        layers = getattr(sample, 'layers', None) if sample is not None else None
         for entry in plan:
             if entry[0] != 'disc':
                 continue
             _, ni, nx, ny, nz, base = entry
+            # RAY TRIM at stair nodes.  The march stops at walls and at sudden
+            # drops, but a surface that RAMPS away descends a legal step per
+            # station, so a ray at a stair-top node happily marches the whole
+            # flight and the FLAT disc then covers ground 40u+ below its own
+            # height (the phantom second level that emits vertical triangles —
+            # see _clip_disc_against_steep).  Walk the real surface outward and
+            # stop the ray where the surface has left the node's level by more
+            # than a step in total.
+            trim = (DISC_RAY_TRIM and layers is not None
+                    and steep_count.get(ni, 0) >= 1)
             disc = []
             for kk in range(nrays):
                 ang = 2.0 * math.pi * kk / nrays
                 ddx, ddy = math.cos(ang), math.sin(ang)
                 d = float(widths[base + kk])
+                if trim and d > params.RIBBON_HALF_WIDTH:
+                    zcur = nz
+                    good = params.RIBBON_HALF_WIDTH
+                    dd = good
+                    while dd < d - 1e-6:
+                        dd = min(d, dd + 8.0)
+                        cand = [z for z in layers(nx + ddx * dd, ny + ddy * dd)
+                                if abs(z - zcur) <= params.MAX_CLIMB]
+                        if not cand:
+                            # collision gap: bridge it (the march itself saw
+                            # ground here), only an OFF-LEVEL surface stops us
+                            good = dd
+                            continue
+                        zc = min(cand, key=lambda z: abs(z - zcur))
+                        if abs(zc - nz) > params.MAX_CLIMB:
+                            break
+                        zcur = zc
+                        good = dd
+                    d = good
                 disc.append((nx + ddx * d, ny + ddy * d))
             disc = _simplify(disc, params.RIBBON_RAIL_SIMPLIFY)
+            if len(disc) < 3:
+                continue
+            disc = _clip_flat_poly_off_level(disc, nx, ny, nz, steep_strips)
             if len(disc) < 3:
                 continue
             rmax = max(math.hypot(px - nx, py - ny) for (px, py) in disc)
@@ -558,6 +612,149 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
                 'poly': disc,
             })
     return strips
+
+
+def _clip_flat_poly_off_level(disc, nx, ny, nz, steep_strips):
+    """Remove from a FLAT polygon (node disc, door footprint) the ground where
+    a steep ribbon that MEETS it has LEFT the polygon's level by more than a
+    step.
+
+    The polygon keeps the flight's mouth (the ribbon within MAX_CLIMB of its
+    own height — legitimately shared ground where the two must weld) and
+    gives up everything further down/up the flight, so a flat surface can
+    never hang mesh over a stairwell.  (nx, ny) anchors which piece survives
+    a split.
+
+    ANCHORING.  |dz| alone cannot tell "my own flight ramping away" from "an
+    unrelated flight on another storey passing under me in plan" — and cutting
+    the latter opened holes on ChorrolFightersGuild's mid-floor corridors
+    (37 pathgrid samples lost).  A cut interval is therefore taken only when
+    it is CONTIGUOUS along the strip with a mouth station that lies INSIDE
+    this polygon: the flight genuinely joins this surface here, so the ground
+    beyond the mouth is the same flight descending — while a storey-below
+    flight has its mouth somewhere else in plan and never anchors.
+    """
+    from shapely.geometry import Polygon as _AnchP, Point as _AnchPt
+    _apoly_cache = []
+
+    def _anchor_poly():
+        """Built lazily: most discs/quads have no steep strip in range."""
+        if not _apoly_cache:
+            try:
+                ap = _AnchP(disc)
+                if not ap.is_valid:
+                    ap = ap.buffer(0)
+                _apoly_cache.append(ap.buffer(8.0))
+            except Exception:
+                _apoly_cache.append(None)
+        return _apoly_cache[0]
+
+    hit = []
+    for s in steep_strips:
+        ax, ay, az = s['a']
+        bx, by, bz = s['b']
+        run = math.hypot(bx - ax, by - ay)
+        if run < 1e-6:
+            continue
+        # Quick reject: strip nowhere near the disc.
+        rmax = max(math.hypot(px - nx, py - ny) for (px, py) in disc)
+        half = float(s.get('half', params.RIBBON_STAIR_HALF_WIDTH))
+        dx, dy = bx - ax, by - ay
+        t0 = max(0.0, min(1.0, ((nx - ax) * dx + (ny - ay) * dy)
+                          / (run * run)))
+        cx, cy = ax + dx * t0, ay + dy * t0
+        if math.hypot(nx - cx, ny - cy) > rmax + half + 8.0:
+            continue
+        prof = s.get('prof')
+
+        def _zat(t):
+            if not prof:
+                return az + (bz - az) * t
+            # piecewise: prof points are evenly spaced along the plan line
+            f = t * (len(prof) - 1)
+            k = min(len(prof) - 2, max(0, int(f)))
+            fr = f - k
+            return prof[k][2] + (prof[k + 1][2] - prof[k][2]) * fr
+
+        n = max(2, int(run // 8.0))
+        # nz may be a constant (node discs) or a callable (sloped door quads):
+        # the off-level test always compares against the flat surface's OWN
+        # height at the sampled point.
+        if callable(nz):
+            mask = [abs(_zat(k / n)
+                        - nz(ax + (bx - ax) * (k / n),
+                             ay + (by - ay) * (k / n)))
+                    > params.MAX_CLIMB for k in range(n + 1)]
+        else:
+            mask = [abs(_zat(k / n) - nz) > params.MAX_CLIMB
+                    for k in range(n + 1)]
+        ux, uy = dx / run, dy / run
+        wx, wy = -uy, ux
+        # Mouth stations (on-level) that lie INSIDE this polygon anchor the
+        # flight to this surface; without one the strip is another storey.
+        anchored = set()
+        ap = _anchor_poly()
+        if ap is None:
+            continue
+        for k in range(n + 1):
+            if mask[k]:
+                continue
+            px_ = ax + dx * (k / n)
+            py_ = ay + dy * (k / n)
+            try:
+                if ap.contains(_AnchPt(px_, py_)):
+                    anchored.add(k)
+            except Exception:
+                pass
+        if not anchored:
+            continue
+        k = 0
+        while k <= n:
+            if not mask[k]:
+                k += 1
+                continue
+            k2 = k
+            while k2 + 1 <= n and mask[k2 + 1]:
+                k2 += 1
+            # Contiguity: the off-level run must border an anchored mouth
+            # station, or it belongs to a flight that never joins this
+            # surface here.
+            if not ((k - 1) in anchored or (k2 + 1) in anchored):
+                k = k2 + 1
+                continue
+            d0, d1 = run * k / n, run * k2 / n
+            if d1 - d0 > 1.0:
+                hit.append(((ax + ux * d0 + wx * half, ay + uy * d0 + wy * half),
+                            (ax + ux * d0 - wx * half, ay + uy * d0 - wy * half),
+                            (ax + ux * d1 - wx * half, ay + uy * d1 - wy * half),
+                            (ax + ux * d1 + wx * half, ay + uy * d1 + wy * half)))
+            k = k2 + 1
+    if not hit:
+        return disc
+    try:
+        from shapely.geometry import Polygon as _SP, Point as _SPt
+        from shapely.ops import unary_union as _uu
+        dp = _SP(disc)
+        if not dp.is_valid:
+            dp = dp.buffer(0)
+        cut = dp.difference(_uu([_SP(q) for q in hit]))
+        if cut.is_empty:
+            return disc
+        pieces = list(cut.geoms) if hasattr(cut, 'geoms') else [cut]
+        pieces = [g for g in pieces if g.geom_type == 'Polygon'
+                  and g.area > 1.0]
+        if not pieces:
+            return disc
+        node = _SPt(nx, ny)
+        # Keep the piece the node stands on (the node itself is never inside a
+        # subtracted region: |z - nz| is ~0 there).
+        best = min(pieces, key=lambda g: g.distance(node))
+        ring = list(best.exterior.coords)
+        if len(ring) > 1 and ring[0] == ring[-1]:
+            ring = ring[:-1]
+        return ring
+    except Exception:
+        return disc
 
 
 def _simplify(pts, tol):
@@ -598,11 +795,14 @@ def _simplify(pts, tol):
 # ---------------------------------------------------------------------------
 
 def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
-                    land_rec=None, origin_x=0.0, origin_y=0.0, doors=None):
+                    land_rec=None, origin_x=0.0, origin_y=0.0, doors=None,
+                    door_bases=None):
     """Phase-1 corridor navmesh for one cell: (verts, tris, ledges) lists.
 
     doors: [(x, y, z, rot_z, is_teleport, width), ...] pivot-corrected door
         centres; width is the measured doorway span in world units.
+    door_bases: low-24 DOOR base FormIDs whose refs contribute no collision
+        (a panel is opened, never a wall).
     ledges: [(upper_tri, lower_tri, drop), ...] drop-down pairs between
         disconnected storeys, for NVNM Ledge Up/Down edge links.
     """
@@ -612,7 +812,7 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     walkable, blocking, land_walk = world.gather_cell_geometry(
         refr_recs or [], base_model_by_fid or {}, get_collision,
         land_rec=land_rec, origin_x=origin_x, origin_y=origin_y,
-        split_land=True)
+        split_land=True, skip_bases=door_bases)
     if land_walk is not None and len(land_walk):
         walkable = (np.concatenate([walkable, land_walk])
                     if len(walkable) else land_walk)
@@ -688,16 +888,85 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     door_edges = []
     door_pins = []
     if door_list:
+        # probe_only: this mesh feeds door_footprints and is then DISCARDED --
+        # the real union below rebuilds it with the door quads included.  The
+        # probe needs coverage, heights and welded edges; it does not need the
+        # connectivity repair passes (see build_union_mesh).
         rv, rt = corridor_union.build_union_mesh(corridors,
                                                  cell_bounds=cell_clip,
-                                                 wall_cut=wall_cut)
+                                                 wall_cut=wall_cut,
+                                                 probe_only=True)
         if rt:
+            # STEEP ribbons, to clip flat door footprints against.  A door at
+            # the top of a staircase sweeps its footprint toward the nearest
+            # corridor mesh, which is the FLIGHT below it — the flat quad then
+            # covers ramping ground 40u+ under its own height, the level
+            # lookup answers both heights there, and emission bridges them
+            # with a near-vertical triangle (measured at the top of
+            # ImperialDungeon01's prison stairs: door quad at 513.8 hanging
+            # over stair ground at 457-474).  The clip keeps the quad down to
+            # where the flight is within a step of the door's level, which is
+            # exactly where the two must weld.
+            steep_list = [s for s in corridors
+                          if s.get('len', 0.0) > 1e-6
+                          and abs(s['nb'][2] - s['na'][2]) / s['len']
+                          > params.RIBBON_GROW_MAX_SLOPE]
             for fp in corridor_doors.door_footprints(rv, rt, door_list,
                                                      wall_hit=wall_hit,
                                                      nodes=nodes,
                                                      pg_edges=edges):
-                door_strips.append(corridor_union._poly_strip(fp['poly'],
-                                                              fp['z']))
+                poly = fp['poly']
+                # The quad RAMPS from the threshold (z, at the base line) to
+                # the corridor mesh under its far edge (z_far) — see
+                # corridor_doors._sweep.  Both the off-level clip and the
+                # strip's height axis use that slope.
+                zb = float(fp['z'])
+                zf = float(fp.get('z_far', fp['z']))
+                bmx = 0.5 * (poly[0][0] + poly[1][0])
+                bmy = 0.5 * (poly[0][1] + poly[1][1])
+                fmx = 0.5 * (poly[2][0] + poly[3][0])
+                fmy = 0.5 * (poly[2][1] + poly[3][1])
+                sweep = math.hypot(fmx - bmx, fmy - bmy)
+                # The ramp may only slope as steeply as ground an actor can
+                # walk (the steepest real stair at a door measures ~0.4).
+                # z_far comes from a mesh probe with a storey-scale tolerance,
+                # so a doorway over a stacked lower floor can grab the WRONG
+                # storey — the quad then paints a 45-degree cliff across the
+                # corridor and the degenerate/wall culls tear real coverage
+                # out with it (measured on Moranda02 nodes 40/41/57).
+                if abs(zf - zb) > 0.5 * max(sweep, 1.0):
+                    zf = zb
+
+                def _qz(px, py, bmx=bmx, bmy=bmy, fmx=fmx, fmy=fmy,
+                        zb=zb, zf=zf, sweep=sweep):
+                    if sweep < 1e-6:
+                        return zb
+                    t = (((px - bmx) * (fmx - bmx) + (py - bmy) * (fmy - bmy))
+                         / (sweep * sweep))
+                    return zb + (zf - zb) * max(0.0, min(1.0, t))
+
+                if steep_list and len(poly) >= 3:
+                    if fp['base'] is not None:
+                        ax_ = 0.5 * (fp['base'][0][0] + fp['base'][1][0])
+                        ay_ = 0.5 * (fp['base'][0][1] + fp['base'][1][1])
+                    else:
+                        ax_ = sum(p[0] for p in poly) / len(poly)
+                        ay_ = sum(p[1] for p in poly) / len(poly)
+                    poly = _clip_flat_poly_off_level(poly, ax_, ay_,
+                                                     _qz, steep_list)
+                if len(poly) < 3:
+                    continue
+                ps = corridor_union._poly_strip(poly, zb)
+                if abs(zf - zb) > 1.0 and sweep > 1e-6:
+                    ux_, uy_ = (fmx - bmx) / sweep, (fmy - bmy) / sweep
+                    ps['a'] = (bmx, bmy, zb)
+                    ps['b'] = (fmx, fmy, zf)
+                    ps['na'], ps['nb'] = ps['a'], ps['b']
+                    ps['u'] = (ux_, uy_)
+                    ps['w'] = (-uy_, ux_)
+                    ps['len'] = sweep
+                    ps['half'] = max(float(ps['half']), sweep) + 8.0
+                door_strips.append(ps)
                 # Far-side quads (interior doors) carry no base constraint —
                 # they are plain ground; ONE Door Triangle per door, on the
                 # primary side.  The entry is (base0, base1, apex, storey_z):
@@ -752,16 +1021,23 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
         run = math.hypot(nodes[j][0] - nodes[i][0], nodes[j][1] - nodes[i][1])
         if run < 1e-6:
             continue
+        ux_ = (nodes[j][0] - nodes[i][0]) / run
+        uy_ = (nodes[j][1] - nodes[i][1]) / run
         steps = max(2, int(run // params.RIBBON_STEP))
         for s in range(steps + 1):
             f = s / steps
+            # (x, y, z, ux, uy): the direction lets the sliver cull measure
+            # the corridor's CROSS-WIDTH at this sample (the walkable-width
+            # contract) — consumers that only read x/y/z are unaffected.
             pin_xy.append((nodes[i][0] + (nodes[j][0] - nodes[i][0]) * f,
                            nodes[i][1] + (nodes[j][1] - nodes[i][1]) * f,
-                           node_z[i] + (node_z[j] - node_z[i]) * f))
+                           node_z[i] + (node_z[j] - node_z[i]) * f,
+                           ux_, uy_))
 
     verts, tris, ledge_marks = corridor_clean.finalize(
         verts, tris, cs=cs, doors=door_xy, cell_bounds=cell_bounds,
-        pin_xy=pin_xy, door_pins=door_pins)
+        pin_xy=pin_xy, door_pins=door_pins,
+        node_pins=[(nodes[i][0], nodes[i][1]) for i in range(len(nodes))])
 
     verts = [tuple(float(c) for c in v) for v in verts]
     tris = [tuple(int(i) for i in t) for t in tris]
@@ -813,6 +1089,11 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
                 drop.update(comp)
         if drop:
             tris = [t for ti, t in enumerate(tris) if ti not in drop]
+
+    # Attach can mint plan-degenerate seam slivers of its own (measured: a
+    # zero-width 65u wall along ImperialDungeon01's prison-gate quad seam);
+    # the finalize-era cull ran before attach, so run it once more.
+    tris = corridor_clean._drop_degenerate_guarded(verts, tris)
 
     # NORMALISE WINDING.  The mesh is a heightfield, so every triangle must be
     # CCW in plan (Z-normal up); the engine and the CK's DOWNFACING rule both

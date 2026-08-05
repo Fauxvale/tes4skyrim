@@ -136,14 +136,12 @@ theories externally first.
 ### Working with the user
 
 - **NEVER STOP TO GIVE A MID-SESSION STATUS REPORT.** Not "here's where I am",
-  not "should I continue?", not a summary of progress so far. Finish the whole task, then report once. A status update mid-task is a failure, not politeness.
+  not "should I continue?", not a summary of progress so far. Finish the whole task, then report once. A status update mid-task is a failure, not politeness. If something the user has asked for remains unsolved, YOU ARE NOT DONE!
 - **Measure the invariant the user asked for, not a proxy for it.**
 - **Trust the user's in-game test results as ground truth.** Never question
   whether they tested something, and never rebut a reported result with file
   timestamps or a reconstructed timeline. (Reading Papyrus logs to *diagnose* is
   encouraged — using them to dispute the user's report is not.)
-- **Never assume `output/Oblivion.esm` reflects the latest code** from its
-  timestamp. Ask, or rebuild first.
 - **BUILD EVERY FILE YOUR CHANGES TOUCH, before reporting back.** The user should
   be able to launch the game and verify immediately — never leave them to work out
   which stage to re-run, and never hand back a change that only compiles in

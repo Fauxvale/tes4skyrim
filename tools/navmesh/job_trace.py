@@ -19,18 +19,18 @@ job's identity is flushed BEFORE the call, so a hard crash leaves the culprit as
 the last line printed (this is how Nehrim's cell 011E4FEC was found -- see
 docs/performance_notes.md).
 
-`tools/navmesh_cell_check.py` names cells by EditorID out of an audit index and
+`tools/navmesh/cell_check.py` names cells by EditorID out of an audit index and
 checks CK rules; this takes the raw FormID straight from an error message and
 cares only about reproducing the failure.
 
     # one cell, full traceback
-    python tools/navmesh_job_trace.py --plugin Nehrim.esm --cell 012217C1
+    python tools/navmesh/job_trace.py --plugin Nehrim.esm --cell 012217C1
 
     # walk jobs in dispatch order to find one that hard-crashes
-    python tools/navmesh_job_trace.py --plugin Nehrim.esm --all --max 100
+    python tools/navmesh/job_trace.py --plugin Nehrim.esm --all --max 100
 
     # only the jobs with no geometry-cache entry (the ones that recompute)
-    python tools/navmesh_job_trace.py --plugin Nehrim.esm --uncached --max 20
+    python tools/navmesh/job_trace.py --plugin Nehrim.esm --uncached --max 20
 """
 
 import argparse
@@ -40,7 +40,7 @@ import sys
 import time
 import traceback
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
 def _load(export_dir, offset):
@@ -79,12 +79,24 @@ def main():
                     help='only jobs with no geometry-cache entry')
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--max', type=int, default=50)
+    ap.add_argument('--no-cache', action='store_true',
+                    help='ignore the geometry cache: time a REAL build '
+                         '(what an unprimed machine, or any navmesh code '
+                         'change, actually costs)')
+    ap.add_argument('--sample', type=int, metavar='N',
+                    help='run N jobs drawn evenly across the whole job list '
+                         'instead of the first --max. Dispatch order is '
+                         'grouped by worldspace, so the head of the list is '
+                         'not representative of the population')
+    ap.add_argument('--extrapolate', nargs=2, type=int,
+                    metavar=('JOBS', 'WORKERS'),
+                    help='project the measured mean onto a full run')
     ap.add_argument('--offset', type=int, default=1,
                     help='load-order FormID index offset (default 1)')
     args = ap.parse_args()
 
-    if not (args.cell or args.all or args.uncached):
-        ap.error('pass --cell, --all, or --uncached')
+    if not (args.cell or args.all or args.uncached or args.sample):
+        ap.error('pass --cell, --all, --uncached or --sample')
 
     export_dir = args.export or os.path.join('export', args.plugin)
     if not os.path.isdir(export_dir):
@@ -125,12 +137,30 @@ def main():
             sel = [(i, j) for i, j in sel
                    if '%08X_%08X.pkl' % j['key'] not in have]
             print(f'  {len(sel)} jobs have no geometry-cache entry', flush=True)
-        sel = sel[args.start:args.start + args.max]
+        if args.sample:
+            # EVENLY SPACED, not the head and not random: jobs are dispatched
+            # grouped by worldspace, so the first N are all one region (and
+            # often all interiors).  A fixed stride covers the whole
+            # population and is reproducible run to run.
+            step = max(1, len(sel) // args.sample)
+            sel = sel[::step][:args.sample]
+        else:
+            sel = sel[args.start:args.start + args.max]
+
+    if args.no_cache:
+        # COLD-CACHE timing: the geometry cache turns a real build into a
+        # pickle load, so any run that hits it measures I/O, not generation.
+        # Disabling it is the only way to time what an unprimed machine (or a
+        # navmesh code change, which the input-keyed hash cannot see) pays.
+        geom_cache = None
+        print('  geometry cache DISABLED (cold-cache timing)', flush=True)
 
     print(f'\nrunning {len(sel)} job(s) in-process...', flush=True)
     failed = 0
+    times = []
     for i, job in sel:
         cell, pgrd = job['key']
+        _t0 = time.time()
         # Flushed BEFORE the call on purpose: if the native code aborts the
         # process, this is the line that names the culprit.
         print(f'  job[{i}] cell {cell:08X} pgrd {pgrd:08X} '
@@ -148,8 +178,11 @@ def main():
             traceback.print_exc()
             sys.stdout.flush()
             continue
+        _dt = time.time() - _t0
+        times.append(_dt)
         if nb is None:
-            print('      -> no navmesh (no usable geometry)', flush=True)
+            print(f'      -> no navmesh (no usable geometry) [{_dt:.2f}s]',
+                  flush=True)
         else:
             m = meta or {}
             extra = []
@@ -158,9 +191,26 @@ def main():
             if m.get('door_refs'):
                 extra.append(f'{len(m["door_refs"])} door links')
             print(f'      -> {len(nb)} bytes'
-                  + (f' ({", ".join(extra)})' if extra else ''), flush=True)
+                  + (f' ({", ".join(extra)})' if extra else '')
+                  + f' [{_dt:.2f}s]', flush=True)
 
     print(f'\n{len(sel) - failed}/{len(sel)} ran without raising', flush=True)
+    if times:
+        ts = sorted(times)
+        n = len(ts)
+        total = sum(ts)
+        print('\nPER-JOB SECONDS  n=%d  total=%.1fs  mean=%.2f  '
+              'p50=%.2f  p90=%.2f  max=%.2f'
+              % (n, total, total / n, ts[n // 2], ts[min(n - 1, int(n * .9))],
+                 ts[-1]))
+        # Extrapolate to the whole plugin: the pool runs `workers` jobs at a
+        # time, so wall-clock is (mean * jobs) / workers -- an ESTIMATE that
+        # ignores scheduling tail and per-worker startup.
+        if args.extrapolate:
+            jobs_n, workers = args.extrapolate
+            est = (total / n) * jobs_n / max(1, workers)
+            print('  extrapolated: %d jobs / %d workers -> %.1f min'
+                  % (jobs_n, workers, est / 60.0))
     return 1 if failed else 0
 
 

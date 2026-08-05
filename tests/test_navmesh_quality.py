@@ -142,15 +142,22 @@ def test_cull_removes_a_boundary_needle_but_keeps_connectivity():
     assert len(_components(out)) == 1
 
 
-def test_cull_spares_a_sliver_carrying_the_pathgrid():
+def test_cull_spares_the_sole_cover_of_a_walked_line():
+    """A sliver that is the ONLY cover of a pathgrid sample must survive.
+
+    (The blanket rule — any sample inside the triangle protects it — was
+    refined: a sample that stays covered by neighbours after the cull no
+    longer blocks it.  So the fixture's sample sits well past the shared
+    edge, where only the sliver itself covers it.)
+    """
     verts = [
         [0, 0, 0], [100, 0, 0], [100, 100, 0], [0, 100, 0],
-        [70, 105, 0],
+        [70, 130, 0],
     ]
     tris = [(0, 1, 2), (0, 2, 3), (3, 2, 4)]
     out = cc.cull_boundary_slivers(verts, [tuple(t) for t in tris],
-                                   pin_xy=[(70.0, 102.0)])
-    assert (3, 2, 4) in out, "a pathgrid-carrying triangle must survive"
+                                   pin_xy=[(70.0, 115.0, 0.0)])
+    assert (3, 2, 4) in out, "the sole cover of the walked line must survive"
 
 
 # ---------------------------------------------------------------------------
@@ -188,3 +195,134 @@ def test_edge_ratio_contract_is_two():
     assert params.MAX_EDGE_RATIO == 2.0
     assert params.CULL_SLIVER_RATIO == 2.0
     assert params.MIN_TRI_AREA > 0
+
+
+# ---------------------------------------------------------------------------
+# METRIC regression tests.  These guard the DIAGNOSTICS, not the generator:
+# a hole straight through a doorway once shipped because the sweep reported it
+# as "miss=1" — one uncovered sample, indistinguishable from fringe noise.  A
+# contiguous gap ON a walked line, and especially one inside a doorway, must
+# always surface as its own number.
+# ---------------------------------------------------------------------------
+
+class _FakeCell(object):
+    def __init__(self, nodes, edges, doors=()):
+        self.nodes = nodes
+        self.edges = edges
+        self.doors = list(doors)
+
+    def walked_samples(self, step=16.0):
+        for (a, b) in self.edges:
+            pa, pb = self.nodes[a], self.nodes[b]
+            n = max(2, int(math.dist(pa[:2], pb[:2]) / step) + 1)
+            for i in range(n + 1):
+                f = i / n
+                yield (pa[0] + (pb[0] - pa[0]) * f,
+                       pa[1] + (pb[1] - pa[1]) * f,
+                       pa[2] + (pb[2] - pa[2]) * f)
+
+
+def _strip_with_hole():
+    """Two coplanar plates 64u apart: a walked line crosses the void."""
+    verts = [(0.0, -100.0, 0.0), (200.0, -100.0, 0.0),
+             (200.0, -32.0, 0.0), (0.0, -32.0, 0.0),
+             (0.0, 32.0, 0.0), (200.0, 32.0, 0.0),
+             (200.0, 100.0, 0.0), (0.0, 100.0, 0.0)]
+    tris = [(0, 1, 2), (0, 2, 3), (4, 5, 6), (4, 6, 7)]
+    return verts, tris
+
+
+def test_walked_gap_reports_the_contiguous_run_not_a_sample_count():
+    from tools.navmesh import metrics
+    verts, tris = _strip_with_hole()
+    cell = _FakeCell([(100.0, -100.0, 0.0), (100.0, 100.0, 0.0)], [(0, 1)])
+    surf = metrics.Surface(verts, tris)
+    gaps = metrics.walked_gaps(surf, cell)
+    assert gaps, 'a walked line crossing a 64u void must report a gap'
+    # The run is what matters: it is far longer than one 16u sample.
+    assert gaps[0][0] >= 48.0, gaps[0]
+
+
+def test_door_gap_is_reported_separately_from_ordinary_misses():
+    from tools.navmesh import metrics
+    verts, tris = _strip_with_hole()
+    # A door sits exactly on the void: this is the unwalkable case.
+    cell = _FakeCell([(100.0, -100.0, 0.0), (100.0, 100.0, 0.0)], [(0, 1)],
+                     doors=[(100.0, 0.0, 0.0, 0.0, 'D1', False, 96.0)])
+    surf = metrics.Surface(verts, tris)
+    assert metrics.door_gaps(surf, cell), \
+        'a gap inside a doorway must be flagged as a door gap'
+
+
+def test_no_door_gap_when_the_doorway_is_meshed():
+    from tools.navmesh import metrics
+    verts = [(0.0, -100.0, 0.0), (200.0, -100.0, 0.0),
+             (200.0, 100.0, 0.0), (0.0, 100.0, 0.0)]
+    tris = [(0, 1, 2), (0, 2, 3)]
+    cell = _FakeCell([(100.0, -100.0, 0.0), (100.0, 100.0, 0.0)], [(0, 1)],
+                     doors=[(100.0, 0.0, 0.0, 0.0, 'D1', False, 96.0)])
+    surf = metrics.Surface(verts, tris)
+    assert not metrics.door_gaps(surf, cell)
+
+
+# ---------------------------------------------------------------- open flaps
+
+
+def _floor_with_flap():
+    """A flat floor plus one triangle hanging off its rim to a point below.
+
+    Vertices 0-3 are a 200x200 floor at z=0; vertex 4 sits 50u below and well
+    outside it.  Triangle (1, 2, 4) reaches from the floor's right-hand rim
+    down to that point, so its two long edges are unshared and each drops 50u
+    — the shape a stairwell flap has.
+    """
+    verts = [(0.0, 0.0, 0.0), (200.0, 0.0, 0.0),
+             (200.0, 200.0, 0.0), (0.0, 200.0, 0.0),
+             (320.0, 100.0, -50.0)]
+    return verts, [(0, 1, 2), (0, 2, 3), (1, 2, 4)]
+
+
+def test_open_flap_is_culled():
+    from tes5_import.navmesh.corridor_clean import cull_open_flaps
+    verts, tris = _floor_with_flap()
+    out = cull_open_flaps(verts, tris)
+    assert (1, 2, 4) not in [tuple(t) for t in out], \
+        'a triangle with two unshared plunging edges must be dropped'
+    assert len(out) == 2, out
+
+
+def test_flat_fringe_triangle_is_kept():
+    """The same topology WITHOUT the drop is ordinary ground, not a flap."""
+    from tes5_import.navmesh.corridor_clean import cull_open_flaps
+    verts, tris = _floor_with_flap()
+    verts[4] = (320.0, 100.0, 0.0)          # level with the floor
+    out = cull_open_flaps(verts, tris)
+    assert len(out) == 3, 'a flat fringe triangle is not a flap'
+
+
+def test_pathgrid_protects_a_walked_ramp():
+    """A ramp the author routed an actor down is never culled.
+
+    LeyawiinCastleCountyHall's 105u/91u ramp presents exactly the flap
+    topology; culling it cost three walked samples.  A sample strictly inside
+    the triangle is the proof that this ground is used.
+    """
+    from tes5_import.navmesh.corridor_clean import cull_open_flaps
+    verts, tris = _floor_with_flap()
+    # Centroid of the flap triangle.
+    cx = (verts[1][0] + verts[2][0] + verts[4][0]) / 3.0
+    cy = (verts[1][1] + verts[2][1] + verts[4][1]) / 3.0
+    out = cull_open_flaps(verts, tris, [(cx, cy, -25.0)])
+    assert len(out) == 3, 'a pathgrid-walked ramp must survive the flap cull'
+
+
+def test_corner_contact_does_not_protect_a_flap():
+    """A sample ON a corner is not evidence the pathgrid crosses the flap.
+
+    Every flap touches the floor rim it hangs from, so its corners always meet
+    the walked line; only an interior sample counts.
+    """
+    from tes5_import.navmesh.corridor_clean import cull_open_flaps
+    verts, tris = _floor_with_flap()
+    out = cull_open_flaps(verts, tris, [(verts[1][0], verts[1][1], 0.0)])
+    assert len(out) == 2, 'a corner touch must not save a flap'

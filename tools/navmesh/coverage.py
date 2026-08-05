@@ -18,9 +18,9 @@ building whose floors sit on top of each other in plan view is not miscounted as
 overlap — that mistake made a clean cell look 42% broken.
 
 Usage:
-    python tools/navmesh_coverage.py --cell AnvilFightersGuild
-    python tools/navmesh_coverage.py --cell AnvilFightersGuild --dump temp/gaps.txt
-    python tools/navmesh_coverage.py --cells AnvilFightersGuild,00005F86 --step 6
+    python tools/navmesh/coverage.py --cell AnvilFightersGuild
+    python tools/navmesh/coverage.py --cell AnvilFightersGuild --dump temp/gaps.txt
+    python tools/navmesh/coverage.py --cells AnvilFightersGuild,00005F86 --step 6
 
 --dump writes the world coordinates of every failing sample, so a defect can be
 located and rendered instead of hunted for by eye.
@@ -31,11 +31,11 @@ import math
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import build, corridor, corridor_clean, world  # noqa: E402
-from tools.navmesh_probe import load_cell  # noqa: E402
+from tools.navmesh.probe import load_cell  # noqa: E402
 
 # A sample and a triangle are on the same storey when their heights differ by
 # less than this.  Matches corridor_cut.CUT_Z_TOLERANCE.

@@ -182,7 +182,7 @@ completes — 26,865 records, 197 MB.
 Corridor navmesh generation was **9.8x** faster after four fixes, all
 **byte-identical output** (13 cells A/B'd on (verts, tris) hashes; large
 interiors 11-14x, small cells 1.3-2.5x). Profile with
-`python tools/navmesh_profile.py --cells <A,B> --stages` (its stage timers now
+`python tools/navmesh/perf.py --cells <A,B> --stages` (its stage timers now
 wrap the CORRIDOR path; they used to wrap the deleted voxel/region/spanmesh and
 so reported everything as "(other)"). Sub-stage rows are INDENTED because they
 nest inside `build_union_mesh` — only top-level rows may be subtracted, or
@@ -221,7 +221,7 @@ nest inside `build_union_mesh` — only top-level rows may be subtracted, or
   `spanmesh.py`, `native/src/decimate.cpp`, and their tests/fixtures in
   `tests/test_pgrd_navm.py` (which asserted collision-discovery rules the
   corridor model does not have — it derives the mesh from the pathgrid).
-  Corridor geometry is verified against real cells by `tools/navmesh_check.py`,
+  Corridor geometry is verified against real cells by `tools/navmesh/check.py`,
   `navmesh_reach.py`, `navmesh_slope_check.py`.
 
 ## Measured throughput

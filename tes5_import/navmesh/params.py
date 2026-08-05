@@ -65,6 +65,13 @@ MAX_ASPECT = 4.0
 # shape CONTRACT: the long side of a triangle may not exceed twice its short
 # side — near-equilateral is what NPC pathfinding wants.
 MAX_EDGE_RATIO = 2.0
+# Aspect bound (longest_edge^2 / (4 * area)) for the CLEANUP passes' shape
+# contract.  Edge ratio alone cannot see a CAP: an obtuse triangle whose apex
+# sits just off a long base has all three edges of comparable length (ratio
+# < 2) and near-zero height — visually the worst sliver there is.  Equilateral
+# scores 0.58; every ratio-2-legal non-cap shape stays under ~2.0; thin caps
+# score 2.5+.  A triangle is BAD when either bound is exceeded.
+MAX_TRI_ASPECT = 2.5
 # Simplification rounds (collapse + flip + smooth per round).  Converges fast;
 # rounds after the third change little.
 SIMPLIFY_PASSES = 4
@@ -343,9 +350,11 @@ RIBBON_GROW_DISC_RAYS = 16
 # Collapse edges shorter than this, turning the needle fans that outline corners
 # breed into near-equilateral triangles.  A collapse is only taken when it keeps
 # the outline, flips nothing, and does not worsen the local edge ratio, so this
-# can only improve shape and never changes coverage.  ~0.4 * TRI_TARGET_EDGE:
-# short enough that a real feature edge survives, long enough to eat the slivers.
-DECIMATE_MIN_EDGE = 51.0
+# can only improve shape and never changes coverage.  ~0.5 * TRI_TARGET_EDGE:
+# short enough that a real feature edge survives, long enough to eat the slivers
+# (64u is the side of an equilateral triangle of ~1774u^2, comfortably above
+# MIN_TRI_AREA, so what the collapses build the area floor never culls).
+DECIMATE_MIN_EDGE = 64.0
 # Passes.  Each round re-derives the boundary and re-sorts candidates.  Five,
 # not three: sawtooth removal converges tooth by tooth — cutting a convex
 # tooth re-derives the outline and only then exposes the next collapse.
@@ -376,13 +385,17 @@ DECIMATE_MAX_AREA_LOSS = 0.10
 # A boundary triangle is culled when its edge ratio exceeds the shape
 # contract AND it is small, or when it is smaller than the hard area floor.
 CULL_SLIVER_RATIO = 2.0
-CULL_SLIVER_MAX_AREA = 1500.0
-# Hard minimum triangle area: below this a triangle covers no usable ground.
-# ~a quarter of an equilateral triangle at DECIMATE_MIN_EDGE side length.
-MIN_TRI_AREA = 300.0
+# "Small" for the ratio cull.  3000u^2 ~ a 100x60 wedge: big enough to catch
+# every visible boundary needle, still well under the size of a triangle that
+# is genuinely load-bearing coverage.
+CULL_SLIVER_MAX_AREA = 3000.0
+# Hard minimum triangle area: below this a triangle covers no usable ground
+# for a Skyrim actor (path radius ~34u -> ~1000u^2 footprint).  Vanilla door
+# triangles bottom out at 992.
+MIN_TRI_AREA = 1000.0
 # Total area the sliver cull may remove, as a fraction of the mesh — the cull
 # trims the periphery, it must never eat into real coverage.
-CULL_SLIVER_AREA_FRAC = 0.05
+CULL_SLIVER_AREA_FRAC = 0.12
 # Vertices within this of a door wedge RING POINT (base corners, base
 # midpoint, apex — the Door Triangle's own corners) are PINNED — never
 # collapsed.  A decimated door corner destroys the Door Triangle and the
@@ -395,6 +408,12 @@ DECIMATE_PIN_RADIUS = 8.0
 # Vertices within this of a door CENTRE are pinned as a fallback for doors
 # that carry no wedge ring (withdrawn/interior-side quads).
 DECIMATE_PIN_CENTER_RADIUS = 24.0
+# Vertices within this of a PATHGRID NODE are pinned.  A node is a junction
+# the walked lines meet AT; outline-moving collapses and the sliver cull had
+# no node awareness and could shave the boundary across one, leaving the
+# node's own position a few units outside coverage (measured as single-sample
+# holes exactly at nodes in ImperialDungeon01 and BarrenCave).
+DECIMATE_PIN_NODE_RADIUS = 24.0
 # Lower bound: a rail never grows NARROWER than this half-width even if a wall or
 # a neighbour centerline is closer, so a corridor squeezed between two close
 # obstacles still carries a walkable strip (the Phase-1 width was unconditional).

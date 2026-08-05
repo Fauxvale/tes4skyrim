@@ -12,8 +12,8 @@ can be judged on the population rather than on one favourite room:
   FLOOR    pathgrid nodes whose nearest navmesh vertex is far off in Z — the
            "triangles on the ceiling of the room below" bug.
 
-    python tools/navmesh_audit.py --interiors 40
-    python tools/navmesh_audit.py --cells AnvilFightersGuild,anvilcastlegreathall
+    python tools/navmesh/audit.py --interiors 40
+    python tools/navmesh/audit.py --cells AnvilFightersGuild,anvilcastlegreathall
 """
 
 import argparse
@@ -26,7 +26,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import build, params  # noqa: E402

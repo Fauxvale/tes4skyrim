@@ -9,7 +9,7 @@ reimplements every one of them against our WRITTEN NVNM records.
 Why validate the written records rather than the generator's in-memory output:
 these are structural invariants of the serialised format (edge symmetry, portal
 targets, index ranges), and the packing step is where several of them can break.
-`tools/navmesh_audit.py` remains the quality metric (coverage, islands, slope);
+`tools/navmesh/audit.py` remains the quality metric (coverage, islands, slope);
 this is the correctness gate.
 
 Rules, with the CK message each mirrors:
@@ -42,10 +42,10 @@ Rules, with the CK message each mirrors:
                      5000 interior) — the CK's own audit warning.
 
 Usage:
-    python tools/navmesh_check.py output/Oblivion.esm/Oblivion.esm
-    python tools/navmesh_check.py <esm> --verbose            # per-defect detail
-    python tools/navmesh_check.py <esm> --rule DEGENERATE --verbose
-    python tools/navmesh_check.py <esm> --csv report.csv
+    python tools/navmesh/check.py output/Oblivion.esm/Oblivion.esm
+    python tools/navmesh/check.py <esm> --verbose            # per-defect detail
+    python tools/navmesh/check.py <esm> --rule DEGENERATE --verbose
+    python tools/navmesh/check.py <esm> --csv report.csv
 """
 
 import argparse
@@ -86,7 +86,7 @@ _DOWNFACE_EPS = 1e-6
 
 
 # ---------------------------------------------------------------------------
-# Record walking (shared shape with tools/navmesh_dump.py)
+# Record walking (shared shape with tools/navmesh/dump.py)
 # ---------------------------------------------------------------------------
 
 def _iter_records(data, start, end, path=()):

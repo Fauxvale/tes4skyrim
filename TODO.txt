@@ -7,18 +7,20 @@ Major Issues for V1:
 	3 - Navmesh refinement
 		ensure corridors connect pathgrid islands + other connectivity issues
 		allow growth even on slopes
+		trim triangles along edges
+		fix slim corridors
 
 	4 - Fix CK Loading (not sure why it doesn't finish)
 
 	5 - Need new skyrim body mesh to actually work to allow leg skin to appear
 	
-	7 - Shops missing full inventory of items
+	6 - Shops missing full inventory of items
 
-	8 - Crime system
+	7 - Crime system
 
-	12 - InUHlaaluUroomuside.nif has floor collision that is inverted. likely due to the nehrim fix for some reverse-facing collision normals
+	8 - InUHlaaluUroomuside.nif has floor collision that is inverted. likely due to the nehrim fix for some reverse-facing collision normals
 	
-	13 - Meshes not animating:
+	9 - Meshes not animating:
 		palacefont01.nif
 		se01waitingrooomwalls.nif
 

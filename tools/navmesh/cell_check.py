@@ -1,27 +1,27 @@
 """Run the CK CheckNavMesh rules on FRESHLY GENERATED cells (no ESM needed).
 
-`tools/navmesh_check.py` validates a built ESM, which means a full conversion
+`tools/navmesh/check.py` validates a built ESM, which means a full conversion
 before you can see whether a generator change worked.  This runs the same rule
 set against `build.build_navmesh` output for named cells, so a fix can be
 iterated in seconds.
 
-    python tools/navmesh_cell_check.py XPAichan01 SancreTor03 Ondo
+    python tools/navmesh/cell_check.py XPAichan01 SancreTor03 Ondo
 
 Cells are named by EditorID and read from the audit index
-(`export/<plugin>/audit_index3.pkl`, built by tools/navmesh_audit.py).
-Exterior cells need their grid origin, so pass those to navmesh_audit.py
+(`export/<plugin>/audit_index3.pkl`, built by tools/navmesh/audit.py).
+Exterior cells need their grid origin, so pass those to navmesh/audit.py
 instead, or extend this with --formid.
 """
 import os, sys, pickle
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),'tools'))
 import numpy as np
 from asset_convert import collision_extract as ce
 from tes5_import.navmesh import build
 from tes5_import.pgrd_to_navm import (_collect_doors, _compute_adjacency,
                                       load_door_centroids)
-import tools.navmesh_audit as na
-import navmesh_check as nc
+import tools.navmesh.audit as na
+import tools.navmesh.check as nc
 EXPORT='export/Oblivion.esm'
 ce.load_collision(os.path.join(EXPORT,'collision_cache.bin'), quiet=True)
 # Without this the door panel centroids, threshold AXIS and doorway WIDTH are

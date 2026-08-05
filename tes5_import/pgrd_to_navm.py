@@ -1031,7 +1031,10 @@ def convert_PGRD(rec: dict, writer=None,
             origin_x=origin_x, origin_y=origin_y,
             doors=[(x, y, z, r, tp, w)
                    for (x, y, z, r, _f, tp, w) in doors],
-            ledges_out=ledges)
+            ledges_out=ledges,
+            door_bases=(set(door_fids.keys())
+                        if isinstance(door_fids, dict)
+                        else set(door_fids or ())))
         if verts3d:
             # Round to float32 NOW so a fresh build and a cache hit (stored as
             # float32) produce byte-identical NVNMs — NVNM packs f32 anyway.

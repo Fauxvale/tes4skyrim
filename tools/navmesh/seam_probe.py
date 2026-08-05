@@ -12,17 +12,17 @@ links were stitched — the number that was ~0 before the InterCell fix.
 
 Usage:
     # by worldspace + grid range (Anvil worldspace 0001C31A around Pinarus):
-    python tools/navmesh_seam_probe.py --wrld 0001C31A --gx -49 -46 --gy -9 -6
+    python tools/navmesh/seam_probe.py --wrld 0001C31A --gx -49 -46 --gy -9 -6
 
     # by explicit PGRD FormIDs:
-    python tools/navmesh_seam_probe.py --pgrd 00012345 00012346
+    python tools/navmesh/seam_probe.py --pgrd 00012345 00012346
 """
 
 import argparse
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from tes5_import.text_reader import (parse_export_directory,
                                       group_records_by_type,

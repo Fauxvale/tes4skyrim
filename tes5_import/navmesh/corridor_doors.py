@@ -129,6 +129,40 @@ def door_footprints(verts, tris, doors, wall_hit=None, nodes=None,
     ztol = params.DOOR_QUAD_ZTOL
     br2 = DOOR_BRIDGE_RADIUS ** 2
 
+    # Mesh-height probe for the quad's FAR edge (see z_far in _sweep).
+    # Bucketed point-in-triangle over the raw corridor mesh.
+    _zcell = 128.0
+    _zgrid = {}
+    for _ti, _t in enumerate(tris):
+        _xs = [verts[_i][0] for _i in _t]
+        _ys = [verts[_i][1] for _i in _t]
+        for _gx in range(int(min(_xs) // _zcell), int(max(_xs) // _zcell) + 1):
+            for _gy in range(int(min(_ys) // _zcell),
+                             int(max(_ys) // _zcell) + 1):
+                _zgrid.setdefault((_gx, _gy), []).append(_ti)
+
+    def _mesh_z_near(px, py, near_z):
+        """Corridor-mesh height at (px, py) nearest near_z, or None."""
+        best = None
+        for _ti in _zgrid.get((int(px // _zcell), int(py // _zcell)), ()):
+            a, b, c = (verts[_i] for _i in tris[_ti])
+            d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+            if abs(d) < 1e-9:
+                continue
+            l0 = ((b[1] - c[1]) * (px - c[0])
+                  + (c[0] - b[0]) * (py - c[1])) / d
+            l1 = ((c[1] - a[1]) * (px - c[0])
+                  + (a[0] - c[0]) * (py - c[1])) / d
+            l2 = 1.0 - l0 - l1
+            if l0 < -0.02 or l1 < -0.02 or l2 < -0.02:
+                continue
+            z = l0 * a[2] + l1 * b[2] + l2 * c[2]
+            if abs(z - near_z) > ztol:
+                continue
+            if best is None or abs(z - near_z) < abs(best - near_z):
+                best = z
+        return best
+
     # Corridor edges once (this reads the RAW ribbon union, unmodified).
     edges = set()
     for t in tris:
@@ -313,11 +347,23 @@ def door_footprints(verts, tris, doors, wall_hit=None, nodes=None,
             # corridor_union._triangulate.
             apex = (dx + fx * float(side) * apex_depth,
                     dy + fy * float(side) * apex_depth)
+            # THE QUAD IS A RAMP, NOT A SHELF.  Its depth is driven by the
+            # apex (a wide door sweeps deep), so over a staircase the far
+            # edge stands on ground well below the threshold — a flat quad
+            # at s_z then hangs 30-40u above the real treads, the level
+            # lookup answers BOTH heights, and emission bridges them with a
+            # near-vertical triangle (measured on ImperialDungeon01's
+            # 139.5u-wide prison gate at the stair head: quad 513.8 over
+            # stair mesh at 474).  The corridor mesh knows the real height
+            # under the far edge; carry it so the strip can slope to meet it.
+            z_far = _mesh_z_near(0.5 * (sflx + sfrx), 0.5 * (sfly + sfry),
+                                 s_z)
             return {'base': ((blx, bly), (brx, bry)) if with_base else None,
                     'apex': apex if with_base else None,
                     'poly': [(blx, bly), (brx, bry), (sfrx, sfry),
                              (sflx, sfly)],
-                    'z': s_z}
+                    'z': s_z,
+                    'z_far': z_far if z_far is not None else s_z}
 
         # PRIMARY quad: sweeps toward the side the PATHGRID says the door
         # serves (nearest node — derived ribbon edges run past BOTH faces of

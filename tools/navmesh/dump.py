@@ -6,9 +6,9 @@ prints subrecord signatures + hex so the on-disk layout can be compared
 against the xEdit definition.
 
 Usage:
-    python tools/navmesh_dump.py "C:/.../Skyrim.esm" --navi --max 1
-    python tools/navmesh_dump.py "C:/.../Skyrim.esm" --navm --max 3
-    python tools/navmesh_dump.py "C:/.../Skyrim.esm" --navm --nvnm-decode --max 1
+    python tools/navmesh/dump.py "C:/.../Skyrim.esm" --navi --max 1
+    python tools/navmesh/dump.py "C:/.../Skyrim.esm" --navm --max 3
+    python tools/navmesh/dump.py "C:/.../Skyrim.esm" --navm --nvnm-decode --max 1
 """
 
 import argparse

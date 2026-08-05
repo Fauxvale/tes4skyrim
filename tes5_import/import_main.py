@@ -1224,7 +1224,9 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # needs neighbour NAVM FormIDs + final triangle indices) and before the group
     # builders serialise them. See docs/world_land_navmesh_notes.md.
     from .navm_edge_links import build_edge_links
+    _t_el = time.time()
     build_edge_links(navm_cache)
+    print(f"    Edge links: {time.time() - _t_el:.1f}s")
 
     # Split multi-component INTERIOR meshes into one NAVM per component.  The
     # engine only joins navmeshes through a door when the two sides are
@@ -1235,7 +1237,9 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # build_edge_links (final triangle indices) and before the XNDP
     # collection below (it moves doors onto the component meshes).
     from .navm_split import split_disconnected_interiors
+    _t_sp = time.time()
     n_split = split_disconnected_interiors(navm_cache, writer)
+    print(f"    Interior split: {time.time() - _t_sp:.1f}s")
     if n_split:
         print(f"  Navmesh split: {n_split} interior meshes split into "
               f"per-component NAVMs")

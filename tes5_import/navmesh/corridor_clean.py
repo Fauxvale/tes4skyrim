@@ -45,9 +45,58 @@ def _drop_degenerate(verts, tris):
     return kept
 
 
-def _make_manifold(verts, tris):
+_WALKED_CELL = 128.0
+
+
+def _walked_lookup(pin_xy):
+    """Bucket walked pathgrid samples for point-in-triangle tests."""
+    grid = {}
+    for p in (pin_xy or ()):
+        grid.setdefault((int(p[0] // _WALKED_CELL), int(p[1] // _WALKED_CELL)),
+                        []).append((p[0], p[1], p[2] if len(p) > 2 else None))
+    return grid
+
+
+def _covers_any_sample(verts, t, grid):
+    """Does triangle t contain a walked sample, at its own height?"""
+    if not grid:
+        return False
+    (ax, ay, az), (bx, by, bz), (cx, cy, cz) = (verts[i][:3] for i in t)
+    d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+    if abs(d) < 1e-9:
+        return False
+    xs = (ax, bx, cx)
+    ys = (ay, by, cy)
+    for gx in range(int(min(xs) // _WALKED_CELL),
+                    int(max(xs) // _WALKED_CELL) + 1):
+        for gy in range(int(min(ys) // _WALKED_CELL),
+                        int(max(ys) // _WALKED_CELL) + 1):
+            for (px, py, pz) in grid.get((gx, gy), ()):
+                l0 = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) / d
+                l1 = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / d
+                l2 = 1.0 - l0 - l1
+                if l0 < -0.01 or l1 < -0.01 or l2 < -0.01:
+                    continue
+                if pz is None or abs(l0 * az + l1 * bz + l2 * cz
+                                     - pz) <= params.MAX_CLIMB + 8.0:
+                    return True
+    return False
+
+
+def _make_manifold(verts, tris, pin_xy=None):
     """Drop the smallest triangle on any edge shared by 3+ triangles until every
     edge has at most two.  Keeps the larger (more load-bearing) triangle.
+
+    pin_xy: walked pathgrid samples [(x, y, z, ...), ...].  A triangle that
+    carries one of them OUTRANKS every other candidate on the edge, whatever
+    its size or neighbour count.  The connectivity guard below cannot protect
+    these: dropping the sole mesh in a doorway does not SPLIT the mesh (the
+    two rooms still meet elsewhere), it just makes the doorway impassable, so
+    the components() test waves it through.  Measured at ImperialDungeon01's
+    prison door 0001FC1E, where three triangles fanned off one 17u edge of a
+    near-collinear boundary chain and the victim chosen by area/neighbours was
+    the only triangle spanning the threshold — a 24u hole across the doorway
+    with a 12u height step, the "completely mangled" area in the report.
     """
     tris = [tuple(map(int, t)) for t in tris]
 
@@ -55,6 +104,11 @@ def _make_manifold(verts, tris):
         va, vb, vc = verts[t[0]], verts[t[1]], verts[t[2]]
         return abs((vb[0] - va[0]) * (vc[1] - va[1]) -
                    (vb[1] - va[1]) * (vc[0] - va[0])) * 0.5
+
+    walked = _walked_lookup(pin_xy)
+
+    def carries_line(t):
+        return _covers_any_sample(verts, t, walked)
 
     for _ in range(6):
         owners = {}
@@ -83,8 +137,10 @@ def _make_manifold(verts, tris):
             live = [ti for ti in ent if ti not in drop]
             if len(live) <= 2:
                 continue
-            # Keep the best-connected triangles first, breaking ties by area.
-            live.sort(key=lambda ti: (nbr[ti], area(tris[ti])), reverse=True)
+            # Carrying a walked line outranks everything; then connectivity,
+            # then area.
+            live.sort(key=lambda ti: (carries_line(tris[ti]), nbr[ti],
+                                      area(tris[ti])), reverse=True)
             drop.update(live[2:])
         if not drop:
             break
@@ -112,7 +168,7 @@ def _make_manifold(verts, tris):
 
 
 def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None,
-             pin_xy=None, door_pins=None):
+             pin_xy=None, door_pins=None, node_pins=None):
     """V1 cleanup: drop degenerate triangles, guarantee manifold, compact.
 
     corridor_union already produces ONE connected, non-overlapping surface (the
@@ -130,7 +186,13 @@ def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None,
     Returns (verts, tris) as numpy arrays (float verts, int32 tris).
     """
     verts, tris = _weld_coincident(verts, tris)
-    tris = _make_manifold(verts, tris)
+    tris = _make_manifold(verts, tris, pin_xy=pin_xy)
+    # Plan-degenerate triangles (three corners collinear in plan) are walls or
+    # zero-width seam slivers — no actor can stand on them, and the CK flags
+    # the coplanar-antiparallel case as OPPOSITE_NORMALS.  Drop them unless
+    # removal would disconnect the mesh (a degenerate connector is still a
+    # working NVNM adjacency, so severing it silently strands a region).
+    tris = _drop_degenerate_guarded(verts, tris)
     # Only DOORS pin the decimator: a collapse at a threshold kills the Door
     # Triangle.  (pin_xy carries every pathgrid sample and is used by the island
     # pass below; pinning all of it would disable decimation everywhere.)
@@ -140,14 +202,40 @@ def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None,
     _pins = ([(d[0], d[1], params.DECIMATE_PIN_CENTER_RADIUS)
               for d in (doors or ())]
              + [(p[0], p[1], params.DECIMATE_PIN_RADIUS)
-                for p in (door_pins or ())])
+                for p in (door_pins or ())]
+             + [(n[0], n[1], params.DECIMATE_PIN_NODE_RADIUS)
+                for n in (node_pins or ())])
     verts, tris = decimate(verts, tris, pinned_xy=_pins,
                            seam_bounds=cell_bounds)
     # The "little bits around the outside": whatever badly-shaped small
     # triangles remain after collapses and flips sit where the outline simply
     # does not admit a good triangle — remove them rather than ship needles.
+    # Culling exposes a NEW boundary ring whose triangles were shaped for the
+    # old one, so re-smooth (collapse + flip) and cull once more with a small
+    # residual budget; one interleave converges (measured), more just churns.
     tris = cull_boundary_slivers(verts, tris, pinned_xy=_pins, pin_xy=pin_xy,
-                                 seam_bounds=cell_bounds)
+                                 seam_bounds=cell_bounds,
+                                 budget_frac=params.CULL_SLIVER_AREA_FRAC)
+    # The second round only RE-SMOOTHS the freshly exposed boundary ring:
+    # two collapse/flip rounds, no splits (a full second decimate measured
+    # ~10% of a dense cell's whole build for marginal further gain).
+    verts, tris = decimate(verts, tris, pinned_xy=_pins,
+                           seam_bounds=cell_bounds, rounds=2,
+                           allow_split=False)
+    tris = cull_boundary_slivers(verts, tris, pinned_xy=_pins, pin_xy=pin_xy,
+                                 seam_bounds=cell_bounds,
+                                 budget_frac=params.CULL_SLIVER_AREA_FRAC
+                                 * 0.4)
+    # Drop OPEN FLAPS — triangles hanging off a floor's rim into a stairwell.
+    # This runs here, after decimation, because that is where they become
+    # visible: emission fans a whole floor rim back to one stair vertex below,
+    # and while every spoke of that fan is present each shares its long edges
+    # with the next, so nothing upstream sees a free edge.  Decimation merges
+    # the spokes into one triangle and the fan's two outer edges become the
+    # silhouette — which is exactly what makes the flap identifiable.  It runs
+    # BEFORE find_ledge_links so a flap is never mistaken for a mezzanine an
+    # actor is meant to drop off.
+    tris = cull_open_flaps(verts, tris, pin_xy)
     # Find drop-down storeys BEFORE the island cull: a mezzanine an actor is
     # meant to step off is a legitimate component and must not be culled as a
     # stray scrap.  These become NVNM Ledge Up/Down EDGE LINKS (Skyrim's own
@@ -158,7 +246,7 @@ def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None,
     # now is meaningless afterwards.  The centroid survives all of them.
     ledge_marks = [(_centroid(verts, tris[hi]), _centroid(verts, tris[lo]),
                     drop) for (hi, lo, drop) in ledge_pairs]
-    tris = _make_manifold(verts, tris)
+    tris = _make_manifold(verts, tris, pin_xy=pin_xy)
     # POST-CLEANUP JUNCTION REPAIR.  Decimation can land two components'
     # boundary vertices on the exact same position (a collapse target is
     # another vertex's position) — coincident, but different indices, so
@@ -170,7 +258,7 @@ def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None,
     from .corridor_union import _stitch_shared_nodes
     verts = [list(map(float, v)) for v in verts]
     tris = _stitch_shared_nodes(verts, [tuple(t) for t in tris], [])
-    tris = _make_manifold(verts, tris)
+    tris = _make_manifold(verts, tris, pin_xy=pin_xy)
     tris = _drop_unreachable_islands(verts, tris, doors, cell_bounds, pin_xy)
     verts, tris = _compact(verts, tris)
     # Ledge MARKS (centroids), not indices: build_corridors still appends the
@@ -180,7 +268,251 @@ def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None,
     return verts, tris, ledge_marks
 
 
-def decimate(verts, tris, pinned_xy=None, seam_bounds=None):
+def cull_open_flaps(verts, tris, pin_xy=None):
+    """Drop triangles that hang off a floor's rim into open space.
+
+    A triangle with TWO UNSHARED edges that each fall a storey-ish drop is not
+    ground.  Both of its long edges are the mesh's own silhouette, so nothing
+    walks across them and nothing is connected through them; the only thing
+    holding it on is the short edge along the floor rim it grew out of.  It
+    reaches from that rim down to a single vertex on the stairs below, across a
+    void — the shape the author saw jutting "from the upper left to the right"
+    through a wall in Pinarus's upstairs.
+
+    WHY SLOPE CANNOT FIND THESE.  `_drop_walls` already removes near-vertical
+    triangles, but a flap is not vertical: the Pinarus one measures 30 degrees
+    (corners at z 68.6, 68.6 and 18.8 spread over ~95u of plan), comfortably
+    inside the walkable band.  Nor is it unsupported — every sample under it
+    lands on real collision, because the stairwell it spans genuinely has
+    floor at the bottom.  What distinguishes it is purely topological: real
+    sloped ground is stitched to its neighbours.  A stair tread shares its
+    edges with the treads above and below; a ramp shares its edges with the
+    floors it joins.  Even a ledge an actor drops off has ONE free edge, at its
+    lip — never two, and never two that both plunge.
+
+    THE PATHGRID IS THE PRIME DIRECTIVE.  Topology alone is not enough: a ramp
+    landing in an open room legitimately presents two free sloping edges, and
+    the census caught one — LeyawiinCastleCountyHall's 105u/91u ramp spanning
+    44u, a ~25 degree slope the authored pathgrid walks straight down.  Culling
+    it cost three walked samples.  So a triangle carrying a pathgrid sample is
+    never dropped, however it is shaped; the same guard `_drop_walls` applies
+    for the same reason.  What remains is only ground the author never routed
+    an actor across.
+
+    Census over the reference cells: zero matches in ChorrolFightersGuild,
+    ImperialDungeon01, ImperialDungeon05, AnvilFightersGuild and Moranda02, and
+    in Pinarus exactly the triangle the author reported.
+
+    The connectivity guard is kept as well: a flap is dropped only when its
+    neighbours remain mutually reachable without it, so this can never sever a
+    mesh even where the census did not look.
+    """
+    if not tris:
+        return tris
+    from .corridor_union import FLAP_EDGE_DROP
+
+    # Pathgrid samples, bucketed for a cheap point-in-triangle test.
+    PG_CELL = 128.0
+    # How far inside a triangle a walked sample must fall to count as CROSSING
+    # it.  A corner or edge contact is not evidence the pathgrid uses this
+    # ground; every flap touches the rim it hangs from.  5% of the triangle is
+    # a small margin in absolute terms (a few units on a 100u triangle) yet
+    # excludes vertex and edge hits cleanly.
+    PG_INSIDE_FRAC = 0.05
+    pg = {}
+    for p in (pin_xy or ()):
+        pg.setdefault((int(p[0] // PG_CELL), int(p[1] // PG_CELL)),
+                      []).append((p[0], p[1]))
+
+    def _carries_pathgrid(t):
+        """Does a walked sample land INSIDE this triangle, off its corners?
+
+        A sample sitting exactly ON a corner proves only that the walked line
+        reaches the rim the flap grew from — which it always does, since that
+        is the floor edge.  The Pinarus flap's single "hit" was precisely its
+        own corner (-269.9, 58.2), barycentric (0,1,0).  Requiring a strictly
+        interior sample is what separates "the pathgrid crosses this ground"
+        from "the pathgrid touches the vertex it hangs off".
+        """
+        (ax, ay) = verts[t[0]][0], verts[t[0]][1]
+        (bx, by) = verts[t[1]][0], verts[t[1]][1]
+        (cx, cy) = verts[t[2]][0], verts[t[2]][1]
+        d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        if abs(d) < 1e-9:
+            return False
+        xs, ys = (ax, bx, cx), (ay, by, cy)
+        for gx in range(int(min(xs) // PG_CELL), int(max(xs) // PG_CELL) + 1):
+            for gy in range(int(min(ys) // PG_CELL),
+                            int(max(ys) // PG_CELL) + 1):
+                for (px, py) in pg.get((gx, gy), ()):
+                    l0 = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) / d
+                    l1 = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / d
+                    l2 = 1.0 - l0 - l1
+                    if min(l0, l1, l2) >= PG_INSIDE_FRAC:
+                        return True
+        return False
+
+    edge_tris = {}
+    for ti, t in enumerate(tris):
+        for k in range(3):
+            a, b = t[k], t[(k + 1) % 3]
+            edge_tris.setdefault((a, b) if a < b else (b, a), []).append(ti)
+
+    cands = []
+    for ti, t in enumerate(tris):
+        free = 0
+        for k in range(3):
+            a, b = t[k], t[(k + 1) % 3]
+            key = (a, b) if a < b else (b, a)
+            if len(edge_tris.get(key, ())) != 1:
+                continue
+            if abs(verts[a][2] - verts[b][2]) >= FLAP_EDGE_DROP:
+                free += 1
+        if free >= 2 and not (pg and _carries_pathgrid(t)):
+            cands.append(ti)
+    if not cands:
+        return tris
+
+    alive = [True] * len(tris)
+
+    def _neighbours(ti):
+        out = []
+        t = tris[ti]
+        for k in range(3):
+            a, b = t[k], t[(k + 1) % 3]
+            for tj in edge_tris.get((a, b) if a < b else (b, a), ()):
+                if tj != ti and alive[tj]:
+                    out.append(tj)
+        return out
+
+    for ti in cands:
+        nbrs = _neighbours(ti)
+        if len(nbrs) > 1:
+            # All neighbours must reach each other without crossing ti.
+            target = set(nbrs[1:])
+            seen = {nbrs[0], ti}
+            queue = [nbrs[0]]
+            budget = 128
+            while queue and target and budget:
+                budget -= 1
+                cur = queue.pop()
+                for tj in _neighbours(cur):
+                    if tj in seen:
+                        continue
+                    seen.add(tj)
+                    target.discard(tj)
+                    queue.append(tj)
+            if target:
+                continue                # ti is the only link: keep it
+        alive[ti] = False
+    return [t for ti, t in enumerate(tris) if alive[ti]]
+
+
+def _badness(verts, t):
+    """Normalised shape badness; 1.0 = exactly at the contract boundary.
+
+    max(edge_ratio / MAX_EDGE_RATIO, aspect / MAX_TRI_ASPECT): the ratio term
+    catches needles (one short edge), the aspect term catches CAPS (all edges
+    comparable, near-zero height) which the ratio cannot see.
+    """
+    p, q, r = verts[t[0]], verts[t[1]], verts[t[2]]
+    e = [math.dist(p[:2], q[:2]), math.dist(q[:2], r[:2]),
+         math.dist(r[:2], p[:2])]
+    lo, hi = min(e), max(e)
+    area = abs((q[0] - p[0]) * (r[1] - p[1]) -
+               (q[1] - p[1]) * (r[0] - p[0])) * 0.5
+    if lo <= 1e-9 or area <= 1e-9:
+        return 1e9
+    return max((hi / lo) / params.MAX_EDGE_RATIO,
+               (hi * hi / (4.0 * area)) / params.MAX_TRI_ASPECT)
+
+
+def _drop_degenerate_guarded(verts, tris):
+    """Drop plan-degenerate (XY footprint < MIN_XY_FOOTPRINT) triangles, but
+    never disconnect the mesh: a candidate that is the only route between its
+    neighbours is kept.
+
+    NOTE the one-at-a-time fallback re-derives candidate INDICES after every
+    removal.  The first version remapped a pre-built index list while
+    iterating it, and the stale indices deleted arbitrary HEALTHY triangles
+    once the list had shifted — measured on Moranda02 as 122 walked-line
+    samples losing their (7,000u^2!) covering triangles.
+    """
+    tris = [tuple(map(int, t)) for t in tris]
+
+    def _deg(t):
+        va, vb, vc = verts[t[0]], verts[t[1]], verts[t[2]]
+        cross = ((vb[0] - va[0]) * (vc[1] - va[1]) -
+                 (vb[1] - va[1]) * (vc[0] - va[0]))
+        # NO SHAPE-BASED CULL HERE.  Dropping tiny high-badness "spikes" was
+        # tried (5% of MIN_TRI_AREA and 4x the shape contract, with both the
+        # local BFS guard and a walked-line exemption) and is a NET LOSS: it
+        # removed the badness-28 needle at ImperialDungeon01's prison door but
+        # cost 25 more defects across the reference cells, LeyawiinCastleCounty
+        # Hall alone going from 10 crack edges to 21.  A spike is usually the
+        # last adjacency between two sheets, and adjacency the engine can use
+        # beats a tidy triangle list.  Shape is the decimator's and the sliver
+        # cull's job, where coverage and width are checked first.
+        return abs(cross) * 0.5 < params.MIN_XY_FOOTPRINT
+
+    if not any(_deg(t) for t in tris):
+        return tris
+    # LOCAL connectivity guard (bounded BFS over shared-edge adjacency, the
+    # same pattern the sliver cull uses).  The first version re-ran a whole-
+    # mesh components() per removal trial — 2.6s on one cave cell.
+    edge_tris = {}
+    for ti, t in enumerate(tris):
+        for k in range(3):
+            a, b = t[k], t[(k + 1) % 3]
+            edge_tris.setdefault((a, b) if a < b else (b, a), []).append(ti)
+    alive = [True] * len(tris)
+
+    def _neighbours(ti):
+        out = []
+        for k in range(3):
+            a, b = tris[ti][k], tris[ti][(k + 1) % 3]
+            for tj in edge_tris.get((a, b) if a < b else (b, a), ()):
+                if tj != ti and alive[tj]:
+                    out.append(tj)
+        return out
+
+    def _removable(ti):
+        nbrs = _neighbours(ti)
+        if len(nbrs) <= 1:
+            return True
+        target = set(nbrs[1:])
+        seen = {nbrs[0], ti}
+        queue = [nbrs[0]]
+        fuel = 256
+        while queue and target and fuel:
+            fuel -= 1
+            cur = queue.pop()
+            for tj in _neighbours(cur):
+                if tj in seen:
+                    continue
+                seen.add(tj)
+                target.discard(tj)
+                queue.append(tj)
+        return not target
+
+    for ti in range(len(tris)):
+        if _deg(tris[ti]) and _removable(ti):
+            alive[ti] = False
+    tris = [t for ti, t in enumerate(tris) if alive[ti]]
+
+    return tris
+
+
+
+
+# Fraction of the ribbon standoff a CONCAVE outline cut may consume.  The
+# standoff is what keeps the boundary clear of collision, so staying well
+# inside it is what makes an outward cut safe.
+CONCAVE_CUT_FRAC = 0.25
+
+
+def decimate(verts, tris, pinned_xy=None, seam_bounds=None, rounds=None,
+             allow_split=True):
     """Collapse sliver-producing SHORT edges into near-equilateral triangles.
 
     The grown ribbon outlines (Phase 2) contribute many boundary corners, and a
@@ -267,11 +599,7 @@ def decimate(verts, tris, pinned_xy=None, seam_bounds=None):
         return math.hypot(p[0] - (a[0] + dx * t), p[1] - (a[1] + dy * t))
 
     def _edge_ratio(t):
-        p, q, r = verts[t[0]], verts[t[1]], verts[t[2]]
-        e = [math.dist(p[:2], q[:2]), math.dist(q[:2], r[:2]),
-             math.dist(r[:2], p[:2])]
-        lo = min(e)
-        return (max(e) / lo) if lo > 1e-9 else 1e9
+        return _badness(verts, t)
 
     def _on_seam(vi):
         if seam_bounds is None:
@@ -296,7 +624,7 @@ def decimate(verts, tris, pinned_xy=None, seam_bounds=None):
     area_budget = params.DECIMATE_MAX_AREA_LOSS * total_area
     area_lost = 0.0
 
-    for _ in range(params.DECIMATE_ROUNDS):
+    for _ in range(rounds if rounds is not None else params.DECIMATE_ROUNDS):
         boundary, bnbr = _boundary_verts(tris)
         # candidate edges, shortest first
         cands = []
@@ -376,8 +704,34 @@ def decimate(verts, tris, pinned_xy=None, seam_bounds=None):
             # them and pushes the mesh through the wall.  So a boundary vertex is
             # never dropped and never moved — only an INTERIOR vertex collapses,
             # into its neighbour.  Pinned (door) vertices never move either.
-            if a in pin or b in pin:
-                continue
+            # A PIN MAY NOT MOVE — but the vertex at the OTHER end of the edge
+            # may still collapse INTO it.  The pin's position is what matters
+            # (a door threshold corner, a pathgrid junction); nothing about it
+            # requires its neighbour to stay.  Refusing the whole edge froze
+            # the merge the author asked for: v464 sits 7.5u from pathgrid
+            # node n124, so the 24u node pin vetoed collapsing the redundant
+            # v598 into it and two 300u^2 slivers survived on the stairs.
+            # Only both-pinned is a genuine stalemate.
+            pin_a, pin_b = a in pin, b in pin
+            if pin_a and pin_b:
+                # Two pins may still fuse when they are REDUNDANT: a pin
+                # protects a POSITION, and a vertex that lies (within
+                # DECIMATE_OUTLINE_TOL) on the straight line between its two
+                # boundary neighbours contributes no position of its own —
+                # dropping it leaves the outline exactly where it was, pin
+                # included.  A single door's 24u centre pin covers ~50u of
+                # boundary, so at ImperialDungeon01's prison door FOUR
+                # consecutive vertices of one near-collinear chain were all
+                # pinned and could never collapse into each other; the chain
+                # forced the fan of 8-360u^2 slivers through the doorway that
+                # the author reported as "completely mangled".
+                if not (a in boundary and b in boundary):
+                    continue
+                if b not in bnbr.get(a, ()):
+                    continue
+                if min(_outline_error(a, bnbr),
+                       _outline_error(b, bnbr)) > params.DECIMATE_OUTLINE_TOL:
+                    continue
             if a_b and b_b:
                 # Two outline vertices may only collapse along an OUTLINE
                 # edge.  If the edge between them is interior, they sit on
@@ -400,13 +754,43 @@ def decimate(verts, tris, pinned_xy=None, seam_bounds=None):
                 tol = params.DECIMATE_OUTLINE_TOL
                 dev = params.DECIMATE_SAWTOOTH_DEV
                 budget_left = area_lost < area_budget
-                ok_a = ea <= tol or (budget_left and ea <= dev
-                                     and not _on_seam(a) and _outline_convex(a))
-                ok_b = eb <= tol or (budget_left and eb <= dev
-                                     and not _on_seam(b) and _outline_convex(b))
+                # CONCAVE corners get a small allowance too.  The outline is a
+                # wall STANDOFF, not the wall: a ribbon is laid at
+                # RIBBON_HALF_WIDTH from its centreline, so the boundary
+                # already sits clear of real collision (measured 11-17u at the
+                # Pinarus corner).  A concave corner whose removal pushes the
+                # silhouette out by less than that clearance therefore cannot
+                # reach a wall — and refusing it is what left the sliver fans
+                # nothing could repair: such a corner cannot be collapsed
+                # (this rule), cannot be flipped (the quad around a concave
+                # corner is non-convex) and cannot be split (its longest edge
+                # is under the split floor).  A census of five reference cells
+                # found 16-32 of them EACH, carrying triangles up to badness
+                # 68.  The allowance is deliberately a fraction of the
+                # standoff, so it can never cross the wall the standoff buys.
+                cc_tol = max(tol, CONCAVE_CUT_FRAC * params.RIBBON_HALF_WIDTH)
+                ok_a = ea <= tol or (budget_left and not _on_seam(a)
+                                     and (ea <= dev if _outline_convex(a)
+                                          else ea <= cc_tol))
+                ok_b = eb <= tol or (budget_left and not _on_seam(b)
+                                     and (eb <= dev if _outline_convex(b)
+                                          else eb <= cc_tol))
                 if not (ok_a or ok_b):
                     continue
-                if ok_a and (not ok_b or ea <= eb):
+                if pin_a and pin_b:
+                    # Both redundant-pinned (checked above): drop whichever
+                    # deviates least from the outline it sits on.
+                    keep, drop = ((a, b) if _outline_error(b, bnbr)
+                                  <= _outline_error(a, bnbr) else (b, a))
+                elif pin_a or pin_b:
+                    # One end is pinned: it survives, the other dissolves into
+                    # it, so the pinned position is untouched.
+                    if pin_a and not ok_b:
+                        continue        # only `a` could go, and it may not
+                    if pin_b and not ok_a:
+                        continue
+                    keep, drop = (a, b) if pin_a else (b, a)
+                elif ok_a and (not ok_b or ea <= eb):
                     keep, drop = b, a        # drop the flatter/jutting one (a)
                 else:
                     keep, drop = a, b
@@ -416,6 +800,11 @@ def decimate(verts, tris, pinned_xy=None, seam_bounds=None):
                 target = verts[keep][:]
             elif b_b:                        # a interior -> merge a into b
                 keep, drop = b, a
+                target = verts[keep][:]
+            elif pin_a or pin_b:
+                # Both interior but one is pinned: keep the pin exactly where
+                # it is instead of averaging it away to a midpoint.
+                keep, drop = (a, b) if pin_a else (b, a)
                 target = verts[keep][:]
             else:
                 keep, drop = a, b            # both interior: midpoint
@@ -436,8 +825,43 @@ def decimate(verts, tris, pinned_xy=None, seam_bounds=None):
                   for v in tris[ti]} - {a, b}
             opp = {v for ti in vmap.get(a, ()) if alive[ti] and b in tris[ti]
                    for v in tris[ti]} - {a, b}
-            if (la & lb) != opp:
-                continue
+            extra = (la & lb) - opp
+            if extra:
+                # A shared vertex beyond the opposite corners normally means
+                # the collapse would pinch a bowtie.  But when EVERY triangle
+                # linking a (or b) to that vertex is one of the two being
+                # collapsed away, there is no second path to pinch: the link
+                # exists only inside the sliver pair the merge dissolves.
+                #
+                # This is the case the author drew: on ImperialDungeon01's
+                # stairs, v600 and v601 sit 2.5u apart on the outline and each
+                # reaches the V apex v382 through its own 300u^2 sliver.  The
+                # strict test read that as a bowtie and refused, so the two
+                # slivers survived every pass — neither dropped (they carry
+                # adjacency) nor merged.  Allowing it produces exactly the two
+                # fat triangles the author sketched: (394,382,465) and
+                # (382,514,464), each a sliver absorbed into its neighbour.
+                # The pinch the link condition guards against is a surface
+                # closing on itself at a point.  That needs the collapsed edge
+                # to be INTERIOR: with mesh on both sides, fusing its ends
+                # joins two separate fans and the join is a single vertex.  On
+                # a BOUNDARY edge (one owner) there is no second fan — one
+                # side is open space — so the collapse simply shortens the
+                # outline and cannot bowtie, whatever else the two vertices
+                # happen to share.
+                #
+                # This is the case the author drew: on ImperialDungeon01's
+                # stairs, v600/v601 sit 2.5u apart on the OUTLINE, joined by a
+                # single 71u^2 sliver, and each reaches the V apex v382
+                # through its own 300u^2 sliver.  The strict test saw v382 as
+                # an extra shared vertex and refused, so the slivers survived
+                # every pass — neither dropped (they carry adjacency) nor
+                # merged.  Allowing it yields exactly the two fat triangles
+                # the author sketched: (394,382,465) and (382,514,464).
+                shared_tris = sum(1 for ti in vmap.get(a, ())
+                                  if alive[ti] and b in tris[ti])
+                if shared_tris != 1:
+                    continue
 
             inc = (vmap.get(keep, set()) | vmap.get(drop, set()))
             aff_idx = [ti for ti in inc if alive[ti]
@@ -461,11 +885,12 @@ def decimate(verts, tris, pinned_xy=None, seam_bounds=None):
             if ok:
                 after = max([_edge_ratio(t) for t in new_tris], default=1.0)
                 # Shape bound: a collapse may not push any affected triangle
-                # past MAX_EDGE_RATIO, nor past the WORST ratio already
-                # present.  ("Strictly improve" was tried and stalled: a
-                # sawtooth cut often worsens one neighbour a little before
-                # the next collapse fixes it, so the outline never cleaned.)
-                if after > max(before, params.MAX_EDGE_RATIO) + 1e-9:
+                # past the shape contract (badness 1.0), nor past the WORST
+                # shape already present.  ("Strictly improve" was tried and
+                # stalled: a sawtooth cut often worsens one neighbour a little
+                # before the next collapse fixes it, so the outline never
+                # cleaned.)
+                if after > max(before, 1.0) + 1e-9:
                     ok = False
             # Charge a boundary cut's removed ground against the budget.  The
             # area of the triangles that vanish (they contained both keep and
@@ -515,29 +940,158 @@ def decimate(verts, tris, pinned_xy=None, seam_bounds=None):
         flipped = _flip_pass(verts, tris, pin)
         if flipped is not None:
             tris = flipped
-        if not changed and flipped is None:
+        # LONG-EDGE BISECTION.  A needle whose edges are all LONG can be fixed
+        # by neither collapse (nothing short) nor flip (the neighbour may be
+        # fine already): bisect its longest edge instead.  The split moves no
+        # vertex and changes no coverage — it only adds a vertex ON the edge —
+        # and the next round's flips and collapses reshape the halves.
+        split = (_split_needles(verts, tris, pin, _on_seam)
+                 if allow_split else None)
+        if split is not None:
+            tris = split
+        if not changed and flipped is None and split is None:
             break
 
     return verts, tris
 
 
+def _split_needles(verts, tris, pin, on_seam):
+    """Bisect the LONGEST edge of triangles violating MAX_EDGE_RATIO.
+
+    Only edges long enough that both halves stay above DECIMATE_MIN_EDGE are
+    split (>= 2 * DECIMATE_MIN_EDGE), so a split never creates collapse bait
+    and the pass terminates.  An interior edge splits BOTH owners, so no
+    hanging node is ever created; door-wedge triangles (all corners pinned)
+    and exterior-seam edges are never touched.  Returns the new triangle list
+    or None if nothing split.
+    """
+    from . import params
+    min_len = 2.0 * params.DECIMATE_MIN_EDGE
+    edge_tris = {}
+    for ti, t in enumerate(tris):
+        for k in range(3):
+            a, b = t[k], t[(k + 1) % 3]
+            edge_tris.setdefault((a, b) if a < b else (b, a),
+                                 []).append(ti)
+
+    def _elen(a, b):
+        return math.dist(verts[a][:2], verts[b][:2])
+
+    consumed = set()
+    new_tris = []
+    dead = set()
+    for ti, t in enumerate(tris):
+        if ti in consumed:
+            continue
+        if _badness(verts, t) <= 1.0:
+            continue
+        cand = [(_elen(t[k], t[(k + 1) % 3]), k) for k in range(3)]
+        d, k = max(cand)
+        if d < min_len:
+            continue
+        a, b = t[k], t[(k + 1) % 3]
+        if on_seam(a) and on_seam(b):
+            continue
+        key = (a, b) if a < b else (b, a)
+        owners = edge_tris.get(key, ())
+        if len(owners) > 2:
+            continue                        # non-manifold edge: leave alone
+        if any(o in consumed for o in owners):
+            continue
+        if any(all(v in pin for v in tris[o]) for o in owners):
+            continue
+        # Split at the PROJECTION of the bad triangle's apex onto the long
+        # edge (a cap's badness lives at its apex; the midpoint leaves two
+        # smaller caps), clamped so both halves stay above DECIMATE_MIN_EDGE.
+        apx = verts[t[(k + 2) % 3]]
+        dx_, dy_ = verts[b][0] - verts[a][0], verts[b][1] - verts[a][1]
+        tproj = (((apx[0] - verts[a][0]) * dx_
+                  + (apx[1] - verts[a][1]) * dy_) / (d * d))
+        tlo = params.DECIMATE_MIN_EDGE / d
+        tproj = max(tlo, min(1.0 - tlo, tproj))
+        mid = (verts[a][0] + dx_ * tproj,
+               verts[a][1] + dy_ * tproj,
+               verts[a][2] + (verts[b][2] - verts[a][2]) * tproj)
+
+        # The split must IMPROVE the local worst shape, or it just mints two
+        # thinner slivers (bisecting a triangle whose SHORT edge is tiny
+        # halves the long side but keeps the tiny side — strictly worse;
+        # measured: two r=11 slivers appeared where one r=4 had been).
+        mv = [list(v_) for v_ in ([verts[a], verts[b], list(mid)])]
+
+        def _b3(pa, pb, pc):
+            return _badness([pa, pb, pc], (0, 1, 2))
+
+        before = max(_badness(verts, tris[o]) for o in owners)
+        after = 0.0
+        halves = []
+        ok = True
+        for o in owners:
+            to = tris[o]
+            for kk in range(3):
+                if {to[kk], to[(kk + 1) % 3]} == {a, b}:
+                    cvi = to[(kk + 2) % 3]
+                    after = max(after,
+                                _b3(verts[to[kk]], list(mid), verts[cvi]),
+                                _b3(list(mid), verts[to[(kk + 1) % 3]],
+                                    verts[cvi]))
+                    halves.append((o, kk, cvi))
+                    break
+            else:
+                ok = False
+        if not ok or after >= before - 1e-9:
+            continue
+        m = len(verts)
+        verts.append([mid[0], mid[1], mid[2]])
+        for (o, kk, cvi) in halves:
+            to = tris[o]
+            new_tris.append((to[kk], m, cvi))
+            new_tris.append((m, to[(kk + 1) % 3], cvi))
+            dead.add(o)
+            consumed.add(o)
+    if not new_tris:
+        return None
+    out = [t for ti, t in enumerate(tris) if ti not in dead]
+    out.extend(new_tris)
+    return out
+
+
 def _pin_verts(verts, pinned_xy):
-    """Vertex indices pinned by the (x, y[, radius]) door-pin list."""
+    """Vertex indices pinned by the (x, y[, radius]) door-pin list.
+
+    Bucketed: the pin list now carries every pathgrid node, and the naive
+    O(verts x pins) scan was 2.5s of a single cave cell's build.
+    """
     pin = set()
     if not pinned_xy:
         return pin
     default_r = params.DECIMATE_PIN_RADIUS
+    rmax = max((p[2] if len(p) > 2 else default_r) for p in pinned_xy)
+    cell = max(float(rmax), 1.0)
+    buckets = {}
+    for p in pinned_xy:
+        buckets.setdefault((int(p[0] // cell), int(p[1] // cell)),
+                           []).append(p)
     for vi, v in enumerate(verts):
-        for p in pinned_xy:
-            r = p[2] if len(p) > 2 else default_r
-            if (v[0] - p[0]) ** 2 + (v[1] - p[1]) ** 2 <= r * r:
-                pin.add(vi)
+        gx, gy = int(v[0] // cell), int(v[1] // cell)
+        hit = False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for p in buckets.get((gx + dx, gy + dy), ()):
+                    r = p[2] if len(p) > 2 else default_r
+                    if (v[0] - p[0]) ** 2 + (v[1] - p[1]) ** 2 <= r * r:
+                        pin.add(vi)
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
                 break
     return pin
 
 
 def cull_boundary_slivers(verts, tris, pinned_xy=None, pin_xy=None,
-                          seam_bounds=None):
+                          seam_bounds=None, budget_frac=None):
     """Remove small, badly-shaped triangles on the OUTLINE.
 
     After collapses and flips have done what they can, a residual needle on
@@ -568,35 +1122,41 @@ def cull_boundary_slivers(verts, tris, pinned_xy=None, pin_xy=None,
                          - (verts[t[1]][1] - verts[t[0]][1])
                          * (verts[t[2]][0] - verts[t[0]][0]))
                      for t in tris) * 0.5
-    budget = params.CULL_SLIVER_AREA_FRAC * total_area
+    budget = ((budget_frac if budget_frac is not None
+               else params.CULL_SLIVER_AREA_FRAC) * total_area)
     removed_area = 0.0
 
     pin = _pin_verts(verts, pinned_xy)
 
-    # Pathgrid samples bucketed for the containment test.
+    # Pathgrid samples bucketed for the containment test (with z and the
+    # line direction when known).
     pgrid = {}
     pcell = 128.0
     for p in (pin_xy or ()):
         px, py = p[0], p[1]
+        pz = p[2] if len(p) > 2 else None
+        pu = (p[3], p[4]) if len(p) > 4 else None
         pgrid.setdefault((int(px // pcell), int(py // pcell)),
-                         []).append((px, py))
+                         []).append((px, py, pz, pu))
 
-    def _has_pgrd_sample(t):
+    def _pgrd_samples_in(t):
+        """Pathgrid samples inside triangle t (as (px, py, pz-or-None) list)."""
         xs = [verts[i][0] for i in t]
         ys = [verts[i][1] for i in t]
         (ax, ay), (bx, by), (cx, cy) = ((verts[i][0], verts[i][1])
                                         for i in t)
         d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
         if abs(d) < 1e-9:
-            return False
+            return []
+        out = []
         for gx in range(int(min(xs) // pcell), int(max(xs) // pcell) + 1):
             for gy in range(int(min(ys) // pcell), int(max(ys) // pcell) + 1):
-                for (px, py) in pgrid.get((gx, gy), ()):
+                for (px, py, pz, _pu) in pgrid.get((gx, gy), ()):
                     l0 = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) / d
                     l1 = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / d
                     if l0 >= -0.02 and l1 >= -0.02 and (1 - l0 - l1) >= -0.02:
-                        return True
-        return False
+                        out.append((px, py, pz))
+        return out
 
     def _on_seam(vi):
         if seam_bounds is None:
@@ -608,13 +1168,9 @@ def cull_boundary_slivers(verts, tris, pinned_xy=None, pin_xy=None,
 
     def _shape(t):
         p, q, r = verts[t[0]], verts[t[1]], verts[t[2]]
-        e = [math.dist(p[:2], q[:2]), math.dist(q[:2], r[:2]),
-             math.dist(r[:2], p[:2])]
-        lo = min(e)
-        ratio = (max(e) / lo) if lo > 1e-9 else 1e9
         area = abs((q[0] - p[0]) * (r[1] - p[1]) -
                    (q[1] - p[1]) * (r[0] - p[0])) * 0.5
-        return ratio, area
+        return _badness(verts, t), area
 
     for _round in range(3):
         counts = {}
@@ -642,13 +1198,34 @@ def cull_boundary_slivers(verts, tris, pinned_xy=None, pin_xy=None,
 
         cands = []
         for ti, t in enumerate(tris):
-            if not any(counts.get((min(t[k], t[(k + 1) % 3]),
-                                   max(t[k], t[(k + 1) % 3]))) == 1
-                       for k in range(3)):
+            nb_edges = sum(1 for k in range(3)
+                           if counts.get((min(t[k], t[(k + 1) % 3]),
+                                          max(t[k], t[(k + 1) % 3]))) == 1)
+            if nb_edges == 0:
                 continue                    # interior triangle: not fringe
+            # ...and ONE boundary edge is not enough to make it fringe.  A
+            # triangle with a single edge on the outline and its other two
+            # deep in the interior is a WEDGE filling a concave pocket:
+            # removing it does not trim the fringe, it bites a slim V into
+            # walkable ground, apex inward, with open boundary down both new
+            # sides.  Coverage and crack metrics are both blind to that (no
+            # ground is uncovered, no walked line crosses the new boundary),
+            # so it shipped while being plainly visible on the staircase —
+            # measured on ImperialDungeon01, ONE cull round took the cell
+            # from 1 open notch to 7, two of them bitten out of the tower
+            # stairs the author reported twice.
+            #
+            # True fringe has TWO boundary edges (a corner of the outline
+            # with one edge back into the mesh): removing it leaves the
+            # remaining boundary running straight through, which is what
+            # "remove the little bits around the outside" actually means.
+            if nb_edges < 2:
+                continue
             ratio, area = _shape(t)
-            bad = ((ratio > params.CULL_SLIVER_RATIO
-                    and area < params.CULL_SLIVER_MAX_AREA)
+            # ratio here is normalised badness: 1.0 == the shape contract
+            # (CULL_SLIVER_RATIO / MAX_EDGE_RATIO for needles, MAX_TRI_ASPECT
+            # for caps).
+            bad = ((ratio > 1.0 and area < params.CULL_SLIVER_MAX_AREA)
                    or area < params.MIN_TRI_AREA)
             if not bad:
                 continue
@@ -659,17 +1236,132 @@ def cull_boundary_slivers(verts, tris, pinned_xy=None, pin_xy=None,
                    and _on_seam(t[k]) and _on_seam(t[(k + 1) % 3])
                    for k in range(3)):
                 continue                    # a border edge on the cell seam
-            if _has_pgrd_sample(t):
-                continue
-            cands.append((-ratio, ti, area))
-        cands.sort()
+            cands.append((-ratio, ti, area, _pgrd_samples_in(t)))
+        cands.sort(key=lambda c: (c[0], c[1]))
+
+        def _z_at(tj, x, y):
+            (ax, ay, az) = verts[tris[tj][0]]
+            (bx, by, bz) = verts[tris[tj][1]]
+            (cx, cy, cz) = verts[tris[tj][2]]
+            d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+            if abs(d) < 1e-9:
+                return None
+            l0 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / d
+            l1 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / d
+            l2 = 1.0 - l0 - l1
+            if l0 < -0.02 or l1 < -0.02 or l2 < -0.02:
+                return None
+            return l0 * az + l1 * bz + l2 * cz
+
+        # Triangle buckets for the coverage test below.
+        tcell = 128.0
+        tgrid = {}
+        for tj, tt in enumerate(tris):
+            xs = [verts[i][0] for i in tt]
+            ys = [verts[i][1] for i in tt]
+            for gx in range(int(min(xs) // tcell), int(max(xs) // tcell) + 1):
+                for gy in range(int(min(ys) // tcell),
+                                int(max(ys) // tcell) + 1):
+                    tgrid.setdefault((gx, gy), []).append(tj)
+
+        def _samples_still_covered(ti, samples):
+            """Would every pathgrid sample in ti stay covered without it?
+
+            The walked line is sacrosanct — but a sliver merely GRAZED by the
+            line at a corner shares those samples with its neighbours, and
+            removing it costs the line nothing.  Only a sliver that is the
+            SOLE cover of some sample must stay.
+
+            The replacement cover must be within a STEP of the sample's own
+            height (or of this triangle's, when the pin carries no z).  An
+            80u window was tried and let a stacked cave ledge 50-70u below
+            count as cover — the cull then ate the real ledge and BarrenCave
+            lost 39 walked-line samples.
+            """
+            for (px, py, pz) in samples:
+                zref = pz if pz is not None else _z_at(ti, px, py)
+                ok = False
+                for tj in tgrid.get((int(px // tcell), int(py // tcell)), ()):
+                    if tj == ti or not alive[tj]:
+                        continue
+                    z = _z_at(tj, px, py)
+                    if z is not None and (zref is None
+                                          or abs(z - zref)
+                                          <= params.MAX_CLIMB + 8.0):
+                        ok = True
+                        break
+                if not ok:
+                    return False
+            return True
+
+        def _cov_z(x, y, zc, skip=None):
+            best = None
+            for tj in tgrid.get((int(x // tcell), int(y // tcell)), ()):
+                if tj == skip or not alive[tj]:
+                    continue
+                z = _z_at(tj, x, y)
+                if z is not None and abs(z - zc) <= 40.0:
+                    if best is None or abs(z - zc) < abs(best - zc):
+                        best = z
+            return best
+
+        def _width_at(px, py, pz, pu):
+            """Continuous covered cross-width at a directed line sample."""
+            wx_, wy_ = -pu[1], pu[0]
+            width = 4.0
+            for sgn in (1, -1):
+                zc = pz
+                for s in range(1, 16):
+                    z = _cov_z(px + sgn * wx_ * s * 4.0,
+                               py + sgn * wy_ * s * 4.0, zc)
+                    if z is None:
+                        break
+                    zc = z
+                    width += 4.0
+            return width
+
+        def _narrows_corridor(t):
+            """Would culling t squeeze a nearby walked line under the
+            walkable-width contract (~half a doorway)?
+
+            Only samples whose corridor is ALREADY tight protect their
+            fringe; in a wide room the same fringe triangle culls freely.
+            The width is re-measured against the LIVE mesh, so a chain of
+            culls stops the moment the contract is at risk.
+            """
+            r = 44.0
+            pts = [verts[i] for i in t]
+            cx = sum(p[0] for p in pts) / 3.0
+            cy = sum(p[1] for p in pts) / 3.0
+            cz = sum(p[2] for p in pts) / 3.0
+            for (px_, py_, pz_) in (pts + [(cx, cy, cz)]):
+                for gx in range(int((px_ - r) // pcell),
+                                int((px_ + r) // pcell) + 1):
+                    for gy in range(int((py_ - r) // pcell),
+                                    int((py_ + r) // pcell) + 1):
+                        for (qx, qy, qz, qu) in pgrid.get((gx, gy), ()):
+                            if qu is None:
+                                continue
+                            if ((qx - px_) ** 2 + (qy - py_) ** 2 > r * r
+                                    or (qz is not None
+                                        and abs(qz - pz_) > 60.0)):
+                                continue
+                            if _width_at(qx, qy,
+                                         qz if qz is not None else pz_,
+                                         qu) < 56.0:
+                                return True
+            return False
 
         changed = False
-        for (_r, ti, area) in cands:
+        for (_r, ti, area, samples) in cands:
             if not alive[ti]:
                 continue
             if removed_area + area > budget:
                 continue
+            if samples and not _samples_still_covered(ti, samples):
+                continue                    # sole cover of the walked line
+            if _narrows_corridor(tris[ti]):
+                continue                    # corridor width is a contract
             nbrs = _neighbours(ti)
             if len(nbrs) > 1:
                 target = set(nbrs[1:])
@@ -712,11 +1404,7 @@ def _flip_pass(verts, tris, pin, rounds=3):
     from . import params
 
     def _ratio(a, b, c):
-        p, q, r = verts[a], verts[b], verts[c]
-        e = [math.dist(p[:2], q[:2]), math.dist(q[:2], r[:2]),
-             math.dist(r[:2], p[:2])]
-        lo = min(e)
-        return (max(e) / lo) if lo > 1e-9 else 1e9
+        return _badness(verts, (a, b, c))
 
     def _area2(a, b, c):
         p, q, r = verts[a], verts[b], verts[c]

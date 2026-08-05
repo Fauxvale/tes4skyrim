@@ -1,0 +1,132 @@
+"""Shared loader for the audit-index navmesh tools (render/sweep/compare).
+
+Every diagnostic that regenerates a cell's navmesh in-process needs the same
+four things: the collision cache, the door-centre cache, the audit index
+(`export/<plugin>/audit_index3.pkl`, built by tools/navmesh/audit.py), and a
+way to turn a cell EditorID into the exact argument tuple `build_navmesh`
+receives from the real pipeline.  Keeping that in ONE place is what stops a
+diagnostic from quietly disagreeing with production about, say, whether door
+bases are excluded from blocking collision — a disagreement that makes every
+number the tool prints a lie.
+
+    from tools.navmesh.index import NavIndex
+    idx = NavIndex('export/Oblivion.esm')
+    cell = idx.cell('ImperialDungeon01')
+    verts, tris = cell.build()
+"""
+
+import math
+import os
+import pickle
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from asset_convert import collision_extract as ce  # noqa: E402
+from tes5_import.navmesh import build  # noqa: E402
+from tes5_import.pgrd_to_navm import (  # noqa: E402
+    _collect_doors, load_door_centroids,
+)
+
+DEFAULT_EXPORT = 'export/Oblivion.esm'
+
+
+class CellCtx(object):
+    """One cell, ready to regenerate."""
+
+    def __init__(self, index, rec):
+        self.index = index
+        self.rec = rec
+        self.name = rec.get('EditorID') or ''
+        self.fid = (rec.get('FormID') or '').upper()
+        pg = index.pgrd_by_cell.get(self.fid)
+        import tools.navmesh.audit as na
+        self.nodes, self.edges = na._pgrd_nodes(pg) if pg is not None else ([], [])
+        self.refrs = index.refr_by_cell.get(self.fid, [])
+        self.doors = _collect_doors(self.refrs, index.door_fids)
+        self.land = index.land_by_cell.get(self.fid)
+
+    @property
+    def has_pathgrid(self):
+        return bool(self.nodes)
+
+    def build(self):
+        """Regenerate this cell's navmesh exactly as the pipeline would."""
+        verts, tris = build.build_navmesh(
+            self.refrs, self.index.base_model, ce.get_collision,
+            self.nodes, self.edges, land_rec=self.land,
+            doors=[(x, y, z, r, tp, w)
+                   for (x, y, z, r, _f, tp, w) in self.doors],
+            door_bases=set(self.index.door_fids.keys()))
+        return verts, [tuple(int(i) for i in tri[:3]) for tri in tris]
+
+    def collision(self):
+        """(walkable, blocking) placed collision triangles for this cell.
+
+        The blocking set is what makes a render readable: the walls are the
+        reason a corridor stops where it does.
+        """
+        from tes5_import.navmesh import world
+        return world.gather_cell_geometry(
+            self.refrs, self.index.base_model, ce.get_collision,
+            land_rec=self.land,
+            skip_bases=set(self.index.door_fids.keys()))
+
+    def walked_samples(self, step=16.0):
+        """Yield (x, y, z) points along every pathgrid edge.
+
+        The pathgrid is the authored ground truth: a point here with no navmesh
+        under it is always a generation failure, never a false positive.
+        """
+        for (a, b) in self.edges:
+            pa, pb = self.nodes[a], self.nodes[b]
+            n = max(2, int(math.dist(pa[:2], pb[:2]) / step) + 1)
+            for i in range(n + 1):
+                f = i / n
+                yield (pa[0] + (pb[0] - pa[0]) * f,
+                       pa[1] + (pb[1] - pa[1]) * f,
+                       pa[2] + (pb[2] - pa[2]) * f)
+
+
+class NavIndex(object):
+    def __init__(self, export=DEFAULT_EXPORT, quiet=True):
+        self.export = export
+        ce.load_collision(os.path.join(export, 'collision_cache.bin'), quiet=quiet)
+        load_door_centroids(os.path.join(export, 'door_centers_cache.json'),
+                            quiet=quiet)
+        with open(os.path.join(export, 'audit_index3.pkl'), 'rb') as fh:
+            (self.base_model, self.refr_by_cell, self.pgrd_by_cell,
+             self.land_by_cell, self.door_fids, self.cells) = pickle.load(fh)
+        self._by_name = {}
+        for c in self.cells:
+            eid = (c.get('EditorID') or '').lower()
+            if eid:
+                self._by_name.setdefault(eid, c)
+        self._by_fid = {(c.get('FormID') or '').upper(): c for c in self.cells}
+
+    def cell(self, name_or_fid):
+        """Look up by EditorID (case-insensitive) or by FormID hex."""
+        rec = self._by_name.get(str(name_or_fid).lower())
+        if rec is None:
+            rec = self._by_fid.get(str(name_or_fid).upper().lstrip('0X').rjust(8, '0'))
+        if rec is None:
+            rec = self._by_fid.get(str(name_or_fid).upper())
+        if rec is None:
+            return None
+        return CellCtx(self, rec)
+
+    def cell_of_ref(self, refid):
+        """Find the cell containing a placed reference (FormID hex).
+
+        Lets a bug report phrased as "the area around 1a01fc1e is mangled" be
+        turned straight into a cell + a bounding box, with no manual hunting.
+        """
+        key = str(refid).upper().lstrip('0X').rjust(8, '0')
+        for fid, refrs in self.refr_by_cell.items():
+            for r in refrs:
+                if (r.get('FormID') or '').upper().lstrip('0X').rjust(8, '0') == key:
+                    rec = self._by_fid.get(fid)
+                    if rec is None:
+                        return None, r
+                    return CellCtx(self, rec), r
+        return None, None

@@ -260,7 +260,7 @@ threshold axis, **width 0**. `navmesh_cell_check.py` additionally never called
 `load_door_centroids` at all. So every generated-cell tool silently graded doors
 with the default orientation and no width — the exact opposite of what shipped.
 If a door metric from a debug tool disagrees with the ESM, check this first.
-`navmesh_probe.py` (and therefore `navmesh_preview.py`) always loaded it.
+`tools/navmesh/index.py` (and therefore `tools/navmesh/render.py`) always loaded it.
 
 ### Drop-downs are EDGE LINKS, not bridging triangles
 
@@ -545,7 +545,7 @@ Two smaller sources found alongside it:
   in `native/src/decimate.cpp` (rebuild with `python native/build.py`).
 
 Verified on all 16 worst-offending cells from the shipped ESM (10 interior +
-6 exterior): every one now reports CLEAN under `tools/navmesh_check.py`'s rules,
+6 exterior): every one now reports CLEAN under `tools/navmesh/check.py`'s rules,
 with coverage/steep/island metrics unchanged.
 
 ### Exterior coverage (the "discontinuities with no obstacles" fixes)
@@ -601,8 +601,8 @@ apart are simply never adjacent, so a cross-floor triangle is *unrepresentable*.
 Result over 150 interior cells: **0 wrong-floor, 0 steep, 0.9% of pathgrid length
 uncovered** (was 2.5% uncovered / 2452 broken pathgrid edges with contours).
 
-- **Quality invariants** (`tools/navmesh_audit.py --interiors N` sweeps many cells
-  in parallel; `tools/navmesh_tri_check.py --cell <id>` for one). The metric that matters is
+- **Quality invariants** (`tools/navmesh/audit.py --interiors N` sweeps many cells
+  in parallel; `tools/navmesh/tri_check.py --cell <id>` for one). The metric that matters is
   **BROKEN PATHGRID EDGES** — an edge whose two ends land on navmesh an NPC cannot
   cross between. A raw component count is NOT a bug metric: a cave with six
   chambers this cell's pathgrid never links is legitimately six components.
@@ -657,7 +657,7 @@ uncovered** (was 2.5% uncovered / 2452 broken pathgrid edges with contours).
   which annihilated the offset and put exterior terrain ~16,700u below its own
   REFRs (Tamriel 47,6: terrain 829..3213 vs objects 18288..19776). This was the
   dominant coverage bug (pathgrid-on-floor 32%→92%).
-- **Iteration tools**: `python tools/navmesh_preview.py --cell <FormID_or_EditorID>`
+- **Iteration tools**: `python tools/navmesh/render.py <cell> [--collision]`
   renders the generated navmesh (green) OVER the collision layer — walkable dim,
   BLOCKING/walls RED — plus pathgrid and door markers (cyan threshold lines;
   white core = teleport door). `--focus X,Y --span N` zooms a world-coord
@@ -665,21 +665,21 @@ uncovered** (was 2.5% uncovered / 2452 broken pathgrid edges with contours).
   colours steep triangles red and needles magenta. Exterior cells can be
   addressed as `--cell grid:X:Y` (colon form survives comma-list splitting;
   Windows filenames can't hold `:` so outputs sanitize it).
-  `tools/navmesh_tri_check.py --cell A,B,...` checks EVERY triangle of a
+  `tools/navmesh/tri_check.py --cell A,B,...` checks EVERY triangle of a
   cell's mesh (slope/zspan/edge-ratio/aspect/area + JUT/SINK = signed distance
   off the real collision surface at its own XY) and lists offenders — the way
   the furniture-hoist and needle defects were found and verified fixed.
-  `tools/navmesh_probe.py --cell X` reports pathgrid-on-floor coverage and Z
+  `tools/navmesh/probe.py --cell X` reports pathgrid-on-floor coverage and Z
   error; `--probe X,Y` dumps nearby REFRs/pathgrid plus the span column
   raw/stamped/filtered — the ground-truth view of any one spot.
-  `tools/navmesh_audit.py --interiors N --exteriors M` sweeps both cell kinds
+  `tools/navmesh/audit.py --interiors N --exteriors M` sweeps both cell kinds
   and reports UNCOV%/BROKEN/STEEP/FLOOR/ISL/TINY/SLIV%/MICRO per cell (UNCOV
   measures the EDGE's z-range, not the chord — the generator follows the
   surface, and a long cave edge's chord cuts open air two storeys up).
-  `tools/navmesh_profile.py --cell X` cProfiles one cell's build (how the
+  `tools/navmesh/perf.py --cell X` cProfiles one cell's build (how the
   shadowed()/plane_err hotspots were found).
 - **NVNM binary layout** (validated byte-exact against Skyrim.esm via
-  `tools/navmesh_dump.py`): all arrays use U32 count prefixes; CRC of
+  `tools/navmesh/dump.py`): all arrays use U32 count prefixes; CRC of
   "PathingCell" = `0xA5E9A03C`; parent union decided by (Parent Worldspace==0)
   → interior = FormID Parent Cell, exterior = `S16 Grid Y` then `S16 Grid X`;
   `Max X/Y Distance` = bbox span / divisor; NavMeshGrid = divisor² arrays each
@@ -706,7 +706,7 @@ uncovered** (was 2.5% uncovered / 2452 broken pathgrid edges with contours).
   two-storey separation, staircase), wall-doesn't-swallow-floor, rug walked over
   vs table routed around, walls contain the mesh, contour orientation,
   triangulation area/holes, VHGT offset, NVNM/NAVI layout).
-- **Reusable tool**: `python tools/navmesh_dump.py <esm> [--navi|--navm]
+- **Reusable tool**: `python tools/navmesh/dump.py <esm> [--navi|--navm]
   [--nvnm-decode] [--max N]` — decompresses + decodes real NAVI/NAVM/NVNM for
   format verification (this is how the layout was validated against Skyrim.esm).
 
@@ -757,7 +757,7 @@ deterministic, see the parallelism rules in CLAUDE.md):
    `1<<edgeIndex` and replace that edge field with the index into its own Edge
    Links array.
 
-**Audit tool**: `python tools/navmesh_connectivity.py <esm> [--ref Skyrim.esm]
+**Audit tool**: `python tools/navmesh/connectivity.py <esm> [--ref Skyrim.esm]
 [--cell gx,gy]` — reports exterior link coverage vs the vanilla 84% baseline,
 link-type mix, door-triangle counts, and internal consistency between
 link-flagged triangle edges and Edge Link entries. Exits non-zero while coverage
@@ -798,10 +798,10 @@ PGRI, so no ribbon ever crossed a boundary.
    the neighbour cell (the "clip at seam, links only" model).
 
 **Verified** on the 8 Anvil cells around Pinarus (worldspace 0x0001C31A, grid
-x −48..−46, y −9..−7) via `tools/navmesh_seam_probe.py`: before = 8 isolated
+x −48..−46, y −9..−7) via `tools/navmesh/seam_probe.py`: before = 8 isolated
 islands; after = **104 reciprocal Portal links, all 8 cells in ONE connected
 component**. InterCell yield jumped with the export fix (e.g. grid (−47,−8):
-30→42 of 58 kept; total portals in the patch 30→104). `tools/navmesh_seam_probe.py
+30→42 of 58 kept; total portals in the patch 30→104). `tools/navmesh/seam_probe.py
 --wrld <hex> --gx lo hi --gy lo hi` reports per-cell seam-edge counts, InterCell
 kept/raw, reciprocity, and the connected-component structure for a cell range —
 use it to spot-check a region without a full rebuild.
@@ -810,7 +810,7 @@ use it to spot-check a region without a full rebuild.
 
 The edge-link stitching above was necessary but NOT sufficient — Arielle
 (MG04, destination in her OWN cell, mesh verified connected across the stairs
-by `tools/navmesh_reach.py`) still never walked. Two more defects in the NAVI
+by `tools/navmesh/reach.py`) still never walked. Two more defects in the NAVI
 record itself, both now fixed:
 
 1. **NAVI must be written as an OVERRIDE of Skyrim.esm's `0x00012FB4`.** The
@@ -865,7 +865,7 @@ shipped builds, which scrambles any existing save's script/dialogue state. The
 import now burns one id at the same point to keep the layout stable. Never
 add or remove an `alloc_formid()` call without accounting for this.
 
-**Reachability tool**: `python tools/navmesh_reach.py <esm> --from-ref <fid>
+**Reachability tool**: `python tools/navmesh/reach.py <esm> --from-ref <fid>
 --to-ref <fid> [--cell <fid> --components]` — decodes every NAVM, builds the
 (mesh, component) graph over NVNM edge links + door-XTEL joins, locates both
 endpoints, and answers REACHABLE yes/no with component/z-range detail. This is

@@ -16,9 +16,9 @@ checks every produced triangle against the cell's real collision:
                  storey but which are EDGE-CONNECTED (the mesh joined storeys)
 
 Usage:
-    python tools/navmesh_grow_check.py --cell AnvilFightersGuild
-    python tools/navmesh_grow_check.py --cell AnvilFightersGuild --fixed
-    python tools/navmesh_grow_check.py --cells A,B --dump temp/defects.txt
+    python tools/navmesh/grow_check.py --cell AnvilFightersGuild
+    python tools/navmesh/grow_check.py --cell AnvilFightersGuild --fixed
+    python tools/navmesh/grow_check.py --cells A,B --dump temp/defects.txt
 """
 
 import argparse
@@ -28,11 +28,11 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from tes5_import.navmesh import (build, corridor, corridor_clean,   # noqa: E402
                                  corridor_grow, params, world)
-from tools.navmesh_probe import load_cell                           # noqa: E402
+from tools.navmesh.probe import load_cell                           # noqa: E402
 
 
 def _centroid(v, t):
