@@ -1,0 +1,160 @@
+"""Tests for tools/release_notes.py -- the path->GUI-step map used to annotate
+each auto-tag (.github/workflows/tag-on-push.yml).
+
+The bug these guard against: the notes told the user to re-run all 12 steps for
+changes that only touched one stage.  Two causes, both covered below --
+convert.py mapping to "ALL" regardless of which phase_* function changed, and
+paths with no rule (TESGameSelect/, process_job.py, external/) falling into the
+"unmapped -> select everything" precaution.
+"""
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+
+import release_notes as rn  # noqa: E402
+
+
+def steps(path):
+    ordered, unmatched, _ = rn.steps_for_paths([path])
+    assert not unmatched, f"{path} matched no rule"
+    return ordered
+
+
+# ── Every rule maps to a real GUI step ────────────────────────────────────
+
+def test_rule_targets_are_known_steps():
+    for _pattern, mapped in rn.RULES:
+        for step in mapped:
+            assert step in rn.STEP_ORDER or step in ("ALL", "GUI", "CONVERT"), step
+
+
+def test_phase_map_targets_are_known_steps():
+    for func, mapped in rn.PHASE_STEPS.items():
+        for step in mapped:
+            assert step in rn.STEP_ORDER, f"{func} -> {step}"
+
+
+# ── Stage packages imply their own step, not every step ───────────────────
+
+@pytest.mark.parametrize("path,expected", [
+    ("tes5_import/record_types/actors.py", "6. Import"),
+    ("script_convert/converter.py",        "8. Scripts"),
+    ("asset_convert/nif_converter.py",     "3. Meshes"),
+    ("asset_convert/audio_converter.py",   "7. Sounds"),
+    ("asset_convert/lod_gen.py",           "9. LOD"),
+    ("asset_convert/bsa_extract.py",       "2. Extract"),
+    ("asset_convert/spt_reader.py",        "4. SpeedTrees"),
+    ("asset_convert/hkx_convert.py",       "5. Creatures"),
+])
+def test_stage_paths_are_narrow(path, expected):
+    got = steps(path)
+    assert expected in got
+    assert len(got) < len(rn.STEP_ORDER), f"{path} selected everything"
+
+
+def test_export_also_implies_import():
+    """The text cache Export writes is Import's only input."""
+    assert steps("tes4_export/record_types/actors.py")[:2] == ["1. Export", "6. Import"]
+
+
+# ── Non-pipeline paths cost nothing ───────────────────────────────────────
+
+@pytest.mark.parametrize("path", [
+    "docs/pipeline_reference.md",
+    "tests/test_import.py",
+    "tools/release_notes.py",
+    "TODO.txt",
+    "CLAUDE.md",
+    ".github/workflows/tag-on-push.yml",
+    # Standalone starter plugin: built by tools/, read by no pipeline step.
+    "TESGameSelect/dist/TESGameSelect.esp",
+    "TESGameSelect/scripts/source/TESGameSelectQuest.psc",
+    # Vendored binaries.
+    "external/bsarch/bsarch.exe",
+    "TESConversion.code-workspace",
+])
+def test_non_pipeline_paths_need_no_rerun(path):
+    assert steps(path) == []
+
+
+def test_gui_change_is_reported_as_gui_only():
+    ordered, unmatched, gui_only = rn.steps_for_paths(["gui.py"])
+    assert not unmatched and ordered == [] and gui_only
+
+
+# ── Packaging is a consequence, never a standalone reason ─────────────────
+
+def test_packaging_follows_a_producing_step():
+    assert set(rn.PACKAGING_STEPS) <= set(steps("tes5_import/import_main.py"))
+
+
+def test_patch_skyrim_alone_does_not_drag_in_packaging():
+    """Patch Skyrim writes a standalone ARMA patch that BSA/zip never read."""
+    assert steps("asset_convert/modify_body_meshes.py") == ["10. Patch Skyrim"]
+
+
+# ── Shared plumbing legitimately means everything ─────────────────────────
+
+@pytest.mark.parametrize("path", [
+    "process_job.py", "worker_budget.py", "subprocess_flags.py",
+])
+def test_pool_plumbing_implies_all_steps(path):
+    assert steps(path) == rn.STEP_ORDER
+
+
+def test_unmapped_path_still_selects_everything():
+    """The precaution must stay for genuinely new top-level packages."""
+    ordered, unmatched, _ = rn.steps_for_paths(["brand_new_package/thing.py"])
+    assert unmatched == ["brand_new_package/thing.py"]
+    assert ordered == rn.STEP_ORDER
+
+
+# ── convert.py resolves per phase_* function ──────────────────────────────
+
+def test_every_phase_function_in_convert_py_is_mapped():
+    """A new phase_* function must get a PHASE_STEPS entry, or convert.py
+    changes silently fall back to selecting all 12 steps."""
+    src = (rn.SCRIPT_DIR / "convert.py").read_text(encoding="utf-8")
+    import re
+    found = set(re.findall(r"^def (phase_\w+)", src, re.MULTILINE))
+    assert found - set(rn.PHASE_STEPS) == set(), "unmapped phase_* function"
+
+
+def test_convert_py_narrows_to_the_changed_phase(monkeypatch):
+    monkeypatch.setattr(rn, "_run", lambda a: (
+        "@@ -580,17 +580,37 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,\n"
+        "@@ -639,15 +659,28 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,\n"
+    ))
+    assert rn.convert_py_steps("0.39", "0.40") == ["9. LOD"]
+
+
+def test_convert_py_declines_to_narrow_for_shared_code(monkeypatch):
+    """A hunk in main() or at module scope affects any step -- fall back."""
+    monkeypatch.setattr(rn, "_run", lambda a: (
+        "@@ -580,17 +580,37 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,\n"
+        "@@ -788,4 +822,4 @@ def main():\n"
+    ))
+    assert rn.convert_py_steps("0.18", "0.19") is None
+
+
+def test_convert_py_fallback_selects_all_steps():
+    ordered, unmatched, _ = rn.steps_for_paths(["convert.py"], None)
+    assert not unmatched
+    assert ordered == rn.STEP_ORDER
+
+
+def test_convert_py_uses_supplied_attribution():
+    ordered, _, _ = rn.steps_for_paths(["convert.py"], ["9. LOD"])
+    assert "9. LOD" in ordered
+    assert "1. Export" not in ordered
+
+
+# ── Output shape ──────────────────────────────────────────────────────────
+
+def test_steps_are_emitted_in_gui_order():
+    ordered, _, _ = rn.steps_for_paths(
+        ["asset_convert/lod_gen.py", "tes4_export/x.py", "script_convert/y.py"])
+    assert ordered == [s for s in rn.STEP_ORDER if s in ordered]

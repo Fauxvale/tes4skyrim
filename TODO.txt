@@ -51,6 +51,8 @@ Later Issues:
 
 	12 - Speed up child LOD gen and add menu option
 
+	13 - Trap damage
+
 Minor Issues:
 
 	1 -	Override gold with skyrim gold

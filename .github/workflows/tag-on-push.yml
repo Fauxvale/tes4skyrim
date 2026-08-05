@@ -8,6 +8,12 @@ on:
 permissions:
   contents: write
 
+# A second push while the first run is still tagging would compute the same
+# "next" tag and fail on the push.  Serialise instead.
+concurrency:
+  group: tag-on-push
+  cancel-in-progress: false
+
 jobs:
   tag:
     runs-on: ubuntu-latest
@@ -16,6 +22,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,9 +31,18 @@ jobs:
 
       - name: Compute and push next tag
         run: |
-          git fetch --tags
+          set -euo pipefail
+          git fetch --tags --force
 
           latest=$(git tag -l '[0-9]*.[0-9][0-9]' | sort -t. -k1,1n -k2,2n | tail -n1)
+
+          # Nothing to do if HEAD is already tagged -- e.g. a workflow re-run,
+          # or a push that only moved a branch pointer.
+          if [ -n "$latest" ] && [ "$(git rev-parse "$latest^{commit}")" = "$(git rev-parse HEAD)" ]; then
+            echo "HEAD is already tagged $latest -- nothing to do."
+            echo "HEAD is already tagged \`$latest\`; no new tag created." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
           if [ -z "$latest" ]; then
             cents=0
@@ -36,10 +52,15 @@ jobs:
             cents=$((10#$major * 100 + 10#$minor))
           fi
 
-          next_cents=$((cents + 1))
-          next_major=$((next_cents / 100))
-          next_minor=$((next_cents % 100))
-          next_tag=$(printf "%d.%02d" "$next_major" "$next_minor")
+          # Advance past any name already taken (a tag created out of sort
+          # order, or a race the concurrency group didn't cover).
+          next_cents=$cents
+          while :; do
+            next_cents=$((next_cents + 1))
+            next_tag=$(printf "%d.%02d" $((next_cents / 100)) $((next_cents % 100)))
+            git rev-parse -q --verify "refs/tags/$next_tag" >/dev/null || break
+            echo "Tag $next_tag already exists, trying the next one."
+          done
 
           echo "Latest tag: ${latest:-<none>}"
           echo "Next tag: $next_tag"

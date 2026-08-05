@@ -137,6 +137,37 @@ theories externally first.
 
 - **NEVER STOP TO GIVE A MID-SESSION STATUS REPORT.** Not "here's where I am",
   not "should I continue?", not a summary of progress so far. Finish the whole task, then report once. A status update mid-task is a failure, not politeness. If something the user has asked for remains unsolved, YOU ARE NOT DONE!
+
+  <a id="no-stopping"></a>**The stop rule has NO exceptions. Low confidence is
+  not one.** Every violation of this rule in practice has come from the same
+  place: being wrong two or three times in a row, losing confidence, and
+  reaching for confirmation before "wasting" another build cycle. That instinct
+  feels like diligence. It is the exact failure this rule exists to prevent —
+  the moment you most want to stop is the moment stopping costs the user most.
+  The tradeoff is ALREADY DECIDED: **the user would rather you finish and be
+  wrong than stop and ask.** Do not re-derive that decision. It is not yours.
+
+  These are all violations, no matter how they are phrased:
+  - "I'd rather confirm the diagnosis before proceeding, given my track record"
+  - "Two paths here, which do you want?" (pick the better one and say why in the
+    final report)
+  - "Want me to X, or stop at Y?" — just do X
+  - Ending a turn with findings + a question instead of findings + a finished fix
+  - "I haven't started it — say the word and I'll go" — you had the word already
+  - A summary that *reads* complete but leaves the task unfixed
+
+  **Uncertainty is reported, never resolved by asking.** If you are unsure,
+  state the assumption plainly IN THE FINAL REPORT, having already done the
+  work under it. If two approaches are viable, implement the one you'd defend
+  and note the alternative at the end. If part of the task is genuinely blocked,
+  finish every unblocked part, then say exactly what was blocked and why.
+  A question is only ever permitted when proceeding would be UNSAFE or
+  DESTRUCTIVE (deleting the user's data, force-pushing, writing during a
+  recovery) — never because you are unsure whether your fix is right.
+
+  **Being wrong repeatedly does not earn a check-in — it obligates you to keep
+  going.** Go back to the sources in "Verifying your work", find a DIFFERENT
+  mechanism, implement it, build it, and report once at the end.
 - **Measure the invariant the user asked for, not a proxy for it.**
 - **Trust the user's in-game test results as ground truth.** Never question
   whether they tested something, and never rebut a reported result with file

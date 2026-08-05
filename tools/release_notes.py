@@ -78,20 +78,50 @@ RULES: list[tuple[str, list[str]]] = [
 
     # ── Native / shared code: conservatively wide ─────────────────────────
     (r"^native/",                 ["3. Meshes", "5. Creatures", "9. LOD"]),
-    (r"^convert\.py$",            ["ALL"]),
+    # convert.py is resolved per-phase-function instead (see PHASE_STEPS);
+    # "ALL" here is only the fallback when the hunks can't be attributed.
+    (r"^convert\.py$",            ["CONVERT"]),
     (r"^gui\.py$|^gui\.pyw$",     ["GUI"]),
-    (r"^worker_budget\.py$|^subprocess_flags\.py$", ["ALL"]),
+    (r"^collision_options\.py$",  ["3. Meshes"]),
+    # Process-pool plumbing: every worker-based stage runs through these.
+    (r"^worker_budget\.py$|^subprocess_flags\.py$|^process_job\.py$", ["ALL"]),
 
     # ── Non-pipeline: never a reason to re-run anything ───────────────────
     (r"^docs/",                   []),
     (r"^tests/",                  []),
     (r"^tools/",                  []),
     (r"^references/",             []),
+    (r"^external/",               []),
     (r"^\.github/",               []),
     (r"^\.claude/|^\.vscode/",    []),
+    # Standalone starter plugin, built by tools/make_game_select_esp.py and
+    # shipped as-is -- none of the 12 pipeline steps read or write it.
+    (r"^TESGameSelect/",          []),
     (r"^CLAUDE\.md$|^README\.md$|^TODO\.txt$|^CK_WARNINGS", []),
     (r"^conversion_config\.json$|^pyproject\.toml$|^\.git\w+$", []),
+    (r"^[^/]+\.code-workspace$", []),
 ]
+
+# convert.py hosts one phase_* function per GUI step.  A change inside exactly
+# one of them implies only that step -- historically the blanket "ALL" here was
+# the single biggest source of "re-run everything" noise (e.g. 0.40, whose
+# convert.py diff was entirely inside phase_lod).
+PHASE_STEPS: dict[str, list[str]] = {
+    "phase_export":             ["1. Export"],
+    "phase_extract":            ["2. Extract"],
+    "phase_assets":             ["3. Meshes"],
+    "phase_prune_textures":     ["3. Meshes"],
+    "phase_speedtrees":         ["4. SpeedTrees"],
+    "phase_creatures":          ["5. Creatures"],
+    "phase_import":             ["6. Import"],
+    "phase_sounds":             ["7. Sounds"],
+    "phase_scripts":            ["8. Scripts"],
+    "phase_compile":            ["8. Scripts"],
+    "phase_lod":                ["9. LOD"],
+    "phase_modify_body_meshes": ["10. Patch Skyrim"],
+    "phase_pack":               ["11. Pack BSAs"],
+    "phase_pack_zip":           ["12. Pack Mod Zip"],
+}
 
 
 def _run(args: list[str]) -> str:
@@ -142,8 +172,49 @@ def changed_files(rev_from: str | None, rev_to: str) -> list[str]:
     return [p for p in out.splitlines() if p.strip()]
 
 
-def steps_for_paths(paths: list[str]) -> tuple[list[str], list[str], bool]:
+_HUNK_FUNC = re.compile(r"^@@ .*? @@\s*(?:def\s+)?([A-Za-z_]\w*)")
+
+
+def convert_py_steps(rev_from: str | None, rev_to: str) -> list[str] | None:
+    """Steps implied by a convert.py change, resolved per phase_* function.
+
+    Git's hunk headers name the enclosing function, so a diff confined to
+    phase_lod costs only the LOD step.  Returns None when the change can't be
+    attributed -- shared helpers, main(), module scope, or a brand-new file --
+    in which case the caller falls back to every step.
+    """
+    if not rev_from:
+        return None
+    try:
+        diff = _run(["diff", "-U0", f"{rev_from}..{rev_to}", "--", "convert.py"])
+    except subprocess.CalledProcessError:
+        return None
+
+    steps: set[str] = set()
+    for line in diff.splitlines():
+        if not line.startswith("@@"):
+            continue
+        m = _HUNK_FUNC.match(line)
+        if not m:
+            # Hunk outside any function (imports, constants) -- affects
+            # everything, so don't narrow.
+            return None
+        mapped = PHASE_STEPS.get(m.group(1))
+        if mapped is None:
+            # main(), a shared helper, or an unknown function.
+            return None
+        steps.update(mapped)
+
+    return sorted(steps) if steps else None
+
+
+def steps_for_paths(paths: list[str],
+                    convert_steps: list[str] | None = None,
+                    ) -> tuple[list[str], list[str], bool]:
     """→ (ordered steps to re-run, paths no rule matched, gui_only_change).
+
+    `convert_steps` is the per-phase attribution of a convert.py change from
+    `convert_py_steps`; None means "couldn't narrow it", i.e. every step.
 
     `gui_only_change` is True when the GUI itself changed but nothing that
     alters conversion output did -- the user needs a fresh GUI, not a re-run.
@@ -163,6 +234,11 @@ def steps_for_paths(paths: list[str]) -> tuple[list[str], list[str], bool]:
                     run_all = True
                 elif "GUI" in mapped:
                     gui_touched = True
+                elif "CONVERT" in mapped:
+                    if convert_steps is None:
+                        run_all = True
+                    else:
+                        steps.update(convert_steps)
                 else:
                     steps.update(mapped)
                 break
@@ -178,7 +254,10 @@ def steps_for_paths(paths: list[str]) -> tuple[list[str], list[str], bool]:
     if unmatched:
         steps.update(STEP_ORDER)
 
-    if steps:
+    # Packaging only matters once something it packages was rebuilt.  "Patch
+    # Skyrim" writes a standalone ARMA patch that the BSA/zip steps never read,
+    # so it must not drag packaging in on its own.
+    if steps - {"10. Patch Skyrim"}:
         steps.update(PACKAGING_STEPS)
 
     ordered = [s for s in STEP_ORDER if s in steps]
@@ -188,7 +267,8 @@ def steps_for_paths(paths: list[str]) -> tuple[list[str], list[str], bool]:
 def build_notes(tag: str | None, rev_from: str | None, rev_to: str) -> str:
     commits = commits_between(rev_from, rev_to)
     paths = changed_files(rev_from, rev_to)
-    steps, unmatched, gui_only = steps_for_paths(paths)
+    steps, unmatched, gui_only = steps_for_paths(
+        paths, convert_py_steps(rev_from, rev_to))
 
     lines: list[str] = []
     lines.append(f"Release {tag}" if tag else "Release notes")
