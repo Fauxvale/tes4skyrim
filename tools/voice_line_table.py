@@ -44,7 +44,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tools.tes5_esm_reader import read_tes5_file, _get, _all, _zstring  # noqa: E402
+from tools.tes5_esm_reader import (read_tes5_file, _get, _all, _zstring,  # noqa: E402
+                                   master_edids)
 from tools.voice_audit import voice_file_prefix  # noqa: E402
 
 FUNC_GET_IS_ID = 72
@@ -152,7 +153,14 @@ def main():
         elif r.type == 'INFO':
             if _get(r, 'TRDT') is not None:
                 infos.append(r)
-    print(f'  {len(infos)} voiced INFOs, {len(npc_edid)} NPCs')
+    # A dependent plugin's actors carry a VTCK (and its topics an owning
+    # quest) that lives in a MASTER — Morroblivion's Jiub points at
+    # Oblivion.esm's TES4MaleHighElf. Resolving from this plugin's records
+    # alone reports every such line NO_VTCK and hides the real status.
+    vtyp_edid.update(master_edids(args.esm, header, 'VTYP'))
+    qust_edid.update(master_edids(args.esm, header, 'QUST'))
+    print(f'  {len(infos)} voiced INFOs, {len(npc_edid)} NPCs, '
+          f'{len(vtyp_edid)} VTYPs, {len(qust_edid)} QUSTs')
 
     voice_dir = Path(args.voice_dir)
     folders = {d.name.lower(): d.name for d in voice_dir.iterdir()

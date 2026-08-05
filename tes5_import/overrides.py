@@ -461,6 +461,23 @@ def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
 
     new_done, unattached = _attach_new_records(new_records, ctx, pending)
 
+    # A bark INFO handed back above needs its parent DIAL in the same batch or
+    # the normal builder has no topic to group it under. That parent is the
+    # MASTER's shared GREETING/HELLO record, which this loop just counted as an
+    # unchanged override and dropped — so re-add this plugin's own copy of it.
+    # The builder re-keys it into per-quest topics of our own; the master's
+    # record is left untouched (we ship no override for it).
+    _bark_parents = {(r.get('ParentDIAL') or '').upper()
+                     for s, r in unattached if s == 'INFO'}
+    if _bark_parents:
+        seen = {(r.get('FormID') or '').upper()
+                for s, r in unattached if s == 'DIAL'}
+        for rec in by_type.get('DIAL', []):
+            fid = (rec.get('FormID') or '').upper()
+            if fid in _bark_parents and fid not in seen:
+                unattached.append(('DIAL', rec))
+                dropped -= 1
+
     emitted, orphaned, anchored = emit_nested_overrides(
         pending, writer, ctx.master_index)
     msg = (f"  {label} overrides: {emitted} emitted in the master's "
@@ -489,6 +506,30 @@ _NEW_NESTED_PARENT = {
 }
 
 
+def _is_bark_parent(rec: dict, ctx: OverrideContext) -> bool:
+    """True when this new INFO's parent DIAL is a MASTER-owned BARK topic.
+
+    GREETING/HELLO/Attack/Idle and friends are engine-named topics shared by
+    every plugin, so a dependent plugin's own bark lines all point at the
+    master's copy. They must go through the normal bark builder (which splits
+    them into per-quest topics and gates them) rather than being nested under
+    the master's topic — see the comment at the call site.
+
+    Read from the MASTER export, since the parent record is the master's.
+    """
+    from .dialog_converter import classify_topic
+    from .text_reader import get_int
+    parent_src = (rec.get('ParentDIAL') or '').upper()
+    if not parent_src:
+        return False
+    parent = (ctx.master_export or {}).get(parent_src)
+    if parent is None:
+        return False
+    _cat, _sub, _snam, is_bark = classify_topic(
+        parent.get('EditorID') or '', get_int(parent, 'DATA.Type'))
+    return is_bark
+
+
 def _attach_new_records(new_records: list, ctx: OverrideContext,
                         pending: list) -> tuple:
     """Convert NEW records that live inside a MASTER's GRUP tree.
@@ -514,6 +555,25 @@ def _attach_new_records(new_records: list, ctx: OverrideContext,
     for sig, rec in new_records:
         parent_key = _NEW_NESTED_PARENT.get(sig)
         parent_src = (rec.get(parent_key) or '') if parent_key else ''
+        # A NEW INFO under a master BARK topic must NOT be nested here.
+        # GREETING/HELLO are shared, engine-named topics every plugin fills, so
+        # every one of this plugin's own greetings resolves to the master's
+        # single GREETING DIAL — and nesting them there:
+        #   * bypasses the dialogue pipeline entirely (the bare convert_INFO
+        #     below emits no GetIsVoiceType, no quest gate, no unlock gate:
+        #     0 of Morroblivion's 2,727 greetings had a voice gate, against
+        #     15,574 everywhere else), and
+        #   * defeats the one-bark-topic-per-quest split. Skyrim honours ONE
+        #     HELO topic per owning quest, and the master's GREETING is owned
+        #     by the MASTER's quest, so 2,727 greetings spanning 384 different
+        #     quests all landed under a topic gated on Oblivion's Charactergen
+        #     — dead for the whole game. Vanilla splits GREETING into 271
+        #     per-quest topics for exactly this reason.
+        # Sending them back as `unattached` makes the normal builder emit this
+        # plugin's OWN per-quest bark topics, fully gated.
+        if sig == 'INFO' and _is_bark_parent(rec, ctx):
+            unattached.append((sig, rec))
+            continue
         parent_out = (master_output_formid(parent_src.upper(),
                                            ctx.master_manifest)
                       if parent_key else 0)

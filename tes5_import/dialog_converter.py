@@ -170,6 +170,51 @@ def _collect_all_scro_properties(rec: dict, fid_to_edid: dict) -> dict:
     return props
 
 
+def _quest_well_known_refs(rec: dict, xref=None) -> set:
+    """Names of synthesized ('well-known') records this quest's stage scripts use.
+
+    A QF_ fragment declares a property for every synthesized record its result
+    scripts touch — TES4ControlsDisabled for (Disable|Enable)PlayerControls,
+    TES4Fame/TES4Infamy, TES4CyrodiilCrimeFaction, TES4Msg_* for button menus.
+    None of these exist in the TES4 export, so they resolve only through the
+    well-known registry; running the same converter the .psc was generated from
+    is what tells us WHICH of them the script actually declares, instead of
+    binding all ~1,880 registry entries to every quest.
+
+    Best-effort: a converter failure yields an empty set, and the property is
+    simply left unbound exactly as before this filtering existed.
+    """
+    scripts = []
+    record_script = get_str(rec, 'ResultScript')
+    if record_script:
+        scripts.append(record_script)
+    for i in range(get_int(rec, 'StageCount')):
+        log_count = get_int(rec, f'Stage[{i}].LogCount')
+        if log_count:
+            for j in range(log_count):
+                src = get_str(rec, f'Stage[{i}].Log[{j}].ResultScript')
+                if src.strip():
+                    scripts.append(src)
+        else:
+            src = get_str(rec, f'Stage[{i}].ResultScript')
+            if src.strip():
+                scripts.append(src)
+    if not scripts or xref is None:
+        return set()
+
+    # One converter for all stages: convert_fragment deliberately preserves
+    # _property_refs across calls, which is how the QF_ generator accumulates
+    # the single declaration list the whole script shares.
+    from script_convert.converter import ScriptConverter
+    conv = ScriptConverter(xref)
+    for src in scripts:
+        try:
+            conv.convert_fragment(src, 'Quest')
+        except Exception:
+            continue
+    return set(conv._property_refs)
+
+
 def _quest_stage_fragments(rec: dict) -> list:
     """List (stage_index, log_index) tuples that need a Papyrus fragment.
 
@@ -682,7 +727,7 @@ def convert_QUST(rec: dict, fid_to_edid: dict = None,
                  well_known_props: dict = None,
                  unlock_plan: dict = None,
                  unlock_globals: dict = None,
-                 pack_plan=None) -> bytes:
+                 pack_plan=None, xref=None) -> bytes:
     """QUST — Quest conversion (original quest, not the synthetic dialogue one).
 
     Order: EDID [VMAD] FULL DNAM NEXT [stages] [objectives] ANAM [aliases].
@@ -705,8 +750,14 @@ def convert_QUST(rec: dict, fid_to_edid: dict = None,
         from script_convert.pipeline import build_vmad_quest_fragments
         prop_vals = (_collect_all_scro_properties(rec, fid_to_edid)
                      if fid_to_edid else {})
+        # Synthesized output-only records (TES4ControlsDisabled, TES4Fame,
+        # TES4Msg_*, ...) resolve ONLY through the well-known registry, but just
+        # the ones this quest's own stage scripts name — merging the whole
+        # ~1,880-entry registry put every unlock global on every scripted quest.
         if well_known_props:
-            prop_vals.update(well_known_props)
+            for name in _quest_well_known_refs(rec, xref):
+                if name in well_known_props:
+                    prop_vals[name] = well_known_props[name]
         if unlock_plan and unlock_globals:
             ql = edid.lower()
             for (qkey, _stage), gnames in unlock_plan['stage_reveals'].items():
@@ -1165,8 +1216,21 @@ _BARK_RESET_HOURS = 0.5
 _BARK_RESET_TICKS = int(_BARK_RESET_HOURS / 24.0 * 65535)   # 1365
 
 
-def _build_info_script_properties(result_script: str, xref) -> dict:
-    """Build VMAD property bindings for an INFO result script via ScriptConverter."""
+def _build_info_script_properties(result_script: str, xref,
+                                  well_known_props: dict = None) -> dict:
+    """Build VMAD property bindings for an INFO result script via ScriptConverter.
+
+    Only properties the generated .psc actually DECLARES are emitted.
+    `well_known_props` is a name->FormID REGISTRY of synthesized records
+    (TES4Unlock_*, TES4Msg_*, TES4Fame, ...) that resolve_property_formid
+    cannot see because they exist only in the output; it is looked up per
+    declared property, never merged wholesale — the registry holds ~1,880
+    entries and copying it into every fragment wrote a 70 KB VMAD onto 4,985
+    INFOs (a third of a gigabyte of properties no script declares, each one
+    logged by the engine as "cannot be initialized because the script no
+    longer contains that property"). Same per-property lookup object_scripts
+    already does.
+    """
     if not xref:
         return {}
     from script_convert.converter import ScriptConverter
@@ -1177,6 +1241,7 @@ def _build_info_script_properties(result_script: str, xref) -> dict:
     except Exception:
         return {}
     from script_convert.constants import resolve_property_formid
+    well_known = well_known_props or {}
     props = {}
     for prop_edid in conv._property_refs:
         low = prop_edid.lower()
@@ -1187,6 +1252,10 @@ def _build_info_script_properties(result_script: str, xref) -> dict:
         # object_scripts.ENGINE_GLOBAL_FORMIDS.
         if low in ENGINE_GLOBAL_FORMIDS:
             props[prop_edid] = ENGINE_GLOBAL_FORMIDS[low]
+            continue
+        # Synthesized output-only records are already remapped in the registry.
+        if prop_edid in well_known:
+            props[prop_edid] = well_known[prop_edid]
             continue
         fid_hex = resolve_property_formid(xref, prop_edid)
         if not fid_hex:
@@ -1280,10 +1349,9 @@ def convert_INFO(rec: dict, *, injected_ctdas: bytes = b'',
                       if ln.strip() and not ln.strip().startswith(';')]
     if info_fid and (code_lines or reveal_props or timer_props):
         from script_convert.pipeline import build_vmad_info_fragment
-        prop_vals = (_build_info_script_properties(result_script, xref)
+        prop_vals = (_build_info_script_properties(result_script, xref,
+                                                   well_known_props)
                      if code_lines else {})
-        if code_lines and well_known_props:
-            prop_vals.update(well_known_props)
         if reveal_props:
             prop_vals.update(reveal_props)
         if timer_props:
@@ -1836,9 +1904,29 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
         _startable_quests.update(_startable)
 
     # Quest EDID lookup (remapped FormID space) for voice filename prefixes.
+    # A DEPENDENT plugin's topics are frequently owned by a quest that lives in
+    # a MASTER (907 of Morroblivion's DIALs name an Oblivion.esm quest), and
+    # the engine builds the voice filename from that quest's EditorID just the
+    # same.  With only this plugin's QUSTs the prefix comes out EMPTY, and
+    # every one of those lines is written as `_<topic>_<fid>.fuz` — a name the
+    # engine never asks for, so the line is silent.  fid_to_edid is already
+    # masters-first, so fall back to it for any quest we don't own.
     quest_edid_by_fid = {get_formid(r, 'FormID'): get_str(r, 'EditorID', '')
                          for r in by_type.get('QUST', [])
                          if get_formid(r, 'FormID')}
+    # fid_to_edid is keyed by the RAW source FormID (get_formid has already
+    # added `offset` to the high byte), so un-shift before looking a master
+    # quest up.
+    if fid_to_edid:
+        for rec in dials:
+            qfid = get_formid(rec, 'Quest[0]')
+            if not qfid or quest_edid_by_fid.get(qfid):
+                continue
+            raw = (((((qfid >> 24) & 0xFF) - offset) & 0xFF) << 24) \
+                | (qfid & 0x00FFFFFF)
+            edid = fid_to_edid.get(raw) or fid_to_edid.get(qfid)
+            if edid:
+                quest_edid_by_fid[qfid] = edid
     quest_edid_by_fid[generic_quest_fid] = 'TES4DialogueGeneric'
     quest_fid_by_edid = {e.lower(): f for f, e in quest_edid_by_fid.items() if e}
 

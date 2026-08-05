@@ -277,6 +277,40 @@ def _zstring(data: bytes) -> str:
     return data.rstrip(b'\x00').decode('utf-8', errors='replace')
 
 
+def master_edids(esm_path, header, sig: str) -> dict:
+    """{FormID in THIS plugin's index space -> EditorID} for one record type,
+    read from every converted master in the plugin's own MAST list.
+
+    A dependent plugin's records freely reference its masters (Morroblivion's
+    topics name Oblivion.esm quests; its actors use Oblivion.esm voice types),
+    so any tool that resolves a FormID to an EditorID from THIS plugin's
+    records alone silently reports the reference as missing — and then agrees
+    with whatever bug it was written to catch. Masters are enumerated in MAST
+    order, which is exactly the load-order index their records carry here.
+    """
+    from pathlib import Path as _Path
+    out = {}
+    masters = [_zstring(s.data) for s in header.subrecords if s.type == 'MAST']
+    for idx, name in enumerate(masters):
+        # Only converted TES4 masters have a build beside ours; Skyrim.esm is
+        # vanilla and owns nothing we convert.
+        path = _Path(esm_path).parent.parent / name / name
+        if not path.is_file():
+            continue
+        try:
+            _h, mrecs, _l = read_tes5_file(str(path),
+                                           parse_types=frozenset({sig}))
+        except Exception:
+            continue
+        for rec in mrecs:
+            if rec.type != sig:
+                continue
+            edid = _get(rec, 'EDID')
+            if edid:
+                out[(idx << 24) | (rec.form_id & 0xFFFFFF)] = _zstring(edid.data)
+    return out
+
+
 def _is_zstring(data: bytes) -> bool:
     """Heuristic: data looks like a null-terminated printable string."""
     if not data:

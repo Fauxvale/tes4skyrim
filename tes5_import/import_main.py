@@ -185,6 +185,69 @@ def _build_assoc_item_index(by_type: dict, ctx=None) -> tuple:
     return lvlc_first, sigs
 
 
+# The synthesized stand-in records, and the signature each one is written as.
+# A plugin WITH TES4 masters does not create them (its master already did) but
+# its scripts still name them, so it adopts the master's FormIDs instead.
+_TES4_SPECIAL_RECORD_SIGS = {
+    'TES4Fame': b'GLOB',
+    'TES4Infamy': b'GLOB',
+    'TES4GoldFenced': b'GLOB',
+    'TES4ControlsDisabled': b'GLOB',
+    'TES4CyrodiilCrimeFaction': b'FACT',
+}
+
+
+def _adopt_master_special_records(ctx) -> None:
+    """Point the well-known registry at the MASTER's synthesized records.
+
+    `_create_tes4_special_records` runs only for a root master, so a dependent
+    plugin's registry is empty — yet its converted scripts still declare
+    TES4ControlsDisabled / TES4Fame / … properties. An unbound property is None
+    at runtime and the first call on it aborts the entire Papyrus function
+    (Morroblivion's chargen stage 1 died on `TES4ControlsDisabled.SetValue(1)`
+    before it could set JiubSpeak). These records have no TES4 source FormID,
+    so the companion manifest cannot name them — find_by_edid exists for
+    exactly this case.
+    """
+    index = getattr(ctx, 'master_index', None)
+    if index is None:
+        return
+    found = 0
+    for edid, sig in _TES4_SPECIAL_RECORD_SIGS.items():
+        try:
+            fid = index.find_by_edid(sig, edid)
+        except Exception:
+            continue
+        if fid:
+            _WELL_KNOWN_PROPERTIES[edid] = fid
+            found += 1
+    if found:
+        print(f"  Adopted {found} synthesized master records "
+              f"(TES4ControlsDisabled, TES4Fame, ...)")
+
+    # The custom TES4* VOICE TYPES are the same story, and the consequence is
+    # far louder: `_create_vtyp_records` (master-only) is what calls
+    # set_voice_type, so a dependent plugin's VOICE_TYPE_MAP stayed EMPTY,
+    # build_npc_to_vtyp_map returned {} ("0 NPC->VTYP" in the build log), and
+    # convert_NPC_/convert_CREA wrote NO VTCK on any of Morroblivion's 3,607
+    # actors. An actor with no voice type matches no dialogue, so EVERY line in
+    # the plugin was silent — including Jiub's, which is why the prison-ship
+    # intro played out mutely. (Oblivion.esm, a root master, has VTCK on 3,396
+    # of 3,838.) The master already wrote these VTYPs; adopt its FormIDs.
+    from .skyrim_overrides import CUSTOM_VTYP_EDIDS, set_voice_type
+    voices = 0
+    for vtyp_edid, (race_edid, gender) in CUSTOM_VTYP_EDIDS.items():
+        try:
+            fid = index.find_by_edid(b'VTYP', vtyp_edid)
+        except Exception:
+            continue
+        if fid:
+            set_voice_type(race_edid, gender, fid)
+            voices += 1
+    if voices:
+        print(f"  Adopted {voices} master voice types (VTYP)")
+
+
 def _create_tes4_special_records(writer: PluginWriter):
     """Create globals and factions needed by converted Papyrus scripts.
 
@@ -511,6 +574,15 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
         print(f"  {sig}: {len(by_type[sig])} records [{status}]")
 
     # Create writer
+    # Module-global, and convert.py imports several plugins in ONE process, so
+    # a previous plugin's synthesized-record FormIDs would otherwise be adopted
+    # by the next one — pointing its VMAD properties at records in the wrong
+    # file. Each run repopulates this (created for a root master, adopted from
+    # the master's output for a dependent plugin).
+    _WELL_KNOWN_PROPERTIES.clear()
+    from .skyrim_overrides import VOICE_TYPE_MAP
+    VOICE_TYPE_MAP.clear()
+
     writer = PluginWriter(masters=masters, is_esm=is_esm,
                           description="Converted from TES4 by tes4_export")
 
@@ -520,6 +592,13 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # leaf filename across directories; only the whole-plugin view can tell
     # which one keeps the bare name, and the STAT must agree with the mesh.
     writer.export_dir = export_dir
+
+    # A TES4 SOUN may name a DIRECTORY of random variants rather than one file;
+    # the SNDR converter enumerates it from the extracted assets, which live
+    # beside the export text (see dialog_misc._sound_anam_paths).
+    from .record_types.dialog_misc import set_sound_source_dir
+    set_sound_source_dir(export_dir)
+
     try:
         from asset_convert.book_inam import distinct_book_models
         writer.book_models = distinct_book_models(export_dir)
@@ -603,6 +682,14 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
 
         # Oblivion's global ambient-dialogue pacing (GMST is otherwise skipped).
         _create_ambient_gmst_overrides(writer, by_type)
+    else:
+        # A plugin WITH TES4 masters does not re-create the synthesized records
+        # above — but its own converted scripts still reference them by name
+        # (Morroblivion's chargen writes TES4ControlsDisabled), and an unbound
+        # property is None, which aborts the whole Papyrus function on first
+        # use. The master's conversion already emitted them, so adopt ITS
+        # FormIDs into the registry instead of duplicating the records.
+        _adopt_master_special_records(ctx)
     _step_done('vtyp/special records')
 
     # --- Phase 0b: Pre-scan for dialogue conversion ---
@@ -610,7 +697,21 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # register it so convert_NPC_/convert_CREA stamp the SAME VNAM-resolved
     # voice on VTCK (an actor whose VTCK disagrees with the dialogue pass's
     # GetIsVoiceType gates never plays its lines).
-    npc_to_vtyp = build_npc_to_vtyp_map(by_type, num_new_masters)
+    # The VNAM voice-race routing lives on the RACE records, and a dependent
+    # plugin's actors overwhelmingly use its MASTERS' races (all 3,607 of
+    # Morroblivion's do). Without them the mapper falls back to the literal
+    # race and hands Jiub TES4MaleDarkElf — a folder that does not exist,
+    # because Oblivion routes DarkElf males to HighElf. Feed it the master's
+    # RACEs so the routing resolves to the folder the recordings really live
+    # in; this plugin's own RACE records still win (applied second).
+    _vtyp_by_type = by_type
+    if ctx and getattr(ctx, 'master_export', None):
+        _master_races = [r for r in ctx.master_export.values()
+                         if r.get('Signature') == 'RACE']
+        if _master_races:
+            _vtyp_by_type = dict(by_type)
+            _vtyp_by_type['RACE'] = _master_races + by_type.get('RACE', [])
+    npc_to_vtyp = build_npc_to_vtyp_map(_vtyp_by_type, num_new_masters)
     from .record_types.actors import set_npc_voice_map
     set_npc_voice_map(npc_to_vtyp)
     _step_done('npc voice map')
@@ -669,8 +770,26 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # Scripts reference external records via SCRO FormIDs. To populate VMAD
     # property values (so CK isn't needed), we need EditorIDs to generate
     # property names that match the compiled .psc files.
+    # An override plugin's SCROs point at its MASTERS' records as freely as at
+    # its own (Morroblivion's chargen stage 1 calls `stopquest tutorials`, a
+    # quest that exists only in Oblivion.esm). A master-owned FormID missing
+    # from this map resolves to no EditorID, so _collect_scro_properties drops
+    # it and the VMAD binds NOTHING for that property — the .psc still declares
+    # it, so it is None at runtime and the FIRST call on it aborts the whole
+    # Papyrus function. That is what killed the Morroblivion intro: stage 1's
+    # opening `tutorials.Stop()` threw, so the fragment never reached
+    # `JiubSpeak = 1` and the prison-ship sequence never started while the
+    # player sat with controls disabled.
+    #
+    # Masters FIRST, then this plugin's own records, so an OVERRIDDEN record
+    # reports the overriding EditorID — the same precedence CrossRefGraph uses
+    # below (they must agree or the importer resolves a different property set
+    # than the .psc was generated against).
     fid_to_edid = {}
-    for rec in all_records:
+    _edid_sources = [ctx.master_export.values()] if (
+        ctx and getattr(ctx, 'master_export', None)) else []
+    _edid_sources.append(all_records)
+    for rec in [r for src in _edid_sources for r in src]:
         fid_str = rec.get('FormID', '')
         edid_str = rec.get('EditorID', '')
         if fid_str and edid_str:
@@ -873,6 +992,13 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # whose folder was converted by the creature pipeline (creatures step).
     # convert_CREA then points RNAM at the generated race; NPC_ humanoids
     # keep the Skyrim playable-race override system.
+    # Actors embed their TES4 SOUN ids and are patched to the real SNDR after
+    # Phase 3 (actors.patch_actor_sounds). Nothing may be allocated here: an
+    # extra Phase 0 allocation shifts every generated FormID and invalidates
+    # anything matched to a previous run by id (it broke the Slot44 patch).
+    from .record_types.dialog_misc import reset_sound_descriptors
+    reset_sound_descriptors()
+
     from .creature_races import build_creature_races
     build_creature_races(by_type, writer, export_dir,
                          ctx.master_export if ctx else None)
@@ -1073,6 +1199,18 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                 errors += 1
 
     # --- Phase 3: SOUN (creates SNDR companion records) ---
+    def _record_master_sndr(ctx, rec):
+        """Map an overridden SOUN to the MASTER's SNDR companion."""
+        from .record_types.dialog_misc import record_sndr_for_soun
+        try:
+            for fid in ctx.master_manifest.companions(
+                    (rec.get('FormID') or '').upper()):
+                if ctx.master_index.record(fid)[:4] == b'SNDR':
+                    record_sndr_for_soun(get_formid(rec, 'FormID'), fid)
+                    return
+        except Exception:
+            pass
+
     soun_records = by_type.get('SOUN', [])
     if soun_records:
         print(f"  Converting {len(soun_records)} SOUN records (with SNDR creation)...")
@@ -1093,6 +1231,10 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                         sndr_ov = ctx.build_soun_companion(rec, writer)
                         if sndr_ov:
                             writer.add_record('SNDR', sndr_ov)
+                        # An overridden SOUN keeps the MASTER's descriptor, so
+                        # actors referencing this sound must resolve to that id
+                        # (see actors.patch_actor_sounds).
+                        _record_master_sndr(ctx, rec)
                     continue
                 soun_bytes, sndr_bytes, sndr_fid = convert_SOUN(rec, writer)
                 writer.add_record('SOUN', soun_bytes)
@@ -1130,7 +1272,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                                           well_known_props=_WELL_KNOWN_PROPERTIES,
                                           unlock_plan=unlock_plan,
                                           unlock_globals=unlock_globals,
-                                          pack_plan=pack_plan)
+                                          pack_plan=pack_plan, xref=xref)
                 writer.add_record('QUST', qust_bytes)
                 converted += 1
                 # Track SGE quests for .seq generation
@@ -1360,6 +1502,25 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
             own = defaultdict(list)
             for sig, rec in unattached_dial:
                 own[sig].append(rec)
+            # build_dialog_groups reads far more than DIAL/INFO out of this
+            # dict, and every one of those reads silently no-ops on an empty
+            # list rather than failing:
+            #   QUST — quest-level CTDAs, which the engine has no equivalent
+            #     for and which MUST be copied onto every INFO the quest owns.
+            #     fbmwChargen carries `GetIsPlayableRace`, so Morroblivion's
+            #     whole chargen conversation converted with that gate MISSING
+            #     (1 such condition in the output vs 12,858 in Oblivion.esm).
+            #   SCPT/QUST/INFO — the Say/SayTo/StartConversation call sites
+            #     that build_say_topic_dispositions needs to decide how a
+            #     script-driven topic's RunOn=Target conditions convert
+            #     ("say-driven topics: 0" in the build log).
+            #   ACHR/ACRE/REFR — the refs those call sites name.
+            # Pass the plugin's full record set for everything EXCEPT the
+            # DIAL/INFO the override pass already emitted.
+            for sig in ('QUST', 'SCPT', 'ACHR', 'ACRE', 'REFR',
+                        'NPC_', 'CREA', 'RACE', 'FACT'):
+                if not own.get(sig):
+                    own[sig] = by_type.get(sig, [])
             print(f"  Building this plugin's OWN dialogue "
                   f"({len(own.get('DIAL', []))} DIAL, "
                   f"{len(own.get('INFO', []))} INFO)")
@@ -1391,6 +1552,20 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     n_fg = patch_forcegreet_topics(writer)
     if n_fg:
         print(f"  ForceGreet packages bound to a greeting topic: {n_fg}")
+    # Actor CSDI still holds TES4 SOUN ids; Phase 3 has now built the SNDRs.
+    from .record_types.actors import patch_actor_sounds
+    n_snd = patch_actor_sounds(writer)
+    if n_snd:
+        print(f"  Actor sound descriptors bound: {n_snd} actors")
+    # Creature voice types: allocated LAST so no other generated FormID moves,
+    # then patched into the already-written creature actors and races.
+    from .creature_races import (build_creature_voice_types,
+                                 patch_creature_voices)
+    n_cv = build_creature_voice_types(writer)
+    if n_cv:
+        n_cvp = patch_creature_voices(writer)
+        print(f"  Creature voice types: {n_cv} generated, "
+              f"{n_cvp} records bound")
     _write_voice_map(output_path, voice_map)
     from .dialog_converter import get_lip_texts
     _write_lip_text(output_path, get_lip_texts())

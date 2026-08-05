@@ -2960,3 +2960,54 @@ class TestAnimationBlockLayout:
         assert 'kg.interpolation = 1' not in src, \
             'LINEAR bool keys crash the engine'
         assert _BLEND_INTERP_FLAGS_ARRAYSIZE == 0x0201
+
+
+class TestVoiceFilePrune:
+    """A VTYP relocation empties the source-race folder: the run stops writing
+    it, so a touched-dirs-only sweep can never reach the dead copies left
+    behind under the old name.  Morroblivion kept 19 `_`-prefixed files in
+    `TES4Maleash ghoul` after their real copies moved to `TES4MaleImperial`,
+    and a stale file makes a still-broken run look fixed."""
+
+    def _tree(self, tmp_path):
+        root = tmp_path / 'sound' / 'Voice' / 'Plugin.esm'
+        live = root / 'TES4MaleImperial'
+        orphan = root / 'TES4Maleash ghoul'
+        live.mkdir(parents=True)
+        orphan.mkdir(parents=True)
+        return root, live, orphan
+
+    def test_relocated_folder_is_swept(self, tmp_path):
+        from asset_convert.audio_converter import _prune_stale_voice_files
+        root, live, orphan = self._tree(tmp_path)
+        keep = live / 'quest_topic_00aafa93_1.fuz'
+        keep.write_bytes(b'x')
+        dead = orphan / '_topic_00aafa93_1.fuz'
+        dead.write_bytes(b'x')
+
+        removed = _prune_stale_voice_files(
+            {live.resolve()}, {keep.resolve()}, {root})
+
+        assert keep.exists(), 'intended file must survive'
+        assert not dead.exists(), 'orphaned relocation copy must be pruned'
+        assert [f.name for f in removed] == ['_topic_00aafa93_1.fuz']
+
+    def test_non_voice_files_are_never_touched(self, tmp_path):
+        from asset_convert.audio_converter import _prune_stale_voice_files
+        root, live, orphan = self._tree(tmp_path)
+        other = orphan / 'readme.txt'
+        other.write_bytes(b'x')
+
+        _prune_stale_voice_files(set(), set(), {root})
+
+        assert other.exists(), 'non-voice content must never be removed'
+
+    def test_without_plugin_roots_behaviour_is_unchanged(self, tmp_path):
+        from asset_convert.audio_converter import _prune_stale_voice_files
+        _root, _live, orphan = self._tree(tmp_path)
+        dead = orphan / '_topic_00aafa93_1.fuz'
+        dead.write_bytes(b'x')
+
+        removed = _prune_stale_voice_files(set(), set())
+
+        assert dead.exists() and not removed

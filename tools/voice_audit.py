@@ -40,7 +40,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tools.tes5_esm_reader import read_tes5_file, _get, _all, _zstring  # noqa: E402
+from tools.tes5_esm_reader import (read_tes5_file, _get, _all, _zstring,  # noqa: E402
+                                   master_edids)
 # Import the naming rule rather than mirroring it — a local copy silently
 # drifted from the converter's and made this audit agree with a bug it was
 # supposed to catch.
@@ -99,7 +100,19 @@ def parse_esm(esm_path):
                               'vtyps': vtyps,
                               'resp_nums': resp_nums,
                               'has_getisid': has_getisid})
+    # A DEPENDENT plugin's topics are often owned by a quest in a MASTER (907
+    # of Morroblivion's DIALs name an Oblivion.esm quest), and the engine
+    # builds the voice filename from that quest's EditorID all the same.
+    # Without the masters every one of those recomputes to an EMPTY prefix and
+    # the audit reports a mismatch against a voicemap that is actually right —
+    # the audit would agree with the bug it exists to catch.
+    qust_edid.update(_master_qust_edids(esm_path, header))
     return infos, dial_by_fid, qust_edid, vtyp_edid
+
+
+def _master_qust_edids(esm_path, header) -> dict:
+    """{QUST FormID (this plugin's index space) -> EditorID} for every master."""
+    return master_edids(esm_path, header, 'QUST')
 
 
 def scan_voice_dir(voice_dir: Path):

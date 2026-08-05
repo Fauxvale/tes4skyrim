@@ -149,9 +149,12 @@ def eval_tes5(conds, w):
     return _eval(conds, w, tes5=True)
 
 
-def _eval(conds, w, tes5):
+def _eval(conds, w, tes5, trace=None):
     """Walk the AND/OR chain; unknown functions are treated as PASS so the
-    comparison isolates target-dependent divergence rather than coverage."""
+    comparison isolates target-dependent divergence rather than coverage.
+
+    `trace`, when a list, collects a per-condition verdict line for --explain.
+    """
     if not conds:
         return True, []
     groups, cur = [], []
@@ -163,10 +166,21 @@ def _eval(conds, w, tes5):
     if cur:
         groups.append(cur)
     why = []
-    for grp in groups:
-        if not any(_eval_one(c, w, tes5, why) for c in grp):
-            return False, why
-    return True, why
+    ok_all = True
+    for gi, grp in enumerate(groups):
+        results = [_eval_one(c, w, tes5, why) for c in grp]
+        if trace is not None:
+            for c, r in zip(grp, results):
+                trace.append(
+                    f'      [{"PASS" if r else "FAIL"}] {_n(c["func"])}'
+                    f'({c["p1"]:#x}, {c["p2"]:#x}) {OPS[c["op"]]} {c["val"]:g}'
+                    + (f' runon={c.get("runon")}' if tes5 else '')
+                    + (f' cis2={c["cis2"]}' if c.get('cis2') else ''))
+        if not any(results):
+            ok_all = False
+            if trace is None:
+                return False, why
+    return ok_all, why
 
 
 def _eval_one(c, w, tes5, why):
@@ -244,6 +258,9 @@ def main():
     ap.add_argument('--speaker', default=None,
                     help='EditorID of the NPC doing the Say (sets GetIsID)')
     ap.add_argument('--sweep', default=None, metavar='NAME=A..B')
+    ap.add_argument('--explain', action='store_true',
+                    help='print every INFO with a per-condition PASS/FAIL '
+                         'verdict on both sides (why nothing was selected)')
     args = ap.parse_args()
 
     t4_dial = {r.get('EditorID', '').lower(): r
@@ -369,6 +386,17 @@ def main():
     print(f'player: race={args.race} sex={args.sex}')
     print()
 
+    def txt4(r):
+        return r.get('Response[0].ResponseText', '') if r else None
+
+    def txt5(r):
+        if not r:
+            return None
+        for s in r.subrecords:
+            if s.type == 'NAM1':
+                return s.data.rstrip(b'\x00').decode('utf-8', 'replace')
+        return ''
+
     for sv in sweep_range:
         vs = dict(variables)
         if sweep_name:
@@ -385,30 +413,35 @@ def main():
                 if c['func'] in (F_GETQUESTVAR, F_GETSCRIPTVAR):
                     table = script_vars.get(c['p1'] & 0xFFFFFF, {})
                     c['varname'] = table.get(c['p2'])
-            ok, _why = eval_tes4(conds, w)
-            if ok:
+            tr = [] if args.explain else None
+            ok, _why = _eval(conds, w, False, tr)
+            if args.explain:
+                print(f'   TES4 INFO {r.get("FormID")} '
+                      f'{"SELECTED" if ok else "rejected"} '
+                      f'"{(r.get("Response[0].ResponseText") or "")[:50]}"')
+                for ln in tr:
+                    print(ln)
+            if ok and pick4 is None:
                 pick4 = r
-                break
+                if not args.explain:
+                    break
         pick5 = None
         why5 = None
         for r in infos5:
-            ok, why = eval_tes5(parse_tes5_ctdas(r), w)
-            if ok:
+            tr = [] if args.explain else None
+            ok, why = _eval(parse_tes5_ctdas(r), w, True, tr)
+            if args.explain:
+                print(f'   TES5 INFO {r.form_id:08X} '
+                      f'{"SELECTED" if ok else "rejected"} '
+                      f'"{(txt5(r) or "")[:50]}"')
+                for ln in tr:
+                    print(ln)
+            if ok and pick5 is None:
                 pick5 = r
-                break
+                if not args.explain:
+                    break
             if why5 is None:
                 why5 = why
-
-        def txt4(r):
-            return r.get('Response[0].ResponseText', '') if r else None
-
-        def txt5(r):
-            if not r:
-                return None
-            for s in r.subrecords:
-                if s.type == 'NAM1':
-                    return s.data.rstrip(b'\x00').decode('utf-8', 'replace')
-            return ''
 
         label = f'{sweep_name}={sv}' if sweep_name else 'state'
         a, b = txt4(pick4), txt5(pick5)

@@ -557,7 +557,8 @@ def find_lip_text(output_dir, source_name) -> 'dict | None':
 _VOICE_OUTPUT_EXTS = frozenset(('.fuz', '.xwm', '.wav', '.mp3', '.lip'))
 
 
-def _prune_stale_voice_files(touched_dirs: set, intended: set) -> list:
+def _prune_stale_voice_files(touched_dirs: set, intended: set,
+                             plugin_roots: 'set | None' = None) -> list:
     """Delete voice files this run did not intend to produce.
 
     The runtime filename is built from the converted quest/topic
@@ -566,11 +567,23 @@ def _prune_stale_voice_files(touched_dirs: set, intended: set) -> list:
     growing, and — worse — a stale file makes a broken run look fixed,
     because the audio is still sitting there under the previous name.
 
-    Only folders this run actually wrote into are touched, and only files
-    with a voice extension, so unrelated content is never at risk.
+    `plugin_roots` are the `Sound/Voice/<plugin>` directories this run owns.
+    Their VTYP subfolders are swept too, because a voice-type RELOCATION
+    empties the old folder completely: when a line moves from the source race
+    dir to the speaker's real VTCK folder, the run never writes the old
+    directory again, so a touched-dirs-only sweep can never reach it and the
+    dead copy survives forever (Morroblivion's `TES4Maleash ghoul` kept 19
+    `_`-prefixed files after their real copies moved to `TES4MaleImperial`).
+
+    Only files with a voice extension are removed, so unrelated content in
+    those folders is never at risk.
     """
+    sweep = set(touched_dirs)
+    for root in (plugin_roots or ()):
+        if root.is_dir():
+            sweep.update(d.resolve() for d in root.iterdir() if d.is_dir())
     removed = []
-    for d in sorted(touched_dirs):
+    for d in sorted(sweep):
         if not d.is_dir():
             continue
         for f in d.iterdir():
@@ -695,6 +708,9 @@ def organize_voice_files(
     # weight and mask exactly the bug they came from, so they are removed.
     intended: set = set()
     touched_dirs: set = set()
+    # `Sound/Voice/<plugin>` roots this run owns — swept wholesale by the
+    # prune so a VTYP relocation cannot strand the emptied source-race folder.
+    plugin_roots: set = set()
 
     for plugin_dir in voice_root.iterdir():
         if not plugin_dir.is_dir():
@@ -723,6 +739,7 @@ def organize_voice_files(
 
                 out_dir = dest_dir / 'sound' / 'Voice' / effective_plugin / voice_type
                 out_dir.mkdir(parents=True, exist_ok=True)
+                plugin_roots.add(out_dir.parent)
 
                 for audio_file in gender_dir.iterdir():
                     if not audio_file.is_file():
@@ -788,7 +805,8 @@ def organize_voice_files(
                 print(f'    {r}/{g}')
         # Still prune: "every file already exists" is exactly the state a
         # re-run lands in after a rename, with the OLD names alongside.
-        pruned = _prune_stale_voice_files(touched_dirs, intended) if prune else []
+        pruned = _prune_stale_voice_files(touched_dirs, intended,
+                                          plugin_roots) if prune else []
         if pruned:
             print(f'  Pruned {len(pruned)} stale voice file(s) under old names')
         print(f'  Voice files: 0 organised (all already present or no files found), '
@@ -867,7 +885,8 @@ def organize_voice_files(
 
     # Prune AFTER conversion: a job that failed never wrote its output, and
     # pruning first would have deleted the previous run's still-usable copy.
-    pruned = _prune_stale_voice_files(touched_dirs, intended) if prune else []
+    pruned = _prune_stale_voice_files(touched_dirs, intended,
+                                      plugin_roots) if prune else []
 
     print(f'  Voice files: {stats["organized"]} organised, '
           f'{stats["skipped"]} already present, '
