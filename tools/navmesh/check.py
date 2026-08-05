@@ -9,7 +9,7 @@ reimplements every one of them against our WRITTEN NVNM records.
 Why validate the written records rather than the generator's in-memory output:
 these are structural invariants of the serialised format (edge symmetry, portal
 targets, index ranges), and the packing step is where several of them can break.
-`tools/navmesh_audit.py` remains the quality metric (coverage, islands, slope);
+`tools/navmesh/audit.py` remains the quality metric (coverage, islands, slope);
 this is the correctness gate.
 
 Rules, with the CK message each mirrors:
@@ -30,16 +30,22 @@ Rules, with the CK message each mirrors:
   TRI_COUNT          "NAVMESH: Triangle count is out of bounds"
   DOOR_OFF_MESH      "Finalize NavMesh: Teleport marker for door %s (%08x) in
                       cell %s (%08x) is not sitting on a navmesh"
+  DOOR_NO_XNDP       teleport door REFR carries no XNDP, so nothing binds it
+                     to a navmesh triangle and it is not a pathing door (not a
+                     CK message — a vanilla invariant: 1,705/1,722 teleport
+                     doors carry XNDP)
+  DOOR_XNDP_BAD_NAVM XNDP names a navmesh absent from this file
+  DOOR_XNDP_BAD_TRI  XNDP triangle index out of range for that navmesh
   NAVI_MISSING       "NavmeshInfo refers to form that does not exist"
                      / "refers to a form that is not a navmesh"
   TRI_COUNT_WARN     uNavmeshTriangleCountWarnThreshold (3500 exterior /
                      5000 interior) — the CK's own audit warning.
 
 Usage:
-    python tools/navmesh_check.py output/Oblivion.esm/Oblivion.esm
-    python tools/navmesh_check.py <esm> --verbose            # per-defect detail
-    python tools/navmesh_check.py <esm> --rule DEGENERATE --verbose
-    python tools/navmesh_check.py <esm> --csv report.csv
+    python tools/navmesh/check.py output/Oblivion.esm/Oblivion.esm
+    python tools/navmesh/check.py <esm> --verbose            # per-defect detail
+    python tools/navmesh/check.py <esm> --rule DEGENERATE --verbose
+    python tools/navmesh/check.py <esm> --csv report.csv
 """
 
 import argparse
@@ -80,7 +86,7 @@ _DOWNFACE_EPS = 1e-6
 
 
 # ---------------------------------------------------------------------------
-# Record walking (shared shape with tools/navmesh_dump.py)
+# Record walking (shared shape with tools/navmesh/dump.py)
 # ---------------------------------------------------------------------------
 
 def _iter_records(data, start, end, path=()):
@@ -474,6 +480,51 @@ def check_door_markers(teleport_doors, meshes, local_mask=None):
     return out
 
 
+def check_door_xndp(teleport_doors, door_xndp, meshes, by_formid,
+                    local_mask=None):
+    """Every teleport door must carry XNDP naming its navmesh + triangle.
+
+    NVNM Door Triangles and NAVI NVMI Door Links both point navmesh -> door.
+    XNDP is the ONLY structure pointing door -> navmesh triangle, and that is
+    the direction the engine needs to build a BSPathingDoor from the door an
+    actor is walking towards.  A teleport door with no XNDP is not a pathing
+    node: an actor whose package destination lies beyond it has no route and
+    never leaves the room, with every package/alias/condition still correct.
+    That was CharacterGen's Ambush A (assassins parked in their holding cell).
+
+    Vanilla invariant: 1,705 of 1,722 Skyrim.esm teleport-door REFRs carry
+    XNDP, and 1,705 of the 1,706 XNDP records in the file are teleport doors.
+    """
+    out = []
+    tri_counts = {nm.formid: len(nm.tris) for nm in meshes}
+    for dfid, cell_fid in sorted(teleport_doors.items()):
+        if local_mask is not None and (dfid >> 24) not in local_mask:
+            continue
+        link = door_xndp.get(dfid)
+        if link is None:
+            out.append(('DOOR_NO_XNDP',
+                        'teleport door %08X (cell %08X) has no XNDP — nothing '
+                        'binds it to a navmesh triangle, so it is not a '
+                        'pathing door and no actor can route through it'
+                        % (dfid, cell_fid)))
+            continue
+        navm_fid, tri = link
+        n = tri_counts.get(navm_fid)
+        if n is None:
+            # A door may legitimately name a MASTER's navmesh.
+            if local_mask is not None and (navm_fid >> 24) not in local_mask:
+                continue
+            out.append(('DOOR_XNDP_BAD_NAVM',
+                        'teleport door %08X XNDP names navmesh %08X, which '
+                        'does not exist in this file' % (dfid, navm_fid)))
+        elif tri < 0 or tri >= n:
+            out.append(('DOOR_XNDP_BAD_TRI',
+                        'teleport door %08X XNDP triangle %d is out of range '
+                        'for navmesh %08X (%d triangles)'
+                        % (dfid, tri, navm_fid, n)))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -506,6 +557,7 @@ def scan(path, want_doors=True):
     meshes = []
     navi_bodies = []
     teleport_doors = {}            # door REFR fid -> parent cell fid
+    door_xndp = {}                 # door REFR fid -> (navm fid, tri) or None
     # A NAVM lives in a CELL's temporary child group (type 9); the enclosing
     # type-6 group's label is the CELL FormID, so the parent cell is readable
     # from the GRUP path without a second pass.
@@ -525,14 +577,23 @@ def scan(path, want_doors=True):
         elif sig == 'NAVI':
             navi_bodies.append(body)
         elif sig == 'REFR' and want_doors:
-            if any(ssig == 'XTEL' for ssig, _ in _iter_subrecords(body)):
+            has_xtel = False
+            xndp = None
+            for ssig, sdata in _iter_subrecords(body):
+                if ssig == 'XTEL':
+                    has_xtel = True
+                elif ssig == 'XNDP' and len(sdata) >= 6:
+                    xndp = (struct.unpack_from('<I', sdata, 0)[0],
+                            struct.unpack_from('<h', sdata, 4)[0])
+            if has_xtel:
                 cell = 0
                 for gtype, label in reversed(gpath):
                     if gtype == 6:
                         cell = label
                         break
                 teleport_doors[fid] = cell
-    return meshes, navi_bodies, teleport_doors, mask
+                door_xndp[fid] = xndp
+    return meshes, navi_bodies, teleport_doors, door_xndp, mask
 
 
 def main():
@@ -551,8 +612,8 @@ def main():
                     help='judge portals into masters too (noisy for plugins)')
     a = ap.parse_args()
 
-    meshes, navi_bodies, teleport_doors, mask = scan(a.esm,
-                                                     want_doors=not a.no_doors)
+    meshes, navi_bodies, teleport_doors, door_xndp, mask = scan(
+        a.esm, want_doors=not a.no_doors)
     if not meshes:
         print('no NAVM records found in %s' % a.esm)
         return 0
@@ -573,6 +634,10 @@ def main():
     if not a.no_doors:
         for rule, detail in check_door_markers(
                 teleport_doors, [nm for nm, _c in meshes], local_mask=mask):
+            findings.append((rule, 0, 0, detail))
+        for rule, detail in check_door_xndp(
+                teleport_doors, door_xndp, [nm for nm, _c in meshes],
+                by_formid, local_mask=mask):
             findings.append((rule, 0, 0, detail))
 
     if a.rule:

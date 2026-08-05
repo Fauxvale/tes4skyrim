@@ -104,7 +104,25 @@ python convert.py -f Oblivion.esm
 The output plugin and assets are written to `output/` (override with `--output-dir`).
 
 
-Once installed and loaded up ingame, begin "Oblivion" with 
+### Starting a converted game
+
+The intended way in is the **TESGameSelect** plugin (*Threads of Prophecy*), a
+small standalone Skyrim SE plugin built separately from the conversion itself.
+It takes over Skyrim's opening quest so that starting a **new game** shows a
+menu asking which world to begin in — Skyrim, Cyrodiil, Nehrim or Vvardenfell.
+Choosing Skyrim runs the vanilla Helgen opening untouched; choosing a converted
+game hands off to that game's own character generation, with its real starting
+equipment and start location. Games whose plugin is not in your load order are
+detected at runtime and simply never appear in the menu, so any subset works.
+
+Ready-to-install files are in [TESGameSelect/dist/](TESGameSelect/dist/) — copy
+them into your `Data` folder and enable `TESGameSelect.esp`.
+Because it overrides `MQ101`, it conflicts with other alternate-start mods
+(Live Another Life, Skyrim Unbound, Alternate Perspective) — use one at a time.
+See [TESGameSelect/README.md](TESGameSelect/README.md) for how it works,
+configuring it, and rebuilding.
+
+Without the plugin, you can start a converted game from the console instead:
 
 ```bash
 setstage Charactergen 5

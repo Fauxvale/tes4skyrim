@@ -3,7 +3,7 @@
 Loads a cell's records, collision cache, pathgrid and world-space geometry, so
 the render/probe tools all agree on how a cell is assembled.
 
-    python tools/navmesh_probe.py --cell AnvilFightersGuild
+    python tools/navmesh/probe.py --cell AnvilFightersGuild
 """
 
 import argparse
@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import world  # noqa: E402
@@ -70,7 +70,7 @@ def _guard_ram(cache_path):
     roughly 3x that as live Python objects.  The in-process memo below makes
     repeat loads free WITHIN one process, but a PROCESS POOL defeats it
     entirely -- every spawned worker unpickles its own independent copy.
-    `navmesh_audit.py --workers 8` therefore wanted ~8 x 6 GB on a 32 GB
+    `navmesh/audit.py --workers 8` therefore wanted ~8 x 6 GB on a 32 GB
     machine, drove it into the pagefile, and hard-locked the whole desktop
     (twice, each needing a reboot).
 
@@ -218,8 +218,8 @@ def load_cell(export_dir, cell_arg, load_collision=True):
     from tes5_import.pgrd_to_navm import _collect_doors, load_door_centroids
     load_door_centroids(os.path.join(export_dir, 'door_centers_cache.json'),
                         quiet=True)
-    doors = [(x, y, z, r, tp)
-             for (x, y, z, r, _f, tp) in _collect_doors(refrs, door_fids)]
+    doors = [(x, y, z, r, tp, w)
+             for (x, y, z, r, _f, tp, w) in _collect_doors(refrs, door_fids)]
 
     is_ext = bool(cell.get('ParentWRLD') and
                   cell.get('ParentWRLD') != '00000000')

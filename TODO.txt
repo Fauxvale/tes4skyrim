@@ -1,5 +1,5 @@
 Major Issues for V1:
-	1 - Iterate on quest and dialog conversion until everything is playable startin with Oblivion Main Quest
+	1 - Iterate on quest and dialog conversion until everything is playable starting with Oblivion Main Quest
 
 	2 - Havok feels off. Items don't move like they should. Specifically, there seems to be too much inertia on small items, like I'm dragging a heavy object when it is something as small as a cup, Animated signs will get stuck in a position after swinging a bit, defying gravicty
 		ctrigtripwire01.nif also fails to break when walked over
@@ -7,22 +7,22 @@ Major Issues for V1:
 	3 - Navmesh refinement
 		ensure corridors connect pathgrid islands + other connectivity issues
 		allow growth even on slopes
-		some doors are rotated (imperialdungeon01)
+		trim triangles along edges
+		fix slim corridors
 
 	4 - Fix CK Loading (not sure why it doesn't finish)
 
 	5 - Need new skyrim body mesh to actually work to allow leg skin to appear
 	
-	7 - Shops missing full inventory of items
+	6 - Shops missing full inventory of items
 
-	8 - Crime system
+	7 - Crime system
 
-	12 - InUHlaaluUroomuside.nif has floor collision that is inverted. likely due to the nehrim fix for some reverse-facing collision normals
-	13 - Meshes not animating:
+	8 - InUHlaaluUroomuside.nif has floor collision that is inverted. likely due to the nehrim fix for some reverse-facing collision normals
+	
+	9 - Meshes not animating:
 		palacefont01.nif
 		se01waitingrooomwalls.nif
-
-		prisonsecretwall01.nif
 
 Later Issues:
 

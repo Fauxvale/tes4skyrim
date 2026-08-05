@@ -324,6 +324,19 @@ Event OnUpdate()
     _dbgLast = _s
     Debug.TraceUser("{LOG}", "{tag} " + _s)
   EndIf
+  ; MOVEMENT probe.  The state line above only prints on CHANGE, so an actor
+  ; that holds one package forever prints once and looks identical whether it
+  ; is walking, stuck against a wall, or standing still.  Position each tick is
+  ; what distinguishes "travelling but slow" from "not moving at all", and
+  ; distance-to-target says whether it is getting closer or has given up.
+  ; Logged unconditionally while the quest is in the ambush window.
+  Int _st = {quest}.GetStage()
+  If _st >= 20 && _st < 30 && Self.Is3DLoaded()
+    Float _x = Self.GetPositionX()
+    Float _y = Self.GetPositionY()
+    Float _z = Self.GetPositionZ()
+    Debug.TraceUser("{LOG}", "{tag} POS " + (_x as Int) + "," + (_y as Int) + "," + (_z as Int) + " pkg=" + _p + " sitting=" + Self.GetSitState() + " move=" + Self.GetActorValue("SpeedMult") + " dist2tgt=" + (Self.GetDistance(Game.GetPlayer()) as Int))
+  EndIf
   RegisterForSingleUpdate(1.0)
 EndEvent
 

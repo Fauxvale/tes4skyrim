@@ -329,7 +329,7 @@ The CK prunes islands by **area** (150 sq units), we pruned by **triangle
 count**. With item 4 applied (512u edges) a 5-triangle island can be an entire
 room, so a count means something different every time the tessellation changes.
 Now `MIN_ISLAND_AREA = 150.0`, applied in `build._prune_islands` and mirrored in
-`tools/navmesh_audit.py`'s TINY census.
+`tools/navmesh/audit.py`'s TINY census.
 
 Note `MIN_REGION_VOXELS` (the `uRecastRegionMinSize` analogue) is **unused** and
 documented as such: our region pass keeps regions by PATHGRID SEEDING rather
@@ -339,7 +339,7 @@ than by size, which is a stronger signal than area.
 
 `NavMesh::CheckNavMesh` (strings at `0x02142410`–`0x02142f80`) enumerates
 exactly what Bethesda considers a malformed navmesh. Every one of these is a
-check we can run in `tools/navmesh_audit.py`:
+check we can run in `tools/navmesh/audit.py`:
 
 - mismatched edge connection (A→B but B↛A)
 - bad vertex index / triangle index / extra-info index
@@ -362,7 +362,7 @@ we've chased before.
 ## Order of work
 
 1. ~~Params~~ **DONE (2026-07-22)** — see results below.
-2. ~~Port `CheckNavMesh`'s rule set~~ **DONE** — `tools/navmesh_check.py`.
+2. ~~Port `CheckNavMesh`'s rule set~~ **DONE** — `tools/navmesh/check.py`.
 3. Boundary-edge stair connection (item 5); then reduce `PGRD_BAND` and see if
    the mesh survives on its own merit.
 4. Water triangle flags (item 7) — mechanical, immediate AI benefit.
@@ -382,7 +382,7 @@ Final values in `tes5_import/navmesh/params.py`:
 | `MAX_SIMPLIFY_ERR` | 12.0 | **10.4** | `fRecastEdgeMaxError` × cs (units trap above) |
 | `MIN_ISLAND_TRIS = 5` | — | **`MIN_ISLAND_AREA = 150.0`** | `fMinIslandArea` |
 
-Measured on 12 interiors (`python tools/navmesh_audit.py --interiors 12`),
+Measured on 12 interiors (`python tools/navmesh/audit.py --interiors 12`),
 old params vs new:
 
 | Cell | Tris old → new | Uncovered |
@@ -408,7 +408,7 @@ regression, but isolated it was a +195% triangle explosion masked by the
 
 ## Results — CheckNavMesh port (2026-07-22)
 
-`tools/navmesh_check.py` implements all 15 rules. Validated against ground
+`tools/navmesh/check.py` implements all 15 rules. Validated against ground
 truth before use — vanilla must come out near-clean, or the checker is wrong:
 
 | File | Navmeshes | Triangles | Findings |

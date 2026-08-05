@@ -614,6 +614,7 @@ struct Strip {
     double ax, ay, az, bx, by, bz;
     double half;                 // admission radius for a rectangle strip
     int poly_off, poly_n;        // outline vertices in `poly` (0 = rectangle)
+    int prof_off, prof_n;        // height profile points (0 = straight chord)
     double x0, x1, y0, y1;       // XY bounds, for bucket rejection
 };
 
@@ -643,44 +644,57 @@ inline double seg_dist(double px, double py, double ax, double ay,
     return std::hypot(px - (ax + dx * t), py - (ay + dy * t));
 }
 
-// levels_at(strips_flat, poly_flat, points, same_surface_z) -> list of lists
+// levels_at(strips_flat, poly_flat, points, same_surface_z[, prof_flat])
+//   -> list of lists
 //
 // strips_flat: (S, 11) float64 -- ax,ay,az,bx,by,bz,half,poly_off,poly_n,
-//              plus two unused slots kept so the row is a round number.
+//              prof_off,prof_n.
 // poly_flat  : (P, 2) float64 outline vertices, indexed by poly_off/poly_n.
 // points     : (N, 2) float64 query points.
+// prof_flat  : (F, 3) float64 height-profile points (x, y, z), indexed by
+//              prof_off/prof_n.  A strip with prof_n >= 2 takes its height
+//              from the closest projection onto this polyline instead of the
+//              a->b chord (the tread-following stair profile).  MUST mirror
+//              corridor_union._height_on exactly, tie-breaks included.
 PyObject* py_levels_at(PyObject*, PyObject* args) {
     PyObject *o_strips, *o_poly, *o_pts;
+    PyObject *o_prof = nullptr;
     double same_z;
-    if (!PyArg_ParseTuple(args, "OOOd", &o_strips, &o_poly, &o_pts, &same_z))
+    if (!PyArg_ParseTuple(args, "OOOd|O", &o_strips, &o_poly, &o_pts, &same_z,
+                          &o_prof))
         return nullptr;
 
     PyArrayObject* a_s = as_f64(o_strips);
     PyArrayObject* a_p = as_f64(o_poly);
     PyArrayObject* a_q = as_f64(o_pts);
-    if (!a_s || !a_p || !a_q) {
-        Py_XDECREF(a_s); Py_XDECREF(a_p); Py_XDECREF(a_q);
+    PyArrayObject* a_f = o_prof ? as_f64(o_prof) : nullptr;
+    if (!a_s || !a_p || !a_q || (o_prof && !a_f)) {
+        Py_XDECREF(a_s); Py_XDECREF(a_p); Py_XDECREF(a_q); Py_XDECREF(a_f);
         return nullptr;
     }
 
     const size_t ns = (size_t)(PyArray_SIZE(a_s) / 11);
     const size_t nq = (size_t)(PyArray_SIZE(a_q) / 2);
+    const size_t nf = a_f ? (size_t)(PyArray_SIZE(a_f) / 3) : 0;
     const double* sp = (const double*)PyArray_DATA(a_s);
     const double* pp = (const double*)PyArray_DATA(a_p);
     const double* qp = (const double*)PyArray_DATA(a_q);
+    const double* fp = a_f ? (const double*)PyArray_DATA(a_f) : nullptr;
 
     // Same contract as TriGrid::build: non-finite coordinates make the bucket
     // spans below non-finite, the cast to long long undefined, and the
     // push_back loop unbounded. Reject them here rather than allocating until
     // bad_alloc aborts the process.
     {
-        const npy_intp checks[3] = {PyArray_SIZE(a_s), PyArray_SIZE(a_p),
-                                    PyArray_SIZE(a_q)};
-        const double* datas[3] = {sp, pp, qp};
-        for (int c = 0; c < 3; ++c) {
+        const npy_intp checks[4] = {PyArray_SIZE(a_s), PyArray_SIZE(a_p),
+                                    PyArray_SIZE(a_q),
+                                    a_f ? PyArray_SIZE(a_f) : 0};
+        const double* datas[4] = {sp, pp, qp, fp};
+        for (int c = 0; c < 4; ++c) {
             for (npy_intp i = 0; i < checks[c]; ++i) {
                 if (!std::isfinite(datas[c][i])) {
                     Py_DECREF(a_s); Py_DECREF(a_p); Py_DECREF(a_q);
+                    Py_XDECREF(a_f);
                     PyErr_SetString(PyExc_ValueError,
                                     "non-finite coordinate in levels_at input");
                     return nullptr;
@@ -698,6 +712,14 @@ PyObject* py_levels_at(PyObject*, PyObject* args) {
         S.half = r[6];
         S.poly_off = (int)r[7];
         S.poly_n = (int)r[8];
+        S.prof_off = (int)r[9];
+        S.prof_n = (int)r[10];
+        // A profile that indexes past the prof array is a caller bug; treat it
+        // as "no profile" rather than reading out of bounds.
+        if (S.prof_n < 2 ||
+            (size_t)(S.prof_off + S.prof_n) > nf) {
+            S.prof_off = 0; S.prof_n = 0;
+        }
         if (S.poly_n > 0) {
             double x0 = 1e300, x1 = -1e300, y0 = 1e300, y1 = -1e300;
             for (int k = 0; k < S.poly_n; ++k) {
@@ -734,7 +756,7 @@ PyObject* py_levels_at(PyObject*, PyObject* args) {
         if (spanx < 0.0 || spany < 0.0 ||
             spanx > (double)kMaxBuckets || spany > (double)kMaxBuckets ||
             spanx * spany > (double)kMaxBuckets) {
-            Py_DECREF(a_s); Py_DECREF(a_p); Py_DECREF(a_q);
+            Py_DECREF(a_s); Py_DECREF(a_p); Py_DECREF(a_q); Py_XDECREF(a_f);
             PyErr_SetString(PyExc_ValueError, "strip XY extent too large");
             return nullptr;
         }
@@ -787,6 +809,36 @@ PyObject* py_levels_at(PyObject*, PyObject* args) {
                           <= S.half + 1e-6;
                 }
                 if (!hit) continue;
+                if (S.prof_n >= 2) {
+                    // Tread-following profile: height at the closest
+                    // projection onto the polyline.  Mirror of the prof
+                    // branch in corridor_union._height_on -- same iteration
+                    // order, same strictly-less comparison, so the scalar
+                    // Python path and this batch agree bit-for-bit.
+                    const double* f = &fp[(size_t)S.prof_off * 3];
+                    double best_d2 = -1.0;
+                    double best_z = f[2];
+                    for (int k = 0; k < S.prof_n - 1; ++k) {
+                        const double qax = f[k * 3],     qay = f[k * 3 + 1];
+                        const double qaz = f[k * 3 + 2];
+                        const double qbx = f[k * 3 + 3], qby = f[k * 3 + 4];
+                        const double qbz = f[k * 3 + 5];
+                        const double dx = qbx - qax, dy = qby - qay;
+                        const double d2 = dx * dx + dy * dy;
+                        double t = (d2 < 1e-9) ? 0.0
+                            : ((px - qax) * dx + (py - qay) * dy) / d2;
+                        t = std::max(0.0, std::min(1.0, t));
+                        const double cx = qax + dx * t, cy = qay + dy * t;
+                        const double dd = (px - cx) * (px - cx)
+                                        + (py - cy) * (py - cy);
+                        if (best_d2 < 0.0 || dd < best_d2) {
+                            best_d2 = dd;
+                            best_z = qaz + (qbz - qaz) * t;
+                        }
+                    }
+                    zs.push_back(best_z);
+                    continue;
+                }
                 // Height on this strip's own slope at (px, py).
                 const double dx = S.bx - S.ax, dy = S.by - S.ay;
                 const double d2 = dx * dx + dy * dy;
@@ -824,7 +876,7 @@ PyObject* py_levels_at(PyObject*, PyObject* args) {
     Py_END_ALLOW_THREADS
 
     if (!err.empty()) {
-        Py_DECREF(a_s); Py_DECREF(a_p); Py_DECREF(a_q);
+        Py_DECREF(a_s); Py_DECREF(a_p); Py_DECREF(a_q); Py_XDECREF(a_f);
         PyErr_SetString(PyExc_ValueError, err.c_str());
         return nullptr;
     }
@@ -840,7 +892,7 @@ PyObject* py_levels_at(PyObject*, PyObject* args) {
             PyList_SET_ITEM(pyout, (Py_ssize_t)n, lst);
         }
     }
-    Py_DECREF(a_s); Py_DECREF(a_p); Py_DECREF(a_q);
+    Py_DECREF(a_s); Py_DECREF(a_p); Py_DECREF(a_q); Py_XDECREF(a_f);
     return pyout;
 }
 

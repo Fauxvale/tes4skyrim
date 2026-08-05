@@ -61,8 +61,17 @@ MAX_ASPECT = 4.0
 # metric alone lets through "one side way shorter than the others" triangles:
 # a 16u voxel edge with two ~100u edges scores aspect ~3 (its area is healthy)
 # yet reads as an obvious needle radiating from a wall corner.  No move may
-# create a triangle whose edges differ by more than this factor.
-MAX_EDGE_RATIO = 4.0
+# create a triangle whose edges differ by more than this factor.  2.0 is the
+# shape CONTRACT: the long side of a triangle may not exceed twice its short
+# side — near-equilateral is what NPC pathfinding wants.
+MAX_EDGE_RATIO = 2.0
+# Aspect bound (longest_edge^2 / (4 * area)) for the CLEANUP passes' shape
+# contract.  Edge ratio alone cannot see a CAP: an obtuse triangle whose apex
+# sits just off a long base has all three edges of comparable length (ratio
+# < 2) and near-zero height — visually the worst sliver there is.  Equilateral
+# scores 0.58; every ratio-2-legal non-cap shape stays under ~2.0; thin caps
+# score 2.5+.  A triangle is BAD when either bound is exceeded.
+MAX_TRI_ASPECT = 2.5
 # Simplification rounds (collapse + flip + smooth per round).  Converges fast;
 # rounds after the third change little.
 SIMPLIFY_PASSES = 4
@@ -182,11 +191,58 @@ ISLAND_EDGE_MARGIN = 48.0
 # ribbon's own vertices always qualify.
 ISLAND_PGRD_RADIUS = 48.0
 
+# --- Island bridging (drop-downs) -------------------------------------------------
+# Oblivion had no pathgrid edge for a DROP: a balcony and the floor below it are
+# two disconnected pathgrid islands, and the actor simply steps off.  The
+# navmesh reproduces the pathgrid faithfully, islands included, so those two
+# storeys arrive as separate components and an NPC pathing between them has no
+# route -- it walks into the wall/door and stops.  (CharacterGen's Ambush A: the
+# assassins' holding cell teleports onto a mezzanine they are meant to DROP from
+# into the ambush room; mezzanine and room floor were separate components, so
+# CGAssassinsAmbushA4 could never complete and the ambush never fired.)
+#
+# The fix bridges two components that all but touch in plan but are separated in
+# Z.  Both sides must ALREADY be separate components, so genuinely-connected
+# storeys (stairs, ramps) are never candidates -- they are one component and
+# never enter this pass.
+#
+# Horizontal reach, the drop window, and the bridge constants themselves are
+# defined AFTER RIBBON_HALF_WIDTH (below), because the reach is derived from
+# the ribbon width rather than hand-fitted.
+
 # --- Corridor ribbons (Phase 1, corridor.py) --------------------------------------
 # Half-width of the flat ribbon laid down each pathgrid edge.  ~80u total sits
 # inside a standard ~110u Oblivion doorway with clearance for the jambs; wide
 # enough for a Skyrim NPC's path radius.  Phase 2 will grow this out to walls.
 RIBBON_HALF_WIDTH = 40.0
+
+# --- Island bridging reach (see the ISLAND_BRIDGE block above) --------------------
+# Matched between BOUNDARY EDGE PAIRS, not single vertices, so the threshold has
+# to cover the length of a ribbon edge: two components can sit directly above one
+# another and still have their nearest edge ENDPOINTS a full edge apart, purely
+# because of where the triangulation put vertices.
+#
+# One ribbon WIDTH, not a hand-fitted constant.  A lip that overhangs the floor
+# below is within a corridor's width of it by construction, while "across the
+# room" is many widths away.  An earlier value fitted to a single measured cell
+# (33u) silently stopped bridging the moment the door-quad fix reshaped that
+# cell's mezzanine to 58u -- which is exactly why this is derived from the
+# ribbon geometry instead.
+ISLAND_BRIDGE_XY = 2.0 * RIBBON_HALF_WIDTH
+# Vertical drop the bridge may span.  A one-storey fall; Skyrim NPCs take this
+# routinely and Oblivion's design relies on it (the Ambush A mezzanine is 192u
+# above the room floor).  More than this would weld a tower's storeys together.
+ISLAND_BRIDGE_MAX_DROP = 220.0
+# Below MAX_CLIMB the two sides are a step apart, not a storey -- ordinary
+# adjacency, not a drop, and not this pass's business.
+ISLAND_BRIDGE_MIN_DROP = MAX_CLIMB
+# Ledge links emitted along ONE lip (component pair).  Vanilla puts a link on
+# several triangles along a balcony edge (half of Skyrim.esm's mesh->target
+# ledge pairs carry 2-12+ links) so an actor drops from wherever it reaches
+# the lip; a single link forced every actor through one small triangle and
+# most simply stopped at the edge.
+LEDGE_LINKS_PER_PAIR = 8
+
 # Spacing of cross-sections along an edge, so a long edge is several quads and
 # the ribbon can follow the pathgrid line's slope in Z rather than one flat
 # quad bridging the whole span.
@@ -294,12 +350,15 @@ RIBBON_GROW_DISC_RAYS = 16
 # Collapse edges shorter than this, turning the needle fans that outline corners
 # breed into near-equilateral triangles.  A collapse is only taken when it keeps
 # the outline, flips nothing, and does not worsen the local edge ratio, so this
-# can only improve shape and never changes coverage.  ~0.4 * TRI_TARGET_EDGE:
-# short enough that a real feature edge survives, long enough to eat the slivers.
-DECIMATE_MIN_EDGE = 0.0
-# Passes.  Each round re-derives the boundary and re-sorts candidates; the mesh
-# converges in a couple of rounds.
-DECIMATE_ROUNDS = 3
+# can only improve shape and never changes coverage.  ~0.5 * TRI_TARGET_EDGE:
+# short enough that a real feature edge survives, long enough to eat the slivers
+# (64u is the side of an equilateral triangle of ~1774u^2, comfortably above
+# MIN_TRI_AREA, so what the collapses build the area floor never culls).
+DECIMATE_MIN_EDGE = 64.0
+# Passes.  Each round re-derives the boundary and re-sorts candidates.  Five,
+# not three: sawtooth removal converges tooth by tooth — cutting a convex
+# tooth re-derives the outline and only then exposes the next collapse.
+DECIMATE_ROUNDS = 5
 # How far the OUTLINE may move when a boundary vertex is decimated away: the
 # vertex's distance from the chord between its two boundary neighbours.  The
 # outline is the wall standoff, so this is deliberately small — straight runs of
@@ -307,11 +366,54 @@ DECIMATE_ROUNDS = 3
 # cannot cut through a wall.  Freezing the outline entirely (tol 0) left 17-21%
 # sliver triangles; this recovers the decimation without the corner-cutting.
 DECIMATE_OUTLINE_TOL = 6.0
-# Vertices within this of a door threshold are PINNED — never collapsed.  A
-# decimated door corner destroys the Door Triangle and the doorway goes dead in
-# the engine (no cross-cell/room pathing through it).  Comfortably covers the
-# door quad (DOOR_QUAD_HALF_WIDTH 48 / HALF_DEPTH 32).
-DECIMATE_PIN_RADIUS = 80.0
+# SAWTOOTH removal: a boundary vertex that juts OUTWARD (convex — its removal
+# can only SHRINK the mesh, never push it through a wall) may be cut even when
+# it deviates more than DECIMATE_OUTLINE_TOL from its neighbours' chord, up to
+# this deviation.  This is what turns a zigzag union outline into a clean
+# polygon: the teeth are cut off inward, real concave corners (which removal
+# would EXPAND across) are never touched.  Bounded by DECIMATE_MAX_AREA_LOSS.
+DECIMATE_SAWTOOTH_DEV = 32.0
+# Total plan area the sawtooth cuts may remove, as a fraction of the mesh's
+# area at decimation start.  "Only a minor area reduction along the periphery."
+DECIMATE_MAX_AREA_LOSS = 0.10
+
+# --- Peripheral sliver cull (corridor_clean.cull_boundary_slivers) -----------
+# After decimation and flips, whatever badly-shaped triangles remain sit on
+# the OUTLINE where the union's shape simply does not admit a good triangle.
+# Those "little bits around the outside" are removed outright — the mesh
+# gives up a fringe sliver rather than carry a needle an actor cannot use.
+# A boundary triangle is culled when its edge ratio exceeds the shape
+# contract AND it is small, or when it is smaller than the hard area floor.
+CULL_SLIVER_RATIO = 2.0
+# "Small" for the ratio cull.  3000u^2 ~ a 100x60 wedge: big enough to catch
+# every visible boundary needle, still well under the size of a triangle that
+# is genuinely load-bearing coverage.
+CULL_SLIVER_MAX_AREA = 3000.0
+# Hard minimum triangle area: below this a triangle covers no usable ground
+# for a Skyrim actor (path radius ~34u -> ~1000u^2 footprint).  Vanilla door
+# triangles bottom out at 992.
+MIN_TRI_AREA = 1000.0
+# Total area the sliver cull may remove, as a fraction of the mesh — the cull
+# trims the periphery, it must never eat into real coverage.
+CULL_SLIVER_AREA_FRAC = 0.12
+# Vertices within this of a door wedge RING POINT (base corners, base
+# midpoint, apex — the Door Triangle's own corners) are PINNED — never
+# collapsed.  A decimated door corner destroys the Door Triangle and the
+# doorway goes dead in the engine.  Tight, because the ring coordinates are
+# EXACT mesh vertices: the old 80u blanket around the whole threshold also
+# froze every sliver in the doorway's neighbourhood, which no collapse or
+# cull could then remove (measured on Pinarus: area-3 MICRO triangles parked
+# beside a door forever).
+DECIMATE_PIN_RADIUS = 8.0
+# Vertices within this of a door CENTRE are pinned as a fallback for doors
+# that carry no wedge ring (withdrawn/interior-side quads).
+DECIMATE_PIN_CENTER_RADIUS = 24.0
+# Vertices within this of a PATHGRID NODE are pinned.  A node is a junction
+# the walked lines meet AT; outline-moving collapses and the sliver cull had
+# no node awareness and could shave the boundary across one, leaving the
+# node's own position a few units outside coverage (measured as single-sample
+# holes exactly at nodes in ImperialDungeon01 and BarrenCave).
+DECIMATE_PIN_NODE_RADIUS = 24.0
 # Lower bound: a rail never grows NARROWER than this half-width even if a wall or
 # a neighbour centerline is closer, so a corridor squeezed between two close
 # obstacles still carries a walkable strip (the Phase-1 width was unconditional).

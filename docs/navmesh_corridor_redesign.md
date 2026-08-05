@@ -12,7 +12,7 @@
 > exist. The Recast-era generator remains on branch **`test-navmesh-2`**.
 > Performance work on the corridor path is recorded in
 > [performance_notes.md](performance_notes.md); geometry is verified by
-> `tools/navmesh_check.py`, `navmesh_reach.py`, `navmesh_slope_check.py`.
+> `tools/navmesh/check.py`, `navmesh_reach.py`, `navmesh_slope_check.py`.
 >
 > Read the rest of this document as the design rationale for what was built.
 
@@ -325,7 +325,7 @@ links. Verify on the canonical problem cells:
 - **Pinarus' house (interior, stairs + upper floor + door):** one connected
   component; staircase is a single clean ramp (not a sawtooth); upstairs
   reachable from downstairs; the exterior door has a Door Triangle and
-  `_build_door_links` attaches it. `tools/navmesh_reach.py` shows the quest
+  `_build_door_links` attaches it. `tools/navmesh/reach.py` shows the quest
   start→goal reachable *through* the door.
 - **A cave interior:** floor followed in Z, no bad triangles.
 - **An exterior grid cell with terrain + a road pathgrid:** ribbon follows the
@@ -341,7 +341,7 @@ links. Verify on the canonical problem cells:
   pathgrid edge through it gets a Door Triangle; byte-reproducible
   (`tools/esm_diff.py`).
 
-Tools: `tools/navmesh_probe.py`, `tools/navmesh_reach.py`, `tools/navmesh_check.py`
+Tools: `tools/navmesh/probe.py`, `tools/navmesh/reach.py`, `tools/navmesh/check.py`
 (validate against Skyrim.esm first — it has known findings, don't chase those).
 
 ---
@@ -419,7 +419,7 @@ Still open, to resolve during the Phase 1 build:
 
 ## Connectivity invariant: status 2026-07-25
 
-Acceptance test is `tools/navmesh_component_audit.py` (SINGLE-PROCESS — see its
+Acceptance test is `tools/navmesh/component_audit.py` (SINGLE-PROCESS — see its
 docstring): **one connected pathgrid component must produce one connected
 navmesh component.** Anything more means the engine cannot make a walk the
 pathgrid asserts, however good the mesh looks in the preview.
@@ -491,12 +491,12 @@ measures the closest approach between two named components.
 still unnavigable in game — the upper floor hung off a single vertex through a
 fan of triangles each climbing 44-54u, and the pathfinder will not traverse a
 triangle whose rise exceeds `MAX_CLIMB` (34). Measure it with
-`tools/navmesh_bottleneck.py`, which reports single-edge BRIDGES (a shared edge
+`tools/navmesh/bottleneck.py`, which reports single-edge BRIDGES (a shared edge
 whose removal splits the mesh) and the total shared-edge width across each Z
 level. Pinarus's stair throat showed **1 shared edge / 106.7u** where every
 other level had 6 edges / ~520u.
 
-**The pathgrid was NOT the problem.** `tools/navmesh_surface_residual.py`
+**The pathgrid was NOT the problem.** `tools/navmesh/surface_residual.py`
 measures mesh_z minus real collision_z per vertex: Pinarus's upper floor is
 **100% of vertices at exactly 0.00u** (flush on collision), and 86.5% of the
 whole cell is within +/-2u. The hover theory is disproved for this cell —
@@ -544,3 +544,210 @@ because the stair polygon is a narrow band in plan. Fixing this needs work in
 triangle spanning > MAX_CLIMB shatters ChorrolFG into `[153,124,123,123,12]` and
 Pinarus into `[128,107,57]`. Those triangles ARE the only floor-to-floor
 connection — they must be SUBDIVIDED into walkable steps, never removed.
+
+---
+
+## The triangle-quality contract (2026-08-04)
+
+The author's explicit brief: **triangles MUST be close to equilateral** — the
+long side no more than 2x the short side, plus a hard MINIMUM triangle area,
+with the sawtooth/decimation machinery existing precisely so the mesh can be
+broken into LARGE well-formed triangles and the little bits around the outside
+simply removed.
+
+**Shape metric — `corridor_clean._badness`.** Edge ratio alone cannot see a
+CAP (obtuse, near-zero height, all edges comparable — visually the worst
+sliver there is).  Badness = max(edge_ratio / MAX_EDGE_RATIO (2.0),
+aspect / MAX_TRI_ASPECT (2.5)) with aspect = longest^2/(4*area); 1.0 is the
+contract boundary.  Every cleanup pass (collapse bound, flip objective, cull
+candidacy, split candidacy) uses this one metric.
+
+**The passes, in order** (decimate -> cull -> decimate -> cull inside
+`finalize`, budget split 100%/40%):
+
+* collapses (edges < DECIMATE_MIN_EDGE 64) with link-condition +
+  outline/sawtooth rules; a collapse may not push shape past the contract;
+* Lawson flips (`_flip_pass`), duplicate-edge-guarded;
+* long-edge bisection (`_split_needles`): a needle whose edges are all LONG
+  can be fixed by neither collapse nor flip — bisect its longest edge at the
+  apex projection, only when both halves beat the parent's badness (a naive
+  midpoint bisect minted two r=11 slivers where one r=4 stood);
+* boundary sliver cull: badness > 1 and area < 3000, or area < MIN_TRI_AREA
+  (1000 — a Skyrim actor's footprint; vanilla door triangles bottom out at
+  992).
+
+**The walkability contract (added same day, author's rule).** Connectivity is
+not the metric — CHOKEPOINTS are: two areas joined by a strip narrower than
+half a doorway (~48u) are UNWALKABLE for NPCs.  Enforcement in the cull:
+
+* a candidate whose pathgrid samples remain covered by neighbours may go
+  (sole-cover slivers never go; replacement cover must be within a STEP of
+  the sample's own z — an 80u window let a stacked cave ledge below count);
+* `_narrows_corridor`: pin_xy samples carry the line DIRECTION; the cull
+  measures the corridor's live cross-width at any nearby sample and refuses
+  the cull when it is already under 56u.  Wide-room fringe still culls.
+* pathgrid NODES are pinned (DECIMATE_PIN_NODE_RADIUS 24): outline collapses
+  and culls had no node awareness and shaved the boundary across junctions
+  (single-sample holes exactly at nodes in ImperialDungeon01/BarrenCave).
+
+**Doors are never walls.** A door is a thing an actor OPENS: vanilla navmesh
+runs under every door.  `gather_cell_geometry(skip_bases=door bases)` keeps a
+door ref's placed FLAT faces (a trapdoor/platform door IS the floor — the
+ImperialDungeon01 nodes 243-248 junction stands on one, and gates are
+authored upright then laid flat by rotation, so the local-space class cannot
+be trusted) and drops everything steep (the panel).  Measured defect: the
+Pinarus upstairs animated door's at-rest panel sits 47u from its threshold
+ACROSS the passage and pinched the doorway to nothing.
+
+**Flat surfaces over flights.**  Three mechanisms keep a FLAT surface (node
+disc, door quad) from hanging mesh over a staircase:
+
+* disc RAY TRIM at stair nodes (`DISC_RAY_TRIM`): the march stops at walls
+  and sudden drops but happily follows a RAMP down a legal step per station;
+  the trim walks the real surface and stops the ray where it has left the
+  node's level by more than a step in total;
+* `_clip_flat_poly_off_level`: discs and door quads give up the parts of a
+  steep ribbon's footprint that are off their level — but ONLY intervals
+  contiguous with a mouth station INSIDE the polygon (anchoring).  |dz| alone
+  cannot tell "my own flight ramping away" from "another storey's flight
+  passing under me in plan": the unanchored version opened 37 walked-line
+  holes on ChorrolFightersGuild's mid floors;
+* door quads are RAMPS, not shelves: `door_footprints` probes the corridor
+  mesh under the quad's far edge (`z_far`) and the strip slopes to meet it,
+  clamped to slope 0.5 (the probe's storey-scale tolerance could grab the
+  WRONG floor and paint a 45-degree cliff across a corridor — Moranda02).
+
+**The crack zipper.** Two emissions of a flight can meet along a zero-area
+lens: coincident in plan, 3-8u apart in z — no shared edge, so the engine
+cannot path across, and it renders as a hairline hole ON the staircase (the
+ImperialDungeon01 "holes in the highest stairs").  `_split_t_junctions` seals
+them: hits project in PLAN with a separate z window (TSPLIT_Z_TOL 12 — a full
+MAX_CLIMB window grabbed genuine fold vertices and minted 18 overlaps), a hit
+that is itself a BOUNDARY vertex may be up to TSPLIT_CRACK_TOL 6u off the
+edge (both sides of a crack are boundary; an interior vertex that close is
+dense healthy mesh and keeps the 2u radius), and a hit is refused when the
+fan's new edges would give any edge a 3rd owner (_make_manifold would rip the
+extras and delete real corridor — measured 3-sample losses in two cells).
+
+**Repair-pass ordering.** `_split_t_junctions` re-runs after the last
+vertex-moving pass (merge/stitch): a hanging node minted late reads as
+point-attached and `_drop_point_attached` deletes REAL coverage (the
+ImperialDungeon01 prison junction triangle).  Plan-degenerate triangles are
+culled by `_drop_degenerate_guarded` (never disconnecting; load-bearing
+degenerate connectors survive) — in `finalize` AND once more after
+`attach_door_triangles`, which mints seam slivers of its own.
+
+**Measured state (in-process harness vs the prior user-approved build)**:
+badness p90 1.15-1.6 vs 1.4-2.1; contract violations down 6-11 points per
+cell; sub-1000u^2 triangles roughly halved; walked-line coverage and
+chokepoints at parity (residual: 1-3 single 16u samples per cave cell and
++1 choke edge on two cells, all borderline z-drift on jagged cave floors).
+Verify with `temp/sweep.py` / `temp/esm_shape_cmp.py` (miss / choke / ovl /
+badness per cell, current build vs the ESM on disk).
+long side no more than ~2x the short side, plus a minimum triangle area — with
+sawtooth outlines simplified inward and the leftover "little bits around the
+outside simply removed."  Implemented as a pipeline of guarded passes; every
+one preserves the two hard invariants (no overlapping same-surface triangles,
+no disconnection the pathgrid contradicts).
+
+### Where the shape comes from
+
+1. **Interior hex lattice** (`corridor_union._hex_refine`).  GEOS's
+   constrained Delaunay uses only the polygon's own vertices, so any region
+   wider than one triangle triangulates as a fan of slivers — no post-collapse
+   can fix that, because the vertices to break the fans do not exist.  A hex
+   lattice at `TRI_TARGET_EDGE` spacing is inserted point-by-point into the
+   CDT (containing-triangle 3-fan split; each point kept 0.45×spacing clear of
+   existing vertices and of the boundary), then `_flip2d` restores local
+   shape.  Lattice anchored on the part's own bounds — deterministic.
+2. **Ratio-improving diagonal flips** (`corridor_union._flip2d` in 2D at
+   triangulation time, `corridor_clean._flip_pass` in 3D during decimation).
+   A flip moves no vertex, so outline and coverage cannot change.  Guards:
+   strict ratio improvement, quad convexity via signed areas, z-span of the
+   new diagonal, door triangles (all corners pinned) untouched, and — learned
+   the hard way — **never flip onto a diagonal that already exists as an edge
+   elsewhere**: folded storeys reuse vertices, the duplicate edge is
+   non-manifold, and `_make_manifold` later rips whole regions out.
+3. **Decimation shape ceiling** `MAX_EDGE_RATIO = 2.0`: no collapse may push
+   any triangle past the 2× contract (or past the worst ratio already
+   present).
+4. **Sawtooth cuts** (decimate boundary rule): a *convex* outline vertex —
+   one whose removal can only SHRINK the mesh — may be cut with deviation up
+   to `DECIMATE_SAWTOOTH_DEV` (32u), budgeted by `DECIMATE_MAX_AREA_LOSS`
+   (10%).  Concave vertices never move (their removal would extend the mesh
+   outward, i.e. through a wall).  Exterior-seam vertices only ever collapse
+   collinearly, so cross-cell stitching is untouched.
+5. **Peripheral sliver cull** (`corridor_clean.cull_boundary_slivers`): a
+   boundary triangle with ratio > `CULL_SLIVER_RATIO` and area <
+   `CULL_SLIVER_MAX_AREA`, or below `MIN_TRI_AREA`, is removed outright —
+   unless it touches a door pin, contains a pathgrid sample, lies on the
+   cell seam, or its neighbours would lose each other (bounded BFS).
+6. **Door pins are TIGHT** (`DECIMATE_PIN_RADIUS` 8u around the wedge ring
+   points, 24u around door centres).  The old 80u blanket froze every sliver
+   near a doorway beyond repair (area-3 MICRO triangles parked forever).
+
+Measured on the reference cells: edge-ratio p50 1.56–1.85, p90 2.3–3.1;
+needles (>3.0) 3–12% (they are the protected minority: pathgrid-carrying
+strips, connectivity bridges, genuinely thin corridors).
+
+### The overlap/connectivity repairs that made it safe
+
+The quality passes exposed a series of latent defects; the fixes are load
+bearing and each encodes a measured failure:
+
+* **Same-emission weld = provisional, checked, reverted** (`_weld_sheets`):
+  a sideways weld that creates any overlap is undone (an outright ban broke
+  ImperialDungeon05's connectivity; the unchecked weld created Pinarus's
+  stair-bottom overlaps).
+* **Junction strips are clipped to the junction disc** (`_clip_strip_near`),
+  and the clip measures from the NODE's projection, not the segment end
+  (stair ribbons extend 48u past their nodes).  Handing over the whole strip
+  leaked its heights across everything it passes under → phantom duplicate
+  floors.
+* **Steep edges carry a tread-following height profile**
+  (`corridor._surface_profile`, mirrored natively in `grow.cpp
+  py_levels_at`): a DP over walkable collision layers along the line,
+  constrained to start/end at the node heights.  The end constraint is what
+  selects the treads over the floor that continues under the flight.
+* **`_merge_at_pathgrid_nodes` welds ONE closest cross-component pair per
+  junction, capped at `RIBBON_HALF_WIDTH`**, in a disc widened by one ribbon
+  width, and runs BEFORE the stitch.  The old whole-band weld deleted every
+  triangle that fit inside the node disc (lattice-sized triangles all do).
+* **`_stitch_shared_nodes`** fuses coincident vertices each round (post-weld
+  passes mint identical positions under different indices), bridges with an
+  overlap guard (relaxed to a 250u² sliver tolerance only for junctions
+  nothing else could join), and slope-based dz guards (a bridge may climb
+  with its plan run; only height without run is a wall).  It is re-run at
+  the END of `finalize` — decimation can land two components' vertices on
+  the same position, invisible to everything upstream.
+* **`_destack`**: same-surface stacked duplicates (two triangles covering
+  the same plan area within 40u of height) that survive the claim are
+  removed, smaller first, connectivity-guarded.
+* **`_drop_walls`**: triangles steeper than `WALL_SLOPE_COS` (55°) removed
+  when their neighbours stay connected without them — never at emission
+  time, which tore caves apart.
+* **Decimation topology guards**: the standard link condition, plus
+  boundary-pair collapses only along an OUTLINE edge (collapsing across a
+  thin neck pinches the sheet and sheds vertex-attached scraps).
+
+State on the 10 reference cells (2026-08-04): component invariant 9/10 OK
+(Moranda02 at 2 components — its historical defect, previously 3–4 — with an
+85u genuine hole in one tunnel), overlaps 0 everywhere except two mutually
+load-bearing bridge pairs in a BarrenCave throat.
+
+### XXXX-oversized NVNMs and the edge linker (2026-08-04)
+
+The lattice pushed ~119 exterior meshes past the 65,535-byte subrecord limit,
+so their NVNMs are written under the XXXX size-override protocol.
+`navm_edge_links._extract_nvnm` did not speak XXXX and read those NVNMs as
+EMPTY — every oversized mesh silently skipped cross-cell edge linking (the
+"6504 → 6385 exterior navmeshes" drop in the build log; the meshes themselves
+were present and fine).  The walker now honours XXXX; `pack_subrecord`
+re-emits it on write.  Any new consumer that walks raw NAVM subrecords MUST
+handle XXXX — `navm_split._decode_record` and `navi_builder` already do.
+
+Known pre-existing gap (not from this work): 53 exterior cells whose pathgrid
+is a single node with only PGRI (cross-seam) links get no navmesh job at all
+(`_gather_navm_jobs` requires in-cell edges); `build_navmesh` produces a valid
+ribbon for them when invoked directly, so the fix is to gate jobs on
+"edges OR PGRI links".

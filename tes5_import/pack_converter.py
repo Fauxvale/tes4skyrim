@@ -173,6 +173,8 @@ FURNITURE_SIGS = frozenset({'FURN', 'CHAI', 'BED '})
 # activate that thing", and the thing's own OnActivate script is what advances
 # the quest — so it must become a TES5 Activate template, never a Sandbox.
 OPERABLE_SIGS = frozenset({'ACTI', 'DOOR', 'CONT'})
+# Placed actors, as ref_base_sig reports them (ACHR -> 'NPC_', ACRE -> 'CREA').
+ACTOR_SIGS = frozenset({'NPC_', 'CREA'})
 
 
 def _operate_target(rec: dict, ctx: 'PackContext') -> bool:
@@ -791,6 +793,30 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
         if _operate_target(rec, ctx):
             i = Inputs(ACTIVATE)
             i.set('target', tgt)
+            return i
+        # "Find" an ACTOR is a seek: go to where that actor is.  At
+        # CharacterGen stage >= 24 the ambush assassins each Find a Blade
+        # (CGAssassinsAmbushAToGlenroy/Baurus/Renote, distance 200) — that
+        # package is what carries them out of the ambush room, through its
+        # teleport door and off the mezzanine drop into the fight; the
+        # sandbox fallback left them standing in the room forever.  Skyrim's
+        # Travel procedure with a "near reference" location is the seek half
+        # of Find (the "use" tail does not apply to an actor), and the ref
+        # routes through a quest alias exactly as resolve_target does.
+        # PTDT.Count on a Find is the approach DISTANCE (see build_target's
+        # census note), so it becomes the location radius.
+        target = get_formid(rec, 'PTDT.Target')
+        if target and ctx.base_sig_of(target) in ACTOR_SIGS:
+            t4_radius = get_int(rec, 'PTDT.Count', 0) or 0
+            t4_radius = max(0, min(int(t4_radius), 4096))
+            alias = ctx.alias_for(pack_fid, target)
+            i = Inputs(TRAVEL)
+            i.set('location',
+                  build_alias_location(alias, t4_radius)
+                  if alias is not None
+                  else build_location(0, target, t4_radius))
+            if use_horse:
+                i.set('ride_horse', 1)
             return i
         # Otherwise: travel to the location, then sandbox there.  The "locate
         # this object" tail has no TES5 standalone equivalent.

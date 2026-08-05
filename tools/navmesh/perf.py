@@ -14,9 +14,9 @@ per-stage attribution across a pool would need timings shipped back per cell.
 Fractions are what matter, and they carry to the parallel run because every
 worker runs this same code.  Use a small cell subset.
 
-    python tools/navmesh_profile.py --cell Wendir02
-    python tools/navmesh_profile.py --cells Wendir02,ICMarketDistrict --stages
-    python tools/navmesh_profile.py --cell grid:12:-8 --top 25
+    python tools/navmesh/perf.py --cell Wendir02
+    python tools/navmesh/perf.py --cells Wendir02,ICMarketDistrict --stages
+    python tools/navmesh/perf.py --cell grid:12:-8 --top 25
 """
 
 import argparse
@@ -26,14 +26,14 @@ import pstats
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import (  # noqa: E402
     build, corridor, corridor_clean, corridor_doors, corridor_grow,
     corridor_union, world,
 )
-from tools.navmesh_probe import load_cell  # noqa: E402
+from tools.navmesh.probe import load_cell  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ def install_stage_timers():
     _wrap(world, 'gather_cell_geometry', 'world.gather_cell_geometry')
 
     # Surface samplers and strip planning — folded in from the retired
-    # tools/navmesh_corridor_profile.py.  corridor.py imports the union/doors/
+    # tools/navmesh/corridor_profile.py.  corridor.py imports the union/doors/
     # clean modules INSIDE build_corridors, so patching the module attribute is
     # what the call actually resolves through.
     _wrap(corridor, '_surface_sampler', 'corridor._surface_sampler')

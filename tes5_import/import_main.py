@@ -50,6 +50,7 @@ from .record_types.world import (
     convert_REFR,
     convert_WRLD,
     set_cell_locations,
+    set_door_navmesh_links,
 )
 from .text_reader import (
     get_float,
@@ -269,6 +270,31 @@ def _create_tes4_special_records(writer: PluginWriter):
           f"TES4GoldFenced={fenced_fid:08X}, "
           f"TES4ControlsDisabled={ctrl_fid:08X}, "
           f"TES4CyrodiilCrimeFaction={crime_fid:08X}")
+
+
+def _create_message_menu_records(writer: PluginWriter, plan: dict) -> dict:
+    """One MESG per button-MessageBox call site (message_menus.py plan).
+
+    Layout matches vanilla script-shown boxes (dunMiddenNamesMenuMSG): DESC =
+    the message text, INAM = null (required leftover), DNAM bit 0 = Message
+    Box (a modal with buttons, not a corner notification), one ITXT per
+    button and no conditions — Show() returns the clicked ITXT's index, which
+    is the same number the TES4 GetButtonPressed poll compared against.
+    Returns {mesg_edid: formid} for _WELL_KNOWN_PROPERTIES.
+    """
+    name_to_fid = {}
+    for edid_low in sorted(plan):
+        for name, text, buttons in plan[edid_low]:
+            fid = writer.alloc_formid()
+            subs = pack_string_subrecord('EDID', name)
+            subs += pack_string_subrecord('DESC', text)
+            subs += pack_subrecord('INAM', struct.pack('<I', 0))
+            subs += pack_subrecord('DNAM', struct.pack('<I', 1))
+            for button in buttons:
+                subs += pack_string_subrecord('ITXT', button)
+            writer.add_record('MESG', pack_record('MESG', fid, 0, subs))
+            name_to_fid[name] = fid
+    return name_to_fid
 
 
 def _create_ambient_gmst_overrides(writer: PluginWriter, by_type: dict):
@@ -623,6 +649,22 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
           f"{len(_SC.topic_unlock_globals)} topic->global names for scripts")
     _step_done('addtopic unlock plan')
 
+    # Button-MessageBox menus: TES4 scripts build choice menus with
+    # `MessageBox "text" "Btn" ...` + a GetButtonPressed poll; Skyrim needs an
+    # authored MESG per call site for Message.Show() to return the clicked
+    # index. Same analysis as the script pipeline (message_menus.py), so the
+    # `TES4Msg_*` Message properties the converted .psc files declare bind to
+    # exactly these records — registration in _WELL_KNOWN_PROPERTIES is what
+    # resolves them, the TES4Fame/TES4Unlock pattern.
+    from script_convert.message_menus import build_message_plan
+    message_plan = build_message_plan(by_type.get('SCPT', []))
+    message_mesgs = _create_message_menu_records(writer, message_plan)
+    _SC.message_menus = message_plan
+    _WELL_KNOWN_PROPERTIES.update(message_mesgs)
+    print(f"  Button menus: {len(message_mesgs)} MESG records for "
+          f"{len(message_plan)} scripts")
+    _step_done('button menu MESGs')
+
     # --- Phase 0b2: Build FormID → EditorID map for VMAD property resolution ---
     # Scripts reference external records via SCRO FormIDs. To populate VMAD
     # property values (so CK isn't needed), we need EditorIDs to generate
@@ -877,6 +919,15 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                 _bs = _base_sig.get(int(_b, 16) & 0xFFFFFF)
                 if _bs:
                     _ref_base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _bs
+            except ValueError:
+                pass
+    # Placed ACTORS, so a Find/UseItemAt package can tell "seek this actor"
+    # from "operate this object" (CGAssassinsAmbushAToGlenroy targets
+    # Glenroy's ACHR — see pack_converter's actor-Find branch).
+    for _sig, _bs in (('ACHR', 'NPC_'), ('ACRE', 'CREA')):
+        for _r in by_type.get(_sig, []):
+            try:
+                _ref_base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _bs
             except ValueError:
                 pass
     pack_ctx = PackContext(plan=pack_plan, script_vars=_script_vars,
@@ -1173,7 +1224,46 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # needs neighbour NAVM FormIDs + final triangle indices) and before the group
     # builders serialise them. See docs/world_land_navmesh_notes.md.
     from .navm_edge_links import build_edge_links
+    _t_el = time.time()
     build_edge_links(navm_cache)
+    print(f"    Edge links: {time.time() - _t_el:.1f}s")
+
+    # Split multi-component INTERIOR meshes into one NAVM per component.  The
+    # engine only joins navmeshes through a door when the two sides are
+    # DIFFERENT NAVM records (vanilla: all 5 same-cell teleport-door pairs
+    # with XNDP live on two meshes); a door pair inside one mesh is never a
+    # portal, so the CharacterGen assassins could not leave their holding
+    # room however correct XNDP/NVNM/NVMI were.  Must run after
+    # build_edge_links (final triangle indices) and before the XNDP
+    # collection below (it moves doors onto the component meshes).
+    from .navm_split import split_disconnected_interiors
+    _t_sp = time.time()
+    n_split = split_disconnected_interiors(navm_cache, writer)
+    print(f"    Interior split: {time.time() - _t_sp:.1f}s")
+    if n_split:
+        print(f"  Navmesh split: {n_split} interior meshes split into "
+              f"per-component NAVMs")
+
+    # The REFR side of every navmesh door link.  NVNM (door triangles) and NAVI
+    # (NVMI door links) both point navmesh -> door; XNDP is the only thing that
+    # points door -> navmesh triangle, and that is the direction the engine
+    # needs to build a PathingDoor.  Without it a teleport door is not a pathing
+    # node at all: an actor whose package destination lies on the far side has
+    # no route, so it never leaves the room even though the package, the alias
+    # and the conditions are all correct.  This is CharacterGen's Ambush A —
+    # the assassins' holding room connects to the ambush floor through the
+    # teleport-door pair 0004F795/0004F7A2, and with no XNDP the four
+    # CGAssassinsAmbushA1-A4 Travel packages had a destination they could not
+    # path to.  Must run after every navmesh exists (triangle indices are final
+    # only once build_edge_links has run) and before the group builders convert
+    # any REFR.
+    door_xndp = {}
+    for _key, (_bytes, _meta) in navm_cache.items():
+        if _meta:
+            door_xndp.update(_meta.get('door_xndp') or {})
+    set_door_navmesh_links(door_xndp)
+    print(f"  Navmesh door links: {len(door_xndp)} doors bound to a "
+          f"navmesh triangle (XNDP)")
     _phase_done('phase 4a navmesh generation')
 
     # LAND is the heaviest per-record converter; convert all of them up front
@@ -1676,6 +1766,7 @@ def _precompute_land(by_type: dict, export_dir: str) -> dict:
         dict(items_mod._BASE_ORIGIN_SHIFT),
         os.path.join(export_dir, 'mesh_bounds_cache.json'),
         get_injected_formids(),
+        dict(world_mod._DOOR_NAVMESH_LINK),
     )
 
     chunks = [[('LAND', rec) for rec in lands[i:i + _LAND_CHUNK]]
@@ -1948,6 +2039,10 @@ def _build_cell_groups(by_type: dict, writer: PluginWriter,
                             temporary.append(navm_bytes)
                             navm_metas.append(meta)
                             converted += 1
+                            for xb, xm in meta.get('extra_navms', ()):
+                                temporary.append(xb)
+                                navm_metas.append(xm)
+                                converted += 1
                     if temporary:
                         children_parts.append(pack_group(9, struct.pack('<I', cell_fid), b''.join(temporary)))
 
@@ -2193,6 +2288,10 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
                                     temporary.append(navm_bytes)
                                     navm_metas.append(meta)
                                     converted += 1
+                                    for xb, xm in meta.get('extra_navms', ()):
+                                        temporary.append(xb)
+                                        navm_metas.append(xm)
+                                        converted += 1
                             if temporary:
                                 cell_children.append(pack_group(9, struct.pack('<I', cell_fid), b''.join(temporary)))
 

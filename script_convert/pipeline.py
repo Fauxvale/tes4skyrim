@@ -41,7 +41,8 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
                         stage_reveals, say_durations=None,
                         say_timer_owners=None, topic_by_dial=None,
                         beat_fields_by_owner=None, quest_script_vars=None,
-                        quest_edid_by_fid=None, topic_unlock_globals=None):
+                        quest_edid_by_fid=None, topic_unlock_globals=None,
+                        message_menus=None):
     _WORKER_CTX.update(xref=xref, output_dir=output_dir,
                        info_reveals=info_reveals,
                        service_topics=service_topics,
@@ -59,6 +60,9 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
     # DIAL EditorID -> unlock global, so a script `AddTopic X` opens the same
     # gate the INFO/QUST fragments do.
     ScriptConverter.topic_unlock_globals = topic_unlock_globals or {}
+    # script EditorID -> button-MessageBox MESG plan; the importer writes the
+    # records this makes the converter reference (message_menus.py).
+    ScriptConverter.message_menus = message_menus or {}
 
 
 def _script_worker_run(job):
@@ -119,10 +123,27 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
     # `TES4Polyfill.*` and INFO VMADs name the service fragments, both of
     # which resolve to the master's shipped copy (phase_compile puts every
     # master's source dir on the -h header path).
+    static_dir = os.path.join(os.path.dirname(__file__), 'static_scripts')
     if master_names(export_dir):
         print('  Static scripts: skipped (owned by this plugin\'s master)')
+        # Remove copies an older (pre-skip) build left in this plugin's
+        # output. They are poison twice over: the stale .psc shadows the
+        # master's fresh copy on the compile header path (Translation.esp's
+        # Aug-1 TES4Polyfill had no ReleaseBreakaway, so every script calling
+        # it failed to compile), and the stale .pex ships under the same
+        # script name as the master's — whichever loads last wins in-game.
+        if os.path.isdir(static_dir):
+            for name in os.listdir(static_dir):
+                if not name.endswith('.psc'):
+                    continue
+                stale_psc = os.path.join(output_dir, name)
+                stale_pex = os.path.join(os.path.dirname(output_dir),
+                                         name[:-4] + '.pex')
+                for stale in (stale_psc, stale_pex):
+                    if os.path.isfile(stale):
+                        os.remove(stale)
+                        print(f'    removed stale master-owned copy: {stale}')
     else:
-        static_dir = os.path.join(os.path.dirname(__file__), 'static_scripts')
         if os.path.isdir(static_dir):
             import shutil
             for name in os.listdir(static_dir):
@@ -255,10 +276,20 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
         if gname:
             topic_unlock_globals[edid] = gname
 
+    # Button-MessageBox plan — the SAME analysis the importer runs to author
+    # the MESG records, so the Message properties emitted here bind to them.
+    from .message_menus import build_message_plan
+    message_menus = build_message_plan(by_type.get('SCPT', []))
+    if message_menus:
+        n_sites = sum(len(v) for v in message_menus.values())
+        print(f'    Button menus: {n_sites} MessageBox sites in '
+              f'{len(message_menus)} scripts')
+
     initargs = (xref, output_dir, info_reveals, service_topics,
                 unlock_plan['stage_reveals'], say_durations,
                 say_timer_owners, topic_by_dial, beat_fields_by_owner,
-                quest_script_vars, quest_edid_by_fid, topic_unlock_globals)
+                quest_script_vars, quest_edid_by_fid, topic_unlock_globals,
+                message_menus)
     if workers <= 1 or len(jobs) <= 2:
         _script_worker_init(*initargs)
         for job in jobs:

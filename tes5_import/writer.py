@@ -418,6 +418,10 @@ class PluginWriter:
             # LCTN first every location logged "Could not find worldspace
             # (0100003C) in load" — 512 warnings and undiscoverable markers.
             'LCTN',
+            # Vanilla puts MESG just after LCTN. Nothing in a MESG is resolved
+            # order-sensitively at load (ours carry no conditions), but keep
+            # the canonical slot rather than letting it append after DLVW.
+            'MESG',
             'SMBN', 'SMQN', 'SMEN',
             'DLBR', 'DLVW',
         ]

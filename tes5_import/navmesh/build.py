@@ -53,20 +53,25 @@ def teleport_door_positions(refr_recs):
                 continue
             if max(abs(x), abs(y), abs(z)) > world._MAX_PLACEMENT:
                 continue
-            out.append((x, y, z, rz, True))
+            # Width 0: no measured doorway span for a bare-XTEL fallback door;
+            # corridor_doors falls back to its constant half-width.
+            out.append((x, y, z, rz, True, 0.0))
     return out
 
 
 def build_navmesh(refr_recs, base_model_by_fid, get_collision, nodes, edges,
                   land_rec=None, origin_x=0.0, origin_y=0.0, budget=None,
-                  doors=None):
+                  doors=None, ledges_out=None, door_bases=None):
     """Build a navmesh for one cell.  Returns (verts3d, tris) or ([], []).
 
     Phase-1 corridor model: delegates to corridor.build_corridors.  See
     corridor.py and docs/navmesh_corridor_redesign.md.
 
-    doors: [(x, y, z, rot_z, is_teleport), ...] door REFRs (teleport AND
+    doors: [(x, y, z, rot_z, is_teleport, width), ...] door REFRs (teleport AND
     interior).  When None, teleport doors are recovered from XTEL alone.
+    door_bases: low-24 DOOR base FormIDs — those refs' panel collision is
+    EXCLUDED (a door is opened, not walked around; see world.gather_cell_geometry).
+    When None, door refs are found via XTEL plus the doors list positions.
     budget is accepted for signature compatibility (the corridor build has no
     per-cell time risk) and ignored.
     """
@@ -74,6 +79,13 @@ def build_navmesh(refr_recs, base_model_by_fid, get_collision, nodes, edges,
         return [], []
     if doors is None:
         doors = teleport_door_positions(refr_recs)
-    return corridor.build_corridors(
+    verts, tris, ledges = corridor.build_corridors(
         refr_recs, base_model_by_fid, get_collision, nodes, edges,
-        land_rec=land_rec, origin_x=origin_x, origin_y=origin_y, doors=doors)
+        land_rec=land_rec, origin_x=origin_x, origin_y=origin_y, doors=doors,
+        door_bases=door_bases)
+    # Drop-down (Ledge Up/Down) pairs are reported OUT-OF-BAND so the long-
+    # standing (verts, tris) return stays intact for the many callers that
+    # only want geometry.  pgrd_to_navm reads this to write the edge links.
+    if ledges_out is not None:
+        ledges_out.extend(ledges)
+    return verts, tris

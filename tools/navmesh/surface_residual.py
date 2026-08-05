@@ -10,8 +10,8 @@ This reports, per vertex, mesh_z - collision_z (positive = floating above the
 floor), bucketed, plus the worst offenders and a per-Z-band breakdown so an
 upper storey can be compared against the ground floor.
 
-    python tools/navmesh_surface_residual.py --cell AnvilPinarusInventiusHouse
-    python tools/navmesh_surface_residual.py --cell X --band 60,80
+    python tools/navmesh/surface_residual.py --cell AnvilPinarusInventiusHouse
+    python tools/navmesh/surface_residual.py --cell X --band 60,80
 """
 
 import argparse
@@ -19,14 +19,14 @@ import os
 import sys
 from collections import defaultdict
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import numpy as np  # noqa: E402
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import (build, corridor, corridor_clean,  # noqa: E402
                                  world)
-from tools.navmesh_probe import load_cell  # noqa: E402
+from tools.navmesh.probe import load_cell  # noqa: E402
 
 
 def measure(export_dir, cell):

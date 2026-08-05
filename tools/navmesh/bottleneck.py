@@ -13,8 +13,8 @@ Reported per articulation edge / bridge:
     joint width    length of that edge (how wide the doorway actually is)
     split sizes    how many triangles end up on each side
 
-    python tools/navmesh_bottleneck.py --cell AnvilPinarusInventiusHouse
-    python tools/navmesh_bottleneck.py --cell X --min-side 5
+    python tools/navmesh/bottleneck.py --cell AnvilPinarusInventiusHouse
+    python tools/navmesh/bottleneck.py --cell X --min-side 5
 """
 
 import argparse
@@ -23,11 +23,11 @@ import os
 import sys
 from collections import defaultdict
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import build, corridor_clean  # noqa: E402
-from tools.navmesh_probe import load_cell  # noqa: E402
+from tools.navmesh.probe import load_cell  # noqa: E402
 
 
 def _components_of(tris, skip_edges=()):

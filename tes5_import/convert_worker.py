@@ -17,7 +17,8 @@ from .text_reader import (get_formid, set_formid_index_offset,
 
 def init_worker(formid_offset: int, cell_loc: dict, grid_loc: dict,
                 world_loc: dict, world_names: dict, origin_shift: dict,
-                mesh_bounds_path: str, injected_formids: dict = None):
+                mesh_bounds_path: str, injected_formids: dict = None,
+                door_links: dict = None):
     """Pool initializer: replay parent-process module state into this child."""
     # Join the parent's containment job so this worker cannot outlive a parent
     # that dies without cleanup (crash / external kill). No-op off Windows.
@@ -29,8 +30,12 @@ def init_worker(formid_offset: int, cell_loc: dict, grid_loc: dict,
     # remaps an injected FormID into the master's range (see text_reader).
     set_injected_formids(injected_formids or {})
 
-    from .record_types.world import set_cell_locations
+    from .record_types.world import set_cell_locations, set_door_navmesh_links
     set_cell_locations(cell_loc, grid_loc, world_loc)
+    # Door -> (NAVM, triangle) for XNDP.  Module state like the rest: a worker
+    # that never receives it writes every door REFR without its navmesh link,
+    # which silently kills pathing through every teleport door it converts.
+    set_door_navmesh_links(door_links)
 
     from .locations import WORLD_NAMES
     WORLD_NAMES.clear()

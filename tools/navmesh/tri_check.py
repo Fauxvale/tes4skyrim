@@ -5,9 +5,9 @@ For each triangle: slope, vertical extent, edge lengths/ratio, aspect
 walkable collision surface at its own XY (the "navmesh juts out" defect: a
 vertex pulled above a flat slope reads as a float on an existing surface).
 
-    python tools/navmesh_tri_check.py --cell AnvilFightersGuild
-    python tools/navmesh_tri_check.py --cell Wendir02,grid:47:6 --all
-    python tools/navmesh_tri_check.py --cell X --csv temp/tris.csv
+    python tools/navmesh/tri_check.py --cell AnvilFightersGuild
+    python tools/navmesh/tri_check.py --cell Wendir02,grid:47:6 --all
+    python tools/navmesh/tri_check.py --cell X --csv temp/tris.csv
 
 Classification (a triangle can carry several flags):
     STEEP   slope > steep_deg (default 50) AND zspan > MAX_CLIMB
@@ -28,11 +28,11 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import build, params  # noqa: E402
-from tools.navmesh_probe import load_cell, cell_geometry  # noqa: E402
+from tools.navmesh.probe import load_cell, cell_geometry  # noqa: E402
 
 
 def surface_z_index(walk_tris, bucket=128.0):
@@ -86,8 +86,8 @@ def wrong_floor(nodes, verts):
     the mesh can look locally clean while describing the wrong ground.  Returns
     (bad_count, total, median_dz, max_dz) or None when no node is near a vertex.
 
-    Folded in from the retired tools/navmesh_diag.py, whose other two checks
-    (STEEP, ISLANDS) are covered here and by navmesh_audit/navmesh_component_audit.
+    Folded in from the retired tools/navmesh/diag.py, whose other two checks
+    (STEEP, ISLANDS) are covered here and by navmesh_audit/navmesh/component_audit.
     """
     v = np.asarray(verts)
     if not len(v):

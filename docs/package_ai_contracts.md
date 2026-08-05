@@ -87,6 +87,28 @@ targetless ambushes keep HoldPosition. The `AmbushPlayer`-named ones (Staada,
 Thadon, Ruma) are also scripted confrontations that TALK first, so the
 player-target test is the right discriminator, not the EditorID.
 
+## Find at an ACTOR is a seek → Travel near-ref (2026-08-03)
+
+TES4 `Find` (Type 0) splits three ways by what its `PTDT.Target` is:
+
+| Target | Conversion |
+|---|---|
+| the player | ForceGreet (73 packages — `...FindPC`, `...ForceGreetPlayer...`) |
+| an ACTI/DOOR/CONT ref | Activate — go operate it (24 packages) |
+| a placed ACTOR (ACHR/ACRE) | **Travel, location = near-reference (alias-routed), radius = `PTDT.Count`** (232 packages) |
+
+The actor case previously fell into the Sandbox fallback, and with no PLDT
+most of these packages sandboxed **at the actor's own editor location** — i.e.
+stand still.  That was `CGAssassinsAmbushAToGlenroy/Baurus/Renote`: at
+CharacterGen stage ≥ 24 the ambush assassins each Find a Blade (distance 200),
+which is what carries them out of the ambush room, through its teleport door
+and off the mezzanine drop into the fight — they stood in the room forever.
+The same idiom covers every `...VisitX` / `...TalkToY` schedule package and
+all the guard-post reliefs.  `PTDT.Count` on a Find is the approach DISTANCE
+(see the PTDA census note in `pack_converter.build_target`), so it becomes the
+location radius.  `ref_base_sig` now maps ACHR→`NPC_` / ACRE→`CREA` so the
+branch can recognise a placed actor.
+
 ## Defensive Combat is NOT Ignore Combat (fixed 2026-07-31)
 
 **TES4 `Defensive Combat` and TES5 `Ignore Combat` occupy the same bit (20) and

@@ -13,9 +13,9 @@ For every cell it reports:
                           approach between the fragments, so the cause is
                           located rather than guessed
 
-    python tools/navmesh_component_audit.py --cell ChorrolFightersGuild
-    python tools/navmesh_component_audit.py --cells A,B,C
-    python tools/navmesh_component_audit.py --all --limit 40
+    python tools/navmesh/component_audit.py --cell ChorrolFightersGuild
+    python tools/navmesh/component_audit.py --cells A,B,C
+    python tools/navmesh/component_audit.py --all --limit 40
 
 MEMORY: this runs SINGLE-PROCESS on purpose.  `load_cell` builds a ~2GB export
 index, and a process pool builds one PER WORKER rather than sharing it, which
@@ -29,11 +29,11 @@ import os
 import sys
 from collections import defaultdict
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import build, corridor, corridor_clean, world  # noqa: E402
-from tools.navmesh_probe import load_cell  # noqa: E402
+from tools.navmesh.probe import load_cell  # noqa: E402
 
 
 def _pathgrid_components(nodes, edges):

@@ -11,8 +11,8 @@ climbable (the two surfaces meet within MAX_CLIMB at the edge itself).  A fold â
 a triangle bonded to its neighbour from above rather than edge-on â€” fails that
 test exactly as it does in game.
 
-    python tools/navmesh_walk_test.py --cell AnvilPinarusInventiusHouse
-    python tools/navmesh_walk_test.py --cell X --from-highest --to-door
+    python tools/navmesh/walk_test.py --cell AnvilPinarusInventiusHouse
+    python tools/navmesh/walk_test.py --cell X --from-highest --to-door
 """
 
 import argparse
@@ -22,11 +22,11 @@ import os
 import sys
 from collections import defaultdict
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import build, params  # noqa: E402
-from tools.navmesh_probe import load_cell  # noqa: E402
+from tools.navmesh.probe import load_cell  # noqa: E402
 
 
 def _tri_centre(v, t):

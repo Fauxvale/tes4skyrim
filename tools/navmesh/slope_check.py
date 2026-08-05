@@ -16,8 +16,8 @@ This reports, per cell:
   * STEP JUMPS     — adjacent (edge-sharing) triangles whose surfaces differ by
                      more than MAX_CLIMB at the shared edge: a cliff in the mesh.
 
-    python tools/navmesh_slope_check.py --cell AnvilPinarusInventiusHouse
-    python tools/navmesh_slope_check.py --cells A,B,C --dump temp/seams.txt
+    python tools/navmesh/slope_check.py --cell AnvilPinarusInventiusHouse
+    python tools/navmesh/slope_check.py --cells A,B,C --dump temp/seams.txt
 """
 
 import argparse
@@ -28,11 +28,11 @@ from collections import defaultdict
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from asset_convert import collision_extract as ce  # noqa: E402
 from tes5_import.navmesh import build, params  # noqa: E402
-from tools.navmesh_probe import load_cell  # noqa: E402
+from tools.navmesh.probe import load_cell  # noqa: E402
 
 # Two surfaces this close in Z at one XY are the same walkable surface.
 SAME_SURFACE = 40.0

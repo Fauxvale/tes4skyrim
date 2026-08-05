@@ -9,8 +9,8 @@ Synthetic rather than a real cell on purpose -- it needs no 2GB export index,
 so it runs in seconds and can cover shapes chosen to exercise each stop rule
 (a wall at a known offset, a floor that drops away, a parallel neighbour).
 
-    python tools/navmesh_grow_verify.py
-    python tools/navmesh_grow_verify.py --cases 400 --tol 1e-9
+    python tools/navmesh/grow_verify.py
+    python tools/navmesh/grow_verify.py --cases 400 --tol 1e-9
 """
 
 import argparse
@@ -20,7 +20,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from tes5_import.navmesh import corridor_grow as cg, params  # noqa: E402
 

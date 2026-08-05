@@ -2888,3 +2888,75 @@ class TestAnimObjectBehaviorGraph:
             f'referencePose must be trans(3) quat(4) scale(3), got {tuples}'
         assert tuples[1].split() == ['0.000000', '0.000000', '0.000000', '1.000000'], \
             f'identity quaternion must be (0,0,0,1), got ({tuples[1]})'
+
+
+# ---------------------------------------------------------------------------
+# Animation block byte-layout contracts (load-time CTD guards)
+# ---------------------------------------------------------------------------
+
+class TestAnimationBlockLayout:
+    """Two blocks whose wrong bytes crash the engine at LOAD time.
+
+    Both round-trip cleanly through PyFFI and NifSkope, so nothing but the
+    engine notices -- these are the invariants that caught the Vilverin
+    ctrigtripwire01 CTDs.  See docs/nif_conversion_notes.md.
+    """
+
+    @staticmethod
+    def _nif():
+        import time
+        if not hasattr(time, 'clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat
+        return NifFormat
+
+    def test_blend_interpolator_is_manager_controlled(self):
+        """Flags bit 0 CLEAR promises the engine seven trailing fields that the
+        7-byte block does not contain, so it reads into the next block and
+        AddRefs whatever it finds.  Vanilla: 8779/8779 Flags=1, ArraySize=2.
+
+        PyFFI mismodels the header as 'unknown_short', so 0x0201 IS
+        Flags=0x01 (low byte) + Array Size=0x02 (high byte).
+        """
+        from asset_convert.nif_converter import _init_blend_interpolator
+        NF = self._nif()
+        blend = _init_blend_interpolator(NF.NiBlendBoolInterpolator())
+        assert blend.unknown_short & 0x00FF == 1, \
+            'Manager Controlled (Flags bit 0) must be set'
+        assert blend.unknown_short >> 8 == 2, 'Array Size must be 2'
+
+        raw = blend.unknown_short.to_bytes(2, 'little')
+        assert raw == b'\x01\x02', \
+            'on-disk header must be 01 02 like vanilla, got %s' % raw.hex(' ')
+
+    def test_normalize_fixes_copied_blend_interpolators(self):
+        """The defect also affects blocks COPIED from Oblivion, not just ones we
+        synthesize, so the fix has to be a tree-wide pass."""
+        from asset_convert.nif_converter import _normalize_blend_interpolators
+        NF = self._nif()
+        root = NF.NiNode()
+        ctrl = NF.NiVisController()
+        blend = NF.NiBlendBoolInterpolator()
+        blend.unknown_short = 0            # what a copied block degrades to
+        ctrl.interpolator = blend
+        root.controller = ctrl
+
+        assert _normalize_blend_interpolators(root) == 1
+        assert blend.unknown_short == 0x0201
+        # idempotent -- a second pass must find nothing left to fix
+        assert _normalize_blend_interpolators(root) == 0
+
+    def test_vis_keys_are_const(self):
+        """Visibility keys must be a step function.  nif.xml documents CONST_KEY
+        (5) as 'Used for visibility keys in NiBoolData'; vanilla Skyrim is
+        3449/3449 and Oblivion source 1296/1296.  LINEAR (1) CTD'd in
+        NiBoolData::Load."""
+        from asset_convert.nif_converter import _BLEND_INTERP_FLAGS_ARRAYSIZE
+        import inspect
+        from asset_convert import nif_converter
+        src = inspect.getsource(nif_converter._emulate_morphs)
+        assert 'kg.interpolation = 5' in src, \
+            'morph vis keys must be written as CONST_KEY (5)'
+        assert 'kg.interpolation = 1' not in src, \
+            'LINEAR bool keys crash the engine'
+        assert _BLEND_INTERP_FLAGS_ARRAYSIZE == 0x0201

@@ -408,12 +408,47 @@ Two exceptions keep their own routes: the `isPCSleeping` idiom becomes
 `OnSleepStart`/`OnSleepStop`, and menu-ID blocks stay commented.
 
 Before merging, check the bodies are safe on an ordinary frame. All 20 are
-idempotent state machines gated by their own doonce/stage variables; the one
-that genuinely reads a menu (`DAOghmaInfiniumScript`'s `getbuttonpressed`)
-already resolves to `-1`, so no branch matches. Where a body is duplicated in
-both blocks (the `Publican*` rent counter), running both in one pass still
-advances the hour once — the first copy rewrites `renthour` to `GameHour`, so
-the second's `(renthour + 1) < GameHour` is false.
+idempotent state machines gated by their own doonce/stage variables; a merged
+body that reads a menu (`DAOghmaInfiniumScript`'s `getbuttonpressed`) is safe
+because the read is consume-once (see the button-MessageBox section below):
+until its own box has been shown and clicked it reads -1, so no branch
+matches. Where a body is duplicated in both blocks (the `Publican*` rent
+counter), running both in one pass still advances the hour once — the first
+copy rewrites `renthour` to `GameHour`, so the second's
+`(renthour + 1) < GameHour` is false.
+
+### Button MessageBoxes become authored MESG records (2026-08-03)
+
+TES4 builds every in-world choice menu as `MessageBox "text" "Btn1" "Btn2"`
+plus a `GetButtonPressed` poll in GameMode. Skyrim has no dynamic boxes, so
+for years both halves were stubbed — the box lost its buttons
+(`Debug.MessageBox`) and the poll read a constant `-1` — which left ~289
+menus dead across the plugins, including two that **soft-locked chargen**:
+Oblivion's `CGSewerExitScript` ("Finished - Exit Sewers" is the dead
+`button == 3` branch that sets MQ01 stage 88) and Morroblivion's
+`mwCGCensusExitDootScript` (same shape, `fbmwChargen` stage 100).
+
+The real conversion (`script_convert/message_menus.py` is the shared plan
+both sides run):
+
+* the **importer** writes one MESG per call site — EDID
+  `TES4Msg_<Script>_<NN>`, DESC = text, one ITXT per trailing quoted string,
+  DNAM bit 0 — and registers the EDIDs in `_WELL_KNOWN_PROPERTIES` so VMAD
+  property binding resolves them;
+* the **converter** emits `TES4_MsgButton = TES4_ShowMsg(TES4Msg_X_NN)` at
+  the call site and `TES4_TakeMsgButton()` for `GetButtonPressed`.
+  `TES4_ShowMsg` clears the state before `Show()` (TES4: displaying a box
+  resets GetButtonPressed to -1), `Show()` parks its thread on the box, and
+  the take helper returns the clicked index once, then -1 — TES4's own
+  contract, which is what keeps `if button == N` polls from re-firing on a
+  stale index.
+
+Sites are matched by (text, buttons) content, not position — MenuMode merges
+can reorder blocks. A `GetButtonPressed` in a script that never shows a
+button box of its own (cross-script polling of TES4's global button state —
+a handful of sites) still reads `-1`, explicitly dead rather than miswired.
+Format specifiers inside a button-box's text (`"...%.0f Drakes?" cost "Yes"
+"No"`) survive literally: MESG DESC is static text.
 
 ### A "no equivalent → 0" fallback can shadow a working handler (2026-07-31)
 

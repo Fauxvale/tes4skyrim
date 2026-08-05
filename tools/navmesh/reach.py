@@ -9,15 +9,15 @@ and reports where the chain breaks.
 
 Usage:
     # Same-cell / cross-cell reachability between two placed refs:
-    python tools/navmesh_reach.py output/Oblivion.esm/Oblivion.esm \
+    python tools/navmesh/reach.py output/Oblivion.esm/Oblivion.esm \
         --from-ref 0102FD6F --to-ref 0106D812
 
     # Reachability between explicit points (worldspace 0 = interior cell):
-    python tools/navmesh_reach.py <esm> --cell 0102DC01 \
+    python tools/navmesh/reach.py <esm> --cell 0102DC01 \
         --from-point 165,2,0 --to-point 712,-18,186
 
     # Dump one cell's mesh component structure (islands, z-ranges, doors):
-    python tools/navmesh_reach.py <esm> --cell 0102DC01 --components
+    python tools/navmesh/reach.py <esm> --cell 0102DC01 --components
 
 FormIDs are the OUTPUT (load-order) ids, e.g. 0102DC01 for Oblivion.esm cell
 0002DC01 loaded after Skyrim.esm.
