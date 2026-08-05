@@ -73,12 +73,14 @@ def _new_scan_out() -> dict:
         'mgef_shaders': {}, 'spell_effects': {},
         'global_types': {}, 'global_values': {},
         'pack_type': {}, 'actor_packages': {},
+        'record_model': {},
     }
 
 
 def _scan_record_lines(sig: str, lines: list, out: dict):
     """Scan one record's KEY=VALUE lines into the partial result dicts."""
     formid = edid = scri = name_fid = None
+    model = None
     schr_type = None
     glob_type = None
     glob_value = None
@@ -98,6 +100,8 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
             scri = line[5:]
         elif line.startswith('NAME='):
             name_fid = line[5:]
+        elif line.startswith('Model.MODL='):
+            model = line[11:]
         elif line.startswith('SCHR.Type='):
             try:
                 schr_type = int(line[10:])
@@ -159,6 +163,8 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
     if name_fid and sig in ('ACHR', 'ACRE', 'REFR'):
         out['record_base'][formid] = name_fid
     out['record_type'][formid] = sig
+    if model:
+        out['record_model'][formid] = model
     if sig == 'GLOB' and edid and glob_type:
         out['global_types'][edid.lower()] = glob_type
     if sig == 'GLOB' and edid and glob_value is not None:
@@ -228,6 +234,11 @@ class CrossRefGraph:
         self.script_formid_to_type: dict[str, int] = {}
         self.record_scri: dict[str, str] = {}  # record FormID -> SCRI FormID
         self.record_type: dict[str, str] = {}  # record FormID -> record Signature
+        # record FormID -> Model.MODL path as authored (backslashes, any case).
+        # Lets the script converter ask the CONVERTED mesh what its physics are
+        # (held-until-scripted trap/breakaway), which the animation-group name
+        # cannot tell it — see the playgroup release in converter.py.
+        self.record_model: dict[str, str] = {}
         self.record_base: dict[str, str] = {}  # placed ref FormID -> base record FormID (NAME)
         self.quest_edids: set[str] = set()
         self.npc_formids: set[str] = set()
@@ -336,6 +347,7 @@ class CrossRefGraph:
         self.record_scri.update(out['record_scri'])
         self.record_base.update(out['record_base'])
         self.record_type.update(out['record_type'])
+        self.record_model.update(out['record_model'])
         self.quest_edids.update(out['quest_edids'])
         self.npc_formids.update(out['npc_formids'])
         self.mgef_shaders.update(out['mgef_shaders'])
@@ -580,6 +592,65 @@ class CrossRefGraph:
         if base_fid:
             return self.record_type.get(base_fid, '')
         return self.record_type.get(fid, '')
+
+    def needs_havok_release(self, name: str) -> bool:
+        """True if *name*'s mesh ships bodies HELD until a script releases them.
+
+        The converted NIF carries KEYFRAMED bodies that kept a non-zero mass —
+        `physics_flags_from_data` bit 1 — which `_convert_collision` writes for
+        breakaway pieces and constrained trap islands only.  Those are exactly
+        the objects whose `playgroup` must be followed by
+        SetMotionType(Motion_Dynamic); every other animated object converts to
+        a mass-0 keyframed body that cannot fall no matter what the script does.
+
+        Resolves through a placed reference to its base record, like
+        get_base_signature, so `CTrapLogs01Ref.playgroup` works.
+        """
+        from tes5_import.mesh_bounds import get_mesh_physics_flags
+
+        fid = self.edid_to_formid.get(name.lower(), '')
+        if not fid:
+            return False
+        model = self.record_model.get(self.record_base.get(fid, '') or fid, '')
+        if not model:
+            return False
+        key = model.replace('\\\\', '/').replace('\\', '/').lower().lstrip('/')
+        if not key.startswith('tes4/'):
+            key = 'tes4/' + key
+        return bool(get_mesh_physics_flags(key) & 2)
+
+    def script_owner_needs_havok_release(self, script_edid: str) -> bool:
+        """needs_havok_release for a BARE (self) `playgroup`.
+
+        A bare call runs on whatever record the script is attached to, so walk
+        SCRI back to the owners.  True if ANY owner's mesh is held — a script
+        shared between a held trap and something else still has to release the
+        trap, and the release is inert on anything that is not held.
+        """
+        from tes5_import.mesh_bounds import get_mesh_physics_flags
+
+        want = (script_edid or '').lower()
+        if not want:
+            return False
+        script_fid = ''
+        for fid, edid in self.script_formid_to_edid.items():
+            if edid.lower() == want:
+                script_fid = fid
+                break
+        if not script_fid:
+            return False
+        for rec_fid, scri in self.record_scri.items():
+            if scri != script_fid:
+                continue
+            model = self.record_model.get(rec_fid, '')
+            if not model:
+                continue
+            key = model.replace('\\\\', '/').replace('\\', '/').lower().lstrip('/')
+            if not key.startswith('tes4/'):
+                key = 'tes4/' + key
+            if get_mesh_physics_flags(key) & 2:
+                return True
+        return False
 
     def get_record_script_type(self, name: str) -> str:
         """Get the Papyrus script class name for any record with an attached script.

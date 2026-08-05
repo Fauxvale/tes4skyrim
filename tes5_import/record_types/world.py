@@ -533,6 +533,30 @@ def convert_REFR(rec: dict) -> bytes:
         xesp_flags = get_int(rec, 'XESP.Flags')
         subs += pack_subrecord('XESP', struct.pack('<II', xesp_ref, xesp_flags))
 
+    # XLKR — Linked Reference.  TES4 has no such field; its `GetParentRef`
+    # returns the ENABLE PARENT instead (xEdit names XESP 'Enable Parent', and
+    # the UESP modding guide states the idiom directly: "make the container its
+    # Parent Ref", then `set rCont to GetParentRef`).  Skyrim exposes no getter
+    # for the enable parent, so script_convert maps GetParentRef ->
+    # GetLinkedRef(), which reads XLKR.
+    #
+    # Nothing wrote XLKR, so every converted GetParentRef resolved to None.
+    # That is why the Vilverin pressure plate did nothing when stepped on: its
+    # body ran, but `target = GetLinkedRef()` was None, so `target.Activate()`
+    # never reached the mace and the trap hung in the air.  Mirroring the
+    # enable parent into XLKR restores the link the script expects.
+    #
+    # Layout (xEdit + a real Skyrim.esm dump, 11287 vanilla uses): 8 bytes,
+    # {Keyword/Ref, Ref} with the keyword slot NULL for a plain link — vanilla
+    # writes 00000000 there on the general case.
+    #
+    # Only emitted when the base record's script actually calls GetParentRef:
+    # XESP is ordinary enable-parenting on 9157 Oblivion refs, and turning all
+    # of those into linked refs would invent links the game never had.
+    from ..object_scripts import base_uses_parent_ref
+    if xesp_ref and base_uses_parent_ref(rec.get('NAME', '')):
+        subs += pack_subrecord('XLKR', struct.pack('<II', 0, xesp_ref))
+
     # Ownership (XOWN)
     xown = get_formid(rec, 'XOWN.Owner')
     if xown:

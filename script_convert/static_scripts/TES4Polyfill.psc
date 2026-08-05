@@ -514,3 +514,28 @@ Function ReleaseBreakaway(ObjectReference akRef) Global
   ; and never starts simulating.
   akRef.SetMotionType(1, true)
 EndFunction
+
+; SetDestroyed(1) deferred until the clip that preceded it has finished.
+;
+; TES4 pairs `playgroup <grp>` with `setDestroyed 1` on the very next line
+; (CTrigTripwire01SCRIPT, CTrapLogs01SCRIPT, CTrapCaveIn01SCRIPT,
+; MPlanksBreakAway01Script).  In Oblivion that was harmless: with no
+; destruction data on the record, setDestroyed only stopped the object being
+; activated again.  Oblivion ships ZERO DEST subrecords, so nothing we convert
+; has a destroyed state either -- but Skyrim's SetDestroyed still RESETS THE
+; REFERENCE'S 3D, and doing that one line after PlayAnimation tore down the
+; NiControllerSequence before a single frame of it had been drawn.  That is
+; what stopped the tripwire visibly snapping when it was walked over.
+;
+; Waiting first preserves both halves of the original intent: the break
+; animation plays to completion, and the object still ends up destroyed so it
+; cannot fire a second time.  Same 1.0s budget as ReleaseBreakaway, chosen the
+; same way -- Papyrus cannot query a Gamebryo sequence's length, and every
+; converted break clip but one outlier finishes well inside it.
+Function DestroyAfterAnimation(ObjectReference akRef) Global
+  If akRef == None
+    Return
+  EndIf
+  Utility.Wait(1.0)
+  akRef.SetDestroyed(true)
+EndFunction

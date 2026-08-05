@@ -281,6 +281,38 @@ ran and the alarm re-fired on every re-evaluation.
 - This is a real defect and the fix stands, but it was **not** the cause of the
   looping chapel bell either. See below.
 
+#### …but the ENTRY frame still has to fire — emit BOTH (2026-08-05, in-game confirmed)
+
+Keeping the body on `OnTrigger` is right, but it is not sufficient: **Skyrim does
+not deliver `OnTrigger` for a fast crossing**, which is exactly what walking over
+a tripwire or a pressure plate is. Stepping on the Vilverin plate did nothing at
+all — the body never ran once.
+
+The vanilla census is unanimous and settles it: `Tripwire.pex`,
+`PressurePlate.pex`, `TrapTriggerBase.pex` and `TrapTriggerHinge.pex` **all**
+define `OnTriggerEnter`, and vanilla's own `Tripwire` does **not** define
+`OnTrigger` at all. (Read them with `skyrim_assets.get_asset_bytes('scripts/
+<Name>.pex')` and grep the string table for `On*` — the .psc sources are not
+shipped.)
+
+So a converted `begin OnTrigger` block now emits **both** events: the body stays
+in `Event OnTrigger` (repeat semantics preserved, Magieverbot counters still
+work) and a generated `Event OnTriggerEnter` delegates to it for the crossing
+frame:
+
+```papyrus
+Event OnTriggerEnter(ObjectReference akActionRef)
+  OnTrigger(akActionRef)
+EndEvent
+```
+
+- Scope: **187 Oblivion scripts**. Skipped when the script authors its own
+  `OnTriggerEnter` block (Papyrus allows one definition per event; 0 Oblivion
+  scripts do, but a third-party plugin may).
+- **Do not "simplify" this back to a single event.** Remapping to
+  `OnTriggerEnter` alone re-freezes the per-frame counters above; leaving it on
+  `OnTrigger` alone means trap triggers never fire. Both are required.
+
 ### Engine globals must bind UNSHIFTED (2026-07-30) — the actual bell bug
 
 **Root cause of the endlessly-looping chapel bell**, found in `Papyrus.0.log`

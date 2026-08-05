@@ -529,6 +529,26 @@ must stay in step. CNAM.CrimeGold carries across as the Steal Multiplier.
 ### REFR Conversion
 - **Lock Level Tiers**: 0-20→1(Novice), 21-40→25(Apprentice), 41-60→50(Adept), 61-80→75(Expert), 81+→100(Master)
 - **Map Marker Types**: Camp→5, Cave→4, City→1, AyleidRuin→7, Fort→6, Landmark→11, Tavern→14, Settlement→3, DaedricShrine→34, OblivionGate→34
+- **XESP must be MIRRORED into XLKR for `GetParentRef` scripts (2026-08-05, in-game confirmed).**
+  TES4 `GetParentRef` returns the reference's **Enable Parent** — the `XESP`
+  field (xEdit literally names it `'Enable Parent'`; the UESP modding guide
+  states the idiom outright: *"make the container its Parent Ref"*, then
+  `set rCont to GetParentRef`). Skyrim exposes **no getter for the enable
+  parent**, so `script_convert` maps `GetParentRef` → `GetLinkedRef()`, which
+  reads **`XLKR`**. Nothing wrote XLKR, so **every converted `GetParentRef`
+  returned None** — this affected all **345** scripts that call it, not just
+  traps. Symptom: the Vilverin pressure plate's body ran, but
+  `target = GetLinkedRef()` was None, so `target.Activate()` never reached the
+  swinging mace and the trap hung frozen in mid-air.
+  - Layout (xEdit **and** a real Skyrim.esm dump — 11,287 vanilla uses): 8
+    bytes, `{Keyword/Ref, Ref}`, keyword slot **NULL** (`00000000`) for a plain
+    link. Written after XESP (vanilla orders it both ways; 548 refs carry both).
+  - **Scoped to bases whose script actually calls `GetParentRef`** (tracked in
+    `object_scripts._GETPARENTREF_BASES`). XESP is ordinary enable-parenting on
+    **9,157** Oblivion refs and only **2,660** belong to such a base — mirroring
+    all of them would invent links the game never had. Output: 2,813 XLKR.
+  - TES4 `XTRG` ("Target") is a *different*, rarer field (90 refs) and still has
+    no TES5 equivalent; it is dropped as before.
 
 ### LTEX Conversion
 - **Create TXST**: Each LTEX needs a companion TXST record with diffuse texture path + derived normal map path (_n.dds suffix)

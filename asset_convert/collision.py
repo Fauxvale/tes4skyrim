@@ -1570,6 +1570,36 @@ def _node_is_breakaway(node, actual_root, rb):
     return False
 
 
+def _node_is_held_trap(node, actual_root, rb):
+    """True if this body is part of a trap island Oblivion holds until scripted.
+
+    Oblivion authors a whole swinging trap (ctrapswingmacelong01's chain links
+    + mace head, ctraplogs01's logs) as ms=6 KEYFRAMED bodies with real mass
+    and `Unyielding = 1`, wired together by constraints.  ITS engine keeps the
+    island rigid until the trap script runs `playgroup` -- the script header
+    says so outright: "On activation havok will turn on and logs will roll".
+
+    Shipping them dynamic (the old "mass>0 and owns a constraint" rule) made
+    every trap swing freely on cell load.  Shipping them mass-0 keyframed
+    welds them solid forever.  They are breakaway pieces in the exact sense
+    the breakaway path already models: HELD, keeping their mass, released to
+    Motion_Dynamic by the converted trap script.
+
+    Membership is island-wide, not per-body: a chain link routinely carries
+    mass with num_constraints == 0 and hangs off a neighbour's constraint
+    (the same reason collision_extract checks constraints file-wide).
+    """
+    if rb.num_constraints > 0:
+        return True
+    root = actual_root if actual_root is not None else node
+    for blk in root.tree():
+        co = getattr(blk, 'collision_object', None)
+        body = getattr(co, 'body', None) if co is not None else None
+        if body is not None and getattr(body, 'num_constraints', 0) > 0:
+            return True
+    return False
+
+
 def _convert_blend_collision(node, coll_obj):
     """Convert a bhkBlendCollisionObject on a creature-skeleton bone.
 
@@ -1737,17 +1767,29 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
     #     script-side release (ObjectReference.SetMotionType(Motion_Dynamic))
     #     hands Havok a body that can actually fall -- a mass-0 body would just
     #     hang there.  See script_convert PlayGroup handling.
+    #  5. HELD TRAP islands (ctrapswingmacelong01's chain + mace,
+    #     ctraplogs01's logs, cprollingrock01): ms=6 bodies with real mass
+    #     that belong to a CONSTRAINED island.  Case 2 shipped these DYNAMIC,
+    #     which is what made every swinging trap swing freely the moment the
+    #     cell loaded, before anything tripped it.  Oblivion's own trap script
+    #     states the contract in its header comment -- "On activation havok
+    #     will turn on and logs will roll" (CTrapLogs01SCRIPT) -- and authors
+    #     the whole island `Unyielding = 1`: the trap is HELD rigid until the
+    #     trap script fires, exactly like a breakaway piece.
+    #
+    #     So a constrained trap island is a breakaway: ship it KEYFRAMED (held,
+    #     not simulating) but KEEP the authored mass, and let the script-side
+    #     SetMotionType(Motion_Dynamic) release start the swing.  Skyrim's own
+    #     trapmace01 ships its links dynamic because a Skyrim trap has no
+    #     script-held phase; ours must reproduce Oblivion's held phase instead.
     breakaway_body = (rb.motion_system == 6 and rb.mass > 0
-                      and _node_is_breakaway(node, actual_root, rb))
+                      and (_node_is_breakaway(node, actual_root, rb)
+                           or _node_is_held_trap(node, actual_root, rb)))
     keyframed_body = (rb.motion_system == 6
-                      and _node_is_animated(node, actual_root))
+                      and (_node_is_animated(node, actual_root)
+                           or breakaway_body))
     if rb.motion_system == 6 and not keyframed_body:
-        if rb.mass > 0 and rb.num_constraints > 0:
-            pass                    # case 2: falls into the dynamic branch
-        elif breakaway_body:
-            pass                    # case 4: keep the mass, fall into dynamic
-        else:
-            rb.mass = 0.0           # case 3: falls into the static branch
+        rb.mass = 0.0               # case 3: falls into the static branch
 
     # Oblivion MO_SYS_FIXED (7) is the explicit "static element of the scene"
     # motion type (nif.xml: landscape/architecture).  The static-vs-dynamic

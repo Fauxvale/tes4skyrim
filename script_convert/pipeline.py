@@ -42,7 +42,13 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
                         say_timer_owners=None, topic_by_dial=None,
                         beat_fields_by_owner=None, quest_script_vars=None,
                         quest_edid_by_fid=None, topic_unlock_globals=None,
-                        message_menus=None):
+                        message_menus=None, mesh_bounds_cache=None):
+    # Windows spawns workers, so module-level caches loaded in the parent do
+    # NOT carry over — each worker reloads the mesh-bounds cache or every
+    # needs_havok_release() lookup answers 0 and no trap gets its release.
+    if mesh_bounds_cache:
+        from tes5_import.mesh_bounds import load_mesh_bounds
+        load_mesh_bounds(mesh_bounds_cache, quiet=True)
     _WORKER_CTX.update(xref=xref, output_dir=output_dir,
                        info_reveals=info_reveals,
                        service_topics=service_topics,
@@ -110,6 +116,15 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
         workers = worker_count()
 
     os.makedirs(output_dir, exist_ok=True)
+
+    # Mesh physics facts, so a converted `playgroup` can ask whether the object
+    # it animates is HELD until a script releases it (breakaway pieces,
+    # constrained trap islands).  Without this the lookup silently answers 0
+    # for every mesh and no trap ever gets its SetMotionType release — see
+    # CrossRefGraph.needs_havok_release.
+    from tes5_import.mesh_bounds import load_mesh_bounds
+    _bounds_cache = os.path.join(export_dir, 'mesh_bounds_cache.json')
+    load_mesh_bounds(_bounds_cache, quiet=True)
 
     # Deploy static scripts (TES4Polyfill + shared service-menu fragments) so
     # they compile alongside the generated ones.
@@ -289,7 +304,7 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
                 unlock_plan['stage_reveals'], say_durations,
                 say_timer_owners, topic_by_dial, beat_fields_by_owner,
                 quest_script_vars, quest_edid_by_fid, topic_unlock_globals,
-                message_menus)
+                message_menus, _bounds_cache)
     if workers <= 1 or len(jobs) <= 2:
         _script_worker_init(*initargs)
         for job in jobs:

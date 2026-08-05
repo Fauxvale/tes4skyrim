@@ -348,23 +348,42 @@ def physics_flags_from_data(data) -> int:
     (vanilla trapbonealarmhavok01 stores its bhkBallSocketConstraintChain on
     the static peg, not on the swinging bones).
 
+    bit 1 — HELD body: the mesh ships at least one KEYFRAMED body that kept a
+    non-zero mass.  `_convert_collision` writes that combination for exactly
+    one thing: a piece Oblivion holds rigid until a script releases it —
+    breakaway planks/bricks and constrained trap islands (see the breakaway
+    and held-trap cases there).  Every other keyframed body is forced to
+    mass 0, so this bit is precisely "this mesh needs
+    SetMotionType(Motion_Dynamic) to ever move".
+
+    The script converter reads it to decide whether a converted `playgroup`
+    should emit the release.  Keying that off the ANIMATION NAME cannot work:
+    'forward' is 491 of the 850 playgroup calls in Oblivion and is
+    overwhelmingly gates, doors and portcullises, which must keep following
+    their clip exactly — but it is also the tripwire's break group.  The mesh
+    knows which it is; the group name does not.
+
     Shipped as the OPTIONAL 7th element of a bounds-cache entry; absent means
     0, so pre-existing 6-element caches stay readable.
     """
     has_dynamic = False
     has_constraint = False
+    flags = 0
     for block in data.blocks:
         cls = type(block).__name__
         if cls in ('bhkRigidBody', 'bhkRigidBodyT'):
             if getattr(block, 'mass', 0) > 0:
                 has_dynamic = True
+                # MO_SYS_KEYFRAMED (4) with mass retained == held-until-scripted.
+                if getattr(block, 'motion_system', 0) == 4:
+                    flags |= 2
             if getattr(block, 'num_constraints', 0) > 0:
                 has_constraint = True
         elif cls.startswith('bhk') and 'Constraint' in cls:
             has_constraint = True
-        if has_dynamic and has_constraint:
-            return 1
-    return 0
+    if has_dynamic and has_constraint:
+        flags |= 1
+    return flags
 
 
 def _tri_shape_points(shape):

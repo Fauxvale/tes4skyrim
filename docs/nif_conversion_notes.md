@@ -135,6 +135,46 @@ animated pieces — vanilla never gives each piece its own body. We keep
 per-piece keyframed bodies (faithful to the source collision), normalized to
 the vanilla per-body contract.
 
+### Constrained trap islands are HELD, not dynamic (2026-08-05, in-game confirmed)
+
+A swinging trap (`ctrapswingmacelong01`'s chain links + mace head,
+`ctraplogs01`, `cprollingrock01`) is authored exactly like a breakaway piece:
+`ms=6` KEYFRAMED bodies with **real mass** and `Unyielding = 1`, wired together
+by constraints. Oblivion's own script states the contract in its header:
+
+> `; On activation havok will turn on and logs will roll` — `CTrapLogs01SCRIPT`
+
+The old rule sent any `ms=6` body with *mass + a constraint* to **DYNAMIC**
+(case 2), which is why **every swinging trap swung freely the instant the cell
+loaded**, before anything tripped it. The opposite error (mass-0 keyframed)
+welds the trap solid forever. Both were wrong for the same reason: the island is
+**held rigid until the trap script fires**.
+
+Fix (`_node_is_held_trap`): a constrained island member ships **KEYFRAMED but
+keeps its authored mass**, and the converted script releases it with
+`SetMotionType(Motion_Dynamic)`. Membership is checked **island-wide, not
+per-body** — a chain link routinely carries mass with `num_constraints == 0` and
+hangs off a neighbour's constraint (same reason `collision_extract` checks
+constraints file-wide).
+
+Vanilla `trapmace01` ships its links dynamic because a *Skyrim* trap has no
+script-held phase; ours must reproduce Oblivion's held phase instead. Do not
+"correct" ours to match vanilla here.
+
+**The release is keyed on the MESH, never the animation-group name.**
+`physics_flags_from_data` bit 1 = "ships a keyframed body that kept a non-zero
+mass", which `_convert_collision` writes for held pieces only (36 meshes).
+Keying off the group name cannot work: `forward` is **491 of Oblivion's 850**
+`playgroup` calls and is overwhelmingly gates, doors and portcullises that must
+keep following their clip exactly — yet it is *also* the tripwire's break group.
+The mesh knows which is which; the name does not.
+
+Gotcha: the bounds cache only regenerates when **missing**, so a physics-flag
+change looks like a no-op until you delete `export/<plugin>/mesh_bounds_cache.json`
+(and `collision_cache.bin` — one scan fills both). The script stage also has to
+load that cache in **both** the parent and the spawned workers (Windows spawn
+does not inherit module state), or every lookup silently answers 0.
+
 ### Every state needs a real transitions array — including at ONE sequence (2026-08-01)
 
 `_transitions(exclude_state=i)` gives each motion state "every OTHER sequence",

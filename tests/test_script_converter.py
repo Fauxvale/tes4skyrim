@@ -2485,3 +2485,90 @@ class TestMoveToBindsItsDestination:
         out = converter._convert_line('Player.MoveTo Player', 'Quest')
         assert out == 'Game.GetPlayer().MoveTo(Game.GetPlayer())'
         assert 'Player' not in converter.get_property_refs()
+
+
+class TestTriggerEntryFires:
+    """A converted `begin OnTrigger` must fire on the ENTRY frame too.
+
+    Skyrim does not deliver OnTrigger for a fast crossing -- which is exactly
+    what walking over a tripwire or pressure plate is -- so stepping on the
+    Vilverin plate ran nothing at all.  Vanilla is unanimous: Tripwire.pex,
+    PressurePlate.pex, TrapTriggerBase.pex and TrapTriggerHinge.pex ALL define
+    OnTriggerEnter, and vanilla's Tripwire never defines OnTrigger.
+
+    The body stays on OnTrigger (per-frame semantics: Nehrim's Magieverbot
+    scripts count their own executions), and a generated OnTriggerEnter
+    delegates to it.  BOTH are required -- see docs/papyrus_conversion_notes.md.
+    """
+
+    SRC = """scn T
+short triggered
+begin onTrigger
+  set triggered to 1
+end
+"""
+
+    def test_body_stays_on_the_repeating_event(self, converter):
+        out = converter.convert_standalone('T', self.SRC, 'ObjectReference', 'T')
+        body = out.split('Event OnTrigger(')[1].split('EndEvent')[0]
+        assert 'triggered = 1' in body
+
+    def test_entry_event_is_emitted_and_delegates(self, converter):
+        out = converter.convert_standalone('T', self.SRC, 'ObjectReference', 'T')
+        assert 'Event OnTriggerEnter(ObjectReference akActionRef)' in out
+        entry = out.split('Event OnTriggerEnter(')[1].split('EndEvent')[0]
+        assert 'OnTrigger(akActionRef)' in entry
+
+    def test_block_filter_survives_the_delegation(self, converter):
+        """The filter guard lives in the OnTrigger body, so the entry path
+        inherits it rather than running unfiltered."""
+        src = "scn T\nshort x\nbegin onTrigger player\n  set x to 1\nend\n"
+        out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+        body = out.split('Event OnTrigger(')[1].split('EndEvent')[0]
+        assert 'Game.GetPlayer()' in body
+
+    def test_actor_and_mob_variants_also_get_entry(self, converter):
+        for block in ('onTriggerActor', 'onTriggerMob'):
+            src = f"scn T\nshort x\nbegin {block}\n  set x to 1\nend\n"
+            out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+            assert 'Event OnTriggerEnter(' in out, block
+
+    def test_authored_entry_block_is_not_duplicated(self, converter):
+        """Papyrus allows one definition per event, so a script that authors
+        its own OnTriggerEnter must not also get a generated one."""
+        src = ("scn T\nshort x\nbegin onTrigger\n  set x to 1\nend\n"
+               "begin onTriggerEnter\n  set x to 2\nend\n")
+        out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+        assert out.count('Event OnTriggerEnter(') == 1
+
+
+class TestDestroyDoesNotCancelTheClip:
+    """SetDestroyed(1) must not tear down the animation started just above it.
+
+    TES4 pairs `playgroup <grp>` with `setDestroyed 1` on the next line
+    (CTrigTripwire01SCRIPT, CTrapLogs01SCRIPT, CTrapCaveIn01SCRIPT).  In
+    Oblivion that was harmless -- with no destruction data it only blocked
+    re-activation, and Oblivion ships ZERO DEST subrecords.  Skyrim's
+    SetDestroyed still RESETS THE REFERENCE'S 3D, killing the
+    NiControllerSequence before a frame drew.
+    """
+
+    def test_destroy_after_animation_is_deferred(self, converter):
+        src = ("scn T\nbegin onActivate\n"
+               "  playgroup forward 0\n  setDestroyed 1\nend\n")
+        out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+        assert 'TES4Polyfill.DestroyAfterAnimation(Self)' in out
+        assert 'SetDestroyed(1)' not in out
+
+    def test_unrelated_destroy_is_left_alone(self, converter):
+        """Only the object that was just animated is at risk."""
+        src = "scn T\nbegin onActivate\n  setDestroyed 1\nend\n"
+        out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+        assert 'DestroyAfterAnimation' not in out
+
+    def test_setdestroyed_zero_is_never_deferred(self, converter):
+        """OnReset re-arms the trap; deferring that would be wrong."""
+        src = ("scn T\nbegin onActivate\n  playgroup forward 0\nend\n"
+               "begin onReset\n  setDestroyed 0\nend\n")
+        out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+        assert 'SetDestroyed(0)' in out

@@ -80,6 +80,26 @@ _PLAYER_ALIAS_SCRIPTS: list[tuple] = []
 # hardcode it; a plugin scripting the player attaches its SCPT here.
 _PLAYER_BASE_FORMID = 0x07
 
+# Base-record FormIDs (TES4 space, as written in the export) whose attached
+# script calls GetParentRef.  Filled by build_object_script_plan(); read by
+# convert_REFR to decide whether a placed reference needs its enable parent
+# MIRRORED into XLKR.
+#
+# TES4 `GetParentRef` returns the reference's ENABLE PARENT (the XESP field --
+# xEdit names it 'Enable Parent', and the UESP modding guide says it outright:
+# "make the container its Parent Ref" then `set rCont to GetParentRef`).
+# Skyrim has no getter for the enable parent, so the converter maps
+# GetParentRef -> GetLinkedRef(), which reads XLKR instead.  Nothing was ever
+# writing XLKR, so every converted `GetParentRef` returned None: the Vilverin
+# pressure plate found no mace to Activate() and the trap stayed frozen in
+# mid-air, and the same held for the tripwire.
+_GETPARENTREF_BASES: set = set()
+
+
+def base_uses_parent_ref(base_fid: str) -> bool:
+    """True if this base record's TES4 script calls GetParentRef."""
+    return base_fid in _GETPARENTREF_BASES
+
 
 def get_object_vmad(record_fid: int) -> bytes:
     """Packed VMAD subrecord for a record's attached object script (b'' if none)."""
@@ -216,6 +236,7 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
     Returns the number of records that received a script VMAD.
     """
     _OBJECT_VMAD.clear()
+    _GETPARENTREF_BASES.clear()
     offset = get_formid_index_offset()
     scpt_by_fid = _collect_scpts(by_type, xref)
 
@@ -257,6 +278,14 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
 
             edid, sctx, extends = scpt_by_fid[scri]
             script_name = papyrus_script_name(edid or f'Script_{scri}')
+
+            # Remember bases whose script reads the enable parent, so
+            # convert_REFR can mirror XESP into XLKR on their placed refs.
+            # Scoped to scripts that actually call it: XESP is ordinary
+            # enable-parenting on 9157 Oblivion refs and only 2660 of those
+            # belong to a base that reads it back as a linked ref.
+            if re.search(r'\bgetparentref\b', sctx, re.IGNORECASE):
+                _GETPARENTREF_BASES.add(rec_fid_str)
 
             obj_props = props_memo.get(scri)
             if obj_props is None:

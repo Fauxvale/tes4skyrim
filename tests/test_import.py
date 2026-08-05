@@ -4775,3 +4775,78 @@ class TestLeveledActorShellDNAM:
         assert size == 52
         body = rec[idx + 6:idx + 6 + size]
         assert struct.unpack_from('<HHH', body, 36) == (55, 37, 49)
+
+
+class TestParentRefBecomesLinkedRef:
+    """TES4 GetParentRef reads the ENABLE PARENT (XESP); Skyrim's
+    GetLinkedRef() reads XLKR.
+
+    xEdit names XESP 'Enable Parent', and the UESP modding guide states the
+    idiom directly: "make the container its Parent Ref", then
+    `set rCont to GetParentRef`.  Skyrim has no getter for the enable parent,
+    so script_convert maps GetParentRef -> GetLinkedRef().  Nothing wrote
+    XLKR, so every converted GetParentRef returned None -- all 345 scripts
+    that call it, not just traps.  The Vilverin pressure plate's body ran but
+    `target.Activate()` never reached the mace, which hung frozen in mid-air.
+
+    Layout (xEdit + a real Skyrim.esm dump, 11287 vanilla uses): 8 bytes,
+    {Keyword/Ref, Ref}, keyword slot NULL for a plain link.
+    """
+
+    BASE = '0005325D'   # pressure-plate base, script calls GetParentRef
+    PLAIN = '0004BD3A'  # a base whose script does not
+
+    @staticmethod
+    def _refr(base_fid, xesp='0006BF3C'):
+        rec = {'Signature': 'REFR', 'FormID': '0006BF3D', 'RecordFlags': '1024',
+               'NAME': base_fid,
+               'PosX': '0.0', 'PosY': '0.0', 'PosZ': '0.0',
+               'RotX': '0.0', 'RotY': '0.0', 'RotZ': '0.0'}
+        if xesp:
+            rec['XESP.Reference'] = xesp
+            rec['XESP.Flags'] = '0'
+        return rec
+
+    def _with_bases(self, *fids):
+        """Register bases as 'script calls GetParentRef' for one test."""
+        from tes5_import import object_scripts
+        object_scripts._GETPARENTREF_BASES.clear()
+        object_scripts._GETPARENTREF_BASES.update(fids)
+
+    def teardown_method(self):
+        from tes5_import import object_scripts
+        object_scripts._GETPARENTREF_BASES.clear()
+
+    def test_enable_parent_is_mirrored_into_xlkr(self):
+        self._with_bases(self.BASE)
+        out = convert_REFR(self._refr(self.BASE))
+        xlkr = _find_subrecord(out, b'XLKR')
+        assert xlkr is not None, 'no XLKR written'
+        keyword, ref = struct.unpack('<II', xlkr)
+        xesp_ref = struct.unpack('<II', _find_subrecord(out, b'XESP'))[0]
+        assert keyword == 0, 'keyword slot must be NULL for a plain link'
+        assert ref == xesp_ref, 'XLKR must point at the enable parent'
+
+    def test_xlkr_is_eight_bytes(self):
+        self._with_bases(self.BASE)
+        out = convert_REFR(self._refr(self.BASE))
+        assert len(_find_subrecord(out, b'XLKR')) == 8
+
+    def test_enable_parent_is_still_written(self):
+        """The mirror ADDS a link; it must not replace enable-parenting."""
+        self._with_bases(self.BASE)
+        out = convert_REFR(self._refr(self.BASE))
+        assert _find_subrecord(out, b'XESP') is not None
+
+    def test_bases_that_never_read_it_get_no_link(self):
+        """XESP is ordinary enable-parenting on 9157 Oblivion refs; only 2660
+        belong to a base that reads it back.  Mirroring all of them would
+        invent links the game never had."""
+        self._with_bases(self.BASE)
+        out = convert_REFR(self._refr(self.PLAIN))
+        assert _find_subrecord(out, b'XLKR') is None
+
+    def test_no_enable_parent_means_no_link(self):
+        self._with_bases(self.BASE)
+        out = convert_REFR(self._refr(self.BASE, xesp=None))
+        assert _find_subrecord(out, b'XLKR') is None

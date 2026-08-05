@@ -57,19 +57,6 @@ SAY_LINE_SECONDS = 3.0
 # and `Call <ScriptName> args` names the SCRIPT, never the function.
 _UDF_NAME = 'TES4Call'
 
-# TES4 animation groups that Oblivion's break-apart props are driven with.  A
-# breakaway piece is a keyframed body with real mass and `Unyielding = 1`: the
-# clip only creaks it off its mounting and Havok drops it once the clip ends.
-# Skyrim keyframed bodies never fall, so these groups get an explicit
-# SetMotionType(Motion_Dynamic) release (TES4Polyfill.ReleaseBreakaway), which
-# is inert on every other animated object because those convert to mass-0
-# bodies.  `Unequip` is the group the whole family uses (mwallplankbreakaway01,
-# IDCrumbleWall01, AlcazarCrumbleWallRef, BergklosterBelagertMauerZerbrechen),
-# and it is the only group in the census that ever breaks a prop apart, so the
-# release stays scoped to it.
-_BREAKAWAY_ANIM_GROUPS = frozenset(('unequip',))
-
-
 def _split_udf_params(block_filter: str) -> list[str]:
     """Parameter names from an OBSE `begin Function{...}` header.
 
@@ -894,6 +881,37 @@ class ScriptConverter:
             if not commented:
                 out.append('EndEvent')
             out.append('')
+
+            # TES4 `begin OnTrigger` ALSO has to fire on the crossing frame.
+            #
+            # Skyrim's OnTrigger is the repeat event, so it stays the body's
+            # home (Nehrim's Magieverbot counters need repeat semantics, and
+            # remapping to OnTriggerEnter froze them -- see BLOCK_MAP).  But
+            # the engine does NOT deliver OnTrigger for a fast crossing: every
+            # vanilla trap trigger implements OnTriggerEnter instead, and the
+            # census is unanimous -- Tripwire.pex, PressurePlate.pex,
+            # TrapTriggerBase.pex and TrapTriggerHinge.pex ALL define
+            # OnTriggerEnter, and vanilla's own Tripwire does not define
+            # OnTrigger at all.  Walking over a converted tripwire or pressure
+            # plate therefore never ran the body.
+            #
+            # Emitting BOTH keeps each event's meaning: OnTriggerEnter catches
+            # the entry frame, OnTrigger keeps repeating while inside.  The
+            # entry event just calls the repeat one, so the body exists once
+            # and both paths stay in lockstep.
+            # Skipped when the script authors its own OnTriggerEnter block:
+            # Papyrus allows one definition per event, and the author's own
+            # body is authoritative.  (No Oblivion script does both, but a
+            # third-party plugin may.)
+            if (merge_key == BLOCK_MAP['ontrigger'][0]
+                    and BLOCK_MAP['ontriggerenter'][0] not in merged_blocks):
+                out.append('Event OnTriggerEnter(ObjectReference akActionRef)')
+                out.append('  ; Entry frame: Skyrim sends OnTriggerEnter, not '
+                           'OnTrigger (vanilla Tripwire/PressurePlate do the '
+                           'same).  Repeat ticks still arrive on OnTrigger.')
+                out.append('  OnTrigger(akActionRef)')
+                out.append('EndEvent')
+                out.append('')
 
         # Emit the OBSE user-defined function (`begin Function{a,b}`, invoked as
         # `Call ThisScript a, b`) as a Papyrus Function.  NOT Global: these
@@ -1764,6 +1782,41 @@ class ScriptConverter:
                     _skip.add(idx)
                     break
         lines = [l for i, l in enumerate(_flat) if i not in _skip]
+        # SetDestroyed(1) must not CANCEL the clip that was started just above
+        # it.  TES4 pairs the two constantly -- `playgroup forward 0` then
+        # `setDestroyed 1` (CTrigTripwire01SCRIPT, CTrapLogs01SCRIPT,
+        # CTrapCaveIn01SCRIPT, MPlanksBreakAway01Script) -- because in Oblivion
+        # setDestroyed on a record with no destruction data only blocked
+        # re-activation.  Oblivion ships ZERO DEST subrecords (censused across
+        # the whole export: 0 in ACTI), so no converted record has a destroyed
+        # state to switch TO -- but Skyrim's SetDestroyed still resets the
+        # reference's 3D, which kills the NiControllerSequence that started one
+        # line earlier.  That is why the tripwire never visibly snapped: the
+        # break animation was dispatched and then immediately torn down.
+        #
+        # Defer the destroy past the clip instead of dropping it (it still has
+        # to run -- it is what stops the trap re-triggering).  The clip length
+        # is not knowable here, so hand it to the polyfill, which waits out the
+        # animation on its own thread and then destroys.
+        _playanim_re = re.compile(r'^(\s*)(.+?)\.PlayAnimation\("([^"]+)"\)\s*$')
+        _setdestroyed_re = re.compile(
+            r'^(\s*)(?:(.+?)\.)?SetDestroyed\(\s*(?:1|true)\s*\)\s*$',
+            re.IGNORECASE)
+        _anim_targets: dict[str, int] = {}
+        for idx, line in enumerate(lines):
+            pm = _playanim_re.match(line)
+            if pm:
+                _anim_targets[pm.group(2).strip()] = idx
+                continue
+            dm = _setdestroyed_re.match(line)
+            if not dm:
+                continue
+            tgt = (dm.group(2) or 'Self').strip()
+            # Only the object that was just animated is at risk; a destroy on
+            # anything else is untouched.
+            if tgt in _anim_targets or (tgt == 'Self' and 'Self' in _anim_targets):
+                lines[idx] = (f'{dm.group(1)}TES4Polyfill.DestroyAfterAnimation('
+                              f'{tgt})')
         # Consecutive PlayGroups on the SAME reference (Nehrim MQ23's loose
         # planks: Forward / Backward / Unequip in one frame) are left as plain
         # PlayAnimation calls: the last event wins and the object snaps to the
@@ -6543,25 +6596,41 @@ class ScriptConverter:
                 # ref plays on THAT object, not on Self.
                 obj = self._resolve_objref_ref(ref_name, extends) if ref_name \
                     else self._implicit_self(extends)
-                # BREAKAWAY release.  Oblivion authors break-apart props
-                # (mwallplankbreakaway01's planks, IDCrumbleWall01's bricks) as
-                # keyframed bodies with real mass and `Unyielding = 1`: the clip
-                # only creaks them off their mounting -- 15.19 deg and ZERO
-                # translation keys for the planks -- and the pieces DETACH AND
-                # FALL under Havok once it finishes.  Skyrim keyframed bodies
-                # never yield to gravity, so the converted planks hung in the
-                # half-broken pose forever.
+                # HAVOK RELEASE.  Oblivion holds two families of prop rigid
+                # until a script fires: break-apart props (mwallplankbreakaway01's
+                # planks, IDCrumbleWall01's bricks) and whole constrained trap
+                # islands (ctrapswingmacelong01, ctraplogs01, ctrigtripwire01).
+                # Both are authored as keyframed bodies with real mass and
+                # `Unyielding = 1` -- the clip only creaks the piece off its
+                # mounting, and HAVOK does the visible part once it ends.
+                # CTrapLogs01SCRIPT says so in its own header: "On activation
+                # havok will turn on and logs will roll".  Skyrim keyframed
+                # bodies never yield to gravity, so without a release the planks
+                # hang half-broken and the tripwire never snaps.
                 #
                 # The release is native: SetMotionType(Motion_Dynamic) after the
-                # clip has run.  It is emitted for the break-apart groups only,
-                # and it is INERT on anything that is not a breakaway piece --
+                # clip has run.  Which objects get it is decided by the MESH, not
+                # by the animation group: `_convert_collision` keeps a non-zero
+                # mass on a keyframed body for held pieces ONLY, and records that
+                # as physics-flag bit 1.  Keying off the group name was wrong --
+                # 'forward' is 491 of Oblivion's 850 playgroup calls and is
+                # overwhelmingly gates, doors and portcullises that must keep
+                # following their clip exactly, yet it is also the tripwire's
+                # break group.  The group name cannot separate them; the mesh
+                # can.  The release stays inert on anything not held, because
                 # every other animated object converts to a mass-0 keyframed
-                # body, which has infinite effective mass and cannot fall even
-                # once it is dynamic.  So doors, gates and portcullises driven
-                # by these same groups are unaffected.  (Shipping the planks
-                # dynamic in the NIF instead was wrong: they dropped the instant
-                # the cell loaded, before the clip ever played.)
-                if anim_name.lower() in _BREAKAWAY_ANIM_GROUPS:
+                # body that cannot fall even once it is dynamic.  (Shipping the
+                # pieces dynamic in the NIF instead was wrong: they dropped the
+                # instant the cell loaded, before the clip ever played -- which
+                # is exactly what made swinging traps free-swing on cell entry.)
+                held = False
+                if self.xref:
+                    if ref_name:
+                        held = self.xref.needs_havok_release(ref_name)
+                    else:
+                        held = self.xref.script_owner_needs_havok_release(
+                            self._current_script_edid)
+                if held:
                     return (f'{obj}.PlayAnimation("{seq}")\n'
                             f'  TES4Polyfill.ReleaseBreakaway({obj})')
                 return f'{obj}.PlayAnimation("{seq}")'
