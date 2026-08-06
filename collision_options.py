@@ -8,11 +8,28 @@ alternating parity — measured on **Nehrim** and **Morrowind_ob**, where the
 Oblivion originals of the same meshes give exact ground truth for what the
 winding should be.
 
-Vanilla Oblivion assets do not have that damage, and while the repair is
-designed to be inert on correctly wound input (step 1 is exact; step 2 requires
-a quorum), "inert" is not "free": it still costs a per-shape weld + BFS, and any
-false positive it *does* make punches a hole in geometry that was already
-correct.  So the repair is **opt-in per plugin** rather than always-on.
+Vanilla Oblivion assets are largely free of that damage — MEASURED, not
+assumed, with ``tools/collision_winding_truth.py`` (which compares each
+near-horizontal collision face against the render face coincident with it):
+
+    Nehrim       architecture   21.99% of decidable faces inverted
+    Oblivion     architecture    1.16%
+                 dungeons        0.13%
+                 clutter         4.80%
+                 furniture       5.10%
+
+That ~20x separation is the actual evidence for the per-plugin default; the
+earlier claim here that Oblivion "does not have that damage" was never
+verified, and Oblivion is not perfectly clean, just far cleaner.  (Take care
+reading such numbers: a naive nearest-skin comparison scores vanilla stairs
+48/48 falsely inverted and furniture at 16%, because a thin slab has both its
+skins in range.  See the tool's THIN-SLAB TRAP note.)
+
+While the repair is designed to be inert on correctly wound input (step 1 is
+exact; step 2 requires a quorum), "inert" is not "free": it still costs a
+per-shape weld + BFS, and any false positive it *does* make punches a hole in
+geometry that was already correct.  So the repair is **opt-in per plugin**
+rather than always-on.
 
 Resolution order (see :func:`winding_fix_enabled`):
 

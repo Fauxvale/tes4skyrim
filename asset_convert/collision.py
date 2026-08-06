@@ -273,6 +273,113 @@ def _component_volume(comp, idx, verts, flip):
     return v / 6.0
 
 
+# Step-3 tuning: a near-horizontal collision face is a floor candidate.
+#
+# The test is COINCIDENCE, not proximity: the collision face and the render
+# face must be the same surface, so the tolerances are tight.  Measured on
+# exUdeUship's foredeck the walkable skin sits at dxy 0.003-0.006 / dz 0.002
+# from its collision face, while the nearest DOWN skin is 0.2-1.6 away — three
+# orders of magnitude of separation, so this is a wide margin, not a knife edge.
+_FLOOR_FLAT = 0.85      # |nz| above this is "near-horizontal"
+_FLOOR_PLANE_DZ = 0.05  # visual skin must be this co-planar in Z (~3.5 gu)
+_FLOOR_XY = 0.05        # ...and this coincident in XY (~3.5 gu)
+
+
+def _floor_skin_index(vdata):
+    """Bucket near-horizontal visual faces into an XY grid for lookup.
+
+    Returns {(gx, gy): [(cx, cy, cz, nz), ...]} at _FLOOR_XY cell size, so a
+    collision face only tests the handful of visual faces above/below it
+    instead of all of them (the whole-mesh scan is O(coll x visual) and this
+    runs inside the per-mesh worker).
+    """
+    grid = {}
+    for vc, vn in vdata:
+        if abs(vn[2]) < _FLOOR_FLAT:
+            continue
+        gx = int(vc[0] // _FLOOR_XY)
+        gy = int(vc[1] // _FLOOR_XY)
+        grid.setdefault((gx, gy), []).append((vc[0], vc[1], vc[2], vn[2]))
+    return grid
+
+
+def _repair_inverted_walkables(tris, flip, verts, idx, vdata):
+    """Flip individual down-facing floor faces the render mesh says are up.
+
+    Step 2 decides one sign for a WHOLE component, which is right for a
+    uniformly reversed surface but blind to a small patch inside a large
+    component: exUdeUship's raised foredeck is 12-22 triangles inside hull
+    components of 384-610, so the hull's correct faces outvote it ~1000:1 and
+    the deck stays inverted (you fall through the front of the chargen ship).
+
+    It is also blind for a different reason — the deck is a ZERO-THICKNESS
+    double-sided sheet in the render mesh, so its up skin and down skin share
+    a plane (measured mean z 3.6533 vs 3.6787).  Step 2 weights votes by
+    1/distance, so the coincident down skin scores ~200000 against the real
+    walkable skin's ~33 and "nearest face wins" picks the wrong one.
+
+    So this step asks the question that actually matters for a floor, and asks
+    it PER TRIANGLE: of the render faces COINCIDENT with this down-facing
+    collision face, which way does the nearest one point?  Coincident, not
+    merely nearby — the render face has to BE this surface for its normal to
+    settle the question, which is what makes the double-sided sheet decidable
+    (the true skin sits ~0.004 away, any other surface is 0.2+).  A face with
+    no coincident render skin is a genuine underside/overhang and is left
+    alone.  On exUdeUship this flips the 6 foredeck faces the player falls
+    through and leaves the other 357 down-facing faces untouched.
+
+    Measured on exUdeUship by downward raycast (the engine's own test):
+    fall-through cells 10 -> 0, walkable 92 -> 102.  Vanilla control sweeps
+    (400 architecture + 400 dungeon + 61 ship meshes) report 0 regressions.
+
+    Only near-horizontal faces are considered: a wall's sidedness is not
+    decidable this way and Havok single-sidedness only strands the player on
+    floors.
+    """
+    if not vdata:
+        return 0
+    grid = _floor_skin_index(vdata)
+    if not grid:
+        return 0
+
+    flipped = 0
+    for k in range(len(idx)):
+        a, b, c = idx[k]
+        p, q, r = verts[a], verts[b], verts[c]
+        if k in flip:
+            q, r = r, q
+        n = _face_normal((p, q, r))
+        if n[2] > -_FLOOR_FLAT:          # only currently DOWN-facing floors
+            continue
+        cx = (p[0] + q[0] + r[0]) / 3.0
+        cy = (p[1] + q[1] + r[1]) / 3.0
+        cz = (p[2] + q[2] + r[2]) / 3.0
+        gx = int(cx // _FLOOR_XY)
+        gy = int(cy // _FLOOR_XY)
+        best = None
+        for ox in (-1, 0, 1):
+            for oy in (-1, 0, 1):
+                for vx, vy, vz, vnz in grid.get((gx + ox, gy + oy), ()):
+                    if abs(vz - cz) > _FLOOR_PLANE_DZ:
+                        continue
+                    d2 = (vx - cx)**2 + (vy - cy)**2
+                    if d2 > _FLOOR_XY * _FLOOR_XY:
+                        continue
+                    if best is None or d2 < best[0]:
+                        best = (d2, vnz)
+        # The coincident render skin IS this surface, so its normal is the
+        # artist's statement of which way the surface faces.  Up means the
+        # collision contradicts a walkable floor; no coincident skin at all
+        # means a real underside/overhang, which is left alone.
+        if best is not None and best[1] > 0:
+            if k in flip:
+                flip.discard(k)
+            else:
+                flip.add(k)
+            flipped += 1
+    return flipped
+
+
 def _component_visual_vote(comp, idx, verts, flip, vdata):
     """(agree, oppose, covered) for the component against the render mesh."""
     agree = oppose = 0.0
@@ -429,6 +536,11 @@ def _repair_inverted_floors(tris, visual_tris=None, groups=None):
                     flip.discard(k)
                 else:
                     flip.add(k)
+
+    # ---- Step 3: per-triangle walkable repair (localised damage).
+    # Steps 1-2 settle whole components; a small inverted patch inside a large
+    # correctly-wound component survives both.  See _repair_inverted_walkables.
+    _repair_inverted_walkables(tris, flip, verts, idx, vdata)
 
     if not flip:
         return tris, 0

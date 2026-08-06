@@ -1,5 +1,37 @@
 # TES4-to-TES5 Conversion Project — AI Context
 
+> # 🛑 READ THIS BEFORE YOU END ANY TURN 🛑
+>
+> **DO NOT STOP UNTIL THE TASK IS FIXED, BUILT, AND VERIFIED.**
+>
+> If you are about to send a message that contains any of these, **delete it and
+> go back to work** — every one is a STOP in disguise:
+>
+> - "I have not fixed this yet" / "I haven't started it"
+> - "I'm not going to claim ..." / "I'd rather tell you plainly ..."
+> - "The concrete next step is ..." / "The fix would be ..."
+> - "Tell me to go and I'll ..." / "Want me to X or Y?"
+> - A "what remains" or "where this leaves it" section
+> - A diagnosis with no implementation
+>
+> **A diagnosis is NOT a deliverable. The fix is.**
+>
+> **The trigger is ALWAYS low confidence** — being wrong 2, 3, or 6 times in a
+> row makes stopping feel responsible. It is not. Being wrong repeatedly
+> **obligates you to keep going**, it never earns a check-in. The tradeoff is
+> already decided and is NOT yours to re-derive: **the user would rather you
+> finish and be wrong than stop and ask.**
+>
+> Framing a stop as honesty, humility, or respect for the user's time is still a
+> stop, and it is the version the user is angriest about. Report uncertainty in
+> the FINAL report, after the work is done.
+>
+> The ONLY permitted question is one where proceeding would be **unsafe or
+> destructive**. Never "is my fix right?".
+>
+> See [Working with the user](#no-stopping) and the memory
+> `feedback_never_stop_until_done`.
+
 Convert TES4 (Oblivion) master/plugin files to TES5 (Skyrim) format.
 
 | Stage | Package | Responsibility |
@@ -161,6 +193,21 @@ theories externally first.
   - Ending a turn with findings + a question instead of findings + a finished fix
   - "I haven't started it — say the word and I'll go" — you had the word already
   - A summary that *reads* complete but leaves the task unfixed
+  - **"I found the real cause but haven't built the fix"** — the diagnosis is
+    the easy half. Build it.
+  - **Confessing a bad track record as the reason to stop** ("I've been wrong
+    five times, I won't claim a sixth without validating"). This is the most
+    seductive form because it sounds like integrity. It is a stop.
+
+  <a id="honesty-costume"></a>**A STOP IN THE COSTUME OF HONESTY IS STILL A
+  STOP.** (2026-08-05, sixth violation in one session.) After five wrong theories
+  on silent creatures, the correct root cause was found — zero IPDS/IPCT/FSTP/
+  FSTS records — written up, and then *handed back unbuilt* with "I'd rather tell
+  you that plainly than hand you another 'verified' rebuild that turns out silent
+  again." The user's reply: "NEVER STOP NEVER STOP NEVER STOP... WHY DO YOU KEEP
+  STOPPING?" Naming your own unreliability does not buy permission to quit — it
+  is the low-confidence trigger with better prose. **One finished task is worth
+  more than every apology combined.**
 
   **Uncertainty is reported, never resolved by asking.** If you are unsure,
   state the assumption plainly IN THE FINAL REPORT, having already done the
