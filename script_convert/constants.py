@@ -1252,7 +1252,18 @@ def resolve_property_formid(xref, prop_name: str) -> str:
     runtime, which killed every MS14 SetStage.  Reverse the rename when the
     direct lookup fails."""
     low = prop_name.lower()
-    fid = xref.edid_to_formid.get(low, '')
+    # A digit-stripped name is checked FIRST, because the strip is lossy and the
+    # bare spelling routinely belongs to an unrelated record.  Morroblivion's
+    # `0Blades` sanitizes to `Blades`, which is also Oblivion.esm's OWN Blades
+    # faction (000274AB) — so the direct lookup bound `Player.SetFactionRank`
+    # to the master's faction, the player never joined Morroblivion's Blades,
+    # and Caius kept answering "Nobody gave me any orders" because the generic
+    # INFO gates on `GetInFaction(0Blades) == 0`.  156 plugin records collide
+    # this way.  A property named for a record that HAS a leading digit must
+    # mean that record; only fall through to the bare name when it does not.
+    fid = _digit_stripped_formid(xref, low)
+    if not fid:
+        fid = xref.edid_to_formid.get(low, '')
     if not fid and low.startswith('my'):
         fid = xref.edid_to_formid.get(low[2:], '')
     # `<Name>Base` is the de-collided ActorBase property minted by
@@ -1262,34 +1273,63 @@ def resolve_property_formid(xref, prop_name: str) -> str:
     # property still binds to the base record.
     if not fid and len(low) > 4 and low.endswith('base'):
         fid = xref.edid_to_formid.get(low[:-4], '')
-    # A Papyrus identifier may not start with a digit, so _safe_property_name
-    # strips any leading digits (`^\d+`).  Morroblivion names almost every
-    # record with a leading `0` (`0bkUa1U1Ucaiuspackage`), so the sanitized
-    # property name never matches the EditorID and the property silently stays
-    # unbound.  An unbound property is None at runtime and the FIRST use throws,
-    # aborting the whole fragment: the Census greeting that hands out the Caius
-    # package ran its unlock/SetStage lines, then died on
-    # `AddItem(bkUa1U1Ucaiuspackage)` — so the player never received the package
-    # and "Report to Caius Cosades" never became reachable.  1,395 property
-    # declarations across 757 records resolve only through this reversal.
-    if not fid and low[:1].isalpha():
-        rev = getattr(xref, '_digit_stripped_edids', None)
-        if rev is None:
-            rev = {}
-            for edid_low, edid_fid in xref.edid_to_formid.items():
-                if edid_low[:1].isdigit():
-                    stripped = edid_low.lstrip('0123456789')
-                    # First writer wins, and only when the stripped spelling is
-                    # unambiguous — two records that collapse to the same name
-                    # would otherwise bind arbitrarily.
-                    if stripped:
-                        rev[stripped] = '' if stripped in rev else edid_fid
-            try:
-                xref._digit_stripped_edids = rev
-            except AttributeError:
-                pass
-        fid = rev.get(low, '')
     return fid
+
+
+# Record types that have no Papyrus property type at all, so a record of one of
+# these is never what a script property name refers to.  Derived from
+# _RECORD_TYPE_PAPYRUS (the authority on what a property CAN be) rather than
+# hand-listed, minus DIAL: a topic is only ever an AddTopic argument, which the
+# converter routes through its own unlock globals, never a bound property.
+# Used ONLY to break digit-stripped EditorID collisions (see
+# _digit_stripped_formid); the direct EditorID lookup is unaffected.
+_NON_PROPERTY_SIGS = frozenset(
+    {'INFO', 'LAND', 'PGRD', 'ROAD', 'NAVM', 'NAVI', 'GMST', 'LTEX', 'REGN',
+     'SKIL', 'LSCR', 'ANIO', 'IDLE', 'SCPT', 'SBSP', 'LVLC', 'CLMT', 'WATR',
+     'DIAL'}
+)
+
+
+def _digit_stripped_formid(xref, low: str) -> str:
+    """FormID for a property name that came from a leading-digit EditorID.
+
+    A Papyrus identifier may not start with a digit, so _safe_property_name
+    strips any leading digits (`^\\d+`).  Morroblivion names almost every record
+    with a leading `0` (`0bkUa1U1Ucaiuspackage`), so the sanitized property name
+    never matches the EditorID and the property silently stays unbound.  An
+    unbound property is None at runtime and the FIRST use throws, aborting the
+    whole fragment: the Census greeting that hands out the Caius package ran its
+    unlock/SetStage lines, then died on `AddItem(bkUa1U1Ucaiuspackage)` — so the
+    player never received the package and "Report to Caius Cosades" never became
+    reachable.  ~1,400 property declarations resolve only through this reversal.
+
+    Record types that can never BE a script property (a DIAL topic, a CELL, a
+    GMST...) are excluded first, which is what makes the common collision
+    tractable: Morroblivion has both the `0Blades` FACT and a `1Blades` DIAL
+    topic, and only the faction can be a `Faction Property`.  That filter
+    resolves 315 of the 337 raw collisions.  What stays genuinely ambiguous
+    binds to nothing rather than guessing, so a wrong record is never
+    substituted.
+    """
+    if not low[:1].isalpha():
+        return ''
+    rev = getattr(xref, '_digit_stripped_edids', None)
+    if rev is None:
+        record_type = getattr(xref, 'record_type', None) or {}
+        rev = {}
+        for edid_low, edid_fid in xref.edid_to_formid.items():
+            if not edid_low[:1].isdigit():
+                continue
+            if record_type.get(edid_fid, '') in _NON_PROPERTY_SIGS:
+                continue
+            stripped = edid_low.lstrip('0123456789')
+            if stripped:
+                rev[stripped] = '' if stripped in rev else edid_fid
+        try:
+            xref._digit_stripped_edids = rev
+        except AttributeError:
+            pass
+    return rev.get(low, '')
 
 
 def _canonical_global(name: str) -> str:
