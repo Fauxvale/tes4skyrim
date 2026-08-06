@@ -1000,6 +1000,13 @@ _SHADER_ALPHA_VAR = (12, 5)
 # BSLightingShaderProperty.  See the shader choice in _process_geometry.
 _LIGHTING_EMISSIVE_ONLY = 0
 
+# Diffuse for a shape whose Oblivion source carries no NiTexturingProperty.
+# Skyrim's lighting shader dereferences the diffuse without a null check, so
+# "no texture" is not representable -- see the else branch in _process_geometry.
+# white.dds is vanilla Skyrim's own neutral texture (shipped in the SSE BSAs),
+# so the material colour we carry across shows through unmodified.
+_DEFAULT_DIFFUSE_TEXTURE = b'Textures\\white.dds'
+
 
 def _collect_tex_transform_ctrls(props):
     """Harvest animated NiTextureTransformControllers from Oblivion properties.
@@ -1338,6 +1345,25 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         tex_set.textures[0] = diffuse.encode('utf-8')
         base = diffuse.rsplit('.', 1)[0] if '.' in diffuse else diffuse
         tex_set.textures[1] = (base + '_n.dds').encode('utf-8')
+    else:
+        # No NiTexturingProperty at all: Oblivion renders these shapes with the
+        # flat NiMaterialProperty colour, so the source legitimately names no
+        # texture.  Skyrim has no such mode -- BSLightingShader::SetupMaterial
+        # binds the diffuse UNCONDITIONALLY (SkyrimSE.exe 1.6.659 +0x1412138 ->
+        # +0x1415790 "mov rax,[rdx+0x48]" with rdx = material->diffuse), so a
+        # null diffuse is an access violation the moment the shape is drawn.
+        # Vanilla never exercises that path: 0 of 772 BSLightingShaderProperty
+        # shapes sampled across Skyrim's own meshes ship an empty slot 0.
+        #
+        # white.dds is Skyrim's own neutral texture, so multiplying it by the
+        # material colour we already carry across reproduces Oblivion's flat
+        # shading exactly.  Slot 1 stays empty on purpose -- the normal map is
+        # null-checked (+0x1412144 "test rax,rax / je") and vanilla ships
+        # normal-less shapes, so a fabricated _n path would only dangle.
+        tex_set.textures[0] = _DEFAULT_DIFFUSE_TEXTURE
+        if stats is not None:
+            stats['untextured_diffuse_defaulted'] = (
+                stats.get('untextured_diffuse_defaulted', 0) + 1)
 
     # Sky geometry takes the dedicated sky shader instead of the lighting one.
     # Skyrim's sky pass draws these before the world, unlit and unfogged, with

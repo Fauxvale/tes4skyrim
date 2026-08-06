@@ -25,6 +25,8 @@ Major Issues for V1:
 		palacefont01.nif
 		se01waitingrooomwalls.nif
 
+	10 - Imperials get all fallback race lines (like reiklings)
+
 for nehrim, the problem i had was with the lod object files! I managed to load it once i replaced them with empty btos. Other than that, i had a few ctds related to meshes near erothin (in the coast region)
 As for oblivion, i had a few ctds due to the ayled well meshes, managed to load it once i made a .esp that disabled all of them
 
