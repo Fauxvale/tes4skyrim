@@ -419,6 +419,25 @@ def _create_vtyp_records(writer: PluginWriter):
         set_voice_type(race_edid, gender, fid)
 
 
+def _creature_sound_slots(export_dir: str) -> dict:
+    """{folder: {csdt_type: SOUN EditorID}} for the footstep chain.
+
+    Reuses the creature pipeline's resolver so the records and the generated
+    assets agree on which sound belongs to which slot (it handles CSCR
+    inheritance — 817 of Oblivion's 909 CREA records inherit their sound set
+    rather than defining one). Import must not hard-depend on asset_convert,
+    so a missing/unimportable pipeline is simply "no footsteps".
+    """
+    try:
+        from asset_convert.creature_pipeline import _sound_slots_by_folder
+    except ImportError:
+        return {}
+    try:
+        return _sound_slots_by_folder(export_dir) or {}
+    except OSError:
+        return {}
+
+
 def _read_tes4_masters(export_dir: str) -> list:
     """The plugin's TES4 master NAMES, from the export's _HEADER.txt.
 
@@ -1583,6 +1602,25 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
         n_cvp = patch_creature_voices(writer)
         print(f"  Creature voice types: {n_cv} generated, "
               f"{n_cvp} records bound")
+    # Creature footsteps: IPCT/IPDS/FSTP/FSTS chain hung off the body ARMA's
+    # SNDD. Skyrim reads locomotion audio from there, NOT from the actor or
+    # from animationdata — CSDT slots 0-3 were being dropped entirely, so no
+    # converted creature ever made a footstep. Allocated last (same reason as
+    # the voice types) and patched into the already-written ARMAs.
+    from .creature_footsteps import (build_creature_footsteps,
+                                     patch_creature_footsteps)
+    from .creature_races import get_creature_arma_folders
+    from .record_types.dialog_misc import get_sndr_for_soun
+    _crea_slots = _creature_sound_slots(export_dir)
+    _soun_fid = {get_str(r, 'EditorID'): get_formid(r, 'FormID')
+                 for r in by_type.get('SOUN', []) if get_str(r, 'EditorID')}
+    n_fs = build_creature_footsteps(
+        writer, _crea_slots,
+        lambda edid: get_sndr_for_soun(_soun_fid.get(edid, 0)))
+    if n_fs:
+        n_fsp = patch_creature_footsteps(writer, get_creature_arma_folders())
+        print(f"  Creature footstep sets: {n_fs} generated, "
+              f"{n_fsp} ARMAs bound")
     _write_voice_map(output_path, voice_map)
     from .dialog_converter import get_lip_texts
     _write_lip_text(output_path, get_lip_texts())

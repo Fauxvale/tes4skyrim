@@ -54,6 +54,127 @@ def _read_items(rec: dict) -> list:
     return items
 
 
+# TES4 CREA sound types that carry over to TES5 unchanged. Both games use the
+# SAME enum for 0-9 (xEdit wbDefinitionsTES4 CREA CSDT vs wbDefinitionsTES5
+# NPC_ CSDT: Left Foot, Right Foot, Left Back Foot, Right Back Foot, Idle,
+# Aware, Attack, Hit, Death, Weapon — TES5 merely appends 10-21), so the type
+# passes straight through. Skyrim kept Oblivion's creature-sound system on the
+# actor record; the only real difference is that CSDI names an SNDR rather
+# than a SOUN, which is exactly the companion convert_SOUN already mints.
+_MAX_TES4_SOUND_TYPE = 9
+
+# CSDC 'Sound Chance'. TES4 has no per-sound chance — the engine always plays
+# the slot's sound — so every converted entry is certain, matching the 100 that
+# all 31 vanilla Skyrim AudioTemplate NPC_ records write.
+_SOUND_CHANCE_ALWAYS = 100
+
+# NPC_ NAM8 'Sound Level' (wbSoundLevelEnum: 0 Loud, 1 Normal, 2 Silent).
+# Vanilla writes Normal on 5116 of 5118 NPC_ records.
+_SOUND_LEVEL_NORMAL = 1
+
+# NPC_ NAM5 is wbUnknown in xEdit, so its width comes from the binary: every
+# NPC_ in the real Skyrim.esm writes exactly 2 bytes, FF 00 (verified over 60
+# decompressed records). Writing it as a u32 would desync the subrecord stream.
+_NAM5_UNKNOWN = b'\xff\x00'
+
+
+def _actor_sound_subs(rec: dict) -> bytes:
+    """CSDT/CSDI/CSDC array for a TES4 CREA, in TES5 NPC_ order.
+
+    This is the ONLY channel a creature's voice travels through: an Oblivion
+    creature's idle/aware/attack/hit/death vocalizations live in these record
+    slots, not in its animations (census of the goblin's 56 .kf files: exactly
+    one carries a sound key, and it is the bow string). Dropping the array —
+    which the converter did — left every converted creature mute even though
+    the .wav files and their SNDR records had converted correctly.
+
+    CSDI is written as the TES4 SOUN FormID and patched to the real SNDR after
+    Phase 3 (patch_actor_sounds). The descriptor does not exist yet, and
+    pre-allocating its id here would shift every other generated FormID — which
+    is what broke the Slot44 patch and left NPCs unarmoured. See
+    dialog_misc._SNDR_FOR_SOUN.
+
+    Returns b'' when the creature has no own sounds; the caller then falls back
+    to CSCR inheritance, exactly as both games do (817 of 909 Oblivion CREA and
+    725 of Skyrim's NPC_ records inherit rather than define).
+    """
+    subs = b''
+    for i in range(get_int(rec, 'SoundTypeCount')):
+        stype = get_int(rec, f'SoundType[{i}].Type', -1)
+        if not 0 <= stype <= _MAX_TES4_SOUND_TYPE:
+            continue
+        soun = get_formid(rec, f'SoundType[{i}].Sound')
+        if not soun:
+            continue
+        subs += pack_uint32_subrecord('CSDT', stype)
+        subs += pack_formid_subrecord('CSDI', soun)   # placeholder
+        subs += pack_uint8_subrecord('CSDC', _SOUND_CHANCE_ALWAYS)
+    return subs
+
+
+def patch_actor_sounds(writer) -> int:
+    """Rewrite every actor CSDI from its TES4 SOUN id to the real SNDR id.
+
+    Actors are written long before Phase 3 creates the sound descriptors, so
+    conversion stores the SOUN FormID and this resolves it — the same
+    placeholder-then-patch approach pack_converter.patch_forcegreet_topics uses
+    for PDTO, and the reason no FormID is allocated early (which would shift
+    every other generated id).
+
+    A CSDI whose SOUN produced no descriptor is dropped along with its CSDT/
+    CSDC, rather than left pointing at a record that does not exist.
+    """
+    from .dialog_misc import sndr_map
+    mapping = sndr_map()
+    if not mapping:
+        return 0
+    # An already-resolved CSDI must survive a second pass untouched, so treat
+    # every descriptor id as mapping to itself.
+    resolved = {v for v in mapping.values()}
+    records = writer._top_groups.get('NPC_') or []
+    patched = 0
+    for i, blob in enumerate(records):
+        if b'CSDI' not in blob:
+            continue
+        out = bytearray(blob[:24])
+        pos = 24
+        changed = False
+        # Walk the subrecord stream, rewriting or dropping each CSDT/CSDI/CSDC
+        # triple as a unit.
+        pending = b''
+        while pos + 6 <= len(blob):
+            sig = blob[pos:pos + 4]
+            size = struct.unpack_from('<H', blob, pos + 4)[0]
+            chunk = blob[pos:pos + 6 + size]
+            pos += 6 + size
+            if sig == b'CSDT':
+                pending = chunk
+                continue
+            if sig == b'CSDI' and pending:
+                soun = struct.unpack_from('<I', chunk, 6)[0]
+                sndr = (soun if soun in resolved
+                        else mapping.get(soun & 0x00FFFFFF, 0))
+                if sndr:
+                    pending += (chunk[:6] + struct.pack('<I', sndr))
+                    changed = changed or sndr != soun
+                else:
+                    pending = b''      # drop the whole triple
+                    changed = True
+                continue
+            if sig == b'CSDC':
+                if pending:
+                    out += pending + chunk
+                pending = b''
+                continue
+            out += chunk
+        if not changed:
+            continue
+        struct.pack_into('<I', out, 4, len(out) - 24)   # data size
+        records[i] = bytes(out)
+        patched += 1
+    return patched
+
+
 def _build_outfit(writer, edid: str, outfit_fids: list) -> int:
     """Emit the OTFT companion record for an actor and return its FormID."""
     otft_fid = writer.alloc_formid()
@@ -1124,10 +1245,16 @@ def convert_NPC_(rec: dict, writer=None) -> bytes:
     if get_formid(rec, 'ZNAM.CombatStyle'):
         subs += pack_formid_subrecord('ZNAM', CSTY_DEFAULT)
 
+    # NAM5 / NAM6 / NAM7 / NAM8 — all four are SetRequired in the TES5 NPC_
+    # definition and present on every one of the 5118 vanilla NPC_ records.
+    # NAM5 and NAM8 were missing entirely; NAM8 'Sound Level' is what lets the
+    # engine voice an actor at all, so without it an NPC is silent.
+    subs += pack_subrecord('NAM5', _NAM5_UNKNOWN)
     # NAM6 / NAM7 — Height / Weight (TES4 has these on RACR records, not NPC;
     # use neutral defaults so the race's own scale applies)
     subs += pack_subrecord('NAM6', struct.pack('<f', 1.0))
     subs += pack_subrecord('NAM7', struct.pack('<f', 1.0))
+    subs += pack_uint32_subrecord('NAM8', _SOUND_LEVEL_NORMAL)
 
     # DOFT — Default outfit (requires OTFT companion record)
     # TES4 NPCs equip out of CNTO; TES5 wears exactly what the outfit lists.
@@ -1209,8 +1336,18 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
     voice = (_npc_voice_map.get(get_formid(rec, 'FormID'))
              or VOICE_TYPE_MAP.get((race_edid, gender))
              or VOICE_TYPE_MAP.get(('Imperial', gender), 0))
-    if voice:
-        subs += pack_formid_subrecord('VTCK', voice)
+    # ALWAYS emit VTCK, even when the humanoid chain yields nothing (which is
+    # the normal case for a creature — no TES4 creature race is in
+    # VOICE_TYPE_MAP). Two reasons, and skipping it broke both:
+    #   * Vanilla never ships an actor without one: all 3,887 Skyrim.esm NPC_
+    #     records carry a non-zero VTCK.
+    #   * creature_races.patch_creature_voices rewrites this slot in the packed
+    #     bytes once the creature VTYPs exist, and it can only patch a
+    #     subrecord that is already THERE — it finds VTCK or skips the record.
+    #     Omitting it left all 442 converted creatures with no voice type at
+    #     all, so every creature sound channel was dead no matter how correct
+    #     the descriptors, triggers and audio files were.
+    subs += pack_formid_subrecord('VTCK', voice)
 
     # RNAM — Race (after VTCK per TES5 NPC_ definition)
     subs += pack_formid_subrecord('RNAM', crea_race_fid)
@@ -1286,6 +1423,32 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
     crea_type = get_int(rec, 'DATA.Type')
     subs += pack_formid_subrecord(
         'ZNAM', CSTY_ANIMAL if crea_type in (0, 4) else CSTY_DEFAULT)
+
+    # NAM5/6/7/8 — required by the TES5 NPC_ definition and present on ALL 5118
+    # vanilla NPC_ records (xEdit marks each SetRequired). convert_CREA wrote
+    # none of them. NAM8 'Sound Level' is the one that matters here: it gates
+    # how loudly the actor is heard, and every vanilla actor carrying a CSDT
+    # sound array (31/31) also carries NAM8 — a creature without it has sound
+    # descriptors the engine never voices.
+    subs += pack_subrecord('NAM5', _NAM5_UNKNOWN)
+    subs += pack_subrecord('NAM6', struct.pack('<f', 1.0))   # height
+    subs += pack_subrecord('NAM7', struct.pack('<f', 50.0))  # weight
+    subs += pack_uint32_subrecord('NAM8', _SOUND_LEVEL_NORMAL)
+
+    # Creature sounds — the actor's voice. TES5 NPC_ keeps Oblivion's CSDT/
+    # CSDI/CSDC array verbatim (same type enum), so this is a straight
+    # passthrough; a creature with no own sounds inherits via CSCR instead,
+    # which is how 817 of Oblivion's 909 CREA (and 725 vanilla Skyrim NPC_)
+    # are authored. Order per wbDefinitionsTES5 NPC_: CSDT[] then CSCR, both
+    # after ZNAM and before DOFT. The two are mutually exclusive — xEdit:
+    # "When CSCR exists CSDT, CSDI, CSDC are not present".
+    sound_subs = _actor_sound_subs(rec)
+    if sound_subs:
+        subs += sound_subs
+    else:
+        inherit = get_formid(rec, 'CSCR.InheritSound')
+        if inherit:
+            subs += pack_formid_subrecord('CSCR', inherit)
 
     # DOFT — Default outfit
     if writer is not None and outfit_fids:

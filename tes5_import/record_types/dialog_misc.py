@@ -4,6 +4,7 @@ All dialog/quest/DIAL/INFO/DLBR/DLVW logic has been moved to
 tes5_import.dialog_converter.
 """
 
+import os
 import struct
 
 from ..text_reader import get_hex_bytes
@@ -64,6 +65,12 @@ def _build_sopm(writer, min_dist: float, max_dist: float, stereo: bool) -> int:
         'EDID', f'TES4_SOM{kind}{round(max_dist):05d}_{round(min_dist):05d}')
     # NAM1: Flags(u8) unknown[2] ReverbSend%(u8).  Flag 0x01 = Attenuates With
     # Distance — required, or the sound plays at full volume everywhere.
+    #
+    # DO NOT "fix" this to (30, 0, 0x01). The Skyrim.esm dump prints NAM1 as a
+    # little-endian u32, so its `NAM1=1E000001` is the bytes 01 00 00 1E on
+    # disk — identical to what this line writes. Reversing it on 2026-08-05
+    # made every sound in the game play far too loud (confirmed in-game),
+    # because it moved the reverb percentage into the flags byte.
     subs += pack_subrecord('NAM1', struct.pack('<BHB', 0x01, 0, 30))
     # MNAM: 0 = Uses HRTF (mono), 1 = Defined Speaker Output (stereo)
     subs += pack_uint32_subrecord('MNAM', 1 if stereo else 0)
@@ -75,6 +82,136 @@ def _build_sopm(writer, min_dist: float, max_dist: float, stereo: bool) -> int:
     writer.add_record('SOPM', pack_record('SOPM', fid, 0, subs))
     cache[key] = fid
     return fid
+
+
+# Root of the extracted TES4 assets for the plugin being imported, set by
+# set_sound_source_dir() at import start. Used only to enumerate the .wav files
+# inside a directory-valued SOUN.FNAM (see _sound_anam_paths).
+_SOUND_SOURCE_DIR = None
+
+# Audio containers Skyrim SE plays natively, in the order convert_sounds copies
+# them through to output/<plugin>/sound/tes4/ (it copies non-voice sounds as-is).
+_AUDIO_EXTS = ('.wav', '.xwm', '.mp3')
+
+
+def set_sound_source_dir(export_dir: str) -> None:
+    """Point the SOUN converter at this plugin's extracted assets.
+
+    Only needed to expand directory-valued FNAMs; a missing/None dir simply
+    means such sounds fall back to the single literal path (see
+    _sound_anam_paths).
+    """
+    global _SOUND_SOURCE_DIR
+    _SOUND_SOURCE_DIR = export_dir
+
+
+# TES4 SOUN FormID (low 24 bits) → the SNDR FormID convert_SOUN gave its
+# companion. Filled DURING Phase 3, and read afterwards to patch the actor
+# records that reference it (see actors._actor_sound_subs / patch_actor_sounds).
+#
+# An earlier version reserved these ids in a Phase 0 pre-pass so actors could
+# embed them directly. That allocated ~1100 FormIDs before anything else and
+# so SHIFTED every other generated id (OTFT, ARMA, TXST, ...) — which silently
+# invalidated the separately-built 'Slot44 Patch.esp', whose 818 ARMO/233 ARMA
+# overrides are matched to the master BY FORMID. NPCs lost their armor. The
+# allocation ORDER is therefore a compatibility contract with anything built
+# against a previous run: never insert an allocating pass ahead of existing
+# ones.
+_SNDR_FOR_SOUN = {}
+
+
+def reset_sound_descriptors() -> None:
+    """Clear the SOUN→SNDR map at the start of an import run."""
+    _SNDR_FOR_SOUN.clear()
+
+
+def record_sndr_for_soun(soun_fid: int, sndr_fid: int) -> None:
+    """Note the companion SNDR convert_SOUN just built for a SOUN."""
+    _SNDR_FOR_SOUN[soun_fid & 0x00FFFFFF] = sndr_fid
+
+
+def sndr_map() -> dict:
+    """TES4 SOUN id (low 24 bits) → companion SNDR FormID, for CSDI patching."""
+    return _SNDR_FOR_SOUN
+
+
+def get_sndr_for_soun(soun_fid: int) -> int:
+    """The SNDR FormID for a TES4 SOUN, or 0 if it has no companion.
+
+    Accepts a FormID in either raw or load-order-offset form; the reservation
+    map is keyed on the low 24 bits (same convention as outfits.load_item_index).
+    """
+    return _SNDR_FOR_SOUN.get(soun_fid & 0x00FFFFFF, 0)
+
+
+def _shipped_name(name: str) -> str:
+    """The on-disk name convert_sounds writes for a source audio file.
+
+    Non-voice audio keeps its extension; only .mp3 is transcoded (to PCM .wav)
+    because the SSE exe has no mp3 support. Keep this in lockstep with
+    asset_convert.audio_converter.convert_sounds — an ANAM naming an extension
+    the sound stage does not produce is a reference to a file that isn't there,
+    and the sound is silently dropped.
+    """
+    stem, ext = os.path.splitext(name)
+    return stem + '.wav' if ext.lower() == '.mp3' else name
+
+
+def _sound_path(name: str) -> str:
+    """One SNDR ANAM value: `tes4\\<path>`, relative to `Sound\\`.
+
+    Both forms are legal and both work: 3512 vanilla ANAM values are rooted at
+    the data folder (`Data\\Sound\\FX\\...`) and 707 are relative like ours
+    (`fx\\npc\\dragon\\npc_dragon_breathe_lp.wav`). Prefixing `Data\\Sound\\`
+    was tried on 2026-08-05 and changed nothing in-game, so the relative form
+    stands — it is the one this pipeline has always written.
+    """
+    return _prefix_path(_shipped_name(name))
+
+
+def _sound_anam_paths(filename: str) -> list:
+    """The ANAM values for one TES4 SOUN.FNAM, as a list of TES5 sound paths.
+
+    Oblivion lets a SOUN name a DIRECTORY instead of a file, and the engine
+    picks one of its files at random per play — 6 of the goblin's 7 sound slots
+    are authored this way, and it is how every creature gets varied vocal
+    lines. Skyrim has the same feature but expresses it differently: the
+    variants are listed explicitly, one ANAM per file, and the engine
+    randomises across them (vanilla NPCWolfHowl lists 5 wav ANAMs).
+
+    A single ANAM naming a bare directory is not a sound Skyrim can open, so
+    every such SOUN was silent — the CREA sound channel converted to records
+    that could never play. Enumerating the extracted folder reproduces
+    Oblivion's random-variant behaviour with Skyrim's own mechanism.
+
+    Falls back to the literal path when the source folder is unavailable or
+    empty, which is also the correct handling for an ordinary file-valued FNAM.
+
+    Every ANAM must name the file the sound stage actually writes. Non-voice
+    audio is copied through with its extension intact (PCM .wav, exactly as
+    vanilla ships it — see audio_converter.convert_sounds), so the only
+    rewrite needed is .mp3 -> .wav, which that stage transcodes because the
+    SSE exe has no mp3 support.
+    """
+    literal = [_sound_path(filename)]
+    # A file-valued FNAM already names a playable asset — nothing to expand.
+    if os.path.splitext(filename)[1]:
+        return literal
+    if not _SOUND_SOURCE_DIR:
+        return literal
+
+    rel = filename.replace('/', '\\').strip('\\')
+    src = os.path.join(_SOUND_SOURCE_DIR, 'sound', *rel.split('\\'))
+    try:
+        entries = sorted(os.listdir(src))
+    except OSError:
+        return literal
+
+    # Sorted so the ANAM order — and therefore the output ESM — is
+    # byte-reproducible across runs (the determinism contract).
+    variants = [_sound_path(f'{rel}\\{e}') for e in entries
+                if e.lower().endswith(_AUDIO_EXTS)]
+    return variants or literal
 
 
 def convert_SOUN(rec: dict, writer=None) -> tuple:
@@ -116,6 +253,10 @@ def convert_SOUN(rec: dict, writer=None) -> tuple:
         is_2d = bool(tes4_flags & (_TES4_SND_2D | _TES4_SND_MENU_SOUND))
 
         sndr_fid = writer.alloc_formid()
+        # Actors reference this descriptor by TES4 SOUN id; they are already
+        # written, so the CSDI placeholders get patched afterwards (see
+        # actors.patch_actor_sounds).
+        record_sndr_for_soun(get_formid(rec, 'FormID'), sndr_fid)
         sndr_subs = b''
         sndr_edid = f"TES4_{edid}_SNDR" if edid else f"TES4_SOUN_{get_formid(rec, 'FormID'):08X}_SNDR"
         sndr_subs += pack_string_subrecord('EDID', sndr_edid)
@@ -123,8 +264,10 @@ def convert_SOUN(rec: dict, writer=None) -> tuple:
         sndr_subs += pack_uint32_subrecord('CNAM', 0x1EEF540A)
         # GNAM = Category: AudioCategorySFX (FormID 0x000172A1 in Skyrim.esm)
         sndr_subs += pack_formid_subrecord('GNAM', 0x000172A1)
-        # ANAM = Sound file path
-        sndr_subs += pack_string_subrecord('ANAM', _prefix_path(filename))
+        # ANAM = Sound file path, one per variant (a directory-valued TES4 FNAM
+        # expands to the files it holds — see _sound_anam_paths).
+        for anam in _sound_anam_paths(filename):
+            sndr_subs += pack_string_subrecord('ANAM', anam)
         # ONAM = Sound Output Model. Required — CK reports 'Sound Output Model
         # missing' if absent.  2D/menu sounds are not positional, so they take
         # the vanilla non-attenuating model; everything else gets a SOPM built

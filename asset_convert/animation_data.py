@@ -113,7 +113,23 @@ def project_block_lines(manifest: dict) -> list:
     lines += manifest['project_files']
     lines.append('1')
     for uid, clip in enumerate(manifest['clips']):
-        timed = [(t, 'SoundPlay') for t in clip.get('sounds', [])]
+        # Sound triggers ALWAYS carry a descriptor name: `SoundPlay.<SNDR
+        # EditorID>`. Verified by disassembling the SSE annotation handler
+        # (0x140565c90 in the GOG build) — it measures the payload with
+        # 0x140c60eb0 and jumps to the exit when the length is zero, so a bare
+        # `SoundPlay:` does nothing at all. Only a named payload reaches the
+        # by-name lookup at 0x140c260f0.
+        #
+        # Vanilla creature projects DO contain bare `SoundPlay:` entries (bear
+        # 14, wolf 66); by the same code path those are inert leftovers, not a
+        # mechanism to copy. Ours name the converted SOUN's companion
+        # descriptor, minted as TES4_<EDID>_SNDR by
+        # tes5_import.record_types.dialog_misc.convert_SOUN.
+        timed = [(t, f'SoundPlay.TES4_{edid}_SNDR')
+                 for t, edid in clip.get('sounds', []) if edid]
+        # Footstep events (FootFront/FootBack) — the engine's own, routed
+        # through the race's footstep/impact set, not through a descriptor.
+        timed += [(t, name) for t, name in clip.get('feet', [])]
         for t in clip.get('hits', []):
             timed.append((max(0.0, t - 0.3), 'weaponSwing'))
             timed.append((max(0.0, t - 0.1), 'preHitFrame'))
@@ -191,25 +207,58 @@ def merge_animationdata(base_lines: list, manifests: list) -> list:
     n = int(base_lines[0])
     names = base_lines[1:1 + n]
     body = base_lines[1 + n:]
+    # Never register a project the base already lists: one extra name with no
+    # matching data block desyncs the whole database (see _is_merged).
+    have = {x.lower() for x in names}
     new_names, new_body = [], []
     for m in manifests:
+        if m['project_txt'].lower() in have:
+            continue
         pb = project_block_lines(m)
         mb = motion_block_lines(m)
         new_names.append(m['project_txt'])
         new_body += [str(len(pb))] + pb + [str(len(mb))] + mb
-    return ([str(n + len(manifests))] + names + new_names + body + new_body)
+    return ([str(n + len(new_names))] + names + new_names + body + new_body)
 
 
 def merge_animationsetdata(base_lines: list, manifests: list) -> list:
     n = int(base_lines[0])
     names = base_lines[1:1 + n]
     body = base_lines[1 + n:]
+    have = {x.lower() for x in names}      # see merge_animationdata
     new_names, new_body = [], []
     for m in manifests:
         stem = os.path.splitext(m['project_txt'])[0]
-        new_names.append(f'{stem}Data\\{m["project_txt"]}')
+        entry = f'{stem}Data\\{m["project_txt"]}'
+        if entry.lower() in have:
+            continue
+        new_names.append(entry)
         new_body += setdata_block_lines(m)
-    return ([str(n + len(manifests))] + names + new_names + body + new_body)
+    return ([str(n + len(new_names))] + names + new_names + body + new_body)
+
+
+# Every project this converter generates is named 'tes4<folder>project'. Its
+# presence in a supposedly-VANILLA singlefile means the file is really one of
+# our own merged outputs (deployed loose into the game folder, or cached from
+# such a copy).
+_GENERATED_PROJECT_MARK = 'tes4'
+
+
+def _is_merged(lines: list) -> bool:
+    """True when a singlefile already contains generated TES4 projects.
+
+    Merging onto such a file registers every project a second time while
+    appending only one data block, so the name list and the block list fall out
+    of step — the engine then reads the WRONG block for every project past the
+    first duplicate. Silent creatures were the visible symptom.
+    """
+    if not lines:
+        return False
+    try:
+        n = int(lines[0])
+    except (ValueError, IndexError):
+        return False
+    return any(_GENERATED_PROJECT_MARK in x.lower() for x in lines[1:1 + n])
 
 
 def get_vanilla_singlefiles(skyrim_data_path: str, cache_dir: str) -> dict:
@@ -223,7 +272,15 @@ def get_vanilla_singlefiles(skyrim_data_path: str, cache_dir: str) -> dict:
         cached = os.path.join(cache_dir, fn)
         if os.path.exists(cached):
             with open(cached, encoding='latin-1') as f:
-                out[fn] = f.read().splitlines()
+                lines = f.read().splitlines()
+            if _is_merged(lines):
+                # A previously cached OUR-OUTPUT copy: drop it and re-source.
+                print(f'  [animdata] cached {fn} contains generated projects '
+                      f'— discarding and re-extracting a clean base')
+                os.remove(cached)
+                missing.append(fn)
+            else:
+                out[fn] = lines
         else:
             missing.append(fn)
     if not missing:
@@ -234,7 +291,19 @@ def get_vanilla_singlefiles(skyrim_data_path: str, cache_dir: str) -> dict:
         loose = os.path.join(skyrim_data_path or '', 'meshes', fn)
         if skyrim_data_path and os.path.exists(loose):
             with open(loose, 'rb') as f:
-                sources[fn] = f.read()
+                data = f.read()
+            # The loose file in the game's Data folder is very likely OUR OWN
+            # deployed output — merging onto it duplicates every generated
+            # project and desyncs the name list from the data blocks, so the
+            # engine reads the wrong block for every project after the first
+            # duplicate and the whole tail of the database is garbage.
+            # Only accept a loose copy that is still pristine vanilla.
+            if _is_merged(data.decode('latin-1').splitlines()):
+                print(f'  [animdata] loose {fn} in the game folder is already '
+                      f'merged (our deployed output) — extracting from the '
+                      f'BSA instead')
+                continue
+            sources[fn] = data
             missing.remove(fn)
     if missing:
         bsa = os.path.join(skyrim_data_path or '', 'Skyrim - Animations.bsa')

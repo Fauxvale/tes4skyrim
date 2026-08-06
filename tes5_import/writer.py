@@ -402,7 +402,14 @@ class PluginWriter:
         """
         order = [
             'GMST', 'KYWD', 'TXST', 'GLOB', 'CLAS', 'FACT', 'HDPT', 'EYES',
-            'RACE', 'SOUN', 'SOPM', 'SNDR', 'MGEF', 'MATT', 'STAT', 'ACTI', 'CONT', 'DOOR',
+            'RACE', 'SOUN', 'SOPM', 'SNDR', 'MGEF', 'MATT',
+            # Impact/footstep chain. xEdit's canonical order is
+            # "... VTYP MATT IPCT IPDS ARMA ... FSTP FSTS ...", so IPCT/IPDS
+            # must precede ARMA (whose SNDD points into it) and FSTP must
+            # precede the FSTS that lists it. Creature footstep audio rides
+            # this chain — see tes5_import/creature_footsteps.py.
+            'IPCT', 'IPDS', 'FSTP', 'FSTS',
+            'STAT', 'ACTI', 'CONT', 'DOOR',
             'FLOR', 'FURN', 'GRAS', 'TREE', 'LIGH', 'MISC', 'KEYM', 'ARMO',
             'ARMA', 'BOOK', 'AMMO', 'ENCH', 'SPEL', 'ALCH', 'INGR', 'SCRL',
             'SLGM', 'VTYP', 'OTFT', 'NPC_', 'LVLN', 'LVLI', 'LVSP', 'WTHR',

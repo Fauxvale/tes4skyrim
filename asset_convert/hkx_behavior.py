@@ -513,12 +513,24 @@ def build_behavior_xml(behavior_name: str, clips: dict,
                        hit_times: dict = None,
                        movement_types: list = None,
                        speeds: dict = None,
-                       ragdoll: dict = None) -> str:
+                       ragdoll: dict = None,
+                       sound_events: list = None) -> str:
     """The generated v1 state machine (see module docstring).
 
     hit_times: {state_name: [seconds]} — Oblivion 'Hit' text-key times for
     attack clips, emitted as preHitFrame/HitFrame triggers (the engine's
     attack-damage contract; without HitFrame an attack never deals damage).
+
+    sound_events: the FULLY-QUALIFIED `SoundPlay.<SNDR EditorID>` names this
+    creature's clips trigger. Every one must be declared in the graph's own
+    event table or the annotation resolves to no event and is dropped — an
+    animationdata trigger is dispatched by matching its text against this
+    table, NOT by parsing the payload at play time. Vanilla does exactly this:
+    chickenbehavior.hkx declares `SoundPlay.NPCChickenPeck` /
+    `SoundPlay.NPCChickenScratch`, wolfbehavior.hkx declares
+    `SoundPlay.NPCDogPantLPMSD` + `SoundStop.NPCDogPantLPMSD`, matching their
+    animationdata triggers verbatim. The bare `SoundPlay` entry those graphs
+    also carry is the inert leftover, not the mechanism.
 
     movement_types: MOVT MNAM strings (movement_type_names()) declared as
     `iState_<X>` INT32 variables — the engine's movement-type registration
@@ -548,6 +560,9 @@ def build_behavior_xml(behavior_name: str, clips: dict,
               'DeathAnimation', 'Ragdoll', 'RagdollInstant',
               'AddRagdollToWorld', 'RemoveCharacterControllerFromWorld',
               'SoundPlay', 'preHitFrame', 'HitFrame', 'FootFront', 'FootBack']
+    # Qualified sound events: one table entry per distinct
+    # `SoundPlay.<SNDR EditorID>` the clips actually fire (see docstring).
+    events += [e for e in dict.fromkeys(sound_events or []) if e not in events]
     attack_events = build_attack_events(clips)
     events += attack_events
     # One enter-event per equip/unequip state (see EQUIP_STANCES); the root
@@ -1274,13 +1289,108 @@ def _write_and_compile(xml: str, out_hkx: str):
     os.remove(xml_path)
 
 
+def _apply_sound_slots(clip_meta: list, clips: dict, sound_slots: dict) -> int:
+    """Turn a creature's CSDT sound slots into clip sound triggers.
+
+    Oblivion keeps a creature's whole voice on the CREA record (idle, aware,
+    attack, hit, death, footsteps) and its .kf files carry almost no sound text
+    keys — exactly 1 of the goblin's 56, and that one is the bow string. Skyrim
+    is the other way round: the actor record is nearly empty (36 CSDT entries
+    across all 5118 vanilla NPC_, none of them Idle/Aware/Death) and the voice
+    comes from `SoundPlay.<SNDR EditorID>` annotations in animationdata. So the
+    record data has to be replayed as annotations or the creature is silent.
+
+    A clip that already carries an authored sound key for a slot keeps it — the
+    source is always the better authority when it exists.
+
+    Returns the number of triggers added.
+    """
+    if not sound_slots:
+        return 0
+    from asset_convert.creature_pipeline import _CSDT_TO_CLIP
+
+    by_name = {c['name']: c for c in clip_meta}
+
+    def add(clip, t, edid):
+        # The annotation MUST carry a descriptor name. Disassembly of the SSE
+        # handler (0x140565c90, GOG build) settles it: after matching the
+        # "SoundPlay" keyword it calls the string-length helper 0x140c60eb0 on
+        # the payload and `je` straight to the exit when the length is ZERO —
+        # a bare `SoundPlay:` is parsed, found empty, and dropped. Only on a
+        # non-empty payload does it reach the lookup at 0x140c260f0, which
+        # resolves the sound BY NAME. So `SoundPlay.<SNDR EditorID>` is the
+        # only form that can ever produce audio; vanilla's bare `SoundPlay:`
+        # entries are inert (they are leftovers from Bethesda's own pipeline).
+        if any(abs(t0 - t) < 1e-3 and s0 == edid for t0, s0 in clip['sounds']):
+            return 0
+        clip['sounds'].append((t, edid))
+        return 1
+
+    added = 0
+    for csdt, edid in sorted(sound_slots.items()):
+        role = _CSDT_TO_CLIP.get(csdt)
+        if role is None:
+            continue
+        kind, where = role
+        if kind == 'idle':
+            c = by_name.get('Idle')
+            if c and not c['sounds']:
+                # Looping idle: one vocalization per cycle, slightly in so it
+                # is not masked by the transition into the state.
+                added += add(c, min(0.25, c['duration'] * 0.25), edid)
+        elif kind == 'combat':
+            c = by_name.get('CombatStance')
+            if c and not c['sounds']:
+                added += add(c, min(0.25, c['duration'] * 0.25), edid)
+        elif kind == 'death':
+            c = by_name.get('Death')
+            if c:
+                added += add(c, 0.0, edid)
+        elif kind == 'attacks':
+            for c in clip_meta:
+                if not c['name'].startswith('Attack_'):
+                    continue
+                # On the swing, not the wind-up: use the hit frame when the
+                # source marked one, else a quarter into the clip.
+                t = (max(0.0, min(c['hits']) - 0.2) if c.get('hits')
+                     else c['duration'] * 0.25)
+                added += add(c, t, edid)
+        elif kind == 'locomotion' and where == 'foot':
+            # Footfalls do NOT go through SoundPlay at all: vanilla creature
+            # projects fire the engine's own `FootFront`/`FootBack` events
+            # (wolf 140/142, bear 56/59), which route through the race's
+            # footstep set rather than a sound descriptor. Two contact points
+            # per cycle, alternating front/back — Oblivion .kf files almost
+            # never mark them, so they are placed from the clip duration.
+            for c in clip_meta:
+                if not c['name'].startswith('Move'):
+                    continue
+                if any(n in ('FootFront', 'FootBack')
+                       for _t, n in c.get('feet', [])):
+                    continue
+                d = c['duration']
+                if d <= 0:
+                    continue
+                c.setdefault('feet', [])
+                c['feet'] += [(d * 0.25, 'FootFront'), (d * 0.75, 'FootBack')]
+                added += 2
+    for c in clip_meta:
+        c['sounds'].sort()
+    return added
+
+
 def generate_creature_project(creature_dir: str, name: str, out_root: str,
-                              fps: float = 30.0) -> dict:
+                              fps: float = 30.0, sound_slots: dict = None) -> dict:
     """Full project generation for one creature.
 
     Writes the hkx project tree plus `project_manifest.json` — the manifest
     is the contract consumed by asset_convert/animation_data.py (singlefile
     registration) and tes5_import (RACE ATKE/behavior-graph paths).
+
+    sound_slots: {CSDT type: SOUN EditorID} for this creature's folder. Skyrim
+    voices creatures through animation annotations rather than the actor
+    record, so these become `SoundPlay.<SNDR>` clip triggers — see
+    creature_pipeline._CSDT_TO_CLIP.
     """
     from asset_convert.hkx_anim import convert_clip_hkx
     from asset_convert.hkx_ragdoll import ragdoll_info
@@ -1400,19 +1510,29 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
                 'duration': base['duration'], 'looping': True,
                 'end_event': None, 'rate': rate,
                 'sounds': [(t / rate, s) for t, s in base['sounds']],
+                'feet': [(t / rate, n) for t, n in base.get('feet', [])],
                 'hits': [],
             }
             clip_meta.append(entry)
             base_of[cnm] = entry
 
+    _apply_sound_slots(clip_meta, clips, sound_slots)
+
     behavior_name = f'TES4{name.capitalize()}Behavior'
     move_types = movement_type_names(lname)
+    # The graph must declare every qualified sound event its clips trigger,
+    # exactly as animation_data.project_block_lines writes it — the engine
+    # dispatches annotations through this table by name.
+    sound_events = sorted({f'SoundPlay.TES4_{edid}_SNDR'
+                           for c in clip_meta
+                           for _t, edid in c.get('sounds', []) if edid})
     _write_and_compile(
         build_behavior_xml(behavior_name, clips,
                            hit_times={c['name']: c['hits']
                                       for c in clip_meta if c['hits']},
                            movement_types=move_types,
-                           speeds=speeds, ragdoll=ragdoll),
+                           speeds=speeds, ragdoll=ragdoll,
+                           sound_events=sound_events),
         os.path.join(proj_dir, 'behaviors', behavior_name.lower() + '.hkx'))
     # dedupe: states can share one animation file (Idle + CombatStance)
     anim_files = list(dict.fromkeys(c['anim'] for c in clip_meta))
