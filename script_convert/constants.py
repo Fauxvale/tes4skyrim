@@ -1167,6 +1167,13 @@ _RECORD_TYPE_PAPYRUS = {
     'WEAP': 'Weapon', 'ARMO': 'Armor', 'BOOK': 'Book',
     'ALCH': 'Potion', 'INGR': 'Ingredient', 'LIGH': 'Light',
     'MISC': 'MiscObject', 'KEYM': 'Key', 'AMMO': 'Ammo',
+    # TES4-only item types, typed by what the IMPORTER writes them as (measured
+    # over Morrowind_ob: 565 CLOT -> ARMO, 22 APPA -> MISC).  Leaving them
+    # unmapped fell through to the 'ObjectReference' default, which is not a
+    # base-object type -- a property bound to the converted ARMO then failed
+    # with "cannot be bound because (...) is not the right type" and read None,
+    # so `player.removeitem <ring>` silently did nothing.
+    'CLOT': 'Armor', 'APPA': 'MiscObject', 'SLGM': 'SoulGem',
     'ACTI': 'Activator', 'DOOR': 'ObjectReference',
     'CONT': 'ObjectReference', 'STAT': 'ObjectReference',
     'FURN': 'ObjectReference', 'FLOR': 'ObjectReference',
@@ -1352,6 +1359,43 @@ def _canonical_global(name: str) -> str:
 def _record_type_to_papyrus(rtype: str) -> str:
     """Map a TES4 record type to a Papyrus property type."""
     return _RECORD_TYPE_PAPYRUS.get(rtype, 'ObjectReference')
+
+
+# Record types whose Papyrus class is a BASE OBJECT (Armor, Weapon, Potion,
+# ...), not a placed reference.  A VMAD property naming one of these binds to
+# the base record itself, and the VM type-checks that binding: an
+# `extends ObjectReference` script class is NOT a valid type for it.
+#
+# TES4 attaches scripts to base items freely (mwCWUItemScript rides every
+# Morroblivion clothing record), and the converter preferred that script class
+# over the record class so cross-script property reads would work. On a base
+# item that preference is wrong and silently fatal -- measured in the game's
+# own Papyrus log:
+#
+#   Property fbmwEngravedRingofHealing on script TES4_TIF__013236A5 ...
+#     cannot be bound because (1B001677) is not the right type
+#   error: Cannot add None to a container
+#     [ (00000014)].Actor.RemoveItem() - "<native>"
+#
+# The property read None, so `player.removeitem fbmwEngravedRingofHealing 1`
+# and Fargoth's matching `additem` both no-oped -- the quest still advanced to
+# stage 100 (native errors are non-fatal), so the ring stayed in the player's
+# inventory after handing it over.
+_BASE_OBJECT_PAPYRUS = frozenset({
+    'Armor', 'Weapon', 'Book', 'Potion', 'Ingredient', 'MiscObject', 'Key',
+    'Ammo', 'SoulGem', 'Light', 'Activator', 'Flora', 'Furniture',
+    'LeveledItem', 'LeveledActor', 'LeveledSpell', 'Scroll',
+})
+
+
+def script_type_may_override(record_ptype: str) -> bool:
+    """Whether an attached TES4 script class may stand in for `record_ptype`.
+
+    Reference-semantics types (ObjectReference, Actor, ...) may: the script
+    extends one of those, so it binds and additionally exposes the script's own
+    variables. Base-object types may NOT -- see _BASE_OBJECT_PAPYRUS.
+    """
+    return record_ptype not in _BASE_OBJECT_PAPYRUS
 
 
 def _record_type_to_base_papyrus(rtype: str) -> str:

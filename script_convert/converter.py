@@ -12,6 +12,8 @@ from script_convert.constants import (
     _OBJREF_IMPLICIT_SELF_FUNCTIONS, _ZERO_ARG_REF_FUNCTIONS,
     _safe_property_name, _canonical_global, _record_type_to_papyrus,
     _record_type_to_base_papyrus, papyrus_script_name,
+    script_type_may_override, _BASE_OBJECT_PAPYRUS,
+    resolve_property_formid,
     TES4_MURDER_BOUNTY, TES4_ASSAULT_BOUNTY, TES4_STEAL_BOUNTY,
     PLAYER_ALIAS_EXTENDS,
 )
@@ -715,6 +717,13 @@ class ScriptConverter:
             if ptype == 'ObjectReference' and _edid_low and \
                (_edid_low, safe_vname.lower()) in self.xref.ref_as_int:
                 ptype = 'Int'
+            # A ref var that some OTHER script assigns a base record into must
+            # be Form -- the local retype pass below only sees this script's
+            # own assignments, so a cross-script write is invisible to it.
+            elif ptype == 'ObjectReference' and _edid_low and \
+                    (_edid_low, safe_vname.lower()) in \
+                    self.xref.ref_as_base_form:
+                ptype = 'Form'
             _var_info.append((safe_vname, ptype))
         var_start_idx = len(out)
         for safe_vname, ptype in _var_info:
@@ -1321,6 +1330,12 @@ class ScriptConverter:
                     continue
                 vlow = am.group(1).lower()
                 val = am.group(2).strip()
+                # `x = None` clears the variable and is assignable to EVERY
+                # object type, so it says nothing about what the variable holds.
+                # Counting it as an unknown type made the set non-unanimous and
+                # blocked the retype (soulGemRef ends with exactly this line).
+                if val == 'None':
+                    continue
                 # A call: take the type from the LAST method in the chain.
                 call_m = re.search(r'(\w+)\(\s*\)\s*$', val)
                 if call_m:
@@ -1330,7 +1345,13 @@ class ScriptConverter:
                 if not re.match(r'^\w+$', val):
                     _assigned.setdefault(vlow, set()).add('')
                     continue
-                fid = self.xref.edid_to_formid.get(val.lower(), '')
+                # Resolve exactly as the property binder does. A bare
+                # edid_to_formid lookup misses the sanitized spellings it
+                # handles -- `0probeUbent` is emitted as the property
+                # `probeUbent`, so the plain lookup found nothing, the assigned
+                # type came back unknown, and the retype was blocked even
+                # though the property itself had bound as MiscObject.
+                fid = resolve_property_formid(self.xref, val)
                 rtype = self.xref.record_type.get(fid, '') if fid else ''
                 # Only BASE records retype; a placed ref really is a reference.
                 ptype = (_record_type_to_base_papyrus(rtype)
@@ -1353,6 +1374,19 @@ class ScriptConverter:
                                                 f'{only} Property ', 1)
                         self._var_types[pname.lower()] = only
                         self._property_refs[pname] = only
+                elif len(types) > 1 and all(
+                        t in _BASE_OBJECT_PAPYRUS for t in types):
+                    # A TES4 `ref` that holds SEVERAL different base objects --
+                    # mwShrineGhostgateScript's soulGemRef takes any of 12 soul
+                    # gems, moXscrXtrapXwritedynamicdata's takes several MISCs.
+                    # No single item class covers them, and ObjectReference is
+                    # WRONG (these are base records, not placed refs), so the
+                    # assignment fails the checker. Form is their common
+                    # supertype and is what the item functions accept.
+                    out[idx] = line.replace('ObjectReference Property ',
+                                            'Form Property ', 1)
+                    self._var_types[pname.lower()] = 'Form'
+                    self._property_refs[pname] = 'Form'
 
         # Post-process: upgrade ObjectReference/Actor variables to more specific types
         # based on usage (Actor from actor-only functions, or script type from SCRO/xref)
@@ -3385,7 +3419,7 @@ class ScriptConverter:
                 rtype = self.xref.record_type.get(fid, '')
                 ptype = _record_type_to_papyrus(rtype)
                 script_type = self.xref.get_record_script_type(inner_name)
-                if script_type:
+                if script_type and script_type_may_override(ptype):
                     ptype = script_type
                 safe = _safe_property_name(inner_name)
                 self._property_refs[safe] = ptype
@@ -4039,8 +4073,9 @@ class ScriptConverter:
                 rtype = self.xref.record_type.get(fid, '')
                 ptype = _record_type_to_papyrus(rtype)
                 # Prefer attached script type for cross-script property access
+                # -- but never on a base-object type, where it cannot bind.
                 script_type = self.xref.get_record_script_type(expr)
-                if script_type:
+                if script_type and script_type_may_override(ptype):
                     ptype = script_type
                 # Key the property on the CANONICAL EditorID, not the spelling
                 # this script happened to use.  TES4 name lookup is
@@ -4194,9 +4229,12 @@ class ScriptConverter:
             rtype = self.xref.record_type.get(fid, '')
             ptype = _record_type_to_papyrus(rtype)
             # Prefer attached script type over generic Actor/ObjectReference
-            # so cross-script property access works (e.g., NPCRef.rent)
+            # so cross-script property access works (e.g., NPCRef.rent).
+            # Base-object types (Armor/Weapon/Potion/...) are excluded: the VM
+            # refuses to bind an ObjectReference-derived script class to a base
+            # record, and the property then reads None.
             script_type = self.xref.get_record_script_type(name)
-            if script_type:
+            if script_type and script_type_may_override(ptype):
                 ptype = script_type
             safe = _safe_property_name(canon_edid)
             # Don't downgrade a more specific type (e.g., Actor from

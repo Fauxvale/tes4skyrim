@@ -245,6 +245,14 @@ class CrossRefGraph:
         # Cross-script ref-as-int analysis: set of (script_name_lower, var_name_lower)
         # where the TES4 `ref` variable is only ever assigned/compared with integers
         self.ref_as_int: set[tuple[str, str]] = set()
+        # Cross-script ref-as-BASE-FORM analysis: (script_low, var_low) where the
+        # `ref` variable is assigned a BASE record (a MISC/SPEL/WEAP/... item),
+        # not a placed reference. Papyrus rejects those into an ObjectReference
+        # variable, and the assignment can live in a DIFFERENT script than the
+        # declaration (moXscrXtrapXwritedynamicdata writes probe MISCs into
+        # moXscrXtrapXmemorystorage.XCURRENTprobeID), so the owning script
+        # cannot detect it alone. Such a variable is declared Form.
+        self.ref_as_base_form: set[tuple[str, str]] = set()
         # Per-script ref-typed variable names (populated by build_ref_as_int_map)
         self.script_ref_vars: dict[str, set[str]] = {}
         # Cross-script variable accesses: script_name_lower -> set of var_name_lower
@@ -768,6 +776,10 @@ class CrossRefGraph:
         )
         # (script_lower, var_lower) -> {'zero', 'int', 'ref'}
         usage: dict[tuple[str, str], set[str]] = {}
+        # dest_var -> {source_vars}: `set A.x to y` where y is another variable
+        # rather than a record name. Used to propagate 'baseform' along
+        # variable-to-variable copies (see Phase C).
+        ref_flow: dict[tuple[str, str], set[tuple[str, str]]] = {}
 
         for scn_low, sctx in script_sources.items():
             for raw_line in sctx.split('\n'):
@@ -825,11 +837,76 @@ class CrossRefGraph:
                                 usage[key].add('int')
                         else:
                             usage[key].add('ref')
+                            # A BASE record assigned here (not a placed ref):
+                            # ObjectReference cannot hold it. TES4 lets a form
+                            # name be quoted (`Set X to "0probeUbent"`), so
+                            # strip quotes before the EditorID lookup.
+                            value = value.strip('"')
+                            if re.match(r'^\w+$', value):
+                                v_fid = self.edid_to_formid.get(
+                                    value.lower(), '')
+                                v_rtype = (self.record_type.get(v_fid, '')
+                                           if v_fid else '')
+                                if v_rtype and v_rtype not in (
+                                        'ACHR', 'ACRE', 'REFR'):
+                                    usage[key].add('baseform')
+                                elif not v_fid:
+                                    # Not a record name -- it is another
+                                    # variable. Remember the edge so a base
+                                    # form reaching THAT variable propagates
+                                    # here too (moXscrXtrapXwritedynamicdata
+                                    # fills local XLOCALXProbeIDA* with probe
+                                    # MISCs, then copies them into
+                                    # memorystorage.XCURRENTprobeID).
+                                    ref_flow.setdefault(key, set()).add(
+                                        (scn_low, value.lower()))
+                            else:
+                                # `A.x = B.y` -- a QUALIFIED source. Resolve
+                                # B to its script so the edge still links the
+                                # two variables (XcurrentTRAPeffect is fed
+                                # from the same script's XSpellIDA*).
+                                qm = re.match(r'^(\w+)\.(\w+)$', value)
+                                if qm:
+                                    src_owner = qm.group(1).lower()
+                                    src_var = qm.group(2).lower()
+                                    src_script = None
+                                    if (src_owner in script_ref_vars
+                                            and src_var
+                                            in script_ref_vars[src_owner]):
+                                        src_script = src_owner
+                                    else:
+                                        s_fid = self.edid_to_formid.get(
+                                            src_owner, '')
+                                        s_scri = (self.record_scri.get(
+                                            s_fid, '') if s_fid else '')
+                                        s_ed = (self.script_formid_to_edid
+                                                .get(s_scri, '')
+                                                if s_scri else '')
+                                        if s_ed:
+                                            src_script = s_ed.lower()
+                                    if src_script:
+                                        ref_flow.setdefault(key, set()).add(
+                                            (src_script, src_var))
 
         # Phase C: ref vars with ONLY non-zero integer usage -> retype to Int
         for (script_low, var_low), types in usage.items():
             if 'ref' not in types and 'int' in types:
                 self.ref_as_int.add((script_low, var_low))
+            elif 'baseform' in types:
+                self.ref_as_base_form.add((script_low, var_low))
+        # Propagate 'holds a base form' along variable-to-variable copies until
+        # it stops spreading. A local that received a base record makes every
+        # variable it is copied into a base-form holder too, however many hops
+        # away and across script boundaries.
+        changed = True
+        while changed:
+            changed = False
+            for dest, sources in ref_flow.items():
+                if dest in self.ref_as_base_form:
+                    continue
+                if any(s in self.ref_as_base_form for s in sources):
+                    self.ref_as_base_form.add(dest)
+                    changed = True
 
         # Phase D: detect cross-script variable access (Owner.VarName patterns)
         # These variables must be Properties on the owning script so other scripts

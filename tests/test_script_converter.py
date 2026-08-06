@@ -2576,3 +2576,47 @@ class TestDestroyDoesNotCancelTheClip:
                "begin onReset\n  setDestroyed 0\nend\n")
         out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
         assert 'SetDestroyed(0)' in out
+
+
+class TestBaseItemPropertiesKeepTheirRecordType:
+    """An attached TES4 script must not retype a BASE-OBJECT property.
+
+    TES4 attaches scripts to base items freely (mwCWUItemScript rides 195 of
+    Morroblivion's clothing records). The converter preferred that script class
+    over the record class so cross-script property reads would work -- but the
+    VM refuses to bind an `extends ObjectReference` script class to a base
+    record, and the property then reads None. From the game's Papyrus log:
+
+        Property fbmwEngravedRingofHealing on script TES4_TIF__013236A5 ...
+          cannot be bound because (1B001677) is not the right type
+        error: Cannot add None to a container
+          [ (00000014)].Actor.RemoveItem() - "<native>"
+
+    So `player.removeitem fbmwEngravedRingofHealing 1` no-oped and the ring
+    stayed in the player's inventory after being handed to Fargoth, while the
+    quest still advanced (native errors are non-fatal).
+    """
+
+    @staticmethod
+    def _xref_with_scripted_item(rtype: str):
+        x = CrossRefGraph()
+        x.formid_to_edid['01001677'] = 'fbmwRing'
+        x.edid_to_formid['fbmwring'] = '01001677'
+        x.record_type['01001677'] = rtype
+        x.record_scri['01001677'] = '01000AAA'
+        x.script_formid_to_edid['01000AAA'] = 'mwCWUItemScript'
+        return x
+
+    def test_clot_item_property_is_armor_not_the_script_class(self):
+        conv = ScriptConverter(self._xref_with_scripted_item('CLOT'))
+        src = "scn T\nbegin onActivate\n  player.removeitem fbmwRing 1\nend\n"
+        out = conv.convert_standalone('T', src, 'ObjectReference', 'T')
+        assert 'Armor Property fbmwRing' in out
+        assert 'TES4_mwCWUItemScript Property fbmwRing' not in out
+
+    def test_reference_types_still_take_the_script_class(self):
+        """The cross-script access this preference exists for must survive."""
+        conv = ScriptConverter(self._xref_with_scripted_item('CONT'))
+        src = "scn T\nbegin onActivate\n  player.removeitem fbmwRing 1\nend\n"
+        out = conv.convert_standalone('T', src, 'ObjectReference', 'T')
+        assert 'TES4_mwCWUItemScript Property fbmwRing' in out
