@@ -52,13 +52,28 @@ from .pack_templates import (
     Template,
 )
 from .dialog_conditions import convert_ctda_list_with_strings
-from .text_reader import get_formid, get_int, get_str
+from .text_reader import (get_formid, get_int, get_str,
+                          PLAYER_REF_FID, PLAYER_BASE_FID)
+
 from .writer import (
     pack_formid_subrecord,
     pack_record,
     pack_string_subrecord,
     pack_subrecord,
 )
+
+# Legacy alias: most call sites here mean "the player's REFERENCE".
+PLAYER_FID = PLAYER_REF_FID
+
+
+def _targets_player(rec: dict) -> bool:
+    """True when this package's PTDT names the player, either spelling.
+
+    Oblivion writes "the player" as the REFERENCE 0x14 or, just as often, as
+    Object-ID + the player's base NPC_ 0x07.  Every player-specific branch
+    below has to accept both or it silently takes the generic path.
+    """
+    return get_formid(rec, 'PTDT.Target') in (PLAYER_REF_FID, PLAYER_BASE_FID)
 
 # --- TES4 PKDT.Type ------------------------------------------------------
 T4_FIND = 0
@@ -78,8 +93,6 @@ T4_CASTMAGIC = 11
 # alias when the package is quest-owned (see resolve_target()).
 REF_TARGET_TYPES = frozenset({T4_FIND, T4_FOLLOW, T4_ESCORT, T4_ACCOMPANY,
                               T4_USEITEMAT, T4_AMBUSH, T4_CASTMAGIC})
-
-PLAYER_FID = 0x00000014
 
 # --- TES4 PKDT flags (wbDefinitionsTES4.pas:3844) ------------------------
 T4_OFFERS_SERVICES = 0x00000001
@@ -541,6 +554,22 @@ def resolve_target(rec: dict, ctx: PackContext, pack_fid: int) -> bytes:
         return _null_target()
     target = get_formid(rec, 'PTDT.Target')
 
+    # "The player", however TES4 spelled it, is the SPECIFIC REFERENCE
+    # PlayerRef.  Oblivion routinely says it as Object-ID + the player's base
+    # NPC_ (0x07); Skyrim's escort/follow procedures need a reference to act
+    # on, and vanilla is emphatic about which one — Skyrim.esm names the player
+    # as a package target 543x as (type 0, 0x14) against just 6x as
+    # (type 1, 0x07).  Left as Object-ID the engine has a base form rather than
+    # an actor to follow, so the package is SELECTED but its procedure never
+    # engages: Morroblivion's chargen guard said "follow me" and stood still.
+    #
+    # Normalised to the reference FIRST so the alias lookup below sees 0x14 and
+    # a quest package still routes the player through its reference alias
+    # (PTDA type 4) — that aliasing is what lets it outrank the standing
+    # schedule, so it must not be short-circuited.
+    if t_type == 1 and target == PLAYER_BASE_FID:
+        t_type, target = 0, PLAYER_REF_FID
+
     if t_type == 0:
         if not target:
             # TES4 "specific reference" slot left empty (CastMagic-at-self
@@ -703,7 +732,7 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
     if ptype == T4_AMBUSH:
         if _has_target(rec):
             radius = float(get_int(rec, 'PLDT.Radius', 0) or 0)
-            if get_formid(rec, 'PTDT.Target') == PLAYER_FID:
+            if _targets_player(rec):
                 i = Inputs(FORCE_GREET)
                 # Vanilla's ForceGreet SingleRef is (type 0, player, count 0);
                 # TES4's PTDT.Count (100 here) is a percentage that has no
@@ -774,7 +803,7 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
         # named accordingly (SE37ThankPC, SE03KilibanFindPC,
         # SE10StaadaForceGreetPlayerDeath).  Sandboxing them made the actor
         # wander instead of seeking the player out and talking.
-        if get_formid(rec, 'PTDT.Target') == PLAYER_FID:
+        if _targets_player(rec):
             i = Inputs(FORCE_GREET)
             i.set('target', _target(0, PLAYER_FID, 0))
             i.set('topic', greet_topic or 0)
@@ -858,7 +887,7 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
     # a hostile ambush: the actor walks over so dialogue can fire.  Real
     # ambushes wait on a location (no PTDT) or target another actor.
     is_forcegreet = (ptype in (T4_AMBUSH, T4_FIND)
-                     and get_formid(rec, 'PTDT.Target') == PLAYER_FID)
+                     and _targets_player(rec))
     flags, speed = convert_flags(get_int(rec, 'PKDT.Flags'), ptype,
                                  not is_forcegreet,
                                  quest_gated=ctx.quest_of(pack_fid) is not None)

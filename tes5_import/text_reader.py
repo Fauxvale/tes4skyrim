@@ -247,13 +247,28 @@ def get_float(record: dict, key: str, default: float = 0.0) -> float:
         return default
 
 
-# Engine-hardcoded FormIDs that exist in NO data file: references to them must
-# never be shifted to our load index, or they dangle (the CK's "Unable to find
-# Package Target Reference (01000014)" — 144 packages plus 5 quest aliases all
-# pointing at a remapped PlayerRef). Skyrim hardcodes the same ids. NOTE: most
-# other low ids (Tamriel WRLD 0x3C, gold MISC 0xF, Player NPC_ 0x7, ...) DO
-# exist as real records in Oblivion.esm and must keep remapping normally.
-_ENGINE_FIXED_FORMIDS = frozenset({0x14})   # PlayerRef
+# The PLAYER's ids. Both games hardcode them at the SAME values, and Skyrim.esm
+# — master index 0 of our output — defines them, so a reference to either must
+# NEVER be shifted to our load index:
+#   0x14  ACHR PlayerRef   (the placed reference)
+#   0x07  NPC_ Player      (its base record; present in the
+#                           references/Skyrim.esm dump as EditorID=Player)
+#
+# Shifting 0x14 dangles outright (the CK's "Unable to find Package Target
+# Reference (01000014)" — 144 packages plus 5 quest aliases). Shifting 0x07 is
+# worse because it does NOT dangle: Oblivion.esm has its own Player NPC_ at
+# 0x07, so 01000007 silently resolves to the CONVERTED OBLIVION player instead
+# of the real one. A package targeting "the player" then aims at an actor that
+# is not the one you control and the procedure never engages — Morroblivion's
+# chargen guard said "follow me" and stood still, his Escort package's PTDA
+# pointing at 01000007.
+#
+# THE one definition for the import side — import these rather than declaring a
+# local PLAYER_FID. (script_convert keeps its own `_PLAYER_FORMIDS` because it
+# matches the hex STRINGS a raw SCRO carries, before any parsing.)
+PLAYER_REF_FID = 0x14    # ACHR PlayerRef
+PLAYER_BASE_FID = 0x07   # NPC_ Player
+_ENGINE_FIXED_FORMIDS = frozenset({PLAYER_REF_FID, PLAYER_BASE_FID})
 
 
 # INJECTED FormIDs: raw TES4 FormID -> the id it must take in our own space.

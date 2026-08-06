@@ -32,7 +32,8 @@ This is exactly the gate Oblivion used, so reading it back gives us the same
 import re
 import struct
 
-from .text_reader import get_formid, get_int, get_str
+from .text_reader import (get_formid, get_int, get_str,
+                          PLAYER_REF_FID as PLAYER_FID)
 
 # TES4 condition functions whose first parameter is a quest FormID.
 QUEST_PARAM_FUNCS = frozenset({
@@ -41,8 +42,6 @@ QUEST_PARAM_FUNCS = frozenset({
     79,   # GetQuestVariable
     56,   # GetQuestRunning
 })
-
-PLAYER_FID = 0x00000014
 
 # TES4 PKDT.Type values whose behaviour targets a specific reference.  These are
 # the ones that need alias routing when quest-owned.
