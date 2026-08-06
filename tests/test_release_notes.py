@@ -4,8 +4,9 @@ each auto-tag (.github/workflows/tag-on-push.yml).
 The bug these guard against: the notes told the user to re-run all 12 steps for
 changes that only touched one stage.  Two causes, both covered below --
 convert.py mapping to "ALL" regardless of which phase_* function changed, and
-paths with no rule (TESGameSelect/, process_job.py, external/) falling into the
-"unmapped -> select everything" precaution.
+paths with no rule (TESGameSelect/, process_job.py, external/) falling into an
+"unmapped -> select everything" precaution.  That precaution is gone: unmapped
+paths now select nothing and are simply listed for the reader to judge.
 """
 import os
 import sys
@@ -105,11 +106,19 @@ def test_pool_plumbing_implies_all_steps(path):
     assert steps(path) == rn.STEP_ORDER
 
 
-def test_unmapped_path_still_selects_everything():
-    """The precaution must stay for genuinely new top-level packages."""
+def test_unmapped_path_selects_no_steps():
+    """An unrecognised path is reported, not turned into a 12-step re-run."""
     ordered, unmatched, _ = rn.steps_for_paths(["brand_new_package/thing.py"])
     assert unmatched == ["brand_new_package/thing.py"]
-    assert ordered == rn.STEP_ORDER
+    assert ordered == []
+
+
+def test_unmapped_path_does_not_widen_a_known_change():
+    ordered, unmatched, _ = rn.steps_for_paths(
+        ["asset_convert/lod_gen.py", "brand_new_package/thing.py"])
+    assert unmatched == ["brand_new_package/thing.py"]
+    assert "9. LOD" in ordered
+    assert "1. Export" not in ordered
 
 
 # ── convert.py resolves per phase_* function ──────────────────────────────

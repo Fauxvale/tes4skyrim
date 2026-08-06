@@ -13,8 +13,19 @@ The step mapping mirrors gui.py's STEPS table (the numbered checkboxes) and
 the phase_* functions in convert.py that each one invokes.  Anything that
 changes the plugin body (tes5_import) implies Import; mesh/creature/sound/LOD
 work implies its own asset step; and because Pack BSAs / Pack Mod Zip consume
-whatever the earlier steps wrote, they are appended whenever any asset- or
-plugin-producing step is triggered.
+whatever the earlier steps wrote, they are appended whenever any step that
+*produces* packaged output is triggered.
+
+Keeping the answer honest means being narrow where the code is narrow:
+
+  * convert.py is attributed per phase_* function via git's hunk headers, so a
+    diff confined to phase_lod costs only the LOD step (see PHASE_STEPS).  Only
+    module-scope/main()/shared-helper hunks fall back to every step.
+  * Paths that are never pipeline input (docs, tests, tools, vendored binaries
+    under external/, the standalone TESGameSelect/ plugin) map to no steps.
+    Genuinely unrecognised paths select nothing -- they are listed verbatim so
+    the reader can judge them (and add a rule), rather than blanket-ticking
+    every step over one stray file.
 """
 from __future__ import annotations
 
@@ -67,10 +78,17 @@ RULES: list[tuple[str, list[str]]] = [
     (r"^asset_convert/(audio_converter)\.py",  ["7. Sounds"]),
     (r"^asset_convert/(lod_gen|lod_far_gen|terrain_lod|terrain_lod_textures|"
      r"landscape_normals)\.py",                ["9. LOD"]),
-    (r"^asset_convert/(modify_body_meshes|skin_replacement)\.py",
-                                               ["10. Patch Skyrim"]),
+    (r"^asset_convert/modify_body_meshes\.py", ["10. Patch Skyrim"]),
+    # skin_replacement is also imported by nif_converter, so it is a mesh
+    # change as well as a body-patch one.
+    (r"^asset_convert/skin_replacement\.py",   ["3. Meshes", "10. Patch Skyrim"]),
     (r"^asset_convert/(bsa_pack)\.py",         ["11. Pack BSAs"]),
     (r"^asset_convert/texture_prune\.py",      ["3. Meshes"]),
+    # Vanilla-asset provider: mesh conversion, creature skeletons
+    # (extract_skeleton_bones) and the slot-44 body patch all pull from it.
+    (r"^asset_convert/skyrim_assets\.py",
+                                               ["3. Meshes", "5. Creatures",
+                                                "10. Patch Skyrim"]),
     # Everything else under asset_convert is mesh conversion (nif_converter,
     # collision, cms, mopp, skin_retarget, body_wrap, book_inam, bow_rig,
     # furniture_markers, inv_marker, sse_nif, pyffi_monkey_patch, ...).
@@ -248,11 +266,9 @@ def steps_for_paths(paths: list[str],
     if run_all:
         steps.update(STEP_ORDER)
 
-    # Unrecognised paths are treated as pipeline-affecting: better to tell the
-    # user to re-run than to silently omit a step because a new module landed
-    # that no rule covers yet.
-    if unmatched:
-        steps.update(STEP_ORDER)
+    # Unrecognised paths select no steps.  They are reported separately so the
+    # reader decides what (if anything) they imply -- ticking all twelve boxes
+    # over one unmapped file made the checklist useless.
 
     # Packaging only matters once something it packages was rebuilt.  "Patch
     # Skyrim" writes a standalone ARMA patch that the BSA/zip steps never read,
@@ -293,15 +309,20 @@ def build_notes(tag: str | None, rev_from: str | None, rev_to: str) -> str:
             lines.append(f"  [x] {step}")
     elif gui_only:
         lines.append("  (none -- GUI-only change; relaunch the GUI, no re-run needed)")
+    elif unmatched:
+        lines.append("  (none matched -- see the unmapped paths below)")
     else:
         lines.append("  (none -- no conversion code changed)")
 
     if unmatched:
+        uniq = sorted(set(unmatched))
         lines.append("")
-        lines.append("Unmapped paths (all steps selected as a precaution -- add "
-                     "a rule in tools/release_notes.py):")
-        for p in sorted(set(unmatched))[:20]:
+        lines.append("Unmapped paths (no step selected -- judge for yourself, and "
+                     "add a rule in tools/release_notes.py):")
+        for p in uniq[:20]:
             lines.append(f"  {p}")
+        if len(uniq) > 20:
+            lines.append(f"  ... and {len(uniq) - 20} more")
 
     return "\n".join(lines) + "\n"
 
