@@ -31,11 +31,11 @@ class TestTexturePathRewriting:
 
     def test_prepend_tes4_to_textures(self):
         result = _rewrite_tex_path(b'textures\\armor\\iron\\cuirass.dds')
-        assert result == 'textures\\tes4\\armor\\iron\\cuirass.dds'
+        assert result == 'Textures\\tes4\\armor\\iron\\cuirass.dds'
 
     def test_already_prefixed_unchanged(self):
         result = _rewrite_tex_path(b'textures\\tes4\\armor\\iron\\cuirass.dds')
-        assert result == 'textures\\tes4\\armor\\iron\\cuirass.dds'
+        assert result == 'Textures\\tes4\\armor\\iron\\cuirass.dds'
 
     def test_empty_path_gets_prefix(self):
         assert _rewrite_tex_path(b'') == 'Textures\\tes4\\'

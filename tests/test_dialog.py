@@ -976,29 +976,56 @@ class TestAddTopicUnlocks:
         # stage script revealer
         assert plan['stage_reveals'] == {('fgquest', 10): ['TES4Unlock_stageTopic']}
 
-    def test_bark_revealed_topics_are_not_gated(self):
-        """A topic revealed by a GREETING/HELLO info must NOT be gated: the
-        bark fires on first contact, so in Oblivion it's effectively visible
-        immediately (Azzan's 'Join the Fighters Guild' via his FG-ad
-        greeting). A gate only risks the fragment racing the topic menu."""
-        from tes5_import.dialog_unlocks import build_unlock_plan
-        bt = self._by_type()
+    def _with_greeting(self, bt, add_topic):
+        """Append a GREETING topic whose INFO explicitly adds `add_topic`."""
         bt['DIAL'].append({'FormID': '000B0005', 'EditorID': 'GREETING',
                            'DATA.Type': '6', 'QuestCount': '1',
                            'Quest[0]': '000A0001'})
         bt['INFO'].append({'FormID': '000C0005', 'ParentDIAL': '000B0005',
                            'QSTI.Quest': '000A0001', 'ResponseCount': '0',
-                           'AddTopic[0]': '000B0002',
+                           'AddTopic[0]': add_topic,
                            'ChoiceCount': '0', 'ConditionCount': '0',
                            'DATA.Flags': '0'})
-        plan = build_unlock_plan(bt)
-        assert 0x0B0002 not in plan['gated'], \
-            "greeting-revealed topic must be ungated"
-        assert 0x0B0004 in plan['gated'], \
-            "conversation/stage-revealed topic stays gated"
+        return bt
+
+    def test_bark_only_revealed_topics_are_not_gated(self):
+        """A topic revealed ONLY by a GREETING/HELLO info must NOT be gated:
+        the bark fires on first contact, so in Oblivion it's effectively
+        visible immediately (Azzan's 'Join the Fighters Guild' via his FG-ad
+        greeting). A gate only risks the fragment racing the topic menu."""
+        from tes5_import.dialog_unlocks import build_unlock_plan
+        bt = self._by_type()
+        # stageTopic is otherwise revealed only by the quest-stage script; give
+        # it a bark revealer and drop the stage one so the bark is its sole
+        # explicit revealer.
+        bt['QUST'][0]['Stage[0].Log[0].ResultScript'] = ''
+        plan = build_unlock_plan(self._with_greeting(bt, '000B0004'))
+        assert 0x0B0004 not in plan['gated'], \
+            "bark-only-revealed topic must be ungated"
+        assert 0x0B0002 in plan['gated'], \
+            "conversation-revealed topic stays gated"
         # no lingering revealer entries for the dropped global
         for gs in plan['info_reveals'].values():
-            assert 'TES4Unlock_ratsTOPIC' not in gs
+            assert 'TES4Unlock_stageTopic' not in gs
+
+    def test_topic_revealed_by_both_bark_and_conversation_stays_gated(self):
+        """A greeting revealer belongs to whichever NPC that greeting is gated
+        to, and says nothing about a DIFFERENT NPC whose reveal comes from a
+        topic line.  Vanilla `contract` is added by three greetings AND by the
+        Fighters Guild join line; ungating it on the greetings' account
+        detached it from the join, desynchronising the menu.  So a topic with
+        BOTH revealer kinds keeps its gate — the reveal is then explicit and
+        idempotent from either side."""
+        from tes5_import.dialog_unlocks import build_unlock_plan
+        # ratsTOPIC is already added by the `contract` conversation INFO.
+        bt = self._with_greeting(self._by_type(), '000B0002')
+        plan = build_unlock_plan(bt)
+        assert 0x0B0002 in plan['gated'], \
+            "topic with a conversation revealer must keep its gate"
+        # both revealers set the same global
+        gname = plan['gated'][0x0B0002]
+        assert gname in plan['info_reveals'][0x0C0001], 'conversation revealer'
+        assert gname in plan['info_reveals'][0x0C0005], 'bark revealer'
 
     def test_gated_choice_target_revealed_by_tclt_parent(self):
         """A gated topic that is also a choice target keeps its gate but the

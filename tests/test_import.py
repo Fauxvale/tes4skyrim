@@ -2191,7 +2191,7 @@ class TestCKWarningFixes:
         keep sandboxing.
         """
         from tes5_import.pack_converter import _choose, PackContext, T4_FIND
-        from tes5_import.pack_templates import ACTIVATE, SANDBOX
+        from tes5_import.pack_templates import ACTIVATE, TRAVEL
 
         rec = {'Signature': 'PACK', 'FormID': '0007303D',
                'EditorID': 'CGRatAmbushAPushBricks',
@@ -2211,10 +2211,19 @@ class TestCKWarningFixes:
         assert _choose(door, PackContext(ref_base_sig={0x01AAAA: 'DOOR'}),
                        0x0007303E).t is ACTIVATE
 
-        # ...but Find at an ACTOR is a greet and must NOT become Activate
+        # ...but Find at an ACTOR is a SEEK, not an operate: it becomes Travel
+        # to a "near reference" location, with PTDT.Count as the radius.
+        # (CGAssassinsAmbushAToGlenroy et al: the package that carries the
+        # assassins out of the ambush room; the old sandbox fallback left them
+        # standing there forever.)
         npc = dict(rec, **{'PTDT.Target': '00023E71'})
-        assert _choose(npc, PackContext(ref_base_sig={0x023E71: 'NPC_'}),
-                       0x0007303F).t is SANDBOX
+        seek = _choose(npc, PackContext(ref_base_sig={0x023E71: 'NPC_'}),
+                       0x0007303F)
+        assert seek.t is TRAVEL, 'Find at an actor must not become Activate'
+        loc = seek.values[TRAVEL.slot('location')]
+        ltype, lfid, lradius = struct.unpack('<iIi', loc)
+        assert (ltype, lfid) == (0, 0x00023E71)
+        assert lradius == 200, 'PTDT.Count is the approach distance'
 
     def test_defensive_combat_is_not_ignore_combat(self):
         """TES4 Defensive Combat must NOT become TES5 Ignore Combat.
@@ -3047,21 +3056,36 @@ class TestActorScriptOnPlacedRef:
         # not an actor event, and must not match on the 'onhit' substring
         assert not _script_uses_reference_event('begin OnMagicEffectHit')
 
-    def test_gamemode_block_forces_relocation(self):
-        """A bare GameMode block must move to the ACHR as well.
+    def test_bare_gamemode_does_not_force_relocation(self):
+        """A bare GameMode block alone does NOT relocate. Known open gap.
 
-        TES4 delivers GameMode everywhere, so it looks base-safe — but the
-        converter compiles it into an OnUpdate poll whose only starters are
-        OnCellAttach/OnLoad/OnInit, gated on ShouldRunGameMode(Self).  Those are
-        ObjectReference members, so on a base NPC_ the poll never starts and the
-        whole block is dead code.  Morroblivion's CATDestinationSorter (the
-        Jo'Tesh/Kisimba world transport) is pure GameMode with no bare
-        self-reference call, so it triggered neither other reason and silently
-        never ran.
+        `gamemode` was briefly a member of _TES4_REFERENCE_EVENTS: TES4
+        delivers GameMode everywhere, but the converter compiles it into an
+        OnUpdate poll whose starters are all ObjectReference members, so on a
+        base NPC_ the poll never starts and the block is dead code.
+        Morroblivion's CATDestinationSorter (the Jo'Tesh/Kisimba world
+        transport) is pure GameMode with no bare self-reference call, so it
+        triggered neither other relocation reason and never ran.
+
+        It was REVERTED alongside the ShouldRunGameMode gate (commit 4a802e2)
+        when that pair regressed CharacterGen.  A GameMode block still
+        relocates whenever it ALSO makes a bare self-reference call — which is
+        the common case (Celebro's `enable`) — so only pure-GameMode scripts
+        are affected.
+
+        This test pins the current behaviour so the revert cannot be undone
+        silently; re-test CharacterGen in-game before restoring `gamemode`.
+        See test_self_enable_deadlock_is_a_known_open_regression in
+        tests/test_script_converter.py for the other half of the same revert.
         """
-        from tes5_import.object_scripts import _script_uses_reference_event
-        assert _script_uses_reference_event('begin GameMode\nset x to 1\nend')
-        assert _script_uses_reference_event('scn X\r\nbegin gamemode\r\nend')
+        from tes5_import.object_scripts import (
+            _script_uses_reference_event, _script_uses_self_reference_call)
+        assert not _script_uses_reference_event('begin GameMode\nset x to 1\nend')
+        assert not _script_uses_reference_event('scn X\r\nbegin gamemode\r\nend')
+        # ...but a GameMode block that calls a self-reference function still
+        # relocates, via reason 3.
+        assert _script_uses_self_reference_call(
+            'scn X\nbegin GameMode\nenable\nend')
 
     def test_bare_self_reference_call_forces_relocation(self):
         """A bare `enable`/`moveto`/... acts on the calling REFERENCE.

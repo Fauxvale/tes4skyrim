@@ -508,29 +508,43 @@ def test_organize_voice_files_prunes_renamed_leftovers(tmp_path):
 
 
 @needs_ffmpeg
-def test_organize_voice_files_prune_leaves_foreign_files(tmp_path):
-    """Pruning only touches voice files in folders this run wrote into."""
+def test_organize_voice_files_prune_scope(tmp_path):
+    """Pruning sweeps every VTYP folder under a plugin root this run owns,
+    but only ever deletes files with a voice extension.
+
+    The whole-root sweep is deliberate: a voice-type RELOCATION empties the
+    old race folder, which the run then never writes again, so a
+    touched-dirs-only sweep could never reach the stranded copies.  Files
+    outside the plugin root, and non-voice files anywhere, stay put.
+    """
     plugin = 'Test.esm'
     voice_src = tmp_path / 'extract' / 'sound' / 'Voice' / plugin / 'Nord' / 'M'
     voice_src.mkdir(parents=True, exist_ok=True)
     _make_wav(voice_src / 'q_t_0000a1b2_1.wav')
     out_root = tmp_path / 'output' / 'sound' / 'Voice' / plugin
-    # A folder this run never writes to, plus a non-voice file in one it does.
+    # A VTYP folder this run never writes into, but which IS under the swept
+    # plugin root: its stale voice file is exactly what the sweep exists for.
     other = out_root / 'TES4FemaleNord'
     other.mkdir(parents=True, exist_ok=True)
-    (other / 'someone_elses_0000ffff_1.fuz').write_bytes(b'keep me')
+    (other / 'someone_elses_0000ffff_1.fuz').write_bytes(b'stale')
     used = out_root / 'TES4MaleNord'
     used.mkdir(parents=True, exist_ok=True)
     (used / 'notes.txt').write_text('not a voice file')
+    # A different plugin's root is not ours to touch.
+    foreign = tmp_path / 'output' / 'sound' / 'Voice' / 'Other.esm' / 'TES4MaleNord'
+    foreign.mkdir(parents=True, exist_ok=True)
+    (foreign / 'someone_elses_0000ffff_1.fuz').write_bytes(b'keep me')
 
     organize_voice_files(source_dir=str(tmp_path / 'extract'),
                          dest_dir=str(tmp_path / 'output'),
                          plugin_name=plugin, convert_audio=True,
                          ffmpeg_path=FFMPEG)
 
-    assert (other / 'someone_elses_0000ffff_1.fuz').is_file(), \
-        'pruned a file in a folder this run never wrote to'
+    assert not (other / 'someone_elses_0000ffff_1.fuz').exists(), \
+        'stale voice file under the swept plugin root was not pruned'
     assert (used / 'notes.txt').is_file(), 'pruned a non-voice file'
+    assert (foreign / 'someone_elses_0000ffff_1.fuz').is_file(), \
+        "pruned a file under another plugin's voice root"
 
 
 def test_organize_voice_files_no_match_counted(tmp_path):
