@@ -17,6 +17,7 @@ from script_convert.constants import (
     BLOCK_MAP,
     TYPE_MAP,
     ACTOR_VALUE_MAP,
+    TES4_ATTRIBUTES,
     FUNCTION_MAP,
     PAPYRUS_MAX_SCRIPT_NAME,
     papyrus_script_name,
@@ -404,11 +405,44 @@ class TestActorValueMap:
     def test_fatigue_to_stamina(self):
         assert ACTOR_VALUE_MAP['fatigue'] == 'Stamina'
 
-    def test_mysticism_to_alteration(self):
-        assert ACTOR_VALUE_MAP['mysticism'] == 'Alteration'
+    def test_mysticism_to_illusion(self):
+        # Mysticism was folded into Illusion in Skyrim; must agree with the
+        # record side (skyrim_overrides.TES4_SKILL_TO_TES5_INDEX maps 24 -> 21).
+        assert ACTOR_VALUE_MAP['mysticism'] == 'Illusion'
 
     def test_resistfire(self):
         assert ACTOR_VALUE_MAP['resistfire'] == 'FireResist'
+
+    def test_attributes_have_no_mapping(self):
+        """Skyrim has no attributes -- none may alias onto a live actor value.
+
+        They used to (strength->UnarmedDamage, endurance->HealRate,
+        agility/speed->SpeedMult), which broke every Morroblivion guild: the
+        Fighters Guild gates each rank on `Player.GetAV Strength >= 30 &&
+        Player.GetAV Endurance >= 30` and UnarmedDamage sits near 0, so no
+        character could qualify at any level.
+        """
+        for attr in TES4_ATTRIBUTES:
+            assert attr not in ACTOR_VALUE_MAP
+
+    def test_attribute_read_is_stubbed_open(self, converter):
+        """A read of a removed attribute yields a value that passes the gate."""
+        result = converter._convert_expression(
+            'Player.GetAV Strength >= 30 && Player.GetAV Endurance >= 30',
+            'Quest')
+        assert result == '100.0 >= 30 && 100.0 >= 30'
+
+    def test_attribute_write_is_dropped(self, converter):
+        result = converter._convert_function_call('Player.SetAV Strength 50',
+                                                  'Quest')
+        assert result.lstrip().startswith(';')
+        assert 'SetActorValue' not in result
+
+    def test_skill_read_still_maps(self, converter):
+        """Skills survive the attribute no-op -- only attributes are stubbed."""
+        result = converter._convert_expression('Player.GetAV Armorer >= 10',
+                                               'Quest')
+        assert result == 'Game.GetPlayer().GetActorValue("Smithing") >= 10'
 
 
 # ===========================================================================

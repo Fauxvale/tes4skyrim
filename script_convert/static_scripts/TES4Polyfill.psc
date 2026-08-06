@@ -54,65 +54,99 @@ EndFunction
 ; Actor Value Mapping (TES4 AV names → TES5 AV names)
 ; ==========================================================================
 
+; SKYRIM HAS NO ATTRIBUTES. Strength, Intelligence, Willpower, Agility, Speed,
+; Endurance, Personality and Luck do not exist as actor values, and no TES5
+; actor value is a faithful stand-in — every candidate sits on a different
+; scale, so comparing a 0-100 attribute threshold against one is arbitrary.
+;
+; These used to be aliased onto the nearest-looking AV (Strength->UnarmedDamage,
+; Endurance->HealRate, Agility->SpeedMult, Personality->Speechcraft) and that
+; silently broke every Morroblivion guild. The Fighters Guild advancement
+; script gates each promotion on `Player.GetAV Strength >= 30 && Player.GetAV
+; Endurance >= 30`; UnarmedDamage sits near 0 so the check could never pass at
+; any level, while SpeedMult sits near 100 so the Thieves Guild's Agility gate
+; passed unconditionally. Neither is the authored behaviour.
+;
+; IsTES4Attribute lets the readers below no-op instead: a read returns a value
+; that satisfies any authored threshold (attribute gates cap at 100 in TES4 —
+; the highest in the guild scripts is 35) so the gate falls open, and a write
+; is discarded rather than corrupting a live Skyrim value. Falling open is the
+; faithful outcome: an Oblivion attribute gate exists to keep an
+; under-developed character out, and a Skyrim character has no way to raise an
+; attribute at all, so enforcing it would lock the content away permanently
+; rather than merely early.
+Bool Function IsTES4Attribute(String avName) Global
+  Return avName == "Strength" || avName == "Intelligence" || \
+         avName == "Willpower" || avName == "Agility" || \
+         avName == "Speed" || avName == "Endurance" || \
+         avName == "Personality" || avName == "Luck"
+EndFunction
+
+; Value returned for a removed attribute. Above every authored TES4 attribute
+; threshold (the ceiling is 100) so `>=` gates pass, and positive so the rarer
+; `> 0` / `!= 0` forms behave the same way.
+Float Function TES4AttributeStub() Global
+  Return 100.0
+EndFunction
+
 String Function MapActorValue(String avName) Global
-  ; Attributes (removed in TES5 — map to closest equivalent)
-  If avName == "Strength"
-    Return "UnarmedDamage"
-  ElseIf avName == "Intelligence"
-    Return "Magicka"
-  ElseIf avName == "Willpower"
-    Return "MagickaRate"
-  ElseIf avName == "Agility"
-    Return "SpeedMult"
-  ElseIf avName == "Speed"
-    Return "SpeedMult"
-  ElseIf avName == "Endurance"
-    Return "HealRate"
-  ElseIf avName == "Personality"
-    Return "Speechcraft"
-  ElseIf avName == "Luck"
-    Return "Health"
-  ; Skills (renamed in TES5)
-  ElseIf avName == "Armorer"
+  ; Skills (renamed and/or merged in TES5). "Speechcraft" and "Marksman" are
+  ; the engine's internal AV names for the skills Skyrim's UI calls Speech and
+  ; Archery — both resolve; the UI names do not.
+  If avName == "Armorer"
     Return "Smithing"
   ElseIf avName == "Athletics"
     Return "Stamina"
   ElseIf avName == "Blade"
     Return "OneHanded"
   ElseIf avName == "Blunt"
-    Return "TwoHanded"
+    Return "OneHanded"
   ElseIf avName == "HandToHand"
     Return "UnarmedDamage"
   ElseIf avName == "Mysticism"
-    Return "Alteration"
+    Return "Illusion"
   ElseIf avName == "Mercantile"
     Return "Speechcraft"
   ElseIf avName == "Security"
     Return "Lockpicking"
   ElseIf avName == "Acrobatics"
-    Return "SpeedMult"
+    Return "Stamina"
   ElseIf avName == "Fatigue"
     Return "Stamina"
   ElseIf avName == "Encumbrance"
     Return "CarryWeight"
+  ElseIf avName == "Responsibility"
+    Return "Morality"
   Else
     Return avName
   EndIf
 EndFunction
 
 Float Function GetTES4ActorValue(Actor akActor, String avName) Global
+  If IsTES4Attribute(avName)
+    Return TES4AttributeStub()
+  EndIf
   Return akActor.GetActorValue(MapActorValue(avName))
 EndFunction
 
 Function SetTES4ActorValue(Actor akActor, String avName, Float afValue) Global
+  If IsTES4Attribute(avName)
+    Return
+  EndIf
   akActor.SetActorValue(MapActorValue(avName), afValue)
 EndFunction
 
 Function ModTES4ActorValue(Actor akActor, String avName, Float afValue) Global
+  If IsTES4Attribute(avName)
+    Return
+  EndIf
   akActor.ModActorValue(MapActorValue(avName), afValue)
 EndFunction
 
 Function ForceTES4ActorValue(Actor akActor, String avName, Float afValue) Global
+  If IsTES4Attribute(avName)
+    Return
+  EndIf
   akActor.ForceActorValue(MapActorValue(avName), afValue)
 EndFunction
 

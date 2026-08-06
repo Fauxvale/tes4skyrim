@@ -128,20 +128,48 @@ TYPE_MAP = {
 }
 
 # Actor value name mapping (TES4 -> TES5)
+# TES4 attribute names. SKYRIM HAS NO ATTRIBUTES — Strength, Intelligence,
+# Willpower, Agility, Speed, Endurance, Personality and Luck do not exist as
+# actor values, and no TES5 actor value is a faithful stand-in, because every
+# candidate sits on a different scale than TES4's 0-100.
+#
+# They used to be aliased onto the nearest-looking AV here
+# (strength->UnarmedDamage, endurance->HealRate, agility/speed/acrobatics->
+# SpeedMult, personality->Speechcraft, luck->LuckModifier — which is not even
+# a real AV name, so it failed silently). That broke every Morroblivion guild:
+# the Fighters Guild gates each rank on `Player.GetAV Strength >= 30 &&
+# Player.GetAV Endurance >= 30`, and UnarmedDamage sits near 0, so no character
+# could ever qualify at any level; the Thieves Guild's Agility gate read
+# SpeedMult (~100) and passed unconditionally instead.
+#
+# An attribute read is now a no-op that returns ATTRIBUTE_STUB_VALUE, so the
+# gate falls OPEN, and an attribute write is discarded. Falling open is the
+# faithful outcome: an Oblivion attribute gate exists to keep an
+# under-developed character out, and a Skyrim character cannot raise an
+# attribute at all, so enforcing it would lock the content away permanently
+# rather than merely early. Mirrors dialog_conditions._TES4_AV_ATTRIBUTES,
+# which drops the equivalent CTDA, and TES4Polyfill.IsTES4Attribute.
+TES4_ATTRIBUTES = frozenset({
+    'strength', 'intelligence', 'willpower', 'agility',
+    'speed', 'endurance', 'personality', 'luck',
+})
+
+# Value substituted for a removed attribute read. Above every authored TES4
+# attribute threshold (TES4 attributes cap at 100; the highest in the guild
+# advancement scripts is 35) so `>=` gates pass, and positive so the rarer
+# `> 0` / `!= 0` forms behave the same way.
+ATTRIBUTE_STUB_VALUE = '100.0'
+
 ACTOR_VALUE_MAP = {
-    'strength':     'UnarmedDamage',
-    'intelligence': 'Magicka',
-    'willpower':    'MagickaRate',
-    'agility':      'SpeedMult',
-    'speed':        'SpeedMult',
-    'endurance':    'HealRate',
-    'personality':  'Speechcraft',
-    'luck':         'LuckModifier',
     'armorer':      'Smithing',
     'athletics':    'Stamina',
     'blade':        'OneHanded',
     'block':        'Block',
-    'blunt':        'TwoHanded',
+    # Blunt is Oblivion's mace/warhammer skill and covers BOTH one- and
+    # two-handed blunt weapons; Skyrim splits them. OneHanded matches Blade so
+    # a script comparing the two reads one consistent scale, and it is what
+    # skyrim_overrides.TES4_SKILL_TO_TES5_INDEX already uses on the record side.
+    'blunt':        'OneHanded',
     'handtohand':   'UnarmedDamage',
     'heavyarmor':   'HeavyArmor',
     'alchemy':      'Alchemy',
@@ -149,9 +177,16 @@ ACTOR_VALUE_MAP = {
     'conjuration':  'Conjuration',
     'destruction':  'Destruction',
     'illusion':     'Illusion',
-    'mysticism':    'Alteration',
+    # Mysticism was folded into Illusion in Skyrim (Detect Life, Telekinesis
+    # and Soul Trap all became Illusion/Conjuration spells); Alteration was a
+    # mismatch with the record side, which already maps it to Illusion.
+    'mysticism':    'Illusion',
     'restoration':  'Restoration',
-    'acrobatics':   'SpeedMult',
+    # Acrobatics and Athletics have no Skyrim skill at all. Stamina is the
+    # athletic-capacity value the engine actually tracks, and matches the
+    # 0-100 scale a TES4 skill threshold expects far better than SpeedMult
+    # (which sits at ~100 for everyone and made every gate pass).
+    'acrobatics':   'Stamina',
     'lightarmor':   'LightArmor',
     'marksman':     'Marksman',
     'mercantile':   'Speechcraft',
@@ -169,7 +204,13 @@ ACTOR_VALUE_MAP = {
     'waterwalking': 'WaterWalking',
     'paralysis':    'Paralysis',
     'detectlife':   'DetectLifeRange',
-    'silencearea':  'MuteModifier',
+    'blindness':    'Blindness',
+    # Skyrim has NO silence actor value — the engine's AV name table (verified
+    # against SkyrimSE.exe) runs ...Blindness, WeaponSpeedMult... with nothing
+    # between, and 'MuteModifier' (what this used to emit) is not a name the
+    # engine knows, so every read returned 0 and every write was rejected.
+    # Silence is a spell-supplied condition in Skyrim, not a trackable value;
+    # omitting it leaves the AV name unmapped, which is the honest outcome.
     'resistfire':   'FireResist',
     'resistfrost':  'FrostResist',
     'resistshock':  'ElectricResist',
@@ -179,9 +220,28 @@ ACTOR_VALUE_MAP = {
     'resistnormalweapons': 'DamageResist',
     'aggression':   'Aggression',
     'confidence':   'Confidence',
-    'energy':       'Magicka',
+    # Energy is an AI trait in BOTH games (TES4 AV 35, TES5 AV 2), not a pool.
+    # Mapping it to Magicka aliased an AI personality value onto the actor's
+    # spell resource, so a scripted energy change silently drained or refilled
+    # magicka instead.
+    'energy':       'Energy',
     'responsibility': 'Morality',
 }
+
+# Every TES4 command whose FIRST argument is an actor-value name.  Used both to
+# quote that argument and to detect calls naming a removed attribute.
+_ACTOR_VALUE_FUNCTIONS = frozenset({
+    'getactorvalue', 'setactorvalue', 'modactorvalue', 'forceactorvalue',
+    'getav', 'setav', 'modav', 'forceav', 'getbaseactorvalue', 'getbaseav',
+    'modpcskill', 'advancepcskill',
+    'modav2', 'modactorvalue2', 'getav2', 'setav2',
+})
+
+# The subset that READS an actor value, so a call naming a removed attribute
+# has to yield a value.  The rest write, and are dropped instead.
+_ACTOR_VALUE_READ_FUNCTIONS = frozenset({
+    'getactorvalue', 'getav', 'getbaseactorvalue', 'getbaseav', 'getav2',
+})
 
 # TES4 global variables that exist in Skyrim — these need GlobalVariable property access
 KNOWN_GLOBALS = {

@@ -5,6 +5,8 @@ from typing import Optional
 
 from script_convert.constants import (
     BLOCK_MAP, BLOCK_FILTER_PARAM, TYPE_MAP, ACTOR_VALUE_MAP, KNOWN_GLOBALS,
+    TES4_ATTRIBUTES, ATTRIBUTE_STUB_VALUE,
+    _ACTOR_VALUE_FUNCTIONS, _ACTOR_VALUE_READ_FUNCTIONS,
     _PAPYRUS_RESERVED, FUNCTION_MAP, _BARE_BOOL_FUNCTIONS,
     _BARE_NO_EQUIV_COMMANDS, _OBSE_NO_EQUIV_COMMANDS,
     _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS, _ACTORBASE_ARG_FUNCTIONS,
@@ -4336,11 +4338,7 @@ class ScriptConverter:
         # vanilla commands they map onto, so they must quote the AV name here
         # too — without them `modAV2 Health 300` emitted an unquoted `Health`
         # ("undefined identifier `Health`").
-        av_funcs = {'getactorvalue', 'setactorvalue', 'modactorvalue', 'forceactorvalue',
-                     'getav', 'setav', 'modav', 'forceav', 'getbaseactorvalue', 'getbaseav',
-                     'modpcskill', 'advancepcskill',
-                     'modav2', 'modactorvalue2', 'getav2', 'setav2'}
-        if func_name in av_funcs:
+        if func_name in _ACTOR_VALUE_FUNCTIONS:
             parts = args_str.split(None, 1)
             av_name = parts[0].rstrip(',').strip('"\'')
             sk_av = ACTOR_VALUE_MAP.get(av_name.lower(), av_name)
@@ -4829,6 +4827,36 @@ class ScriptConverter:
             args_str = ''
 
         # --- Special case functions ---
+
+        # SKYRIM HAS NO ATTRIBUTES.  An actor-value call naming Strength,
+        # Intelligence, Willpower, Agility, Speed, Endurance, Personality or
+        # Luck has no faithful target: every TES5 actor value sits on a
+        # different scale than TES4's 0-100, so aliasing one onto the nearest
+        # look-alike does not preserve the authored threshold.
+        #
+        # This was aliased (strength->UnarmedDamage, endurance->HealRate,
+        # agility/speed->SpeedMult) and it broke every Morroblivion guild.
+        # fbmwFGAdvancementQuestScript gates each Fighters Guild rank on
+        # `Player.GetAV Strength >= 30 && Player.GetAV Endurance >= 30`;
+        # UnarmedDamage sits near 0, so no character qualified at any level and
+        # the recruiter always answered "you don't have enough experience",
+        # while the Thieves Guild's Agility gate read SpeedMult (~100) and
+        # passed unconditionally.
+        #
+        # A read becomes ATTRIBUTE_STUB_VALUE (above every authored TES4
+        # threshold) so the gate falls OPEN, and a write is dropped.  Falling
+        # open is the faithful outcome: the gate exists to keep an
+        # under-developed character out, and a Skyrim character cannot raise an
+        # attribute at all, so enforcing it locks the content away permanently
+        # rather than merely early.  Mirrors
+        # dialog_conditions._TES4_AV_ATTRIBUTES on the record side.
+        if fname_low in _ACTOR_VALUE_FUNCTIONS and args_str:
+            av_first = args_str.split(None, 1)[0].rstrip(',').strip('"\'')
+            if av_first.lower() in TES4_ATTRIBUTES:
+                if fname_low in _ACTOR_VALUE_READ_FUNCTIONS:
+                    return ATTRIBUTE_STUB_VALUE
+                return (f';TES4 attribute {av_first} has no Skyrim equivalent '
+                        f'-- write dropped')
 
         # OBSE `Call <ScriptName> arg1, arg2, ...` — invoke a user-defined
         # function.  The callee is a script, so it is reached through a property

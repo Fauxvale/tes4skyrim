@@ -184,12 +184,14 @@ class TestCTDAConversion:
         in the dialogue menu) the moment any converted NPC was spoken to.
         """
         # 277 GetBaseActorValue(ptActorValue) — the crash from Nehrim's
-        # trainer topics (LehrerWortgewandheit05 / INFO 00207614).
+        # trainer topics (LehrerWortgewandheit05 / INFO 00207614).  The param
+        # is TRANSLATED between the two games' actor-value tables (Speechcraft
+        # 32 -> Speech 17), never load-order remapped.
         out = convert_ctda(_tes4_ctda(func=277, p1=32), offset=1)
-        assert struct.unpack_from('<I', out, 12)[0] == 32
+        assert struct.unpack_from('<I', out, 12)[0] == 17
         # 14 GetActorValue(ptActorValue)
         out = convert_ctda(_tes4_ctda(func=14, p1=32), offset=1)
-        assert struct.unpack_from('<I', out, 12)[0] == 32
+        assert struct.unpack_from('<I', out, 12)[0] == 17
         # 70 GetIsSex(ptSex) / 131 GetPCIsSex(ptSex) — 0/1 enums
         for func in (70, 131):
             out = convert_ctda(_tes4_ctda(func=func, p1=1), offset=1)
@@ -197,6 +199,46 @@ class TestCTDAConversion:
         # 247 GetIsUsedItemType(ptFormType)
         out = convert_ctda(_tes4_ctda(func=247, p1=41), offset=1)
         assert struct.unpack_from('<I', out, 12)[0] == 41
+
+    def test_actor_value_param_translated_between_tables(self):
+        """ptActorValue is a RAW INDEX into each game's actor-value table, and
+        the two tables share no entries — TES4 0 is Strength, TES5 0 is
+        Aggression; TES4 5 is Endurance, TES5 5 is Assistance.
+
+        Regression: the index was passed through unchanged, so every skill gate
+        read an unrelated value. Skills must be translated to their TES5 slot.
+        """
+        for tes4_av, tes5_av in ((12, 10),   # Armorer     -> Smithing
+                                 (14, 6),    # Blade       -> OneHanded
+                                 (16, 6),    # Blunt       -> OneHanded
+                                 (24, 21),   # Mysticism   -> Illusion
+                                 (28, 8),    # Marksman    -> Archery
+                                 (29, 17),   # Mercantile  -> Speech
+                                 (30, 14),   # Security    -> Lockpicking
+                                 (32, 17)):  # Speechcraft -> Speech
+            for func in (14, 277):
+                out = convert_ctda(_tes4_ctda(func=func, p1=tes4_av), offset=1)
+                assert out is not None
+                assert struct.unpack_from('<I', out, 12)[0] == tes5_av
+
+    def test_attribute_conditions_dropped(self):
+        """SKYRIM HAS NO ATTRIBUTES, so an attribute gate must be dropped.
+
+        Regression: joining the Morroblivion Fighters Guild is gated on
+        `GetActorValue Strength >= 30 AND GetActorValue Endurance >= 30`.
+        Passed through verbatim those became Aggression/Assistance — 0-3 enums
+        that can never reach 30 — so the recruiter always answered "you don't
+        have enough experience" and the guild was unjoinable at any level. The
+        Thieves Guild (Agility/Personality) failed the same way.
+
+        Dropping fails OPEN, which is the faithful outcome: a Skyrim character
+        cannot raise an attribute at all, so enforcing the gate would lock the
+        content away permanently rather than merely early.
+        """
+        for attr in range(8):  # Strength .. Luck
+            for func in (14, 277):
+                assert convert_ctda(_tes4_ctda(func=func, p1=attr),
+                                    offset=1) is None
 
     def test_quest_stage_param2_not_remapped(self):
         """59 GetStageDone(ptQuest, ptQuestStage): p1 is a FormID, p2 is the

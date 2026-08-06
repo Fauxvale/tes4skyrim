@@ -15,7 +15,9 @@ OnActivate, …). TES5 uses Papyrus, an object-oriented language.
 - TES4 `set x to y` → `x = y`
 - Player reference: `player.` → `Game.GetPlayer().`
 - No direct equivalent for: GetInCell (→IsInLocation), ShowMap, CloseOblivionGate, SetQuestObject
-- TES4 attributes (Strength, etc.) have no Papyrus equivalent
+- TES4 attributes (Strength, etc.) have no Papyrus equivalent — reads are
+  stubbed open and writes dropped, never aliased onto a look-alike actor value
+  (see "Skyrim has NO attributes" below)
 - Vanilla forms with no TES4 counterpart are reached via
   `Game.GetFormFromFile(0x..., "Skyrim.esm")` in TES4Polyfill (ActorTypeNPC
   keyword for GetIsCreature, GuardDialogueFaction for IsGuard,
@@ -572,6 +574,60 @@ exactly when detected and never otherwise. **Whenever a TES4 function with a
 range wider than 0/1 is mapped onto a Papyrus Bool, rescale to the source's
 range** — do not let the generic `as Int` cast decide, because it collapses the
 range to 0/1 and quietly kills every threshold above 1.
+
+### Skyrim has NO attributes — the AV tables share nothing (2026-08-06)
+
+**The two games' actor-value tables do not overlap at a single index.** TES4 0 is
+Strength, TES5 0 is Aggression; TES4 5 is Endurance, TES5 5 is Assistance
+(xEdit `wbActorValueEnum` in `wbDefinitionsTES4.pas` vs `wbDefinitionsTES5.pas`).
+A CTDA `ptActorValue` param is a **raw index** into that table, so passing it
+through unchanged reads a completely unrelated value.
+
+Worse, Skyrim has no attributes at all. Strength, Intelligence, Willpower,
+Agility, Speed, Endurance, Personality and Luck simply do not exist as actor
+values, and no TES5 value is a faithful stand-in — every candidate (`SpeedMult`,
+`HealRate`, `UnarmedDamage`, …) sits on a different scale, so a 0-100 attribute
+threshold compared against one is arbitrary.
+
+**This made every Morroblivion guild unjoinable.** Joining the Fighters Guild is
+gated on `GetActorValue Strength >= 30 AND GetActorValue Endurance >= 30`
+(INFO `013204F7`); converted verbatim that became `Aggression >= 30 AND
+Assistance >= 30` — 0-3 enums that can never reach 30 at any level — so the
+recruiter always fell through to *"The Fighters Guild can't just sign up anyone.
+You don't meet our requirements."* The Thieves Guild (Agility/Personality →
+Morality/One-Handed) failed identically, and the same defect hit ~600 conditions
+across the exports. The script side had its own version: the polyfill aliased
+`Strength → UnarmedDamage` (≈0, never passes) and `Agility → SpeedMult` (≈100,
+always passes), so `fbmwFGAdvancementQuestScript`'s per-rank promotion gates were
+equally dead.
+
+The rule now, on **both** sides:
+
+| TES4 AV | Conversion |
+|---|---|
+| The 8 attributes | **DROPPED** (CTDA) / stubbed to `100.0` (script read), writes discarded |
+| Skills | Translated to the TES5 skill index / name |
+| Shared derived + AI + magic values | Translated to the matching TES5 index |
+| Everything else (Magicka Multiplier, Attack Bonus, Silence, Telekinesis, …) | Dropped — no TES5 equivalent |
+
+Dropping an attribute gate **fails OPEN**, which is the faithful outcome: the
+gate exists to keep an under-developed character out, and a Skyrim character has
+no way to raise an attribute, so enforcing it would lock the content away
+*permanently* rather than merely early.
+
+Three places must agree, and a change to one needs the same change in the others:
+`tes5_import/dialog_conditions.py` (`_TES4_AV_ATTRIBUTES` / `_TES4_AV_TO_TES5`,
+applied in `convert_ctda` for functions 14 `GetActorValue` and 277
+`GetBaseActorValue`), `script_convert/constants.py` (`TES4_ATTRIBUTES`,
+`ATTRIBUTE_STUB_VALUE`, `ACTOR_VALUE_MAP`), and
+`script_convert/static_scripts/TES4Polyfill.psc` (`IsTES4Attribute`).
+
+Two AV names the map used to emit — `LuckModifier` and `MuteModifier` — are **not
+names the engine knows** (verified against `SkyrimSE.exe`'s AV name table, which
+runs `…Blindness, WeaponSpeedMult…` with no silence entry), so every read
+returned 0 and every write was rejected. Skyrim's internal names for two skills
+are also *not* the UI names: use `Speechcraft` (not Speech) and `Marksman` (not
+Archery) in Papyrus strings; the CTDA side uses the numeric indices 17 and 8.
 
 ### Aggression/Confidence are ENUMS in TES5, not 0-100 (2026-07-28)
 

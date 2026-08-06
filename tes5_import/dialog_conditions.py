@@ -140,6 +140,120 @@ _FUNC_DROP = frozenset({
 _RACE_PARAM_FUNCS = frozenset({69, 130})
 
 
+# --- Actor Value parameters --------------------------------------------------
+# ptActorValue params are RAW INDICES into each game's actor-value table, and
+# the two tables share not one entry: TES4 index 0 is Strength, TES5 index 0 is
+# Aggression; TES4 5 is Endurance, TES5 5 is Assistance. Passing the index
+# through unchanged therefore reads a completely unrelated value.
+#
+# That silently broke every guild in Morroblivion. Joining the Fighters Guild
+# is gated on `GetActorValue Strength >= 30 AND GetActorValue Endurance >= 30`;
+# converted verbatim it became `Aggression >= 30 AND Assistance >= 30`, and
+# those are 0-3 enums that can never reach 30 at any level — so the recruiter
+# always fell through to "You don't meet our requirements." The Thieves Guild
+# (Agility/Personality -> Morality/One-Handed) failed the same way, as did
+# ~600 conditions across the exports.
+#
+# SKYRIM HAS NO ATTRIBUTES. Strength, Intelligence, Willpower, Agility, Speed,
+# Endurance, Personality and Luck simply do not exist as actor values, and no
+# TES5 actor value is a faithful stand-in — every candidate (SpeedMult,
+# HealRate, UnarmedDamage, ...) is on a different scale, so a 0-100 attribute
+# threshold compared against one is arbitrary. An attribute gate is therefore
+# DROPPED, which fails OPEN: the check becomes a no-op and the content behind
+# it stays reachable. That is the faithful outcome here — Oblivion's attribute
+# gates exist to keep an under-developed character out, and a Skyrim character
+# has no way to satisfy them, so enforcing them would lock the content away
+# permanently rather than merely early.
+#
+# Skills DO survive, under different names and indices, so a skill gate is
+# remapped and keeps its threshold (both games score skills 0-100).
+# Derived/status values that exist in both games are remapped too.
+_TES4_AV_ATTRIBUTES = frozenset({
+    0,   # Strength
+    1,   # Intelligence
+    2,   # Willpower
+    3,   # Agility
+    4,   # Speed
+    5,   # Endurance
+    6,   # Personality
+    7,   # Luck
+})
+
+# TES4 actor-value index -> TES5 actor-value index.
+# Skills follow tes5_import.skyrim_overrides.TES4_SKILL_TO_TES5_INDEX with two
+# deliberate differences, because that table exists for BOOK skill teaching
+# (which must name a real trainable skill) while a CONDITION only has to read a
+# comparable number:
+#   * Mercantile -> Speech (17), not Pickpocket. Mercantile is Oblivion's
+#     haggling skill; Speech is Skyrim's. Pickpocket is only in the BOOK table
+#     because Skyrim already ships a Speech skill book for that slot.
+#   * Athletics/Acrobatics -> Stamina (26). They have no Skyrim skill at all;
+#     Stamina is the athletic-capacity value the engine actually tracks.
+_TES4_AV_TO_TES5 = {
+    # --- derived / status values present in both games ---
+    8:  24,   # Health          -> Health
+    9:  25,   # Magicka         -> Magicka
+    10: 26,   # Fatigue         -> Stamina
+    11: 32,   # Encumbrance     -> CarryWeight
+    # --- skills ---
+    12: 10,   # Armorer         -> Smithing
+    13: 26,   # Athletics       -> Stamina        (no Skyrim skill)
+    14: 6,    # Blade           -> OneHanded
+    15: 9,    # Block           -> Block
+    16: 6,    # Blunt           -> OneHanded
+    17: 6,    # HandToHand      -> OneHanded
+    18: 11,   # HeavyArmor      -> HeavyArmor
+    19: 16,   # Alchemy         -> Alchemy
+    20: 18,   # Alteration      -> Alteration
+    21: 19,   # Conjuration     -> Conjuration
+    22: 20,   # Destruction     -> Destruction
+    23: 21,   # Illusion        -> Illusion
+    24: 21,   # Mysticism       -> Illusion       (Mysticism was folded in)
+    25: 22,   # Restoration     -> Restoration
+    26: 26,   # Acrobatics      -> Stamina        (no Skyrim skill)
+    27: 12,   # LightArmor      -> LightArmor
+    28: 8,    # Marksman        -> Archery
+    29: 17,   # Mercantile      -> Speech
+    30: 14,   # Security        -> Lockpicking
+    31: 15,   # Sneak           -> Sneak
+    32: 17,   # Speechcraft     -> Speech
+    # --- AI / crime values present in both games ---
+    33: 0,    # Aggression      -> Aggression
+    34: 1,    # Confidence      -> Confidence
+    35: 2,    # Energy          -> Energy
+    36: 3,    # Responsibility  -> Morality
+    38: 60,   # Fame            -> Fame
+    39: 61,   # Infamy          -> Infamy
+    # --- magic effect values present in both games ---
+    41: 55,   # NightEyeBonus   -> NightEye
+    45: 84,   # Blindness       -> Blindness
+    46: 54,   # Chameleon       -> Invisibility   (nearest: partial concealment)
+    47: 54,   # Invisibility    -> Invisibility
+    52: 83,   # SpellAbsorbChance -> AbsorbChance
+    48: 53,   # Paralysis       -> Paralysis
+    55: 57,   # WaterBreathing  -> WaterBreathing
+    56: 58,   # WaterWalking    -> WaterWalking
+    58: 56,   # DetectLifeRange -> DetectLifeRange
+    61: 41,   # ResistFire      -> ResistFire
+    62: 43,   # ResistFrost     -> ResistFrost
+    63: 45,   # ResistDisease   -> ResistDisease
+    64: 44,   # ResistMagic     -> ResistMagic
+    65: 39,   # ResistNormalWeapons -> DamageResist
+    67: 40,   # ResistPoison    -> PoisonResist
+    68: 42,   # ResistShock     -> ResistShock
+}
+
+# Condition functions whose param1 is a ptActorValue in BOTH games. Every one
+# needs the index translated (or the whole condition dropped when it names an
+# attribute). Sourced from xEdit's wbConditionFunctions tables; TES4-only
+# entries (2571 GetBaseAV3, 2577 IsMajorRef, 1124 IsClassSkill) are already in
+# _FUNC_DROP or have no TES5 counterpart, so they never reach here.
+_AV_PARAM_FUNCS = frozenset({
+    14,    # GetActorValue
+    277,   # GetBaseActorValue
+})
+
+
 def _map_race_param(fid: int) -> 'int | None':
     """The Skyrim race a `GetIsRace` param must name to keep matching.
 
@@ -363,7 +477,18 @@ def convert_ctda(raw: bytes, offset: 'int | None' = None,
     # every NPC. CTDA_FORMID_PARAMS is keyed by the POST-remap (TES5) index
     # because that is the function the output file actually invokes.
     fid_slots = CTDA_FORMID_PARAMS.get(func_idx, frozenset())
-    if func_idx in _RACE_PARAM_FUNCS:
+    if func_idx in _AV_PARAM_FUNCS:
+        # Raw index into each game's actor-value table -- the tables do not
+        # align, so pass-through reads an unrelated value. Attributes have no
+        # Skyrim equivalent at all and are dropped (fails open); skills and
+        # shared derived values are translated. See _TES4_AV_TO_TES5.
+        av = param1 if param1 < 0x80000000 else param1 - 0x100000000
+        if av in _TES4_AV_ATTRIBUTES:
+            return None
+        if av not in _TES4_AV_TO_TES5:
+            return None
+        param1, param2 = _TES4_AV_TO_TES5[av], 0
+    elif func_idx in _RACE_PARAM_FUNCS:
         # RACE records aren't imported: translate the param to the Skyrim
         # race the converted NPCs actually use, or drop the condition.
         param1 = _map_race_param(param1)
