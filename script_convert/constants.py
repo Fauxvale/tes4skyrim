@@ -1262,6 +1262,33 @@ def resolve_property_formid(xref, prop_name: str) -> str:
     # property still binds to the base record.
     if not fid and len(low) > 4 and low.endswith('base'):
         fid = xref.edid_to_formid.get(low[:-4], '')
+    # A Papyrus identifier may not start with a digit, so _safe_property_name
+    # strips any leading digits (`^\d+`).  Morroblivion names almost every
+    # record with a leading `0` (`0bkUa1U1Ucaiuspackage`), so the sanitized
+    # property name never matches the EditorID and the property silently stays
+    # unbound.  An unbound property is None at runtime and the FIRST use throws,
+    # aborting the whole fragment: the Census greeting that hands out the Caius
+    # package ran its unlock/SetStage lines, then died on
+    # `AddItem(bkUa1U1Ucaiuspackage)` — so the player never received the package
+    # and "Report to Caius Cosades" never became reachable.  1,395 property
+    # declarations across 757 records resolve only through this reversal.
+    if not fid and low[:1].isalpha():
+        rev = getattr(xref, '_digit_stripped_edids', None)
+        if rev is None:
+            rev = {}
+            for edid_low, edid_fid in xref.edid_to_formid.items():
+                if edid_low[:1].isdigit():
+                    stripped = edid_low.lstrip('0123456789')
+                    # First writer wins, and only when the stripped spelling is
+                    # unambiguous — two records that collapse to the same name
+                    # would otherwise bind arbitrarily.
+                    if stripped:
+                        rev[stripped] = '' if stripped in rev else edid_fid
+            try:
+                xref._digit_stripped_edids = rev
+            except AttributeError:
+                pass
+        fid = rev.get(low, '')
     return fid
 
 
