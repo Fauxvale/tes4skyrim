@@ -74,6 +74,13 @@ def _new_scan_out() -> dict:
         'global_types': {}, 'global_values': {},
         'pack_type': {}, 'actor_packages': {},
         'record_model': {},
+        # CELL geometry, for GetInCell: {formid: (is_interior, wrld_fid, x, y)}.
+        # An EXTERIOR cell cannot back a Papyrus `Cell` property (see
+        # get_cell_family), so its membership test is made from these instead.
+        'cell_geom': {},
+        # BOOK FormIDs carrying an ENAM: the importer writes these as SCRL, not
+        # BOOK, so a property typed from the source signature would not bind.
+        'enchanted_books': set(),
     }
 
 
@@ -89,6 +96,10 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
     spel_effects: list[tuple[str, int]] = []
     pkdt_type = None
     ai_packages: list[str] = []
+    cell_flags = None
+    cell_wrld = None
+    cell_x = cell_y = None
+    book_enam = None
 
     for line in lines:
         line = line.rstrip()
@@ -121,6 +132,25 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
         elif sig == 'MGEF' and line.startswith('DATA.School='):
             try:
                 mgef_school = int(line[12:])
+            except ValueError:
+                pass
+        elif sig == 'BOOK' and line.startswith('ENAM='):
+            book_enam = line[5:].strip()
+        elif sig == 'CELL' and line.startswith('DATA.Flags='):
+            try:
+                cell_flags = int(line[11:].split()[0], 0)
+            except ValueError:
+                pass
+        elif sig == 'CELL' and line.startswith('ParentWRLD='):
+            cell_wrld = line[11:]
+        elif sig == 'CELL' and line.startswith('XCLC.X='):
+            try:
+                cell_x = int(line[7:])
+            except ValueError:
+                pass
+        elif sig == 'CELL' and line.startswith('XCLC.Y='):
+            try:
+                cell_y = int(line[7:])
             except ValueError:
                 pass
         elif sig == 'PACK' and line.startswith('PKDT.Type='):
@@ -158,6 +188,11 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
             out['script_formid_to_edid'][formid] = edid
         if schr_type is not None:
             out['script_formid_to_type'][formid] = schr_type
+    if sig == 'CELL' and cell_flags is not None:
+        out['cell_geom'][formid] = (bool(cell_flags & 1), cell_wrld or '',
+                                    cell_x, cell_y)
+    if sig == 'BOOK' and book_enam and book_enam.strip('0'):
+        out['enchanted_books'].add(formid)
     if scri:
         out['record_scri'][formid] = scri
     if name_fid and sig in ('ACHR', 'ACRE', 'REFR'):
@@ -239,6 +274,11 @@ class CrossRefGraph:
         # (held-until-scripted trap/breakaway), which the animation-group name
         # cannot tell it — see the playgroup release in converter.py.
         self.record_model: dict[str, str] = {}
+        # CELL FormID -> (is_interior, parent WRLD FormID, grid X, grid Y).
+        # Backs the exterior half of get_cell_family (see there).
+        self.cell_geom: dict[str, tuple] = {}
+        # BOOK records with an ENAM: written as SCRL, so `Book` would not bind.
+        self.enchanted_books: set[str] = set()
         self.record_base: dict[str, str] = {}  # placed ref FormID -> base record FormID (NAME)
         self.quest_edids: set[str] = set()
         self.npc_formids: set[str] = set()
@@ -356,6 +396,8 @@ class CrossRefGraph:
         self.record_base.update(out['record_base'])
         self.record_type.update(out['record_type'])
         self.record_model.update(out['record_model'])
+        self.cell_geom.update(out['cell_geom'])
+        self.enchanted_books.update(out['enchanted_books'])
         self.quest_edids.update(out['quest_edids'])
         self.npc_formids.update(out['npc_formids'])
         self.mgef_shaders.update(out['mgef_shaders'])
@@ -516,6 +558,54 @@ class CrossRefGraph:
         out = [e for e in out if e]
         out.sort(key=lambda e: (e.lower() != low, e.lower()))
         return out
+
+    def split_cell_family(self, cell_name: str) -> tuple:
+        """get_cell_family split into (interior EditorIDs, exterior grid keys).
+
+        A Papyrus `Cell` property only ever binds to an INTERIOR cell. Every
+        vanilla Skyrim script bears this out -- all 43 of its Cell properties
+        name interiors (HelgenKeep, Jorrvaskr, MarkarthAbandonedHouse, ...) and
+        not one names an exterior. Declaring a property for an exterior grid
+        cell produces, at runtime,
+
+            Property <X> ... cannot be bound because (<fid>) is not the right
+            type
+
+        and the property reads None thereafter. That was 773 of the binding
+        failures in one session, all of them exterior cells, while the
+        interiors of the very same families bound fine (MS08BoatScript: 44
+        interior OK, 41 exterior failed, no exceptions).
+
+        Exteriors are still part of the TES4 prefix match, so dropping them
+        would quietly narrow the test. They are returned as
+        (worldspace EditorID, x, y) grid keys instead, which the emitted helper
+        compares against the ref's own worldspace and grid position -- an exact
+        equivalent that needs no property binding.
+        """
+        interior, exterior = [], []
+        for edid in self.get_cell_family(cell_name):
+            fid = self.edid_to_formid.get(edid.lower(), '')
+            geom = self.cell_geom.get(fid)
+            if geom is None:
+                # No geometry recorded: treat as interior, which is the
+                # behaviour before this split and still binds when correct.
+                interior.append(edid)
+                continue
+            is_int, wrld_fid, x, y = geom
+            if is_int:
+                interior.append(edid)
+                continue
+            wrld_edid = self.formid_to_edid.get(wrld_fid, '')
+            if x is None or y is None:
+                # An exterior with no XCLC is the worldspace's own persistent
+                # "dummy cell". It holds no grid square, so the faithful test is
+                # membership of the WORLDSPACE itself -- and it still cannot
+                # back a Cell property, so it must not fall through to one.
+                if wrld_edid:
+                    exterior.append((wrld_edid, None, None))
+                continue
+            exterior.append((wrld_edid, x, y))
+        return interior, exterior
 
     def get_script_owner_packages_of_type(self, script_edid: str,
                                           pkg_type: int) -> list:

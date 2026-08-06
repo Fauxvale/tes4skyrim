@@ -1709,11 +1709,13 @@ class ScriptConverter:
         if not self._cell_families:
             return []
         lines = ['']
-        for key, cells in sorted(self._cell_families.values(),
-                                 key=lambda kv: kv[0].lower()):
+        for entry in sorted(self._cell_families.values(),
+                            key=lambda kv: kv[0].lower()):
+            key, cells = entry[0], entry[1]
+            exterior = entry[2] if len(entry) > 2 else []
             lines.append(
-                f'; TES4 `GetInCell {key}` matched {len(cells)} cells by '
-                f'EditorID prefix.')
+                f'; TES4 `GetInCell {key}` matched {len(cells)} interior and '
+                f'{len(exterior)} exterior cells by EditorID prefix.')
             lines.append(
                 f'Bool Function TES4_IsIn{key}(ObjectReference akRef)')
             # `parent` is taken in this scope (the CK compiler rejects it with
@@ -1725,6 +1727,37 @@ class ScriptConverter:
                 lines.append(f'  If TES4_parentCell == {c}')
                 lines.append('    Return true')
                 lines.append('  EndIf')
+            if exterior:
+                # An exterior cell cannot be a bound Cell property, so match it
+                # by the position that identifies it: same worldspace, same
+                # 4096-unit grid square. GetPositionX/Y are world units;
+                # floor-divide to the cell grid the same way the engine does.
+                lines.append('  WorldSpace TES4_ws = akRef.GetWorldSpace()')
+                lines.append('  Float TES4_fx = akRef.GetPositionX() / 4096.0')
+                lines.append('  Float TES4_fy = akRef.GetPositionY() / 4096.0')
+                lines.append('  Int TES4_gx = TES4_fx as Int')
+                lines.append('  Int TES4_gy = TES4_fy as Int')
+                # `as Int` truncates toward zero; the grid floors. Correct only
+                # when truncation actually rounded UP, i.e. the value was
+                # negative and not already exact (-4096.0 is cell -1, not -2).
+                lines.append('  If TES4_fx < 0.0 && TES4_fx != (TES4_gx as Float)')
+                lines.append('    TES4_gx = TES4_gx - 1')
+                lines.append('  EndIf')
+                lines.append('  If TES4_fy < 0.0 && TES4_fy != (TES4_gy as Float)')
+                lines.append('    TES4_gy = TES4_gy - 1')
+                lines.append('  EndIf')
+                for wrld, x, y in exterior:
+                    if not wrld:
+                        continue
+                    if x is None or y is None:
+                        # Worldspace dummy cell: anywhere in the worldspace.
+                        lines.append(f'  If TES4_ws == {wrld}')
+                    else:
+                        lines.append(
+                            f'  If TES4_ws == {wrld} && TES4_gx == {x} '
+                            f'&& TES4_gy == {y}')
+                    lines.append('    Return true')
+                    lines.append('  EndIf')
             lines.append('  Return false')
             lines.append('EndFunction')
             lines.append('')
@@ -2202,17 +2235,63 @@ class ScriptConverter:
         """
         return dict(self._property_refs)
 
-    def _register_cell_family(self, name: str, cells: list) -> str:
+    def _mark_topic_property(self, name: str) -> None:
+        """Type `name` as a Topic, but only if it really names a DIAL.
+
+        Say/SayTo/StartConversation take a topic, and TES4 EditorIDs are not
+        unique across record types: Morroblivion has CELLs named DagothSUr and
+        KoalSCave with no DIAL of that name at all. Typing those `Topic`
+        produced a property the VM refuses to bind ("is not the right type"),
+        which reads None. Leave the name untyped instead -- the AddTopic unlock
+        global is what actually drives the topic.
+        """
+        key = (name or '').strip()
+        if not key:
+            return
+        if self.xref:
+            fid = self.xref.edid_to_formid.get(key.lower(), '')
+            rtype = self.xref.record_type.get(fid, '') if fid else ''
+            if rtype and rtype != 'DIAL':
+                return
+        self._property_refs[key] = 'Topic'
+
+    def _papyrus_type_for(self, fid: str, rtype: str) -> str:
+        """Papyrus property type for a record, as the IMPORTER writes it.
+
+        `_record_type_to_papyrus` maps the TES4 signature, which is right until
+        the importer changes the signature on the way out. A BOOK carrying an
+        ENAM becomes a SCRL (see project_enchanted_book_is_a_scroll), so a
+        `Book` property naming one cannot bind and reads None in-game.
+        """
+        ptype = _record_type_to_papyrus(rtype)
+        if (ptype == 'Book' and self.xref
+                and fid in getattr(self.xref, 'enchanted_books', ())):
+            return 'Scroll'
+        return ptype
+
+    def _register_cell_family(self, name: str, cells: list,
+                              exterior: list = None) -> str:
         """Record a GetInCell prefix family and return its helper's name.
 
         See the GetInCell handler in _emit_function for why a family exists at
         all.  Helpers are keyed case-insensitively so `Chorrol` and `chorrol`
         (both appear in vanilla scripts) share one function.
+
+        `cells` are INTERIOR EditorIDs (compared as Cell properties);
+        `exterior` are (worldspace EditorID, x, y) grid keys.
         """
         key = _safe_property_name(name)
         existing = self._cell_families.get(key.lower())
         if existing is None:
-            self._cell_families[key.lower()] = (key, list(cells))
+            self._cell_families[key.lower()] = (key, list(cells),
+                                                list(exterior or []))
+            # Register the worldspace properties HERE, not when the helper body
+            # is emitted: get_cell_family_helpers() runs after the property
+            # declarations have already been written, so a ref added there
+            # never gets declared and the helper cites an undefined identifier.
+            for wrld, _x, _y in (exterior or []):
+                if wrld:
+                    self._property_refs[wrld] = 'WorldSpace'
         else:
             key = existing[0]
         return f'TES4_IsIn{key}'
@@ -3417,7 +3496,7 @@ class ScriptConverter:
             fid = self.xref.edid_to_formid.get(_inner_low, '')
             if fid:
                 rtype = self.xref.record_type.get(fid, '')
-                ptype = _record_type_to_papyrus(rtype)
+                ptype = self._papyrus_type_for(fid, rtype)
                 script_type = self.xref.get_record_script_type(inner_name)
                 if script_type and script_type_may_override(ptype):
                     ptype = script_type
@@ -4071,7 +4150,7 @@ class ScriptConverter:
             fid = self.xref.edid_to_formid.get(bare_low, '')
             if fid:
                 rtype = self.xref.record_type.get(fid, '')
-                ptype = _record_type_to_papyrus(rtype)
+                ptype = self._papyrus_type_for(fid, rtype)
                 # Prefer attached script type for cross-script property access
                 # -- but never on a base-object type, where it cannot bind.
                 script_type = self.xref.get_record_script_type(expr)
@@ -4227,7 +4306,7 @@ class ScriptConverter:
             # Use canonical EditorID (original case) as key to match _add_scro_ref
             canon_edid = self.xref.formid_to_edid.get(fid, name)
             rtype = self.xref.record_type.get(fid, '')
-            ptype = _record_type_to_papyrus(rtype)
+            ptype = self._papyrus_type_for(fid, rtype)
             # Prefer attached script type over generic Actor/ObjectReference
             # so cross-script property access works (e.g., NPCRef.rent).
             # Base-object types (Armor/Weapon/Potion/...) are excluded: the VM
@@ -5578,7 +5657,7 @@ class ScriptConverter:
             if len(pparts) >= 2 and pparts[1].strip():
                 topic_str = pparts[1].strip().split()[0]
                 topic = self._convert_expression(topic_str, extends)
-                self._property_refs[topic_str] = 'Topic'
+                self._mark_topic_property(topic_str)
                 return f'{ref}.Say({topic})'
             # No topic.  Per UESP's function table the Topic argument is
             # explicitly "(Optional)", and omitting it makes the engine open the
@@ -6045,11 +6124,11 @@ class ScriptConverter:
                 # If topic part has a trailing number (force flag), strip it
                 topic_str = pparts[1].strip().split()[0] if pparts[1].strip() else 'None'
                 topic = self._convert_expression(topic_str, extends)
-                self._property_refs[topic_str] = 'Topic'
+                self._mark_topic_property(topic_str)
             else:
                 topic = self._convert_expression(pparts[0], extends) if pparts else 'None'
                 if pparts:
-                    self._property_refs[pparts[0].strip()] = 'Topic'
+                    self._mark_topic_property(pparts[0].strip())
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
             return f'{ref}.Say({topic})'
 
@@ -6562,19 +6641,23 @@ class ScriptConverter:
         if fname_low == 'getincell':
             arg = args_str.strip().strip('"') if args_str else 'None'
             ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
-            family = self.xref.get_cell_family(arg) if self.xref else []
+            # A `Cell` property binds only to an INTERIOR cell, so the family is
+            # split: interiors keep the property comparison, exteriors are
+            # matched by worldspace + grid coordinates instead.  See
+            # CrossRefGraph.split_cell_family.
+            interior, exterior = ((self.xref.split_cell_family(arg))
+                                  if self.xref else ([], []))
             # Fall back to the literal name when the index knows nothing.
-            if not family:
-                family = [arg]
-            for cell in family:
+            if not interior and not exterior:
+                interior = [arg]
+            for cell in interior:
                 self._property_refs[cell] = 'Cell'
-            if len(family) == 1:
-                return f'{ref}.GetParentCell() == {family[0]}'
+            if len(interior) == 1 and not exterior:
+                return f'{ref}.GetParentCell() == {interior[0]}'
             # Families run to hundreds of cells ("IC" covers 431), far too many
             # to inline at every call site, so emit one helper per family and
-            # call it.  The helper compares against a Cell[] built once, which
-            # also evaluates GetParentCell() a single time.
-            helper = self._register_cell_family(arg, family)
+            # call it.  The helper evaluates GetParentCell() a single time.
+            helper = self._register_cell_family(arg, interior, exterior)
             return f'{helper}({ref})'
 
         # GetInSameCell: ref.GetInSameCell otherRef -> ref.GetParentCell() == otherRef.GetParentCell()

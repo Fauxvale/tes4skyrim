@@ -2620,3 +2620,60 @@ class TestBaseItemPropertiesKeepTheirRecordType:
         src = "scn T\nbegin onActivate\n  player.removeitem fbmwRing 1\nend\n"
         out = conv.convert_standalone('T', src, 'ObjectReference', 'T')
         assert 'TES4_mwCWUItemScript Property fbmwRing' in out
+
+
+class TestGetInCellSplitsInteriorFromExterior:
+    """`GetInCell` must not declare a Cell property for an EXTERIOR cell.
+
+    A Papyrus `Cell` property binds only to an interior -- every one of the 43
+    Cell properties in vanilla Skyrim's own scripts names an interior, and none
+    names an exterior. Declaring one for an exterior grid cell produced, at
+    runtime, "cannot be bound because (...) is not the right type", and the
+    property then read None. Measured in one session: 773 such failures, and in
+    MS08BoatScript the split was exact -- 44 interior bound, 41 exterior failed.
+
+    Exteriors are still part of the TES4 prefix match, so they must not simply
+    be dropped: they are matched by worldspace + grid coordinates instead.
+    """
+
+    @staticmethod
+    def _xref():
+        x = CrossRefGraph()
+        # One interior and one exterior in the same prefix family.
+        for fid, edid, sig in (('01000001', 'BravilCastleBarracks', 'CELL'),
+                               ('01000002', 'BravilBeach01', 'CELL'),
+                               ('0100003C', 'Tamriel', 'WRLD')):
+            x.formid_to_edid[fid] = edid
+            x.edid_to_formid[edid.lower()] = fid
+            x.record_type[fid] = sig
+        x.cell_geom['01000001'] = (True, '', None, None)
+        x.cell_geom['01000002'] = (False, '0100003C', 17, -12)
+        return x
+
+    def test_split_separates_the_two(self):
+        interior, exterior = self._xref().split_cell_family('Bravil')
+        assert interior == ['BravilCastleBarracks']
+        assert exterior == [('Tamriel', 17, -12)]
+
+    def test_exterior_gets_no_cell_property(self):
+        conv = ScriptConverter(self._xref())
+        src = ("scn T\nbegin GameMode\n"
+               "  if player.GetInCell Bravil == 1\n"
+               "    set x to 1\n  endif\nend\n")
+        out = conv.convert_standalone('T', src, 'Quest', 'T')
+        out += '\n'.join(conv.get_cell_family_helpers())
+        assert 'Cell Property BravilCastleBarracks' in out
+        assert 'Cell Property BravilBeach01' not in out
+
+    def test_exterior_is_matched_by_grid_instead(self):
+        conv = ScriptConverter(self._xref())
+        src = ("scn T\nbegin GameMode\n"
+               "  if player.GetInCell Bravil == 1\n"
+               "    set x to 1\n  endif\nend\n")
+        out = conv.convert_standalone('T', src, 'Quest', 'T')
+        helpers = '\n'.join(conv.get_cell_family_helpers())
+        # The worldspace must be a declared property, not just cited: the
+        # helpers are emitted AFTER the declarations, so registering the ref
+        # while emitting them would leave an undefined identifier.
+        assert 'WorldSpace Property Tamriel' in out
+        assert 'TES4_gx == 17' in helpers and 'TES4_gy == -12' in helpers

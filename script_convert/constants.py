@@ -1174,6 +1174,12 @@ _RECORD_TYPE_PAPYRUS = {
     # with "cannot be bound because (...) is not the right type" and read None,
     # so `player.removeitem <ring>` silently did nothing.
     'CLOT': 'Armor', 'APPA': 'MiscObject', 'SLGM': 'SoulGem',
+    # LVLC is Oblivion's leveled CREATURE list; the importer writes it as a
+    # Skyrim LVLN (measured: 682 in Oblivion.esm). SGST (sigil stone) becomes a
+    # SCRL (150). Both are base objects, so leaving them on the
+    # 'ObjectReference' default made their properties fail to bind
+    # (SE12GnarlSpawnerNewSCRIPT's PlaceAtMe spawners among them).
+    'LVLC': 'LeveledActor', 'SGST': 'Scroll',
     'ACTI': 'Activator', 'DOOR': 'ObjectReference',
     'CONT': 'ObjectReference', 'STAT': 'ObjectReference',
     'FURN': 'ObjectReference', 'FLOR': 'ObjectReference',

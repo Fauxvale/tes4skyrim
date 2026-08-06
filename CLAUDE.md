@@ -146,7 +146,22 @@ theories externally first.
 - **NEVER `git stash` / `git stash pop`** in this repository.
 - **NEVER `git commit` or `git push`.** The user commits after in-game testing.
 - **NEVER `git add` / `git rm`** (staging, including staged deletions). Use plain
-  `rm`. `git reset` destroys the user's own staging. The ONLY exception is an EXPLICIT instruction from the user. Even in this case, never use -A. Only stage files you worked on or files the user asked you to stage.
+  `rm`. `git reset` destroys the user's own staging.
+
+  <a id="staging-is-single-use"></a>**Authorization to stage is SINGLE-USE and
+  CHUNK-SCOPED.** An explicit "go ahead and stage" covers **that one staging
+  action and nothing after it**. It does not carry to your next edit, the next
+  turn, or the end of the session — the next time you want to stage, you need a
+  new explicit instruction. Specifically:
+  - **Stage HUNKS, never whole files.** Stage only the chunks you just wrote.
+    A file you edited almost always contains the user's own uncommitted work
+    too, and `git add <file>` silently swallows it into your commit's scope.
+    Use `git apply --cached` with a patch limited to your hunks.
+  - **NEVER `git add -A` / `-u` / `.`** — no exceptions, ever.
+  - **Never re-stage "to be helpful"** after a later edit. Staging you were not
+    asked for a second time is a violation even if the first one was authorized.
+  - If you are unsure whether the authorization still applies, it does not.
+    Leave the index alone and say so in your final report.
 - **NEVER go snooping in the live, heavily-modded SSE install.** It is full of
   other mods' assets, so nothing you find there tells you anything about this
   converter. In particular: **never inspect it to check whether your changes were
