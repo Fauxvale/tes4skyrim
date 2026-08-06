@@ -29,6 +29,7 @@ from script_convert.pipeline import build_vmad_object_script
 from .text_reader import (parse_export_file, get_formid_index_offset,
                           remap_formid, unescape_value)
 from .constants import ENGINE_GLOBAL_FORMIDS
+from .skyrim_overrides import TES4_ITEM_FORMID_TO_SKYRIM
 
 # Papyrus property types that are literal-valued (not bound to a FormID).
 _VALUE_TYPES = {'Int', 'Float', 'Bool'}
@@ -601,5 +602,10 @@ def _resolve_props(sctx: str, edid: str, extends: str, xref,
             continue
         if raw == 0:
             continue
-        obj_props[safe] = _remap(raw, offset)
+        # Engine-hardcoded base objects (Gold001) must bind to SKYRIM's record,
+        # not our remapped copy — a scripted `player.AddItem Gold001 200` quest
+        # reward otherwise hands out inert Oblivion gold that cannot be spent.
+        # get_formid() applies this for export-driven references; a script
+        # PROPERTY resolves through xref instead, so it needs it here too.
+        obj_props[safe] = TES4_ITEM_FORMID_TO_SKYRIM.get(raw) or _remap(raw, offset)
     return obj_props

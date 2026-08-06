@@ -1266,7 +1266,12 @@ def _build_info_script_properties(result_script: str, xref,
             continue
         if raw_fid == 0:
             continue
-        props[prop_edid] = remap_formid(raw_fid, offset)
+        # Engine-hardcoded base objects (Gold001) bind to SKYRIM's record, not
+        # our remapped copy: a quest-reward `player.AddItem Gold001 200` in a
+        # QF_/TIF_ fragment otherwise pays out inert Oblivion gold.
+        from .skyrim_overrides import TES4_ITEM_FORMID_TO_SKYRIM
+        props[prop_edid] = (TES4_ITEM_FORMID_TO_SKYRIM.get(raw_fid)
+                            or remap_formid(raw_fid, offset))
     return props
 
 
