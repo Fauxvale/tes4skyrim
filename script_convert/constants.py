@@ -965,6 +965,18 @@ _OBSE_NO_EQUIV_COMMANDS = {
     'getmodlocaldata', 'setaltcontrol',
     'fileexists', 'getgodmode', 'getplayerbirthsign',
     'getdisplayname', 'getname',
+    # AddActorValues (OBSE plugin) — the float-typed AV-modifier accessors that
+    # sit alongside the already-listed setavmod/modavmod.  Skyrim has no such
+    # plugin, and every TES4 caller already guards the block with
+    # `IsPluginInstalled "AddActorValues" == 0 / return`, so the block is dead
+    # by construction.
+    #
+    # Left unrouted they survived as undefined identifiers and failed the
+    # CHECKER, so NO .pex was emitted for the owning script at all.  That is
+    # what kept mwMorroDefaultQuestScript from running, and with it the
+    # PlayerInMorrowind global its GameMode block maintains -- the global that
+    # gates Fargoth's unique greeting and his "ring" topic.
+    'getavmodf', 'setavmodf',
 }
 
 _BARE_NO_EQUIV_COMMANDS = {

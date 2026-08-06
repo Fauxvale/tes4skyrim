@@ -1227,6 +1227,54 @@ class TestOriginGate:
         assert not needs_origin_gate(rec)
 
 
+class TestPluginAuthoredRaceConditionsSurvive:
+    """A GetIsRace naming a race the PLUGIN adds must not be dropped.
+
+    TES4_RACE_FID_TO_EDID holds only the 15 vanilla Oblivion races, so
+    Morroblivion's mwBMRieklingRace resolved to None and the whole condition
+    was deleted.  A deleted condition fails OPEN: mwGenericRieklingGreeting's
+    three greetings carry no INFO conditions of their own, so with the
+    quest-level race gate gone they matched every actor in the plugin, and that
+    quest's priority (47) outranks fbmwMSGreetings (44).  Fargoth, a Wood Elf,
+    greeted the player with "What is it, human?" and so never played the
+    greeting whose fragment unlocks his "ring" topic.
+
+    The param must resolve exactly as _resolve_npc_race does, fallback
+    included, because that is the race the actors were actually converted to.
+    """
+
+    @staticmethod
+    def _race_ctda(race_fid: int) -> str:
+        import struct
+        return (bytes(4)
+                + struct.pack('<f', 1.0)
+                + struct.pack('<I', 69)          # GetIsRace
+                + struct.pack('<I', race_fid)
+                + bytes(8)).hex()
+
+    def _params(self, race_fid: int) -> list:
+        import struct
+        from tes5_import.dialog_conditions import convert_ctda_list_with_strings
+        rec = {'FormID': '010628F9', 'ConditionCount': '1',
+               'Condition[0].Raw': self._race_ctda(race_fid)}
+        out = convert_ctda_list_with_strings(rec, {}, 0x01000000)
+        return [struct.unpack_from('<I', c, 12)[0] for c, _s in out]
+
+    def test_plugin_authored_race_is_kept_not_dropped(self):
+        """mwBMRieklingRace -> the same DEFAULT_RACE its NPCs converted to."""
+        from tes5_import.constants import DEFAULT_RACE
+        assert self._params(0x01A804D3) == [DEFAULT_RACE]
+
+    def test_vanilla_race_keeps_its_own_skyrim_race(self):
+        """WoodElf must NOT collapse onto the fallback -- that separation is
+        what keeps the Riekling gate off Fargoth."""
+        from tes5_import.constants import DEFAULT_RACE
+        from tes5_import.skyrim_overrides import RACE_MAP
+        got = self._params(0x000223C8)           # WoodElf
+        assert got == [RACE_MAP['WoodElf']]
+        assert got != [DEFAULT_RACE]
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])
 

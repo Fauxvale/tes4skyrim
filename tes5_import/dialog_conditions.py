@@ -141,11 +141,32 @@ _RACE_PARAM_FUNCS = frozenset({69, 130})
 
 
 def _map_race_param(fid: int) -> 'int | None':
+    """The Skyrim race a `GetIsRace` param must name to keep matching.
+
+    This MUST resolve exactly as `_resolve_npc_race` does, including its
+    fallback: an actor whose RACE is plugin-authored (Morroblivion adds
+    mwBMRieklingRace, and TES4_RACE_FID_TO_EDID holds only the 15 vanilla
+    Oblivion races) is converted with DEFAULT_RACE, so a condition naming that
+    race must name DEFAULT_RACE too or it can never match the actors it was
+    written for.
+
+    Returning None here instead DROPPED the condition, and a dropped condition
+    does not fail closed -- it fails OPEN.  mwGenericRieklingGreeting's three
+    greetings ("What is it, human?", "What?", "Speak!") carry no INFO
+    conditions of their own; the quest-level `GetIsRace(mwBMRieklingRace)` was
+    the only thing keeping them on Rieklings.  With it deleted they became
+    unconditioned greetings in a priority-47 quest, which outranks
+    fbmwMSGreetings (44) -- so they won the greeting for EVERY actor in the
+    plugin, including Fargoth, a Wood Elf.  That also cost him his "ring"
+    topic: the topic is unlocked only by his own greeting's fragment, which
+    never got to play.
+    """
+    from .constants import DEFAULT_RACE
     from .skyrim_overrides import RACE_MAP, TES4_RACE_FID_TO_EDID
     edid = TES4_RACE_FID_TO_EDID.get(fid & 0x00FFFFFF)
     if edid is None:
-        return None
-    return RACE_MAP.get(edid)
+        return DEFAULT_RACE
+    return RACE_MAP.get(edid, DEFAULT_RACE)
 
 
 def _remap_formid(fid: int, offset: int) -> int:
