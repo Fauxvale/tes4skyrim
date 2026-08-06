@@ -316,15 +316,31 @@ def remap_formid(fid: int, offset: int = None) -> int:
     return fid
 
 
+# Base objects the ENGINE resolves by a fixed id, so a REFERENCE to one must
+# land on Skyrim.esm's copy rather than our remapped Oblivion copy.
+# TES4_ITEM_FORMID_TO_SKYRIM (skyrim_overrides) is the single definition; it
+# imports nothing from here, so this direction is safe.
+#
+# Applied to REFERENCES only. `key == 'FormID'` is the record's OWN id and is
+# left alone, so Oblivion's Gold001 still gets written at 0x0100000F (inert,
+# simply never pointed at) instead of colliding with Skyrim's at 0x0F.
+from .skyrim_overrides import TES4_ITEM_FORMID_TO_SKYRIM as _ITEM_SUBSTITUTIONS
+
+
 def get_formid(record: dict, key: str, default: int = 0) -> int:
     """Get a FormID (hex string) as an integer, applying load order remapping."""
     val = record.get(key)
     if val is None:
         return default
     try:
-        return remap_formid(int(val, 16))
+        raw = int(val, 16)
     except (ValueError, TypeError):
         return default
+    if key != 'FormID':
+        sub = _ITEM_SUBSTITUTIONS.get(raw)
+        if sub is not None:
+            return sub
+    return remap_formid(raw)
 
 
 # Module-level FormID remapping: when converting TES4→TES5, the file's load

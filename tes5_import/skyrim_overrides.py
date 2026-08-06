@@ -1085,6 +1085,30 @@ TES4_MARKER_FORMID_TO_SKYRIM = {
 }
 
 # ---------------------------------------------------------------------------
+# Engine-hardcoded ITEM substitutions: raw TES4 FormID -> Skyrim.esm FormID.
+#
+# Same idea as the marker table, but for base objects the ENGINE looks up by a
+# fixed id rather than ones whose Oblivion asset is missing.
+#
+# Gold001 sits at 0x0000000F in BOTH masters (verified in the
+# references/Skyrim.esm dump: MISC / EditorID=Gold001). Remapped normally it
+# becomes 0x0100000F — a perfectly valid converted MISC also called "Gold",
+# which is why nothing errors. But Skyrim hardcodes 0x0F as CURRENCY: barter,
+# Actor.GetGoldAmount(), and every vendor transaction resolve that id. The
+# converted copy is therefore inert money — it stacks in the inventory as a
+# junk item that cannot be spent, and ~1,150 loot/vendor entries across the two
+# plugins handed it out.
+#
+# Substituted at REFERENCE sites only (inventories, leveled lists, script
+# refs). Oblivion's own Gold001 record keeps being written at 0x0100000F,
+# exactly as the marker bases do — it is simply never pointed at. Adding 0x0F
+# to _ENGINE_FIXED_FORMIDS instead would try to write that record AT 0x0F and
+# collide with Skyrim's.
+TES4_ITEM_FORMID_TO_SKYRIM = {
+    0x0000000F: 0x0000000F,  # Gold001 → Skyrim.esm Gold001 (currency)
+}
+
+# ---------------------------------------------------------------------------
 # Weapon equipment type (EQUP) FormIDs — Skyrim.esm
 # ETYP subrecord on WEAP records must reference one of these.
 # ---------------------------------------------------------------------------
