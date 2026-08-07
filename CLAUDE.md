@@ -395,7 +395,7 @@ relevant doc when working in that area.
 | [dialogue_conversion_notes.md](docs/dialogue_conversion_notes.md) | DIAL/INFO/QUST/DLBR/DLVW implementation, voice type routing, AddTopic unlocks, GetIsID injection |
 | [dialogue_engine_contracts.md](docs/dialogue_engine_contracts.md) | Verified engine rules for dialogue routing |
 | [dialogue_transfer_gaps.md](docs/dialogue_transfer_gaps.md) | Measured gaps: what Oblivion dialogue does NOT survive conversion, with counts from both emulators |
-| [ambient_dialogue_channel_plan.md](docs/ambient_dialogue_channel_plan.md) | Oblivion's 3 delivery channels vs Skyrim's 2; constant quipping, NPC-to-NPC topics in the player menu |
+| [ambient_dialogue_channel_plan.md](docs/ambient_dialogue_channel_plan.md) | Oblivion's 3 delivery channels vs Skyrim's 2; constant quipping, NPC-to-NPC topics in the player menu; **the NPC-to-NPC conversation scheduler Skyrim lacks** and the driver quest that replays quest-advancing chains |
 | [QUEST_AUDIT.md](docs/QUEST_AUDIT.md) | Quest completability audit via the walkthrough emulator (2026-07-17, all 390 QUSTs) |
 | [creature_conversion.md](docs/creature_conversion.md) | CREA→actor: behavior graphs, HKX skeleton/animation/ragdoll, creature records |
 | [horse_rideability_plan.md](docs/horse_rideability_plan.md) | Rideable horses: RACE Mount Data, horse/rider graph pair, rider-animation sourcing |

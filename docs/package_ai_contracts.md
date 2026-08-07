@@ -167,6 +167,55 @@ binds it afterwards (54 packages). Only 120/7,209 packages are quest-OWNED, so
 the quest is taken from the package's own conditions
 (`GetStage`/`GetQuestVariable` param1) when there is no owner.
 
+### A force greet must be able to RETIRE
+
+**Once Per Day (0x400) is a force greet's only retire mechanism when the
+greeting advances no stage — so it is RESTORED on force greets even though
+`convert_flags` strips it everywhere else.**
+
+The general strip is correct and must stay: on a quest-gated package the
+`GetStage` condition already scopes when it may run, and the daily latch
+actively breaks it (a persistent actor loaded since game start counts as having
+used the package today). That is the Renault `CGRenoteOpenSecretDoor`
+regression — see the comment in `convert_flags`.
+
+A force greet is the exception, because its condition is often unbounded. The
+CharacterGen stage-56 stall:
+
+- `CGBaurusGreetPlayer` (TES4 Find → player, flags 5124 = Must Complete + Once
+  Per Day) hands the player a torch. Its ONLY condition is
+  `GetStage(CharacterGen) >= 50` — nothing ever falsifies it.
+- With the latch stripped it re-qualified forever, so **Baurus greeted, ended
+  dialogue, immediately re-greeted**, and never advanced to
+  `CGBaurusFollowEmperorToF/ToG`.
+- Stage 56 requires *both* Baurus and the Emperor in `ImperialDungeon03`
+  (`BaurusRef.getincell ImperialDungeon03 == 1 && UrielSeptimRef.getincell
+  ImperialDungeon03`), so only Glenroy arrived and the quest stopped at 56.
+
+Symptom to recognise: an NPC who **repeatedly force-greets the player and stops
+moving** is a force greet that cannot retire.
+
+Vanilla-legal at scale — census of Skyrim.esm's ForceGreet-template
+(`0003C1C4`) packages:
+
+```
+302 ForceGreet-template packages (PKCU template 0003C1C4)
+ 55 carry Once Per Day (0x400)     <- incl. quest-gated ones:
+                                      MQ203DelphineRiverwoodSceneForceGreet
+                                      MG01FaraldaBridgeForcegreet
+                                      DA07SilusForcegreetPiecesPackage
+ 38 carry Must Complete (0x4)
+ 16 carry both
+```
+
+Reproduce: scan `references/Skyrim.esm/PACK.txt` for records whose `PKCU.hex`
+holds template `C4C10300` (little-endian `0003C1C4`) and unpack `PKDT.hex[0:4]`
+as the flags u32.
+
+Guarded by `tests/test_dialog.py::TestForceGreetOncePerDay` — one test that the
+force greet keeps the latch, one that ordinary quest-gated packages still lose
+it (the Renault fix must survive).
+
 ## Template data inputs
 
 The engine SKIPS inline ANAM data inputs when `PKCU.Template != 0`. See

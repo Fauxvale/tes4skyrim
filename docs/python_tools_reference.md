@@ -13,6 +13,17 @@ Python modules and `tools/` debug utilities.
 - **Import**: `python -m tes5_import export/Oblivion.esm -o output/Oblivion.esm -m Skyrim.esm` — TES4 text → TES5 binary ESM/ESP
 - **Tests**: `python -m pytest tests/ -v`
 - Import performance: ~28K records converted from Oblivion.esm, 413MB output, 0 errors
+- **NPC-to-NPC conversations**: `tes5_import/npc_conversations.py` — `build_conversation_plan(by_type, script_vars, plugin_stem)` detects and linearizes Oblivion's engine-scheduled quest-advancing conversation chains (Skyrim has no such scheduler); `generate_driver_psc(plan, say_durations)` renders the driver script; `chain_property_bindings(chain, remap, resolve_hop_topic)` yields its VMAD bindings. **Shared analysis** — `tes5_import.dialog_converter` builds the head topics + `TES4NPCConv<plugin>` quest from the plan and `script_convert.pipeline` generates the `.psc` from the same plan, so a change to either caller must keep both in step (same contract as `message_menus`/`dialog_unlocks`). Design + traps: [ambient_dialogue_channel_plan.md](ambient_dialogue_channel_plan.md#the-npc-to-npc-conversation-scheduler). Inspect a plan without building:
+  ```bash
+  python -c "from tes5_import.text_reader import parse_export_file as p; \
+  from tes5_import.pack_aliases import build_script_var_map as v; \
+  from tes5_import.npc_conversations import build_conversation_plan as b; \
+  bt={s:p(f'export/Oblivion.esm/{s}.txt') for s in ('DIAL','INFO','QUST','SCPT','ACHR','ACRE')}; \
+  pl=b(bt, script_vars=v(bt), plugin_stem='Oblivion'); \
+  print(len(pl['chains']),'chains',pl['skipped'])"
+  # -> 15 chains [(301075, '2 subject identities'), (97753, '0 subject identities')]
+  ```
+  **`script_vars` is not optional in practice**: without `build_script_var_map`, `GetQuestVariable` gates cannot resolve a variable NAME and those chains skip (TG03Elven drops, 15 → 14). Same table `dialog_conditions` uses for `::<name>_var` CIS2 strings.
 
 ## asset_convert (asset pipeline)
 - **NIF conversion**: `python -m asset_convert.nif_converter <src_dir> <dst_dir> [--workers N]` — Full Oblivion→Skyrim NIF conversion (strips, textures, bones, collision, skin retarget). See [nif_conversion_notes.md](nif_conversion_notes.md) for the deep implementation notes.

@@ -170,7 +170,12 @@ expensive, and it is a genuine design decision, not a mechanical translation.
 is no cheap correct destination — a topic in the player menu is wrong, and a
 solo ambient bark is the very "NPCs talking to themselves" defect being fixed.
 Absence is the only honest intermediate state. The content is recorded in
-TODO.txt #16 and restored by Step 4 when scenes are built properly.
+TODO.txt #16.
+
+**Update 2026-08-07:** the *quest-advancing* subset of these conversations is
+no longer absent — 15 chains are replayed by a generated driver quest. See
+[The NPC-to-NPC conversation scheduler](#the-npc-to-npc-conversation-scheduler).
+The flavor families below remain dropped.
 
 ---
 
@@ -318,31 +323,193 @@ unnecessary.
 
 ---
 
-### Step 4 — Restore NPC-to-NPC conversations via SCEN (deferred)
+### Step 4 — Restore NPC-to-NPC conversations (partially done 2026-08-07)
 
-**Not part of this fix.** Step 1 drops these lines; this step is how they come
-back. Tracked as **TODO.txt "Later Issues" #16** so the content is not
-forgotten.
+Step 1 drops these lines; this step is how they come back. Still tracked as
+**TODO.txt "Later Issues" #16** for the *flavor* families. The
+**quest-advancing** subset is now restored — not via SCEN, but by a generated
+driver quest. See
+[**The NPC-to-NPC conversation scheduler**](#the-npc-to-npc-conversation-scheduler)
+below, which is the implemented design and supersedes the SCEN sketch that
+used to sit here.
 
-**Change:** synthesize Skyrim `SCEN` records for the dropped conversation
-families, using the surviving `TCLT` chains (1,753 of 2,881 core INFOs) as phase
-structure.
+**Still deferred (the flavor families):** synthesize `SCEN` records for the
+~240 dropped `*NQDResponses` / `*RumorResponses` chatter families, using the
+surviving `TCLT` chains (1,753 of 2,881 core INFOs) as phase structure. Cost is
+high — vanilla scenes bind 2–7 quest **alias** actors each (1,706 SCEN records)
+whereas Oblivion picks the pair at runtime from proximity + AI packages, so
+this needs invented actor pairing plus aliases, phases/actions and per-scene
+conditions. Every partial version is worse than absence — which is exactly how
+these lines came to be labelled `SE` and `FGD02Insults` in the player's menu.
+Do not ship a half-version of it.
 
-**Effect:** restores the behaviour originally described — NPCs holding
-occasional conversations with each other.
+The driver below does **not** generalize to these: it works precisely because
+quest-advancing chains name both actors with `GetIsID`, which the flavor
+families do not.
 
-**Cost:** high. Requires inventing actor pairing that Oblivion does not record:
-vanilla scenes bind 2–7 quest **alias** actors each (1,706 SCEN records), whereas
-Oblivion selects the pair at runtime from proximity and AI packages. Also needs
-quest aliases, phases/actions, and per-scene conditions.
+---
 
-**Risk:** high, and partly a design question rather than an engineering one.
+## The NPC-to-NPC conversation scheduler
 
-**Why it is deferred rather than attempted now:** Steps 1–3 remove reported
-defects; this one adds back a feature. Every partial version of it is worse than
-absence — which is exactly how these lines came to be labelled `SE` and
-`FGD02Insults` in the player's menu. Do not block the first three steps on it,
-and do not ship a half-version of it.
+**Oblivion has an ambient conversation SCHEDULER that Skyrim does not have at
+all, and no record conversion can substitute for it.** This is the mechanism
+behind the dropped families, and it is also why several main-quest chains
+stalled.
+
+### How Oblivion runs one
+
+When two NPCs idle near each other, the engine may start a conversation
+between them:
+
+1. It picks the pair from proximity + AI packages.
+2. The initiator speaks a **`HELLO`** line whose conditions name BOTH actors —
+   `GetIsID(<speaker>)` on the subject side and `GetIsID(<listener>)` with the
+   **Run-on-Target** bit on the target side. The target-side identity is what
+   makes the line mean "say this *to that specific NPC*".
+3. The engine then walks the line's **`Choice`/`TCLT`** links, alternating
+   speakers per each INFO's `DATA.NextSpeaker`, until a `GOODBYE` ends it.
+4. Each INFO's result script runs as it plays — which is where the quest
+   payload lives.
+
+Quest authors lean on this. **CharacterGen stage 26→27 IS such a chain:**
+
+```
+Baurus  HELLO   0004EA44  "Are you all right, sire? We're clear, for now."
+        conditions: GetIsID(Baurus) + GetIsID(UrielSeptim)[Target]
+                    + GetStage(CharacterGen)==26
+   -> TCLT
+Emperor CharGenVoice 0004EA45  "Captain Renault?"
+   -> TCLT
+Baurus  GOODBYE 0005144A  "She's dead. I'm sorry, sire, but we have to keep
+                           moving."          result: setstage charactergen 27
+```
+
+The stage-26 result script itself only calls `evp` — **nothing in the plugin
+starts this conversation.** The scheduler does. So on Skyrim the three lines
+were never spoken, stage 27 never fired, and the intro stopped dead with
+everyone standing in position. (`setstage 27` from the console resumed it
+normally, which is what isolated the chain as the only broken link.)
+
+### Why the obvious destinations don't work
+
+| Tried | Why it fails |
+|---|---|
+| Leave the head on `HELO` | Skyrim evaluates HELO **only when greeting the PLAYER**, so `GetIsID(<other NPC>)[Target]` can never pass. Silent. |
+| Route the head to `ACAC` (subtype 92) | ❌ **Wrong — do not retry.** `ACAC` is **"ActorCollidewithActor"**, the bump-into-someone bark. It is not a conversation channel. Tried 2026-08-07; still silent in-game. Source: the engine subtype table in `references/xEdit/Tools/xSE/f4se_plugin_xEdit/f4se_plugin_xEdit-20180628.txt` — `108;"ActorCollidewithActor";108;"ACAC";7;0;0`. **Its presence in Skyrim.esm (3 topics) was mistaken for evidence it was the ambient-conversation channel; that inference was wrong.** |
+| Full `SCEN` synthesis | Correct in principle but needs actor pairing Oblivion never records — see the deferred Step 4 above. |
+
+### What is implemented: `tes5_import/npc_conversations.py`
+
+These chains are **identity-pinned** — the head names both actors — so the
+proven `Actor.Say()` machinery (which already drives every scripted CharGen
+conversation) can replay them. Two pieces, built from ONE shared plan:
+
+* **The head INFO is reparented** onto a synthesized hidden topic
+  `TES4NPCConv<plugin>Topic<N>` (a Type-1 CUST topic registered say-driven, so
+  `Say()` reaches it and the player menu never shows it — the same shape
+  `CharGenVoice` already has). Source-space FormIDs come from
+  `_CONV_FAKE_FID_BASE = 0x00F40000`, asserted collision-free against the real
+  DIALs.
+* **A generated start-game-enabled quest** `TES4NPCConv<plugin>` (in the `.seq`)
+  polls on a 4 s `RegisterForSingleUpdate` loop and, when a chain's gate
+  passes, `Say()`s the sequence with measured waits.
+
+The poll reproduces the scheduler's own preconditions:
+
+```papyrus
+Bool Function CanConverse(Actor akA, Actor akB)
+    ; both loaded, both alive, neither fighting, within 500 units
+```
+
+**Line selection stays with the engine.** The plan fixes only the TOPIC
+sequence, each hop's speaker, and the expected line length; which INFO plays
+within a topic is decided by that INFO's own converted conditions — exactly
+Oblivion's rule. So per-line CTDA fidelity is preserved and the INFO End
+fragments (the `setstage` payloads) fire as they do for any other `Say()`.
+
+### The selection rules (and why each exists)
+
+Restored only when ALL hold:
+
+| Rule | Why |
+|---|---|
+| Head is a `HELLO` INFO whose **every** target-side `GetIsID` names a non-player actor | That is the scheduler's signature. |
+| The identity is **positive** (`== 1`, operator `==`) | `GetIsID(x)[Target] == 0` is an *exclusion* on a player greeting, not an address. |
+| The chain's TCLT closure carries a quest-advancing result (`setstage`/`startquest`/`stopquest`/`set X.y to`) | Pure flavor stays dropped per "better absent than wrong". |
+| Exactly one subject identity, and both actors have a **unique** placed ref | The driver needs concrete `Actor` properties. |
+| Every non-identity head condition compiles to a poll gate | See below. |
+
+Supported gates: `GetStage` (58), `GetQuestVariable` (79 → the converted quest
+script's property), `GetItemCount` (47 → `Conv<i>A.GetItemCount`). **Anything
+else SKIPS the chain** rather than firing it on a looser trigger — a
+conversation firing EARLY is worse than one that stays absent. Skips are
+logged, not silent.
+
+### Traps this hit, all still live
+
+* **`GOODBYE` hops are bark-grouped.** The bark pass emits one topic per
+  (owning quest, subtype), so a chain's GOODBYE line does NOT live at the
+  source `GOODBYE` DIAL's FormID. `_build_bark_pass` publishes
+  `ctx['bark_topic_fids'][(quest, subtype)]` and the driver binds through that.
+* **Hops that ride `HELLO` itself** (MS91 Weebam-Na → Mazoga) must point at the
+  *other chain's* synthesized head topic, since the raw HELLO DIAL doesn't
+  survive as one record. Chains whose HELLO hop has no restored head are
+  dropped.
+* **Chain indices name Papyrus properties**, so after any filtering pass the
+  chains are **renumbered gapless** — both pipelines must agree on the numbering
+  or every property binds to the wrong thing.
+* **Overlapping chains are mutually exclusive.** Two heads can open the same
+  authored talk (MS91: Weebam-Na's "You want to speak to me?" and Mazoga's
+  "You are Weebam-Na?" both walk the MazogaTalk lines). Whichever fires sets
+  the other's `_done` flag, or the whole conversation replays.
+* **Member topics must be un-dropped.** A chain routing through a Type-1 topic
+  the NPC-to-NPC drop would remove registers it say-driven so it survives.
+
+### The mirroring contract
+
+`build_conversation_plan()` is **shared analysis**, in the same family as
+`message_menus` and `dialog_unlocks`: `tes5_import` builds the head topics and
+the quest VMAD from it, `script_convert.pipeline` generates the matching
+`.psc` from it. **Any divergence leaves VMAD properties unbound** — the
+generated script guards every property against `None` and disables that chain
+rather than aborting the whole poll function (see
+`project_unbound_vmad_property_aborts`), but it cannot repair the binding.
+Both sides gate on masterless plugins only.
+
+Verify the contract holds after any change:
+
+```bash
+# psc-declared Conv* properties must equal the VMAD-bound set, exactly
+python temp/verify_conv_vmad.py     # 99/99, dangling: 0
+```
+
+### Measured result (Oblivion.esm, 2026-08-07)
+
+```
+NPC-to-NPC conversation topics dropped: 243 (TODO.txt #16)
+quest-advancing chains restored: 15
+NPC conversations: 15 chains on TES4NPCConvOblivion (2 skipped), 99 bound properties
+```
+
+By OWNING quest (note this is the QSTI owner, not the quest a chain's gate
+tests — MQConversations holds the MQ13 Narina/Martin exchange, whose gate is
+`GetStage(MQ13)==20`):
+
+```
+Charactergen 1   MQ04 1   MQ15 1   MQ16 3   MQConversations 1
+MS91 3           SEConversations 3         TG01BestThief 1   TG03Elven 1
+```
+
+All were stalled the same way, not just the reported one — **MQ16's three are
+the endgame Ocato/messenger conversations**. The 2 skips are heads whose
+speaker cannot be statically resolved (0 or 2 subject identities).
+
+### Known compromise
+
+`_done` latches are script state, so an overlapping *flavor* pair (the SE
+spouse chats) plays once per save rather than recurring. The quest-critical
+chains all self-terminate via their own `setstage`, so this costs nothing
+there.
 
 ---
 
@@ -363,7 +530,13 @@ Target end state after Steps 1–2:
 | Pure NPC-to-NPC topics emitted | 242 | 0 (dropped) ✅ |
 | Script-driven Type-1 topics kept | 293 | 293, unlisted ✅ |
 | Dangling TCLT after the drop | — | 0 ✅ |
-| SCEN records | 0 | 0 (Steps 1–3) / >0 (Step 4, deferred) |
+| SCEN records | 0 | 0 (flavor families still deferred) |
+| Quest-advancing chains restored | 0 | 15, via the driver quest ✅ |
 
 Ground truth is in-game: the fix is confirmed when NPCs stop quipping
 unprompted and their menus no longer list EditorIDs.
+
+For the conversation driver specifically, the in-game check is that
+CharacterGen advances 26→27 on its own (Baurus and the Emperor speak the
+three-line exchange while the player stands in the ambush room) — and the
+equivalent beats in MQ16, MS91 and TG03.
