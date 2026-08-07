@@ -1697,7 +1697,8 @@ def build_npc_to_vtyp_map(by_type: dict, num_new_masters: int) -> dict:
             # Shift exactly as the record converters do, for any source index —
             # an override keeps its master's index and must still land on the
             # same key the converter stamps.
-            remapped = remap_formid(int(rec.get('FormID', '0'), 16), offset)
+            remapped = remap_formid(int(rec.get('FormID', '0'), 16), offset,
+                                    is_own_id=True)
             gender = 'Female' if (get_int(rec, 'ACBS.Flags') & 1) else 'Male'
             race_fid = get_formid(rec, 'RNAM.Race') & 0x00FFFFFF
             voice_race_fid = race_voice.get(race_fid, {}).get(gender, race_fid)

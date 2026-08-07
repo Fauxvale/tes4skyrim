@@ -1561,28 +1561,19 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     n_fg = patch_forcegreet_topics(writer)
     if n_fg:
         print(f"  ForceGreet packages bound to a greeting topic: {n_fg}")
-    # Actor CSDI still holds TES4 SOUN ids; Phase 3 has now built the SNDRs.
-    from .record_types.actors import patch_actor_sounds
-    n_snd = patch_actor_sounds(writer)
-    if n_snd:
-        print(f"  Actor sound descriptors bound: {n_snd} actors")
-    # DOOR SNAM/ANAM/BNAM hold TES4 SOUN ids for the same reason (Phase 1 runs
-    # before the descriptors exist) — TES5 wants the SNDR there.
+    # (Actor CSDI patching is part of the creature-sound work and lives on
+    # `creature-sound-fix-attempt`, not here — actors write no CSDI on master.)
+    # DOOR SNAM/ANAM/BNAM hold TES4 SOUN ids because Phase 1 runs before the
+    # descriptors exist — TES5 wants the SNDR there.
     from .record_types.items import patch_door_sounds
     n_dsnd = patch_door_sounds(
         writer,
         {get_formid(r, 'FormID') & 0x00FFFFFF for r in by_type.get('SOUN', [])})
     if n_dsnd:
         print(f"  Door sound descriptors bound: {n_dsnd} doors")
-    # Creature voice types: allocated LAST so no other generated FormID moves,
-    # then patched into the already-written creature actors and races.
-    from .creature_races import (build_creature_voice_types,
-                                 patch_creature_voices)
-    n_cv = build_creature_voice_types(writer)
-    if n_cv:
-        n_cvp = patch_creature_voices(writer)
-        print(f"  Creature voice types: {n_cv} generated, "
-              f"{n_cvp} records bound")
+    # (Creature voice types are part of the creature-sound work and live on
+    # `creature-sound-fix-attempt`, not here. They must stay allocated LAST
+    # when that branch merges, so no other generated FormID moves.)
     _write_voice_map(output_path, voice_map)
     from .dialog_converter import get_lip_texts
     _write_lip_text(output_path, get_lip_texts())

@@ -29,6 +29,65 @@ _TES4_SND_LOOP              = 0x0010
 _TES4_SND_MENU_SOUND        = 0x0020
 _TES4_SND_2D                = 0x0040
 
+# Root of the extracted TES4 assets for the plugin being imported, set by
+# set_sound_source_dir() at import start. Used only to enumerate the .wav files
+# inside a directory-valued SOUN.FNAM.
+_SOUND_SOURCE_DIR = None
+
+
+def set_sound_source_dir(export_dir: str) -> None:
+    """Point the SOUN converter at this plugin's extracted assets.
+
+    Only needed to expand directory-valued FNAMs; a missing/None dir simply
+    means such sounds fall back to the single literal path.
+    """
+    global _SOUND_SOURCE_DIR
+    _SOUND_SOURCE_DIR = export_dir
+
+
+def get_sound_source_dir() -> str:
+    return _SOUND_SOURCE_DIR
+
+
+# TES4 SOUN FormID (low 24 bits) → the SNDR FormID convert_SOUN gave its
+# companion. Filled DURING Phase 3, and read afterwards to patch the records
+# that reference it (see items.patch_door_sounds).
+#
+# An earlier version reserved these ids in a Phase 0 pre-pass so records could
+# embed them directly. That allocated ~1100 FormIDs before anything else and
+# so SHIFTED every other generated id (OTFT, ARMA, TXST, ...) — which silently
+# invalidated the separately-built 'Slot44 Patch.esp', whose 818 ARMO/233 ARMA
+# overrides are matched to the master BY FORMID. NPCs lost their armor. The
+# allocation ORDER is therefore a compatibility contract with anything built
+# against a previous run: never insert an allocating pass ahead of existing
+# ones.
+_SNDR_FOR_SOUN = {}
+
+
+def reset_sound_descriptors() -> None:
+    """Clear the SOUN→SNDR map at the start of an import run."""
+    _SNDR_FOR_SOUN.clear()
+
+
+def record_sndr_for_soun(soun_fid: int, sndr_fid: int) -> None:
+    """Note the companion SNDR convert_SOUN just built for a SOUN."""
+    _SNDR_FOR_SOUN[soun_fid & 0x00FFFFFF] = sndr_fid
+
+
+def sndr_map() -> dict:
+    """TES4 SOUN id (low 24 bits) → companion SNDR FormID, for slot patching."""
+    return _SNDR_FOR_SOUN
+
+
+def get_sndr_for_soun(soun_fid: int) -> int:
+    """The SNDR FormID for a TES4 SOUN, or 0 if it has no companion.
+
+    Accepts a FormID in either raw or load-order-offset form; the map is keyed
+    on the low 24 bits (same convention as outfits.load_item_index).
+    """
+    return _SNDR_FOR_SOUN.get(soun_fid & 0x00FFFFFF, 0)
+
+
 # Vanilla Skyrim SOPM constants (verified against references/Skyrim.esm SOPM dump)
 _SOPM_2D = 0x000B5183            # SOMDialogue2D — non-attenuating, for menu/2D sounds
 _SOPM_ONAM_CHANNELS = bytes.fromhex(
@@ -148,6 +207,10 @@ def convert_SOUN(rec: dict, writer=None) -> tuple:
 
     if sndr_fid:
         subs += pack_formid_subrecord('SDSC', sndr_fid)
+        # Records written BEFORE Phase 3 (DOOR sound slots) hold this
+        # SOUN's id as a placeholder; register the descriptor so their
+        # patch pass can resolve it.
+        record_sndr_for_soun(get_formid(rec, 'FormID'), sndr_fid)
 
     soun_bytes = pack_record('SOUN', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
     return soun_bytes, sndr_bytes, sndr_fid

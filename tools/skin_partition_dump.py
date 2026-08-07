@@ -11,9 +11,16 @@ produce vmovdqa/memcpy access violations in BSBatchRenderer):
   - bones-per-partition GPU palette limits
   - union of partition vertices vs geometry vertex count
 
+For BSDismemberSkinInstance geometry it also prints each partition's biped
+body_part slot and the part flags, which is what decides whether the engine
+renders a partition at all: a partition whose slot is not claimed by the
+wearing ARMA is culled (invisible skin), and an equipped item hides entire
+shapes of other addons whose partition slots intersect its ARMO biped slots.
+
 Usage:
     python tools/skin_partition_dump.py <nif> [<nif> ...]
     python tools/skin_partition_dump.py <dir>          # scans *.nif recursively
+    python tools/skin_partition_dump.py --slots <nif>  # one line per shape/slot
 """
 
 import sys
@@ -30,6 +37,44 @@ from pyffi.formats.nif import NifFormat
 # (LE and SSE) cap skinned draw calls at 80 bones per partition; vanilla
 # assets stay well under (typically <= 60).
 SKYRIM_MAX_BONES_PER_PARTITION = 80
+
+
+def _dismember_parts(skin):
+    """Return the BSDismemberSkinInstance partition list, or [] if not one.
+
+    Each entry is (body_part, part_flags).  body_part is the raw biped slot
+    value: Skyrim stores it as 30 + slot index (32 = body, 33 = hands,
+    34 = forearms, 37 = feet, 38 = calves, 44 = the slot this pipeline gives
+    Oblivion LowerBody items).
+    """
+    if not isinstance(skin, getattr(NifFormat, 'BSDismemberSkinInstance', ())):
+        return []
+    return [(int(pd.body_part), int(pd.part_flag))
+            for pd in getattr(skin, 'partitions', [])]
+
+
+def dump_slots(path: str) -> int:
+    """Compact per-shape body-part slot listing (one line per geometry)."""
+    data = NifFormat.Data()
+    with open(path, 'rb') as f:
+        data.read(f)
+    print(f'\n=== {path}')
+    for root in data.roots:
+        if root is None:
+            continue
+        for block in root.tree():
+            if not isinstance(block, (NifFormat.NiTriShape,
+                                      NifFormat.NiTriStrips,
+                                      getattr(NifFormat, 'BSTriShape', ()))):
+                continue
+            skin = getattr(block, 'skin_instance', None)
+            if skin is None:
+                continue
+            name = bytes(block.name).rstrip(b'\x00').decode('latin-1', 'replace')
+            parts = _dismember_parts(skin)
+            slots = ','.join(str(bp) for bp, _ in parts) if parts else '-'
+            print(f'  {name:<32} slots=[{slots}] skin={skin.__class__.__name__}')
+    return 0
 
 
 def dump_nif(path: str) -> int:
@@ -82,6 +127,17 @@ def dump_nif(path: str) -> int:
             if sp is None:
                 print('    (no NiSkinPartition)')
                 continue
+
+            dismember = _dismember_parts(skin)
+            if dismember:
+                print('    Dismember slots: ' + ', '.join(
+                    f'[{i}] body_part={bp} flags=0x{fl:04X}'
+                    for i, (bp, fl) in enumerate(dismember)))
+                if len(dismember) != sp.num_skin_partition_blocks:
+                    print(f'      !! {len(dismember)} dismember partitions != '
+                          f'{sp.num_skin_partition_blocks} NiSkinPartition '
+                          f'blocks (engine indexes them in lockstep)')
+                    problems += 1
 
             covered = set()
             for pi in range(sp.num_skin_partition_blocks):
@@ -143,9 +199,11 @@ def dump_nif(path: str) -> int:
 
 def main():
     args = sys.argv[1:]
-    if not args:
+    if not args or '-h' in args or '--help' in args:
         print(__doc__)
-        sys.exit(1)
+        sys.exit(0 if args else 1)
+    slots_only = '--slots' in args
+    args = [a for a in args if a != '--slots']
     paths = []
     for a in args:
         p = Path(a)
@@ -156,7 +214,7 @@ def main():
     total = 0
     for p in paths:
         try:
-            total += dump_nif(str(p))
+            total += (dump_slots if slots_only else dump_nif)(str(p))
         except Exception as e:
             print(f'\n=== {p}\n  ERROR: {e}')
             total += 1

@@ -266,6 +266,18 @@ def get_float(record: dict, key: str, default: float = 0.0) -> float:
 # THE one definition for the import side — import these rather than declaring a
 # local PLAYER_FID. (script_convert keeps its own `_PLAYER_FORMIDS` because it
 # matches the hex STRINGS a raw SCRO carries, before any parsing.)
+#
+# APPLIES TO REFERENCES ONLY — exactly like _ITEM_SUBSTITUTIONS below, and for
+# the same reason. Oblivion.esm defines its OWN record at 0x07 (NPC_ "Bendu
+# Olo", EditorID=Player), so passing a record's own id through unshifted writes
+# that record at 0x00000007 — an OVERRIDE of Skyrim.esm's Player, replacing the
+# real player's race, voice, spells, AI data and factions with Oblivion's. That
+# is what broke the CharacterGen Emperor conversation: his topics are gated on
+# `GetIsID(Player) [Target]` (1,325 such conditions across INFO), and with the
+# player base clobbered the target test stopped matching, so every CGEmperor
+# topic vanished and only the quest-less 'Rumors' channel survived.
+# Own ids therefore keep shifting to 0x01000007 (inert — simply never pointed
+# at), while REFERENCES to 0x07/0x14 resolve to Skyrim.esm's real player.
 PLAYER_REF_FID = 0x14    # ACHR PlayerRef
 PLAYER_BASE_FID = 0x07   # NPC_ Player
 _ENGINE_FIXED_FORMIDS = frozenset({PLAYER_REF_FID, PLAYER_BASE_FID})
@@ -292,7 +304,8 @@ def get_injected_formids() -> dict:
     return dict(_injected_formids)
 
 
-def remap_formid(fid: int, offset: int = None) -> int:
+def remap_formid(fid: int, offset: int = None,
+                 is_own_id: bool = False) -> int:
     """Shift a TES4 FormID's load-order index into the output plugin's space.
 
     The TES5 master list is the TES4 one with `offset` new masters prepended,
@@ -304,13 +317,19 @@ def remap_formid(fid: int, offset: int = None) -> int:
     Injected records (registered via set_injected_formids) are the exception:
     they carry a master's index but the master has no such record, so they are
     redirected into our own space instead of dangling in the master's.
+
+    `is_own_id` marks a record's OWN FormID rather than a reference to another
+    record. Own ids skip the _ENGINE_FIXED_FORMIDS passthrough: that table
+    exists so a REFERENCE to the player lands on Skyrim.esm's copy, but
+    Oblivion.esm defines its own record at 0x07, and writing it unshifted makes
+    it an override of the real Player. See _ENGINE_FIXED_FORMIDS.
     """
     if offset is None:
         offset = _formid_index_offset
     redirect = _injected_formids.get(fid)
     if redirect is not None:
         return redirect
-    if fid and offset and fid not in _ENGINE_FIXED_FORMIDS:
+    if fid and offset and (is_own_id or fid not in _ENGINE_FIXED_FORMIDS):
         high = (fid >> 24) & 0xFF
         return ((high + offset) << 24) | (fid & 0x00FFFFFF)
     return fid
@@ -336,11 +355,12 @@ def get_formid(record: dict, key: str, default: int = 0) -> int:
         raw = int(val, 16)
     except (ValueError, TypeError):
         return default
-    if key != 'FormID':
+    is_own_id = (key == 'FormID')
+    if not is_own_id:
         sub = _ITEM_SUBSTITUTIONS.get(raw)
         if sub is not None:
             return sub
-    return remap_formid(raw)
+    return remap_formid(raw, is_own_id=is_own_id)
 
 
 # Module-level FormID remapping: when converting TES4→TES5, the file's load
