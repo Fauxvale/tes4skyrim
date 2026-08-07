@@ -39,8 +39,6 @@ Later Issues:
 	
 	2 - Convert weathers
 
-	3 - Missing greeting voice lines (like Hello)
-
 	4 - Allow running process on zip (mod)
 
 	5 - Fix walking up stairs
@@ -54,8 +52,6 @@ Later Issues:
 	9 - Magic and Spell Conversion including effects (see magic conversion md)
 
 	10 - Make horses rideable
-
-	11 - NPCS don't say quips anymore (preferable to always quipping)
 
 	12 - Speed up child LOD gen and add menu option
 
