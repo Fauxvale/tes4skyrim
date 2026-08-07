@@ -176,8 +176,117 @@ _FOLDER_KEYWORDS = {
 
 # crea_fid_low24 → (race_fid, folder) — consumed by convert_CREA
 _CREA_RACE_MAP = {}
+
+# folder(lower) → generated creature VTYP FormID, filled by
+# build_creature_voice_types() at the END of the import run.
+#
+# A creature must NOT share a humanoid dialogue voice type. Every one of the 42
+# vanilla Cr* voice types writes DNAM=0 (no flags), while human voices set bit 0
+# 'Allow Default Dialog' (DNAM=1 male / 3 female) — the flag that routes an
+# actor into the dialogue system. convert_CREA ran creatures through the
+# humanoid chain (TES4 race → VOICE_TYPE_MAP → Imperial fallback), and since a
+# creature has no TES4 race in that map they ALL landed on TES4MaleImperial:
+# a human dialogue voice, which is not how a creature is voiced.
+#
+# Allocated LAST, after every other generated record, so no existing FormID
+# moves — an allocating pass inserted earlier renumbers everything after it
+# (see project_formid_allocation_order_contract; it broke NPC outfits).
+_CREA_VOICE_MAP = {}
+
+# Vanilla creature VTYP DNAM: 0 on all 42 Cr* records in Skyrim.esm.
+_CREATURE_VTYP_DNAM = 0
+
+
+# crea_fid_low24 → folder, for EVERY CREA — including ones that never got a
+# generated race. A creature whose mesh is an effect NIF rather than a skinned
+# body has no NIFZ parts, so build_creature_races skips it (the 5 Oblivion
+# Will-o-the-Wisps), but it still carries a full CSDT sound set and still needs
+# a creature voice rather than the humanoid fallback.
+_CREA_FOLDER_MAP = {}
+
+# Generated body-ARMA FormID → creature folder. The footstep chain
+# (creature_footsteps) needs to find each creature's ARMA to fill in SNDD.
+_CREA_ARMA_FOLDER = {}
+
+
+def get_creature_arma_folders() -> dict:
+    """{generated body ARMA FormID: creature folder}, for footstep wiring."""
+    return _CREA_ARMA_FOLDER
+
+
+def get_creature_voice(fid_low24: int) -> int:
+    """Generated creature VTYP FormID for a CREA, or 0 if it has none."""
+    folder = _CREA_FOLDER_MAP.get(fid_low24)
+    return _CREA_VOICE_MAP.get(folder, 0) if folder else 0
+
+
+def build_creature_voice_types(writer) -> int:
+    """Phase LAST: one VTYP per creature folder.
+
+    Runs after all other allocation so existing generated FormIDs are
+    unchanged; the RACE/actor records that reference these voices are already
+    written, so their VTCK slots are patched afterwards (patch_creature_voices).
+    """
+    _CREA_VOICE_MAP.clear()
+    for folder in sorted(set(_CREA_FOLDER_MAP.values())):
+        fid = writer.alloc_formid()
+        subs = pack_string_subrecord(
+            'EDID', f'TES4Cr{folder.capitalize()}Voice')
+        subs += pack_subrecord('DNAM', struct.pack('<B', _CREATURE_VTYP_DNAM))
+        writer.add_record('VTYP', pack_record('VTYP', fid, 0, subs))
+        _CREA_VOICE_MAP[folder] = fid
+    return len(_CREA_VOICE_MAP)
 # folder → project summary (attacks etc.) for anything else that needs it
 _PROJECTS = {}
+
+
+def patch_creature_voices(writer) -> int:
+    """Point every converted creature's VTCK at its generated creature voice.
+
+    Creature NPC_ records carry a 4-byte VTCK and the generated RACE an 8-byte
+    male+female pair; both were written with the humanoid fallback voice before
+    the creature VTYPs existed (build_creature_voice_types runs last so it
+    cannot disturb any other FormID). This rewrites those slots in the packed
+    bytes — the same placeholder-then-patch approach used for actor sounds and
+    ForceGreet topics.
+
+    Returns the number of records patched.
+    """
+    if not _CREA_VOICE_MAP:
+        return 0
+
+    # crea_fid -> voice, for every creature (raced or not)
+    actor_voice = {}
+    for crea_fid, folder in _CREA_FOLDER_MAP.items():
+        voice = _CREA_VOICE_MAP.get(folder)
+        if voice:
+            actor_voice[crea_fid] = voice
+    # race_fid -> voice, only for the folders that produced a race
+    race_voice = {}
+    for _crea_fid, (race_fid, folder) in _CREA_RACE_MAP.items():
+        voice = _CREA_VOICE_MAP.get(folder)
+        if voice:
+            race_voice[race_fid] = voice
+
+    patched = 0
+    for sig, table, size in (('NPC_', actor_voice, 4), ('RACE', race_voice, 8)):
+        records = writer._top_groups.get(sig) or []
+        for i, blob in enumerate(records):
+            if len(blob) < 24:
+                continue
+            fid = struct.unpack_from('<I', blob, 12)[0]
+            voice = table.get(fid if sig == 'RACE' else fid & 0x00FFFFFF)
+            if not voice:
+                continue
+            at = blob.find(b'VTCK', 24)
+            if at < 0 or struct.unpack_from('<H', blob, at + 4)[0] != size:
+                continue
+            off = at + 6
+            new = (struct.pack('<I', voice) if size == 4
+                   else struct.pack('<II', voice, voice))
+            records[i] = blob[:off] + new + blob[off + size:]
+            patched += 1
+    return patched
 
 
 def get_creature_race(fid_low24: int):
@@ -535,6 +644,10 @@ def _build_skin(writer, folder: str, bodies: list, race_fid: int,
     subs += pack_subrecord('DNAM', _ARMA_DNAM)
     subs += pack_string_subrecord('MOD2', f'Actors\\TES4\\{folder}\\{body}')
     writer.add_record('ARMA', pack_record('ARMA', arma_fid, 0, subs))
+    # Footstep sounds hang off ARMA.SNDD, which is written later (the FSTS it
+    # points at is allocated last so it cannot shift other FormIDs) — see
+    # creature_footsteps.patch_creature_footsteps.
+    _CREA_ARMA_FOLDER[arma_fid] = folder
 
     subs = b''
     subs += pack_string_subrecord('EDID', f'TES4Skin{edid_base}')
@@ -608,7 +721,20 @@ def build_creature_races(by_type: dict, writer, export_dir: str,
     project. Populates the crea→race map used by convert_CREA."""
     global _PROJECTS
     _CREA_RACE_MAP.clear()
+    _CREA_FOLDER_MAP.clear()
+    _CREA_ARMA_FOLDER.clear()
     load_creature_item_index(by_type, master_export)
+
+    # Folder for EVERY CREA, independent of whether it earns a generated race —
+    # the creature voice types key off this, and a creature with no body NIFs
+    # (wisps) still needs one. Done before the early return below so a plugin
+    # without converted projects still gets creature voices.
+    for rec in by_type.get('CREA', []):
+        model = (get_str(rec, 'Model.MODL') or '').replace('/', '\\')
+        parts = [p for p in model.lower().split('\\') if p]
+        folder = parts[-2] if len(parts) >= 2 else ''
+        if folder:
+            _CREA_FOLDER_MAP[get_formid(rec, 'FormID') & 0x00FFFFFF] = folder
 
     _PROJECTS = _load_projects(export_dir)
     if not _PROJECTS:

@@ -315,6 +315,89 @@ hardest humanoid-pipeline problem (rest-pose retarget) from the creature path en
     whichever placement vanilla uses per event type (visible in the extracted deer data:
     triggers live in `animationdata/<x>project.txt`).
 
+    The sound trigger MUST be `SoundPlay.<SNDR EditorID>:<time>` — a bare
+    `SoundPlay:` is measured and discarded by the engine before any lookup
+    (handler `0x140565c90`, GOG build), so vanilla's bare entries are inert
+    leftovers and must not be copied. `FootFront`/`FootBack` are different:
+    they are genuine bare engine events routed through the race's
+    footstep/impact set.
+
+    **The behavior graph must also DECLARE each qualified event.** Annotations
+    are dispatched by matching their text against the graph's own event-name
+    table — a name missing from it resolves to no event and is dropped, which
+    is what made every creature totally silent. Vanilla declares them plainly
+    among the other events (`chickenbehavior.hkx`:
+    `SoundPlay.NPCChickenPeck` / `SoundPlay.NPCChickenScratch`;
+    `wolfbehavior.hkx`: `SoundPlay.NPCDogPantLPMSD` +
+    `SoundStop.NPCDogPantLPMSD`), with no extra transition wiring.
+    `build_behavior_xml(sound_events=...)` adds ours from the clip metadata.
+
+#### Footsteps are a RECORD chain, not an animation trigger (2026-08-05)
+
+**Skyrim reads creature locomotion audio from the body ARMA, not from the actor
+and not from animationdata:**
+
+```
+ARMA.SNDD -> FSTS (per-gait footstep lists)
+               -> FSTP (one per footstep tag)
+                    -> IPDS (material -> impact table)
+                         -> IPCT (one impact, carrying the sound)
+                              -> SNDR
+```
+
+Oblivion keeps the same sounds in CREA **CSDT slots 0-3** (LeftFoot, RightFoot,
+LBackFoot, RBackFoot). Those were converted to SNDRs but never wired to
+anything, and every generated creature ARMA had **no SNDD at all** — measured
+before the fix: 0 IPCT / 0 IPDS / 0 FSTP / 0 FSTS in the entire output, 63 of 63
+creature ARMAs with `SNDD=NONE`.
+
+Implemented in `tes5_import/creature_footsteps.py`, following the vanilla
+`NPCWolfFootFrontWalk*` chain exactly:
+- **IPCT** = EDID + DATA(24) + DODT(36) + SNAM→SNDR. No model; footstep impacts
+  are sound-only.
+- **IPDS** = one PNAM(8) per MATERIAL, all pointing at the single IPCT. Wolf
+  lists **60 materials** mapped to one impact, so a creature sounds the same on
+  every surface — `_FOOTSTEP_MATERIALS` reproduces that list verbatim.
+- **FSTP** = DATA→IPDS + ANAM tag.
+- **FSTS** = XCNT(20) counts in **walk, run, sprint, sneak, swim** order, but
+  the DATA arrays are the **REVERSE**: swim, sneak, sprint, run, walk
+  (`wbDefinitionsTES5.pas:7108`). Getting this backwards silently misassigns
+  every gait.
+
+One chain per DISTINCT foot sound: bipeds share one for both feet, quadrupeds
+get a front and a back pair. Allocated **last** (like the creature VTYPs) so no
+existing generated FormID shifts, then `patch_creature_footsteps` INSERTS
+`SNDD` into the already-packed ARMAs and fixes the 24-byte header's dataSize —
+unlike VTCK there is no placeholder to overwrite, because SNDD is a genuinely
+new subrecord.
+
+Group order matters: `IPCT`/`IPDS` must precede `ARMA`, and `FSTP` must precede
+`FSTS` (xEdit canonical order `... VTYP MATT IPCT IPDS ARMA ... FSTP FSTS ...`).
+
+Result: 41 footstep sets, 222 creature ARMAs bound, 0 broken links across the
+whole chain, 125 footstep audio files all present on disk.
+
+#### The audio file the SNDR names (silent-creature root cause, 2026-08-05)
+
+Non-voice (creature/effect) audio is **PCM `.wav` in both games** — vanilla's
+`sound/fx/npc/bear/npc_bear_idlerooting_01.wav` is `RIFF/WAVE` with
+`wFormatTag=0x1`, and the Oblivion source is the same, so it needs no
+transcode. **Never re-encode it to `.xwm`.**
+
+There is **no extension substitution in the engine**: the SNDR `ANAM` is
+opened exactly as written. The only exe code touching the `.wav`/`.xwm`/`.fuz`
+strings (`0x140512485`) is the `sound\` / `data\sound\` path-prefix helper.
+Encoding these to `.xwm` while ANAM still said `.wav` pointed all ~2000 actor
+sound references at nonexistent files — every creature was silent even though
+records, triggers and files each looked correct in isolation.
+
+Only `.mp3` is transcoded (to PCM `.wav`), because the SSE exe contains no
+`.mp3` string at all. `_shipped_name()` in `dialog_misc.py` mirrors that one
+rename and must stay in lockstep with `audio_converter.convert_sounds`.
+**Voice lines are the exception** and are legitimately `.xwm`/`.fuz` (lip data
+loads only from `.fuz`) — that separate path working is what wrongly suggested
+xWMA was needed everywhere.
+
 ### Step 5 — Behavior graph generation (the new core)
 New `asset_convert/behavior_gen.py`: emit per-creature `Actors\TES4\<creature>\`:
 `<creature>project.hkx`, `characters\<creature>character.hkx`, `behaviors\<creature>

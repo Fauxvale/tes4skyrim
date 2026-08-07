@@ -343,8 +343,11 @@ def convert_sounds(
     * ``sound/Voice/`` — reorganised into TES5 voice layout via
       :func:`organize_voice_files` (race/gender folders → VoiceType folders,
       FormIDs shifted by *formid_index*).
-    * Everything else — copied as-is to ``output/<source_name>/sound/tes4/``
-      (Skyrim SE plays MP3/WAV/XWM natively; no conversion needed).
+    * Everything else — ENCODED to xWMA under
+      ``output/<source_name>/sound/tes4/``. SSE has no MP3 support (no '.mp3'
+      string in the exe) and does not play raw PCM .wav for actor sounds; the
+      SNDR record still names .wav, exactly as vanilla does, and the engine
+      resolves it to the .xwm on disk.
 
     Args:
         source_file:   Plugin filename (e.g. 'Oblivion.esm').
@@ -387,33 +390,93 @@ def convert_sounds(
         lip_text=find_lip_text(output_dir, source_name),
     )
 
-    # ── Non-voice sounds: copy as-is (Skyrim SE plays MP3/WAV/XWM natively) ──
+    # ── Non-voice sounds: keep .wav, transcode only .mp3 ────────────────────
+    # Non-voice (actor/effect) sounds are PCM .wav in BOTH games, so the file
+    # extension must survive the copy unchanged.
+    #
+    # An earlier version encoded these to xWMA on the theory that "SSE only
+    # plays xWMA, and vanilla ANAMs name .wav because the engine substitutes
+    # the extension". Both halves are wrong, and together they made every
+    # creature silent:
+    #   * Vanilla ships real PCM .wav for these. The cached vanilla asset
+    #     sound/fx/npc/bear/npc_bear_idlerooting_01.wav is RIFF/WAVE with
+    #     wFormatTag=0x1 (PCM, 32 kHz mono) — not xWMA. Vanilla ANAM names
+    #     .wav because a .wav is genuinely there.
+    #   * No extension substitution exists. The only exe code touching the
+    #     ".wav"/".xwm"/".fuz" string trio (0x140512485, GOG build) is the
+    #     sound\ / data\sound\ PATH-PREFIX helper; the other .xwm strings are
+    #     music paths and the BSA archive-type table. Nothing rewrites a .wav
+    #     reference into .xwm.
+    # So renaming the files to .xwm left all ~2000 SNDR ANAMs pointing at
+    # paths with no file behind them. Only VOICE lines are xWMA/.fuz (that
+    # path is separate, above, and keeps its own encoding).
+    #
+    # MP3 still has to go: the SSE exe contains no '.mp3' string at all. Those
+    # transcode to PCM .wav, which is what vanilla would have shipped.
     print('\n  [Non-voice sounds]')
-    count = 0
+    jobs = []
     for root_dir, dirs, files in os.walk(snd_src):
         # Skip the Voice subtree — already handled by organize_voice_files above
         if Path(root_dir).resolve() == snd_src.resolve():
             dirs[:] = [d for d in dirs if d.lower() != 'voice']
         for fname in files:
             src = Path(root_dir) / fname
-            dst = snd_dst / src.relative_to(snd_src)
+            rel = src.relative_to(snd_src)
+            if src.suffix.lower() == '.mp3':
+                dst = snd_dst / rel.with_suffix('.wav')   # SSE cannot read mp3
+            else:
+                dst = snd_dst / rel                       # .wav/.xwm: as-is
             if dst.exists():
                 continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            count += 1
-    if count:
-        print(f'  Copied {count} files -> {snd_dst}')
-    else:
-        print('  No non-voice sound files to copy (all already present or none found).')
+            jobs.append((src, dst))
 
-    total = voice_stats.get('organized', 0) + count
+    count = failed = copied = 0
+    if not jobs:
+        print('  No non-voice sound files to convert (all already present).')
+    else:
+        need_ffmpeg = any(s.suffix.lower() == '.mp3' for s, _ in jobs)
+        if need_ffmpeg and not ffmpeg:
+            print('  WARNING: ffmpeg not found — .mp3 sounds will be copied '
+                  'unconverted and will NOT play in SSE.')
+
+        def _encode(job):
+            src, dst = job
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.suffix.lower() != '.mp3':
+                shutil.copy2(src, dst)
+                return None
+            if not ffmpeg:
+                shutil.copy2(src, dst.with_suffix(src.suffix))
+                return None
+            # 16-bit PCM, matching the vanilla non-voice container.
+            r = subprocess.run(
+                [ffmpeg, '-y', '-loglevel', 'error', '-i', str(src),
+                 '-acodec', 'pcm_s16le', str(dst)],
+                capture_output=True, timeout=120)
+            return r.returncode == 0 and dst.is_file() and dst.stat().st_size > 0
+
+        # I/O- and subprocess-bound: threads are the right pool here.
+        with ThreadPoolExecutor(max_workers=(os.cpu_count() or 4)) as pool:
+            for ok in pool.map(_encode, jobs):
+                if ok is None:
+                    copied += 1
+                elif ok:
+                    count += 1
+                else:
+                    failed += 1
+        print(f'  Copied {copied} sounds'
+              + (f', transcoded {count} mp3 -> wav' if count else '')
+              + (f', {failed} FAILED' if failed else ''))
+
+    non_voice = copied + count
+    total = voice_stats.get('organized', 0) + non_voice
     print(
         f'\n  Sound conversion complete: '
-        f'{count} non-voice copied | '
+        f'{non_voice} non-voice | '
         f'{voice_stats.get("organized", 0)} voice organised to TES5 layout'
     )
-    return {'converted': 0, 'copied': total, 'failed': voice_stats.get('errors', 0),
+    return {'converted': count, 'copied': total,
+            'failed': voice_stats.get('errors', 0) + failed,
             'total': total}
 
 
