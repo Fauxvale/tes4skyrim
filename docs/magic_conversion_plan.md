@@ -212,7 +212,9 @@ What actually shipped, beyond the sketch below:
 
 4. **AssocItem is type-checked, not copied.** `wbMGEFAssocItemDecider` reads
    Assoc. Item for **10 archetypes only**, and each expects a specific record
-   type — Summon Creature an `NPC_`, Bound Weapon a `WEAP`/`ARMO`. The
+   type — Summon Creature an `NPC_`, Bound Weapon a `WEAP`/`ARMO` (what the
+   field *accepts*; the engine only implements weapons — see
+   [Bound items](#bound-items)). The
    converter resolves the TES4 FormID through a plugin-wide index
    (`_build_assoc_item_index`, masters included) and drops it under any other
    archetype rather than writing a meaningless FormID. Two Oblivion summons
@@ -273,7 +275,9 @@ The archetype table replaces the current FormID table as the primary mapping.
 Sketch, by family:
 
 - summons (`Z0xx`, `Zxxx`) → `18 Summon Creature`, AssocItem = converted CREA/NPC\_
-- bound weapon/armor (`BW*`, `BA*`, `BACU`, `MYHL`) → `17 Bound Weapon`, AssocItem = converted WEAP/ARMO
+- bound **weapon** (`BW*`) on a castable spell → `17 Bound Weapon`, AssocItem = converted WEAP
+- bound **armor** (`BA*`, `MYHL`, `MYTH`), and any bound item on an Ability/Lesser
+  Power → `1 Script` + `TES4_BoundItemEffect` ([Bound items](#bound-items))
 - `OPEN` → `16 Open`; `LOCK` → `15 Lock`
 - `DSPL` → `2 Dispel`; `TURN` → `24 Turn Undead`
 - `CHRM`/`CALM` → `6 Calm`; `DEMO` → `7 Demoralize`; `FRNZ` → `8 Frenzy`; `RALY` → `38 Rally`
@@ -405,6 +409,100 @@ Two script-side gaps had to be closed for these to be more than inert records
   damage, so a levitation scroll would grant temporary immortality — a worse
   defect than the one being fixed.
 
+<a id="bound-items"></a>
+### Bound items — DONE 2026-08-07 (user-confirmed in-game)
+
+**Skyrim has no bound armor.** Archetype `17 Bound Weapon` is a bound *weapon*
+implementation. xEdit types the Assoc. Item field as `[WEAP, ARMO, NULL]`, but
+that is only what the field **accepts** — it is not evidence the engine equips
+armor, and reading it that way cost three round trips. The census settles it:
+
+| | |
+|---|---|
+| Vanilla archetype-17 effects | 7 |
+| …whose AssocItem is a `WEAP` | **7** |
+| …whose AssocItem is an `ARMO` | **0** |
+
+Oblivion, by contrast, has a full bound-armor family — `BACU` cuirass, `BAGR`
+greaves, `BAGA` gauntlets, `BAHE` helmet, `BABO` boots, `BASH` shield, plus the
+Mythic Dawn set (`MYTH`/`MYHL`) — none of which the native archetype can serve.
+
+**Second, independent gap: archetype 17 only fires on a CAST.** Oblivion also
+delivers bound gear through Abilities (`SPIT.Type` 4) and Lesser Powers (3),
+which Skyrim applies passively and never casts, so even a bound *weapon* dies
+when delivered that way. Vanilla census: archetype 17 appears under `Type 0`
+only — 8 uses, zero under Type 3/4. Oblivion has 10 Ability + 3 Lesser Power
+spells carrying bound effects; the Mythic Dawn assassins in the Imperial Dungeon
+wear `AbBoundArmorMaceNoHelmetMD`, an Ability.
+
+So the routing rule keys on **both** the item type and the delivery:
+
+| | Castable spell (Type 0) | Ability / Lesser Power |
+|---|---|---|
+| **Bound armor** | scripted | scripted |
+| **Bound weapon** | native archetype 17 | scripted |
+
+`magic.bound_script_variant()` clones the bound MGEF into an archetype-`1`
+(Script) stand-in whose VMAD carries `TES4_BoundItemEffect`, with the item as a
+`Form` property (`Assoc. Item` is "Unused" under archetype 1, so it is zeroed).
+Clones are cached per source MGEF and allocated inside the serial, sorted record
+pass, so the output stays byte-reproducible. The source DATA is registered in
+Phase 0 by `register_mgef_formids()`: Phase 1 converts types **alphabetically**,
+so SPEL runs *before* MGEF and would otherwise find nothing to clone.
+
+**Teardown is the hard half.** Bound gear is not real equipment: it must vanish
+when the effect drops, including on death, so a corpse is never lootable for it.
+`OnEffectFinish` alone does **not** achieve that — an Ability is permanent and
+never finishes, so on death the engine simply stops processing the actor. The
+script therefore reclaims from `OnDying` (which fires while the actor is still
+alive, before the body can be searched), `OnDeath`, and `OnEffectFinish`, all
+routed through one idempotent function that clears its holder reference first.
+
+Two traps worth keeping written down:
+
+- **`UnequipItem`'s second argument is `abPreventEquip`.** Passing `true` tells
+  the engine *not* to re-equip the freed slot, which left the assassins stripped
+  after the armor vanished. Every `UnequipItem` call in vanilla Skyrim's own
+  scripts uses the defaults.
+- **A dying or dead actor never re-evaluates its equipment**, so the engine's
+  own re-equip cannot be relied on. The script samples every biped slot (30–61)
+  with `GetEquippedArmorInSlot`, plus both hands with `GetEquippedWeapon`,
+  *before* equipping, and restores those by name. A bound cuirass covers the
+  same slots as whatever was underneath — the Mythic Dawn robe occupies exactly
+  the 32/33/37/44 the bound armor takes — so nothing comes back on its own.
+  Sweeping the full range matters: the Mythic Dawn *helmet* claims 30/31/41/42/43,
+  which a hand-picked head/body/hands/feet set would have missed.
+
+### SPEL needs `ETYP` — DONE 2026-08-07 (user-confirmed in-game)
+
+`ETYP` (Equip Type) names the slot the magic menu files a spell under. **A spell
+without one never appears in the menu at all** — it can be added by console but
+is invisible and uncastable. All 1137 converted spells were missing it; the
+symptom surfaced on the Bound Dagger/Mace spells.
+
+Census of `references/Skyrim.esm`: **827/827 spells carry `ETYP`**, with no
+exceptions in any spell type — the strongest possible evidence it is mandatory.
+Oblivion has no equivalent field, so it is derived from the spell type using
+vanilla's own majority choice per type:
+
+| TES5 type | Vanilla majority | Emitted |
+|---|---|---|
+| 0 Spell | EitherHand (292/407) | `EitherHand` `0x00013F44` |
+| 1 Disease | EitherHand (13/13) | `EitherHand` |
+| 2 Power | Voice (24/28) | `Voice` `0x00025BEE` |
+| 3 Lesser Power | Voice (2/3) | `Voice` |
+| 4 Ability | EitherHand (242/250) | `EitherHand` |
+
+**Diseases and abilities still do not show in the menu, and `ETYP` is not what
+keeps them out** — the *spell type* is, which the engine handles. All 13 vanilla
+diseases carry `ETYP=EitherHand`, so omitting it for them would be the deviation.
+The field that does track "not menu-facing" is `MDOB` (the menu icon): diseases
+are the only type with zero (0/13). We emit no `MDOB` anywhere, which is
+consistent with diseases and a cosmetic gap elsewhere, not a functional one.
+
+The same trap was already known for `SCRL`, where the converter has always
+written `ETYP` — `convert_SPEL` was simply never given it.
+
 ### Phase 5 — Cleanup
 
 No record loses all its effects any more (audit: 0 for both plugins), so the
@@ -430,6 +528,16 @@ consumer of `vanilla_mgef_data.py`).
   the 47 archetypes; the ones it skips (Dispel, Lock, Open, Turn Undead) are
   still fully implemented engine classes. Check the exe's RTTI before assuming
   an unused enum value is dead.
+- **…but an xEdit type signature cannot license one either — it says what a
+  field ACCEPTS, not what the engine IMPLEMENTS.** `Assoc. Item` is typed
+  `[WEAP, ARMO, NULL]` under archetype 17, and bound *armor* still does nothing
+  in game: all 7 vanilla uses name a WEAP, none an ARMO. When the two disagree,
+  a unanimous vanilla census is the stronger evidence — 0/7 is a finding, not a
+  coincidence. (Cost three round trips; see [Bound items](#bound-items).)
+- **A field every vanilla record carries is mandatory until proven otherwise.**
+  827/827 spells have `ETYP`, and the spells we shipped without it were
+  invisible in the magic menu. "n/n with no exceptions" is the strongest signal
+  this codebase gets — treat a 100% census as a requirement, not a convention.
 - **`Assoc. Item` is typed by archetype and the target must be re-checked, not
   copied.** A CREA converts to an NPC_ (fine for Summon Creature) but an LVLC
   converts to an LVLN, which that archetype rejects.

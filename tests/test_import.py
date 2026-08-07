@@ -4033,6 +4033,133 @@ class TestMgefConversion:
             0x0100AAAA, magic.A_SUMMON_CREATURE,
             magic.T4_USE_CREATURE) == 0x0100BBBB
 
+    def test_every_spell_gets_an_equip_type(self):
+        """ETYP is mandatory: without it a spell never reaches the magic menu.
+
+        ETYP names the slot the menu files a spell under. A converted spell
+        that omitted it could be added by console but was invisible and
+        uncastable (user-confirmed on the Bound Dagger/Mace spells). Oblivion
+        has no equivalent field, so it is derived from the spell type.
+
+        Census of references/Skyrim.esm: 827/827 spells carry ETYP with no
+        exceptions in any type. Vanilla's majority choice is EitherHand for
+        ordinary spells and abilities, Voice for powers.
+        """
+        import struct as _s
+        from tes5_import.record_types import equipment
+        from tes5_import.skyrim_overrides import (SPELL_EQUIP_EITHER_HAND,
+                                                  SPELL_EQUIP_VOICE)
+
+        def _etyp(spit_type):
+            rec = {'FormID': '000A97BD', 'EditorID': 'S',
+                   'SPIT.Type': str(spit_type), 'SPIT.Cost': '50',
+                   'SPIT.Flags': '0', 'EffectCount': '1',
+                   'Effect[0].EFID': 'DGHE', 'Effect[0].Magnitude': '1',
+                   'Effect[0].Area': '0', 'Effect[0].Duration': '5',
+                   'Effect[0].Type': 'Target'}
+            out = equipment.convert_SPEL(rec)
+            assert out.find(b'ETYP') < out.find(b'SPIT'), 'ETYP must precede SPIT'
+            return _s.unpack('<I', _find_subrecord(out, b'ETYP'))[0]
+
+        assert _etyp(0) == SPELL_EQUIP_EITHER_HAND    # Spell
+        assert _etyp(1) == SPELL_EQUIP_EITHER_HAND    # Disease
+        assert _etyp(4) == SPELL_EQUIP_EITHER_HAND    # Ability
+        assert _etyp(2) == SPELL_EQUIP_VOICE          # Power
+        assert _etyp(3) == SPELL_EQUIP_VOICE          # Lesser Power
+
+    def test_bound_items_use_the_script_only_where_the_engine_cannot(self):
+        """Archetype 17 covers strictly less than Oblivion's bound-item family.
+
+        Two independent gaps, both verified against references/Skyrim.esm:
+
+        * **No bound armor at all.** All seven vanilla archetype-17 effects
+          name a WEAP; not one names an ARMO. xEdit types the field as
+          [WEAP, ARMO, NULL], but that is what it ACCEPTS, not proof the
+          engine equips armor — user-confirmed in-game, casting the converted
+          Bound Greaves spell did nothing.
+        * **Only fires on a cast.** Archetype 17 appears under SPIT.Type 0
+          only, never Type 3/4, so an Ability or Lesser Power (which Skyrim
+          applies passively) never reaches BoundItemEffect even for a weapon.
+
+        So: armor is always scripted; a weapon is scripted only when the
+        spell cannot cast, and otherwise keeps the engine's own path.
+        """
+        import struct as _s
+        from tes5_import.record_types import equipment, magic
+
+        class _W:
+            def __init__(self):
+                self.n = 0x800
+                self.recs = []
+
+            def alloc_formid(self):
+                self.n += 1
+                return self.n
+
+            def add_record(self, sig, b):
+                self.recs.append((sig, b))
+
+        def _mgef(fid, code, assoc):
+            return {'FormID': fid, 'EditorID': code, 'DATA.Flags': '139538',
+                    'DATA.BaseCost': '1.0', 'DATA.AssocItem': assoc,
+                    'DATA.School': '1', 'DATA.ResistValue': '4294967295'}
+
+        # BAGR (bound greaves) -> ARMO; BWSW (bound sword) -> WEAP.
+        magic.set_assoc_item_index({}, {0x00026270: 'ARMO', 0x0002627C: 'WEAP'})
+        magic.register_mgef_formids([
+            _mgef('0000184F', 'BAGR', '00026270'),
+            _mgef('00001857', 'BWSW', '0002627C'),
+        ])
+
+        def _spell(code, spit_type):
+            return {'FormID': '000A97B9', 'EditorID': 'BoundSpell',
+                    'SPIT.Type': str(spit_type), 'SPIT.Cost': '0',
+                    'SPIT.Flags': '0', 'EffectCount': '1',
+                    'Effect[0].EFID': code, 'Effect[0].Magnitude': '0',
+                    'Effect[0].Area': '0', 'Effect[0].Duration': '45',
+                    'Effect[0].Type': 'Self'}
+
+        def _first_efid(record_bytes):
+            return _s.unpack('<I', _find_subrecord(record_bytes, b'EFID'))[0]
+
+        armor_base = magic.get_mgef_formid('BAGR')
+        weapon_base = magic.get_mgef_formid('BWSW')
+
+        # A bound WEAPON on a castable spell keeps the engine's own archetype.
+        w = _W()
+        assert _first_efid(
+            equipment.convert_SPEL(_spell('BWSW', 0), writer=w)) == weapon_base
+        assert w.recs == []
+
+        # A bound weapon on an ABILITY cannot cast, so it gets the script.
+        w = _W()
+        assert _first_efid(
+            equipment.convert_SPEL(_spell('BWSW', 4), writer=w)) != weapon_base
+        assert len(w.recs) == 1
+
+        # Bound ARMOR is scripted even on a perfectly castable spell — Skyrim
+        # has no bound-armor implementation for it to fall back on.
+        w = _W()
+        scripted = _first_efid(
+            equipment.convert_SPEL(_spell('BAGR', 0), writer=w))
+        assert scripted != armor_base
+        assert len(w.recs) == 1
+        sig, clone = w.recs[0]
+        assert sig == 'MGEF'
+        data = _find_subrecord(clone, b'DATA')
+        assert _s.unpack_from('<I', data, magic._O_ARCHETYPE)[0] == magic.A_SCRIPT
+        # Assoc. Item is "Unused" under archetype 1 — the item travels as the
+        # script's BoundItem property instead.
+        assert _s.unpack_from('<I', data, magic._O_ASSOC_ITEM)[0] == 0
+        assert magic.BOUND_ITEM_SCRIPT.encode() in clone
+        assert b'BoundItem' in clone
+
+        # A lesser power is equally uncastable, and shares the cached clone.
+        w2 = _W()
+        assert _first_efid(
+            equipment.convert_SPEL(_spell('BAGR', 3), writer=w2)) == scripted
+        assert w2.recs == []
+
     def test_counter_effect_count_matches_the_esce_array(self):
         """DATA offset 20 must equal the ESCE count or the CK reads garbage."""
         import struct as _s

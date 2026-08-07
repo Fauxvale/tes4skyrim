@@ -1262,6 +1262,30 @@ ATTRIBUTE_SKILL_MAP = {
 # Skyrim EQUP FormID for shields (ETYP subrecord on ARMO)
 SHIELD_EQUIP_TYPE = 0x000141E8
 
+# ---------------------------------------------------------------------------
+# Spell equip types (ETYP subrecord on SPEL)
+#
+# ETYP tells the magic menu which slot a spell equips to.  A spell WITHOUT it
+# cannot be filed into a hand and never appears in the menu at all — the
+# converted Bound Dagger/Mace spells were addable by console but invisible and
+# uncastable (user-confirmed).  The same trap is already documented for SCRL,
+# where the converter has always written ETYP.
+#
+# Census of references/Skyrim.esm: 827/827 spells carry ETYP, with NO
+# exceptions in any spell type — the strongest possible evidence it is
+# mandatory.  The values below are vanilla's own majority choice per type:
+# EitherHand for ordinary castable spells and abilities (292/407 Type 0,
+# 242/250 Type 4), Voice for powers cast from the shout key (24/28 Type 2).
+SPELL_EQUIP_EITHER_HAND = 0x00013F44    # EitherHand
+SPELL_EQUIP_VOICE = 0x00025BEE          # Voice (powers / lesser powers)
+
+# TES5 spell type -> EQUP.  0 Spell, 1 Disease, 2 Power, 3 Lesser Power,
+# 4 Ability.  Powers are voice-slotted; everything else goes to either hand.
+SPELL_TYPE_EQUIP_TYPE = {
+    2: SPELL_EQUIP_VOICE,
+    3: SPELL_EQUIP_VOICE,
+}
+
 # Skyrim footstep sets (FormIDs verified against references/Skyrim.esm/FSTS.txt
 # — the old Light/Clothing values 0x24238/0x24237 didn't exist in Skyrim.esm,
 # giving every clothing/light-boot ArmorAddon a dangling FootstepSet).

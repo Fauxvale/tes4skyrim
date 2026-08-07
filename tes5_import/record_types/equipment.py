@@ -14,6 +14,8 @@ from ..skyrim_overrides import (
     MGEF_AV_CODE_TO_SKYRIM,
     MGEF_CODE_TO_SKYRIM,
     SHIELD_EQUIP_TYPE,
+    SPELL_EQUIP_EITHER_HAND,
+    SPELL_TYPE_EQUIP_TYPE,
     TES4_SKILL_TO_TES5_INDEX,
     WEAPON_ANIM_BAMT,
     WEAPON_ANIM_BIDS,
@@ -83,6 +85,37 @@ def _resolve_mgef(code: str, actor_value: int = -1, script_fid: str = '',
     return MGEF_CODE_TO_SKYRIM.get(code, 0)
 
 
+def _bound_script_for(mgef_fid: int, writer, uncastable: bool) -> int:
+    """Scripted stand-in for a bound-item MGEF, or 0 to keep the native path.
+
+    Two independent reasons a bound effect cannot use Skyrim's own archetype 17:
+
+    * **The item is armor.**  Skyrim has no bound armor at all — every one of
+      the seven vanilla archetype-17 effects names a WEAP, none an ARMO — so a
+      converted bound cuirass/greaves/helmet is inert under the native path
+      regardless of how it is delivered.  Oblivion's whole BA**/Mythic Dawn
+      family lands here.
+    * **The spell never casts.**  An Ability or Lesser Power is applied
+      passively, and BoundItemEffect only fires on a cast, so even a bound
+      WEAPON dies when delivered that way.
+
+    A bound weapon on a normal castable spell keeps the engine's own
+    implementation, which is better than any script.
+
+    The item the script conjures is the source MGEF's own Assoc. Item, already
+    resolved to an output WEAP/ARMO by the MGEF pass — reusing it means the
+    script and the native archetype always agree on what gets equipped.
+    """
+    from .magic import bound_assoc_is_armor, bound_item_assoc, bound_script_variant
+
+    assoc = bound_item_assoc(mgef_fid)
+    if not assoc:
+        return 0
+    if not uncastable and not bound_assoc_is_armor(mgef_fid):
+        return 0
+    return bound_script_variant(mgef_fid, assoc, writer)
+
+
 # TES4 ENCH records by raw FormID (uppercase hex), for the enchanted-book →
 # scroll conversion: Skyrim's SCRL carries its effects DIRECTLY, so a book
 # whose ENAM names an enchantment needs that enchantment's effect list copied
@@ -107,7 +140,7 @@ _FILLER_EFFECTS = (0x0003EB15, 0x0003EB17, 0x0003EB16, 0x0003EAF3)  # AlchRestor
 
 
 def _pack_effects(rec: dict, count_key: str = 'EffectCount', pad_to: int = 0,
-                  delivery: int = 0, writer=None) -> bytes:
+                  delivery: int = 0, writer=None, uncastable: bool = False) -> bytes:
     """Pack EFID/EFIT pairs for all effects on a record.
 
     Effects with no TES5 equivalent are dropped — an EFID of 0 (null MGEF)
@@ -119,6 +152,13 @@ def _pack_effects(rec: dict, count_key: str = 'EffectCount', pad_to: int = 0,
     item fires the projectile of its effects' MGEFs, so if none of them has
     one the item casts NOTHING in game.  In that case the first effect is
     swapped for a synthesized aimed clone (see magic_effects.aimed_variant).
+
+    Bound-item effects are re-pointed at a scripted stand-in whenever the
+    engine's own archetype 17 cannot serve them — always for bound ARMOR
+    (Skyrim implements bound weapons only), and for any bound item on a
+    never-cast spell.  ``uncastable`` marks that second case: a spell the
+    engine APPLIES rather than casts (an Ability or Lesser Power).  See
+    _bound_script_for and magic.bound_script_variant.
     """
     effects = []
     effect_count = get_int(rec, count_key)
@@ -135,6 +175,13 @@ def _pack_effects(rec: dict, count_key: str = 'EffectCount', pad_to: int = 0,
         if not mgef_fid:
             dropped_dur = max(dropped_dur, get_int(rec, f'Effect[{i}].Duration'))
             continue
+        # Bound armor has no engine implementation at all, and any bound item
+        # on a never-cast spell is equally dead — either way the scripted
+        # stand-in takes over.  A bound weapon on a castable spell is left on
+        # the native archetype.
+        scripted = _bound_script_for(mgef_fid, writer, uncastable)
+        if scripted:
+            mgef_fid = scripted
         mag = get_int(rec, f'Effect[{i}].Magnitude')
         area = get_int(rec, f'Effect[{i}].Area')
         dur = get_int(rec, f'Effect[{i}].Duration')
@@ -806,7 +853,10 @@ def convert_ENCH(rec: dict, writer=None) -> bytes:
 
 
 def convert_SPEL(rec: dict, writer=None) -> bytes:
-    """SPEL — Spell. SPIT restructured for TES5."""
+    """SPEL — Spell. SPIT restructured for TES5.
+
+    TES5 order: EDID OBND FULL KWDA MDOB ETYP DESC SPIT EFID/EFIT*
+    """
     subs = b''
     edid = get_str(rec, 'EditorID')
     if edid:
@@ -824,6 +874,15 @@ def convert_SPEL(rec: dict, writer=None) -> bytes:
     # TES5 spell types: 0=Spell, 1=Disease, 2=Power, 3=Lesser Power, 4=Ability, 10=Addiction, 11=Voice
     # TES4: 0=Spell, 1=Disease, 2=Power, 3=Lesser Power, 4=Ability
     tes5_type = tes4_type if tes4_type <= 4 else 0
+
+    # ETYP — Equip Type.  MANDATORY: it names the slot the magic menu files the
+    # spell under, and a spell without one never appears in the menu at all
+    # (converted Bound Dagger/Mace were addable by console but invisible and
+    # uncastable).  Oblivion has no equivalent field, so it is derived from the
+    # spell type exactly as vanilla does.  Census: 827/827 vanilla spells carry
+    # ETYP, no exceptions.
+    subs += pack_formid_subrecord(
+        'ETYP', SPELL_TYPE_EQUIP_TYPE.get(tes5_type, SPELL_EQUIP_EITHER_HAND))
 
     # Target from first effect
     target_type = 0
@@ -855,8 +914,11 @@ def convert_SPEL(rec: dict, writer=None) -> bytes:
     # Half-cost Perk FormID at 32 = 0
     subs += pack_subrecord('SPIT', bytes(spit))
 
-    # Effects
-    subs += _pack_effects(rec, delivery=target_type, writer=writer)
+    # Effects.  An Ability (4) or Lesser Power (3) is applied, never cast, so
+    # any bound-item effect it carries needs the scripted stand-in.
+    from .magic import UNCASTABLE_SPELL_TYPES
+    subs += _pack_effects(rec, delivery=target_type, writer=writer,
+                          uncastable=tes5_type in UNCASTABLE_SPELL_TYPES)
 
     return pack_record('SPEL', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
