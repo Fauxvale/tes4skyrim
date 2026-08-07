@@ -183,6 +183,43 @@ _CSDT_TO_CLIP = {
 }
 
 
+def foot_tags(slots: dict) -> dict:
+    """{footstep tag: SOUN EditorID} for a creature's CSDT foot slots (0-3).
+
+    The tag is simultaneously the animation event the clips fire AND the
+    FSTP.ANAM string the engine matches that event against — vanilla FSTPs
+    carry exactly the event name (NPCWolfFootFrontWalkFootstep ANAM=FootFront).
+    Both sides MUST derive it from this one function, or the fired event and
+    the record tag drift apart and every footstep goes silent.
+
+    Quadrupeds (an authored back-foot slot) collapse to the vanilla wolf pair
+    FootFront/FootBack; bipeds get FootLeft/FootRight like vanilla two-legged
+    creatures. Slot layout: 0=LeftFoot, 1=RightFoot, 2=LBackFoot, 3=RBackFoot.
+    """
+    slots = slots or {}
+    front = slots.get(0) or slots.get(1)
+    back = slots.get(2) or slots.get(3)
+    if back:
+        out = {'FootBack': back}
+        if front:
+            out['FootFront'] = front
+        return out
+    if not front:
+        return {}
+    return {'FootLeft': slots.get(0) or front,
+            'FootRight': slots.get(1) or front}
+
+
+def foot_enum_map(slots: dict) -> dict:
+    """Oblivion kf 'Enum: <X>' foot text key (lowercased, spaces stripped) →
+    the Skyrim footstep event to fire, consistent with foot_tags()."""
+    if 'FootLeft' in foot_tags(slots):
+        return {'left': 'FootLeft', 'right': 'FootRight',
+                'backleft': 'FootLeft', 'backright': 'FootRight'}
+    return {'left': 'FootFront', 'right': 'FootFront',
+            'backleft': 'FootBack', 'backright': 'FootBack'}
+
+
 def _sound_slots_by_folder(export_dir: str) -> dict:
     """folder(lower) -> {csdt_type: SOUN EditorID}, from the CREA export.
 

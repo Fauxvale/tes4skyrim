@@ -559,7 +559,8 @@ def build_behavior_xml(behavior_name: str, clips: dict,
               'attackStop', 'returnToDefault', 'deathStart', 'IdleStop',
               'DeathAnimation', 'Ragdoll', 'RagdollInstant',
               'AddRagdollToWorld', 'RemoveCharacterControllerFromWorld',
-              'SoundPlay', 'preHitFrame', 'HitFrame', 'FootFront', 'FootBack']
+              'SoundPlay', 'preHitFrame', 'HitFrame',
+              'FootFront', 'FootBack', 'FootLeft', 'FootRight']
     # Qualified sound events: one table entry per distinct
     # `SoundPlay.<SNDR EditorID>` the clips actually fire (see docstring).
     events += [e for e in dict.fromkeys(sound_events or []) if e not in events]
@@ -1357,22 +1358,29 @@ def _apply_sound_slots(clip_meta: list, clips: dict, sound_slots: dict) -> int:
                 added += add(c, t, edid)
         elif kind == 'locomotion' and where == 'foot':
             # Footfalls do NOT go through SoundPlay at all: vanilla creature
-            # projects fire the engine's own `FootFront`/`FootBack` events
-            # (wolf 140/142, bear 56/59), which route through the race's
-            # footstep set rather than a sound descriptor. Two contact points
-            # per cycle, alternating front/back — Oblivion .kf files almost
-            # never mark them, so they are placed from the clip duration.
+            # projects fire the engine's own footstep events (wolf 140/142
+            # FootFront/FootBack, bear 56/59), which route through the race's
+            # footstep set rather than a sound descriptor. The event name
+            # must be EXACTLY a tag creature_footsteps put in FSTP.ANAM —
+            # both derive from creature_pipeline.foot_tags. Clips with
+            # authored 'Enum:' footfall keys keep them; the rest get two
+            # contact points per cycle placed from the clip duration.
+            from asset_convert.creature_pipeline import foot_tags
+            tags = foot_tags(sound_slots)
+            if not tags:
+                continue
+            if 'FootLeft' in tags:
+                pair = [(0.25, 'FootLeft'), (0.75, 'FootRight')]
+            else:
+                pair = [(0.25, 'FootFront' if 'FootFront' in tags
+                         else 'FootBack'), (0.75, 'FootBack')]
             for c in clip_meta:
-                if not c['name'].startswith('Move'):
-                    continue
-                if any(n in ('FootFront', 'FootBack')
-                       for _t, n in c.get('feet', [])):
+                if not c['name'].startswith('Move') or c.get('feet'):
                     continue
                 d = c['duration']
                 if d <= 0:
                     continue
-                c.setdefault('feet', [])
-                c['feet'] += [(d * 0.25, 'FootFront'), (d * 0.75, 'FootBack')]
+                c['feet'] = [(d * f, tag) for f, tag in pair]
                 added += 2
     for c in clip_meta:
         c['sounds'].sort()
@@ -1392,7 +1400,9 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     record, so these become `SoundPlay.<SNDR>` clip triggers — see
     creature_pipeline._CSDT_TO_CLIP.
     """
-    from asset_convert.hkx_anim import convert_clip_hkx
+    from asset_convert.creature_pipeline import foot_enum_map
+    from asset_convert.hkx_anim import (decode_clip, event_annotations,
+                                        parse_kf_events, write_clip_hkx)
     from asset_convert.hkx_ragdoll import ragdoll_info
     from asset_convert.hkx_skeleton import generate_skeleton_hkx
 
@@ -1414,18 +1424,37 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
         convert_list.append(('MoveForwardRun', clips['run'], True, None,
                              None))
     attack_kfs = set(clips['attacks'])
+    enum_map = foot_enum_map(sound_slots)
+
+    # Phase 1 — DECODE every clip and collect its translated events
+    # (parse_kf_events: 'Sound: X' → SoundPlay descriptor names, authored
+    # 'Enum: Left/...' footfalls → engine foot events, 'Hit' → hit times).
+    # Compilation waits until _apply_sound_slots has folded the CREA CSDT
+    # slots in, because the events must be EMBEDDED in the animation hkx as
+    # annotations — the channel the engine dispatches at runtime (vanilla:
+    # 58/74 wolf animations carry SoundPlay./FootFront/FootBack annotations
+    # inside the .hkx; animationdata triggers alone stayed silent in game).
+    decoded, decode_failed = {}, {}         # stem -> (clip, motion) / error
     clip_meta, motions, failures = [], {}, []
     for st_name, kf, looping, _enter, end_evt in convert_list:
         stem = _clip_state_name(kf)
-        out_hkx = os.path.join(proj_dir, 'animations', stem + '.hkx')
-        try:
-            clip, motion = convert_clip_hkx(kf, bones, out_hkx, fps=fps,
-                                            is_attack=kf in attack_kfs)
-        except Exception as e:  # keep going; report at the end
-            failures.append((kf, f'{type(e).__name__}: {e}'))
+        if stem not in decoded and stem not in decode_failed:
+            try:
+                decoded[stem] = decode_clip(kf, fps)
+            except Exception as e:  # keep going; report at the end
+                decode_failed[stem] = f'{type(e).__name__}: {e}'
+        if stem in decode_failed:
+            failures.append((kf, decode_failed[stem]))
             if st_name == 'MoveForwardRun':
                 clips['run'] = None     # blender must not reference it
             continue
+        clip, motion = decoded[stem]
+        events = parse_kf_events(clip.text_keys, enum_map)
+        if kf in attack_kfs and not events['hits']:
+            # Keyless attack: the damage contract (weaponSwing/preHitFrame/
+            # HitFrame, fired by the graph's clip triggers) still needs a hit
+            # moment. ~40% in is where vanilla one-shot attacks put it.
+            events['hits'] = [float(clip.duration) * 0.4]
         clip_meta.append({
             'name': st_name,
             'stem': stem,
@@ -1433,22 +1462,22 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
             'duration': float(clip.duration),
             'looping': looping,
             'end_event': end_evt,
-            # Oblivion 'sound: <SOUN EDID>' text keys.  The EDID must survive:
-            # a behaviour-graph trigger is 'SoundPlay.<SNDR EDID>' and the
+            # The SOUN EDID must survive: both the hkx annotation and the
+            # animationdata trigger are 'SoundPlay.<SNDR EDID>' and the
             # engine resolves that name at playback.  Keeping only the
-            # timestamp emitted a bare 'SoundPlay' naming no descriptor, which
-            # plays nothing.
-            # This is the GRAPH channel and is unrelated to plain NIF sequence
-            # text keys: those stay in Oblivion's 'sound: X' form, which the
-            # engine handles natively (nif_converter._convert_sound_text_keys).
-            'sounds': [(float(t), s.strip().split(':', 1)[1].strip())
-                       for t, s in clip.text_keys
-                       if s.strip().lower().startswith('sound:')],
+            # timestamp emitted a bare 'SoundPlay' naming no descriptor,
+            # which plays nothing.
+            # This channel is unrelated to plain NIF sequence text keys:
+            # those stay in Oblivion's 'sound: X' form, which the engine
+            # handles natively (nif_converter._convert_sound_text_keys).
+            'sounds': events['sounds'],
+            # Authored Oblivion footfall keys, already translated to the
+            # engine's own footstep events (FSTP.ANAM match).
+            'feet': events['feet'],
             # Oblivion 'Hit' text keys → HitFrame triggers (damage contract)
-            'hits': [float(t) for t, s in clip.text_keys
-                     if s.strip().lower() == 'hit'],
+            'hits': events['hits'],
         })
-        if motion:
+        if motion and stem not in motions:
             motions[stem] = {
                 'bone': motion['bone'],
                 'duration': float(clip.duration),
@@ -1459,6 +1488,36 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
                 'rotations': (motion['rotations'].tolist()
                               if motion['rotations'] is not None else None),
             }
+
+    # CREA CSDT sound slots → SoundPlay/footstep events on the right clips,
+    # BEFORE compiling, so they land inside the animation hkx too.
+    _apply_sound_slots(clip_meta, clips, sound_slots)
+
+    # Phase 2 — COMPILE, embedding each animation FILE's full event union as
+    # annotations (states sharing one file share its annotations; blend
+    # children reuse base files, whose annotation times are file-local, so
+    # only rate-1 entries contribute). Hits stay OUT of the annotations: the
+    # graph already fires weaponSwing/preHitFrame/HitFrame through its
+    # hkbClipTriggerArray and double-firing would double the damage window.
+    ann_by_stem = {}
+    for c in clip_meta:
+        ann = ann_by_stem.setdefault(c['stem'], set())
+        ann.update(event_annotations(
+            {'sounds': c['sounds'], 'feet': c.get('feet', [])},
+            include_hits=False))
+    for stem in sorted(decoded):
+        clip, _motion = decoded[stem]
+        out_hkx = os.path.join(proj_dir, 'animations', stem + '.hkx')
+        try:
+            write_clip_hkx(clip, bones, out_hkx,
+                           sorted(ann_by_stem.get(stem, ())))
+        except Exception as e:  # drop every state that used this file
+            failures.append((stem + '.hkx', f'{type(e).__name__}: {e}'))
+            dropped = {c['name'] for c in clip_meta if c['stem'] == stem}
+            clip_meta = [c for c in clip_meta if c['stem'] != stem]
+            motions.pop(stem, None)
+            if 'MoveForwardRun' in dropped:
+                clips['run'] = None
 
     # natural clip speeds (game units/sec) from root-motion endpoints —
     # ck-cmd calculateMOVTs: forwardWalk = |end translation| / duration.
@@ -1515,8 +1574,6 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
             }
             clip_meta.append(entry)
             base_of[cnm] = entry
-
-    _apply_sound_slots(clip_meta, clips, sound_slots)
 
     behavior_name = f'TES4{name.capitalize()}Behavior'
     move_types = movement_type_names(lname)

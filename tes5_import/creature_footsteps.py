@@ -25,7 +25,9 @@ Vanilla template followed exactly (Skyrim.esm NPCWolfFootFrontWalk* chain):
     IPCT. Wolf lists 60 materials all pointing at ONE impact, so a creature
     sounds the same on every surface; we reproduce that list verbatim
     (_FOOTSTEP_MATERIALS) rather than inventing per-material variants.
-  * FSTP = EDID + DATA->IPDS + ANAM tag string.
+  * FSTP = EDID + DATA->IPDS + ANAM tag string. ANAM is matched VERBATIM
+    against the footstep event the animation fires (FootFront/FootBack/
+    FootLeft/FootRight — creature_pipeline.foot_tags on both sides).
   * FSTS = EDID + XCNT(20: walk/run/sprint/sneak/swim counts) + DATA, the
     FSTP FormID arrays. NOTE the DATA array order is the REVERSE of XCNT:
     swim, sneak, sprint, run, walk (xEdit wbDefinitionsTES5 line 7108).
@@ -75,9 +77,6 @@ _FOOTSTEP_MATERIALS = (
     0x00050AFA, 0x000388FB, 0x0001C151, 0x000774B6, 0x00012F34, 0x00012F3B,
 )
 
-# TES4 CSDT sound-type slots that are footsteps.
-_FOOT_SLOTS = (0, 1, 2, 3)
-
 # folder -> FSTS FormID, filled by build_creature_footsteps()
 _CREA_FSTS_MAP = {}
 
@@ -91,29 +90,38 @@ def get_creature_footstep_set(folder: str) -> int:
     return _CREA_FSTS_MAP.get(folder, 0)
 
 
-def _build_one(writer, folder: str, sndr_fids: list) -> int:
-    """IPCT+IPDS+FSTP per distinct foot sound, then one FSTS. Returns FSTS."""
+def _build_one(writer, folder: str, tag_sndrs: dict) -> int:
+    """IPCT+IPDS per distinct foot sound, one FSTP per TAG, then one FSTS.
+
+    tag_sndrs: {footstep tag: SNDR FormID}. The tag (FootFront/FootBack/
+    FootLeft/FootRight, from creature_pipeline.foot_tags) goes into FSTP.ANAM
+    VERBATIM — the engine matches the animation's footstep event against that
+    string exactly, so an invented tag name is a silent footstep. Vanilla:
+    NPCWolfFootFrontWalkFootstep ANAM=FootFront. Returns the FSTS FormID.
+    """
     base = folder.capitalize()
-    fstp_fids = []
-    for i, sndr in enumerate(sndr_fids):
-        tag = f'TES4{base}Foot{i + 1}'
+    ipds_of, fstp_fids = {}, []
+    for tag in sorted(tag_sndrs):
+        sndr = tag_sndrs[tag]
+        if sndr not in ipds_of:
+            ipct_fid = writer.alloc_formid()
+            subs = pack_string_subrecord('EDID', f'TES4{base}{tag}Impact')
+            subs += pack_subrecord('DATA', _IPCT_DATA)
+            subs += pack_subrecord('DODT', _IPCT_DODT)
+            subs += pack_formid_subrecord('SNAM', sndr)
+            writer.add_record('IPCT', pack_record('IPCT', ipct_fid, 0, subs))
 
-        ipct_fid = writer.alloc_formid()
-        subs = pack_string_subrecord('EDID', f'{tag}Impact')
-        subs += pack_subrecord('DATA', _IPCT_DATA)
-        subs += pack_subrecord('DODT', _IPCT_DODT)
-        subs += pack_formid_subrecord('SNAM', sndr)
-        writer.add_record('IPCT', pack_record('IPCT', ipct_fid, 0, subs))
-
-        ipds_fid = writer.alloc_formid()
-        subs = pack_string_subrecord('EDID', f'{tag}ImpactSet')
-        for mat in _FOOTSTEP_MATERIALS:
-            subs += pack_subrecord('PNAM', struct.pack('<II', mat, ipct_fid))
-        writer.add_record('IPDS', pack_record('IPDS', ipds_fid, 0, subs))
+            ipds_fid = writer.alloc_formid()
+            subs = pack_string_subrecord('EDID', f'TES4{base}{tag}ImpactSet')
+            for mat in _FOOTSTEP_MATERIALS:
+                subs += pack_subrecord('PNAM',
+                                       struct.pack('<II', mat, ipct_fid))
+            writer.add_record('IPDS', pack_record('IPDS', ipds_fid, 0, subs))
+            ipds_of[sndr] = ipds_fid
 
         fstp_fid = writer.alloc_formid()
-        subs = pack_string_subrecord('EDID', f'{tag}Footstep')
-        subs += pack_formid_subrecord('DATA', ipds_fid)
+        subs = pack_string_subrecord('EDID', f'TES4{base}{tag}Footstep')
+        subs += pack_formid_subrecord('DATA', ipds_of[sndr])
         subs += pack_string_subrecord('ANAM', tag)
         writer.add_record('FSTP', pack_record('FSTP', fstp_fid, 0, subs))
         fstp_fids.append(fstp_fid)
@@ -145,25 +153,22 @@ def build_creature_footsteps(writer, sound_slots: dict,
 
     Returns the number of folders wired.
     """
+    from asset_convert.creature_pipeline import foot_tags
+
     _CREA_FSTS_MAP.clear()
     if not sound_slots:
         return 0
     for folder in sorted(sound_slots):
-        slots = sound_slots[folder] or {}
-        # Distinct foot sounds, in slot order; most creatures use one sound for
-        # both front feet, quadrupeds a second for the back pair.
-        seen, sndrs = set(), []
-        for slot in _FOOT_SLOTS:
-            edid = slots.get(slot)
-            if not edid or edid in seen:
-                continue
+        # One FSTP per footstep TAG the animations fire; foot_tags is the
+        # single source of both the event names and these ANAM strings.
+        tag_sndrs = {}
+        for tag, edid in foot_tags(sound_slots[folder] or {}).items():
             fid = sndr_for_soun(edid)
             if fid:
-                seen.add(edid)
-                sndrs.append(fid)
-        if not sndrs:
+                tag_sndrs[tag] = fid
+        if not tag_sndrs:
             continue
-        _CREA_FSTS_MAP[folder] = _build_one(writer, folder, sndrs)
+        _CREA_FSTS_MAP[folder] = _build_one(writer, folder, tag_sndrs)
     return len(_CREA_FSTS_MAP)
 
 

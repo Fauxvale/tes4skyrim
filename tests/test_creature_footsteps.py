@@ -48,6 +48,11 @@ def _slots(**kw):
     return kw
 
 
+def _anams(w):
+    return {dict(_subrecords(b))[b'ANAM'].rstrip(b'\0').decode()
+            for b in w._top_groups.get('FSTP', [])}
+
+
 def test_builds_full_chain_per_folder():
     reset_creature_footsteps()
     w = FakeWriter()
@@ -55,11 +60,14 @@ def test_builds_full_chain_per_folder():
         w, {'goblin': {0: 'Foot', 1: 'Foot', 4: 'Idle'}},
         lambda edid: 0x01191000 if edid == 'Foot' else 0)
     assert n == 1
-    # One distinct foot sound -> one IPCT/IPDS/FSTP, and one FSTS per folder.
+    # Biped, one distinct foot sound -> one IPCT/IPDS shared by a
+    # FootLeft + FootRight FSTP pair, and one FSTS per folder.
     assert len(w._top_groups['IPCT']) == 1
     assert len(w._top_groups['IPDS']) == 1
-    assert len(w._top_groups['FSTP']) == 1
+    assert len(w._top_groups['FSTP']) == 2
     assert len(w._top_groups['FSTS']) == 1
+    # ANAM must be the exact event names the animations fire.
+    assert _anams(w) == {'FootLeft', 'FootRight'}
     assert get_creature_footstep_set('goblin')
 
 
@@ -85,8 +93,8 @@ def test_ipds_maps_every_material_to_the_impact():
     assert {struct.unpack_from('<I', v, 4)[0] for v in pnams} == {ipct_fid}
 
 
-def test_quadruped_gets_one_chain_per_distinct_foot_sound():
-    """Front/back pairs share a sound each -> 2 chains, not 4."""
+def test_quadruped_gets_front_and_back_tags():
+    """Front/back pairs share a sound each -> FootFront + FootBack chains."""
     reset_creature_footsteps()
     w = FakeWriter()
     build_creature_footsteps(
@@ -94,6 +102,7 @@ def test_quadruped_gets_one_chain_per_distinct_foot_sound():
         lambda edid: {'Front': 0x11, 'Back': 0x22}[edid])
     assert len(w._top_groups['IPCT']) == 2
     assert len(w._top_groups['FSTP']) == 2
+    assert _anams(w) == {'FootFront', 'FootBack'}
 
 
 def test_fsts_counts_match_the_data_arrays():
@@ -104,7 +113,8 @@ def test_fsts_counts_match_the_data_arrays():
                              lambda edid: 0x01191000)
     subs = dict(_subrecords(w._top_groups['FSTS'][0]))
     walk, run, sprint, sneak, swim = struct.unpack('<IIIII', subs[b'XCNT'])
-    assert (walk, run, sprint, sneak) == (1, 1, 1, 1)
+    # biped single sound still lists BOTH FootLeft and FootRight per gait
+    assert (walk, run, sprint, sneak) == (2, 2, 2, 2)
     assert swim == 0
     assert len(subs[b'DATA']) == 4 * (walk + run + sprint + sneak + swim)
 

@@ -34,7 +34,8 @@ from asset_convert.kf_decode import (DecodedClip, decode_kf,  # noqa: E402
 
 
 def clip_to_animation_data(clip: DecodedClip, bone_names: list,
-                           reference_pose=None) -> AnimationData:
+                           reference_pose=None,
+                           annotations=None) -> AnimationData:
     """Build a pynifly AnimationData with one track per skeleton bone.
 
     bone_names: skeleton bone order (from hkx_skeleton.load_skeleton_bones).
@@ -42,6 +43,13 @@ def clip_to_animation_data(clip: DecodedClip, bone_names: list,
     bones the clip does not animate; defaults to identity (the engine blends
     against the skeleton reference pose anyway, but vanilla files carry real
     values, so pass the skeleton pose when available).
+    annotations: [(time, text)] SKYRIM events to embed in the animation —
+    this is the channel the engine actually dispatches at runtime (vanilla:
+    58/74 wolf animations carry SoundPlay.<SNDR>/FootFront/FootBack/HitFrame
+    annotations inside the .hkx). Oblivion's raw text keys ('Sound: X',
+    'Enum: Left') mean nothing to Skyrim and are NOT carried over — translate
+    them first (parse_kf_events/event_annotations); embedding them verbatim
+    was exactly what left every converted creature silent.
     """
     n_frames = len(clip.times)
     # KF tracks carry Oblivion bone names; the skeleton bone list has the
@@ -87,11 +95,70 @@ def clip_to_animation_data(clip: DecodedClip, bone_names: list,
             td.scales.append([s, s, s])
         anim.tracks.append(td)
 
-    for t, text in clip.text_keys:
-        text = text.strip()
-        if text and text.lower() not in ('start', 'end'):
-            anim.annotations.append(Annotation(time=float(t), text=text))
+    for t, text in sorted(annotations or []):
+        anim.annotations.append(Annotation(time=float(t), text=text))
     return anim
+
+
+# Default (quadruped) mapping for Oblivion foot enums; creature projects pass
+# the slot-aware map from creature_pipeline.foot_enum_map instead.
+_QUAD_ENUM_MAP = {'left': 'FootFront', 'right': 'FootFront',
+                  'backleft': 'FootBack', 'backright': 'FootBack'}
+
+
+def parse_kf_events(text_keys, enum_map=None) -> dict:
+    """Oblivion .kf text keys → translated Skyrim event lists.
+
+    Returns {'sounds': [(t, SOUN EditorID)], 'feet': [(t, foot event)],
+    'hits': [t]}:
+      * 'Sound: <SOUN EDID>'  — Oblivion plays the sound directly; Skyrim's
+        equivalent is a SoundPlay.<SNDR EDID> event (see event_annotations).
+      * 'Enum: Left/Right/BackLeft/BackRight' — Oblivion's authored footfall
+        moments (they fire CSDT foot slots 0-3); translated via enum_map to
+        the engine's own footstep events. AUTHORED times beat any synthesis.
+      * 'Hit' — the damage frame (weaponSwing/preHitFrame/HitFrame contract).
+    Anything else ('start'/'end', 'Enum: Attack', ...) is Oblivion-internal
+    and dropped.
+    """
+    enum_map = enum_map or _QUAD_ENUM_MAP
+    sounds, feet, hits = [], [], []
+    for t, s in text_keys:
+        k = s.strip()
+        low = k.lower()
+        if low.startswith('sound:'):
+            edid = k.split(':', 1)[1].strip()
+            if edid:
+                sounds.append((float(t), edid))
+        elif low.startswith('enum:'):
+            tag = enum_map.get(low.split(':', 1)[1].replace(' ', ''))
+            if tag:
+                feet.append((float(t), tag))
+        elif low == 'hit':
+            hits.append(float(t))
+    return {'sounds': sorted(sounds), 'feet': sorted(feet),
+            'hits': sorted(hits)}
+
+
+def event_annotations(events: dict, include_hits: bool = True) -> list:
+    """parse_kf_events()-shaped dict → [(t, text)] hkx annotations.
+
+    Sound events MUST be the fully-qualified `SoundPlay.<SNDR EditorID>` —
+    a bare `SoundPlay` is measured and discarded by the engine (handler
+    0x140565c90, GOG build). include_hits=False for creature-project clips:
+    their behavior graph already fires the weaponSwing/preHitFrame/HitFrame
+    triple through hkbClipTriggerArray (proven live — attack states return
+    to default via those triggers), and firing it from both channels would
+    double the damage window and the swing sound.
+    """
+    out = [(t, f'SoundPlay.TES4_{edid}_SNDR')
+           for t, edid in events.get('sounds', []) if edid]
+    out += [(t, name) for t, name in events.get('feet', [])]
+    if include_hits:
+        for t in events.get('hits', []):
+            out += [(max(0.0, t - 0.3), 'weaponSwing'),
+                    (max(0.0, t - 0.1), 'preHitFrame'),
+                    (t, 'HitFrame')]
+    return sorted(out)
 
 
 def ensure_weapon_swing(anim: AnimationData, clip: DecodedClip) -> None:
@@ -218,27 +285,34 @@ def build_animation_xml(anim: 'AnimationData', skeleton_root: str) -> str:
     return pf.render(top)
 
 
-def convert_clip_hkx(ob_kf_path: str, bones, out_hkx: str,
-                     fps: float = 30.0, extract_motion: bool = True,
-                     keep_xml: bool = False, is_attack: bool = False):
-    """Oblivion .kf → Skyrim LE .hkx (XML → hkxcmd serializer).
-
-    bones: hkx_skeleton.Bone list of the creature's generated skeleton.
-    is_attack: attack clips get the weaponSwing annotation Skyrim expects
-    (see ensure_weapon_swing).
-    Returns (DecodedClip, motion_or_None).
-    """
-    from asset_convert.hkx_xml import compile_hkx
-
+def decode_clip(ob_kf_path: str, fps: float = 30.0,
+                extract_motion: bool = True):
+    """Decode an Oblivion .kf. Returns (DecodedClip, motion_or_None)."""
     clips = decode_kf(ob_kf_path, fps)
     if not clips:
         raise ValueError(f'no NiControllerSequence in {ob_kf_path}')
     clip = clips[0]
     motion = split_root_motion(clip) if extract_motion else None
+    return clip, motion
+
+
+def write_clip_hkx(clip: DecodedClip, bones, out_hkx: str,
+                   annotations=(), is_attack: bool = False,
+                   keep_xml: bool = False):
+    """Compile a decoded clip to Skyrim LE .hkx (XML → hkxcmd serializer).
+
+    bones: hkx_skeleton.Bone list of the creature's generated skeleton.
+    annotations: [(t, text)] translated Skyrim events (see
+    clip_to_animation_data).
+    is_attack: attack clips get the weaponSwing annotation Skyrim expects
+    (see ensure_weapon_swing) unless the annotation list already has one.
+    """
+    from asset_convert.hkx_xml import compile_hkx
 
     bone_names = [b.name for b in bones]
     anim = clip_to_animation_data(clip, bone_names,
-                                  reference_pose_from_bones(bones))
+                                  reference_pose_from_bones(bones),
+                                  annotations)
     if is_attack:
         ensure_weapon_swing(anim, clip)
     xml = build_animation_xml(anim, skeleton_root=bone_names[0])
@@ -250,6 +324,23 @@ def convert_clip_hkx(ob_kf_path: str, bones, out_hkx: str,
     compile_hkx(xml_path, out_hkx)
     if not keep_xml:
         os.remove(xml_path)
+
+
+def convert_clip_hkx(ob_kf_path: str, bones, out_hkx: str,
+                     fps: float = 30.0, extract_motion: bool = True,
+                     keep_xml: bool = False, is_attack: bool = False):
+    """One-shot Oblivion .kf → Skyrim LE .hkx (CLI/standalone path).
+
+    Annotations are translated from the kf's own text keys (quadruped foot
+    naming). Creature projects instead decode first, fold in the CREA CSDT
+    sound slots, and call write_clip_hkx with the full annotation set —
+    see hkx_behavior.generate_creature_project.
+    Returns (DecodedClip, motion_or_None).
+    """
+    clip, motion = decode_clip(ob_kf_path, fps, extract_motion)
+    annotations = event_annotations(parse_kf_events(clip.text_keys))
+    write_clip_hkx(clip, bones, out_hkx, annotations,
+                   is_attack=is_attack, keep_xml=keep_xml)
     return clip, motion
 
 
