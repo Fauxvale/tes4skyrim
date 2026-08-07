@@ -34,6 +34,35 @@ def _t(b):
     return type(b).__name__ if b is not None else 'None'
 
 
+def _shader_flag_bits(flags):
+    """Reconstruct the numeric value of a Skyrim shader-flags bit struct.
+
+    PyFFI exposes these as a bit_struct with one named 1-bit attribute per
+    flag, in declaration order, and NO aggregate integer -- the previous
+    `flags._value` read always missed and silently printed 0x00000000, which
+    hid real flag state (soft_effect in particular) behind a constant zero.
+    """
+    val = 0
+    try:
+        attrs = flags._get_attribute_list()
+    except Exception:
+        return 0
+    for pos, a in enumerate(attrs):
+        if getattr(flags, a.name, 0):
+            val |= 1 << pos
+    return val
+
+
+def _shader_flag_names(flags):
+    """Comma-joined names of the set flags, so the hex is readable."""
+    try:
+        attrs = flags._get_attribute_list()
+    except Exception:
+        return ''
+    on = [a.name for a in attrs if getattr(flags, a.name, 0)]
+    return ','.join(on) if on else '-'
+
+
 def dump_interpolator(interp, indent):
     pad = ' ' * indent
     if interp is None:
@@ -146,7 +175,8 @@ def dump_psys(ps, indent):
         tn = _t(p)
         if tn == 'BSEffectShaderProperty':
             print(f'{pad}  bs_prop: {tn} tex={p.source_texture!r} '
-                  f'flags1=0x{int(p.shader_flags_1._value if hasattr(p.shader_flags_1, "_value") else 0):08x} '
+                  f'flags1=0x{_shader_flag_bits(p.shader_flags_1):08x} '
+                  f'[{_shader_flag_names(p.shader_flags_1)}] '
                   f'emis_mult={p.emissive_multiple} '
                   f'emis_col=({p.emissive_color.r},{p.emissive_color.g},{p.emissive_color.b},{p.emissive_color.a}) '
                   f'clamp={p.texture_clamp_mode} falloff=({p.falloff_start_angle},{p.falloff_stop_angle},'

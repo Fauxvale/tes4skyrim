@@ -1970,6 +1970,90 @@ class TestBowRig:
             'BSXFlags Animated bit missing - graph never ticks'
 
 
+class TestFXBrightnessAndSoftEffect:
+    """Blended FX geometry: authored brightness + the soft-particle depth fade.
+
+    User report (2026-08-07): Ayleid-ruin smoke "incredibly bright... way
+    brighter than in Oblivion and difficult to see through", and transparent
+    effects showing "a rectangular bounding box around them".
+
+    Three regressions guarded here:
+      * the authored NiMaterialProperty.emissive_color must survive (it was
+        being overwritten with full white, so every dimmed FX surface rendered
+        at ~2x its intended brightness, compounding per additive layer);
+      * emissive_multiple must stay at the vanilla-neutral 1.0 rather than the
+        fire-specific 1.5 that was applied to every particle system;
+      * slsf_1_soft_effect must be set on blended FX, or the quad hard-cuts
+        against intersecting geometry and shows its own rectangular edge.
+    """
+
+    MIST = 'export/Oblivion.esm/meshes/dungeons/misc/fx/fxmist01.nif'
+    GROUND_MIST = ('export/Oblivion.esm/meshes/dungeons/misc/fx/'
+                   'fxmistgroundeffect01.nif')
+
+    def _convert(self, src, tmp_path):
+        import time
+        if not hasattr(time, 'clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat
+
+        dst = tmp_path / 'fx.nif'
+        result = convert_nif(src, str(dst))
+        assert not result.get('error'), result
+        data = NifFormat.Data()
+        with open(str(dst), 'rb') as f:
+            data.read(f)
+        return data
+
+    def _effect_shaders(self, data):
+        from pyffi.formats.nif import NifFormat
+        return [b for b in data.blocks
+                if isinstance(b, NifFormat.BSEffectShaderProperty)]
+
+    @pytest.mark.skipif(not Path(MIST).exists(),
+                        reason='Oblivion mist mesh not available')
+    def test_mist_keeps_its_authored_emissive(self, tmp_path):
+        """fxmist01 is authored at 0.47 grey -- not white."""
+        shaders = self._effect_shaders(self._convert(self.MIST, tmp_path))
+        assert shaders, 'mist quad did not get an effect shader'
+        for s in shaders:
+            assert abs(float(s.emissive_color.r) - 0.47) < 0.02, \
+                'authored emissive was overwritten (mist renders ~2x too bright)'
+            assert abs(float(s.emissive_multiple) - 1.0) < 0.01, \
+                'emissive_multiple must stay vanilla-neutral 1.0'
+
+    @pytest.mark.skipif(not Path(MIST).exists(),
+                        reason='Oblivion mist mesh not available')
+    def test_blended_fx_gets_soft_depth_fade(self, tmp_path):
+        """Without soft_effect the quad shows a hard rectangular edge."""
+        shaders = self._effect_shaders(self._convert(self.MIST, tmp_path))
+        assert shaders
+        for s in shaders:
+            assert int(s.shader_flags_1.slsf_1_soft_effect) == 1, \
+                'blended FX quad has no soft depth fade (rectangular edge)'
+            assert float(s.soft_falloff_depth) > 0.0, \
+                'soft_effect set but falloff depth is 0 (fade does nothing)'
+
+    @pytest.mark.skipif(not Path(GROUND_MIST).exists(),
+                        reason='Oblivion ground-mist mesh not available')
+    def test_additive_fx_without_vertex_colour_prop_is_not_lit(self, tmp_path):
+        """The Ayleid ground mist declares no NiVertexColorProperty.
+
+        lighting_mode therefore defaults to "lit" and every plane used to be
+        routed to BSLightingShaderProperty -- lit, normal-mapped and with no
+        soft fade.  Additive blending is the second authored unlit indicator.
+        """
+        from pyffi.formats.nif import NifFormat
+        data = self._convert(self.GROUND_MIST, tmp_path)
+        eff = self._effect_shaders(data)
+        assert eff, 'additively-blended mist planes did not reach the FX shader'
+        for s in eff:
+            assert int(s.shader_flags_1.slsf_1_soft_effect) == 1
+            # Authored at (0.13, 0.16, 0.17) -- a dim blue-grey, not white.
+            assert float(s.emissive_color.r) < 0.5, \
+                'ground mist emissive was promoted to white'
+
+
 class TestTextureTransformControllerConversion:
     """NiTextureTransformController -> BS*ShaderPropertyFloatController.
 
@@ -2139,8 +2223,16 @@ class TestTextureTransformControllerConversion:
                  if isinstance(b, (NifFormat.BSLightingShaderPropertyFloatController,
                                    NifFormat.BSEffectShaderPropertyFloatController))]
         assert ctrls, 'converted waterfall has no UV animation'
-        assert all(c.type_of_controlled_variable == 22 for c in ctrls), \
-            'waterfall scroll is not on V Offset'
+        # "V Offset" is numbered per shader type -- 22 on the lighting shader,
+        # 8 on the effect shader (_TEX_TRANSFORM_VARS).  The waterfall is
+        # additively blended, so it takes BSEffectShaderProperty; assert the
+        # variable the controller's OWN shader uses rather than one constant.
+        v_offset_for = {
+            NifFormat.BSLightingShaderPropertyFloatController: 22,
+            NifFormat.BSEffectShaderPropertyFloatController: 8,
+        }
+        assert all(c.type_of_controlled_variable == v_offset_for[type(c)]
+                   for c in ctrls), 'waterfall scroll is not on V Offset'
         assert all(c.interpolator is not None and c.interpolator.data is not None
                    for c in ctrls), 'controller lost its curve'
 

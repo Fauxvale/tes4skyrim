@@ -1000,6 +1000,54 @@ _SHADER_ALPHA_VAR = (12, 5)
 # BSLightingShaderProperty.  See the shader choice in _process_geometry.
 _LIGHTING_EMISSIVE_ONLY = 0
 
+# NiAlphaProperty.flags: bit 0 = alpha blending enabled.  Everything below keys
+# off "does this FX surface alpha-blend", which is the discriminator vanilla
+# itself uses for the soft-particle depth fade (see _apply_fx_soft_effect).
+_ALPHA_BLEND_ENABLED = 0x0001
+
+# NiAlphaProperty.flags bits 5-8 = destination blend factor.  0 = GL_ONE, i.e.
+# ADDITIVE blending (the surface adds its colour to whatever is behind it).
+# Oblivion's FX quads are authored this way; ordinary lit geometry never is.
+_ALPHA_DST_SHIFT = 5
+_ALPHA_DST_ONE = 0
+
+# Skyrim's soft-particle depth fade.  A blended FX quad that intersects solid
+# geometry is normally cut off along the intersection line, so a smoke/mist
+# billboard standing in a floor or wall shows the QUAD'S OWN RECTANGULAR EDGE --
+# the "distracting bounding box around transparent effects".  slsf_1_soft_effect
+# makes the engine fade the quad out over Soft Falloff Depth units of depth
+# difference instead, which is what removes the hard edge.
+#
+# Oblivion has no equivalent flag (its FX quads are simply hand-placed to avoid
+# intersections), so there is no source field to carry across -- the value comes
+# from what vanilla Skyrim does with the same kind of surface.  Census of 1,198
+# BSEffectShaderProperty shapes across meshes/effects + meshes/dungeons:
+#
+#   alpha 0x100d (additive)  n=470   soft_effect=1 in 417 (89%)
+#   alpha 0x10ed (blend)     n=362   soft_effect=1 in 224 (62%)
+#   no NiAlphaProperty       n=332   soft_effect=0 in 322 (97%)
+#
+# So: blended FX gets the fade, unblended FX does not.  100.0 is the commonest
+# falloff depth in the same census (250/521 on mist/smoke/fog geometry) and is
+# the value vanilla uses for ambient room fog, which is exactly this case.
+_SOFT_FALLOFF_DEPTH = 100.0
+
+
+def _apply_fx_soft_effect(eff_shader, alpha_prop):
+    """Enable the soft-particle depth fade on a blended FX shader.
+
+    Keyed on the source's own NiAlphaProperty: blending on -> fade, off/absent
+    -> leave hard (matching the vanilla split above).  A quad that does not
+    blend has no soft edge to preserve in the first place.
+    """
+    if alpha_prop is None:
+        return False
+    if not (int(alpha_prop.flags) & _ALPHA_BLEND_ENABLED):
+        return False
+    eff_shader.shader_flags_1.slsf_1_soft_effect = 1
+    eff_shader.soft_falloff_depth = _SOFT_FALLOFF_DEPTH
+    return True
+
 # Diffuse for a shape whose Oblivion source carries no NiTexturingProperty.
 # Skyrim's lighting shader dereferences the diffuse without a null check, so
 # "no texture" is not representable -- see the else branch in _process_geometry.
@@ -1480,8 +1528,33 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     # fields are useless here too -- these FX shapes disagree on every one of
     # them (roomRoomFX emissive-white + blended, LightBeam emissive-black +
     # blended, Cone01 no alpha property, GlowPlane material-alpha 0).
+    #
+    # lighting_mode == 0 is Oblivion's EXPLICIT unlit declaration, but it is not
+    # the only one: many FX meshes ship no NiVertexColorProperty at all, so the
+    # mode defaults to "lit" and genuine FX geometry took the lighting shader.
+    # dungeons/misc/fx/fxmistgroundeffect01 -- the Ayleid-ruin ground mist --
+    # is exactly that: five additively-blended AtmosphereCloud01 planes, no
+    # vertex-colour property, so every one became a LIT, normal-mapped surface
+    # with no soft fade.  That is the visible rectangle the user reported.
+    # Across Oblivion's own FX directories 76 of 179 blended shapes declare no
+    # lighting_mode at all, so the gap is the common case, not an edge case.
+    #
+    # ADDITIVE blending is the second authored indicator.  A surface whose
+    # NiAlphaProperty sets dst=ONE ADDS its colour to the framebuffer; it can
+    # never be ordinary lit geometry, because lighting it would double-count the
+    # light it is already contributing.  Vanilla Skyrim agrees without exception:
+    # of 64 additively-blended shapes sampled across meshes/effects and
+    # meshes/dungeons, 64 use BSEffectShaderProperty and 0 use the lighting
+    # shader.  Plain alpha blending is deliberately NOT included -- that census
+    # does show 3 legitimate BSLightingShaderProperty cases (glass, ice), so
+    # widening this to all blending would misroute real lit geometry.
+    is_additive_fx = (alpha_prop is not None and
+                      (int(alpha_prop.flags) & _ALPHA_BLEND_ENABLED) and
+                      ((int(alpha_prop.flags) >> _ALPHA_DST_SHIFT) & 0xF)
+                      == _ALPHA_DST_ONE)
     is_static_fx = (flip_ctrl is None and diffuse_path and
-                    vertex_lighting_mode == _LIGHTING_EMISSIVE_ONLY)
+                    (vertex_lighting_mode == _LIGHTING_EMISSIVE_ONLY or
+                     is_additive_fx))
     if flip_ctrl is not None or is_static_fx:
         srcs = ([s for s in flip_ctrl.sources if s is not None and s.file_name]
                 if flip_ctrl is not None else [])
@@ -1522,12 +1595,35 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         eff_shader.source_texture = effective_path
         eff_shader.texture_clamp_mode = 3
         # emissive_multiple defaults to 0.0 → the flame quad renders BLACK.
-        # Fire is self-illuminated; scale its emission to full.
+        # Fire is self-illuminated; scale its emission to full.  1.0 is also
+        # what vanilla uses on 852/1164 blended FX shapes -- it is the neutral
+        # value, and anything above it is a deliberate over-brighten.
         eff_shader.emissive_multiple = 1.0
-        eff_shader.emissive_color.r = 1.0
-        eff_shader.emissive_color.g = 1.0
-        eff_shader.emissive_color.b = 1.0
-        eff_shader.emissive_color.a = 1.0
+        # Carry Oblivion's AUTHORED emissive colour instead of forcing white.
+        # NiMaterialProperty.emissive_color is how Oblivion dims an FX surface:
+        # dungeons/misc/fx/fxmist01 ships (0.47, 0.47, 0.47), i.e. the mist is
+        # authored at just under HALF brightness.  Overwriting that with white
+        # doubled every such effect, and on an additively-blended quad (dst=ONE)
+        # the excess accumulates per overlapping layer -- which is why the
+        # Ayleid-ruin mist read as blinding and opaque rather than translucent.
+        # Fall back to white only when the source genuinely declares no emissive
+        # (pure black), so unlit-but-untinted quads still light up.
+        if emissive_r > 0.0 or emissive_g > 0.0 or emissive_b > 0.0:
+            eff_shader.emissive_color.r = emissive_r
+            eff_shader.emissive_color.g = emissive_g
+            eff_shader.emissive_color.b = emissive_b
+        else:
+            eff_shader.emissive_color.r = 1.0
+            eff_shader.emissive_color.g = 1.0
+            eff_shader.emissive_color.b = 1.0
+        # Oblivion's NiMaterialProperty.alpha is a second opacity multiplier the
+        # effect path was dropping entirely (the lighting path already carries it
+        # via shader.alpha).  On the effect shader it belongs in the emissive
+        # alpha, which is what the engine multiplies the sampled texel by.
+        eff_shader.emissive_color.a = material_alpha
+        # Kill the rectangular hard edge where the quad intersects walls/floor.
+        if _apply_fx_soft_effect(eff_shader, alpha_prop) and stats is not None:
+            stats['fx_soft_effect'] = stats.get('fx_soft_effect', 0) + 1
 
         if atlas is not None:
             atlas_path, n_pad, n_real = atlas
@@ -2933,6 +3029,11 @@ def _convert_particle_system(node, fix_textures):
     diffuse_path = b''
     flip_ctrl = None
     alpha_prop = None
+    # Oblivion's authored brightness/opacity for the particles, taken from the
+    # emitter's NiMaterialProperty exactly as the geometry path does.  A smoke
+    # emitter authored at (0.35, 0.35, 0.35) must not be promoted to white.
+    psys_emissive = None
+    psys_alpha = 1.0
 
     # Harvest UV-scroll controllers before the Oblivion properties are cleared.
     tex_transforms = _collect_tex_transform_ctrls(node.properties)
@@ -2947,6 +3048,11 @@ def _convert_particle_system(node, fix_textures):
                     flip_ctrl = ctrl
                     break
                 ctrl = getattr(ctrl, 'next_controller', None)
+        elif isinstance(prop, NifFormat.NiMaterialProperty):
+            ec = prop.emissive_color
+            if ec.r > 0.0 or ec.g > 0.0 or ec.b > 0.0:
+                psys_emissive = (ec.r, ec.g, ec.b)
+            psys_alpha = float(prop.alpha)
         elif isinstance(prop, NifFormat.NiAlphaProperty):
             alpha_prop = prop
 
@@ -3039,11 +3145,25 @@ def _convert_particle_system(node, fix_textures):
     # u32 packs clamp mode (low byte, 3 = WRAP_S|WRAP_T) with lighting
     # influence (byte 1, 0xFF) — every vanilla fire effect shader uses 0xFF03.
     shader.texture_clamp_mode = 0xFF03
-    shader.emissive_multiple = 1.5
-    shader.emissive_color.r = 1.0
-    shader.emissive_color.g = 1.0
-    shader.emissive_color.b = 1.0
-    shader.emissive_color.a = 1.0
+    # 1.5 was applied here to EVERY particle system regardless of what it emits.
+    # It is a fire value (vanilla flame shaders sit at 1.25-1.5), but the same
+    # code path converts smoke, mist, steam and dust, and a 50% over-brighten on
+    # an additively-blended smoke plume makes it glaring and opaque instead of
+    # translucent.  Vanilla's overwhelming default is 1.0 (852/1164 blended FX
+    # shapes); the brighter values are authored per-effect, not applied blanket.
+    # Oblivion states the intended brightness in NiMaterialProperty.emissive_color
+    # (harvested below), so the multiple stays neutral and the authored colour
+    # does the dimming.
+    shader.emissive_multiple = 1.0
+    if psys_emissive is not None:
+        shader.emissive_color.r = psys_emissive[0]
+        shader.emissive_color.g = psys_emissive[1]
+        shader.emissive_color.b = psys_emissive[2]
+    else:
+        shader.emissive_color.r = 1.0
+        shader.emissive_color.g = 1.0
+        shader.emissive_color.b = 1.0
+    shader.emissive_color.a = psys_alpha
 
     node.bs_properties[0] = shader
     _attach_tex_transform_ctrls(shader, tex_transforms)
@@ -3061,6 +3181,11 @@ def _convert_particle_system(node, fix_textures):
         cloned.threshold = alpha_prop.threshold
         alpha_prop = cloned
     node.bs_properties[1] = alpha_prop
+    # Soft-particle depth fade.  Particles are the case this matters most for:
+    # a smoke plume drifting into a wall otherwise cuts off along a hard line,
+    # and every billboard shows its own quad edge.  alpha_prop is always set by
+    # this point (defaulted to additive above), so blended systems all qualify.
+    _apply_fx_soft_effect(shader, alpha_prop)
 
 
 # Skyrim billboard axis correction (see the root-billboard handling for the
