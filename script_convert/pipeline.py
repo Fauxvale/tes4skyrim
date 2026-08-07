@@ -755,6 +755,53 @@ def _split_counter_step(lines: list, seq_gate: str) -> tuple:
     return [lines[idx]], lines[:idx] + lines[idx + 1:]
 
 
+_STAGE_ADVANCE_RE = re.compile(
+    r'^(\s*)([A-Za-z_]\w*)\.SetStage\((\d+)\)\s*(;.*)?$', re.IGNORECASE)
+
+
+def _split_stage_advances(body: list) -> tuple:
+    """Split a sequenced fragment body into (gated writes, stage advances).
+
+    The sequence gate exists to stop an out-of-turn `counter + 1` and stale
+    speaker/target writes from clobbering a mid-line re-seed. Its original
+    form swallowed the fragment's SetStage too, and that line is frequently
+    the ONLY path to the next quest beat: a package-completion re-seed landed
+    while CharacterGen line 11 was still audible (Say() is async), line 11's
+    End fragment was rejected, its `SetStage(13)` never ran, and the quest
+    stalled forever — the Emperor greeted generically and offered only
+    'Rumors', with nothing in the Papyrus log because a rejected gate is
+    silent by design.
+
+    A stage advance is safe OUTSIDE the gate because it is emitted behind a
+    monotonic guard: TES4 stages are flags and its GetStage returns the
+    highest one set, so an authored `SetStage N` can only mean "beat N is
+    reached". Past N already → the guard skips it; turn rejected but the
+    advance still owed → it runs.
+
+    Only TOP-LEVEL `<quest>.SetStage(<literal>)` lines are lifted; one nested
+    in the body's own If/While block stays where the author put it.
+    """
+    gated, advances = [], []
+    depth = 0
+    for line in body:
+        m = _STAGE_ADVANCE_RE.match(line) if depth == 0 else None
+        if m:
+            indent, quest, stage, comment = m.groups()
+            advances.append(f'{indent}If {quest}.GetStage() < {stage}'
+                            '  ; advance survives a rejected turn')
+            advances.append(f'{indent}  {quest}.SetStage({stage})'
+                            + (f'  {comment}' if comment else ''))
+            advances.append(f'{indent}EndIf')
+            continue
+        gated.append(line)
+        s = line.strip().lower()
+        if s.startswith('if ') or s.startswith('while '):
+            depth += 1
+        elif s == 'endif' or s == 'endwhile':
+            depth -= 1
+    return gated, advances
+
+
 def _state_writes_before_setstage(lines: list) -> list:
     """Move plain state assignments ahead of the first SetStage call.
 
@@ -998,14 +1045,22 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             counter_step, rest_body = _split_counter_step(body_lines, seq_gate)
             if seq_gate and body_lines and counter_step:
                 counter, rest = counter_step, rest_body
+                # The quest's stage advance must survive a REJECTED turn — see
+                # _split_stage_advances. Only the counter/speaker state writes
+                # stay inside the gate.
+                gated_rest, stage_advances = _split_stage_advances(rest)
                 out_lines.append(f'  If {seq_gate}  ; still this line\'s turn')
                 out_lines.extend('  ' + b for b in counter)
                 out_lines.extend('  ' + r for r in release)
-                out_lines.extend('  ' + b for b in rest)
+                out_lines.extend('  ' + b for b in gated_rest)
                 out_lines.append('  EndIf')
                 # Rejected path: the gate did nothing, so the timer is still
                 # armed and must be freed here (constraint 1).
                 out_lines.extend('  ' + r for r in release)
+                # Unconditional, and AFTER the release (constraint 3): the
+                # stage fragment's EvaluatePackage arbitrates against the
+                # committed timer state.
+                out_lines.extend(stage_advances)
             else:
                 # Ungated: there is no counter to close the guard with, but the
                 # timer must still be free before any SetStage hands control to

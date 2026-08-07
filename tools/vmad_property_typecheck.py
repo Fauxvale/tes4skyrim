@@ -25,6 +25,7 @@ treating it as a real defect.
 import argparse
 import os
 import re
+import struct
 import sys
 from collections import Counter, defaultdict
 
@@ -66,12 +67,125 @@ _ACCEPTS = {
 _PERMISSIVE = {'Form', 'ScriptObject', 'Alias', 'ReferenceAlias'}
 
 
+def _read_vmad_bindings(path):
+    """script name (lower) -> set of property names actually bound in any VMAD.
+
+    Walks the raw file rather than the record parser: a VMAD can hang off any
+    record type, and only the property NAMES are needed here.
+    """
+    data = open(path, 'rb').read()
+    bound = defaultdict(set)
+    pos = 0
+    while True:
+        i = data.find(b'VMAD', pos)
+        if i < 0:
+            break
+        pos = i + 4
+        size = struct.unpack_from('<H', data, i + 4)[0]
+        v = data[i + 6:i + 6 + size]
+        if len(v) < 8:
+            continue
+        try:
+            ver, fmt, nscripts = struct.unpack_from('<hhH', v, 0)
+            # Guard against a false 'VMAD' hit inside arbitrary record data.
+            if ver != 5 or fmt != 2 or not 0 <= nscripts <= 50:
+                continue
+            p = 6
+            for _ in range(nscripts):
+                ln = struct.unpack_from('<H', v, p)[0]
+                p += 2
+                sname = v[p:p + ln].decode('ascii', 'replace')
+                p += ln + 1                      # + flags byte
+                nprops = struct.unpack_from('<H', v, p)[0]
+                p += 2
+                for _ in range(nprops):
+                    pl = struct.unpack_from('<H', v, p)[0]
+                    p += 2
+                    pname = v[p:p + pl].decode('ascii', 'replace')
+                    p += pl
+                    ptype = v[p]
+                    p += 2                       # type + status
+                    bound[sname.lower()].add(pname)
+                    if ptype == 1:               # object: unused+alias+formID
+                        p += 8
+                    elif ptype in (2, 3, 4, 5):  # string handled below
+                        p += 4
+                    elif ptype == 11:            # array of objects
+                        n = struct.unpack_from('<I', v, p)[0]
+                        p += 4 + n * 8
+                    else:
+                        raise ValueError('unhandled property type')
+        except Exception:
+            continue
+    return bound
+
+
+def _report_unbound(plugin, src, limit, verbose):
+    """Declared-but-UNBOUND object properties -- the other way a property Nones.
+
+    A property the .psc declares but no VMAD binds reads None for the whole
+    session, and the first use aborts the entire Papyrus function. That is a
+    different defect from a type mismatch (which this tool's main pass finds)
+    with an identical runtime symptom, and it is invisible to the type pass
+    because there is nothing to compare types against.
+
+    This is how the CharacterGen Emperor broke: `Player` is in no registry, so
+    when the QUST VMAD builder moved from merging the whole well-known registry
+    to a per-declared-name lookup, `Player` stopped being bound in 18 QF_
+    scripts. `UrielSeptimRef.SetLookAt(Player)` then aborted Charactergen stage
+    12 before it unlocked CGEmperor01-24.
+
+    Names a TES4 script legitimately references but that exist in NO record
+    (TG02Taxes, SE11A -- dead names in Oblivion's own sources) are unbound
+    correctly, so a residue here is expected; the signal is a name that names a
+    real record, or an engine-hardcoded one like Player/GameHour.
+    """
+    esm = os.path.join(ROOT, 'output', plugin, plugin)
+    bound = _read_vmad_bindings(esm)
+    decl = re.compile(r'^\s*([A-Za-z_]\w*)\s+Property\s+(\w+)\s+Auto', re.M)
+    per_name = Counter()
+    per_script = defaultdict(list)
+    for fn in sorted(os.listdir(src)):
+        if not fn.endswith('.psc'):
+            continue
+        sname = fn[:-4].lower()
+        if sname not in bound:
+            continue          # script attached to nothing -- not this check
+        text = open(os.path.join(src, fn), encoding='utf-8',
+                    errors='replace').read()
+        for m in decl.finditer(text):
+            ptype, pname = m.group(1), m.group(2)
+            if ptype.lower() in ('int', 'float', 'bool', 'string'):
+                continue
+            if pname not in bound[sname]:
+                per_name[pname] += 1
+                per_script[fn].append((ptype, pname))
+    print()
+    print(f'scripts with >=1 unbound declared property: {len(per_script)}')
+    print(f'unbound declared object properties: {sum(per_name.values())}')
+    if per_name:
+        print()
+        print(f'{"property":<32} {"scripts":>7}')
+        print('-' * 41)
+        for name, n in per_name.most_common(limit):
+            print(f'{name:<32} {n:>7}')
+    if verbose:
+        for fn, items in sorted(per_script.items())[:limit]:
+            print()
+            print(f'== {fn} ==')
+            for ptype, pname in items:
+                print(f'  {ptype} {pname}')
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='Statically predict VMAD property binding failures')
     ap.add_argument('--plugin', default='Oblivion.esm')
     ap.add_argument('--verbose', '-v', action='store_true',
                     help='list offending properties, not just counts')
+    ap.add_argument('--unbound', action='store_true',
+                    help='also report properties the .psc DECLARES but no '
+                         'VMAD binds (they read None and abort the function)')
     ap.add_argument('--max', type=int, default=25)
     args = ap.parse_args()
 
@@ -158,6 +272,9 @@ def main():
             print(f'== {p} <- {a} ({n}) ==')
             for fn, pname in detail[(p, a)][:args.max]:
                 print(f'  {fn}: {pname}')
+
+    if args.unbound:
+        _report_unbound(args.plugin, src, args.max, args.verbose)
 
 
 if __name__ == '__main__':

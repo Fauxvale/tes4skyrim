@@ -4995,3 +4995,63 @@ class TestParentRefBecomesLinkedRef:
         self._with_bases(self.BASE)
         out = convert_REFR(self._refr(self.BASE, xesp=None))
         assert _find_subrecord(out, b'XLKR') is None
+
+
+class TestPlayerFormIDIsReferenceOnly:
+    """A record's OWN id must never take the engine-fixed passthrough.
+
+    _ENGINE_FIXED_FORMIDS pins REFERENCES to the player (NPC_ 0x07 / ACHR 0x14)
+    so they resolve to Skyrim.esm's real player rather than our converted copy.
+    Oblivion.esm, however, defines its own record AT 0x07 (EditorID=Player,
+    FULL="Bendu Olo"). Passing that record's own id through unshifted writes it
+    at 0x00000007 -- an OVERRIDE of Skyrim's Player, replacing the real
+    player's race, voice, spells, AI data and factions.
+
+    That is the measured cause of the CharacterGen Emperor losing his topic
+    list: CGEmperor01-24 are gated on `GetIsID(Player) [Target]` (1,325 such
+    conditions across Oblivion's INFOs), and with the player base clobbered the
+    target test stopped matching, collapsing his menu to 'Rumors' alone.
+    """
+
+    PLAYER_BASE = 0x00000007
+    PLAYER_REF = 0x00000014
+
+    def setup_method(self):
+        from tes5_import import text_reader
+        self._saved = text_reader.get_formid_index_offset()
+        text_reader.set_formid_index_offset(1)
+
+    def teardown_method(self):
+        from tes5_import import text_reader
+        text_reader.set_formid_index_offset(self._saved)
+
+    def test_own_player_id_shifts_into_our_space(self):
+        """Oblivion's Player NPC_ becomes an inert 0x01000007, not an override."""
+        from tes5_import.text_reader import get_formid
+        out = get_formid({'FormID': '00000007'}, 'FormID')
+        assert out == 0x01000007, (
+            f'Oblivion Player NPC_ written at {out:08X}; at 00000007 it '
+            f'overrides Skyrim.esm Player and breaks GetIsID(Player)')
+
+    def test_reference_to_player_base_stays_pinned(self):
+        from tes5_import.text_reader import get_formid
+        assert get_formid({'X': '00000007'}, 'X') == self.PLAYER_BASE
+
+    def test_reference_to_player_ref_stays_pinned(self):
+        from tes5_import.text_reader import get_formid
+        assert get_formid({'X': '00000014'}, 'X') == self.PLAYER_REF
+
+    def test_own_playerref_id_also_shifts(self):
+        from tes5_import.text_reader import get_formid
+        assert get_formid({'FormID': '00000014'}, 'FormID') == 0x01000014
+
+    def test_ordinary_record_unaffected_either_way(self):
+        """UrielSeptim shifts identically as an own id and as a reference."""
+        from tes5_import.text_reader import get_formid
+        assert get_formid({'FormID': '00023F2E'}, 'FormID') == 0x01023F2E
+        assert get_formid({'X': '00023F2E'}, 'X') == 0x01023F2E
+
+    def test_remap_formid_flag_is_explicit(self):
+        from tes5_import.text_reader import remap_formid
+        assert remap_formid(0x07, 1) == 0x07
+        assert remap_formid(0x07, 1, is_own_id=True) == 0x01000007

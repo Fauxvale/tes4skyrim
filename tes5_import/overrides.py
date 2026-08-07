@@ -133,7 +133,7 @@ def master_output_formid(src_fid: str, master_manifest) -> int:
         if fid:
             return fid
     try:
-        return remap_formid(int(src_fid, 16))
+        return remap_formid(int(src_fid, 16), is_own_id=True)
     except (ValueError, TypeError):
         return 0
 

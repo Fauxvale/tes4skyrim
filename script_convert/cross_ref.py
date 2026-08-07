@@ -280,6 +280,9 @@ class CrossRefGraph:
         # BOOK records with an ENAM: written as SCRL, so `Book` would not bind.
         self.enchanted_books: set[str] = set()
         self.record_base: dict[str, str] = {}  # placed ref FormID -> base record FormID (NAME)
+        # base FormID (upper) -> its ONE placed ref FormID; lazily inverted
+        # from record_base by unique_placed_ref().
+        self._base_to_unique_ref: 'dict[str, str] | None' = None
         self.quest_edids: set[str] = set()
         self.npc_formids: set[str] = set()
         # Cross-script ref-as-int analysis: set of (script_name_lower, var_name_lower)
@@ -515,6 +518,32 @@ class CrossRefGraph:
     def is_quest_ref(self, name: str) -> bool:
         """Check if a name refers to a known quest."""
         return name.lower() in self.quest_edids
+
+    def unique_placed_ref(self, base_fid: str) -> str:
+        """The ONE placed reference of a base record, or '' when there is none
+        or more than one.
+
+        Oblivion resolves a unique actor's base EditorID to its placed
+        instance, so a script property that names an NPC_/CREA base means the
+        ACHR/ACRE — Skyrim's VM refuses the base into a reference-typed
+        property and it reads None (see constants.wants_placed_reference).
+        Ambiguity binds to nothing new: with several placements the base is
+        returned unchanged by the caller, exactly as before this existed.
+        """
+        if self._base_to_unique_ref is None:
+            first: dict[str, str] = {}
+            dup: set[str] = set()
+            for ref_fid, b in self.record_base.items():
+                key = (b or '').upper()
+                if not key:
+                    continue
+                if key in first:
+                    dup.add(key)
+                else:
+                    first[key] = ref_fid
+            self._base_to_unique_ref = {k: v for k, v in first.items()
+                                        if k not in dup}
+        return self._base_to_unique_ref.get((base_fid or '').upper(), '')
 
     def get_quest_script_type(self, quest_name: str) -> str:
         """Get the Papyrus script class name for a quest, e.g. 'TES4_MyQuestScript'.

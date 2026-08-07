@@ -1364,7 +1364,14 @@ class ScriptConverter:
                 if idx >= len(out):
                     break
                 line = out[idx]
-                if 'ObjectReference Property ' not in line:
+                # `Form Property` is the cross-script ref-as-base-form
+                # pre-declaration (see ref_as_base_form). It is the right
+                # FALLBACK, but a UNANIMOUS specific base type still upgrades
+                # it — stockFX only ever holds EFSH records, and as a bare
+                # Form its `.Play(...)` no longer compiled.
+                gen = next((g for g in ('ObjectReference Property ',
+                                        'Form Property ') if g in line), None)
+                if gen is None:
                     continue
                 pname = line.split('Property ', 1)[1].split()[0]
                 types = _assigned.get(pname.lower(), set())
@@ -1372,12 +1379,11 @@ class ScriptConverter:
                 if len(types) == 1:
                     only = next(iter(types))
                     if only and only not in ('ObjectReference', 'Form'):
-                        out[idx] = line.replace('ObjectReference Property ',
-                                                f'{only} Property ', 1)
+                        out[idx] = line.replace(gen, f'{only} Property ', 1)
                         self._var_types[pname.lower()] = only
                         self._property_refs[pname] = only
-                elif len(types) > 1 and all(
-                        t in _BASE_OBJECT_PAPYRUS for t in types):
+                elif gen == 'ObjectReference Property ' and len(types) > 1 \
+                        and all(t in _BASE_OBJECT_PAPYRUS for t in types):
                     # A TES4 `ref` that holds SEVERAL different base objects --
                     # mwShrineGhostgateScript's soulGemRef takes any of 12 soul
                     # gems, moXscrXtrapXwritedynamicdata's takes several MISCs.
@@ -2270,6 +2276,24 @@ class ScriptConverter:
                 and fid in getattr(self.xref, 'enchanted_books', ())):
             return 'Scroll'
         return ptype
+
+    def _script_type_binds(self, ptype: str, fid: str) -> bool:
+        """Whether an attached script class may stand in for `ptype` HERE.
+
+        Base-object types normally cannot (the VM refuses the base record —
+        see script_type_may_override), but a scripted world object (ACTI/LIGH)
+        with exactly ONE placed ref can: the property binder redirects the
+        binding to that ref, which carries the script instance. Without this,
+        the base gate stripped cross-script variables off unique activators —
+        `SE01Metronome.weatherVAR` and the SE11 trigzone stopped compiling.
+        Inventory item types (ARMO/WEAP/...) stay excluded even with a lone
+        world placement, because their properties mean the BASE (AddItem /
+        RemoveItem), never that placement.
+        """
+        if script_type_may_override(ptype):
+            return True
+        return (self.xref.record_type.get(fid, '') in ('ACTI', 'LIGH')
+                and bool(self.xref.unique_placed_ref(fid)))
 
     def _register_cell_family(self, name: str, cells: list,
                               exterior: list = None) -> str:
@@ -3500,7 +3524,7 @@ class ScriptConverter:
                 rtype = self.xref.record_type.get(fid, '')
                 ptype = self._papyrus_type_for(fid, rtype)
                 script_type = self.xref.get_record_script_type(inner_name)
-                if script_type and script_type_may_override(ptype):
+                if script_type and self._script_type_binds(ptype, fid):
                     ptype = script_type
                 safe = _safe_property_name(inner_name)
                 self._property_refs[safe] = ptype
@@ -4154,9 +4178,10 @@ class ScriptConverter:
                 rtype = self.xref.record_type.get(fid, '')
                 ptype = self._papyrus_type_for(fid, rtype)
                 # Prefer attached script type for cross-script property access
-                # -- but never on a base-object type, where it cannot bind.
+                # -- but never on a base-object type, where it cannot bind
+                # (unless the binder can redirect to a unique placed ref).
                 script_type = self.xref.get_record_script_type(expr)
-                if script_type and script_type_may_override(ptype):
+                if script_type and self._script_type_binds(ptype, fid):
                     ptype = script_type
                 # Key the property on the CANONICAL EditorID, not the spelling
                 # this script happened to use.  TES4 name lookup is
@@ -4313,9 +4338,10 @@ class ScriptConverter:
             # so cross-script property access works (e.g., NPCRef.rent).
             # Base-object types (Armor/Weapon/Potion/...) are excluded: the VM
             # refuses to bind an ObjectReference-derived script class to a base
-            # record, and the property then reads None.
+            # record, and the property then reads None. A unique-placed
+            # ACTI/LIGH is the exception — the binder redirects to its ref.
             script_type = self.xref.get_record_script_type(name)
-            if script_type and script_type_may_override(ptype):
+            if script_type and self._script_type_binds(ptype, fid):
                 ptype = script_type
             safe = _safe_property_name(canon_edid)
             # Don't downgrade a more specific type (e.g., Actor from

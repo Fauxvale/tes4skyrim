@@ -1580,13 +1580,10 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     n_fg = patch_forcegreet_topics(writer)
     if n_fg:
         print(f"  ForceGreet packages bound to a greeting topic: {n_fg}")
-    # Actor CSDI still holds TES4 SOUN ids; Phase 3 has now built the SNDRs.
-    from .record_types.actors import patch_actor_sounds
-    n_snd = patch_actor_sounds(writer)
-    if n_snd:
-        print(f"  Actor sound descriptors bound: {n_snd} actors")
-    # DOOR SNAM/ANAM/BNAM hold TES4 SOUN ids for the same reason (Phase 1 runs
-    # before the descriptors exist) — TES5 wants the SNDR there.
+    # (Actor CSDI patching is part of the creature-sound work and lives on
+    # `creature-sound-fix-attempt`, not here — actors write no CSDI on master.)
+    # DOOR SNAM/ANAM/BNAM hold TES4 SOUN ids because Phase 1 runs before the
+    # descriptors exist — TES5 wants the SNDR there.
     from .record_types.items import patch_door_sounds
     n_dsnd = patch_door_sounds(
         writer,
