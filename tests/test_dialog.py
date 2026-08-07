@@ -98,6 +98,10 @@ class _FakeWriter:
         self._next = 0x01F00000
         self.records = []
         self.groups = {}
+        # Mirrors PluginWriter: one new master (Skyrim.esm), so index 1 is
+        # this plugin's own space — the bark splitter only reuses a donor
+        # DIAL FormID the plugin owns.
+        self.own_index = 1
 
     def alloc_formid(self):
         self._next += 1
@@ -1388,3 +1392,49 @@ class TestPlayerScriptQuest:
         assert top == []
         alias_scripts = parse_qust_alias_scripts(tail)
         assert [n for n, _p in alias_scripts] == ['TES4_GlobalplayerScript']
+
+
+class TestQuestFragmentPropertiesAllBind:
+    """Every property a QF_ quest fragment declares must be BOUND.
+
+    An unbound VMAD property reads None for the whole session and the first use
+    aborts the ENTIRE Papyrus function. convert_QUST once merged the whole
+    well-known registry into every scripted quest; replacing that with a
+    per-declared-name lookup fixed 100+ MB of bloat but bound ONLY names the
+    registry held. Player is in no registry, so it stopped binding in 18 quests
+    -- `UrielSeptimRef.SetLookAt(Player)` then aborted Charactergen stage 12
+    before it unlocked CGEmperor01-24, leaving the Emperor with only 'Rumors'.
+    """
+
+    def _resolve(self, declared, well_known=None):
+        from tes5_import.dialog_converter import _resolve_declared_properties
+        return _resolve_declared_properties(declared, well_known)
+
+    def test_player_binds_to_playerref(self):
+        """PlayerRef 0x14, never the converted TES4 player NPC_."""
+        assert self._resolve({'Player'}) == {'Player': 0x14}
+
+    def test_playerref_spelling_also_binds(self):
+        assert self._resolve({'PlayerRef'}) == {'PlayerRef': 0x14}
+
+    def test_engine_global_keeps_vanilla_formid(self):
+        from tes5_import.object_scripts import ENGINE_GLOBAL_FORMIDS
+        out = self._resolve({'GameHour'})
+        assert out['GameHour'] == ENGINE_GLOBAL_FORMIDS['gamehour']
+
+    def test_well_known_record_binds(self):
+        out = self._resolve({'TES4Fame'}, well_known={'TES4Fame': 0x0100BEEF})
+        assert out == {'TES4Fame': 0x0100BEEF}
+
+    def test_player_wins_over_a_same_named_registry_entry(self):
+        """The engine's player must never be displaced by a registry hit."""
+        out = self._resolve({'Player'}, well_known={'Player': 0x01000007})
+        assert out == {'Player': 0x14}
+
+    def test_unresolvable_name_is_left_unbound(self):
+        """A name that resolves to nothing is omitted, not bound to zero."""
+        assert self._resolve({'NoSuchRecord'}) == {}
+
+    def test_no_declared_properties_yields_nothing(self):
+        assert self._resolve(set()) == {}
+        assert self._resolve(None) == {}

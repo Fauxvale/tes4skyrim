@@ -77,6 +77,7 @@ from .dialog_conditions import (
 )
 
 _PLAYER_FORMID = 0x14
+_PLAYER_BASE_FID = 0x07     # NPC_ Player — see text_reader.PLAYER_BASE_FID
 
 # Remapped FormIDs of TES4 topics that have NO INFOs at all (Oblivion.esm
 # ships ~850 such placeholder shells). Oblivion never displays a topic without
@@ -136,7 +137,12 @@ def _collect_scro_properties(rec: dict, fid_to_edid: dict, prefix: str = '') -> 
             raw_fid = int(fid_str, 16)
         except (ValueError, TypeError):
             continue
-        if raw_fid in (0, _PLAYER_FORMID):
+        # The player's ids never bind through a SCRO: 0x14 has no EditorID to
+        # name a property with, and 0x07 is the TES4 player NPC_ (EditorID
+        # `Player`), which would bind the quest's `Actor Property Player` to a
+        # BASE record the VM refuses — the declared-name pass below binds the
+        # spelling the script uses to PlayerRef instead.
+        if raw_fid in (0, _PLAYER_BASE_FID, _PLAYER_FORMID):
             continue
         edid = fid_to_edid.get(raw_fid)
         if not edid:
@@ -170,18 +176,18 @@ def _collect_all_scro_properties(rec: dict, fid_to_edid: dict) -> dict:
     return props
 
 
-def _quest_well_known_refs(rec: dict, xref=None) -> set:
-    """Names of synthesized ('well-known') records this quest's stage scripts use.
+def _quest_well_known_refs(rec: dict, xref=None) -> dict:
+    """{name: Papyrus type} of every property this quest's QF_ script declares.
 
-    A QF_ fragment declares a property for every synthesized record its result
-    scripts touch — TES4ControlsDisabled for (Disable|Enable)PlayerControls,
-    TES4Fame/TES4Infamy, TES4CyrodiilCrimeFaction, TES4Msg_* for button menus.
-    None of these exist in the TES4 export, so they resolve only through the
-    well-known registry; running the same converter the .psc was generated from
-    is what tells us WHICH of them the script actually declares, instead of
-    binding all ~1,880 registry entries to every quest.
+    Running the same converter the .psc was generated from is what tells us
+    WHICH properties the script actually declares — the synthesized records
+    (TES4ControlsDisabled, TES4Fame, TES4Msg_*) that resolve only through the
+    well-known registry, the engine-hardcoded names (Player) no SCRO covers,
+    and the declared TYPE of each, which decides whether an actor-base binding
+    must be redirected to the placed reference. Binding all ~1,880 registry
+    entries to every quest instead is what this replaced.
 
-    Best-effort: a converter failure yields an empty set, and the property is
+    Best-effort: a converter failure yields an empty dict, and the property is
     simply left unbound exactly as before this filtering existed.
     """
     scripts = []
@@ -200,7 +206,7 @@ def _quest_well_known_refs(rec: dict, xref=None) -> set:
             if src.strip():
                 scripts.append(src)
     if not scripts or xref is None:
-        return set()
+        return {}
 
     # One converter for all stages: convert_fragment deliberately preserves
     # _property_refs across calls, which is how the QF_ generator accumulates
@@ -212,7 +218,34 @@ def _quest_well_known_refs(rec: dict, xref=None) -> set:
             conv.convert_fragment(src, 'Quest')
         except Exception:
             continue
-    return set(conv._property_refs)
+    return dict(conv._property_refs)
+
+
+def _resolve_declared_properties(declared, well_known_props: dict = None) -> dict:
+    """FormID bindings for the engine-hardcoded and synthesized names a QF_
+    quest fragment declares.
+
+    The record's SCROs cover ordinary records, but NOT these: the player is in
+    no registry and its SCRO is deliberately skipped (see
+    _collect_scro_properties), and the synthesized records exist only in the
+    output. An unbound property is None and the first use aborts the WHOLE
+    fragment — `UrielSeptimRef.SetLookAt(Player)` killed Charactergen stage 12
+    before it unlocked CGEmperor01-24, leaving the Emperor with only 'Rumors'.
+
+    The player check comes FIRST so the engine's PlayerRef can never be
+    displaced by a same-named registry entry or record. Names that resolve to
+    nothing are omitted, never bound to zero.
+    """
+    out = {}
+    for name in (declared or ()):
+        low = name.lower()
+        if low in ('player', 'playerref'):
+            out[name] = _PLAYER_FORMID
+        elif low in ENGINE_GLOBAL_FORMIDS:
+            out[name] = ENGINE_GLOBAL_FORMIDS[low]
+        elif well_known_props and name in well_known_props:
+            out[name] = well_known_props[name]
+    return out
 
 
 def _quest_stage_fragments(rec: dict) -> list:
@@ -750,14 +783,55 @@ def convert_QUST(rec: dict, fid_to_edid: dict = None,
         from script_convert.pipeline import build_vmad_quest_fragments
         prop_vals = (_collect_all_scro_properties(rec, fid_to_edid)
                      if fid_to_edid else {})
-        # Synthesized output-only records (TES4ControlsDisabled, TES4Fame,
-        # TES4Msg_*, ...) resolve ONLY through the well-known registry, but just
-        # the ones this quest's own stage scripts name — merging the whole
-        # ~1,880-entry registry put every unlock global on every scripted quest.
-        if well_known_props:
-            for name in _quest_well_known_refs(rec, xref):
-                if name in well_known_props:
-                    prop_vals[name] = well_known_props[name]
+        # Bind every property the QF_ script DECLARES, not just what the SCROs
+        # cover: the player is in no registry and its SCRO is skipped, and the
+        # synthesized records (TES4ControlsDisabled, TES4Msg_*, ...) resolve
+        # ONLY through the well-known registry — looked up per declared name,
+        # because merging the whole ~1,880-entry registry put every unlock
+        # global on every scripted quest.
+        declared = _quest_well_known_refs(rec, xref)
+        for name, fid in _resolve_declared_properties(
+                declared, well_known_props).items():
+            if name.lower() in ('player', 'playerref'):
+                # The engine's PlayerRef always wins — a SCRO-derived case
+                # variant naming the converted TES4 player NPC_ would bind a
+                # BASE record the VM refuses, and the property reads None.
+                for k in [k for k in prop_vals
+                          if k.lower() == name.lower() and k != name]:
+                    del prop_vals[k]
+                prop_vals[name] = fid
+            elif name.lower() in ENGINE_GLOBAL_FORMIDS:
+                prop_vals.setdefault(name, fid)
+            else:
+                prop_vals[name] = fid
+        # A reference-typed property naming an actor BASE means the placed
+        # instance (`CarmaloTruiand.moveto ...` on QF_MS26); the VM refuses an
+        # NPC_/CREA into it and the property reads None. Rebind the SCRO's
+        # base to its one placed ref — and bind names the SCROs missed.
+        if xref is not None:
+            from script_convert.constants import wants_placed_reference
+            offset = get_formid_index_offset()
+            for name, ptype in declared.items():
+                if not wants_placed_reference(ptype):
+                    continue
+                if name.lower() in ('player', 'playerref'):
+                    continue    # always PlayerRef 0x14, bound above
+                raw_hex = xref.edid_to_formid.get(name.lower(), '')
+                if not raw_hex or \
+                        xref.record_type.get(raw_hex, '') not in (
+                            'NPC_', 'CREA', 'ACTI', 'LIGH'):
+                    continue
+                ref_hex = xref.unique_placed_ref(raw_hex)
+                if not ref_hex:
+                    continue
+                try:
+                    fid = remap_formid(int(ref_hex, 16), offset)
+                except ValueError:
+                    continue
+                for k in [k for k in prop_vals
+                          if k.lower() == name.lower() and k != name]:
+                    del prop_vals[k]
+                prop_vals[name] = fid
         if unlock_plan and unlock_globals:
             ql = edid.lower()
             for (qkey, _stage), gnames in unlock_plan['stage_reveals'].items():
@@ -1240,10 +1314,11 @@ def _build_info_script_properties(result_script: str, xref,
         conv.convert_fragment(result_script, 'TopicInfo')
     except Exception:
         return {}
-    from script_convert.constants import resolve_property_formid
+    from script_convert.constants import (resolve_property_formid,
+                                          wants_placed_reference)
     well_known = well_known_props or {}
     props = {}
-    for prop_edid in conv._property_refs:
+    for prop_edid, ptype in conv._property_refs.items():
         low = prop_edid.lower()
         if low in ('player', 'playerref'):
             props[prop_edid] = _PLAYER_FORMID
@@ -1260,6 +1335,16 @@ def _build_info_script_properties(result_script: str, xref,
         fid_hex = resolve_property_formid(xref, prop_edid)
         if not fid_hex:
             continue
+        # A reference-typed property naming a BASE means the placed instance;
+        # the VM refuses an NPC_/CREA/ACTI/LIGH base into it and the property
+        # reads None. Bind the base's one placed ref instead (see
+        # constants.wants_placed_reference).
+        if wants_placed_reference(ptype) and \
+                xref.record_type.get(fid_hex, '') in ('NPC_', 'CREA',
+                                                      'ACTI', 'LIGH'):
+            ref_hex = xref.unique_placed_ref(fid_hex)
+            if ref_hex:
+                fid_hex = ref_hex
         try:
             raw_fid = int(fid_hex, 16)
         except (ValueError, TypeError):
@@ -2646,14 +2731,22 @@ def _build_bark_pass(bark_dials, info_by_dial, writer,
             groups[key]['infos'].append(info_rec)
 
     # Assign FormIDs: each group tries to reuse the original FormID of its
-    # donor source DIAL, but a DIAL FormID can be claimed by only one group.
+    # donor source DIAL, but a DIAL FormID can be claimed by only one group —
+    # and only when this plugin OWNS the donor. A dependent plugin's bark
+    # INFOs point at its MASTER's shared GREETING/HELLO record; reusing that
+    # fid here emits an OVERRIDE of the master's topic, re-keyed to this
+    # plugin's quest. Morrowind_ob shipped Oblivion's GREETING_0102466E
+    # re-keyed to its own chargen quest (twice), which clobbered the
+    # CharacterGen Emperor's greeting topic — his choices vanished and only
+    # 'Rumors' survived whenever Morrowind_ob was loaded.
     claimed = set()
     content = b''
     for key in order:
         owner_qfid, subtype = key
         g = groups[key]
         src_fid = g['src_fid']
-        if src_fid not in claimed:
+        if src_fid not in claimed and \
+                (src_fid >> 24) == writer.own_index:
             this_dial_fid = src_fid
             claimed.add(src_fid)
         else:

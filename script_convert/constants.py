@@ -1306,7 +1306,20 @@ def _safe_property_name(name: str) -> str:
     if len(name) > 1 and name[0] == '"' and name[-1] == '"':
         name = name[1:-1]
     safe = re.sub(r'[^\w]', '_', name)
-    safe = re.sub(r'^\d+', '', safe)
+    # A Papyrus identifier may not start with a digit. DELETING the leading
+    # digits is lossy and collides: Morroblivion names ~19,000 records with a
+    # leading digit, and stripping collapses 337 of them onto a shared name,
+    # 155 onto a DIFFERENT record this plugin already owns, and 32 onto a
+    # VANILLA SKYRIM record (`0miner` -> the Skyrim CLAS `Miner`,
+    # `0banditfaction` -> the Skyrim FACT `BanditFaction`). A property bound by
+    # name then resolves to the wrong record entirely, and nothing downstream
+    # can tell. Prefix instead: `d` + the digits keeps the name UNIQUE and
+    # REVERSIBLE (`0Blades` -> `d0Blades`, `1Necromancy` -> `d1Necromancy`), so
+    # two records that differ only in their leading digits stay distinct and
+    # neither can shadow an existing EditorID.
+    m = re.match(r'^(\d+)(.*)$', safe)
+    if m:
+        safe = 'd' + m.group(1) + m.group(2)
     if not safe:
         safe = 'var_' + name.replace(' ', '_')
     # PapyrusCompiler mangles a variable `x` to the register `::x_var`, and it
@@ -1337,18 +1350,23 @@ def resolve_property_formid(xref, prop_name: str) -> str:
     runtime, which killed every MS14 SetStage.  Reverse the rename when the
     direct lookup fails."""
     low = prop_name.lower()
-    # A digit-stripped name is checked FIRST, because the strip is lossy and the
-    # bare spelling routinely belongs to an unrelated record.  Morroblivion's
-    # `0Blades` sanitizes to `Blades`, which is also Oblivion.esm's OWN Blades
-    # faction (000274AB) — so the direct lookup bound `Player.SetFactionRank`
-    # to the master's faction, the player never joined Morroblivion's Blades,
-    # and Caius kept answering "Nobody gave me any orders" because the generic
-    # INFO gates on `GetInFaction(0Blades) == 0`.  156 plugin records collide
-    # this way.  A property named for a record that HAS a leading digit must
-    # mean that record; only fall through to the bare name when it does not.
-    fid = _digit_stripped_formid(xref, low)
+    # `d<digits><rest>` is the leading-digit rename minted by
+    # _safe_property_name, and it is EXACT: undo the prefix and the original
+    # EditorID comes back verbatim, so it binds to that record and no other.
+    # (The old scheme DELETED the digits, which made `0Blades` bind to
+    # Oblivion.esm's own `Blades` faction — the player never joined
+    # Morroblivion's Blades and Caius kept answering "Nobody gave me any
+    # orders". Prefixing removes the whole class of collision rather than
+    # ranking two ambiguous candidates.)
+    fid = ''
+    if low.startswith('d') and len(low) > 1 and low[1].isdigit():
+        fid = xref.edid_to_formid.get(low[1:], '')
     if not fid:
         fid = xref.edid_to_formid.get(low, '')
+    # Legacy fallback: a name sanitized by the OLD digit-deleting scheme still
+    # has to resolve, so a stale property spelling keeps binding.
+    if not fid:
+        fid = _digit_stripped_formid(xref, low)
     if not fid and low.startswith('my'):
         fid = xref.edid_to_formid.get(low[2:], '')
     # `<Name>Base` is the de-collided ActorBase property minted by
@@ -1462,6 +1480,27 @@ def script_type_may_override(record_ptype: str) -> bool:
     variables. Base-object types may NOT -- see _BASE_OBJECT_PAPYRUS.
     """
     return record_ptype not in _BASE_OBJECT_PAPYRUS
+
+
+def wants_placed_reference(ptype: str) -> bool:
+    """Whether a VMAD property of this Papyrus type must bind a PLACED
+    reference rather than an actor BASE record.
+
+    Oblivion resolves a unique actor's BASE EditorID to its placed instance
+    (`ArenaMouth.Say ...` works even though ArenaMouth is the NPC_ record), so
+    TES4 scripts name bases and mean references constantly. Skyrim's VM
+    type-checks the binding: an NPC_/CREA base does NOT satisfy an
+    Actor/ObjectReference(-derived) property, the bind is refused, and the
+    property reads None for the whole session — measured live in the Papyrus
+    log across 69 scripts (every Daedric statue voice, the Arena's ArenaMouth
+    chain, the house-furnisher merchants). A TES4_* script class extends
+    Actor/ObjectReference when it resolves to an actor base, so it needs the
+    same treatment; script classes with other extends (Quest,
+    ActiveMagicEffect) never resolve to an NPC_/CREA and fall out at the
+    caller's record-type gate.
+    """
+    return (ptype in ('Actor', 'ObjectReference')
+            or ptype.startswith('TES4_'))
 
 
 def _record_type_to_base_papyrus(rtype: str) -> str:

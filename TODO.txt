@@ -8,8 +8,9 @@ Major Issues for V1:
 		ensure corridors connect pathgrid islands
 		allow growth even on slopes
 		trim triangles along edges
-		fix slim corridors
+		fix slim corridors like vaults in anvilcastlegreathall
 		fix occasional crack (vilvern near entrance)
+		Fix wrong side of door like the upstairs in anvilfightersguild
 
 	4 - Fix CK Loading (not sure why it doesn't finish)
 
@@ -19,7 +20,7 @@ Major Issues for V1:
 
 	7 - Crime system
 
-	8 - InUHlaaluUroomuside.nif has floor collision that is inverted. likely due to the nehrim fix for some reverse-facing collision normals
+	8 - Still a lot of reversed collision in morroblivion
 	
 	9 - Meshes not animating:
 		palacefont01.nif
@@ -27,8 +28,10 @@ Major Issues for V1:
 
 	10 - Imperials get all fallback race lines (like reiklings)
 
-for nehrim, the problem i had was with the lod object files! I managed to load it once i replaced them with empty btos. Other than that, i had a few ctds related to meshes near erothin (in the coast region)
-As for oblivion, i had a few ctds due to the ayled well meshes, managed to load it once i made a .esp that disabled all of them
+	Work on some quest fixes:
+	Oblivion: Attempting to start an arena match fails
+	Morroblivion: can't get fighters guild quest after joining
+	Cheydinhall fighters guild: I give the weapons away, but the NPCs stand still and don't fight with me
 
 Later Issues:
 

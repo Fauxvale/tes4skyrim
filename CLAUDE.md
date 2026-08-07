@@ -113,6 +113,43 @@ caching, skipped record types, the export text format, and the directory layout.
 - **Look for the AUTHORED indicator** If you need to resort to heuristics, your approach is most likely incorrect. Remember, everything in the original plugin works for a reason
 - **Pay close attention to performance** This needs to run quickly on a modest PC. If your new code makes a step run significantly slower than it did before you **MUST optimize**. Python first optimizations, and then native C++ if necessary.
 
+### <a id="regression-read-the-commits"></a>🛑 IF IT IS A REGRESSION, READ THE COMMITS
+
+**"This used to work" / "this is a recent regression" means the cause is ON A
+`+` LINE IN A RECENT DIFF. Go read the diffs. That is the entire method.**
+
+```bash
+git log --oneline --since=3.days                 # candidates
+git show <sha> -- script_convert/ tes5_import/   # READ THE + LINES
+```
+
+Read the changed *logic* and ask "what does this make the output do
+differently?" A regression cannot come from code that did not change, so the
+broken code is sitting in that window waiting to be read.
+
+**Do NOT do any of these before you have read every candidate diff:**
+
+- **Rebuilding the plugin at an old commit to A/B artifacts.** Minutes per
+  build, and `git checkout <sha> -- <paths>` **WRITES THE INDEX** — it silently
+  staged 30 files and violated the never-stage rule.
+- **Writing probe scripts to dump and compare records.** The probe is usually
+  wrong. One reported records "identical" while the raw bytes went 21120 → 786.
+- **Re-examining the same record from new angles.** That is a loop, not
+  progress.
+- **Concluding "nothing changed in this window, so it must be older."** That is
+  almost always a broken tool or the wrong artifact — not proof.
+
+**A generated `.psc`/`.pex` is an artifact too.** `--import-only` does NOT
+regenerate scripts, so a script-side regression stays invisible until
+`--scripts-only` runs. If the symptom is behavioural, suspect the generated
+Papyrus and read `script_convert/` diffs.
+
+(2026-08-06: the user said "check the commits" in their first message and
+repeated it five more times while I kept measuring instead. Hours lost. The bug
+was one readable hunk in `script_convert/pipeline.py` — a sequence gate wrapped
+around a fragment body including its `SetStage`, so an out-of-turn fragment
+applied nothing and the CharacterGen conversation stalled forever.)
+
 ### Verifying your work
 
 **Always check theories against several of these** before acting:

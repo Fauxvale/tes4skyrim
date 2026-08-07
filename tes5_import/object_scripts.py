@@ -24,6 +24,7 @@ import re
 from script_convert.converter import ScriptConverter
 from script_convert.constants import (_safe_property_name, papyrus_script_name,
                                       resolve_property_formid,
+                                      wants_placed_reference,
                                       PLAYER_ALIAS_EXTENDS)
 from script_convert.pipeline import build_vmad_object_script
 from .text_reader import (parse_export_file, get_formid_index_offset,
@@ -596,6 +597,16 @@ def _resolve_props(sctx: str, edid: str, extends: str, xref,
         fid_hex = resolve_property_formid(xref, pname)
         if not fid_hex:
             continue
+        # A reference-typed property naming a BASE means the placed instance
+        # (Oblivion resolves `ArenaMouth.Say ...` through the NPC_ EditorID);
+        # the VM refuses an NPC_/CREA/ACTI/LIGH base into it and the property
+        # reads None. Bind the base's one placed ref instead.
+        if wants_placed_reference(ptype) and \
+                xref.record_type.get(fid_hex, '') in ('NPC_', 'CREA',
+                                                      'ACTI', 'LIGH'):
+            ref_hex = xref.unique_placed_ref(fid_hex)
+            if ref_hex:
+                fid_hex = ref_hex
         try:
             raw = int(fid_hex, 16)
         except ValueError:
