@@ -274,6 +274,34 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
                          for r in by_type.get('QUST', [])
                          if r.get('FormID')}
 
+    # NPC-to-NPC conversation driver: the generated TES4NPCConv<plugin>.psc
+    # replays Oblivion's engine-scheduled quest-advancing conversations
+    # (CharacterGen 26→27, MQ16, MS91, ...).  MUST be built from the same
+    # plan the importer bound the driver quest's VMAD against — the
+    # message_menus/dialog_unlocks mirroring contract.  Masterless plugins
+    # only, mirroring the importer's gate (a dependent plugin's copy would
+    # collide with its master's script name).
+    if not master_names(export_dir):
+        from tes5_import.npc_conversations import (build_conversation_plan,
+                                                   generate_driver_psc)
+        conv_by_type = dict(by_type)
+        for sig in ('ACHR', 'ACRE'):
+            _p = os.path.join(export_dir, f'{sig}.txt')
+            conv_by_type[sig] = (parse_export_file(_p)
+                                 if os.path.exists(_p) else [])
+        _stem = os.path.splitext(
+            os.path.basename(os.path.normpath(export_dir)))[0]
+        conv_plan = build_conversation_plan(
+            conv_by_type, script_vars=quest_script_vars, plugin_stem=_stem)
+        conv_psc = generate_driver_psc(conv_plan, say_durations)
+        if conv_psc:
+            _pname = conv_plan['script_name'] + '.psc'
+            with open(os.path.join(output_dir, _pname), 'w',
+                      encoding='utf-8') as f:
+                f.write(conv_psc)
+            print(f"    NPC conversations: {len(conv_plan['chains'])} chains "
+                  f"-> {_pname} ({len(conv_plan['skipped'])} skipped)")
+
     # `AddTopic X` in a SCRIPT body is the third reveal route (alongside INFO
     # fragments and quest stages), so it needs the gated topic's global by
     # EditorID. Keyed off the same unlock_plan the other two use, so all three

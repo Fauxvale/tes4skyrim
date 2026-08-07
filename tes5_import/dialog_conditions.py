@@ -509,7 +509,39 @@ def convert_ctda(raw: bytes, offset: 'int | None' = None,
         if run_on_target_ref is not None and not identity:
             run_on = 2                    # Reference
             reference = run_on_target_ref
-        elif drop_run_on_target and not identity:
+        elif drop_run_on_target:
+            # DROP, even for an identity function.  `identity` must veto
+            # RETARGETING (a GetIsID pinned to a reference compares the wrong
+            # base form and can never pass — the 667-GREETING regression above),
+            # but it must NOT veto DROPPING: dropping does not retarget
+            # anything.  Inside a Say-driven topic there is no dialogue target
+            # at all, so leaving an identity condition on RunOn=Target is not
+            # "falling back" — it is a condition that can NEVER pass, for the
+            # exact reason stated above.  Failing OPEN is right here because the
+            # script call site has already chosen both speaker and topic.
+            #
+            # This is what stalled CharacterGen at stage 26.  The 26->27 bridge
+            # is a single GOODBYE INFO (0005144A, "She's dead. I'm sorry, sire,
+            # but we have to keep moving.") conditioned on
+            # GetIsID(Baurus) AND GetIsID(UrielSeptim)[RunOnTarget] AND
+            # GetStage(CharacterGen)==26.  Baurus delivers it from his poll via
+            # Actor.Say(), so the target-run GetIsID never passed, the GOODBYE
+            # never fired, `setstage charactergen 27` never ran, and the whole
+            # intro stopped with everyone standing in position in silence.
+            # (`setstage 27` from the console resumed it normally, confirming
+            # this condition was the only broken link.)
+            return None
+        elif run_on_target_ref is not None:
+            # Say-driven topic whose listener WAS resolved ('ref'
+            # disposition), but this is an identity function the veto above
+            # kept off RunOn=Reference.  The same no-target logic applies:
+            # under Say() a RunOn=Target identity can never pass, so
+            # emitting it silences the line.  The resolved listener is the
+            # very NPC the call site addresses, so the authored identity
+            # check is statically satisfied — drop it, exactly as the
+            # 'drop' disposition does.  (First hit: the restored
+            # NPC-conversation head topics, whose GetIsID(<listener>)
+            # [Target] otherwise survived as a dead RunOn=Target.)
             return None
         else:
             run_on = 1                    # Target

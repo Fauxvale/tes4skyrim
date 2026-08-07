@@ -1558,7 +1558,12 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                 unlock_plan=unlock_plan, unlock_globals=unlock_globals,
                 script_vars=_script_vars, master_index=ctx.master_index)
     else:
-        dialog_sge_fids = build_dialog_groups(by_type, writer, npc_to_vtyp, fid_to_edid=fid_to_edid, xref=xref, well_known_props=_WELL_KNOWN_PROPERTIES, voice_map=voice_map, unlock_plan=unlock_plan, unlock_globals=unlock_globals, script_vars=_script_vars)
+        dialog_sge_fids = build_dialog_groups(
+            by_type, writer, npc_to_vtyp, fid_to_edid=fid_to_edid, xref=xref,
+            well_known_props=_WELL_KNOWN_PROPERTIES, voice_map=voice_map,
+            unlock_plan=unlock_plan, unlock_globals=unlock_globals,
+            script_vars=_script_vars,
+            plugin_stem=os.path.splitext(os.path.basename(output_path))[0])
     sge_quest_fids |= dialog_sge_fids
 
     # A TES4 script attached to the PLAYER BASE record needs a start-game

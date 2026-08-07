@@ -897,13 +897,41 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
     # real instances: MS05InductionForcegreet and CWEscapeCitySceneActivateDoor.
     is_activate = _operate_target(rec, ctx)
     if is_forcegreet:
-        # Copy vanilla's force-greet PKDT exactly (MS05InductionForcegreet):
-        # no flags, speed 2 (run), and interrupt flags 0xFEFF.  The interrupts
-        # are the point — they AUTHORISE the actor to break off the package to
-        # speak.  Our global default is 0x0000 (all interrupts denied, which is
-        # right for ordinary packages), and with that a force-greet can never
-        # open dialogue no matter how close the actor gets.
-        subs += pack_subrecord('PKDT', build_pkdt(0, SPEED_RUN,
+        # Take vanilla's force-greet speed 2 (run) and interrupt flags 0xFEFF
+        # (MS05InductionForcegreet).  The interrupts are the point — they
+        # AUTHORISE the actor to break off the package to speak.  Our global
+        # default is 0x0000 (all interrupts denied, which is right for ordinary
+        # packages), and with that a force-greet can never open dialogue no
+        # matter how close the actor gets.
+        #
+        # But KEEP the converted TES4 flags — this used to write 0, and a
+        # force-greet with no flags NEVER RETIRES.  Once Per Day (0x400) and
+        # Must Complete (0x4) are exactly what made Oblivion's one-shot
+        # greetings fire once and stop; dropping them left the package
+        # permanently re-qualifying, so the actor greets, ends dialogue,
+        # immediately re-greets, and never advances to his next package.
+        #
+        # CharacterGen stalled at stage 56 on this.  Baurus's
+        # CGBaurusGreetPlayer (TES4 Find->player, flags 5124 = Must Complete +
+        # Once Per Day) hands the player a torch, and its ONLY condition is the
+        # unbounded `GetStage(CharacterGen) >= 50`.  With the flags dropped it
+        # re-fired forever, so Baurus stood there force-greeting instead of
+        # running CGBaurusFollowEmperorToF/ToG into ImperialDungeon03 — and
+        # stage 56's `Baurus.GetParentCell() == ImperialDungeon03 &&
+        # UrielSeptim...` gate could never be satisfied.  Only Glenroy made it
+        # into the cell.
+        #
+        # Once Per Day must be RESTORED here: convert_flags strips it from
+        # every quest-gated package (the Renault secret-door regression — a
+        # UseItemAt package the daily latch kept from ever running), but on a
+        # FORCE-GREET the latch is the package's only retire mechanism when
+        # the greeting advances no stage, and vanilla ships it at scale on
+        # this very template: 57 of Skyrim.esm's 302 ForceGreet-template
+        # packages carry 0x400, including quest-gated ones
+        # (MQ203DelphineRiverwoodSceneForceGreet, MG01FaraldaBridgeForcegreet).
+        if get_int(rec, 'PKDT.Flags') & T4_ONCE_PER_DAY:
+            flags |= T5_ONCE_PER_DAY
+        subs += pack_subrecord('PKDT', build_pkdt(flags, SPEED_RUN,
                                                   interrupt=0xFEFF))
     elif is_activate:
         # Keep the TES4 flags (Must Complete / Once Per Day are real), but take

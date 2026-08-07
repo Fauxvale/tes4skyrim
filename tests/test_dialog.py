@@ -155,6 +155,38 @@ class TestCTDAConversion:
         assert out[0] & 0x02 == 0
         assert struct.unpack_from('<I', out, 20)[0] == 1
 
+    def test_identity_run_on_target_is_dropped_in_a_say_topic(self):
+        """An identity RunOn=Target condition must DROP in a Say-driven topic.
+
+        `identity` (GetIsID & co.) vetoes RETARGETING onto a reference — a
+        GetIsID pinned to a ref compares the wrong base form and can never
+        pass. But it must not veto DROPPING: Actor.Say() has no dialogue
+        target, so keeping RunOn=Target is a condition that can NEVER pass.
+
+        CharacterGen stalled at stage 26 on exactly this. The 26->27 bridge is
+        one GOODBYE INFO (0005144A) gated on GetIsID(UrielSeptim)[RunOnTarget];
+        Baurus says it via Actor.Say(), so it never fired and `setstage 27`
+        never ran.
+        """
+        raw = _tes4_ctda(type_byte=0x02, func=72, p1=0x00023F2E)
+        assert convert_ctda(raw, offset=1, drop_run_on_target=True) is None
+
+    def test_identity_run_on_target_kept_outside_say_topics(self):
+        """Menu dialogue DOES have a target, so the condition stays on Target
+        — this is what keeps GREETINGs working (667 INFOs regressed once)."""
+        raw = _tes4_ctda(type_byte=0x02, func=72, p1=0x00023F2E)
+        out = convert_ctda(raw, offset=1, drop_run_on_target=False)
+        assert out is not None
+        assert struct.unpack_from('<I', out, 20)[0] == 1
+
+    def test_identity_is_never_retargeted_onto_a_reference(self):
+        """GetIsID must never land on RunOn=Reference (the 667-GREETING
+        regression).  In a 'ref'-disposition Say topic the listener is known
+        and the authored identity is statically satisfied, so the condition
+        is DROPPED — the one thing it must never become is a Reference pin."""
+        raw = _tes4_ctda(type_byte=0x02, func=72, p1=0x00023F2E)
+        assert convert_ctda(raw, offset=1, run_on_target_ref=0x14) is None
+
     def test_use_global_flag_remaps_compvalue(self):
         """Only type bit 0x04 (Use Global) makes CompValue a FormID."""
         out = convert_ctda(_tes4_ctda(type_byte=0x04, comp=0x00001234, func=58,
@@ -1438,3 +1470,212 @@ class TestQuestFragmentPropertiesAllBind:
     def test_no_declared_properties_yields_nothing(self):
         assert self._resolve(set()) == {}
         assert self._resolve(None) == {}
+
+
+# ---------------------------------------------------------------------------
+# NPC-to-NPC conversation chains (npc_conversations.py)
+# ---------------------------------------------------------------------------
+
+class TestNpcConversationChains:
+    """Oblivion's engine-scheduled NPC-to-NPC conversations have no Skyrim
+    scheduler; quest-advancing chains are replayed by a generated driver
+    (CharacterGen 26->27 is the canonical case). The plan is the mirroring
+    contract between the importer (VMAD bindings) and the script pipeline
+    (generated .psc) — these tests pin the analysis both sides share."""
+
+    A_BASE, B_BASE = 0x000AAA01, 0x000AAA02
+    QUEST = 0x000AAA10
+    HELLO_D, MID_D, GBYE_D = 0x000000D2, 0x000AAA20, 0x000AAA21
+
+    @staticmethod
+    def _f(v: float) -> int:
+        return struct.unpack('<I', struct.pack('<f', v))[0]
+
+    def _info(self, fid, parent, text, conds, choices=(), result='', ns='0'):
+        rec = {'Signature': 'INFO', 'FormID': f'{fid:08X}',
+               'ParentDIAL': f'{parent:08X}', 'DATA.DialogType': '1',
+               'DATA.NextSpeaker': ns, 'DATA.Flags': '0',
+               'QSTI.Quest': f'{self.QUEST:08X}',
+               'Response[0].ResponseText': text,
+               'ConditionCount': str(len(conds))}
+        for i, c in enumerate(conds):
+            rec[f'Condition[{i}].Raw'] = c.hex()
+        rec['ChoiceCount'] = str(len(choices))
+        for i, ch in enumerate(choices):
+            rec[f'Choice[{i}]'] = f'{ch:08X}'
+        if result:
+            rec['ResultScript'] = result
+        return rec
+
+    def _by_type(self, head_conds=None, goodbye_result='setstage MyQuest 27'):
+        head_conds = head_conds if head_conds is not None else [
+            _tes4_ctda(func=72, p1=self.A_BASE),
+            _tes4_ctda(type_byte=0x02, func=72, p1=self.B_BASE),
+            _tes4_ctda(func=58, comp=self._f(26.0), p1=self.QUEST),
+        ]
+        head = self._info(0x000AAA30, self.HELLO_D,
+                          'Are you all right, sire?', head_conds,
+                          choices=(self.MID_D,))
+        mid = self._info(0x000AAA31, self.MID_D, 'Captain Renault?', [
+            _tes4_ctda(func=72, p1=self.B_BASE),
+            _tes4_ctda(func=58, comp=self._f(26.0), p1=self.QUEST),
+        ], choices=(self.GBYE_D,))
+        gbye = self._info(0x000AAA32, self.GBYE_D, 'She is dead.', [
+            _tes4_ctda(func=72, p1=self.A_BASE),
+            _tes4_ctda(func=58, comp=self._f(26.0), p1=self.QUEST),
+        ], result=goodbye_result)
+        return {
+            'DIAL': [
+                {'Signature': 'DIAL', 'FormID': f'{self.HELLO_D:08X}',
+                 'EditorID': 'HELLO', 'DATA.Type': '1'},
+                {'Signature': 'DIAL', 'FormID': f'{self.MID_D:08X}',
+                 'EditorID': 'MidTopic', 'DATA.Type': '1'},
+                {'Signature': 'DIAL', 'FormID': f'{self.GBYE_D:08X}',
+                 'EditorID': 'GOODBYE', 'DATA.Type': '1'},
+            ],
+            'INFO': [head, mid, gbye],
+            'QUST': [{'Signature': 'QUST', 'FormID': f'{self.QUEST:08X}',
+                      'EditorID': 'MyQuest'}],
+            'SCPT': [],
+            'ACHR': [
+                {'Signature': 'ACHR', 'FormID': '000AAB01',
+                 'EditorID': 'ARef', 'NAME': f'{self.A_BASE:08X}'},
+                {'Signature': 'ACHR', 'FormID': '000AAB02',
+                 'EditorID': 'BRef', 'NAME': f'{self.B_BASE:08X}'},
+            ],
+            'ACRE': [],
+        }
+
+    def _plan(self, **kw):
+        from tes5_import.npc_conversations import build_conversation_plan
+        return build_conversation_plan(self._by_type(**kw),
+                                       plugin_stem='Test')
+
+    def test_quest_advancing_chain_is_restored(self):
+        plan = self._plan()
+        assert len(plan['chains']) == 1
+        c = plan['chains'][0]
+        assert c['subj']['ref_edid'] == 'ARef'
+        assert c['tgt']['ref_edid'] == 'BRef'
+        assert [h['topic_edid'] for h in c['hops']] == ['MidTopic', 'GOODBYE']
+        # NextSpeaker=Target alternates: head is A, so Mid is B, GOODBYE is A.
+        assert [h['speaker'] for h in c['hops']] == ['B', 'A']
+        assert c['gates'] == [{'kind': 'stage', 'quest_fid': self.QUEST,
+                               'quest_edid': 'MyQuest', 'op': '==',
+                               'value': 26}]
+
+    def test_dropped_mid_topic_is_undropped_not_skipped(self):
+        """MidTopic is Type-1 chatter the NPC-to-NPC drop would remove; a
+        restored chain must instead carry it (the driver Says it)."""
+        plan = self._plan()
+        assert plan['chains'][0]['undrop_topic_fids'] == [self.MID_D]
+
+    def test_flavor_chain_stays_dropped(self):
+        """No quest-advancing result anywhere -> not restored (the
+        better-absent-than-wrong rule for pure chatter)."""
+        plan = self._plan(goodbye_result='')
+        assert plan['chains'] == []
+
+    def test_negative_identity_is_not_an_address(self):
+        """GetIsID(npc)[Target] == 0 EXCLUDES that npc — such a head is a
+        player greeting with an exclusion, not an NPC-to-NPC opener."""
+        conds = [
+            _tes4_ctda(func=72, p1=self.A_BASE),
+            _tes4_ctda(type_byte=0x02, comp=0, func=72, p1=self.B_BASE),
+            _tes4_ctda(func=58, comp=self._f(26.0), p1=self.QUEST),
+        ]
+        plan = self._plan(head_conds=conds)
+        assert plan['chains'] == []
+
+    def test_unsupported_gate_skips_the_chain(self):
+        """A gate the driver cannot compile must SKIP the chain — firing a
+        conversation early is worse than leaving it absent."""
+        conds = [
+            _tes4_ctda(func=72, p1=self.A_BASE),
+            _tes4_ctda(type_byte=0x02, func=72, p1=self.B_BASE),
+            _tes4_ctda(func=45, comp=self._f(1.0), p1=self.A_BASE),
+        ]
+        plan = self._plan(head_conds=conds)
+        assert plan['chains'] == []
+        assert any('unsupported gate' in why for _fid, why in plan['skipped'])
+
+    def test_generated_psc_shape(self):
+        from tes5_import.npc_conversations import generate_driver_psc
+        plan = self._plan()
+        psc = generate_driver_psc(plan, {'info:000AAA31': 3.0})
+        assert psc.startswith('ScriptName TES4NPCConvTest extends Quest')
+        assert 'Conv0A.Say(Conv0T0)' in psc
+        assert 'Conv0B.Say(Conv0T1)' in psc
+        assert 'Conv0A.Say(Conv0T2)' in psc
+        assert 'Conv0Q0.GetStage() == 26' in psc
+        # Unbound-property guards: a binding divergence disables the chain
+        # instead of aborting the poll function.
+        assert 'Conv0T0 != None' in psc and 'Conv0Q0 != None' in psc
+        assert 'Utility.Wait(3.60)' in psc     # measured 3.0 + 0.6 beat
+
+    def test_property_bindings_mirror_the_psc(self):
+        """Every Conv* property the psc declares must be bound by
+        chain_property_bindings + the caller's T0 — name-for-name."""
+        import re as _re
+        from tes5_import.npc_conversations import (chain_property_bindings,
+                                                   generate_driver_psc)
+        plan = self._plan()
+        chain = plan['chains'][0]
+        props = chain_property_bindings(chain, lambda f: 0x01000000 | f,
+                                        lambda hop: 0x01BB0000)
+        props['Conv0T0'] = 0x01AA0000
+        psc = generate_driver_psc(plan, {})
+        declared = set(_re.findall(r'Property (Conv\w+) Auto', psc))
+        assert declared == set(props)
+
+    def test_overlapping_chains_are_mutually_exclusive(self):
+        """Two heads opening the same authored talk must retire each other,
+        or the whole conversation replays (MS91 Weebam-Na/Mazoga)."""
+        from tes5_import.npc_conversations import (build_conversation_plan,
+                                                   generate_driver_psc)
+        by_type = self._by_type()
+        second = self._info(0x000AAA33, self.HELLO_D, 'You wanted me?', [
+            _tes4_ctda(func=72, p1=self.B_BASE),
+            _tes4_ctda(type_byte=0x02, func=72, p1=self.A_BASE),
+            _tes4_ctda(func=58, comp=self._f(26.0), p1=self.QUEST),
+        ], choices=(self.GBYE_D,))
+        by_type['INFO'].append(second)
+        plan = build_conversation_plan(by_type, plugin_stem='Test')
+        assert len(plan['chains']) == 2
+        assert plan['chains'][0]['exclusive_with'] == [1]
+        assert plan['chains'][1]['exclusive_with'] == [0]
+        psc = generate_driver_psc(plan, {})
+        done1 = [l for l in psc.splitlines() if l.strip() == '_done1 = True']
+        assert len(done1) == 2      # its own block and chain 0's
+
+
+class TestForceGreetOncePerDay:
+    def test_quest_gated_forcegreet_keeps_once_per_day(self):
+        """convert_flags strips Once Per Day from quest-gated packages (the
+        Renault secret-door regression), but a FORCE-GREET's daily latch is
+        its only retire mechanism when the greeting advances no stage —
+        CGBaurusGreetPlayer re-fired forever and stalled CharacterGen 56.
+        Vanilla ships 0x400 on 57 of its 302 ForceGreet-template packages,
+        including quest-gated ones, so restoring it is vanilla-legal."""
+        from tes5_import.pack_converter import convert_PACK, PackContext
+        rec = {'Signature': 'PACK', 'FormID': '0002C2F1',
+               'EditorID': 'CGBaurusGreetPlayer',
+               'PKDT.Type': '0', 'PKDT.Flags': '5124',
+               'PLDT.Type': '2', 'PLDT.Location': '0', 'PLDT.Radius': '500',
+               'PTDT.Type': '0', 'PTDT.Target': '00000014',
+               'PTDT.Count': '200'}
+        ctx = PackContext()
+        ctx.quest_of = lambda fid: 0x0100AAAA          # quest-gated
+        blob = convert_PACK(rec, ctx)
+        pkdt = _find_subrecord(blob, b'PKDT')
+        flags = struct.unpack_from('<I', pkdt, 0)[0]
+        assert flags & 0x400, 'Once Per Day lost - the greet never retires'
+        assert flags & 0x004, 'Must Complete lost'
+
+    def test_non_forcegreet_quest_gated_still_strips_once_per_day(self):
+        """The Renault fix must survive: an ordinary quest-gated package
+        (UseItemAt/Travel) still loses the daily latch."""
+        from tes5_import.pack_converter import (convert_flags, T4_ONCE_PER_DAY,
+                                                T5_ONCE_PER_DAY)
+        flags, _ = convert_flags(T4_ONCE_PER_DAY, 2, True, quest_gated=True)
+        assert not (flags & T5_ONCE_PER_DAY)
