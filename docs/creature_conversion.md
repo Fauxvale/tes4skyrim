@@ -308,34 +308,41 @@ hardest humanoid-pipeline problem (rest-pose retarget) from the creature path en
     (b) pynifly's hand-rolled BINARY packfile writer — output crashes real Havok
     deserializers (unaligned allocations, layout quirks; even a rewritten vanilla
     file crashes hkxcmd). Its reader + compressor are used; its writer is not.
-4.4 **Text keys → clip triggers/annotations**: `Sound: X` → `SoundPlay` (+ SNDR wiring
-    later), `Hit` → `HitFrame` (and a `preHitFrame` slightly earlier), `a: L/R` → attack
-    annotations, gait `Enum: Left/Right` → `FootFront/FootBack`. These land in the
-    animationdata clip trigger lists (timestamps) and/or in-hkx annotations — copy
-    whichever placement vanilla uses per event type (visible in the extracted deer data:
-    triggers live in `animationdata/<x>project.txt`).
+4.4 **Text keys → ANNOTATIONS INSIDE THE ANIMATION HKX** (root cause of silent
+    creatures, CONFIRMED IN GAME 2026-08-07): the engine dispatches these
+    events from **hkaAnnotationTrack entries embedded in the animation .hkx
+    itself** — 58/74 vanilla wolf animations carry `SoundPlay.NPCWolfAttackA`,
+    `FootFront`/`FootBack`, `weaponSwing`/`preHitFrame`/`HitFrame` as
+    annotations in the binary; `idle_sitdpeck.hkx` carries
+    `SoundPlay.NPCChickenPeck`. Writing the triggers ONLY into
+    `animationdatasinglefile.txt` (+ declaring them in the graph event table)
+    produced **zero audio**; the same events embedded as animation annotations
+    produce correct audio. Worse, the old converter embedded Oblivion's raw
+    text keys VERBATIM (`Sound: NPCDogGrowl`, `Enum: Left`) — meaningless to
+    Skyrim. The translation (hkx_anim.parse_kf_events/event_annotations):
+    `Sound: X` → `SoundPlay.TES4_<X>_SNDR`, gait `Enum: Left/Right/BackLeft/
+    BackRight` → the foot_tags event (AUTHORED footfall times — use them),
+    `Hit` → hit times. animationdata triggers are still written to mirror
+    vanilla, but they are not the dispatch channel.
 
-    The sound trigger MUST be `SoundPlay.<SNDR EditorID>:<time>` — a bare
-    `SoundPlay:` is measured and discarded by the engine before any lookup
+    The sound annotation MUST be `SoundPlay.<SNDR EditorID>` — a bare
+    `SoundPlay` is measured and discarded by the engine before any lookup
     (handler `0x140565c90`, GOG build), so vanilla's bare entries are inert
-    leftovers and must not be copied. `FootFront`/`FootBack` are different:
-    they are genuine bare engine events routed through the race's
-    footstep/impact set.
+    leftovers and must not be copied.
 
-    **The behavior graph must also DECLARE each qualified event.** Annotations
-    are dispatched by matching their text against the graph's own event-name
-    table — a name missing from it resolves to no event and is dropped, which
-    is what made every creature totally silent. Vanilla declares them plainly
-    among the other events (`chickenbehavior.hkx`:
-    `SoundPlay.NPCChickenPeck` / `SoundPlay.NPCChickenScratch`;
-    `wolfbehavior.hkx`: `SoundPlay.NPCDogPantLPMSD` +
-    `SoundStop.NPCDogPantLPMSD`), with no extra transition wiring.
-    `build_behavior_xml(sound_events=...)` adds ours from the clip metadata.
+    **Channel split (no event may fire from two places):** SoundPlay + foot
+    events live in the animation annotations; the weaponSwing/preHitFrame/
+    HitFrame damage triple and end-events live in the GRAPH's
+    hkbClipTriggerArray (proven live: attack states return to default through
+    them). Embedding the triple in the animation too would double the damage
+    window. Attack clips without an authored `Hit` key get one synthesized at
+    40% duration so the triple always exists.
 
-#### Footsteps are a RECORD chain, not an animation trigger (2026-08-05)
+#### Footsteps are a RECORD chain **plus** a matching animation event (2026-08-07)
 
-**Skyrim reads creature locomotion audio from the body ARMA, not from the actor
-and not from animationdata:**
+**Skyrim reads creature locomotion audio from the body ARMA — but the chain
+only fires when the playing animation raises a footstep EVENT whose name
+matches an FSTP.ANAM tag verbatim:**
 
 ```
 ARMA.SNDD -> FSTS (per-gait footstep lists)
@@ -358,18 +365,23 @@ Implemented in `tes5_import/creature_footsteps.py`, following the vanilla
 - **IPDS** = one PNAM(8) per MATERIAL, all pointing at the single IPCT. Wolf
   lists **60 materials** mapped to one impact, so a creature sounds the same on
   every surface — `_FOOTSTEP_MATERIALS` reproduces that list verbatim.
-- **FSTP** = DATA→IPDS + ANAM tag.
+- **FSTP** = DATA→IPDS + ANAM tag. **ANAM is the EVENT NAME, matched verbatim
+  against what the animation fires** — vanilla `NPCWolfFootFrontWalkFootstep`
+  has `ANAM=FootFront`. The first implementation invented tags
+  (`TES4DogFoot1`) that no event ever names: every footstep silent even with
+  a perfect chain. `creature_pipeline.foot_tags()` is now the SINGLE SOURCE
+  for the tag names on both sides (quadruped = back-foot CSDT slot authored →
+  `FootFront`/`FootBack` like vanilla wolf; biped → `FootLeft`/`FootRight`);
+  one FSTP per tag, IPCT/IPDS deduped per distinct sound.
 - **FSTS** = XCNT(20) counts in **walk, run, sprint, sneak, swim** order, but
   the DATA arrays are the **REVERSE**: swim, sneak, sprint, run, walk
   (`wbDefinitionsTES5.pas:7108`). Getting this backwards silently misassigns
   every gait.
 
-One chain per DISTINCT foot sound: bipeds share one for both feet, quadrupeds
-get a front and a back pair. Allocated **last** (like the creature VTYPs) so no
-existing generated FormID shifts, then `patch_creature_footsteps` INSERTS
-`SNDD` into the already-packed ARMAs and fixes the 24-byte header's dataSize —
-unlike VTCK there is no placeholder to overwrite, because SNDD is a genuinely
-new subrecord.
+Allocated **last** (like the creature VTYPs) so no existing generated FormID
+shifts, then `patch_creature_footsteps` INSERTS `SNDD` into the already-packed
+ARMAs and fixes the 24-byte header's dataSize — unlike VTCK there is no
+placeholder to overwrite, because SNDD is a genuinely new subrecord.
 
 Group order matters: `IPCT`/`IPDS` must precede `ARMA`, and `FSTP` must precede
 `FSTS` (xEdit canonical order `... VTYP MATT IPCT IPDS ARMA ... FSTP FSTS ...`).

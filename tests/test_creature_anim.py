@@ -203,6 +203,9 @@ class TestAnimHkx:
         assert res.returncode == 0
 
     def test_annotations_carried(self, tmp_path):
+        """Annotations must be TRANSLATED Skyrim events, never Oblivion's raw
+        text keys — raw `Sound: X`/`Enum: Y` embedded verbatim was the
+        confirmed root cause of totally silent creatures (2026-08-07)."""
         from asset_convert.hkx_anim import convert_clip_hkx
         from asset_convert.hkx_skeleton import load_skeleton_bones
         from external.pynifly_hkx.anim_skyrim import load_skyrim_animation
@@ -212,5 +215,21 @@ class TestAnimHkx:
         convert_clip_hkx(kf, bones, out)
         back = load_skyrim_animation(out)
         texts = {a.text for a in back.annotations}
-        assert any('Hit' in t for t in texts)
-        assert any('Sound' in t for t in texts)
+        assert any(t == 'HitFrame' for t in texts)
+        assert any(t.startswith('SoundPlay.TES4_') and t.endswith('_SNDR')
+                   for t in texts)
+        low = {t.lower() for t in texts}
+        assert not any(t.startswith(('sound:', 'enum:')) for t in low)
+
+    def test_foot_enums_translated(self, tmp_path):
+        """`Enum: Left/BackLeft/...` gait keys become engine footstep events
+        at their AUTHORED times (FSTP.ANAM matches these names verbatim)."""
+        from asset_convert.hkx_anim import convert_clip_hkx
+        from asset_convert.hkx_skeleton import load_skeleton_bones
+        from external.pynifly_hkx.anim_skyrim import load_skyrim_animation
+        bones = load_skeleton_bones(DOG_SKEL)
+        out = str(tmp_path / 'forward.hkx')
+        convert_clip_hkx(DOG_FORWARD, bones, out)
+        back = load_skyrim_animation(out)
+        texts = {a.text for a in back.annotations}
+        assert 'FootFront' in texts and 'FootBack' in texts
