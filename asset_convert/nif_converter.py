@@ -4228,8 +4228,13 @@ def _upgrade_skin_instances(data):
 
 
 def _convert_nif(data, fix_textures=True, src_path='', weight=0,
-                 creature=False):
+                 creature=False, worn=False):
     """Convert a PyFFI NifFormat.Data in-place to Skyrim format.
+
+    worn=True marks the NIF as body-worn gear on the plugin's own authority (an
+    ARMO/CLOT record names it as a biped model — see wearable_plan.is_worn).
+    It only ever widens the armor path: the folder-name guess below still
+    applies on its own for meshes no record references.
 
     creature=True selects the creature-asset rules (skeleton.nif and skinned
     body parts from meshes/creatures/): skinned bodies keep a plain NiNode
@@ -4285,8 +4290,14 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
     # --- Armor / clothing NIF fixups (before version upgrade) ---------------
     nif_basename = os.path.basename(src_path).lower()
     _is_gnd = _is_ground_model(nif_basename)
-    _in_armor_dir = 'armor' in src_path.lower().replace('\\', '/') or \
-                    'clothes' in src_path.lower().replace('\\', '/')   # clothing
+    # Worn gear: the plugin's biped model references decide it (worn), and the
+    # vanilla folder convention is the fallback for meshes no record names.
+    # Never the folder alone — Nehrim files its armor under eyren/, spinat/,
+    # nehrim/, skeletonk/ and would lose the dismember skin, the NiNode root
+    # and the Skyrim skeleton retarget on all 88 of them.
+    _in_armor_dir = worn or \
+        'armor' in src_path.lower().replace('\\', '/') or \
+        'clothes' in src_path.lower().replace('\\', '/')   # clothing
     _is_shield = 'shield' in nif_basename
 
     # Bow bend rig: capture string vertex masks from the Oblivion draw morph
@@ -5359,8 +5370,17 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
         result['error'] = 'NOGEO'
         return result
 
+    # Does the plugin itself wear this mesh?  Asked before the conversion so the
+    # armor rules (dismember skin, NiNode root, skeleton retarget) apply to gear
+    # filed outside meshes\armor and meshes\clothes.
+    _worn = False
+    if wearable_plan is not None and src_meshes_dir is not None and not creature:
+        from . import wearable_plan as _wp
+        _worn = _wp.is_worn(wearable_plan, src_path, src_meshes_dir)
+
     stats = _convert_nif(data, fix_textures=fix_textures,
-                         src_path=str(src_path), creature=creature)
+                         src_path=str(src_path), creature=creature,
+                         worn=_worn)
 
     # Graft the converted Oblivion flame NIF under FlameNode* markers (candle
     # flame / torch fire) — full conversion of Oblivion's own flame visuals,
@@ -5466,9 +5486,13 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # the plain mesh unless it doubles as a ground model.  wearable_plan
     # derives that from the same records the importer writes, so we only emit
     # files something actually references.
+    #
+    # Which mesh is a wearable is the plan's call, not the folder's:
+    # variants_for returns BASE for anything no ARMO/CLOT record names, so
+    # non-wearables keep their plain conversion either way, while gear filed
+    # outside meshes\armor finally gets the _0/_1 pair its ARMA asks for.
     _srcl = str(src_path).lower().replace('\\', '/')
-    _wearable = (not creature and not _is_ground_model(_srcl.rsplit('/', 1)[-1])
-                 and ('armor' in _srcl or 'clothes' in _srcl))
+    _wearable = not creature and not _is_ground_model(_srcl.rsplit('/', 1)[-1])
     if _wearable and wearable_plan is not None:
         from . import wearable_plan as _wp
         want = _wp.variants_for(wearable_plan, src_path, src_meshes_dir)
