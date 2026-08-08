@@ -94,8 +94,14 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
         # The textures the converted meshes reference, harvested as they were
         # written.  Persisted because the prune runs in a later phase (after LOD
         # and speedtrees add their own meshes), possibly a separate invocation.
-        texture_prune.write_manifest(
-            plugin_dir, stats['mesh_conversion'].pop('textures_used', set()))
+        #
+        # A --mesh-subdirs run only saw part of the tree, so it must ADD to the
+        # manifest rather than replace it: overwriting leaves the prune believing
+        # nothing outside those folders uses a texture, and it deletes the rest.
+        _used = stats['mesh_conversion'].pop('textures_used', set())
+        if mesh_subdirs:
+            _used = set(_used) | texture_prune.read_manifest(plugin_dir)
+        texture_prune.write_manifest(plugin_dir, _used)
     else:
         print(f"  No meshes found at {mesh_src}")
         stats['mesh_conversion'] = {'converted': 0, 'skipped': 0, 'errors': 0}
