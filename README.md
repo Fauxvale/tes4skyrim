@@ -65,13 +65,6 @@ A decent PC. The more cores and ram the better. The more cores, the more ram it 
 pip install PyFFI numpy scipy shapely Pillow lz4 mapbox_earcut pytest
 ```
 
-> These three are easy to miss because almost every import in the pipeline is
-> lazy — nothing fails at startup. Without **Pillow** the terrain-LOD stage
-> writes zero tiles, without **lz4** every armor/clothing mesh fails once the
-> vanilla-asset cache is cold, and without **mapbox_earcut** individual cells
-> get no navmesh. In all three cases the run still ends with
-> "Pipeline complete".
-
 > **Navmesh native extensions.** The navmesh build requires two compiled modules,
 > committed prebuilt in `native/dist/` for **CPython 3.14 / 64-bit Windows**. A
 > `.pyd` only loads in a matching interpreter, so on any other Python version or
