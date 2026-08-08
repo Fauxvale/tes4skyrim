@@ -47,6 +47,38 @@ python -m pytest tests/test_import.py -v          # targeted tests only
 - Processing `Knights.esp` reuses the cached `Oblivion.esm` export + mappings.
 - `--no-cache` forces a re-export.
 
+### 🔴 Generated FormIDs are NOT stable across builds — an old save is not a valid test bed
+
+`writer.alloc_formid()` is a plain sequential counter, so every record the
+importer *invents* (as opposed to converting from TES4) takes the next number in
+one shared stream. Adding or removing records anywhere early shifts everything
+after it. On Nehrim that stream holds **25,891 records**:
+
+| | |
+|---|---|
+| REFR | 11,111 |
+| NAVM | 3,350 |
+| ARMA | 2,215 |
+| OTFT | 1,754 |
+| IDLE / STAT / SNDR / DLBR | 1,386 / 1,248 / 1,045 / 916 |
+| VTYP | 116 |
+
+Skyrim persists an actor's inventory and a reference's state in the save once it
+has been loaded. Re-run `--import-only` after a change that emits a different
+number of early records — 2026-08-08 the voice fix added 28 VTYP and the
+female-only-armature fix added 5 ARMA — and every OTFT, ARMA and REFR after them
+moves. A save made against the previous ESM then resolves an actor's stored
+equipment to FormIDs that now mean something else, and the actor **stands there
+naked** even though the outfit, the armature and the meshes are all correct.
+That exact false alarm cost a debugging cycle: `ErothinKampfmagier01` verified
+clean at every level (5-piece outfit, armature present, meshes on disk,
+BSDismember partition 32, `_0`/`_1` pair complete) and was still naked in game.
+
+**Always test an ESM change on a NEW GAME.** `resetinventory` on the actor is the
+quick confirmation — if it dresses, the save was stale, not the build. Making
+the allocation deterministic (keyed on the source record rather than on
+call order) would fix this properly and is not yet done.
+
 ## Stages
 
 1. **Export** (`tes4_export`) — reads the TES4 binary, writes KEY=VALUE text,
