@@ -17,6 +17,7 @@ from asset_convert.nif_converter import (
     batch_convert,
     convert_nif,
 )
+from asset_convert import wearable_plan
 from asset_convert.skyrim_overrides import OBLIVION_TO_SKYRIM_BONE_MAP as BONE_MAP
 
 # Primary Oblivion NIF version (no single constant exported)
@@ -569,6 +570,77 @@ def _verify_block_structure(data: bytes, hdr: dict) -> list[str]:
         errors.append("Footer: truncated")
 
     return errors
+
+
+class TestWearablePlan:
+    """Worn gear is decided by the plugin's biped references, not the folder.
+
+    Nehrim files 88 wearables outside meshes\\armor and meshes\\clothes; the old
+    folder-name test converted every one of them as a world object (no dismember
+    skin, no skeleton retarget, no _0/_1 pair), so guards rendered without a
+    torso.  These pin the plan's answers for both layouts.
+    """
+
+    @staticmethod
+    def _export(tmp_path, biped, flags, world=''):
+        rec = (f'---RECORD_BEGIN---\n'
+               f'Male.BipedModel.MODL={biped}\n'
+               f'BMDT.BipedFlags={flags}\n'
+               + (f'Male.WorldModel.MODL={world}\n' if world else '')
+               + '---RECORD_END---\n')
+        (tmp_path / 'ARMO.txt').write_text(rec, encoding='utf-8')
+        (tmp_path / 'CLOT.txt').write_text('', encoding='utf-8')
+        return wearable_plan.build_plan(tmp_path)
+
+    def test_worn_is_independent_of_folder(self, tmp_path):
+        """A cuirass under nehrim\\ is worn gear exactly like one under armor\\."""
+        meshes = tmp_path / 'meshes'
+        for path, gnd in (('Nehrim\\Taranorcuirass.nif', 'Nehrim\\cuirass_gnd.nif'),
+                          ('armor\\glass\\m\\cuirass.nif', 'armor\\glass\\cuirassgnd.nif')):
+            plan = self._export(tmp_path, path, 4, world=gnd)
+            src = meshes / path.replace('\\', os.sep)
+            assert wearable_plan.is_worn(plan, src, meshes), path
+            # body armor drives the weight slider -> _0/_1, and with a world
+            # model shipped the plain mesh is dead
+            mask = wearable_plan.variants_for(plan, src, meshes)
+            assert mask & wearable_plan.W0 and mask & wearable_plan.W1, path
+            assert not mask & wearable_plan.BASE, path
+
+    def test_biped_mesh_doubles_as_ground_model(self, tmp_path):
+        """No world model: the biped mesh IS the dropped item, so BASE lives on."""
+        meshes = tmp_path / 'meshes'
+        plan = self._export(tmp_path, 'Nehrim\\Taranorcuirass.nif', 4)
+        src = meshes / 'Nehrim' / 'Taranorcuirass.nif'
+        mask = wearable_plan.variants_for(plan, src, meshes)
+        assert mask & wearable_plan.BASE
+        assert mask & wearable_plan.W0 and mask & wearable_plan.W1
+
+    def test_non_slider_gear_keeps_the_plain_mesh(self, tmp_path):
+        """Helmets are worn but have the slider off — plain mesh, no variants."""
+        meshes = tmp_path / 'meshes'
+        plan = self._export(tmp_path, 'Chelm.nif', 1)      # bit 0, not 2-5
+        src = meshes / 'Chelm.nif'
+        assert wearable_plan.is_worn(plan, src, meshes)
+        mask = wearable_plan.variants_for(plan, src, meshes)
+        assert mask & wearable_plan.BASE
+        assert not mask & (wearable_plan.W0 | wearable_plan.W1)
+
+    def test_ground_model_is_not_worn(self, tmp_path):
+        """A world model is referenced but never worn — it must not be retargeted."""
+        meshes = tmp_path / 'meshes'
+        plan = self._export(tmp_path, 'Nehrim\\cuirass.nif', 4,
+                            world='Nehrim\\cuirass_gnd.nif')
+        gnd = meshes / 'Nehrim' / 'cuirass_gnd.nif'
+        assert not wearable_plan.is_worn(plan, gnd, meshes)
+        assert wearable_plan.variants_for(plan, gnd, meshes) == wearable_plan.BASE
+
+    def test_unreferenced_mesh_is_not_worn(self, tmp_path):
+        """Meshes no record names keep their plain conversion and gain nothing."""
+        meshes = tmp_path / 'meshes'
+        plan = self._export(tmp_path, 'Nehrim\\cuirass.nif', 4)
+        loose = meshes / 'clutter' / 'barrel.nif'
+        assert not wearable_plan.is_worn(plan, loose, meshes)
+        assert wearable_plan.variants_for(plan, loose, meshes) == wearable_plan.BASE
 
 
 class TestSkyrimLEReferenceValidation:

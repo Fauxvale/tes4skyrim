@@ -35,6 +35,7 @@ _SLIDER_BIPED_MASK = 0b111100
 BASE = 1        # <name>.nif
 W0 = 2          # <name>_0.nif
 W1 = 4          # <name>_1.nif
+WORN = 8        # named as an ARMA worn (biped) model by some ARMO/CLOT record
 
 
 def _norm(path: str) -> str:
@@ -92,8 +93,11 @@ def build_plan(export_dir) -> dict:
                 biped_flags = 0
 
             # ARMA worn models (MOD2/MOD3): _1 + engine-derived _0 when the
-            # slider is on, otherwise the plain mesh.
-            worn_flags = (W0 | W1) if (biped_flags & _SLIDER_BIPED_MASK) else BASE
+            # slider is on, otherwise the plain mesh.  WORN rides along on every
+            # biped reference — it is what marks the mesh as body-worn gear, a
+            # fact only the plugin knows (see is_worn).
+            worn_flags = WORN | (
+                (W0 | W1) if (biped_flags & _SLIDER_BIPED_MASK) else BASE)
             want(male_biped, worn_flags)
             want(female_biped or male_biped, worn_flags)
 
@@ -116,3 +120,26 @@ def variants_for(plan: dict, src_path, meshes_root) -> int:
     except ValueError:
         return BASE
     return plan.get(_norm(rel), BASE)
+
+
+def is_worn(plan: dict, src_path, meshes_root) -> bool:
+    """True if some ARMO/CLOT record wears this NIF on the body.
+
+    The converter used to answer this by looking for 'armor' or 'clothes' in the
+    source path.  That holds for vanilla Oblivion, which files every wearable
+    under meshes\\armor or meshes\\clothes, but it is a guess about a naming
+    convention rather than a fact about the plugin — Nehrim ships 88 worn meshes
+    under its own folders (eyren/, spinat/, nehrim/, skeletonk/, ...) and every
+    one of them was converted as a world object: BSFadeNode root instead of
+    NiNode, plain NiSkinInstance instead of BSDismemberSkinInstance, and no
+    retarget onto the Skyrim skeleton, so the engine draws nothing where the
+    body should be.  The plugin's own biped model references are the authored
+    answer, so ask them.
+    """
+    if not plan:
+        return False
+    try:
+        rel = os.path.relpath(str(src_path), str(meshes_root))
+    except (ValueError, TypeError):
+        return False
+    return bool(plan.get(_norm(rel), 0) & WORN)
