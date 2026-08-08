@@ -43,7 +43,8 @@ _EXCLUDE = {'boxtest', 'endgame'}
 
 def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
                       part_sets: list = None, fps: float = 30.0,
-                      sound_slots: dict = None) -> dict:
+                      sound_slots: dict = None,
+                      sound_chances: dict = None) -> dict:
     """Full conversion of one creature folder. Returns its manifest
     (with added 'skeleton_nif'/'bodies' keys) or raises.
 
@@ -57,7 +58,8 @@ def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
     from asset_convert.nif_converter import convert_nif, merge_creature_body
 
     manifest = generate_creature_project(creature_dir, name, out_meshes_dir,
-                                         fps=fps, sound_slots=sound_slots)
+                                         fps=fps, sound_slots=sound_slots,
+                                         sound_chances=sound_chances)
     proj_dir = os.path.join(out_meshes_dir, 'actors', 'tes4', name.lower())
 
     # SSE only loads 64-bit havok files: a 32-bit project makes the engine
@@ -174,10 +176,16 @@ _CSDT_TO_CLIP = {
     1: ('locomotion', 'foot'),    # Right Foot
     2: ('locomotion', 'foot'),    # Left Back Foot
     3: ('locomotion', 'foot'),    # Right Back Foot
-    4: ('idle', 'start'),         # Idle
-    5: ('combat', 'start'),       # Aware  -> combat stance entry
     6: ('attacks', 'start'),      # Attack
-    8: ('death', 'start'),        # Death
+    8: ('death', 'start'),        # Death (only creatures WITH a death anim)
+    # 4 (Idle) and 5 (Aware) must NOT be annotated onto the base clips: the
+    # Idle/CombatStance clips LOOP, so an embedded SoundPlay fires every
+    # cycle — the confirmed "same squeak over and over, even after death"
+    # bug (the ragdoll wrapper states also play the idle clip as their pose
+    # source). They become dedicated single-play vocal states instead,
+    # paced by the engine's own idle system (ActionIdle / ActionIdleWarn
+    # IDLE records — the vanilla WolfIdleHowl / WolfIdleWarn pattern). See
+    # hkx_behavior.generate_creature_project + tes5_import/creature_idles.
     # 7 (Hit) is driven by the engine's own hit event, and is the ONE slot
     # vanilla still writes on the record (31/36) — left to the CSDT array.
 }
@@ -220,13 +228,17 @@ def foot_enum_map(slots: dict) -> dict:
             'backleft': 'FootBack', 'backright': 'FootBack'}
 
 
-def _sound_slots_by_folder(export_dir: str) -> dict:
-    """folder(lower) -> {csdt_type: SOUN EditorID}, from the CREA export.
+def _sound_data_by_folder(export_dir: str) -> dict:
+    """folder(lower) -> {csdt_type: (SOUN EditorID, chance)}, from the CREA
+    export.
 
     Resolves CSCR inheritance (817 of Oblivion's 909 CREA records inherit their
     sounds from another creature rather than defining their own), and takes the
     richest slot set in a folder: one behavior project serves every creature
     sharing that mesh folder, so the annotations have to be the union.
+
+    chance is the authored CSDC play-chance (0-100); 100 when the export
+    predates the field.
     """
     from tes5_import.text_reader import parse_export_file
 
@@ -247,15 +259,18 @@ def _sound_slots_by_folder(export_dir: str) -> dict:
     by_fid = {(r.get('FormID') or '').upper(): r for r in recs}
 
     def slots_of(rec, depth=0):
-        """{type: SOUN fid} for a CREA, following CSCR inheritance."""
+        """{type: (SOUN fid, chance)} for a CREA, following CSCR
+        inheritance."""
         n = int(rec.get('SoundTypeCount', 0) or 0)
         if n:
             out = {}
             for i in range(n):
                 t = rec.get(f'SoundType[{i}].Type')
                 s = rec.get(f'SoundType[{i}].Sound')
+                c = rec.get(f'SoundType[{i}].Sound.Chance')
                 if t is not None and s:
-                    out[int(t)] = s.upper()
+                    out[int(t)] = (s.upper(),
+                                   int(c) if c is not None else 100)
             return out
         if depth < 4:
             src = (rec.get('CSCR.InheritSound') or '').upper()
@@ -270,7 +285,7 @@ def _sound_slots_by_folder(export_dir: str) -> dict:
         folder = parts[-2] if len(parts) >= 2 else ''
         if not folder:
             continue
-        slots = {t: soun_edid[s] for t, s in slots_of(rec).items()
+        slots = {t: (soun_edid[s], c) for t, (s, c) in slots_of(rec).items()
                  if s in soun_edid}
         if not slots:
             continue
@@ -278,6 +293,13 @@ def _sound_slots_by_folder(export_dir: str) -> dict:
         if len(slots) > len(out.get(folder, {})):
             out[folder] = slots
     return out
+
+
+def _sound_slots_by_folder(export_dir: str) -> dict:
+    """folder(lower) -> {csdt_type: SOUN EditorID} (see
+    _sound_data_by_folder; this is the chance-less view most callers use)."""
+    return {folder: {t: edid for t, (edid, _c) in slots.items()}
+            for folder, slots in _sound_data_by_folder(export_dir).items()}
 
 
 def _part_sets_by_folder(export_dir: str) -> dict:
@@ -408,10 +430,15 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
     # Distinct NIFZ part sets per folder (dog/wolf/skeletal-hound share a
     # folder but each merges into its own whole-animal NIF).
     part_sets = _part_sets_by_folder(export_dir)
-    # CSDT sound slots per folder — replayed as animationdata SoundPlay
-    # triggers, which is how Skyrim voices a creature (see
-    # _sound_slots_by_folder / hkx_behavior._apply_sound_slots).
-    sound_slots = _sound_slots_by_folder(export_dir)
+    # CSDT sound slots per folder — replayed as animation annotations and
+    # vocal idle states, which is how Skyrim voices a creature (see
+    # _sound_data_by_folder / hkx_behavior._apply_sound_slots /
+    # generate_creature_project's vocal states).
+    sound_data = _sound_data_by_folder(export_dir)
+    sound_slots = {f: {t: e for t, (e, _c) in s.items()}
+                   for f, s in sound_data.items()}
+    sound_chances = {f: {t: c for t, (_e, c) in s.items()}
+                     for f, s in sound_data.items()}
 
     log(f'  Converting {len(dirs)} creatures '
         f'({workers or _WORKERS} workers)...')
@@ -422,7 +449,8 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
     with ProcessPoolExecutor(max_workers=workers or _WORKERS) as pool:
         futs = {pool.submit(_convert_creature, cdir, name, out_meshes_dir,
                             part_sets.get(name.lower()), 30.0,
-                            sound_slots.get(name.lower())):
+                            sound_slots.get(name.lower()),
+                            sound_chances.get(name.lower())):
                 name for cdir, name in dirs}
         for fut in as_completed(futs):
             name = futs[fut]
@@ -483,6 +511,9 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
         'has_ragdoll': m.get('has_ragdoll', False),
         'clips': [c['name'] for c in m.get('clips', [])],
         'bones': m.get('bones', []),
+        # vocal idle states -> import generates their ActionIdle/
+        # ActionIdleWarn IDLE entry records (creature_idles)
+        'vocal_events': m.get('vocal_events', []),
     } for name, m in all_manifests.items()}
     with open(os.path.join(export_dir, 'creature_projects.json'), 'w',
               encoding='utf-8') as f:

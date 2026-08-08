@@ -51,6 +51,8 @@ _ACTIONS = {
     'ActionSwimStateChange': 0x00013003,
     'ActionKnockDown': 0x000D1FDC,
     'ActionRagdollInstant': 0x0009BB4E,
+    'ActionIdle': 0x00013002,
+    'ActionIdleWarn': 0x00098886,
 }
 
 # (edid suffix, graph event, action, vanilla-dog DATA hex)
@@ -81,6 +83,15 @@ _LEAVES = [
 # IsSwimming == 1 condition, verbatim from vanilla DogSwimStart
 _SWIM_CTDA = bytes.fromhex(
     '000F8B000000803FB900933300000000000000000000000000000000FFFFFFFF')
+# Aware-vocal DATA bytes, verbatim from vanilla WolfIdleWarn.
+#
+# NEVER add an IDLE record under ActionIdle (0x00013002) for these graphs:
+# it sends the actor into an engine-tracked dynamic idle whose lifecycle our
+# minimal graphs do not complete, and every creature stopped walking and
+# floated in its idle (2026-08-07). Vanilla parents its vocal idles
+# (WolfIdleHowl) under per-creature NonCombatIdle chains with graph-side
+# idle handling we do not generate yet.
+_VOCAL_WARN_DATA = bytes.fromhex('000000000000')
 _SWIM_DATA = bytes.fromhex('0000003F0000')
 # vanilla DogDeathWait conditions (verbatim) — gate the DeathAnimation
 # branch; when false the walk falls through to the Ragdoll sibling
@@ -142,3 +153,13 @@ def build_creature_idles(writer, folder: str, proj: dict) -> None:
                   0, _DEATH_ANIM_DATA, ctda=_DEATH_ANIM_CTDAS)
     _idle(writer, f'{base}DeathWaitRagdoll', dnam, 'Ragdoll', droot, danim,
           _DEATH_RAGDOLL_DATA)
+
+    # Aware vocal: the entry point for the graph's AwareVocal state (CSDT
+    # Aware slot). ActionIdleWarn fires during an aggro warning — the exact
+    # vanilla WolfIdleWarn layout, and the engine-native equivalent of
+    # Oblivion's 'Aware' sound. (The Idle slot has NO record here — see the
+    # ActionIdle warning above.)
+    for v in proj.get('vocal_events') or []:
+        if v.get('event') == 'awareVocalStart':
+            _idle(writer, f'{base}IdleWarn', dnam, 'awareVocalStart',
+                  _ACTIONS['ActionIdleWarn'], 0, _VOCAL_WARN_DATA)

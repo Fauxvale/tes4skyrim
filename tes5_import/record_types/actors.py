@@ -54,19 +54,26 @@ def _read_items(rec: dict) -> list:
     return items
 
 
-# TES4 CREA sound types that carry over to TES5 unchanged. Both games use the
-# SAME enum for 0-9 (xEdit wbDefinitionsTES4 CREA CSDT vs wbDefinitionsTES5
-# NPC_ CSDT: Left Foot, Right Foot, Left Back Foot, Right Back Foot, Idle,
-# Aware, Attack, Hit, Death, Weapon — TES5 merely appends 10-21), so the type
-# passes straight through. Skyrim kept Oblivion's creature-sound system on the
-# actor record; the only real difference is that CSDI names an SNDR rather
-# than a SOUN, which is exactly the companion convert_SOUN already mints.
-_MAX_TES4_SOUND_TYPE = 9
-
-# CSDC 'Sound Chance'. TES4 has no per-sound chance — the engine always plays
-# the slot's sound — so every converted entry is certain, matching the 100 that
-# all 31 vanilla Skyrim AudioTemplate NPC_ records write.
-_SOUND_CHANCE_ALWAYS = 100
+# TES4 CREA sound types written to the TES5 record. Both games use the SAME
+# enum for 0-9 (xEdit wbSoundTypeSounds is one shared struct), but the census
+# of all 5118 vanilla Skyrim NPC_ records is the contract for which slots the
+# TES5 ENGINE actually reads from the record: 31 Hit, 4 Attack, 1 Left Foot,
+# and ZERO of everything else. So only Hit rides the record. The other slots
+# are delivered through the channels vanilla uses for them:
+#   0-3 feet  -> ARMA.SNDD footstep chain (creature_footsteps) + FootFront/
+#                FootBack animation events
+#   4 Idle / 5 Aware -> single-play vocal states entered via ActionIdle/
+#                ActionIdleWarn IDLE records (hkx_behavior vocal states +
+#                creature_idles) — NEVER per-loop clip annotations, and never
+#                chance-100 record slots: both made the creature vocalize
+#                non-stop, continuing after death
+#   6 Attack -> SoundPlay annotation at the swing frame of each attack clip
+#   8 Death  -> annotation on the death clip when one exists (writing the
+#                slot vanilla never writes risks untested engine paths in
+#                the kill flow)
+# (Attack is annotation-driven here even though vanilla has 4 record
+# entries — writing both channels would double the bark.)
+_RECORD_SOUND_TYPES = (7,)          # Hit
 
 # NPC_ NAM8 'Sound Level' (wbSoundLevelEnum: 0 Loud, 1 Normal, 2 Silent).
 # Vanilla writes Normal on 5116 of 5118 NPC_ records.
@@ -81,12 +88,11 @@ _NAM5_UNKNOWN = b'\xff\x00'
 def _actor_sound_subs(rec: dict) -> bytes:
     """CSDT/CSDI/CSDC array for a TES4 CREA, in TES5 NPC_ order.
 
-    This is the ONLY channel a creature's voice travels through: an Oblivion
-    creature's idle/aware/attack/hit/death vocalizations live in these record
-    slots, not in its animations (census of the goblin's 56 .kf files: exactly
-    one carries a sound key, and it is the bow string). Dropping the array —
-    which the converter did — left every converted creature mute even though
-    the .wav files and their SNDR records had converted correctly.
+    Only the slots in _RECORD_SOUND_TYPES are written (the vanilla-census
+    channel split — see the table above); the rest of the creature's voice
+    travels through animation annotations, vocal idle states and the
+    footstep chain. CSDC is the AUTHORED TES4 play-chance (the same shared
+    wbSoundTypeSounds struct in both games), not a hardcoded 100.
 
     CSDI is written as the TES4 SOUN FormID and patched to the real SNDR after
     Phase 3 (patch_actor_sounds). The descriptor does not exist yet, and
@@ -101,14 +107,24 @@ def _actor_sound_subs(rec: dict) -> bytes:
     subs = b''
     for i in range(get_int(rec, 'SoundTypeCount')):
         stype = get_int(rec, f'SoundType[{i}].Type', -1)
-        if not 0 <= stype <= _MAX_TES4_SOUND_TYPE:
+        if stype not in _RECORD_SOUND_TYPES:
             continue
-        soun = get_formid(rec, f'SoundType[{i}].Sound')
-        if not soun:
+        # first sound keeps the un-indexed key; a type may list several
+        pairs, j = [], 0
+        while True:
+            key = (f'SoundType[{i}].Sound' if j == 0
+                   else f'SoundType[{i}].Sound[{j}]')
+            soun = get_formid(rec, key)
+            if not soun:
+                break
+            pairs.append((soun, get_int(rec, f'{key}.Chance', 100)))
+            j += 1
+        if not pairs:
             continue
         subs += pack_uint32_subrecord('CSDT', stype)
-        subs += pack_formid_subrecord('CSDI', soun)   # placeholder
-        subs += pack_uint8_subrecord('CSDC', _SOUND_CHANCE_ALWAYS)
+        for soun, chance in pairs:
+            subs += pack_formid_subrecord('CSDI', soun)   # placeholder
+            subs += pack_uint8_subrecord('CSDC', max(0, min(100, chance)))
     return subs
 
 
@@ -126,12 +142,12 @@ def patch_actor_sounds(writer) -> int:
     """
     from .dialog_misc import sndr_map
     mapping = sndr_map()
-    if not mapping:
-        return 0
+    records = writer._top_groups.get('NPC_') or []
+    if not mapping or not records:
+        return _flatten_cscr(records) if records else 0
     # An already-resolved CSDI must survive a second pass untouched, so treat
     # every descriptor id as mapping to itself.
     resolved = {v for v in mapping.values()}
-    records = writer._top_groups.get('NPC_') or []
     patched = 0
     for i, blob in enumerate(records):
         if b'CSDI' not in blob:
@@ -139,36 +155,113 @@ def patch_actor_sounds(writer) -> int:
         out = bytearray(blob[:24])
         pos = 24
         changed = False
-        # Walk the subrecord stream, rewriting or dropping each CSDT/CSDI/CSDC
-        # triple as a unit.
-        pending = b''
+        # Walk the subrecord stream. A group is one CSDT followed by its
+        # CSDI/CSDC pairs (a type may list several sounds); the CSDT is only
+        # emitted if at least one of its sounds resolved.
+        cur_type = b''          # pending CSDT chunk
+        cur_pairs = b''         # resolved CSDI/CSDC pairs for it
+        drop_csdc = False       # current CSDI was dropped -> drop its CSDC
+
+        def _flush():
+            nonlocal cur_type, cur_pairs
+            if cur_type and cur_pairs:
+                out.extend(cur_type + cur_pairs)
+            cur_type, cur_pairs = b'', b''
+
         while pos + 6 <= len(blob):
             sig = blob[pos:pos + 4]
             size = struct.unpack_from('<H', blob, pos + 4)[0]
             chunk = blob[pos:pos + 6 + size]
             pos += 6 + size
             if sig == b'CSDT':
-                pending = chunk
-                continue
-            if sig == b'CSDI' and pending:
+                _flush()
+                cur_type = chunk
+                drop_csdc = False
+            elif sig == b'CSDI' and cur_type:
                 soun = struct.unpack_from('<I', chunk, 6)[0]
                 sndr = (soun if soun in resolved
                         else mapping.get(soun & 0x00FFFFFF, 0))
                 if sndr:
-                    pending += (chunk[:6] + struct.pack('<I', sndr))
+                    cur_pairs += chunk[:6] + struct.pack('<I', sndr)
+                    drop_csdc = False
                     changed = changed or sndr != soun
                 else:
-                    pending = b''      # drop the whole triple
+                    drop_csdc = True
                     changed = True
-                continue
-            if sig == b'CSDC':
-                if pending:
-                    out += pending + chunk
-                pending = b''
-                continue
-            out += chunk
+            elif sig == b'CSDC' and cur_type:
+                if not drop_csdc:
+                    cur_pairs += chunk
+                drop_csdc = False
+            else:
+                _flush()
+                out += chunk
+        _flush()
         if not changed:
             continue
+        struct.pack_into('<I', out, 4, len(out) - 24)   # data size
+        records[i] = bytes(out)
+        patched += 1
+    patched += _flatten_cscr(records)
+    return patched
+
+
+def _sound_chunks(blob: bytes) -> bytes:
+    """The record's CSDT/CSDI/CSDC subrecord bytes, contiguous, or b''."""
+    out, pos = b'', 24
+    while pos + 6 <= len(blob):
+        sig = blob[pos:pos + 4]
+        size = struct.unpack_from('<H', blob, pos + 4)[0]
+        if sig in (b'CSDT', b'CSDI', b'CSDC'):
+            out += blob[pos:pos + 6 + size]
+        pos += 6 + size
+    return out
+
+
+def _flatten_cscr(records: list) -> int:
+    """Replace every actor CSCR with the target's own resolved CSDT array.
+
+    TES4 lets inheritance CHAIN (rat variant -> base rat -> ...); vanilla
+    Skyrim CSCR always points ONE hop to an actor with a direct array, and
+    the sound-commit regression window is exactly when non-vanilla record
+    shapes entered the kill path — so instead of shipping chains (or CSCR
+    targets that themselves were skipped records), resolve the chain here
+    and write the sounds directly. Runs after the CSDI->SNDR patch so the
+    inlined bytes already carry real descriptor ids.
+    """
+    by_fid = {struct.unpack_from('<I', blob, 12)[0]: i
+              for i, blob in enumerate(records)}
+
+    def find_cscr(blob):
+        """(offset, size) of the CSCR subrecord via a proper subrecord walk
+        (a raw .find could match 'CSCR' inside another subrecord's data)."""
+        pos = 24
+        while pos + 6 <= len(blob):
+            sig = blob[pos:pos + 4]
+            size = struct.unpack_from('<H', blob, pos + 4)[0]
+            if sig == b'CSCR':
+                return pos, size
+            pos += 6 + size
+        return None
+
+    def resolved_sounds(blob, depth=0):
+        own = _sound_chunks(blob)
+        if own:
+            return own
+        hit = find_cscr(blob)
+        if hit is None or depth >= 4:
+            return b''
+        target = struct.unpack_from('<I', blob, hit[0] + 6)[0]
+        k = by_fid.get(target)
+        return resolved_sounds(records[k], depth + 1) if k is not None else b''
+
+    patched = 0
+    for i, blob in enumerate(records):
+        hit = find_cscr(blob)
+        if hit is None:
+            continue
+        j, size = hit
+        inline = resolved_sounds(blob)
+        out = bytearray(blob[:j]) + inline + blob[j + 6 + size:]
         struct.pack_into('<I', out, 4, len(out) - 24)   # data size
         records[i] = bytes(out)
         patched += 1
@@ -1435,13 +1528,14 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
     subs += pack_subrecord('NAM7', struct.pack('<f', 50.0))  # weight
     subs += pack_uint32_subrecord('NAM8', _SOUND_LEVEL_NORMAL)
 
-    # Creature sounds — the actor's voice. TES5 NPC_ keeps Oblivion's CSDT/
-    # CSDI/CSDC array verbatim (same type enum), so this is a straight
-    # passthrough; a creature with no own sounds inherits via CSCR instead,
-    # which is how 817 of Oblivion's 909 CREA (and 725 vanilla Skyrim NPC_)
-    # are authored. Order per wbDefinitionsTES5 NPC_: CSDT[] then CSCR, both
-    # after ZNAM and before DOFT. The two are mutually exclusive — xEdit:
-    # "When CSCR exists CSDT, CSDI, CSDC are not present".
+    # Creature sounds — the record channel carries the Hit slot only (see
+    # _RECORD_SOUND_TYPES for the full vanilla-census channel split); a
+    # creature with no own sounds gets a PLACEHOLDER CSCR here which
+    # patch_actor_sounds/_flatten_cscr later replaces with the target's
+    # resolved array — TES4 inheritance CHAINS (and targets that were
+    # skipped records) are shapes vanilla CSCR never has, so no CSCR
+    # survives into the output. Order per wbDefinitionsTES5 NPC_: CSDT[]
+    # then CSCR, both after ZNAM and before DOFT.
     sound_subs = _actor_sound_subs(rec)
     if sound_subs:
         subs += sound_subs

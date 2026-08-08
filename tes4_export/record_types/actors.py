@@ -231,16 +231,34 @@ def export_CREA(rec: Record) -> list:
         for i, p in enumerate(parts):
             lines.append(f"KFFZ[{i}]={escape_value(p)}")
 
-    # Sound entries (CSDT/CSDI/CSDC chains)
-    csdts = get_all_subrecords(rec, "CSDT")
-    csdis = get_all_subrecords(rec, "CSDI")
-    if csdts:
-        lines.append(f"SoundTypeCount={len(csdts)}")
-        for i, csdt in enumerate(csdts):
-            if len(csdt.data) >= 4:
-                lines.append(f"SoundType[{i}].Type={struct.unpack_from('<I', csdt.data, 0)[0]}")
-            if i < len(csdis) and len(csdis[i].data) >= 4:
-                lines.append(f"SoundType[{i}].Sound={get_formid_str(struct.unpack_from('<I', csdis[i].data, 0)[0])}")
+    # Sound entries: each CSDT (type) is followed IN STREAM ORDER by its
+    # CSDI/CSDC (sound + chance) pairs — a type may list several sounds, so
+    # positional zipping of the flat CSDT/CSDI lists mispairs them. CSDC is
+    # the authored play chance (wbSoundTypeSounds, shared TES4/TES5 struct).
+    entries = []                    # (type, [[sound_fid, chance], ...])
+    cur = pending = None
+    for sub in rec.subrecords:
+        if sub.type == "CSDT" and len(sub.data) >= 4:
+            cur = (struct.unpack_from('<I', sub.data, 0)[0], [])
+            entries.append(cur)
+            pending = None
+        elif sub.type == "CSDI" and cur is not None and len(sub.data) >= 4:
+            pending = [struct.unpack_from('<I', sub.data, 0)[0], None]
+            cur[1].append(pending)
+        elif sub.type == "CSDC" and pending is not None and sub.data:
+            pending[1] = sub.data[0]
+            pending = None
+    if entries:
+        lines.append(f"SoundTypeCount={len(entries)}")
+        for i, (stype, sounds) in enumerate(entries):
+            lines.append(f"SoundType[{i}].Type={stype}")
+            for j, (fid, chance) in enumerate(sounds):
+                # first pair keeps the historical un-indexed names
+                key = (f"SoundType[{i}].Sound" if j == 0
+                       else f"SoundType[{i}].Sound[{j}]")
+                lines.append(f"{key}={get_formid_str(fid)}")
+                if chance is not None:
+                    lines.append(f"{key}.Chance={chance}")
 
     return lines
 

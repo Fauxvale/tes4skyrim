@@ -514,7 +514,8 @@ def build_behavior_xml(behavior_name: str, clips: dict,
                        movement_types: list = None,
                        speeds: dict = None,
                        ragdoll: dict = None,
-                       sound_events: list = None) -> str:
+                       sound_events: list = None,
+                       vocal_states: list = None) -> str:
     """The generated v1 state machine (see module docstring).
 
     hit_times: {state_name: [seconds]} — Oblivion 'Hit' text-key times for
@@ -531,6 +532,12 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     `SoundPlay.NPCDogPantLPMSD` + `SoundStop.NPCDogPantLPMSD`, matching their
     animationdata triggers verbatim. The bare `SoundPlay` entry those graphs
     also carry is the inert leftover, not the mechanism.
+
+    vocal_states: [(state_name, enter_event, anim_stem)] single-play vocal
+    idle states (CSDT Idle/Aware slots), entered via the engine's idle
+    system (ActionIdle/ActionIdleWarn IDLE records) and returning through
+    returnToDefault. Each plays its OWN annotation-carrying copy of the
+    idle animation so the sound fires once per entry, never per loop.
 
     movement_types: MOVT MNAM strings (movement_type_names()) declared as
     `iState_<X>` INT32 variables — the engine's movement-type registration
@@ -561,6 +568,8 @@ def build_behavior_xml(behavior_name: str, clips: dict,
               'AddRagdollToWorld', 'RemoveCharacterControllerFromWorld',
               'SoundPlay', 'preHitFrame', 'HitFrame',
               'FootFront', 'FootBack', 'FootLeft', 'FootRight']
+    # Vocal idle enter-events (the IDLE records' ENAM strings)
+    events += [evt for _s, evt, _a in (vocal_states or [])]
     # Qualified sound events: one table entry per distinct
     # `SoundPlay.<SNDR EditorID>` the clips actually fire (see docstring).
     events += [e for e in dict.fromkeys(sound_events or []) if e not in events]
@@ -617,13 +626,19 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         b.param('indexOfBindingToEnable', -1)
         return b
 
-    def _clip(name, kf_path, looping, triggers_ref='null', rate=1.0):
+    def _clip(name, kf_path, looping, triggers_ref='null', rate=1.0,
+              anim=None):
+        # anim: override the animation FILE stem. Annotations live in the
+        # file, so a state whose events differ from the kf's other states
+        # (vocal idles) — or must have none (the ragdoll pose) — points at
+        # its own copy instead of the shared one.
         clip = pf.add('hkbClipGenerator')
         clip.param('variableBindingSet', 'null')
         clip.param('userData', 0)
         clip.param('name', name)
         clip.param('animationName',
-                   'Animations\\' + _clip_state_name(kf_path) + '.hkx')
+                   'Animations\\' + (anim or _clip_state_name(kf_path))
+                   + '.hkx')
         clip.param('triggers', triggers_ref)
         clip.param('cropStartAmountLocalTime', '0.000000')
         clip.param('cropEndAmountLocalTime', '0.000000')
@@ -925,6 +940,21 @@ def build_behavior_xml(behavior_name: str, clips: dict,
             next_id += 1
             equip_dispatch.append((kind, evt, hand_types))
 
+    # Vocal idle states (CSDT Idle/Aware slots). Single-play — the sound
+    # annotation lives in the state's OWN animation file, so it fires once
+    # per entry, and entry is paced by the engine's idle system through the
+    # ActionIdle / ActionIdleWarn IDLE records (tes5_import/creature_idles),
+    # exactly like vanilla WolfIdleHowl / WolfIdleWarn. Embedding the sound
+    # in the looping Idle/CombatStance clips instead made it fire every
+    # cycle, in life and in the ragdoll wrapper states after death.
+    for st_name, evt, stem in (vocal_states or []):
+        clip = _clip(st_name, clips['idle'], False,
+                     _clip_triggers(st_name, 'returnToDefault'), anim=stem)
+        root_states_inner.append(_state(
+            next_id, f'{st_name}State', clip.ref))
+        root_wilds.append((eid[evt], next_id, _F_WILD))
+        next_id += 1
+
     equip_eem = None
     if equip_dispatch:
         # weaponDraw/weaponSheathe -> the class-specific enter event. Guarded on
@@ -1156,7 +1186,13 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         def _mod_state_gen(name, modifiers, clip_name):
             # objects must be defined before their referencers (hkxcmd
             # parser rejects forward references)
-            pose_clip = _clip(clip_name, clips['idle'], True)
+            # The pose source is a CLEAN copy of the idle animation
+            # ('ragdollpose.hkx', written without annotations): this clip
+            # keeps looping for as long as the corpse exists, so any
+            # SoundPlay annotation in its file would vocalize the corpse
+            # forever (the confirmed squeaking-dead-rat bug).
+            pose_clip = _clip(clip_name, clips['idle'], True,
+                              anim='ragdollpose')
             lst = pf.add('hkbModifierList')
             lst.param('variableBindingSet', 'null')
             lst.param('userData', 0)
@@ -1298,8 +1334,15 @@ def _apply_sound_slots(clip_meta: list, clips: dict, sound_slots: dict) -> int:
     keys — exactly 1 of the goblin's 56, and that one is the bow string. Skyrim
     is the other way round: the actor record is nearly empty (36 CSDT entries
     across all 5118 vanilla NPC_, none of them Idle/Aware/Death) and the voice
-    comes from `SoundPlay.<SNDR EditorID>` annotations in animationdata. So the
-    record data has to be replayed as annotations or the creature is silent.
+    comes from `SoundPlay.<SNDR EditorID>` annotations in the animations. So
+    the record data has to be replayed as annotations or the creature is
+    silent.
+
+    Only SINGLE-PLAY moments are handled here (attack swings, the death anim,
+    plus footfall events on the gait cycle, which ARE per-cycle by nature).
+    The Idle/Aware slots go through dedicated vocal states instead
+    (generate_creature_project) — annotating the looping Idle/CombatStance
+    clips fired them every cycle, in life and after death.
 
     A clip that already carries an authored sound key for a slot keeps it — the
     source is always the better authority when it exists.
@@ -1333,17 +1376,7 @@ def _apply_sound_slots(clip_meta: list, clips: dict, sound_slots: dict) -> int:
         if role is None:
             continue
         kind, where = role
-        if kind == 'idle':
-            c = by_name.get('Idle')
-            if c and not c['sounds']:
-                # Looping idle: one vocalization per cycle, slightly in so it
-                # is not masked by the transition into the state.
-                added += add(c, min(0.25, c['duration'] * 0.25), edid)
-        elif kind == 'combat':
-            c = by_name.get('CombatStance')
-            if c and not c['sounds']:
-                added += add(c, min(0.25, c['duration'] * 0.25), edid)
-        elif kind == 'death':
+        if kind == 'death':
             c = by_name.get('Death')
             if c:
                 added += add(c, 0.0, edid)
@@ -1388,7 +1421,8 @@ def _apply_sound_slots(clip_meta: list, clips: dict, sound_slots: dict) -> int:
 
 
 def generate_creature_project(creature_dir: str, name: str, out_root: str,
-                              fps: float = 30.0, sound_slots: dict = None) -> dict:
+                              fps: float = 30.0, sound_slots: dict = None,
+                              sound_chances: dict = None) -> dict:
     """Full project generation for one creature.
 
     Writes the hkx project tree plus `project_manifest.json` — the manifest
@@ -1398,7 +1432,10 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     sound_slots: {CSDT type: SOUN EditorID} for this creature's folder. Skyrim
     voices creatures through animation annotations rather than the actor
     record, so these become `SoundPlay.<SNDR>` clip triggers — see
-    creature_pipeline._CSDT_TO_CLIP.
+    creature_pipeline._CSDT_TO_CLIP — except the Idle/Aware slots, which
+    become dedicated single-play vocal states so they cannot fire per loop.
+    sound_chances: {CSDT type: authored CSDC chance 0-100}, carried into the
+    manifest's vocal_events for the import-side IDLE record conditions.
     """
     from asset_convert.creature_pipeline import foot_enum_map
     from asset_convert.hkx_anim import (decode_clip, event_annotations,
@@ -1493,12 +1530,62 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     # BEFORE compiling, so they land inside the animation hkx too.
     _apply_sound_slots(clip_meta, clips, sound_slots)
 
+    # Vocal state for the CSDT Aware(5) slot. It CANNOT be an annotation on
+    # the looping Idle/CombatStance clips — an annotation fires every loop
+    # cycle, so the creature squeaked non-stop, and kept squeaking after
+    # death because the ragdoll wrapper states loop the idle clip as their
+    # pose source. Instead it is a single-play state playing its OWN copy of
+    # the idle animation with the sound annotation, entered through the
+    # engine's ActionIdleWarn IDLE record — the exact vanilla WolfIdleWarn
+    # layout (leaf under the action, ENAM, aggroWarning lifecycle), and it
+    # only ever fires during an aggro warning.
+    #
+    # The Idle(4) slot is DELIVERED NOWHERE for now — both candidate
+    # channels are disqualified:
+    #   * an annotation on the looping base idle fires every cycle (the
+    #     confirmed squeak-spam bug; vanilla only does this for cow/goat
+    #     cud-chewing — predators' mt_idle carries no SoundPlay at all);
+    #   * an IDLE record under ActionIdle sent the actor into an
+    #     engine-tracked dynamic idle over and over (authored chance 75+ per
+    #     idle poll), and creatures stopped walking and floated in their
+    #     idle — vanilla routes ActionIdle through deep per-creature
+    #     NonCombatIdle chains whose lifecycle our minimal graph does not
+    #     implement. Restoring idle chatter needs that full chain first.
+    idle_stem = _clip_state_name(clips['idle']) if clips['idle'] else None
+    vocal_states, vocal_events = [], []
+    if idle_stem and idle_stem in decoded:
+        idle_clip, _m = decoded[idle_stem]
+        d = float(idle_clip.duration)
+        edid = (sound_slots or {}).get(5)
+        if edid:
+            st_name, evt, stem = 'AwareVocal', 'awareVocalStart', 'awarevocal'
+            decoded[stem] = decoded[idle_stem]
+            clip_meta.append({
+                'name': st_name, 'stem': stem,
+                'anim': 'Animations\\' + stem + '.hkx',
+                'duration': d, 'looping': False,
+                'end_event': 'returnToDefault',
+                'sounds': [(min(0.25, d * 0.25), edid)],
+                'feet': [], 'hits': [],
+            })
+            vocal_states.append((st_name, evt, stem))
+            vocal_events.append({
+                'state': st_name, 'event': evt, 'slot': 5,
+                'chance': (sound_chances or {}).get(5, 100),
+            })
+        # The ragdoll wrapper states loop the idle animation as their pose
+        # source for as long as the corpse exists — give them a CLEAN copy so
+        # no annotation (CSDT-injected or kf-authored) can voice a corpse.
+        if ragdoll:
+            decoded['ragdollpose'] = decoded[idle_stem]
+
     # Phase 2 — COMPILE, embedding each animation FILE's full event union as
     # annotations (states sharing one file share its annotations; blend
     # children reuse base files, whose annotation times are file-local, so
     # only rate-1 entries contribute). Hits stay OUT of the annotations: the
     # graph already fires weaponSwing/preHitFrame/HitFrame through its
     # hkbClipTriggerArray and double-firing would double the damage window.
+    # 'ragdollpose' has no clip_meta entry, so it compiles annotation-free.
     ann_by_stem = {}
     for c in clip_meta:
         ann = ann_by_stem.setdefault(c['stem'], set())
@@ -1583,16 +1670,24 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     sound_events = sorted({f'SoundPlay.TES4_{edid}_SNDR'
                            for c in clip_meta
                            for _t, edid in c.get('sounds', []) if edid})
+    # A vocal state whose animation failed to compile must not reach the
+    # graph (its clip would reference a missing file).
+    surviving = {c['name'] for c in clip_meta}
+    vocal_states = [v for v in vocal_states if v[0] in surviving]
+    vocal_events = [v for v in vocal_events if v['state'] in surviving]
     _write_and_compile(
         build_behavior_xml(behavior_name, clips,
                            hit_times={c['name']: c['hits']
                                       for c in clip_meta if c['hits']},
                            movement_types=move_types,
                            speeds=speeds, ragdoll=ragdoll,
-                           sound_events=sound_events),
+                           sound_events=sound_events,
+                           vocal_states=vocal_states),
         os.path.join(proj_dir, 'behaviors', behavior_name.lower() + '.hkx'))
     # dedupe: states can share one animation file (Idle + CombatStance)
     anim_files = list(dict.fromkeys(c['anim'] for c in clip_meta))
+    if 'ragdollpose' in decoded:
+        anim_files.append('Animations\\ragdollpose.hkx')
     _write_and_compile(
         build_character_xml(
             f'TES4{name.capitalize()}Character', anim_files,
@@ -1619,6 +1714,10 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
         'movement_types': move_types,
         'speeds': speeds,
         'has_ragdoll': bool(ragdoll),
+        # Vocal idle states: tes5_import/creature_idles generates the
+        # ActionIdle/ActionIdleWarn IDLE records that let the engine enter
+        # them (event = the IDLE's ENAM; chance = authored TES4 CSDC).
+        'vocal_events': vocal_events,
         'motions': motions,
         'bones': len(bones),
         'failures': failures,
