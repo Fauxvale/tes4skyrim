@@ -409,6 +409,35 @@ class TestConverters:
         assert 'ARMA' in writer._top_groups
         assert len(writer._top_groups['ARMA']) == 1
 
+    def test_arma_generation_female_only(self):
+        """A wearable authored for one gender only must still get an armature.
+
+        Nehrim ships 5 (IrlandaRobe, the Silverlight set): the male fields are
+        empty, the ARMA build was gated on the male model, and an ARMO with no
+        ARMA equips but draws nothing — Goddess Irlanda and the MQ34 Eliath
+        embodiment stood there naked. Vanilla Skyrim.esm has 4 ARMA carrying
+        MOD3 only and 0 carrying neither, so female-only is legal and empty is
+        not: MOD3 must be written and MOD2 must NOT be invented.
+        """
+        from tes5_import.writer import PluginWriter
+        rec = {'Signature': 'ARMO', 'FormID': '00000301', 'RecordFlags': '0',
+               'EditorID': 'IrlandaRobe', 'FULL': 'Robe',
+               'BMDT.BipedFlags': '12', 'BMDT.GeneralFlags': '0',
+               'DATA.ArmorRating': '0', 'DATA.Value': '10', 'DATA.Weight': '2.0',
+               'Female.BipedModel.MODL': 'OE\\Armor\\Robes\\RobeBanshee2.nif'}
+        writer = PluginWriter(masters=['Skyrim.esm'])
+        writer.next_object_id = 0x01002000
+        result = convert_ARMO(rec, writer=writer)
+
+        assert self._has_subrecord(result, 'MODL'), 'no armature generated'
+        assert len(writer._top_groups.get('ARMA', [])) == 1
+        arma = writer._top_groups['ARMA'][0]
+        assert b'MOD3' in arma, 'female model missing from the armature'
+        assert b'MOD2' not in arma, 'invented a male model vanilla does not have'
+        # The dropped-item model has to fall back across genders too, or the
+        # item is invisible on the ground and in the inventory viewer.
+        assert self._has_subrecord(result, 'MOD2')
+
     def test_npc(self):
         rec = {'Signature': 'NPC_', 'FormID': '00000500', 'RecordFlags': '0',
                'EditorID': 'TestNPC', 'FULL': 'Test Guard',

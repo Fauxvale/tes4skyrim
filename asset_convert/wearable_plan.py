@@ -103,7 +103,10 @@ def build_plan(export_dir) -> dict:
 
             # ARMO ground models (MOD2/MOD4): always the plain mesh, and the
             # biped mesh stands in when the record ships no world model.
-            want(male_world or male_biped, BASE)
+            # A female-only wearable has no male field at all, so the fallback
+            # has to reach across genders or its dropped item has no mesh —
+            # this must track convert_ARMO's ground_model expression exactly.
+            want(male_world or male_biped or female_world or female_biped, BASE)
             want(female_world, BASE)
 
     return plan

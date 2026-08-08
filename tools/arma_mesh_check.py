@@ -39,11 +39,12 @@ def _source_for(rel: str) -> str:
 
 h, recs, _ = read_tes5_file(f'output/{plugin}/{plugin}')
 missing, present, total = [], 0, 0
+halfpair = []
 for r in recs:
     if r.type != 'ARMA':
         continue
     for s in r.subrecords:
-        if s.type != 'MOD2':
+        if s.type not in ('MOD2', 'MOD3'):
             continue
         rel = _zstring(s.data).replace('\\', '/')
         total += 1
@@ -54,14 +55,25 @@ for r in recs:
             src = _source_for(rel)
             kind = 'GATE' if os.path.exists(SRC + src) else 'NOSRC'
             missing.append((kind, _zstring(e.data) if e else '?', rel))
-        break
+        # The record names <name>_1 and the ENGINE derives <name>_0 — nothing
+        # in the plugin references the partner, so a missing _0 is invisible to
+        # a path check and the weight lerp has nothing to interpolate from.
+        stem, ext = os.path.splitext(rel)
+        if stem.endswith('_1'):
+            partner = stem[:-2] + '_0' + ext
+            if os.path.exists(ROOT + rel) and not os.path.exists(ROOT + partner):
+                e = _get(r, 'EDID')
+                halfpair.append((_zstring(e.data) if e else '?', partner))
 
 gate = [m for m in missing if m[0] == 'GATE']
 nosrc = [m for m in missing if m[0] == 'NOSRC']
 
-print(f'ARMA with a model path: {total}')
+print(f'ARMA model paths checked (MOD2+MOD3): {total}')
 print(f'  file present: {present}')
 print(f'  MISSING:      {len(missing)}   (GATE {len(gate)} / NOSRC {len(nosrc)})')
+print(f'  HALF PAIR (_1 present, engine-derived _0 absent): {len(halfpair)}')
+for edid, rel in halfpair[:10]:
+    print(f'    {edid:32} {rel}')
 for kind, edid, rel in (missing if show_all else missing[:15]):
     print(f'    {kind:5} {edid:32} {rel}')
 if not show_all and len(missing) > 15:
