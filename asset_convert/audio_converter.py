@@ -762,6 +762,18 @@ def organize_voice_files(
 
     stats = {'organized': 0, 'skipped': 0, 'no_match': 0, 'errors': 0}
     unmapped_races: set = set()
+
+    # The plugin's own races, keyed by the display name that also names the
+    # folder we are about to walk.  This is the authoritative source: the
+    # table below is Oblivion's English race list, and a localised plugin
+    # names its folders differently (Nehrim: alemanne, hochelf).  The importer
+    # creates its VTYP records from the same module, so a folder resolved here
+    # always names a voice type that exists as a record.
+    from .voice_races import load_race_voices, vtyp_edid as _vtyp_edid
+    race_voices = load_race_voices(source_dir)
+    if race_voices:
+        print(f'  Plugin races: {len(race_voices.keys)} voice identities '
+              f'from {len(race_voices.by_race_edid)} RACE records')
     conversion_jobs: list[tuple] = []   # (src_path, dst_path)
     # Every output path this run WANTS to exist, and the VTYP folders it
     # writes into. Used by _prune_stale_voice_files() below: the runtime
@@ -790,7 +802,12 @@ def organize_voice_files(
                     continue
                 gender = gender_dir.name.upper()[:1]   # 'M' or 'F'
 
-                voice_type = _TES4_VOICE_TYPE_MAP.get((race, gender))
+                # The plugin's own RACE records win: they are what the
+                # importer built its VTYP records from.
+                key = race_voices.folder_key(race)
+                voice_type = _vtyp_edid(key, gender) if key else None
+                if voice_type is None:
+                    voice_type = _TES4_VOICE_TYPE_MAP.get((race, gender))
                 if voice_type is None:
                     for (r, g), vt in _TES4_VOICE_TYPE_MAP.items():
                         if r.lower() == race.lower() and g.upper() == gender:

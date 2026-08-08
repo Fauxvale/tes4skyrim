@@ -1777,10 +1777,22 @@ def build_npc_to_vtyp_map(by_type: dict, num_new_masters: int) -> dict:
     from .skyrim_overrides import TES4_RACE_FID_TO_EDID, VOICE_TYPE_MAP
     # RACE fid24 -> per-gender voice race fid24 (0/missing = the race itself).
     race_voice = {}
+    # RACE fid24 -> the plugin's OWN EditorID.  A hardcoded Oblivion FormID
+    # table cannot name a race the plugin invented, and it silently misnames
+    # one that REUSES an Oblivion FormID for something else.  Nehrim does both:
+    # Alemanne1 sits at 0x18A893 (absent from the table -> every NPC fell
+    # through to the 'Imperial' default), and 0x19204 is HighElf in both games
+    # but Nehrim's reads FULL=Hochelf.  Its VNAM chain then points nearly every
+    # race at Alemanne1, which is exactly the one voice folder the BSA ships.
+    # The table stays as the fallback for master-owned races.
+    race_edids = {}
     for rr in by_type.get('RACE', []):
         rfid = get_formid(rr, 'FormID') & 0x00FFFFFF
         if not rfid:
             continue
+        edid = get_str(rr, 'EditorID')
+        if edid:
+            race_edids[rfid] = edid
         m = get_formid(rr, 'VNAM.MaleVoice') & 0x00FFFFFF
         f = get_formid(rr, 'VNAM.FemaleVoice') & 0x00FFFFFF
         race_voice[rfid] = {'Male': m or rfid, 'Female': f or rfid}
@@ -1797,7 +1809,9 @@ def build_npc_to_vtyp_map(by_type: dict, num_new_masters: int) -> dict:
             gender = 'Female' if (get_int(rec, 'ACBS.Flags') & 1) else 'Male'
             race_fid = get_formid(rec, 'RNAM.Race') & 0x00FFFFFF
             voice_race_fid = race_voice.get(race_fid, {}).get(gender, race_fid)
-            race_edid = TES4_RACE_FID_TO_EDID.get(voice_race_fid, 'Imperial')
+            race_edid = (race_edids.get(voice_race_fid)
+                         or TES4_RACE_FID_TO_EDID.get(voice_race_fid,
+                                                      'Imperial'))
             vtyp = (VOICE_TYPE_MAP.get((race_edid, gender))
                     or VOICE_TYPE_MAP.get(('Imperial', gender), 0))
             if vtyp:
@@ -2191,12 +2205,21 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
 
     # VTYP FormID -> EditorID, so an NPC-specific line can record the folder its
     # speaker's voice type resolves to (voice files are relocated there).
-    from .skyrim_overrides import CUSTOM_VTYP_EDIDS, VOICE_TYPE_MAP
-    vtyp_edid_by_fid = {}
-    for vt_edid, key in CUSTOM_VTYP_EDIDS.items():
-        vt_fid = VOICE_TYPE_MAP.get(key)
-        if vt_fid:
-            vtyp_edid_by_fid[vt_fid] = vt_edid
+    # Read the mapping the writer RECORDED, never rebuild it from
+    # CUSTOM_VTYP_EDIDS: that table is Oblivion's race list, so walking it
+    # backwards labels a FormID with whatever race name happens to point at it.
+    # After localised races join the map, `VOICE_TYPE_MAP[('HighElf','Male')]`
+    # is the *Hochelf* voice type — and the reconstruction stamped it
+    # `TES4MaleHighElf`, sending 42 Nehrim voice files to a folder no speaker
+    # ever reads.  It also cannot see a VTYP no fixed race points at.
+    from .skyrim_overrides import (CUSTOM_VTYP_EDIDS, VOICE_TYPE_MAP,
+                                   VTYP_EDID_BY_FID)
+    vtyp_edid_by_fid = dict(VTYP_EDID_BY_FID)
+    if not vtyp_edid_by_fid:        # no VTYPs written this run (override plugin)
+        for vt_edid, key in CUSTOM_VTYP_EDIDS.items():
+            vt_fid = VOICE_TYPE_MAP.get(key)
+            if vt_fid:
+                vtyp_edid_by_fid[vt_fid] = vt_edid
 
     # TES4 quest priorities: Oblivion picks the first passing INFO in QUEST
     # PRIORITY order (highest first), NOT file order. Our flattened topics are

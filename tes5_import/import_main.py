@@ -38,6 +38,7 @@ from .skyrim_overrides import (
     CUSTOM_VTYP_EDIDS,
     TES4_RACE_FID_TO_EDID,
     VOICE_TYPE_MAP,
+    VTYP_EDID_BY_FID,
     set_voice_type,
 )
 from .navi_builder import NAVI_SINGLETON_FID, build_navi_record
@@ -397,12 +398,27 @@ def _create_ambient_gmst_overrides(writer: PluginWriter, by_type: dict):
     print(f"  Ambient dialogue pacing (GMST): {', '.join(written)}")
 
 
-def _create_vtyp_records(writer: PluginWriter):
-    """Create custom VTYP records for all Oblivion races in the output plugin.
+def _create_vtyp_records(writer: PluginWriter, export_dir: str = None):
+    """Create custom VTYP records for every race the output plugin can voice.
 
     All voice types are created from scratch — we never reference Skyrim.esm
     VTYPs.  Voice files go in Sound/Voice/<plugin>/<EditorID>/ and must match
     the EditorIDs created here (TES4Male*, TES4Female*).
+
+    Two sources, in this order:
+
+      1. The fixed Oblivion set (`CUSTOM_VTYP_EDIDS`), emitted first so its
+         FormIDs never move, and so the ('Imperial', gender) fallback in
+         `build_npc_to_vtyp_map` always resolves whatever races the plugin
+         itself ships.
+      2. The plugin's OWN races, identified by the display name that also
+         names the voice folder on disk.  Oblivion's voice layout is
+         sound\\voice\\<plugin>\\<RACE FULL>\\<gender>\\, and in a localised
+         plugin FULL and EditorID diverge — Nehrim's seven Alemanne* races all
+         read FULL=Alemanne, and its HighElf race reads FULL=Hochelf.  Keying
+         on the EditorID alone left those folders pointing at voice types no
+         record declared, so the lines were unreachable.  See
+         asset_convert.voice_races, which the sound stage resolves through too.
 
     Updates VOICE_TYPE_MAP at runtime so NPC_ converters pick the right FormID.
 
@@ -410,13 +426,49 @@ def _create_vtyp_records(writer: PluginWriter):
       Male   voices: DNAM = 1
       Female voices: DNAM = 3
     """
-    for vtyp_edid, (race_edid, gender) in CUSTOM_VTYP_EDIDS.items():
+    edid_to_fid: dict = {}
+
+    def _emit(vtyp_edid: str, gender: str) -> int:
+        fid = edid_to_fid.get(vtyp_edid)
+        if fid is not None:
+            return fid
         fid = writer.alloc_formid()
         dnam = 3 if gender == 'Female' else 1
         subs = pack_string_subrecord('EDID', vtyp_edid)
         subs += pack_subrecord('DNAM', struct.pack('<B', dnam))
         writer.add_record('VTYP', pack_record('VTYP', fid, 0, subs))
-        set_voice_type(race_edid, gender, fid)
+        edid_to_fid[vtyp_edid] = fid
+        VTYP_EDID_BY_FID[fid] = vtyp_edid
+        return fid
+
+    for vtyp_edid, (race_edid, gender) in CUSTOM_VTYP_EDIDS.items():
+        set_voice_type(race_edid, gender, _emit(vtyp_edid, gender))
+
+    if not export_dir:
+        return
+    try:
+        from asset_convert.voice_races import load_race_voices
+        from asset_convert.voice_races import vtyp_edid as _vtyp_edid
+    except ImportError:
+        return          # asset_convert unavailable — keep the fixed set only
+    try:
+        races = load_race_voices(export_dir)
+    except OSError:
+        return
+    if not races:
+        return
+
+    # Sorted iteration: the ESM must stay byte-reproducible.
+    for key in races.keys:
+        for gender in ('Male', 'Female'):
+            _emit(_vtyp_edid(key, gender), gender)
+    for race_edid, key in sorted(races.by_race_edid.items()):
+        for gender in ('Male', 'Female'):
+            set_voice_type(race_edid, gender,
+                           edid_to_fid[_vtyp_edid(key, gender)])
+    print(f"  Voice types: {len(edid_to_fid)} VTYP records "
+          f"({len(races.keys)} plugin races by display name), "
+          f"{len(races.by_race_edid)} race EditorIDs bound")
 
 
 def _creature_sound_slots(export_dir: str) -> dict:
@@ -601,6 +653,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     _WELL_KNOWN_PROPERTIES.clear()
     from .skyrim_overrides import VOICE_TYPE_MAP
     VOICE_TYPE_MAP.clear()
+    VTYP_EDID_BY_FID.clear()
 
     writer = PluginWriter(masters=masters, is_esm=is_esm,
                           description="Converted from TES4 by tes4_export")
@@ -682,7 +735,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                                       reset_origin_faction)
     reset_origin_faction()
     if not ctx:
-        _create_vtyp_records(writer)
+        _create_vtyp_records(writer, export_dir)
 
         # Plugin-origin marker faction. ROOT MASTERS ONLY (no TES4 masters of
         # their own): every actor this file defines joins it, and dialogue that
