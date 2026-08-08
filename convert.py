@@ -807,7 +807,14 @@ def phase_modify_body_meshes(tes5_data: str = None, plugins: list = None,
 
     plugins = plugins or ["Skyrim.esm"]
     out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
-    out_path = out_root / "Oblivion.esm" / "Slot44 Patch.esp"
+    # Straight into output/, NOT into a per-plugin folder. This step takes no
+    # `-f` and patches the vanilla Skyrim body records for the whole load
+    # order, so it belongs to no single conversion. Hardcoding "Oblivion.esm"
+    # put it somewhere `--pack-only -f <other plugin>` never looks: converting
+    # Nehrim created an otherwise-empty output/Oblivion.esm/ holding just this
+    # file, and it shipped with nothing.
+    out_root.mkdir(parents=True, exist_ok=True)
+    out_path = out_root / "Slot44 Patch.esp"
 
     plugin_paths = []
     for name in plugins:
