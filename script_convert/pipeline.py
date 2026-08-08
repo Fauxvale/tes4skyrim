@@ -346,6 +346,9 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
             for part in ex.map(_script_worker_run, jobs):
                 _merge_stats(stats, part)
 
+    _fix_udf_call_arg_types(output_dir)
+    _comment_undeclared_identifiers(output_dir)
+
     total = stats['scpt_ok'] + stats['info_ok'] + stats['qust_ok']
     errs = stats['scpt_err'] + stats['info_err'] + stats['qust_err']
     print(f'\n  Script conversion complete:')
@@ -356,6 +359,188 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
 
     _write_report(output_dir, stats)
     return stats
+
+
+_UDF_SIG_RE = re.compile(
+    r'^\s*(?:\w+\s+)?Function\s+TES4Call\s*\((.*)\)\s*$', re.IGNORECASE)
+_UDF_CALL_RE = re.compile(
+    r'\b([A-Za-z_]\w*)\.TES4Call\(([^()]*)\)')
+# Papyrus converts freely UP to these, so only a DOWNCAST needs the explicit
+# `as`. Anything already this type, or a literal, is left alone.
+_UDF_WIDE_TYPES = {'form', 'objectreference'}
+
+
+def _fix_udf_call_arg_types(output_dir: str) -> None:
+    """Insert the casts a cross-script `X.TES4Call(...)` needs to compile.
+
+    An OBSE user function's parameter type is inferred from how its OWN body
+    uses the value, so a callee that calls GetRace() takes an `Actor` while the
+    caller holds the same thing in an `ObjectReference` property (TES4 spelled
+    both `ref`).  Papyrus refuses that implicit downcast and fails the CALLER —
+    and a script that fails to compile takes down every script declaring a
+    property of its type, so one mismatch can silently disable a quest line.
+
+    Signatures are only known once every script has been converted, which is why
+    this runs here rather than in the converter: it reads each generated
+    `Function TES4Call(...)` header, then rewrites the argument at each call
+    site whose property is typed wider than the parameter.
+    """
+    if not os.path.isdir(output_dir):
+        return
+    # Parameter types per callee script name, e.g. TES4_Foo -> ['Actor', 'String'].
+    sigs: dict = {}
+    sources: dict = {}
+    for name in os.listdir(output_dir):
+        if not name.endswith('.psc'):
+            continue
+        path = os.path.join(output_dir, name)
+        try:
+            with open(path, encoding='utf-8') as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        sources[name[:-4]] = (path, text)
+        for line in text.splitlines():
+            m = _UDF_SIG_RE.match(line)
+            if not m:
+                continue
+            params = [p.strip() for p in m.group(1).split(',') if p.strip()]
+            sigs[name[:-4].lower()] = [p.split()[0] for p in params if p.split()]
+            break
+
+    if not sigs:
+        return
+
+    _prop_re = re.compile(
+        r'^\s*([A-Za-z_][\w]*)\s+Property\s+(\w+)\b', re.IGNORECASE)
+    fixed = 0
+    for script, (path, text) in sources.items():
+        if '.TES4Call(' not in text:
+            continue
+        # The CALLER's own property types, to know what each argument is.
+        prop_types = {}
+        for line in text.splitlines():
+            pm = _prop_re.match(line)
+            if pm:
+                prop_types[pm.group(2).lower()] = pm.group(1)
+
+        def _fix(m):
+            callee = m.group(1)
+            # The property naming the callee is typed as that script.
+            callee_type = prop_types.get(callee.lower(), '')
+            want = sigs.get(callee_type.lower())
+            if not want:
+                return m.group(0)
+            args = [a.strip() for a in m.group(2).split(',')]
+            if len(args) != len(want):
+                return m.group(0)
+            out_args = []
+            for arg, ptype in zip(args, want):
+                have = prop_types.get(arg.lower(), '')
+                if (have and have.lower() in _UDF_WIDE_TYPES
+                        and ptype.lower() not in _UDF_WIDE_TYPES
+                        and ' as ' not in arg):
+                    out_args.append(f'({arg} as {ptype})')
+                else:
+                    out_args.append(arg)
+            return f'{callee}.TES4Call({", ".join(out_args)})'
+
+        new_text = _UDF_CALL_RE.sub(_fix, text)
+        if new_text != text:
+            try:
+                with open(path, 'w', encoding='utf-8') as fh:
+                    fh.write(new_text)
+                fixed += 1
+            except OSError:
+                pass
+    if fixed:
+        print(f'    UDF call arg casts inserted in {fixed} script(s)')
+
+
+# `Owner.member` at the head of a statement, which is the shape a dangling
+# cross-script reference takes.  Anchored so it only sees the STATEMENT's
+# subject, never an identifier deeper in an expression.
+_MEMBER_STMT_RE = re.compile(r'^(\s*)([A-Za-z_]\w*)\.(\w+)')
+
+# Names a generated script may use without declaring them: Papyrus globals,
+# script-scope keywords, and the event parameters the fragments are handed.
+_IMPLICIT_NAMES = {
+    'game', 'debug', 'utility', 'self', 'parent', 'math', 'input',
+    'akspeakerref', 'akactionref', 'aktarget', 'akcaster', 'akaggressor',
+    'akkiller', 'akactor', 'akitem', 'aksource', 'akrefself',
+    'tes4polyfill', 'form', 'true', 'false', 'none',
+}
+
+
+def _comment_undeclared_identifiers(output_dir: str) -> None:
+    """Comment out statements whose SUBJECT was never declared.
+
+    Morroblivion's scripts contain references the mod itself never defines --
+    `fbmwMQHlaaluSuccess.hortvotes`, `fbmwMVRichTrader.follownow` -- pointing at
+    records that exist in no plugin, master included.  Oblivion ignored the
+    dangling name silently; Papyrus rejects the whole file, and a fragment that
+    fails to compile takes its quest stage with it.
+
+    Only a statement whose leading `Owner.` is neither a declared property, a
+    local, nor a Papyrus built-in is touched, so a legitimate call is never
+    suppressed.  Mirrors ScriptConverter._dangling_cross_script_target, which
+    handles the case where the owner DOES resolve but the variable does not.
+    """
+    if not os.path.isdir(output_dir):
+        return
+    _decl_re = re.compile(
+        r'^\s*(?:\w+(?:\[\])?)\s+(?:Property\s+)?(\w+)\b', re.IGNORECASE)
+    _sig_re = re.compile(r'\((.*)\)')
+    commented = 0
+    for name in sorted(os.listdir(output_dir)):
+        if not name.endswith('.psc'):
+            continue
+        path = os.path.join(output_dir, name)
+        try:
+            with open(path, encoding='utf-8') as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+
+        known = set(_IMPLICIT_NAMES)
+        for line in lines:
+            s = line.strip()
+            low = s.lower()
+            if low.startswith('scriptname'):
+                continue
+            if (low.startswith('function ') or low.startswith('event ')
+                    or re.match(r'^\w+\s+function\s', low)):
+                sm = _sig_re.search(s)
+                if sm:
+                    for p in sm.group(1).split(','):
+                        bits = p.split()
+                        if len(bits) >= 2:
+                            known.add(bits[1].strip('=').lower())
+                continue
+            dm = _decl_re.match(s)
+            if dm and not s.startswith(';'):
+                known.add(dm.group(1).lower())
+
+        changed = False
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if not s or s.startswith(';'):
+                continue
+            m = _MEMBER_STMT_RE.match(line)
+            if not m or m.group(2).lower() in known:
+                continue
+            lines[i] = (f'{m.group(1)};{s}  ;NE: {m.group(2)} is not declared '
+                        f'anywhere (dangling in the original mod)')
+            changed = True
+            commented += 1
+        if changed:
+            try:
+                with open(path, 'w', encoding='utf-8') as fh:
+                    fh.write('\n'.join(lines) + '\n')
+            except OSError:
+                pass
+    if commented:
+        print(f'    dangling references commented out: {commented} line(s)')
 
 
 def _scpt_batch(records: list, output_dir: str, xref: CrossRefGraph, stats: dict):

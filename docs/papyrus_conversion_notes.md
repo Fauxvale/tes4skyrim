@@ -541,6 +541,61 @@ silently no-ops an unresolved target; Papyrus will not compile an undefined
 name, so **one dead line in the mod took down the whole start-menu script**, and
 with it the Imperial City transport.
 
+### A script that fails to COMPILE takes its dependents down with it (2026-08-07)
+
+**Symptom:** Morroblivion's Fighters Guild handed out no quests after joining.
+The Papyrus log named a *linking* failure, not a compile one:
+
+```
+Error: Unable to link type of variable "::fbmwFGAdvancement_var" on object
+  "TES4_QF_fbmwFGKillBosses"
+error: Unable to bind script TES4_QF_fbmwFGKillBosses to fbmwFGKillBosses (...)
+  because their base types do not match
+```
+
+**The chain, and why the log points at the wrong file.** `TES4_QF_...KillBosses`
+declares a property typed `TES4_fbmwFGAdvancementQuestScript`. That script
+declares one typed `TES4_mwGetFactionWitnessesFunc` — which **failed to compile,
+so no `.pex` was ever written**. A missing type cannot be linked, so the quest
+script fails to load, so the QF fragment cannot bind, so **no stage fragment ever
+runs**. Three files away from the error message.
+
+The lesson generalises: **check `output/<plugin>/scripts/compile_errors.log`
+before theorising about a dead quest.** One uncompilable script silently
+disables every script that names its type, and the runtime error surfaces on the
+dependent, never on the culprit.
+
+`mwGetFactionWitnessesFunc` is called by **all nine** Morroblivion guild
+advancement scripts, so a single unconvertible OBSE loop disabled every guild.
+
+**What was actually wrong with it**, each fixed generically:
+
+| Defect | Fix |
+|---|---|
+| OBSE `Label`/`Goto` ref-walk — not Papyrus keywords at all | `GetFirstRef 69`/`GetNextRef` → `Game.FindRandomActorFromRef` sampling; `Label` opens a `While`, `Goto` is a no-op (the header re-tests) |
+| `GetIsGhost` / `GetUnconscious` unmapped (only the SETTERS were) | → `IsGhost()` / `IsUnconscious()` |
+| `NextActor.IsCreature` — the dotted path resolves a name only if it is a `FUNCTION_MAP` key | added the `iscreature` alias beside `getiscreature` |
+| `SetFunctionValue` with **no following `return`** | staged value inside a branch now returns where it stands — it was being dropped, making the function a constant `false` |
+| `IsInFaction(Form)` — Papyrus wants a `Faction` | table-driven downcast at UDF call sites (`_UDF_ARG_DOWNCASTS`) |
+| `_balance_if_endif` matched only a bare `function `, never `Int Function ...` | typed UDF bodies are now balanced too |
+
+**Two parser bugs found alongside, both silent corruption rather than errors:**
+
+- The arithmetic split ignored string literals, so `FileExists "Data\Morrowind_ob
+  - Meshes.bsa"` split on the hyphen *inside the path* and leaked fragments out
+  as code (`If 0 - Meshes.bsa(") == 0`).
+- `_convert_args` split on whitespace regardless of quotes, so
+  `IsModLoaded "Voice Overs V002.esp"` became three arguments and collapsed to a
+  bare `If True` — firing every "deprecated plugin detected" warning
+  unconditionally.
+
+**Polarity matters when neutralising an install probe.** `FileExists` and
+`GetModIndex` have no Papyrus answer, but every TES4 caller uses them to detect a
+BROKEN install (`if FileExists ... == 0 → "ERROR: ... is missing"`). The paths
+named are Oblivion-side BSAs and inis that do not exist after conversion *by
+design*. Answering `0` fired every missing-file branch at once and greeted the
+player with a bogus error box, so both answer the not-an-error side.
+
 ### `GetIsClass` / `GetPCIsClass` read the ActorBase (2026-08-02)
 
 Both were **absent from `FUNCTION_MAP` entirely**, so the call survived

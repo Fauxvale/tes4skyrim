@@ -406,6 +406,14 @@ FUNCTION_MAP = {
     'setunconscious':    ('SetUnconscious',    True,  None),
     'setghost':          ('SetGhost',          True,  None),
     'isghost':           ('IsGhost',           True,  None),
+    # TES4 spells the ghost/unconscious GETTERS `GetIsGhost` / `GetUnconscious`
+    # while Skyrim names them IsGhost() / IsUnconscious().  Only the SETTERS
+    # were mapped, so a read emitted a bare member access
+    # (`NextActor.GetIsGhost`) that the compiler rejects as an unknown property
+    # — which is fatal, not cosmetic: the whole script fails to compile and
+    # every script declaring a property of its type then fails to LINK.
+    'getisghost':        ('IsGhost',           True,  None),
+    'getunconscious':    ('IsUnconscious',     True,  None),
     'setcrimegold':      (None,                False, None),  # Special handler
     'getcrimegold':      (None,                False, None),  # Special handler
     'modcrimegold':      (None,                False, None),  # Special handler
@@ -479,6 +487,15 @@ FUNCTION_MAP = {
     'equipitemsilent':   ('EquipItem',         True,  None),
     'equipitemns':       ('EquipItem',         True,  None),
     'unequipitemns':     ('UnequipItem',       True,  None),
+    # The remaining OBSE spellings of the same two commands.  `2` widens the
+    # argument types and `NS`/`Silent` suppress the equip sound — Skyrim carries
+    # both on the SAME natives (abSilent), so they map like the variants above
+    # rather than being neutralised.
+    'equipitem2':        ('EquipItem',         True,  None),
+    'equipitem2ns':      ('EquipItem',         True,  None),
+    'unequipitem2':      ('UnequipItem',       True,  None),
+    'unequipitem2ns':    ('UnequipItem',       True,  None),
+    'unequipitemsilent': ('UnequipItem',       True,  None),
     # OBSE aliases that only widen the vanilla command's argument types.
     'modav2':            ('ModActorValue',     True,  None),
     'modactorvalue2':    ('ModActorValue',     True,  None),
@@ -526,6 +543,29 @@ FUNCTION_MAP = {
     # OBSE file/plugin probes and god-mode read: no VANILLA Papyrus equivalent
     # (GetGodMode exists only in third-party SKSE plugins, not Game.psc).
     'fileexists':        (None,                False, None),  # Special handler
+    # OBSE `GetModIndex "Foo.esm"` — the plugin's load-order slot.  Papyrus
+    # cannot read load order, and every TES4 caller compares it to flag a
+    # MIS-ordered install (`> 1` meaning "not loaded early enough").  Special
+    # handler so the answer lands on the not-an-error side.
+    'getmodindex':       (None,                False, None),  # Special handler
+    # OBSE form-TYPE tests, written both bare and as a dotted member read
+    # (`crosshairRef.IsDoor == 1`).  The dotted path resolves a name as a
+    # FUNCTION only when it is a FUNCTION_MAP key, so without these entries the
+    # read fell through to a raw member access on a type that has no such
+    # property.  They neutralise in _emit_function (Papyrus cannot ask a form
+    # its type — GetType is SKSE).
+    'isdoor':            (None,                True,  None),  # Special handler
+    'isactivator':       (None,                True,  None),  # Special handler
+    'iscontainer':       (None,                True,  None),  # Special handler
+    'isbook':            (None,                True,  None),  # Special handler
+    'isingredient':      (None,                True,  None),  # Special handler
+    'islight':           (None,                True,  None),  # Special handler
+    'ismisc':            (None,                True,  None),  # Special handler
+    'iskey':             (None,                True,  None),  # Special handler
+    'isclothing':        (None,                True,  None),  # Special handler
+    'isarmor':           (None,                True,  None),  # Special handler
+    'isweapon':          (None,                True,  None),  # Special handler
+    'ispotion':          (None,                True,  None),  # Special handler
     'getgodmode':        (None,                False, None),  # Special handler
     'getplayerbirthsign': (None,               False, None),  # Special handler
     # Same question as IsModLoaded — route to the same polyfill.
@@ -716,6 +756,12 @@ FUNCTION_MAP = {
     'disableplayercontrols': ('Game.DisablePlayerControls', False, None),
     'enableplayercontrols': ('Game.EnablePlayerControls', False, None),
     'enablefasttravel': ('Game.EnableFastTravel', False,  None),
+    # OBSE `SetCanFastTravelFromWorld <worldspace> <flag>` toggles fast travel
+    # PER WORLDSPACE.  Skyrim only has the global Game.EnableFastTravel(bool),
+    # so the worldspace argument is dropped — see the special handler, which
+    # cannot be a plain mapping because the arity differs (a straight map passed
+    # the worldspace where the bool goes).
+    'setcanfasttravelfromworld': (None,        False, None),  # Special handler
     'playbink':          (None,                False, None),  # no-op
     'sendtrespassalarm': (None,               True,  None),  # no-op
     'getpcisrace':       (None,                False, None),  # Special handler
@@ -869,6 +915,12 @@ FUNCTION_MAP = {
     'isspelltarget':     (None,                True,  None),  # Special handler (HasMagicEffect)
     'getarmorrating':    (None,                True,  None),  # Special handler (DamageResist AV)
     'getiscreature':     (None,                True,  None),  # Special handler (polyfill)
+    # Oblivion accepts BOTH spellings of the creature test, and the dotted
+    # member path (`NextActor.IsCreature`) resolves a function only when the
+    # name is a FUNCTION_MAP key.  Without the alias the read fell through to a
+    # raw member access on a type that has no such property, failing the whole
+    # compile.  Routed to the same polyfill handler as `getiscreature`.
+    'iscreature':        (None,                True,  None),  # Special handler (polyfill)
     'isguard':           (None,                True,  None),  # Special handler (polyfill)
     'hasvampirefed':     (None,                False, None),  # Special handler (polyfill)
     'getclothingvalue':  (None,                True,  '(clothing value not tracked in Skyrim; 0)'),
@@ -892,7 +944,12 @@ FUNCTION_MAP = {
     'ispcanmurderer':    (None,                False, None),  # Special handler
     'ispcamurderer':     (None,                False, None),  # Special handler
     'getpcismurderer':   (None,                False, None),  # Special handler
-    'isowner':           ('IsInFaction',        True,  None),
+    # TES4 `IsOwner [owner]` asks whether the ACTOR owns this reference, and is
+    # written bare (`if IsOwner != 1`) to mean the player.  Mapping it to
+    # IsInFaction was wrong twice over: it is a different question, and the bare
+    # form emitted the argument-less `IsInFaction()`, a hard compile error that
+    # took the whole script down.  Skyrim answers it with GetActorOwner().
+    'isowner':           (None,                True,  None),  # Special handler
     'gettalkedtopc':     (None,                False, None),  # no-op
     'gettalkedtopcp':    (None,                False, None),  # no-op
     'menumode':          (None,                False, None),  # no-op
@@ -1016,14 +1073,28 @@ _OBSE_NO_EQUIV_COMMANDS = {
     'setlowlevelprocessing', 'setharvested', 'selectplayerspell',
     'setquestitem', 'setpcamurderer', 'setcellwaterheight',
     'setstringinisetting', 'setstringgamesettingex', 'getobseversion',
-    'getformfrommod', 'getfirstref', 'getnextref', 'getaltcontrol2',
+    # getfirstref/getnextref are NOT here: they have a real special handler
+    # (the ref-walk becomes Game.FindRandomActorFromRef sampling).  Listing
+    # them neutralised them to `0`, which left the loop body walking a ref that
+    # was never assigned.
+    'getformfrommod', 'getaltcontrol2',
     'sifh', 'equipme', 'modavmod',
     'getvelocity', 'setvelocity',
     'isunderwater', 'getvampire', 'getweapontype', 'iswaiting',
     'getnumfollowers', 'getnthfollower', 'getspells', 'getdisplayname',
     'setattackdamage', 'togglespecialanim', 'setavmod', 'starttimer',
-    'getmodlocaldata', 'setaltcontrol',
-    'fileexists', 'getgodmode', 'getplayerbirthsign',
+    'getmodlocaldata', 'setmodlocaldata', 'setaltcontrol',
+    # OBSE plugin functions with no Skyrim counterpart at all.  SetPlayerSkeleton
+    # Path swaps the player's skeleton .nif at runtime (Skyrim's is fixed by
+    # race); IsDoor/IsActivator/IsContainer ask a form's TYPE, which Papyrus
+    # does not expose (GetType is SKSE).  Neutralised so a werewolf/trap script
+    # keeps the rest of its logic instead of failing to compile outright.
+    'setplayerskeletonpath', 'getplayerskeletonpath',
+    # The form-type tests are NOT here: they need the dotted spelling too, so
+    # they have FUNCTION_MAP entries and a shared handler (_FORM_TYPE_TESTS).
+    # NOT fileexists: neutralising it to 0 answers "the file is MISSING", which
+    # is the wrong polarity — see its dedicated handler in _emit_function.
+    'getgodmode', 'getplayerbirthsign',
     'getdisplayname', 'getname',
     # AddActorValues (OBSE plugin) — the float-typed AV-modifier accessors that
     # sit alongside the already-listed setavmod/modavmod.  Skyrim has no such
@@ -1191,12 +1262,28 @@ _ACTOR_ARG_FUNCTIONS = {
 # or topic acts upon.  Distinct from _ACTOR_ONLY_FUNCTIONS: these need the
 # receiver redirected but NOT an `as Actor` cast, since they are valid on any
 # reference.
+# OBSE tests that ask a form what TYPE it is.  Vanilla Papyrus cannot answer —
+# Form.GetType is SKSE — so all of them neutralise to 0 ("not that type"),
+# which is the branch-not-taken side for every TES4 caller.
+_FORM_TYPE_TESTS = {
+    'isdoor', 'isactivator', 'iscontainer', 'isbook', 'isingredient',
+    'islight', 'ismisc', 'iskey', 'isclothing', 'isarmor', 'isweapon',
+    'ispotion',
+}
+
+
 _OBJREF_IMPLICIT_SELF_FUNCTIONS = {
     'disable', 'enable', 'getdisabled', 'isdisabled', 'delete',
     'getlinkedref', 'getparentref', 'activate', 'reset',
     'getparentcell', 'getpos', 'setpos', 'getangle', 'setangle',
     'moveto', 'playgroup', 'playanimation', 'setopenstate',
     'getitemcount', 'isininterior',
+    # Lock state.  A TES4 `scripteffectstart` block calls these bare, on the
+    # effect's TARGET (Morroblivion's two lock spells do exactly that).  Emitted
+    # without a receiver they are undefined functions — ActiveMagicEffect has no
+    # such method — which fails the whole script to compile.
+    'islocked', 'lock', 'getlocked', 'getlocklevel',
+    'getbaseobject', 'setactorowner', 'is3dloaded', 'isdeleted',
 }
 
 
