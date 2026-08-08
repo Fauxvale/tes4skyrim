@@ -53,13 +53,16 @@ A decent PC. The more cores and ram the better. The more cores, the more ram it 
 | **[numpy](https://numpy.org/)** | Skin retargeting math | `pip install numpy` |
 | **[scipy](https://scipy.org/)** | Navmesh triangulation, collision hulls, trees | `pip install scipy` |
 | **[shapely](https://shapely.readthedocs.io/)** | Navmesh corridor boolean union | `pip install shapely` |
+| **[Pillow](https://pypi.org/project/pillow/)** | Terrain-LOD texture compositing, object-LOD atlas normals, book inventory art. **Terrain LOD produces no tiles at all without it** | `pip install Pillow` |
+| **[lz4](https://pypi.org/project/lz4/)** | Reading Skyrim SE BSAs (v105) — how vanilla assets are fetched when `export/skyrim_assets/` has no cached copy yet | `pip install lz4` |
+| **[mapbox_earcut](https://pypi.org/project/mapbox-earcut/)** | Navmesh triangulation fallback when Delaunay fails on a piece | `pip install mapbox_earcut` |
 | **[pytest](https://pytest.org/)** | Test runner | `pip install pytest` |
 | **ffmpeg** | Voice/sound audio conversion | On `PATH` |
 | **xWMAEncode.exe** | xWMA voice compression | See note below |
 | **LipGenerator.exe** | Lip sync generation | Install the Creation Kit |
 
 ```bash
-pip install PyFFI numpy scipy shapely pytest
+pip install PyFFI numpy scipy shapely Pillow lz4 mapbox_earcut pytest
 ```
 
 > **Navmesh native extensions.** The navmesh build requires two compiled modules,
