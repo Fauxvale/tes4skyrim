@@ -240,11 +240,39 @@ def test_cache_matches_tag_is_exact(tmp_path, monkeypatch):
 
 
 def test_next_tag_format(monkeypatch):
-    """The manifest's starting tag must match tag-on-push.yml's MAJOR.MM."""
+    """The manifest's starting tag must match tag-on-push.yml's MAJOR.MMM."""
     monkeypatch.setattr(hook.subprocess, 'run', lambda *a, **k: None)
     monkeypatch.setattr(hook, 'git',
                         lambda *a: '0.54\n0.55\nnot-a-tag' if a[0] == 'tag' else '')
-    assert hook.next_tag() == '0.56'
+    assert hook.next_tag() == '0.551'
+
+
+def test_next_tag_widens_legacy_two_digit_tags(monkeypatch):
+    """A 2-digit tag is worth TEN new units: 0.58 is 0.580, so next is 0.581.
+
+    Reading '0.58' as 58 thousandths would emit 0.059 and march the version
+    backwards past every existing name.
+    """
+    monkeypatch.setattr(hook.subprocess, 'run', lambda *a, **k: None)
+    monkeypatch.setattr(hook, 'git',
+                        lambda *a: '0.57\n0.58' if a[0] == 'tag' else '')
+    assert hook.next_tag() == '0.581'
+
+
+def test_next_tag_ranks_three_digit_above_two_digit(monkeypatch):
+    """0.580 outranks 0.58 (equal) and must not be beaten by a stray 0.59."""
+    monkeypatch.setattr(hook.subprocess, 'run', lambda *a, **k: None)
+    monkeypatch.setattr(hook, 'git',
+                        lambda *a: '0.58\n0.581\n0.582' if a[0] == 'tag' else '')
+    assert hook.next_tag() == '0.583'
+
+
+def test_next_tag_rolls_over_to_v1_at_999(monkeypatch):
+    """The thousandths scheme reaches v1 at 0.999 -> 1.000."""
+    monkeypatch.setattr(hook.subprocess, 'run', lambda *a, **k: None)
+    monkeypatch.setattr(hook, 'git',
+                        lambda *a: '0.998\n0.999' if a[0] == 'tag' else '')
+    assert hook.next_tag() == '1.000'
 
 
 def test_next_tag_skips_names_already_taken(monkeypatch):
@@ -257,8 +285,8 @@ def test_next_tag_skips_names_already_taken(monkeypatch):
     """
     monkeypatch.setattr(hook.subprocess, 'run', lambda *a, **k: None)
     monkeypatch.setattr(hook, 'git',
-                        lambda *a: '0.54\n0.55\n0.56' if a[0] == 'tag' else '')
-    assert hook.next_tag() == '0.57'
+                        lambda *a: '0.54\n0.55\n0.551' if a[0] == 'tag' else '')
+    assert hook.next_tag() == '0.552'
 
 
 def test_next_tag_fetches_before_computing(monkeypatch):
@@ -458,9 +486,23 @@ def test_release_name_states_the_version_range():
 
 def test_previous_tag_matches_tag_on_push_numbering():
     """A closed range ends on the last version the cache was VALID for."""
+    # Legacy 2-digit tags keep stepping by a hundredth: those names are the
+    # ones actually published, and '0.569' would 404.
     assert nc.previous_tag('0.73') == '0.72'
     assert nc.previous_tag('1.00') == '0.99'   # MAJOR.MM rollover
     assert nc.previous_tag('0.57') == '0.56'
+    # 3-digit tags step by a thousandth.
+    assert nc.previous_tag('0.582') == '0.581'
+    assert nc.previous_tag('0.599') == '0.598'
+    # Past the switchover every thousandth is a real published tag, so the
+    # v1 rollover steps to 0.999 -- NOT to the 2-digit '0.99'.
+    assert nc.previous_tag('1.000') == '0.999'
+    assert nc.previous_tag('1.001') == '1.000'
+    # The boundary steps back into the old scheme's spelling, since 0.581 was
+    # the first 3-digit tag and 0.58 the last 2-digit one.
+    assert nc.previous_tag('0.581') == '0.58'
+    # A trailing-zero 3-digit tag is the same version as its 2-digit spelling.
+    assert nc.previous_tag('0.580') == '0.57'
 
 
 def _mock_releases(monkeypatch, listing):

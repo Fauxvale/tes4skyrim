@@ -153,10 +153,17 @@ def _run(args: list[str]) -> str:
 
 
 def previous_tag(before: str = "HEAD") -> str | None:
-    """Latest MAJOR.MM tag reachable from `before`, matching the workflow's
-    own tag scheme.  None when the repo has no release tag yet."""
+    """Latest release tag reachable from `before`, matching the workflow's own
+    tag scheme.  None when the repo has no release tag yet.
+
+    Tags through 0.58 are MAJOR.MM (hundredths); 0.581 onward are MAJOR.MMM
+    (thousandths).  Both forms must be globbed AND ranked on a common scale:
+    comparing the minor fields as bare ints would sort 0.59 above 0.580, and
+    globbing only two digits would pin the notes to 0.58 forever.
+    """
     try:
-        tags = _run(["tag", "-l", "[0-9]*.[0-9][0-9]"]).splitlines()
+        tags = _run(["tag", "-l", "[0-9]*.[0-9][0-9]",
+                     "[0-9]*.[0-9][0-9][0-9]"]).splitlines()
     except subprocess.CalledProcessError:
         return None
     tags = [t.strip() for t in tags if t.strip()]
@@ -166,7 +173,9 @@ def previous_tag(before: str = "HEAD") -> str | None:
     def key(t: str) -> tuple[int, int]:
         major, _, minor = t.partition(".")
         try:
-            return (int(major), int(minor))
+            # Scale by width so both schemes compare in thousandths.
+            scale = 10 if len(minor) == 2 else 1
+            return (int(major), int(minor) * scale)
         except ValueError:
             return (-1, -1)
 

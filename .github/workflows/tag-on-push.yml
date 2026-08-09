@@ -34,7 +34,26 @@ jobs:
           set -euo pipefail
           git fetch --tags --force
 
-          latest=$(git tag -l '[0-9]*.[0-9][0-9]' | sort -t. -k1,1n -k2,2n | tail -n1)
+          # Tags are MAJOR.MMM (thousandths) from 0.581 on; 0.58 and earlier
+          # are MAJOR.MM (hundredths).  A 2-digit minor is worth TEN of the new
+          # units -- 0.58 IS 0.580 -- so scale by the field's width.  `sort -n`
+          # cannot do this: it compares 58 against 580 and would rank 0.59
+          # above 0.580.  Compute the max numerically instead.
+          latest=""
+          latest_mils=0
+          for t in $(git tag -l '[0-9]*.[0-9][0-9]' '[0-9]*.[0-9][0-9][0-9]'); do
+            major=${t%%.*}
+            minor=${t#*.}
+            case ${#minor} in
+              2) mils=$((10#$major * 1000 + 10#$minor * 10)) ;;
+              3) mils=$((10#$major * 1000 + 10#$minor)) ;;
+              *) continue ;;
+            esac
+            if [ "$mils" -gt "$latest_mils" ]; then
+              latest_mils=$mils
+              latest=$t
+            fi
+          done
 
           # Nothing to do if HEAD is already tagged -- e.g. a workflow re-run,
           # or a push that only moved a branch pointer.
@@ -44,20 +63,12 @@ jobs:
             exit 0
           fi
 
-          if [ -z "$latest" ]; then
-            cents=0
-          else
-            major=$(echo "$latest" | cut -d. -f1)
-            minor=$(echo "$latest" | cut -d. -f2)
-            cents=$((10#$major * 100 + 10#$minor))
-          fi
-
           # Advance past any name already taken (a tag created out of sort
           # order, or a race the concurrency group didn't cover).
-          next_cents=$cents
+          next_mils=$latest_mils
           while :; do
-            next_cents=$((next_cents + 1))
-            next_tag=$(printf "%d.%02d" $((next_cents / 100)) $((next_cents % 100)))
+            next_mils=$((next_mils + 1))
+            next_tag=$(printf "%d.%03d" $((next_mils / 1000)) $((next_mils % 1000)))
             git rev-parse -q --verify "refs/tags/$next_tag" >/dev/null || break
             echo "Tag $next_tag already exists, trying the next one."
           done

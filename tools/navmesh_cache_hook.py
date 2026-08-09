@@ -166,9 +166,16 @@ def remote_master_base() -> str:
 def next_tag() -> str:
     """The tag tag-on-push.yml will create for this push.
 
-    Mirrors that workflow: tags are MAJOR.MM, and the next one is the highest
-    existing tag plus one hundredth.  The published asset is stamped with this
+    Mirrors that workflow: tags are MAJOR.MMM, and the next one is the highest
+    existing tag plus one thousandth.  The published asset is stamped with this
     so users know the first version it applies to.
+
+    THREE DIGITS, SCALED BY WIDTH.  Tags up to 0.58 used two minor digits
+    (MAJOR.MM, hundredths); everything from 0.581 on uses three (thousandths).
+    A 2-digit tag is therefore worth TEN of the new units -- 0.58 is 0.580 --
+    so the width of the minor field, not a fixed multiplier, decides the scale.
+    Reading a legacy '0.58' as 58 thousandths instead of 580 would compute a
+    "next" tag of 0.059, jumping the version backwards past 500 existing names.
 
     FETCH FIRST.  The workflow runs `git fetch --tags --force` before it
     computes anything, so it sees tags this clone may not have.  Reading only
@@ -182,16 +189,26 @@ def next_tag() -> str:
                    capture_output=True, cwd=nc.repo_root(), timeout=60)
     tags = [t for t in git('tag', '-l').splitlines() if t]
     taken = set(tags)
-    cents = 0
+    mils = 0
     for t in tags:
         parts = t.split('.')
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-            cents = max(cents, int(parts[0]) * 100 + int(parts[1]))
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        # Scale by the minor field's width: 2 digits are hundredths (x10 to
+        # reach thousandths), 3 digits are already thousandths.  Anything else
+        # is not ours -- ignore it rather than misread its magnitude.
+        if len(parts[1]) == 2:
+            value = int(parts[0]) * 1000 + int(parts[1]) * 10
+        elif len(parts[1]) == 3:
+            value = int(parts[0]) * 1000 + int(parts[1])
+        else:
+            continue
+        mils = max(mils, value)
     # Skip past any name already taken, exactly as the workflow's loop does (a
     # tag created out of order, or a race the concurrency group missed).
     while True:
-        cents += 1
-        candidate = '%d.%02d' % (cents // 100, cents % 100)
+        mils += 1
+        candidate = '%d.%03d' % (mils // 1000, mils % 1000)
         if candidate not in taken:
             return candidate
 

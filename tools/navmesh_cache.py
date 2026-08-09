@@ -383,17 +383,44 @@ def _version_key(tag: str) -> tuple | None:
         return None
 
 
-def previous_tag(tag: str) -> str:
-    """The code tag one hundredth below *tag* ('0.73' -> '0.72').
+# Last version issued under the 2-digit MAJOR.MM scheme, in thousandths.
+# 0.58 was the final hundredths tag; 0.581 began MAJOR.MMM.  Stepping down to
+# or below this point must produce a 2-digit name, because that is how every
+# release at or before it was actually published.
+_SCHEME_SWITCH_MILS = 580
 
-    Mirrors tag-on-push.yml's MAJOR.MM numbering, so a range closes on the last
-    version the cache was actually valid for rather than the one that broke it.
+
+def previous_tag(tag: str) -> str:
+    """The code tag one step below *tag* ('0.582' -> '0.581', '0.73' -> '0.72').
+
+    Mirrors tag-on-push.yml's numbering, so a range closes on the last version
+    the cache was actually valid for rather than the one that broke it.
+
+    The step size follows the minor field's WIDTH.  Tags through 0.58 are
+    MAJOR.MM (hundredths); 0.581 onward are MAJOR.MMM (thousandths).  Legacy
+    2-digit tags must keep decrementing by a hundredth -- rewriting '0.57' as
+    '0.569' would name a release that never existed and 404 the download.  The
+    3-digit boundary steps back into the old scheme's last name: 0.580 -> 0.58.
     """
     key = _version_key(tag)
     if not key or len(key) != 2:
         return tag
-    cents = key[0] * 100 + key[1] - 1
-    return '%d.%02d' % (cents // 100, cents % 100)
+    minor_width = len(tag.split('.')[1])
+    if minor_width == 2:
+        cents = key[0] * 100 + key[1] - 1
+        return '%d.%02d' % (cents // 100, cents % 100)
+    if minor_width == 3:
+        mils = key[0] * 1000 + key[1] - 1
+        # Below the switchover every name was 2-digit, so a step that lands
+        # there must be spelled in the old scheme: 0.581 -> 0.58, never
+        # '0.580' (never published) nor '0.579' (never existed).  Above it,
+        # every thousandth is its own real tag -- 1.000 -> 0.999 -- so the
+        # 2-digit spelling applies ONLY on the legacy side of the boundary.
+        if mils <= _SCHEME_SWITCH_MILS:
+            cents = mils // 10
+            return '%d.%02d' % (cents // 100, cents % 100)
+        return '%d.%03d' % (mils // 1000, mils % 1000)
+    return tag
 
 
 def tag_exists(tag: str) -> bool:
