@@ -2580,6 +2580,88 @@ end
         assert out.count('Event OnTriggerEnter(') == 1
 
 
+class TestPhysicalTrapDamage:
+    """A physical trap's damage lives in TES4's ENGINE, not in its script.
+
+    When an OL_TRAP (layer 14) body struck an actor, Oblivion read the magic
+    variables fTrapDamage / fLevelledDamage / fTrapPushBack off the striking
+    object's script and applied `fTrapDamage + fLevelledDamage * level` plus
+    pushback.  Nothing in the script body says so, which is why converted
+    swinging maces and logs connected but dealt ZERO damage.
+
+    Skyrim keeps the layer-14 contact detection but dispatches it as
+    OnTrapHitStart and leaves the damage to the script (vanilla
+    TrapHitBase.psc -> native ProcessTrapHit).  In-game confirmed 2026-08-09;
+    see docs/papyrus_conversion_notes.md.
+    """
+
+    # CTrapSwingMace01SCRIPT's shape: armed at 0, 20 on release, 5 after 6s.
+    SRC = """scn T
+short triggered
+float fTrapDamage
+float fTrapPushBack
+float fLevelledDamage
+begin onActivate
+  set fTrapDamage to 20
+  set fTrapPushBack to 900
+  set fLevelledDamage to 1.5
+  set triggered to 1
+end
+"""
+
+    def _handler(self, converter, src=None, extends='ObjectReference'):
+        out = converter.convert_standalone('T', src or self.SRC, extends, 'T')
+        assert 'Event OnTrapHitStart(' in out, out
+        return out.split('Event OnTrapHitStart(')[1].split('EndEvent')[0]
+
+    def test_handler_applies_levelled_damage_via_processtraphit(self, converter):
+        body = self._handler(converter)
+        assert 'fTrapDamage + fLevelledDamage * victim.GetLevel()' in body
+        assert '.ProcessTrapHit(Self, totalDamage, fTrapPushBack,' in body
+
+    def test_variables_are_read_live_not_baked(self, converter):
+        """The authored lifecycle (0 while held -> 20 -> 5) only survives if
+        the handler reads the properties at hit time.  Baking the literals in
+        would arm the trap permanently and ignore the decay."""
+        body = self._handler(converter)
+        assert '20' not in body and '1.5' not in body, \
+            'damage numbers must come from the live properties, not literals'
+
+    def test_unarmed_trap_deals_nothing(self, converter):
+        """TES4 leaves the variables at 0 until the trap fires, so brushing a
+        held mace must be harmless."""
+        body = self._handler(converter)
+        assert 'totalDamage <= 0.0' in body
+        guard = body.split('totalDamage <= 0.0')[1].split('EndIf')[0]
+        assert 'Return' in guard
+
+    def test_non_actor_hits_are_ignored(self, converter):
+        body = self._handler(converter)
+        assert 'akTarget as Actor' in body
+        assert 'victim == None' in body
+
+    def test_flat_only_trap_omits_the_level_term(self, converter):
+        """A script declaring fTrapDamage alone must not reference variables
+        it never declared -- that would not compile."""
+        src = ("scn T\nfloat fTrapDamage\nbegin onActivate\n"
+               "  set fTrapDamage to 10\nend\n")
+        body = self._handler(converter, src)
+        assert 'fLevelledDamage' not in body
+        assert 'fTrapPushBack' not in body
+        assert 'Float totalDamage = fTrapDamage' in body
+
+    def test_scripts_without_trap_variables_get_no_handler(self, converter):
+        src = "scn T\nshort x\nbegin onActivate\n  set x to 1\nend\n"
+        out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+        assert 'OnTrapHitStart' not in out
+
+    def test_quest_scripts_get_no_handler(self, converter):
+        """OnTrapHitStart is an ObjectReference event; emitting it on a Quest
+        script would not compile."""
+        out = converter.convert_standalone('T', self.SRC, 'Quest', 'T')
+        assert 'OnTrapHitStart' not in out
+
+
 class TestDestroyDoesNotCancelTheClip:
     """SetDestroyed(1) must not tear down the animation started just above it.
 

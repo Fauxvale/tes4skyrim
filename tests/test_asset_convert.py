@@ -3135,6 +3135,91 @@ class TestAnimationBlockLayout:
             'morph swap entries must be transform (scale) entries'
         assert _BLEND_INTERP_FLAGS_ARRAYSIZE == 0x0201
 
+    def test_tripwire_morph_ships_a_scale_swap(self):
+        """End-to-end on the mesh the bug was reported against: converting
+        ctrigtripwire01 must produce paired wrapper NiNodes whose scale curves
+        are INVERSE (base 1->0 as the snapped clone goes 0->1), with the clone
+        wrapper resting at 0 so the un-tripped wire looks intact."""
+        src = Path('export/Oblivion.esm/meshes/dungeons/caves/triggers/'
+                   'ctrigtripwire01.nif')
+        if not src.exists():
+            pytest.skip('tripwire source NIF not exported')
+        NF = self._nif()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dst = os.path.join(tmpdir, 'meshes', 'ctrigtripwire01.nif')
+            os.makedirs(os.path.dirname(dst))
+            result = convert_nif(str(src), dst)
+            if result.get('error'):
+                pytest.skip(f'Conversion failed: {result["error"]}')
+
+            data = NF.Data()
+            with open(dst, 'rb') as f:
+                data.inspect(f)
+                f.seek(0)
+                data.read(f)
+            root = data.roots[0]
+
+            mgr = root.controller
+            assert isinstance(mgr, NF.NiControllerManager)
+            curves = {}
+            for seq in mgr.controller_sequences:
+                for cb in seq.controlled_blocks:
+                    name = bytes(cb.node_name).decode('latin-1')
+                    if not name.endswith(' Swap'):
+                        continue
+                    ctype = bytes(cb.controller_type or b'').decode('latin-1')
+                    assert ctype == 'NiTransformController', \
+                        f'{name} must swap via transform, got {ctype!r}'
+                    keys = cb.interpolator.data.scales.keys
+                    curves[name] = [(k.time, k.value) for k in keys]
+
+            assert len(curves) == 2, f'expected a base/clone pair, got {curves}'
+            base = [c for n, c in curves.items() if 'Mrph' not in n][0]
+            clone = [c for n, c in curves.items() if 'Mrph' in n][0]
+            assert base[0][1] == 1.0 and base[-1][1] == 0.0, \
+                'the intact wire must start visible and scale away'
+            assert clone[0][1] == 0.0 and clone[-1][1] == 1.0, \
+                'the snapped wire must start hidden and scale in'
+            assert abs(base[-1][0] - clone[-1][0]) < 1e-3, \
+                'both halves of the cut must happen at the same instant'
+
+            # Wrappers must exist as real nodes, rest at the right scale, and
+            # be reachable by the manager (extra_targets + object palette) --
+            # a CB naming a node the manager cannot resolve drives nothing.
+            wrappers = {}
+            stack = [root]
+            while stack:
+                blk = stack.pop()
+                nm = bytes(getattr(blk, 'name', b'') or b'').decode('latin-1')
+                if nm.endswith(' Swap'):
+                    wrappers[nm] = blk
+                stack.extend(getattr(blk, 'children', []) or [])
+            assert set(wrappers) == set(curves)
+            for nm, node in wrappers.items():
+                want = 0.0 if 'Mrph' in nm else 1.0
+                assert node.scale == want, \
+                    f'{nm} must rest at scale {want}, got {node.scale}'
+                assert not int(node.flags) & 0x01, f'{nm} must not be hidden'
+
+            mtc = mgr.next_controller
+            while mtc is not None and not isinstance(
+                    mtc, NF.NiMultiTargetTransformController):
+                mtc = mtc.next_controller
+            assert mtc is not None, 'scale CBs need an MTC to bind through'
+            targets = {bytes(t.name).decode('latin-1')
+                       for t in mtc.extra_targets if t is not None}
+            assert set(curves) <= targets, \
+                'every animated wrapper must be an MTC extra target'
+            palette = {bytes(o.name).decode('latin-1')
+                       for o in mgr.object_palette.objs}
+            assert set(curves) <= palette, \
+                'every animated wrapper must be in the object palette'
+
+            # The failed approach must not creep back in via any other pass.
+            assert not any(isinstance(b, NF.NiVisController)
+                           for b in root.tree()), \
+                'no NiVisController may survive on a morph-swap mesh'
+
 
 class TestVoiceFilePrune:
     """A VTYP relocation empties the source-race folder: the run stops writing

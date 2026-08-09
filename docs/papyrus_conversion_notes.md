@@ -315,6 +315,81 @@ EndEvent
   `OnTriggerEnter` alone re-freezes the per-frame counters above; leaving it on
   `OnTrigger` alone means trap triggers never fire. Both are required.
 
+### Physical-trap damage: TES4's ENGINE read the script's variables (2026-08-09, in-game confirmed)
+
+A converted swinging mace, swinging log, falling log or cave-in fired, swung
+and connected — and dealt **zero damage**. Nothing in the TES4 script explains
+it, because **the damage is not in the script**: Oblivion's engine dealt it.
+
+When a Havok body on layer 14 (`OL_TRAP`) struck an actor, TES4 read three
+magic variables off the striking object's script and applied
+`fTrapDamage + fLevelledDamage × victimLevel` damage plus `fTrapPushBack`:
+
+| TES4 script variable | Meaning |
+|---|---|
+| `fTrapDamage` | flat damage |
+| `fLevelledDamage` | per-victim-level damage coefficient |
+| `fTrapPushBack` | knockback impulse |
+| `fTrapMinVelocity` | contact speed floor (NOT converted — see below) |
+| `bTrapContinuous` | re-hit while in contact (NOT converted) |
+
+The names are a **convention the engine keys on**, not ordinary locals — the
+script body never assigns damage anywhere. `CTrapSwingMace01SCRIPT` sets
+`fTrapDamage 20 / fLevelledDamage 1.5` on activation, which is exactly UESP's
+documented "20 + 1.5 × level" for the swinging mace; the swinging log's 15 and
+the falling logs' 30 match their scripts the same way. Census:
+`fTrapDamage` appears in **226 Oblivion and 127 Nehrim** scripts.
+
+**Skyrim keeps the detection but moves the damage into the script.** The
+layer-14 contact still fires — it arrives as the `OnTrapHitStart` script event
+— and vanilla answers it in `TrapHitBase.psc` with the native
+`ObjectReference.ProcessTrapHit`. So the conversion mirrors vanilla's contract:
+every converted `ObjectReference`/`Actor` script that DECLARES `fTrapDamage`
+gets a synthesized handler.
+
+```papyrus
+Event OnTrapHitStart(ObjectReference akTarget, float afXVel, float afYVel, \
+    float afZVel, float afXPos, float afYPos, float afZPos, int aeMaterial, \
+    bool abInitialHit, int aeMotionType)
+  Actor victim = akTarget as Actor
+  If victim == None
+    Return
+  EndIf
+  Float totalDamage = fTrapDamage + fLevelledDamage * victim.GetLevel()
+  If totalDamage <= 0.0
+    Return   ; not armed yet - TES4 variables start at 0
+  EndIf
+  akTarget.ProcessTrapHit(Self, totalDamage, fTrapPushBack, afXVel, afYVel, \
+      afZVel, afXPos, afYPos, afZPos, aeMaterial, 0.0)
+EndEvent
+```
+
+- **Read the variables LIVE, never bake the numbers in.** Doing so reproduces
+  the whole authored lifecycle for free: the mace script leaves `fTrapDamage`
+  at 0 while the trap is armed and held (so brushing it is harmless), sets 20
+  on release, and drops it to 5 six seconds later. The `<= 0.0` guard is what
+  makes the held phase safe, and it is why an un-triggered trap does nothing.
+- Only `fLevelledDamage`/`fTrapPushBack` that the script actually declares are
+  referenced; a script with `fTrapDamage` alone emits the flat term only.
+- Scope: **64 Oblivion + 33 Nehrim** scripts (maces, swinging/falling logs,
+  cave-ins, spike pits, blades, gas emitters).
+- `fTrapMinVelocity` and `bTrapContinuous` are deliberately **not** converted.
+  The event's velocity units are unverified, and gating on a wrong threshold
+  silences all damage — the exact failure being fixed. `OnTrapHitStart` fires
+  per contact-start rather than per frame, which already approximates the
+  non-continuous case.
+- The collision side needed no change: `_remap_world_filter` passes authored
+  layer 14 straight through, and vanilla agrees — `trapmace01`'s striking mace
+  head is layer 14 while its chain links are layer 10.
+- **General rule: when a TES4 feature has no code behind it, suspect an engine
+  convention keyed on variable names.** Grepping the script for "damage" finds
+  nothing; the census of variable NAMES across all scripts is what exposes it.
+- Pinned by `tests/test_script_converter.py::TestPhysicalTrapDamage` — including
+  the two cases that would not compile if the emission were naive: a script
+  declaring `fTrapDamage` alone must not reference the variables it lacks, and a
+  Quest script must get no handler at all (`OnTrapHitStart` is an
+  `ObjectReference` event).
+
 ### Engine globals must bind UNSHIFTED (2026-07-30) — the actual bell bug
 
 **Root cause of the endlessly-looping chapel bell**, found in `Papyrus.0.log`

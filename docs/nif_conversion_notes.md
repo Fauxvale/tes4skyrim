@@ -175,6 +175,16 @@ change looks like a no-op until you delete `export/<plugin>/mesh_bounds_cache.js
 load that cache in **both** the parent and the spawned workers (Windows spawn
 does not inherit module state), or every lookup silently answers 0.
 
+**Layer 14 (`OL_TRAP`) on the striking body is LOAD-BEARING — never remap it.**
+`_remap_world_filter` passes 14 through unchanged and must keep doing so: it is
+the layer whose contact raises Skyrim's `OnTrapHitStart`, which is the ONLY
+thing that makes a converted trap deal damage (see the trap-damage section of
+[papyrus_conversion_notes.md](papyrus_conversion_notes.md) — the damage lives
+in the script's `fTrapDamage` variables, not in the mesh). Oblivion and Skyrim
+agree on the idiom: `ctrapswingmacelong01`'s mace-end link is layer 14 with its
+chain on 10, and vanilla `trapmace01` is identical (Mace01 = 14, Link01-11 =
+10). Flattening 14 → 10 "for consistency" would silently disarm every trap.
+
 ### Every state needs a real transitions array — including at ONE sequence (2026-08-01)
 
 `_transitions(exclude_state=i)` gives each motion state "every OTHER sequence",
@@ -206,38 +216,64 @@ Fixed generically in `_normalize_shader_cb_strings` (runs at the end of
 `_match_seq_shader_types`).  PSys controlled-block strings were already
 vanilla-identical (`var1='NiPSysBoxEmitter:0'`, `var2='BirthRate'`) — leave.
 
-### NiGeomMorpherController does not exist in Skyrim — emulate as a vis swap (2026-08-02)
+### NiGeomMorpherController does not exist in Skyrim — emulate as a wrapper-node SCALE swap (2026-08-09, in-game confirmed)
 
 The SSE exe has NO `NiGeomMorpherController` RTTI class (only the orphaned
 `NiMorphData` remains) and vanilla ships 0 uses, so morph entries HAD to be
 dropped — but the morph IS the visible effect for 18 Oblivion meshes
 (ctrigtripwire01's wire snap, se01waitingroomwalls, obliviongate_forming,
 gnarlspawner…).  `_emulate_morphs` (fed by a harvest at the drop site in
-`_process_controller_manager`) bakes each animated morph target into a hidden
-sibling copy of the shape (relative_targets → base verts + deltas) and adds
-NiVisController entries that swap base → target where the weight curve crosses
-0.5.  Structure copied exactly from vanilla sldjailwallcollapse01: node carries
-NiVisController flags=108 + NiBlendBoolInterpolator(bool_value=2); the sequence
-entry carries NiBoolInterpolator + NiBoolData step keys, `controller_type
-'NiVisController'`, empty property/variable strings; clones are appended to the
-manager's NiDefaultAVObjectPalette.  Smooth crossfades degrade to a cut — the
-closest this engine gets.
+`_process_controller_manager`) bakes each animated morph target into a sibling
+copy of the shape (relative_targets → base verts + deltas) and CUTS from base
+to copy where the weight curve crosses 0.5.  A smooth crossfade degrades to a
+cut — the closest this engine gets.
 
-**The NiBoolData keys MUST be `CONST_KEY` (5), never `LINEAR` (1).**  The first
-cut of `_emulate_morphs` wrote 1 under a comment claiming that was what vanilla
-stores; it is not, and it CTD'd on entering Vilverin — an access violation at
-`0x0` (a null call target) inside `NiBoolData::Load` with the NIF still on the
-stack, `RSI/R14 = NiBoolData*`, `inputFilePath: ctrigtripwire01.nif`.  The
-census is absolute in both directions: **3449/3449 vanilla Skyrim NiBoolData
-and 1296/1296 Oblivion source NiBoolData store 5**, and `nif [version].xml`
-documents type 5 as "Step function.  Used for visibility keys in NiBoolData".
-The two types are byte-identical on disk (`{float time, byte value}`), so the
-file round-trips through PyFFI and NifSkope cleanly and nothing but the engine
-notices — which is why `tools/nif_block_type_audit.py` now checks it (check 3).
-A bool has no meaningful interpolant anyway, so step is also the only type that
-expresses these keys correctly.  This was never Vilverin-specific: it affected
-30 meshes across both plugins, including the Oblivion gates, the Night Mother
-statue, and Nehrim's lockpicking tumblers.
+**The cut is animated as wrapper-node SCALE, never as a NiVisController on the
+geometry.**  Each shape — the base and every baked target — is wrapped in its
+own `NiNode` (`"<shape> Swap"`), and the sequence drives that node's scale
+1 ↔ 0 through an ordinary `NiTransformController` entry bound to the manager's
+`NiMultiTargetTransformController`.  Clone wrappers rest at scale 0 (so the
+authored rest pose shows only the base shape) and the clone geometry itself
+ships VISIBLE; wrappers are added to the MTC's `extra_targets` and to the
+manager's `NiDefaultAVObjectPalette`.  Scale keys are `LINEAR` (1) floats with
+a hold key one frame (1/30 s) before each transition, which expresses the step
+without touching the bool-key machinery.
+
+**Do NOT "restore" the NiVisController version.**  The first implementation
+toggled `NiVisController` entries aimed at the NiTriShapes themselves; it
+produced NO visible swap in-game across three rounds of fixes, and the vanilla
+census explains why it was never trustworthy: sequence-driven NiVisController
+controlled blocks target **NiNode / NiBillboardNode / particle systems in
+1852/1852 cases and a NiTriShape in ZERO**.  Meanwhile transform entries on
+plain NiNodes carrying scale keys are routine (406 in a 130-file sample), and
+converted transform sequences are the one animation path already confirmed
+working in-game (CharacterGen's secret wall).  The scale swap therefore reuses
+only proven machinery and generates no `NiVisController` /
+`NiBlendBoolInterpolator` at all — which also retires both Vilverin CTDs below
+for this path.  Two tests in
+`tests/test_asset_convert.py::TestAnimationBlockLayout` pin it:
+`test_morph_emulation_never_targets_geometry` (no vis entries are synthesized)
+and `test_tripwire_morph_ships_a_scale_swap` (converts the real
+ctrigtripwire01 and asserts inverse scale curves, wrapper rest scales, MTC
+extra-target + palette registration, and zero surviving NiVisController).
+
+Historical note — **the two CTDs the vis-swap path caused**, kept because
+`_normalize_blend_interpolators` still repairs blocks COPIED from Oblivion:
+
+1. **NiBoolData keys must be `CONST_KEY` (5), never `LINEAR` (1).**  Writing 1
+   CTD'd on entering Vilverin — an access violation at `0x0` inside
+   `NiBoolData::Load`, `RSI/R14 = NiBoolData*`,
+   `inputFilePath: ctrigtripwire01.nif`.  Census: **3449/3449 vanilla Skyrim
+   and 1296/1296 Oblivion source NiBoolData store 5**; `nif [version].xml`
+   documents type 5 as "Step function.  Used for visibility keys in
+   NiBoolData".  The two types are byte-identical on disk
+   (`{float time, byte value}`), so the file round-trips through PyFFI and
+   NifSkope cleanly and nothing but the engine notices — hence check 3 in
+   `tools/nif_block_type_audit.py`.
+2. The Manager-Controlled flag defect below, which the same crash hunt found.
+
+Both still apply to any NiBoolData / blend interpolator the converter copies
+through; they are simply no longer reachable from morph emulation.
 
 ### NiBlendInterpolator must be Manager Controlled (2026-08-02)
 
