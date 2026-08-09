@@ -155,6 +155,7 @@ see the `oblivion-to-skyrim-dialog` skill.
 - **RACE** — Almost entirely restructured. Only basic data (height/weight/skill boosts/spells) can transfer.
 - **ENCH/SPEL** — ENIT/SPIT completely restructured. Effects need MGEF FormID resolution.
 - **ARMO/CLOT** — Missing ARMA records means armor won't render in-game.
+- **🔴 A wearable authored for ONE gender must still get an armature (2026-08-08).** `convert_ARMO` gated the ARMA build on `male_model`, and `_build_arma`/the ground-model fallback read only the male fields. Oblivion lets a record ship a female biped model with the male field empty — Nehrim has 5 (`IrlandaRobe`, the four `SFLight*` Silverlight pieces) — so those ARMO came out with **no armature at all**. An ARMO with no ARMA still equips and occupies its slot but renders nothing, i.e. the actor looks naked while apparently dressed: Goddess Irlanda and both MQ34 Eliath embodiments. Fix: build the ARMA when EITHER gender has a mesh, fall back across genders for the ground model and the boot test. **Do not invent a MOD2** — vanilla census (Skyrim.esm, 766 ARMA): 590 MOD2+MOD3, 172 MOD2 only, **4 MOD3 only, 0 with neither**, so female-only is legal and empty never is. `wearable_plan`'s ground-model fallback must track `convert_ARMO.ground_model` exactly or the dropped item's mesh gets pruned. Diagnose with `tools/naked_npc_trace.py`.
 
 ### Common Causes of ESP Failing to Load in Skyrim Engine
 1. **Missing OBND** on records that require it (most item/object types)

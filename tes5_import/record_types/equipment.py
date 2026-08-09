@@ -398,9 +398,15 @@ def convert_ARMO(rec: dict, is_clothing: bool = False, writer=None) -> bytes:
 
     # MOD2 — Male world model (ground/dropped item mesh)
     # TES5 ground models use a separate GND mesh; fall back to biped model
+    # A wearable may be authored for ONE gender only — the male fields are then
+    # empty and every "the model" lookup below has to fall back to the female
+    # one, or the record ends up with no mesh at all.  Nehrim ships 5 such
+    # items (IrlandaRobe, the Silverlight set); they equipped and drew nothing.
     male_model = get_str(rec, 'Male.BipedModel.MODL')
+    female_model = get_str(rec, 'Female.BipedModel.MODL')
     male_world = get_str(rec, 'Male.WorldModel.MODL')
-    ground_model = male_world if male_world else male_model
+    ground_model = (male_world or male_model
+                    or get_str(rec, 'Female.WorldModel.MODL') or female_model)
     if ground_model:
         subs += pack_string_subrecord('MOD2', _prefix_path(ground_model))
 
@@ -431,8 +437,13 @@ def convert_ARMO(rec: dict, is_clothing: bool = False, writer=None) -> bytes:
         vendor_kwd = 'Clothing' if is_clothing else 'Armor'
     subs += pack_keywords([VENDOR_KYWD[vendor_kwd]])
 
-    # MODL[] — Armature (ARMA references): generate ARMA companion record
-    if writer is not None and male_model:
+    # MODL[] — Armature (ARMA references): generate ARMA companion record.
+    # EITHER gender's mesh is enough. Gating on the male model alone left
+    # female-only wearables with no armature, and an ARMO with no ARMA equips
+    # but renders nothing — the actor looks naked while the slot is occupied.
+    # Vanilla census (Skyrim.esm, 766 ARMA): 4 carry MOD3 only and 0 carry
+    # neither, so a female-only armature is legal and an empty one never is.
+    if writer is not None and (male_model or female_model):
         arma_fid = writer.alloc_formid()
         arma_bytes = _build_arma(rec, arma_fid, tes5_biped, armor_type,
                                  is_shield=is_shield)
@@ -470,8 +481,9 @@ def _build_arma(rec: dict, arma_fid: int, tes5_biped: int, armor_type: int,
     # geometry that should remain visible when gloves are equipped.
     # Shoes should NOT claim Calves — only boots (armor foot items) should.
     is_clothing = (armor_type == 2)
-    male_model = get_str(rec, 'Male.BipedModel.MODL', '').lower()
-    is_boot = ('boot' in male_model)
+    # Either gender's path — a female-only boot is still a boot.
+    is_boot = ('boot' in (get_str(rec, 'Male.BipedModel.MODL', '')
+                          or get_str(rec, 'Female.BipedModel.MODL', '')).lower())
     for bit, extras in ARMA_BODY_COVERAGE_EXTRA.items():
         if arma_biped & (1 << bit):
             for extra_bit in extras:
