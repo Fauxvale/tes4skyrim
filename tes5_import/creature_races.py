@@ -296,9 +296,15 @@ def build_creature_body_parts(writer) -> int:
             s += pack_string_subrecord('BPNT', target)
             s += pack_string_subrecord('BPNI', base_path)
             s += pack_subrecord('BPND', bpnd)
-            s += pack_string_subrecord('NAM1', '0')
+            # NAM1 is the Limb Replacement Model *path*. All 76 vanilla body
+            # parts write it as the empty string (a lone NUL). Writing '0'
+            # here made it a 1-character filename, so the engine took the
+            # "has a replacement mesh" branch and fed "0" into the archive
+            # path-hash lookup, faulting during load. NAM5 (wbModelInfo) is
+            # zero-length in vanilla, not a NUL-terminated empty string.
+            s += pack_string_subrecord('NAM1', '')
             s += pack_string_subrecord('NAM4', base_path)
-            s += pack_string_subrecord('NAM5', '')
+            s += pack_subrecord('NAM5', b'')
             return s
 
         fid = writer.alloc_formid()
