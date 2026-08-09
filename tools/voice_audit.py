@@ -219,6 +219,7 @@ def main():
     vm_mismatch = []
     stats = Counter()
     expected_stems = defaultdict(set)   # folder -> stems we expect there
+    no_gate_reported = set()            # ungated stems already counted as a miss
 
     for info in infos:
         fid = info['fid']
@@ -257,6 +258,20 @@ def main():
                 if stem in files_by_folder[tf]:
                     stats['found'] += 1
                     continue
+                if not info['vtyps']:
+                    # No GetIsVoiceType gate, so the engine resolves the
+                    # SPEAKER's own folder at runtime and this audit cannot
+                    # know which one that is. Present in ANY folder is
+                    # therefore reachable. Demanding it in every folder turned
+                    # one line into one miss per folder: on Nehrim that
+                    # inflated 405 ungated lines into 2042 "misses" and made a
+                    # correctly routed voice tree look broken.
+                    if any(stem in files_by_folder[f] for f in all_folders):
+                        stats['no_gate_reachable'] += 1
+                        continue
+                    if stem in no_gate_reported:
+                        continue        # report a genuine miss once, not per folder
+                    no_gate_reported.add(stem)
                 # Classify the miss
                 on_disk = disk_by_fid.get(fid24, set())
                 same_prefix_elsewhere = [e for e in on_disk
@@ -311,8 +326,9 @@ def main():
                 'MISSING_IN_VTYP', 'NO_VTYP_FOLDER', 'NOT_ORGANIZED'):
         if stats[cls]:
             print(f'  {cls}: {stats[cls]}')
-    print(f"  INFOs with no voice gate (checked in all folders): "
-          f"{stats['no_voice_gate_infos']}")
+    print(f"  INFOs with no voice gate: {stats['no_voice_gate_infos']} "
+          f"({stats['no_gate_reachable']} lookups reachable in the speaker's "
+          f"own folder, counted once)")
     if stats['vtyp_param_unresolved']:
         print(f"  GetIsVoiceType params not resolving to a VTYP record: "
               f"{stats['vtyp_param_unresolved']}")

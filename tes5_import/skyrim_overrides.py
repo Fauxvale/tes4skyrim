@@ -319,6 +319,17 @@ CUSTOM_VTYP_EDIDS = {
 }
 
 
+# VTYP FormID -> the EditorID actually written on that record.  Populated by
+# _create_vtyp_records as it allocates them.  Anything needing the reverse
+# direction MUST read it here rather than reconstructing it from
+# CUSTOM_VTYP_EDIDS: several race EditorIDs share one VTYP (Nehrim's seven
+# Alemanne* races), and a localised race's VTYP is named after its display
+# name, so walking the fixed table backwards mislabels the FormID — it
+# relabelled the Hochelf voice type as `TES4MaleHighElf` and sent 42 voice
+# files to a folder no speaker reads.
+VTYP_EDID_BY_FID: dict = {}
+
+
 def set_voice_type(race_edid: str, gender: str, fid: int):
     """Register a custom VTYP FormID (called by _create_vtyp_records once
     each VTYP record has been allocated and written)."""

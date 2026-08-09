@@ -138,6 +138,8 @@ cow tes4tamriel 20 20
 
 If you'd like to use any modded Oblivion assets such as models or textures, first complete the "extract" step and then place your modded assets in the export/"plugin you are trying to convert" directory and overwrite
 
+**IMPORTANT NOTE** This project is still under rapid development and it's possible that Formids can change from underneath you. Updates WILL likely break your save file and you'll have to start anew
+
 ---
 
 ## Command line

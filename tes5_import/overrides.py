@@ -172,6 +172,10 @@ class OverrideContext:
 
     def __init__(self, export_dir: str, masters: list, num_tes4_masters: int,
                  output_root: str):
+        # Kept so consumers can re-resolve the MASTERS' export directories the
+        # same way `load_master_export` does (voice-type adoption reads their
+        # RACE.txt — see `_master_export_dirs` in import_main).
+        self.export_dir = export_dir
         self.master_index = load_master_index(
             masters, num_tes4_masters, output_root)
         self.master_manifest = load_master_manifests(
