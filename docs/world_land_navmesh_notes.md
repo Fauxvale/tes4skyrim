@@ -915,6 +915,32 @@ VTEX[i]=FormID
 - Exterior cell block grouping: block = `floor(grid / 32)`, sub-block = `floor(grid / 8)`. Use Python `//` (floor division), NOT bitwise `>>` — the `>>` formula is wrong for exact negative multiples (e.g. -32 gives -2 instead of -1).
 - Persistent worldspace cell classification: use `RecordFlags & 0x400`, NOT `XCLC.X == ''`. Persistent cells often have XCLC=(0,0) so the empty-string check mis-classifies them as exterior cells, putting them in the wrong block/sub-block structure and breaking all exterior cell loading.
 
+### 🔴 The texture PRUNE must speak the importer's paths (2026-08-09)
+
+Cause of "almost all landscape textures are missing" on Nehrim. An Oblivion
+LTEX `ICON` is relative to `Textures\Landscape\`, and the importer prepends
+`landscape\` (`record_types/world.py:111`). `texture_prune.refs_from_records`
+did not: it kept `oblivion/terrainhd…dds` and `tes4/oblivion/terrainhd…dds`
+while the plugin asks for `tes4/landscape/oblivion/terrainhd…dds`. Nothing
+matched, so **every LTEX texture was pruned as unused and never packed.**
+
+Measured on the shipped build: **252 of 484 referenced LTEX texture slots were
+in no BSA, all of them still on disk.** The survivors were exactly the 116 the
+MESH manifest happened to name — a texture a mesh also used survived, which is
+why *some* terrain was textured and most was not. The LTEX records themselves
+were fine (229/242 resolve, 0 dangling LAND layers), which is what makes this
+so easy to misdiagnose: every record-level check passes.
+
+`refs_from_records` now carries a per-signature prefix table
+(`_RECORD_TEX_PREFIX`), keyed on the export filename since that is the only
+place the record type is known. **Any record type whose texture field is
+relative to a subfolder has to be listed there**, and it must mirror whatever
+the importer prepends. Guarded by `tests/test_texture_prune.py`.
+
+Diagnose with `python tools/ltex_check.py [plugin]` (LTEX → TXST → file, plus
+dangling LAND layers). Note `refs_from_records` regex-scans **every** `.txt` in
+the export — ~2 GB for Nehrim, so it takes minutes; that is not a hang.
+
 ### TXST for Landscape Textures
 - No DNAM: vanilla Skyrim LTEX TXSTs omit DNAM. The 0x0001Fa "No Specular Map" flag only applies to the object (BSLightingShader) path, NOT the landscape shader. Writing it has no positive effect.
 - TX00 = diffuse (`tes4\landscape\<icon>.dds`)

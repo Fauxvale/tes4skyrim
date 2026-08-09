@@ -71,18 +71,44 @@ def _norm(raw) -> str:
     return p
 
 
+# Record types whose texture field is relative to a SUBFOLDER of textures\,
+# not to the textures root.  The prune has to reproduce whatever the importer
+# prepends, or the reference it is holding never matches the shipped path and
+# the texture is deleted as unused.
+#   LTEX ICON: relative to Textures\Landscape\
+#              (record_types/world.py:111 does the same prepend)
+_RECORD_TEX_PREFIX = {'ltex': 'landscape/'}
+
+# Map suffixes the engine loads implicitly beside a diffuse. Longest first, so
+# `_msn` and `_em` are recognised before `_n`/`_m` swallow their tail.
+_MAP_SUFFIXES = ('_msn', '_em', '_sk', '_n', '_g', '_m', '_s', '_e', '_p')
+
+
 def refs_from_records(export_dir) -> set:
     """Texture paths named by the plugin's records (icons, LTEX, ...)."""
     refs = set()
     for txt in Path(export_dir).glob('*.txt'):
+        # The filename IS the record signature, which is the only way to know
+        # what the paths inside are relative to.
+        prefix = _RECORD_TEX_PREFIX.get(txt.stem.lower(), '')
         body = txt.read_text(encoding='utf-8', errors='replace').lower()
+        # `_TEX_TEXT_RE` opens with a LAZY star, so on text containing no match
+        # it still expands at every position — quadratic. Most of the export is
+        # exactly that: LAND.txt (386 MB) and REFR.txt (166 MB) hold vertex and
+        # placement data with ZERO '.dds' in them, yet they are 92% of the bytes
+        # scanned. A plain substring test is a C-level memchr and rejects them
+        # outright, turning a multi-minute phase into seconds.
+        if '.dds' not in body:
+            continue
         for m in _TEX_TEXT_RE.finditer(body):
             p = _norm(m.group(0))     # collapses the export's escaped slashes
-            if p:
-                refs.add(p)
+            if not p:
+                continue
+            for variant in ({p, prefix + p} if prefix else {p}):
+                refs.add(variant)
                 # records name the path as Oblivion wrote it; the importer
                 # prefixes it with tes4\ on the way into the plugin.
-                refs.add('tes4/' + p)
+                refs.add('tes4/' + variant)
     return refs
 
 
@@ -112,7 +138,7 @@ def _companions(refs: set) -> set:
     extra = set()
     for r in refs:
         stem = r[:-4]
-        for suffix in ('_n', '_g', '_m', '_s', '_e', '_em', '_p', '_sk', '_msn'):
+        for suffix in _MAP_SUFFIXES:
             if stem.endswith(suffix):
                 continue
             extra.add(stem + suffix + '.dds')
@@ -141,7 +167,56 @@ def build_refs(plugin_dir, export_dir, mesh_texture_refs=None) -> set:
     refs |= refs_from_assets(late)
 
     refs |= _companions(refs)
+    refs |= _shared_maps_on_disk(plugin_dir, refs)
     return refs
+
+
+def _shared_maps_on_disk(plugin_dir, refs: set) -> set:
+    """Map siblings a VARIANT diffuse borrows from its base name.
+
+    Oblivion's convention lets a colour/state variant reuse the base texture's
+    maps: `brumawoodpost_grey.dds` is shipped without its own normal map and the
+    engine loads `brumawoodpost_n.dds` from the same folder. Nothing writes that
+    down — not the NIF, not the record — and `_companions` only derives from the
+    FULL name, so it produces `brumawoodpost_grey_n.dds`, which does not exist,
+    while the map actually in use is pruned. Measured on Nehrim: 27 such maps,
+    including `armor/nehrimsoldier/cuirass_n.dds` (used by `cuirass_b.dds`) and
+    `characters/imperial/headhuman_m_n.dds` — where the convention collides with
+    itself, `_m` being both a map suffix and the gender marker, so the male head
+    counted as a "map of headhuman" and got no siblings of its own.
+
+    So this looks at what is really on disk: a map sibling survives when some
+    KEPT diffuse in the same folder starts with its base name. Disk-bounded, so
+    it can only ever keep files that exist, and it only ever adds.
+    """
+    tex_root = Path(plugin_dir) / 'textures'
+    if not tex_root.is_dir():
+        return set()
+
+    # folder -> (map siblings present, kept diffuse stems)
+    maps: dict = {}
+    kept_stems: dict = {}
+    for f in tex_root.rglob('*.dds'):
+        key = f.relative_to(tex_root).as_posix().lower()
+        folder, _, name = key.rpartition('/')
+        stem = name[:-4]
+        suffix = next((s for s in _MAP_SUFFIXES if stem.endswith(s)), None)
+        if suffix:
+            maps.setdefault(folder, []).append((key, stem[:-len(suffix)]))
+        elif key in refs:
+            kept_stems.setdefault(folder, set()).add(stem)
+
+    rescued = set()
+    for folder, entries in maps.items():
+        stems = kept_stems.get(folder)
+        if not stems:
+            continue
+        for key, base in entries:
+            if key in refs or not base:
+                continue
+            if any(s.startswith(base) for s in stems):
+                rescued.add(key)
+    return rescued
 
 
 def prune(plugin_dir, export_dir, mesh_texture_refs=None,
