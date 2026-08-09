@@ -94,6 +94,40 @@ Profile it in isolation without paying for a full import: set
 `TESCONV_DUMP_NAVM_CACHE=<path>` on an import run to pickle the precomputed
 navmesh cache, then profile `build_edge_links` against it.
 
+### 0. NIF output was NON-DETERMINISTIC (fixed — read this first)
+
+Converting the same source NIF twice produced **different bytes**, with no code
+change between runs. It is stable *within* one process and varies *between*
+processes — the signature of `PYTHONHASHSEED`. Pinning the seed makes three
+separate runs agree exactly.
+
+Cause, in PyFFI's `NifFormat.Data.write` (line ~1462):
+
+```python
+self._string_list = list(set(self._string_list))   # ensure unique elements
+```
+
+`set` over **bytes**, whose hash is randomised per process (PEP 456). Every
+`NiStringRef` stores an *index* into that list, so the whole header string table
+and its references shuffle. Measured on `dungeons/chargen/dobrick01.nif`: same
+size, same 10 blocks, same geometry — **26 of 7,433 bytes differ**, all in the
+string table and the indices into it.
+
+**Patch 10** in `pyffi_monkey_patch.py` makes the dedupe insertion-ordered
+(`dict.fromkeys`). It recompiles that one method from PyFFI's own source with
+the single line rewritten, and declines to install (loudly) if the source does
+not match, so it cannot silently drift from the installed PyFFI.
+
+Why it matters beyond tidiness: **no mesh build was reproducible**, a BSA
+differed from the previous one for no reason, and — the reason this surfaced —
+every before/after byte-comparison of a mesh optimisation reported a spurious
+mismatch, so it could not tell a real regression from seed noise. Any mesh
+perf work done before this fix was measured with a broken instrument.
+
+Check it with `python tools/nif_determinism.py` (converts a sample under
+several `PYTHONHASHSEED` values and diffs the hashes; non-zero exit on failure).
+Verified: 65 meshes across 5 seed pairs, 0 differences.
+
 ### 3. Mesh conversion is ~100% PyFFI object-model overhead
 
 Per-mesh cost scales with file size (~95 ms per 100 KB; median 304 ms, worst
@@ -110,10 +144,66 @@ pipeline's `_PyFFICapture` handler attaches at WARNING+. Measured 1,517,371
 calls / 4.44 s cumulative on two heavy NIFs. **1.09x, byte-identical**; the
 patch is skipped if DEBUG really is enabled for `pyffi.nif.data.struct`.
 
+**Patch 11**: `NiTriBasedGeom.update_tangent_space` reimplemented in numpy. It
+became the hottest single function once the logging patch was in (4.34 s
+cumulative of ~11 s across 12 meshes, in only **57 calls**) because it runs a
+per-**triangle** Python loop allocating several `Vector3` objects each, then a
+per-**vertex** Gram-Schmidt loop. The numpy version reproduces the algorithm
+exactly — the same quantised `(vertex, normal)` merge hash (so uv seams still
+share a frame), degenerate-triangle skipping, per-triangle normalisation
+*before* accumulation, the `r_sign` factor, the Gram-Schmidt order, and the
+`x cross n` / `y cross n` fallback basis. Anything it cannot handle (no uvs, no
+normals, no triangles, length mismatch) falls through to the original.
+
+**1.39x on its own; 1.85x for the whole mesh stage with Patches 9+11**
+(15.27 s -> 8.25 s on a 24-mesh sample). Used by the main mesh path (via
+`SpellAddTangentSpace`), `lod_far_gen` and `spt_converter`, so all three gain.
+
+Output is *not* byte-identical here, and that is expected: the original
+accumulated in float32 `Vector3`s, this accumulates in float64. Measured
+divergence across sample meshes is **1e-16 to 1e-5 per component** — rounding,
+not a different answer. Toggle with `TESCONV_PYFFI_NO_FAST_TANGENTS=1` to A/B.
+
 Still on the table, not done (riskier — it touches conversion correctness):
 `NiTriBasedGeom.get_interchangeable_tri_shape` does a **double deepcopy** of all
 geometry (verts, normals, UVs, colours) purely to change the container type —
 8.4 s cumulative on two meshes.
+
+**NOT DONE, and do not retry blindly:** caching `_get_filtered_attribute_list`
+(1.98M calls, the obvious next target). Memoising it per
+`(class, version, user_version)` — even restricted to classes where no attribute
+carries a `cond` — **changed the output of 7 of 30 sample meshes**. The
+filtering is not instance-independent: `arg`/`vercond` can reference instance
+fields, and PyFFI mutates instance state *while* walking the list during read,
+so a later attribute's inclusion can depend on an earlier one's just-read value.
+
+### 4. Terrain LOD: the Python side is not the bottleneck
+
+Object LOD (786 `_far.nif` across 29 workers) and the terrain tile pool are both
+properly parallel. Two findings:
+
+- **`LODGenx64.exe` dominates the stage.** It had burned **493 CPU-seconds**
+  when sampled, running **6.4 cores across 122 threads** on 180,575 references.
+  It is a third-party binary, already parallel — not our lever.
+- **The serial LAND parse runs once PER WORLDSPACE**, and Oblivion.esm ships
+  **18** of them, so the same ESM is re-scanned ~18 times before each
+  worldspace's tile pool starts. Tamriel alone has **14,686 LAND records**.
+  Two vectorisations took that parse from **5.9 s to 2.9 s (2.0x)**, i.e. about
+  **54 s off the serial part of the stage**:
+  - `_decode_land` (VHGT) ran a **33x33 nested Python loop per LAND record**.
+    Replaced with integer prefix sums. The deltas are int8, so an integer
+    `cumsum` is **exact** — there is no accumulation-order rounding to
+    reproduce, unlike a float cumsum, which could not have matched the scalar
+    loop's mixed float32/Python-float accumulator anyway. Worst height
+    difference vs the old code: **0.002 game units (0.0014 cm)**.
+  - `decode_land_layers` (VTXT) did one `struct.unpack_from` **per opacity
+    entry** — 14.7M calls across Tamriel, since one layer carries up to
+    17x17 = 289 entries per quadrant. A structured-dtype `np.frombuffer` reads
+    each array in one go: **1.4x**, and verified **identical on 4,000 real LAND
+    records** (`temp/vtxt_verify.py` pattern).
+- Do NOT bother caching the plugin bytes across worldspaces: measured, the
+  613 MB read is **0.10 s** (OS page cache) against a 2.9 s scan. Tried and
+  reverted.
 
 ## Parallelism rules (learned 2026-07-16)
 

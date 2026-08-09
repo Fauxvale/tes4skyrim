@@ -47,8 +47,18 @@ Summary of patches
    that the (never-enabled) logger then throws away.  ~11.5% of NIF conversion
    time.  Replaced with a no-op unless DEBUG is actually enabled for the
    "pyffi.nif.data.struct" logger.  Cannot affect output bytes.
+   Set TESCONV_PYFFI_NO_PERF_PATCH=1 to disable (for A/B measurement).
+
+10. Deterministic header string table  (CORRECTNESS)
+   Data.write() deduplicated the string table with `list(set(...))` over BYTES,
+   whose hash is randomised per process, so the same source NIF produced
+   different output bytes on every run — identical blocks and geometry, but a
+   reordered string table and therefore different NiStringRef indices.  Made
+   insertion-ordered.  Verify with `python tools/nif_determinism.py`.
 """
 
+import os
+import sys
 import time as _time
 
 # ---------------------------------------------------------------------------
@@ -799,6 +809,8 @@ def _install_no_op_struct_logging():
 
     if getattr(StructBase, '_tesconv_nolog', False):
         return
+    if os.environ.get('TESCONV_PYFFI_NO_PERF_PATCH'):
+        return                      # A/B escape hatch (tools/nif_perf.py)
     if logging.getLogger("pyffi.nif.data.struct").isEnabledFor(logging.DEBUG):
         return                      # someone wants the debug output; leave it
 
@@ -807,6 +819,289 @@ def _install_no_op_struct_logging():
 
     StructBase._log_struct = _log_struct
     StructBase._tesconv_nolog = True
+
+
+# ---------------------------------------------------------------------------
+# Patch 10: DETERMINISTIC header string table  (CORRECTNESS, not speed)
+# ---------------------------------------------------------------------------
+#
+# NifFormat.Data.write() deduplicates the header string table with
+#
+#     self._string_list = list(set(self._string_list))   # ensure unique elements
+#
+# `set` of BYTES objects, whose hash is randomised per process (PEP 456), so
+# the ORDER of that list changes on every run.  Every NiStringRef stores an
+# INDEX into it, so the same source NIF converts to different bytes each time:
+# measured on dungeons/chargen/dobrick01.nif, 26 of 7,433 bytes differ between
+# two runs, all of them in the string table and the indices pointing at it.
+# Same size, same blocks, same geometry — only the ordering moves.
+#
+# Consequences beyond tidiness: no build is reproducible, a BSA differs from
+# the last one for no reason, and — the reason this was found — every
+# before/after byte-comparison of a converter optimisation reports a spurious
+# mismatch, so it cannot distinguish a real regression from seed noise.
+#
+# Fix: dedupe preserving FIRST APPEARANCE, which is a pure function of the
+# block tree.  `dict.fromkeys` is the stable-unique idiom and is O(n) like the
+# set version.  This does not change WHICH strings are written, only their
+# order, and PyFFI itself resolves every reference through
+# `_string_list.index(...)`, so the indices follow automatically.
+#
+# The dedupe sits in the MIDDLE of Data.write, so it cannot be wrapped from
+# outside.  It is patched by recompiling that one method from PyFFI's own
+# source with the single line rewritten — no behaviour is reimplemented here,
+# so the method cannot drift from the installed PyFFI version.  If the source
+# ever stops matching (different PyFFI release), the patch declines to install
+# rather than silently applying to something it does not understand.
+_STRING_DEDUPE_SRC = "self._string_list = list(set(self._string_list))"
+_STRING_DEDUPE_FIX = "self._string_list = list(dict.fromkeys(self._string_list))"
+
+
+def _install_deterministic_string_table():
+    import inspect
+    import textwrap
+    from pyffi.formats.nif import NifFormat
+
+    if getattr(NifFormat.Data, '_tesconv_stable_strings', False):
+        return False
+
+    try:
+        src = inspect.getsource(NifFormat.Data.write)
+    except (OSError, TypeError):
+        return False
+    if src.count(_STRING_DEDUPE_SRC) != 1:
+        return False                     # unrecognised PyFFI; leave it alone
+
+    src = textwrap.dedent(src).replace(_STRING_DEDUPE_SRC, _STRING_DEDUPE_FIX)
+
+    # Compile against the defining module's globals so every name the method
+    # uses (logging, NifFormat, struct, ...) resolves exactly as before.
+    mod = sys.modules[NifFormat.Data.write.__module__]
+    ns: dict = {}
+    exec(compile(src, mod.__file__, 'exec'), mod.__dict__, ns)
+    new_write = ns.get('write')
+    if new_write is None:
+        return False
+
+    NifFormat.Data.write = new_write
+    NifFormat.Data._tesconv_stable_strings = True
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Patch 11: vectorised update_tangent_space  (PERFORMANCE ONLY)
+# ---------------------------------------------------------------------------
+#
+# NiTriBasedGeom.update_tangent_space is the single hottest function left in
+# mesh conversion once the logging patch is in (measured 4.34 s cumulative of
+# ~11 s across 12 meshes, in only 57 calls).  It runs a per-TRIANGLE Python
+# loop that allocates several NifFormat.Vector3 objects per triangle, then a
+# per-VERTEX Gram-Schmidt loop, on meshes with thousands of each.
+#
+# The algorithm is reproduced here exactly, in numpy:
+#   * vertices are merged by the SAME quantised (vertex, normal) hash, so uv
+#     seams still share a tangent frame,
+#   * degenerate triangles (two hashes equal) are skipped,
+#   * each triangle's sdir/tdir are NORMALISED BEFORE accumulation (pyffi does
+#     this; skipping it changes the weighting) and a triangle whose sdir or
+#     tdir is zero-length is skipped entirely,
+#   * the r_sign factor, the Gram-Schmidt order (bitangent first, then tangent
+#     against both n and the new bitangent), and the fallback basis for
+#     degenerate frames all match.
+#
+# It is used by the main mesh path (via SpellAddTangentSpace), lod_far_gen and
+# spt_converter, so all three benefit.  Verify with
+# `python tools/nif_perf.py --baseline ...` — byte-equality is the contract.
+def _install_vectorised_tangent_space():
+    try:
+        import numpy as np
+    except ImportError:
+        return False
+    from pyffi.formats.nif import NifFormat
+
+    geom = NifFormat.NiTriBasedGeom
+    if getattr(geom, '_tesconv_fast_tangents', False):
+        return False
+    if os.environ.get('TESCONV_PYFFI_NO_PERF_PATCH') \
+            or os.environ.get('TESCONV_PYFFI_NO_FAST_TANGENTS'):
+        return False
+
+    original = geom.update_tangent_space
+
+    def _quantise(a, factor):
+        """pyffi float_to_int semantics: round-half-away-from-zero, NaN -> 0."""
+        scaled = a * factor
+        out = np.where(np.isfinite(scaled),
+                       np.trunc(np.abs(scaled) + 0.5) * np.sign(scaled), 0.0)
+        return out.astype(np.int64)
+
+    def update_tangent_space(self, as_extra=None, vertexprecision=3,
+                             normalprecision=3):
+        data = self.data
+        if not isinstance(data, NifFormat.NiTriBasedGeomData):
+            return original(self, as_extra=as_extra,
+                            vertexprecision=vertexprecision,
+                            normalprecision=normalprecision)
+        if not data.uv_sets or not data.has_normals or not data.num_vertices:
+            return original(self, as_extra=as_extra,
+                            vertexprecision=vertexprecision,
+                            normalprecision=normalprecision)
+
+        n_v = data.num_vertices
+        verts = np.array([(v.x, v.y, v.z) for v in data.vertices],
+                         dtype=np.float64)
+        norms = np.array([(v.x, v.y, v.z) for v in data.normals],
+                         dtype=np.float64)
+        uvs = np.array([(v.u, v.v) for v in data.uv_sets[0]], dtype=np.float64)
+        if len(verts) != n_v or len(norms) != n_v or len(uvs) != n_v:
+            return original(self, as_extra=as_extra,
+                            vertexprecision=vertexprecision,
+                            normalprecision=normalprecision)
+
+        tris = np.array(data.get_triangles(), dtype=np.int64)
+        if tris.size == 0:
+            return original(self, as_extra=as_extra,
+                            vertexprecision=vertexprecision,
+                            normalprecision=normalprecision)
+
+        # Merge key: quantised vertex + normal (uv/vcol excluded, as pyffi
+        # passes uvprecision=-2 / vcolprecision=-2 for this call).
+        key = np.concatenate([_quantise(verts, 10 ** vertexprecision),
+                              _quantise(norms, 10 ** normalprecision)], axis=1)
+        _uniq, h_index = np.unique(key, axis=0, return_inverse=True)
+        h_index = h_index.reshape(-1)
+        n_h = int(h_index.max()) + 1 if len(h_index) else 0
+
+        i1, i2, i3 = tris[:, 0], tris[:, 1], tris[:, 2]
+        h1, h2, h3 = h_index[i1], h_index[i2], h_index[i3]
+        live = (h1 != h2) & (h2 != h3) & (h3 != h1)
+        if not live.any():
+            return original(self, as_extra=as_extra,
+                            vertexprecision=vertexprecision,
+                            normalprecision=normalprecision)
+        i1, i2, i3 = i1[live], i2[live], i3[live]
+        h1, h2, h3 = h1[live], h2[live], h3[live]
+
+        d_v2 = verts[i2] - verts[i1]
+        d_v3 = verts[i3] - verts[i1]
+        d_w2 = uvs[i2] - uvs[i1]
+        d_w3 = uvs[i3] - uvs[i1]
+
+        r = d_w2[:, 0] * d_w3[:, 1] - d_w3[:, 0] * d_w2[:, 1]
+        r_sign = np.where(r >= 0, 1.0, -1.0)[:, None]
+
+        sdir = (d_w3[:, 1:2] * d_v2 - d_w2[:, 1:2] * d_v3) * r_sign
+        tdir = (d_w2[:, 0:1] * d_v3 - d_w3[:, 0:1] * d_v2) * r_sign
+
+        with np.errstate(invalid='ignore', divide='ignore'):
+            s_len = np.linalg.norm(sdir, axis=1)
+            t_len = np.linalg.norm(tdir, axis=1)
+        ok = (s_len > 0) & (t_len > 0) & np.isfinite(s_len) & np.isfinite(t_len)
+        if not ok.any():
+            return original(self, as_extra=as_extra,
+                            vertexprecision=vertexprecision,
+                            normalprecision=normalprecision)
+        sdir = sdir[ok] / s_len[ok][:, None]
+        tdir = tdir[ok] / t_len[ok][:, None]
+        hh = np.stack([h1[ok], h2[ok], h3[ok]], axis=1).reshape(-1)
+
+        bins = np.zeros((n_h, 3))
+        tans = np.zeros((n_h, 3))
+        np.add.at(bins, hh, np.repeat(sdir, 3, axis=0))
+        np.add.at(tans, hh, np.repeat(tdir, 3, axis=0))
+
+        # Per-vertex Gram-Schmidt against the (normalised) normal.
+        nrm = norms.copy()
+        with np.errstate(invalid='ignore', divide='ignore'):
+            n_len = np.linalg.norm(nrm, axis=1)
+        bad_n = ~np.isfinite(n_len) | (n_len == 0)
+        nrm[bad_n] = (0.0, 1.0, 0.0)          # pyffi's yvec fallback
+        n_len = np.where(bad_n, 1.0, n_len)
+        nrm /= n_len[:, None]
+
+        b_v = bins[h_index]
+        t_v = tans[h_index]
+
+        b_v = b_v - nrm * np.einsum('ij,ij->i', nrm, b_v)[:, None]
+        with np.errstate(invalid='ignore', divide='ignore'):
+            b_len = np.linalg.norm(b_v, axis=1)
+        t_v = t_v - nrm * np.einsum('ij,ij->i', nrm, t_v)[:, None]
+
+        safe_b = np.where((b_len > 0) & np.isfinite(b_len), b_len, 1.0)[:, None]
+        b_unit = b_v / safe_b
+        t_v = t_v - b_unit * np.einsum('ij,ij->i', b_unit, t_v)[:, None]
+        with np.errstate(invalid='ignore', divide='ignore'):
+            t_len2 = np.linalg.norm(t_v, axis=1)
+
+        degenerate = (~np.isfinite(b_len) | (b_len == 0)
+                      | ~np.isfinite(t_len2) | (t_len2 == 0))
+        b_out = b_unit
+        t_out = t_v / np.where((t_len2 > 0) & np.isfinite(t_len2),
+                               t_len2, 1.0)[:, None]
+
+        if degenerate.any():
+            # pyffi: bin = x cross n (fall back to y cross n), tan = n cross bin
+            idx = np.nonzero(degenerate)[0]
+            n_d = nrm[idx]
+            b_d = np.cross(np.array((1.0, 0.0, 0.0)), n_d)
+            l_d = np.linalg.norm(b_d, axis=1)
+            fallback = (l_d == 0) | ~np.isfinite(l_d)
+            if fallback.any():
+                b_d[fallback] = np.cross(np.array((0.0, 1.0, 0.0)),
+                                         n_d[fallback])
+                l_d = np.linalg.norm(b_d, axis=1)
+            b_d = b_d / np.where(l_d > 0, l_d, 1.0)[:, None]
+            b_out = b_out.copy()
+            t_out = t_out.copy()
+            b_out[idx] = b_d
+            t_out[idx] = np.cross(n_d, b_d)
+
+        b_out = np.nan_to_num(b_out, nan=0.0, posinf=0.0, neginf=0.0)
+        t_out = np.nan_to_num(t_out, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # ---- write back exactly as pyffi does -------------------------------
+        extra = None
+        for ed in self.get_extra_datas():
+            if isinstance(ed, NifFormat.NiBinaryExtraData):
+                if ed.name == b'Tangent space (binormal & tangent vectors)':
+                    extra = ed
+                    break
+        if as_extra is None:
+            as_extra = bool(extra)
+
+        t32 = t_out.astype('<f4')
+        b32 = b_out.astype('<f4')
+        if as_extra:
+            if not extra:
+                extra = NifFormat.NiBinaryExtraData()
+                extra.name = b'Tangent space (binormal & tangent vectors)'
+                self.add_extra_data(extra)
+            extra.binary_data = t32.tobytes() + b32.tobytes()
+        else:
+            data.extra_vectors_flags = 16
+            data.tangents.update_size()
+            data.bitangents.update_size()
+            for vec, row in zip(data.tangents, t_out):
+                vec.x, vec.y, vec.z = float(row[0]), float(row[1]), float(row[2])
+            for vec, row in zip(data.bitangents, b_out):
+                vec.x, vec.y, vec.z = float(row[0]), float(row[1]), float(row[2])
+
+    geom.update_tangent_space = update_tangent_space
+    geom._tesconv_fast_tangents = True
+    return True
+
+
+# ---------------------------------------------------------------------------
+# NOT DONE: caching _get_filtered_attribute_list.  It looks like the obvious
+# next win (5.1M calls in a two-mesh conversion, re-deriving a per-class
+# constant), and it is WRONG.  Memoising it per (class, version, user_version)
+# — even restricted to classes where no attribute carries a `cond` — changed
+# the output of 7 of 30 sample meshes.  The filtering is not instance-
+# independent: `arg`/`vercond` can reference instance fields, and PyFFI mutates
+# instance state *while* walking the list during read, so a later attribute's
+# inclusion can depend on an earlier one's just-read value.  Verify any retry
+# with `python tools/nif_perf.py --baseline ...`, which is how this was caught.
+# ---------------------------------------------------------------------------
 
 
 def apply_patches():
@@ -818,6 +1113,13 @@ def apply_patches():
         from pyffi.formats.nif import NifFormat
         _apply_nifformat_patches(NifFormat)
         _install_no_op_struct_logging()
+        _install_vectorised_tangent_space()
+        if not _install_deterministic_string_table():
+            # Loud on purpose: without it every mesh build differs from the
+            # last one for no reason, and byte-comparisons become meaningless.
+            print("WARNING: PyFFI string-table determinism patch did not "
+                  "install; converted NIFs will vary between runs.",
+                  file=sys.stderr)
         _PYFFI_PATCHED = True
         return True
     except ImportError:

@@ -537,19 +537,27 @@ def _decode_land(body, _sub):
     #   Offset += ShiftZ / DELTA_SCALE  → Offset is in delta units.
     vhgt_offset = struct.unpack_from('<f', vhgt, 0)[0]
     deltas = np.frombuffer(vhgt[4:4 + VERTS_SIDE*VERTS_SIDE], dtype=np.int8
-                           ).reshape(VERTS_SIDE, VERTS_SIDE).astype(np.float32)
+                           ).reshape(VERTS_SIDE, VERTS_SIDE)
 
-    heights = np.zeros((VERTS_SIDE, VERTS_SIDE), dtype=np.float32)
-    acc = vhgt_offset
-    for row in range(VERTS_SIDE):
-        acc += deltas[row, 0]           # first delta of each row updates row accumulator
-        row_start = acc
-        col_acc = row_start
-        heights[row, 0] = col_acc * DELTA_SCALE
-        for col in range(1, VERTS_SIDE):
-            col_acc += deltas[row, col]
-            heights[row, col] = col_acc * DELTA_SCALE
-        acc = row_start                 # next row's delta[row,0] is relative to this row's start
+    # Vectorised form of the two nested accumulations described above.  The
+    # scalar version ran 33x33 = 1,089 Python iterations per LAND record, and
+    # Tamriel has tens of thousands of them — it dominated the SERIAL LAND
+    # parse that runs before the terrain-LOD tile pool starts (~18x faster
+    # here).
+    #
+    # Both accumulations are plain prefix sums, and they are done in INT32:
+    #   row starts   = cumsum(delta[:, 0])        (down column 0)
+    #   within a row = row_start + cumsum(...)    (across, seeded at column 0)
+    # The deltas are int8, so integer prefix sums are EXACT — there is no
+    # accumulation-order rounding to reproduce, which a float32 cumsum could
+    # not have matched against the scalar loop's mixed float32/Python-float
+    # accumulator anyway.  The single float conversion happens at the end, so
+    # each height is (offset + integer) * DELTA_SCALE computed once.
+    steps = deltas.astype(np.int32)
+    steps[:, 0] = np.cumsum(steps[:, 0])          # row starts, exact
+    np.cumsum(steps, axis=1, out=steps)           # across, seeded by column 0
+    heights = ((steps + np.float32(vhgt_offset)) * DELTA_SCALE
+               ).astype(np.float32)
 
     vclr = _sub(body, 'VCLR')
     if vclr and len(vclr) >= VERTS_SIDE * VERTS_SIDE * 3:
