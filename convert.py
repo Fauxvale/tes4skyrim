@@ -36,6 +36,8 @@ import argparse
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -58,6 +60,13 @@ if sys.stderr and hasattr(sys.stderr, "buffer"):
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
 SCRIPT_DIR = Path(__file__).parent.resolve()  # TESConversion root
+
+# Papyrus batch compilation (see phase_compile).  An error line from
+# papyrus.exe looks like:  <path>\Foo.psc:12:3: Checker error: <message>
+# The compiler aborts the whole batch on the first bad file, so each failing
+# script is quarantined and the batch retried; this bounds that loop.
+_PSC_ERR_RE = re.compile(r'^.*?([^\\/:]+\.psc):\d+:\d+:\s*(.*)$')
+_MAX_BATCH_RETRIES = 25
 
 # Suppress console windows when spawned from a console-less parent (pythonw/.pyw)
 from subprocess_flags import POPEN_FLAGS as _POPEN_FLAGS, configure_multiprocessing
@@ -507,6 +516,74 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
     err_count = 0
     err_samples: list = []
 
+    def _header_args() -> list:
+        h = ["-h", str(skyrim_headers), "-h", str(script_src)]
+        for d in master_src_dirs:
+            h += ["-h", str(d)]
+        return h
+
+    def _compile_batch(quarantine: set) -> tuple:
+        """Compile the whole source dir in ONE compiler process.
+
+        papyrus.exe parses the ~3,000 Skyrim headers once per invocation, so
+        compiling per-file paid that cost 15,961 times (~82 ms each = ~22 min
+        of serial CPU, which is what a 4-core machine actually experiences).
+        Batch mode is ~2.4 ms/script marginal — the whole plugin in ~40 s in a
+        single process, with no dependence on the core count at all.
+
+        The catch, and why this is not a plain swap: the compiler ABORTS the
+        run on the first bad file and writes NO .pex at all (measured: 1 broken
+        script of 201 -> 0 .pex).  So a failing file must be quarantined and
+        the batch retried.  Scanner/parser errors surface one file at a time;
+        checker errors surface for every bad file at once.  Either way each
+        error line names its file, so `quarantine` grows by at least one entry
+        per pass and the loop terminates.
+
+        Returns (ok, errors, bad_files).
+        """
+        # A quarantined file must leave the input directory, so a failing batch
+        # runs against a staging copy.  Built ONCE and then maintained
+        # incrementally: re-copying ~16k scripts on every retry costs far more
+        # than the compile itself, and each retry only ever removes files.
+        if quarantine:
+            stage = script_out / "_batch_src"
+            if not stage.is_dir():
+                stage.mkdir(parents=True, exist_ok=True)
+                for p in psc_files:
+                    shutil.copy2(p, stage / p.name)
+            for name in quarantine:
+                try:
+                    (stage / name).unlink()
+                except FileNotFoundError:
+                    pass
+            in_dir = stage
+        else:
+            in_dir = script_src
+
+        c = [str(compiler), "compile", "-nocache",
+             "-i", str(in_dir), "-o", str(script_out)] + _header_args()
+        try:
+            r = subprocess.run(c, capture_output=True, text=True,
+                               timeout=1800, cwd=str(SCRIPT_DIR), **_POPEN_FLAGS)
+        except Exception as e:
+            return (False, [f"batch: {e}"], set())
+
+        combined = (r.stdout or "") + (r.stderr or "")
+        bad: set = set()
+        errors: list = []
+        # Error lines look like: <path>\Foo.psc:12:3: Checker error: ...
+        for line in combined.splitlines():
+            m = _PSC_ERR_RE.match(line.strip())
+            if m:
+                bad.add(m.group(1))
+                errors.append(f"{m.group(1)}: {m.group(2).strip()}")
+        ok = not bad and "failed to compile" not in combined
+        if not ok and not bad:
+            # Failed without naming a file — cannot make progress by
+            # quarantining, so let the caller fall back to per-file.
+            errors.append("batch failed without naming a file")
+        return (ok, errors, bad)
+
     def _compile_one(psc: Path) -> tuple:
         pex_name = psc.stem + ".pex"
         pex_path = script_out / pex_name
@@ -541,17 +618,72 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
             return (False, str(e))
 
     all_errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_compile_one, psc): psc for psc in psc_files}
-        for fut in as_completed(futures):
-            success_f, msg = fut.result()
-            if success_f:
-                ok_count += 1
-            else:
-                err_count += 1
-                all_errors.append(f"{futures[fut].name}: {msg}")
-                if len(err_samples) < 10:
-                    err_samples.append(f"  {futures[fut].name}: {msg}")
+
+    # ── Batch first ──────────────────────────────────────────────────────
+    # One compiler process for the whole directory. Only the files it names as
+    # broken fall back to a per-file compile, so a healthy build never spawns
+    # 15,961 processes and a broken one still produces every good .pex.
+    t_c = time.time()
+    quarantine: set = set()
+    batch_ok = False
+    give_up = False
+    for _attempt in range(_MAX_BATCH_RETRIES):
+        ok, errs, bad = _compile_batch(quarantine)
+        if ok:
+            batch_ok = True
+            break
+        new_bad = bad - quarantine
+        if not new_bad:
+            # No progress possible (unnamed failure, or the same file again).
+            give_up = True
+            break
+        quarantine |= new_bad
+        print(f"  batch: quarantining {len(new_bad)} failing script(s), "
+              f"retrying ({len(quarantine)} total)")
+    else:
+        give_up = True
+
+    shutil.rmtree(script_out / "_batch_src", ignore_errors=True)
+
+    if batch_ok or not give_up:
+        # Every non-quarantined script compiled in the batch pass.
+        ok_count = psc_count - len(quarantine)
+        # Recheck the quarantined ones individually: a file can be dragged into
+        # a batch failure by a *dependency* error, and compiles fine alone.
+        if quarantine:
+            print(f"  batch: {ok_count} compiled; re-checking "
+                  f"{len(quarantine)} quarantined script(s) individually...")
+            for name in sorted(quarantine):
+                psc = script_src / name
+                success_f, msg = _compile_one(psc)
+                if success_f:
+                    ok_count += 1
+                else:
+                    err_count += 1
+                    all_errors.append(f"{name}: {msg}")
+                    if len(err_samples) < 10:
+                        err_samples.append(f"  {name}: {msg}")
+        print(f"  Batch compile: {time.time() - t_c:.1f}s")
+    else:
+        # The batch could not be made to make progress — fall back to the
+        # original per-file path so a pathological case still ships .pex files.
+        print("  batch compile could not isolate the failure; "
+              "falling back to per-file compilation")
+        ok_count = err_count = 0
+        err_samples.clear()
+        all_errors.clear()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_compile_one, psc): psc for psc in psc_files}
+            for fut in as_completed(futures):
+                success_f, msg = fut.result()
+                if success_f:
+                    ok_count += 1
+                else:
+                    err_count += 1
+                    all_errors.append(f"{futures[fut].name}: {msg}")
+                    if len(err_samples) < 10:
+                        err_samples.append(f"  {futures[fut].name}: {msg}")
+        print(f"  Per-file compile: {time.time() - t_c:.1f}s")
 
     print(f"[{file_name}] Compilation: {ok_count}/{psc_count} succeeded, "
           f"{err_count} failed")

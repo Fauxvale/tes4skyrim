@@ -38,6 +38,8 @@ mesh's links are appended in sorted order, so the output stays byte-reproducible
 import struct
 from collections import defaultdict
 
+import numpy as np
+
 # NVNM layout constants (see module docstring).
 EDGE_LINK_SIZE = 10
 DOOR_TRI_SIZE = 10
@@ -82,15 +84,35 @@ class NavMeshView:
             self.grid = None
             p += 4                               # interior: cell FormID
         head_end = p
+        # Vectorised decode.  The per-element struct.unpack_from loops this
+        # replaces were 39% of the whole edge-link pass (15.3M calls over 6.5k
+        # meshes).
+        #
+        # verts/tris stay NUMPY ARRAYS rather than being converted back to
+        # Python lists: add_link mutates a triangle row in place, so a list
+        # form would have to be re-converted with np.asarray on every seam scan
+        # (measured: 103k asarray calls, 11.9s — more than the decode it was
+        # meant to save).  Arrays are mutated directly and _border_edges reads
+        # them with no conversion at all.
+        #
+        # verts are float64 for the same reason the seam midpoints are: the
+        # original scalar code did that arithmetic on Python floats (doubles),
+        # and computing it in float32 shifts midpoints enough to reorder
+        # near-ties in the greedy pairing (measured: 4 extra links).
         nv = struct.unpack_from('<I', blob, p)[0]
         p += 4
-        self.verts = [struct.unpack_from('<fff', blob, p + i * 12)
-                      for i in range(nv)]
+        self.verts = np.frombuffer(blob, dtype='<f4', count=nv * 3,
+                                   offset=p).reshape(nv, 3).astype(np.float64)
         p += nv * 12
         nt = struct.unpack_from('<I', blob, p)[0]
         p += 4
-        self.tris = [list(struct.unpack_from(TRI_STRUCT, blob, p + i * TRI_SIZE))
-                     for i in range(nt)]
+        # Triangle record is 6 signed + 2 unsigned shorts.  Reading it as int16
+        # would make the two trailing unsigned fields negative, so widen to
+        # int32 and restore the sign of the last two columns only.
+        self.tris = np.frombuffer(blob, dtype='<i2', count=nt * 8,
+                                  offset=p).reshape(nt, 8).astype(np.int32)
+        if nt:
+            self.tris[:, 6:8] &= 0xFFFF
         p += nt * TRI_SIZE
         ne = struct.unpack_from('<I', blob, p)[0]
         p += 4
@@ -101,13 +123,20 @@ class NavMeshView:
         self.tail = blob[p:]                     # doors, cover, grid, bbox
 
     def pack(self) -> bytes:
+        """Re-emit the NVNM blob.
+
+        Vectorised for the same reason as the decode above.  Byte-for-byte
+        identical to the per-element struct.pack loop it replaces: verts are
+        float32 triples, triangles 8 little-endian shorts (the two unsigned
+        trailing fields wrap identically under an int16 view), links 10 bytes
+        each — the one field group that stays a Python loop, since it is a
+        mixed 4/4/2 layout and there are only a handful per mesh.
+        """
         out = bytearray(self.head)
         out += struct.pack('<I', len(self.verts))
-        for x, y, z in self.verts:
-            out += struct.pack('<fff', x, y, z)
+        out += self.verts.astype('<f4', copy=False).tobytes()
         out += struct.pack('<I', len(self.tris))
-        for t in self.tris:
-            out += struct.pack(TRI_STRUCT, *t)
+        out += self.tris.astype('<i2', copy=False).tobytes()
         out += struct.pack('<I', len(self.links))
         for typ, nav, tri in self.links:
             out += struct.pack('<IIh', typ, nav, tri)
@@ -119,7 +148,7 @@ class NavMeshView:
         """Flag one triangle edge as external and point it at another mesh."""
         link_index = len(self.links)
         self.links.append([LINK_TYPE_PORTAL, other_fid, other_tri])
-        tri = self.tris[tri_index]
+        tri = self.tris[tri_index]               # numpy row view — mutates in place
         tri[3 + edge_slot] = link_index          # edge field becomes a link index
         tri[6] |= (1 << edge_slot)               # 'Edge N Link' flag
         self.dirty = True
@@ -158,25 +187,50 @@ def _border_edges(view: NavMeshView, axis: int, coord: float):
     A border edge is one whose neighbour field is -1 (nothing local adjoins it).
     `axis` 0 = the seam is a constant-X plane, 1 = constant-Y.
     """
-    out = []
+    if len(view.tris) == 0:
+        return []
+    # Vectorised: this was 28% of the edge-link pass, because every seam
+    # rescans both of its meshes' full triangle lists in Python (24k calls over
+    # 6.5k meshes).  The numpy form evaluates the same predicate over all
+    # triangles x 3 slots at once.  Emission order is preserved (triangle
+    # index, then slot) so the greedy seam matching downstream is unchanged.
+    tris = view.tris
     verts = view.verts
-    for ti, t in enumerate(view.tris):
-        if t[6] & 0x0008:                       # Deleted
+    flags = tris[:, 6]
+    alive = (flags & 0x0008) == 0
+    vids = tris[:, 0:3]
+
+    rows = []
+    for slot in range(3):
+        sel = alive & (tris[:, 3 + slot] == -1) & ((flags & (1 << slot)) == 0)
+        if not sel.any():
             continue
-        vids = (t[0], t[1], t[2])
-        for slot in range(3):
-            if t[3 + slot] != -1:
-                continue                        # has a local neighbour
-            if t[6] & (1 << slot):
-                continue                        # already linked
-            a = verts[vids[slot]]
-            b = verts[vids[(slot + 1) % 3]]
-            if abs(a[axis] - coord) > SEAM_BAND or abs(b[axis] - coord) > SEAM_BAND:
-                continue
-            mid_other = ((a[1 - axis] + b[1 - axis]) * 0.5)
-            mid_z = (a[2] + b[2]) * 0.5
-            out.append((ti, slot, mid_other, mid_z))
-    return out
+        idx = np.nonzero(sel)[0]
+        a = verts[vids[idx, slot]]
+        b = verts[vids[idx, (slot + 1) % 3]]
+        # NOT(> band) rather than (<= band): the original skipped on `>`, so a
+        # NaN coordinate (Nehrim ships uninitialised placement floats) was
+        # KEPT.  `<=` would silently drop it.  Same predicate, same result.
+        with np.errstate(invalid='ignore'):
+            on_seam = ~((np.abs(a[:, axis] - coord) > SEAM_BAND) |
+                        (np.abs(b[:, axis] - coord) > SEAM_BAND))
+        if not on_seam.any():
+            continue
+        keep = np.nonzero(on_seam)[0]
+        ti = idx[keep]
+        mid_other = (a[keep, 1 - axis] + b[keep, 1 - axis]) * 0.5
+        mid_z = (a[keep, 2] + b[keep, 2]) * 0.5
+        rows.append((ti, np.full(ti.shape, slot), mid_other, mid_z))
+
+    if not rows:
+        return []
+    ti = np.concatenate([r[0] for r in rows])
+    sl = np.concatenate([r[1] for r in rows])
+    mo = np.concatenate([r[2] for r in rows])
+    mz = np.concatenate([r[3] for r in rows])
+    order = np.lexsort((sl, ti))            # triangle index, then slot
+    return [(int(ti[i]), int(sl[i]), float(mo[i]), float(mz[i]))
+            for i in order]
 
 
 def _seam_sort_key(e):

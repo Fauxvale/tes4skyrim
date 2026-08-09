@@ -40,6 +40,13 @@ Summary of patches
    — absent for ALL Bethesda 20.2 formats including Skyrim.
    Fix: change condition to user_version >= 11 so they are absent in both FO3
    and Skyrim when version == 20.2.0.7.
+
+9. StructBase._log_struct -> no-op  (PERFORMANCE ONLY)
+   PyFFI calls a debug-logging helper for every attribute of every struct on
+   both read and write, doing getattr/isinstance/get_value/str.format work
+   that the (never-enabled) logger then throws away.  ~11.5% of NIF conversion
+   time.  Replaced with a no-op unless DEBUG is actually enabled for the
+   "pyffi.nif.data.struct" logger.  Cannot affect output bytes.
 """
 
 import time as _time
@@ -768,6 +775,40 @@ def _install_skyrim_psysdata_serializer(NifFormat):
     PSysData.read = read
 
 
+# ---------------------------------------------------------------------------
+# Patch 9: kill PyFFI's per-attribute debug logging (PURE SPEED, no behaviour)
+# ---------------------------------------------------------------------------
+#
+# StructBase.read/write call self._log_struct(stream, attr) for EVERY attribute
+# of EVERY struct.  _log_struct does real work before the logger ever gets to
+# discard the record: a getattr for the value object, an isinstance check, a
+# get_value() call, and on the else-branch a full "".format() of six operands
+# including hex().  Nothing reads the output — the pipeline never enables DEBUG
+# on the "pyffi.nif.data.struct" logger.
+#
+# Measured on the two heaviest architecture NIFs (38.5 s of conversion):
+# 1,517,371 _log_struct calls costing 4.44 s cumulative (~11.5%), plus the
+# str.format hits inside it.  Replacing it with a no-op is a strict subset of
+# "logging is disabled", so it cannot change any output byte.
+#
+# Kept honest: if someone really does turn DEBUG on for that logger, the
+# original is restored, so the debugging path still exists.
+def _install_no_op_struct_logging():
+    import logging
+    from pyffi.object_models.xml.struct_ import StructBase
+
+    if getattr(StructBase, '_tesconv_nolog', False):
+        return
+    if logging.getLogger("pyffi.nif.data.struct").isEnabledFor(logging.DEBUG):
+        return                      # someone wants the debug output; leave it
+
+    def _log_struct(self, stream, attr):
+        return
+
+    StructBase._log_struct = _log_struct
+    StructBase._tesconv_nolog = True
+
+
 def apply_patches():
     """Import NifFormat and apply all patches.  Safe to call multiple times."""
     global _PYFFI_PATCHED
@@ -776,6 +817,7 @@ def apply_patches():
     try:
         from pyffi.formats.nif import NifFormat
         _apply_nifformat_patches(NifFormat)
+        _install_no_op_struct_logging()
         _PYFFI_PATCHED = True
         return True
     except ImportError:

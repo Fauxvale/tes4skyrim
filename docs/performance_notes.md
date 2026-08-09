@@ -3,6 +3,118 @@
 Linked from [CLAUDE.md](../CLAUDE.md). Measured optimisation results and the
 rules that keep the output byte-reproducible.
 
+## Low-core machines: where the time actually goes (measured 2026-08-09)
+
+The pipeline takes ~30 min on a 32-core box. Profiling for 4-8 core machines
+found that **the parallel stages are already mature** — the wins were all in
+*serial* work and in *per-process-spawn* overhead, both of which a low-core
+machine pays in full.
+
+The default worker count is `cpu_total() - 3` (`worker_budget.py`), so a 4-core
+machine runs **1 worker**. Anything not parallel therefore dominates there.
+
+### 1. Papyrus compile — one process per script (the biggest low-core win)
+
+`phase_compile` spawned **one `papyrus.exe` per .psc file**: 15,961 processes
+for Oblivion.esm, each re-parsing the ~3,000 Skyrim `Data\Source\Scripts`
+headers from scratch.
+
+| | measured |
+|---|---|
+| per-file, serial | 82 ms/script -> **~1,316 s of CPU** |
+| per-file @ 4 cores (1 worker) | **~22 minutes** |
+| per-file @ 32 cores (29 workers) | ~45 s (why it was invisible here) |
+| **batch `-i <dir>`, one process** | 200 scripts in 1.08 s; **2.37 ms/script marginal**, ~40 s for the whole plugin |
+
+`papyrus.exe compile -i` accepts a **directory**. The catch — and the reason
+the original code deliberately used per-file — is that **the compiler aborts
+the whole batch on the first bad file and writes ZERO .pex** (measured: 1
+broken script of 201 -> 0 .pex).
+
+So `phase_compile` is now **batch-first with quarantine-and-retry**: compile the
+directory; parse the failing filenames out of the error lines; copy everything
+except those into a staging dir; retry. Error-reporting shape (measured):
+
+- **Scanner/parser** errors surface **one file at a time**, each aborting.
+- **Checker** (semantic) errors surface for **every** bad file in one pass
+  (`failed to compile files, N errors`).
+- Every error line is `<path>\Foo.psc:LINE:COL: <Kind> error: <msg>`, so the
+  failing file is always recoverable from stdout.
+
+Quarantined scripts are then re-tried individually (a file can be dragged into
+a batch failure by a dependency), and if the batch cannot make progress at all
+the original per-file path still runs as a fallback. A healthy build spawns
+**one** compiler process instead of 15,961.
+
+Measured end-to-end on Oblivion.esm with every `.pex` deleted first:
+
+- **Clean build: 15,961/15,961 succeeded in 10.0 s** (one compiler process).
+- **With 2 deliberately-broken scripts injected**: quarantined both over two
+  retries, still compiled **15,961 of 15,963**, and reported each failure with
+  its exact compiler error. Plain batch mode would have emitted **zero** .pex.
+
+The staging directory is built **once and maintained incrementally** (each
+retry only deletes the newly-quarantined file). Re-copying all ~16k scripts per
+retry cost 129 s for the two-failure case — far more than the compiles.
+
+### 2. `build_edge_links` — 60-93 s single-threaded (4.25x, byte-identical)
+
+The largest serial block in `--import-only`: 93.2 s cold / 60.3 s warm, versus
+**21.7 s** for generating all 8,228 navmeshes across 29 workers.
+
+The cause was **not** algorithmic. Real seams are tiny — mean |A| = 5.7,
+median 5, max 33; 262k total inner-loop iterations across every seam — so
+`_match_seam`'s O(A x B) greedy pairing is only **1%** of the pass. The cost was
+per-element `struct` work:
+
+| | share |
+|---|---|
+| `NavMeshView.__init__` (per-vertex/per-tri `unpack_from`) | 39% |
+| `_border_edges` (Python triangle scan, 24k calls) | 28% |
+| `zlib.compress` | 11% |
+| `pack()` (per-element `struct.pack`) | 6% |
+
+numpy vectorisation of the decode, the pack, and the border-edge scan gives
+**4.25x (35.9 s -> 8.4 s), byte-identical output and an identical link count**
+(258,872). Two traps, both of which silently changed the link count:
+
+- **Vertices must stay float64.** The original computed seam midpoints from
+  Python floats (doubles). Doing it in float32 shifts midpoints by ~1e-2 units,
+  which reorders near-ties in the greedy pairing — **4 extra links**.
+- **Keep `verts`/`tris` as numpy arrays; do NOT `.tolist()` them.** `add_link`
+  mutates a triangle in place, so a list form has to be re-converted with
+  `np.asarray` on every seam scan: 103k calls costing **11.9 s**, more than the
+  decode it was meant to save. That version measured only 1.15x. Arrays are
+  mutated directly (`self.tris[i]` is a row view) and need no cache at all.
+- `np.frombuffer` returns a **read-only** array; the `.astype()` that widens
+  i2 -> i4 is what makes it writable (and restores the two unsigned columns
+  with `&= 0xFFFF`).
+
+Profile it in isolation without paying for a full import: set
+`TESCONV_DUMP_NAVM_CACHE=<path>` on an import run to pickle the precomputed
+navmesh cache, then profile `build_edge_links` against it.
+
+### 3. Mesh conversion is ~100% PyFFI object-model overhead
+
+Per-mesh cost scales with file size (~95 ms per 100 KB; median 304 ms, worst
+~9 s for a 2 MB architecture NIF). The profile is almost entirely PyFFI's
+generic XML-driven object model — `struct_.__init__`, `get_basic_attribute`,
+`getattr`, `_get_filtered_attribute_list` — **not** our conversion code. The
+stage already runs one process per core, so the only lever is per-mesh CPU.
+
+**Patch 9** (`asset_convert/pyffi_monkey_patch.py`): `StructBase._log_struct`
+-> no-op. PyFFI calls it for every attribute of every struct on **both** read
+and write, doing a `getattr`, an `isinstance`, a `get_value()` and a six-operand
+`str.format()` before the logger discards the record. Nothing consumes it — the
+pipeline's `_PyFFICapture` handler attaches at WARNING+. Measured 1,517,371
+calls / 4.44 s cumulative on two heavy NIFs. **1.09x, byte-identical**; the
+patch is skipped if DEBUG really is enabled for `pyffi.nif.data.struct`.
+
+Still on the table, not done (riskier — it touches conversion correctness):
+`NiTriBasedGeom.get_interchangeable_tri_shape` does a **double deepcopy** of all
+geometry (verts, normals, UVs, colours) purely to change the container type —
+8.4 s cumulative on two meshes.
+
 ## Parallelism rules (learned 2026-07-16)
 
 - **ThreadPoolExecutor is ONLY for I/O or subprocess work** (file reads,

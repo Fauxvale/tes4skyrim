@@ -1509,6 +1509,17 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # actor stands up) and never moves. Must run after every mesh exists (it
     # needs neighbour NAVM FormIDs + final triangle indices) and before the group
     # builders serialise them. See docs/world_land_navmesh_notes.md.
+    # Debug hook: TESCONV_DUMP_NAVM_CACHE=<path> pickles the precomputed cache
+    # so the edge-link / split post-passes can be profiled in isolation without
+    # paying for a full import each iteration (temp/edge_link_profile.py).
+    _dump_to = os.environ.get('TESCONV_DUMP_NAVM_CACHE', '').strip()
+    if _dump_to:
+        import pickle as _pickle
+        with open(_dump_to, 'wb') as _fh:
+            _pickle.dump(navm_cache, _fh, protocol=_pickle.HIGHEST_PROTOCOL)
+        print(f"  [debug] navm_cache dumped to {_dump_to} "
+              f"({len(navm_cache)} entries)")
+
     from .navm_edge_links import build_edge_links
     _t_el = time.time()
     build_edge_links(navm_cache)
