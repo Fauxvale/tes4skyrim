@@ -101,20 +101,20 @@ jobs:
 
           # Tag HEAD ITSELF -- no stamp commit.
           #
-          # This job used to write the version into VERSION and UPGRADE_STEPS.json,
-          # commit that, and tag the commit.  The commit could not be pushed to
-          # master (protected: "changes must be made through a pull request",
-          # and the Actions bot is not a bypass actor -- GH013), so it lived
-          # only on the tag, leaving master's VERSION permanently stale.  Worse,
-          # it made the whole scheme push-only: nothing about it could work for
-          # a PR merged in GitHub's UI.
+          # This job used to write a version stamp and a steps table into the
+          # tree, commit that, and tag the commit.  The commit could not be
+          # pushed to master (protected: "changes must be made through a pull
+          # request", and the Actions bot is not a bypass actor -- GH013), so it
+          # lived only on the tag, leaving master permanently stale.  Worse, it
+          # made the whole scheme push-only: nothing about it could work for a
+          # PR merged in GitHub's UI.
           #
-          # Both files it wrote are now delivered without a commit:
-          #   * VERSION  -- an `export-subst` template (.gitattributes), which
+          # Neither file is written any more:
+          #   * VERSION is an `export-subst` template (.gitattributes), which
           #     git expands to the tag name while building the source zip.  The
           #     download therefore knows its own version with no commit at all.
-          #   * UPGRADE_STEPS.json -- uploaded as a release asset below and
-          #     fetched over HTTPS by the GUI.
+          #   * The steps table is gone entirely -- the checklist inside THESE
+          #     NOTES is the only copy, read back from the release body below.
           git tag -a "$next_tag" -F "$RUNNER_TEMP/notes.txt"
           git push origin "$next_tag"
 

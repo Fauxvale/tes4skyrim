@@ -409,22 +409,6 @@ def installed_version_for(plugin: str | None) -> str | None:
 _TABLE: list[tuple[dict[str, list[str]], bool] | None] = [None]
 
 
-def _parse_steps_table(payload: object) -> dict[str, list[str]]:
-    """{version: [step labels]} from either table shape.
-
-    Tolerates both the wrapped `{"format":1,"versions":{...}}` form and a bare
-    version -> steps mapping, so an older published asset still parses.
-    """
-    if not isinstance(payload, dict):
-        return {}
-    versions = payload.get("versions", payload)
-    if not isinstance(versions, dict):
-        return {}
-    out: dict[str, list[str]] = {}
-    for version, steps in versions.items():
-        if isinstance(version, str) and isinstance(steps, list):
-            out[version] = [s for s in steps if isinstance(s, str)]
-    return out
 
 
 def _get_json(url: str, timeout: int):
