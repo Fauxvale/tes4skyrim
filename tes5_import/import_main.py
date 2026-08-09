@@ -198,6 +198,35 @@ _TES4_SPECIAL_RECORD_SIGS = {
 }
 
 
+def _master_export_dirs(ctx) -> list:
+    """The export directory of each TES4 master, in _HEADER.txt order.
+
+    `load_master_export` resolves masters exactly this way (sibling directories
+    of the plugin's own export, named after the master file). Both the master's
+    VTYP creation and this plugin's adoption of it must read the SAME RACE.txt,
+    so the derivation is shared rather than reproduced.
+    """
+    export_dir = getattr(ctx, 'export_dir', None)
+    if not export_dir:
+        return []
+    header = os.path.join(export_dir, '_HEADER.txt')
+    if not os.path.isfile(header):
+        return []
+    dirs = []
+    root = os.path.dirname(os.path.normpath(export_dir))
+    try:
+        with open(header, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('Master['):
+                    _, _, val = line.partition('=')
+                    mdir = os.path.join(root, val.strip())
+                    if os.path.isdir(mdir):
+                        dirs.append(mdir)
+    except OSError:
+        return []
+    return dirs
+
+
 def _adopt_master_special_records(ctx) -> None:
     """Point the well-known registry at the MASTER's synthesized records.
 
@@ -237,16 +266,49 @@ def _adopt_master_special_records(ctx) -> None:
     # of 3,838.) The master already wrote these VTYPs; adopt its FormIDs.
     from .skyrim_overrides import CUSTOM_VTYP_EDIDS, set_voice_type
     voices = 0
-    for vtyp_edid, (race_edid, gender) in CUSTOM_VTYP_EDIDS.items():
+
+    def _adopt(vtyp_edid: str, race_edid: str, gender: str) -> bool:
         try:
             fid = index.find_by_edid(b'VTYP', vtyp_edid)
         except Exception:
-            continue
-        if fid:
-            set_voice_type(race_edid, gender, fid)
+            return False
+        if not fid:
+            return False
+        set_voice_type(race_edid, gender, fid)
+        return True
+
+    for vtyp_edid, (race_edid, gender) in CUSTOM_VTYP_EDIDS.items():
+        if _adopt(vtyp_edid, race_edid, gender):
             voices += 1
-    if voices:
-        print(f"  Adopted {voices} master voice types (VTYP)")
+
+    # The fixed table above is Oblivion's race list, so it names only the VTYPs
+    # the master created from THAT list. A master also emits one VTYP per race
+    # of its OWN (Nehrim's Alemanne/Hochelf/..., Morroblivion's Draugr/Vivec/
+    # ...), and a dependent plugin has no other way to reach them: creation is
+    # gated on `if not ctx`, so adoption is the ONLY path. Skipping them left
+    # 29 of Morroblivion's 36 resolvable actors falling through to the Imperial
+    # default — the same silently-wrong routing this whole module exists to
+    # stop, just quieter, because Imperial does have recordings. Derive the
+    # master's own races the way the master itself did and adopt those too.
+    derived = 0
+    try:
+        from asset_convert.voice_races import load_race_voices
+        from asset_convert.voice_races import vtyp_edid as _vtyp_edid
+    except ImportError:
+        load_race_voices = None     # asset_convert unavailable — fixed set only
+    if load_race_voices is not None:
+        for mdir in _master_export_dirs(ctx):
+            try:
+                races = load_race_voices(mdir)
+            except OSError:
+                continue
+            for race_edid, key in sorted(races.by_race_edid.items()):
+                for gender in ('Male', 'Female'):
+                    if _adopt(_vtyp_edid(key, gender), race_edid, gender):
+                        derived += 1
+    if voices or derived:
+        extra = f"; {derived} from the master's own races" if derived else ''
+        print(f"  Adopted {voices + derived} master voice types (VTYP){extra}")
 
 
 def _create_tes4_special_records(writer: PluginWriter):

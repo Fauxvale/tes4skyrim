@@ -26,8 +26,14 @@ cannot disagree:
     generic per-race lines land in the folder the speaker's VTYP names.
 
 For Oblivion this reproduces the previously hardcoded names exactly — "High
-Elf" -> HighElf, "Dark Elf" -> DarkElf, "Golden Saint" -> GoldenSaint — so its
-output is unchanged.
+Elf" -> HighElf, "Dark Elf" -> DarkElf, "Golden Saint" -> GoldenSaint — so
+every race keeps the voice type it already had.
+
+A race with no FULL is SKIPPED rather than falling back to its EditorID: the
+folder on disk is the display name, so a race that has no display name has no
+folder, and giving it an identity here would point it at an empty directory.
+Oblivion's VampireRace is exactly that case and the fixed table routes it to
+Imperial on purpose.
 """
 
 from pathlib import Path
@@ -104,10 +110,18 @@ def load_race_voices(export_dir) -> RaceVoices:
         edid = (rec.get('EditorID') or '').strip()
         if not edid:
             continue
-        # A race with no display name (Oblivion's VampireRace, UndeadRace) can
-        # still own NPCs, so give it an identity of its own rather than
-        # dropping it into somebody else's voice type.
-        full = (rec.get('FULL') or '').strip() or edid
+        # A race with NO display name has no voice folder either — the folder
+        # IS the display name.  Minting it an identity of its own therefore
+        # points it at a directory that cannot exist, so it must fall through
+        # to the caller's fixed table instead.  Oblivion's VampireRace
+        # (0x00000019, FULL absent) is the case that matters: the fixed table
+        # deliberately routes it to Imperial, which HAS recordings, and
+        # claiming it here overrode that and silenced those actors.  "Somebody
+        # else's voice type" is a folder with audio in it; its own would be
+        # empty.
+        full = (rec.get('FULL') or '').strip()
+        if not full:
+            continue
         key = voice_key(full)
         if not key:
             continue
