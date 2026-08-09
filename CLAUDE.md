@@ -355,6 +355,15 @@ theories externally first.
   Rules and measured results: [docs/performance_notes.md](docs/performance_notes.md).
 - **Never exhaust memory**: some pool tools load the ~2.1 GB export index per
   worker. Cap `--workers` or run single-process.
+- **<a id="formid-drift"></a>NEVER CAUSE FORMID DRIFT — AND SAY SO IF YOU DO.**
+  `alloc_formid()` is a bare `+1` counter, so an id is set purely by its call's
+  POSITION: add/remove/reorder ONE earlier allocation and every later id shifts,
+  silently corrupting every save. Add new generators at the END, never delete a
+  "dead" allocation, never unwrap a `sorted()` around a set. If a change shifts
+  ids anyway, **lead the final report with it** (types, rough count, why it was
+  unavoidable) — never bury it, never accept drift for tidiness. Guarded by
+  `tests/test_formid_determinism.py`; details and the per-file fragility map:
+  [performance_notes.md#formid-fragility-map](docs/performance_notes.md#formid-fragility-map).
 
 ### Output paths
 

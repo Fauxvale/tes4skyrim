@@ -30,6 +30,121 @@ rules that keep the output byte-reproducible.
 - **Pool tools can exhaust memory**: some load the ~2.1 GB export index PER
   WORKER. Cap `--workers` or run single-process for those.
 
+## FormID determinism — the save-game contract (audited 2026-08-09)
+
+A save game stores **FormIDs**. If a rebuild gives a generated record a
+different id, every save silently rebinds that object to whatever now holds the
+id — so **generated FormIDs must be identical run to run, and must not move
+when unrelated code changes.**
+
+`PluginWriter.alloc_formid()` (`tes5_import/writer.py:252`) is a bare `+1`
+counter. It carries no identity: an id is decided **purely by the position of
+its allocation call in the global sequence**. Two consequences:
+
+1. Same call sequence → same ids. Verified byte-for-byte.
+2. **Insert or remove ONE earlier allocation and every later id shifts by one.**
+
+### Audit result: currently deterministic (verified, not assumed)
+
+Every `alloc_formid()` call site is reached through `sorted()` or list-order
+iteration; there is no builtin `hash()` anywhere in the pipeline (only hashlib);
+every `os.listdir`/`glob` in `tes5_import` is sorted; pools use `ex.map`
+(submission order) and navmesh ids are pre-allocated serially *before* dispatch.
+The allocator base, `max_formid + 0x1000` (`import_main.py:761-771`), is a
+`max()` over all records — order-independent.
+
+End-to-end proof: built each plugin twice under different `PYTHONHASHSEED`
+values (`1` vs `424242`/`555555`/`99999`) — **byte-for-byte identical**:
+
+| Plugin | Size | Path exercised |
+|---|---|---|
+| `Oblivion.esm` | 613,807,139 B | full record set, navmesh + LAND pools |
+| `Morrowind_ob.esm` | 206,162,203 B | **masters** — overrides + injected records |
+| `DLCBattlehornCastle.esp` | 7,899 B | small dependent plugin |
+
+Guarded by `tests/test_formid_determinism.py` (static AST guards, verified to
+fire on a deliberate canary — they are not vacuous).
+
+### <a id="formid-fragility-map"></a>Where a code change WILL renumber FormIDs
+
+These are ordering-sensitive by design. Editing them is legal, but it **breaks
+existing saves**, so it belongs in a deliberate "saves reset" change, not a
+drive-by refactor.
+
+**A. Anything that adds/removes/reorders an allocation.** All ~50 sites shift
+everything allocated after them:
+
+| File | Generates |
+|---|---|
+| `record_types/equipment.py` (324, 447, 624, 804) | weapon STAT, **ARMA**, **PROJ**, book INAM |
+| `record_types/actors.py` (273, 869, 929, 991, 1017, 1118, 1133) | **OTFT**, origin/vendor/trainer FACT, FLST, CLAS clone |
+| `record_types/magic.py` (926, 1017, 1168) | AV / SEFF / bound-script MGEF variants |
+| `record_types/dialog_misc.py` (121, 314) | SOPM, **SNDR** |
+| `record_types/world.py` (106) | LTEX **TXST** |
+| `creature_races.py` (232, 304, 728, 740, 922-923) | creature VTYP, BPTD, MOVT, skin ARMA, RACE |
+| `creature_footsteps.py` (107-132) | IPCT / IPDS / FSTP / FSTS |
+| `creature_idles.py` (112) | creature IDLE tree |
+| `dialog_converter.py` (1847, 1884, 2006, 2434, 2617, 2924, 3013) | DIAL / INFO / **DLBR** / **DLVW** |
+| `dialog_unlocks.py` (405) | unlock **GLOB** per gated topic |
+| `locations.py` (189, 279) | **LCTN** |
+| `magic_effects.py` (126) | aimed-MGEF variants |
+| `leveled_actors.py` (205) | leveled-actor shells |
+| `navm_split.py` (230), `pgrd_to_navm.py` (1058) | **NAVM** |
+| `overrides.py` (166) | injected-record redirects |
+| `import_main.py` (324-497) | fame/infamy/fenced/crime GLOBs, GMSTs |
+
+**`import_main.py:1626` is a deliberate no-op allocation — never "clean it up".**
+It burns one id where the old freshly-allocated NAVI FormID used to sit. NAVI is
+now the fixed singleton `0x00012FB4`, so the alloc is functionally dead — but
+thousands of generated DIAL/INFO/DLBR/DLVW/LCTN/SNDR records are allocated after
+it, and removing it shifts every one of them by one relative to shipped builds,
+scrambling any save's dialogue/Papyrus state. It is the clearest example of rule
+A: an allocation's *existence* is load-bearing even when its *result* is unused.
+
+**B. Phase order in `import_main.py`.** Phase 1 is a serial loop
+(`import_main.py:1267`, "Serial on purpose") *specifically* to keep allocation
+order stable — the comment there records that a thread pool once shuffled
+companion FormIDs. Reordering phases, moving a `build_*` call, or making Phase 1
+concurrent renumbers everything. The creature voice/footstep/BPTD builders are
+allocated **last on purpose** (`import_main.py:1731` onward) so adding one
+cannot move any earlier id — **put new generators there.**
+
+**C. The sorted() calls that look redundant.** The `sorted()` wrapping a set at
+`creature_races.py:231` / `:276`, `dialog_unlocks.py:404`, `magic.py:917` /
+`:1011`, and the sorted-key loops in `locations.py` / `navm_split.py`, are all
+load-bearing. "Simplifying" one to a bare set
+reintroduces `PYTHONHASHSEED` dependence — the ids then differ **between runs on
+the same machine**, the worst form of this bug.
+
+**D. Conversion-order inputs.** `text_reader.parse_export_directory`
+(`sorted(os.listdir)` + `ex.map`) fixes record order; `by_type[sig]` lists
+inherit it. Changing export file naming, dedup (keep-last), or pool result
+assembly reorders records and therefore ids.
+
+**E. The allocator base.** `max_formid + 0x1000` — a new record with a higher
+TES4 id, or changing the `0x1000` gap, moves the whole generated range.
+
+### If a change WILL shift ids: tell the user, up front
+
+Drift is the user's call, not a detail to absorb — the cost lands on players,
+not on the build. Prefer the non-drifting route (add at the END, reuse an
+existing record, leave the allocation alone). If drift is genuinely unavoidable,
+finish the work, then **lead the final report with it**:
+
+1. Say it explicitly and up front — never buried at the bottom, never omitted
+   because the change is otherwise correct.
+2. State the blast radius: which record types renumber, and roughly how many.
+3. Say why it was unavoidable, and which non-drifting alternative you rejected.
+4. Never accept drift for a refactor, tidy-up or "simplification". If the only
+   benefit is cleanliness, the answer is no.
+
+This is a reporting duty, not a licence to stop mid-task.
+
+**Before shipping a change in these areas**, rebuild and diff with
+`tools/esm_diff.py old.esm new.esm` (it separates real diffs from reorders). To
+check pure reproducibility, build twice with different `PYTHONHASHSEED` and
+`cmp` the output — it must be byte-identical.
+
 ## Process containment — orphaned workers (learned 2026-07-29)
 
 `process_job.py` puts the pipeline in a **Windows Job Object**. Two properties,

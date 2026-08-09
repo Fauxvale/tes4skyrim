@@ -33,8 +33,6 @@ Major Issues for V1:
 	Morroblivion: can't get fighters guild quest after joining
 	Cheydinhall fighters guild: I give the weapons away, but the NPCs stand still and don't fight with me
 
-	11 - Make formid allocation deterministic
-
 Later Issues:
 
 	1 - Refine creature conversion further. Speed is still a bit off
