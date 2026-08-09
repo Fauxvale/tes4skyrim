@@ -48,7 +48,7 @@ A decent PC. The more cores and ram the better. The more cores, the more ram it 
 
 | Dependency | Purpose | Install |
 |------------|---------|---------|
-| **Python 3.8+** | Runs the whole pipeline | — |
+| **Python 3.14** | Runs the whole pipeline | — |
 | **[PyFFI](https://pyffi.sourceforge.net/)** | NIF mesh reading/writing | `pip install PyFFI` |
 | **[numpy](https://numpy.org/)** | Skin retargeting math | `pip install numpy` |
 | **[scipy](https://scipy.org/)** | Navmesh triangulation, collision hulls, trees | `pip install scipy` |
@@ -56,28 +56,31 @@ A decent PC. The more cores and ram the better. The more cores, the more ram it 
 | **[Pillow](https://pypi.org/project/pillow/)** | Terrain-LOD texture compositing, object-LOD atlas normals, book inventory art. **Terrain LOD produces no tiles at all without it** | `pip install Pillow` |
 | **[lz4](https://pypi.org/project/lz4/)** | Reading Skyrim SE BSAs (v105) — how vanilla assets are fetched when `export/skyrim_assets/` has no cached copy yet | `pip install lz4` |
 | **[mapbox_earcut](https://pypi.org/project/mapbox-earcut/)** | Navmesh triangulation fallback when Delaunay fails on a piece | `pip install mapbox_earcut` |
-| **[pytest](https://pytest.org/)** | Test runner | `pip install pytest` |
-| **ffmpeg** | Voice/sound audio conversion | On `PATH` |
+| **ffmpeg** | Voice/sound audio conversion | On `PATH` — [download](https://ffmpeg.org/download.html), or `winget install Gyan.FFmpeg` |
+| **Skyrim SE Creation Kit** | Supplies `LipGenerator.exe` (lip sync) and the Papyrus source headers every converted script compiles against | Free on Steam |
 | **xWMAEncode.exe** | xWMA voice compression | See note below |
-| **LipGenerator.exe** | Lip sync generation | Install the Creation Kit |
 
 ```bash
-pip install PyFFI numpy scipy shapely Pillow lz4 mapbox_earcut pytest
+pip install PyFFI numpy scipy shapely Pillow lz4 mapbox_earcut
 ```
 
-> **Navmesh native extensions.** The navmesh build requires two compiled modules,
-> committed prebuilt in `native/dist/` for **CPython 3.14 / 64-bit Windows**. A
-> `.pyd` only loads in a matching interpreter, so on any other Python version or
-> platform rebuild them with `python native/build.py` — that needs "Build Tools
-> for Visual Studio" with the C++ workload (a full Visual Studio install is not
-> required). See `native/dist/README.md`.
 
 > **xWMAEncode.exe** ships with the [Microsoft DirectX SDK (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=6812)
 > and cannot be redistributed. After installing the SDK, find it in `Utilities\bin\x86\`
 > and copy it to `external/xwmaencode/`. (You can also extract it from the SDK installer with
 > 7-Zip without a full install.)
 
-You also need to install the Skyrim SE Creation Kit from Steam (free)
+
+> **Note** Make sure your installed python version is **3.14** or you will run into issues
+> The navmesh build requires a compiled module, for **CPython 3.14 / 64-bit Windows**
+> A `.pyd` only loads in a matching interpreter, so you run with any other version you would need to rebuild
+> That can be done with `python native/build.py`
+> which needs "Build Tools for Visual Studio" with the C++ workload installed.
+>See `native/dist/README.md`.
+
+The pipeline checks each phase's dependencies before it starts: anything missing
+stops that phase and every phase after it, and says what to install at the bottom
+of the console. Run `python preflight.py` to check without starting a conversion.
 
 ---
 
@@ -194,6 +197,19 @@ python -m asset_convert.bsa_extract Oblivion.esm --data-path "C:/path/to/Oblivio
 # Tests
 python -m pytest tests/ -v
 ```
+
+### Development dependencies
+
+Only needed to run the test suite — a conversion never uses these, so end users
+can skip this entirely.
+
+| Dependency | Purpose | Install |
+|------------|---------|---------|
+| **[pytest](https://pytest.org/)** | Test runner | `pip install pytest` |
+
+A few `tools/` analysis scripts need extras nothing else does: `pefile` and
+`capstone` (exe disassembly), and `pywin32` for `game_bridge/test_protocol.py`.
+Install those only if you run those scripts.
 
 ---
 

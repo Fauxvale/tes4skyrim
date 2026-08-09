@@ -115,6 +115,9 @@ RULES: list[tuple[str, list[str]]] = [
     # Standalone starter plugin, built by tools/make_game_select_esp.py and
     # shipped as-is -- none of the 12 pipeline steps read or write it.
     (r"^TESGameSelect/",          []),
+    # Dependency preflight: gates the run before any phase starts and produces
+    # no conversion output of its own, so a change here re-runs nothing.
+    (r"^preflight\.py$",          []),
     (r"^CLAUDE\.md$|^README\.md$|^TODO\.txt$|^CK_WARNINGS", []),
     (r"^conversion_config\.json$|^pyproject\.toml$|^\.git\w+$", []),
     (r"^[^/]+\.code-workspace$", []),

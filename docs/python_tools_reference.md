@@ -3,6 +3,45 @@
 Linked from [CLAUDE.md](../CLAUDE.md). Command reference for the pipeline's
 Python modules and `tools/` debug utilities.
 
+## preflight.py (dependency gate)
+
+- **Check every phase**: `python preflight.py` — prints OK / MISSING per phase
+- **Check some phases**: `python preflight.py sounds lod scripts`
+- Exit code `0` = all satisfied, `1` = something missing, `2` = bad arguments
+
+`convert.py` calls `check_phases()` **before any phase runs** and aborts with
+`RC_MISSING_DEP` (=2) on the first gap, printing `format_report()` at the very
+bottom of the console. The GUI treats that exit code as fatal and stops the
+remaining steps — without it each step is its own process, so later ones would
+run on and produce half-converted output.
+
+- **Python version is a WARNING, not a gate** (`python_version_warning()`,
+  `SUPPORTED_PYTHON = (3, 14)`). Off-version runs are viable once the navmesh
+  `.pyd` is rebuilt, so the run continues — but the warning says so up front,
+  because the rebuild needs "Build Tools for Visual Studio" with the C++
+  workload and that is where people get stuck. The expected filename comes from
+  `sysconfig.get_config_var('EXT_SUFFIX')`, never a hardcoded `cp314` — a
+  literal would tell a 3.13 user to look for a file their build never produces.
+- **Why a gate at all**: a missing external tool usually does **not** fail
+  loudly. `convert_sounds` passes `convert_audio=(ffmpeg is not None)` and
+  returns success, so no ffmpeg silently ships a plugin whose every voice line
+  is missing. Same shape for Pillow (terrain LOD emits no tiles at all).
+- **A probe must reuse the phase's own lookup.** The audio probes call
+  `find_ffmpeg` / `find_xwmaencode` / `find_lipgenerator` from
+  `asset_convert.audio_converter`; the native probe mirrors
+  `_native_loader.py`'s ABI-tagged filename rule. A probe that reimplements the
+  search can pass while the phase then fails to find the tool —
+  `tests/test_preflight.py` asserts they agree.
+- **Probe by IMPORT name, not pip name** (`PIL`, not `Pillow`) — the pip name
+  goes only in the instruction text.
+- Binaries committed under `external/` (papyrus, hkxcmd, BSArch, LODGenx64,
+  MOPP bridge) are still checked, but reported as "restore it from git", not as
+  something to install — they ship with the repo, so absence means a broken
+  checkout or an antivirus quarantine.
+- Adding a phase requirement: add the probe to `_REQUIREMENTS[<phase>]`. Any
+  new pip package must also go in the README's install line — a test enforces
+  that both lists match exactly, in both directions.
+
 ## tes4_export (export pipeline)
 - **Export**: `python -m tes4_export.export "path/to/Oblivion.esm"` — Pure TES4 binary dump to KEY=VALUE text
 - **Pipeline**: `python convert.py` — Full export→import pipeline

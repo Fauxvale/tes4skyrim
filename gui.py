@@ -20,6 +20,7 @@ SCRIPT_DIR  = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / "conversion_config.json"
 
 from worker_budget import worker_count, cpu_total, WORKERS_ENV_VAR
+from preflight import RC_MISSING_DEP as _RC_MISSING_DEP
 from collision_options import (
     WINDING_FIX_DEFAULT_PLUGINS,
     default_for_plugin as _winding_default,
@@ -1355,8 +1356,36 @@ def gui_main():
                                    font=("Consolas", 9, "bold"))
     log_text.tag_configure("dim",  foreground=CLR["subtext"])
 
+    # preflight emits two multi-line banners, each `HEADER / rule / body / rule`
+    # (header FIRST, so no leading rule steals the "head" style).  Both must
+    # keep one colour throughout: their bodies are install/build instructions
+    # that would otherwise classify as plain text and lose the visual grouping.
+    # State is (tag, rules_seen); the banner closes on its second rule.
+    #   MISSING DEPENDENCY … / "=" rules  -> err   (run aborted)
+    #   WARNING: Python version / "-" rules -> warn (run continues)
+    _banner = [None]
+
     def _classify(line: str) -> str:
         l = line.lower()
+        stripped = line.strip()
+        is_rule = bool(stripped) and set(stripped) in ({"="}, {"-"})
+        if _banner[0] is not None:
+            tag, seen = _banner[0]
+            if is_rule:
+                seen += 1
+                _banner[0] = None if seen >= 2 else (tag, seen)
+            return tag
+        # Match each banner's own header line only — the one-line "STOPPED -
+        # MISSING DEPENDENCY" summary the GUI prints afterwards also says
+        # "missing dependency" and must not re-open the banner.
+        if l.startswith("missing dependency"):
+            _banner[0] = ("err", 0)
+            return "err"
+        if l.startswith("warning: python version"):
+            _banner[0] = ("warn", 0)
+            return "warn"
+        if "missing dependency" in l:
+            return "err"
         if line.startswith("===") or "phase" in l[:20]:
             return "head"
         if "error" in l and "errors" not in l:
@@ -1551,12 +1580,21 @@ def gui_main():
                         if r == -2:
                             ret = -2
                             break
+                        if r == _RC_MISSING_DEP:
+                            # convert.py already printed what is missing and how
+                            # to install it.  Each step is its own process, so
+                            # nothing else would stop the remaining ones from
+                            # running and producing half-converted output.
+                            ret = r
+                            break
                         if r != 0:
                             ret = r
 
                 q.put("")
                 if ret == -2:
                     q.put("  CANCELLED")
+                elif ret == _RC_MISSING_DEP:
+                    q.put("  STOPPED - MISSING DEPENDENCY (see above)")
                 elif ret == 0:
                     q.put("  DONE")
                 else:

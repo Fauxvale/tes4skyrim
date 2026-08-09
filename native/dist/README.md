@@ -1,12 +1,15 @@
-# Prebuilt navmesh extensions
+# Prebuilt navmesh extension
 
-Two compiled modules, both **committed on purpose** — the navmesh build
-requires them and most machines running the conversion have no C++ compiler:
+One compiled module, **committed on purpose** — the navmesh build requires it
+and most machines running the conversion have no C++ compiler:
 
 | Module | Source | Used by |
 |---|---|---|
-| `_navmesh_native.<abi>.pyd` | `../src/decimate.cpp` | `navmesh.spanmesh` — mesh decimation |
 | `_navgrow_native.<abi>.pyd` | `../src/grow.cpp` | `navmesh.corridor_grow` (Phase-2 width march) and `navmesh.corridor_union` (per-vertex surface levels) |
+
+(`_navmesh_native` / `decimate.cpp` served the old `spanmesh` generator and was
+deleted with it — see
+[performance_notes.md](../../docs/performance_notes.md#L588).)
 
 `grow.cpp` exists because those two kernels dominated generation: a single
 dense interior cell (Wendir02, 938 edges) spent ~150s in the width march alone

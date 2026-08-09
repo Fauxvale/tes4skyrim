@@ -1200,6 +1200,41 @@ def main():
         do_lod = do_skyrim_patch = do_pack_bsa = do_prune = True
         do_pack_zip = False
 
+    # ── Dependency preflight ─────────────────────────────────────────────────
+    # Check every selected phase BEFORE running any of them.  A phase whose
+    # tool is missing does not fail loudly on its own -- Sounds without ffmpeg
+    # just ships a mute plugin -- so the run stops at the first gap and prints
+    # what to install at the very bottom of the console, where the GUI log
+    # leaves it on screen.
+    import preflight
+    # A version mismatch is a warning, not a gate: the pipeline does run on
+    # another 3.x once the navmesh extension is rebuilt.  Printed before the
+    # dependency check so the two do not interleave.
+    _pywarn = preflight.python_version_warning()
+    if _pywarn:
+        print(preflight.format_python_warning(_pywarn))
+    _selected = [name for name, on in (
+        ('export',       do_export),
+        ('extract',      do_extract),
+        ('meshes',       do_meshes),
+        ('speedtrees',   do_speedtrees),
+        ('creatures',    do_creatures),
+        ('import',       do_import),
+        ('sounds',       do_sounds),
+        ('scripts',      do_scripts),
+        ('lod',          do_lod),
+        ('skyrim_patch', do_skyrim_patch),
+        ('prune',        do_prune),
+        ('pack_bsa',     do_pack_bsa),
+        ('pack_zip',     do_pack_zip),
+    ) if on]
+    _failed = preflight.check_phases(_selected)
+    if _failed is not None:
+        _phase, _missing = _failed
+        _skipped = _selected[_selected.index(_phase) + 1:]
+        print(preflight.format_report(_phase, _missing, _skipped))
+        return preflight.RC_MISSING_DEP
+
     success = True
 
     if do_export:
