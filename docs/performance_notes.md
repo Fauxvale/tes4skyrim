@@ -182,14 +182,57 @@ so a later attribute's inclusion can depend on an earlier one's just-read value.
 Object LOD (786 `_far.nif` across 29 workers) and the terrain tile pool are both
 properly parallel. Two findings:
 
-- **`LODGenx64.exe` dominates the stage.** It had burned **493 CPU-seconds**
-  when sampled, running **6.4 cores across 122 threads** on 180,575 references.
-  It is a third-party binary, already parallel — not our lever.
+**Stage result: 18m37s -> 10m58s (1.70x) for all 18 worldspaces**, with
+**every one of the 18 LODGen reference counts identical** (Tamriel 180,575) and
+**2,507 terrain tiles in both runs**. Measured end-to-end, not extrapolated.
+
+- **`write_lodgen_input` was the real bottleneck — 249.9 s for Tamriel, and
+  99.6% of it was one function.** Instrumented: `_lod_mesh_is_safe` accounted
+  for **248.8 s in 2,968 calls (84 ms each)**; `_parse_esm` was 5.0 s and the
+  `_mesh_exists`/`_import_master_mesh` filesystem checks 0.1 s each.
+
+  That screen exists for a real reason — LODGenx64 casts every LOD mesh's root
+  to `NiNode` without checking, and one bad root kills the whole worldspace's
+  object LOD — but it was doing a **full `NifFormat.Data.read`** to learn one
+  block's type name. Reading just the header (version string, `user_version_2`,
+  the 3 export-info strings, the block-type table, `block_type_index[0]`) gives
+  the same answer **267x faster** (25.12 s -> 0.09 s over 600 meshes).
+
+  **Verify any change to that parser with `temp/root_check.py`**, which diffs
+  the fast path against the full parse. The first attempt omitted
+  `user_version_2` and the export-info strings and returned False for **600 of
+  600** meshes — i.e. it would have silently dropped every object from LOD.
+  Header shapes older than 10.0.1.0 fall back to the full parse.
+
+- **`LODGenx64.exe` is NOT the dominant cost** (an earlier note here said it
+  was — wrong). Its own log brackets each run: Tamriel is **3m27s**, and all
+  seven worldspaces in one measured run totalled **3.6 min**. It is a
+  third-party binary already using 6.4 cores across 122 threads, so it is not
+  our lever either way.
+
+- **`_parse_esm` ran once per worldspace**, re-deriving identical data from the
+  same 613 MB file 18 times (5.7 s, 1,017,612 refs) — ~103 s. Now memoised on
+  `(path, mtime, size)`. The overlay merge mutates all four returned
+  structures, so `generate_lod` shallow-copies them when overlays exist;
+  without that the second worldspace inherits the first one's merged state.
 - **The serial LAND parse runs once PER WORLDSPACE**, and Oblivion.esm ships
   **18** of them, so the same ESM is re-scanned ~18 times before each
   worldspace's tile pool starts. Tamriel alone has **14,686 LAND records**.
-  Two vectorisations took that parse from **5.9 s to 2.9 s (2.0x)**, i.e. about
-  **54 s off the serial part of the stage**:
+  Two vectorisations roughly **halve** that parse — measured per worldspace:
+
+  | worldspace | LANDs | before | after | saved |
+  |---|---|---|---|---|
+  | TES4Tamriel | 14,686 | 11.09 s | 5.57 s | 5.52 s |
+  | MS13CheydinhalOblivionWorld | 1,762 | 3.25 s | 2.39 s | 0.86 s |
+  | OblivionRD004 | 441 | 1.81 s | 1.67 s | 0.14 s |
+
+  **Do not multiply the Tamriel figure by 18.** The saving scales with LAND
+  *count* (~0.37 s per 1,000 records) on top of a ~1.6 s fixed cost — scanning
+  the whole 613 MB file — that the vectorisation does not touch. Only Tamriel is
+  large; the other 17 worldspaces have 45-1,762 records. Realistic total across
+  the stage: **~9 s, of which Tamriel is ~5.5 s (62%)**. An earlier note here
+  claimed ~54 s by assuming every worldspace cost the same; that was wrong.
+  The two changes:
   - `_decode_land` (VHGT) ran a **33x33 nested Python loop per LAND record**.
     Replaced with integer prefix sums. The deltas are int8, so an integer
     `cumsum` is **exact** — there is no accumulation-order rounding to
@@ -202,8 +245,18 @@ properly parallel. Two findings:
     each array in one go: **1.4x**, and verified **identical on 4,000 real LAND
     records** (`temp/vtxt_verify.py` pattern).
 - Do NOT bother caching the plugin bytes across worldspaces: measured, the
-  613 MB read is **0.10 s** (OS page cache) against a 2.9 s scan. Tried and
+  613 MB read is **0.10 s** (OS page cache) against a ~2.9 s scan. Tried and
   reverted.
+- **The remaining per-worldspace fixed cost is the record walk itself**, not the
+  read — `_scan_land_file` walks every record in the file to find one
+  worldspace's LANDs, 18 times over. Caching the *parsed* result per worldspace
+  (or bucketing all worldspaces in a single pass) is the next real LOD win and
+  is NOT done.
+- Stage scale, for anyone timing this: a `--lod-only` run on Oblivion.esm did
+  **1,584 tiles across 6 worldspaces in ~50 minutes** and was still going when a
+  3,000 s harness timeout killed it at worldspace 7 of 18. **Tamriel alone is
+  1,301 of those tiles (82%).** Budget accordingly — and do not put a timeout on
+  a real LOD build.
 
 ## Parallelism rules (learned 2026-07-16)
 

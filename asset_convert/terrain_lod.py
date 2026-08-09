@@ -247,6 +247,42 @@ def changed_lod_cells(plugin_esm: Path, master_esm: Path,
     return changed
 
 
+def count_land_records(esm_path: Path, worldspace_edid: str) -> int:
+    """How many LAND records `esm_path` holds for one worldspace.
+
+    `phase_lod` needs this ONLY as a number, to decide whether this plugin or a
+    master owns a worldspace's terrain.  It used to call `_parse_land_records`
+    and take `len()` of the result, which fully DECODES every record — VHGT
+    heights, VCLR colours and the whole BTXT/ATXT/VTXT layer tree — and then
+    throws all of it away.  Measured on Tamriel that is 2.8 s discarded per
+    worldspace, and `_records_esm` runs it once for this plugin plus once per
+    master, for every one of the 18 worldspaces.
+
+    This walks the same group structure but skips the per-record decode, so it
+    costs the file scan and nothing else.
+
+    It must match `len(_parse_land_records(...)[0])` EXACTLY, because the two
+    numbers are compared against each other to pick a record source.  Two
+    subtleties, both found by testing against the real parse:
+
+      * the parse keys `lands` by CELL COORDINATE, so several LAND records for
+        the same cell (an override on top of a master) collapse to one entry —
+        counting raw LAND records reported 704 where the parse saw 516;
+      * when the worldspace EditorID is not present at all, the parse warns and
+        collects EVERY LAND record in the file rather than none.
+
+    Delegating to the real scan is what keeps those rules in one place; only
+    the expensive decode is skipped.
+    """
+    lands = {}
+    cell_water = {}
+    wrld_water = {'default': None}
+    cell_coords = {}
+    _scan_land_file(esm_path, worldspace_edid, lands, cell_water,
+                    wrld_water, cell_coords, count_only=True)
+    return len(lands)
+
+
 def _scan_cell_coords(esm_path: Path, coords: dict):
     """Collect {cell FormID -> (x, y)} from every CELL carrying XCLC."""
     raw = esm_path.read_bytes()
@@ -386,7 +422,7 @@ def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel',
 
 def _scan_land_file(esm_path: Path, worldspace_edid: str,
                     lands: dict, cell_water: dict, wrld_water: dict,
-                    cell_coords: dict):
+                    cell_coords: dict, count_only: bool = False):
     """Scan one plugin's LAND/CELL/WRLD data into the shared accumulators.
 
     A CELL record an override plugin ships carries only the fields its author
@@ -503,9 +539,18 @@ def _scan_land_file(esm_path: Path, worldspace_edid: str,
                     if target_wrld_fid is None or cur_wrld_fid == target_wrld_fid:
                         coords = cell_coords.get(cur_cell_fid)
                         if coords is not None:
-                            land = _decode_land(body, _sub)
-                            if land is not None:
-                                lands[coords] = land
+                            if count_only:
+                                # count_land_records() wants only len(lands);
+                                # the VHGT/VCLR/layer decode is the expensive
+                                # part and its result would be discarded.  The
+                                # VHGT presence check is kept so the count
+                                # matches what a real parse would store.
+                                if _sub(body, 'VHGT') is not None:
+                                    lands[coords] = True
+                            else:
+                                land = _decode_land(body, _sub)
+                                if land is not None:
+                                    lands[coords] = land
                 p = np_
 
     # Skip TES4/TES5 file header

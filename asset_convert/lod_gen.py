@@ -156,6 +156,40 @@ def _zstr(b: bytes) -> str:
     return b.rstrip(b'\x00').decode('latin-1', errors='replace')
 
 
+# Parsed-ESM cache, keyed on file identity.
+#
+# generate_lod() is called ONCE PER WORLDSPACE and re-parsed the whole plugin
+# every time.  Oblivion.esm ships 18 worldspaces and the parse is 5.7 s over
+# 613 MB (1,017,612 refs), so ~103 s of the object-LOD stage was spent
+# re-deriving byte-for-byte identical data.
+#
+# Keyed on (path, mtime_ns, size) so a rebuilt ESM is re-parsed rather than
+# served stale.  Only the most recent file is kept: the caller walks one plugin
+# (plus its overlays) per run, so a 1-entry cache hits on every worldspace
+# without pinning several hundred MB per extra plugin.
+#
+# The returned structures are treated as READ-ONLY by callers — write_lodgen_input
+# builds its own per-worldspace views and generate_lod merges overlays into a
+# COPY (see _merge_overlay below); if that ever stops being true this must hand
+# out deep copies instead.
+_PARSED_ESM_CACHE: dict = {}
+
+
+def _parse_esm_cached(esm_path: Path):
+    """`_parse_esm` memoised on (path, mtime, size). See _PARSED_ESM_CACHE."""
+    try:
+        st = esm_path.stat()
+        key = (str(esm_path).lower(), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return _parse_esm(esm_path)
+    hit = _PARSED_ESM_CACHE.get(key)
+    if hit is None:
+        hit = _parse_esm(esm_path)
+        _PARSED_ESM_CACHE.clear()
+        _PARSED_ESM_CACHE[key] = hit
+    return hit
+
+
 def _parse_esm(esm_path: Path):
     """
     Minimal ESM parser. Returns dicts:
@@ -381,23 +415,112 @@ def _lod_mesh_is_safe(path: str, output_meshes_dir: Path) -> bool:
     if cached is not None:
         return cached
 
-    safe = True
+    safe = _root_is_ninode(full)
+    _NIF_ROOT_SAFE_CACHE[key] = safe
+    return safe
+
+
+# Block types LODGen can safely cast to NiNode (NiNode and its subclasses as
+# they appear as a NIF root).  Resolved lazily against NifFormat so the list
+# cannot drift from what pyffi actually considers a NiNode subclass.
+_NINODE_ROOT_NAMES = None
+
+
+def _ninode_root_names():
+    global _NINODE_ROOT_NAMES
+    if _NINODE_ROOT_NAMES is None:
+        from .lod_far_gen import NifFormat
+        names = set()
+        for attr in dir(NifFormat):
+            cls = getattr(NifFormat, attr, None)
+            if (isinstance(cls, type)
+                    and issubclass(cls, NifFormat.NiNode)):
+                names.add(attr)
+        _NINODE_ROOT_NAMES = names
+    return _NINODE_ROOT_NAMES
+
+
+def _root_is_ninode(full: Path) -> bool:
+    """True if this NIF's FIRST root block is an NiNode subclass.
+
+    Reads only the NIF HEADER (version, block-type table, block-type index)
+    instead of parsing the whole file.  The full `NifFormat.Data.read` this
+    replaces cost ~14 ms per mesh, and with ~8,800 unique base models that was
+    minutes of the object-LOD stage — all to learn one block's type name.
+
+    Header layout, verified against real converted output (20.2.0.7, UV1=12,
+    BSStream 83):
+
+        "Gamebryo File Format, Version 20.2.0.7\n"
+        u32 version, u8 endian, u32 user_version, u32 num_blocks,
+        u32 user_version_2            <- BSStream; ONLY when version >= 20.2
+        3 x export-info short strings (u8 length + bytes)  <- only with UV2
+        u16 num_block_types
+        num_block_types x (u32 length + ASCII name)
+        u16 block_type_index[num_blocks]   (high bit is a flag)
+
+    Root is block 0 for every mesh we ship. Both fields I first guessed wrong
+    (the missing user_version_2 and the export-info strings) made this return
+    False for EVERY mesh — caught by temp/root_check.py, which diffs this
+    against the full parse. Re-run that after any edit here.
+
+    Anything unreadable returns False, matching the old behaviour: unreadable
+    here means unreadable for LODGen too, and one bad mesh aborts the entire
+    worldspace, so exclusion is the safe answer.
+    """
+    try:
+        with open(full, 'rb') as fh:
+            head = fh.read(8192)
+        nl = head.find(b'\n')
+        if nl < 0 or nl > 128:
+            return False
+        p = nl + 1
+        version = struct.unpack_from('<I', head, p)[0]
+        p += 4
+        if version < 0x0A000100:          # older layouts differ; use the slow path
+            return _root_is_ninode_slow(full)
+        p += 1                            # endian type
+        p += 4                            # user version
+        num_blocks = struct.unpack_from('<I', head, p)[0]
+        p += 4
+        if version >= 0x14020007:
+            p += 4                        # user version 2 (BSStream)
+            for _ in range(3):            # export info: creator / scripts
+                ln = head[p]
+                p += 1 + ln
+        num_types = struct.unpack_from('<H', head, p)[0]
+        p += 2
+        if not num_types or num_types > 512:
+            return False
+        types = []
+        for _ in range(num_types):
+            ln = struct.unpack_from('<I', head, p)[0]
+            p += 4
+            if ln > 128 or p + ln > len(head):
+                return False
+            types.append(head[p:p + ln].decode('ascii', 'replace').rstrip('\x00'))
+            p += ln
+        if not num_blocks or p + 2 > len(head):
+            return False
+        idx0 = struct.unpack_from('<H', head, p)[0] & 0x7FFF
+        if idx0 >= len(types):
+            return False
+        return types[idx0] in _ninode_root_names()
+    except Exception:
+        return False
+
+
+def _root_is_ninode_slow(full: Path) -> bool:
+    """Full-parse fallback for header shapes the fast path does not model."""
     try:
         from .lod_far_gen import NifFormat
         data = NifFormat.Data()
         with open(full, 'rb') as fh:
             data.read(fh)
         roots = data.roots
-        if not roots or roots[0] is None:
-            safe = False
-        else:
-            safe = isinstance(roots[0], NifFormat.NiNode)
+        return bool(roots) and isinstance(roots[0], NifFormat.NiNode)
     except Exception:
-        # Unreadable here means unreadable for LODGen too — leave it out
-        # rather than gamble the whole worldspace on it.
-        safe = False
-    _NIF_ROOT_SAFE_CACHE[key] = safe
-    return safe
+        return False
 
 
 # Objects smaller than this (max OBND dimension, game units) are only baked
@@ -769,9 +892,24 @@ def generate_lod(esm_path: Path, output_dir: Path,
     """
     print(f"\n[LOD] Generating object LOD for worldspace '{worldspace_edid}'")
 
-    # Parse ESM once; reuse data for both LODSettings and LODGen input
+    # Parse ESM once; reuse data for both LODSettings and LODGen input.
+    #
+    # Served from _PARSED_ESM_CACHE, because this function runs once per
+    # WORLDSPACE and the parse is 5.7 s over 613 MB — 18 worldspaces meant
+    # ~103 s spent re-deriving identical data.
+    #
+    # The overlay merge below MUTATES all four structures (dict.update, list
+    # append/replace), so take shallow copies before touching them or the
+    # second worldspace inherits the first one's merged state.  Copies are
+    # cheap next to the parse: the per-record dicts are shared, and nothing
+    # here mutates an individual record.
     print(f"  Parsing ESM: {esm_path.name}")
-    worldspaces, cells, stats, refs = _parse_esm(esm_path)
+    worldspaces, cells, stats, refs = _parse_esm_cached(esm_path)
+    if overlay_paths:
+        worldspaces = dict(worldspaces)
+        cells = dict(cells)
+        stats = dict(stats)
+        refs = list(refs)
 
     # Apply override plugins on top, in load order. References merge BY FORMID
     # so a plugin that moved, rescaled or re-based one of the master's objects

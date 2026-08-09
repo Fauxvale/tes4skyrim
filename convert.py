@@ -746,6 +746,7 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
                                            changed_lod_cells,
                                            _master_names as _tes4_master_names,
                                            _parse_land_records as _terrain_parse_land,
+                                           count_land_records as _terrain_count_land,
                                            _find_worldspace_fid)
 
     def _esm_defines_worldspace(path, edid):
@@ -762,10 +763,14 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
         alone made the plugin its own record source, so terrain LOD was baked
         from 10 isolated cells with no surrounding terrain and no LTEX
         textures. The bulk of the terrain is what decides.
+
+        Uses the COUNT-ONLY scan: this needs a number, and the full parse
+        decodes VHGT/VCLR and the whole layer tree for every record before
+        throwing it away (2.8 s wasted per worldspace on Tamriel, once for this
+        plugin plus once per master, across all 18 worldspaces).
         """
         try:
-            lands, _cw, _dw = _terrain_parse_land(Path(path), edid)
-            return len(lands)
+            return _terrain_count_land(Path(path), edid)
         except Exception:
             return 0
 
