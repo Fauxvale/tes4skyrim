@@ -10,6 +10,15 @@ import struct
 import sys
 from collections import defaultdict
 
+# Names in a localised plugin are not ASCII (Nehrim is German), and a Windows
+# console defaults to cp1252, so printing one raised UnicodeEncodeError and
+# killed the report partway through — on exactly the plugin this tool exists
+# to diagnose. Replace unencodable characters rather than dying.
+try:
+    sys.stdout.reconfigure(errors='replace')
+except (AttributeError, ValueError):
+    pass
+
 sys.path.insert(0, 'tools')
 sys.path.insert(0, '.')
 from tes5_esm_reader import read_tes5_file      # noqa: E402
