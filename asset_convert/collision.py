@@ -1736,6 +1736,9 @@ def _convert_blend_collision(node, coll_obj):
     rb.center.y *= _HAVOK_SCALE
     rb.center.z *= _HAVOK_SCALE
     _convert_rigid_body(rb)
+    # bhkEntityCInfo byte: prop bodies use 116/10, but the vanilla creature
+    # blend-body census is 0 (COM root occasionally 3)
+    rb.unknown_byte = 0
     for attr in ('m_11', 'm_12', 'm_13', 'm_21', 'm_22', 'm_23',
                  'm_31', 'm_32', 'm_33'):
         setattr(rb.inertia, attr,
@@ -1743,8 +1746,29 @@ def _convert_blend_collision(node, coll_obj):
     rb.motion_system = 4        # MO_SYS_KEYFRAMED (bone follows animation)
     rb.quality_type = 1         # MO_QUAL_FIXED
     rb.deactivator_type = 1
-    rb.solver_deactivation = 1
+    # Dynamics contract (vanilla census: wolf/dog/bear/deer/sabrecat/skeever,
+    # 136/136 blend bodies identical).  Skyrim APPLIES these on blend bodies
+    # — same lesson as the chains/signs saga — and Oblivion ships garbage:
+    # damping 5.0/5.0 froze every corpse solid mid-air (no gravity reaction,
+    # immovable by havok grab), maxLinearVelocity up to 10000, restitution
+    # 0.3, solverDeactivation 1, and junk in translation.w.
+    rb.linear_damping = 0.0996
+    rb.angular_damping = 0.0498
+    rb.max_linear_velocity = 104.4
+    rb.max_angular_velocity = 31.57
+    rb.solver_deactivation = 2
+    rb.friction = 0.3
+    rb.restitution = 0.8
+    rb.translation.w = 0.0
     rb.havok_col_filter.layer = 8   # SKYL_BIPED
+    # Oblivion's filter byte (0x40 | part) means nothing to Skyrim — the
+    # vanilla creature-skeleton census is plain small part numbers with NO
+    # flag bits (wolf: all 0 across 22 bodies; bear: 0-2). Carrying the
+    # Oblivion byte through left every blend body flagged.
+    rb.havok_col_filter.flags_and_part_number = 0
+    if hasattr(rb, 'havok_col_filter_copy'):
+        rb.havok_col_filter_copy.layer = 8
+        rb.havok_col_filter_copy.flags_and_part_number = 0
     rb.shape = _convert_shape(rb.shape, node)
     _convert_materials(rb.shape)
 
@@ -2194,7 +2218,7 @@ def _demote_malleable_constraints(data):
     return new_blocks
 
 
-def _fix_limited_hinge(d):
+def _fix_limited_hinge(d, clamp_friction=True):
     """Skyrim-format fixes for a LimitedHingeDescriptor (pivots already scaled).
 
     1. Missing perp_2_axle_in_b_1: Oblivion's LimitedHingeDescriptor does not
@@ -2216,11 +2240,11 @@ def _fix_limited_hinge(d):
     if perp_a1 is not None:
         perp_a1.w = -1.0
 
-    if d.max_friction > 0.5:
+    if clamp_friction and d.max_friction > 0.5:
         d.max_friction = 0.01
 
 
-def _fix_ragdoll(d):
+def _fix_ragdoll(d, clamp_friction=True):
     """Derive the Skyrim-only RagdollDescriptor motor axes and clamp friction.
 
     In the Skyrim (Havok 2010) layout twist/plane/motor are the three columns
@@ -2233,9 +2257,11 @@ def _fix_ragdoll(d):
     value the joint has enough rotational friction to lock solid — chains and
     swinging traps LOOK fine but never move when touched.  Vanilla Skyrim prop
     ragdoll constraints use 0.01 (desecratedimperial.nif), the same value the
-    limited-hinge clamp already uses (the tavern-sign fix).
+    limited-hinge clamp already uses (the tavern-sign fix).  Creature
+    skeleton joints (clamp_friction=False) keep the authored value — the
+    vanilla creature census mixes 10.0/0.5/0.01.
     """
-    if d.max_friction > 0.5:
+    if clamp_friction and d.max_friction > 0.5:
         d.max_friction = 0.01
     for twist_name, plane_name, motor_name in (('twist_a', 'plane_a', 'motor_a'),
                                                ('twist_b', 'plane_b', 'motor_b')):
@@ -2351,9 +2377,19 @@ def scale_constraint_pivots(data):
                          if isinstance(b, NifFormat.bhkConstraint)]
     constraint_blocks += _demote_malleable_constraints(data)
 
+    # Creature-skeleton blend bodies follow the VANILLA CREATURE contract,
+    # not the prop contract: constraint max_friction stays authored (vanilla
+    # skeleton.nif joints mix 10.0/0.5/0.01 — the prop clamp to 0.01 does
+    # not apply) and the broadphase byte stays 0, not the dynamic-prop 10.
+    blend_ids = {id(b.body) for b in data.blocks
+                 if isinstance(b, NifFormat.bhkBlendCollisionObject)
+                 and b.body is not None}
+
     for block in constraint_blocks:
         if isinstance(block, NifFormat.bhkMalleableConstraint):
             continue  # replaced by its demoted inner constraint
+        is_blend = any(e is not None and id(e) in blend_ids
+                       for e in block.entities)
         for kind, d in _constraint_descriptors(block):
             # Scale pivot positions (xyz only; w is unused padding).
             for pivot_attr in ('pivot_a', 'pivot_b'):
@@ -2363,9 +2399,9 @@ def scale_constraint_pivots(data):
                     pivot.y *= _HAVOK_SCALE
                     pivot.z *= _HAVOK_SCALE
             if kind == 'limited_hinge':
-                _fix_limited_hinge(d)
+                _fix_limited_hinge(d, clamp_friction=not is_blend)
             elif kind == 'ragdoll':
-                _fix_ragdoll(d)
+                _fix_ragdoll(d, clamp_friction=not is_blend)
             elif kind == 'hinge':
                 _fix_hinge(d)
             elif kind == 'prismatic':
@@ -2376,7 +2412,7 @@ def scale_constraint_pivots(data):
                     d.length = length * _HAVOK_SCALE
 
         for e in block.entities:
-            if e is not None and e.mass > 0.0:
+            if e is not None and e.mass > 0.0 and id(e) not in blend_ids:
                 e.unknown_byte = 10
 
 

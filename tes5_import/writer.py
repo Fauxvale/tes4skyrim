@@ -402,7 +402,10 @@ class PluginWriter:
         """
         order = [
             'GMST', 'KYWD', 'TXST', 'GLOB', 'CLAS', 'FACT', 'HDPT', 'EYES',
-            'RACE', 'SOUN', 'SOPM', 'SNDR', 'MGEF', 'MATT',
+            'RACE', 'SOUN', 'SOPM', 'SNDR', 'MGEF',
+            # xEdit canonical: ... FLST PERK BPTD ADDN AVIF ... VTYP MATT —
+            # BPTD (creature body part data) precedes the MATT/impact block
+            'BPTD', 'MATT',
             # Impact/footstep chain. xEdit's canonical order is
             # "... VTYP MATT IPCT IPDS ARMA ... FSTP FSTS ...", so IPCT/IPDS
             # must precede ARMA (whose SNDD points into it) and FSTP must

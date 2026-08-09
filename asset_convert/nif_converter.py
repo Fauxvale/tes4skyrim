@@ -4062,6 +4062,13 @@ def _add_prn_skin(data, root_node, keep_bone_names=False, plain=False):
     plain=True builds a plain NiSkinInstance instead of a
     BSDismemberSkinInstance (vanilla creature meshes never use dismember).
 
+    The per-bone skin bind is IDENTITY, which is correct here: the caller
+    runs _bake_node_transforms_into_verts first, leaving the verts in
+    bone-LOCAL space (verified: converted dog Head centroid (2.8,14.5,0),
+    a bone-local coordinate, not the (0,42,57) bind-world of Bip01 Head), so
+    `vert · I · boneWorld` places the part correctly and tracks the bone
+    under both animation and ragdoll.
+
     Returns the number of geometry blocks that were skinned.
     """
     if not isinstance(root_node, NifFormat.NiNode):
@@ -4518,6 +4525,28 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
             # Prn tells Skyrim which skeleton node to attach this mesh to.
             # BSFurnitureMarker is converted to BSFurnitureMarkerNode for sit/sleep.
             if hasattr(root, 'extra_data_list'):
+                # --- BSBound (actor bounding box) ---
+                # "Bethesda-specific collision bounding box for skeletons"
+                # (nif.xml).  The engine uses it as the actor's physical
+                # bounds; a creature skeleton without one has no bounds to
+                # place or collide a body against, so the ragdoll/death
+                # handoff has nothing to land on.  Oblivion creature
+                # skeletons ship one (name 'BBX') and 35/39 vanilla Skyrim
+                # creature skeletons have one — but the SELECTIVE copy below
+                # never carried it, so all 44 converted creature skeletons
+                # lost it at the NiNode->BSFadeNode swap (2026-08-08).
+                # Values are already in NIF object space (NOT Havok space),
+                # so they carry over verbatim — no _HAVOK_SCALE here.
+                for ed in root.extra_data_list:
+                    if isinstance(ed, NifFormat.BSBound):
+                        fade.num_extra_data_list += 1
+                        fade.extra_data_list.update_size()
+                        fade.extra_data_list[
+                            fade.num_extra_data_list - 1] = ed
+                        stats.setdefault('bsbound_kept', 0)
+                        stats['bsbound_kept'] += 1
+                        break
+
                 # --- Furniture marker conversion ---
                 # See _convert_furniture_markers: Oblivion entry points on the
                 # floor become Skyrim seat positions (clustered, re-headed).

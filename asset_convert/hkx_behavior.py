@@ -63,6 +63,8 @@ hkx_xml.SIGNATURES.update({
     'hkbBlenderGeneratorChild': '0xe2b384b0',
     'hkbPoweredRagdollControlsModifier': '0x7cb54065',
     'BSRagdollContactListenerModifier': '0x8003d8ce',
+    'hkbKeyframeBonesModifier': '0x95f66629',
+    'hkbRigidBodyRagdollControlsModifier': '0xaa87d1eb',
     'hkbBoneIndexArray': '0xaa8619',
     'hkbBoneWeightArray': '0xcd902b77',
     'BSIsActiveModifier': '0xb0fde45a',
@@ -343,11 +345,25 @@ def build_character_xml(name: str, anim_files: list, behavior_file: str,
     mirror.param('mirrorAxis', '(1.000000 0.000000 0.000000 0.000000)')
     mirror.param_array('bonePairMap', list(range(n_bones)))
 
+    # Ragdoll-driver feedback config (vanilla dog character, verbatim): the
+    # engine reads these character properties to couple the MODEL to the
+    # RAGDOLL (worldFromModel feedback while ragdolled / hit-reacting).
+    # Without them every gain defaults to 0 — the actor never follows its
+    # ragdoll.  Values are IEEE-754 bit patterns in wordVariableValues:
+    # 0.6 / 0.25 / 0.4 / 0.25.
+    _DRIVER_PROPS = [
+        ('m_worldFromModelFeedbackGain', 1058642330),   # 0.6
+        ('m_alignWorldFromModelGain', 1048576000),      # 0.25
+        ('m_errorUpDownBias', 1053609165),              # 0.4
+        ('m_ankleOrientationGain', 1048576000),         # 0.25
+    ]
+
     strings.param_array('deformableSkinNames', [])
     strings.param_array('rigidSkinNames', [])
     strings.param_strings('animationNames', anim_files)
     strings.param_array('animationFilenames', [])
-    strings.param_array('characterPropertyNames', [])
+    strings.param_strings('characterPropertyNames',
+                          [n for n, _v in _DRIVER_PROPS])
     strings.param_array('retargetingSkeletonMapperFilenames', [])
     strings.param_array('lodNames', [])
     strings.param_array('mirroredSyncPointSubstringsA', [])
@@ -357,7 +373,8 @@ def build_character_xml(name: str, anim_files: list, behavior_file: str,
     strings.param('ragdollName', 'Character Assets\\skeleton.HKX')
     strings.param('behaviorFilename', behavior_file)
 
-    values.param_structs('wordVariableValues', [])
+    values.param_structs('wordVariableValues',
+                         [[('value', v)] for _n, v in _DRIVER_PROPS])
     values.param_array('quadVariableValues', [])
     values.param_array('variantVariableValues', [])
 
@@ -371,7 +388,17 @@ def build_character_xml(name: str, anim_files: list, behavior_file: str,
     cdata.param('modelUpMS', '(0.000000 0.000000 1.000000 0.000000)')
     cdata.param('modelForwardMS', '(0.000000 1.000000 0.000000 0.000000)')
     cdata.param('modelRightMS', '(1.000000 -0.000000 -0.000000 0.000000)')
-    cdata.param_structs('characterPropertyInfos', [])
+    cdata.param_raw('characterPropertyInfos', '\n'.join(
+        '<hkobject>\n'
+        '\t<hkparam name="role">\n'
+        '\t\t<hkobject>\n'
+        '\t\t\t<hkparam name="role">ROLE_DEFAULT</hkparam>\n'
+        '\t\t\t<hkparam name="flags">0</hkparam>\n'
+        '\t\t</hkobject>\n'
+        '\t</hkparam>\n'
+        '\t<hkparam name="type">VARIABLE_TYPE_REAL</hkparam>\n'
+        '</hkobject>' for _p in _DRIVER_PROPS),
+        numelements=len(_DRIVER_PROPS))
     cdata.param_array('numBonesPerLod', [])
     cdata.param('characterPropertyValues', values.ref)
     cdata.param('footIkDriverInfo', 'null')
@@ -419,8 +446,38 @@ _TRANSITION_TMPL = '''<hkobject>
 # state machines).
 _F_LOCAL = 'FLAG_DISABLE_CONDITION'
 _F_WILD = 'FLAG_IS_LOCAL_WILDCARD|FLAG_DISABLE_CONDITION'
+
+# vanilla dogbehavior #0125 hkbRigidBodyRagdollControlsModifier controlData,
+# verbatim (shared by the root state's live tracker and the
+# AnimateToRagdoll death stage)
+_RB_RAGDOLL_CONTROL_DATA = (
+    '<hkobject>\n'
+    '\t<hkparam name="keyFrameHierarchyControlData">\n'
+    '\t\t<hkobject>\n'
+    '\t\t\t<hkparam name="hierarchyGain">0.170000</hkparam>\n'
+    '\t\t\t<hkparam name="velocityDamping">0.000000</hkparam>\n'
+    '\t\t\t<hkparam name="accelerationGain">1.000000</hkparam>\n'
+    '\t\t\t<hkparam name="velocityGain">0.600000</hkparam>\n'
+    '\t\t\t<hkparam name="positionGain">0.050000</hkparam>\n'
+    '\t\t\t<hkparam name="positionMaxLinearVelocity">1.400000</hkparam>\n'
+    '\t\t\t<hkparam name="positionMaxAngularVelocity">1.800000</hkparam>\n'
+    '\t\t\t<hkparam name="snapGain">0.100000</hkparam>\n'
+    '\t\t\t<hkparam name="snapMaxLinearVelocity">0.300000</hkparam>\n'
+    '\t\t\t<hkparam name="snapMaxAngularVelocity">0.300000</hkparam>\n'
+    '\t\t\t<hkparam name="snapMaxLinearDistance">0.030000</hkparam>\n'
+    '\t\t\t<hkparam name="snapMaxAngularDistance">0.100000</hkparam>\n'
+    '\t\t</hkobject>\n'
+    '\t</hkparam>\n'
+    '\t<hkparam name="durationToBlend">0.500000</hkparam>\n'
+    '</hkobject>')
 _F_GLOBAL = ('FLAG_IS_LOCAL_WILDCARD|FLAG_IS_GLOBAL_WILDCARD|'
              'FLAG_DISABLE_CONDITION')
+
+# When the death pose clip fires `Ragdoll` (releases the keyframed bodies
+# into the limp ragdoll): 8 frames after AnimateToRagdoll entry, the wolf's
+# authored Death-clip timing (`Ragdoll:0.267`). Shared between the graph
+# clip trigger and the animationdata cache block.
+_RAGDOLL_RELEASE_T = 0.266667
 
 _TRIGGER_TMPL = '''<hkobject>
 \t<hkparam name="localTime">{time:.6f}</hkparam>
@@ -548,10 +605,10 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     ForwardWalkBlend: children weighted by natural clip speed, blend
     parameter bound to SpeedSampled, flags=17 SYNC|PARAMETRIC).
 
-    ragdoll: hkx_ragdoll.ragdoll_info() dict — enables the death/ragdoll
-    wrapper states (DeathAnimation/Ragdoll/RagdollInstant routing, mirrors
-    the vanilla dogbehavior root SM). Oblivion creatures have no death
-    animations: death IS the ragdoll.
+    ragdoll: hkx_ragdoll.ragdoll_info() dict — enables the Fully Ragdoll
+    death state (DeathAnimation/Ragdoll/RagdollInstant routing, a
+    structural clone of the vanilla dogbehavior root SM state 4). Oblivion
+    creatures have no death animations: death IS the ragdoll.
     """
     hit_times = hit_times or {}
     movement_types = movement_types or []
@@ -564,7 +621,7 @@ def build_behavior_xml(behavior_name: str, clips: dict,
               'combatStanceStart', 'combatStanceStop',
               'weaponDraw', 'weaponSheathe', 'weaponSwing',
               'attackStop', 'returnToDefault', 'deathStart', 'IdleStop',
-              'DeathAnimation', 'Ragdoll', 'RagdollInstant',
+              'DeathAnimation', 'Ragdoll', 'RagdollInstant', 'GetUpBegin',
               'AddRagdollToWorld', 'RemoveCharacterControllerFromWorld',
               'SoundPlay', 'preHitFrame', 'HitFrame',
               'FootFront', 'FootBack', 'FootLeft', 'FootRight']
@@ -1094,6 +1151,46 @@ def build_behavior_xml(behavior_name: str, clips: dict,
                         eid['combatStanceStart'], eid['combatStanceStop'],
                         False)
 
+    # ---- live ragdoll tracking (vanilla dogbehavior 'Root Mod List') ----
+    # While the actor is ALIVE the ragdoll rigid bodies must be KEYFRAMED to
+    # the animation pose and PD-driven toward it (hkbKeyframeBonesModifier +
+    # hkbRigidBodyRagdollControlsModifier, both present in every vanilla
+    # creature root state).  Without them the bodies sit wherever the file
+    # left them, so the moment the death ragdoll activates, the corpse snaps
+    # to those stale transforms — the 2026-08-07 "jumps sideways on death /
+    # collision beside the body / sinks through the floor" report.
+    #
+    # The bone list is `keyframe_lower`, NOT every ragdoll bone: vanilla's
+    # modifier is literally named `KeyframeLowerBody` and omits the tail,
+    # neck and head so those chains hang free under physics on a living
+    # creature.  Keyframing ALL of them pins the entire ragdoll to the
+    # animation pose (see ragdoll._keyframe_bone_sets — the 2026-08-08
+    # rigid-corpse root cause).
+    live_track = []
+    if ragdoll:
+        kf_bones = pf.add('hkbBoneIndexArray')
+        kf_bones.param('variableBindingSet', 'null')
+        kf_bones.param_array('boneIndices', ragdoll['keyframe_lower'])
+        kf_mod = pf.add('hkbKeyframeBonesModifier')
+        kf_mod.param('variableBindingSet', 'null')
+        kf_mod.param('userData', 1)
+        kf_mod.param('name', 'KeyframeLowerBody')
+        kf_mod.param('enable', True)
+        kf_mod.param_raw('keyframeInfo', '', numelements=0)
+        kf_mod.param('keyframedBonesList', kf_bones.ref)
+
+        drive_bones = pf.add('hkbBoneIndexArray')
+        drive_bones.param('variableBindingSet', 'null')
+        drive_bones.param_array('boneIndices', [])
+        drive_mod = pf.add('hkbRigidBodyRagdollControlsModifier')
+        drive_mod.param('variableBindingSet', 'null')
+        drive_mod.param('userData', 1)
+        drive_mod.param('name', 'DriveRagdollRB')
+        drive_mod.param('enable', True)
+        drive_mod.param_raw('controlData', _RB_RAGDOLL_CONTROL_DATA)
+        drive_mod.param('bones', drive_bones.ref)
+        live_track = [kf_mod.ref, drive_mod.ref]
+
     mod_list = pf.add('hkbModifierList')
     mod_list.param('variableBindingSet', 'null')
     mod_list.param('userData', 1)
@@ -1102,7 +1199,8 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     # EquipDispatch must run alongside the combat pair: it turns the engine's
     # weaponDraw/weaponSheathe into the per-weapon-class equip event.
     mod_list.param_array('modifiers',
-                         [stop_combat.ref, start_combat.ref, sampler.ref]
+                         live_track
+                         + [stop_combat.ref, start_combat.ref, sampler.ref]
                          + ([equip_eem.ref] if equip_eem is not None else []))
 
     mod_gen = pf.add('hkbModifierGenerator')
@@ -1116,12 +1214,14 @@ def build_behavior_xml(behavior_name: str, clips: dict,
                     transitions_ref='null'):
         enter_ref = 'null'
         if enter_evt_name:
+            names = ([enter_evt_name] if isinstance(enter_evt_name, str)
+                     else list(enter_evt_name))
             arr = pf.add('hkbStateMachineEventPropertyArray')
-            arr.param_raw('events', (
+            arr.param_raw('events', '\n'.join(
                 '<hkobject>\n'
-                f'\t<hkparam name="id">{eid[enter_evt_name]}</hkparam>\n'
+                f'\t<hkparam name="id">{eid[n]}</hkparam>\n'
                 '\t<hkparam name="payload">null</hkparam>\n'
-                '</hkobject>'), numelements=1)
+                '</hkobject>' for n in names), numelements=len(names))
             enter_ref = arr.ref
         st = pf.add('hkbStateMachineStateInfo')
         st.param('variableBindingSet', 'null')
@@ -1139,14 +1239,25 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     root_states = [_root_state(0, 'Root', mod_gen.ref)]
     root_wild_ref = 'null'
 
-    # ---- death / ragdoll wrapper states (vanilla dogbehavior root SM) ----
+    # ---- death / ragdoll states (vanilla dogbehavior states 3 + 4) ----
     # Oblivion creatures ship no death animations — death IS the ragdoll.
-    # The engine's kill flow fires ActionDeathWait, whose IDLE tree
-    # (tes5_import/creature_idles.py) sends DeathAnimation or Ragdoll; the
-    # wrapper states power the ragdoll (skeleton.hkx hkaRagdollInstance) and
-    # notify AddRagdollToWorld / RemoveCharacterControllerFromWorld, which
-    # the engine itself consumes.  Without them `kill` leaves the actor
-    # standing in its idle forever.
+    # BOTH vanilla states are required and the split is load-bearing:
+    #
+    #   state 1 'AnimateToRagdoll' (vanilla #0130, entered on
+    #   DeathAnimation): its enterNotifyEvents raises `AddRagdollToWorld` —
+    #   THE ONLY thing in the entire pipeline that ever does.  The engine
+    #   does NOT add the ragdoll on the normal kill path by itself; a
+    #   2026-08-08 "simplification" that dropped this state left corpses
+    #   with no ragdoll and (state 2 still removing the character
+    #   controller) NO collision at all — falling through the floor,
+    #   nothing activatable, pose playing forever.
+    #
+    #   state 2 'Fully Ragdoll' (vanilla #0117, entered on Ragdoll /
+    #   RagdollInstant — fired by the contact listener, or directly by the
+    #   engine when it ragdolled the actor itself: killmoves, paralysis):
+    #   ModifierGenerator [FullRagdoll event-driven wrapper ->
+    #   PoweredRagdoll No Matching (maxForce 0, MODE_RAGDOLL)] over the
+    #   frozen pose clip, notifying RemoveCharacterControllerFromWorld.
     if ragdoll and clips['idle']:
         pb0, pb1, pb2 = ragdoll['pose_bones']
 
@@ -1183,37 +1294,140 @@ def build_behavior_xml(behavior_name: str, clips: dict,
             m.param('boneWeights', weights.ref)
             return m
 
-        def _mod_state_gen(name, modifiers, clip_name):
-            # objects must be defined before their referencers (hkxcmd
-            # parser rejects forward references)
-            # The pose source is a CLEAN copy of the idle animation
-            # ('ragdollpose.hkx', written without annotations): this clip
-            # keeps looping for as long as the corpse exists, so any
-            # SoundPlay annotation in its file would vocalize the corpse
-            # forever (the confirmed squeaking-dead-rat bug).
-            pose_clip = _clip(clip_name, clips['idle'], True,
-                              anim='ragdollpose')
-            lst = pf.add('hkbModifierList')
-            lst.param('variableBindingSet', 'null')
-            lst.param('userData', 0)
-            lst.param('name', f'{name}_ML')
-            lst.param('enable', True)
-            lst.param_array('modifiers', [m.ref for m in modifiers])
-            gen = pf.add('hkbModifierGenerator')
-            gen.param('variableBindingSet', 'null')
-            gen.param('userData', 1)
-            gen.param('name', f'{name}_MG')
-            gen.param('modifier', lst.ref)
-            gen.param('generator', pose_clip.ref)
-            return gen
+        # Vanilla #0092 'FullRagdoll': the limp powered ragdoll is active by
+        # default and released by GetUpBegin (the getup flow; inert for a
+        # corpse but kept for structural parity with vanilla).
+        full_rag_edm = _edm(
+            'FullRagdoll',
+            _powered_ragdoll('PoweredRagdoll No Matching', 0.0,
+                             'WORLD_FROM_MODEL_MODE_RAGDOLL').ref,
+            -1, eid['GetUpBegin'], True)
 
-        # falling-over stage: powered ragdoll drives toward the animated
-        # pose; the contact listener converts floor contact into a Ragdoll
-        # event (vanilla CollisionListener), completing the collapse
+        # Pose source: a CLEAN copy of the idle animation
+        # ('ragdollpose.hkx', written without annotations — an annotation in
+        # a looping corpse clip voices the corpse forever, the confirmed
+        # squeaking-dead-rat bug).  The clip generator MUST be registered in
+        # animationdata/animationsetdata under this exact name
+        # ('FullyRagdollPose' -> generate_creature_project clip_meta entry):
+        # an unregistered creature clip never binds — the death state then
+        # runs with a dead pose source and the whole ragdoll handoff
+        # collapses into the engine's stiff-fall fallback (static corpse,
+        # standing collision, model pivoting sideways about its root).
+        #
+        # MODE_SINGLE_PLAY at speed 1.0 — the exact vanilla death-state clip
+        # semantics (dogbehavior state 3 plays Death.hkx MODE_SINGLE_PLAY;
+        # state 4's pose sources are MODE_SINGLE_PLAY getup clips; NO
+        # vanilla file anywhere ships playbackSpeed 0).  A single play holds
+        # its LAST frame when it ends, so the corpse does not breathe or wag
+        # (the 2026-08-08 report against the LOOPING idle).
+        #
+        # THE RAGDOLL RELEASE IS A CLIP TRIGGER, not (only) the contact
+        # listener (2026-08-08, frozen-corpse root cause #2): vanilla
+        # dogbehavior's Death clip (#0119) carries exactly one trigger —
+        # event 81 `Ragdoll`, relativeToEndOfClip — and the wolf's
+        # animationdata Death block fires `Ragdoll:0.267` absolute.  That
+        # event is what moves state 3 -> 4 and releases the keyframed
+        # bodies into the limp powered ragdoll; the
+        # BSRagdollContactListenerModifier alone never fired for our
+        # keyframed bodies, so corpses stayed rigid in their death pose
+        # forever.  Vanilla's trigger sits at the end of an authored ~1s
+        # dying animation; our pose source is a HELD IDLE, so the wolf's
+        # early absolute timing (8 frames — enough for the engine to
+        # process AddRagdollToWorld raised on state entry) is the right
+        # equivalent, in BOTH the graph triggers and the animationdata
+        # block (_RAGDOLL_RELEASE_T, shared with the clip_meta entry).
+        pose_trig = pf.add('hkbClipTriggerArray')
+        pose_trig.param_raw(
+            'triggers',
+            _TRIGGER_TMPL.format(time=_RAGDOLL_RELEASE_T,
+                                 event_id=eid['Ragdoll'], rel='false'),
+            numelements=1)
+        pose_clip = _clip('FullyRagdollPose', clips['idle'], False,
+                          triggers_ref=pose_trig.ref, anim='ragdollpose')
+        full_rag_ml = pf.add('hkbModifierList')
+        full_rag_ml.param('variableBindingSet', 'null')
+        full_rag_ml.param('userData', 1)
+        full_rag_ml.param('name', 'Fully Ragdoll Mod List')
+        full_rag_ml.param('enable', True)
+        full_rag_ml.param_array('modifiers', [full_rag_edm.ref])
+        full_rag = pf.add('hkbModifierGenerator')
+        full_rag.param('variableBindingSet', 'null')
+        full_rag.param('userData', 1)
+        full_rag.param('name', 'Fully Ragdoll Mod Gen')
+        full_rag.param('modifier', full_rag_ml.ref)
+        full_rag.param('generator', pose_clip.ref)
+
+        # Vanilla #0082, verbatim: DeathAnimation and Ragdoll BLEND over
+        # 0.2s; RagdollInstant switches clean.
+        rag_fx = pf.add('hkbBlendingTransitionEffect')
+        rag_fx.param('variableBindingSet', 'null')
+        rag_fx.param('userData', 0)
+        rag_fx.param('name', 'RagdollBlend')
+        rag_fx.param('selfTransitionMode', 'SELF_TRANSITION_MODE_BLEND')
+        rag_fx.param('eventMode', 'EVENT_MODE_DEFAULT')
+        rag_fx.param('duration', '0.200000')
+        rag_fx.param('toGeneratorStartTimeFraction', '0.000000')
+        rag_fx.param('flags', 0)
+        rag_fx.param('endMode', 'END_MODE_NONE')
+        rag_fx.param('blendCurve', 'BLEND_CURVE_SMOOTH')
+
+        # ---- vanilla state 3 'AnimateToRagdoll' (#0130) — THE state whose
+        # enterNotifyEvents raises event 82 `AddRagdollToWorld`.  NOTHING
+        # ELSE ever raises it: a 2026-08-08 "simplification" deleted this
+        # state on the wrong theory that the engine adds the ragdoll itself
+        # on the kill path, and with no AddRagdollToWorld the ragdoll never
+        # entered the world — while Fully Ragdoll still removed the
+        # character controller (event 87), so corpses had NO collision at
+        # all: they fell through the floor, no part could be activated, and
+        # the pose source played on forever (the 2026-08-08 in-game report;
+        # multi-part goblins/lions just made it obvious — the rat's blend-
+        # body ghost was close enough to its tiny body to pass).
+        #
+        # Structure is the vanilla clone: ModGen[AnimateToRagdoll ModList ->
+        # KeyframeFullRagdoll (ALL ragdoll bones — the freshly added bodies
+        # stay keyframed to the pose), DriveRagdollRB, CollisionListener
+        # (floor contact -> Ragdoll)] over the frozen pose clip (vanilla
+        # plays its authored death clip here; Oblivion creatures have none,
+        # so the corpse holds pose until a keyframed body touches the
+        # ground — feet touch immediately on flat ground — and the Ragdoll
+        # event releases everything into the limp state).
+        # `keyframe_full`, NOT every bone: vanilla leaves the deepest limb
+        # leaves (toe/palm tips) UNPINNED so gravity has a purchase the frame
+        # the ragdoll enters the world; the `Ragdoll` trigger then releases
+        # the rest.  With every body keyframed the corpse is welded to its
+        # animation pose, generates no contacts at all (so the contact
+        # listener never fires), and the ragdoll handover collapses — the
+        # rigid-limbs / teleport / sink-through-floor / dead-pick-geometry
+        # cluster (2026-08-08).
+        kf2_bones = pf.add('hkbBoneIndexArray')
+        kf2_bones.param('variableBindingSet', 'null')
+        kf2_bones.param_array('boneIndices', ragdoll['keyframe_full'])
+        kf2 = pf.add('hkbKeyframeBonesModifier')
+        kf2.param('variableBindingSet', 'null')
+        kf2.param('userData', 1)
+        kf2.param('name', 'KeyframeFullRagdoll')
+        kf2.param('enable', True)
+        kf2.param_raw('keyframeInfo', '', numelements=0)
+        kf2.param('keyframedBonesList', kf2_bones.ref)
+
+        drive2_bones = pf.add('hkbBoneIndexArray')
+        drive2_bones.param('variableBindingSet', 'null')
+        drive2_bones.param_array('boneIndices', [])
+        drive2 = pf.add('hkbRigidBodyRagdollControlsModifier')
+        drive2.param('variableBindingSet', 'null')
+        drive2.param('userData', 1)
+        drive2.param('name', 'DriveRagdollRB')
+        drive2.param('enable', True)
+        drive2.param_raw('controlData', _RB_RAGDOLL_CONTROL_DATA)
+        drive2.param('bones', drive2_bones.ref)
+
+        # `contact_bones` — the limb ROOTS plus the spine/neck/head links,
+        # never the toe/palm tips or the tail (vanilla dog: 8 of 22).  A
+        # scuffing toe or a dragging tail must not fire the `Ragdoll`
+        # release before the body has landed.
         contact_bones = pf.add('hkbBoneIndexArray')
         contact_bones.param('variableBindingSet', 'null')
-        contact_bones.param_array('boneIndices',
-                                  list(range(ragdoll['parts'])))
+        contact_bones.param_array('boneIndices', ragdoll['contact_bones'])
         listener = pf.add('BSRagdollContactListenerModifier')
         listener.param('variableBindingSet', 'null')
         listener.param('userData', 2)
@@ -1226,44 +1440,41 @@ def build_behavior_xml(behavior_name: str, clips: dict,
             '</hkobject>'))
         listener.param('bones', contact_bones.ref)
 
-        anim2rag = _mod_state_gen(
-            'AnimateToRagdoll',
-            [_powered_ragdoll('PoweredRagdollMatching', 200.0,
-                              'WORLD_FROM_MODEL_MODE_COMPUTE'), listener],
-            'AnimateToRagdollPose')
-        full_rag = _mod_state_gen(
-            'FullyRagdoll',
-            [_powered_ragdoll('PoweredRagdollNoMatching', 0.0,
-                              'WORLD_FROM_MODEL_MODE_RAGDOLL')],
-            'FullyRagdollPose')
+        a2r_ml = pf.add('hkbModifierList')
+        a2r_ml.param('variableBindingSet', 'null')
+        a2r_ml.param('userData', 1)
+        a2r_ml.param('name', 'AnimateToRagdoll ModList')
+        a2r_ml.param('enable', True)
+        a2r_ml.param_array('modifiers',
+                           [kf2.ref, drive2.ref, listener.ref])
+        a2r_gen = pf.add('hkbModifierGenerator')
+        a2r_gen.param('variableBindingSet', 'null')
+        a2r_gen.param('userData', 1)
+        a2r_gen.param('name', 'AnimateToRagdoll Mod Gen')
+        a2r_gen.param('modifier', a2r_ml.ref)
+        a2r_gen.param('generator', pose_clip.ref)
 
-        rag_fx = pf.add('hkbBlendingTransitionEffect')
-        rag_fx.param('variableBindingSet', 'null')
-        rag_fx.param('userData', 0)
-        rag_fx.param('name', 'RagdollBlend')
-        rag_fx.param('selfTransitionMode',
-                     'SELF_TRANSITION_MODE_CONTINUE_IF_CYCLIC')
-        rag_fx.param('eventMode', 'EVENT_MODE_DEFAULT')
-        rag_fx.param('duration', '0.200000')
-        rag_fx.param('toGeneratorStartTimeFraction', '0.000000')
-        rag_fx.param('flags', 'FLAG_IGNORE_FROM_WORLD_FROM_MODEL')
-        rag_fx.param('endMode', 'END_MODE_NONE')
-        rag_fx.param('blendCurve', 'BLEND_CURVE_SMOOTH')
-
+        # state 3's own transition (#0128): Ragdoll -> Fully Ragdoll,
+        # blending, plain FLAG_DISABLE_CONDITION (not a wildcard)
         a2r_trans = pf.add('hkbStateMachineTransitionInfoArray')
         a2r_trans.param_raw(
             'transitions',
             _TRANSITION_TMPL.format(effect=rag_fx.ref,
                                     event_id=eid['Ragdoll'], to_state=2,
-                                    flags=_F_WILD),
+                                    flags='FLAG_DISABLE_CONDITION'),
             numelements=1)
 
-        root_states.append(_root_state(1, 'AnimateToRagdoll', anim2rag.ref,
-                                       'AddRagdollToWorld', a2r_trans.ref))
+        root_states.append(_root_state(
+            1, 'AnimateToRagdoll', a2r_gen.ref,
+            'AddRagdollToWorld', a2r_trans.ref))
         root_states.append(_root_state(
             2, 'Fully Ragdoll', full_rag.ref,
             'RemoveCharacterControllerFromWorld'))
 
+        # root wildcard, vanilla #0081 verbatim: DeathAnimation ->
+        # AnimateToRagdoll (adds the ragdoll), Ragdoll / RagdollInstant ->
+        # Fully Ragdoll directly (those fire when the engine has already
+        # ragdolled the actor itself: killmoves, paralysis).
         root_wild = pf.add('hkbStateMachineTransitionInfoArray')
         root_wild.param_raw(
             'transitions',
@@ -1573,11 +1784,40 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
                 'state': st_name, 'event': evt, 'slot': 5,
                 'chance': (sound_chances or {}).get(5, 100),
             })
-        # The ragdoll wrapper states loop the idle animation as their pose
-        # source for as long as the corpse exists — give them a CLEAN copy so
-        # no annotation (CSDT-injected or kf-authored) can voice a corpse.
+        # The ragdoll death state needs an annotation-free pose source (an
+        # annotation in a looping corpse clip voices the corpse forever —
+        # the squeaking-dead-rat bug), so 'ragdollpose' is a clean COPY of
+        # the converted idle.  It must be the REAL converted clip, NOT a
+        # synthesized frozen frame: the 2026-08-07 static_pose_clip
+        # experiment shipped a hand-built 2-frame clip and the corpse
+        # teleported on death (user-confirmed regression; the synthesized
+        # root placement did not match the pipeline-converted clips).
+        #
+        # The clip_meta entry is REQUIRED, not bookkeeping: it is what
+        # registers the 'FullyRagdollPose' clip generator in animationdata
+        # and puts ragdollpose.hkx in the animationsetdata CRC preload list.
+        # The engine binds creature clips exclusively through that cache —
+        # every OTHER generator in the graph is registered (vanilla
+        # registers its death/getup clips the same way: dogproject.txt
+        # carries DeathPose, GetUpLeft, ...), and this one was not, so the
+        # death state ran with a pose source that could never bind and the
+        # entire ragdoll handoff died with it (2026-08-07 static-corpse /
+        # sideways-teleport / misaligned-hitbox report).  No sounds/feet ->
+        # its hkx annotation union stays empty, so corpses stay silent.
         if ragdoll:
-            decoded['ragdollpose'] = decoded[idle_stem]
+            decoded['ragdollpose'] = (idle_clip, None)
+            # rate 1.0 single-play, matching the graph clip (vanilla
+            # death-clip semantics; the cache and graph playback speeds
+            # must agree).  The `Ragdoll` event trigger is the release
+            # into the limp ragdoll — see the pose_clip comment in
+            # build_behavior_xml; it must be in BOTH the graph and here.
+            clip_meta.append({
+                'name': 'FullyRagdollPose', 'stem': 'ragdollpose',
+                'anim': 'Animations\\ragdollpose.hkx', 'rate': 1.0,
+                'duration': d, 'looping': False, 'end_event': None,
+                'sounds': [], 'feet': [], 'hits': [],
+                'events': [(_RAGDOLL_RELEASE_T, 'Ragdoll')],
+            })
 
     # Phase 2 — COMPILE, embedding each animation FILE's full event union as
     # annotations (states sharing one file share its annotations; blend
@@ -1684,10 +1924,9 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
                            sound_events=sound_events,
                            vocal_states=vocal_states),
         os.path.join(proj_dir, 'behaviors', behavior_name.lower() + '.hkx'))
-    # dedupe: states can share one animation file (Idle + CombatStance)
+    # dedupe: states can share one animation file (Idle + CombatStance);
+    # ragdollpose.hkx arrives through its FullyRagdollPose clip_meta entry
     anim_files = list(dict.fromkeys(c['anim'] for c in clip_meta))
-    if 'ragdollpose' in decoded:
-        anim_files.append('Animations\\ragdollpose.hkx')
     _write_and_compile(
         build_character_xml(
             f'TES4{name.capitalize()}Character', anim_files,
@@ -1714,6 +1953,10 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
         'movement_types': move_types,
         'speeds': speeds,
         'has_ragdoll': bool(ragdoll),
+        # ragdoll part bone names -> the race's generated BPTD (body part
+        # data); node names must exist in THIS skeleton or the engine's
+        # ragdoll/hit binding has nothing to attach to
+        'ragdoll_bones': (ragdoll or {}).get('part_bones', []),
         # Vocal idle states: tes5_import/creature_idles generates the
         # ActionIdle/ActionIdleWarn IDLE records that let the engine enter
         # them (event = the IDLE's ENAM; chance = authored TES4 CSDC).

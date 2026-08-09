@@ -240,6 +240,108 @@ def build_creature_voice_types(writer) -> int:
 _PROJECTS = {}
 
 
+# folder → generated BPTD FormID, filled by build_creature_body_parts()
+# at the END of the import run (allocation-last contract, like the VTYPs).
+_CREA_BPTD_MAP = {}
+
+# Vanilla DogBodyPartData (0x0004FBF5) BPND payloads, verbatim. Torso is
+# part type 0, Head part type 1; everything else in the struct is the
+# vanilla default block.
+_BPND_TORSO = bytes.fromhex(
+    '0000803F000005FF640000000000000000000000000000000000803F00000000000000'
+    '00000000000000803F00000000000000000000000000000000000000000000000000000'
+    '00000000000000000000000803F')
+_BPND_HEAD = bytes.fromhex(
+    '0000803F000105FF640000000000000000000000000000000000803F00000000000000'
+    '00000000000000803F00000000000000000000000000000000000000000000000000000'
+    '00000000000000000000000803F')
+_BPTD_MODT = bytes.fromhex('020000000000000000000000')
+
+
+def build_creature_body_parts(writer) -> int:
+    """Phase LAST: one BPTD (body part data) per creature folder.
+
+    Every generated creature RACE was pointing its GNAM at the vanilla
+    CANINE body part data, whose part node names (Canine_Pelvis,
+    Canine_Head) exist in no converted skeleton — so the engine's
+    ragdoll/hit binding had nothing to attach to: corpses could not be
+    grabbed with havok and sank through the floor. Each folder now gets a
+    BPTD in the vanilla dog LAYOUT (Head part + Torso part) but with THIS
+    skeleton's actual ragdoll part bones as the node names.
+
+    Allocated last so no other generated FormID moves; the RACE GNAM slots
+    are byte-patched afterwards (patch_creature_bptd).
+    """
+    _CREA_BPTD_MAP.clear()
+    for folder in sorted({f for _r, f in _CREA_RACE_MAP.values()}):
+        proj = _PROJECTS.get(folder) or {}
+        part_bones = proj.get('ragdoll_bones') or []
+        if not part_bones:
+            continue
+        skel = f'Actors\\TES4\\{folder}\\Character Assets\\skeleton.nif'
+        base_path = f'BASE Meshes\\{skel}'
+        torso_node = part_bones[0]
+        spine = next((b for b in part_bones
+                      if 'spine' in b.lower() or 'chest' in b.lower()),
+                     torso_node)
+        # Oblivion rigs name the head bone 'Bip01 Head' OR 'Bip01 Skull';
+        # vanilla BPTDs match ('Canine_Head', cow 'Scull')
+        head = next((b for b in part_bones
+                     if 'head' in b.lower() or 'skull' in b.lower()
+                     or 'scull' in b.lower()), None)
+
+        def _part(name, node, target, bpnd):
+            s = pack_string_subrecord('BPTN', name)
+            s += pack_string_subrecord('BPNN', node)
+            s += pack_string_subrecord('BPNT', target)
+            s += pack_string_subrecord('BPNI', base_path)
+            s += pack_subrecord('BPND', bpnd)
+            s += pack_string_subrecord('NAM1', '0')
+            s += pack_string_subrecord('NAM4', base_path)
+            s += pack_string_subrecord('NAM5', '')
+            return s
+
+        fid = writer.alloc_formid()
+        subs = pack_string_subrecord(
+            'EDID', f'TES4{folder.capitalize()}BodyPartData')
+        subs += pack_string_subrecord('MODL', skel)
+        subs += pack_subrecord('MODT', _BPTD_MODT)
+        # vanilla dog order: Head part first, Torso second
+        if head:
+            subs += _part('Head', head, head, _BPND_HEAD)
+        subs += _part('Torso', torso_node, spine, _BPND_TORSO)
+        writer.add_record('BPTD', pack_record('BPTD', fid, 0, subs))
+        _CREA_BPTD_MAP[folder] = fid
+    return len(_CREA_BPTD_MAP)
+
+
+def patch_creature_bptd(writer) -> int:
+    """Point every generated creature RACE's GNAM at its folder's BPTD
+    (same placeholder-then-patch approach as the voice types)."""
+    if not _CREA_BPTD_MAP:
+        return 0
+    race_bptd = {}
+    for _crea_fid, (race_fid, folder) in _CREA_RACE_MAP.items():
+        b = _CREA_BPTD_MAP.get(folder)
+        if b:
+            race_bptd[race_fid] = b
+    patched = 0
+    records = writer._top_groups.get('RACE') or []
+    for i, blob in enumerate(records):
+        if len(blob) < 24:
+            continue
+        fid = struct.unpack_from('<I', blob, 12)[0]
+        bptd = race_bptd.get(fid)
+        if not bptd:
+            continue
+        at = blob.find(b'GNAM', 24)
+        if at < 0 or struct.unpack_from('<H', blob, at + 4)[0] != 4:
+            continue
+        records[i] = blob[:at + 6] + struct.pack('<I', bptd) + blob[at + 10:]
+        patched += 1
+    return patched
+
+
 def patch_creature_voices(writer) -> int:
     """Point every converted creature's VTCK at its generated creature voice.
 

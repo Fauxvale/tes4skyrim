@@ -107,8 +107,31 @@ def _rdp_keep(times, values, tol):
 # Per-project block emitters (consume hkx_behavior project_manifest.json)
 # ---------------------------------------------------------------------------
 
+def _anim_file_index(manifest: dict) -> dict:
+    """anim path -> index into the character hkx's animationNames.
+
+    THE ENGINE CONTRACT (2026-08-08 root cause of the dead creature
+    ragdolls): an animationdata clip block's second line is the index into
+    `hkbCharacterStringData.animationNames` — the DEDUPLICATED animation
+    file list — NOT the clip's ordinal position.  The character emitter
+    builds that list as `dict.fromkeys(c['anim'] for c in clip_meta)`
+    (hkx_behavior.generate_creature_project); this mirrors it exactly.
+    Writing `enumerate()` ordinals instead kept the first six clips (one
+    file each) correct — idle and locomotion, so live creatures LOOKED
+    fine — then desynced at the first shared-file clip (CombatStance):
+    every attack played the next attack's file, the run gait played the
+    aware-vocal clip, and every index past the file count (the parametric
+    gait children and FullyRagdollPose, the death-state pose source) was
+    OUT OF RANGE and never bound.  An unbindable death pose source killed
+    the whole ragdoll handoff regardless of the graph: corpse teleports,
+    limbs rigid, no corpse collision."""
+    return {a: i for i, a in enumerate(
+        dict.fromkeys(c['anim'] for c in manifest['clips']))}
+
+
 def project_block_lines(manifest: dict) -> list:
     """The animationdata/<project>.txt content."""
+    anim_index = _anim_file_index(manifest)
     lines = ['1', str(len(manifest['project_files']))]
     lines += manifest['project_files']
     lines.append('1')
@@ -130,6 +153,9 @@ def project_block_lines(manifest: dict) -> list:
         # Footstep events (FootFront/FootBack) — the engine's own, routed
         # through the race's footstep/impact set, not through a descriptor.
         timed += [(t, name) for t, name in clip.get('feet', [])]
+        # Raw graph events (e.g. the death pose clip's `Ragdoll` release —
+        # the vanilla wolf Death block's `Ragdoll:0.267`).
+        timed += [(t, name) for t, name in clip.get('events', [])]
         for t in clip.get('hits', []):
             timed.append((max(0.0, t - 0.3), 'weaponSwing'))
             timed.append((max(0.0, t - 0.1), 'preHitFrame'))
@@ -137,7 +163,8 @@ def project_block_lines(manifest: dict) -> list:
         triggers = [f'{name}:{_fmt(t)}' for t, name in sorted(timed)]
         if clip.get('end_event'):
             triggers.append(f"{clip['end_event']}:{_fmt(clip['duration'])}")
-        lines += [clip['name'], str(uid), '%g' % clip.get('rate', 1),
+        lines += [clip['name'], str(anim_index[clip['anim']]),
+                  '%g' % clip.get('rate', 1),
                   '0', '0', str(len(triggers))]
         lines += triggers
         lines.append('')
@@ -148,11 +175,18 @@ def motion_block_lines(manifest: dict, trans_tol: float = 0.5,
                        rot_tol: float = 0.002) -> list:
     """The animationdata/boundanims/anims_<project>.txt content.
 
-    Every clip gets a block (vanilla does the same); clips without root
-    motion get a single zero row at the clip duration.
+    One block per ANIMATION FILE INDEX (the same index space as the clip
+    blocks — see _anim_file_index; vanilla stores root motion per animation,
+    not per clip).  Files without root motion get a single zero row at the
+    clip duration.
     """
+    anim_index = _anim_file_index(manifest)
+    per_file = {}               # index -> representative clip (first user)
+    for clip in manifest['clips']:
+        per_file.setdefault(anim_index[clip['anim']], clip)
     lines = []
-    for uid, clip in enumerate(manifest['clips']):
+    for uid in sorted(per_file):
+        clip = per_file[uid]
         motion = manifest['motions'].get(clip['stem'])
         dur = clip['duration']
         t_rows, r_rows = [], []

@@ -296,6 +296,8 @@ def decode_clip(ob_kf_path: str, fps: float = 30.0,
     return clip, motion
 
 
+
+
 def write_clip_hkx(clip: DecodedClip, bones, out_hkx: str,
                    annotations=(), is_attack: bool = False,
                    keep_xml: bool = False):

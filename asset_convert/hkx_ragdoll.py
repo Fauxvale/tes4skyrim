@@ -50,6 +50,7 @@ Unit/convention notes (all verified against the vanilla deer dump):
 
 import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -72,6 +73,8 @@ hkx_xml.SIGNATURES.update({
     'hkpPhysicsSystem': '0xff724c17',
     'hkpPhysicsData': '0xc2a461e4',
     'hkMemoryResourceContainer': '0x4762f92a',
+    'hkMemoryResourceHandle': '0xbffac086',
+    'hkpShapeInfo': '0xea7f1d08',
 })
 
 _OB_TO_GAME = 7.0          # Oblivion Havok units → game units
@@ -141,8 +144,66 @@ def _bone_worlds(bones):
     return worlds
 
 
+def _unit(v):
+    v = np.asarray(v, dtype=float)
+    return v / (np.linalg.norm(v) or 1.0)
+
+
 def _v4(v, scale=1.0):
     return np.array([v.x * scale, v.y * scale, v.z * scale], dtype=float)
+
+
+def _capsule_inertia(shape, mass):
+    """Principal inertia diagonal (Ixx, Iyy, Izz) of a solid capsule of the
+    given (radius, vertexA, vertexB), about its centre of mass.
+
+    A capsule is a cylinder (length L along its segment axis, radius r) capped
+    by two hemispheres.  This is the well-conditioned tensor Havok expects —
+    replacing Oblivion's ill-conditioned authored diagonals, which diverge the
+    ragdoll solver (rigid corpse).  The diagonal is expressed in the capsule's
+    local frame with the segment along the discovered principal axis, then
+    mapped back to (x,y,z) so the axis with the segment gets Iaxial and the
+    other two get Iradial — vanilla stores exactly this axis-aligned form
+    (thin limbs anisotropic ~5x, hubs near-isotropic), never worse than ~7x.
+    """
+    r, va, vb = (float(shape[0]), np.asarray(shape[1], float),
+                 np.asarray(shape[2], float))
+    seg = vb - va
+    L = float(np.linalg.norm(seg))
+    r = max(r, 1e-3)
+
+    # masses split by volume between the cylinder and the two hemisphere caps
+    v_cyl = math.pi * r * r * L
+    v_cap = (4.0 / 3.0) * math.pi * r ** 3
+    v_tot = v_cyl + v_cap or 1.0
+    m_cyl = mass * v_cyl / v_tot
+    m_cap = mass * v_cap / v_tot
+
+    # axial (about the segment axis) and radial (perpendicular) moments
+    i_axial = 0.5 * m_cyl * r * r + 2.0 * (0.4 * m_cap * r * r)
+    i_radial = (m_cyl * (r * r / 4.0 + L * L / 12.0)
+                + 2.0 * m_cap * (0.4 * r * r
+                                 + 0.5 * (L / 2.0) ** 2 + 0.375 * r * L))
+
+    # place i_axial on the axis most aligned with the segment; radial on the
+    # other two.  A near-spherical capsule (L~0) comes out near-isotropic.
+    axis = int(np.argmax(np.abs(seg))) if L > 1e-6 else 2
+    diag = [i_radial, i_radial, i_radial]
+    diag[axis] = i_axial
+
+    # Clamp the principal-axis RATIO to what the ragdoll solver stays stable
+    # under.  Even the exact capsule tensor of a long thin limb (forearm ~31x)
+    # ill-conditions Havok's joint solver; vanilla Skyrim's WORST creature
+    # body is 6.6x, so it evidently fattens the effective inertia ellipsoid.
+    # Raise the small axes toward the largest until no axis exceeds MAX_ANISO
+    # times the smallest — preserves the ellipsoid orientation (limbs still
+    # resist axial spin least) while guaranteeing a well-conditioned tensor.
+    MAX_ANISO = 6.5
+    lo = min(diag)
+    if lo > 0:
+        diag = [min(x, lo * MAX_ANISO) for x in diag]
+        diag = [max(x, max(diag) / MAX_ANISO) for x in diag]
+    return tuple(max(x, 1e-6) for x in diag)
 
 
 class RagdollPart:
@@ -487,10 +548,6 @@ def extract_ragdoll(skeleton_nif_path: str, bones: list):
         out = np.asarray(v, dtype=float) @ R_delta
         return out + t_delta if is_point else out
 
-    def _unit(v):
-        v = np.asarray(v, dtype=float)
-        return v / (np.linalg.norm(v) or 1.0)
-
     # per-child constraint info: real descriptors for planned edges,
     # synthetic vanilla-template ragdoll joints for the augmentation.
     # Everything is normalized here into bone-space game-unit dicts so the
@@ -614,16 +671,6 @@ def extract_ragdoll(skeleton_nif_path: str, bones: list):
         p.constraint = con_of.get(nid)
 
         p.mass = float(body.mass) if body.mass > 0 else 1.0
-        # anisotropic inertia (vanilla bodies are MOTION_BOX_INERTIA — an
-        # isotropic sphere tensor makes long thin limbs tumble unnaturally).
-        # The Oblivion diagonal is in the body frame; rotate the tensor into
-        # our bone frame (R_delta is identity on real exports, kept for
-        # safety) and keep the diagonal.
-        R_delta, _t_delta = xf_of[nid]
-        I_body = np.diag([max(0.0, body.inertia.m_11),
-                          max(0.0, body.inertia.m_22),
-                          max(0.0, body.inertia.m_33)]) * (_OB_TO_GAME ** 2)
-        I_bone = np.abs(np.diag(R_delta.T @ I_body @ R_delta))
         p.com = _to_bone(nid, _v4(body.center, _OB_TO_GAME), 1)
         shape = _capsule_from_shape(body.shape)
         if shape is not None:
@@ -632,25 +679,202 @@ def extract_ragdoll(skeleton_nif_path: str, bones: list):
         else:
             r = max(1.0, float(np.linalg.norm(p.com)))
             p.shape = (r, p.com - [0, 0, 0.5], p.com + [0, 0, 0.5])
-        if not np.all(I_bone > 0):
-            r_bs = max(np.linalg.norm(p.shape[1]),
-                       np.linalg.norm(p.shape[2])) + p.shape[0]
-            fallback = 0.4 * p.mass * r_bs * r_bs
-            I_bone = np.where(I_bone > 0, I_bone, fallback)
-        p.inertia = tuple(float(x) for x in I_bone)
+        # Inertia is COMPUTED FROM THE CAPSULE, not carried from Oblivion
+        # (2026-08-08, the rigid-ragdoll root cause).  Oblivion's authored
+        # inertia diagonals are wildly ill-conditioned — our census of the
+        # carried-through tensors hit 32x anisotropy on the forearm, 20x on
+        # the thigh, vs vanilla Skyrim's WORST body at 6.6x — and a badly
+        # ill-conditioned inertia on a constrained ragdoll body makes Havok's
+        # joint solver diverge: the whole limp ragdoll stays RIGID, and the
+        # destabilised island snaps to a fallback transform / drops out of
+        # collision (teleport, fall-through-floor, can't be dragged, attached
+        # parts lose their hitbox — every symptom, all on the frame physics
+        # takes over).  Vanilla recomputes each body's tensor from its
+        # capsule; so do we, giving the well-conditioned solid-capsule tensor
+        # (analytic cylinder+hemisphere-caps approximation about the COM).
+        # Computed for ALL parts after _widen_root_hub below, so the root hub's
+        # tensor matches its final radius.
 
         part_of_node[nid] = len(parts)
         parts.append(p)
 
+    for p in parts:
+        p.inertia = _capsule_inertia(p.shape, p.mass)
     return parts
+
+
+# ---------------------------------------------------------------------------
+# DEAD END, do not rebuild: "re-root the ragdoll at anim bone 1"
+#
+# A `_ensure_root_at_bone1()` used to live here, on the theory that the ragdoll
+# root must map to ANIM BONE 1 because vanilla dog's mapper #0121 maps ragdoll
+# `A0 -> Canine_COM` (anim bone 1).  THREE variants were built and all three
+# were user-confirmed BROKEN (corpses stopped ragdolling entirely and stood
+# upright).  The theory itself is wrong:
+#
+#   vanilla dog bone 1 'Canine_COM'  world z = 59.3  <- UP IN THE BODY
+#   scamp/rat  bone 1 'Bip01 NonAccum' world z = 71.7 / 27.3  (their NPC Root
+#       carries the elevation, so NonAccum IS the trunk bone -> they work)
+#   lion/boar/dog bone 1 'Bip01 NonAccum' world z = 0.0  <- AT THE FEET,
+#       and 'Bip01 Spine0' (bone 2) is the trunk, 33-53 units up.
+#
+# The real invariant is "the ragdoll root is the TRUNK bone directly under
+# NPC Root", NOT "bone index 1".  On lion/boar/dog `Spine0` ALREADY satisfies
+# it, so `extract_ragdoll`'s natural root choice is correct and needs no
+# adjustment; re-targeting moved the trunk body's FRAME to the ground while
+# compensating the capsule offsets, and the engine's pose mapper /
+# worldFromModel work off bone frames, not capsule offsets -> no simulation.
+#
+# The three variants, for the record: (1) hub inserted with a capsule spanning
+# bone 1 -> old root = a 67-unit r=16.8 bar through the whole creature;
+# (2) compact hub at the trunk = an exact duplicate of Spine0, doubling trunk
+# mass; (3) re-target the existing root body onto bone 1 = trunk frame at the
+# feet.  See docs/creature_conversion.md#ragdoll-root-bone1-dead-end.
+# ---------------------------------------------------------------------------
+
+
+
+# Bone-name WORDS identifying the chains vanilla leaves UNPINNED on a LIVE
+# actor: the tail wags and the head/neck bob under physics while the
+# locomotion body is keyframed to the animation.  Vanilla dog census
+# (`KeyframeLowerBody`, 17 of 22 bones) omits exactly Tail1/2/3, Neck2 and
+# Head — nothing else.
+#
+# Matched as whole WORDS, never as substrings: a plain `'ear' in name` test
+# also matches "For<ear>m", which set every forearm (and its hand subtree)
+# loose on a living creature.
+_LOOSE_WHILE_ALIVE = ('tail', 'neck', 'head', 'skull', 'scull',
+                      'ponytail', 'ear', 'jaw', 'tongue', 'wing')
+
+# Trailing digits/side letters are part of the chain, not the word:
+# 'Bip01 Tail3', 'Canine_Neck2', 'Bip01 L Ear01' all belong to their chain.
+_WORD_RE = re.compile(r'[^a-z]+')
+
+# The axial (trunk) chain: everything that is NOT a limb.  Used to find the
+# limb ROOTS for the contact-listener set — vanilla lists limb roots plus the
+# trunk's own links, never the toe/palm tips.
+_AXIAL_WORDS = {'pelvis', 'spine', 'chest', 'ribcage', 'neck', 'head',
+                'skull', 'scull', 'com', 'tail', 'nonaccum', 'torso',
+                'body', 'abdomen', 'thorax'}
+
+
+def _bone_words(name: str):
+    """Lower-case word set of a bone name, digits stripped."""
+    return {w for w in _WORD_RE.split(name.lower()) if w}
+
+
+def _keyframe_bone_sets(parts):
+    """The three vanilla `hkbBoneIndexArray` sets, in ragdoll indices.
+
+    Returns (keyframe_full, keyframe_lower, contact).  **Never `range(n)`** —
+    that was the 2026-08-08 root cause of the whole broken-corpse cluster
+    (rigid limbs, teleport on death, sinking through the floor, dead pick
+    geometry on the attached parts).  `hkbKeyframeBonesModifier` PINS each
+    listed ragdoll body to the animation pose, and a pinned body is
+    immovable by the solver and generates no contacts, so keyframing every
+    body left nothing for gravity to act on and nothing for
+    `BSRagdollContactListenerModifier` to fire on.
+
+    Vanilla dogbehavior (22-body dog ragdoll) is the model:
+
+    * `KeyframeFullRagdoll` — death state 3 `AnimateToRagdoll`, 18/22 bones:
+      everything EXCEPT the deepest limb LEAVES (LBackLegToe, RFrontLeg2,
+      L/RFrontLegPalm).  The extremities are already free the frame the
+      ragdoll enters the world, so gravity gets a purchase and the corpse
+      starts folding; the `Ragdoll` clip trigger then releases the rest.
+    * `KeyframeLowerBody` — the LIVE root state, 17/22 bones: everything
+      EXCEPT the tail chain, neck and head, which hang free so a living
+      creature's tail wags and its head bobs under physics.
+    * `CollisionListener.bones` — 8/22: the bones that actually touch the
+      world (limb ROOTS, spine, neck, head), never the toe/palm tips.  These
+      are what convert floor contact into the `Ragdoll` release event.
+    """
+    n = len(parts)
+    children = {}
+    for i, p in enumerate(parts):
+        if p.parent >= 0:
+            children.setdefault(p.parent, []).append(i)
+    leaves = [i for i in range(n) if i not in children]
+
+    def _depth(i):
+        d = 0
+        while parts[i].parent >= 0:
+            i = parts[i].parent
+            d += 1
+        return d
+
+    # --- KeyframeFullRagdoll: drop the deepest limb leaves.  Vanilla drops 4
+    # of 22 (18%); scale that ratio, always at least one leaf, and never so
+    # many that the trunk itself comes loose.
+    n_free = max(1, round(n * 4.0 / 22.0))
+    free_at_death = sorted(leaves, key=_depth, reverse=True)[:n_free]
+    kf_full = [i for i in range(n) if i not in set(free_at_death)]
+
+    # --- KeyframeLowerBody: drop the tail/neck/head chains entirely (a bone
+    # is loose if it OR any ancestor is named as a loose chain, so the whole
+    # sub-chain below Tail1 or Neck comes free, matching vanilla).
+    def _loose(i):
+        j = i
+        while j >= 0:
+            if _bone_words(parts[j].name) & set(_LOOSE_WHILE_ALIVE):
+                return True
+            j = parts[j].parent
+        return False
+
+    kf_lower = [i for i in range(n) if not _loose(i)]
+    if not kf_lower:                       # all-loose rig (snake, tentacle)
+        kf_lower = list(kf_full)
+
+    # --- CollisionListener: only the bones that actually reach the world.
+    # Vanilla dog is 8 of 22 (36%) — the four limb ROOTS (the first body of
+    # each chain hanging off the trunk) plus the trunk's own spine/neck/head
+    # links.  Deeper limb bodies and every leaf are excluded: a toe tip
+    # scuffing the floor must not fire the `Ragdoll` release.
+    # The TRUNK is the axial chain — the root plus every body whose name is a
+    # spine/pelvis/neck/head link.  Walking "the single child that has
+    # children" instead stops at the first spine node that also carries a
+    # leg, which left the front limbs out of the contact set entirely.
+    trunk = {0} | {i for i in range(n)
+                   if _bone_words(parts[i].name) & _AXIAL_WORDS}
+    # Limb roots: the first body of each chain hanging off the trunk that is
+    # itself not a leaf (a lone leaf hanging off the spine is a fin/ear, not
+    # a leg).
+    limb_roots = {i for i in range(n)
+                  if parts[i].parent in trunk and i not in trunk
+                  and i in children}
+    # The TAIL is excluded from contacts even though it is axial: vanilla's
+    # 8-bone dog set is the four limb roots plus Spine1/Spine3/Neck2/Head,
+    # with all three tail links absent.  A dragging tail must not fire the
+    # `Ragdoll` release before the body has actually landed.
+    spine_contacts = {i for i in trunk
+                      if parts[i].parent >= 0
+                      and not (_bone_words(parts[i].name) & {'tail'})}
+    contact = sorted(limb_roots | spine_contacts)
+    if not contact:
+        contact = [i for i in range(n)
+                   if i in children and parts[i].parent >= 0] or [0]
+    return kf_full, kf_lower, contact
 
 
 def ragdoll_info(skeleton_nif_path: str, bones: list):
     """Slim summary for the behavior generator (death/ragdoll states):
-    {'parts': n, 'pose_bones': (i0, i1, i2)} with pose-matching picks in
-    RAGDOLL skeleton indices (vanilla uses pelvis + a leg + head; we pick the
-    root part and the two deepest parts of distinct subtrees), or None when
-    the skeleton has no usable ragdoll."""
+
+    pose_bones — pose-matching picks in RAGDOLL skeleton indices.  Vanilla
+    dogbehavior uses (COM, RBackLegPalm, LBackLegPalm): the trunk root plus
+    two SYMMETRIC low extremities, a wide well-conditioned triangle.  The
+    old pick (root + the two deepest chain tips) could hand Havok a
+    near-collinear tail-tip/toe triangle, and the pose matcher then derives
+    a garbage worldFromModel — the corpse visibly teleported sideways on
+    death and its collision no longer aligned with the rendered body
+    (2026-08-07).  Generic rule: root part + the lowest opposite-side leaf
+    pair, widest apart in X; depth picks only as a last resort.
+
+    keyframe_full / keyframe_lower / contact_bones — the three
+    `hkbBoneIndexArray` sets the behavior graph needs.  **None of them is
+    `range(parts)`** (2026-08-08 root cause: all three were, which pinned
+    every ragdoll body to the animation pose forever — see
+    `_keyframe_bone_sets`).
+    """
     try:
         parts = extract_ragdoll(skeleton_nif_path, bones)
     except Exception:
@@ -665,10 +889,42 @@ def ragdoll_info(skeleton_nif_path: str, bones: list):
             d += 1
         return d
 
-    order = sorted(range(len(parts)), key=_depth, reverse=True)
-    b1 = order[0] if len(parts) > 1 else 0
-    b2 = next((i for i in order if i not in (0, b1)), b1)
-    return {'parts': len(parts), 'pose_bones': (0, b1, b2)}
+    worlds = _bone_worlds(bones)
+    pos = [worlds[p.anim_index][1] for p in parts]
+    parents = {p.parent for p in parts}
+    leaves = [i for i in range(len(parts)) if i not in parents]
+    zs = sorted(v[2] for v in pos)
+    median_z = zs[len(zs) // 2]
+
+    b1 = b2 = None
+    low_leaves = [i for i in leaves if pos[i][2] <= median_z] or leaves
+    best = -1.0
+    for a in low_leaves:
+        for b in low_leaves:
+            if a >= b or pos[a][0] * pos[b][0] >= 0:
+                continue  # need one left-side and one right-side extremity
+            spread = abs(pos[a][0] - pos[b][0])
+            if spread > best:
+                best, b1, b2 = spread, a, b
+    if b1 is None:  # no symmetric pair (snake-like chain): depth fallback
+        order = sorted(range(len(parts)), key=_depth, reverse=True)
+        b1 = order[0] if len(parts) > 1 else 0
+        b2 = next((i for i in order if i not in (0, b1)), b1)
+
+    kf_full, kf_lower, contact = _keyframe_bone_sets(parts)
+    return {'parts': len(parts), 'pose_bones': (0, b1, b2),
+            # the three vanilla hkbBoneIndexArray sets — see
+            # _keyframe_bone_sets; NEVER range(parts)
+            'keyframe_full': kf_full,
+            'keyframe_lower': kf_lower,
+            'contact_bones': contact,
+            # part BONE names (the skeleton.nif NODE names, NOT the
+            # 'Ragdoll_'-prefixed ragdoll-skeleton bone names), part order —
+            # the import side builds the race's BPTD from these.  Vanilla
+            # BPTD BPNN/BPNT name plain skeleton nodes ('Canine_Pelvis',
+            # 'Scull'); the Ragdoll_ prefix shipped 2026-08-07 pointed every
+            # body part at a nonexistent node.
+            'part_bones': [bones[p.anim_index].name for p in parts]}
 
 
 # ---------------------------------------------------------------------------
@@ -712,7 +968,7 @@ def _filter_info(part_index: int, parent_index: int) -> int:
 
 
 def _add_rigid_body(pf, part, world_R, world_t, filter_info=0):
-    """hkpCapsuleShape + hkpRigidBody pair; returns the body object."""
+    """hkpCapsuleShape + hkpRigidBody pair; returns (body, shape)."""
     shape = pf.add('hkpCapsuleShape')
     r, va, vb = part.shape
     shape.param('userData', 0)
@@ -761,8 +1017,30 @@ def _add_rigid_body(pf, part, world_R, world_t, filter_info=0):
 </hkobject>''')
     ix, iy, iz = part.inertia
     inv_m = 1.0 / part.mass
+    # Motion type — vanilla creature ragdolls are NOT uniformly BOX_INERTIA
+    # (2026-08-08, the rigid-corpse root cause).  Dog census: 18 BOX + 4
+    # SPHERE_INERTIA, and the 4 spheres are exactly the ROUND bodies — the
+    # COM/torso hub, the mid-spine hub, and the tiny leg-tip caps — each with
+    # an ISOTROPIC inertia (0.001,0.001,0.001 / 0.094,0.094,0.094).  A round,
+    # heavily-CONSTRAINED hub carrying a strongly anisotropic box tensor
+    # (ours shipped Spine3 invInertia (0.0002,0.0017,0.0002), 9x anisotropy)
+    # ill-conditions Havok's ragdoll solver: the joint iteration cannot
+    # converge, so the whole limp ragdoll stays RIGID and the destabilised
+    # island snaps to a fallback transform and drops out of collision (the
+    # teleport / fall-through-floor / can't-be-dragged / attached-parts-lose-
+    # -collision cluster, all on the frame physics takes over).  A body is
+    # "round" when its capsule segment is short relative to its radius; those
+    # get SPHERE_INERTIA with the isotropic (min-axis) tensor a sphere has.
+    # Long limb capsules keep BOX_INERTIA + their real anisotropic tensor
+    # (an isotropic tensor there makes thin limbs tumble unnaturally).
+    seg_len = float(np.linalg.norm(np.asarray(vb) - np.asarray(va)))
+    is_round = seg_len < 0.8 * r
+    if is_round:
+        iso = min(ix, iy, iz)
+        ix = iy = iz = iso
+    motion_type = 'MOTION_SPHERE_INERTIA' if is_round else 'MOTION_BOX_INERTIA'
     body.param_raw('motion', f'''<hkobject>
-\t<hkparam name="type">MOTION_BOX_INERTIA</hkparam>
+\t<hkparam name="type">{motion_type}</hkparam>
 \t<hkparam name="deactivationIntegrateCounter">15</hkparam>
 \t<hkparam name="deactivationNumInactiveFrames">49152 49152</hkparam>
 \t<hkparam name="motionState">
@@ -798,7 +1076,7 @@ def _add_rigid_body(pf, part, world_R, world_t, filter_info=0):
 </hkobject>''')
     body.param('localFrame', 'null')
     body.param('npData', 0)
-    return body
+    return body, shape
 
 
 def _add_ragdoll_constraint_data(pf, info, motor_ref):
@@ -1011,11 +1289,22 @@ def emit_ragdoll(pf, bones, parts, anim_skel_ref):
     rskel.param_structs('bones', [
         [('name', p.name), ('lockTranslation', p.parent != -1)]
         for p in parts])
+    # The root's reference pose is its transform relative to the ACTOR ROOT
+    # (anim bone 0).  Identical to writing world on every vanilla rig, whose
+    # bone 0 sits at the origin; kept root-relative because Oblivion rigs
+    # sometimes carry a bind transform on `Bip01` itself.
+    #
+    # NOTE: this is NOT what caused the teleport-on-death — that was
+    # `lockTranslation` on the ragdoll root's mapped anim bone (see
+    # hkx_skeleton.build_skeleton_xml).  Changing this alone measured as a
+    # pure no-op on every broken creature.
+    _R_actor, t_actor = worlds[0]
     pose_lines = []
     for p in parts:
         R, t = worlds[p.anim_index]
         if p.parent < 0:
-            lt, lq = t, _mat_row_to_quat(R)
+            lt = (t - t_actor) @ _R_actor.T
+            lq = _mat_row_to_quat(R @ _R_actor.T)
         else:
             Rp, tp = worlds[parts[p.parent].anim_index]
             inv = Rp.T
@@ -1083,9 +1372,11 @@ def emit_ragdoll(pf, bones, parts, anim_skel_ref):
     motor.param('proportionalRecoveryVelocity', '5.000000')
     motor.param('constantRecoveryVelocity', '0.200000')
 
-    bodies = [_add_rigid_body(pf, p, *worlds[p.anim_index],
-                              filter_info=_filter_info(i, p.parent))
-              for i, p in enumerate(parts)]
+    body_shapes = [_add_rigid_body(pf, p, *worlds[p.anim_index],
+                                   filter_info=_filter_info(i, p.parent))
+                   for i, p in enumerate(parts)]
+    bodies = [b for b, _s in body_shapes]
+    shapes = [s for _b, s in body_shapes]
 
     def _constraints(motor_ref):
         insts = []
@@ -1125,10 +1416,53 @@ def emit_ragdoll(pf, bones, parts, anim_skel_ref):
     pdata.param('worldCinfo', 'null')
     pdata.param_array('systems', [system.ref])
 
+    # 'Resource Data' tree (vanilla creature skeleton.hkx, dog census): one
+    # hkMemoryResourceContainer PER RAGDOLL PART, named after the part,
+    # nested along the ragdoll parent tree, each holding two
+    # hkMemoryResourceHandles — 'hkRigidBody' -> the part's hkpRigidBody and
+    # 'hkpShapeInfo' -> an hkpShapeInfo naming the part and carrying its
+    # bind world transform.  Our old empty container was the last structural
+    # delta against vanilla: this tree is the Bethesda-side registry of the
+    # ragdoll parts (name -> body/shape), so ship it verbatim.
+    ident_t = ('(1.000000 0.000000 0.000000)(0.000000 1.000000 0.000000)'
+               '(0.000000 0.000000 1.000000)(0.000000 0.000000 0.000000)')
+    kids = {}
+    for i, p in enumerate(parts):
+        if p.parent >= 0:
+            kids.setdefault(p.parent, []).append(i)
+    part_res = [None] * len(parts)
+    for i in reversed(range(len(parts))):   # children before their parent:
+        p = parts[i]                        # hkxcmd rejects forward refs
+        R, t = worlds[p.anim_index]
+        sinfo = pf.add('hkpShapeInfo')
+        sinfo.param('shape', shapes[i].ref)
+        sinfo.param('isHierarchicalCompound', False)
+        sinfo.param('hkdShapesCollected', False)
+        sinfo.param_raw('childShapeNames',
+                        f'<hkcstring>{p.name}</hkcstring>', numelements=1)
+        sinfo.param_raw('childTransforms', ident_t, numelements=1)
+        sinfo.param('transform', _fmt_transform_rows(R, t))
+        h_rb = pf.add('hkMemoryResourceHandle')
+        h_rb.param('variant', bodies[i].ref)
+        h_rb.param('name', 'hkRigidBody')
+        h_rb.param_array('references', [])
+        h_si = pf.add('hkMemoryResourceHandle')
+        h_si.param('variant', sinfo.ref)
+        h_si.param('name', 'hkpShapeInfo')
+        h_si.param_array('references', [])
+        cont = pf.add('hkMemoryResourceContainer')
+        cont.param('name', p.name)
+        cont.param_array('resourceHandles', [h_rb.ref, h_si.ref])
+        cont.param_array('children',
+                         [part_res[j].ref for j in kids.get(i, [])])
+        part_res[i] = cont
+
     resource = pf.add('hkMemoryResourceContainer')
     resource.param('name', '')
     resource.param_array('resourceHandles', [])
-    resource.param_array('children', [])
+    resource.param_array('children',
+                         [part_res[i].ref for i, p in enumerate(parts)
+                          if p.parent < 0])
 
     return rskel, [
         [('name', 'Resource Data'),

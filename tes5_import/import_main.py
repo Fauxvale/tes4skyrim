@@ -1630,6 +1630,16 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
         n_fsp = patch_creature_footsteps(writer, get_creature_arma_folders())
         print(f"  Creature footstep sets: {n_fs} generated, "
               f"{n_fsp} ARMAs bound")
+    # Creature body part data: per-folder BPTD with THIS skeleton's ragdoll
+    # part nodes (the vanilla-canine GNAM matched no bones — corpses could
+    # not be havok-grabbed and fell through the floor). Allocated last,
+    # then patched into the already-written RACEs.
+    from .creature_races import build_creature_body_parts, patch_creature_bptd
+    n_bp = build_creature_body_parts(writer)
+    if n_bp:
+        n_bpp = patch_creature_bptd(writer)
+        print(f"  Creature body part data: {n_bp} generated, "
+              f"{n_bpp} races bound")
     _write_voice_map(output_path, voice_map)
     from .dialog_converter import get_lip_texts
     _write_lip_text(output_path, get_lip_texts())

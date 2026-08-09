@@ -145,7 +145,9 @@ def build_creature_idles(writer, folder: str, proj: dict) -> None:
 
     # Death: vanilla dog tree — ActionDeathWait root, DeathAnimation child
     # (conditioned) with Ragdoll as the fall-through sibling.  The generated
-    # graph handles both (AnimateToRagdoll / Fully Ragdoll wrapper states);
+    # graph routes DeathAnimation into AnimateToRagdoll (whose enter raises
+    # AddRagdollToWorld — the ONLY raiser) and Ragdoll straight into Fully
+    # Ragdoll (fired when the engine already ragdolled the actor);
     # without this tree `kill` leaves the actor idling upright forever.
     droot = _idle(writer, f'{base}DeathWaitRoot', dnam, '',
                   _ACTIONS['ActionDeathWait'], 0, _DEATH_ROOT_DATA)

@@ -188,13 +188,43 @@ def build_skeleton_xml(bones: list, skeleton_nif_path: str = None) -> str:
     # vanilla convention: referenced objects defined BEFORE referencers,
     # root container last (hkxcmd's parser crashes on forward references)
     pf = HkxPackfile(first_id=8)
-    skel = pf.add('hkaSkeleton')
 
+    # The ragdoll must be extracted BEFORE the anim skeleton is emitted: the
+    # bone its ROOT part maps to has to ship lockTranslation=false (see below),
+    # and that bone is only known once the ragdoll tree is built.
+    parts = None
+    if skeleton_nif_path:
+        from asset_convert.hkx_ragdoll import extract_ragdoll
+        parts = extract_ragdoll(skeleton_nif_path, bones)
+
+    # **THE TELEPORT-ON-DEATH ROOT CAUSE (2026-08-08).**  `lockTranslation` on
+    # an anim bone tells the engine "this bone's translation never changes —
+    # use the reference pose".  The ragdoll's ROOT body drives its mapped anim
+    # bone's TRANSLATION (that is how a corpse moves as one rigid unit), so if
+    # that bone is LOCKED the translation is discarded and snapped back to
+    # bind — displacing the corpse by exactly the bone's offset the frame
+    # physics takes over.  Vanilla ships `Canine_COM`, the dog ragdoll's root
+    # bone, with lockTranslation **false** for precisely this reason (its
+    # bone 0 `NPC Root [Root]` is unlocked too).
+    #
+    # Our `UNLOCKED_BONES` only covered `Bip01`/`Bip01 NonAccum`, so rigs whose
+    # ragdoll roots at `Bip01 Spine0`/`Bip01 Pelvis` shipped a LOCKED root.
+    # In-game census (2026-08-08, 15/15 match):
+    #   root = NonAccum (unlocked): scamp, rat, zombie, minotaur, skeleton
+    #       -> NO teleport
+    #   root = Spine0/Pelvis (locked): spriggan 0.29, lich 0.72, mudcrab 10.3,
+    #       boar 45, dog 55.8, goblin 66, lion 67, troll 74.8, deer 78,
+    #       horse 106 -> teleport BY EXACTLY THAT OFFSET
+    unlocked = set(UNLOCKED_BONES)
+    if parts:
+        unlocked.add(bones[parts[0].anim_index].name)
+
+    skel = pf.add('hkaSkeleton')
     skel.param('name', bones[0].name)
     skel.param_array('parentIndices', [b.parent for b in bones])
     skel.param_structs('bones', [
         [('name', b.name),
-         ('lockTranslation', b.name not in UNLOCKED_BONES and b.parent != -1)]
+         ('lockTranslation', b.name not in unlocked and b.parent != -1)]
         for b in bones])
     pose_lines = [
         fmt_vec(*b.translation) + fmt_vec(*b.quat_xyzw)
@@ -208,12 +238,10 @@ def build_skeleton_xml(bones: list, skeleton_nif_path: str = None) -> str:
 
     ragdoll_skel = None
     extra_variants = []
-    if skeleton_nif_path:
-        from asset_convert.hkx_ragdoll import emit_ragdoll, extract_ragdoll
-        parts = extract_ragdoll(skeleton_nif_path, bones)
-        if parts:
-            ragdoll_skel, extra_variants = emit_ragdoll(pf, bones, parts,
-                                                        skel.ref)
+    if parts:                       # extracted above, before the anim skeleton
+        from asset_convert.hkx_ragdoll import emit_ragdoll
+        ragdoll_skel, extra_variants = emit_ragdoll(pf, bones, parts,
+                                                    skel.ref)
 
     anim_container = pf.add('hkaAnimationContainer')
     top = pf.add('hkRootLevelContainer')

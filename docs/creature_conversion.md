@@ -189,15 +189,92 @@ The whole chain is implemented and wired as pipeline **Phase 4b: Creatures**
     every bind angle inside its window (deer: exactly 0.0 everywhere), so
     `_legalize_limits` widens (never shifts) each window to contain the
     measured bind angle.
+  - <a id="resource-data-tree"></a>**the 'Resource Data'
+    hkMemoryResourceContainer tree is load-bearing, NOT boilerplate**
+    (2026-08-07, corpse-never-simulates root cause). Vanilla creature
+    skeleton.hkx ships one `hkMemoryResourceContainer` **per ragdoll part**,
+    named after the part, nested along the ragdoll parent tree, each holding
+    two `hkMemoryResourceHandle`s — `hkRigidBody` → the part's `hkpRigidBody`
+    and `hkpShapeInfo` → an `hkpShapeInfo` that names the part and carries
+    its bind world transform (dog: 22 containers + 44 handles + 22
+    hkpShapeInfo, under one empty-name root). We shipped a single **empty**
+    root container. That was the last structural delta from vanilla and it
+    is exactly the registry the engine's ragdoll-build path walks to
+    resolve part-name → rigid body when it assembles the `bhkRagdoll`
+    template from the graph's `hkaRagdollInstance`. With the tree empty the
+    template comes back with no bodies, so `AddRagdollToWorld` never adds
+    anything: the corpse plays its death/idle pose forever, is not affected
+    by gravity, cannot be havok-grabbed, and its collision stays at the
+    single base capsule (why a one-piece creature like the rat looked
+    "fine-but-fixed" while a multi-part goblin/mountain-lion had only its
+    torso selectable and sank through the floor). `_emit_ragdoll_objects`
+    now builds the full per-part tree; `hkpShapeInfo`/`hkMemoryResourceHandle`
+    signatures added. The engine confirms the shape: the graph's
+    `Fully Ragdoll` state and its `FullyRagdollPose` clip must ALSO be
+    registered in animationdata/animationsetdata (an unregistered creature
+    clip never binds), and the character.hkx must carry the
+    `m_worldFromModelFeedbackGain` driver properties — but none of those
+    matter until the resource tree gives the ragdoll bodies to add.
 - `tes5_import/creature_races.py` — Phase 0f: generated RACE/ARMA/ARMO per
   unique (creature folder, NIFZ body set), layouts mirrored from real
   Skyrim.esm DogRace/SkinDog/NakedDogAA dumps; ATKE = the generated
   `attackStart_TES4_*` events; `convert_CREA` RNAM → the generated race
   (`resolve_creature_race` aliasing kept only as fallback). NPC_ humanoids
   keep the Skyrim race override system.
-- Death: `death.kf`/`dies.kf` = single-play `Death` state on `deathStart`
-  (holds last pose); ragdoll-driven death via the behavior graph
-  (PoweredRagdoll modifier) is still a refinement.
+- Death: Oblivion creatures ship NO death animations — death IS the
+  ragdoll. The generated graph clones BOTH vanilla dogbehavior death states,
+  and the split is load-bearing:
+  - **AnimateToRagdoll** (vanilla state 3, entered on DeathAnimation): its
+    enterNotifyEvents raises **`AddRagdollToWorld`** — the ONLY raiser in
+    the entire pipeline. **The engine does NOT add the ragdoll by itself on
+    the normal kill path** (2026-08-08 root cause: a "simplification" that
+    dropped this state left every corpse with no ragdoll while Fully
+    Ragdoll still removed the character controller — so corpses had NO
+    collision at all: they fell through the floor, no part could be
+    activated/selected, and the pose source played forever; multi-part
+    goblins/lions made it obvious, the rat's standing blend-body ghost was
+    close enough to its tiny body to look "relatively fine"). Modifiers:
+    `KeyframeFullRagdoll` (all ragdoll bones — the freshly added bodies
+    stay keyframed to the pose), `DriveRagdollRB`, and the
+    `BSRagdollContactListenerModifier` (floor contact → `Ragdoll`); feet
+    touch the ground immediately, so the corpse releases into the limp
+    state right away.
+  - **Fully Ragdoll** (vanilla state 4, entered on Ragdoll/RagdollInstant —
+    fired by the contact listener or directly by the engine when IT already
+    ragdolled the actor: killmoves, paralysis): event-driven `FullRagdoll`
+    wrapper over `PoweredRagdoll No Matching` (maxForce 0,
+    `WORLD_FROM_MODEL_MODE_RAGDOLL`), notifying
+    `RemoveCharacterControllerFromWorld`.
+  - Both states' pose source is the `FullyRagdollPose` clip,
+    **MODE_SINGLE_PLAY at playbackSpeed 1.0** in both the graph and its
+    animationdata entry — the exact vanilla death-state clip semantics
+    (dogbehavior state 3 plays Death.hkx single-play; state 4's pose
+    sources are single-play getup clips). A single play holds its last
+    frame, so the corpse does not keep breathing/wagging (the 2026-08-08
+    report against the LOOPING idle). A `playbackSpeed 0` MODE_LOOPING
+    freeze was tried in between; **no vanilla file anywhere ships
+    playbackSpeed 0** (grep of every decompiled canine behavior), so it was
+    reverted to the vanilla contract the same day.
+  - **The `Ragdoll` release is a CLIP TRIGGER** (2026-08-08, frozen-corpse
+    root cause #2 — found immediately after the index fix landed: corpses
+    stopped teleporting but stayed rigid in their death pose). Vanilla
+    dogbehavior's Death clip (#0119 → triggers #0118) carries exactly one
+    trigger: event 81 `Ragdoll`, `relativeToEndOfClip=true`; the wolf's
+    animationdata Death block fires `Ragdoll:0.267` absolute. That event —
+    not the `BSRagdollContactListenerModifier`, which never fired for our
+    keyframed bodies — is what moves AnimateToRagdoll → Fully Ragdoll and
+    releases the keyframed bodies into the limp powered ragdoll. Our pose
+    source is a held idle rather than an authored dying animation, so the
+    trigger uses the wolf's early absolute timing
+    (`_RAGDOLL_RELEASE_T = 0.266667`, 8 frames — enough for the engine to
+    process the `AddRagdollToWorld` raised on state entry), emitted in
+    BOTH the graph's `hkbClipTriggerArray` and the animationdata block
+    (clip_meta `events`).
+  The `DeathWait` IDLE tree (`creature_idles.py`) routes the engine's kill
+  flow into DeathAnimation (conditioned) or Ragdoll (fall-through when the
+  actor is already ragdolled). The ragdoll add also requires the
+  skeleton.hkx Resource Data tree to list the parts (see [the resource-tree
+  contract](#resource-data-tree)).
 
 Remaining refinements: specialidle/IDLE wiring (Step 7), foot IK / look-at /
 speed-blended gait states, per-creature SNDR sound sets + ARMA footstep
@@ -210,6 +287,369 @@ part data), equip/unequip weapon states, in-game validation pass.
 0.2 Fix `tes4_nif_analyzer.py` `bhkSimpleShapePhantom` crash. (open)
 0.3 Extract `Update.bsa` over `references/Skyrim Animations/` (BSArch) for fixed vanilla
     animation data. (open — reference-only concern)
+
+<a id="ragdoll-root-locktranslation"></a>
+### ★★★★ THE TELEPORT-ON-DEATH ROOT CAUSE (2026-08-08): `lockTranslation` on the ragdoll root's bone
+
+**Symptom:** on death the corpse teleports — sideways, upward, or into the
+ground — by a fixed distance, then settles (sometimes hovering).
+
+**Root cause:** `lockTranslation` on an anim bone tells the engine "this
+bone's translation never changes, use the reference pose". The ragdoll's ROOT
+body drives its mapped anim bone's **translation** (that is how a corpse moves
+as one rigid unit), so a LOCKED root bone means the translation is discarded
+and snapped back to bind — displacing the corpse by exactly that bone's offset
+the frame physics takes over. Vanilla ships `Canine_COM`, the dog ragdoll's
+root bone, with `lockTranslation=false` for exactly this reason (bone 0
+`NPC Root [Root]` is unlocked too).
+
+`UNLOCKED_BONES` only listed `Bip01` / `Bip01 NonAccum`, so any rig whose
+ragdoll roots at `Bip01 Spine0` or `Bip01 Pelvis` shipped a **locked** root.
+
+**In-game census — 15/15 match with the offset, user-tested:**
+
+| ragdoll root bone | lock | creatures | result |
+|---|---|---|---|
+| `Bip01 NonAccum` | false | scamp, rat, zombie, minotaur, skeleton | **no teleport** |
+| `Bip01 Pelvis` | true | spriggan (0.29), lich (0.72) | teleports, small |
+| `Bip01 Spine0` | true | mudcrab 10.3, boar 45, dog 55.8, goblin 66, lion 67, troll 74.8, deer 78, horse 106 | teleports by that exact distance |
+
+**Fix (`hkx_skeleton.build_skeleton_xml`):** extract the ragdoll BEFORE
+emitting the anim skeleton, then add `bones[parts[0].anim_index].name` to the
+unlocked set. 16 creatures change; the 26 others (including every
+confirmed-working one) are byte-identical.
+
+**Dead ends ruled out on the way — do not re-chase:** the ragdoll→anim mapper
+(root pair is `A0 → B<own bone>` with identity `aFromBTransform` on ours AND
+vanilla — correct everywhere, working and broken alike); the ragdoll
+`referencePose` root translation (making it actor-root-relative instead of
+world measured as a pure NO-OP, since the broken rigs' `NPC Root` is already at
+the origin); root-hub capsule size; mass/inertia scale; and "the ragdoll must
+be rooted at anim bone 1" (below).
+
+<a id="ragdoll-root-bone1-dead-end"></a>
+### ✗ DEAD END (2026-08-08): "the ragdoll must be rooted at ANIM BONE 1"
+
+**Symptoms:** on death the corpse teleports to a different frame of reference,
+falls through the floor or floats above it, its limbs stay rigid, and the
+PRN-attached parts (mountain-lion head) lose pick/activation geometry even
+though the *standing* creature was fully selectable.
+
+**What isolated it:** the user reported that the **rat** and the **scamp**
+ragdoll correctly while the mountain lion and goblin do not. Nothing about
+size, mass, capsule volume or root-hub proportion separates those two groups —
+but this does:
+
+| creature | ragdoll root part | anim bone | result |
+|---|---|---|---|
+| rat, scamp (+22 more) | `Bip01 NonAccum` | **1** | **correct** |
+| mountainlion, goblin, dog, bear, boar, deer, horse, imp, mudcrab, sheep, troll | `Bip01 Spine0` | **2** | broken |
+| lich, spriggan, mehrunesdagon | `Bip01 Pelvis` | 2 | broken |
+| landdreugh / willothewisp | `Spine01` / `ContainerGoo01` | 16 / 23 | broken |
+
+**Vanilla contract** (dog `skeleton.hkx`, mapper `#0121`): the ragdoll
+skeleton's root bone `Ragdoll_Canine_COM` maps to **anim bone 1**
+(`Canine_COM`, the immediate child of `NPC Root [Root]`) with an
+`aFromBTransform` of identity. The ragdoll root is ALWAYS the child of the
+actor root — and that is precisely the premise our mappers rely on when they
+emit identity `aFromBTransform` for every pair.
+
+`extract_ragdoll` roots the tree at whichever authored body has no outgoing
+constraint. On Oblivion rigs that is often `Spine0`, up at z=50–66. The
+ragdoll skeleton's root then sits at the *spine* while the engine composes the
+ragdoll pose relative to the ACTOR root, so the whole ragdoll is displaced by
+the `NPC Root → Spine0` vector the instant physics takes over — lion
+(0,−40.5,+53.5), goblin (0,−6.2,+65.8). That is the teleport; the displaced
+capsules then sit below or above the floor (clip / float) and no longer cover
+the rendered body, so the attached parts have no pick geometry. The rat and
+scamp escape it only because their authored root already *is* bone 1.
+
+**REVERTED — the whole theory was wrong.** Vanilla's bone 1 `Canine_COM` is at
+world z=59.3 (up in the body); the working scamp/rat have `NonAccum` as a real
+trunk bone, while lion/boar/dog have `NonAccum` at the FEET (0,0,0) with
+`Spine0` as the trunk. So "bone index 1" was a coincidence of where `NonAccum`
+sits, and re-targeting moved the trunk body's FRAME to the ground — corpses
+stopped ragdolling and stood upright. The real invariant is
+[`lockTranslation`](#ragdoll-root-locktranslation). Three variants were built
+and all three broke it:
+
+**(historical) Fix (`_ensure_root_at_bone1`): RE-TARGET the existing root body
+onto anim bone 1 — do NOT add a body.** The part count, the constraint tree and every
+authored mass stay exactly as Oblivion wrote them; only the root part's
+`anim_index` moves from the trunk bone to bone 1, with its capsule and COM
+re-expressed in bone 1's frame so the collision stays put in world space. Each
+child constraint's PARENT-side data (`piv_b`, `rows_b`) is mapped through the
+same delta; child-side data is untouched.
+
+**Two wrong versions of this fix shipped first, both user-confirmed broken —
+do not reintroduce either:**
+
+1. **Insert a hub part whose capsule spans bone 1 → old root.** That is a
+   67-unit-long, r=16.8 vertical bar running through the whole creature. It
+   enclosed the body, so corpses could not fall over and **just stood
+   upright**. Vanilla `Canine_COM` is r=15.35 with a segment of only 2.91 — a
+   compact hub *at* the bone, never a bridge to the ground origin.
+2. **Insert a compact hub at the trunk.** Still wrong: the hub came out an
+   exact DUPLICATE of `Spine0` (same radius, length, mass, position), doubling
+   the trunk mass and adding a synthetic joint the authored rig never had.
+   Vanilla rigs have ONE trunk body — the rat/scamp `NonAccum` root is a
+   genuine authored body with a separate `Spine` below it, not a twin.
+
+After the fix all 40 ragdoll-bearing creatures root at anim bone 1, every part
+count is byte-identical to before the change, and the emitted mapper starts
+`A0 → B1` matching vanilla. (`ghost` and `wraith` have no extractable ragdoll
+at all — `parts is None` before and after.)
+
+Pre-existing pivot mismatches, NOT caused by this (verified byte-identical
+with the fix disabled): lich `Bip01 Head` 2.93 units; landdreugh's 16 leg
+constraints 0.2–0.9 units.
+
+Pre-existing, NOT caused by this change: the lich's authored `Bip01 Head`
+joint has a 2.93-unit pivot mismatch (byte-identical with the fix disabled).
+
+<a id="keyframe-bone-sets"></a>
+### ★★ Contributing cause (2026-08-08): every ragdoll bone was keyframed
+
+**Symptoms (all four from one cause):** on death the corpse (1) teleports to a
+different frame of reference, (2) has rigid limbs that never flop — exactly
+like the rigid `prisoncellchains01.nif`, (3) falls through the floor or floats
+above it, and (4) loses pick/activation geometry on the PRN-attached parts
+(mountain-lion head), even though the *standing* creature was fully
+selectable.
+
+**Root cause:** the three `hkbBoneIndexArray`s in the generated behavior graph
+were all `list(range(ragdoll['parts']))` — **every** ragdoll bone.
+`hkbKeyframeBonesModifier` **PINS** each listed ragdoll body to the animation
+pose, and a pinned body is immovable by the solver *and generates no
+contacts*. With all of them pinned:
+
+- nothing can flop (rigid limbs);
+- `BSRagdollContactListenerModifier` never fires, because contact requires a
+  dynamic body — so the `Ragdoll` release never comes from contact (the
+  earlier "the contact listener never fired for our keyframed bodies" note was
+  this bug, worked around with a clip trigger instead of fixed);
+- `WORLD_FROM_MODEL_MODE_RAGDOLL` derives worldFromModel from a root body that
+  is itself keyframed to the anim pose — a circular definition that resolves
+  to the raw bind transform, snapping the corpse (teleport);
+- the pinned bodies hold the bind pose while the character controller is
+  removed, so the pick geometry sits where the bind pose is, not where the
+  corpse is drawn — worst at the extremities, i.e. the attached parts.
+
+**Vanilla dogbehavior census (22-body dog ragdoll) — none is `range(n)`:**
+
+| array | modifier | count | contents |
+|---|---|---|---|
+| `#0122` | `KeyframeFullRagdoll` (death state 3) | **18/22** | all EXCEPT the deepest limb leaves (LBackLegToe, RFrontLeg2, L/RFrontLegPalm) |
+| `#0134` | `KeyframeLowerBody` (LIVE root state) | **17/22** | all EXCEPT the tail chain, Neck2 and Head |
+| `#0120` | `CollisionListener.bones` | **8/22** | limb ROOTS + Spine1/Spine3/Neck2/Head — no toe/palm tips, no tail |
+| `#0126` | `DriveRagdollRB.bones` | **0** | empty == all bodies |
+
+The splits are load-bearing: at death the limb *tips* are already free so
+gravity gets a purchase; while alive the tail/neck/head hang free so a living
+creature's tail wags (vanilla's live modifier is literally named
+`KeyframeLowerBody`, not `KeyframeAllBones`).
+
+**Fix:** `hkx_ragdoll._keyframe_bone_sets(parts)` derives all three
+generically from ragdoll tree topology + bone names and returns them via
+`ragdoll_info()` as `keyframe_full` / `keyframe_lower` / `contact_bones`;
+`hkx_behavior` consumes those instead of `range(n)`. Measured against vanilla
+(dog 81%/77%/36%), our output lands at 80–87% / 55–88% / 38–66%. Bone-name
+matching is by WHOLE WORD (`_bone_words`), never substring — a plain
+`'ear' in name` also matches "For**ear**m" and set every forearm loose.
+
+Regression check: no `hkbBoneIndexArray` feeding a keyframe modifier or the
+contact listener may ever equal `range(parts)`.
+
+<a id="root-bone-not-identity"></a>
+#### Measured, NOT the ragdoll bug, still NOT fixed: 33/42 non-identity `NPC Root [Root]`
+
+**This is NOT the cause of the broken corpses** — the rat is in the
+non-identity group and is one of the two creatures that ragdoll *correctly*,
+while the mountain lion and goblin are identity-rooted and broken. The real
+cause is [the ragdoll root bone](#ragdoll-root-at-bone1). Kept here as a
+separate real deviation from the engine contract, unfixed.
+
+Vanilla requires the anim skeleton's bone 0 `NPC Root [Root]` to be **exactly
+identity** (dog referencePose[0] = t(0,0,0) q(0,0,0,1); it is the node the
+engine equates with the reference's world position, at the actor's ground
+origin). Oblivion's `Bip01` root carries an **arbitrary authored bind
+transform**, and `BONE_RENAMES` renames it in place without normalising:
+
+| creature | `Bip01` bind translation | rotation |
+|---|---|---|
+| bear, boar, deer, dog, goblin, mountainlion, slaughterfish, troll, willothewisp (9) | (0,0,0) | identity ✅ |
+| daedroth | (0,0,**101.96**) | 90° |
+| frostatronach | (0,−6.42,**89.14**) | 90° |
+| mehrunesdagon | (0,0,**691.92**) | 90° |
+| rat | (0,**−20.01**,**27.29**) | ~90° |
+| …29 more | z 13.6–105.2 | mostly 90° |
+
+Census: `for p in export/<plugin>/meshes/creatures/*/skeleton.nif:
+load_skeleton_bones(p)[0]`. The rat is the extreme case — its ragdoll ROOT
+part is `Bip01 NonAccum` (the motion-accumulation node) rather than a real
+trunk bone like every other creature's `Bip01 Spine0`, and its whole skeleton
+sits at (0,−20,+27.3) instead of the origin.
+
+This is a real deviation from the engine contract and a plausible second
+contributor to death-frame misplacement on those 33 creatures. It was NOT
+changed together with the keyframe fix: normalising the root means
+re-expressing every bone transform, every animation track and every skinned
+mesh bind, which would touch the 9 creatures that currently work. Do it as its
+own scoped pass with its own in-game verification — do not bundle it.
+
+<a id="ragdoll-inertia-root-cause"></a>
+### THE RIGID-RAGDOLL THEORY (2026-08-08): ill-conditioned inertia tensors
+
+(Superseded as the root cause by the keyframe-bone-set bug above, but the
+capsule-derived tensor is kept: it is closer to vanilla than Oblivion's
+authored diagonals either way.)
+
+Converted creatures died with a **rigid** ragdoll (limbs never flopped) that
+**teleported, fell through the floor, and lost collision on its attached
+parts** — all on the frame physics takes over, while the live creature was
+perfect. Four sessions of static audits (bind pose, mappers, constraints,
+friction, filters, motion system, body transforms) all found the ragdoll
+byte-equivalent to vanilla, because they never compared the **inertia
+tensor** — the one field that was wrong.
+
+`extract_ragdoll` carried Oblivion's authored inertia diagonals through
+verbatim (×49). Oblivion's values are wildly ill-conditioned: our shipped
+tensors hit **32×** principal-axis anisotropy on the forearm, 20× on the
+thigh, 15× on spine2 — against vanilla Skyrim's **worst creature body at
+6.6×**. A badly ill-conditioned inertia on a constrained ragdoll body makes
+Havok's joint solver **diverge**: the limp ragdoll stays rigid, and the
+destabilised simulation island snaps to a fallback transform and drops out of
+collision. Two vanilla-parity gaps compounded it — ours emitted every body
+`MOTION_BOX_INERTIA` (vanilla uses `MOTION_SPHERE_INERTIA` with isotropic
+inertia on the ~4 round bodies: the COM/torso hub and the tiny leg-tip caps),
+and the anisotropy was unbounded.
+
+**Fix (`asset_convert/hkx_ragdoll.py`):**
+- `_capsule_inertia(shape, mass)` computes each body's tensor analytically
+  from its capsule (solid cylinder + two hemisphere caps) instead of trusting
+  Oblivion's diagonal.
+- The principal-axis ratio is clamped to `MAX_ANISO = 6.5` (vanilla's
+  ceiling) — even the *exact* capsule tensor of a long thin limb is ~31×, so
+  the ellipsoid is fattened while keeping its orientation.
+- `_add_rigid_body` emits `MOTION_SPHERE_INERTIA` + isotropic (min-axis)
+  inertia for a "round" body (`seg_len < 0.8·radius`), else `BOX_INERTIA`.
+  Dog result: 22 BOX + 4 SPHERE (vanilla's exact split), worst anisotropy
+  6.5 (was 32).
+
+Diagnostic: decompile a converted `skeleton.hkx` and read each
+`hkpRigidBody`'s `inertiaAndMassInv` — any body whose max/min of the first
+three components exceeds ~7 is the regression.
+
+<a id="ragdoll-ab-bisect"></a>
+### Death-ragdoll A/B bisect ESPs (2026-08-08 — superseded by the inertia fix above; kept for method)
+
+The animationdata index fix and the `Ragdoll` release trigger below are real
+contract fixes but did NOT fix the in-game ragdoll (user-confirmed): with the
+release firing, corpses teleport and fall through the floor; with it absent
+they freeze standing (stable, controller still present). **The failure is
+therefore isolated to the ragdoll handover itself** — whatever
+`AddRagdollToWorld` + `Fully Ragdoll` produce is wrong at runtime even though
+skeleton.hkx / skeleton.nif / behavior / RACE all verify vanilla-contract
+clean offline (do NOT re-audit them; three sessions have). Three test ESPs
+exist in `output/` targeting `TES4SEUshnarDogRace` (dog rig — spawn via
+console, kill, observe the corpse):
+
+| ESP | Swaps in | Corpse ragdolls properly ⇒ | Still broken ⇒ |
+|---|---|---|---|
+| `TES4AB_AllVanilla.esp` | vanilla canine behavior+skeleton+body | records/cache exonerated; fault in generated assets | fault in records/cache side (or engine needs something per-race we lack) |
+| `TES4AB_VanillaBehavior.esp` | vanilla behavior project only (our NIFs) | our project stack (hkx/cache) at fault | our skeleton.nif/body side at fault |
+| `TES4AB_VanillaNifs.esp` | vanilla skeleton.nif+body only (our project) | our NIF side at fault | our project stack at fault |
+
+(Judge ONLY death/ragdoll behavior; live animation will look wrong in the
+mixed arms — bone names don't match across rigs.)
+
+<a id="animdata-index-contract"></a>
+### THE 2026-08-08 DEAD-RAGDOLL ROOT CAUSE: animationdata clip indices were clip ordinals, not file indices
+
+**Symptom (persistent across ~a dozen graph/physics-side fixes that changed
+nothing):** on death the corpse teleported up/sideways, limbs stayed rigid,
+and the body fell through the floor.
+
+**Root cause (`animation_data.py project_block_lines`):** the second line of
+an animationdata clip block is the index into the character hkx's
+`hkbCharacterStringData.animationNames` — the **deduplicated animation FILE
+list** — but the emitter wrote `enumerate(manifest['clips'])` ordinals.
+Clips and files stay aligned only until the first clip that SHARES a file
+(CombatStance reuses idle.hkx), after which every index is off by one, and
+every clip past the file count is **out of range**: all the parametric gait
+children and `FullyRagdollPose`, the death-state pose source. An
+out-of-range clip generator never binds, so the death states ran with a
+dead pose source and the whole ragdoll handoff collapsed — regardless of
+how correct the behavior graph, skeleton.hkx, skeleton.nif, RACE records,
+character file and 64-bit serialization were (each was verified
+vanilla-equal during the 2026-08-08 audit; the corruption lived only in the
+cache text). Live creatures LOOKED fine because the first six clips (idle +
+locomotion, one file each) were correctly numbered; the desync quietly made
+each attack play the NEXT attack's file and the run gait play the
+aware-vocal clip. `motion_block_lines` had the same bug — root-motion
+blocks are keyed by animation index, one per FILE, not one per clip.
+
+Fixed by `_anim_file_index()` (mirrors the character emitter's
+`dict.fromkeys` dedupe exactly). **Audit with
+`python tools/animdata_index_check.py`** after touching `animation_data.py`,
+`clip_meta` composition, or the character animation list; the older
+`animcache_validate.py` checks only the grammar and passed this corruption.
+
+Note on the earlier "Resource Data tree is load-bearing" claim (2026-08-07,
+above): ck-cmd's `build_skeleton_from_ragdoll` — the tool Skyblivion's own
+working creatures come from — ships an **empty** `hkMemoryResourceContainer`
+as Resource Data. The per-part tree matches vanilla and is kept, but it
+cannot have been the ragdoll gate; the animationdata index corruption was
+present under every experiment of that period.
+
+<a id="rigid-part-bind"></a>
+### "Attached parts have no hitbox / corpse falls through ground" — it was AddRagdollToWorld (2026-08-08)
+
+**Symptom (in-game):** attached rigid parts (mountain-lion head, goblin
+head/helmets/pauldrons — every Prn part NIF) had NO hitbox and corpses
+clipped/fell through the ground; corpses kept playing their idles.  The rat
+only *looked* right because its standing blend-body ghost roughly overlaps
+its tiny body.
+
+**Root cause: nothing raised `AddRagdollToWorld`** (see the Death bullet
+above).  With no ragdoll in the world and the character controller removed
+by Fully Ragdoll, a corpse has NO collision anywhere — so every region
+"had no hitbox", and the most-visible regions (the big attached parts)
+were reported first.  Two capsule-geometry "fixes" were built on the wrong
+theory and both REVERTED the same day; the authored Oblivion capsules are
+correct and ship unchanged:
+
+1. `fit_ragdoll_capsules_to_mesh` wrote each part's **bone-local** mesh
+   centroid into the blend body's `rb.translation` — but that field is the
+   body's **BIND WORLD** position in BOTH engines (vanilla dog census:
+   Canine_Head rb_t = (0, 49.6, 70.4)); capsule vertexA/B are BODY-local,
+   and Oblivion's body frame == the bone frame (verified |R_body −
+   R_node_world| = 0 on lion source + converted).  The fit teleported
+   capsules to the model origin (shipped goblin: `Bip01 Head` rb_t z=0,
+   `R UpperArm` z=−17.7 — underground).
+2. `_enlarge_for_attachments` grew capsules to enclose the Prn part meshes
+   (lion head r 3.8→12.5, goblin head r 7.2→22, neck spanning the
+   pauldrons).  Coverage math was correct but the result was visibly
+   oversized in NifSkope and pointless once the real cause was found —
+   reverted; revisit only with in-game evidence that authored capsules are
+   too thin to activate (they match what Oblivion shipped, and the
+   "radius 0.5, 40× too small" claim was a units error — 0.54 ob-havok
+   units × `_OB_TO_GAME`(7) = 3.8 game units).
+
+**Frame contracts (the traps that made both wrong fixes easy to write):**
+- Blend body `rb.translation`/`rotation` are BIND WORLD; capsule
+  vertexA/B are BODY-local (== bone-local on these rigs).  Never write
+  bone-local values into `rb.translation`.
+- `extract_ragdoll` reads the SOURCE (Oblivion) skeleton.nif; skeleton.hkx
+  is generated BEFORE nif conversion, so post-conversion NIF edits never
+  reach the hkx.
+- skeleton.hkx works in GAME units (vanilla dog capsule radii 3.4–5.7,
+  not havok metres); the converted skeleton.nif bhk fields are
+  game/69.9904.
+- The Prn attachment verts are bone-local after
+  `_bake_node_transforms_into_verts`; only the mountain lion has a
+  whitespace bone name (`'Bip01 Spine0 '`, trailing space) and it is
+  consistent across skeleton.nif / hkx / BPTD, so it binds.
 
 ### Step 1 — Creature manifest (plugin-agnostic inventory)
 New tool `tools/creature_inventory.py`: for each CREA record (post-0.1 export), emit a

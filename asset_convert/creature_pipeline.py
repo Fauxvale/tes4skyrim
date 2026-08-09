@@ -480,14 +480,44 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
                 with open(mp, encoding='utf-8') as f:
                     all_manifests[d] = json.load(f)
 
-    if all_manifests:
+    # UNION across EVERY built plugin (masters and siblings): the game's Data
+    # folder holds exactly ONE animationdatasinglefile.txt, so whichever
+    # plugin's copy is deployed last must still register every other
+    # plugin's creatures — deploying Morrowind_ob's file over Oblivion's
+    # de-registered all of Oblivion's projects and its creatures froze in
+    # their idles (confirmed in game 2026-08-07). This plugin's own version
+    # of a same-named folder wins; the deployed loose meshes collide on the
+    # same paths anyway.
+    union = dict(all_manifests)
+    plugins_root = os.path.dirname(os.path.dirname(out_meshes_dir))
+    try:
+        siblings = sorted(os.listdir(plugins_root))
+    except OSError:
+        siblings = []
+    for plug in siblings:
+        sib_actors = os.path.join(plugins_root, plug, 'meshes', 'actors',
+                                  'tes4')
+        if os.path.normpath(sib_actors) == os.path.normpath(actors_root) \
+                or not os.path.isdir(sib_actors):
+            continue
+        for d in sorted(os.listdir(sib_actors)):
+            if d in union:
+                continue
+            mp = os.path.join(sib_actors, d, 'project_manifest.json')
+            if os.path.exists(mp):
+                with open(mp, encoding='utf-8') as f:
+                    union[d] = json.load(f)
+
+    if union:
         cache_dir = os.path.join(export_dir, 'animdata_base')
-        manifests = [all_manifests[n] for n in sorted(all_manifests)]
+        manifests = [union[n] for n in sorted(union)]
         counts = write_singlefiles(manifests, out_meshes_dir,
                                    skyrim_data_path, cache_dir)
         log(f'  Registered {len(manifests)} projects '
-            f'(animationdatasinglefile: {counts["animationdatasinglefile.txt"]}'
-            f' total projects)')
+            f'({len(all_manifests)} own, '
+            f'{len(union) - len(all_manifests)} from sibling plugins; '
+            f'animationdatasinglefile: {counts["animationdatasinglefile.txt"]}'
+            f' total)')
 
     # Contract for tes5_import (RACE/ARMA/ARMO generation).
     # .get defaults: an interrupted run can leave a manifest without the
@@ -511,6 +541,8 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
         'has_ragdoll': m.get('has_ragdoll', False),
         'clips': [c['name'] for c in m.get('clips', [])],
         'bones': m.get('bones', []),
+        # ragdoll part bone names -> per-creature BPTD (creature_races)
+        'ragdoll_bones': m.get('ragdoll_bones', []),
         # vocal idle states -> import generates their ActionIdle/
         # ActionIdleWarn IDLE entry records (creature_idles)
         'vocal_events': m.get('vocal_events', []),
