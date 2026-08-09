@@ -288,6 +288,129 @@ part data), equip/unequip weapon states, in-game validation pass.
 0.3 Extract `Update.bsa` over `references/Skyrim Animations/` (BSArch) for fixed vanilla
     animation data. (open — reference-only concern)
 
+<a id="ragdoll-mass-and-friction"></a>
+### ★★ Corpses "weigh a million pounds" + 4 creatures never fall over (2026-08-08)
+
+Two independent defects, both fixed after the
+[`lockTranslation` teleport fix](#ragdoll-root-locktranslation) landed.
+
+#### 0. ⚠️ THE TRAP: mass/friction live in BOTH skeleton.nif AND skeleton.hkx
+
+**A creature's ragdoll bodies are described TWICE** — as `bhkRigidBody` blend
+bodies in `skeleton.nif` (converted by `collision.py`) and as `hkpRigidBody` in
+`skeleton.hkx` (built by `hkx_ragdoll.py`). Vanilla ships **identical** values
+in both (dog: mass total 74.00 either side; every constraint friction 0.0).
+
+Both fixes below were first applied ONLY to `hkx_ragdoll.py` and **the in-game
+symptoms did not change at all**, because the engine weighs the NIF blend
+bodies: they still carried Oblivion's raw mass (dog total 262, per-body 25-50)
+and raw `max_friction` (10.0/12.0) while the hkx said 37.4 / 0.0. The two
+representations disagreed and the heavy, high-friction one won.
+
+**Any change to ragdoll mass, friction, inertia or motion type MUST be made in
+both files, or they desync.** Verify with: our output nif total == our output
+hkx total, and both in vanilla's range for a comparable creature.
+
+#### 1. Mass was never unit-converted (`_OB_MASS_DIV`)
+
+**Symptom:** dead creatures are nearly immovable — havok-grabbing a limb moves
+it only slightly, on EVERY ragdoll.
+
+**Cause:** `extract_ragdoll` scaled every LENGTH by `_OB_TO_GAME` (7) but
+carried Oblivion's authored **mass** through untouched. Oblivion tunes mass
+against Oblivion-scale lengths, and Havok's rotational inertia goes as
+`mass * length^2`, so unconverted mass inflates resistance-to-rotation by 49x
+versus what the animators tuned.
+
+**Fix:** divide mass by 7 (`_OB_MASS_DIV = _OB_TO_GAME`). Inertia is computed
+from mass in `_capsule_inertia`, so it follows automatically. Matched-pair
+landing (total mass, ours vs closest vanilla creature): dog 262 -> 37.4 vs wolf
+29; rat 271 -> 38.7 vs skeever 60; lion 501 -> 71.6 vs sabrecat 245; minotaur
+1270 -> 181 vs giant 510. Was 1.3-9x heavy, now 0.1-1.3x.
+
+A single divisor is deliberate — vanilla per-body masses are hand-authored
+round numbers with **no** volume/density law (vanilla dog's own density varies
+**46x** across its bodies; totals span wolf 29 -> dragon 4852), so there is
+nothing physical to derive, only the unit scale. It also preserves each rig's
+RELATIVE proportions, so heavy creatures stay heavy (stormatronach 1617 vs
+goblin 25.7) — a Skyrim dragon is immovable and should be.
+
+#### 2. ★ THE REAL "never falls over" CAUSE: the NIF ragdoll tree had ORPHAN bodies
+
+**Symptom:** skeleton, shambles, mehrunesdagon and stormatronach never fall
+over on death (user-confirmed 4/4); every other creature does.
+
+**Root cause:** vanilla creature skeleton.nifs ship exactly **`bodies - 1`**
+constraints — every body except the ragdoll root is constrained, no orphans
+(dog 22/21, wolf 22/21, sabrecat 28/27, skeever 21/20). Oblivion leaves some
+bodies unconstrained (its animators wanted them as collision, not joints). A
+`bhkRigidBody` with NO constraint is **not part of the ragdoll's constraint
+island**, so the chain through it cannot collapse and the corpse stays
+standing. `hkx_ragdoll` already synthesized joints for these on the
+skeleton.**hkx** side — but nothing closed the tree in the NIF, and the engine
+reads the NIF (see the two-file trap above).
+
+Census of our output before the fix — matched the reports 4/4 with zero false
+positives:
+
+| creature | bodies | constraints | missing | result |
+|---|---|---|---|---|
+| stormatronach | 70 | 16 | **53** | never fell |
+| mehrunesdagon | 23 | 0 | **22** | never fell |
+| shambles | 17 | 13 | **3** | never fell |
+| skeleton | 17 | 13 | **3** | never fell |
+| all 39 others | — | — | **0** | all fell |
+
+**Fix:** `collision.add_missing_creature_constraints(data, root)`, called from
+`nif_converter` after `scale_constraint_pivots` (the synthesized pivots are
+built from body `center` values already in Skyrim Havok units). Each orphan
+body gets a `bhkRagdollConstraint` to its nearest body-carrying ancestor, on
+the vanilla atronach rock template (cone 50 deg, plane +-90, twist +-5,
+friction 0) with an orthonormal twist/plane/motor basis. After: 43/43 creatures
+complete, one orphan each (the ragdoll root, which vanilla also leaves bare).
+
+#### 3. `_SYNTH_FRICTION` (contributing, not the cause)
+
+**Symptom:** skeleton, shambles, mehrunesdagon and stormatronach never fall
+over on death (user-confirmed 4/4); everything else does.
+
+**Cause:** those are **exactly** the 4 creatures whose Oblivion rig ships
+bodies with NO authored constraint (skeleton/shambles 3 each on `Head` + both
+`UpperArm`; mehrunesdagon 22 of 23 — its whole spine and both legs;
+stormatronach 53, its rock shell). Every other creature has exactly one
+unconstrained body — the ragdoll ROOT, which needs no joint. Our planner
+attaches unconstrained bodies with the atronach rock-joint template, which
+carried `_SYNTH_FRICTION = 10.0`; `maxFrictionTorque` is an angular friction
+torque, so a joint with 10 resists rotation hard enough that the chain through
+it cannot collapse under gravity. **Vanilla creature ragdolls are friction 0
+across the board (dog census: 42/42 `maxFrictionTorque` = 0.000000).**
+
+The tell was the storm atronach: its ROCKS (the synthetic-jointed bodies)
+tumbled correctly while its BODY stayed rigid, and its mainline spine/leg
+joints are authored at friction 0 — the frozen links were the ones our
+template gave friction to.
+
+**Fix, BOTH sides:** `hkx_ragdoll._SYNTH_FRICTION = 0.0`, and in
+`collision.py` the creature blend joints are now clamped to **0.0** instead of
+being exempted from the clamp. The old comment there claimed "vanilla
+skeleton.nif joints mix 10.0/0.5/0.01 so keep the authored value" — measurably
+wrong: a census of the vanilla dog/wolf/sabrecat/skeever creature skeleton.nifs
+is **89/89 constraints at exactly 0.000000**. Rock-joint LIMITS (cone 50,
+plane +-90, twist +-5) stay: a sane vanilla-derived default for a joint
+Oblivion never authored.
+
+**Dead ends on the fall-over hunt — do not re-chase.** Nothing on the
+geometry/keyframe side separates fallers from non-fallers: skeleton and zombie
+have IDENTICAL free-at-death sets (`Head`, `L Hand`, `R Hand`) and 17 parts
+each, yet zombie falls. Also falsified: joint-limit tightness (zombie falls
+with a 1-5 deg spine vs skeleton's 15), keyframe percentages (80-83% in both
+groups), mass ratios, SPHERE_INERTIA counts (boar falls at 25%, horse did not
+at 23%), "a free body must be low enough to touch the floor" (10/18
+mismatches), and synthetic joints blocking the load path (stormatronach's
+mainline legs are unblocked). The horse was ALSO a false lead — reported
+not-falling once, then confirmed falling on a retest, so its uniform 44-55
+mass spread is NOT a defect.
+
 <a id="ragdoll-root-locktranslation"></a>
 ### ★★★★ THE TELEPORT-ON-DEATH ROOT CAUSE (2026-08-08): `lockTranslation` on the ragdoll root's bone
 

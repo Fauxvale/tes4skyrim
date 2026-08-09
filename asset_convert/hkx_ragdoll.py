@@ -78,6 +78,26 @@ hkx_xml.SIGNATURES.update({
 })
 
 _OB_TO_GAME = 7.0          # Oblivion Havok units → game units
+
+# Oblivion's authored ragdoll MASSES have to be divided by the same 7 (2026-08-08
+# "dead creatures weigh a million pounds — I can only move limbs a little" report).
+#
+# Oblivion tunes mass against OBLIVION-scale lengths; we multiply every length by
+# `_OB_TO_GAME`, and Havok's rotational inertia goes as mass * length^2, so
+# carrying the mass through unchanged inflates the resistance-to-rotation by 49x
+# relative to what the animators actually tuned.  Dividing mass by 7 restores
+# Oblivion's own feel while preserving each rig's RELATIVE proportions, so a
+# heavy creature stays heavy (a Skyrim dragon is immovable and should be) and a
+# rat becomes flickable.
+#
+# Landing check against matched vanilla creatures (our dog, mass total / max
+# principal inertia):  carried through 262 / 4548; /7 -> 37.4 / 650.  Vanilla
+# wolf is 29 / 426 and vanilla dog 74 / 819, so /7 sits between them.  A single
+# divisor is deliberate: vanilla per-body masses are hand-authored round numbers
+# with no volume/density law (dog density varies 46x across its own bodies, and
+# vanilla totals span wolf 29 -> dragon 4852), so there is nothing physical to
+# derive — only the unit scale.
+_OB_MASS_DIV = _OB_TO_GAME
 _HUGE = '18446726481523507000.000000'
 _MAX_IMPULSE = '340282001837565600000000000000000000000.000000'
 
@@ -347,7 +367,29 @@ def _legalize_limits(kind, info, R_cw, R_pw):
 _SYNTH_CONE = 0.872665          # 50 deg
 _SYNTH_PLANE = 1.570796         # +/- 90 deg
 _SYNTH_TWIST = 0.087266         # +/- 5 deg
-_SYNTH_FRICTION = 10.0
+# Friction 0, like EVERY vanilla creature ragdoll joint (dog census: 42/42
+# `maxFrictionTorque` = 0.000000).  The Oblivion-authored ~10 was carried onto
+# synthetic joints and is the 2026-08-08 "corpse never falls over" cause:
+# `maxFrictionTorque` is an angular friction torque on the joint, so a joint
+# carrying 10 resists rotation hard enough that the chain through it cannot
+# collapse under gravity.
+#
+# The 4 creatures whose Oblivion rig ships bodies with NO authored constraint
+# are exactly the 4 that never fell over (user-confirmed 4/4): skeleton and
+# shambles (3 synthetic joints each, on `Head` + both `UpperArm`),
+# mehrunesdagon (22 of 23 — its whole spine and both legs), stormatronach
+# (53, its rock shell).  Every other creature has exactly one unconstrained
+# body — the ragdoll ROOT, which needs no joint — and every one of those
+# falls.  The tell was the storm atronach: its ROCKS (the synthetic-jointed
+# bodies) tumbled correctly while its BODY stayed rigid, and its mainline
+# spine/leg joints are authored, friction 0 — the frozen links are the ones
+# our template gave friction to.
+#
+# Nothing else distinguished the two groups: free-at-death sets are IDENTICAL
+# between skeleton and zombie (`Head`, `L Hand`, `R Hand`; 17 parts each) yet
+# zombie falls, and joint limits, mass ratios, keyframe percentages,
+# SPHERE_INERTIA counts and load-path blocking all fail to separate them.
+_SYNTH_FRICTION = 0.0
 
 
 def _decode_name(node):
@@ -670,7 +712,11 @@ def extract_ragdoll(skeleton_nif_path: str, bones: list):
         p.parent = part_of_node[id(pnode)] if pnode is not None else -1
         p.constraint = con_of.get(nid)
 
-        p.mass = float(body.mass) if body.mass > 0 else 1.0
+        # /_OB_MASS_DIV: Oblivion mass is authored against Oblivion-scale
+        # lengths (see the constant) — carrying it through unconverted while
+        # scaling lengths x7 made every corpse feel immovable.
+        p.mass = (float(body.mass) / _OB_MASS_DIV if body.mass > 0
+                  else 1.0 / _OB_MASS_DIV)
         p.com = _to_bone(nid, _v4(body.center, _OB_TO_GAME), 1)
         shape = _capsule_from_shape(body.shape)
         if shape is not None:

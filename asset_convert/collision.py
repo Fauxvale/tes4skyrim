@@ -19,6 +19,11 @@ from .cms_builder import build_cms_collision
 
 _HAVOK_SCALE = 0.1
 _GAME_UNITS_PER_HAVOK = 69.9904  # Skyrim: 1 Havok unit = 69.9904 game units
+# Oblivion->game unit scale, used to divide authored ragdoll MASS on creature
+# blend bodies.  Must stay equal to hkx_ragdoll._OB_MASS_DIV: skeleton.nif and
+# skeleton.hkx describe the SAME bodies and vanilla ships identical masses in
+# both (dog total 74.00 either side).  See _convert_blend_collision.
+_OB_MASS_DIV = 7.0
 NIF_FLAGS = 14  # Standard Skyrim NiAVObject flags (SelectiveUpdate bits 1-3)
 
 # ---------------------------------------------------------------------------
@@ -1739,10 +1744,26 @@ def _convert_blend_collision(node, coll_obj):
     # bhkEntityCInfo byte: prop bodies use 116/10, but the vanilla creature
     # blend-body census is 0 (COM root occasionally 3)
     rb.unknown_byte = 0
+    # MASS: divide by the Oblivion->game unit scale, exactly as
+    # hkx_ragdoll._OB_MASS_DIV does for the skeleton.hkx ragdoll bodies.
+    #
+    # **These are the SAME physical bodies described twice** — vanilla ships
+    # identical masses in skeleton.nif and skeleton.hkx (dog: total 74.00 in
+    # both, per-body 2-6).  The 2026-08-08 "dead creatures weigh a million
+    # pounds, I can only move limbs a little" report survived fixing the hkx
+    # side alone because the ENGINE WEIGHS THE NIF BLEND BODIES: they still
+    # shipped Oblivion's raw values (dog total 262, per-body 25-50) while the
+    # hkx said 37.4, so the two representations disagreed and the heavy one won.
+    #
+    # Whenever mass handling changes, it MUST change in both places or they
+    # desync.  Verify with: vanilla dog nif == 74.0 total, and our output nif
+    # total == our output hkx total.
+    rb.mass = float(rb.mass) / _OB_MASS_DIV
     for attr in ('m_11', 'm_12', 'm_13', 'm_21', 'm_22', 'm_23',
                  'm_31', 'm_32', 'm_33'):
         setattr(rb.inertia, attr,
-                getattr(rb.inertia, attr) * _HAVOK_SCALE * _HAVOK_SCALE)
+                getattr(rb.inertia, attr) * _HAVOK_SCALE * _HAVOK_SCALE
+                / _OB_MASS_DIV)
     rb.motion_system = 4        # MO_SYS_KEYFRAMED (bone follows animation)
     rb.quality_type = 1         # MO_QUAL_FIXED
     rb.deactivator_type = 1
@@ -2218,7 +2239,7 @@ def _demote_malleable_constraints(data):
     return new_blocks
 
 
-def _fix_limited_hinge(d, clamp_friction=True):
+def _fix_limited_hinge(d, clamp_friction=True, friction_target=0.01):
     """Skyrim-format fixes for a LimitedHingeDescriptor (pivots already scaled).
 
     1. Missing perp_2_axle_in_b_1: Oblivion's LimitedHingeDescriptor does not
@@ -2240,11 +2261,11 @@ def _fix_limited_hinge(d, clamp_friction=True):
     if perp_a1 is not None:
         perp_a1.w = -1.0
 
-    if clamp_friction and d.max_friction > 0.5:
-        d.max_friction = 0.01
+    if clamp_friction and d.max_friction > friction_target:
+        d.max_friction = friction_target
 
 
-def _fix_ragdoll(d, clamp_friction=True):
+def _fix_ragdoll(d, clamp_friction=True, friction_target=0.01):
     """Derive the Skyrim-only RagdollDescriptor motor axes and clamp friction.
 
     In the Skyrim (Havok 2010) layout twist/plane/motor are the three columns
@@ -2257,12 +2278,18 @@ def _fix_ragdoll(d, clamp_friction=True):
     value the joint has enough rotational friction to lock solid — chains and
     swinging traps LOOK fine but never move when touched.  Vanilla Skyrim prop
     ragdoll constraints use 0.01 (desecratedimperial.nif), the same value the
-    limited-hinge clamp already uses (the tavern-sign fix).  Creature
-    skeleton joints (clamp_friction=False) keep the authored value — the
-    vanilla creature census mixes 10.0/0.5/0.01.
+    limited-hinge clamp already uses (the tavern-sign fix).
+
+    `friction_target` selects which contract applies: 0.01 for props, and
+    **0.0 for creature blend joints** — vanilla creature skeleton.nifs are
+    89/89 constraints at exactly 0.0 (dog/wolf/sabrecat/skeever census
+    2026-08-08), matching their skeleton.hkx ragdolls.  The previous code
+    exempted creature joints from the clamp entirely on the false premise that
+    "the vanilla creature census mixes 10.0/0.5/0.01"; carrying Oblivion's 10
+    through is what stopped corpses falling over.
     """
-    if clamp_friction and d.max_friction > 0.5:
-        d.max_friction = 0.01
+    if clamp_friction and d.max_friction > friction_target:
+        d.max_friction = friction_target
     for twist_name, plane_name, motor_name in (('twist_a', 'plane_a', 'motor_a'),
                                                ('twist_b', 'plane_b', 'motor_b')):
         motor = getattr(d, motor_name, None)
@@ -2349,6 +2376,136 @@ def _constraint_descriptors(block):
             yield kind, d
 
 
+def add_missing_creature_constraints(data, root):
+    """Give every unconstrained creature blend body a joint to its nearest
+    body-carrying ancestor, so the NIF ragdoll is a CONNECTED tree.
+
+    **This is the 2026-08-08 "corpse never falls over" root cause.**  Vanilla
+    creature skeleton.nifs ship exactly `bodies - 1` constraints — every body
+    except the ragdoll root is constrained, no orphans (dog 22/21, wolf 22/21,
+    sabrecat 28/27, skeever 21/20).  A `bhkRigidBody` with NO constraint is not
+    part of the ragdoll's constraint island, so the chain through it cannot
+    collapse and the corpse stays standing.
+
+    Oblivion leaves some bodies unconstrained (its animators only needed them
+    as collision, not as joints).  `hkx_ragdoll` already synthesizes joints for
+    these on the skeleton.**hkx** side — but the engine also reads the NIF, and
+    nothing was closing the tree there.  Census of our output before this fix,
+    which matched the in-game reports exactly (4/4, no false positives):
+
+        stormatronach  70 bodies, 16 constraints (53 missing)  never fell
+        mehrunesdagon  23 bodies,  0 constraints (22 missing)  never fell
+        shambles       17 bodies, 13 constraints ( 3 missing)  never fell
+        skeleton       17 bodies, 13 constraints ( 3 missing)  never fell
+        ...all 39 other creatures complete                     all fell
+
+    The synthesized joint is a `bhkRagdollConstraint` on the vanilla atronach
+    rock template (cone 50 deg, plane +-90, twist +-5) with friction 0, pivoted
+    at the child body's centre — the same template and pivot rule
+    `hkx_ragdoll._SYNTH_*` uses, so the two files stay consistent.
+    """
+    # body -> owning node, in tree order, plus each node's parent
+    node_of_body = {}
+    parent_of = {}
+
+    def walk(n, parent):
+        parent_of[id(n)] = parent
+        co = getattr(n, 'collision_object', None)
+        body = getattr(co, 'body', None) if co is not None else None
+        if body is not None and isinstance(body, NifFormat.bhkRigidBody):
+            node_of_body[id(body)] = n
+        for c in getattr(n, 'children', []) or []:
+            if isinstance(c, NifFormat.NiNode):
+                walk(c, n)
+
+    walk(root, None)
+    if not node_of_body:
+        return 0
+
+    # id(node) -> body object
+    body_of_node = {}
+    for _bid, n in node_of_body.items():
+        body_of_node[id(n)] = n.collision_object.body
+
+    added = 0
+    for bid, node in list(node_of_body.items()):
+        body = body_of_node[id(node)]
+        if len(list(getattr(body, 'constraints', []) or [])) > 0:
+            continue
+        # nearest ancestor that carries a body = this body's ragdoll parent
+        anc = parent_of.get(id(node))
+        target = None
+        while anc is not None:
+            if id(anc) in body_of_node:
+                target = body_of_node[id(anc)]
+                break
+            anc = parent_of.get(id(anc))
+        if target is None:
+            continue        # genuinely the ragdoll ROOT — vanilla leaves it bare
+        _add_synth_ragdoll_constraint(data, body, target)
+        added += 1
+    return added
+
+
+# Vanilla atronach rock-joint template, shared with hkx_ragdoll._SYNTH_*:
+# cone 50 deg, plane +-90 deg, twist +-5 deg, friction 0.
+_SYNTH_CONE = 0.872665
+_SYNTH_PLANE = 1.570796
+_SYNTH_TWIST = 0.087266
+
+
+def _add_synth_ragdoll_constraint(data, child_body, parent_body):
+    """Append a bhkRagdollConstraint joining child_body to parent_body.
+
+    Pivots at the child body's own centre expressed in each body's local space
+    (both bodies' `center` fields are already in Skyrim Havok units at this
+    point, so the pivot needs no further scaling).  Frames are axis-aligned:
+    twist = X, plane = Y, motor = Z — the orthonormal basis Skyrim's 2010
+    layout requires (a zero motor ships a singular basis).
+    """
+    con = NifFormat.bhkRagdollConstraint()
+    con.num_entities = 2
+    con.entities.update_size()
+    con.entities[0] = child_body
+    con.entities[1] = parent_body
+    con.priority = 1
+
+    d = con.ragdoll
+    for name, (x, y, z) in (('twist_a', (1.0, 0.0, 0.0)),
+                            ('plane_a', (0.0, 1.0, 0.0)),
+                            ('motor_a', (0.0, 0.0, 1.0)),
+                            ('twist_b', (1.0, 0.0, 0.0)),
+                            ('plane_b', (0.0, 1.0, 0.0)),
+                            ('motor_b', (0.0, 0.0, 1.0))):
+        v = getattr(d, name, None)
+        if v is not None:
+            v.x, v.y, v.z = x, y, z
+            if hasattr(v, 'w'):
+                v.w = 0.0
+    for name, src in (('pivot_a', child_body.center),
+                      ('pivot_b', child_body.center)):
+        v = getattr(d, name, None)
+        if v is not None:
+            v.x, v.y, v.z = src.x, src.y, src.z
+            if hasattr(v, 'w'):
+                v.w = 0.0
+    d.cone_max_angle = _SYNTH_CONE
+    d.plane_min_angle = -_SYNTH_PLANE
+    d.plane_max_angle = _SYNTH_PLANE
+    d.twist_min_angle = -_SYNTH_TWIST
+    d.twist_max_angle = _SYNTH_TWIST
+    d.max_friction = 0.0
+
+    # register on the child body (Havok convention: the constraint lives on
+    # entity A) and in the block list
+    n = child_body.num_constraints
+    child_body.num_constraints = n + 1
+    child_body.constraints.update_size()
+    child_body.constraints[n] = con
+    data.blocks.append(con)
+    return con
+
+
 def scale_constraint_pivots(data):
     """Fix Havok constraint data for Oblivion → Skyrim conversion.
 
@@ -2377,10 +2534,21 @@ def scale_constraint_pivots(data):
                          if isinstance(b, NifFormat.bhkConstraint)]
     constraint_blocks += _demote_malleable_constraints(data)
 
-    # Creature-skeleton blend bodies follow the VANILLA CREATURE contract,
-    # not the prop contract: constraint max_friction stays authored (vanilla
-    # skeleton.nif joints mix 10.0/0.5/0.01 — the prop clamp to 0.01 does
-    # not apply) and the broadphase byte stays 0, not the dynamic-prop 10.
+    # Creature-skeleton blend bodies follow the VANILLA CREATURE contract, not
+    # the prop contract: the broadphase byte stays 0, not the dynamic-prop 10.
+    #
+    # max_friction is FORCED TO 0 on them (2026-08-08).  The old comment here
+    # claimed "vanilla skeleton.nif joints mix 10.0/0.5/0.01 so keep the
+    # authored value" — that is measurably WRONG: a census of the vanilla
+    # dog/wolf/sabrecat/skeever creature skeleton.nifs is **89/89 constraints
+    # at exactly 0.000000**, matching their skeleton.hkx ragdolls (dog 42/42
+    # `maxFrictionTorque` = 0).  Oblivion ships 10.0/12.0, and
+    # `max_friction` is an ANGULAR FRICTION TORQUE: at that magnitude the joint
+    # resists rotation hard enough that the chain through it cannot collapse
+    # under gravity, so corpses never fall over.  Fixing only the hkx side left
+    # this in place and the symptom survived — **the engine reads the NIF blend
+    # bodies**, so nif and hkx must agree.
+    _force_blend_friction_zero = True
     blend_ids = {id(b.body) for b in data.blocks
                  if isinstance(b, NifFormat.bhkBlendCollisionObject)
                  and b.body is not None}
@@ -2398,10 +2566,13 @@ def scale_constraint_pivots(data):
                     pivot.x *= _HAVOK_SCALE
                     pivot.y *= _HAVOK_SCALE
                     pivot.z *= _HAVOK_SCALE
+            # Blend (creature) joints clamp to 0.0, props to 0.01 — both are
+            # clamped now; only the TARGET differs.  See the census note above.
+            tgt = 0.0 if is_blend else 0.01
             if kind == 'limited_hinge':
-                _fix_limited_hinge(d, clamp_friction=not is_blend)
+                _fix_limited_hinge(d, friction_target=tgt)
             elif kind == 'ragdoll':
-                _fix_ragdoll(d, clamp_friction=not is_blend)
+                _fix_ragdoll(d, friction_target=tgt)
             elif kind == 'hinge':
                 _fix_hinge(d)
             elif kind == 'prismatic':

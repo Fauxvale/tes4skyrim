@@ -64,8 +64,10 @@ from .skyrim_overrides import (
     WEAPON_INV_MARKER_ROT_Z,
     WEAPON_INV_MARKER_ZOOM,
 )
-from .collision import (bake_node_transform_into_body, convert_all_collisions, hoist_collision,
-                        remove_empty_collision_nodes, scale_constraint_pivots)
+from .collision import (add_missing_creature_constraints,
+                        bake_node_transform_into_body, convert_all_collisions,
+                        hoist_collision, remove_empty_collision_nodes,
+                        scale_constraint_pivots)
 from .tri_reconstruct import (clear_match_groups, fix_missing_triangles,
                               UnreconstructibleGeometry)
 
@@ -4980,6 +4982,19 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         # Also sets broadphaseType=10 for dynamic constrained bodies (swinging signs).
         if has_constraints:
             scale_constraint_pivots(data)
+
+        # Creature skeletons: close the ragdoll constraint tree.  Vanilla ships
+        # exactly `bodies - 1` constraints (no orphan bodies); Oblivion leaves
+        # some bodies unconstrained and an unconstrained bhkRigidBody is not in
+        # the ragdoll's constraint island, so the chain through it cannot
+        # collapse — the "corpse never falls over" bug (skeleton, shambles,
+        # mehrunesdagon, stormatronach were exactly the 4 incomplete rigs).
+        # AFTER scale_constraint_pivots: the synthesized pivots are built from
+        # body `center` values that are already in Skyrim Havok units.
+        if creature and 'skeleton' in nif_basename:
+            n_added = add_missing_creature_constraints(data, root)
+            if n_added:
+                has_constraints = True
 
         # Skyrim requires BSXFlags extra data when collision is present
         _add_bsx_flags(root, has_constraints=has_constraints)
