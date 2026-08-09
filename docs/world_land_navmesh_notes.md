@@ -938,8 +938,22 @@ relative to a subfolder has to be listed there**, and it must mirror whatever
 the importer prepends. Guarded by `tests/test_texture_prune.py`.
 
 Diagnose with `python tools/ltex_check.py [plugin]` (LTEX → TXST → file, plus
-dangling LAND layers). Note `refs_from_records` regex-scans **every** `.txt` in
-the export — ~2 GB for Nehrim, so it takes minutes; that is not a hang.
+dangling LAND layers).
+
+**Why this hid for so long:** the keep-set is applied by `bsa_pack` when the
+textures archive is staged, and the mesh phase re-copies the whole texture tree
+into `output/` on every run. A full pipeline run therefore always has the
+textures back on disk by the time anyone looks, so a wrong keep-set only ever
+showed up *inside the BSA* — never as a missing file. It bites hardest on
+`--mesh-subdirs` runs, where the manifest names a fraction of the tree.
+Corollary: **file mtimes in `output/textures/` prove nothing** about what the
+keep-set did — `copy2` preserves the extract cache's timestamps.
+
+`refs_from_records` used to regex-scan every `.txt` in the export (~2 GB for
+Nehrim, minutes) because `_TEX_TEXT_RE` opens with a lazy star and expands at
+every position on text with no match. `LAND.txt` alone is 1.47 GB on Oblivion
+with zero `.dds` in it. A `'.dds' not in body` substring test skips those
+outright: **4.2 s** for the whole export.
 
 ### TXST for Landscape Textures
 - No DNAM: vanilla Skyrim LTEX TXSTs omit DNAM. The 0x0001Fa "No Specular Map" flag only applies to the object (BSLightingShader) path, NOT the landscape shader. Writing it has no positive effect.

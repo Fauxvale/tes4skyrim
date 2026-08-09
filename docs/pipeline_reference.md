@@ -24,6 +24,32 @@ Each stage has a `--<step>-only` flag. The steps are: `export`, `import`,
 `modify-body-meshes`, `pack`, `pack-zip`. Read `convert.py`'s module docstring
 for the authoritative list — it changes more often than this doc.
 
+### Unreferenced textures are dropped at PACK time, never deleted
+
+Oblivion's BSAs carry textures for content the conversion never emits, so the
+textures archive is filtered against `texture_prune.build_refs` as `bsa_pack`
+stages it. On Oblivion that is 26,099 files on disk → 13,492 packed (3.5 GB →
+2.7 GB). **`output/<plugin>/textures/` always keeps the full tree**, so
+loose-file testing is unaffected and re-packing is idempotent.
+
+This used to be its own phase (11a) that unlinked from `output/`, which was
+wrong twice over and is why a broken keep-set went unnoticed for months:
+
+- The **meshes** phase re-copies the *entire* extracted texture tree into
+  `output/` on every run (`asset_pipeline._copy_tree`, no incremental check),
+  so the deletions were silently undone before anyone looked. A wrong keep-set
+  only ever showed up *inside the BSA*, never as a missing file on disk.
+- The user tests with **loose files**, so deleting from `output/` removed the
+  very assets under test.
+
+Corollary: **texture mtimes under `output/` prove nothing** about the keep-set
+— `copy2` preserves the extract cache's timestamps, so files can look
+untouched-since-extraction while having been deleted and restored repeatedly.
+
+If the mesh manifest is missing, `build_refs` raises and packing ships every
+texture rather than guessing — a missing mesh pass must never silently strip
+textures that are in use.
+
 Direct module entry points:
 
 ```bash

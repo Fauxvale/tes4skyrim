@@ -1,8 +1,16 @@
-"""Drop output textures that nothing we ship references.
+"""Work out which output textures the shipped plugin can actually ask for.
 
 Oblivion's BSAs carry textures for content the conversion never emits — the
 character/face/body art whose meshes are skipped outright being the biggest
 block — and copying the texture tree wholesale ships all of it.
+
+This module only BUILDS the keep-set (`build_refs`); `bsa_pack` applies it
+while staging the textures archive.  Nothing here deletes.  An earlier design
+ran as its own phase and unlinked from `output/`, which was wrong twice over:
+the mesh phase re-copies the whole texture tree on every run, so the deletions
+were silently undone (and thus never noticed when the keep-set was wrong), and
+the user tests with loose files, so deleting from `output/` removed the very
+assets under test.  Packing is the only phase that decides what ships.
 
 The reference set is assembled from every producer of a texture reference,
 without re-reading the (multi-GB) output tree:
@@ -15,7 +23,7 @@ without re-reading the (multi-GB) output tree:
               after mesh conversion, so they are scanned from disk; there are
               few of them and they are small
 
-Anything under textures/ that no reference names is deleted.
+Anything under textures/ that no reference names is left out of the archive.
 """
 
 import os
@@ -179,15 +187,20 @@ def _shared_maps_on_disk(plugin_dir, refs: set) -> set:
     engine loads `brumawoodpost_n.dds` from the same folder. Nothing writes that
     down — not the NIF, not the record — and `_companions` only derives from the
     FULL name, so it produces `brumawoodpost_grey_n.dds`, which does not exist,
-    while the map actually in use is pruned. Measured on Nehrim: 27 such maps,
-    including `armor/nehrimsoldier/cuirass_n.dds` (used by `cuirass_b.dds`) and
-    `characters/imperial/headhuman_m_n.dds` — where the convention collides with
-    itself, `_m` being both a map suffix and the gender marker, so the male head
-    counted as a "map of headhuman" and got no siblings of its own.
+    while the map actually in use is left out. Examples on Nehrim:
+    `armor/nehrimsoldier/cuirass_n.dds` (used by `cuirass_b.dds`) and
+    `creatures/deer/deer_n.dds` (used by `deer_doe01.dds`).
 
     So this looks at what is really on disk: a map sibling survives when some
     KEPT diffuse in the same folder starts with its base name. Disk-bounded, so
     it can only ever keep files that exist, and it only ever adds.
+
+    NOT covered here: a diffuse whose own name ends in a map suffix, e.g.
+    `characters/imperial/headhuman_m.dds`, where `_m` is the gender marker
+    rather than a map. It is classified as a map, so it never enters
+    `kept_stems` and can never rescue its own `headhuman_m_n.dds`. That file is
+    kept anyway — `_companions` uses `continue`, not `break`, so a stem ending
+    in `_m` still gets `_n`/`_g`/`_s`… appended; only `_m` itself is skipped.
     """
     tex_root = Path(plugin_dir) / 'textures'
     if not tex_root.is_dir():
@@ -217,49 +230,3 @@ def _shared_maps_on_disk(plugin_dir, refs: set) -> set:
             if any(s.startswith(base) for s in stems):
                 rescued.add(key)
     return rescued
-
-
-def prune(plugin_dir, export_dir, mesh_texture_refs=None,
-          dry_run: bool = False) -> tuple:
-    """Delete every texture under *plugin_dir* that nothing references.
-
-    mesh_texture_refs: the set nif_converter harvested while writing the meshes.
-    Defaults to the manifest mesh conversion left behind.
-    Returns (kept, removed, bytes_freed).
-    """
-    plugin_dir = Path(plugin_dir)
-    tex_root = plugin_dir / 'textures'
-    if not tex_root.is_dir():
-        return 0, 0, 0
-
-    refs = build_refs(plugin_dir, export_dir, mesh_texture_refs)
-
-    kept = removed = 0
-    freed = 0
-    for f in tex_root.rglob('*'):
-        if not f.is_file():
-            continue
-        key = f.relative_to(tex_root).as_posix().lower()
-        if key in refs:
-            kept += 1
-            continue
-        size = f.stat().st_size
-        if not dry_run:
-            try:
-                f.unlink()
-            except OSError:
-                kept += 1
-                continue
-        removed += 1
-        freed += size
-
-    if not dry_run:
-        # Remove the directories the deletions emptied out.
-        for d in sorted((p for p in tex_root.rglob('*') if p.is_dir()),
-                        key=lambda p: len(p.parts), reverse=True):
-            try:
-                d.rmdir()
-            except OSError:
-                pass   # not empty
-
-    return kept, removed, freed

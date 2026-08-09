@@ -1,9 +1,9 @@
 """The prune's keep-set must speak the same paths the importer writes.
 
-A texture the plugin references but the keep-set spells differently is deleted
-as unused and never ships. That failure is invisible offline — the record is
-correct, the file was on disk when it was checked — and only shows in game as
-untextured terrain.
+A texture the plugin references but the keep-set spells differently is left out
+of the BSA and never ships. That failure is invisible offline — the record is
+correct, the file is still on disk because the mesh phase re-copies the whole
+texture tree every run — and only shows in game as untextured terrain.
 """
 
 from asset_convert import texture_prune as tp
@@ -19,8 +19,8 @@ class TestSharedMapSiblings:
     `brumawoodpost_grey.dds` ships without its own normal map; the engine loads
     `brumawoodpost_n.dds` from the same folder. `_companions` derives only from
     the full name, so it invents `brumawoodpost_grey_n.dds` (which does not
-    exist) while the map actually in use gets pruned. Measured on Nehrim: 27,
-    including `armor/nehrimsoldier/cuirass_n.dds`, used by `cuirass_b.dds`.
+    exist) while the map actually in use is left out of the archive. Seen on
+    Nehrim as `armor/nehrimsoldier/cuirass_n.dds`, used by `cuirass_b.dds`.
     """
 
     @staticmethod
@@ -62,8 +62,8 @@ class TestRecordTexturePrefixes:
         Nehrim shipped 252 of 484 referenced landscape texture slots outside
         every BSA because of exactly this: the keep-set held
         `tes4/oblivion/terrainhd...dds` while the plugin asks for
-        `tes4/landscape/oblivion/terrainhd...dds`. Nothing matched, the prune
-        deleted them, and most of the terrain rendered untextured.
+        `tes4/landscape/oblivion/terrainhd...dds`. Nothing matched, so they
+        were left out of the BSA and the terrain rendered untextured.
         Mirrors tes5_import/record_types/world.py:111.
         """
         _write(tmp_path, 'LTEX.txt',
@@ -93,7 +93,7 @@ class TestRecordTexturePrefixes:
         assert not any(r.startswith('tes4/landscape/') for r in refs)
 
     def test_referenced_landscape_texture_survives_the_keep_set(self, tmp_path):
-        """End to end: the LTEX texture must be in build_refs, not pruned."""
+        """End to end: the LTEX texture must be in build_refs, so it ships."""
         export = tmp_path / 'export'
         export.mkdir()
         _write(export, 'LTEX.txt',
@@ -103,11 +103,72 @@ class TestRecordTexturePrefixes:
                '---RECORD_END---\n')
         plugin_dir = tmp_path / 'out'
         plugin_dir.mkdir()
-        # A non-empty manifest is required: build_refs refuses to prune without
-        # one, so that a missing mesh pass cannot wipe textures that are in use.
+        # A non-empty manifest is required: build_refs refuses to build a
+        # keep-set without one, so a missing mesh pass cannot strip the
+        # textures that are in use out of the archive.
         tp.write_manifest(plugin_dir, {'tes4/clutter/unrelated.dds'})
 
         refs = tp.build_refs(plugin_dir, export)
         assert 'tes4/landscape/terrainmud02.dds' in refs
         # the normal map rides along via _companions
         assert 'tes4/landscape/terrainmud02_n.dds' in refs
+
+
+class TestPackTimeFilter:
+    """The keep-set is applied when STAGING the BSA, never by deleting.
+
+    An earlier design pruned `output/` in its own phase. That was wrong twice
+    over: the mesh phase re-copies the whole texture tree every run, so the
+    deletions were silently undone (which is why a broken keep-set went
+    unnoticed for so long), and the user tests with loose files, so deleting
+    from `output/` removed the assets under test.
+    """
+
+    @staticmethod
+    def _tree(tmp_path):
+        tex = tmp_path / 'textures' / 'tes4' / 'landscape'
+        tex.mkdir(parents=True)
+        for n in ('kept.dds', 'unreferenced.dds'):
+            (tex / n).write_bytes(b'DDS ')
+        (tmp_path / 'meshes').mkdir()
+        (tmp_path / 'meshes' / 'a.nif').write_bytes(b'NIF')
+        return tmp_path
+
+    def test_unreferenced_texture_is_left_out_of_the_archive(self, tmp_path):
+        from asset_convert import bsa_pack
+        plugin = self._tree(tmp_path)
+        keep = {'tes4/landscape/kept.dds'}
+
+        staged = bsa_pack._collect_files(plugin, ['textures'], keep)
+        names = {p.as_posix() for _src, p, _sz in staged}
+        assert 'textures/tes4/landscape/kept.dds' in names
+        assert 'textures/tes4/landscape/unreferenced.dds' not in names
+
+    def test_the_filter_never_deletes_from_output(self, tmp_path):
+        """Loose-file testing must keep the full tree."""
+        from asset_convert import bsa_pack
+        plugin = self._tree(tmp_path)
+        bsa_pack._collect_files(plugin, ['textures'],
+                                {'tes4/landscape/kept.dds'})
+
+        tex = plugin / 'textures' / 'tes4' / 'landscape'
+        assert (tex / 'kept.dds').is_file()
+        assert (tex / 'unreferenced.dds').is_file(), \
+            'staging must not remove anything from output/'
+
+    def test_no_keep_set_packs_everything(self, tmp_path):
+        """Without an export dir the filter is off — never guess."""
+        from asset_convert import bsa_pack
+        plugin = self._tree(tmp_path)
+
+        staged = bsa_pack._collect_files(plugin, ['textures'], None)
+        assert len(staged) == 2
+
+    def test_non_texture_dirs_are_never_filtered(self, tmp_path):
+        """The keep-set is about textures/ only; meshes/ passes through."""
+        from asset_convert import bsa_pack
+        plugin = self._tree(tmp_path)
+
+        staged = bsa_pack._collect_files(plugin, ['meshes'], set())
+        names = {p.as_posix() for _src, p, _sz in staged}
+        assert names == {'meshes/a.nif'}
