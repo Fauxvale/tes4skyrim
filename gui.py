@@ -720,6 +720,132 @@ def gui_main():
     converted_menu.bind("<Map>", lambda _e: _rebuild_converted_menu())
     _rebuild_converted_menu()
 
+    # ── Tools ─────────────────────────────────────────────────────────────────
+    tools_menu = _menubutton("Tools")
+
+    def _check_dependencies():
+        """Report every phase's unmet dependencies, without running anything.
+
+        Called IN-PROCESS rather than shelling out to `python preflight.py`:
+        under gui.pyw a spawn can allocate a console window, and the GUI is one
+        window.  preflight's probes are plain imports and file checks, so this
+        is fast enough to run inline.
+        """
+        try:
+            import preflight
+        except Exception as exc:
+            _info("Check Dependencies",
+                  f"Could not load the dependency checker:\n\n{exc}")
+            return
+
+        ok, bad = [], []
+        for phase, label in preflight.PHASE_LABELS.items():
+            try:
+                missing = preflight.check_phase(phase)
+            except Exception as exc:
+                bad.append((label, [f"check failed: {exc}"]))
+                continue
+            if missing:
+                bad.append((label, [f"{m.name} — {m.purpose}" for m in missing]))
+            else:
+                ok.append(label)
+
+        lines = []
+        warn = preflight.python_version_warning()
+        if warn:
+            # A version mismatch is a warning, not a gate (the pipeline runs on
+            # other 3.x once the navmesh extension is rebuilt), so it leads but
+            # does not turn the report into a failure.
+            lines.append(warn.strip())
+            lines.append("")
+
+        if not bad:
+            lines.append("All phases have what they need.")
+            lines.append("")
+            lines.append(f"Checked: {', '.join(ok)}")
+            _info("Check Dependencies", "\n".join(lines))
+            return
+
+        # Deduplicate: one missing tool usually blocks several phases, and
+        # listing it once per phase buries how few things are actually absent.
+        seen, items = set(), []
+        for _label, missing in bad:
+            for m in missing:
+                if m not in seen:
+                    seen.add(m)
+                    items.append(m)
+
+        lines.append(f"{len(bad)} phase(s) are missing dependencies:")
+        lines.append("")
+        for label, missing in bad:
+            lines.append(f"  {label}: {', '.join(m.split(' — ')[0] for m in missing)}")
+        lines.append("")
+        lines.append("Missing:")
+        for m in items:
+            lines.append(f"  • {m}")
+        lines.append("")
+        lines.append("See the Requirements section of README.md to install these.")
+        if ok:
+            lines.append("")
+            lines.append(f"Ready: {', '.join(ok)}")
+        _info("Check Dependencies", "\n".join(lines))
+
+    def _open_folder(path: str, what: str):
+        """Reveal `path` in the system file manager."""
+        if not path or not os.path.isdir(path):
+            _info(f"Open {what}",
+                  f"{what} does not exist yet:\n\n{path or '(not set)'}\n\n"
+                  "Run a conversion first.")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)          # no subprocess, no console window
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path], **_POPEN_FLAGS)
+            else:
+                subprocess.Popen(["xdg-open", path], **_POPEN_FLAGS)
+        except OSError as exc:
+            _info(f"Open {what}", f"Could not open:\n\n{path}\n\n{exc}")
+
+    tools_menu.add_command(label="Check Dependencies",
+                           command=_check_dependencies)
+    tools_menu.add_separator()
+    tools_menu.add_command(
+        label="Open Output Folder",
+        command=lambda: _open_folder(output_var.get().strip(), "Output folder"))
+
+    # ── About ─────────────────────────────────────────────────────────────────
+    # Top-level rather than under Help: it is currently the only such item, and
+    # a one-entry menu is a worse click than a direct button.  Move it back
+    # under Help once there are more help items to group with it.
+    DISCORD_URL = "https://discord.gg/NTkCDfYUru"
+    YOUTUBE_URL = "https://www.youtube.com/@bryanthinton"
+
+    def _about():
+        version = version_info.current_version()
+        note = ("  (development build)"
+                if version_info.is_dev_version(version) else "")
+        _info("About TES4 Auto-Convert",
+              f"TES4 Auto-Convert {version}{note}\n\n"
+              "Converts TES4 (Oblivion) master and plugin files into TES5 "
+              "(Skyrim SE) format — records, meshes, textures, collision, "
+              "animations, sounds, dialogue and scripts.\n\n"
+              "Released under the MIT License. Bethesda game assets are not "
+              "redistributed; this tool converts the copies you already own.",
+              links=(("GitHub — source, releases and issues", version_info.REPO_URL),
+                     ("YouTube — @bryanthinton", YOUTUBE_URL),
+                     ("Discord — community and support", DISCORD_URL)))
+
+    about_mb = tk.Menubutton(menubar, text="About",
+                             bg=CLR["panel"], fg=CLR["text"],
+                             activebackground=CLR["btn_hover"],
+                             activeforeground=CLR["text"],
+                             disabledforeground=CLR["subtext"],
+                             relief="flat", borderwidth=0, padx=10, pady=4,
+                             font=("Segoe UI", 9))
+    about_mb.pack(side=tk.LEFT)
+    about_mb.bind("<Button-1>", lambda _e: _about())
+
     # ── Check for Updates ─────────────────────────────────────────────────────
     # Never automatic: the check is a network call, and a GUI that phones home
     # on launch would both stall startup and do it without being asked.
@@ -753,8 +879,7 @@ def gui_main():
                     "button will then select only the steps that changed.\n\n"
                     "Open the downloads page now?",
                     yes="Open Page", no="Not Now"):
-            import webbrowser
-            webbrowser.open(version_info.RELEASES_URL)
+            _open_url(version_info.RELEASES_URL)
 
     def _check_for_updates():
         if str(update_mb.cget("state")) == "disabled":
@@ -780,13 +905,30 @@ def gui_main():
     outer = ttk.Frame(root)
     outer.pack(fill=tk.BOTH, expand=True)
 
+    def _open_url(url: str):
+        """Open `url` in the default browser, hidden.
+
+        webbrowser can shell out on some platforms, so it runs on a worker
+        thread: a slow browser launch must not freeze the window, and nothing
+        on the UI thread may block.
+        """
+        def _go():
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:
+                pass
+        threading.Thread(target=_go, daemon=True).start()
+
     def _dialog(title: str, message: str, buttons=("OK",),
-                default: int = 0) -> str:
+                default: int = 0, links=()) -> str:
         """Modal message card in the app's palette.  Returns the button clicked.
 
         tkinter's `messagebox` renders NATIVE OS dialogs, which ignore every
         colour here and flash white in a dark UI.  This is the same card the
         mesh-subfolder panel uses, so dialogs match the rest of the window.
+
+        `links` is [(label, url)] rendered as clickable rows under the message.
 
         Modal via grab_set + wait_window, so it returns the user's answer
         inline exactly like messagebox did.
@@ -811,7 +953,18 @@ def gui_main():
         ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16, pady=8)
         tk.Label(card, text=message, bg=CLR["panel"], fg=CLR["subtext"],
                  font=("Segoe UI", 9), justify=tk.LEFT, anchor="w",
-                 wraplength=380).pack(anchor="w", padx=16, pady=(0, 12))
+                 wraplength=380).pack(anchor="w", padx=16,
+                                      pady=(0, 6 if links else 12))
+
+        for text, url in links:
+            lnk = tk.Label(card, text=text, bg=CLR["panel"], fg=CLR["accent_hover"],
+                           font=("Segoe UI", 9, "underline"), cursor="hand2",
+                           anchor="w")
+            lnk.pack(anchor="w", padx=16, pady=1)
+            lnk.bind("<Button-1>", lambda _e, u=url: _open_url(u))
+        if links:
+            # Breathing room before the button row, matching the no-link case.
+            tk.Frame(card, bg=CLR["panel"], height=6).pack(fill=tk.X)
 
         btn_row = tk.Frame(card, bg=CLR["panel"])
         btn_row.pack(fill=tk.X, padx=16, pady=(0, 14))
@@ -833,8 +986,8 @@ def gui_main():
         root.wait_window(card)
         return result[0]
 
-    def _info(title: str, message: str) -> None:
-        _dialog(title, message)
+    def _info(title: str, message: str, links=()) -> None:
+        _dialog(title, message, links=links)
 
     def _confirm(title: str, message: str,
                  yes: str = "Yes", no: str = "No") -> bool:

@@ -494,7 +494,8 @@ def describe_plan(plan: dict) -> str:
 # Where releases are published.  A source drop has no git remote to derive this
 # from, so it is a constant.
 REPO = "bryantmh/tes4skyrim"
-RELEASES_URL = f"https://github.com/{REPO}/releases"
+REPO_URL = f"https://github.com/{REPO}"
+RELEASES_URL = f"{REPO_URL}/releases"
 _TAGS_API = f"https://api.github.com/repos/{REPO}/tags?per_page=100"
 
 # Anonymous: reading tags on a public repo needs no credentials, and gating an

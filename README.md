@@ -97,6 +97,7 @@ The GUI:
 - Lets you pick an output directory (saved to `conversion_config.json`)
 - Offers per-step checkboxes with **All** / **Default** shortcuts
 - Streams the pipeline log live
+- **Tools ▸ Check Dependencies** reports what's missing before you start a run
 
 
 Or run the full pipeline from the command line:
