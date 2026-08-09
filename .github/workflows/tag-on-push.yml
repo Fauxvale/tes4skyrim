@@ -101,17 +101,36 @@ jobs:
           # UPGRADE_STEPS.json gains this release's step list at the same
           # time, letting an offline install work out what an upgrade owes.
           echo "$next_tag" > VERSION
+          # Rebuild from the WHOLE tag history, then add the release being cut.
+          # `--add` alone would be wrong here: the stamp commit never lands on
+          # master (see below), so master's table never accumulates entries and
+          # each tag would carry only its own.  A user upgrading across two
+          # releases would then hit a hole, which reads as "unknown" and
+          # selects all twelve steps forever.  Rebuilding makes every tag's
+          # table complete up to itself.
+          python tools/upgrade_table.py
           python tools/upgrade_table.py --add "$next_tag" --to HEAD
 
+          # Commit the stamp LOCALLY and tag that commit, then push ONLY the
+          # tag.  master is protected by a ruleset ("changes must be made
+          # through a pull request") and the Actions bot is not a bypass actor,
+          # so `git push origin HEAD:master` is rejected with GH013 and takes
+          # the whole tagging step down with it -- which is exactly what
+          # happened on the 0.581 attempt.
+          #
+          # Pushing only the tag is enough: the tag is what users download, so
+          # it carries VERSION and UPGRADE_STEPS.json regardless of whether
+          # master has them.  The stamp commit itself is deliberately NOT on
+          # master -- it exists only to be tagged.
+          #
           # `git commit` exits non-zero on an empty index and `set -e` would
-          # abort the tag with it, so only commit when something actually
-          # changed (a re-run can find both files already correct).
+          # abort with it, so only commit when something actually changed
+          # (a re-run can find both files already correct).
           git add VERSION UPGRADE_STEPS.json
           if git diff --cached --quiet; then
             echo "VERSION and UPGRADE_STEPS.json already current."
           else
-            git commit -m "chore(release): stamp $next_tag [skip ci]"
-            git push origin HEAD:master
+            git commit -m "chore(release): stamp $next_tag"
           fi
 
           # Tag the stamped commit, not the one below it, so the tree a user
