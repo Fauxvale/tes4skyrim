@@ -72,6 +72,7 @@ import pickle
 import shutil
 import subprocess
 import sys
+import urllib.request
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -244,6 +245,99 @@ def archive(plugin: str, out_dir: str, tag: str, quiet: bool = False) -> str | N
 # publish
 # ---------------------------------------------------------------------------
 
+def api_repo() -> str:
+    """'owner/name' for the GitHub API, from the origin remote."""
+    got = gh_repo()
+    return got[1] if len(got) == 2 else ''
+
+
+def _api_releases(timeout: int = 20) -> list:
+    """Every release, via the ANONYMOUS REST API.  [] on any failure.
+
+    Reading releases needs no credentials on a public repo, so downloading a
+    cache must NOT require the GitHub CLI: `gh` is a developer tool that
+    approximately no end user has installed, and gating the whole feature on it
+    would leave almost everyone silently regenerating navmesh.  Publishing
+    still uses gh (it genuinely needs auth); only the read path is anonymous.
+    """
+    repo = api_repo()
+    if not repo:
+        return []
+    url = 'https://api.github.com/repos/%s/releases?per_page=100' % repo
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'tes4skyrim-navmesh-cache',
+        'Accept': 'application/vnd.github+json'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as fh:
+            return json.load(fh)
+    except Exception:
+        return []
+
+
+def _download(url: str, dest: str, quiet: bool = False,
+              timeout: int = 60) -> bool:
+    """Stream *url* to *dest* with a coarse progress line.  False on failure."""
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'tes4skyrim-navmesh-cache'})
+    tmp = dest + '.part'
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            total = int(resp.headers.get('Content-Length') or 0)
+            done = 0
+            step = max(1, total // 10) if total else (8 << 20)
+            nxt = step
+            with open(tmp, 'wb') as out:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if not quiet and done >= nxt:
+                        nxt += step
+                        if total:
+                            print('    %d%% (%.1f/%.1f MB)'
+                                  % (done * 100 // total, done / (1 << 20),
+                                     total / (1 << 20)), flush=True)
+                        else:
+                            print('    %.1f MB' % (done / (1 << 20)),
+                                  flush=True)
+        os.replace(tmp, dest)
+        return True
+    except Exception as exc:
+        if not quiet:
+            print('    download failed (%s)' % exc)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def gh_repo() -> list:
+    """['--repo', 'owner/name'] for gh, or [] if it cannot be determined.
+
+    Every gh call names the repo explicitly instead of relying on the process
+    CWD.  `install` is the reason: it is the one command a downloader may run
+    from outside a checkout (or against a redirected repo root), and a bare
+    `gh release list` there reports "no releases found" rather than failing
+    loudly -- which is exactly how a working publish looked broken.
+    """
+    out = subprocess.run(['git', 'remote', 'get-url', 'origin'],
+                         capture_output=True, text=True, cwd=repo_root())
+    url = out.stdout.strip() if out.returncode == 0 else ''
+    if not url:
+        return []
+    # git@github.com:owner/name.git  |  https://github.com/owner/name(.git)
+    if url.startswith('git@'):
+        path = url.split(':', 1)[-1]
+    else:
+        path = url.split('github.com/', 1)[-1] if 'github.com/' in url else ''
+    path = path[:-4] if path.endswith('.git') else path
+    return ['--repo', path] if path.count('/') == 1 else []
+
+
 def cache_release_tag(tag: str, until: str = None) -> str:
     """Name for a cache release: 'navmesh-cache-0.56+' or '...-0.56-0.72'.
 
@@ -354,7 +448,22 @@ def cache_release_notes(tag: str) -> str:
         '',
         'Using it outside that range is harmless -- the entries simply miss and',
         'regenerate.',
+        '',
+        # Machine-readable, for auto_install's pre-download check: comparing
+        # this against the local source tag turns "download 115 MB, then find
+        # out it misses" into a metadata request.  Kept last and prefixed so it
+        # reads as a footnote rather than instructions.
+        '<!-- navmesh-source-tag: %s -->' % (source_tag_for_notes() or ''),
     ))
+
+
+def source_tag_for_notes() -> str | None:
+    """Source tag of any locally-cached plugin (they all share one tag)."""
+    for plugin in discover_plugins():
+        tag = source_tag(plugin)
+        if tag:
+            return tag
+    return None
 
 
 def resolve_cache_release(tag: str) -> str | None:
@@ -369,8 +478,8 @@ def resolve_cache_release(tag: str) -> str | None:
     if want is None:
         return None
     out = subprocess.run(
-        ['gh', 'release', 'list', '--limit', '100', '--json', 'tagName',
-         '--jq', '.[].tagName'],
+        ['gh', 'release', 'list', *gh_repo(), '--limit', '100',
+         '--json', 'tagName', '--jq', '.[].tagName'],
         capture_output=True, text=True, cwd=repo_root())
     if out.returncode != 0:
         return None
@@ -423,7 +532,7 @@ def close_cache_release(new_tag: str) -> str | None:
         return None
     print('Closing %s -> %s (superseded by %s)' % (open_rel, closed, new_tag))
     rc = subprocess.run(
-        ['gh', 'release', 'edit', open_rel, '--tag', closed,
+        ['gh', 'release', 'edit', *gh_repo(), open_rel, '--tag', closed,
          '--title', 'Navmesh cache for %s-%s (not the converter)'
          % (start, previous_tag(new_tag))],
         cwd=repo_root()).returncode
@@ -443,8 +552,8 @@ def latest_cache_release() -> str | None:
     'navmesh-cache-0.9' does not beat 'navmesh-cache-0.10'.
     """
     out = subprocess.run(
-        ['gh', 'release', 'list', '--limit', '100', '--json', 'tagName',
-         '--jq', '.[].tagName'],
+        ['gh', 'release', 'list', *gh_repo(), '--limit', '100',
+         '--json', 'tagName', '--jq', '.[].tagName'],
         capture_output=True, text=True, cwd=repo_root())
     if out.returncode != 0:
         return None
@@ -524,12 +633,12 @@ def publish(plugins: list[str], tag: str, out_dir: str,
     close_cache_release(tag)
 
     rel_tag = cache_release_tag(tag)
-    exists = subprocess.run(['gh', 'release', 'view', rel_tag],
+    exists = subprocess.run(['gh', 'release', 'view', *gh_repo(), rel_tag],
                             capture_output=True, text=True).returncode == 0
     if not exists:
         print('\nCreating cache release %s...' % rel_tag)
         rc = subprocess.run(
-            ['gh', 'release', 'create', rel_tag,
+            ['gh', 'release', 'create', *gh_repo(), rel_tag,
              '--title',
              'Navmesh cache for %s and above (not the converter)' % tag,
              '--notes', cache_release_notes(tag),
@@ -537,7 +646,14 @@ def publish(plugins: list[str], tag: str, out_dir: str,
              # as TAGS, not releases, and GitHub sorts a real Release above a
              # plain tag.  Without this the top of the Releases page would
              # advertise a build artifact as if it were the converter.
-             '--latest=false',
+             #
+             # --latest=false ALONE IS NOT ENOUGH (measured 2026-08-09, the
+             # first real publish): /releases/latest still returned the cache
+             # release, because that endpoint serves the newest non-draft,
+             # non-prerelease release and there was nothing else to promote in
+             # its place.  --prerelease excludes it unconditionally, and shows
+             # a "Pre-release" label that reinforces "this is not the build".
+             '--latest=false', '--prerelease',
              # Point the release at the code tag it belongs to, so the "N
              # commits to master since this release" line reads correctly.
              '--target', tag if tag_exists(tag) else 'master']
@@ -547,7 +663,7 @@ def publish(plugins: list[str], tag: str, out_dir: str,
             return rc
 
     print('\nUploading %d asset(s) to %s...' % (len(zips), rel_tag))
-    rc = subprocess.run(['gh', 'release', 'upload', rel_tag, *zips,
+    rc = subprocess.run(['gh', 'release', 'upload', *gh_repo(), rel_tag, *zips,
                          '--clobber']).returncode
     if rc != 0:
         print('ERROR: upload failed.')
@@ -593,7 +709,7 @@ def install(plugin: str, tag: str | None, zip_path: str | None,
                 print('ERROR: no navmesh-cache release found in this repo.')
             print('Pass --zip to install a local archive instead.')
             return 1
-        args = ['gh', 'release', 'download', rel_tag,
+        args = ['gh', 'release', 'download', *gh_repo(), rel_tag,
                 '--pattern', asset_name(plugin), '--output', tmp_zip,
                 '--clobber']
         print('Downloading %s...' % asset_name(plugin))
@@ -659,6 +775,133 @@ def install(plugin: str, tag: str | None, zip_path: str | None,
         os.remove(tmp_zip)
     print('Done. Supported from tag %s.' % manifest.get('starting_tag', '?'))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Drop-in auto-install (called by the import phase; no command to learn)
+# ---------------------------------------------------------------------------
+
+# Where a user drops a downloaded cache zip.  Checked automatically at the top
+# of every import, so the whole workflow is "download the zip, put it here,
+# press Import" -- no CLI, no docs, no flags.
+DROPIN_DIRNAME = 'navmesh_cache'
+
+
+def dropin_dir() -> str:
+    return os.path.join(repo_root(), DROPIN_DIRNAME)
+
+
+def _find_dropin(plugin: str) -> str | None:
+    """A cache zip for *plugin* sitting in navmesh_cache/, or None."""
+    ddir = dropin_dir()
+    if not os.path.isdir(ddir):
+        return None
+    want = asset_name(plugin)
+    cand = os.path.join(ddir, want)
+    if os.path.exists(cand):
+        return cand
+    # Be forgiving about the filename: browsers rename duplicates
+    # ("...(1).zip") and users rename things.  Match on the plugin stem.
+    stem = want[:-4].lower()
+    hits = [f for f in sorted(os.listdir(ddir))
+            if f.lower().endswith('.zip') and stem in f.lower()]
+    return os.path.join(ddir, hits[0]) if hits else None
+
+
+def auto_install(plugin: str, quiet: bool = False,
+                 allow_download: bool = True) -> bool:
+    """Get this plugin's navmesh cache in place, with nothing for the user to do.
+
+    Called at the top of the import phase, so the cache "just works" from the
+    GUI and the CLI alike -- there is no command to learn and no flag to pass.
+    Order of preference:
+
+      1. The local cache is already current -> nothing to do.
+      2. A zip dropped in `navmesh_cache/` -> install it (works offline, and is
+         the answer for anyone without the GitHub CLI).
+      3. Download the matching release asset -> install it.
+
+    Downloading is skipped unless it would actually help: the manifest is
+    checked FIRST via the release's own metadata, so a user whose navmesh code
+    differs never pays for a ~115 MB transfer that would miss anyway.
+
+    Every failure path is non-fatal and quiet-ish.  This runs inside a
+    conversion; a missing, corrupt or mismatched cache must never stop a build
+    that would otherwise succeed -- the navmesh simply regenerates, which is
+    exactly what would have happened without any of this.
+    """
+    try:
+        from tools import navmesh_cache_hook as _hook
+        if _hook.cache_matches_tag(plugin, source_tag(plugin)):
+            return False                      # already current
+
+        cand = _find_dropin(plugin)
+        if cand:
+            if not quiet:
+                print('  Navmesh cache: found %s, installing...'
+                      % os.path.basename(cand))
+            rc = install(plugin, None, cand)
+            if not quiet:
+                print('  Navmesh cache: %s' % (
+                    'installed -- navmesh generation will be mostly skipped.'
+                    if rc == 0 else
+                    'drop-in does not match this build; generating normally.'))
+            if rc == 0:
+                return True
+
+        if not allow_download:
+            return False
+
+        # ANONYMOUS HTTPS -- deliberately not gh.  Release assets on a public
+        # repo need no credentials, and requiring the GitHub CLI would mean
+        # almost every real user silently falls back to regenerating.
+        want = source_tag(plugin)
+        asset = None
+        for rel in _api_releases():
+            if not parse_cache_release_tag(rel.get('tag_name', '')):
+                continue
+            # Only download a cache built by the SAME navmesh code.  The check
+            # is metadata-only, so a mismatch costs a few KB, not ~115 MB.
+            body = rel.get('body') or ''
+            marker = 'navmesh-source-tag:'
+            if marker in body and want:
+                got = body.split(marker, 1)[1]
+                got = got.split('-->', 1)[0].strip()
+                if got != want:
+                    continue
+            for a in rel.get('assets', ()):
+                if a.get('name') == asset_name(plugin):
+                    asset = a
+                    break
+            if asset:
+                break
+
+        if not asset:
+            return False
+
+        os.makedirs(os.path.join(repo_root(), 'temp'), exist_ok=True)
+        tmp = os.path.join(repo_root(), 'temp', asset_name(plugin))
+        if not quiet:
+            print('  Navmesh cache: downloading %s (%.0f MB)...'
+                  % (asset['name'], asset.get('size', 0) / (1 << 20)))
+        if not _download(asset['browser_download_url'], tmp, quiet=quiet):
+            return False
+
+        rc = install(plugin, None, tmp)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        if not quiet:
+            print('  Navmesh cache: %s' % (
+                'installed -- navmesh generation will be mostly skipped.'
+                if rc == 0 else
+                'downloaded cache does not match; generating normally.'))
+        return rc == 0
+    except Exception as exc:                      # never break an import
+        if not quiet:
+            print('  Navmesh cache: skipped (%s)' % exc)
+        return False
 
 
 # ---------------------------------------------------------------------------

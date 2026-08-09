@@ -536,6 +536,68 @@ def test_have_gh_requires_auth_not_just_presence(monkeypatch):
     assert nc.have_gh() is True
 
 
+def test_auto_install_is_a_noop_when_already_current(tmp_path, monkeypatch):
+    """A current cache must not be re-installed or re-downloaded every import."""
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(hook, 'cache_matches_tag', lambda *a, **k: True)
+    called = []
+    monkeypatch.setattr(nc, 'install', lambda *a, **k: called.append(a) or 0)
+    assert nc.auto_install('Test.esm', quiet=True) is False
+    assert not called
+
+
+def test_auto_install_prefers_dropin_over_download(tmp_path, monkeypatch):
+    """An offline drop-in must win, so no network is needed at all."""
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(hook, 'cache_matches_tag', lambda *a, **k: False)
+    ddir = tmp_path / nc.DROPIN_DIRNAME
+    ddir.mkdir()
+    (ddir / nc.asset_name('Test.esm')).write_bytes(b'zip')
+
+    seen = {}
+
+    def _install(plugin, tag, zip_path, force=False):
+        seen['zip'] = zip_path
+        return 0
+
+    monkeypatch.setattr(nc, 'install', _install)
+    monkeypatch.setattr(nc, 'have_gh', lambda: True)
+    monkeypatch.setattr(nc, 'latest_cache_release',
+                        lambda: pytest.fail('must not download'))
+    assert nc.auto_install('Test.esm', quiet=True) is True
+    assert seen['zip'].endswith(nc.asset_name('Test.esm'))
+
+
+def test_auto_install_tolerates_a_renamed_dropin(tmp_path, monkeypatch):
+    """Browsers rename duplicates ('...(1).zip'); still find it."""
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    ddir = tmp_path / nc.DROPIN_DIRNAME
+    ddir.mkdir()
+    (ddir / 'navmesh-cache-Test (1).zip').write_bytes(b'zip')
+    assert nc._find_dropin('Test.esm').endswith('(1).zip')
+
+
+def test_auto_install_never_raises(tmp_path, monkeypatch):
+    """It runs inside a conversion -- it must never break one."""
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+
+    def _boom(*a, **k):
+        raise RuntimeError('network on fire')
+
+    monkeypatch.setattr(hook, 'cache_matches_tag', _boom)
+    assert nc.auto_install('Test.esm', quiet=True) is False
+
+
+def test_auto_install_respects_download_opt_out(tmp_path, monkeypatch):
+    """allow_download=False must not touch the network (metered connections)."""
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(hook, 'cache_matches_tag', lambda *a, **k: False)
+    monkeypatch.setattr(nc, 'latest_cache_release',
+                        lambda: pytest.fail('must not download'))
+    assert nc.auto_install('Test.esm', quiet=True,
+                           allow_download=False) is False
+
+
 def test_asset_name_is_stable():
     assert nc.asset_name('Oblivion.esm') == 'navmesh-cache-Oblivion.zip'
     assert nc.asset_name('Morrowind_ob.esm') == 'navmesh-cache-Morrowind_ob.zip'

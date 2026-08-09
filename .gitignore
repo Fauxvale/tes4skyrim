@@ -25,3 +25,6 @@ native/dist/*.lib
 native/dist/*.exp
 native/dist/*.pdb
 native/dist/*.obj
+# Navmesh cache drop-in: keep the folder and its README, ignore the zips.
+navmesh_cache/*
+!navmesh_cache/README.md

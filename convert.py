@@ -379,6 +379,20 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
         print(f"[{file_name}] No export directory, skipping import")
         return False
 
+    # Navmesh generation is the slowest part of this phase, and a prebuilt
+    # cache is published with each release.  Pick it up automatically -- from
+    # navmesh_cache/ if the user dropped a zip there, else by downloading the
+    # matching asset -- so nobody has to know a command exists.  Never fatal:
+    # on any problem the navmesh just regenerates as it always did.
+    # Opt out with TESCONV_NO_CACHE_DOWNLOAD=1 (metered connections).
+    try:
+        from tools.navmesh_cache import auto_install
+        auto_install(file_name,
+                     allow_download=os.environ.get(
+                         'TESCONV_NO_CACHE_DOWNLOAD', '') not in ('1', 'true'))
+    except Exception:
+        pass
+
     out_root = output_dir or str(SCRIPT_DIR / "output")
     os.makedirs(out_root, exist_ok=True)
     # Every plugin gets its own output folder (output/<plugin>/<plugin>), which

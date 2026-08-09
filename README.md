@@ -64,12 +64,10 @@ A decent PC. The more cores and ram the better. The more cores, the more ram it 
 pip install PyFFI numpy scipy shapely Pillow lz4 mapbox_earcut
 ```
 
-
 > **xWMAEncode.exe** ships with the [Microsoft DirectX SDK (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=6812)
 > and cannot be redistributed. After installing the SDK, find it in `Utilities\bin\x86\`
 > and copy it to `external/xwmaencode/`. (You can also extract it from the SDK installer with
 > 7-Zip without a full install.)
-
 
 > **Note** Make sure your installed python version is **3.14** or you will run into issues
 > The navmesh build requires a compiled module, for **CPython 3.14 / 64-bit Windows**
@@ -108,6 +106,13 @@ python convert.py -f Oblivion.esm
 ```
 
 The output plugin and assets are written to `output/` (override with `--output-dir`).
+
+The Import step downloads a [prebuilt navmesh cache](https://github.com/bryantmh/tes4skyrim/releases)
+for you when one matches your build, turning minutes of navmesh generation into
+seconds. Offline, drop the release's `.zip`
+into `navmesh_cache/` and Import picks it up; set `TESCONV_NO_CACHE_DOWNLOAD=1`
+to skip the download on a metered connection. The conversion is identical either
+way — a cache only ever saves time, never changes the result.
 
 
 ### Starting a converted game
@@ -234,30 +239,6 @@ These are the steps as presented (and run) by the GUI, in order:
 
 > **Design principle:** the export is a *pure* dump of TES4 data — no type mapping, no path
 > prefixing, no derived fields. **All** transformations live in the import and asset steps.
-
-### Speeding up the Import phase (optional)
-
-Import spends most of its time generating navmesh — a few seconds per cell across
-thousands of cells. That result is cached, and a prebuilt cache is published with each
-release, so you can download it instead of computing it:
-
-```bash
-# after the Meshes phase has run at least once
-python tools/navmesh_cache.py install --plugin Oblivion.esm
-```
-
-Run it **after** the mesh phase: the cache is keyed partly to the collision data built
-from your own converted meshes, and entries that don't match are simply regenerated.
-
-A few things worth knowing:
-
-- **It can never make the conversion wrong.** Every entry carries a hash of the inputs it
-  was built from. Anything that doesn't match is regenerated from scratch, so a stale or
-  mismatched cache costs time, never correctness.
-- **Replacing a few meshes doesn't throw the whole cache away.** Invalidation is per mesh,
-  so swapping in your own models only recomputes the cells that actually place them.
-- **It contains no Oblivion assets** — only generated navmesh geometry (vertex and triangle
-  arrays produced by this converter).
 
 ---
 
