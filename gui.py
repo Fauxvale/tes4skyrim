@@ -170,6 +170,42 @@ def scan_plugins(data_path: str) -> list:
     return plugins
 
 
+def scan_converted(output_path: str) -> list:
+    """Plugins already converted into `output_path`, sorted.
+
+    Keyed on `<name>.manifest.json`, which `phase_import` writes per plugin.
+    Listing the directory names instead would offer things that were never a
+    source plugin: `output/` also accumulates the standalone `Slot44 Patch.esp`,
+    the `TESGameSelect` folder and `<plugin>.zip` archives, none of which can be
+    re-run.  The manifest's `source` field names the plugin the pipeline was
+    invoked with, which is exactly what re-running needs.
+    """
+    if not output_path or not os.path.isdir(output_path):
+        return []
+    found = set()
+    try:
+        entries = sorted(os.listdir(output_path))
+    except OSError:
+        return []
+    for name in entries:
+        folder = os.path.join(output_path, name)
+        if not os.path.isdir(folder):
+            continue
+        manifest = os.path.join(folder, f"{name}.manifest.json")
+        if not os.path.isfile(manifest):
+            continue
+        source = name
+        try:
+            with open(manifest, encoding="utf-8") as fh:
+                got = json.load(fh).get("source")
+            if isinstance(got, str) and got.strip():
+                source = got.strip()
+        except (OSError, ValueError):
+            pass          # a truncated manifest still proves the folder is ours
+        found.add(source)
+    return sorted(found, key=str.lower)
+
+
 # Base game + official Creation Club content, in Bethesda's own load-order
 # priority (the order the game/CC installer expects them in, independent of
 # whatever plugins.txt says) — these are always listed first, and default to
@@ -427,7 +463,7 @@ def _run_process(cmd, log_cb, env=None, cancel_event=None):
 def gui_main():
     try:
         import tkinter as tk
-        from tkinter import ttk, filedialog, messagebox
+        from tkinter import ttk, filedialog
     except ImportError:
         print("ERROR: tkinter not available")
         return 1
@@ -629,9 +665,180 @@ def gui_main():
     settings_menu.add_cascade(label=f"Workers  (max {cpu_max})",
                               menu=workers_menu)
 
+    # ── Converted ▸ (plugins already in output/) ──────────────────────────────
+    # Picking one selects it AND ticks the steps its last conversion still owes,
+    # so "re-run what this plugin needs" is two clicks from a cold start.
+    # Rebuilt on every open: output/ gains entries as conversions finish, and a
+    # menu built once at startup would go stale within the session.
+    converted_menu = _menubutton("Converted")
+
+    def _select_converted(name: str):
+        """Point the GUI at an already-converted plugin and plan its re-run.
+
+        Plugins do NOT share a data directory -- Nehrim and Morrowind_ob each
+        live in their own install -- so selecting one has to restore the
+        directory it was actually converted from.  Without this, picking Nehrim
+        while the box points at Oblivion's Data folder fails the "is this a
+        real plugin" check in _run_clicked, even though Nehrim converts fine
+        from its own directory.
+        """
+        source_dir = version_info.source_path_for(name)
+        if source_dir and os.path.isdir(source_dir) and source_dir != tes4_var.get():
+            tes4_var.set(source_dir)
+            _on_tes4_change(source_dir)     # rescans plugins for the new dir
+
+        if all_plugins and name not in all_plugins:
+            # Either nothing was recorded for this plugin (converted before the
+            # source was tracked) or its install has since moved.
+            _info("Source Not Found",
+                  f"{name!r} is in the output folder, but its source plugin is "
+                  f"not in:\n\n{tes4_var.get()}\n\n"
+                  "Point the Oblivion data directory at the install that has "
+                  "it, then pick it again.")
+            return
+
+        _commit(name)
+        file_combo.selection_clear()
+        # Re-selecting a plugin is an explicit request to re-plan it, even if
+        # its plan was already auto-applied once this session.
+        _plan_applied.discard(name)
+        _refresh_upgrade_notice()
+
+    def _rebuild_converted_menu():
+        converted_menu.delete(0, tk.END)
+        names = scan_converted(output_var.get().strip())
+        if not names:
+            converted_menu.add_command(label="(nothing converted yet)",
+                                       state="disabled")
+            return
+        for name in names:
+            converted_menu.add_command(
+                label=name, command=lambda n=name: _select_converted(n))
+
+    # <Map> is the menu's own "about to be shown" signal, so the list is always
+    # current without polling the filesystem on a timer.
+    converted_menu.bind("<Map>", lambda _e: _rebuild_converted_menu())
+    _rebuild_converted_menu()
+
+    # ── Check for Updates ─────────────────────────────────────────────────────
+    # Never automatic: the check is a network call, and a GUI that phones home
+    # on launch would both stall startup and do it without being asked.
+    update_mb = tk.Menubutton(menubar, text="Check for Updates",
+                              bg=CLR["panel"], fg=CLR["text"],
+                              activebackground=CLR["btn_hover"],
+                              activeforeground=CLR["text"],
+                              disabledforeground=CLR["subtext"],
+                              relief="flat", borderwidth=0, padx=10, pady=4,
+                              font=("Segoe UI", 9))
+    update_mb.pack(side=tk.LEFT)
+
+    def _show_update_result(result: dict):
+        """Report a finished check.  UI thread only (via root.after)."""
+        update_mb.configure(text="Check for Updates", state="normal")
+        if not result["reachable"]:
+            _info("Update Check Failed",
+                  "Could not reach GitHub to check for updates.\n\n"
+                  "Check your connection, or see:\n"
+                  f"{version_info.RELEASES_URL}")
+            return
+        if not result["available"]:
+            _info("Up to Date",
+                  f"You are running {result['current']}, which is the newest "
+                  f"release.")
+            return
+        if _confirm("Update Available",
+                    f"{result['latest']} is available (you have "
+                    f"{result['current']}).\n\n"
+                    "Download it and paste it over this folder; the Upgrade "
+                    "button will then select only the steps that changed.\n\n"
+                    "Open the downloads page now?",
+                    yes="Open Page", no="Not Now"):
+            import webbrowser
+            webbrowser.open(version_info.RELEASES_URL)
+
+    def _check_for_updates():
+        if str(update_mb.cget("state")) == "disabled":
+            return                      # a check is already in flight
+        update_mb.configure(text="Checking...", state="disabled")
+
+        def _worker():
+            try:
+                result = version_info.check_for_update()
+            except Exception:
+                result = {"current": version_info.current_version(),
+                          "latest": None, "available": False, "reachable": False}
+            # Hop back to the UI thread; tkinter is not thread-safe.
+            root.after(0, lambda: _show_update_result(result))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # A Menubutton with no menu behaves as a plain click target, matching the
+    # look of Settings/Converted without pretending to be a dropdown.
+    update_mb.bind("<Button-1>", lambda _e: _check_for_updates())
+
     # ── Layout: sidebar + log pane ────────────────────────────────────────────
     outer = ttk.Frame(root)
     outer.pack(fill=tk.BOTH, expand=True)
+
+    def _dialog(title: str, message: str, buttons=("OK",),
+                default: int = 0) -> str:
+        """Modal message card in the app's palette.  Returns the button clicked.
+
+        tkinter's `messagebox` renders NATIVE OS dialogs, which ignore every
+        colour here and flash white in a dark UI.  This is the same card the
+        mesh-subfolder panel uses, so dialogs match the rest of the window.
+
+        Modal via grab_set + wait_window, so it returns the user's answer
+        inline exactly like messagebox did.
+        """
+        result = [buttons[-1] if len(buttons) > 1 else buttons[0]]
+
+        # Just the card, placed over the window -- NOT a full-size backdrop
+        # frame.  A backdrop covers the log and the whole sidebar, which reads
+        # as the app disappearing rather than a popup appearing.  The card
+        # still takes the grab, so it is modal without hiding anything.
+        card = tk.Frame(outer, bg=CLR["panel"],
+                        highlightbackground=CLR["border"], highlightthickness=1)
+
+        def _close(choice: str):
+            result[0] = choice
+            card.grab_release()
+            card.destroy()
+
+        tk.Label(card, text=title, bg=CLR["panel"], fg=CLR["text"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w",
+                                                     padx=16, pady=(14, 0))
+        ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16, pady=8)
+        tk.Label(card, text=message, bg=CLR["panel"], fg=CLR["subtext"],
+                 font=("Segoe UI", 9), justify=tk.LEFT, anchor="w",
+                 wraplength=380).pack(anchor="w", padx=16, pady=(0, 12))
+
+        btn_row = tk.Frame(card, bg=CLR["panel"])
+        btn_row.pack(fill=tk.X, padx=16, pady=(0, 14))
+        for i, label in enumerate(reversed(buttons)):
+            is_default = (len(buttons) - 1 - i) == default
+            ttk.Button(btn_row, text=label, width=10,
+                       style="Accent.TButton" if is_default else "TButton",
+                       command=lambda l=label: _close(l)).pack(
+                           side=tk.RIGHT, padx=(6, 0))
+
+        card.update_idletasks()
+        card.place(in_=outer, anchor="center", relx=0.5, rely=0.5)
+        card.lift()
+        # Escape answers as the non-default button, matching a native dialog's
+        # Cancel semantics.
+        card.bind("<Escape>", lambda _e: _close(buttons[-1]))
+        card.focus_set()
+        card.grab_set()
+        root.wait_window(card)
+        return result[0]
+
+    def _info(title: str, message: str) -> None:
+        _dialog(title, message)
+
+    def _confirm(title: str, message: str,
+                 yes: str = "Yes", no: str = "No") -> bool:
+        return _dialog(title, message, buttons=(yes, no)) == yes
     outer.columnconfigure(0, weight=0, minsize=330)
     outer.columnconfigure(1, weight=1)
     outer.rowconfigure(0, weight=1)
@@ -1585,16 +1792,14 @@ def gui_main():
         out_dir = output_var.get().strip()
         steps   = [key for key, *_ in STEPS if step_vars[key].get()]
         if not steps:
-            messagebox.showwarning("No Steps",
-                                   "Select at least one pipeline step.", parent=root)
+            _info("No Steps", "Select at least one pipeline step.")
             return
 
         # The plugin box is typable, so the text may not name a real plugin.
         if all_plugins and fname not in all_plugins:
-            messagebox.showwarning(
-                "Unknown Plugin",
-                f"{fname!r} is not a plugin in the Oblivion data directory.\n"
-                "Pick one from the list.", parent=root)
+            _info("Unknown Plugin",
+                  f"{fname!r} is not a plugin in the Oblivion data directory.\n"
+                  "Pick one from the list.")
             return
 
         # Collect selected mesh subdirs (None = all)

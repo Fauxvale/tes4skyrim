@@ -1429,7 +1429,8 @@ def main():
         for step_key, per_file in _step_ok.items():
             for fn, ok in per_file.items():
                 if ok:
-                    _version.record_step_run(step_key, fn)
+                    _version.record_step_run(step_key, fn,
+                                             data_path=tes4_data)
     except Exception as exc:
         print(f"Note: could not record conversion state ({exc}).")
 

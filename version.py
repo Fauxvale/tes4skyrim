@@ -46,8 +46,8 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -72,48 +72,106 @@ def _read_version_file() -> str | None:
     return text or None
 
 
-def _git(args: list[str]) -> str | None:
-    """Run a git command, hidden.  None on any failure.
-
-    POPEN_FLAGS is mandatory, not decoration: under `gui.pyw` the parent is
-    console-less `pythonw.exe`, so every un-flagged spawn ALLOCATES ITS OWN
-    CONSOLE WINDOW.  Omitting it here popped a terminal for each git call while
-    the GUI was still building its window.
-    """
+def _head_commit(git_dir: Path) -> str | None:
+    """HEAD's commit sha, following one level of symbolic ref."""
     try:
-        from subprocess_flags import POPEN_FLAGS
-    except ImportError:
-        POPEN_FLAGS = {}
-    try:
-        out = subprocess.run(["git", *args], cwd=SCRIPT_DIR,
-                             capture_output=True, text=True, timeout=10,
-                             **POPEN_FLAGS)
-    except (OSError, subprocess.SubprocessError):
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
         return None
-    return out.stdout.strip() if out.returncode == 0 else None
-
-
-_TAG_MATCH = ["--match", "[0-9]*.[0-9][0-9]", "--match", "[0-9]*.[0-9][0-9][0-9]"]
+    if not head.startswith("ref:"):
+        return head or None                       # detached HEAD
+    ref = head.partition(":")[2].strip()
+    try:
+        return (git_dir / ref).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        pass
+    # Ref not loose -> it was packed by `git gc`.
+    try:
+        for line in (git_dir / "packed-refs").read_text(
+                encoding="utf-8").splitlines():
+            if line.startswith(("#", "^")):
+                continue
+            sha, _, name = line.partition(" ")
+            if name.strip() == ref:
+                return sha.strip()
+    except OSError:
+        pass
+    return None
 
 
 def _git_version() -> str | None:
-    """What this checkout is, per git.  None when git is unavailable.
+    """What this checkout is, read straight from `.git`.  None if unavailable.
 
     Only a *fallback*: end users install by pasting a source drop, which has no
-    `.git`, so this path exists so a DEVELOPER's title bar shows something true
+    `.git`, so this exists so a DEVELOPER's title bar shows something true
     rather than the `0.0-dev` placeholder in VERSION.
 
-    Reported verbatim, e.g. `0.58-3-g6c7a351-dirty` = three commits past 0.58
-    with local edits.  Deliberately NOT reduced to something like "0.58+dev":
-    that reads as a release number, and no such release exists.  Exactly on a
-    tag, describe prints the bare tag and this returns it unchanged.
+    Deliberately does NOT shell out to `git describe`.  The GUI resolves the
+    version while building its window, and under `gui.pyw` the parent is
+    console-less `pythonw.exe`, where every spawn is a potential console
+    window.  The GUI is ONE window; the safe number of subprocesses on that
+    path is zero, not "some, but flagged".  Reading the ref files directly is
+    also ~50x faster than the spawn it replaces.
 
-    ONE git call, not three.  `--dirty` plus describe's own `-<n>-g<sha>`
-    suffix answers "has this moved past the tag" for free; the first version
-    also ran `status --porcelain`, which walks the whole working tree (this
-    repo carries a multi-GB gitignored `export/`).
+    Returns the exact tag when HEAD is on one, else `<tag>+g<short-sha>` --
+    git describe's own shape minus the commit count, which cannot be had
+    without walking the object graph (packfiles included) and is not worth that
+    machinery for a title-bar string.  The sha is the part that actually
+    identifies the build.
     """
-    return _git(["describe", "--tags", "--dirty", *_TAG_MATCH]) or None
+    git_dir = SCRIPT_DIR / ".git"
+    if git_dir.is_file():
+        # A worktree/submodule: ".git" is a file pointing at the real dir.
+        try:
+            pointer = git_dir.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not pointer.startswith("gitdir:"):
+            return None
+        git_dir = Path(pointer.partition(":")[2].strip())
+        if not git_dir.is_absolute():
+            git_dir = (SCRIPT_DIR / git_dir).resolve()
+    if not git_dir.is_dir():
+        return None
+
+    # Map tag -> sha for release tags only, from both loose and packed refs.
+    tags: dict[str, str] = {}
+    tag_root = git_dir / "refs" / "tags"
+    try:
+        for entry in tag_root.iterdir():
+            if entry.is_file():
+                try:
+                    tags[entry.name] = entry.read_text(encoding="utf-8").strip()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    try:
+        for line in (git_dir / "packed-refs").read_text(
+                encoding="utf-8").splitlines():
+            if line.startswith(("#", "^")):
+                continue
+            sha, _, name = line.partition(" ")
+            name = name.strip()
+            if name.startswith("refs/tags/"):
+                tags.setdefault(name[len("refs/tags/"):], sha.strip())
+    except OSError:
+        pass
+
+    releases = {t: k for t in tags if (k := version_key(t)) and t == _base_tag(t)}
+    if not releases:
+        return None
+    latest = max(releases, key=lambda t: releases[t])
+
+    head = _head_commit(git_dir)
+    if not head:
+        return latest
+    if tags.get(latest) == head:
+        # Annotated tags point at a tag OBJECT, not the commit, so an exact
+        # match here proves "on the tag" but a mismatch does not disprove it --
+        # hence the sha below rather than a bare claim of being ahead.
+        return latest
+    return f"{latest}+g{head[:7]}"
 
 
 # current_version() is called on every plugin selection and on each GUI
@@ -206,19 +264,36 @@ def _save_state(state: dict) -> None:
 
 
 def record_step_run(step_key: str, plugin: str | None,
-                    version: str | None = None) -> None:
+                    version: str | None = None,
+                    data_path: str | None = None) -> None:
     """Note that *step_key* completed for *plugin* at the current version.
 
     Called on a step's SUCCESS only.  A failed step must stay stale, or the
     next upgrade check would report clean and the user would ship half-built
     output.
+
+    `data_path` is the TES4 data directory the plugin was converted FROM.
+    Plugins do not share one: Nehrim and Morrowind_ob live in their own
+    installs, so re-running a converted plugin means restoring its own source
+    directory, not assuming whichever one is currently configured.
     """
     version = current_version() if version is None else version
     state = _load_state()
     steps = state.setdefault("steps", {})
     entry  = steps.setdefault(_plugin_key(plugin), {})
     entry[step_key] = version
+    if data_path:
+        state.setdefault("sources", {})[_plugin_key(plugin)] = data_path
     _save_state(state)
+
+
+def source_path_for(plugin: str | None) -> str | None:
+    """The TES4 data directory *plugin* was last converted from, if recorded."""
+    sources = _load_state().get("sources", {})
+    if not isinstance(sources, dict):
+        return None
+    got = sources.get(_plugin_key(plugin))
+    return got if isinstance(got, str) and got.strip() else None
 
 
 def _plugin_key(plugin: str | None) -> str:
@@ -410,6 +485,75 @@ def describe_plan(plan: dict) -> str:
     if not plan["upgraded"]:
         return f"Version {cur} - steps never run: {names}."
     return (f"Version {cur} (was {plan['installed']}) - re-run: {names}")
+
+
+# ---------------------------------------------------------------------------
+# Update check
+# ---------------------------------------------------------------------------
+
+# Where releases are published.  A source drop has no git remote to derive this
+# from, so it is a constant.
+REPO = "bryantmh/tes4skyrim"
+RELEASES_URL = f"https://github.com/{REPO}/releases"
+_TAGS_API = f"https://api.github.com/repos/{REPO}/tags?per_page=100"
+
+# Anonymous: reading tags on a public repo needs no credentials, and gating an
+# update check on the GitHub CLI would exclude essentially every end user
+# (the same reasoning tools/navmesh_cache.py records for its download path).
+_UA = {"User-Agent": "tes4skyrim-update-check",
+       "Accept": "application/vnd.github+json"}
+
+
+def latest_release(timeout: int = 8) -> str | None:
+    """Newest release tag on the remote, or None if it cannot be determined.
+
+    NETWORK CALL -- never invoke this on the UI thread.
+    """
+    try:
+        req = urllib.request.Request(_TAGS_API, headers=_UA)
+        with urllib.request.urlopen(req, timeout=timeout) as fh:
+            payload = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(payload, list):
+        return None
+
+    best, best_key = None, None
+    for row in payload:
+        name = row.get("name") if isinstance(row, dict) else None
+        if not isinstance(name, str):
+            continue
+        # Release tags only: the repo also carries navmesh-cache-* tags, which
+        # are a different series and must never be offered as an update.
+        if name != _base_tag(name):
+            continue
+        key = version_key(name)
+        if key and (best_key is None or key > best_key):
+            best, best_key = name, key
+    return best
+
+
+def check_for_update(timeout: int = 8) -> dict:
+    """Compare this install against the newest published release.
+
+    NETWORK CALL -- run on a worker thread.  Returns:
+      current   -- this tree's version
+      latest    -- newest release tag, or None if the check failed
+      available -- True when `latest` is strictly newer than `current`
+      reachable -- False when the remote could not be queried
+    """
+    current = current_version()
+    latest = latest_release(timeout=timeout)
+    if latest is None:
+        return {"current": current, "latest": None,
+                "available": False, "reachable": False}
+
+    here, there = version_key(current), version_key(latest)
+    # A dev tree sitting on the newest tag with local commits ('0.58+') is not
+    # behind, so compare on the base tag and treat equal as up to date.
+    available = bool(here and there and there > here)
+    return {"current": current, "latest": latest,
+            "available": available, "reachable": True}
 
 
 def main() -> int:

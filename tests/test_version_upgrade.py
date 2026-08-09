@@ -31,13 +31,13 @@ def test_ordering_across_the_scheme_boundary():
     assert v.version_key("1.00") > v.version_key("0.999")
 
 
-def test_git_describe_output_ranks_as_its_base_tag():
-    """A dev checkout reports git's raw `describe`, e.g. 0.58-3-g6c7a351-dirty.
+def test_dev_version_string_ranks_as_its_base_tag():
+    """A dev checkout reports `<tag>+g<sha>`, e.g. 0.58+ge49ab44.
 
     It must rank as 0.58, or a developer's upgrade plan resolves against a
     version that does not exist and reports 'unknown' -> re-run everything.
     """
-    for described in ("0.58-3-g6c7a351-dirty", "0.58-3-g6c7a351", "0.58-dirty"):
+    for described in ("0.58+ge49ab44", "0.58+", "0.58-3-g6c7a351-dirty"):
         assert v.version_key(described) == v.version_key("0.58"), described
 
 
@@ -47,10 +47,56 @@ def test_exact_tag_is_not_a_dev_version():
 
 
 @pytest.mark.parametrize("described", [
-    "0.58-3-g6c7a351-dirty", "0.58-dirty", "0.0-dev",
+    "0.58+ge49ab44", "0.58+", "0.0-dev",
 ])
 def test_moved_past_a_tag_is_a_dev_version(described):
     assert v.is_dev_version(described) is True
+
+
+def test_resolving_the_version_never_spawns_a_subprocess():
+    """The GUI resolves the version while building its window, and under
+    gui.pyw the parent is console-less pythonw.exe -- every spawn there is a
+    potential console window.  The GUI is ONE window."""
+    import subprocess
+    calls = []
+    originals = {n: getattr(subprocess, n)
+                 for n in ("run", "Popen", "call", "check_output")}
+    for name in originals:
+        setattr(subprocess, name,
+                lambda *a, _n=name, **k: calls.append(_n))
+    try:
+        v._CURRENT[0] = None
+        v.current_version()
+    finally:
+        for name, fn in originals.items():
+            setattr(subprocess, name, fn)
+        v._CURRENT[0] = None
+    assert calls == [], f"version resolution spawned: {calls}"
+
+
+# ── Update check ──────────────────────────────────────────────────────────
+
+def test_update_check_ignores_non_release_tags(monkeypatch):
+    """The repo also carries navmesh-cache-* tags; offering one as an update
+    would send the user to a release that is not the converter."""
+    monkeypatch.setattr(v, "latest_release", lambda timeout=8: None)
+    monkeypatch.setattr(v, "current_version", lambda: "0.58")
+    got = v.check_for_update()
+    assert got["reachable"] is False and got["available"] is False
+
+
+def test_update_available_only_when_strictly_newer(monkeypatch):
+    monkeypatch.setattr(v, "current_version", lambda: "0.58")
+    for latest, expect in (("0.59", True), ("0.58", False), ("0.57", False)):
+        monkeypatch.setattr(v, "latest_release", lambda timeout=8, l=latest: l)
+        assert v.check_for_update()["available"] is expect, latest
+
+
+def test_dev_tree_on_the_newest_tag_is_not_behind(monkeypatch):
+    """`0.58+ge49ab44` is ahead of 0.58, never behind it."""
+    monkeypatch.setattr(v, "current_version", lambda: "0.58+ge49ab44")
+    monkeypatch.setattr(v, "latest_release", lambda timeout=8: "0.58")
+    assert v.check_for_update()["available"] is False
 
 
 @pytest.mark.parametrize("bad", ["", "dev", "x.yy", "0", "0.", ".58"])
@@ -164,6 +210,33 @@ def test_installed_version_is_the_oldest_step_not_the_newest(state):
 
 def test_unknown_plugin_has_no_installed_version(state):
     assert v.installed_version_for("Never.esm") is None
+
+
+# ── Source directory: plugins do not share one ────────────────────────────
+
+def test_each_plugin_remembers_its_own_data_directory(state):
+    """Nehrim and Morrowind_ob live in their own installs, so re-running a
+    converted plugin must restore ITS directory, not whichever is configured."""
+    v.record_step_run("import_", "Nehrim.esm", "0.55", data_path=r"D:\Nehrim\Data")
+    v.record_step_run("import_", "Oblivion.esm", "0.55", data_path=r"D:\Obliv\Data")
+    assert v.source_path_for("Nehrim.esm") == r"D:\Nehrim\Data"
+    assert v.source_path_for("Oblivion.esm") == r"D:\Obliv\Data"
+
+
+def test_source_path_is_case_insensitive(state):
+    v.record_step_run("import_", "Nehrim.esm", "0.55", data_path=r"D:\Nehrim\Data")
+    assert v.source_path_for("NEHRIM.ESM") == r"D:\Nehrim\Data"
+
+
+def test_source_path_absent_when_never_recorded(state):
+    v.record_step_run("import_", "Nehrim.esm", "0.55")   # no data_path
+    assert v.source_path_for("Nehrim.esm") is None
+    assert v.source_path_for("Unknown.esm") is None
+
+
+def test_recording_a_source_does_not_disturb_step_versions(state):
+    v.record_step_run("meshes", "Nehrim.esm", "0.55", data_path=r"D:\Nehrim\Data")
+    assert v.steps_run_at("Nehrim.esm") == {"meshes": "0.55"}
 
 
 def test_corrupt_state_file_is_survivable(state):
