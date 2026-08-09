@@ -57,6 +57,12 @@ jobs:
 
           # Nothing to do if HEAD is already tagged -- e.g. a workflow re-run,
           # or a push that only moved a branch pointer.
+          #
+          # This also absorbs the release-stamp commit this job pushes below.
+          # That commit carries [skip ci], but it is ALSO the commit the tag
+          # lands on, so even if the marker were ignored the re-triggered run
+          # finds HEAD already tagged and exits here.  Two independent guards,
+          # because a loop in a tagging workflow burns a tag number per lap.
           if [ -n "$latest" ] && [ "$(git rev-parse "$latest^{commit}")" = "$(git rev-parse HEAD)" ]; then
             echo "HEAD is already tagged $latest -- nothing to do."
             echo "HEAD is already tagged \`$latest\`; no new tag created." >> "$GITHUB_STEP_SUMMARY"
@@ -88,6 +94,28 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stamp the version INTO the tree before tagging, so a source drop
+          # knows what it is without a .git directory -- the release zip
+          # GitHub generates has none, and that is how users install.
+          # UPGRADE_STEPS.json gains this release's step list at the same
+          # time, letting an offline install work out what an upgrade owes.
+          echo "$next_tag" > VERSION
+          python tools/upgrade_table.py --add "$next_tag" --to HEAD
+
+          # `git commit` exits non-zero on an empty index and `set -e` would
+          # abort the tag with it, so only commit when something actually
+          # changed (a re-run can find both files already correct).
+          git add VERSION UPGRADE_STEPS.json
+          if git diff --cached --quiet; then
+            echo "VERSION and UPGRADE_STEPS.json already current."
+          else
+            git commit -m "chore(release): stamp $next_tag [skip ci]"
+            git push origin HEAD:master
+          fi
+
+          # Tag the stamped commit, not the one below it, so the tree a user
+          # downloads carries its own version number.
           git tag -a "$next_tag" -F "$RUNNER_TEMP/notes.txt"
           git push origin "$next_tag"
 

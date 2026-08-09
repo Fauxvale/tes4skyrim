@@ -1251,12 +1251,25 @@ def main():
 
     success = True
 
+    # Per-step, per-plugin outcome, so a version stamp is only recorded for
+    # what actually completed.  Marking a failed step "run at 0.59" would make
+    # the next upgrade check report it clean and quietly ship stale output, so
+    # a step is recorded only when every plugin in `order` succeeded.
+    import version as _version
+    _step_ok: dict[str, dict[str, bool]] = {}
+
+    def _mark(step_key: str, fn: str, ok: bool) -> None:
+        _step_ok.setdefault(step_key, {})[fn] = (
+            _step_ok.get(step_key, {}).get(fn, True) and ok)
+
     if do_export:
         print("=" * 54)
         print("  Phase 1: EXPORT TES4 RECORDS")
         print("=" * 54)
         for fn in order:
-            if not phase_export(fn, tes4_data, export_dir, config):
+            ok = phase_export(fn, tes4_data, export_dir, config)
+            _mark('export', fn, ok)
+            if not ok:
                 success = False
         print()
 
@@ -1265,7 +1278,9 @@ def main():
         print("  Phase 2: EXTRACT TES4 ARCHIVES")
         print("=" * 54)
         for fn in order:
-            if not phase_extract(fn, tes4_data, config):
+            ok = phase_extract(fn, tes4_data, config)
+            _mark('extract', fn, ok)
+            if not ok:
                 success = False
         print()
 
@@ -1274,9 +1289,14 @@ def main():
         print("  Phase 3: CONVERT MESHES AND TEXTURES")
         print("=" * 54)
         for fn in order:
-            if not phase_assets(fn, config, output_dir=output_dir,
-                                mesh_subdirs=getattr(args, 'mesh_subdirs', None),
-                                winding_fix=args.collision_winding_fix):
+            ok = phase_assets(fn, config, output_dir=output_dir,
+                              mesh_subdirs=getattr(args, 'mesh_subdirs', None),
+                              winding_fix=args.collision_winding_fix)
+            # A filtered mesh run converts only some subfolders, so it must not
+            # certify the Meshes step as fully rebuilt at this version.
+            if not getattr(args, 'mesh_subdirs', None):
+                _mark('meshes', fn, ok)
+            if not ok:
                 success = False
         print()
 
@@ -1285,7 +1305,9 @@ def main():
         print("  Phase 4: CONVERT SPEEDTREES")
         print("=" * 54)
         for fn in order:
-            if not phase_speedtrees(fn, config, output_dir=output_dir):
+            ok = phase_speedtrees(fn, config, output_dir=output_dir)
+            _mark('speedtrees', fn, ok)
+            if not ok:
                 success = False
         print()
 
@@ -1294,8 +1316,9 @@ def main():
         print("  Phase 5: CONVERT CREATURES")
         print("=" * 54)
         for fn in order:
-            if not phase_creatures(fn, tes5_data, config,
-                                   output_dir=output_dir):
+            ok = phase_creatures(fn, tes5_data, config, output_dir=output_dir)
+            _mark('creatures', fn, ok)
+            if not ok:
                 success = False
         print()
 
@@ -1304,8 +1327,10 @@ def main():
         print("  Phase 6: BUILD TES5 PLUGIN")
         print("=" * 54)
         for fn in order:
-            if not phase_import(fn, tes4_data, tes5_data, export_dir, config,
-                                output_dir=output_dir):
+            ok = phase_import(fn, tes4_data, tes5_data, export_dir, config,
+                              output_dir=output_dir)
+            _mark('import_', fn, ok)
+            if not ok:
                 success = False
         print()
 
@@ -1314,7 +1339,9 @@ def main():
         print("  Phase 7: CONVERT SOUNDS")
         print("=" * 54)
         for fn in order:
-            if not phase_sounds(fn, config, output_dir=output_dir):
+            ok = phase_sounds(fn, config, output_dir=output_dir)
+            _mark('sounds', fn, ok)
+            if not ok:
                 success = False
         print()
 
@@ -1323,10 +1350,17 @@ def main():
         print("  Phase 8: CONVERT SCRIPTS")
         print("=" * 54)
         for fn in order:
-            if not phase_scripts(fn, config, output_dir=output_dir):
+            ok = phase_scripts(fn, config, output_dir=output_dir)
+            if not ok:
                 success = False
-            if success and not phase_compile(fn, config, output_dir=output_dir):
-                success = False
+            # Compilation is gated on `success` upstream; the step counts as
+            # run only when transpile AND compile both land.
+            compiled = False
+            if success:
+                compiled = phase_compile(fn, config, output_dir=output_dir)
+                if not compiled:
+                    success = False
+            _mark('scripts', fn, ok and compiled)
         print()
 
     if do_lod:
@@ -1334,16 +1368,24 @@ def main():
         print("  Phase 9: GENERATE LOD")
         print("=" * 54)
         for fn in order:
+            # phase_lod's result is advisory upstream (a worldspace with no LOD
+            # is not an error), so the step is recorded as run regardless.
             phase_lod(fn, tes5_data, config, output_dir=output_dir)
+            _mark('lod', fn, True)
         print()
 
     if do_skyrim_patch:
         print("=" * 54)
         print("  Phase 10: PATCH SKYRIM (SLOT 44 BODY MESHES)")
         print("=" * 54)
-        if not phase_modify_body_meshes(
-                tes5_data, plugins=getattr(args, 'patch_plugins', None),
-                output_dir=output_dir):
+        ok = phase_modify_body_meshes(
+            tes5_data, plugins=getattr(args, 'patch_plugins', None),
+            output_dir=output_dir)
+        # Patches the user's load order, not a converted plugin, so it is
+        # recorded once against every plugin in the run.
+        for fn in order:
+            _mark('modify_body_meshes', fn, ok)
+        if not ok:
             success = False
         print()
 
@@ -1362,7 +1404,9 @@ def main():
         print("  Phase 11: PACK BSA ARCHIVES")
         print("=" * 54)
         for fn in order:
-            if not phase_pack(fn, config, output_dir=output_dir):
+            ok = phase_pack(fn, config, output_dir=output_dir)
+            _mark('pack', fn, ok)
+            if not ok:
                 success = False
         print()
 
@@ -1371,9 +1415,23 @@ def main():
         print("  Phase 12: PACK ZIP ARCHIVES")
         print("=" * 54)
         for fn in order:
-            if not phase_pack_zip(fn, config, output_dir=output_dir):
+            ok = phase_pack_zip(fn, config, output_dir=output_dir)
+            _mark('pack_zip', fn, ok)
+            if not ok:
                 success = False
         print()
+
+    # Stamp the version onto every step that completed for every plugin it ran
+    # for.  This is what lets the next paste-over-the-top install work out that
+    # e.g. only Meshes and Import are stale.  Never let bookkeeping fail a run
+    # that otherwise succeeded.
+    try:
+        for step_key, per_file in _step_ok.items():
+            for fn, ok in per_file.items():
+                if ok:
+                    _version.record_step_run(step_key, fn)
+    except Exception as exc:
+        print(f"Note: could not record conversion state ({exc}).")
 
     print("Pipeline complete." if success else "Pipeline completed with errors.")
     return 0 if success else 1

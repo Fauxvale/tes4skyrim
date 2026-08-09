@@ -28,3 +28,8 @@ native/dist/*.obj
 # Navmesh cache drop-in: keep the folder and its README, ignore the zips.
 navmesh_cache/*
 !navmesh_cache/README.md
+
+# Per-install record of which version last ran each pipeline step.  Local
+# history, not source: committing it would ship one machine's conversion state
+# to every user and make their upgrade check lie.
+.conversion_state.json

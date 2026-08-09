@@ -106,6 +106,23 @@ def test_pool_plumbing_implies_all_steps(path):
     assert steps(path) == rn.STEP_ORDER
 
 
+# ── native/: the extension rebuilds, its docs do not ──────────────────────
+
+@pytest.mark.parametrize("path", ["native/build.py", "native/dist/navmesh.pyd"])
+def test_native_code_implies_the_asset_steps(path):
+    assert "3. Meshes" in steps(path)
+
+
+@pytest.mark.parametrize("path", ["native/dist/README.md", "native/notes.txt"])
+def test_native_docs_trigger_nothing(path):
+    """0.57 charged a mesh + creature + LOD rebuild for `native/dist/README.md`.
+
+    The doc rule must stay ABOVE the blanket `^native/` rule -- first match
+    wins, so reordering silently reinstates hours of needless rebuilding.
+    """
+    assert steps(path) == []
+
+
 def test_unmapped_path_selects_no_steps():
     """An unrecognised path is reported, not turned into a 12-step re-run."""
     ordered, unmatched, _ = rn.steps_for_paths(["brand_new_package/thing.py"])

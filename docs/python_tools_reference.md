@@ -255,6 +255,10 @@ Correctness first, then quality, then geometry probes. See
   - The path→step map (`RULES`) mirrors `gui.py`'s `STEPS` table. **Add a rule whenever a new top-level package lands**, otherwise unmapped paths conservatively select every step — that precaution is deliberate, but an unmapped path that is *never* pipeline input (docs, vendored binaries, standalone plugins) should get an explicit empty rule instead.
   - `convert.py` is resolved **per phase function**, not as a blanket "run everything": git's `-U0` hunk headers name the enclosing `phase_*`, which `PHASE_STEPS` maps to its step. Hunks in `main()`, a shared helper, or at module scope can't be attributed and fall back to all steps. **A new `phase_*` function needs a `PHASE_STEPS` entry** — a test asserts this.
   - Packaging (`11. Pack BSAs`, `12. Pack Mod Zip`) is appended only when a step that *produces* packaged output fires. `10. Patch Skyrim` writes a standalone ARMA patch the BSA/zip steps never read, so it does not pull packaging in on its own.
+- **Upgrade table**: `python tools/upgrade_table.py [--add TAG [--to REV]] [--check]` — writes `UPGRADE_STEPS.json`, the per-release table of GUI steps each version requires re-running. No args rebuilds it from the whole tag history; `--add` appends one release (what CI calls at tag time); `--check` exits 1 if the committed table has drifted from the tags.
+  - **Reuses `release_notes.py`'s `RULES`/`PHASE_STEPS` rather than copying them.** Two path→step maps would drift the moment one was edited, and the release notes and the GUI's pre-selection must never disagree about what an upgrade costs.
+  - Each entry is that release's **own delta** (previous tag → this tag), not a cumulative set. `version.steps_between` unions the entries in range, so an upgrade that skips releases owes all of them.
+  - Maintained by `.github/workflows/tag-on-push.yml`, which runs `--add` alongside the `VERSION` stamp and commits both before tagging. A tag cut outside that workflow leaves a hole, which `steps_between` reports as *unknown* → select every step; the feature degrades to the old behaviour rather than under-selecting.
 
 ## verify_plugin.py
 

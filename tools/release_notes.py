@@ -95,6 +95,11 @@ RULES: list[tuple[str, list[str]]] = [
     (r"^asset_convert/",                       ["3. Meshes"]),
 
     # ── Native / shared code: conservatively wide ─────────────────────────
+    # Docs and build notes shipped alongside the extension are not inputs to
+    # anything.  Listed BEFORE the blanket native/ rule (first match wins), or
+    # a README edit costs the user a mesh, creature AND LOD rebuild -- which is
+    # exactly what 0.57 charged for `native/dist/README.md`.
+    (r"^native/.*\.(md|txt)$",    []),
     (r"^native/",                 ["3. Meshes", "5. Creatures", "9. LOD"]),
     # convert.py is resolved per-phase-function instead (see PHASE_STEPS);
     # "ALL" here is only the fallback when the hunks can't be attributed.

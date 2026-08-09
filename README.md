@@ -114,6 +114,13 @@ into `navmesh_cache/` and Import picks it up; set `TESCONV_NO_CACHE_DOWNLOAD=1`
 to skip the download on a metered connection. The conversion is identical either
 way — a cache only ever saves time, never changes the result.
 
+### Upgrading
+
+Paste a new download over your existing folder. The version is in the title bar,
+and the **Upgrade** button ticks only the steps that changed since the version
+you last converted with — usually three or four instead of twelve. It greys out
+to **Up to date** when nothing is owed, and selects everything if the range
+can't be resolved.
 
 ### Starting a converted game
 

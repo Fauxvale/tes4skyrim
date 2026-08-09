@@ -2,7 +2,6 @@ Major Issues for V1:
 	1 - Iterate on quest and dialog conversion until everything is playable starting with Oblivion Main Quest
 
 	2 - Havok feels off. Items don't move like they should. Specifically, there seems to be too much inertia on small items, like I'm dragging a heavy object when it is something as small as a cup, Animated signs will get stuck in a position after swinging a bit, defying gravicty
-		ctrigtripwire01.nif also fails to break when walked over
 
 	3 - Navmesh refinement
 		ensure corridors connect pathgrid islands
@@ -59,7 +58,7 @@ Later Issues:
 
 	13 - Trap damage
 
-	14 - Potential remapping of low level formids like player (07) or gold (f)
+	14 - Potential remapping of low level formids like how player (07) or gold (f) already do
 
 	15 - Add progress bar for navmesh step
 

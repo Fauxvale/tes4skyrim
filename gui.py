@@ -20,6 +20,7 @@ SCRIPT_DIR  = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / "conversion_config.json"
 
 from worker_budget import worker_count, cpu_total, WORKERS_ENV_VAR
+import version as version_info
 from preflight import RC_MISSING_DEP as _RC_MISSING_DEP
 from collision_options import (
     WINDING_FIX_DEFAULT_PLUGINS,
@@ -449,7 +450,7 @@ def gui_main():
 
     # ── Root window ───────────────────────────────────────────────────────────
     root = tk.Tk()
-    root.title("TES4 Auto-Convert")
+    root.title(f"TES4 Auto-Convert  {version_info.current_version()}")
     root.geometry("1060x900")
     root.minsize(860, 680)
     root.configure(bg=CLR["bg"])
@@ -659,8 +660,13 @@ def gui_main():
         popup has to be free to overhang the window edge.  It is created on
         enter and destroyed on leave, so nothing lingers if the widget itself is
         destroyed while the tip is up.
+
+        Returns a setter for the text.  Widgets whose tip changes (the Upgrade
+        button) MUST use it rather than calling _attach_tooltip again: the
+        bindings below are `add="+"`, so re-attaching stacks another set of
+        handlers on every refresh and leaks a popup per call.
         """
-        state = {"win": None, "after": None}
+        state = {"win": None, "after": None, "text": text}
 
         def _hide(*_):
             if state["after"] is not None:
@@ -678,7 +684,7 @@ def gui_main():
             win.wm_overrideredirect(True)   # no title bar / decorations
             win.configure(bg=CLR["border"])
             tk.Label(
-                win, text=text, justify="left", wraplength=width,
+                win, text=state["text"], justify="left", wraplength=width,
                 bg=CLR["log_bg"], fg=CLR["text"],
                 font=("Segoe UI", 9), padx=8, pady=6,
             ).pack(padx=1, pady=1)       # 1px border via the parent's bg
@@ -700,6 +706,13 @@ def gui_main():
         widget.bind("<Leave>", _hide, add="+")
         widget.bind("<Button-1>", _hide, add="+")
         widget.bind("<Destroy>", _hide, add="+")
+
+        def _set_text(new_text: str):
+            state["text"] = new_text
+            if state["win"] is not None:   # retarget a tip that is already up
+                _hide()
+
+        return _set_text
 
     def _path_row(parent, label_text: str, var: tk.StringVar,
                   browse_dir=True, on_change=None):
@@ -943,6 +956,9 @@ def gui_main():
         last_valid[0] = name
         file_var.set(name)
         file_combo["values"] = list(all_plugins)
+        # Each plugin carries its own conversion history, so the upgrade notice
+        # is per-plugin and has to follow the selection.
+        _refresh_upgrade_notice()
 
     def _on_selected(_evt=None):
         _commit(file_var.get())
@@ -1063,6 +1079,78 @@ def gui_main():
         side=tk.RIGHT, padx=(2, 0))
     ttk.Button(sh, text="All", command=_set_all, width=4).pack(
         side=tk.RIGHT, padx=(2, 0))
+
+    # ── Upgrade shortcut ──────────────────────────────────────────────────────
+    # Sits with All/Default/None: ticks exactly the steps whose code changed
+    # between the version that last converted this plugin and the one in this
+    # folder.  Without it every upgrade costs a full multi-hour reconversion
+    # for what is usually a 3-step change.  Disabled and labelled "Up to date"
+    # when nothing is owed, so the button's state IS the status readout -- no
+    # separate banner needed.
+    _upgrade_plan = [None]
+    # Plugins already auto-applied, so re-selecting one does not stamp over
+    # choices the user has since made by hand.
+    _plan_applied = set()
+
+    def _apply_upgrade_plan():
+        plan = _upgrade_plan[0]
+        if not plan or not plan.get("steps"):
+            return
+        for key, v in step_vars.items():
+            v.set(key in plan["steps"])
+        _update_run_btn()
+
+    upgrade_btn = ttk.Button(sh, text="Upgrade", width=9,
+                             command=_apply_upgrade_plan)
+    upgrade_btn.pack(side=tk.RIGHT, padx=(2, 0))
+
+    _UPGRADE_TIP_IDLE = (
+        "Everything in this folder's version has already been run for this "
+        "plugin, so there is nothing to re-convert.")
+    # Bound ONCE; the refresh only swaps the text (see _attach_tooltip).
+    _set_upgrade_tip = _attach_tooltip(upgrade_btn, _UPGRADE_TIP_IDLE)
+
+    def _refresh_upgrade_notice(auto_apply: bool = True):
+        """Recompute the upgrade shortcut for the selected plugin.
+
+        `auto_apply` ticks the implied steps the first time a given plugin's
+        plan is seen -- the point of the feature is that a user who pastes a
+        new build over the old one and hits Run gets the right subset without
+        having to read anything.
+        """
+        fname = file_var.get().strip()
+        try:
+            plan = version_info.upgrade_plan(fname or None)
+        except Exception:
+            plan = None
+        _upgrade_plan[0] = plan
+
+        if not plan or plan["never_run"] or not plan["steps"]:
+            # Nothing converted yet, or already current.  Keep the button in
+            # place but inert, so the row never reflows and the state is legible.
+            upgrade_btn.configure(text="Up to date", state="disabled")
+            _set_upgrade_tip(_UPGRADE_TIP_IDLE)
+            return
+
+        label_of = dict(version_info.STEP_KEYS)
+        names = ", ".join(label_of.get(k, k) for k in plan["steps"])
+        if plan["unknown"]:
+            tip = (f"Updated to {plan['current']} from {plan['installed']}.\n\n"
+                   f"Which steps changed could not be determined, so all are "
+                   f"selected.")
+        elif plan["upgraded"]:
+            tip = (f"Updated {plan['installed']} → {plan['current']}.\n\n"
+                   f"Selects only the steps that upgrade changed:\n{names}")
+        else:
+            tip = (f"These steps have not been run at {plan['current']} for "
+                   f"this plugin:\n{names}")
+
+        upgrade_btn.configure(text="Upgrade", state="normal")
+        _set_upgrade_tip(tip)
+
+        if auto_apply and fname and fname not in _plan_applied:
+            _plan_applied.add(fname)
+            _apply_upgrade_plan()
 
     def _update_run_btn(*_):
         has = any(v.get() for v in step_vars.values())
@@ -1450,6 +1538,10 @@ def gui_main():
             prog_bar.pack_forget()
             status_var.set("Ready")
             _stop_timer()
+            # The run just rewrote the conversion state, so what is still
+            # outstanding has changed.  Recompute, but do NOT re-tick the
+            # boxes: the user is looking at the selection they just ran.
+            _refresh_upgrade_notice(auto_apply=False)
         _update_run_btn()
 
     def _cancel_clicked():
@@ -1606,6 +1698,9 @@ def gui_main():
         # Start draining the queue in the UI thread
         root.after(50, _drain_queue)
 
+    # Startup: the plugin combo is already populated, so an upgrade is visible
+    # (and pre-selected) before the user touches anything.
+    _refresh_upgrade_notice()
     _update_run_btn()
     root.mainloop()
     return 0
