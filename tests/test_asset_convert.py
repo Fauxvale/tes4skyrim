@@ -3082,9 +3082,14 @@ class TestAnimationBlockLayout:
         PyFFI mismodels the header as 'unknown_short', so 0x0201 IS
         Flags=0x01 (low byte) + Array Size=0x02 (high byte).
         """
-        from asset_convert.nif_converter import _init_blend_interpolator
+        from asset_convert.nif_converter import _normalize_blend_interpolators
         NF = self._nif()
-        blend = _init_blend_interpolator(NF.NiBlendBoolInterpolator())
+        root = NF.NiNode()
+        ctrl = NF.NiVisController()
+        blend = NF.NiBlendBoolInterpolator()
+        ctrl.interpolator = blend
+        root.controller = ctrl
+        _normalize_blend_interpolators(root)
         assert blend.unknown_short & 0x00FF == 1, \
             'Manager Controlled (Flags bit 0) must be set'
         assert blend.unknown_short >> 8 == 2, 'Array Size must be 2'
@@ -3110,19 +3115,24 @@ class TestAnimationBlockLayout:
         # idempotent -- a second pass must find nothing left to fix
         assert _normalize_blend_interpolators(root) == 0
 
-    def test_vis_keys_are_const(self):
-        """Visibility keys must be a step function.  nif.xml documents CONST_KEY
-        (5) as 'Used for visibility keys in NiBoolData'; vanilla Skyrim is
-        3449/3449 and Oblivion source 1296/1296.  LINEAR (1) CTD'd in
-        NiBoolData::Load."""
+    def test_morph_emulation_never_targets_geometry(self):
+        """The morph swap must not synthesize NiVisController entries: across
+        every vanilla Skyrim mesh, sequence-driven NiVisController entries
+        target only NiNode / NiBillboardNode / particle systems (1852/1852),
+        never a NiTriShape, and trishape-targeted vis swaps never produced a
+        visible swap in-game.  The swap is a wrapper-NODE scale animation
+        driven by NiTransformController -- the machinery confirmed working
+        in-game (CharacterGen secret wall)."""
         from asset_convert.nif_converter import _BLEND_INTERP_FLAGS_ARRAYSIZE
         import inspect
         from asset_convert import nif_converter
         src = inspect.getsource(nif_converter._emulate_morphs)
-        assert 'kg.interpolation = 5' in src, \
-            'morph vis keys must be written as CONST_KEY (5)'
-        assert 'kg.interpolation = 1' not in src, \
-            'LINEAR bool keys crash the engine'
+        assert 'NiVisController()' not in src, \
+            'morph emulation must not construct NiVisController blocks'
+        assert "b'NiVisController'" not in src, \
+            'morph emulation must not emit NiVisController sequence entries'
+        assert "controller_type = b'NiTransformController'" in src, \
+            'morph swap entries must be transform (scale) entries'
         assert _BLEND_INTERP_FLAGS_ARRAYSIZE == 0x0201
 
 

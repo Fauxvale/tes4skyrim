@@ -1083,6 +1083,65 @@ class ScriptConverter:
             self._udf_returns = False
             self._udf_return_value = ''
 
+        # TES4 physical traps: the ENGINE dealt the contact damage.  When a
+        # Havok body on layer 14 (OL_TRAP) struck an actor, Oblivion read the
+        # magic variables `fTrapDamage` / `fLevelledDamage` / `fTrapPushBack`
+        # off the striking object's script and applied
+        # `fTrapDamage + fLevelledDamage * victimLevel` damage plus pushback —
+        # UESP documents the per-trap results (swinging mace "20 + 1.5 x
+        # level", swinging log "15 + 1.5 x level").  The script body itself
+        # never contains a damage line, so nothing survived conversion and
+        # every converted swinging mace / log / rolling rock hit for zero.
+        #
+        # Skyrim keeps the layer-14 contact detection (the mesh conversion
+        # preserves authored OL_TRAP → SKYL_TRAP on the striking bodies, the
+        # same layer vanilla trapmace01's mace head uses) but dispatches it as
+        # the OnTrapHitStart script event and leaves the damage to the script:
+        # vanilla TrapHitBase.psc answers it with the native
+        # ObjectReference.ProcessTrapHit.  Mirror that contract by reading the
+        # same authored variables at hit time.  The values are LIVE, which
+        # reproduces the whole authored lifecycle for free: CTrapSwingMace01
+        # sets fTrapDamage=20 only on activation (0 while the trap is still
+        # armed and held, so brushing it is harmless) and lowers it to 5 six
+        # seconds after release.
+        def _declared_trap_var(name_low):
+            for _vt, _vn in variables:
+                if _vn.lower() == name_low:
+                    return _safe_property_name(_vn)
+            return None
+
+        _trap_dmg = _declared_trap_var('ftrapdamage')
+        if _trap_dmg and extends in ('ObjectReference', 'Actor'):
+            _trap_lvl = _declared_trap_var('flevelleddamage')
+            _trap_push = _declared_trap_var('ftrappushback')
+            total = _trap_dmg
+            if _trap_lvl:
+                total += f' + {_trap_lvl} * victim.GetLevel()'
+            out.append('Event OnTrapHitStart(ObjectReference akTarget, '
+                       'float afXVel, float afYVel, float afZVel, '
+                       'float afXPos, float afYPos, float afZPos, '
+                       'int aeMaterial, bool abInitialHit, int aeMotionType)')
+            out.append("  ; TES4's engine read this script's fTrapDamage "
+                       'variables when an OL_TRAP')
+            out.append('  ; body struck an actor.  Skyrim raises '
+                       'OnTrapHitStart instead and the')
+            out.append('  ; script deals the hit itself, like vanilla '
+                       'TrapHitBase.psc.')
+            out.append('  Actor victim = akTarget as Actor')
+            out.append('  If victim == None')
+            out.append('    Return')
+            out.append('  EndIf')
+            out.append(f'  Float totalDamage = {total}')
+            out.append('  If totalDamage <= 0.0')
+            out.append('    Return   ; not armed yet - TES4 variables start at 0')
+            out.append('  EndIf')
+            out.append(f'  akTarget.ProcessTrapHit(Self, totalDamage, '
+                       f'{_trap_push if _trap_push else "0.0"}, '
+                       'afXVel, afYVel, afZVel, afXPos, afYPos, afZPos, '
+                       'aeMaterial, 0.0)')
+            out.append('EndEvent')
+            out.append('')
+
         # In TES4 a `begin GameMode` block on a placed object/actor reference
         # only runs while that reference is LOADED (in/near an active cell); on
         # a quest script it runs globally once the quest is running.  Auto-
@@ -1992,22 +2051,24 @@ class ScriptConverter:
                     _skip.add(idx)
                     break
         lines = [l for i, l in enumerate(_flat) if i not in _skip]
-        # SetDestroyed(1) must not CANCEL the clip that was started just above
-        # it.  TES4 pairs the two constantly -- `playgroup forward 0` then
+        # Defer SetDestroyed(1) past the clip started just above it.  TES4
+        # pairs the two constantly -- `playgroup forward 0` then
         # `setDestroyed 1` (CTrigTripwire01SCRIPT, CTrapLogs01SCRIPT,
-        # CTrapCaveIn01SCRIPT, MPlanksBreakAway01Script) -- because in Oblivion
-        # setDestroyed on a record with no destruction data only blocked
-        # re-activation.  Oblivion ships ZERO DEST subrecords (censused across
-        # the whole export: 0 in ACTI), so no converted record has a destroyed
-        # state to switch TO -- but Skyrim's SetDestroyed still resets the
-        # reference's 3D, which kills the NiControllerSequence that started one
-        # line earlier.  That is why the tripwire never visibly snapped: the
-        # break animation was dispatched and then immediately torn down.
+        # CTrapCaveIn01SCRIPT, MPlanksBreakAway01Script) -- because in
+        # Oblivion setDestroyed on a record with no destruction data only
+        # blocked re-activation, and Oblivion ships ZERO DEST subrecords
+        # (censused: 0 in ACTI).
         #
-        # Defer the destroy past the clip instead of dropping it (it still has
-        # to run -- it is what stops the trap re-triggering).  The clip length
-        # is not knowable here, so hand it to the polyfill, which waits out the
-        # animation on its own thread and then destroys.
+        # NOTE (2026-08-06): an earlier version of this comment blamed the
+        # SetDestroyed ordering for the tripwire never visibly snapping.
+        # That was WRONG -- vanilla's own Tripwire.pex calls setDestroyed on
+        # TrapTripwire01, which has no destruction data either (610/1870
+        # vanilla ACTI carry DEST), so the call is safe on a DEST-less record
+        # and was never the tripwire's problem (that was the morph-emulation
+        # NiVisController swap; see nif_converter._emulate_morphs).  The
+        # deferral stays because it is behaviour-preserving and cheap: the
+        # destroy still runs (it is what stops the trap re-triggering), just
+        # after the polyfill has waited out the animation.
         _playanim_re = re.compile(r'^(\s*)(.+?)\.PlayAnimation\("([^"]+)"\)\s*$')
         _setdestroyed_re = re.compile(
             r'^(\s*)(?:(.+?)\.)?SetDestroyed\(\s*(?:1|true)\s*\)\s*$',

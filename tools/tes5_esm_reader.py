@@ -515,10 +515,18 @@ def _dec_armo_data(data: bytes) -> list:
 
 
 def _dec_armo_dnam(data: bytes) -> list:
-    """ARMO DNAM — 4 bytes: f32 armor rating."""
+    """ARMO DNAM — 4 bytes: S32 armor rating stored x100.
+
+    NOT a float: xEdit's TES5 ARMO definition is
+    `wbInteger(DNAM, 'Armor Rating', itS32, wbDiv(100))`
+    (wbDefinitionsTES5.pas:4176). Decoding it as f32 made every real rating
+    print as 0.00 (1000 read as a float is ~1.4e-42), which reads as "Skyrim
+    stores no armor rating here" and hides the x100 scale.
+    """
     if len(data) < 4:
         return [f'DNAM.hex={data.hex()}']
-    return [f'DNAM.ArmorRating={struct.unpack_from("<f", data, 0)[0]:.2f}']
+    raw = struct.unpack_from('<i', data, 0)[0]
+    return [f'DNAM.ArmorRating={raw / 100:.2f}', f'DNAM.ArmorRatingRaw={raw}']
 
 
 def _dec_misc_data(data: bytes) -> list:

@@ -212,17 +212,28 @@ def dump_block(block, data, indent=0, lines=None):
         rb = getattr(co, 'body', None)
         if rb is not None:
             lines.append(f"{prefix}    Body: {rb.__class__.__name__}")
-            lines.append(f"{prefix}      mass={rb.mass:.2f} friction={rb.friction:.2f} "
-                         f"restitution={rb.restitution:.2f}")
-            lines.append(f"{prefix}      motionSystem={rb.motion_system} "
-                         f"qualityType={rb.quality_type} "
-                         f"deactivatorType={rb.deactivator_type}")
-            lines.append(f"{prefix}      translation: {_fmt_vec4(rb.translation)}")
-            lines.append(f"{prefix}      center: {_fmt_vec4(rb.center)}")
-            lines.append(f"{prefix}      linearDamping={rb.linear_damping:.4f} "
-                         f"angularDamping={rb.angular_damping:.4f}")
-            lines.append(f"{prefix}      maxLinVel={rb.max_linear_velocity:.2f} "
-                         f"maxAngVel={rb.max_angular_velocity:.2f}")
+            if hasattr(rb, 'mass'):
+                lines.append(f"{prefix}      mass={rb.mass:.2f} friction={rb.friction:.2f} "
+                             f"restitution={rb.restitution:.2f}")
+            if hasattr(rb, 'motion_system'):
+                lines.append(f"{prefix}      motionSystem={rb.motion_system} "
+                             f"qualityType={rb.quality_type} "
+                             f"deactivatorType={rb.deactivator_type}")
+            if hasattr(rb, 'translation'):
+                lines.append(f"{prefix}      translation: {_fmt_vec4(rb.translation)}")
+            if hasattr(rb, 'center'):
+                lines.append(f"{prefix}      center: {_fmt_vec4(rb.center)}")
+            if hasattr(rb, 'linear_damping'):
+                lines.append(f"{prefix}      linearDamping={rb.linear_damping:.4f} "
+                             f"angularDamping={rb.angular_damping:.4f}")
+            if hasattr(rb, 'max_linear_velocity'):
+                lines.append(f"{prefix}      maxLinVel={rb.max_linear_velocity:.2f} "
+                             f"maxAngVel={rb.max_angular_velocity:.2f}")
+            hf = (getattr(rb, 'havok_col_filter', None)
+                  or getattr(rb, 'layer', None))
+            layer = getattr(hf, 'layer', hf)
+            if layer is not None:
+                lines.append(f"{prefix}      layer={layer}")
             if hasattr(rb, 'unknown_byte'):
                 lines.append(f"{prefix}      broadphaseType={rb.unknown_byte}")
             if hasattr(rb, 'unknown_6_shorts'):
@@ -242,6 +253,35 @@ def dump_block(block, data, indent=0, lines=None):
                     if c is not None:
                         lines.append(f"{prefix}        {c.__class__.__name__}")
 
+    # Generic controller chain (levers, vis swaps, shader anims, ...)
+    ctrl = getattr(block, 'controller', None)
+    if ctrl is not None and not isinstance(ctrl, NifFormat.NiControllerManager) \
+            and not isinstance(block, NifFormat.NiParticleSystem):
+        c = ctrl
+        while c is not None:
+            tgt = _safe_name(getattr(c, 'target', None)) if getattr(c, 'target', None) else ''
+            desc = (f"{prefix}  Controller: {c.__class__.__name__} flags=0x{c.flags:04X} "
+                    f"freq={c.frequency:.2f} start={c.start_time:.4f} stop={c.stop_time:.4f} "
+                    f"target='{tgt}'")
+            lines.append(desc)
+            interp = getattr(c, 'interpolator', None)
+            if interp is not None:
+                i_desc = f"{prefix}    Interp: {interp.__class__.__name__}"
+                if hasattr(interp, 'flags'):
+                    i_desc += f" flags={interp.flags}"
+                if hasattr(interp, 'bool_value'):
+                    i_desc += f" boolValue={interp.bool_value}"
+                if hasattr(interp, 'value') and isinstance(getattr(interp, 'value', None), float):
+                    i_desc += f" value={interp.value:.4f}"
+                lines.append(i_desc)
+                idata = getattr(interp, 'data', None)
+                if idata is not None and hasattr(idata, 'data'):
+                    kd = idata.data
+                    if hasattr(kd, 'num_keys'):
+                        keys = [f"({k.time:.4f},{k.value})" for k in kd.keys[:8]]
+                        lines.append(f"{prefix}      Keys: n={kd.num_keys} interpolation={kd.interpolation} {' '.join(keys)}")
+            c = getattr(c, 'next_controller', None)
+
     # NiControllerManager / animation
     ctrl = getattr(block, 'controller', None)
     if ctrl is not None and isinstance(ctrl, NifFormat.NiControllerManager):
@@ -260,16 +300,35 @@ def dump_block(block, data, indent=0, lines=None):
                     nn = f"offset:{nn}"
                 elif isinstance(nn, bytes):
                     nn = nn.decode('latin-1', errors='replace')
-                ct = getattr(cb, 'controller_type', b'')
-                if isinstance(ct, bytes):
-                    ct = ct.decode('latin-1', errors='replace')
+                def _cbs(field):
+                    v = getattr(cb, field, b'')
+                    if isinstance(v, int):
+                        return f"offset:{v}"
+                    if isinstance(v, bytes):
+                        return v.decode('latin-1', errors='replace')
+                    return str(v)
+                ct = _cbs('controller_type')
+                pt = _cbs('property_type')
+                v1 = _cbs('variable_1')
+                v2 = _cbs('variable_2')
+                prio = getattr(cb, 'priority', '')
                 interp = cb.interpolator
                 i_cls = interp.__class__.__name__ if interp else 'None'
-                lines.append(f"{prefix}        CB node='{nn}' type='{ct}' interp={i_cls}")
+                cb_ctrl = getattr(cb, 'controller', None)
+                c_cls = cb_ctrl.__class__.__name__ if cb_ctrl else 'None'
+                lines.append(f"{prefix}        CB node='{nn}' type='{ct}' prop='{pt}' "
+                             f"var1='{v1}' var2='{v2}' prio={prio} interp={i_cls} ctrl={c_cls}")
                 if interp is not None and isinstance(interp, NifFormat.NiTransformInterpolator):
                     has_data = interp.data is not None
                     lines.append(f"{prefix}          hasData={has_data} "
                                  f"trans={_fmt_vec3(interp.translation)}")
+                if interp is not None and isinstance(interp, NifFormat.NiBoolInterpolator):
+                    bd = getattr(interp, 'data', None)
+                    lines.append(f"{prefix}          boolValue={interp.bool_value} hasData={bd is not None}")
+                    if bd is not None and hasattr(bd, 'data') and hasattr(bd.data, 'num_keys'):
+                        kd = bd.data
+                        keys = [f"({k.time:.4f},{k.value})" for k in kd.keys[:8]]
+                        lines.append(f"{prefix}          Keys: n={kd.num_keys} interpolation={kd.interpolation} {' '.join(keys)}")
         # Object palette
         pal = getattr(ctrl, 'object_palette', None)
         if pal is not None and hasattr(pal, 'num_objs'):
