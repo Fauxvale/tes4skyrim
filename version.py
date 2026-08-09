@@ -10,12 +10,24 @@ The version a user is *running* and the version they last *converted with* are
 different facts, and only the second one tells you what is stale in `output/`.
 Both are tracked:
 
-  * `VERSION` (repo root, committed and stamped by the tag workflow) names the
-    release the source tree IS.  A source drop carries it; git does not have to
-    be present, and usually is not -- the release zip GitHub generates has no
-    `.git` at all, so `git describe` is not a fallback that works where it
-    matters.  In a dev checkout the file reads `0.0-dev`, and git tags take
-    over so a developer still sees a real number.
+  * `VERSION` (repo root) names the release the source tree IS.  A source drop
+    carries it; git does not have to be present, and usually is not -- the
+    release zip GitHub generates has no `.git` at all, so `git describe` is not
+    a fallback that works where it matters.
+
+    It is NOT a committed number.  The file holds a literal
+    `$Format:%(describe:tags)$` and is marked `export-subst` in
+    `.gitattributes`, so git expands it to the tag name while building the
+    archive.  The zip a user downloads for tag 0.581 therefore says `0.581`
+    though no commit ever contained that text.  A working checkout reads the
+    unexpanded placeholder, which `_read_version_file` treats as absent so git
+    tags take over and a developer still sees a real number.
+
+    This replaced a CI commit that wrote the number into VERSION and tagged
+    itself.  That commit could not reach protected master, so it existed only
+    on the tag -- which made master's VERSION permanently wrong and, worse,
+    meant the whole scheme depended on a direct push and could not work for a
+    PR merge.
   * `.conversion_state.json` (repo root, gitignored) records the version that
     last completed each pipeline step.  It is per-step and per-plugin because
     an upgrade that only touches meshes should not invalidate an Import the
@@ -29,35 +41,73 @@ set of commits whose changed paths decide which steps must re-run.  That path
 which the tag workflow already uses to write the same answer into every
 release's notes.  One mapping, two consumers.
 
-Offline is the normal case, so the step list must not depend on the network.
-Each release's notes embed their own step list, and the tag workflow also
-writes `UPGRADE_STEPS.json` into the source tree: a cumulative
-version -> steps table, so a drop knows what every prior version owes without
-asking GitHub anything.
+The version -> steps table is FETCHED OVER HTTPS from the GitHub RELEASES, and
+there is no file anywhere -- nothing committed, nothing published.  Each
+release's body is its annotated tag's message verbatim, which already contains
+the "Steps to re-run in the GUI" checklist `tools/release_notes.py` wrote at
+tag time.  The releases ARE the table; `steps_table()` just reads them back.
 
-The table is maintained by CI, not by hand: tag-on-push.yml appends the new
-release's entry via `tools/upgrade_table.py --add` and commits it with the
-version stamp, and `--check` fails if the committed table has drifted from the
-tag history.  A hole in it (a tag cut outside the workflow) makes
-`steps_between` return None, which selects every step -- the feature degrades
-to today's behaviour rather than under-selecting.
+Deriving it rather than committing it is what lets a PR merge cut a release at
+all.  A committed table has to be WRITTEN by the release job, and a write means
+a commit on master -- which branch protection refuses, and which no PR-merge
+release could ever perform.
+
+ONE request, anonymous: `releases?per_page=100` returns every body at once.
+The obvious alternative -- list tag refs, then fetch each tag object for its
+message -- costs one request PER TAG, and with 59 annotated tags against an
+anonymous limit of 60/hour a single refresh exhausted the quota and everything
+afterwards got a 429.  (GraphQL also answers in one query but needs a token,
+which no end user has.)  This is why the release job must create a Release for
+every tag, not merely push the tag.
+
+When the fetch fails the answer is "unknown", never "nothing owed".
+`steps_between` returns None, `upgrade_plan` reports `offline`, and the GUI
+disables the Upgrade button rather than showing a plan built from no data --
+an empty list would tell a user with stale output that they are current.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 VERSION_FILE = SCRIPT_DIR / "VERSION"
-STEPS_FILE   = SCRIPT_DIR / "UPGRADE_STEPS.json"
 STATE_FILE   = SCRIPT_DIR / ".conversion_state.json"
 
 # What VERSION reads in a working checkout, where the tree sits between tags.
 DEV_VERSION = "0.0-dev"
+
+# ── Remote endpoints ────────────────────────────────────────────────────────
+# Where releases are published.  A source drop has no git remote to derive this
+# from, so it is a constant.
+REPO = "bryantmh/tes4skyrim"
+REPO_URL = f"https://github.com/{REPO}"
+RELEASES_URL = f"{REPO_URL}/releases"
+_TAGS_API = f"https://api.github.com/repos/{REPO}/tags?per_page=100"
+
+# Every release, WITH ITS BODY, in ONE anonymous request.  The body is the
+# annotated tag's message (the release job passes it through verbatim), so it
+# already carries the "Steps to re-run in the GUI" checklist -- the releases
+# ARE the table.  Nothing is published, committed, or kept in sync.
+#
+# One request matters: the anonymous API allows 60 an hour, and the obvious
+# alternative -- list tag refs, then fetch each tag object's message -- costs
+# one request PER TAG.  Measured on this repo (60 tags) that exhausted the
+# entire quota on a single refresh and every later call got a 429.  GraphQL can
+# also do it in one query but requires a token, which no end user has.
+_RELEASES_API = f"https://api.github.com/repos/{REPO}/releases?per_page=100"
+
+# Anonymous: reading a public repo's tags and assets needs no credentials, and
+# gating this on the GitHub CLI would exclude essentially every end user (the
+# same reasoning tools/navmesh_cache.py records for its download path).
+_UA = {"User-Agent": "tes4skyrim-update-check",
+       "Accept": "application/vnd.github+json"}
 
 
 # ---------------------------------------------------------------------------
@@ -65,11 +115,32 @@ DEV_VERSION = "0.0-dev"
 # ---------------------------------------------------------------------------
 
 def _read_version_file() -> str | None:
+    """The release stamped into VERSION by `git archive`, or None.
+
+    VERSION is an `export-subst` template (`.gitattributes`).  In a real
+    checkout it still holds the raw `$Format:...$` placeholder, and in an
+    archive built from an UNTAGGED commit `%(describe:tags)` expands to a
+    describe string like `0.581-4-gaaef46e` rather than a bare tag.
+
+    Both are rejected here as "not a release stamp":
+
+      * The placeholder is not a version at all -- returning it would put
+        `$Format:%(describe:tags)$` in the title bar and make every comparison
+        fail.  `_git_version()` answers correctly for a checkout anyway.
+      * A describe string means the archive was cut from a commit that is not a
+        release.  `current_version` falls through to git (absent here) and then
+        to DEV_VERSION, which reads as a development build -- true, and better
+        than presenting an unreleased commit as its nearest tag.
+    """
     try:
         text = VERSION_FILE.read_text(encoding="utf-8").strip()
     except OSError:
         return None
-    return text or None
+    if not text or text.startswith("$Format:"):
+        return None
+    # Only a bare release tag counts; `_base_tag` strips describe suffixes, so
+    # a value that survives it unchanged is exactly a tag.
+    return text if text == _base_tag(text) and version_key(text) else None
 
 
 def _head_commit(git_dir: Path) -> str | None:
@@ -330,35 +401,122 @@ def installed_version_for(plugin: str | None) -> str | None:
 # Upgrade plan
 # ---------------------------------------------------------------------------
 
-_TABLE: list[dict[str, list[str]] | None] = [None]
+# (table, fetched_ok).  Cached for the process: the GUI asks for a plan on
+# every plugin selection and must not re-hit the network each time.  A FAILED
+# fetch is cached too -- an offline user would otherwise pay the full timeout on
+# every combo-box change, freezing the UI repeatedly.  `refresh=True` is the
+# escape hatch for a user who reconnects and asks again.
+_TABLE: list[tuple[dict[str, list[str]], bool] | None] = [None]
 
 
-def _load_steps_table() -> dict[str, list[str]]:
-    """{version: [step labels]} written at tag time by the release workflow.
+def _parse_steps_table(payload: object) -> dict[str, list[str]]:
+    """{version: [step labels]} from either table shape.
 
-    Ships inside the source drop precisely so an offline install can answer
-    "what changed between the version I ran and this one" with no network.
-
-    Parsed once: the GUI asks for a plan on every plugin selection, and the
-    file cannot change under a running process.
+    Tolerates both the wrapped `{"format":1,"versions":{...}}` form and a bare
+    version -> steps mapping, so an older published asset still parses.
     """
-    if _TABLE[0] is not None:
-        return _TABLE[0]
-    try:
-        with open(STEPS_FILE, encoding="utf-8") as fh:
-            table = json.load(fh)
-    except (OSError, ValueError):
-        _TABLE[0] = {}
+    if not isinstance(payload, dict):
         return {}
-    if not isinstance(table, dict):
-        _TABLE[0] = {}
+    versions = payload.get("versions", payload)
+    if not isinstance(versions, dict):
         return {}
     out: dict[str, list[str]] = {}
-    for version, steps in table.get("versions", table).items():
-        if isinstance(steps, list):
+    for version, steps in versions.items():
+        if isinstance(version, str) and isinstance(steps, list):
             out[version] = [s for s in steps if isinstance(s, str)]
-    _TABLE[0] = out
     return out
+
+
+def _get_json(url: str, timeout: int):
+    req = urllib.request.Request(url, headers=_UA)
+    with urllib.request.urlopen(req, timeout=timeout) as fh:
+        return json.load(fh)
+
+
+# The checklist release_notes.py writes into every annotated tag message:
+#   Steps to re-run in the GUI:
+#
+#     [x] 3. Meshes
+#     [x] 8. Scripts
+_STEP_LINE = re.compile(r"^\s*\[[xX ]\]\s*(\d+\.\s*.+?)\s*$")
+
+# Proves the tag was cut by the release workflow and its checklist is therefore
+# authoritative -- including when the checklist is empty.  Must stay in step
+# with release_notes.build_notes; a test asserts they agree.
+_CHECKLIST_HEADING = "Steps to re-run in the GUI:"
+
+
+def steps_from_tag_message(message: str) -> list[str]:
+    """The step labels checked off in an annotated tag's message.
+
+    The tag message is ALREADY the authoritative record -- release_notes.py
+    writes the same checklist into it that it prints in the release notes -- so
+    reading it back needs no published file, nothing committed, and nothing
+    kept in sync.  A tag cut by hand simply has no checklist, which reads as a
+    hole and selects everything.
+    """
+    steps = [m.group(1) for line in message.splitlines()
+             if (m := _STEP_LINE.match(line))]
+    # Keep only labels we recognise, in run order, so a typo in a hand-written
+    # tag cannot inject a step key the GUI has no checkbox for.
+    known = [label for _key, label in STEP_KEYS]
+    return [label for label in known if label in steps]
+
+
+def steps_table(timeout: int = 8, refresh: bool = False
+                ) -> tuple[dict[str, list[str]], bool]:
+    """({version: [step labels]}, reachable), read from the git TAGS.
+
+    NETWORK CALL -- never invoke this on the UI thread.
+
+    No file is involved, published or committed.  Each release's annotated tag
+    message already carries its "Steps to re-run in the GUI" checklist, so the
+    tags ARE the table: nothing to write at release time, nothing that can go
+    stale against them, and no commit on master -- which is what lets a
+    PR-merge release work at all.
+
+    `reachable` answers "was GITHUB reachable", NOT "did we get a table".  An
+    HTTP error response is a REACHABLE server, which is a hole in our data
+    rather than a problem with the user's connection; reporting that as offline
+    told users with working internet to go and fix their connection.  Only a
+    transport failure -- DNS, TLS, refused, timeout -- is genuinely offline.
+
+    Either way an empty table makes the caller select every step; the flag only
+    decides which explanation the user is given.
+    """
+    if _TABLE[0] is not None and not refresh:
+        return _TABLE[0]
+
+    table: dict[str, list[str]] = {}
+    reachable = False
+    try:
+        got = _get_json(_RELEASES_API, timeout)
+        reachable = True
+        for rel in got if isinstance(got, list) else []:
+            name = str(rel.get("tag_name", ""))
+            # Release tags only: navmesh-cache-* is a different series and
+            # would otherwise be read as a version.
+            if not version_key(name) or name != _base_tag(name):
+                continue
+            body = str(rel.get("body") or "")
+            # An empty checklist is a REAL entry, not a missing one: a docs-only
+            # release genuinely owes nothing.  Dropping it would leave a hole,
+            # and a hole selects all twelve steps forever.  Only a body with no
+            # checklist at all (a release cut by hand) is absent.
+            if _CHECKLIST_HEADING in body:
+                table[name] = steps_from_tag_message(body)
+    except urllib.error.HTTPError:
+        reachable = True          # the server answered; we just have no data
+    except Exception:
+        # Transport failure, or a body that would not parse.  Never propagates:
+        # the caller's fallback (select everything) is always safe, whereas an
+        # exception on a plugin-selection handler would take the GUI down.
+        reachable = False
+
+    _TABLE[0] = (table, reachable)
+    return _TABLE[0]
+
+
 
 
 # The GUI's step keys, in run order, paired with the labels release_notes.py
@@ -392,16 +550,24 @@ def steps_between(from_version: str, to_version: str) -> list[str] | None:
     Unions every table entry in (from, to] -- an upgrade that skips four
     releases owes the union of all four, not just the newest one's steps.
 
-    Returns None when the table cannot answer honestly: a missing table, or a
-    gap where some intervening version has no entry.  None means "unknown",
-    which the caller must render as "re-run everything" rather than "nothing" --
-    a silent empty list would tell the user their stale output is current.
+    Returns None when the table cannot answer honestly: an unreachable or
+    missing table, or a gap where some intervening version has no entry.  None
+    means "unknown", which the caller must render as "re-run everything" rather
+    than "nothing" -- a silent empty list would tell the user their stale output
+    is current.
+
+    NETWORK CALL (via `steps_table` / `steps_for_tag`) -- never invoke this on
+    the UI thread.
+
+    Only the tags INSIDE the range have their message fetched.  Reading all of
+    them cost one request per tag and the anonymous API allows 60 an hour, so a
+    single refresh exhausted the quota and everything afterwards got a 429.
     """
     lo, hi = version_key(from_version), version_key(to_version)
     if not lo or not hi or lo >= hi:
         return []
 
-    table = _load_steps_table()
+    table, _reachable = steps_table()
     if not table:
         return None
 
@@ -422,6 +588,8 @@ def steps_between(from_version: str, to_version: str) -> list[str] | None:
 def upgrade_plan(plugin: str | None) -> dict:
     """What the user must re-run for *plugin* after pasting in this version.
 
+    NETWORK CALL (the steps table is fetched) -- run this on a worker thread.
+
     Returns a dict the GUI and CLI both render:
       current      -- version of this source tree
       installed    -- oldest version any recorded step ran at (None if never)
@@ -430,6 +598,10 @@ def upgrade_plan(plugin: str | None) -> dict:
       unknown      -- True when the range could not be resolved and `steps`
                       is a conservative everything-list rather than a
                       measured one
+      offline      -- True when `unknown` is due to the table being
+                      unreachable, as opposed to a genuine hole in it.  The
+                      distinction is the user's to act on: a hole is ours to
+                      fix, no connection is theirs.
       never_run    -- True when nothing has ever been converted for `plugin`
     """
     current   = current_version()
@@ -440,12 +612,18 @@ def upgrade_plan(plugin: str | None) -> dict:
         # Nothing recorded: a first run, so everything is owed, but this is a
         # fresh install rather than an upgrade -- the GUI says so differently.
         return {"current": current, "installed": None, "upgraded": False,
-                "steps": [], "unknown": False, "never_run": True}
+                "steps": [], "unknown": False, "offline": False,
+                "never_run": True}
 
     labels = steps_between(installed, current)
     if labels is None:
+        # Distinguish "could not ask" from "asked, and the table has a hole".
+        # Both select everything; only the first is worth telling the user to
+        # reconnect over.
+        _table, reachable = steps_table()
         return {"current": current, "installed": installed, "upgraded": True,
-                "steps": all_keys, "unknown": True, "never_run": False}
+                "steps": all_keys, "unknown": True, "offline": not reachable,
+                "never_run": False}
 
     keys = [k for k in (label_to_key(l) for l in labels) if k]
 
@@ -461,6 +639,7 @@ def upgrade_plan(plugin: str | None) -> dict:
             "upgraded": version_key(installed) != version_key(current),
             "steps": keys,
             "unknown": False,
+            "offline": False,
             "never_run": False}
 
 
@@ -480,8 +659,10 @@ def describe_plan(plan: dict) -> str:
     label_of = dict(STEP_KEYS)
     names = ", ".join(label_of.get(k, k) for k in plan["steps"]) or "nothing"
     if plan["unknown"]:
-        return (f"Version {cur} (was {plan['installed']}) - cannot tell which "
-                f"steps changed, so all are selected.")
+        why = ("could not reach GitHub for the step list"
+               if plan.get("offline") else "cannot tell which steps changed")
+        return (f"Version {cur} (was {plan['installed']}) - {why}, "
+                f"so all are selected.")
     if not plan["upgraded"]:
         return f"Version {cur} - steps never run: {names}."
     return (f"Version {cur} (was {plan['installed']}) - re-run: {names}")
@@ -490,20 +671,6 @@ def describe_plan(plan: dict) -> str:
 # ---------------------------------------------------------------------------
 # Update check
 # ---------------------------------------------------------------------------
-
-# Where releases are published.  A source drop has no git remote to derive this
-# from, so it is a constant.
-REPO = "bryantmh/tes4skyrim"
-REPO_URL = f"https://github.com/{REPO}"
-RELEASES_URL = f"{REPO_URL}/releases"
-_TAGS_API = f"https://api.github.com/repos/{REPO}/tags?per_page=100"
-
-# Anonymous: reading tags on a public repo needs no credentials, and gating an
-# update check on the GitHub CLI would exclude essentially every end user
-# (the same reasoning tools/navmesh_cache.py records for its download path).
-_UA = {"User-Agent": "tes4skyrim-update-check",
-       "Accept": "application/vnd.github+json"}
-
 
 def latest_release(timeout: int = 8) -> str | None:
     """Newest release tag on the remote, or None if it cannot be determined.

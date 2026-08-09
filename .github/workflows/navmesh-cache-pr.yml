@@ -1,0 +1,160 @@
+name: Navmesh cache check
+
+# The shared navmesh cache can only be rebuilt on a machine that has the game,
+# the export and the collision cache -- see tools/navmesh_cache_hook.py.  A
+# runner has none of those, so CI cannot regenerate or validate it.
+#
+# What CI *can* do is notice that a PR changes the navmesh sources, which
+# invalidates every cached entry, and say so loudly enough that the cache gets
+# republished from a real machine before the release goes out.  Without this
+# the PR route is silently worse than a direct push: the pre-push hook blocks a
+# direct push with a stale cache, but a PR merged in GitHub's UI runs no local
+# hook and ships a cache that misses for every downloader.
+#
+# This job WARNS, it does not block.  Blocking would be wrong here: the fix has
+# to happen on the author's machine, and a required check nobody on the runner
+# can satisfy would just be bypassed.
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Both sides of the diff, plus tags so the reported "next" version is
+          # the real one rather than a guess from a shallow clone.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Does this PR invalidate the navmesh cache?
+        id: check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Reuse the hook's own path/function attribution rather than a second
+          # copy of the rules -- two lists would drift the moment one is edited,
+          # and this one deciding differently from the pre-push gate is exactly
+          # the failure the whole check exists to prevent.
+          python - "$BASE_SHA" "$HEAD_SHA" <<'PY' >> "$GITHUB_OUTPUT"
+          import subprocess, sys
+          from tools import navmesh_cache_hook as h
+
+          base, head = sys.argv[1], sys.argv[2]
+          changed = subprocess.run(
+              ["git", "diff", "--name-only", f"{base}...{head}"],
+              capture_output=True, text=True, check=True).stdout.split()
+          hits = h.touches_navmesh(changed, base=base, head=head)
+          print("touched=%s" % ("1" if hits else ""))
+          # Multi-line outputs need a heredoc delimiter, not a bare newline.
+          print("files<<EOF")
+          for p in sorted(set(hits)):
+              print("  - `%s`" % p)
+          print("EOF")
+          PY
+
+      - name: Warn on the pull request
+        if: steps.check.outputs.touched == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          FILES: ${{ steps.check.outputs.files }}
+          # Hidden in rendered markdown; the only thing that identifies our
+          # comment for the update-in-place path below.
+          MARKER: '<!-- navmesh-cache-warning -->'
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/body.md" <<EOF
+          ## :rotating_light: This PR invalidates the shared navmesh cache
+
+          These changed files feed the navmesh cache tag, so **every cached
+          entry for every plugin is invalidated** by this PR:
+
+          $FILES
+
+          Merging without republishing ships a cache that **misses for every
+          downloader** -- they pay full navmesh generation (the slowest import
+          stage, ~8,200 cells for Oblivion) while believing they have a cache.
+
+          ### Required before this ships
+
+          CI cannot do this: the cache is built from gitignored \`export/\` data
+          that only exists on a machine with a real Oblivion install. On that
+          machine, after merging:
+
+          \`\`\`
+          python convert.py -f Oblivion.esm --import-only   # regenerate
+          python tools/navmesh_cache.py verify --plugin Oblivion.esm
+          python tools/navmesh_cache_hook.py --run          # publish
+          \`\`\`
+
+          <sub>Posted by \`.github/workflows/navmesh-cache-pr.yml\`. This is a
+          warning, not a blocking check -- the work has to happen locally.</sub>
+          $MARKER
+          EOF
+
+          # One comment per PR, edited in place.  A fresh comment on every push
+          # would bury the PR in duplicates of the same warning, so find ours by
+          # the hidden marker and PATCH it.  Matching on the marker rather than
+          # on prose means rewording the warning never orphans the old comment.
+          id=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" \
+                 --paginate --jq \
+                 "[.[] | select(.body | contains(\"$MARKER\"))] | last | .id // empty")
+
+          if [ -n "$id" ]; then
+            gh api --method PATCH \
+              "repos/${{ github.repository }}/issues/comments/$id" \
+              -F body=@"$RUNNER_TEMP/body.md" >/dev/null
+            echo "Updated existing warning comment ($id)."
+          else
+            gh pr comment "$PR" --body-file "$RUNNER_TEMP/body.md"
+          fi
+
+      - name: Label the pull request
+        if: steps.check.outputs.touched == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # A label is what makes this visible in the PR LIST, not just inside
+          # the PR -- the comment is easy to scroll past, a red label on the
+          # index is not.  Created on demand so the repo needs no setup.
+          gh label create "navmesh-cache-stale" \
+            --color B60205 \
+            --description "Merging requires republishing the navmesh cache locally" \
+            2>/dev/null || true
+          gh pr edit "$PR" --add-label "navmesh-cache-stale"
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check.outputs.touched }}" = "1" ]; then
+            {
+              echo "## :rotating_light: Navmesh cache needs republishing"
+              echo ""
+              echo "Changed files that invalidate the cache:"
+              echo ""
+              echo "${{ steps.check.outputs.files }}"
+              echo ""
+              echo 'After merging, on a machine with the export:'
+              echo '`python tools/navmesh_cache_hook.py --run`'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No navmesh source changes; the shared cache stays valid." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi

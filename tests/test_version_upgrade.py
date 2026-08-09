@@ -106,8 +106,10 @@ def test_unparseable_tags_are_rejected(bad):
 
 # ── steps_between: union, and the honest "unknown" ────────────────────────
 
-def _table(monkeypatch, versions):
-    monkeypatch.setattr(v, "_load_steps_table", lambda: versions)
+def _table(monkeypatch, versions, reachable=True):
+    """Stand in for the fetched table, bypassing the network entirely."""
+    monkeypatch.setattr(v, "steps_table",
+                        lambda timeout=8, refresh=False: (versions, reachable))
 
 
 def test_skipping_releases_unions_every_entry_in_range(monkeypatch):
@@ -312,3 +314,258 @@ def test_describe_plan_is_console_safe(state, monkeypatch):
     for plugin in ("Oblivion.esm", "Never.esm"):
         text = v.describe_plan(v.upgrade_plan(plugin))
         text.encode("cp1252")  # raises UnicodeEncodeError on failure
+
+
+# ── VERSION as an export-subst template ───────────────────────────────────
+# VERSION holds a literal `$Format:%(describe:tags)$` on master and is marked
+# `export-subst`, so `git archive` expands it while building the source zip a
+# user downloads.  Nothing is ever committed, which is what lets a PR-merge
+# release stamp a version at all -- the old scheme needed a commit on protected
+# master and therefore only worked for a direct push.
+
+def _version_file(tmp_path, monkeypatch, text):
+    path = tmp_path / "VERSION"
+    path.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(v, "VERSION_FILE", path)
+    monkeypatch.setattr(v, "_CURRENT", [None])
+
+
+def test_unexpanded_placeholder_is_not_a_version(tmp_path, monkeypatch):
+    """A real checkout reads the raw template; it must never surface as-is.
+
+    Returning it would put `$Format:...$` in the title bar and make every
+    version comparison fail.
+    """
+    _version_file(tmp_path, monkeypatch, "$Format:%(describe:tags)$\n")
+    assert v._read_version_file() is None
+
+
+def test_expanded_tag_is_the_version(tmp_path, monkeypatch):
+    """What the release zip for tag 0.581 actually contains."""
+    _version_file(tmp_path, monkeypatch, "0.581\n")
+    assert v._read_version_file() == "0.581"
+    assert v.current_version() == "0.581"
+    assert v.is_dev_version() is False
+
+
+def test_archive_of_an_untagged_commit_is_a_dev_build(tmp_path, monkeypatch):
+    """`%(describe:tags)` expands to `0.581-4-gaaef46e` off a tag.
+
+    That archive is NOT release 0.581, so it must not claim to be one.  With no
+    .git beside it the honest answer is a development build.
+    """
+    _version_file(tmp_path, monkeypatch, "0.581-4-gaaef46e\n")
+    assert v._read_version_file() is None
+    monkeypatch.setattr(v, "_git_version", lambda: None)
+    monkeypatch.setattr(v, "_CURRENT", [None])
+    assert v.current_version() == v.DEV_VERSION
+    assert v.is_dev_version() is True
+
+
+# ── The steps table over HTTPS ────────────────────────────────────────────
+
+def _body(*steps, heading=True):
+    """A release body shaped like the one release_notes.py writes."""
+    lines = ["Release 0.581", "", "Changes since 0.58 (2 commits):", "",
+             "  abc1234  did a thing", ""]
+    if heading:
+        lines += ["Steps to re-run in the GUI:", ""]
+        lines += [f"  [x] {s}" for s in steps] or ["  (none -- no conversion "
+                                                   "code changed)"]
+    return "\n".join(lines) + "\n"
+
+
+def _serve(monkeypatch, releases=None, fail=False, status=None):
+    """Stand in for the `releases?per_page=100` fetch.
+
+    `releases` is a list of (tag_name, body).  `fail` is a TRANSPORT failure
+    (genuinely offline); `status` is an HTTP error response, which proves the
+    server was reached.
+    """
+    import io
+    import json as _json
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body
+        def __enter__(self):
+            return io.BytesIO(self._body)
+        def __exit__(self, *a):
+            return False
+
+    payload = [{"tag_name": t, "body": b} for t, b in (releases or [])]
+
+    def _open(*a, **k):
+        if fail:
+            raise OSError("no network")
+        if status:
+            raise v.urllib.error.HTTPError(v._RELEASES_API, status, "err",
+                                           {}, None)
+        return _Resp(_json.dumps(payload).encode())
+
+    monkeypatch.setattr(v.urllib.request, "urlopen", _open)
+    monkeypatch.setattr(v, "_TABLE", [None])
+
+
+def test_checklist_is_read_from_the_release_body(monkeypatch):
+    """The release body IS the table -- no asset, nothing committed."""
+    _serve(monkeypatch, [("0.581", _body("6. Import", "11. Pack BSAs"))])
+    table, reachable = v.steps_table()
+    assert reachable is True
+    assert table == {"0.581": ["6. Import", "11. Pack BSAs"]}
+
+
+def test_steps_come_back_in_run_order(monkeypatch):
+    """A body listing steps out of order still yields GUI run order."""
+    _serve(monkeypatch, [("0.581", _body("11. Pack BSAs", "1. Export"))])
+    assert v.steps_table()[0]["0.581"] == ["1. Export", "11. Pack BSAs"]
+
+
+def test_non_release_tags_are_ignored(monkeypatch):
+    """navmesh-cache-* is a different series and must never rank as a version."""
+    _serve(monkeypatch, [("navmesh-cache-0.57+", _body("6. Import")),
+                         ("0.581", _body("3. Meshes"))])
+    assert v.steps_table()[0] == {"0.581": ["3. Meshes"]}
+
+
+def test_an_empty_checklist_is_an_entry_not_a_hole(monkeypatch):
+    """A docs-only release genuinely owes nothing.
+
+    Dropping it would leave a hole, and a hole selects all twelve steps
+    forever -- so the heading, not the presence of ticks, decides.
+    """
+    _serve(monkeypatch, [("0.581", _body())])
+    assert v.steps_table()[0] == {"0.581": []}
+
+
+def test_a_body_with_no_checklist_is_absent(monkeypatch):
+    """A release cut by hand has no checklist; it must read as a hole."""
+    _serve(monkeypatch, [("0.581", _body("6. Import", heading=False))])
+    assert v.steps_table()[0] == {}
+
+
+def test_unreachable_table_is_reported_not_raised(monkeypatch):
+    """A network failure on a plugin-selection handler must never propagate."""
+    _serve(monkeypatch, fail=True)
+    table, reachable = v.steps_table(timeout=1)
+    assert table == {}
+    assert reachable is False
+
+
+def test_offline_selects_everything_never_nothing(state, monkeypatch):
+    """No table means UNKNOWN, which owes every step.
+
+    An empty list here would tell a user with stale output they are current --
+    the exact silent failure the table exists to prevent.
+    """
+    _serve(monkeypatch, fail=True)
+    monkeypatch.setattr(v, "current_version", lambda: "0.582")
+    for key, _ in v.STEP_KEYS:
+        v.record_step_run(key, "Oblivion.esm", "0.581")
+
+    plan = v.upgrade_plan("Oblivion.esm")
+    assert plan["unknown"] is True
+    assert plan["offline"] is True
+    assert plan["steps"] == [key for key, _ in v.STEP_KEYS]
+
+
+def test_a_hole_in_a_reachable_table_is_not_offline(state, monkeypatch):
+    """`offline` must distinguish 'could not ask' from 'asked, table has a gap'.
+
+    Only the first is the user's to fix by reconnecting; the GUI disables the
+    button for it and would be wrong to do so for the second.
+    """
+    _serve(monkeypatch, [("0.581", _body("6. Import"))])          # 0.582 absent
+    monkeypatch.setattr(v, "current_version", lambda: "0.582")
+    for key, _ in v.STEP_KEYS:
+        v.record_step_run(key, "Oblivion.esm", "0.580")
+
+    plan = v.upgrade_plan("Oblivion.esm")
+    assert plan["unknown"] is True
+    assert plan["offline"] is False
+
+
+def test_a_failed_fetch_is_cached(monkeypatch):
+    """An offline user must not pay the timeout on every plugin selection."""
+    calls = []
+
+    def _open(*a, **k):
+        calls.append(1)
+        raise OSError("no network")
+
+    monkeypatch.setattr(v.urllib.request, "urlopen", _open)
+    monkeypatch.setattr(v, "_TABLE", [None])
+    for _ in range(5):
+        v.steps_table(timeout=1)
+    assert len(calls) == 1, f"re-fetched {len(calls)} times"
+
+
+def test_a_404_is_not_offline(state, monkeypatch):
+    """No data yet != the user has no internet.
+
+    An HTTP response proves GitHub was reached, so it is a hole in our data,
+    not a problem with the connection.  Reporting it as "offline" told users
+    with working connections to go and fix their connection.
+    """
+    _serve(monkeypatch, status=404)
+    table, reachable = v.steps_table()
+    assert table == {}
+    assert reachable is True, "a 404 means reached-but-empty, not offline"
+
+    monkeypatch.setattr(v, "current_version", lambda: "0.582")
+    for key, _ in v.STEP_KEYS:
+        v.record_step_run(key, "Oblivion.esm", "0.581")
+    plan = v.upgrade_plan("Oblivion.esm")
+    # Still unknown -> still selects everything; only the EXPLANATION differs.
+    assert plan["unknown"] is True
+    assert plan["offline"] is False
+    assert plan["steps"] == [key for key, _ in v.STEP_KEYS]
+
+
+def test_only_a_transport_failure_is_offline(monkeypatch):
+    _serve(monkeypatch, fail=True)
+    assert v.steps_table(timeout=1)[1] is False
+
+
+def test_never_converted_is_not_up_to_date(state, monkeypatch):
+    """A plugin with no recorded run owes EVERYTHING, not nothing.
+
+    `upgrade_plan` returns steps=[] here because the shortcut has nothing to
+    narrow -- there is no previous version to diff against.  The GUI must not
+    read that empty list as "up to date": it renders `never_run` as its own
+    state ("Not converted"), because telling a user with no output at all that
+    they are current is the exact inversion of the truth.
+    """
+    _table(monkeypatch, {"0.581": ["6. Import"]})
+    monkeypatch.setattr(v, "current_version", lambda: "0.581")
+
+    plan = v.upgrade_plan("NeverTouched.esm")
+    assert plan["never_run"] is True
+    assert plan["upgraded"] is False
+    # The distinguishing flag: steps is empty for BOTH never_run and up-to-date,
+    # so never_run is the only thing separating them.
+    assert plan["steps"] == []
+    assert "no previous conversion" in v.describe_plan(plan)
+
+
+def test_parser_agrees_with_what_release_notes_actually_writes(monkeypatch):
+    """The heading and checkbox shape are a CONTRACT between two modules.
+
+    release_notes.py writes the tag message; version.py parses it back out of
+    the release body.  Nothing else links them, so a reworded heading or a
+    changed bullet would silently empty the table -- every upgrade would then
+    read as "unknown" and select all twelve steps.  Build a real notes body and
+    round-trip it.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import release_notes as rn
+
+    steps = ["3. Meshes", "8. Scripts"]
+    monkeypatch.setattr(rn, "commits_between", lambda a, b: [("abc1234", "x")])
+    monkeypatch.setattr(rn, "changed_files", lambda a, b: [])
+    monkeypatch.setattr(rn, "convert_py_steps", lambda a, b: None)
+    monkeypatch.setattr(rn, "steps_for_paths", lambda *a, **k: (steps, [], False))
+
+    notes = rn.build_notes("0.581", "0.58", "HEAD")
+    assert v._CHECKLIST_HEADING in notes, "heading drifted from release_notes"
+    assert v.steps_from_tag_message(notes) == steps

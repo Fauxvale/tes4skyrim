@@ -2,6 +2,24 @@
 # This prevents git (and VS Code) from generating expensive text diffs while
 # leaving files tracked so they can still be committed.
 
+# ── Release version stamping ────────────────────────────────────────────────
+# VERSION holds a literal `$Format:%(describe:tags)$` on master.  `export-subst`
+# makes git EXPAND it while building an archive, so the source zip GitHub
+# generates for a tag carries "0.581" even though no commit ever contained that
+# string.  That is the whole point: users install by downloading the tag's zip,
+# which has no .git, so the version has to be baked into the tree -- and the
+# only way to bake it in WITHOUT a commit is at archive time.
+#
+# The alternative we replaced was a CI commit that wrote the number into
+# VERSION and got tagged.  It could never reach master (protected: changes must
+# go through a PR), so it lived only on the tag, which meant master's VERSION
+# was permanently a lie and the same trick could not work for a PR merge.
+#
+# Expansion happens for `git archive` only.  A working checkout still reads the
+# raw `$Format:...$` literal, which version.py detects and replaces with the
+# git-derived version -- see version._read_version_file.
+VERSION export-subst
+
 # Common libraries / executables
 *.dll -diff
 *.exe -diff

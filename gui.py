@@ -1470,6 +1470,15 @@ def gui_main():
     # Bound ONCE; the refresh only swaps the text (see _attach_tooltip).
     _set_upgrade_tip = _attach_tooltip(upgrade_btn, _UPGRADE_TIP_IDLE)
 
+    _UPGRADE_TIP_NEVER_RUN = (
+        "This plugin has never been converted, so there is no previous version "
+        "to compare against and nothing to narrow down.\n\nLeave the default "
+        "steps ticked and press Run.")
+    _UPGRADE_TIP_OFFLINE = (
+        "The list of steps each release changed is published on GitHub and "
+        "could not be fetched.\n\nConnect to the internet and reselect this "
+        "plugin to enable the shortcut, or tick the steps by hand.")
+
     def _refresh_upgrade_notice(auto_apply: bool = True):
         """Recompute the upgrade shortcut for the selected plugin.
 
@@ -1477,40 +1486,86 @@ def gui_main():
         plan is seen -- the point of the feature is that a user who pastes a
         new build over the old one and hits Run gets the right subset without
         having to read anything.
+
+        The plan is now a NETWORK call: the version -> steps table is fetched
+        from the release assets rather than shipped in the tree (see
+        version.py).  It therefore runs on a worker thread and comes back
+        through `root.after`, because this function is called from combo-box
+        and tab handlers where a blocking socket would freeze the window for
+        the whole timeout.  version.py caches the result, including a failure,
+        so only the first call per process actually goes out.
         """
         fname = file_var.get().strip()
-        try:
-            plan = version_info.upgrade_plan(fname or None)
-        except Exception:
-            plan = None
-        _upgrade_plan[0] = plan
 
-        if not plan or plan["never_run"] or not plan["steps"]:
-            # Nothing converted yet, or already current.  Keep the button in
-            # place but inert, so the row never reflows and the state is legible.
-            upgrade_btn.configure(text="Up to date", state="disabled")
-            _set_upgrade_tip(_UPGRADE_TIP_IDLE)
-            return
+        def _worker():
+            try:
+                plan = version_info.upgrade_plan(fname or None)
+            except Exception:
+                plan = None
+            root.after(0, lambda: _apply_refresh(plan))
 
-        label_of = dict(version_info.STEP_KEYS)
-        names = ", ".join(label_of.get(k, k) for k in plan["steps"])
-        if plan["unknown"]:
-            tip = (f"Updated to {plan['current']} from {plan['installed']}.\n\n"
-                   f"Which steps changed could not be determined, so all are "
-                   f"selected.")
-        elif plan["upgraded"]:
-            tip = (f"Updated {plan['installed']} → {plan['current']}.\n\n"
-                   f"Selects only the steps that upgrade changed:\n{names}")
-        else:
-            tip = (f"These steps have not been run at {plan['current']} for "
-                   f"this plugin:\n{names}")
+        def _apply_refresh(plan):
+            # The user may have changed plugin while the fetch was in flight;
+            # a stale answer must not overwrite the current selection's state.
+            if file_var.get().strip() != fname:
+                return
+            _upgrade_plan[0] = plan
 
-        upgrade_btn.configure(text="Upgrade", state="normal")
-        _set_upgrade_tip(tip)
+            if not plan:
+                upgrade_btn.configure(text="Upgrade", state="disabled")
+                _set_upgrade_tip(_UPGRADE_TIP_IDLE)
+                return
 
-        if auto_apply and fname and fname not in _plan_applied:
-            _plan_applied.add(fname)
-            _apply_upgrade_plan()
+            if plan["never_run"]:
+                # NEVER CONVERTED is not "up to date".  It owes every step, and
+                # labelling it "Up to date" told users with no output at all
+                # that they had nothing to run -- the exact inversion of the
+                # truth.  The shortcut still has nothing to *narrow* (there is
+                # no previous version to diff against), so it stays inert, but
+                # it must not claim the work is done.
+                upgrade_btn.configure(text="Not converted", state="disabled")
+                _set_upgrade_tip(_UPGRADE_TIP_NEVER_RUN)
+                return
+
+            if not plan["steps"]:
+                # Genuinely current: something has been converted, and nothing
+                # has changed since.  Keep the button in place but inert, so the
+                # row never reflows and the state is legible.
+                upgrade_btn.configure(text="Up to date", state="disabled")
+                _set_upgrade_tip(_UPGRADE_TIP_IDLE)
+                return
+
+            if plan.get("offline"):
+                # No table means no plan.  Ticking all twelve boxes here would
+                # look like a considered recommendation for a multi-hour
+                # reconversion when it is really just "we could not ask", so
+                # the button goes inert and says why instead.
+                upgrade_btn.configure(text="Offline", state="disabled")
+                _set_upgrade_tip(_UPGRADE_TIP_OFFLINE)
+                return
+
+            label_of = dict(version_info.STEP_KEYS)
+            names = ", ".join(label_of.get(k, k) for k in plan["steps"])
+            if plan["unknown"]:
+                tip = (f"Updated to {plan['current']} from "
+                       f"{plan['installed']}.\n\n"
+                       f"Which steps changed could not be determined, so all "
+                       f"are selected.")
+            elif plan["upgraded"]:
+                tip = (f"Updated {plan['installed']} → {plan['current']}.\n\n"
+                       f"Selects only the steps that upgrade changed:\n{names}")
+            else:
+                tip = (f"These steps have not been run at {plan['current']} "
+                       f"for this plugin:\n{names}")
+
+            upgrade_btn.configure(text="Upgrade", state="normal")
+            _set_upgrade_tip(tip)
+
+            if auto_apply and fname and fname not in _plan_applied:
+                _plan_applied.add(fname)
+                _apply_upgrade_plan()
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _update_run_btn(*_):
         has = any(v.get() for v in step_vars.values())

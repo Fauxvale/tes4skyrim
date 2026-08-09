@@ -157,11 +157,50 @@ def test_convert_py_narrows_to_the_changed_phase(monkeypatch):
     assert rn.convert_py_steps("0.39", "0.40") == ["9. LOD"]
 
 
-def test_convert_py_declines_to_narrow_for_shared_code(monkeypatch):
-    """A hunk in main() or at module scope affects any step -- fall back."""
+def test_main_is_orchestration_and_narrows_to_nothing(monkeypatch):
+    """main() parses args and dispatches phases; it produces no output.
+
+    It used to count as unattributable -> every step, so any CLI-plumbing commit
+    demanded a full multi-hour reconversion.  Measured on 0.58..0.581: all 16
+    convert.py hunks were in main(), and the release asked for all twelve steps
+    when only Meshes and Scripts had actually changed.
+    """
     monkeypatch.setattr(rn, "_run", lambda a: (
         "@@ -580,17 +580,37 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,\n"
         "@@ -788,4 +822,4 @@ def main():\n"
+    ))
+    assert rn.convert_py_steps("0.18", "0.19") == ["9. LOD"]
+
+
+def test_a_main_only_change_costs_no_steps(monkeypatch):
+    """An EMPTY list is a real answer -- it must not degrade to None.
+
+    None means "could not attribute" and selects everything, so returning it
+    for a main()-only diff would resurrect the exact bug above.
+    """
+    monkeypatch.setattr(rn, "_run", lambda a: (
+        "@@ -788,4 +822,4 @@ def main():\n"
+        "@@ -900,2 +934,9 @@ def main():\n"
+    ))
+    assert rn.convert_py_steps("0.18", "0.19") == []
+    ordered, _unmatched, _gui = rn.steps_for_paths(["convert.py"], [])
+    assert ordered == []
+
+
+def test_convert_py_declines_to_narrow_for_shared_code(monkeypatch):
+    """A genuinely unattributable hunk still falls back to every step.
+
+    Module scope (no function in the header) and unknown helpers can affect any
+    phase, so narrowing there would under-select.
+    """
+    monkeypatch.setattr(rn, "_run", lambda a: (
+        "@@ -580,17 +580,37 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,\n"
+        "@@ -12,3 +12,5 @@\n"                       # module scope
+    ))
+    assert rn.convert_py_steps("0.18", "0.19") is None
+
+    monkeypatch.setattr(rn, "_run", lambda a: (
+        "@@ -300,4 +300,8 @@ def _shared_helper(config):\n"
     ))
     assert rn.convert_py_steps("0.18", "0.19") is None
 

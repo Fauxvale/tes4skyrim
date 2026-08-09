@@ -123,6 +123,11 @@ RULES: list[tuple[str, list[str]]] = [
     # Dependency preflight: gates the run before any phase starts and produces
     # no conversion output of its own, so a change here re-runs nothing.
     (r"^preflight\.py$",          []),
+    # Version identity and the upgrade shortcut itself.  It reports what is
+    # stale; it never converts anything, so it cannot make output stale.  VERSION
+    # is an export-subst template expanded at archive time -- its content is the
+    # release number, which likewise changes no output.
+    (r"^version\.py$|^VERSION$",  []),
     (r"^CLAUDE\.md$|^README\.md$|^TODO\.txt$|^CK_WARNINGS", []),
     (r"^conversion_config\.json$|^pyproject\.toml$|^\.git\w+$", []),
     (r"^[^/]+\.code-workspace$", []),
@@ -132,6 +137,13 @@ RULES: list[tuple[str, list[str]]] = [
 # one of them implies only that step -- historically the blanket "ALL" here was
 # the single biggest source of "re-run everything" noise (e.g. 0.40, whose
 # convert.py diff was entirely inside phase_lod).
+# convert.py functions that ORCHESTRATE phases without producing output.
+# A hunk in one of these narrows to nothing rather than falling back to every
+# step: main() parses arguments and dispatches, so editing it changes which
+# phases the user can ask for, never what a phase writes.  `_mark` just records
+# that a step completed (version.record_step_run) and is likewise output-inert.
+ORCHESTRATION_FUNCS = frozenset({"main", "_mark"})
+
 PHASE_STEPS: dict[str, list[str]] = {
     "phase_export":             ["1. Export"],
     "phase_extract":            ["2. Extract"],
@@ -234,13 +246,28 @@ def convert_py_steps(rev_from: str | None, rev_to: str) -> list[str] | None:
             # Hunk outside any function (imports, constants) -- affects
             # everything, so don't narrow.
             return None
-        mapped = PHASE_STEPS.get(m.group(1))
+        func = m.group(1)
+        if func in ORCHESTRATION_FUNCS:
+            # main() is argument parsing and phase dispatch.  It decides WHICH
+            # phases run, never what any of them produces, so a change confined
+            # to it costs no re-conversion.
+            #
+            # It used to fall through to "cannot attribute" -> every step, which
+            # made any CLI-plumbing commit (a new flag, the per-step state
+            # recording) demand a full multi-hour reconversion.  Measured on
+            # 0.58..0.581: all 16 hunks were in main(), and the release asked
+            # for all twelve steps when only Meshes and Scripts had changed.
+            continue
+        mapped = PHASE_STEPS.get(func)
         if mapped is None:
-            # main(), a shared helper, or an unknown function.
+            # A shared helper or an unknown function -- genuinely unattributable.
             return None
         steps.update(mapped)
 
-    return sorted(steps) if steps else None
+    # An EMPTY set is a real answer here, not a failure: it means every hunk
+    # was orchestration, which costs nothing to re-run.  Returning None for it
+    # would resurrect the all-twelve-steps bug this function exists to avoid.
+    return sorted(steps)
 
 
 def steps_for_paths(paths: list[str],
