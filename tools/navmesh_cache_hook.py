@@ -1,0 +1,402 @@
+#!/usr/bin/env python
+"""pre-push gate: never push navmesh changes without refreshing the shared cache.
+
+Installed as a `.git/hooks/pre-push` step (see `--install`).  On a push to
+master that touches navmesh generation, it verifies the local geometry cache
+was rebuilt against the NEW sources and, if so, publishes it as a release asset.
+
+    python tools/navmesh_cache_hook.py --install     # wire into .git/hooks
+    python tools/navmesh_cache_hook.py --check       # what would happen?
+    python tools/navmesh_cache_hook.py --run         # publish now (manual)
+
+WHY A HOOK AND NOT CI
+---------------------
+The cache is built from `export/`, which is gitignored and hundreds of MB --
+it exists only on a machine that has actually run the pipeline against a real
+Oblivion install.  A GitHub Actions runner has neither the game nor the export,
+so it cannot regenerate or validate the cache.  The only place the check can
+run is the machine that did the conversion.
+
+This means it only fires on a DIRECT push to master, not on pull requests -- a
+PR merged through GitHub's UI never runs a local hook.  That is a real gap and
+it is accepted deliberately: the alternative is no automation at all.  `--run`
+covers the PR case manually, and `verify` is cheap enough to run any time.
+
+WHAT COUNTS AS A NAVMESH CHANGE
+-------------------------------
+Exactly the files whose contents feed the cache tag
+(import_main._navmesh_geom_cache): `tes5_import/navmesh/*.py` and
+`tes5_import/pgrd_to_navm.py`.  Editing any of them changes the tag and
+invalidates every entry, so the published cache MUST be rebuilt or it is dead
+weight for every downloader.  `_geom_hash` also consumes collision geometry,
+but per-mesh and via the export, so asset-side edits are not gated here.
+
+WHY IT BLOCKS
+-------------
+A push that changes navmesh code without a matching cache leaves the published
+asset silently useless: every entry misses, and downloaders pay full
+generation while believing they have a cache.  Blocking is the only way the
+mistake surfaces before the release rather than after.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from tools import navmesh_cache as nc  # noqa: E402
+
+# Sources whose bytes feed the cache tag.  Keep in step with
+# import_main._navmesh_geom_cache -- a test asserts they agree.
+NAVMESH_PATHS = ('tes5_import/navmesh/', 'tes5_import/pgrd_to_navm.py')
+
+# Files that do not feed the tag but contain SOME code that can change what
+# gets cached or how it is keyed.  Listing a function here makes the CHECK run;
+# it does not by itself block anything.  The block only happens if the check
+# then finds the cache was built by different code (cache_matches_tag), so
+# over-triggering costs a fast stamp comparison and nothing else -- a cache
+# that is already correct always passes.  That asymmetry is why the function
+# lists can stay generous: a missed trigger ships a dead cache, an extra
+# trigger costs microseconds.
+#
+# Attribution uses git's `-U0` hunk headers, which name the enclosing function
+# (the same technique release_notes.py uses to attribute convert.py per phase).
+# It exists to keep the *reported reason* honest -- so the hook says "you
+# changed _gather_navm_jobs" rather than "you changed import_main.py" -- not to
+# suppress checks.
+#
+# Deliberately NOT gated: navm_edge_links.py.  build_edge_links stitches
+# cross-cell portals into the NVNM *after* geometry comes out of the cache, so
+# editing it changes the written mesh but never the cached geometry.
+NAVMESH_FUNCS = {
+    'tes5_import/import_main.py': frozenset({
+        '_navmesh_geom_cache',    # computes the tag itself
+        '_navm_model_key',        # builds the collision keys _geom_hash digests
+        '_build_base_model_index',
+        '_build_door_fid_set',    # door set feeds the door wedges
+        '_gather_navm_jobs',      # decides which cells are built, and with what
+        '_precompute_navmeshes',  # wires the cache into the pool
+    }),
+    'asset_convert/collision_extract.py': frozenset({
+        'collision_digest',       # the per-mesh digest every cell hash consumes
+        'collision_content_hash',
+        '_serialize', '_deserialize',   # change the bytes a digest is taken over
+        'load_collision',
+    }),
+}
+
+HOOK_MARKER = '# >>> navmesh-cache-gate >>>'
+HOOK_SNIPPET = '''%s
+# Added by tools/navmesh_cache_hook.py --install
+# Blocks a push to master that changes navmesh generation unless the shared
+# geometry cache has been rebuilt, then publishes it as a release asset.
+python tools/navmesh_cache_hook.py --pre-push "$@" </dev/null || exit 1
+# <<< navmesh-cache-gate <<<
+''' % HOOK_MARKER
+
+
+def git(*args: str) -> str:
+    return subprocess.run(['git', *args], capture_output=True, text=True,
+                          cwd=nc.repo_root()).stdout.strip()
+
+
+def changed_paths(base: str, head: str) -> list[str]:
+    out = git('diff', '--name-only', '%s..%s' % (base, head))
+    return [p for p in out.splitlines() if p]
+
+
+_HUNK_FUNC = re.compile(r"^@@ .*? @@\s*(?:def\s+)?([A-Za-z_]\w*)")
+
+
+def touches_navmesh(paths: list[str], base: str = None,
+                    head: str = 'HEAD') -> list[str]:
+    """Which changed paths actually invalidate cached navmesh geometry.
+
+    Files in NAVMESH_PATHS feed the tag directly, so any edit counts.  Files in
+    NAVMESH_FUNCS only count when a hunk lands in one of the listed functions --
+    otherwise an unrelated dialogue fix in import_main.py would block the push.
+    """
+    hits = [p for p in paths
+            if any(p.startswith(n) or p == n for n in NAVMESH_PATHS)]
+    for path in paths:
+        funcs = NAVMESH_FUNCS.get(path)
+        if funcs and (base is None
+                      or _hunks_touch_funcs(path, funcs, base, head)):
+            hits.append(path)
+    return hits
+
+
+def _hunks_touch_funcs(path: str, funcs: frozenset, base: str,
+                       head: str) -> bool:
+    """Does any hunk in *path* fall inside one of *funcs*?
+
+    A hunk git cannot attribute (module scope, imports, constants) is treated
+    as a HIT: it could be a shared constant the cache depends on, and a false
+    block costs one --no-verify while a false pass ships a dead cache.
+    """
+    diff = git('diff', '-U0', '%s..%s' % (base, head), '--', path)
+    if not diff:
+        return False
+    for line in diff.splitlines():
+        if not line.startswith('@@'):
+            continue
+        m = _HUNK_FUNC.match(line)
+        if not m:
+            return True                 # unattributable -- assume it matters
+        if m.group(1) in funcs:
+            return True
+    return False
+
+
+def remote_master_base() -> str:
+    """Best-effort merge-base with the pushed branch's upstream."""
+    for ref in ('origin/master', 'master@{u}'):
+        base = git('merge-base', 'HEAD', ref)
+        if base:
+            return base
+    # No upstream (first push): fall back to the previous commit so the check
+    # still inspects something rather than silently passing.
+    return git('rev-parse', 'HEAD~1') or git('rev-parse', 'HEAD')
+
+
+def next_tag() -> str:
+    """The tag tag-on-push.yml will create for this push.
+
+    Mirrors that workflow: tags are MAJOR.MM, and the next one is the highest
+    existing tag plus one hundredth.  The published asset is stamped with this
+    so users know the first version it applies to.
+
+    FETCH FIRST.  The workflow runs `git fetch --tags --force` before it
+    computes anything, so it sees tags this clone may not have.  Reading only
+    local refs predicts a number that is already taken -- measured: local
+    topped out at 0.55 while the remote already had 0.56, so the cache would
+    have been published as '0.56+' while CI tagged the code 0.57, labelling the
+    cache one version behind the code it was built for.  A failed fetch (no
+    network, no remote) falls back to local refs rather than blocking a push.
+    """
+    subprocess.run(['git', 'fetch', '--tags', '--force', '--quiet'],
+                   capture_output=True, cwd=nc.repo_root(), timeout=60)
+    tags = [t for t in git('tag', '-l').splitlines() if t]
+    taken = set(tags)
+    cents = 0
+    for t in tags:
+        parts = t.split('.')
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            cents = max(cents, int(parts[0]) * 100 + int(parts[1]))
+    # Skip past any name already taken, exactly as the workflow's loop does (a
+    # tag created out of order, or a race the concurrency group missed).
+    while True:
+        cents += 1
+        candidate = '%d.%02d' % (cents // 100, cents % 100)
+        if candidate not in taken:
+            return candidate
+
+
+def check(verbose: bool = True) -> tuple[bool, list[str], list[str]]:
+    """(gated, navmesh_files_changed, plugins_with_stale_cache)."""
+    base = remote_master_base()
+    touched = touches_navmesh(changed_paths(base, 'HEAD'), base=base)
+
+    # Run the check even when nothing obvious was touched.  The stamp
+    # comparison is a single file read per plugin, and it catches the cases the
+    # path list cannot see: a navmesh change that arrived via a merge, an
+    # indirect edit (a constant in a module the tag hashes), or a cache that
+    # was simply never rebuilt.  A cache that is already correct passes here,
+    # so the only cost of checking always is the read itself.
+    drifted = [p for p in nc.discover_plugins()
+               if not cache_matches_tag(p, nc.source_tag(p))]
+
+    if not touched and not drifted:
+        if verbose:
+            print('navmesh-cache: no navmesh source changes in %s..HEAD, '
+                  'and every cache matches the current sources.' % base[:8])
+        return False, [], []
+
+    if verbose:
+        if touched:
+            print('navmesh-cache: navmesh sources changed:')
+            for p in touched:
+                print('  %s' % p)
+        else:
+            print('navmesh-cache: no navmesh source change in this push, but a '
+                  'cache does not match the current sources:')
+            for p in drifted:
+                print('  %s' % p)
+
+    stale = []
+    for plugin in nc.discover_plugins():
+        info = nc.verify(plugin, quiet=not verbose)
+        # A cache is fresh iff it verifies AND was produced by these sources.
+        # verify() reports the tag the CURRENT code computes; entries built by
+        # older code carry a different tag inside each pickle and will miss.
+        if not info['ok']:
+            stale.append(plugin)
+            continue
+        if not cache_matches_tag(plugin, info['tag']):
+            stale.append(plugin)
+    return True, touched, stale
+
+
+def cache_matches_tag(plugin: str, tag: str | None) -> bool:
+    """Was the cache built by the CURRENT navmesh code?
+
+    Exact, not heuristic: the import stamps the tag it used into
+    `navmesh_geom_cache/CACHE_TAG` (import_main._navmesh_geom_cache), and the
+    tag is a hash of the navmesh sources.  Equal stamp means the entries were
+    produced by exactly this code, whatever their mtimes say.
+
+    This is deliberately NOT an mtime comparison.  mtimes are rewritten by a
+    checkout, a branch switch or an unzip, so an mtime rule rejects caches that
+    are perfectly valid -- and the gate is only useful if it never cries wolf
+    on a correct cache.  An unstamped cache (built before this existed, or
+    hand-copied) is treated as stale, which is the safe direction: the cost is
+    one regeneration, not wrong geometry.
+    """
+    if tag is None:
+        return False
+    stamp = os.path.join(nc.cache_dir(plugin), 'CACHE_TAG')
+    try:
+        with open(stamp) as fh:
+            return fh.read().strip() == tag
+    except OSError:
+        return False
+
+
+def run_publish(tag: str | None = None, dry_run: bool = False) -> int:
+    tag = tag or next_tag()
+    plugins = nc.discover_plugins()
+    if not plugins:
+        print('navmesh-cache: no caches to publish.')
+        return 0
+    print('navmesh-cache: publishing %s for tag %s' % (', '.join(plugins), tag))
+    return nc.publish(plugins, tag, os.path.join(nc.repo_root(), 'temp'),
+                      dry_run=dry_run)
+
+
+def pre_push(argv: list[str]) -> int:
+    """git pre-push entry point.  Only gates pushes that update master."""
+    # git feeds "<local ref> <local sha> <remote ref> <remote sha>" on stdin.
+    # When stdin is unavailable (the snippet redirects </dev/null so the hook
+    # can prompt), fall back to gating any push.
+    updating_master = True
+    try:
+        lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
+        if lines:
+            updating_master = any(l.split()[2].endswith('refs/heads/master')
+                                  for l in lines if len(l.split()) >= 3)
+    except Exception:
+        pass
+
+    if not updating_master:
+        return 0
+
+    gated, touched, stale = check(verbose=True)
+    if not gated:
+        return 0
+
+    if stale:
+        print('')
+        if touched:
+            print('PUSH BLOCKED: navmesh generation changed, but these caches '
+                  'were not rebuilt:')
+        else:
+            print('PUSH BLOCKED: these caches were not built by the current '
+                  'navmesh code:')
+        for p in stale:
+            print('  - %s' % p)
+        print('')
+        if touched:
+            print('Editing navmesh sources changes the cache tag, so every '
+                  'entry is invalidated.')
+        print('Publishing as-is would ship a cache that misses for every '
+              'downloader.')
+        print('')
+        print('Fix by re-running the import so the cache regenerates:')
+        for p in stale:
+            print('  python convert.py -f "%s" --import-only' % p)
+        print('')
+        print('Then push again.  To publish without pushing: '
+              'python tools/navmesh_cache_hook.py --run')
+        print('To bypass this check once: git push --no-verify')
+        return 1
+
+    print('navmesh-cache: caches are current; publishing...')
+    rc = run_publish()
+    if rc != 0:
+        print('')
+        print('navmesh-cache: publish failed. The push is allowed to continue '
+              '-- the archives are in temp/ and can be uploaded manually.')
+    return 0
+
+
+def install_hook() -> int:
+    hooks = os.path.join(nc.repo_root(), '.git', 'hooks')
+    path = os.path.join(hooks, 'pre-push')
+    existing = ''
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+            existing = fh.read()
+        if HOOK_MARKER in existing:
+            print('Already installed in %s' % path)
+            return 0
+
+    if not existing:
+        existing = '#!/bin/sh\n'
+    elif not existing.endswith('\n'):
+        existing += '\n'
+
+    # Append: an existing hook (git-lfs ships one here) must keep working.
+    with open(path, 'w', encoding='utf-8', newline='\n') as fh:
+        fh.write(existing + '\n' + HOOK_SNIPPET)
+    try:
+        os.chmod(path, 0o755)
+    except OSError:
+        pass
+    print('Installed navmesh cache gate into %s' % path)
+    if existing.strip() and 'git lfs' in existing:
+        print('(appended after the existing git-lfs hook, which still runs)')
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument('--install', action='store_true',
+                   help='wire into .git/hooks/pre-push')
+    g.add_argument('--check', action='store_true',
+                   help='report what a push would do; never uploads')
+    g.add_argument('--run', action='store_true',
+                   help='publish the cache now (manual / PR workflow)')
+    g.add_argument('--pre-push', action='store_true',
+                   help=argparse.SUPPRESS)
+    ap.add_argument('--tag', help='release tag (default: the next one)')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='with --run: archive but do not upload')
+    args, extra = ap.parse_known_args(argv)
+
+    if args.install:
+        return install_hook()
+    if args.pre_push:
+        return pre_push(extra)
+    if args.run:
+        return run_publish(args.tag, args.dry_run)
+
+    gated, touched, stale = check(verbose=True)
+    if not gated:
+        print('navmesh-cache: push would not be gated.')
+        return 0
+    if stale:
+        print('\nnavmesh-cache: push WOULD BE BLOCKED (stale: %s)'
+              % ', '.join(stale))
+        return 1
+    print('\nnavmesh-cache: caches current; push would publish for tag %s.'
+          % next_tag())
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

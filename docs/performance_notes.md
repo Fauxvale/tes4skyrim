@@ -594,6 +594,54 @@ nest inside `build_union_mesh` — only top-level rows may be subtracted, or
   Corridor geometry is verified against real cells by `tools/navmesh/check.py`,
   `navmesh_reach.py`, `navmesh_slope_check.py`.
 
+### <a id="cache-keys-must-be-machine-independent"></a>Cache keys must be machine-independent (2026-08-09)
+
+The navmesh geometry cache is now **published as a release asset**
+([python_tools_reference.md](python_tools_reference.md#release--repo)), which
+turned two long-standing properties of its key into bugs:
+
+- **`os.stat().st_mtime` was in the tag.** `_navmesh_geom_cache` hashed
+  `(size, mtime)` of `collision_cache.bin`. mtime is machine-local and is
+  preserved by neither git nor a zip round-trip, so *every* downloader computed
+  a different tag and the shared cache would have missed 100% of the time.
+  Measured: shifting the mtime by **one second** changed the tag and orphaned
+  all 8,217 Oblivion entries. **Never put mtime, an absolute path, a worker
+  count, or anything else machine-local into a cache key** — hash the CONTENT.
+  Content-hashing a 19 MB collision cache costs 10 ms, once.
+- **Whole-file collision hashing made every entry share one fate.** One
+  replaced mesh invalidated all ~8,200 entries. Collision now enters each
+  cell's hash *per mesh* (`collision_extract.collision_digest`, memoised on
+  load), so a user who swaps a few meshes only loses the cells that place them.
+  Cost of the finer key, measured on a 400-REFR / 120-model cell:
+  **0.083 ms → 0.122 ms per cell (+0.32 s across a full 8,228-cell import)** —
+  against navmesh generation measured in minutes. Digesting all 6,080 meshes
+  (74 MB of float arrays) is 39 ms once per process.
+
+Measured on Nehrim.esm (2,929 cells, 29 workers), real `--import-only` runs:
+
+| run | navmesh stage | cache hits | whole import |
+|---|---|---|---|
+| cold (tag changed, full regen) | **192.08 s** | 0 | 205.13 s |
+| warm | **3.81 s** | 2,918 / 2,929 (99.6%) | 15.80 s |
+
+**50x on the stage, 13x on the whole import**, and the ESM is identical
+(180,578,463 bytes both ways, 27,014 records / 0 errors). The 11 non-hits are
+cells whose geometry legitimately depends on something the entry does not
+cache. Expect **one** full regeneration after any navmesh source change — that
+is the tag doing its job, not a cache bug.
+
+The collision cache is **byte-reproducible** across worker counts (verified:
+identical bytes and identical content hash at `--workers 2` vs `6`), which is
+what makes a shared cache viable at all — `ex.map` preserves input order and
+`os.walk` is deterministic. If that ever changes, every downloader's hash
+diverges and the published cache silently stops hitting.
+
+Freshness is certified by `navmesh_geom_cache/CACHE_TAG`, written **only after
+a failure-free generation pass** — never by `_navmesh_geom_cache` itself, or
+merely *reading* the tag would stamp a stale cache as fresh. Comparison is
+stamp-vs-tag, deliberately not mtime: a checkout or unzip rewrites mtimes and
+would reject perfectly valid caches.
+
 ## Measured throughput
 
 - Export: ~8s to parse 1.17M records from Oblivion.esm, ~36s total with write.

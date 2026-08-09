@@ -61,6 +61,7 @@ Cache: two-phase, mirroring mesh_bounds.
     load_collision(cache_path)             — in each navmesh worker
 """
 
+import hashlib
 import json
 import math
 import os
@@ -719,6 +720,9 @@ def _worker_both(args: tuple):
 
 _MAGIC = b'TESCOL03'
 _COLLISION: Dict[str, dict] = {}
+# path_key -> short collision digest, memoised by collision_digest().  Cleared
+# with _COLLISION so a reload cannot serve digests for the previous cache.
+_DIGESTS: Dict[str, str] = {}
 
 
 def _serialize(results: Dict[str, dict]) -> bytes:
@@ -896,7 +900,7 @@ def scan_collision(mesh_dir: str, cache_path: str, workers: int = None) -> int:
 
 def load_collision(cache_path: str, quiet: bool = False) -> int:
     """Load the collision cache into this process's module cache."""
-    global _COLLISION
+    global _COLLISION, _DIGESTS
     if not os.path.exists(cache_path):
         if not quiet:
             print(f"  Collision: cache not found ({cache_path})")
@@ -904,6 +908,7 @@ def load_collision(cache_path: str, quiet: bool = False) -> int:
     try:
         with open(cache_path, 'rb') as fh:
             _COLLISION = _deserialize(fh.read())
+        _DIGESTS = {}          # memo belongs to the cache that was just replaced
         if not quiet:
             print(f"  Collision: loaded {len(_COLLISION)} entries")
         return len(_COLLISION)
@@ -916,6 +921,61 @@ def load_collision(cache_path: str, quiet: bool = False) -> int:
 def get_collision(path_key: str) -> Optional[dict]:
     """Return {'w': [...9N floats], 'b': [...]} in game units for a key, or None."""
     return _COLLISION.get(path_key)
+
+
+def collision_digest(path_key: str) -> str:
+    """Short stable digest of ONE mesh's collision soup ('' if absent).
+
+    The navmesh geometry cache keys each cell on the collision of the meshes
+    THAT CELL places (pgrd_to_navm._geom_hash).  Hashing the whole
+    collision_cache.bin instead would be far cheaper here, but it makes every
+    entry share one fate: replacing a single mesh would invalidate all ~8,200
+    Oblivion entries and force a full regeneration.  Per-mesh digests keep the
+    blast radius to the cells that actually place the changed mesh.
+
+    Digests are computed once on load and memoised, so a cell pays a dict
+    lookup per distinct model, not a re-hash.
+    """
+    if path_key in _DIGESTS:
+        return _DIGESTS[path_key]
+    ent = _COLLISION.get(path_key)
+    if ent is None:
+        digest = ''
+    else:
+        h = hashlib.sha1()
+        # float32 bytes, the same representation the cache FILE stores, so the
+        # digest is stable across machines and across a rebuild that produced
+        # identical geometry.  load_collision yields numpy arrays, but the
+        # scanners (scan_mesh_data / scan_collision) build plain float lists
+        # before serialising, and either shape can reach here -- coerce so the
+        # two produce the SAME digest rather than crashing on .tobytes().
+        import numpy as np
+        for part in ('w', 'b'):
+            arr = ent[part]
+            if not isinstance(arr, np.ndarray):
+                arr = np.asarray(arr, dtype=np.float32)
+            h.update(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
+            h.update(b'|')
+        digest = h.hexdigest()[:16]
+    _DIGESTS[path_key] = digest
+    return digest
+
+
+def collision_content_hash() -> str:
+    """Digest over EVERY loaded mesh's collision, independent of file layout.
+
+    Used to certify a published navmesh cache: two machines that converted the
+    same meshes get the same value here even though their collision_cache.bin
+    files differ in mtime (and may differ in key order or zlib output).  Never
+    ship collision_cache.bin itself — it is keyed-by-name Bethesda collision
+    geometry.  This hash proves a local cache matches without carrying any of
+    it.
+    """
+    h = hashlib.sha1()
+    for key in sorted(_COLLISION):
+        h.update(key.encode('utf-8'))
+        h.update(collision_digest(key).encode('ascii'))
+    return h.hexdigest()
 
 
 def collision_loaded() -> int:

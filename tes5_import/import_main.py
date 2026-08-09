@@ -2074,10 +2074,22 @@ def _gather_navm_jobs(by_type: dict, door_fids: set = None):
 def _navmesh_geom_cache(collision_cache: str):
     """(cache_dir, tag) for the on-disk navmesh geometry cache, or None.
 
-    The tag hashes the navmesh generator SOURCES plus the collision cache's
-    identity, so editing any navmesh code (params included) or rebuilding the
-    collision cache invalidates every entry automatically — no version
+    The tag hashes the navmesh generator SOURCES only, so editing any navmesh
+    code (params included) invalidates every entry automatically — no version
     constant to forget to bump, no stale-geometry debugging sessions.
+
+    Collision deliberately does NOT enter here.  It used to, as
+    (size, mtime) of collision_cache.bin, which was wrong twice over:
+
+      * mtime is machine-local and survives neither git nor an archive
+        round-trip, so the tag differed on every machine and a published cache
+        (tools/navmesh_cache.py) would have missed 100% for every downloader;
+      * whole-file granularity meant replacing ONE mesh invalidated all ~8,200
+        Oblivion entries.
+
+    Collision now enters per-cell and per-mesh via pgrd_to_navm._geom_hash, so
+    a changed mesh only misses the cells that place it.  The cache dir still
+    lives beside the collision cache, and its existence still gates caching.
     """
     if not collision_cache or not os.path.exists(collision_cache):
         return None
@@ -2093,12 +2105,33 @@ def _navmesh_geom_cache(collision_cache: str):
                 h.update(fh.read())
         except OSError:
             return None
-    st = os.stat(collision_cache)
-    h.update(repr((st.st_size, int(st.st_mtime))).encode())
     cache_dir = os.path.join(os.path.dirname(collision_cache),
                              'navmesh_geom_cache')
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir, h.hexdigest()
+
+
+def _stamp_navmesh_cache_tag(geom_cache) -> None:
+    """Record the tag the entries were just BUILT with, in CACHE_TAG.
+
+    Nothing in the import reads this — every entry already self-validates — but
+    it lets tools distinguish "this cache was produced by the current navmesh
+    code" from "these files merely exist", which mtimes cannot do (a checkout,
+    a branch switch or an unzip rewrites them).  The pre-push gate
+    (tools/navmesh_cache_hook.py) and the publish manifest both rely on it.
+
+    Called only AFTER a generation pass, never from _navmesh_geom_cache: merely
+    asking for the tag must not certify a cache as current, or a tool that
+    reads the tag would stamp a stale cache into looking fresh.
+    """
+    if not geom_cache:
+        return
+    cache_dir, tag = geom_cache
+    try:
+        with open(os.path.join(cache_dir, 'CACHE_TAG'), 'w') as fh:
+            fh.write(tag)
+    except OSError:
+        pass                    # a stamp failure must never fail the import
 
 
 def _navm_worker_count(job_count: int) -> int:
@@ -2293,6 +2326,11 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
                   f"{m['error']}")
         if len(failures) > 20:
             print(f"      ... and {len(failures) - 20} more")
+    else:
+        # Certify the cache ONLY after a clean, complete pass.  A run with
+        # failed cells left entries missing, so stamping it would advertise a
+        # partial cache as a full one to anyone who downloads it.
+        _stamp_navmesh_cache_tag(geom_cache)
     return cache
 
 

@@ -2526,7 +2526,7 @@ class TestSayTopicRetarget:
 
     def test_base_form_identity_conditions_are_never_retargeted(self):
         """GetIsID/GetIsClass answer by comparing a BASE FORM, so they must
-        stay RunOn=Target and never be pinned to PlayerRef.
+        never be pinned to a reference — under Say() they are DROPPED instead.
 
         PlayerRef's base is vanilla Skyrim's 0x00000007, never the converted
         TES4 player NPC_ 0x01000007, so retargeting makes them UNPASSABLE.
@@ -2536,22 +2536,35 @@ class TestSayTopicRetarget:
 
         Vanilla Skyrim.esm corroborates the split: GetIsID appears with
         RunOn=Reference ZERO times.
+
+        The veto only blocks RETARGETING; it does not keep the condition alive
+        as RunOn=Target.  Skyrim's Say() has no dialogue target at all, so a
+        surviving RunOn=Target identity can never pass either — emitting it
+        silences the very line it guards.  Since the script call site has
+        already chosen both speaker and topic, the authored identity check is
+        statically satisfied and dropping fails OPEN, which is correct here.
+        (2026-08-07, commit 5dd1cbf: a target-run GetIsID(Baurus) on the
+        CharacterGen 26->27 GOODBYE bridge never passed, so `setstage 27` never
+        ran and the intro stalled with everyone standing in silence.)
+
+        A RunOn=Target identity in a topic that is NOT Say-driven — neither
+        disposition passed — still falls through to plain RunOn=Target.
         """
         import struct
         from tes5_import.dialog_conditions import convert_ctda
         for func in (72, 68):
             raw = self._raw_ctda(func=func)
-            # ...neither the retarget...
-            out = convert_ctda(raw, offset=1, run_on_target_ref=0x14)
-            assert out is not None, f'func {func} must not be dropped'
+            # Never retargeted to the reference, under either disposition...
+            assert convert_ctda(raw, offset=1, run_on_target_ref=0x14) is None, \
+                f'identity func {func} must not survive as RunOn=Reference'
+            assert convert_ctda(raw, offset=1, drop_run_on_target=True) is None, \
+                f'identity func {func} must be dropped under Say()'
+            # ...but outside a Say-driven topic it stays RunOn=Target.
+            out = convert_ctda(raw, offset=1)
+            assert out is not None, f'func {func} must survive outside Say()'
             run_on, reference = struct.unpack_from('<II', out, 20)
             assert (run_on, reference) == (1, 0), \
-                f'identity func {func} was retargeted to {run_on}/{reference:#x}'
-            # ...nor the drop applies to them.
-            out = convert_ctda(raw, offset=1, drop_run_on_target=True)
-            assert out is not None, f'identity func {func} must not be dropped'
-            run_on, _ = struct.unpack_from('<II', out, 20)
-            assert run_on == 1
+                f'identity func {func} became {run_on}/{reference:#x}'
 
     def test_actor_state_conditions_are_retargeted(self):
         """GetIsRace/GetIsSex/GetInFaction/GetFactionRank read live actor STATE,

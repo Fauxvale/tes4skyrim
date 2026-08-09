@@ -371,6 +371,47 @@ theories externally first.
 `output/Oblivion.esm/Oblivion.esm`. A write failure there means you are trying to
 overwrite a folder with a file, not that a file is locked.
 
+### <a id="shared-navmesh-cache"></a>The shared navmesh cache
+
+Navmesh generation is the slowest import stage. Results are cached per cell in
+`export/<plugin>/navmesh_geom_cache/*.pkl`, and that cache is **published as a
+GitHub Release asset** so downloaders don't regenerate it — not committed
+(git keeps every version of a churning binary forever) and not Git LFS (free
+tier: 1 GB bandwidth per *month*, about three clones).
+
+```bash
+python tools/navmesh_cache.py verify  --plugin Oblivion.esm   # publishable?
+python tools/navmesh_cache.py install --plugin Oblivion.esm   # get the cache
+python tools/navmesh_cache_hook.py --install                  # gate pushes
+python tools/navmesh_cache_hook.py --run                      # publish manually
+```
+
+- **NEVER ship `collision_cache.bin`.** It maps Oblivion mesh *paths* to
+  verbatim Havok collision triangles lifted from Bethesda's NIFs — derived
+  asset data keyed by asset name. Only the generated `navmesh_geom_cache`
+  pickles (hash + verts + tris + ledges, our own output) go in the archive, and
+  the manifest carries just a one-way hash of the collision cache to prove a
+  local build matches. Same reason archiving names the cache dir explicitly:
+  globbing `export/**/*.pkl` would sweep in the ~2.1 GB index pickles.
+- **Invalidation is per mesh, not per file.** Each cell's hash folds in the
+  collision digest of only the meshes *that cell places*
+  (`collision_extract.collision_digest`), so replacing a few meshes costs only
+  the cells that use them. It used to hash the whole collision file, where one
+  changed mesh invalidated all ~8,200 Oblivion entries.
+- **The cache tag must stay machine-independent.** It hashes the navmesh
+  sources only. It previously folded in `collision_cache.bin`'s *mtime*, which
+  is machine-local and survives neither git nor an unzip — every downloader
+  computed a different tag and the shared cache would have missed 100% of the
+  time. Never reintroduce mtime, absolute paths, or worker counts into any
+  cache key.
+- **`CACHE_TAG` is written only by a real, failure-free generation pass.**
+  Computing the tag must never stamp it, or reading the tag would certify a
+  stale cache as fresh. A stale entry always regenerates, so a wrong cache is
+  *slow*, never *incorrect*.
+- The pre-push gate only runs on **direct pushes to master** (a PR merged in
+  GitHub's UI runs no local hook) — CI cannot validate a cache built from
+  gitignored `export/` data. Use `--run` for the PR case.
+
 ---
 
 ## Documentation Map

@@ -769,38 +769,61 @@ def _pack_navm_record(form_id: int, subrecords: bytes) -> bytes:
 # Building a cell's navmesh geometry (ribbons -> union -> triangulate -> clean)
 # costs seconds; packing it into an NVNM costs milliseconds.  The geometry
 # depends ONLY on inputs that rarely change between imports — the pathgrid,
-# the placed REFRs, the LAND heights, the collision cache and the generator
-# code itself — so (verts, tris) is cached to disk keyed by a hash of exactly
-# those inputs.  Any edit to the navmesh sources, params included, changes the
-# tag and self-invalidates every entry; there is no version constant to forget
-# to bump.  FormID-dependent work (NVNM parent, door links, ONAM, water flags)
-# is recomputed every run, so load-order changes cannot be baked in.
+# the placed REFRs, the LAND heights, the collision of the meshes the cell
+# places, and the generator code itself — so (verts, tris) is cached to disk
+# keyed by a hash of exactly those inputs.  Any edit to the navmesh sources,
+# params included, changes the tag and self-invalidates every entry; there is
+# no version constant to forget to bump.  FormID-dependent work (NVNM parent,
+# door links, ONAM, water flags) is recomputed every run, so load-order changes
+# cannot be baked in.
+#
+# Collision enters PER MESH, not as one whole-file hash (see _geom_hash v4).
+# The coarse version made every entry share one fate: replacing a single mesh
+# invalidated all ~8,200 Oblivion entries.  Per-mesh digests confine the miss to
+# the cells that actually place the changed mesh, which is what makes a
+# downloaded cache (tools/navmesh_cache.py) still mostly useful to a user who
+# has swapped in a few meshes of their own.
 
 def _geom_hash(tag, points, edges, refr_recs, base_model_by_fid, doors,
                land_rec, origin_x, origin_y):
     """Hash of everything the geometry build consumes."""
+    from asset_convert.collision_extract import collision_digest
     h = hashlib.sha1()
     # Bump when the CACHED PAYLOAD's shape changes, not just its inputs: the
     # entry now carries ledge links too, and an older entry would silently
     # restore geometry with no drop-downs.
     # v3: analytic door wedges (exact width/centre/apex side) changed the
     # geometry for every cell with a door without changing the inputs.
-    h.update(b'geom-v3-doorwedge')
+    # v4: per-mesh collision digests replaced the whole-file collision hash that
+    # used to ride in via `tag`.  One replaced mesh previously invalidated EVERY
+    # entry (~8,200 for Oblivion) and forced a full regeneration; now only the
+    # cells that actually place that mesh miss.  This is also what lets a
+    # published cache survive a user's own mesh edits — see
+    # collision_extract.collision_digest and tools/navmesh_cache.py.
+    h.update(b'geom-v4-permesh-collision')
     h.update(repr((tag, origin_x, origin_y)).encode())
     h.update(repr(points).encode())
     h.update(repr(edges).encode())
     base_model_by_fid = base_model_by_fid or {}
+    # Digest each DISTINCT model once: a cell can place hundreds of REFRs that
+    # share a handful of models, and collision_digest memoises per key anyway.
+    seen_models = {}
     for refr in refr_recs or ():
         name = refr.get('NAME', '')
         try:
             key = base_model_by_fid.get(int(name, 16) & 0xFFFFFF, '')
         except ValueError:
             key = ''
+        if key and key not in seen_models:
+            seen_models[key] = collision_digest(key)
         h.update(('%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' % (
             name, key,
             refr.get('PosX'), refr.get('PosY'), refr.get('PosZ'),
             refr.get('RotX'), refr.get('RotY'), refr.get('RotZ'),
             refr.get('XSCL.Scale'), bool(refr.get('XTEL.Door')))).encode())
+    # Sorted so REFR order cannot perturb the hash (it already contributes above).
+    for key in sorted(seen_models):
+        h.update(('C|%s|%s\n' % (key, seen_models[key])).encode())
     for (x, y, z, r, _fid, tp, w) in doors or ():
         # Width participates: it sizes the door quad, so a changed panel
         # measurement must invalidate the cached geometry.
