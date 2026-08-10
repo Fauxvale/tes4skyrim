@@ -222,6 +222,41 @@ OUTPUT_USER_VERSION_2 = 83
 
 NIF_FLAGS = 14  # Standard Skyrim NiAVObject flags (SelectiveUpdate bits 1-3)
 
+# Controller types vanilla Skyrim puts inside a NiControllerSequence's
+# controlled blocks.  A NiControllerSequence stores its controller type as a
+# STRING and the engine instantiates it BY NAME at load, so any type outside
+# this set rejects the entire NIF (Skyrim's red missing-mesh triangle).
+# Census of ~8,300 vanilla meshes (references/Skyrim Meshes) via
+# tools/nif_block_scan.py --histogram; NiFlipController and NiSourceTexture
+# appear ZERO times, which is what killed the four Oblivion gate meshes.
+_VANILLA_SEQ_CONTROLLERS = frozenset({
+    'BSEffectShaderPropertyFloatController',
+    'BSEffectShaderPropertyColorController',
+    'BSLightingShaderPropertyFloatController',
+    'BSLightingShaderPropertyColorController',
+    'BSNiAlphaPropertyTestRefController',
+    'BSFrustumFOVController',
+    'BSLagBoneController',
+    'BSProceduralLightningController',
+    'BSPSysMultiTargetEmitterCtlr',
+    'NiControllerManager',
+    'NiMultiTargetTransformController',
+    'NiTransformController',
+    'NiVisController',
+    'NiFloatExtraDataController',
+    'NiBSBoneLODController',
+    'NiPSysUpdateCtlr',
+    'NiPSysEmitterCtlr',
+    'NiPSysModifierActiveCtlr',
+    'NiPSysEmitterSpeedCtlr',
+    'NiPSysGravityStrengthCtlr',
+    'NiPSysEmitterInitialRadiusCtlr',
+    'NiPSysEmitterLifeSpanCtlr',
+    'NiPSysEmitterPlanarAngleCtlr',
+    'NiPSysEmitterDeclinationCtlr',
+    'NiPSysInitialRotSpeedCtlr',
+})
+
 # BSLightingShaderProperty flags (default preset)
 # SLSF1: Specular | Receive_Shadows | Cast_Shadows | Own_Emit | Remappable | ZBufferTest
 _SF1_SPECULAR           = 0x00000001
@@ -1272,7 +1307,14 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         ts = strips_or_shape
         src = strips_or_shape
 
-    ts.flags = NIF_FLAGS
+    # Preserve the AUTHORED hidden bit.  Oblivion hides helper geometry
+    # (particle emitter sources, spawn volumes, effect proxies) with bit 0 of
+    # the node flags; overwriting flags wholesale with NIF_FLAGS un-hides all of
+    # it, so the helper renders in game as an untextured shard.  That geometry
+    # carries no UVs, so a lighting shader over it samples an absent texcoord
+    # stream -- the OblivionArchGate01 "red triangle".  Bit 0 means the same
+    # thing in both games, so carry it across rather than re-deriving it.
+    ts.flags = NIF_FLAGS | (int(getattr(src, 'flags', 0)) & 0x0001)
 
     # Extract inline tangents from NiBinaryExtraData before clearing extra data
     bitangents = tangents = None
@@ -1858,6 +1900,27 @@ def _process_controller_manager(node, palette):
                 seq.num_controlled_blocks -= 1
                 continue
 
+            # NiFlipController inside a SEQUENCE.  The property-side handler
+            # only sees flip controllers hanging off a geometry's
+            # NiTexturingProperty; one referenced from a sequence entry never
+            # reaches it, so the block -- and every NiSourceTexture frame it
+            # holds -- stayed in the file.  Both types are dead in Skyrim
+            # (NiSourceTexture: 0 of ~8,300 vanilla meshes), and the sequence
+            # names "NiFlipController" as a type string the engine instantiates
+            # by name, so the load fails outright: OblivionArchGate01 and the
+            # other three gates rendered as the red missing-mesh triangle.
+            #
+            # DROP the entry rather than retarget it: the flip-book is already
+            # fully converted geometry-side into a frame-strip atlas driven by
+            # a BSEffectShaderPropertyFloatController on the shader itself
+            # (verified on all 5 of this mesh's flip nodes -- each carries its
+            # *_flip.dds atlas and a working controller).  The sequence entry is
+            # pure duplicate, so removing it loses no animation.
+            if isinstance(blk.controller, NifFormat.NiFlipController):
+                seq.controlled_blocks.pop(key)
+                seq.num_controlled_blocks -= 1
+                continue
+
             # A NiControllerSequence names its controller TYPE as a string and
             # the engine instantiates it by name when the sequence loads, so an
             # Oblivion-only type here fails the WHOLE NIF -> red missing-mesh
@@ -1936,6 +1999,20 @@ def _process_controller_manager(node, palette):
                 seq.num_controlled_blocks -= 1
                 continue
 
+            # Backstop: ANY controller type vanilla never puts in a sequence.
+            # The engine instantiates the controlled block's type BY NAME when
+            # the sequence loads, so one unknown string rejects the whole NIF
+            # (the red missing-mesh triangle) -- and every handler above is
+            # type-by-type, so the next Oblivion-only controller to turn up
+            # would ship broken exactly the way NiFlipController did.  Dropping
+            # the entry costs at most one animation channel; leaving it costs
+            # the entire mesh.
+            ctrl_cls = blk.controller.__class__.__name__ if blk.controller else None
+            if ctrl_cls is not None and ctrl_cls not in _VANILLA_SEQ_CONTROLLERS:
+                seq.controlled_blocks.pop(key)
+                seq.num_controlled_blocks -= 1
+                continue
+
             key += 1
 
 
@@ -1977,12 +2054,23 @@ def _apply_rest_visibility(root, stats=None):
             if ctrl_type != b'NiVisController':
                 continue
             interp = cb.interpolator
+            if interp is None:
+                continue
             data = getattr(interp, 'data', None)
             keys = getattr(data, 'data', None) if data is not None else None
-            if keys is None or not keys.num_keys:
-                continue
-            first = min(keys.keys, key=lambda k: k.time)
-            if first.value:
+            if keys is not None and keys.num_keys:
+                first = min(keys.keys, key=lambda k: k.time)
+                rest_visible = bool(first.value)
+            else:
+                # A NiBoolInterpolator with NO data block is a CONSTANT: its
+                # bool_value IS the rest state, and there are no keys to read.
+                # OblivionArchGate01 drives every one of its 30+ vis-controlled
+                # nodes this way, so the keys-only path skipped all of them and
+                # the meteors/tendrils rendered from cell load.
+                if not isinstance(interp, NifFormat.NiBoolInterpolator):
+                    continue
+                rest_visible = bool(getattr(interp, 'bool_value', True))
+            if rest_visible:
                 continue        # visible at rest -- leave it alone
             name = bytes(getattr(cb, 'node_name', b'') or b'')
             if not name:
@@ -4998,6 +5086,44 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                     mesh.bs_properties[pi] = None
                 stats['emitter_meshes_hidden'] = \
                     stats.get('emitter_meshes_hidden', 0) + 1
+
+        # A lighting shader over UV-less geometry is unrenderable.
+        # BSLightingShaderProperty ALWAYS samples a diffuse texcoord and reads
+        # the tangent basis for its normal map, but geometry with
+        # num_uv_sets == 0 ships neither stream, so the shader samples whatever
+        # follows the vertex buffer -- OblivionArchGate01's "red triangle".
+        # Vanilla census (373 shapes, references/Skyrim Meshes): ZERO pair a
+        # lighting shader with 0 UV sets.  The 54 UV-less vanilla shapes are
+        # either BSEffectShaderProperty (45 -- that shader needs no tangents)
+        # or carry NO shader at all (9).
+        #
+        # These are Oblivion helper volumes (emitter sources, spawn//effect
+        # proxies) that the source hides but that the emitter_meshes pass above
+        # cannot see: they reach the shape through a path other than
+        # NiPSysMeshEmitter, or nothing references them at all.  Match vanilla:
+        # drop the shader and hide the node.  Geometry that is genuinely meant
+        # to be drawn always has UVs, so this can only ever catch helpers.
+        for block in root.tree():
+            if not isinstance(block, NifFormat.NiTriBasedGeom):
+                continue
+            geom_data = getattr(block, 'data', None)
+            if geom_data is None:
+                continue
+            if int(getattr(geom_data, 'num_uv_sets', 0) or 0):
+                continue
+            props = getattr(block, 'bs_properties', None)
+            if props is None:
+                continue
+            lit = [pi for pi, p in enumerate(props)
+                   if p is not None
+                   and isinstance(p, NifFormat.BSLightingShaderProperty)]
+            if not lit:
+                continue
+            for pi in lit:
+                props[pi] = None
+            block.flags = int(block.flags) | 0x0001   # hidden
+            stats['uvless_lit_shapes_hidden'] = \
+                stats.get('uvless_lit_shapes_hidden', 0) + 1
 
         # Skyrim requires collision on the root node only.
         # If we did NOT wrap, check whether a child holds the collision and hoist it.

@@ -1,5 +1,8 @@
 Major Issues for V1:
 	1 - Iterate on quest and dialog conversion until everything is playable starting with Oblivion Main Quest
+		Oblivion: Attempting to start an arena match fails. I select the dialog option, but the quest doesn't advance
+		Morroblivion: can't get fighters guild quest after joining
+		Cheydinhall fighters guild: I give the weapons away, but the NPCs stand still and don't fight with me
 
 	2 - Havok feels off. Items don't move like they should. Specifically, there seems to be too much inertia on small items, like I'm dragging a heavy object when it is something as small as a cup, Animated signs will get stuck in a position after swinging a bit, defying gravicty
 
@@ -27,10 +30,7 @@ Major Issues for V1:
 
 	10 - Imperials get all fallback race lines (like reiklings)
 
-	Work on some quest fixes:
-	Oblivion: Attempting to start an arena match fails. I select the dialog option, but the quest doesn't advance
-	Morroblivion: can't get fighters guild quest after joining
-	Cheydinhall fighters guild: I give the weapons away, but the NPCs stand still and don't fight with me
+	11 - All-in-one installer that people can just click and expect to work
 
 Later Issues:
 
@@ -38,33 +38,29 @@ Later Issues:
 	
 	2 - Convert weathers
 
-	4 - Allow running process on zip (mod)
+	3 - Allow running process on zip (mod)
 
-	5 - Fix walking up stairs
+	4 - Fix walking up stairs
 
-	6 - Arrows are held at an invisible location behind the arrow when nocking, and can't be picked up after shooting
+	5 - Arrows are held at an invisible location behind the arrow when nocking, and can't be picked up after shooting
 
-	7 - Some converted books (scrolls) are using the wrong Skyrim base mesh
+	6 - Some converted books (scrolls) are using the wrong Skyrim base mesh
 
-	8 - Restore Oblivion's remaining NPC-to-NPC conversations (see docs/ambient_dialogue_channel_plan.md)
+	7 - Restore Oblivion's remaining NPC-to-NPC conversations (see docs/ambient_dialogue_channel_plan.md)
 		DONE 2026-08-07: the 15 QUEST-ADVANCING chains are replayed by a generated driver quest
 		REMAINING: the ~240 pure-flavor chatter families are still dropped; they need SCEN synthesis with invented actor pairing.
 
-	9 - Magic and Spell Conversion including effects (see magic conversion md)
+	8 - Magic and Spell Conversion including effects (see magic conversion md)
 
-	10 - Make horses rideable
+	9 - Make horses rideable
 
-	12 - Speed up child LOD gen and add menu option
+	10 - Speed up child LOD gen and add menu option
 
-	13 - Trap damage
+	11 - Potential remapping of low level formids like how player (07) or gold (f) already do
 
-	14 - Potential remapping of low level formids like how player (07) or gold (f) already do
-
-	15 - Add progress bar for navmesh step
+	12 - Add progress bar for navmesh step
 
 Minor Issues:
-
-	1 -	Override gold with skyrim gold
 
 	2 - Improve landscape layer blending
 	

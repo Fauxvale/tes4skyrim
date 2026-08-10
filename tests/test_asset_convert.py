@@ -816,6 +816,172 @@ class TestConvertedNifStructure:
         assert src_nif.read_bytes() == original, "Source file was modified!"
 
 
+# Meshes whose Oblivion source hides helper geometry (particle emitter sources,
+# spawn/effect proxies) with node-flag bit 0.  Converting used to clobber that
+# bit with NIF_FLAGS, leaving a BSLightingShaderProperty over UV-less geometry.
+_UVLESS_HELPER_SAMPLES = [
+    'oblivion/gate/oblivionarchgate01.nif',
+    'oblivion/gate/obliviongate_simple.nif',
+    'oblivion/gate/obliviongate_forming.nif',
+    'oblivion/gate/oblivionwargateani02.nif',
+]
+
+
+class TestUvlessGeometryNeverLit:
+    """A lighting shader over UV-less geometry is unrenderable.
+
+    BSLightingShaderProperty always samples a diffuse texcoord and reads the
+    tangent basis for its normal map.  Geometry with num_uv_sets == 0 ships
+    neither stream, so the shader reads past the vertex buffer and renders as
+    an untextured red shard (the OblivionArchGate01 "red triangle").
+
+    Vanilla census (373 shapes in references/Skyrim Meshes): ZERO pair a
+    lighting shader with 0 UV sets.
+    """
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    @pytest.mark.parametrize('rel_path', _UVLESS_HELPER_SAMPLES)
+    def test_uvless_shapes_carry_no_lighting_shader(self, rel_path, tmp_path):
+        from pyffi.formats.nif import NifFormat
+
+        src = EXPORT_MESHES / rel_path
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        result = convert_nif(str(src), str(dst))
+        assert result['converted'], f"Conversion failed: {result.get('error')}"
+
+        data = NifFormat.Data()
+        with open(dst, 'rb') as fh:
+            data.read(fh)
+
+        offenders = []
+        lit_shapes = 0
+        for root in data.roots:
+            for block in root.tree():
+                if not isinstance(block, NifFormat.NiTriBasedGeom):
+                    continue
+                geom = getattr(block, 'data', None)
+                if geom is None:
+                    continue
+                lit = [p for p in (getattr(block, 'bs_properties', None) or [])
+                       if p is not None
+                       and isinstance(p, NifFormat.BSLightingShaderProperty)]
+                if not lit:
+                    continue
+                lit_shapes += 1
+                if not int(getattr(geom, 'num_uv_sets', 0) or 0):
+                    offenders.append(block.name)
+
+        assert offenders == [], \
+            f'{rel_path}: lighting shader over UV-less geometry: {offenders}'
+        # Guard against the assertion passing because everything lost its
+        # shader: the visible gate geometry must still be textured.
+        assert lit_shapes > 0, f'{rel_path}: no lit shapes survived conversion'
+
+
+class TestNoOblivionOnlyBlocksSurvive:
+    """Oblivion-only block types must never reach a Skyrim NIF.
+
+    A NiControllerSequence stores its controller type as a STRING and the
+    engine instantiates it BY NAME at load, so an Oblivion-only type rejects
+    the whole file -- Skyrim's red missing-mesh triangle.  NiFlipController
+    reached the output through a sequence entry (the property-side handler
+    only sees flip controllers on a geometry's NiTexturingProperty) and
+    dragged 121 NiSourceTexture frames with it.
+
+    Vanilla census of ~8,300 meshes: NiFlipController and NiSourceTexture
+    appear ZERO times.
+    """
+
+    _DEAD_IN_SKYRIM = (
+        'NiFlipController',
+        'NiSourceTexture',
+        'NiTexturingProperty',
+        'NiMaterialProperty',
+        'NiTextureTransformController',
+        'NiAlphaController',
+        'NiGeomMorpherController',
+    )
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    @pytest.mark.parametrize('rel_path', _UVLESS_HELPER_SAMPLES)
+    def test_no_oblivion_only_block_types(self, rel_path, tmp_path):
+        src = EXPORT_MESHES / rel_path
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        result = convert_nif(str(src), str(dst))
+        assert result['converted'], f"Conversion failed: {result.get('error')}"
+
+        data = dst.read_bytes()
+        hdr = _parse_sky_header(data)
+        present = set(hdr['block_types'])
+        leaked = sorted(present.intersection(self._DEAD_IN_SKYRIM))
+        assert leaked == [], f'{rel_path}: Oblivion-only blocks in output: {leaked}'
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    @pytest.mark.parametrize('rel_path', _UVLESS_HELPER_SAMPLES)
+    def test_block_sizes_match_declared_types(self, rel_path, tmp_path):
+        """Every block must parse to exactly the size the header declares."""
+        src = EXPORT_MESHES / rel_path
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        result = convert_nif(str(src), str(dst))
+        assert result['converted']
+        data = dst.read_bytes()
+        hdr = _parse_sky_header(data)
+        # The 112-byte BSLightingShaderProperty variant is vanilla-legal
+        # (1,876 occurrences in references/Skyrim Meshes) and simply unknown
+        # to this verifier -- not a conversion defect.
+        errors = [e for e in _verify_block_structure(data, hdr)
+                  if not ('BSLightingShaderProperty' in e
+                          and 'block size is 112' in e)]
+        assert errors == [], f'{rel_path}: structural errors: {errors[:5]}'
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_flipbook_animation_survives_as_atlas(self, tmp_path):
+        """Dropping the sequence entry must not lose the flip-book animation.
+
+        The frames live on a *_flip.dds atlas driven by a
+        BSEffectShaderPropertyFloatController stepping U Offset, built
+        geometry-side -- so the sequence entry is a duplicate, not the source.
+        """
+        from pyffi.formats.nif import NifFormat
+
+        src = EXPORT_MESHES / 'oblivion/gate/oblivionarchgate01.nif'
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        result = convert_nif(str(src), str(dst))
+        assert result['converted']
+
+        data = NifFormat.Data()
+        with open(dst, 'rb') as fh:
+            data.read(fh)
+
+        animated = 0
+        for root in data.roots:
+            for block in root.tree():
+                if not isinstance(block, NifFormat.NiTriBasedGeom):
+                    continue
+                for prop in (getattr(block, 'bs_properties', None) or []):
+                    if not isinstance(prop, NifFormat.BSEffectShaderProperty):
+                        continue
+                    tex = bytes(prop.source_texture or b'').lower()
+                    ctrl = prop.controller
+                    if b'_flip.dds' in tex and ctrl is not None:
+                        assert isinstance(
+                            ctrl, NifFormat.BSEffectShaderPropertyFloatController), \
+                            f'flip atlas driven by {ctrl.__class__.__name__}'
+                        assert int(ctrl.type_of_controlled_variable) == 6, \
+                            'flip atlas controller must step U Offset (var 6)'
+                        animated += 1
+        assert animated >= 5, \
+            f'expected the 5 flip-book quads to keep their atlas animation, got {animated}'
+
+
 # ---------------------------------------------------------------------------
 # Tests for session fixes: animated meshes, collision, particles, worn armor
 # ---------------------------------------------------------------------------
