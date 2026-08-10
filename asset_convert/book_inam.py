@@ -567,16 +567,43 @@ def emit_inam_nif(template_bytes, out_path, retarget_texes, diffuse_path, normal
 # Driver
 # ---------------------------------------------------------------------------
 
-def _find_source_texture(extract_root, tex_rel):
+def _find_source_texture(extract_roots, tex_rel):
     """Map a NIF-internal texture path to the extracted file, trying the
-    _n-suffix sibling for normal maps via tex_rel directly."""
+    _n-suffix sibling for normal maps via tex_rel directly.
+
+    `extract_roots` is this plugin's export dir followed by its MASTERS'. A
+    child plugin places its masters' book models (Clutter\\Books\\*), whose
+    meshes and textures were extracted into the MASTER's export only, so
+    searching this plugin's tree alone reported every one of them missing and
+    silently shipped no inventory art for them."""
     if not tex_rel:
         return None
     rel = tex_rel.lower().replace('/', '\\')
     if not rel.startswith('textures\\'):
         rel = 'textures\\' + rel
-    p = os.path.join(extract_root, *rel.split('\\'))
-    return p if os.path.isfile(p) else None
+    for root in _as_roots(extract_roots):
+        p = os.path.join(root, *rel.split('\\'))
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _as_roots(roots):
+    """Accept a single root or an ordered list; always yield a list."""
+    if not roots:
+        return []
+    if isinstance(roots, (str, os.PathLike)):
+        return [str(roots)]
+    return [str(r) for r in roots]
+
+
+def _find_source_mesh(extract_roots, rel):
+    """Locate a book model across this plugin's export tree then its masters'."""
+    for root in _as_roots(extract_roots):
+        p = os.path.join(root, 'meshes', *rel.split('\\'))
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 def _normal_sibling(tex_path):
@@ -716,8 +743,8 @@ def _convert_one(model_rel):
     Returns (model_rel, status, detail)."""
     base = _W['basenames'].get(model_rel) or inv_basename(model_rel)
     rel = model_rel.replace('/', '\\')
-    src_nif = os.path.join(_W['extract_root'], 'meshes', *rel.split('\\'))
-    if not os.path.isfile(src_nif):
+    src_nif = _find_source_mesh(_W['extract_root'], rel)
+    if src_nif is None:
         return (model_rel, 'skip', 'source mesh missing')
     try:
         obl_cal = calibrate(read_shapes(src_nif))
@@ -755,14 +782,27 @@ def _convert_one(model_rel):
 
 
 def generate_book_inams(source_file, extract_dir='export', output_dir='output',
-                        templates_dir=None, skyrim_data=None, workers=None):
+                        templates_dir=None, skyrim_data=None, workers=None,
+                        master_names=None):
     """Generate INAM meshes/textures for every distinct book model of a plugin.
+
+    `master_names` are this plugin's TES4 masters, in load order. A plugin
+    routinely places its masters' book models, whose meshes and textures were
+    extracted into the MASTER's export dir only; without them every such model
+    resolves to "source mesh missing" and ships no inventory art.
 
     Returns {'ok': n, 'skip': n, 'fail': n}.
     """
     source_name = Path(source_file).name
     export_subdir = os.path.join(extract_dir, source_name)
     out_root = os.path.join(output_dir, source_name)
+    # This plugin's export first, then its masters' — nearest wins, so a
+    # plugin that overrides a master's asset still uses its own copy.
+    extract_roots = [export_subdir]
+    for m in (master_names or []):
+        d = os.path.join(extract_dir, m)
+        if os.path.isdir(d) and os.path.normpath(d) != os.path.normpath(export_subdir):
+            extract_roots.append(d)
     models = distinct_book_models(export_subdir)
     if not models:
         return {'ok': 0, 'skip': 0, 'fail': 0}
@@ -777,7 +817,7 @@ def generate_book_inams(source_file, extract_dir='export', output_dir='output',
     stats = {'ok': 0, 'skip': 0, 'fail': 0}
     n_workers = workers if workers is not None else max(1, cpu_count() - 1)
     n_workers = min(n_workers, len(models))
-    init_args = (tpls['book'], tpls['note'], export_subdir, out_root, basenames)
+    init_args = (tpls['book'], tpls['note'], extract_roots, out_root, basenames)
     # Validate templates in the parent BEFORE spawning workers: an initializer
     # crash in a pool worker (e.g. an SSE-format BSTriShape template pyffi
     # can't parse) surfaces only as an opaque BrokenProcessPool — and the
@@ -809,8 +849,11 @@ def main(argv=None):
     ap.add_argument('--workers', type=int, default=None)
     args = ap.parse_args(argv)
 
+    from asset_convert.terrain_lod import _master_names
     stats = generate_book_inams(args.source_file, args.extract_dir, args.output_dir,
-                                args.templates_dir, args.skyrim_data, args.workers)
+                                args.templates_dir, args.skyrim_data, args.workers,
+                                master_names=_master_names(
+                                    Path(args.extract_dir) / args.source_file))
     print('book_inam: ok=%(ok)d skip=%(skip)d fail=%(fail)d' % stats)
     return 0 if stats['fail'] == 0 else 1
 
