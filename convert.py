@@ -11,7 +11,8 @@ Pipeline steps (each runnable via --<step>-only):
   scripts         Convert TES4 scripts to Papyrus .psc and compile to .pex
   lod             Generate object & terrain LOD meshes
   modify-body-meshes  Add greaves partition to character body NIFs
-  pack            Pack assets into Skyrim SE BSA archives
+  pack            Pack assets into Skyrim SE BSA archives (textures nothing
+                  references are left out of the archive, never deleted)
   pack-zip        Zip converted plugin/BSA files for distribution
 
 Usage:
@@ -991,56 +992,27 @@ def phase_modify_body_meshes(tes5_data: str = None, plugins: list = None,
 
 
 # ===========================================================================
-# Phase 11a: PRUNE UNREFERENCED TEXTURES
-# ===========================================================================
-
-def phase_prune_textures(file_name: str, config: dict, output_dir: str = None,
-                         dry_run: bool = False):
-    """Delete output textures no shipped mesh or record references.
-
-    Runs after LOD/speedtree/terrain generation (the last producers of meshes
-    that can name a texture) and before packing, so the BSAs never carry the
-    face/body/eye art of the character meshes the conversion skips.
-    """
-    from asset_convert import texture_prune
-
-    out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
-    plugin_dir = out_root / file_name
-    export_dir = SCRIPT_DIR / "export" / file_name
-    if not plugin_dir.is_dir():
-        print(f"[{file_name}] No output directory found, skipping texture prune")
-        return False
-
-    print(f"[{file_name}] Pruning unreferenced textures"
-          + (" (dry run)" if dry_run else "") + "...")
-    try:
-        kept, removed, freed = texture_prune.prune(plugin_dir, export_dir,
-                                                   dry_run=dry_run)
-    except RuntimeError as e:
-        print(f"[{file_name}] SKIPPED: {e}")
-        return False
-    verb = "would remove" if dry_run else "removed"
-    print(f"[{file_name}] Textures: {kept} kept, {removed} {verb} "
-          f"({freed / 1e6:.0f} MB freed)")
-    return True
-
-
-# ===========================================================================
 # Phase 11: PACK BSA ARCHIVES
 # ===========================================================================
 
 def phase_pack(file_name: str, config: dict, output_dir: str = None):
-    """Pack converted output assets into Skyrim SE BSA archives."""
+    """Pack converted output assets into Skyrim SE BSA archives.
+
+    Textures nothing references are filtered out as the archive is staged, so
+    output/ keeps the full loose tree for testing (see bsa_pack).
+    """
     from asset_convert.bsa_pack import pack_bsas
 
     out_dir = output_dir or str(SCRIPT_DIR / "output")
     bsarch  = config.get("bsarchPath") or None
+    export_dir = SCRIPT_DIR / "export" / file_name
 
     print(f"[{file_name}] Packing BSAs...")
     results = pack_bsas(
         source_file=file_name,
         output_dir=out_dir,
         bsarch_path=bsarch,
+        export_dir=str(export_dir) if export_dir.is_dir() else None,
     )
     packed  = len(results['packed'])
     skipped = len(results['skipped'])
@@ -1129,12 +1101,6 @@ def main():
                         help="Pack output assets into Skyrim SE BSA archives")
     parser.add_argument("--pack-zip-only",       action="store_true",
                         help="Zip converted plugin/BSA files for distribution")
-    parser.add_argument("--prune-textures-only", action="store_true",
-                        help="Delete output textures no mesh or record "
-                             "references (run after LOD, before packing)")
-    parser.add_argument("--dry-run",             action="store_true",
-                        help="With --prune-textures-only: report what would be "
-                             "deleted without deleting it")
     parser.add_argument("--mesh-subdirs",        nargs="+", metavar="SUBDIR",
                         help="Limit mesh conversion to these root subfolders "
                              "(e.g. architecture clutter). Default: all.")
@@ -1191,7 +1157,7 @@ def main():
         args.meshes_only, args.speedtrees_only, args.creatures_only,
         args.sounds_only,
         args.lod_only, args.modify_body_meshes, args.scripts_only,
-        args.pack_only, args.pack_zip_only, args.prune_textures_only,
+        args.pack_only, args.pack_zip_only,
     ])
     if _any_only:
         do_export       = args.export_only
@@ -1206,12 +1172,11 @@ def main():
         do_scripts      = args.scripts_only
         do_pack_bsa     = args.pack_only
         do_pack_zip     = args.pack_zip_only
-        do_prune        = args.prune_textures_only
     else:
         # Default
         do_export = do_extract = do_meshes = do_speedtrees = True
         do_creatures = do_import = do_sounds = do_scripts = True
-        do_lod = do_skyrim_patch = do_pack_bsa = do_prune = True
+        do_lod = do_skyrim_patch = do_pack_bsa = True
         do_pack_zip = False
 
     # ── Dependency preflight ─────────────────────────────────────────────────
@@ -1238,7 +1203,6 @@ def main():
         ('scripts',      do_scripts),
         ('lod',          do_lod),
         ('skyrim_patch', do_skyrim_patch),
-        ('prune',        do_prune),
         ('pack_bsa',     do_pack_bsa),
         ('pack_zip',     do_pack_zip),
     ) if on]
@@ -1387,16 +1351,6 @@ def main():
             _mark('modify_body_meshes', fn, ok)
         if not ok:
             success = False
-        print()
-
-    if do_prune:
-        # TODO: This should be part of packing BSA
-        print("=" * 54)
-        print("  Phase 11a: PRUNE UNREFERENCED TEXTURES")
-        print("=" * 54)
-        for fn in order:
-            phase_prune_textures(fn, config, output_dir=output_dir,
-                                 dry_run=args.dry_run)
         print()
 
     if do_pack_bsa:

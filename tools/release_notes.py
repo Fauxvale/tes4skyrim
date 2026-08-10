@@ -148,7 +148,6 @@ PHASE_STEPS: dict[str, list[str]] = {
     "phase_export":             ["1. Export"],
     "phase_extract":            ["2. Extract"],
     "phase_assets":             ["3. Meshes"],
-    "phase_prune_textures":     ["3. Meshes"],
     "phase_speedtrees":         ["4. SpeedTrees"],
     "phase_creatures":          ["5. Creatures"],
     "phase_import":             ["6. Import"],

@@ -320,8 +320,6 @@ _REQUIREMENTS = {
         lambda: _pip('numpy', 'numpy', 'Mesh math'),
     ],
 
-    'prune': [],
-
     'pack_bsa': [
         lambda: _bundled_exe(
             'external/bsarch/BSArch.exe', 'BSArch.exe',
@@ -344,7 +342,6 @@ PHASE_LABELS = {
     'scripts':      'Scripts',
     'lod':          'LOD',
     'skyrim_patch': 'Patch Skyrim',
-    'prune':        'Prune Textures',
     'pack_bsa':     'Pack BSAs',
     'pack_zip':     'Pack Mod Zip',
 }

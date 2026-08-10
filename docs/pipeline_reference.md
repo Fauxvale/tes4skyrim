@@ -24,6 +24,47 @@ Each stage has a `--<step>-only` flag. The steps are: `export`, `import`,
 `modify-body-meshes`, `pack`, `pack-zip`. Read `convert.py`'s module docstring
 for the authoritative list — it changes more often than this doc.
 
+### Unreferenced textures are dropped at PACK time, never deleted
+
+Oblivion's BSAs carry textures for content the conversion never emits, so the
+textures archive is filtered against `texture_prune.build_refs` as `bsa_pack`
+stages it. On Oblivion that is 26,099 files on disk → 13,492 packed (3.5 GB →
+2.7 GB). **`output/<plugin>/textures/` always keeps the full tree**, so
+loose-file testing is unaffected and re-packing is idempotent.
+
+This used to be its own phase (11a) that unlinked from `output/`, which was
+wrong twice over and is why a broken keep-set went unnoticed for months:
+
+- The **meshes** phase re-copies the *entire* extracted texture tree into
+  `output/` on every run (`asset_pipeline._copy_tree`, no incremental check),
+  so the deletions were silently undone before anyone looked. A wrong keep-set
+  only ever showed up *inside the BSA*, never as a missing file on disk.
+- The user tests with **loose files**, so deleting from `output/` removed the
+  very assets under test.
+
+Corollary: **texture mtimes under `output/` prove nothing** about the keep-set
+— `copy2` preserves the extract cache's timestamps, so files can look
+untouched-since-extraction while having been deleted and restored repeatedly.
+
+If the mesh manifest is missing, `build_refs` raises and packing ships every
+texture rather than guessing — a missing mesh pass must never silently strip
+textures that are in use.
+
+**Both texture scanners were quadratic.** A `[...]{3,200}?\.dds` pattern opens
+with a lazy star, so on a blob with no match the engine retries at *every*
+offset. Two copies existed:
+
+| Scanner | Fix | Result |
+|---|---|---|
+| `refs_from_records` (export text) | `'.dds' not in body` substring reject — `LAND.txt` is 1.47 GB with zero `.dds` | minutes → 4.2 s |
+| `refs_from_assets` + `nif_converter._harvest_texture_bytes` (binary) | `_texture_refs_in`: `bytes.find` each `.dds`, walk back over legal bytes | 13.8x, `build_refs` 87.6 s → 11.5 s |
+
+The binary case could not use a substring reject — every `.bto` really does
+contain `.dds`. Watch the bound when touching `_texture_refs_in`: the old
+`{3,200}` counted the run *before* `.dds`, so a whole match reaches **204**
+bytes; capping the match at 200 silently truncates the longest paths.
+Equivalence with the original regex is pinned by `TestBinaryTextureScan`.
+
 Direct module entry points:
 
 ```bash

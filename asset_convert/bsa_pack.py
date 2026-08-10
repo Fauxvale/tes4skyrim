@@ -7,6 +7,15 @@ Produces BSAs in ``output/<plugin>/``, alongside the converted ESM:
 Uses BSArch.exe (from xEdit / SSEEdit) for BSA5 (SSE) format creation.
 BSArch is searched in common locations; pass ``bsarch_path`` to override.
 
+Unreferenced textures
+---------------------
+Oblivion's BSAs carry textures for content the conversion never emits, so the
+textures archive is filtered against ``texture_prune.build_refs`` as it is
+staged.  The filter runs HERE and nowhere else: packing is the only phase that
+decides what ships, and a phase that deleted from ``output/`` instead would
+fight the mesh phase (which re-copies the whole texture tree every run) and
+would break loose-file testing.
+
 Size limit / overflow
 ---------------------
 The BSA format addresses file data with 32-bit offsets, so a single archive
@@ -61,20 +70,33 @@ def _link_or_copy(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
-def _collect_files(plugin_dir: Path, subdir_names: 'list[str]') -> 'list[tuple[Path, Path, int]]':
+def _collect_files(plugin_dir: Path, subdir_names: 'list[str]',
+                   texture_keep: set = None) -> 'list[tuple[Path, Path, int]]':
     """Enumerate every file under plugin_dir/<subdir>/ for packing.
 
     Returns a list of (absolute_source, archive_relative_path, size_bytes),
     sorted by archive path so binning is deterministic across runs.
+
+    texture_keep: if given, the set of textures-root-relative keys the plugin
+    can actually ask for (see texture_prune.build_refs).  Anything under
+    textures/ outside that set is left out of the archive.  This is the ONLY
+    place the prune applies — it filters what gets packed and never deletes
+    from output/, so loose-file testing keeps the full tree and re-running the
+    pack is idempotent.
     """
     out: 'list[tuple[Path, Path, int]]' = []
     for name in subdir_names:
         src = plugin_dir / name
         if not src.is_dir():
             continue
+        is_textures = name.lower() == 'textures'
         for f in src.rglob('*'):
             if not f.is_file():
                 continue
+            if is_textures and texture_keep is not None:
+                key = f.relative_to(src).as_posix().lower()
+                if key not in texture_keep:
+                    continue
             # Archive path keeps the top-level dir (meshes/..., textures/...)
             rel = Path(name) / f.relative_to(src)
             try:
@@ -251,6 +273,7 @@ def pack_bsas(
     bsarch_path: str = None,
     compress_textures: bool = False,
     size_limit: int = BSA_SIZE_LIMIT,
+    export_dir: str = None,
 ) -> dict:
     """Pack converted assets into Skyrim SE BSA archives.
 
@@ -262,6 +285,12 @@ def pack_bsas(
     additional archives, each paired with a generated dummy ESL loader plugin
     (``oblivion_loader.esl``, ``oblivion_loader_1.esl``, …) so Skyrim mounts it.
 
+    Textures nothing the plugin ships can reference are left OUT of the
+    textures archive (see ``texture_prune.build_refs``).  This is a pack-time
+    filter, not a delete: ``output/<plugin>/textures/`` keeps the full tree, so
+    loose-file testing is unaffected and re-packing is idempotent.  Without
+    ``export_dir``, or when the mesh manifest is missing, everything is packed.
+
     The source folder structure is NOT modified; original folders are left intact.
 
     Args:
@@ -271,6 +300,9 @@ def pack_bsas(
         compress_textures:  Compress the textures BSA (-z flag). Default False.
         size_limit:         Max payload bytes per archive (default ~2 GiB minus
                             BSA metadata overhead).
+        export_dir:         Export text dir for this plugin (e.g.
+                            'export/Oblivion.esm').  Enables the texture
+                            keep-set; omit to pack every texture on disk.
 
     Returns:
         dict with keys: packed (list of BSA paths), skipped (list),
@@ -320,6 +352,18 @@ def pack_bsas(
 
     results: dict = {'packed': [], 'skipped': [], 'errors': [], 'loaders': []}
 
+    # The texture keep-set.  Building it needs the export text, so a caller
+    # without one (or a build whose mesh pass never ran) packs the full tree
+    # rather than guessing — the prune must never be the reason a texture in
+    # use goes missing.
+    texture_keep = None
+    if export_dir is not None:
+        from asset_convert import texture_prune
+        try:
+            texture_keep = texture_prune.build_refs(plugin_dir, export_dir)
+        except RuntimeError as e:
+            print(f"  Texture prune SKIPPED, packing everything: {e}")
+
     # Overflow archives are mounted by generated loader ESLs.  A loader plugin
     # mounts both '<stem>.bsa' and '<stem> - Textures.bsa', so each spec keeps
     # its own overflow counter and they share the loader plugins by index.
@@ -328,7 +372,7 @@ def pack_bsas(
     for subdir_names, bsa_suffix, compress in specs:
         base_name = f"{stem} - {bsa_suffix}.bsa" if bsa_suffix else f"{stem}.bsa"
 
-        files = _collect_files(plugin_dir, subdir_names)
+        files = _collect_files(plugin_dir, subdir_names, texture_keep)
         if not files:
             print(f"  SKIP  {base_name} (no source content)")
             results['skipped'].append(base_name)
@@ -439,10 +483,15 @@ if __name__ == '__main__':
     parser.add_argument('--size-limit', type=int, default=BSA_SIZE_LIMIT,
                         metavar='BYTES',
                         help=f'Max payload bytes per BSA (default: {BSA_SIZE_LIMIT})')
+    parser.add_argument('--export-dir', default=None, metavar='DIR',
+                        help='Export text dir (e.g. export/Oblivion.esm). '
+                             'Enables the texture keep-set; without it every '
+                             'texture on disk is packed.')
     a = parser.parse_args()
     r = pack_bsas(a.source_file, output_dir=a.output_dir,
                   bsarch_path=a.bsarch,
                   compress_textures=a.compress_textures,
-                  size_limit=a.size_limit)
+                  size_limit=a.size_limit,
+                  export_dir=a.export_dir)
     print(f"\nPacked: {len(r['packed'])}  Skipped: {len(r['skipped'])}  "
           f"Loaders: {len(r['loaders'])}  Errors: {len(r['errors'])}")

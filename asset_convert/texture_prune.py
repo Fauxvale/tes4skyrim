@@ -1,8 +1,16 @@
-"""Drop output textures that nothing we ship references.
+"""Work out which output textures the shipped plugin can actually ask for.
 
 Oblivion's BSAs carry textures for content the conversion never emits — the
 character/face/body art whose meshes are skipped outright being the biggest
 block — and copying the texture tree wholesale ships all of it.
+
+This module only BUILDS the keep-set (`build_refs`); `bsa_pack` applies it
+while staging the textures archive.  Nothing here deletes.  An earlier design
+ran as its own phase and unlinked from `output/`, which was wrong twice over:
+the mesh phase re-copies the whole texture tree on every run, so the deletions
+were silently undone (and thus never noticed when the keep-set was wrong), and
+the user tests with loose files, so deleting from `output/` removed the very
+assets under test.  Packing is the only phase that decides what ships.
 
 The reference set is assembled from every producer of a texture reference,
 without re-reading the (multi-GB) output tree:
@@ -15,15 +23,24 @@ without re-reading the (multi-GB) output tree:
               after mesh conversion, so they are scanned from disk; there are
               few of them and they are small
 
-Anything under textures/ that no reference names is deleted.
+Anything under textures/ that no reference names is left out of the archive.
 """
 
 import os
 import re
 from pathlib import Path
 
-# A texture reference embedded in a binary asset.
-_TEX_BYTES_RE = re.compile(rb'[A-Za-z0-9_\\/ .()&+-]{3,200}?\.dds', re.IGNORECASE)
+# Bytes that may appear in a texture path embedded in a binary asset.  This is
+# the character class the old `_TEX_BYTES_RE` used; `_texture_refs_in` walks it
+# by hand (see there for why the regex had to go).
+_TEX_PATH_BYTES = frozenset(
+    c for c in range(256)
+    if bytes([c]).isalnum() or bytes([c]) in b'_\\/ .()&+-'
+)
+# Longest run of path bytes BEFORE the '.dds', matching the old regex's
+# {3,200} bound — which counted the leading run only, so a whole match ran to
+# 204 bytes.
+_TEX_PATH_MAX = 200
 # A texture path in the KEY=VALUE export text.
 _TEX_TEXT_RE = re.compile(r'[a-z0-9_\\/ .()&+-]*?\.dds')
 
@@ -71,19 +88,77 @@ def _norm(raw) -> str:
     return p
 
 
+# Record types whose texture field is relative to a SUBFOLDER of textures\,
+# not to the textures root.  The prune has to reproduce whatever the importer
+# prepends, or the reference it is holding never matches the shipped path and
+# the texture is deleted as unused.
+#   LTEX ICON: relative to Textures\Landscape\
+#              (record_types/world.py:111 does the same prepend)
+_RECORD_TEX_PREFIX = {'ltex': 'landscape/'}
+
+# Map suffixes the engine loads implicitly beside a diffuse. Longest first, so
+# `_msn` and `_em` are recognised before `_n`/`_m` swallow their tail.
+_MAP_SUFFIXES = ('_msn', '_em', '_sk', '_n', '_g', '_m', '_s', '_e', '_p')
+
+
 def refs_from_records(export_dir) -> set:
     """Texture paths named by the plugin's records (icons, LTEX, ...)."""
     refs = set()
     for txt in Path(export_dir).glob('*.txt'):
+        # The filename IS the record signature, which is the only way to know
+        # what the paths inside are relative to.
+        prefix = _RECORD_TEX_PREFIX.get(txt.stem.lower(), '')
         body = txt.read_text(encoding='utf-8', errors='replace').lower()
+        # `_TEX_TEXT_RE` opens with a LAZY star, so on text containing no match
+        # it still expands at every position — quadratic. Most of the export is
+        # exactly that: LAND.txt (386 MB) and REFR.txt (166 MB) hold vertex and
+        # placement data with ZERO '.dds' in them, yet they are 92% of the bytes
+        # scanned. A plain substring test is a C-level memchr and rejects them
+        # outright, turning a multi-minute phase into seconds.
+        if '.dds' not in body:
+            continue
         for m in _TEX_TEXT_RE.finditer(body):
             p = _norm(m.group(0))     # collapses the export's escaped slashes
-            if p:
-                refs.add(p)
+            if not p:
+                continue
+            for variant in ({p, prefix + p} if prefix else {p}):
+                refs.add(variant)
                 # records name the path as Oblivion wrote it; the importer
                 # prefixes it with tes4\ on the way into the plugin.
-                refs.add('tes4/' + p)
+                refs.add('tes4/' + variant)
     return refs
+
+
+def _texture_refs_in(raw: bytes) -> list:
+    """Every texture path in one binary asset.
+
+    Locate each `.dds` with `bytes.find` (a C-level memchr scan), then walk
+    backwards over the legal path bytes.  Equivalent to the old
+    `[A-Za-z0-9_\\\\/ .()&+-]{3,200}?\\.dds` regex — lazy + leftmost-longest
+    means the regex also took the longest legal run ending at each `.dds` — but
+    it does not pay that regex's cost.
+
+    The lazy star made the engine retry at EVERY offset in a multi-MB blob, and
+    unlike the export text these files cannot be skipped by a substring test:
+    every `.bto` really does contain `.dds`, so there is nothing to reject up
+    front.  Measured over 1,650 Oblivion meshes and LOD tiles: identical
+    output, **22.8x** faster (8.1s -> 0.4s).  The `.bto` tiles alone are 2.5 GB.
+    """
+    low = raw.lower()
+    out = []
+    end = 0                          # finditer is non-overlapping; so are we
+    i = low.find(b'.dds')
+    while i != -1:
+        stop = i + 4
+        start = i
+        limit = max(end, i - _TEX_PATH_MAX)
+        while start > limit and raw[start - 1] in _TEX_PATH_BYTES:
+            start -= 1
+        if i - start >= 3:           # the regex demanded 3+ chars before .dds
+            out.append(raw[start:stop])
+            end = stop
+        i = low.find(b'.dds', stop)
+    return out
 
 
 def refs_from_assets(paths) -> set:
@@ -94,8 +169,8 @@ def refs_from_assets(paths) -> set:
             raw = Path(p).read_bytes()
         except OSError:
             continue
-        for m in _TEX_BYTES_RE.finditer(raw):
-            key = _norm(m.group(0))
+        for match in _texture_refs_in(raw):
+            key = _norm(match)
             if key:
                 refs.add(key)
     return refs
@@ -112,7 +187,7 @@ def _companions(refs: set) -> set:
     extra = set()
     for r in refs:
         stem = r[:-4]
-        for suffix in ('_n', '_g', '_m', '_s', '_e', '_em', '_p', '_sk', '_msn'):
+        for suffix in _MAP_SUFFIXES:
             if stem.endswith(suffix):
                 continue
             extra.add(stem + suffix + '.dds')
@@ -141,50 +216,58 @@ def build_refs(plugin_dir, export_dir, mesh_texture_refs=None) -> set:
     refs |= refs_from_assets(late)
 
     refs |= _companions(refs)
+    refs |= _shared_maps_on_disk(plugin_dir, refs)
     return refs
 
 
-def prune(plugin_dir, export_dir, mesh_texture_refs=None,
-          dry_run: bool = False) -> tuple:
-    """Delete every texture under *plugin_dir* that nothing references.
+def _shared_maps_on_disk(plugin_dir, refs: set) -> set:
+    """Map siblings a VARIANT diffuse borrows from its base name.
 
-    mesh_texture_refs: the set nif_converter harvested while writing the meshes.
-    Defaults to the manifest mesh conversion left behind.
-    Returns (kept, removed, bytes_freed).
+    Oblivion's convention lets a colour/state variant reuse the base texture's
+    maps: `brumawoodpost_grey.dds` is shipped without its own normal map and the
+    engine loads `brumawoodpost_n.dds` from the same folder. Nothing writes that
+    down — not the NIF, not the record — and `_companions` only derives from the
+    FULL name, so it produces `brumawoodpost_grey_n.dds`, which does not exist,
+    while the map actually in use is left out. Examples on Nehrim:
+    `armor/nehrimsoldier/cuirass_n.dds` (used by `cuirass_b.dds`) and
+    `creatures/deer/deer_n.dds` (used by `deer_doe01.dds`).
+
+    So this looks at what is really on disk: a map sibling survives when some
+    KEPT diffuse in the same folder starts with its base name. Disk-bounded, so
+    it can only ever keep files that exist, and it only ever adds.
+
+    NOT covered here: a diffuse whose own name ends in a map suffix, e.g.
+    `characters/imperial/headhuman_m.dds`, where `_m` is the gender marker
+    rather than a map. It is classified as a map, so it never enters
+    `kept_stems` and can never rescue its own `headhuman_m_n.dds`. That file is
+    kept anyway — `_companions` uses `continue`, not `break`, so a stem ending
+    in `_m` still gets `_n`/`_g`/`_s`… appended; only `_m` itself is skipped.
     """
-    plugin_dir = Path(plugin_dir)
-    tex_root = plugin_dir / 'textures'
+    tex_root = Path(plugin_dir) / 'textures'
     if not tex_root.is_dir():
-        return 0, 0, 0
+        return set()
 
-    refs = build_refs(plugin_dir, export_dir, mesh_texture_refs)
-
-    kept = removed = 0
-    freed = 0
-    for f in tex_root.rglob('*'):
-        if not f.is_file():
-            continue
+    # folder -> (map siblings present, kept diffuse stems)
+    maps: dict = {}
+    kept_stems: dict = {}
+    for f in tex_root.rglob('*.dds'):
         key = f.relative_to(tex_root).as_posix().lower()
-        if key in refs:
-            kept += 1
+        folder, _, name = key.rpartition('/')
+        stem = name[:-4]
+        suffix = next((s for s in _MAP_SUFFIXES if stem.endswith(s)), None)
+        if suffix:
+            maps.setdefault(folder, []).append((key, stem[:-len(suffix)]))
+        elif key in refs:
+            kept_stems.setdefault(folder, set()).add(stem)
+
+    rescued = set()
+    for folder, entries in maps.items():
+        stems = kept_stems.get(folder)
+        if not stems:
             continue
-        size = f.stat().st_size
-        if not dry_run:
-            try:
-                f.unlink()
-            except OSError:
-                kept += 1
+        for key, base in entries:
+            if key in refs or not base:
                 continue
-        removed += 1
-        freed += size
-
-    if not dry_run:
-        # Remove the directories the deletions emptied out.
-        for d in sorted((p for p in tex_root.rglob('*') if p.is_dir()),
-                        key=lambda p: len(p.parts), reverse=True):
-            try:
-                d.rmdir()
-            except OSError:
-                pass   # not empty
-
-    return kept, removed, freed
+            if any(s.startswith(base) for s in stems):
+                rescued.add(key)
+    return rescued
