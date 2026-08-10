@@ -304,11 +304,15 @@ def phase_assets(file_name: str, config: dict, output_dir: str = None,
 
     _, tes5_data = get_paths(config)
     print(f"[{file_name}] Generating book inventory-art meshes...")
+    # A plugin places its MASTERS' book models too, and those meshes/textures
+    # were extracted into the master's export dir only.
+    from asset_convert.terrain_lod import _master_names as _tes4_masters
     bstats = generate_book_inams(
         source_file=file_name,
         extract_dir=extract_dir,
         output_dir=out_dir,
         skyrim_data=tes5_data or None,
+        master_names=_tes4_masters(Path(extract_dir) / file_name),
     )
     print(f"[{file_name}] Book INAM complete: ok={bstats['ok']} "
           f"skip={bstats['skip']} fail={bstats['fail']}")
