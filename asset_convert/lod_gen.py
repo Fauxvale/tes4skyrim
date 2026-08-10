@@ -669,7 +669,8 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
                        worldspace_edid: str,
                        _parsed=None,
                        cell_sw: tuple = None,
-                       master_dirs=None, replace_tiles=False) -> Path:
+                       master_dirs=None, master_mesh_dirs=None,
+                       replace_tiles=False) -> Path:
     """
     Parse the converted ESM and write the LODGen input text file.
 
@@ -679,6 +680,11 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
     LOD run already baked it, and re-baking it would have this plugin ship a
     duplicate copy of the master's entire object LOD to gain the handful of
     objects it actually introduces.
+
+    `master_mesh_dirs` is where MESHES are sourced from, and unlike
+    `master_dirs` it is set even when THIS plugin owns the worldspace. LODGen
+    resolves every listed mesh under the one PathData root it is given, so a
+    master-owned model must be copied into this tree to be listable at all.
 
     `replace_tiles` turns that off. When this plugin REPLACES whole tiles
     (because it changed cells the master also covers), the tile it writes is
@@ -726,7 +732,11 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
     # resolves in some other plugin's tree makes LODGen abort with "file not
     # found" (exit 404) and no tiles at all get baked.
     output_meshes_dir = output_dir / 'meshes'
-    master_meshes = [Path(d) / 'meshes' for d in (master_dirs or [])]
+    # Two different questions, two different lists (see the docstring):
+    #   owned_meshes  — does a master already SHIP LOD for this base? (skip it)
+    #   master_meshes — where can this base's meshes be SOURCED from? (import)
+    owned_meshes  = [Path(d) / 'meshes' for d in (master_dirs or [])]
+    master_meshes = [Path(d) / 'meshes' for d in (master_mesh_dirs or [])]
 
     # Index cells by form_id → parent_wrld for fast lookup
     cell_wrld = {fid: c['parent_wrld'] for fid, c in cells.items()}
@@ -775,11 +785,19 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
             base_entry = None
             skip = (not replace_tiles
                     and any(_mesh_exists(_far_nif_path(model), m)
-                            for m in master_meshes))
+                            for m in owned_meshes))
             if not skip:
                 lod4, lod8, lod16 = _lod_meshes_for(
                     stat, output_meshes_dir, master_meshes)
                 if lod4 or lod8 or lod16:
+                    # The FULL model is listed too (LODGen falls back to it),
+                    # so it must exist in THIS tree — a master-owned model is
+                    # otherwise absent, and screening reads "missing" as
+                    # "unsafe" and drops the object entirely. That is how
+                    # ElsweyrAnequina lost 882 meshes' worth of object LOD
+                    # while their _far.nif files sat here perfectly readable.
+                    _import_master_mesh(model, output_meshes_dir,
+                                        master_meshes)
                     # One mesh LODGen cannot parse aborts the whole
                     # worldspace, so screen each listed mesh (and the full
                     # model it falls back to) up front.
@@ -947,6 +965,7 @@ def _lodgen_output_dir(lodgen_input: Path):
 def generate_lod(esm_path: Path, output_dir: Path,
                  worldspace_edid: str = 'Tamriel',
                  master_dirs=None, master_texture_dirs=None,
+                 master_mesh_dirs=None,
                  overlay_paths=None, only_cells=None) -> bool:
     """
     Full LOD generation pipeline:
@@ -968,10 +987,23 @@ def generate_lod(esm_path: Path, output_dir: Path,
         output_dir:        Output dir owning the assets and receiving the
                            generated LOD (contains meshes/, textures/, …).
         worldspace_edid:   Editor ID of the worldspace to generate LOD for
-        master_dirs:       Converted output dirs of this plugin's masters.
-                           Anything they already ship LOD for is skipped, so
-                           an override plugin bakes only what IT introduces.
-                           Only set when a MASTER owns the worldspace.
+        master_dirs:       Converted output dirs of this plugin's masters, for
+                           TILE OWNERSHIP. Anything they already ship LOD for is
+                           skipped, so an override plugin bakes only what IT
+                           introduces. Only set when a MASTER owns the
+                           worldspace — when THIS plugin owns it, the master
+                           ships no tiles for it and nothing may be skipped.
+        master_mesh_dirs:  Converted output dirs of this plugin's masters, for
+                           MESH REUSE, always. A plugin routinely places a
+                           master's models in its OWN worldspace; those models
+                           and their _far.nif LOD were converted into the
+                           master's output only. Reusing them is both correct
+                           and far cheaper than re-deriving them here, and
+                           without it the full model is absent from this tree,
+                           so screening rejects the object and its LOD is lost.
+                           Distinct from master_dirs because the tile-ownership
+                           skip above is NOT valid when this plugin owns the
+                           worldspace, while mesh reuse always is.
         master_texture_dirs: Converted output dirs of this plugin's masters,
                            always. A plugin regularly places a master's models
                            in its OWN worldspace, and their textures exist only
@@ -1101,10 +1133,15 @@ def generate_lod(esm_path: Path, output_dir: Path,
             if m:
                 referenced_models.add(m)
 
-    # Drop models a master already ships LOD for: this plugin overrides the
-    # master's records, so re-deriving their billboards would duplicate the
-    # master's whole LOD set for the sake of the few models it adds.
-    master_meshes = [Path(d) / 'meshes' for d in (master_dirs or [])]
+    # Drop models a MASTER already generated a _far.nif for and reuse that file
+    # instead of re-deriving it. QEM-decimating a mesh we already have costs
+    # seconds each, and the result is the same file — ElsweyrAnequina rebuilt
+    # 882 of Oblivion.esm's 1,173 billboards this way.
+    #
+    # This is keyed off master_MESH_dirs, not master_dirs: a plugin that owns
+    # its worldspace still places its masters' models in it, so mesh reuse
+    # applies even though the master ships no tiles for that worldspace.
+    master_meshes = [Path(d) / 'meshes' for d in (master_mesh_dirs or [])]
     if master_meshes:
         before = len(referenced_models)
         referenced_models = {
@@ -1113,8 +1150,8 @@ def generate_lod(esm_path: Path, output_dir: Path,
         }
         skipped = before - len(referenced_models)
         if skipped:
-            print(f"  Skipping {skipped} model(s) already covered by a "
-                  f"master's LOD; generating only this plugin's "
+            print(f"  Reusing {skipped} master _far.nif LOD mesh(es); "
+                  f"generating only this plugin's "
                   f"{len(referenced_models)}")
 
     from .lod_far_gen import generate_missing_far_nifs
@@ -1130,6 +1167,7 @@ def generate_lod(esm_path: Path, output_dir: Path,
                                     _parsed=(worldspaces, cells, stats, refs),
                                     cell_sw=(eff_sw_x, eff_sw_y),
                                     master_dirs=master_dirs,
+                                    master_mesh_dirs=master_mesh_dirs,
                                     replace_tiles=bool(only_cells))
     ok = False
     if lodgen_txt:

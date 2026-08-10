@@ -32,13 +32,11 @@ Major Issues for V1:
 
 	11 - All-in-one installer that people can just click and expect to work
 
-	12 - Spiddal Stick fails to play its poison animation
-
 Later Issues:
 
 	1 - Refine creature conversion further. Speed is still a bit off
 	
-	2 - Convert weathers
+	2 - Refine weathers further. They still feel a bit off. Need exact values to tweak
 
 	3 - Allow running process on zip (mod)
 
