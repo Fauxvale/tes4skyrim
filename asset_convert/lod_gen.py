@@ -26,6 +26,9 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 from subprocess_flags import POPEN_FLAGS  # noqa: E402
 
+# LODGen 3.0.36.0. This replaced the 2.2.0.0 build of the same name, which
+# let an unparseable model throw out of a worker thread and take the whole
+# process down, losing every tile after it. See run_lodgen().
 LODGEN_EXE = (
     SCRIPT_DIR / "external" / "lodgen" / "LODGenx64.exe"
 )
@@ -695,74 +698,37 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
     return out_txt
 
 
-# LODGen 3.0.36.0, shipped alongside the 2.2.0.0 generator. It is NOT used to
-# bake — its output differs — but where 2.2 dies with an unhandled exception on
-# a worker thread and says nothing, 3.x catches the same fault per object and
-# prints `Error processing <EditorID>`. That name is the only way to learn
-# WHICH model is poisoning the run, so it is used purely as a detector.
-LODGEN_DETECT_EXE = (
-    SCRIPT_DIR / "external" / "lodgen" / "LODGenx64_new.exe"
-)
-
 _LODGEN_ERR_RE = _re.compile(r'Error processing (\S+)')
-
-# A single bad model aborts the whole worldspace, so a couple of rounds of
-# exclude-and-retry are worth it; beyond that something systemic is wrong and
-# looping only wastes minutes.
-_LODGEN_MAX_RETRIES = 4
-
-
-def _detect_lodgen_offenders(lodgen_input: Path) -> set:
-    """EditorIDs whose model faults LODGen, named by the 3.x detector."""
-    if not LODGEN_DETECT_EXE.exists():
-        return set()
-    try:
-        r = subprocess.run(
-            [str(LODGEN_DETECT_EXE), str(lodgen_input),
-             "--dontFixTangents", "--removeUnseenFaces"],
-            cwd=str(LODGEN_DETECT_EXE.parent),
-            capture_output=True, text=True, **POPEN_FLAGS)
-    except Exception as exc:
-        print(f"  (detector unavailable: {exc})")
-        return set()
-    return set(_LODGEN_ERR_RE.findall((r.stdout or "") + (r.stderr or "")))
-
-
-def _drop_refs(lodgen_input: Path, edids: set) -> int:
-    """Remove every reference line whose base EditorID is in *edids*."""
-    lines = lodgen_input.read_text(encoding='utf-8',
-                                   errors='replace').splitlines(True)
-    keep, dropped = [], 0
-    for line in lines:
-        fields = line.split('\t')
-        if len(fields) > 10 and fields[9] in edids:
-            dropped += 1
-            continue
-        keep.append(line)
-    if dropped:
-        lodgen_input.write_text(''.join(keep), encoding='utf-8')
-    return dropped
 
 
 def run_lodgen(lodgen_input: Path, output_dir: Path) -> bool:
-    """Invoke LODGenx64.exe, excluding models that crash it and retrying.
+    """Invoke LODGen to bake the worldspace's object-LOD .bto tiles.
 
-    LODGen 2.2.0.0 handles no exceptions: one model it cannot process throws
-    on a ThreadPool worker and kills the process, so every remaining tile of
-    the worldspace is silently lost. Measured on Nehrim: 28 of 418 object-LOD
-    tiles were baked, twice in a row, because of ONE model
-    (`LeyawiinHouseLower01`). Excluding just that model's 5 references let all
-    418 tiles bake. The mesh itself parses fine and its geometry is valid —
-    both a tangent-flag repair and a recomputed-normals repair were tried and
-    made it crash EARLIER, so the fault is inside LODGen, not in the file.
+    `LODGenx64.exe` is 3.0.36.0. It replaced the 2.2.0.0 build because 2.2
+    handles no exceptions: a model it cannot parse throws on a ThreadPool
+    worker and kills the whole process, so every tile not yet written is
+    silently lost. Measured on Nehrim: 28 of 418 tiles baked, twice in a
+    row, because of ONE model
+    (`LeyawiinHouseLower01`, 5 references in the entire game). 3.x catches the
+    same `ArgumentOutOfRangeException` per object, prints
+    `Error processing <EditorID>`, and carries on with the rest — so one bad
+    model costs only its own LOD copy (it pops in at load distance) instead of
+    the entire worldspace.
 
-    So: run it, and if it dies, ask the 3.x detector which model it choked on,
-    drop that model's references and try again. An excluded model has no
-    distant-LOD copy — it pops in at load distance — which is a far smaller
-    loss than the entire worldspace having no object LOD.
+    The fault is inside LODGen, not the mesh: repairing that model's tangent
+    flag and recomputing its missing normals each made 2.2 crash EARLIER.
+
+    Verified equivalent, not merely tolerable: on the same input 3.x emits the
+    same tile set with the same block structure as 2.2 (39 BSSegmentedTriShape
+    / BSMultiBoundNode per tile, NIF 20.2.0.7), differing only in slightly
+    tighter mesh reduction.
+
+    Note 3.x's exit code is NOT a success signal — it returns 0 on a clean run
+    but a nonzero value when any object failed, even though the bake completed
+    and every tile was written. Success is therefore judged by tiles produced.
     """
     if not LODGEN_EXE.exists():
-        print(f"  ERROR: LODGenx64.exe not found at {LODGEN_EXE}")
+        print(f"  ERROR: LODGen not found at {LODGEN_EXE}")
         return False
 
     # PathOutput is embedded in the input file; LODGen reads it from there.
@@ -774,39 +740,48 @@ def run_lodgen(lodgen_input: Path, output_dir: Path) -> bool:
         # --skyblivionTexPath is NOT used: it prepends an extra 'tes4\\' to texture paths
         # already under textures\\tes4\\, doubling the prefix and causing null-ptr crashes.
     ]
-    excluded: set = set()
-    for attempt in range(_LODGEN_MAX_RETRIES + 1):
-        print(f"  Running: {' '.join(cmd)}")
-        # Capture output so it reaches the GUI log instead of a popped-up console
-        # window (which never exists under the console-less GUI launcher).
-        result = subprocess.run(cmd, cwd=str(LODGEN_EXE.parent),
-                                capture_output=True, text=True, **POPEN_FLAGS)
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.stderr:
-            print(result.stderr, end="")
-        if result.returncode == 0:
-            if excluded:
-                print(f"  Object LOD baked with {len(excluded)} model(s) "
-                      f"excluded: {', '.join(sorted(excluded))}")
-            return True
+    print(f"  Running: {' '.join(cmd)}")
+    # Capture output so it reaches the GUI log instead of a popped-up console
+    # window (which never exists under the console-less GUI launcher).
+    result = subprocess.run(cmd, cwd=str(LODGEN_EXE.parent),
+                            capture_output=True, text=True, **POPEN_FLAGS)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="")
 
-        print(f"  WARNING: LODGenx64.exe exited with code {result.returncode}")
-        if attempt >= _LODGEN_MAX_RETRIES:
-            break
-        offenders = _detect_lodgen_offenders(lodgen_input) - excluded
-        if not offenders:
-            print("  Could not identify the offending model; giving up "
-                  "(object LOD will be incomplete)")
-            break
-        dropped = _drop_refs(lodgen_input, offenders)
-        if not dropped:
-            break
-        excluded |= offenders
-        print(f"  Excluding {len(offenders)} crashing model(s) "
-              f"({dropped} references) and retrying: "
-              f"{', '.join(sorted(offenders))}")
-    return False
+    # Objects LODGen could not parse. It skipped them and kept going; report
+    # them so a model that loses its distant LOD is visible in the log rather
+    # than silently absent in-game.
+    skipped = sorted(set(_LODGEN_ERR_RE.findall(
+        (result.stdout or "") + (result.stderr or ""))))
+    if skipped:
+        print(f"  WARNING: LODGen could not process {len(skipped)} model(s); "
+              f"they have no distant LOD and will pop in at load distance: "
+              f"{', '.join(skipped)}")
+
+    # Tiles on disk are the only trustworthy success signal (see docstring).
+    tiles = _lodgen_output_dir(lodgen_input)
+    baked = len(list(tiles.glob('*.bto'))) if tiles else 0
+    if not baked:
+        print(f"  WARNING: LODGen produced no .bto tiles "
+              f"(exit code {result.returncode})")
+        return False
+    return True
+
+
+def _lodgen_output_dir(lodgen_input: Path):
+    """The PathOutput directory declared in a LODGen input file."""
+    try:
+        for line in lodgen_input.read_text(encoding='utf-8',
+                                           errors='replace').splitlines():
+            if line.startswith('PathOutput='):
+                return Path(line.split('=', 1)[1].strip())
+            if '\t' in line:  # reference rows follow the header
+                break
+    except OSError:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
