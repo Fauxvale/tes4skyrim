@@ -32,6 +32,8 @@ Major Issues for V1:
 
 	11 - All-in-one installer that people can just click and expect to work
 
+	12 - Spiddal Stick fails to play its poison animation
+
 Later Issues:
 
 	1 - Refine creature conversion further. Speed is still a bit off
@@ -59,6 +61,10 @@ Later Issues:
 	11 - Potential remapping of low level formids like how player (07) or gold (f) already do
 
 	12 - Add progress bar for navmesh step
+
+	13 - Add optional skyrim weather remapping
+
+	14 - Add optional skyrim creature remapping
 
 Minor Issues:
 

@@ -5705,23 +5705,46 @@ class ScriptConverter:
                 arg = f'{arg} as Int'
             return f'TES4Infamy.SetValueInt({arg})'
 
-        # Weather functions are a deliberate NO-OP: weather conversion is broken
-        # and is currently skipped.  CONVERT_CLIMATE is False, so the CLMT chain
-        # (WRLD -> CNAM -> CLMT -> WLST) that is the only route to a weather is
-        # never written, and Cyrodiil renders under Skyrim's default climate.
-        # Forcing an unreachable weather into Skyrim's sky system divides-by-zero
-        # in the weather update and hard-crashes, so neutralize the override
-        # rather than emit a call.  Keep this a no-op until weather conversion
-        # itself is fixed.
+        # Weather functions.  WTHR/CLMT/REGN weather are fully converted, so
+        # scripted weather moments (Oblivion-gate storms, SE quest skies)
+        # drive the real converted records.  Signatures verified against the
+        # vanilla Papyrus sources (references/skse64-master/scripts/vanilla/
+        # Weather.psc):
+        #   ForceActive(bool abOverride=false)            — instant switch
+        #   SetActive(bool abOverride=false, bool abAccelerate=false)
+        #   ReleaseOverride() global
+        #   GetCurrentWeatherTransition() global  — 0..1, the same scale as
+        #     Oblivion's GetCurrentWeatherPercent (the old constant-50 stub
+        #     assumed 0..100 and broke every `>= 1` fully-transitioned check).
+        #
+        # abOverride must be FALSE on both.  Oblivion holds scripted weather
+        # by CONTINUOUS RE-APPLICATION — the gate scripts re-force the storm
+        # every GameMode pass while the player is near — not by an engine
+        # lock; its scripts stop running when the ref unloads and the sky
+        # then rolls naturally.  Skyrim's abOverride=True is a GLOBAL lock
+        # that survives the caller unloading, so mapping to True let a
+        # fast-travel away from an Oblivion gate strand OblivionStormTamriel
+        # over the whole world forever (the release call lives in the same
+        # unloaded script's update loop and can never run).  With False the
+        # converted loops keep the storm applied while they run — same
+        # observable behaviour near the gate — and the region/climate system
+        # reclaims the sky on its next re-roll once they stop.
         if fname_low in ('forceweather', 'fw', 'setweather', 'sw'):
-            arg = args_str.strip() if args_str else ''
-            return f';NE: {fname_low} {arg} (Oblivion weather not converted)'
+            parts = ([p.strip() for p in args_str.split(',')] if ',' in (args_str or '')
+                     else (args_str.split() if args_str else []))
+            if not parts:
+                return ';NE: ' + fname_low + ' (no weather argument)'
+            wname = parts[0].strip('"\'')
+            self._property_refs[wname] = 'Weather'
+            if fname_low in ('forceweather', 'fw'):
+                return f'{wname}.ForceActive(False)'
+            return f'{wname}.SetActive(False, False)'
         if fname_low == 'releaseweatheroverride':
-            return ';NE: ReleaseWeatherOverride (Oblivion weather not converted)'
-        if fname_low in ('getiscurrentweather', 'getweatherpercent'):
-            if fname_low == 'getweatherpercent':
-                self._line_comments.append(';NE: GetWeatherPercent approximated')
-                return '50'
+            return 'Weather.ReleaseOverride()'
+        if fname_low in ('getiscurrentweather', 'getweatherpercent',
+                         'getcurrentweatherpercent'):
+            if fname_low in ('getweatherpercent', 'getcurrentweatherpercent'):
+                return 'Weather.GetCurrentWeatherTransition()'
             arg = self._convert_expression(args_str.strip(), extends) if args_str else 'None'
             if args_str and args_str.strip():
                 self._property_refs[args_str.strip()] = 'Weather'
@@ -7716,8 +7739,19 @@ class ScriptConverter:
                             ref = f'({ref} as Actor)'
                 result = f'{ref}.{papyrus_func}({args})'
             else:
-                # No ref — infer implicit target based on script context
-                if needs_self and fname_low in _ACTOR_ONLY_FUNCTIONS:
+                # No ref — infer implicit target based on script context.
+                # `_OBJREF_SHARED_FUNCTIONS` must be excluded here exactly as it
+                # is at the ref'd-receiver site above: 14 of _ACTOR_ONLY_FUNCTIONS
+                # are also declared on ObjectReference, and casting one of those
+                # to Actor on a non-actor Self yields **None**, so the call
+                # aborts at runtime instead of failing to compile.
+                # MS48OblivionGateScript (an ACTI) called TES4's bare
+                # `getdistance player`; emitted as `(Self as Actor).GetDistance`
+                # it returned None -> the comparison read 0 -> `0 < 1000` was
+                # always true, so the gate hammered
+                # `OblivionStormTamriel.ForceActive()` every 0.1s.
+                if (needs_self and fname_low in _ACTOR_ONLY_FUNCTIONS
+                        and fname_low not in _OBJREF_SHARED_FUNCTIONS):
                     event_actor = self._current_event_actor_param()
                     if extends == 'TopicInfo':
                         result = f'(akSpeakerRef as Actor).{papyrus_func}({args})'
@@ -7740,12 +7774,21 @@ class ScriptConverter:
                     else:
                         result = f'{papyrus_func}({args})'
                 elif (needs_self
-                      and fname_low in _OBJREF_IMPLICIT_SELF_FUNCTIONS
+                      and (fname_low in _OBJREF_IMPLICIT_SELF_FUNCTIONS
+                           or fname_low in _OBJREF_SHARED_FUNCTIONS)
                       and extends in ('ActiveMagicEffect', 'TopicInfo',
                                       PLAYER_ALIAS_EXTENDS)):
                     # ObjectReference method called bare inside a script whose
                     # Self is not a reference — route it onto the reference the
                     # effect/topic acts on, with no `as Actor` cast.
+                    #
+                    # `_OBJREF_SHARED_FUNCTIONS` is included for the RECEIVER,
+                    # not the cast: dropping the bogus `(Self as Actor)` above
+                    # must not leave these bare, because TopicInfo/
+                    # ActiveMagicEffect have no implicit reference at all and a
+                    # bare `AddItem(...)` is an undefined function (52 scripts
+                    # failed to compile at exactly this point).  Route the
+                    # receiver, keep the type honest.
                     result = (f'{self._resolve_objref_ref(None, extends)}'
                               f'.{papyrus_func}({args})')
                 else:

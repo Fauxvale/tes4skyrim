@@ -702,7 +702,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     _phase_done('parse export text')
 
     for sig in sorted(by_type.keys()):
-        special_types = {'LTEX', 'SOUN', 'CELL', 'WRLD', 'REFR', 'ACHR', 'ACRE', 'LAND', 'DIAL', 'INFO'}
+        special_types = {'LTEX', 'SOUN', 'WTHR', 'CELL', 'WRLD', 'REFR', 'ACHR', 'ACRE', 'LAND', 'DIAL', 'INFO'}
         status = "SKIP" if sig in all_skip else ("CONVERT" if sig in IMPORT_DISPATCH or sig in special_types else "UNKNOWN")
         print(f"  {sig}: {len(by_type[sig])} records [{status}]")
 
@@ -1141,6 +1141,11 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     from .record_types.dialog_misc import reset_sound_descriptors
     reset_sound_descriptors()
 
+    # Region registry: convert_REGN (phase 1) records which weather regions
+    # emitted, and the CELL builders later filter XCLR against it.
+    from .record_types.world import reset_emitted_regions
+    reset_emitted_regions()
+
     from .creature_races import build_creature_races
     build_creature_races(by_type, writer, export_dir,
                          ctx.master_export if ctx else None)
@@ -1300,6 +1305,12 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                     record_bytes = converter(rec, writer=writer)
                 else:
                     record_bytes = converter(rec)
+            # A converter returning None chose to emit nothing for this
+            # record (convert_REGN skips regions with no weather list —
+            # their object/grass/sound data drives TES4-side generators with
+            # no equivalent here).
+            if not record_bytes:
+                continue
             # A converter may retarget PER RECORD, not just per signature:
             # a TES4 BOOK carrying an enchantment is a scroll, and Skyrim's
             # BOOK has no field for an object effect, so convert_BOOK emits a
@@ -1307,8 +1318,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
             # 4-byte signature is the authority on which group it belongs in —
             # filing a SCRL under the BOOK group makes the engine read it as a
             # BOOK and the scroll silently reverts to unusable paper.
-            writer.add_record(record_bytes[:4].decode('ascii', 'replace')
-                              if record_bytes else target_sig,
+            writer.add_record(record_bytes[:4].decode('ascii', 'replace'),
                               record_bytes)
             converted += 1
         except Exception as e:
@@ -1339,6 +1349,41 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                 converted += 1
             except Exception as e:
                 print(f"  ERROR converting LTEX '{get_str(rec, 'EditorID', '?')}': {e}")
+                errors += 1
+
+    # --- Phase 2b: WTHR (creates IMGS companion records) ---
+    # Skyrim has no per-weather HDR field: tone mapping lives in an imagespace
+    # the weather points at, so each converted weather mints four IMGS (one
+    # per time of day) from its TES4 HNAM block.  Serial, like the other
+    # companion-allocating phases, so writer.alloc_formid() stays
+    # deterministic.
+    from .record_types.dialog_misc import convert_WTHR, set_nam0_normalization
+    wthr_records = by_type.get('WTHR', [])
+    if wthr_records:
+        # Self-calibrating colour normalization: Oblivion authors weather
+        # colours far hotter than Skyrim (Sun slot 193 vs 43 median day
+        # luminance) and ambient darker; scale each slot so this plugin's
+        # median lands on the vanilla median. Must run before any weather
+        # converts.
+        set_nam0_normalization(wthr_records)
+        print(f"  Converting {len(wthr_records)} WTHR records (with IMGS creation)...")
+        for rec in wthr_records:
+            try:
+                ov = ctx.build(rec, 'WTHR') if ctx else None
+                if ov is not None:
+                    # An override reuses the master's record and its IMGS
+                    # companions; converting fresh would mint duplicates.
+                    if ov.record_bytes:
+                        writer.add_record('WTHR', ov.record_bytes)
+                        converted += 1
+                    continue
+                wthr_bytes, imgs_list = convert_WTHR(rec, writer)
+                for imgs_bytes in imgs_list:
+                    writer.add_record('IMGS', imgs_bytes)
+                writer.add_record('WTHR', wthr_bytes)
+                converted += 1
+            except Exception as e:
+                print(f"  ERROR converting WTHR '{get_str(rec, 'EditorID', '?')}': {e}")
                 errors += 1
 
     # --- Phase 3: SOUN (creates SNDR companion records) ---
@@ -2046,9 +2091,15 @@ def _gather_navm_jobs(by_type: dict, door_fids: set = None):
 
     for wrld_rec in sorted(worlds, key=lambda w: get_formid(w, 'FormID')):
         wrld_fid = get_formid(wrld_rec, 'FormID')
+        # Persistent cells have no PGRDs generated (builder skips them), so skip.
+        # `_ensure_cell_grid` mirrors _build_world_groups so a cell whose TES4
+        # record omitted XCLC (it sits at (0,0)) is bucketed into the same
+        # block here as it is there — the two passes must agree or the cell
+        # gets navmesh for a square it does not occupy.
         exterior_cells = [c for c in ext_cells_by_wrld.get(wrld_fid, [])
                           if not (get_int(c, 'RecordFlags') & 0x400)]
-        # Persistent cells have no PGRDs generated (builder skips them), so skip.
+        for _c in exterior_cells:
+            _ensure_cell_grid(_c)
         ext_blocks = defaultdict(lambda: defaultdict(list))
         for cell in exterior_cells:
             grid_x = get_int(cell, 'XCLC.X')
@@ -2478,6 +2529,26 @@ def _build_cell_groups(by_type: dict, writer: PluginWriter,
     print(f"    Interior cells: {len(interior_cells)}, children: {converted}")
 
 
+def _ensure_cell_grid(cell: dict) -> None:
+    """Give a non-persistent exterior CELL explicit grid coords if it has none.
+
+    Oblivion omits XCLC when the cell sits at grid (0,0), since an absent
+    subrecord already reads as 0 there.  Skyrim does not tolerate the omission:
+    it builds the grid-cell array by walking the block tree and reading each
+    cell's XCLC, so a cell with none never occupies its slot.  The slot is then
+    null while its four neighbours exist, and the cell-streaming tick indexes
+    it without a bounds check (SkyrimSE.exe+050E6AD).
+
+    Writing the default is faithful, not a patch: every ref in all 30 affected
+    cells floors to (0,0).  Mutates in place so convert_CELL and the
+    block/sub-block bucketing below both see the coordinate.
+    """
+    if get_str(cell, 'XCLC.X'):
+        return
+    cell['XCLC.X'] = '0'
+    cell['XCLC.Y'] = '0'
+
+
 def _build_world_groups(by_type: dict, writer: PluginWriter,
                         navm_metas: list = None, base_model_by_fid: dict = None,
                         door_fids: set = None, navm_cache: dict = None,
@@ -2594,12 +2665,33 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
             # placed directly under the WRLD type=1 group without block/sub-block wrapping.
             # It often has XCLC=(0,0) so the old empty-string check was wrong.
             # Some worldspaces have multiple persistent cells (IC districts, Oblivion planes).
+            #
+            # A NON-persistent cell with no XCLC is a REAL exterior cell at
+            # grid (0,0) whose coords Oblivion simply omitted, because 0 is the
+            # default for an absent subrecord.  30 such cells exist —
+            # OblivionMQKvatchBridge (60 refs), MQ14OblivionGate (34),
+            # CheydinhalOblivion (19), DABoethiaStatue (21), every IC district.
+            # Verified: 100% of each one's refs floor to grid (0,0)
+            # (`floor(pos / 4096)`), so the coordinate is not a guess.
+            #
+            # They must stay in the block tree WITH an XCLC written for them.
+            # Removing them instead (an earlier attempt at this) punched a hole
+            # at (0,0) in a grid whose neighbours all exist, and the streaming
+            # tick then indexed the null grid slot — SkyrimSE+050E6AD
+            # `mov rbx,[rax+rcx*8]` with rax=0, which does NOT bounds-check.
+            # Census: vanilla Skyrim has 2 enclosed grid holes total, both at
+            # arbitrary coordinates; every hole we produced was at exactly
+            # (0,0), which is the signature of this defect.
+            #
+            # `_ensure_cell_grid` stamps the default so convert_CELL emits
+            # XCLC and the block/sub-block maths below bucket it correctly.
             persistent_cells = []
             exterior_cells = []
             for cell in wrld_cells:
                 if get_int(cell, 'RecordFlags') & 0x400:
                     persistent_cells.append(cell)
                 else:
+                    _ensure_cell_grid(cell)
                     exterior_cells.append(cell)
 
             # Persistent worldspace cells (group type 6 per cell)

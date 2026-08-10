@@ -99,6 +99,49 @@ Audited output carries only 2 `;TODO:` markers across 18,566 scripts, so marker
 counts measure honesty, not correctness — never treat a clean output scan as
 evidence the conversion is complete.
 
+### 🔴 An `as Actor` cast on a non-actor INVERTS every guard around it (2026-08-09)
+
+**`(Self as Actor)` on an ObjectReference is `None` at runtime — and Papyrus
+does not stop there. It aborts the call and substitutes `0` for the result**,
+so a distance test built on it silently flips to always-true.
+
+`MS48OblivionGateScript` rides on an ACTI (the Oblivion gate). TES4:
+
+```
+if getdistance player < 8000
+    if MQ00.nearOblivionGate == 0 && getdistance player < 1000
+        forceweather OblivionStormTamriel 1
+```
+
+emitted as `If (Self as Actor).GetDistance(Player) < 1000`. The gate is not an
+actor, so the cast is None, the call aborts, the comparison reads `0 < 1000`,
+and the gate hammered `OblivionStormTamriel.ForceActive()` **every 0.1s** while
+the player crossed into the Plane of Oblivion. Papyrus.0.log shows the
+signature 34x in the two seconds before the CTD:
+
+```
+error: Cannot call getDistance() on a None object, aborting function call
+warning: Assigning None to a non-object variable named "::temp5"
+```
+
+Cause: `_ACTOR_ONLY_FUNCTIONS` and `_OBJREF_SHARED_FUNCTIONS` deliberately
+overlap — 14 entries are declared on BOTH Actor and ObjectReference. The
+ref'd-receiver site in `converter.py` subtracts the shared set; the
+**implicit-Self site did not**, so any bare call to an overlapping function on
+a non-actor script got the cast. Blast radius before the fix: **383 calls in
+101 scripts** (137 GetDistance, 115 GetItemCount, 115 AddItem, 11 RemoveItem,
+4 RemoveAllItems, 1 SetAlpha).
+
+Rule: **every site that consults `_ACTOR_ONLY_FUNCTIONS` must subtract
+`_OBJREF_SHARED_FUNCTIONS`.** Note `saa`/`setactoralpha` are deliberately NOT
+in the shared set — their documented `(Self as Actor).SetAlpha()` degradation
+is intentional and must survive. Guarded by
+`tests/test_script_converter.py::TestObjRefSharedFunctionsNeverCastToActor`,
+which asserts the invariant across the whole overlap, not just GetDistance.
+
+This is the archetypal silent mis-conversion: it compiles, it is plausible, and
+it does the opposite of the original.
+
 ### The two stages build DIFFERENT CrossRefGraphs (2026-07-31)
 
 A conversion decision that depends on the graph can come out **differently in

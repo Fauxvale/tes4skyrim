@@ -2494,6 +2494,85 @@ class TestCKWarningFixes:
         assert get_formid(exterior, 'FormID') not in cell_to_location
 
 
+class TestGridlessWorldspaceCellPlacement:
+    """A non-persistent worldspace CELL with no XCLC is a real (0,0) cell.
+
+    Oblivion omits XCLC at grid (0,0) because an absent subrecord already
+    reads as 0.  Skyrim builds its grid-cell array by walking the type-4/5
+    block tree and reading each cell's XCLC, so an omitted one never occupies
+    its slot -- leaving a null grid entry surrounded by live neighbours, which
+    the streaming tick indexes without a bounds check
+    (SkyrimSE.exe+050E6AD `mov rbx,[rax+rcx*8]`, rax=0).
+
+    Verified faithful, not a patch: 100% of the refs in all 30 affected cells
+    floor to grid (0,0).  Removing the cells instead (an earlier attempt)
+    PUNCHED the hole rather than filling it -- vanilla Skyrim has 2 enclosed
+    grid holes total, both at arbitrary coords, while every hole that attempt
+    produced sat at exactly (0,0).
+    """
+
+    def _build(self):
+        from tes5_import.import_main import _build_world_groups
+        writer = PluginWriter(masters=['Skyrim.esm'])
+        writer.next_object_id = 0x01100000
+        wrld = {'Signature': 'WRLD', 'FormID': '0001D0BC',
+                'EditorID': 'OblivionMQKvatch', 'DATA.Flags': '7'}
+        # No XCLC and persistent bit CLEAR -- exactly OblivionMQKvatchBridge.
+        gridless = {'Signature': 'CELL', 'FormID': '0001E896',
+                    'EditorID': 'OblivionMQKvatchBridge', 'RecordFlags': '0',
+                    'ParentWRLD': '0001D0BC', 'DATA.Flags': '2'}
+        gridded = {'Signature': 'CELL', 'FormID': '0001E895',
+                   'EditorID': 'OblivionMQKvatchEntrance', 'RecordFlags': '0',
+                   'ParentWRLD': '0001D0BC', 'DATA.Flags': '2',
+                   'XCLC.X': '0', 'XCLC.Y': '-1'}
+        by_type = {'WRLD': [wrld], 'CELL': [gridless, gridded]}
+        _build_world_groups(by_type, writer)
+        return writer
+
+    def _blocked_cells(self, raw):
+        """(fid, full record bytes) for CELLs inside a type-4/5 block group."""
+        found, stack, pos = [], [], 0
+        while pos + 24 <= len(raw):
+            while stack and pos >= stack[-1][0]:
+                stack.pop()
+            sig = raw[pos:pos + 4]
+            if sig == b'GRUP':
+                gsize, _l, gtype = struct.unpack_from('<IiI', raw, pos + 4)[:3]
+                stack.append((pos + gsize, gtype))
+                pos += 24
+                continue
+            size, _flags, fid = struct.unpack_from('<III', raw, pos + 4)
+            if sig == b'CELL' and any(g[1] in (4, 5) for g in stack):
+                found.append((fid & 0xFFFFFF, raw[pos:pos + 24 + size]))
+            pos += 24 + size
+        return found
+
+    def test_gridless_cell_stays_in_the_block_tree(self):
+        raw = b''.join(self._build()._top_groups['WRLD'])
+        assert 0x01E896 in {f for f, _ in self._blocked_cells(raw)},             'removing the cell punches a null hole at (0,0) -> CTD on stream'
+
+    def test_gridless_cell_gets_explicit_zero_xclc(self):
+        raw = b''.join(self._build()._top_groups['WRLD'])
+        body = dict(self._blocked_cells(raw))[0x01E896]
+        xclc = _find_subrecord(body, b'XCLC')
+        assert xclc is not None, 'cell must carry XCLC or it never fills its slot'
+        assert struct.unpack_from('<ii', xclc)[:2] == (0, 0)
+
+    def test_every_blocked_cell_has_xclc(self):
+        """The invariant: vanilla Skyrim is 0/16,942 blocked cells without XCLC."""
+        raw = b''.join(self._build()._top_groups['WRLD'])
+        blocked = self._blocked_cells(raw)
+        assert blocked, 'expected at least one blocked cell in the fixture'
+        for _fid, body in blocked:
+            assert _find_subrecord(body, b'XCLC') is not None
+
+    def test_gridded_sibling_keeps_its_own_coords(self):
+        raw = b''.join(self._build()._top_groups['WRLD'])
+        body = dict(self._blocked_cells(raw))[0x01E895]
+        xclc = _find_subrecord(body, b'XCLC')
+        assert struct.unpack_from('<ii', xclc)[:2] == (0, -1),             'stamping the default must never overwrite real coords'
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])
 
@@ -3197,9 +3276,6 @@ class TestLoadGatedPollStart:
 # Weather / climate conversion
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason='WTHR imagespace conversion lives on the '
-                         'weather-conversion branch; master convert_WTHR '
-                         'returns bytes, not (wthr, imgs)')
 class TestWeatherConversion:
     """WTHR conversion.
 
@@ -3266,37 +3342,58 @@ class TestWeatherConversion:
         assert rgb(3) == (30, 31, 32)     # Ambient
         assert rgb(6) == (60, 61, 62)     # Stars
         assert rgb(8) == (80, 81, 82)     # Horizon
-        # TES4's two cloud tints move to TES5's Cloud LOD slots
-        assert rgb(10) == (90, 91, 92)    # Clouds-Upper -> Cloud LOD Diffuse
-        assert rgb(11) == (20, 21, 22)    # Clouds-Lower -> Cloud LOD Ambient
+        # Cloud LOD Diffuse/Ambient (10/11) stay BLACK: vanilla ships 0 in
+        # both (median AND p90, all four times); Oblivion's tints there lit
+        # the distant cloud LOD pass white.
+        assert rgb(10) == (0, 0, 0)
+        assert rgb(11) == (0, 0, 0)
         assert rgb(12) == (10, 11, 12)    # Fog Far reuses the single TES4 fog
+        # Effect Lighting (9) has no TES4 source; vanilla authors it BRIGHT
+        # (black leaves effect shaders unlit) — per-time channel medians.
+        assert rgb(9) == (198, 193, 193)
 
-    def test_glare_and_sky_static_slots_default_dark(self):
-        """Slots 13/15/16 tint ADDITIVE passes.
+    def test_tes5_only_slots_take_class_and_time_medians(self):
+        """Slots 13-16 come from the per-classification, per-time census of
+        the REAL Skyrim.esm (the references dump truncates NAM0 hex).
 
-        Copying the TES4 Sun/Stars colours into Sun Glare / Moon Glare, and
-        forcing Sky Statics white, produced a blinding sky.  Vanilla ships
-        black in all three (Sky Statics 7/84 exact-black and never white,
-        Sun Glare 35/84 black, Moon Glare 27/84 black).
+        Two prior calibrations were wrong: copying the TES4 Sun/Stars colours
+        into the glare slots produced a blinding sky, and the 'vanilla mode is
+        black' correction hid the MOONS — slot 13 Sky Statics tints the moon
+        discs and is never black in vanilla outdoor weathers (SkyrimClear
+        night is 45,137,208).  Stars kept rendering (slot 6), which is what
+        localised the bug.
         """
-        nam0 = _find_subrecord(self._convert(self._rec()), b'NAM0')
-
-        def rgb(slot, time=1):
+        def rgb(rec_bytes, slot, time):
+            nam0 = _find_subrecord(rec_bytes, b'NAM0')
             o = (slot * 4 + time) * 4
             return tuple(nam0[o:o + 3])
 
-        assert rgb(13) == (0, 0, 0), 'Sky Statics must not be white'
-        assert rgb(15) == (0, 0, 0), 'Sun Glare must not copy the Sun colour'
-        assert rgb(16) == (0, 0, 0), 'Moon Glare must not copy the Stars colour'
-        # Water Multiplier is the one slot that genuinely defaults to white
-        assert rgb(14) == (255, 255, 255)
+        # Default test record is Rainy (classification 4)
+        rainy = self._convert(self._rec())
+        assert rgb(rainy, 13, 1) == (142, 161, 173)   # never black
+        assert rgb(rainy, 15, 1) == (0, 0, 0)         # clouds hide the sun
+        assert rgb(rainy, 16, 3) == (0, 0, 0)         # and the moons
+        assert rgb(rainy, 14, 3) == (31, 63, 75)      # night water is dark teal
+
+        clear = self._convert(self._rec(**{'DATA.Classification': '1'}))
+        assert rgb(clear, 13, 3) == (62, 93, 108), 'moons must not tint black'
+        assert rgb(clear, 16, 3) == (255, 173, 138)   # warm night moon halo
+        assert rgb(clear, 15, 3) == (0, 0, 0)         # no sun glare at night
+        assert rgb(clear, 15, 1) == (72, 58, 57)      # dark brown by day
 
     def test_data_carries_every_tes4_field(self):
-        """Offsets 6-14 were dropped entirely by the original converter."""
+        """Offsets 6-14 were dropped entirely by the original converter.
+
+        Trans Delta and Sun Glare are RESCALED, not copied: TES4's median
+        Trans Delta is 255 where vanilla TES5 ships 125 almost universally
+        (x125/255), and TES4 clear weathers author Sun Glare 255 where the
+        vanilla ceiling is 191 / p90 153 (x0.6) — a raw 255 painted the sky
+        white toward the sun."""
         d = _find_subrecord(self._convert(self._rec()), b'DATA')
         assert d[0] == 25                        # wind speed
         assert (d[1], d[2]) == (0, 0)            # TES5 padding (was cloud speed)
-        assert d[3] == 3 and d[4] == 255         # trans delta, sun glare
+        assert d[3] == round(3 * 125 / 255)      # trans delta, rescaled
+        assert d[4] == 153                       # sun glare 255 -> vanilla p90
         assert d[5] == 200                       # sun damage
         assert (d[6], d[7]) == (5, 6)            # precipitation fades
         assert (d[8], d[9]) == (7, 8)            # thunder fades
@@ -3364,10 +3461,32 @@ class TestWeatherConversion:
 
     def test_required_subrecords_present(self):
         """LNAM/MNAM/NNAM are .SetRequired in xEdit; LNAM=0 allocated no layers."""
-        rec = self._convert(self._rec())
+        rec = self._convert(self._rec(**{'DATA.Classification': '1',
+                                         'DATA.ThunderFrequency': '255'}))
         assert struct.unpack('<I', _find_subrecord(rec, b'LNAM'))[0] == 29
         assert _find_subrecord(rec, b'MNAM') == b'\x00\x00\x00\x00'
         assert _find_subrecord(rec, b'NNAM') == b'\x00\x00\x00\x00'
+
+    def test_precipitation_maps_to_vanilla_spgd(self):
+        """A NULL MNAM means an authored rainstorm produces NO rain.
+
+        Skyrim draws precipitation via the SPGD in MNAM (18 of 84 vanilla
+        weathers); Oblivion picked hardcoded Sky\\ meshes off the
+        classification bits, so the classification is the authored source:
+        Rainy -> RainParticles, Rainy+thunder -> RainStormParticles,
+        Snow -> SnowParticlesMed.  ThunderFrequency is inverted (255=never).
+        """
+        def mnam(**over):
+            out = self._convert(self._rec(**over))
+            return struct.unpack('<I', _find_subrecord(out, b'MNAM'))[0]
+
+        # The default test record is Rainy (4) with thunder at 188 -> storm.
+        assert mnam() == 0x0010780F
+        assert mnam(**{'DATA.ThunderFrequency': '255'}) == 0x00023C48
+        assert mnam(**{'DATA.Classification': '8'}) == 0x00023C49
+        assert mnam(**{'DATA.Classification': '1'}) == 0
+        assert mnam(**{'DATA.Classification': '2',
+                       'DATA.ThunderFrequency': '255'}) == 0
 
     def test_dalc_follows_vanilla_face_weights(self):
         """Z+ is the DARKEST face and Z- the brightest.
@@ -3394,6 +3513,81 @@ class TestWeatherConversion:
         rec = self._rec()
         del rec['NAM0.Data']
         assert len(_find_subrecord(self._convert(rec), b'NAM0')) == 272
+
+    def test_luminance_normalization_lands_plugin_median_on_vanilla(self):
+        """Oblivion authors weather colours far hotter than Skyrim — the Sun
+        slot's midday median is 193 luminance vs vanilla 43 (a 255 disc
+        BLOOMS enormously; Skyrim's sun brightness is HDR, not this slot) —
+        while Ambient is authored at HALF vanilla (92 vs 172), giving blown
+        highlights over black shadows that no imagespace can fix.  The
+        normalization is self-calibrating: the plugin's per-slot median is
+        scaled onto the vanilla median, hue preserved, capped at p90."""
+        from tes5_import.record_types.dialog_misc import (
+            set_nam0_normalization, _NAM0_K)
+        # A synthetic plugin whose Sun (slot 5) day colour is flat (200,200,200)
+        # (lum 200) and whose Ambient (slot 3) day is (60,60,60) (lum 60).
+        raw = bytearray(160)
+        for time in range(4):
+            o5 = (5 * 4 + time) * 4
+            raw[o5:o5 + 3] = bytes((200, 200, 200))
+            o3 = (3 * 4 + time) * 4
+            raw[o3:o3 + 3] = bytes((60, 60, 60))
+        recs = [self._rec(**{'NAM0.Data': bytes(raw).hex().upper(),
+                             'FormID': f'{0x300 + i:08X}'}) for i in range(6)]
+        try:
+            set_nam0_normalization(recs)
+            out = self._convert(recs[0])
+            nam0 = _find_subrecord(out, b'NAM0')
+            o = (5 * 4 + 1) * 4          # Sun, day
+            sun = nam0[o:o + 3]
+            lum = 0.299 * sun[0] + 0.587 * sun[1] + 0.114 * sun[2]
+            assert abs(lum - 43.0) < 2.0, 'plugin Sun median must land on vanilla 43'
+            o = (3 * 4 + 1) * 4          # Ambient, day: scaled UP 60 -> 172
+            amb = nam0[o:o + 3]
+            lum = 0.299 * amb[0] + 0.587 * amb[1] + 0.114 * amb[2]
+            assert abs(lum - 172.2) < 2.0, 'dark Oblivion ambient must scale up'
+        finally:
+            _NAM0_K.clear()
+
+    def test_without_normalization_colors_still_capped_at_vanilla_p90(self):
+        """Unit conversions (no pre-pass) still cap: a 255-white Sun cannot
+        exceed vanilla's day p90 of 121."""
+        raw = bytearray(160)
+        for time in range(4):
+            o = (5 * 4 + time) * 4
+            raw[o:o + 3] = bytes((255, 255, 255))
+        out = self._convert(self._rec(**{'NAM0.Data': bytes(raw).hex().upper()}))
+        nam0 = _find_subrecord(out, b'NAM0')
+        o = (5 * 4 + 1) * 4
+        sun = nam0[o:o + 3]
+        lum = 0.299 * sun[0] + 0.587 * sun[1] + 0.114 * sun[2]
+        assert lum <= 122.0
+
+    def test_ambience_loops_land_in_the_amb_audio_category(self):
+        """A 2D looping TES4 sound is an ambience bed; filed under
+        AudioCategorySFX it bypasses the ambience mix/slider and Oblivion's
+        weather winds played LOUD over everything.  Vanilla AMBWeather*
+        descriptors all use AudioCategoryAMB (0x7F80B)."""
+        from tes5_import.record_types.dialog_misc import convert_SOUN
+
+        class W:
+            def __init__(self):
+                self.next = 0x01000000
+            def alloc_formid(self):
+                self.next += 1
+                return self.next
+
+        def sndr_gnam(flags):
+            rec = {'Signature': 'SOUN', 'FormID': '00000400', 'RecordFlags': '0',
+                   'EditorID': 'TestWind', 'FNAM.Filename': 'ambient\\wind.wav',
+                   'SNDX.Flags': str(flags), 'SNDX.MinAttDist': '0',
+                   'SNDX.MaxAttDist': '0', 'SNDX.StaticAttenuation': '1586'}
+            _soun, sndr, _fid = convert_SOUN(rec, W())
+            return struct.unpack('<I', _find_subrecord(sndr, b'GNAM'))[0]
+
+        assert sndr_gnam(0x0010 | 0x0040) == 0x0007F80B   # loop + 2D -> AMB
+        assert sndr_gnam(0x0040) == 0x000172A1            # 2D one-shot -> SFX
+        assert sndr_gnam(0x0010) == 0x000172A1            # 3D loop -> SFX
 
 
 class TestClimateConversion:
@@ -3440,22 +3634,29 @@ class TestClimateConversion:
         del rec['Model.MODL']
         assert _find_subrecord(convert_CLMT(rec), b'MODL') == b'tes4\\Sky\\Stars.nif\x00'
 
-    def test_tnam_timing_is_six_bytes_verbatim(self):
+    def test_tnam_timing_passes_through_except_volatility(self):
+        """Volatility is NOT a passthrough: TES4's byte spans 0..255 and 0
+        still cycles weather in Oblivion, while Skyrim's census is bimodal —
+        50 on the one variable outdoor climate (SkyrimClimate), 0 only on
+        locked skies (Sovngarde).  TES4's 0 froze every converted sky on its
+        first weather.  The moons byte (195 = 0xC3, Masser+Secunda+phase 3)
+        is byte-identical to vanilla SkyrimClimate's."""
         from tes5_import.record_types.dialog_misc import convert_CLMT
         tnam = _find_subrecord(convert_CLMT(self._rec()), b'TNAM')
-        assert tnam == bytes((36, 60, 96, 120, 0, 195))
+        assert tnam == bytes((36, 60, 96, 120, 50, 195))
 
-    def test_climate_dispatch_follows_the_feature_flag(self):
-        """Climate conversion is gated on CONVERT_CLIMATE; the converter above
-        stays tested either way so the flag can be flipped back on."""
-        from tes5_import.constants import (
-            CONVERT_CLIMATE, IMPORT_DISPATCH, SKIP_TYPES)
-        if CONVERT_CLIMATE:
-            assert 'CLMT' not in SKIP_TYPES
-            assert 'CLMT' in IMPORT_DISPATCH
-        else:
-            assert 'CLMT' in SKIP_TYPES
-            assert 'CLMT' not in IMPORT_DISPATCH
+    def test_climate_is_always_dispatched(self):
+        """CLMT is the ONLY path to the converted weathers
+        (WRLD -> CNAM -> CLMT -> WLST); skipping it orphans all of them.
+        WTHR itself lives in its own serial phase (import_main 2b), not the
+        generic dispatch, because it mints IMGS companions."""
+        from tes5_import.constants import IMPORT_DISPATCH, SKIP_TYPES
+        assert 'CLMT' not in SKIP_TYPES
+        assert 'CLMT' in IMPORT_DISPATCH
+        assert 'WTHR' not in SKIP_TYPES
+        assert 'WTHR' not in IMPORT_DISPATCH
+        assert 'REGN' not in SKIP_TYPES
+        assert 'REGN' in IMPORT_DISPATCH
 
 
 class TestWorldspaceClimate:
@@ -3466,10 +3667,7 @@ class TestWorldspaceClimate:
         return rec
 
     def test_authored_climate_is_kept(self):
-        from tes5_import.constants import CONVERT_CLIMATE
         from tes5_import.record_types.world import convert_WRLD
-        if not CONVERT_CLIMATE:
-            pytest.skip('climate conversion disabled (CONVERT_CLIMATE)')
         out = convert_WRLD(self._rec(**{'CNAM.Climate': '00097C60'}))
         cnam = struct.unpack('<I', _find_subrecord(out, b'CNAM'))[0]
         assert cnam & 0x00FFFFFF == 0x97C60
@@ -3480,23 +3678,107 @@ class TestWorldspaceClimate:
         0x543200, which does LookupForm(0x15F).  Skyrim has no such fallback,
         and 57 of 84 TES4 worldspaces (incl. Tamriel and every city) author no
         CNAM, so it must be written explicitly."""
-        from tes5_import.constants import CONVERT_CLIMATE
         from tes5_import.record_types.world import convert_WRLD
-        if not CONVERT_CLIMATE:
-            pytest.skip('climate conversion disabled (CONVERT_CLIMATE)')
         cnam = _find_subrecord(convert_WRLD(self._rec()), b'CNAM')
         assert cnam is not None, 'a CNAM-less worldspace would use Skyrim weather'
         assert struct.unpack('<I', cnam)[0] & 0x00FFFFFF == 0x15F
 
-    def test_no_dangling_climate_reference_when_disabled(self):
-        """With CLMT in SKIP_TYPES, a CNAM would point at a record that was
-        never written -- omit it rather than ship a dangling FormID."""
-        from tes5_import.constants import CONVERT_CLIMATE
-        from tes5_import.record_types.world import convert_WRLD
-        if CONVERT_CLIMATE:
-            pytest.skip('climate conversion enabled (CONVERT_CLIMATE)')
-        out = convert_WRLD(self._rec(**{'CNAM.Climate': '00097C60'}))
-        assert _find_subrecord(out, b'CNAM') is None
+
+class TestRegionWeatherConversion:
+    """REGN weather entries — where Cyrodiil's weather variety actually lives.
+
+    TamrielClimate's WLST is a single Clear weather at 100%; the rain, snow
+    and fog come from 59 region RDWT lists layered over it, exactly the
+    mechanism Skyrim itself uses (WeatherCoastFog, WeatherWinterhold...).
+    RDAT headers are byte-identical across the games; RDWT entries widen from
+    8 to 12 bytes with a trailing Global FormID; RPLI/RPLD pass through.
+    """
+
+    def _rec(self, **over):
+        rec = {
+            'Signature': 'REGN', 'FormID': '00001234', 'RecordFlags': '0',
+            'EditorID': 'TestWeatherRegion',
+            'RCLR.R': '10', 'RCLR.G': '20', 'RCLR.B': '30',
+            'WNAM.Worldspace': '0000003C',
+            'AreaCount': '1',
+            'Area[0].EdgeFalloff': '1024',
+            'Area[0].PointsHex': struct.pack(
+                '<8f', 0, 0, 1000, 0, 1000, 1000, 0, 1000).hex().upper(),
+            'RegionDataCount': '2',
+            'RegionData[0].Type': '7',       # sound entry: dropped
+            'RegionData[0].Override': '0',
+            'RegionData[0].Priority': '50',
+            'RegionData[1].Type': '3',       # weather entry: converted
+            'RegionData[1].Override': '1',
+            'RegionData[1].Priority': '95',
+            'RegionData[1].WeatherCount': '2',
+            'RegionData[1].Weather[0].FormID': '00000200',
+            'RegionData[1].Weather[0].Chance': '70',
+            'RegionData[1].Weather[1].FormID': '00000201',
+            'RegionData[1].Weather[1].Chance': '30',
+        }
+        rec.update(over)
+        return rec
+
+    def test_weather_entries_survive_with_area_and_header(self):
+        from tes5_import.record_types.world import convert_REGN
+        out = convert_REGN(self._rec())
+        rdat = _find_subrecord(out, b'RDAT')
+        rtype, override, priority = struct.unpack_from('<IBB', rdat, 0)
+        assert (rtype, override, priority) == (3, 1, 95)
+        rdwt = _find_subrecord(out, b'RDWT')
+        assert len(rdwt) == 24                       # 2 entries x 12 bytes
+        w0, c0, g0 = struct.unpack_from('<III', rdwt, 0)
+        w1, c1, g1 = struct.unpack_from('<III', rdwt, 12)
+        assert (c0, c1) == (70, 30) and (g0, g1) == (0, 0)
+        assert w0 != 0 and w1 != 0
+        rpli = _find_subrecord(out, b'RPLI')
+        assert struct.unpack('<I', rpli)[0] == 1024
+        assert len(_find_subrecord(out, b'RPLD')) == 32   # 4 points x 8 bytes
+
+    def test_non_weather_entries_are_dropped(self):
+        from tes5_import.record_types.world import convert_REGN
+        out = convert_REGN(self._rec())
+        # exactly ONE RDAT survives (the weather one); the sound entry is gone
+        assert len(_find_all_subrecords(out, b'RDAT')) == 1
+
+    def test_region_without_weather_emits_nothing(self):
+        from tes5_import.record_types.world import convert_REGN
+        rec = self._rec(**{'RegionDataCount': '1'})   # only the sound entry
+        assert convert_REGN(rec) is None
+
+    def test_region_without_area_emits_nothing(self):
+        """The engine applies region data only inside RPLD polygons; weather
+        with no area can never fire, so don't emit the record at all."""
+        from tes5_import.record_types.world import convert_REGN
+        assert convert_REGN(self._rec(**{'AreaCount': '0'})) is None
+
+    def test_cell_xclr_lists_only_emitted_regions(self):
+        """Region weather reaches the sky through the CELL's XCLR list —
+        Skyrim.esm puts WeatherWinterhold in 30 cells' XCLR — so exterior
+        cells must carry it.  Without XCLR every converted exterior fell back
+        to the climate WLST, and TamrielClimate's is a single Clear at 100%:
+        the sky NEVER changed.  Refs are filtered to regions that actually
+        emitted (TES4 lists object/grass/sound regions here too, which we
+        drop) and sorted (xEdit wbArrayS)."""
+        from tes5_import.record_types.world import (
+            convert_CELL, convert_REGN, reset_emitted_regions)
+        reset_emitted_regions()
+        convert_REGN(self._rec())                     # registers 0x00001234
+        cell = {
+            'Signature': 'CELL', 'FormID': '00002000', 'RecordFlags': '0',
+            'DATA.Flags': '0', 'XCLC.X': '5', 'XCLC.Y': '-3',
+            'Region[0]': '00009999',                  # dropped (never emitted)
+            'Region[1]': '00001234',                  # the weather region
+        }
+        xclr = _find_subrecord(convert_CELL(cell), b'XCLR')
+        assert xclr is not None
+        fids = struct.unpack(f'<{len(xclr) // 4}I', xclr)
+        assert len(fids) == 1
+        assert fids[0] & 0x00FFFFFF == 0x1234
+        reset_emitted_regions()
+        cell2 = dict(cell)
+        assert _find_subrecord(convert_CELL(cell2), b'XCLR') is None
 
 
 class TestSkyMeshShaders:
@@ -3742,9 +4024,6 @@ class TestSayTimerRelease:
             'against stale state:\n' + '\n'.join(offenders[:10]))
 
 
-@pytest.mark.skip(reason='WTHR imagespace conversion lives on the '
-                         'weather-conversion branch; master convert_WTHR '
-                         'returns bytes, not (wthr, imgs)')
 class TestWeatherImageSpace:
     """WTHR HDR tone mapping -> companion IMGS records.
 
@@ -3842,7 +4121,24 @@ class TestWeatherImageSpace:
                                               'HNAM.UpperLumClamp': '1.3'}))
         h = self._hnam(imgs[self.DAY])
         assert h[4] < 0.8, 'Receive Bloom Threshold must not sit at the ceiling'
-        assert h[5] < 1.05, 'White must not sit at the ceiling'
+        assert h[5] <= 1.05, 'White must stay inside the vanilla day p90'
+
+    def test_median_tes4_weather_lands_on_vanilla_medians(self):
+        """The first calibration rescaled SPANS, but the TES4 medians sit at
+        the EDGE of their spans (median UpperLumClamp is 1.0, the bottom of
+        1.0..1.3), so nearly every weather got White = 0.88 — vanilla's
+        bottom decile, a lowered white point — and the day rendered as an
+        overexposed camera.  A median TES4 weather must land ON the vanilla
+        per-slot median: White 1.0, Receive Bloom 0.625, Bloom Threshold
+        0.625, Bloom Scale 3.0 at midday."""
+        _w, imgs = self._convert(self._rec(**{
+            'HNAM.TargetLum': '1.2', 'HNAM.UpperLumClamp': '1.0',
+            'HNAM.BrightScale': '2.0', 'HNAM.BrightClamp': '0.3'}))
+        h = self._hnam(imgs[self.DAY])
+        assert abs(h[2] - 0.625) < 1e-6     # Bloom Threshold
+        assert abs(h[3] - 3.0) < 1e-6       # Bloom Scale
+        assert abs(h[4] - 0.625) < 1e-6     # Receive Bloom Threshold
+        assert abs(h[5] - 1.0) < 1e-6       # White — NOT 0.88
 
     def test_sky_scale_tracks_sky_brightness(self):
         """Sky Scale is the sky's contribution to exposure and TES4 has no
@@ -3902,6 +4198,21 @@ class TestWeatherImageSpace:
         tnam = struct.unpack('<4f', _find_subrecord(imgs[0], b'TNAM'))
         assert cnam == (1.0, 1.0, 1.0)
         assert tnam[0] == 0.0
+
+    def test_imagespace_ships_dnam_with_sky_excluded_from_blur(self):
+        """213 of the 214 weather-used vanilla imagespaces ship DNAM;
+        omitting it leaves depth-of-field and SKY BLUR undefined.  Use the
+        MODAL COMPLETE vanilla tuple (19 records ship exactly this) so the
+        combination is coherent: distant-only DoF, sky EXCLUDED from blur
+        (16816 = 'No Sky, Radius 2')."""
+        _w, imgs = self._convert(self._rec())
+        for b in imgs:
+            dnam = _find_subrecord(b, b'DNAM')
+            assert dnam is not None and len(dnam) == 16
+            strength, distance, rng = struct.unpack_from('<3f', dnam, 0)
+            sky = struct.unpack_from('<H', dnam, 14)[0]
+            assert (strength, distance, rng) == (0.5, 20000.0, 20000.0)
+            assert sky == 16816
 
     def test_imagespace_is_written_before_the_weather(self):
         """IMGS must precede WTHR in the group order: the weather's IMSP

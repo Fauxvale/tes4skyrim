@@ -370,14 +370,51 @@ def export_REGN(rec: Record) -> list:
         lines.append(f"RCLR.G={rclr.data[1]}")
         lines.append(f"RCLR.B={rclr.data[2]}")
     emit_formid(lines, "WNAM.Worldspace", get_subrecord(rec, "WNAM"))
-    # Region data entries (RDAT/RDOT/RDMP/RDGS/RDMD/RDSD/RDWT)
-    rdats = get_all_subrecords(rec, "RDAT")
-    if rdats:
-        lines.append(f"RegionDataCount={len(rdats)}")
-        for i, rdat in enumerate(rdats):
-            if len(rdat.data) >= 8:
-                lines.append(f"RegionData[{i}].Type={struct.unpack_from('<I', rdat.data, 0)[0]}")
-                lines.append(f"RegionData[{i}].Flags={rdat.data[4]}")
+
+    # Areas and data entries are walked in SUBRECORD ORDER, not collected by
+    # signature: each RPLD point array belongs to the RPLI edge-falloff just
+    # before it, and each RDWT weather list to the RDAT header just before it
+    # (xEdit wbDefinitionsTES4 wbRegionAreas / Region Data Entries).  RPLD is
+    # dumped as raw hex — the TES5 layout is byte-identical (x,y float pairs).
+    areas = []    # [edge_falloff, points_hex]
+    entries = []  # {type, override, priority, weathers: [(fid, chance)]}
+    for sub in rec.subrecords:
+        if sub.type == "RPLI" and len(sub.data) >= 4:
+            areas.append([struct.unpack_from("<I", sub.data, 0)[0], ""])
+        elif sub.type == "RPLD":
+            if not areas:
+                areas.append([0, ""])
+            areas[-1][1] = sub.data.hex().upper()
+        elif sub.type == "RDAT" and len(sub.data) >= 8:
+            entries.append({
+                "type": struct.unpack_from("<I", sub.data, 0)[0],
+                "override": sub.data[4],
+                "priority": sub.data[5],
+                "weathers": [],
+            })
+        elif sub.type == "RDWT" and entries:
+            # TES4 entry is 8 bytes: Weather FormID, Chance u32.
+            for off in range(0, len(sub.data) - 7, 8):
+                fid, chance = struct.unpack_from("<II", sub.data, off)
+                entries[-1]["weathers"].append((fid, chance))
+
+    if areas:
+        lines.append(f"AreaCount={len(areas)}")
+        for i, (falloff, points_hex) in enumerate(areas):
+            lines.append(f"Area[{i}].EdgeFalloff={falloff}")
+            if points_hex:
+                lines.append(f"Area[{i}].PointsHex={points_hex}")
+    if entries:
+        lines.append(f"RegionDataCount={len(entries)}")
+        for i, e in enumerate(entries):
+            lines.append(f"RegionData[{i}].Type={e['type']}")
+            lines.append(f"RegionData[{i}].Override={e['override']}")
+            lines.append(f"RegionData[{i}].Priority={e['priority']}")
+            if e["weathers"]:
+                lines.append(f"RegionData[{i}].WeatherCount={len(e['weathers'])}")
+                for j, (fid, chance) in enumerate(e["weathers"]):
+                    lines.append(f"RegionData[{i}].Weather[{j}].FormID={get_formid_str(fid)}")
+                    lines.append(f"RegionData[{i}].Weather[{j}].Chance={chance}")
     return lines
 
 

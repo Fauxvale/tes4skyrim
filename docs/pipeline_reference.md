@@ -141,20 +141,17 @@ topic binding is patched in after Phase 5. Read the phase comments in
 
 `SKIP_TYPES` in [tes5_import/constants.py](../tes5_import/constants.py) is the
 single source of truth. Currently skipped: ROAD, SCPT, SKIL, BSGN, RACE, MGEF,
-CSTY, IDLE, GMST, REGN, EYES, HAIR.
+CSTY, IDLE, GMST, EYES, HAIR.
 
-Notably **converted** (do not assume otherwise): GLOB, CLAS, CLMT, WATR, PACK.
-PACK is converted in its own phase (3b2, after QUST) rather than via the generic
-dispatch.
-
-**WTHR is NOT converted on `master` as of 2026-07-26.** A `convert_WTHR` dispatch
-entry exists in `constants.py`, but the work that actually enables weather
-conversion lives on **another branch and is not merged** — don't read the
-dispatch entry as proof the feature is live, and don't "fix" docs that describe
-weather as unconverted (e.g. the WTHR row in
-[skse_conversion_audit.md](skse_conversion_audit.md)). CLMT stays converted
-regardless: weather is only reachable via WRLD → CNAM → CLMT → WLST, so CLMT is
-the chain that the branch's WTHR records will hang from.
+Notably **converted** (do not assume otherwise): GLOB, CLAS, CLMT, WATR, PACK,
+WTHR, REGN. PACK is converted in its own phase (3b2, after QUST) rather than
+via the generic dispatch, and so is WTHR (Phase 2b — it mints four IMGS
+companions per weather for HDR tone mapping, see
+[weather_climate_conversion.md](weather_climate_conversion.md)). REGN is
+converted for its **weather** entries only (RDWT lists + RPLI/RPLD areas);
+its object/grass/sound/map generators stay dropped — that is where all of
+Cyrodiil's weather variety lives, since TamrielClimate's own WLST is a single
+Clear weather at 100%.
 GMST is skipped wholesale *except* the four ambient-dialogue pacing settings in
 `AMBIENT_GMST_OVERRIDES`, which exist in both engines with identical meaning.
 

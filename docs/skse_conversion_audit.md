@@ -83,7 +83,7 @@ These appear heavily in the original scripts but are **vanilla Oblivion commands
 | **Path-based music** (`StreamMusic` 38 + Nehrim's `emc*` plugin) | ~170 | **~143** | Skyrim music is `MusicType`-form-based; no engine (vanilla or SKSE) plays a track by file path. Needs authored `MUSC` records + a path→MusicType map. |
 | **Flame toggles** (`HasFlames` 58, `AddFlames` 46, `RemoveFlames` 31) | ~135 | 8 | Skyrim lights carry no scriptable flame state. No vanilla or SKSE native. |
 | **AI inspection** (`GetCurrentAIProcedure` 18, `GetCurrentAIPackage` 9, `GetIsCurrentPackage`) | ~30 | ~30 | SKSE registers **zero** package natives. `Actor.GetCurrentPackage` is vanilla but shallow. |
-| **Weather** (`ForceWeather` 16, `SetWeather` 8) | ~24 | ~21 | Blocked because `WTHR` is in `SKIP_TYPES` (dangling FormID crashes the sky system) — an *engine/skip* problem, not an API one. Vanilla `SetWeather` Papyrus exists; convert WTHR to unlock. SKSE irrelevant. |
+| **Weather** (`ForceWeather` 16, `SetWeather` 8) | ~24 | 0 | **CONVERTED (2026-08-09)**: the full WTHR/CLMT/REGN chain is live, so these now emit `Weather.ForceActive(True)` / `SetActive(True, False)` / `Weather.ReleaseOverride()` against the converted records (see [weather_climate_conversion.md](weather_climate_conversion.md)). |
 | `GetPlayerHasLastRiddenHorse` | 12 | 12 | Engine tracks no last-ridden horse. (SKSE has only a *setter*.) |
 | `ModDisposition` / `GetDisposition` | ~18 | ~15 | Disposition removed from Skyrim's engine. No native anywhere. |
 | `PositionCell`, `ForceFlee`, `SetForceSneak`, `SetActorsAI` | ~65 | ~15 | No vanilla or SKSE natives; approximations only. |

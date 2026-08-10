@@ -4,7 +4,6 @@ import math
 import struct
 
 from ..constants import (
-    CONVERT_CLIMATE,
     MAP_MARKER_TYPE_MAP,
     MATT_MAP,
     SKYRIM_MAP_MARKER_LCRT,
@@ -13,7 +12,7 @@ from ..constants import (
 from ..locations import WORLD_NAMES
 from ..skyrim_overrides import TES4_MARKER_FORMID_TO_SKYRIM
 from .items import get_base_origin_shift
-from ..text_reader import remap_formid
+from ..text_reader import get_hex_bytes, remap_formid
 from .common import (
     _prefix_path,
     get_float,
@@ -291,6 +290,26 @@ def convert_CELL(rec: dict) -> bytes:
     if xclw_payload is not None:
         subs += pack_subrecord('XCLW', xclw_payload)
 
+    # XCLR — the cell's region list.  THIS is how region weather reaches the
+    # sky: the engine activates a region's RDWT list only in cells whose XCLR
+    # names that region (Skyrim.esm: WeatherWinterhold sits in 30 cells' XCLR)
+    # — the RPLD polygons alone do nothing at runtime.  Without XCLR every
+    # converted exterior fell back to the climate's own WLST, and Tamriel's
+    # is a single Clear weather at 100%, so the sky never changed.  Filtered
+    # to regions that actually emitted (weather regions); TES4 lists many
+    # object/grass/sound regions here that convert_REGN drops.  Sorted:
+    # xEdit declares XCLR wbArrayS.
+    region_fids = []
+    i = 0
+    while f'Region[{i}]' in rec:
+        rfid = get_formid(rec, f'Region[{i}]')
+        if rfid in _EMITTED_REGION_FIDS:
+            region_fids.append(rfid)
+        i += 1
+    if region_fids:
+        subs += pack_subrecord(
+            'XCLR', struct.pack(f'<{len(region_fids)}I', *sorted(region_fids)))
+
     # XLCN — Location.  This does double duty in Skyrim: entering a cell that
     # belongs to a location discovers it (revealing its map marker), and it is
     # also where the engine reads the cell's *name* from.  Not one vanilla
@@ -335,26 +354,19 @@ def convert_WRLD(rec: dict) -> bytes:
     if wnam:
         subs += pack_formid_subrecord('WNAM', wnam)
 
-    # CNAM — Climate.  Gated on CONVERT_CLIMATE (tes5_import/constants.py):
-    # with climate conversion off, CLMT is in SKIP_TYPES, so a CNAM here would
-    # be a DANGLING reference — omit it and let the worldspace fall back to
-    # Skyrim's own default climate.  SNAM is omitted either way; it references a
-    # TES4 record we skip.
-    #
-    # With the flag on, the reference is live and matters: 57 of 84 TES4
-    # worldspaces author no CNAM at all — including Tamriel itself, every
-    # Imperial City district and every walled city.  Oblivion resolves those at
-    # RUNTIME rather than at load: verified in Oblivion.exe (GOG/Steam
-    # 1.2.0.416), the sky setup at 0x667688 calls the worldspace's get-climate
-    # (0x4CAF90) and, when it returns null, falls through to 0x543200, which
-    # does LookupForm(0x15F) — the engine-created 'DefaultClimate' form
-    # (bootstrap at 0x44CCE9 pushes 0x15F and names it from the string at
-    # 0xA37CA0).  Skyrim has no such fallback, so TES4's DefaultClimate is
-    # written explicitly and the worldspace keeps Cyrodiil's sun, moons and
-    # weather list.
-    if CONVERT_CLIMATE:
-        cnam = get_formid(rec, 'CNAM.Climate') or remap_formid(_TES4_DEFAULT_CLIMATE)
-        subs += pack_formid_subrecord('CNAM', cnam)
+    # CNAM — Climate.  57 of 84 TES4 worldspaces author no CNAM at all —
+    # including Tamriel itself, every Imperial City district and every walled
+    # city.  Oblivion resolves those at RUNTIME rather than at load: verified
+    # in Oblivion.exe (GOG/Steam 1.2.0.416), the sky setup at 0x667688 calls
+    # the worldspace's get-climate (0x4CAF90) and, when it returns null, falls
+    # through to 0x543200, which does LookupForm(0x15F) — the engine-created
+    # 'DefaultClimate' form (bootstrap at 0x44CCE9 pushes 0x15F and names it
+    # from the string at 0xA37CA0).  Skyrim has no such fallback, so TES4's
+    # DefaultClimate is written explicitly and the worldspace keeps Cyrodiil's
+    # sun, moons and weather list.  SNAM is omitted; it references a TES4
+    # record we skip.
+    cnam = get_formid(rec, 'CNAM.Climate') or remap_formid(_TES4_DEFAULT_CLIMATE)
+    subs += pack_formid_subrecord('CNAM', cnam)
 
     # Water: TES4 WATR records are in skipTypes (we use Skyrim's water), so
     # point NAM2 (water type) and NAM3 (LOD water type) at Skyrim.esm's
@@ -799,33 +811,98 @@ def build_land_layers(rec: dict) -> bytes:
     return subs
 
 
-def convert_REGN(rec: dict) -> bytes:
-    """REGN — Region. TES5 order: EDID RCLR WNAM RPLI/RPLD RDAT/ICON/RDMP/etc."""
+# TES4 REGN data-entry type enum, shared verbatim by TES5 (xEdit
+# wbDefinitionsTES4/TES5): 2 Objects, 3 Weather, 4 Map, 5 Land, 6 Grass,
+# 7 Sound.
+_REGN_DATA_WEATHER = 3
+
+# Remapped FormIDs of the regions convert_REGN actually emitted.  The engine
+# activates a region's weather through the CELL's XCLR region list (verified
+# against Skyrim.esm: WeatherWinterhold appears in 30 cells' XCLR,
+# WeatherCoastFog in 51), so convert_CELL writes XCLR filtered against this
+# set — a cell must never reference a region that was dropped.  Regions are
+# converted in import phase 1, before any CELL is built.
+_EMITTED_REGION_FIDS = set()
+
+
+def reset_emitted_regions():
+    """Called at import start so a multi-plugin run doesn't leak regions."""
+    _EMITTED_REGION_FIDS.clear()
+
+
+def convert_REGN(rec: dict):
+    """REGN — Region, converted for its WEATHER entries only.
+    Returns packed bytes, or None to emit nothing.
+
+    This is where Cyrodiil's weather actually lives: TamrielClimate's WLST is
+    a single Clear weather at 100%, and the variety (rain in the Blackwood,
+    snow around Bruma...) comes from 59 region RDWT weather lists layered over
+    it.  Skyrim uses the identical mechanism for its own coasts and holds
+    (WeatherCoastFog, WeatherWinterhold...), so the data passes through:
+    RDAT header byte-identical, RDWT entries widened 8 -> 12 bytes by the
+    trailing Global FormID, RPLI/RPLD area polygons byte-identical.
+
+    The other data types (objects, grass, sound, map) drive TES4-side
+    generators with no behavioural equivalent here and are dropped.  A region
+    with no weather list — or no area polygon to apply it in — emits nothing.
+
+    TES5 subrecord order (wbDefinitionsTES5): EDID, RCLR, WNAM,
+    [RPLI, RPLD]*, [RDAT, RDWT]*.
+    """
+    n_entries = get_int(rec, 'RegionDataCount')
+    weather_entries = []
+    for i in range(n_entries):
+        if get_int(rec, f'RegionData[{i}].Type') != _REGN_DATA_WEATHER:
+            continue
+        wlist = b''
+        for j in range(get_int(rec, f'RegionData[{i}].WeatherCount')):
+            wfid = get_formid(rec, f'RegionData[{i}].Weather[{j}].FormID')
+            if not wfid:
+                continue
+            chance = get_int(rec, f'RegionData[{i}].Weather[{j}].Chance')
+            wlist += struct.pack('<III', wfid, chance, 0)
+        if wlist:
+            weather_entries.append((get_int(rec, f'RegionData[{i}].Override'),
+                                    get_int(rec, f'RegionData[{i}].Priority'),
+                                    wlist))
+
+    # Area polygons: the engine applies region data only inside these.
+    areas = b''
+    for i in range(get_int(rec, 'AreaCount')):
+        points = get_hex_bytes(rec, f'Area[{i}].PointsHex')
+        if not points:
+            continue
+        areas += pack_subrecord(
+            'RPLI', struct.pack('<I', get_int(rec, f'Area[{i}].EdgeFalloff')))
+        areas += pack_subrecord('RPLD', points)
+
+    if not weather_entries or not areas:
+        return None
+
     subs = b''
     edid = get_str(rec, 'EditorID')
     if edid:
         subs += pack_string_subrecord('EDID', edid)
 
-    # RCLR — Map color (before WNAM)
-    r = get_int(rec, 'RCLR.R')
-    g = get_int(rec, 'RCLR.G')
-    b = get_int(rec, 'RCLR.B')
-    if r or g or b:
-        subs += pack_subrecord('RCLR', struct.pack('<BBBB', r, g, b, 0))
+    subs += pack_subrecord('RCLR', struct.pack(
+        '<BBBB', get_int(rec, 'RCLR.R'), get_int(rec, 'RCLR.G'),
+        get_int(rec, 'RCLR.B'), 0))
 
-    # WNAM — Worldspace
     wnam = get_formid(rec, 'WNAM.Worldspace')
     if wnam:
         subs += pack_formid_subrecord('WNAM', wnam)
 
-    # Region Data Entries — ICON goes inside RDAT, not at top level
-    icon = get_str(rec, 'ICON')
-    if icon:
-        # Map name region data entry (type 4 = Map)
-        subs += pack_subrecord('RDAT', struct.pack('<IBBxx', 4, 0, 0))
-        subs += pack_string_subrecord('ICON', _prefix_path(icon))
+    subs += areas
 
-    return pack_record('REGN', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
+    for override, priority, wlist in weather_entries:
+        subs += pack_subrecord('RDAT', struct.pack(
+            '<IBBxx', _REGN_DATA_WEATHER, 1 if override else 0,
+            min(255, priority)))
+        subs += pack_subrecord('RDWT', wlist)
+
+    fid = get_formid(rec, 'FormID')
+    _EMITTED_REGION_FIDS.add(fid)
+    return pack_record('REGN', fid, get_int(rec, 'RecordFlags'), subs)
 
 
 def convert_LSCR(rec: dict) -> bytes:

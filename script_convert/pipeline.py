@@ -466,6 +466,9 @@ _MEMBER_STMT_RE = re.compile(r'^(\s*)([A-Za-z_]\w*)\.(\w+)')
 # script-scope keywords, and the event parameters the fragments are handed.
 _IMPLICIT_NAMES = {
     'game', 'debug', 'utility', 'self', 'parent', 'math', 'input',
+    # 'weather' is the CLASS in `Weather.ReleaseOverride()` /
+    # `Weather.GetCurrentWeather()` global calls, not a variable.
+    'weather',
     'akspeakerref', 'akactionref', 'aktarget', 'akcaster', 'akaggressor',
     'akkiller', 'akactor', 'akitem', 'aksource', 'akrefself',
     'tes4polyfill', 'form', 'true', 'false', 'none',

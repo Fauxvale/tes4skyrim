@@ -870,6 +870,50 @@ block after the swap must retarget *all* of them — it already handled
 - TES4 exports `NAM0.MinX=-262144.0` → write exactly -262144.0 to TES5 file (do NOT divide by 4096)
 - If divided: NAM0=-64.0 looks like valid cell coords but is actually 64 times smaller than needed → SSELodGen won't generate world map correctly
 
+### 🔴 LODSettings must COVER the terrain, or the worldspace CTDs on entry (2026-08-10)
+
+Crashes `crash-2026-08-09-23-15-19` through `crash-2026-08-10-00-16-34`, all
+byte-identical: `EXCEPTION_ACCESS_VIOLATION` at `SkyrimSE.exe+050E6AD`,
+`mov rbx, [rax+rcx*8]` with `rax=0`, on a `BSJobs::JobThread`, in
+`Plane of Oblivion`. **Reproducible with `coc OblivionMQKvatchEntrance`** —
+which is what proved it is the worldspace's own load path, not the Oblivion
+gate, the transition, or any script.
+
+The engine builds its terrain-LOD quadtree from `LODSettings/<WRLD>.lod`: root
+at SW, `size` cells across, recursively subdivided into 4 children
+(`0x4d1020` recurses over `[node+0x30]` with exactly 4 children, stride 0x50).
+A `.btr` tile outside that square has **no node**, and the per-frame walk
+indexes the node array with **no bounds check**.
+
+Cause: `write_lod_settings` took its extents from `WRLD.MNAM` alone, and **57
+of 84 TES4 worldspaces author no usable MNAM** — so `sw == ne == 0` arrived,
+and the old `size = 1 << ceil(log2(ne - sw))` plus `eff_sw = -(size // 2)`
+produced a **1×1 grid** (`SWx=0 SWy=1`) for every converted worldspace, while
+LODGen still emitted tiles out to (-32,-32).
+
+Fix, in two parts:
+- Extents are measured from the **CELLS** (always carry XCLC), unioned with
+  MNAM only when MNAM is populated.
+- `size` grows from 4 until the square covers `[sw, ne)`; **SW is the literal
+  terrain corner, NOT snapped or centred**, and `maxLOD` tracks `size`
+  (capped at 32) rather than being hardcoded to 32.
+
+Ground truth — vanilla `.lod` files extracted from `Skyrim - Meshes0.bsa`
+(layout `<hhIII` = SWx i16, SWy i16, size u32, minLOD u32, maxLOD u32):
+
+| worldspace | SW | size | minLOD | maxLOD |
+|---|---|---|---|---|
+| japhetsfollyworld | (-9, -6) | 16 | 4 | **16** |
+| dlc01falmervalley | (-16, -13) | 32 | 4 | 32 |
+| skuldafnworld | (0, -21) | 64 | 4 | 32 |
+
+The new formula reproduces the first two **exactly** from their cell extents,
+which is what confirms it rather than merely being self-consistent. Note SW is
+unaligned in all three — an earlier attempt that snapped SW down to a multiple
+of `size` never converges for a span crossing the origin (the gap grows as
+fast as the size). Guarded by
+`tests/test_asset_convert.py::TestLODSettingsCoversTheTerrain`.
+
 ### Terrain LOD (SSELodGen) — data chain
 - LAND BTXT/ATXT subrecords contain direct LTEX FormIDs (NOT indices into VTEX array)
 - SSELodGen uses: BTXT.Texture(LTEX) → LTEX.TNAM(TXST) → TXST.TX00(path) → Data\Textures\{path}

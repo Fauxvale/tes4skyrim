@@ -3436,3 +3436,70 @@ class TestVoiceFilePrune:
         removed = _prune_stale_voice_files(set(), set())
 
         assert dead.exists() and not removed
+
+
+class TestLODSettingsCoversTheTerrain:
+    """LODSettings/<WRLD>.lod must describe a grid that CONTAINS every tile.
+
+    The engine builds its terrain-LOD quadtree from this header (root at SW,
+    `size` cells across).  A .btr/.bto tile outside that square has no node,
+    and the per-frame walk indexes the node array with no bounds check --
+    SkyrimSE.exe+050E6AD `mov rbx,[rax+rcx*8]` with rax=0: a hard CTD the
+    moment the worldspace streams, reproducible with `coc`.
+
+    Two things had to be true at once, and getting only the first still CTD'd:
+      1. extents must come from the CELLS -- 57 of 84 TES4 worldspaces author
+         no usable WRLD.MNAM, so the old code saw sw==ne==0 and wrote a 1x1
+         grid (`SWx=0 SWy=1`) while tiles ran out to (-32,-32);
+      2. SW must be ALIGNED to the coarsest LOD level -- LODGen snaps each
+         tile's origin down to a multiple of its own level, so tiles begin
+         below the literal terrain corner.  Measured against real output,
+         an unaligned SW left 324 tiles outside their grid.
+    """
+
+    def _read(self, sw_x, sw_y, ne_x, ne_y):
+        from asset_convert.lod_gen import write_lod_settings
+        tmp = Path(tempfile.mkdtemp())
+        write_lod_settings('W', sw_x, sw_y, ne_x, ne_y, tmp)
+        raw = (tmp / 'LODSettings' / 'W.lod').read_bytes()
+        assert len(raw) == 16
+        return struct.unpack('<hhIII', raw)
+
+    def test_grid_covers_a_span_crossing_the_origin(self):
+        """Plane of Oblivion: cells -2..3 x -2..4, which the old code sized 1."""
+        sx, sy, size, _mn, _mx = self._read(-2, -2, 4, 5)
+        assert sx <= -2 and sy <= -2
+        assert sx + size >= 4 and sy + size >= 5
+
+    def test_sw_is_aligned_to_the_max_lod_level(self):
+        """LODGen names a level-N tile at a multiple of N, so SW must be one."""
+        for extents in ((-2, -2, 4, 5), (-9, -6, 7, 10), (11, 11, 18, 18),
+                        (-64, -69, 65, 60)):
+            sx, sy, _size, _mn, max_lod = self._read(*extents)
+            assert sx % max_lod == 0 and sy % max_lod == 0,                 f'SW {(sx, sy)} not aligned to max LOD {max_lod} for {extents}'
+
+    def test_degenerate_extents_still_produce_a_real_grid(self):
+        """An all-zero MNAM must never yield the 1x1 grid that caused the CTD."""
+        _sx, _sy, size, min_lod, max_lod = self._read(0, 0, 0, 0)
+        assert size >= 4, 'a 1x1 LOD grid cannot hold even one LOD4 tile'
+        assert max_lod >= min_lod
+
+    def test_tiles_at_snapped_origins_fall_inside_the_grid(self):
+        """The real invariant, stated the way the output is measured."""
+        sw_x, sw_y, ne_x, ne_y = -2, -2, 4, 5      # Plane of Oblivion
+        sx, sy, size, _mn, max_lod = self._read(sw_x, sw_y, ne_x, ne_y)
+        for level in (4, 8, 16, 32):
+            if level > max_lod:
+                continue
+            # every tile origin LODGen could emit for this terrain
+            tx = (sw_x // level) * level
+            ty = (sw_y // level) * level
+            while tx < ne_x:
+                ty2 = ty
+                while ty2 < ne_y:
+                    assert sx <= tx and sy <= ty2,                         f'tile {level}.{tx}.{ty2} starts before SW {(sx, sy)}'
+                    assert tx + level <= sx + size and ty2 + level <= sy + size,                         f'tile {level}.{tx}.{ty2} ends past the grid'
+                    ty2 += level
+                tx += level
+
+

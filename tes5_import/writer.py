@@ -415,7 +415,10 @@ class PluginWriter:
             'STAT', 'ACTI', 'CONT', 'DOOR',
             'FLOR', 'FURN', 'GRAS', 'TREE', 'LIGH', 'MISC', 'KEYM', 'ARMO',
             'ARMA', 'BOOK', 'AMMO', 'ENCH', 'SPEL', 'ALCH', 'INGR', 'SCRL',
-            'SLGM', 'VTYP', 'OTFT', 'NPC_', 'LVLN', 'LVLI', 'LVSP', 'WTHR',
+            'SLGM', 'VTYP', 'OTFT', 'NPC_', 'LVLN', 'LVLI', 'LVSP',
+            # IMGS before WTHR: a weather's IMSP points at the imagespaces
+            # carrying its HDR tone mapping, and CLMT/REGN then point at WTHR.
+            'IMGS', 'WTHR',
             'CLMT', 'REGN', 'IDLE', 'PACK', 'EFSH', 'LSCR', 'ANIO',
             'WEAP', 'NAVI',
             # References resolved by quests must exist before QUST loads:

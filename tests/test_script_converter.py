@@ -2793,3 +2793,104 @@ class TestGetInCellSplitsInteriorFromExterior:
         # while emitting them would leave an undefined identifier.
         assert 'WorldSpace Property Tamriel' in out
         assert 'TES4_gx == 17' in helpers and 'TES4_gy == -12' in helpers
+
+
+class TestWeatherFunctions:
+    """Scripted weather drives the REAL converted records now.
+
+    The old stubs (';NE: ... weather not converted') existed because the CLMT
+    chain was gated off; with WTHR/CLMT/REGN converted, the Oblivion-gate
+    storm scripts must force the converted OblivionStormTamriel.  Signatures
+    verified against references/skse64-master/scripts/vanilla/Weather.psc.
+    """
+
+    def _convert(self, body):
+        conv = ScriptConverter(CrossRefGraph())
+        src = f"scn T\nbegin GameMode\n{body}\nend\n"
+        return conv.convert_standalone('T', src, 'Quest', 'T')
+
+    def test_forceweather_is_instant_but_never_engine_locked(self):
+        """abOverride must be False: Oblivion holds scripted weather by
+        re-applying it every GameMode pass, not by an engine lock.  Mapping
+        to True let a fast-travel away from an Oblivion gate strand
+        OblivionStormTamriel over the whole world forever — the release call
+        lives in the same unloaded script's update loop."""
+        out = self._convert('  forceweather OblivionStormTamriel 1')
+        assert 'OblivionStormTamriel.ForceActive(False)' in out
+        assert 'Weather Property OblivionStormTamriel Auto' in out
+        assert ';NE:' not in out
+
+    def test_setweather_transitions_naturally_without_lock(self):
+        out = self._convert('  setweather OblivionStormTamriel 1')
+        assert 'OblivionStormTamriel.SetActive(False, False)' in out
+
+    def test_release_weather_override(self):
+        out = self._convert('  ReleaseWeatherOverride')
+        assert 'Weather.ReleaseOverride()' in out
+
+    def test_get_is_current_weather_compares_converted_record(self):
+        out = self._convert('  if getiscurrentweather OblivionStormTamriel == 0\n'
+                            '    set x to 1\n  endif')
+        assert 'Weather.GetCurrentWeather() == OblivionStormTamriel' in out
+        assert 'Weather Property OblivionStormTamriel Auto' in out
+
+
+class TestObjRefSharedFunctionsNeverCastToActor:
+    """A bare TES4 call to a function that exists on ObjectReference must NOT
+    become `(Self as Actor).F()`.
+
+    `(Self as Actor)` on a non-actor reference is **None** at runtime, so the
+    call aborts — and Papyrus substitutes 0 for the aborted result rather than
+    stopping the script.  That silently INVERTS distance guards: MS48Oblivion-
+    GateScript (an ACTI) has TES4 `if getdistance player < 1000`, which became
+    `If (Self as Actor).GetDistance(Player) < 1000` -> `0 < 1000` -> always
+    true, so the Oblivion gate called `OblivionStormTamriel.ForceActive()`
+    every 0.1s while the player transitioned worldspaces
+    (crash-2026-08-09-23-34-53, "Cannot call getDistance() on a None object"
+    x34 in Papyrus.0.log immediately before the CTD).
+
+    `_ACTOR_ONLY_FUNCTIONS` and `_OBJREF_SHARED_FUNCTIONS` deliberately
+    overlap; every site that consults the first must subtract the second.
+    """
+
+    def _convert(self, body, extends='ObjectReference'):
+        conv = ScriptConverter(CrossRefGraph())
+        src = f"scn T\nbegin GameMode\n{body}\nend\n"
+        return conv.convert_standalone('T', src, extends, 'T')
+
+    def test_bare_getdistance_is_not_cast_to_actor(self):
+        out = self._convert('  if getdistance player < 1000\n'
+                            '    set x to 1\n  endif')
+        assert '(Self as Actor).GetDistance' not in out, \
+            'cast yields None at runtime -> aborted call -> 0 -> guard inverts'
+        assert 'GetDistance(' in out
+
+    def test_every_objref_shared_function_stays_uncast(self):
+        """The invariant across the whole overlap, not just getdistance."""
+        from script_convert.constants import (
+            _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS)
+        overlap = sorted(_ACTOR_ONLY_FUNCTIONS & _OBJREF_SHARED_FUNCTIONS)
+        assert overlap, 'fixture expects the two sets to overlap'
+        for fn in overlap:
+            out = self._convert(f'  {fn}')
+            assert f'(Self as Actor).{fn}' not in out.lower(), \
+                f'{fn} is valid on ObjectReference and must not be cast'
+
+    def test_shared_function_on_topicinfo_gets_a_receiver_not_a_bare_call(self):
+        """Removing the bogus `as Actor` must not leave the call receiverless.
+
+        TopicInfo/ActiveMagicEffect have no implicit reference, so a bare
+        `AddItem(...)` is `undefined function` at compile time — and an
+        uncompilable script takes every script naming its type down with it.
+        Route the receiver instead; just don't cast it to Actor.
+        """
+        conv = ScriptConverter(CrossRefGraph())
+        src = "scn T\nbegin GameMode\n  additem gold001 5\nend\n"
+        out = conv.convert_standalone('T', src, 'TopicInfo', 'T')
+        add = [l.strip() for l in out.splitlines() if 'AddItem' in l]
+        assert add, 'AddItem was dropped entirely'
+        for line in add:
+            assert not line.startswith('AddItem('), \
+                f'bare receiverless call will not compile: {line}'
+            assert '(Self as Actor).AddItem' not in line, \
+                'must not reintroduce the None-yielding cast'

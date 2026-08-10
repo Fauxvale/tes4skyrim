@@ -65,15 +65,48 @@ def write_lod_settings(worldspace_edid: str, sw_x: int, sw_y: int,
     lod_dir.mkdir(parents=True, exist_ok=True)
     out = lod_dir / f"{worldspace_edid}.lod"
 
-    # Round SW down and NE up to the nearest power of 2 boundary
-    raw_w = ne_x - sw_x
-    raw_h = ne_y - sw_y
-    size = 1 << math.ceil(math.log2(max(raw_w, raw_h, 1)))
-    # Centre the grid: expand SW symmetrically
-    eff_sw_x = -(size // 2)
-    eff_sw_y = -(size // 2)
+    # The grid must COVER the terrain.  The engine builds its terrain-LOD
+    # quadtree from this header (root at SW, `size` cells across, subdivided to
+    # `min_lod`); a tile outside that square has no node, and the per-frame
+    # walk indexes the node array without a bounds check —
+    # SkyrimSE.exe+050E6AD `mov rbx,[rax+rcx*8]` with rax=0, a hard CTD the
+    # moment the worldspace streams.
+    #
+    # 57 of 84 TES4 worldspaces author no usable MNAM map dimensions, so
+    # sw==ne==0 arrives here and the old maths produced size=1 — a 1x1 grid —
+    # while LODGen still emitted .btr tiles out to (-32,-32).  Every converted
+    # worldspace got `SWx=0 SWy=1`; Kvatch crashed on entry.  Callers now pass
+    # the extents measured from the CELLS, which always exist.
+    #
+    # Vanilla (extracted from Skyrim - Meshes0.bsa) confirms both the layout
+    # and that SW is REAL, not centred: japhetsfollyworld (-9,-6) size 16
+    # maxLOD 16; dlc01falmervalley (-16,-13) size 32; skuldafnworld (0,-21)
+    # size 64.  maxLOD tracks size — it is not always 32.
+    # The root must contain every TILE, and LODGen snaps each tile's origin
+    # DOWN to a multiple of its own level (a level-16 tile covering cell -9
+    # is named ...16.-16.y), so tiles start below the literal terrain corner.
+    # Anchor SW at a multiple of max_lod and size the square from there.
+    #
+    # max_lod is the coarsest level emitted, capped at 32; it is chosen first
+    # because it sets the anchor granularity.  Grow both together until the
+    # aligned square covers [sw, ne) — growing is always safe, and the pair is
+    # recomputed each round so the anchor tracks the level.
+    max_lod = 4
+    while True:
+        anchor = min(max_lod, 32)
+        eff_sw_x = (sw_x // anchor) * anchor
+        eff_sw_y = (sw_y // anchor) * anchor
+        size = anchor
+        while (eff_sw_x + size < ne_x or eff_sw_y + size < ne_y) and size < 4096:
+            size <<= 1
+        # The square is anchored and covers the terrain; accept unless a
+        # coarser level would still be emitted inside it (max_lod < size).
+        if max_lod >= min(size, 32) or max_lod >= 32:
+            break
+        max_lod <<= 1
+    max_lod = min(max_lod, 32)
 
-    out.write_bytes(struct.pack("<hhIII", eff_sw_x, eff_sw_y, size, 4, 32))
+    out.write_bytes(struct.pack("<hhIII", eff_sw_x, eff_sw_y, size, 4, max_lod))
     print(f"  Wrote {out}")
     return out, eff_sw_x, eff_sw_y
 
@@ -1015,11 +1048,38 @@ def generate_lod(esm_path: Path, output_dir: Path,
         return False
 
     edid = wrld_info['edid']
+
+    # Measure the extents from the CELLS this worldspace actually contains.
+    # WRLD.MNAM is the wrong source on its own: 57 of 84 TES4 worldspaces leave
+    # it zeroed, which collapsed the LOD grid to 1x1 and CTD'd on entry (see
+    # write_lod_settings).  Cells always carry XCLC, so this is the reliable
+    # measure; MNAM is only consulted when it is populated AND wider, so a
+    # worldspace whose authored map area exceeds its cells keeps that area.
+    grid_xs, grid_ys = [], []
+    for c in cells.values():
+        if c.get('parent_wrld') != wrld_fid:
+            continue
+        if c.get('grid_x') is None:
+            continue
+        grid_xs.append(c['grid_x'])
+        grid_ys.append(c['grid_y'])
+    if grid_xs:
+        # +1: NE is exclusive, a cell at x occupies [x, x+1).
+        sw_x, sw_y = min(grid_xs), min(grid_ys)
+        ne_x, ne_y = max(grid_xs) + 1, max(grid_ys) + 1
+        if wrld_info['ne_x'] > wrld_info['sw_x']:   # MNAM authored — union it
+            sw_x = min(sw_x, wrld_info['sw_x'])
+            sw_y = min(sw_y, wrld_info['sw_y'])
+            ne_x = max(ne_x, wrld_info['ne_x'])
+            ne_y = max(ne_y, wrld_info['ne_y'])
+        print(f"  LOD extents from {len(grid_xs)} cells: "
+              f"SW=({sw_x},{sw_y}) NE=({ne_x},{ne_y})")
+    else:
+        sw_x, sw_y = wrld_info['sw_x'], wrld_info['sw_y']
+        ne_x, ne_y = wrld_info['ne_x'], wrld_info['ne_y']
+
     _, eff_sw_x, eff_sw_y = write_lod_settings(
-        edid,
-        wrld_info['sw_x'], wrld_info['sw_y'],
-        wrld_info['ne_x'], wrld_info['ne_y'],
-        output_dir,
+        edid, sw_x, sw_y, ne_x, ne_y, output_dir,
     )
 
     # Ensure Objects output dir exists

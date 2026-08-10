@@ -914,6 +914,48 @@ VTEX[i]=FormID
 - VTXT export field is `VT[k].Op` but import uses `VT[k].Opacity` — use Opacity in import
 - Exterior cell block grouping: block = `floor(grid / 32)`, sub-block = `floor(grid / 8)`. Use Python `//` (floor division), NOT bitwise `>>` — the `>>` formula is wrong for exact negative multiples (e.g. -32 gives -2 instead of -1).
 - Persistent worldspace cell classification: use `RecordFlags & 0x400`, NOT `XCLC.X == ''`. Persistent cells often have XCLC=(0,0) so the empty-string check mis-classifies them as exterior cells, putting them in the wrong block/sub-block structure and breaking all exterior cell loading.
+- …but a NON-persistent cell with no XCLC is **not** a persistent cell: it is a real exterior cell at grid (0,0) whose coords Oblivion omitted. Stamp `XCLC=(0,0)` and leave it in the block tree — moving it out punches a null grid hole. See below.
+
+### 🔴 A worldspace CELL with no XCLC is a real (0,0) cell — STAMP IT (2026-08-10)
+
+Crash `crash-2026-08-09-23-15-19` / `-23-34-53` / `crash-2026-08-10-00-00-48`,
+all byte-identical: `EXCEPTION_ACCESS_VIOLATION` at `SkyrimSE.exe+050E6AD`,
+`mov rbx, [rax+rcx*8]` with `rax=0`, on a `BSJobs::JobThread`, streaming
+`OblivionMQKvatchEntrance` in `Plane of Oblivion`.
+
+**Oblivion omits XCLC when a cell sits at grid (0,0)** — an absent subrecord
+already reads as 0, so the CS never wrote one. Skyrim does not tolerate the
+omission: it builds its grid-cell array by walking the type-4/5 block tree and
+reading each cell's XCLC, so a cell without one never occupies its slot. The
+slot stays null while all four neighbours are live, and the streaming tick
+indexes it **without a bounds check** — an allocated grid array is an assumed
+invariant.
+
+30 cells are affected: `OblivionMQKvatchBridge` (60 refs), `MQ14OblivionGate`
+(34), `CheydinhalOblivion` (19), `DABoethiaStatue` (21), every IC district,
+MQ16, DreamWorld. **100% of every one of their refs floors to grid (0,0)**
+(`floor(pos / 4096)`), so stamping `XCLC=(0,0)` is faithful, not a patch.
+
+Fix: `_ensure_cell_grid()` in `import_main.py` stamps the default on any
+non-persistent exterior cell lacking XCLC, before both `convert_CELL` and the
+block/sub-block bucketing — and `_gather_navm_jobs` calls it too, or the two
+passes disagree about which block a cell belongs to.
+
+**A dead end worth recording: REMOVING these cells from the block tree makes it
+worse.** That was the first attempt here — it looked right (vanilla is 0 of
+16,942 blocked cells without XCLC) but it *punched* the hole instead of filling
+it. The diagnostic that settles it is counting **enclosed grid holes** (a
+missing (x,y) whose four neighbours all exist):
+
+| | enclosed holes |
+|---|---|
+| vanilla Skyrim.esm | 2, at arbitrary coords (WindhelmWorld, KatariahWorld) |
+| ours, after removing the cells | 22, **every one at exactly (0,0)** |
+| ours, after stamping XCLC | 0 |
+
+Holes are legal in general; a hole at (0,0) is the signature of this bug.
+Guarded by `tests/test_import.py::TestGridlessWorldspaceCellPlacement` and
+checkable with `tools/cell_grid_check.py --holes`.
 
 ### 🔴 The texture PRUNE must speak the importer's paths (2026-08-09)
 

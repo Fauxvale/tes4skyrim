@@ -448,6 +448,7 @@ relevant doc when working in that area.
 | [ambient_dialogue_channel_plan.md](docs/ambient_dialogue_channel_plan.md) | Oblivion's 3 delivery channels vs Skyrim's 2; constant quipping, NPC-to-NPC topics in the player menu; **the NPC-to-NPC conversation scheduler Skyrim lacks** and the driver quest that replays quest-advancing chains |
 | [QUEST_AUDIT.md](docs/QUEST_AUDIT.md) | Quest completability audit via the walkthrough emulator (2026-07-17, all 390 QUSTs) |
 | [creature_conversion.md](docs/creature_conversion.md) | CREA→actor: behavior graphs, HKX skeleton/animation/ragdoll, creature records |
+| [creature_race_equivalence.md](docs/creature_race_equivalence.md) | Oblivion creature ↔ vanilla Skyrim race map (exact/near tiers) for a possible "use the vanilla creature" option; which creatures have NO equivalent |
 | [horse_rideability_plan.md](docs/horse_rideability_plan.md) | Rideable horses: RACE Mount Data, horse/rider graph pair, rider-animation sourcing |
 
 ### Scripts
