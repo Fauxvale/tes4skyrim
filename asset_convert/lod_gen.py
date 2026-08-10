@@ -26,6 +26,9 @@ SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 from subprocess_flags import POPEN_FLAGS  # noqa: E402
 
+# LODGen 3.0.36.0. This replaced the 2.2.0.0 build of the same name, which
+# let an unparseable model throw out of a worker thread and take the whole
+# process down, losing every tile after it. See run_lodgen().
 LODGEN_EXE = (
     SCRIPT_DIR / "external" / "lodgen" / "LODGenx64.exe"
 )
@@ -818,15 +821,40 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
     return out_txt
 
 
+_LODGEN_ERR_RE = _re.compile(r'Error processing (\S+)')
+
+
 def run_lodgen(lodgen_input: Path, output_dir: Path) -> bool:
-    """Invoke LODGenx64.exe on the prepared input file."""
+    """Invoke LODGen to bake the worldspace's object-LOD .bto tiles.
+
+    `LODGenx64.exe` is 3.0.36.0. It replaced the 2.2.0.0 build because 2.2
+    handles no exceptions: a model it cannot parse throws on a ThreadPool
+    worker and kills the whole process, so every tile not yet written is
+    silently lost. Measured on Nehrim: 28 of 418 tiles baked, twice in a
+    row, because of ONE model
+    (`LeyawiinHouseLower01`, 5 references in the entire game). 3.x catches the
+    same `ArgumentOutOfRangeException` per object, prints
+    `Error processing <EditorID>`, and carries on with the rest — so one bad
+    model costs only its own LOD copy (it pops in at load distance) instead of
+    the entire worldspace.
+
+    The fault is inside LODGen, not the mesh: repairing that model's tangent
+    flag and recomputing its missing normals each made 2.2 crash EARLIER.
+
+    Verified equivalent, not merely tolerable: on the same input 3.x emits the
+    same tile set with the same block structure as 2.2 (39 BSSegmentedTriShape
+    / BSMultiBoundNode per tile, NIF 20.2.0.7), differing only in slightly
+    tighter mesh reduction.
+
+    Note 3.x's exit code is NOT a success signal — it returns 0 on a clean run
+    but a nonzero value when any object failed, even though the bake completed
+    and every tile was written. Success is therefore judged by tiles produced.
+    """
     if not LODGEN_EXE.exists():
-        print(f"  ERROR: LODGenx64.exe not found at {LODGEN_EXE}")
+        print(f"  ERROR: LODGen not found at {LODGEN_EXE}")
         return False
 
-    # Ensure output terrain/Objects dir exists (LODGen may not create it)
     # PathOutput is embedded in the input file; LODGen reads it from there.
-
     cmd = [
         str(LODGEN_EXE),
         str(lodgen_input),
@@ -844,10 +872,39 @@ def run_lodgen(lodgen_input: Path, output_dir: Path) -> bool:
         print(result.stdout, end="")
     if result.stderr:
         print(result.stderr, end="")
-    if result.returncode != 0:
-        print(f"  WARNING: LODGenx64.exe exited with code {result.returncode}")
+
+    # Objects LODGen could not parse. It skipped them and kept going; report
+    # them so a model that loses its distant LOD is visible in the log rather
+    # than silently absent in-game.
+    skipped = sorted(set(_LODGEN_ERR_RE.findall(
+        (result.stdout or "") + (result.stderr or ""))))
+    if skipped:
+        print(f"  WARNING: LODGen could not process {len(skipped)} model(s); "
+              f"they have no distant LOD and will pop in at load distance: "
+              f"{', '.join(skipped)}")
+
+    # Tiles on disk are the only trustworthy success signal (see docstring).
+    tiles = _lodgen_output_dir(lodgen_input)
+    baked = len(list(tiles.glob('*.bto'))) if tiles else 0
+    if not baked:
+        print(f"  WARNING: LODGen produced no .bto tiles "
+              f"(exit code {result.returncode})")
         return False
     return True
+
+
+def _lodgen_output_dir(lodgen_input: Path):
+    """The PathOutput directory declared in a LODGen input file."""
+    try:
+        for line in lodgen_input.read_text(encoding='utf-8',
+                                           errors='replace').splitlines():
+            if line.startswith('PathOutput='):
+                return Path(line.split('=', 1)[1].strip())
+            if '\t' in line:  # reference rows follow the header
+                break
+    except OSError:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
