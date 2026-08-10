@@ -185,6 +185,40 @@ agree on the idiom: `ctrapswingmacelong01`'s mace-end link is layer 14 with its
 chain on 10, and vanilla `trapmace01` is identical (Mace01 = 14, Link01-11 =
 10). Flattening 14 → 10 "for consistency" would silently disarm every trap.
 
+### The Rest state is CORRECT — the animobject crash is elsewhere (2026-08-10)
+
+Recorded so the next session does not re-tread this. `pSequence=''` on
+`GamebryoSequenceGeneratorRest` is **right** and must not be changed: nothing
+should play on cell load, for doors, rubble AND plants alike (the Spiddal
+plant animates when the player approaches, driven by its script, not by the
+graph starting in Forward).
+
+Two "fixes" were tried and both were wrong:
+
+| change | crash | door |
+|---|---|---|
+| `pSequence=sequences[0]`, `fPercent=0` | stopped | **opened on cell load** |
+| non-empty sentinel naming no sequence | **still crashed** (in Generator00) | ok |
+
+The decisive evidence: the FIRST crash of this family
+(crash-2026-08-10-00-42-35) was already on **`GamebryoSequenceGenerator00`** —
+the generator that plays `Forward` — not on the Rest generator. So the empty
+Rest name was never the cause, and every Rest-state change merely moved the
+symptom.
+
+Also ruled out by census (700 vanilla meshes, 149 sequences): a **dataless
+interpolator is legal**. Vanilla ships 72 dataless `NiFloatInterpolator`, 248
+`NiBoolInterpolator`, 259 `NiBoolTimelineInterpolator` and even 4 dataless
+`NiTransformInterpolator` (fxbatgroup, fxpoisongaswithonoff,
+sprigganfxtestunified). Both crashing meshes carry dataless blocks, but so does
+working vanilla content — it is not the discriminator.
+
+RESOLVED (same day): the crash was **empty text key values** in the activated
+sequence — see "🔴 A graph-bound mesh must ship NO empty text keys" below.
+The secret door's `Forward` plays fine because its keys are only
+`start`/`end`, both non-empty; the plants shipped Oblivion-authored empty
+keys.
+
 ### Every state needs a real transitions array — including at ONE sequence (2026-08-01)
 
 `_transitions(exclude_state=i)` gives each motion state "every OTHER sequence",
@@ -869,6 +903,101 @@ block after the swap must retarget *all* of them — it already handled
 - xEdit **displays** them scaled by `1/4096` (cell units) but the raw file value is NOT divided
 - TES4 exports `NAM0.MinX=-262144.0` → write exactly -262144.0 to TES5 file (do NOT divide by 4096)
 - If divided: NAM0=-64.0 looks like valid cell coords but is actually 64 times smaller than needed → SSELodGen won't generate world map correctly
+
+### 🔴 MTTC targets and sequence blocks must be dropped TOGETHER (2026-08-10)
+
+Crashes `crash-2026-08-10-00-42-35` / `-00-51-26` / `-00-53-49`:
+`EXCEPTION_ACCESS_VIOLATION` at `VCRUNTIME140.dll+0019BCF`,
+`movdqu xmm2, [rax]` with `rax=0`. This one names its own cause in the object
+list: `NiControllerSequence`, `BGSGamebryoSequenceGenerator`, behavior graph
+`spiddalcloudplant`, `BSFadeNode "spiddalplant"
+("tes4\Oblivion\Plants\SpiddalCloudPlant.NIF")`. It fires **when the plant
+animates** (walking up to a Spiddal Stick as it spews its cloud), not on cell
+load.
+
+`NiMultiTargetTransformController.extra_targets` is a **POSITIONAL** list: the
+engine pairs slot N with the `NiControllerSequence` controlled-block that
+drives it. Break the pairing either way and the slot resolves to a null
+interpolator, which the sequence generator dereferences.
+
+**Both directions were shipped and both crashed identically** — worth
+recording, because each looked correct in isolation:
+
+1. The original code dropped any controlled block whose node name equalled the
+   **root node's** name, leaving `num_extra_targets` unchanged. Oblivion
+   routinely names the root and its animated node the same thing
+   (`spiddalcloudplant.nif`'s root IS `spiddalplant`, also extra-target #1),
+   so the target lost its driver. Source 10 blocks / 3 targets → ours 9 / 3.
+2. "Keep the root-named block so the target matches" — this restored 10/3 and
+   **still crashed**, because a root-targeting entry is itself illegal.
+
+Census of 141 sequences across 43 animated vanilla meshes, and **both numbers
+are zero**:
+
+| invariant | vanilla |
+|---|---|
+| controlled blocks targeting their own root | **0** |
+| MTTC extra targets with no controlled block | **0** |
+
+Vanilla satisfies both by never listing the root as a target at all. So the
+correct fix is to drop the block **and** remove that node from every MTTC
+target list, decrementing `num_extra_targets` with it (`_drop_mttc_target`).
+Result on the crashing mesh: 9 blocks / **2** targets, root absent, every
+target driven.
+
+Blast radius: **413 meshes**, including `obcloud01.nif` and
+`oblivionsmokeemitter01.nif` — the two REFRs that appeared in the earlier
+`SkyrimSE+050E6AD` logs, where a separate LOD fault happened to crash first.
+Audit with `tools/mttc_target_check.py`; guarded by
+`tests/test_asset_convert.py::TestMTTCTargetsStayInSyncWithControlledBlocks`,
+which drives the REAL converter (a hand-built MTTC tests pyffi's reference
+arrays, not the converter).
+
+### 🔴 A graph-bound mesh must ship NO empty text keys (2026-08-10)
+
+Crashes `crash-2026-08-10-01-08-13` / `-01-39-02` / `-01-41-07` — the Spiddal
+Stick and Harrada Root CTDs that survived both the MTTC fix (above) and every
+Rest-state theory.  Same signature as the MTTC family (`movdqu xmm2,[rax]`,
+rax=0, VCRUNTIME140, under `BGSGamebryoSequenceGenerator`) but a different
+null.
+
+**Mechanism, from disassembly** (`tools/address_lib.py --log` → GOG RVA
+`0x505130`, Address Library ID 32774; crash site is the call returning to
+`+0x1B0`): on state activation the generator walks the activated
+`NiControllerSequence`'s `NiTextKeyExtraData` translating keys into behavior
+events.  Each value is first matched WHOLE against the project's registered
+event table (hash map on `BShkbHkxDB::ProjectDBData+0xC8`); on a miss the
+engine calls `strchr(value, '.')` to split an `Event.Payload` key
+(`mov edx, 0x2e` right before the crashing call — and the crash log's
+`R9=0x2E2E` is strchr's broadcast needle).  The strchr runs on the RAW string
+pointer: an **empty NiString loads as a NULL BSFixedString**, and the read of
+address 0 is the CTD.  So the crash fires the moment the object first
+animates — the Spiddal Stick spewing its cloud as the player walks up.
+
+The sources really do ship empty keys — Oblivion authored them freely and its
+engine ignored them: `spiddalcloudplant.nif`'s Forward has `t=0.1 ''`,
+`harradauprightattack.nif` has SEVEN of them.
+
+**Vanilla census draws the exact legality line:**
+
+| where | empty text keys |
+|---|---|
+| graph-carrying meshes (animobjects, traps, furniture) | **0** |
+| graph-less meshes | 2 (`impjaildoor01`, `ruinscanopicjar02` — plain Open/Close) |
+| keys with trailing whitespace (`'Sound: X\r\n'`) | 107 in dungeons alone — **legal, do not trim** |
+
+Empty keys are tolerated on the graph-less path (vanilla ships them and those
+doors work), and lethal on the graph path (vanilla ships none).  So the fix
+(`_strip_empty_text_keys`) drops whitespace-only keys **only for meshes that
+get an animobject graph** — converted graph-less doors stay byte-identical to
+what already works.  Verified: `idsecretwall01` and `doceilingcollapse01`
+(the ImperialDungeon01 hidden door and falling rubble) re-convert
+byte-identical; the plants lose exactly their empty keys and keep
+`start`/`end`/`sound:` verbatim, including the vanilla-legal trailing `\r\n`.
+
+Audit: `tools/gamebryo_seq_check.py` (check 3).  Guarded by
+`tests/test_asset_convert.py::TestGraphMeshesShipNoEmptyTextKeys`, driven
+through the real converter on both crashing meshes.
 
 ### 🔴 LODSettings must COVER the terrain, or the worldspace CTDs on entry (2026-08-10)
 

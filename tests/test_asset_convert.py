@@ -2,6 +2,7 @@
 
 import math
 import os
+import re
 import shutil
 import struct
 import tempfile
@@ -3503,3 +3504,144 @@ class TestLODSettingsCoversTheTerrain:
                 tx += level
 
 
+
+
+class TestMTTCTargetsStayInSyncWithControlledBlocks:
+    """MTTC extra targets and sequence controlled-blocks must stay in lockstep.
+
+    `extra_targets` is POSITIONAL: the engine pairs slot N with the
+    NiControllerSequence entry that drives it.  Break the pairing and
+    BGSGamebryoSequenceGenerator dereferences a null interpolator the moment
+    the object animates -- `movdqu xmm2,[rax]` with rax=0 in VCRUNTIME140.
+
+    Two failures were shipped chasing this, one in each direction:
+      * leaving the target while dropping the root-named block
+        (crash-2026-08-10-00-42-35);
+      * keeping the root-named block so the target matched
+        (crash-2026-08-10-00-51-26) -- illegal for a different reason.
+
+    Census of 141 sequences across 43 animated vanilla meshes settles it, and
+    BOTH numbers are zero: 0 blocks target their own root, and 0 targets lack
+    a block.  Vanilla satisfies both by never listing the root as a target, so
+    dropping the block must drop the target with it.
+
+    Driven through the REAL converter on the mesh that crashed, rather than a
+    hand-built NiMultiTargetTransformController: pyffi's reference arrays do
+    not reliably retain slot assignments on a synthesised block, so a stub
+    fixture tests the fixture, not the converter.
+    """
+
+    MESH = 'oblivion/plants/spiddalcloudplant.nif'
+
+    def _convert(self):
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from asset_convert import nif_converter as nc, sse_nif
+        src = EXPORT_MESHES / self.MESH
+        if not src.exists():
+            pytest.skip(f'{self.MESH} not exported')
+        out = Path(tempfile.mkdtemp()) / 'out.nif'
+        nc.convert_nif(str(src), str(out))
+        return sse_nif.read_nif(str(out))
+
+    def _facts(self, data):
+        from pyffi.formats.nif import NifFormat
+        for root in data.roots:
+            root_name = bytes(getattr(root, 'name', b'') or b'')
+            blocks, targets = set(), []
+            for b in root.tree():
+                if isinstance(b, NifFormat.NiControllerSequence):
+                    for cb in (b.controlled_blocks or ()):
+                        blocks.add(bytes(cb.node_name or b''))
+                elif isinstance(b, NifFormat.NiMultiTargetTransformController):
+                    stated = int(getattr(b, 'num_extra_targets', 0))
+                    listed = [t for t in (b.extra_targets or ()) if t is not None]
+                    targets.append((stated, [bytes(t.name) for t in listed]))
+            return root_name, blocks, targets
+        return b'', set(), []
+
+    def test_root_is_not_an_extra_target(self):
+        """Vanilla: 0 of 141 sequences target their own root."""
+        root_name, _blocks, targets = self._facts(self._convert())
+        for _stated, names in targets:
+            assert root_name not in names,                 f'{root_name!r} is the root AND an extra target'
+
+    def test_every_target_has_a_driving_block(self):
+        """Vanilla: 0 targets without a block.  A null slot is the crash."""
+        _root, blocks, targets = self._facts(self._convert())
+        for _stated, names in targets:
+            missing = [n for n in names if n and n not in blocks]
+            assert not missing, f'targets with no controlled block: {missing}'
+
+    def test_stated_count_is_not_asserted(self):
+        """num_extra_targets ABOVE the live entries is legal -- vanilla does it.
+
+        spitpotopen01 states 16 and lists 2; 134 of 1,741 sampled vanilla
+        clutter meshes disagree the same way.  Asserting equality here would
+        encode a rule vanilla breaks, so only the two real invariants above
+        are enforced.
+        """
+        _root, _blocks, targets = self._facts(self._convert())
+        assert targets, 'fixture expects at least one MTTC'
+
+
+class TestGraphMeshesShipNoEmptyTextKeys:
+    """A graph-bound mesh must ship NO empty text key values.
+
+    On state activation BGSGamebryoSequenceGenerator (GOG exe 0x505130,
+    AddrLib ID 32774) walks the sequence's NiTextKeyExtraData: each value is
+    matched whole against the project's event table, and on a miss the engine
+    calls `strchr(value, '.')` to split an `Event.Payload` key.  An empty
+    NiString loads as a NULL BSFixedString and the strchr dereferences it --
+    `movdqu xmm2,[rax]`, rax=0, R9=0x2E2E (the broadcast '.') in
+    VCRUNTIME140.  That is the Spiddal Stick CTD (crash-2026-08-10-01-41-07;
+    the source ships `t=0.1 ''`) and the Harrada Root CTD (-01-39-02; SEVEN
+    empty keys).
+
+    Vanilla ships empty keys ONLY on graph-less meshes (impjaildoor01,
+    ruinscanopicjar02 -- plain Open/Close, no BGED), and zero beside a
+    behavior graph, so the strip is scoped to meshes that get an animobject
+    graph.  Real keys must survive: the `sound:` key is the plant's audio,
+    and trailing whitespace is vanilla-legal (107 dungeon keys carry it) so
+    it must NOT be trimmed.
+
+    Driven through the REAL converter on the meshes that crashed.
+    """
+
+    MESHES = ('oblivion/plants/spiddalcloudplant.nif',
+              'oblivion/plants/harradauprightattack.nif')
+
+    def _text_keys(self, mesh):
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from asset_convert import nif_converter as nc, sse_nif
+        from pyffi.formats.nif import NifFormat
+        src = EXPORT_MESHES / mesh
+        if not src.exists():
+            pytest.skip(f'{mesh} not exported')
+        out = Path(tempfile.mkdtemp()) / 'out.nif'
+        nc.convert_nif(str(src), str(out))
+        data = sse_nif.read_nif(str(out))
+        keys = []
+        for root in data.roots:
+            for b in root.tree():
+                if isinstance(b, NifFormat.NiControllerSequence) and b.text_keys:
+                    keys.extend(bytes(k.value or b'')
+                                for k in b.text_keys.text_keys)
+        return keys
+
+    @pytest.mark.parametrize('mesh', MESHES)
+    def test_no_empty_text_keys_survive(self, mesh):
+        keys = self._text_keys(mesh)
+        assert keys, 'fixture expects text keys'
+        empty = [k for k in keys if not k.strip()]
+        assert not empty, f'{len(empty)} empty text key(s) shipped: CTD on activation'
+
+    @pytest.mark.parametrize('mesh', MESHES)
+    def test_real_keys_survive_verbatim(self, mesh):
+        keys = self._text_keys(mesh)
+        assert b'start' in keys and b'end' in keys
+        sound = [k for k in keys if k.startswith(b'sound:')]
+        assert sound, 'the sound: key is the plant audio -- it must survive'

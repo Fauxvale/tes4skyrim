@@ -1756,6 +1756,48 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
 
 
 
+def _drop_mttc_target(mgr, node_name: bytes) -> int:
+    """Remove `node_name` from every NiMultiTargetTransformController's targets.
+
+    The extra-target list is POSITIONAL -- the engine pairs slot N with the
+    NiControllerSequence entry that drives it -- so a target whose entry has
+    been removed leaves a null interpolator that
+    BGSGamebryoSequenceGenerator dereferences when the object animates.
+    Whenever a controlled block goes, its target must go with it.
+
+    Returns the number of slots removed (for stats/tests).
+    """
+    removed = 0
+    for ctrl in _iter_controllers(mgr):
+        if not isinstance(ctrl, NifFormat.NiMultiTargetTransformController):
+            continue
+        targets = list(getattr(ctrl, 'extra_targets', None) or ())
+        kept = [t for t in targets
+                if t is None
+                or bytes(getattr(t, 'name', b'') or b'') != node_name]
+        if len(kept) == len(targets):
+            continue
+        removed += len(targets) - len(kept)
+        ctrl.num_extra_targets = len(kept)
+        ctrl.extra_targets.update_size()
+        for i, t in enumerate(kept):
+            ctrl.extra_targets[i] = t
+    return removed
+
+
+def _iter_controllers(mgr):
+    """Every controller reachable from a NiControllerManager."""
+    ctrl = getattr(mgr, 'next_controller', None)
+    while ctrl is not None:
+        yield ctrl
+        ctrl = getattr(ctrl, 'next_controller', None)
+    for seq in (getattr(mgr, 'controller_sequences', None) or ()):
+        for cb in (getattr(seq, 'controlled_blocks', None) or ()):
+            c = getattr(cb, 'controller', None)
+            if c is not None:
+                yield c
+
+
 def _process_controller_manager(node, palette):
     """Strip unsupported NiControllerManager sequences.
 
@@ -1795,8 +1837,29 @@ def _process_controller_manager(node, palette):
             blk = seq.controlled_blocks[key]
             node_name = _resolve_name(blk, seq, 'node_name')
 
-            # Remove blocks with empty or root node name
+            # Remove blocks with an empty or root node name -- AND, for the
+            # root case, drop that node from every NiMultiTargetTransformController
+            # extra-target list at the same time.
+            #
+            # Both halves are required, and vanilla satisfies both because it
+            # never puts the root in the target list at all.  Census of 141
+            # sequences across 43 animated vanilla meshes:
+            #   * 0 controlled blocks target their own root node
+            #   * 0 MTTC extra targets lack a driving controlled block
+            #
+            # `extra_targets` is POSITIONAL: the engine pairs slot N with the
+            # entry that drives it.  Leaving the target while removing the
+            # block gives that slot a null interpolator, which
+            # BGSGamebryoSequenceGenerator dereferences as soon as the object
+            # animates -- `movdqu xmm2,[rax]`, rax=0, in VCRUNTIME140
+            # (crash-2026-08-10-00-42-35, spiddalcloudplant.nif, whose root
+            # `spiddalplant` is also extra-target #1).  Keeping the block
+            # instead is equally wrong: it produces a root-targeting entry
+            # vanilla never ships, and it crashed in exactly the same place
+            # (crash-2026-08-10-00-51-26, after that attempt shipped).
             if not node_name or node_name == root_name:
+                if node_name:
+                    _drop_mttc_target(mgr, node_name)
                 seq.controlled_blocks.pop(key)
                 seq.num_controlled_blocks -= 1
                 continue
@@ -3860,6 +3923,54 @@ def _convert_sound_text_keys(data):
     return 0
 
 
+def _strip_empty_text_keys(data):
+    """Drop whitespace-only text keys — ONLY for meshes that get a graph.
+
+    On state activation, BGSGamebryoSequenceGenerator (GOG SkyrimSE.exe
+    0x505130, Address Library ID 32774) walks the sequence's
+    NiTextKeyExtraData translating keys into behavior events: each value is
+    first matched whole against the project's event table, and on a miss the
+    engine calls `strchr(value, '.')` to split an `Event.Payload` key.  An
+    EMPTY NiString loads as a NULL BSFixedString, and the strchr runs on the
+    raw pointer — `movdqu xmm2,[rax]` with rax=0 in VCRUNTIME140, R9=0x2E2E
+    (the broadcast '.').  That is crash-2026-08-10-01-41-07 (spiddalcloudplant
+    ships `t=0.1 ''`) and -01-39-02 (harradauprightattack ships SEVEN empty
+    keys): the plant crashed the game the moment it animated.
+
+    Oblivion authored empty keys freely and its engine ignored them.  Skyrim
+    tolerates them ONLY on the graph-less path: vanilla ships exactly two
+    (impjaildoor01, ruinscanopicjar02 — both plain Open/Close meshes with no
+    BSBehaviorGraphExtraData), and zero on any graph-carrying mesh.  So the
+    strip is scoped to meshes we give an animobject graph, keeping converted
+    graph-less doors byte-identical to what already works in-game.
+
+    Trailing whitespace is left alone — 107 vanilla dungeon keys carry it
+    (`'Sound: X\\r\\n'`), so it is engine-legal and not ours to "fix".
+    """
+    removed = 0
+    seen = set()
+    for root in data.roots:
+        if root is None:
+            continue
+        for block in root.tree():
+            if not isinstance(block, NifFormat.NiTextKeyExtraData):
+                continue
+            if id(block) in seen:
+                continue
+            seen.add(id(block))
+            kept = [(k.time, k.value) for k in block.text_keys
+                    if bytes(k.value or b'').strip()]
+            if len(kept) == block.num_text_keys:
+                continue
+            removed += block.num_text_keys - len(kept)
+            block.num_text_keys = len(kept)
+            block.text_keys.update_size()
+            for slot, (t, v) in zip(block.text_keys, kept):
+                slot.time = t
+                slot.value = v
+    return removed
+
+
 def _fix_controller_flags(data):
     """Set "Compute Scaled Time" on every NiTimeController (Skyrim requirement).
 
@@ -5647,6 +5758,15 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # write so the BGED ships in the file.  See asset_convert/hkx_animobject.py.
     _seq_names = collect_sequence_names(data)
     if _seq_names:
+        # A graph-bound mesh must ship NO empty text keys: the generator
+        # strchr()s every key value on activation and an empty NiString loads
+        # as a NULL pointer (see _strip_empty_text_keys — the Spiddal Stick /
+        # Harrada crash).  Stripped BEFORE project generation so the rule
+        # holds even if hkxcmd later fails and the BGED is skipped: a
+        # graph-less mesh with fewer dead keys loses nothing.
+        _stripped = _strip_empty_text_keys(data)
+        if _stripped:
+            stats['empty_text_keys_stripped'] = _stripped
         _dstn = str(dst_path).replace('/', os.sep).replace('\\', os.sep)
         _k = os.sep + 'meshes' + os.sep
         _i = _dstn.lower().rfind(_k)
