@@ -169,15 +169,22 @@ def _bundled_exe(rel: str, name: str, purpose: str,
 
 
 def _ffmpeg() -> 'Missing | None':
+    """ffmpeg ships with the repo (external/ffmpeg/), so absence is a broken
+    checkout rather than a missing user install -- same as the other bundled
+    exes.  PATH is still searched as a fallback, so a user who deleted the
+    bundled copy but has their own ffmpeg keeps working."""
     from asset_convert.audio_converter import find_ffmpeg
     if find_ffmpeg():
         return None
     return Missing(
         'ffmpeg',
         'Decoding Oblivion MP3/WAV audio before re-encoding',
-        'Download from https://ffmpeg.org/download.html and put ffmpeg.exe on '
-        'your PATH\n'
-        '(or: winget install Gyan.FFmpeg)',
+        'This binary ships with the repo. Restore it:\n'
+        'git checkout -- external/ffmpeg/ffmpeg.exe\n'
+        '(if that does not restore it, your antivirus may have quarantined '
+        'it)\n'
+        'Or rebuild it: python tools/build_ffmpeg.py\n'
+        'Or install any ffmpeg on your PATH: winget install Gyan.FFmpeg',
     )
 
 

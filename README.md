@@ -56,7 +56,6 @@ A decent PC. The more cores and ram the better. The more cores, the more ram it 
 | **[Pillow](https://pypi.org/project/pillow/)** | Terrain-LOD texture compositing, object-LOD atlas normals, book inventory art. **Terrain LOD produces no tiles at all without it** | `pip install Pillow` |
 | **[lz4](https://pypi.org/project/lz4/)** | Reading Skyrim SE BSAs (v105) — how vanilla assets are fetched when `export/skyrim_assets/` has no cached copy yet | `pip install lz4` |
 | **[mapbox_earcut](https://pypi.org/project/mapbox-earcut/)** | Navmesh triangulation fallback when Delaunay fails on a piece | `pip install mapbox_earcut` |
-| **ffmpeg** | Voice/sound audio conversion | On `PATH` — [download](https://ffmpeg.org/download.html), or `winget install Gyan.FFmpeg` |
 | **Skyrim SE Creation Kit** | Supplies `LipGenerator.exe` (lip sync) and the Papyrus source headers every converted script compiles against | Free on Steam |
 | **xWMAEncode.exe** | xWMA voice compression | See note below |
 
@@ -295,11 +294,19 @@ covered by this project's MIT license.
 | [Bad Dog — PyNifly](https://github.com/BadDogSkyrim/PyNifly) | Pure-Python Havok hk_2010 packfile reader + hkaSplineCompressedAnimation codec (vendored in `external/pynifly_hkx/`) — the heart of creature animation conversion | **GPL-3.0** (vendored from PyNifly 27.4.0; local changes marked `# TESConversion:`) — see the GPL note below |
 | [figment — hkxcmd](https://github.com/figment/hkxcmd) | Havok packfile XML↔binary compiler, `external/hkxcmd/hkxcmd.exe`, used to build skeleton/behavior/animation `.hkx` | **BSD-3-Clause** for hkxcmd's own sources (© 2011; text in `external/hkxcmd/LICENSE.TXT`). **Statically links Havok** — see the Havok note below |
 | [Microsoft DirectX SDK (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=6812) | `external/xwmaencode/xWMAEncode.exe`, xWMA voice compression | Microsoft — **not redistributed**; obtain from the SDK (see [Requirements](#requirements)) |
+| [FFmpeg](https://ffmpeg.org/) | `external/ffmpeg/ffmpeg.exe`, decoding Oblivion MP3/WAV voice and sound files | **LGPL v2.1 or later** — redistributed; license text in `external/ffmpeg/COPYING.LGPLv2.1`. See the LGPL note below |
 | Oblivion banner font ([dafont](https://www.dafont.com/oblivion.font)) | Project banner | *Free for personal use only*, based on Bethesda's trademarked logo. **Not** bundled in this repo; the banner ships as pre-rendered vector outlines. |
 
 > **Note on GPL-3.0:** `external/pynifly_hkx/` is GPL-3.0. It is used by the creature
 > animation conversion path (`asset_convert/hkx_anim.py`). If you redistribute a build
 > that includes it, the GPL's terms apply to that distribution.
+
+> **Note on LGPL (FFmpeg):** `external/ffmpeg/ffmpeg.exe` is built from **unmodified**
+> FFmpeg 7.1.2 sources under LGPL v2.1, with no GPL components (`--enable-gpl` and
+> `--enable-version3` are both off). Because it is statically linked, LGPL §6 requires
+> that recipients be able to relink it against a modified FFmpeg — satisfied by
+> `tools/build_ffmpeg.py`, which pins the exact upstream tarball and records every
+> configure flag used to produce the shipped binary.
 
 > ### ⚠️ Note on Havok
 >

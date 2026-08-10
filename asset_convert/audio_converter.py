@@ -55,18 +55,45 @@ _LIP_WORKER_COUNT = max(_WORKER_COUNT, min(64, _WORKER_COUNT * 2))
 # ---------------------------------------------------------------------------
 
 def find_ffmpeg(ffmpeg_path: str = 'ffmpeg') -> 'str | None':
-    """Return the ffmpeg executable path if found, else None."""
-    try:
-        r = subprocess.run(
-            [ffmpeg_path, '-version'],
-            capture_output=True,
-            timeout=10,
-            **POPEN_FLAGS,
-        )
-        if b'ffmpeg version' in r.stdout or b'ffmpeg version' in r.stderr:
-            return ffmpeg_path
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
+    """Return the ffmpeg executable path if found, else None.
+
+    An explicit ``ffmpeg_path`` (anything but the bare default ``'ffmpeg'``)
+    is used ALONE: a caller who names a specific binary -- from config, or a
+    test -- gets that binary or None.  Silently falling back to the bundled
+    copy would turn a typo'd config path into a run that looks fine while
+    ignoring what the user asked for.
+
+    Otherwise the search order is:
+      1. external/ffmpeg/ under the project root -- the minimal LGPL build
+         that ships with the repo (see external/ffmpeg/BUILD.md).
+      2. System PATH.
+
+    The bundled copy is preferred over PATH so a run is reproducible: it is a
+    known build with a known codec set, whereas whatever ffmpeg a user already
+    has could be any version with any codecs compiled out.
+    """
+    if ffmpeg_path and ffmpeg_path != 'ffmpeg':
+        candidates = [ffmpeg_path]
+    else:
+        candidates = []
+        project_root = Path(__file__).resolve().parent.parent
+        bundled = project_root / 'external' / 'ffmpeg' / 'ffmpeg.exe'
+        if bundled.is_file():
+            candidates.append(str(bundled))
+        candidates.append('ffmpeg')
+
+    for cand in candidates:
+        try:
+            r = subprocess.run(
+                [cand, '-version'],
+                capture_output=True,
+                timeout=10,
+                **POPEN_FLAGS,
+            )
+            if b'ffmpeg version' in r.stdout or b'ffmpeg version' in r.stderr:
+                return cand
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
     return None
 
 
