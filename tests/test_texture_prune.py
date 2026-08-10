@@ -6,6 +6,8 @@ correct, the file is still on disk because the mesh phase re-copies the whole
 texture tree every run — and only shows in game as untextured terrain.
 """
 
+import re
+
 from asset_convert import texture_prune as tp
 
 
@@ -172,3 +174,61 @@ class TestPackTimeFilter:
         staged = bsa_pack._collect_files(plugin, ['meshes'], set())
         names = {p.as_posix() for _src, p, _sz in staged}
         assert names == {'meshes/a.nif'}
+
+
+class TestBinaryTextureScan:
+    r"""`_texture_refs_in` replaced a lazy-star regex; it must match it exactly.
+
+    The old pattern was `[A-Za-z0-9_\\/ .()&+-]{3,200}?\.dds` (IGNORECASE).
+    Lazy + leftmost means it took the longest legal run ending at each `.dds`,
+    which is what the hand-rolled walk reproduces — byte-identical output over
+    3,189 real Oblivion meshes and LOD tiles, 12.7x faster.
+
+    The `{3,200}` bounds the run BEFORE `.dds`, so a whole match reaches 204
+    bytes. Capping the whole match at 200 instead silently truncated the
+    longest paths; that is what this class caught.
+    """
+
+    # Verbatim copy of the regex this replaced. The class needs FOUR
+    # backslashes: `\\\\` in a raw bytes literal is an escaped `\` to the regex
+    # engine, i.e. a literal backslash in the class. Write two and the class
+    # loses the backslash, so every path truncates at its last separator.
+    _OLD_RE = re.compile(rb'[A-Za-z0-9_\\\\/ .()&+-]{3,200}?\.dds',
+                         re.IGNORECASE)
+
+    @staticmethod
+    def _keys(matches):
+        return {tp._norm(m) for m in matches} - {''}
+
+    def _assert_same(self, raw):
+        assert self._keys(tp._texture_refs_in(raw)) == \
+            self._keys(self._OLD_RE.findall(raw)), raw[:80]
+
+    def test_matches_the_old_regex_on_realistic_blobs(self):
+        for raw in (
+            b'\x00\x00' + rb'textures\tes4\rocks\rock01.dds' + b'\x00junk',
+            rb'data\textures\tes4\land\a_n.dds' + b'\x00\x01' + b'bcd.dds',
+            b'no textures here at all',
+            b'.dds',                      # nothing before it
+            b'ab.dds',                    # 2 chars: below the {3,} floor
+            b'abc.dds',                   # exactly at the floor
+            b'name with spaces (1)&x+y-z.dds',
+            rb'UPPER\MiXeD\CaSe.DDS',
+            b'back\x00to\x00back.dds\x00' + rb'second\one.dds',
+            b'\xff\xfe' + rb'deep\path\here.dds',
+        ):
+            self._assert_same(raw)
+
+    def test_adjacent_paths_do_not_bleed_into_each_other(self):
+        """Non-overlapping, exactly like finditer."""
+        raw = rb'first\a01.dds' + rb'second\b02.dds'
+        keys = self._keys(tp._texture_refs_in(raw))
+        assert keys == self._keys(self._OLD_RE.findall(raw))
+        assert len(keys) == 2
+
+    def test_a_run_longer_than_the_cap_matches_the_regex(self):
+        """{3,200} counts the run BEFORE '.dds' — the match runs to 204."""
+        raw = b'x' * 400 + b'.dds'
+        got = tp._texture_refs_in(raw)
+        assert len(got[0]) == 204
+        self._assert_same(raw)

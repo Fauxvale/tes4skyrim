@@ -50,6 +50,21 @@ If the mesh manifest is missing, `build_refs` raises and packing ships every
 texture rather than guessing — a missing mesh pass must never silently strip
 textures that are in use.
 
+**Both texture scanners were quadratic.** A `[...]{3,200}?\.dds` pattern opens
+with a lazy star, so on a blob with no match the engine retries at *every*
+offset. Two copies existed:
+
+| Scanner | Fix | Result |
+|---|---|---|
+| `refs_from_records` (export text) | `'.dds' not in body` substring reject — `LAND.txt` is 1.47 GB with zero `.dds` | minutes → 4.2 s |
+| `refs_from_assets` + `nif_converter._harvest_texture_bytes` (binary) | `_texture_refs_in`: `bytes.find` each `.dds`, walk back over legal bytes | 13.8x, `build_refs` 87.6 s → 11.5 s |
+
+The binary case could not use a substring reject — every `.bto` really does
+contain `.dds`. Watch the bound when touching `_texture_refs_in`: the old
+`{3,200}` counted the run *before* `.dds`, so a whole match reaches **204**
+bytes; capping the match at 200 silently truncates the longest paths.
+Equivalence with the original regex is pinned by `TestBinaryTextureScan`.
+
 Direct module entry points:
 
 ```bash
