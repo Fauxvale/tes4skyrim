@@ -361,11 +361,24 @@ def get_vanilla_singlefiles(skyrim_data_path: str, cache_dir: str) -> dict:
 
 
 def write_singlefiles(manifests: list, out_meshes_dir: str,
-                      skyrim_data_path: str, cache_dir: str) -> dict:
+                      skyrim_data_path: str, cache_dir: str,
+                      singlefile_dir: str = None,
+                      own_manifests: list = None) -> dict:
     """Merge all generated project manifests onto the vanilla base and write
     both singlefiles (plus the per-project debug sources) under
     `out_meshes_dir`. Always merges from the VANILLA base so re-runs are
-    idempotent. Returns {filename: total project count}."""
+    idempotent. Returns {filename: total project count}.
+
+    `singlefile_dir` redirects the two SHARED singlefiles (and only those)
+    elsewhere — a child plugin sends them to its MASTER's meshes dir. The game
+    reads exactly ONE animationdatasinglefile.txt out of Data, so a child that
+    ships its own copy is not adding a file, it is racing the master for the
+    same path: whichever deploys last silently de-registers the other's
+    projects. Writing through to the master's single shared copy removes the
+    race, and keeps the child's output to the files it genuinely owns. The
+    `own_manifests` is this plugin's OWN projects; the per-project source
+    files are written for those alone. It defaults to `manifests` so a
+    single-plugin (master) run is unchanged."""
     base = get_vanilla_singlefiles(skyrim_data_path, cache_dir)
     os.makedirs(out_meshes_dir, exist_ok=True)
 
@@ -373,17 +386,29 @@ def write_singlefiles(manifests: list, out_meshes_dir: str,
         base['animationdatasinglefile.txt'], manifests)
     merged_asd = merge_animationsetdata(
         base['animationsetdatasinglefile.txt'], manifests)
+    sf_dir = singlefile_dir or out_meshes_dir
+    os.makedirs(sf_dir, exist_ok=True)
     for fn, lines in (('animationdatasinglefile.txt', merged_ad),
                       ('animationsetdatasinglefile.txt', merged_asd)):
-        with open(os.path.join(out_meshes_dir, fn), 'w', encoding='latin-1',
+        with open(os.path.join(sf_dir, fn), 'w', encoding='latin-1',
                   newline='\r\n') as f:
             f.write('\n'.join(lines) + '\n')
+        # A child must not leave a stale copy of the shared file in its own
+        # tree: it would still deploy and still win the race.
+        if singlefile_dir:
+            stale = os.path.join(out_meshes_dir, fn)
+            if os.path.exists(stale):
+                os.remove(stale)
 
-    # per-project source files (engine ignores these; kept for debugging)
+    # Per-project source files (engine ignores these; kept for debugging).
+    # Written for the plugin's OWN projects only. `manifests` is the union of
+    # every plugin's projects — needed to merge the shared singlefiles above,
+    # but writing a per-project file for each one made a child ship the whole
+    # master's set (ElsweyrAnequina: 147 files for the 7 creatures it owns).
     ad_dir = os.path.join(out_meshes_dir, 'animationdata')
     ba_dir = os.path.join(ad_dir, 'boundanims')
     os.makedirs(ba_dir, exist_ok=True)
-    for m in manifests:
+    for m in (own_manifests if own_manifests is not None else manifests):
         stem = os.path.splitext(m['project_txt'])[0]
         with open(os.path.join(ad_dir, m['project_txt']), 'w',
                   encoding='latin-1', newline='\r\n') as f:

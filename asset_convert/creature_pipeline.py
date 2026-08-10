@@ -360,15 +360,41 @@ def _crea_model_dirs(export_dir: str) -> set:
     return out
 
 
+def _shared_singlefile_dir(out_meshes_dir: str, master_dirs) -> str:
+    """Where the two SHARED animation singlefiles belong, or None for 'here'.
+
+    Data holds exactly ONE animationdatasinglefile.txt. A child that ships its
+    own copy does not add a file — it races its master for the same path, and
+    whichever deploys last de-registers the other's creatures (they then freeze
+    in their idles; confirmed in game 2026-08-07). So a child writes through to
+    its master's copy, which already carries the union of every project.
+
+    Picks the FIRST master that has a meshes dir; masters are passed in load
+    order, so that is the base everything else overrides.
+    """
+    for d in (master_dirs or []):
+        cand = os.path.join(str(d), 'meshes')
+        if os.path.normpath(cand) == os.path.normpath(out_meshes_dir):
+            continue
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
 def convert_creatures(export_dir: str, out_meshes_dir: str,
                       skyrim_data_path: str = None,
                       names: list = None, workers: int = None,
+                      master_dirs=None,
                       log=print) -> dict:
     """Convert every creature folder under <export_dir>/meshes/creatures.
 
     Writes the actor projects + converted meshes, merges the animation
     singlefiles (vanilla base from the user's Skyrim install, cached in
     <export_dir>/animdata_base), and saves <export_dir>/creature_projects.json.
+
+    `master_dirs` lists this plugin's MASTERS' converted output dirs. When set,
+    the two shared singlefiles are written into the FIRST master's meshes dir
+    instead of this one's, and this plugin ships only the projects it owns.
 
     Returns {'projects': {name: manifest}, 'errors': {name: str}}.
     """
@@ -481,13 +507,20 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
                     all_manifests[d] = json.load(f)
 
     # UNION across EVERY built plugin (masters and siblings): the game's Data
-    # folder holds exactly ONE animationdatasinglefile.txt, so whichever
-    # plugin's copy is deployed last must still register every other
-    # plugin's creatures — deploying Morrowind_ob's file over Oblivion's
-    # de-registered all of Oblivion's projects and its creatures froze in
-    # their idles (confirmed in game 2026-08-07). This plugin's own version
-    # of a same-named folder wins; the deployed loose meshes collide on the
-    # same paths anyway.
+    # folder holds exactly ONE animationdatasinglefile.txt, so the single
+    # deployed copy must register every plugin's creatures — deploying
+    # Morrowind_ob's file over Oblivion's de-registered all of Oblivion's
+    # projects and its creatures froze in their idles (confirmed in game
+    # 2026-08-07). This plugin's own version of a same-named folder wins; the
+    # deployed loose meshes collide on the same paths anyway.
+    #
+    # A child no longer ships a rival copy (it writes through to its master's,
+    # see _shared_singlefile_dir), so the race is gone — but the union is still
+    # required: whichever plugin is built LAST rewrites that one shared file
+    # from the vanilla base, and must put every sibling's projects back. This
+    # scan reads project_manifest.json under each plugin's actors/tes4, which
+    # every plugin still ships for the creatures it owns, so it is unaffected
+    # by where the singlefiles land.
     union = dict(all_manifests)
     plugins_root = os.path.dirname(os.path.dirname(out_meshes_dir))
     try:
@@ -511,9 +544,18 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
     if union:
         cache_dir = os.path.join(export_dir, 'animdata_base')
         manifests = [union[n] for n in sorted(union)]
+        own = [all_manifests[n] for n in sorted(all_manifests)]
+        # The two singlefiles are ONE shared file in the game's Data folder.
+        # A child plugin must not ship its own copy racing the master's for
+        # that path — it writes THROUGH to the master's instead. Only the
+        # per-project sources (written from `own`) land in this plugin's tree.
+        sf_dir = _shared_singlefile_dir(out_meshes_dir, master_dirs)
         counts = write_singlefiles(manifests, out_meshes_dir,
-                                   skyrim_data_path, cache_dir)
-        log(f'  Registered {len(manifests)} projects '
+                                   skyrim_data_path, cache_dir,
+                                   singlefile_dir=sf_dir,
+                                   own_manifests=own)
+        where = ('the master\'s shared file' if sf_dir else 'this plugin')
+        log(f'  Registered {len(manifests)} projects in {where} '
             f'({len(all_manifests)} own, '
             f'{len(union) - len(all_manifests)} from sibling plugins; '
             f'animationdatasinglefile: {counts["animationdatasinglefile.txt"]}'
