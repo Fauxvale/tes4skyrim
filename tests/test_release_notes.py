@@ -70,9 +70,6 @@ def test_export_also_implies_import():
     "TODO.txt",
     "CLAUDE.md",
     ".github/workflows/tag-on-push.yml",
-    # Standalone starter plugin: built by tools/, read by no pipeline step.
-    "TESGameSelect/dist/TESGameSelect.esp",
-    "TESGameSelect/scripts/source/TESGameSelectQuest.psc",
     # Vendored binaries.
     "external/bsarch/bsarch.exe",
     "TESConversion.code-workspace",
@@ -94,7 +91,18 @@ def test_packaging_follows_a_producing_step():
 
 def test_patch_skyrim_alone_does_not_drag_in_packaging():
     """Patch Skyrim writes a standalone ARMA patch that BSA/zip never read."""
-    assert steps("asset_convert/modify_body_meshes.py") == ["10. Patch Skyrim"]
+    assert steps("asset_convert/modify_body_meshes.py") == ["Patch Skyrim"]
+
+
+@pytest.mark.parametrize("path", [
+    "TESGameSelect/dist/TESGameSelect.esp",
+    "TESGameSelect/scripts/source/TESGameSelectQuest.psc",
+])
+def test_starter_mod_repackages_itself_only(path):
+    """The starter mod is committed prebuilt, so a change to it re-runs only
+    the packaging action -- never a pipeline step, and never the BSA/zip steps,
+    whose archives do not contain it."""
+    assert steps(path) == ["Package Start Mod"]
 
 
 # ── Shared plumbing legitimately means everything ─────────────────────────

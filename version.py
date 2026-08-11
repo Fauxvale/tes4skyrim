@@ -637,9 +637,14 @@ STEP_KEYS: list[tuple[str, str]] = [
     ("sounds",             "7. Sounds"),
     ("scripts",            "8. Scripts"),
     ("lod",                "9. LOD"),
-    ("modify_body_meshes", "10. Patch Skyrim"),
-    ("pack",               "11. Pack BSAs"),
-    ("pack_zip",           "12. Pack Mod Zip"),
+    ("pack",               "10. Pack BSAs"),
+    ("pack_zip",           "11. Pack Mod Zip"),
+    # Global actions. Numberless on purpose: they are not positions in the
+    # per-plugin pipeline, they are one-off jobs covering the whole load order,
+    # and the GUI presents them as buttons rather than numbered checkboxes.
+    ("package_start_mod",  "Package Start Mod"),
+    ("modify_body_meshes", "Patch Skyrim"),
+    ("sibling_lod",        "Merge Sibling LOD"),
 ]
 
 _LABEL_TO_KEY = {label: key for key, label in STEP_KEYS}
@@ -658,7 +663,11 @@ _LABEL_OF     = {key: label for key, label in STEP_KEYS}
 # never run for Nehrim and selected it again -- for every plugin the user had
 # not happened to run it alongside, despite the one shared patch already
 # existing on disk.
-GLOBAL_STEPS: frozenset[str] = frozenset({"modify_body_meshes"})
+#
+# "Merge Sibling LOD" is global for the same reason: it exists precisely to
+# reconcile SEVERAL plugins against each other, so it belongs to none of them.
+GLOBAL_STEPS: frozenset[str] = frozenset({"modify_body_meshes", "sibling_lod",
+                                          "package_start_mod"})
 
 # The state-file key those steps are recorded under.  `_plugin_key(None)`
 # already collapses to "*", which is exactly "belongs to no plugin".

@@ -179,6 +179,18 @@ applied nothing and the CharacterGen conversation stalled forever.)
 Never attribute a bug to LE-vs-SSE mesh format differences — verify engine
 theories externally first.
 
+### <a id="code-review"></a>🛑 Code review: RUN THE CLAIM, DON'T READ IT
+
+**An unexecuted finding is a GUESS. Delete it — never soften it** to "possible
+issue" / "may not handle". Ship it only with a reproduction, a query against
+real data, or a failing-then-passing test.
+
+- **Every number is measured or absent.** Never write a count you did not
+  compute this session.
+- **Read the code, don't infer** Otherwise you will produce confident nonsense.
+- Mark verified vs suspected differently
+- **Don't nitpick** = no theoretical edge cases, style, or naming.
+
 ### Hard prohibitions
 
 - **NEVER `git stash` / `git stash pop`** in this repository.

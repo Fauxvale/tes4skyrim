@@ -208,9 +208,9 @@ def test_skipping_releases_unions_every_entry_in_range(monkeypatch):
 
 
 def test_result_is_in_run_order_not_table_order(monkeypatch):
-    _table(monkeypatch, {"0.51": ["12. Pack Mod Zip", "1. Export", "6. Import"]})
+    _table(monkeypatch, {"0.51": ["11. Pack Mod Zip", "1. Export", "6. Import"]})
     assert v.steps_between("0.50", "0.51") == [
-        "1. Export", "6. Import", "12. Pack Mod Zip"]
+        "1. Export", "6. Import", "11. Pack Mod Zip"]
 
 
 def test_releases_outside_the_range_are_excluded(monkeypatch):
@@ -247,14 +247,33 @@ def test_no_upgrade_owes_nothing(monkeypatch):
 # ── Step keys line up with the GUI and with release_notes ─────────────────
 
 def test_step_keys_match_the_gui_step_table():
-    """version.STEP_KEYS must mirror gui.STEPS, or auto-selection ticks nothing.
+    """version.STEP_KEYS must mirror the GUI, or auto-selection ticks nothing.
 
-    gui.py is imported for its STEPS constant only; it must not need tkinter at
-    import time for this to work.
+    The GUI splits its work in two: STEPS are the numbered per-plugin
+    checkboxes, GLOBAL_ACTIONS are the buttons that run once for the whole load
+    order.  version.STEP_KEYS carries both, steps first and globals last, so
+    the concatenation is what has to line up.
+
+    gui.py is imported for those two constants only; it must not need tkinter
+    at import time for this to work.
     """
     import gui
-    assert [k for k, *_ in gui.STEPS] == [k for k, _ in v.STEP_KEYS]
-    assert [s[2] for s in gui.STEPS] == [lbl for _k, lbl in v.STEP_KEYS]
+    gui_keys   = [k for k, *_ in gui.STEPS] + [k for k, *_ in gui.GLOBAL_ACTIONS]
+    gui_labels = [s[2] for s in gui.STEPS] + [g[1] for g in gui.GLOBAL_ACTIONS]
+    assert gui_keys   == [k for k, _ in v.STEP_KEYS]
+    assert gui_labels == [lbl for _k, lbl in v.STEP_KEYS]
+
+
+def test_every_global_action_is_a_global_step():
+    """A GUI global button must be recorded plugin-independently.
+
+    Recording one per-plugin is the bug that made "Patch Skyrim" re-tick
+    forever: the single shared artefact already covered every plugin, but the
+    planner saw no record of it for the ones it had not run alongside.
+    """
+    import gui
+    for key, *_ in gui.GLOBAL_ACTIONS:
+        assert key in v.GLOBAL_STEPS
 
 
 def test_labels_match_release_notes_step_order():
@@ -299,7 +318,7 @@ def test_unknown_plugin_has_no_installed_version(state):
 
 
 # ── Plugin-independent steps ──────────────────────────────────────────────
-# "10. Patch Skyrim" takes no `-f`: it patches the vanilla Skyrim body records
+# "Patch Skyrim" takes no `-f`: it patches the vanilla Skyrim body records
 # for the whole load order and writes ONE shared `Slot44 Patch.esp` at the root
 # of output/.  Running it once covers every plugin.  Recording it per-plugin
 # meant patching while converting Oblivion left Nehrim with no record, so the
@@ -328,7 +347,7 @@ def test_a_global_step_counts_for_a_plugin_that_never_ran_it(state, monkeypatch)
 def test_a_global_step_is_still_owed_when_its_own_code_changed(state, monkeypatch):
     """Sharing the record must not make the step un-re-runnable."""
     monkeypatch.setattr(v, "current_version", lambda: "0.586")
-    _table(monkeypatch, {"0.586": ["10. Patch Skyrim"]})
+    _table(monkeypatch, {"0.586": ["Patch Skyrim"]})
     for key, _ in v.STEP_KEYS:
         v.record_step_run(key, "Nehrim.esm", "0.585")
     v.record_step_run("modify_body_meshes", "Oblivion.esm", "0.585")
@@ -434,7 +453,7 @@ def test_fresh_install_is_never_run_not_an_upgrade(state, monkeypatch):
 
 def test_upgrade_selects_only_the_changed_steps(state, monkeypatch):
     monkeypatch.setattr(v, "current_version", lambda: "0.58")
-    _table(monkeypatch, {"0.58": ["6. Import", "11. Pack BSAs"]})
+    _table(monkeypatch, {"0.58": ["6. Import", "10. Pack BSAs"]})
     for key, _ in v.STEP_KEYS:
         v.record_step_run(key, "Oblivion.esm", "0.57")
 
@@ -471,7 +490,7 @@ def test_a_step_that_never_ran_is_owed_even_without_an_upgrade(state, monkeypatc
 
 def test_steps_are_returned_in_run_order(state, monkeypatch):
     monkeypatch.setattr(v, "current_version", lambda: "0.58")
-    _table(monkeypatch, {"0.58": ["12. Pack Mod Zip", "1. Export", "6. Import"]})
+    _table(monkeypatch, {"0.58": ["11. Pack Mod Zip", "1. Export", "6. Import"]})
     for key, _ in v.STEP_KEYS:
         v.record_step_run(key, "Oblivion.esm", "0.57")
     assert v.upgrade_plan("Oblivion.esm")["steps"] == [
@@ -667,16 +686,16 @@ def _serve(monkeypatch, releases=None, fail=False, status=None):
 
 def test_checklist_is_read_from_the_release_body(monkeypatch):
     """The release body IS the table -- no asset, nothing committed."""
-    _serve(monkeypatch, [("0.581", _body("6. Import", "11. Pack BSAs"))])
+    _serve(monkeypatch, [("0.581", _body("6. Import", "10. Pack BSAs"))])
     table, reachable = v.steps_table()
     assert reachable is True
-    assert table == {"0.581": ["6. Import", "11. Pack BSAs"]}
+    assert table == {"0.581": ["6. Import", "10. Pack BSAs"]}
 
 
 def test_steps_come_back_in_run_order(monkeypatch):
     """A body listing steps out of order still yields GUI run order."""
-    _serve(monkeypatch, [("0.581", _body("11. Pack BSAs", "1. Export"))])
-    assert v.steps_table()[0]["0.581"] == ["1. Export", "11. Pack BSAs"]
+    _serve(monkeypatch, [("0.581", _body("10. Pack BSAs", "1. Export"))])
+    assert v.steps_table()[0]["0.581"] == ["1. Export", "10. Pack BSAs"]
 
 
 def test_non_release_tags_are_ignored(monkeypatch):

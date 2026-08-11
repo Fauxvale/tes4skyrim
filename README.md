@@ -89,8 +89,8 @@ This will install most of the following dependencies:
 Once that is done, there are two more things you need to do. First, install the Skyrim SE Creation Kit on Steam, and then acquire xWMAEncode.exe
 
 > **xWMAEncode.exe** ships with the [Microsoft DirectX SDK (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=6812)
-> and cannot be redistributed. You should extract it from the SK installer using 7-zip to avoid having to do a full install.
-> Then, copy it to `external/xwmaencode/`. (You could also install the SDk and findAfter installing the SDK, find it in `Utilities\bin\x86\`.)
+> and cannot be redistributed. You should extract it from the SDK installer using 7-zip to avoid having to do a full install.
+> Then, copy it to `external/xwmaencode/`. (If you choose to install the SDK instead, find it in `Utilities\bin\x86\`.)
 
 The pipeline checks each phase's dependencies before it starts: anything missing
 stops that phase and every phase after it, and says what to install at the bottom
@@ -203,7 +203,9 @@ python convert.py -f Oblivion.esm --sounds-only        # Copy/convert sound file
 python convert.py -f Oblivion.esm --scripts-only       # Transpile scripts → Papyrus
 python convert.py -f Oblivion.esm --lod-only           # Generate object & terrain LOD (slow)
 python convert.py -f Oblivion.esm --pack-only          # Pack output assets into Skyrim BSAs
-python convert.py -f Oblivion.esm --modify-body-meshes # Build ARMA slot-44 patch for your load order
+python convert.py --modify-body-meshes                 # Build ARMA slot-44 patch (takes no -f)
+python tools/package_start_mod.py                      # Zip the TESGameSelect starter mod
+python tools/merge_sibling_lod.py --dry-run            # Report LOD tiles two converted mods both claim
 python convert.py -f Oblivion.esm --mesh-bounds-only   # Rescan mesh bounds → OBND cache
 ```
 
@@ -260,8 +262,20 @@ These are the steps as presented (and run) by the GUI, in order:
 | 8 | **Scripts** | Transpile Oblivion scripts to Papyrus and compile. |
 | 9 | **LOD** | *(opt-in, off by default)* Generate object and terrain LOD meshes. |
 | 10 | **Pack BSAs** | *(opt-in, off by default)* Pack the converted assets into Skyrim BSA archives. |
-| 11 | **Patch Skyrim** | Build the ARMA slot-44 body patch for your load order. |
-| 12 | **Pack Mod Zip** | Zip the plugin(s) and BSAs into a single archive for installation. |
+| 11 | **Pack Mod Zip** | Zip the plugin(s) and BSAs into a single archive for installation. |
+
+Three further actions belong to **no single plugin**, so they are buttons under
+**Global** in the sidebar rather than numbered steps. Each runs once and covers
+everything you have converted:
+
+| Action | What happens |
+|--------|--------------|
+| **Start Mod** | Zip the prebuilt TESGameSelect starter mod (see *Starting a converted game*) to `output/TESGameSelect.zip`. |
+| **Patch Skyrim** | Build the ARMA slot-44 body patch for your whole Skyrim load order (*select plugins...* chooses which). |
+| **Merge LOD** | Rebake the LOD tiles that two or more converted plugins both change, into `output/ZZZ Merged Sibling LOD/`. Only needed when you install more than one converted mod covering the same worldspace — **install that folder after the mods it merges**. *merge order...* sets which plugin wins a contested tile (defaults to your `plugins.txt` order). |
+
+A Global button greys out with a check once its result is current, and lights up
+again when something it depends on changes.
 
 > **Design principle:** the export is a *pure* dump of TES4 data — no type mapping, no path
 > prefixing, no derived fields. **All** transformations live in the import and asset steps.

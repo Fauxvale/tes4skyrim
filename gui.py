@@ -49,15 +49,45 @@ STEPS = [
      "Convert Oblivion scripts to Papyrus",      True,  True),
     ("lod",                "--lod-only",           "9. LOD",
      "Generate distant LOD",               False, True),
-    ("modify_body_meshes", "--modify-body-meshes", "10. Patch Skyrim",
-     "Build ARMA slot-44 patch for your load order",       True,  False),
-    ("pack",               "--pack-only",          "11. Pack BSAs",
+    ("pack",               "--pack-only",          "10. Pack BSAs",
      "Pack assets into BSA archives",             False, True),
-    ("pack_zip",           "--pack-zip-only",      "12. Pack Mod Zip",
+    ("pack_zip",           "--pack-zip-only",      "11. Pack Mod Zip",
      "Zip mod files for installation",   True,  True),
 ]
 
 _DEFAULT_ON = {k for k, *_ in STEPS}
+
+# ── Global actions ────────────────────────────────────────────────────────────
+# Work that belongs to NO single plugin: it takes no `-f`, runs once for the
+# whole load order, and produces one shared artefact every conversion uses.
+#
+# Both used to be (or would have been) step checkboxes, which was wrong in the
+# same way for both. A checkbox in the numbered list reads as "part of
+# converting THIS plugin", so ticking it while converting Oblivion looked like
+# it left the job undone for Nehrim — even though the single shared output
+# already covered both. They are buttons now: pressed once, they apply to
+# everything, and they grey out until something makes them stale again.
+#
+# `label` is the full name (menu entries, log lines); `short` is what fits on
+# the side-by-side sidebar buttons.
+# `label` is the full name (menu entries, log lines); `short` is what fits on
+# the side-by-side sidebar buttons. `row` groups them into sidebar rows.
+# (key, label, tooltip, short, row)
+GLOBAL_ACTIONS = [
+    # Row 0: full width. Depends on nothing else — the starter mod is committed
+    # prebuilt, so it can be packaged before anything has been converted.
+    ("package_start_mod", "Package Start Mod",
+     "Zip the prebuilt TESGameSelect starter mod (the new-game world "
+     "selector) into output/, ready to install like any converted plugin",
+     "Start Mod", 0),
+    # Row 1: the two that consume converted output, side by side.
+    ("modify_body_meshes", "Patch Skyrim",
+     "Build the ARMA slot-44 body patch for your Skyrim load order",
+     "Patch Skyrim", 1),
+    ("sibling_lod", "Merge Sibling LOD",
+     "Rebake the LOD tiles that two or more converted plugins both change",
+     "Merge LOD", 1),
+]
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 CLR = {
@@ -84,6 +114,10 @@ CLR = {
     "check_off":    "#44475a",
     "gold":         "#c9a35c",
     "gold_hover":   "#ddb96f",
+    # Global (non-pipeline) actions — teal, to read as a different class of
+    # button from the gold Run and the purple accents.
+    "global_btn":   "#26404a",
+    "global_hover": "#325764",
 }
 
 
@@ -493,8 +527,12 @@ def gui_main():
     # ── Root window ───────────────────────────────────────────────────────────
     root = tk.Tk()
     root.title(f"TES4 Auto-Convert  {version_info.current_version()}")
-    root.geometry("1060x900")
-    root.minsize(860, 680)
+    # Slightly taller than the old 900 to fit the Global action row below the
+    # steps. The progress bar needs no extra height of its own: it is anchored
+    # to the bottom beside the status row, so it grows the pair upward rather
+    # than demanding headroom that sits empty whenever no run is in flight.
+    root.geometry("1060x1000")
+    root.minsize(860, 740)
     root.configure(bg=CLR["bg"])
     root.option_add("*Background", CLR["bg"])
     root.option_add("*Foreground", CLR["text"])
@@ -565,9 +603,38 @@ def gui_main():
               background=[("active", "#5a3030"), ("disabled", CLR["border"])],
               foreground=[("disabled", CLR["subtext"])])
 
+    # Same padding and font as Cancel.TButton, which it shares a row with.
+    # A smaller pad (8, 4) and the default font made it visibly shorter than
+    # the button beside it.
     S("Danger.TButton", background="#453030", foreground=CLR["red"],
-                        borderwidth=0, relief="flat", padding=(8, 4))
+                        borderwidth=0, relief="flat", padding=(8, 6),
+                        font="Segoe\\ UI 10")
     style.map("Danger.TButton", background=[("active", "#5a3030")])
+
+    # ── Global actions ────────────────────────────────────────────────────────
+    # These two ("Patch Skyrim", "Merge Sibling LOD") are NOT pipeline steps:
+    # they take no plugin, run once for the whole load order, and their result
+    # is shared by every conversion.  Deliberately teal and outlined rather than
+    # gold-and-solid like Run, so the sidebar reads as two different kinds of
+    # thing and neither is mistaken for a per-plugin step.
+    S("Global.TButton", background=CLR["global_btn"], foreground=CLR["blue"],
+                        borderwidth=0, relief="flat", padding=(8, 6),
+                        font="Segoe\\ UI 9")
+    style.map("Global.TButton",
+              background=[("active", CLR["global_hover"]),
+                          ("disabled", CLR["panel"])],
+              foreground=[("disabled", CLR["subtext"])])
+
+    # The same button once its work is already done and still current: sunk
+    # into the panel and muted, so the eye skips it.  It stays CLICKABLE —
+    # re-running is always allowed — it just stops advertising itself as
+    # outstanding work.
+    S("GlobalDone.TButton", background=CLR["btn"], foreground=CLR["subtext"],
+                        borderwidth=0, relief="flat", padding=(8, 6),
+                        font="Segoe\\ UI 9")
+    style.map("GlobalDone.TButton",
+              background=[("active", CLR["btn_hover"])],
+              foreground=[("active", CLR["text"])])
 
     S("TSeparator",    background=CLR["border"])
     S("TScrollbar",    background=CLR["btn"], troughcolor=CLR["bg"],
@@ -835,6 +902,14 @@ def gui_main():
     tools_menu.add_command(label="Check Dependencies",
                            command=_check_dependencies)
     tools_menu.add_separator()
+    # The same two global actions as the sidebar buttons. Menu entries are
+    # late-bound (`_run_global_action` is defined further down, with the rest of
+    # the run logic) so the lambda resolves it at click time, not build time.
+    for _gkey, _glabel, _gtip, _gshort, _grow in GLOBAL_ACTIONS:
+        tools_menu.add_command(
+            label=_glabel,
+            command=(lambda k=_gkey: _run_global_action(k)))
+    tools_menu.add_separator()
     tools_menu.add_command(
         label="Open Output Folder",
         command=lambda: _open_folder(output_var.get().strip(), "Output folder"))
@@ -1028,9 +1103,16 @@ def gui_main():
     log_pane.grid(row=0, column=1, sticky="nsew")
 
     # ── Sidebar helpers ───────────────────────────────────────────────────────
+    # One rule, one gap. Every block that meets a separator packs flush against
+    # it (pady 0 on that side) and lets this own the whole space, so the gap
+    # above a rule always equals the gap below it. When both sides contributed
+    # their own padding the two halves silently differed — 12px over vs 16px
+    # under the same line.
+    _SEP_GAP = 12
+
     def _sep():
         ttk.Separator(sidebar, orient=tk.HORIZONTAL).pack(
-            fill=tk.X, padx=14, pady=6)
+            fill=tk.X, padx=14, pady=_SEP_GAP)
 
     def _section(text: str):
         f = ttk.Frame(sidebar, style="Panel.TFrame")
@@ -1102,8 +1184,12 @@ def gui_main():
     def _path_row(parent, label_text: str, var: tk.StringVar,
                   browse_dir=True, on_change=None):
         """A labelled Entry + Browse button row."""
+        # No pady on the label: every field block owns its own spacing via its
+        # frame's pady, so a second source of vertical padding here made the
+        # four blocks (three path rows + the plugin selector) sit at four
+        # different intervals.
         ttk.Label(parent, text=label_text, style="PanelSub.TLabel").pack(
-            anchor="w", pady=(4, 0))
+            anchor="w")
         row = ttk.Frame(parent, style="Panel.TFrame")
         row.pack(fill=tk.X)
         row.columnconfigure(0, weight=1)
@@ -1130,7 +1216,7 @@ def gui_main():
 
     # ── Title ─────────────────────────────────────────────────────────────────
     tf = ttk.Frame(sidebar, style="Panel.TFrame")
-    tf.pack(fill=tk.X, padx=14, pady=(16, 4))
+    tf.pack(fill=tk.X, padx=14, pady=(16, 0))
 
     banner_img = None
     banner_path = SCRIPT_DIR / "docs" / "banner.png"
@@ -1164,7 +1250,7 @@ def gui_main():
 
     # ── Oblivion data directory ───────────────────────────────────────────────
     dir_frame = ttk.Frame(sidebar, style="Panel.TFrame")
-    dir_frame.pack(fill=tk.X, padx=14, pady=(0, 4))
+    dir_frame.pack(fill=tk.X, padx=14, pady=(0, 8))
 
     def _on_tes4_change(path):
         """Refresh plugin list when Oblivion data dir changes."""
@@ -1191,7 +1277,7 @@ def gui_main():
 
     # ── Plugin selector ───────────────────────────────────────────────────────
     pf = ttk.Frame(sidebar, style="Panel.TFrame")
-    pf.pack(fill=tk.X, padx=14, pady=(6, 0))
+    pf.pack(fill=tk.X, padx=14, pady=(0, 8))
     ttk.Label(pf, text="Plugin File", style="PanelSub.TLabel").pack(anchor="w")
     initial_plugins = scan_plugins(tes4_path)
     # Master list of every plugin in the data dir.  file_combo["values"] holds
@@ -1401,11 +1487,9 @@ def gui_main():
     # before the first pick still has a real plugin name to snap back to.
     last_valid[0] = file_var.get()
 
-    _sep()
-
     # ── Output directory ──────────────────────────────────────────────────────
     out_frame = ttk.Frame(sidebar, style="Panel.TFrame")
-    out_frame.pack(fill=tk.X, padx=14, pady=(0, 4))
+    out_frame.pack(fill=tk.X, padx=14, pady=(0, 8))
 
     def _on_output_change(path):
         _save_dir_to_config()
@@ -1423,11 +1507,9 @@ def gui_main():
 
     tes4_var.trace_add("write", lambda *_: None)  # live binding via on_change
 
-    _sep()
-
     # ── Skyrim SE data directory (for the "Patch Skyrim" step) ───────────────
     tes5_frame = ttk.Frame(sidebar, style="Panel.TFrame")
-    tes5_frame.pack(fill=tk.X, padx=14, pady=(0, 4))
+    tes5_frame.pack(fill=tk.X, padx=14, pady=(0, 0))
 
     def _on_tes5_change(path):
         _refresh_patch_plugin_vars()
@@ -1436,11 +1518,36 @@ def gui_main():
     _path_row(tes5_frame, "Skyrim SE Data Directory", tes5_var,
               browse_dir=True, on_change=_on_tes5_change)
 
+    # ── Field order ───────────────────────────────────────────────────────────
+    # Display order: Oblivion dir, Skyrim dir, Output dir, then Plugin File.
+    # The three directories are set once and rarely touched again; the plugin is
+    # what changes run to run, so it reads last, nearest the steps it drives.
+    #
+    # Re-packed here rather than by moving the blocks themselves: the plugin
+    # selector carries ~200 lines of combobox search/focus handling that the
+    # directory callbacks close over (_on_tes4_change repopulates file_combo),
+    # so reordering the source would mean reordering those dependencies too.
+    # Pack order alone decides layout, so restating it is the whole change.
+    for _blk in (dir_frame, tes5_frame, out_frame):
+        _blk.pack_forget()
+        _blk.pack(fill=tk.X, padx=14, pady=(0, 8))
+    # Last directory before the rule sits flush against it; _sep owns that gap.
+    out_frame.pack_configure(pady=(0, 0))
+
+    # The rule goes ABOVE the plugin box, not below it: it closes off the three
+    # set-once directories, leaving the plugin selector grouped with the
+    # Pipeline Steps it actually drives.
     _sep()
+
+    # A little more room below than the 8px the directory blocks use between
+    # each other: this gap separates two different KINDS of thing (the plugin
+    # field and the step list), not two fields of the same kind.
+    pf.pack_forget()
+    pf.pack(fill=tk.X, padx=14, pady=(0, 12))
 
     # ── Pipeline steps ────────────────────────────────────────────────────────
     sh = ttk.Frame(sidebar, style="Panel.TFrame")
-    sh.pack(fill=tk.X, padx=14, pady=(0, 4))
+    sh.pack(fill=tk.X, padx=14, pady=(0, 4))  # flush to the rule above
     ttk.Label(sh, text="Pipeline Steps", style="PanelSub.TLabel").pack(side=tk.LEFT)
 
     def _set_all():
@@ -1693,6 +1800,135 @@ def gui_main():
 
     _refresh_patch_plugin_vars()
 
+    # ── LOD merge order ───────────────────────────────────────────────────────
+    # The order sibling plugins are overlaid in when their contested LOD tiles
+    # are rebaked. The LAST entry wins any reference two of them both change,
+    # so this is conflict resolution, not presentation.
+    #
+    # None means "not chosen by hand" — the merge then derives it from
+    # plugins.txt (what the game itself obeys) with anything unlisted appended
+    # alphabetically. Only a deliberate drag pins it.
+    lod_order: list[str] = []
+
+    def _default_lod_order() -> list[str]:
+        """Converted plugins in plugins.txt order, unlisted appended A-Z."""
+        try:
+            from asset_convert.sibling_lod import (converted_plugins,
+                                                   plugins_txt_order)
+        except Exception:
+            return []
+        out_dir = output_var.get().strip() or str(SCRIPT_DIR / "output")
+        names = converted_plugins(Path(out_dir))
+        rank = {n.lower(): i for i, n in enumerate(plugins_txt_order())}
+        listed = [n for n in names if n.lower() in rank]
+        unlisted = sorted(n for n in names if n.lower() not in rank)
+        return sorted(listed, key=lambda n: rank[n.lower()]) + unlisted
+
+    def _open_lod_order_panel():
+        """Drag-to-reorder list deciding which sibling wins a contested tile."""
+        names = list(lod_order) if lod_order else _default_lod_order()
+
+        card = tk.Frame(outer, bg=CLR["panel"],
+                        highlightbackground=CLR["border"], highlightthickness=1)
+
+        def _close():
+            card.destroy()
+
+        title_row = tk.Frame(card, bg=CLR["panel"])
+        title_row.pack(fill=tk.X, padx=16, pady=(14, 0))
+        tk.Label(title_row, text="LOD merge order",
+                 bg=CLR["panel"], fg=CLR["text"],
+                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+
+        tk.Label(card,
+                 text=("Drag to reorder. Lowest priority first — the plugin at "
+                       "the BOTTOM\nwins any LOD tile two of them both change."),
+                 bg=CLR["panel"], fg=CLR["subtext"], justify=tk.LEFT,
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(4, 0))
+
+        ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16, pady=8)
+
+        if not names:
+            tk.Label(card,
+                     text="Nothing converted yet — convert a plugin first.",
+                     bg=CLR["panel"], fg=CLR["subtext"],
+                     font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(0, 8))
+        else:
+            # A plain Listbox, not a stack of widgets: it already gives index
+            # -> item hit-testing (`nearest`), selection and scrolling, which
+            # is the whole mechanic a drag-reorder needs.
+            lb = tk.Listbox(card, bg=CLR["log_bg"], fg=CLR["text"],
+                            selectbackground=CLR["accent"],
+                            selectforeground="#ffffff",
+                            highlightthickness=0, borderwidth=0, activestyle="none",
+                            font=("Segoe UI", 9), width=42,
+                            height=min(14, max(4, len(names))))
+            for n in names:
+                lb.insert(tk.END, n)
+            lb.pack(fill=tk.BOTH, expand=True, padx=16)
+
+            drag_from = [None]
+
+            def _press(e):
+                drag_from[0] = lb.nearest(e.y)
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(drag_from[0])
+
+            def _motion(e):
+                src = drag_from[0]
+                if src is None:
+                    return
+                dst = lb.nearest(e.y)
+                if dst < 0 or dst == src:
+                    return
+                # Move one row at a time so the list follows the cursor
+                # continuously instead of jumping on release.
+                item = lb.get(src)
+                lb.delete(src)
+                lb.insert(dst, item)
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(dst)
+                drag_from[0] = dst
+
+            def _release(_e):
+                drag_from[0] = None
+
+            lb.bind("<Button-1>", _press)
+            lb.bind("<B1-Motion>", _motion)
+            lb.bind("<ButtonRelease-1>", _release)
+
+            def _reset():
+                lb.delete(0, tk.END)
+                for n in _default_lod_order():
+                    lb.insert(tk.END, n)
+
+            def _accept():
+                # Store explicitly, even when it equals the default: the user
+                # having LOOKED and approved is itself information, and it
+                # keeps the merge stable if plugins.txt changes later.
+                lod_order[:] = list(lb.get(0, tk.END))
+                _close()
+
+            btns = tk.Frame(card, bg=CLR["panel"])
+            btns.pack(fill=tk.X, padx=16, pady=(10, 0))
+            ttk.Button(btns, text="Reset to load order",
+                       command=_reset).pack(side=tk.LEFT)
+
+            ttk.Separator(card, orient=tk.HORIZONTAL).pack(
+                fill=tk.X, padx=16, pady=8)
+            ttk.Button(card, text="OK", style="Accent.TButton",
+                       command=_accept).pack(pady=(0, 14))
+
+        if not names:
+            ttk.Separator(card, orient=tk.HORIZONTAL).pack(
+                fill=tk.X, padx=16, pady=8)
+            ttk.Button(card, text="OK", style="Accent.TButton",
+                       command=_close).pack(pady=(0, 14))
+
+        card.update_idletasks()
+        card.place(in_=outer, anchor="center", relx=0.5, rely=0.5)
+        card.lift()
+
     def _open_patch_plugin_panel():
         _refresh_patch_plugin_vars()
 
@@ -1759,7 +1995,6 @@ def gui_main():
 
     # Build step checkboxes
     _mesh_step_row = None
-    _body_step_row = None
     for step in STEPS:
         key, label, tip = step[0], step[2], step[3]
         row = ttk.Frame(sidebar, style="Panel.TFrame")
@@ -1770,8 +2005,6 @@ def gui_main():
             side=tk.LEFT, padx=(6, 0))
         if key == "meshes":
             _mesh_step_row = row
-        if key == "modify_body_meshes":
-            _body_step_row = row
 
     # Small link sitting just below the Meshes checkbox row
     _mesh_toggle_row = ttk.Frame(sidebar, style="Panel.TFrame")
@@ -1806,22 +2039,15 @@ def gui_main():
     _attach_tooltip(_winding_chk, _WINDING_TIP)
     _attach_tooltip(_winding_hint, _WINDING_TIP)
 
-    # Small link sitting just below the Patch Skyrim checkbox row
-    _body_toggle_row = ttk.Frame(sidebar, style="Panel.TFrame")
-    _body_toggle_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_body_step_row)
-    body_toggle_lbl = tk.Label(
-        _body_toggle_row, text="  select plugins...",
-        bg=CLR["panel"], fg=CLR["subtext"],
-        font=("Segoe UI", 9, "underline"), cursor="hand2",
-    )
-    body_toggle_lbl.pack(side=tk.LEFT, padx=(20, 0))
-    body_toggle_lbl.bind("<Button-1>", lambda _: _open_patch_plugin_panel())
-
-    _sep()
-
     # ── Action buttons ────────────────────────────────────────────────────────
+    # 12px above, matching a separator's gap: the step rows are packed tight
+    # (pady=1 each), so without it the Run button crowds the last checkbox and
+    # reads as another entry in the list rather than the thing that runs them.
+    # Bottom pad 0: the rule below owns that gap. A 6px pad here stacked on the
+    # separator's own 12px and made the space above that line visibly wider
+    # than the matching space below it.
     bf = ttk.Frame(sidebar, style="Panel.TFrame")
-    bf.pack(fill=tk.X, padx=14, pady=(0, 6))
+    bf.pack(fill=tk.X, padx=14, pady=(_SEP_GAP, 0))
 
     run_btn = ttk.Button(bf, text="  Run Selected Steps",
                          style="Run.TButton", command=lambda: _run_clicked())
@@ -1841,13 +2067,103 @@ def gui_main():
                             style="Cancel.TButton", state="disabled")
     cancel_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
-    # Progress bar + status
-    prog_bar = ttk.Progressbar(sidebar, mode="indeterminate", length=200)
-    prog_bar.pack(fill=tk.X, padx=14, pady=(4, 0))
-    prog_bar.pack_forget()
+    # ── Global actions ────────────────────────────────────────────────────────
+    # Below the whole Run/Clear/Cancel cluster, behind its own rule. Those three
+    # are one control group — Run starts the numbered steps for the ONE selected
+    # plugin, Cancel stops them, Clear tidies their log — and putting Global in
+    # the middle of it split that group in half.
+    #
+    # These two take no plugin at all: they run once over everything converted
+    # so far. Separate concern, so they get their own captioned block at the
+    # bottom rather than sitting among the per-plugin controls.
+    #
+    # Uses the shared _sep() rather than a hand-rolled Separator so its spacing
+    # matches the only two other rules in the sidebar instead of being a third,
+    # slightly different gap.
+    _sep()
 
+    # Padded exactly like the "Pipeline Steps" header block above — same frame
+    # pady, same bare label — so the gap under this rule matches the gap under
+    # the other two instead of being its own value.
+    # The 8px top pad is deliberate and matches, not pads past, the "Pipeline
+    # Steps" header: that frame is 31px tall because it also carries the
+    # All/Default/None buttons, which centre its label 16px below the rule.
+    # This header has no buttons to stretch it, so the same optical gap has to
+    # be stated outright — copying the other block's padding alone left it
+    # sitting 8px high and the two rules looked unevenly spaced.
+    gh = ttk.Frame(sidebar, style="Panel.TFrame")
+    gh.pack(fill=tk.X, padx=14, pady=(0, 4))  # flush to the rule above
+    ttk.Label(gh, text="Global", style="PanelSub.TLabel").pack(side=tk.LEFT)
+
+    gf = ttk.Frame(sidebar, style="Panel.TFrame")
+    gf.pack(fill=tk.X, padx=14, pady=(0, 6))
+
+    # Laid out by the `row` field. EVERY row keeps the same two columns, so a
+    # row holding one action fills only its own half and the lone button comes
+    # out the same width as the pair below it — spanning the full width made it
+    # read as the most important action here, which it is not.
+    global_btns: dict[str, ttk.Button] = {}
+    _rows: dict[int, list] = {}
+    for _act in GLOBAL_ACTIONS:
+        _rows.setdefault(_act[4], []).append(_act)
+
+    for _r in sorted(_rows):
+        _acts = _rows[_r]
+        _row_f = ttk.Frame(gf, style="Panel.TFrame")
+        _row_f.pack(fill=tk.X, pady=(0 if _r == 0 else 4, 0))
+        _row_f.columnconfigure(0, weight=1, uniform="global")
+        _row_f.columnconfigure(1, weight=1, uniform="global")
+        for _i, (gkey, glabel, gtip, gshort, _rr) in enumerate(_acts):
+            gb = ttk.Button(_row_f, text=gshort, style="Global.TButton",
+                            command=(lambda k=gkey: _run_global_action(k)))
+            gb.grid(row=0, column=_i, sticky="ew",
+                    padx=((0, 3) if _i == 0 else (3, 0)))
+            _attach_tooltip(gb, gtip)
+            global_btns[gkey] = gb
+
+    # One sub-link per global action, on a single row sharing the SAME two
+    # columns as the buttons above, so each link sits directly under the button
+    # it belongs to. Stacked on separate rows they read as two options of the
+    # left-hand button rather than one option of each.
+    _links_row = ttk.Frame(gf, style="Panel.TFrame")
+    _links_row.pack(fill=tk.X, pady=(5, 0))
+    _links_row.columnconfigure(0, weight=1, uniform="global")
+    _links_row.columnconfigure(1, weight=1, uniform="global")
+
+    body_toggle_lbl = tk.Label(
+        _links_row, text="select plugins...",
+        bg=CLR["panel"], fg=CLR["subtext"],
+        font=("Segoe UI", 9, "underline"), cursor="hand2",
+    )
+    body_toggle_lbl.grid(row=0, column=0, sticky="w", padx=(0, 3))
+    body_toggle_lbl.bind("<Button-1>", lambda _: _open_patch_plugin_panel())
+
+    order_toggle_lbl = tk.Label(
+        _links_row, text="merge order...",
+        bg=CLR["panel"], fg=CLR["subtext"],
+        font=("Segoe UI", 9, "underline"), cursor="hand2",
+    )
+    order_toggle_lbl.grid(row=0, column=1, sticky="w", padx=(3, 0))
+    order_toggle_lbl.bind("<Button-1>", lambda _: _open_lod_order_panel())
+
+    # Progress bar + status, both anchored to the BOTTOM of the sidebar.
+    #
+    # The status row was already side=BOTTOM while the bar was side=TOP, so
+    # every spare pixel in the sidebar pooled between the two — the taller
+    # window needed to fit the bar turned into a 74px void above "Ready".
+    # Anchoring the bar to the bottom as well keeps the pair together and puts
+    # the slack above the whole group, where it reads as ordinary breathing
+    # room instead of a hole. status_row is packed FIRST so that, with
+    # side=BOTTOM stacking upward, it ends up underneath the bar.
     status_row = ttk.Frame(sidebar, style="Panel.TFrame")
     status_row.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(0, 10))
+
+    # pady on the BOTTOM side, not the top: the bar sits ABOVE "Ready" now, so
+    # a top pad puts the gap on the wrong side of it and the bar ends up
+    # touching the status text.
+    prog_bar = ttk.Progressbar(sidebar, mode="indeterminate", length=200)
+    prog_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(0, 6))
+    prog_bar.pack_forget()
 
     status_var = tk.StringVar(value="Ready")
     ttk.Label(status_row, textvariable=status_var, style="PanelSub.TLabel").pack(
@@ -1973,7 +2289,10 @@ def gui_main():
                              text="Cancel")
         file_combo.configure(state="disabled" if state else "normal")
         if state:
-            prog_bar.pack(fill=tk.X, padx=14, pady=(4, 0))
+            # Must match the original pack exactly — side=BOTTOM (or the bar
+            # re-appears at the TOP of the sidebar on the first run) and the
+            # pad on the bottom side (or it butts against "Ready").
+            prog_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(0, 6))
             prog_bar.start(12)
             status_var.set("Running...")
             _start_timer()
@@ -1986,6 +2305,9 @@ def gui_main():
             # outstanding has changed.  Recompute, but do NOT re-tick the
             # boxes: the user is looking at the selection they just ran.
             _refresh_upgrade_notice(auto_apply=False)
+            # A conversion that just added a plugin changes what the global
+            # actions would produce, so a previously-done one goes live again.
+            _refresh_global_btns()
         _update_run_btn()
 
     def _cancel_clicked():
@@ -2003,7 +2325,7 @@ def gui_main():
                 else "--no-collision-winding-fix")
 
     def _build_cmd(step_key: str, fname: str, out_dir: str,
-                   selected_subdirs=None, selected_patch_plugins=None) -> list:
+                   selected_subdirs=None) -> list:
         """Build the convert.py command for a single step."""
         _, flag, _, _, _, needs_file = next(
             s for s in STEPS if s[0] == step_key)
@@ -2018,9 +2340,203 @@ def gui_main():
             # Always explicit: the checkbox is the user's answer, whether it
             # came from the per-plugin default or from them ticking the box.
             cmd.append(_winding_flag())
-        if step_key == "modify_body_meshes" and selected_patch_plugins:
-            cmd += ["--patch-plugins"] + selected_patch_plugins
         return cmd
+
+    # ── Global actions ────────────────────────────────────────────────────────
+    def _global_cmd(key: str, out_dir: str) -> list:
+        """The argv for one global action."""
+        if key == "package_start_mod":
+            cmd = [sys.executable, "-u",
+                   str(SCRIPT_DIR / "tools" / "package_start_mod.py")]
+            if out_dir:
+                cmd += ["--output-dir", out_dir]
+            return cmd
+
+        if key == "sibling_lod":
+            cmd = [sys.executable, "-u",
+                   str(SCRIPT_DIR / "tools" / "merge_sibling_lod.py")]
+            if out_dir:
+                cmd += ["--output-dir", out_dir]
+            # Only when the user arranged one by hand; otherwise the tool
+            # derives it from plugins.txt itself, which keeps the default
+            # correct as their load order changes.
+            if lod_order:
+                cmd += ["--order"] + lod_order
+            return cmd
+
+        cmd = [sys.executable, "-u", str(SCRIPT_DIR / "convert.py"),
+               "--modify-body-meshes"]
+        if out_dir:
+            cmd += ["--output-dir", out_dir]
+        chosen = [n for n, v in patch_plugin_vars if v.get()]
+        if chosen and chosen != [n for n, _ in patch_plugin_vars]:
+            cmd += ["--patch-plugins"] + chosen
+        return cmd
+
+    def _global_is_current(key: str) -> bool:
+        """Has this action run, and is its result still up to date?
+
+        "Done" is not permanent. These actions consume the set of things
+        CONVERTED SO FAR, so converting another plugin (or editing the Skyrim
+        load order) can invalidate a result that was correct when it was
+        produced — a merged LOD folder built before ElsweyrAnequina existed
+        knows nothing about ElsweyrAnequina's tiles. So the stamp is compared
+        against the newest input rather than merely existing.
+
+        The ARTEFACT is the evidence, not the run record. An action whose output
+        is already on disk is done however it got there — packaged by an earlier
+        session, by the CLI tool directly, or by a teammate's copy of output/ —
+        and demanding a locally-recorded run marked finished work as outstanding.
+        """
+        art = _global_artifact(key)
+        if art is not None and not art.exists():
+            return False
+        try:
+            stamp = _global_stamp(key)
+        except Exception:
+            return False
+        if _last_global_stamp.get(key) == stamp:
+            return True
+        # No stamp from this session: fall back to the recorded run, which is
+        # all there is for an action whose output we cannot point at.
+        if art is None:
+            return False
+        # The artefact exists AND its inputs are unchanged since it was made.
+        # Adopt the stamp so later input changes are still detected.
+        _last_global_stamp[key] = stamp
+        return True
+
+    def _global_artifact(key: str):
+        """The file this action produces, when it has a single obvious one.
+
+        None means "no artefact to test" — the result is spread over a folder
+        (merged LOD) or lives outside output/, so only the run record can speak
+        for it.
+        """
+        out_dir = output_var.get().strip() or str(SCRIPT_DIR / "output")
+        if key == "package_start_mod":
+            return Path(out_dir) / "TESGameSelect.zip"
+        if key == "modify_body_meshes":
+            return Path(out_dir) / "Slot44 Patch.esp"
+        return None
+
+    def _global_stamp(key: str) -> str:
+        """A fingerprint of everything `key`'s result depends on.
+
+        Changing any input changes the stamp, which un-greys the button. For
+        both actions that means the set of converted plugins; "Patch Skyrim"
+        additionally depends on the Skyrim load order it patches.
+        """
+        out_dir = output_var.get().strip() or str(SCRIPT_DIR / "output")
+
+        if key == "package_start_mod":
+            # Depends on the COMMITTED starter mod, not on anything converted:
+            # keying it to the plugin set would re-light it every time an
+            # unrelated conversion finished, when the zip is still correct.
+            # Name+size+mtime of each dist file is enough to notice a pull that
+            # updated the prebuilt mod.
+            dist = SCRIPT_DIR / "TESGameSelect" / "dist"
+            try:
+                src = sorted(
+                    f"{p.relative_to(dist).as_posix()}:{st.st_size}:"
+                    f"{int(st.st_mtime)}"
+                    for p in dist.rglob('*') if p.is_file()
+                    for st in (p.stat(),))
+            except OSError:
+                src = []
+            # Whether the zip EXISTS is not folded in here: _global_is_current
+            # already tests the artefact directly, so this only has to describe
+            # the inputs that would make an existing zip stale.
+            return "\x1f".join(src)
+
+        parts = []
+        try:
+            from asset_convert.sibling_lod import converted_plugins
+            parts += sorted(converted_plugins(Path(out_dir)))
+        except Exception:
+            pass
+        if key == "modify_body_meshes":
+            parts += ["|"] + sorted(n for n, v in patch_plugin_vars if v.get())
+        if key == "sibling_lod":
+            # The ORDER is an input, not a presentation detail: it decides
+            # which sibling wins a contested tile, so re-ordering invalidates a
+            # merge exactly as much as converting another plugin does. Falls
+            # back to the derived default so an edit to plugins.txt counts too.
+            parts += ["|"] + (lod_order or _default_lod_order())
+        return "\x1f".join(parts)
+
+    # The stamp each action was last completed at, so a later conversion can
+    # un-grey it. Session-scoped: on a fresh start the buttons show as done if
+    # the step was ever recorded, and go live again the moment an input moves.
+    _last_global_stamp: dict[str, str] = {}
+
+    def _refresh_global_btns():
+        """Grey out the actions whose result is current; light up the rest."""
+        for gkey, _glabel, _tip, gshort, _grow in GLOBAL_ACTIONS:
+            btn = global_btns.get(gkey)
+            if btn is None:
+                continue
+            if _global_is_current(gkey):
+                btn.configure(text=f"✓ {gshort}", style="GlobalDone.TButton")
+            else:
+                btn.configure(text=gshort, style="Global.TButton")
+
+    def _run_global_action(key: str):
+        """Run one global action in a worker thread, logging to the main pane."""
+        if running.is_set():
+            return
+        out_dir = output_var.get().strip()
+        cmd = _global_cmd(key, out_dir)
+        label = next(l for k, l, _t, _s, _r in GLOBAL_ACTIONS if k == key)
+
+        _clear_log()
+        _log(label)
+        _log(f"Output: {out_dir}")
+        _log("")
+
+        q = queue.Queue()
+
+        def _drain():
+            try:
+                while True:
+                    _log(q.get_nowait())
+            except queue.Empty:
+                pass
+            if running.is_set():
+                root.after(50, _drain)
+
+        run_env = {WORKERS_ENV_VAR: str(_get_workers())}
+
+        def _worker():
+            _set_running(True)
+            ret = 1
+            try:
+                q.put(f"Running: {' '.join(cmd)}")
+                ret = _run_process(cmd, q.put, env=run_env,
+                                   cancel_event=cancel_evt)
+                q.put("")
+                q.put("  CANCELLED" if ret == -2
+                      else "  DONE" if ret == 0
+                      else f"  FAILED (exit {ret})")
+            finally:
+                if ret == 0:
+                    # Stamp only on success: a failed or cancelled run must
+                    # leave the button lit, not quietly mark the work done.
+                    try:
+                        _last_global_stamp[key] = _global_stamp(key)
+                        import version as _v
+                        _v.record_step_run(key, None)
+                    except Exception:
+                        pass
+                root.after(0, lambda: _set_running(False))
+
+        threading.Thread(target=_worker, daemon=True).start()
+        # Schedule the drain, never call it inline: `running` is set INSIDE
+        # _worker, on the worker thread, so an immediate call almost always
+        # sees it still clear, skips the `if running.is_set()` re-arm and never
+        # runs again — every line of output stays stranded in the queue and the
+        # button looks dead. Deferring lets the worker set the flag first.
+        root.after(50, _drain)
 
     def _run_clicked():
         if running.is_set():
@@ -2047,14 +2563,6 @@ def gui_main():
             if chosen and chosen != all_names:
                 selected_subdirs = chosen
 
-        # Collect selected Skyrim plugins to patch (None = all/default)
-        selected_patch_plugins = None
-        if "modify_body_meshes" in steps and patch_plugin_vars:
-            chosen = [name for name, v in patch_plugin_vars if v.get()]
-            all_names = [name for name, _ in patch_plugin_vars]
-            if chosen != all_names:
-                selected_patch_plugins = chosen
-
         _clear_log()
         _log(f"File: {fname or '(none)'}")
         _log(f"Steps: {', '.join(steps)}")
@@ -2064,8 +2572,6 @@ def gui_main():
             _log(f"Mesh subdirs: {', '.join(selected_subdirs)}")
         if "meshes" in steps:
             _log(f"Collision winding fix: {'on' if winding_var.get() else 'off'}")
-        if selected_patch_plugins is not None:
-            _log(f"Patch plugins: {', '.join(selected_patch_plugins) or '(none)'}")
         _log("")
 
         q = queue.Queue()
@@ -2097,11 +2603,20 @@ def gui_main():
                 active_set  = set(steps)
                 ret = 0
                 # If selection == default set and a file is specified and no
-                # mesh subfolder / patch-plugin filter, run the pipeline once
+                # mesh subfolder filter, run the pipeline once.
+                #
+                # NOT via a bare `convert.py -f <plugin>`: that takes convert's
+                # own default path, which still switches Patch Skyrim on. That
+                # step is a global BUTTON now, so running it as a side effect of
+                # converting one plugin is exactly the coupling this change
+                # removes — it would rewrite the shared patch (and the load
+                # order it was built for) behind the user's back. Listing the
+                # steps explicitly keeps the button the only thing that runs it.
                 if (active_set == default_set and fname
-                        and not selected_subdirs and selected_patch_plugins is None):
+                        and not selected_subdirs):
                     cmd = [sys.executable, "-u", str(SCRIPT_DIR / "convert.py"),
                            "-f", fname, _winding_flag()]
+                    cmd += [flag for key, flag, *_ in STEPS if key in active_set]
                     if out_dir:
                         cmd += ["--output-dir", out_dir]
                     q.put(f"Running: {' '.join(cmd)}")
@@ -2111,8 +2626,7 @@ def gui_main():
                     for step in steps:
                         if cancel_evt.is_set():
                             break
-                        cmd = _build_cmd(step, fname, out_dir, selected_subdirs,
-                                         selected_patch_plugins)
+                        cmd = _build_cmd(step, fname, out_dir, selected_subdirs)
                         q.put(f"Running: {' '.join(cmd)}")
                         r = _run_process(cmd, q.put, env=run_env,
                                          cancel_event=cancel_evt)
@@ -2149,6 +2663,20 @@ def gui_main():
     # (and pre-selected) before the user touches anything.
     _refresh_upgrade_notice()
     _update_run_btn()
+    # Seed the global buttons from what has already been run, so a session that
+    # opens onto an up-to-date output shows them greyed rather than outstanding.
+    # Actions with a testable artefact are resolved by _global_is_current
+    # itself; this only has to seed the ones that have none, where a recorded
+    # run is the sole evidence they ever completed.
+    for _gk, *_ in GLOBAL_ACTIONS:
+        try:
+            import version as _v
+            if (_global_artifact(_gk) is None
+                    and _v.steps_run_at(None).get(_gk)):
+                _last_global_stamp[_gk] = _global_stamp(_gk)
+        except Exception:
+            pass
+    _refresh_global_btns()
     root.mainloop()
     return 0
 
