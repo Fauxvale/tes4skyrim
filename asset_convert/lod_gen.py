@@ -9,6 +9,7 @@ Workflow:
 All three are orchestrated by generate_lod(), which convert.py calls as Phase 4.
 """
 
+import hashlib as _hashlib
 import math
 import os
 import re as _re
@@ -573,15 +574,38 @@ def _obnd_max_dim(stat: dict) -> float:
     return float(max(x2 - x1, y2 - y1, z2 - z1))
 
 
+# ---------------------------------------------------------------------------
+# Master-owned assets and what a child plugin may ship
+#
+# The rule, for MESHES and TEXTURES alike: a child never ships a file its
+# master already ships at the same path. The game's Data folder holds exactly
+# one file per path, so the child's .bto tiles resolve against the master's
+# copy — a second byte-identical copy only bloats the plugin (ElsweyrAnequina:
+# 2,015 meshes / 211 MB plus 828 textures / 165 MB).
+#
+# Textures need nothing staged: they are read at RUNTIME, so the master's copy
+# is simply left in place (_fill_missing_lod_textures skips anything a master
+# ships). Meshes are read by LODGen at BUILD time under a single PathData root
+# that cannot span both trees, so they are staged here and dropped afterwards.
+_STAGED_MASTER_MESHES = set()
+
+
 def _import_master_mesh(rel: str, output_meshes_dir: Path,
                         master_meshes) -> bool:
-    """Copy a mesh from a master's output into this plugin's, if needed.
+    """Stage a master's mesh into this plugin's tree, if needed.
 
     LODGen resolves every listed mesh under the SINGLE PathData root it is
     given, so a mesh that only exists in the master's tree cannot merely be
     referenced — listing it makes LODGen abort with "file not found" and bake
-    no tiles at all. An override plugin that rebuilds a whole tile needs the
-    master's tree/rock/building LOD meshes, so they are imported here.
+    no tiles at all. PathData cannot be widened to cover both trees: it is also
+    the TEXTURE root and it contains PathOutput, so pointing it elsewhere either
+    shadows this plugin's own assets or writes the .bto into the master's tree.
+
+    So the file is staged here for the duration of the bake and REMOVED
+    afterwards (_drop_staged_master_meshes). The .bto has the geometry baked in
+    by then, and the master already ships the mesh at that same path, so
+    shipping a second byte-identical copy would only bloat the plugin — 2,015
+    meshes / 211 MB for ElsweyrAnequina.
 
     Returns True when the mesh is available in this plugin's tree afterwards.
     """
@@ -600,10 +624,68 @@ def _import_master_mesh(rel: str, output_meshes_dir: Path,
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
+            # Only a file WE created is scratch; never a pre-existing one.
+            _STAGED_MASTER_MESHES.add(str(dst))
             return True
         except OSError:
             return False
     return False
+
+
+def _file_digest(p: Path) -> bytes:
+    h = _hashlib.sha1()
+    with open(p, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b''):
+            h.update(chunk)
+    return h.digest()
+
+
+def _overrides_master_model(model: str, own_meshes_root: Path,
+                            master_meshes) -> bool:
+    """True if this plugin ships its OWN version of a master's full model.
+
+    Reusing a master's _far.nif is only correct when the geometry it was
+    derived from is the geometry this plugin places. A child that overrides
+    rock01.nif with a different shape must derive its own rock01_far.nif, or
+    its distant LOD would show the MASTER's rock.
+
+    Byte-identical is not an override — that is the ordinary duplicate case,
+    where reuse is exactly what we want.
+    """
+    rel = (model or '').lower().replace('/', '\\').lstrip('\\')
+    if not rel:
+        return False
+    if rel.startswith('meshes\\'):
+        rel = rel[len('meshes\\'):]
+    own = own_meshes_root / rel
+    if not own.is_file():
+        return False
+    for mm in master_meshes:
+        src = Path(mm) / rel
+        if not src.is_file():
+            continue
+        if own.stat().st_size != src.stat().st_size:
+            return True
+        return _file_digest(own) != _file_digest(src)
+    # Master has no copy: this model is wholly this plugin's.
+    return True
+
+
+def _drop_staged_master_meshes() -> int:
+    """Remove the master meshes staged for the bake; return how many went.
+
+    Mirrors _prune_unaffected_tiles: output that is byte-for-byte what the
+    master already ships is not this plugin's to carry.
+    """
+    n = 0
+    for p in sorted(_STAGED_MASTER_MESHES):
+        try:
+            os.remove(p)
+            n += 1
+        except OSError:
+            pass
+    _STAGED_MASTER_MESHES.clear()
+    return n
 
 
 def _lod_meshes_for(stat: dict, output_meshes_dir: Path, master_meshes=None):
@@ -665,12 +747,67 @@ def _lod_meshes_for(stat: dict, output_meshes_dir: Path, master_meshes=None):
 # ---------------------------------------------------------------------------
 
 
+def _kept_tile_cells(only_cells, levels=(4, 8, 16, 32)) -> set:
+    """Every cell composited by a tile that `_prune_unaffected_tiles` keeps.
+
+    A tile survives pruning when it covers ANY changed cell, and it composites
+    all level x level cells of its footprint. So the cells whose objects can
+    still reach a surviving tile are the UNION of those footprints — strictly
+    wider than `only_cells` itself, and the exact set worth baking.
+
+    Anything outside it lands only in tiles that are deleted moments later, so
+    listing it makes LODGen bake geometry into a file destined for `unlink()`.
+    That is the whole cost being avoided: DLCBattlehornCastle changes 14 cells
+    and keeps 8 of 997 tiles, having baked all 997 from ~1M references.
+
+    The largest level dominates the union (a level-32 tile spans 32x32 cells),
+    so the result stays a wide neighbourhood, not a tight box — deliberately,
+    because a coarse tile at the edit's edge really does draw those objects.
+
+    Use `_kept_tile_cells_by_level` when the goal is to stop LODGen CREATING
+    surplus tiles; this flat union only bounds their CONTENT.
+    """
+    kept = set()
+    for cells in _kept_tile_cells_by_level(only_cells, levels).values():
+        kept |= cells
+    return kept
+
+
+def _kept_tile_cells_by_level(only_cells, levels=(4, 8, 16, 32)) -> dict:
+    """Per-level footprints: {level: cells composited by that level's kept tiles}.
+
+    LODGen has no switch for "bake only these tiles" — it derives the tile set
+    from the references it is given, emitting a tile at EVERY level for any
+    cell that carries one. So a single flat footprint (the level-32 union, 32x32
+    cells wide) makes it bake a level-4 tile for all 1,024 of those cells, and
+    `_prune_unaffected_tiles` then deletes nearly all of them: measured on
+    DLCBattlehornCastle, 177 tiles baked to ship 8.
+
+    Splitting per level is what removes that. A reference is listed for a level
+    only when it falls inside a tile THAT level actually keeps, so a distant
+    object still reaches the coarse level-32 tile that legitimately draws it
+    while contributing no level-4 tile of its own.
+    """
+    by_level = {}
+    for level in levels:
+        # A tile's SW corner is floor-aligned to its own level.
+        tiles = {((cx // level) * level, (cy // level) * level)
+                 for cx, cy in only_cells}
+        cells = set()
+        for tx, ty in tiles:
+            for dy in range(level):
+                for dx in range(level):
+                    cells.add((tx + dx, ty + dy))
+        by_level[level] = cells
+    return by_level
+
+
 def write_lodgen_input(esm_path: Path, output_dir: Path,
                        worldspace_edid: str,
                        _parsed=None,
                        cell_sw: tuple = None,
                        master_dirs=None, master_mesh_dirs=None,
-                       replace_tiles=False) -> Path:
+                       replace_tiles=False, only_cells=None) -> Path:
     """
     Parse the converted ESM and write the LODGen input text file.
 
@@ -692,6 +829,15 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
     master's objects as well — otherwise every tree, rock and building in the
     rebuilt tiles disappears. The two modes are mutually exclusive: skip the
     master's objects only when shipping tiles ALONGSIDE the master's.
+
+    `only_cells` restricts the listed references to those that can land in a
+    tile this run actually KEEPS (see `_kept_tile_cells`). Without it an
+    override plugin lists the master's entire worldspace, LODGen bakes every
+    tile, and `_prune_unaffected_tiles` then deletes almost all of them —
+    ElsweyrAnequina fed 189,702 references to bake 997 tiles and kept 127;
+    DLCBattlehornCastle kept 8. The refs are still needed (replace_tiles means
+    the rebuilt tiles must carry the master's objects too), just only within
+    the surviving tiles' footprint.
 
     Returns path to the written file, or None if no LOD refs found.
     """
@@ -741,6 +887,11 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
     # Index cells by form_id → parent_wrld for fast lookup
     cell_wrld = {fid: c['parent_wrld'] for fid, c in cells.items()}
 
+    # Cells whose objects can still reach a tile that survives pruning. Refs
+    # outside this footprint are baked into tiles that are deleted immediately
+    # afterwards, so screening and listing them is pure waste.
+    keep_cells = _kept_tile_cells(only_cells) if only_cells else None
+
     # Collect exterior REFR records in this worldspace whose base is a STAT/ACTI/etc.
     lines = []
     skipped_unsafe = set()
@@ -755,6 +906,16 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
         if ref['parent_wrld'] != wrld_fid:
             pc = ref['parent_cell']
             if cell_wrld.get(pc, 0) != wrld_fid:
+                continue
+
+        # Drop refs that cannot land in a surviving tile. Position decides the
+        # cell, not the parent CELL record: an override plugin's refs are
+        # merged from two files and a ref's own cell is not always present in
+        # `cells`, while its X/Y always place it on the grid. Skyrim cell size
+        # is 4096 units and floor division is correct for negatives.
+        if keep_cells is not None:
+            if (int(math.floor(ref['x'] / 4096.0)),
+                    int(math.floor(ref['y'] / 4096.0))) not in keep_cells:
                 continue
 
         base_fid = ref['base_fid']
@@ -868,6 +1029,10 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
         f.write('\n'.join(header) + '\n')
         f.write('\n'.join(lines) + '\n')
 
+    if keep_cells is not None:
+        print(f"  Restricted to the {len(keep_cells)} cell(s) covered by the "
+              f"tiles this run keeps: {len(lines)} of {len(refs)} references "
+              f"listed")
     print(f"  LODGen input: {out_txt} ({len(lines)} references)")
     return out_txt
 
@@ -1121,12 +1286,21 @@ def generate_lod(esm_path: Path, output_dir: Path,
     # Generate _far.nif LOD meshes for any LOD-flagged objects that don't have one.
     # Only process models that are actually placed in this worldspace.
     # Must happen before writing the LODGen input so the new files are found.
+    #
+    # When only some tiles survive, a model placed nowhere near them never
+    # reaches a shipped tile, so QEM-decimating it is wasted work — the same
+    # footprint used for the LODGen input applies here.
     cell_wrld_map = {fid: c['parent_wrld'] for fid, c in cells.items()}
+    keep_cells = _kept_tile_cells(only_cells) if only_cells else None
     referenced_models = set()
     for ref in refs:
         pw = ref['parent_wrld']
         if pw != wrld_fid and cell_wrld_map.get(ref['parent_cell'], 0) != wrld_fid:
             continue
+        if keep_cells is not None:
+            if (int(math.floor(ref['x'] / 4096.0)),
+                    int(math.floor(ref['y'] / 4096.0))) not in keep_cells:
+                continue
         base_fid = ref['base_fid']
         if base_fid in stats:
             m = stats[base_fid].get('model', '')
@@ -1141,12 +1315,18 @@ def generate_lod(esm_path: Path, output_dir: Path,
     # This is keyed off master_MESH_dirs, not master_dirs: a plugin that owns
     # its worldspace still places its masters' models in it, so mesh reuse
     # applies even though the master ships no tiles for that worldspace.
+    # Reuse is only valid when this plugin does NOT override the full model.
+    # A child that ships its own rock01.nif needs its OWN rock01_far.nif —
+    # the master's was derived from the master's geometry, so reusing it would
+    # draw the master's shape in this plugin's distant LOD.
+    own_meshes_root = output_dir / 'meshes'
     master_meshes = [Path(d) / 'meshes' for d in (master_mesh_dirs or [])]
     if master_meshes:
         before = len(referenced_models)
         referenced_models = {
             m for m in referenced_models
-            if not any(_mesh_exists(_far_nif_path(m), mm) for mm in master_meshes)
+            if _overrides_master_model(m, own_meshes_root, master_meshes)
+            or not any(_mesh_exists(_far_nif_path(m), mm) for mm in master_meshes)
         }
         skipped = before - len(referenced_models)
         if skipped:
@@ -1168,7 +1348,8 @@ def generate_lod(esm_path: Path, output_dir: Path,
                                     cell_sw=(eff_sw_x, eff_sw_y),
                                     master_dirs=master_dirs,
                                     master_mesh_dirs=master_mesh_dirs,
-                                    replace_tiles=bool(only_cells))
+                                    replace_tiles=bool(only_cells),
+                                    only_cells=only_cells)
     ok = False
     if lodgen_txt:
         # Remove stale tiles first: LODGen only rewrites tiles that still have
@@ -1197,6 +1378,13 @@ def generate_lod(esm_path: Path, output_dir: Path,
         objects_dir, _textures_root(output_dir),
         master_tex_roots=[_textures_root(Path(d))
                           for d in (master_texture_dirs or master_dirs or [])])
+
+    # The master meshes staged for LODGen have served their purpose: the
+    # geometry is baked into the .bto and the master ships the mesh itself.
+    dropped = _drop_staged_master_meshes()
+    if dropped:
+        print(f"  Dropped {dropped} master mesh(es) staged for the bake; "
+              f"the master already ships them at the same paths")
 
     if ok:
         print(f"[LOD] Object LOD generation complete.")
@@ -1278,32 +1466,28 @@ def _fill_missing_lod_textures(bto_dir: Path, tex_root: Path,
 
     A plugin can also bake a MASTER's models into its own LOD (Morrowind_ob
     places Oblivion architecture in its worldspace), and those diffuse textures
-    live only in the master's output — 117 of them, which would render as
-    untextured LOD.  They are copied in from the master, since this plugin's
-    .bto tiles are what reference them.
+    live only in the master's output.  A .bto references a texture by PATH, and
+    Data holds exactly ONE file per path — the master already ships that path,
+    so the child's tiles resolve against the master's copy.  Copying it in
+    would duplicate the master's asset byte-for-byte (828 files, 165 MB for
+    ElsweyrAnequina) to gain nothing, so a texture a master already ships is
+    left to the master and only genuinely absent ones are handled here.
     """
+    def _in_master(rel):
+        return any((mr / rel).exists() for mr in (master_tex_roots or []))
+
     missing = sorted(r for r in _bto_texture_refs(bto_dir)
-                     if not (tex_root / r).exists())
+                     if not (tex_root / r).exists() and not _in_master(r))
     if not missing:
         return
 
     synth = 0
-    from_master = 0
     unresolved = []
     for rel in missing:
         dest = tex_root / rel
         if not rel.endswith('_n.dds'):
-            # Diffuse (or any non-normal) the master already converted.
-            src = next((mr / rel for mr in (master_tex_roots or [])
-                        if (mr / rel).exists()), None)
-            if src is not None:
-                try:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dest)
-                    from_master += 1
-                    continue
-                except Exception:
-                    pass
+            # Nothing to copy: a master-shipped path was filtered out above,
+            # so anything reaching here exists in no tree we know of.
             unresolved.append(rel)
             continue
         stem = rel[:-len('_n.dds')]              # 'tes4\...\lcstone01_a'
@@ -1337,9 +1521,6 @@ def _fill_missing_lod_textures(bto_dir: Path, tex_root: Path,
         except Exception:
             unresolved.append(rel)
 
-    if from_master:
-        print(f"  Copied {from_master} object-LOD texture(s) from a master's "
-              f"output (this plugin bakes the master's models into its LOD).")
     if synth:
         print(f"  Synthesized {synth} object-LOD normal maps.")
     if unresolved:
