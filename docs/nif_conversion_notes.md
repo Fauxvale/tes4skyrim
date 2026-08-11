@@ -161,6 +161,38 @@ Vanilla `trapmace01` ships its links dynamic because a *Skyrim* trap has no
 script-held phase; ours must reproduce Oblivion's held phase instead. Do not
 "correct" ours to match vanilla here.
 
+**But the MOTION TYPE is the only thing the held phase changes — quality_type
+and solver_deactivation must be the POST-RELEASE values (2026-08-10, in-game
+confirmed hang).** `SetMotionType(Motion_Dynamic)` swaps the motion type and
+nothing else, so whatever the NIF ships for collision quality is what the body
+simulates with *after* it is let go. The keyframed branch used to give every
+animated body `quality_type=1` (MO_QUAL_FIXED, "static body") with
+`solver_deactivation=1` (OFF) — right for a door, whose position really is
+deterministic and which is never released, but wrong for a held trap. On
+release that handed Havok a ring of mass-bearing bodies inside a live
+constraint island all still claiming to be static with deactivation disabled;
+the solver has no consistent state to converge on and the simulation step stops
+completing. The game keeps running and never renders another frame — it reads
+as a **freeze on a black loading screen**, not a crash, and nothing appears in
+the Papyrus log.
+
+Symptom that isolated it: walking onto the tripwire in Natural Caverns
+(`ImperialDungeon05`, `CGTrigTripwire01` → three chained `CTrapSwingMaceLong01`)
+hung the game, while the Vilverin tripwire was fine. Vilverin's trap is
+`CTrapSwingMaceShort01`, and the two differ in exactly one way that matters:
+the long mace hangs on **7 `chainLink` bodies with `bhkRagdollConstraint`**,
+the short one had no chain at the point it was compared. Same mesh family,
+same script, same `playgroup` — the constraint island was the whole difference.
+
+Vanilla is the reference for the released state: `trapmace01.nif` ships every
+`Link01..11` **and** `Mace01` at `quality_type=4` (MO_QUAL_MOVING) with
+`solver_deactivation=2` (LOW). So `_convert_collision` now branches on
+`breakaway_body`: held/breakaway pieces get 4/2, plain animated bodies keep
+1/1. Plain animated doors (`cdoor03`, `ricketyfencegate01`) stay
+**byte-identical**, and creature skeletons are untouched because they route
+through `_convert_blend_collision` before this branch. Regression test:
+`test_held_trap_ships_post_release_quality`.
+
 **The release is keyed on the MESH, never the animation-group name.**
 `physics_flags_from_data` bit 1 = "ships a keyframed body that kept a non-zero
 mass", which `_convert_collision` writes for held pieces only (36 meshes).
@@ -250,7 +282,8 @@ Fixed generically in `_normalize_shader_cb_strings` (runs at the end of
 `_match_seq_shader_types`).  PSys controlled-block strings were already
 vanilla-identical (`var1='NiPSysBoxEmitter:0'`, `var2='BirthRate'`) — leave.
 
-### NiGeomMorpherController does not exist in Skyrim — emulate as a wrapper-node SCALE swap (2026-08-09, in-game confirmed)
+<a id="morph-emulation"></a>
+### NiGeomMorpherController does not exist in Skyrim — emulate as a shape swap (⚠ SCALE version REVERTED 2026-08-10, see notice below)
 
 The SSE exe has NO `NiGeomMorpherController` RTTI class (only the orphaned
 `NiMorphData` remains) and vanilla ships 0 uses, so morph entries HAD to be
@@ -273,7 +306,110 @@ manager's `NiDefaultAVObjectPalette`.  Scale keys are `LINEAR` (1) floats with
 a hold key one frame (1/30 s) before each transition, which expresses the step
 without touching the bool-key machinery.
 
-**Do NOT "restore" the NiVisController version.**  The first implementation
+> ## 🛑 REVERTED 2026-08-10 — THE SCALE SWAP FREEZES THE GAME
+>
+> **Everything described above and below about the wrapper-node SCALE swap is
+> the state of `90d04a3`, which is NOT what the tree currently builds.**
+> `_emulate_morphs` has been reverted to the pre-`90d04a3` **NiVisController**
+> implementation because the scale swap hard-freezes Skyrim.
+>
+> ### The symptom
+> Walking onto the tripwire in **Natural Caverns / `ImperialDungeon05`**
+> (ref `00051AC9`, base `CGTrigTripwire01` `000CD4CC`) freezes the game: no
+> crash, no crash log, nothing in the Papyrus log — the process stays alive
+> and never renders another frame.  The **same mesh file** in **Vilverin**
+> (ref `0006BF50`, base `CTrigTripwire01` `0004CAD9`) works perfectly, wire
+> snap and all.  One `ctrigtripwire01.nif` serves both cells, so the mesh
+> alone cannot explain the difference — that contradiction was never resolved.
+>
+> ### How it was isolated (in-game bisection, user-run)
+> Each removed in turn from `output/`, one at a time:
+> * long mace `ctrapswingmacelong01.nif` removed → **still froze**
+> * tripwire `ctrigtripwire01.nif` removed → **no freeze**
+> * tripwire restored, `ctrigtripwire01_behavior/` removed → **froze**
+>   (so the animobject graph is innocent)
+> * tripwire rebuilt with `_emulate_morphs` disabled → **no freeze**
+>
+> That last step is the definitive result: **morph emulation ON = freeze,
+> OFF = no freeze.**  The trap-damage `OnTrapHitStart` scripts were also
+> stripped and rebuilt separately — the freeze persisted, so the scripts are
+> innocent too.
+>
+> ### Four fixes attempted, all failed in-game
+> 1. **Move the wrappers off the MTC** (own `NiTransformController` each) —
+>    still froze, and the wire stopped breaking.
+> 2. **Give the entries full translation+rotation+scale key channels** —
+>    still froze.
+> 3. **Replace scale with a shader-ALPHA cross-fade**
+>    (`BSLightingShaderPropertyFloatController`, variable 12) — no freeze
+>    reported, but the wire **did not visually break**, so it is not a fix.
+> 4. **Add a constant rotation key channel** so the entry reads `r=3 s=3`
+>    like vanilla's `t=0 r=1 s=0` shape — still froze.
+>
+> ### Verified facts — do NOT re-derive these
+> From the **GOG/AE** `SkyrimSE.exe` (the Steam copy is DRM-packed and
+> disassembles to garbage — `tools/skyrim_disasm.py` still defaults to the
+> Steam path, pass `--exe` explicitly):
+> * `NiMultiTargetTransformController`: interpolator slots at `+0x48`, sized
+>   `count * 0x48`, allocated at `0xd0d857`; target pointers at `+0x50`,
+>   `count * 8`, zero-filled at `0xd0d91f`; `num_extra_targets` is a **ushort**
+>   at `+0x58`.  Both arrays are walked **strictly by index** (`0xd0ca20`,
+>   bounded by `cmp bx, word ptr [rdi+0x58]`).
+> * Blend bookkeeping at `0xd0b640` walks `0x20`-byte `NiBlendInterpolator`
+>   records, reading each slot's interpolator pointer and **priority byte** at
+>   `+0x10` to track highest / second-highest contributor.
+> * `NiTransformInterpolator`: `+0x18` translation, `+0x24` rotation quat,
+>   `+0x34` scale, `+0x38` data pointer.
+> * `NiTransformData`: `+0x10`/`+0x18` translation count/keys, `+0x20`/`+0x28`
+>   rotation, `+0x30` scale keys, `+0x14`/`+0x24` key types.
+> * `NiControllerSequence`: controlled blocks are a 32-byte stride array at
+>   `+0x20`, count at `+0x18`, with a priority-ordered insertion pass at
+>   `0xd08890`.  Its constructor seeds float fields with `0xff7fffff`
+>   (**-FLT_MAX**) at `0xd04549`–`0xd04589`, so that sentinel is
+>   **engine-native and correct** — writing real values there is wrong.
+>
+> Ruled out by measurement, all dead ends:
+> * MTC target **count** — vanilla `alduin.nif` ships **246** targets.
+> * Targets with **no driving block** — vanilla `fxnocturnalbirdl.nif` has
+>   10 targets and 1 block, 9 of them NULL.
+> * Missing `NiBlendTransformInterpolator` blocks — vanilla ships **0**; the
+>   engine allocates them at runtime.
+> * MTC identity / manager-chain shape — ours matches vanilla exactly (one
+>   MTC in the chain, all blocks binding to it).
+> * Degenerate `scale = 0.0` — replacing it with `1e-4` did not help.
+> * Orphaned manager-chain `NiTransformController` — present **identically**
+>   in the pre-`90d04a3` build that works, so it is not the cause.
+> * `-FLT_MAX` statics, node/child array consistency, palette registration,
+>   scene-graph reachability, clone geometry flags, controlled-block
+>   priorities, the two maces' NIFs and behaviour graphs (8 bodies + 7
+>   constraints each, identical graph file sizes) — all verified equal.
+>
+> ### The one lead never chased to a conclusion
+> The two placements differ in exactly two authored ways: `XSCL` (0.75 in
+> ImperialDungeon05 vs 0.71 in Vilverin) and the **persistent** record flag
+> (Vilverin's ref is `0x400` persistent, ImperialDungeon05's is not).  A
+> non-persistent ref whose 3D unloads/reloads while a sequence holds MTC
+> interpolator slots is the only mechanism found that is consistent with
+> "same file, different cell, freezes *sometimes*".  Untested.
+>
+> ### What "reverted" means concretely
+> `_emulate_morphs` is the pre-`90d04a3` body (`git show 90d04a3^:asset_convert/nif_converter.py`),
+> plus its `_init_blend_interpolator` helper which `90d04a3` had deleted.
+> Output for `ctrigtripwire01.nif` is block-for-block identical to that build
+> (the only delta is `BSBehaviorGraphExtraData`, added by a later, unrelated
+> commit).  **Consequence: the wire does not visibly snap.**  That is the
+> accepted trade — a cosmetic loss instead of a hard freeze.  The two tests
+> named below still assert the SCALE design and will fail against the
+> reverted code; fix them together with the real fix.
+>
+> **When returning to this:** the scale swap itself is not obviously illegal,
+> and it demonstrably works in Vilverin.  Start from the persistence /
+> ref-scale difference above, not from the mesh — the mesh has been
+> exhaustively compared and is identical in both cells.
+
+**Do NOT "restore" the NiVisController version.**  *(Superseded — see the
+revert notice above; the NiVisController version is what currently ships.)*
+The first implementation
 toggled `NiVisController` entries aimed at the NiTriShapes themselves; it
 produced NO visible swap in-game across three rounds of fixes, and the vanilla
 census explains why it was never trustworthy: sequence-driven NiVisController
@@ -290,6 +426,17 @@ for this path.  Two tests in
 and `test_tripwire_morph_ships_a_scale_swap` (converts the real
 ctrigtripwire01 and asserts inverse scale curves, wrapper rest scales, MTC
 extra-target + palette registration, and zero surviving NiVisController).
+
+> **Note (2026-08-10):** the "406 scale-key transform entries in a 130-file
+> sample" claim above **does not reproduce**.  A 250-mesh re-census found 36
+> `NiTransformData` total, only 8 with scale keys, and every one of those is
+> on `skeleton.nif` at a constant `1.0` — vanilla never animates a node's
+> scale, and ZERO sequence entries are scale-only.  Vanilla makes geometry
+> appear/disappear mid-sequence with shader float controllers instead:
+> `BSEffectShaderPropertyFloatController` (25),
+> `BSLightingShaderPropertyFloatController` (17),
+> `BSNiAlphaPropertyTestRefController` (4); `NiTransformController` accounts
+> for 4 and none drive scale.  Treat the original census as unreliable.
 
 Historical note — **the two CTDs the vis-swap path caused**, kept because
 `_normalize_blend_interpolators` still repairs blocks COPIED from Oblivion:

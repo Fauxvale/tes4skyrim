@@ -3282,6 +3282,16 @@ class TestAnimationBlockLayout:
         # idempotent -- a second pass must find nothing left to fix
         assert _normalize_blend_interpolators(root) == 0
 
+    @pytest.mark.skip(reason=
+        'The wrapper-node SCALE morph swap was REVERTED 2026-08-10: it hard-'
+        'freezes Skyrim on the ImperialDungeon05 tripwire (no crash, no log, '
+        'process alive but never renders again), while the SAME mesh works in '
+        'Vilverin.  _emulate_morphs is back to the pre-90d04a3 '
+        'NiVisController version, so this test asserts a design that is no '
+        'longer shipped.  Re-enable it together with a real fix - see '
+        'docs/nif_conversion_notes.md "NiGeomMorpherController does not exist '
+        'in Skyrim" for the bisection, the four failed fixes, the verified exe '
+        'field offsets, and the one unchased lead (the ref persistent flag).')
     def test_morph_emulation_never_targets_geometry(self):
         """The morph swap must not synthesize NiVisController entries: across
         every vanilla Skyrim mesh, sequence-driven NiVisController entries
@@ -3302,6 +3312,11 @@ class TestAnimationBlockLayout:
             'morph swap entries must be transform (scale) entries'
         assert _BLEND_INTERP_FLAGS_ARRAYSIZE == 0x0201
 
+    @pytest.mark.skip(reason=
+        'Same revert as test_morph_emulation_never_targets_geometry: the '
+        'SCALE swap freezes the game, so ctrigtripwire01 no longer ships '
+        'wrapper "<shape> Swap" nodes or inverse scale curves.  See '
+        'docs/nif_conversion_notes.md before re-enabling.')
     def test_tripwire_morph_ships_a_scale_swap(self):
         """End-to-end on the mesh the bug was reported against: converting
         ctrigtripwire01 must produce paired wrapper NiNodes whose scale curves

@@ -2545,6 +2545,13 @@ def _vis_toggle_times(curve):
 _BLEND_INTERP_FLAGS_ARRAYSIZE = 0x0201
 
 
+def _init_blend_interpolator(blend):
+    """Give a synthesized NiBlend*Interpolator vanilla's manager-driven header."""
+    blend.unknown_short = _BLEND_INTERP_FLAGS_ARRAYSIZE
+    blend.unknown_int = 0          # Weight Threshold 0.0f
+    return blend
+
+
 _BLEND_INTERP_TYPES = tuple(
     t for t in (getattr(NifFormat, n, None) for n in (
         'NiBlendBoolInterpolator', 'NiBlendFloatInterpolator',
@@ -2587,35 +2594,20 @@ def _emulate_morphs(root, stats=None):
     """Rebuild dropped NiGeomMorpherController animation as shape swaps.
 
     Skyrim's engine has no morph-controller class (RTTI absent from the SSE
-    exe, 0 vanilla uses), so a converted sequence cannot morph vertices.
-    Instead, for every animated morph target harvested by
-    _process_controller_manager, bake the target's vertex positions into a
-    sibling copy of the shape and CUT from base to copy where the weight
-    curve crosses 0.5 (a smooth crossfade degrades to a cut, which is the
-    closest this engine gets).
+    exe, 0 vanilla uses), so a converted sequence cannot morph vertices.  What
+    it CAN do is toggle visibility: for every animated morph target harvested
+    by _process_controller_manager, bake the target's vertex positions into a
+    hidden sibling copy of the shape and add NiVisController entries to the
+    sequence that swap base -> target when the weight curve crosses 0.5.
+    The wire of ctrigtripwire01 visibly snaps again; the smooth crossfade of
+    slow morphs degrades to a cut, which is the closest the engine gets.
 
-    The cut is animated as wrapper-node SCALE (1 <-> 0): each shape (base and
-    every baked target) is wrapped in its own NiNode and the sequence drives
-    that node's scale through an ordinary NiTransformController entry bound
-    to the manager's NiMultiTargetTransformController.  A clone's wrapper
-    rests at scale 0, so the authored rest pose shows only the base shape.
+    Vanilla structure copied exactly from sldjailwallcollapse01: node carries
+    NiVisController (flags 108, NiBlendBoolInterpolator bool_value=2), the
+    sequence entry carries NiBoolInterpolator + NiBoolData step keys,
+    controller_type 'NiVisController', empty property/variable strings.
 
-    An earlier cut of this pass instead toggled NiVisController entries
-    aimed at the NiTriShapes themselves.  That never produced a visible swap
-    in-game, and the vanilla census says why it could never be trusted:
-    across every Skyrim mesh, sequence-driven NiVisController entries target
-    only NiNode / NiBillboardNode / particle systems (1852/1852 controlled
-    blocks), NEVER a NiTriShape -- while transform entries on plain NiNodes
-    with scale keys are routine (406 in a 130-file sample) and our own
-    converted transform sequences are confirmed working in-game
-    (CharacterGen's secret wall).  The scale swap uses only that proven
-    machinery; no NiVisController / NiBlendBoolInterpolator is generated at
-    all.
-
-    Scale keys are LINEAR floats -- the shared KeyGroup<float> loader the
-    engine uses everywhere (emitter BirthRate curves etc.), unlike the
-    bool-key CONST/LINEAR trap that CTD'd the old path.  The step shape is
-    expressed with a hold key one frame before each transition.
+    The keys MUST be CONST_KEY (5), never LINEAR (1) -- see _add_vis_cb.
     """
     swaps = []
     for blk in root.tree():
@@ -2647,95 +2639,66 @@ def _emulate_morphs(root, stats=None):
         entry.name = bytes(obj.name)
         entry.av_object = obj
 
-    def _multi_target_ctrl():
-        ctrl = root.controller
+    def _vis_controller(geom):
+        ctrl = geom.controller
         while ctrl is not None:
-            if isinstance(ctrl, NifFormat.NiMultiTargetTransformController):
+            if isinstance(ctrl, NifFormat.NiVisController):
                 return ctrl
             ctrl = ctrl.next_controller
-        ctrl = NifFormat.NiMultiTargetTransformController()
+        ctrl = NifFormat.NiVisController()
         ctrl.flags = 108           # ACTIVE | CLAMP | Compute Scaled Time
         ctrl.frequency = 1.0
         ctrl.phase = 0.0
         ctrl.start_time = 0.0
         ctrl.stop_time = 0.0
-        ctrl.target = root
-        if isinstance(mgr, NifFormat.NiControllerManager):
-            ctrl.next_controller = mgr.next_controller
-            mgr.next_controller = ctrl
-        else:
-            ctrl.next_controller = root.controller
-            root.controller = ctrl
+        blend = NifFormat.NiBlendBoolInterpolator()
+        _init_blend_interpolator(blend)
+        blend.bool_value = 2       # vanilla's "no authored value" sentinel
+        ctrl.interpolator = blend
+        ctrl.target = geom
+        ctrl.next_controller = geom.controller
+        geom.controller = ctrl
         return ctrl
 
-    mtc = _multi_target_ctrl()
-
-    def _mtc_add_target(node):
-        n = int(mtc.num_extra_targets)
-        mtc.num_extra_targets = n + 1
-        mtc.extra_targets.update_size()
-        mtc.extra_targets[n] = node
-
-    def _make_wrapper(geom, rest_scale):
-        wrapper = NifFormat.NiNode()
-        wrapper.name = bytes(geom.name) + b' Swap'
-        wrapper.flags = 14
-        wrapper.rotation.set_identity()
-        wrapper.scale = rest_scale
-        wrapper.add_child(geom)
-        _palette_add(wrapper)
-        _mtc_add_target(wrapper)
-        return wrapper
-
-    # One frame at the 30fps these sequences were authored at: the hold key
-    # sits this far before each transition so LINEAR keys read as a step.
-    _STEP = 1.0 / 30.0
-
-    def _add_scale_cb(seq, node, initially_on, toggles):
-        keys = [(0.0, 1.0 if initially_on else 0.0)]
+    def _add_vis_cb(seq, geom, initially_on, toggles):
+        bd = NifFormat.NiBoolData()
+        kg = bd.data
+        times = [0.0] + [t for t in toggles if t > 0.0]
+        values = []
         state = initially_on
-        for t in toggles:
-            if t <= 0.0:
-                continue
+        # value at each emitted key; the 0.0 key carries the initial state
+        values.append(1 if state else 0)
+        for _ in times[1:]:
             state = not state
-            hold = t - _STEP
-            if hold > keys[-1][0] + 1e-4:
-                keys.append((hold, keys[-1][1]))
-            keys.append((max(t, keys[-1][0] + 1e-4),
-                         1.0 if state else 0.0))
-        td = NifFormat.NiTransformData()
-        kg = td.scales
-        kg.interpolation = 1       # LINEAR_KEY
-        kg.num_keys = len(keys)
+            values.append(1 if state else 0)
+        # CONST_KEY (step).  nif.xml calls type 5 "Step function.  Used for
+        # visibility keys in NiBoolData", and the census agrees absolutely:
+        # 3449/3449 vanilla Skyrim NiBoolData and 1296/1296 Oblivion source
+        # NiBoolData store 5.  LINEAR (1) appears in neither game, and writing
+        # it crashed the engine inside NiBoolData::Load while streaming
+        # ctrigtripwire01 (Vilverin).  A bool has no meaningful interpolant,
+        # so step is also the only type that expresses these keys correctly.
+        kg.interpolation = 5
+        kg.num_keys = len(times)
         kg.keys.update_size()
-        for i, (t, v) in enumerate(keys):
+        for i, (t, v) in enumerate(zip(times, values)):
             kg.keys[i].time = t
             kg.keys[i].value = v
-        ip = NifFormat.NiTransformInterpolator()
-        # Channels the data does not carry are "no value" (-FLT_MAX), the
-        # same marker vanilla and our data-None path use: only scale plays,
-        # translation/rotation stay whatever the node rests at.
-        _NO_VALUE = -3.4028234663852886e+38
-        ip.translation.x = _NO_VALUE
-        ip.translation.y = _NO_VALUE
-        ip.translation.z = _NO_VALUE
-        ip.rotation.w = _NO_VALUE
-        ip.rotation.x = _NO_VALUE
-        ip.rotation.y = _NO_VALUE
-        ip.rotation.z = _NO_VALUE
-        ip.scale = _NO_VALUE
-        ip.data = td
-        mtc.stop_time = max(mtc.stop_time, seq.stop_time)
+        ip = NifFormat.NiBoolInterpolator()
+        ip.bool_value = bool(values[0])
+        ip.data = bd
+        ctrl = _vis_controller(geom)
+        ctrl.stop_time = max(ctrl.stop_time, seq.stop_time)
         seq.num_controlled_blocks += 1
         seq.controlled_blocks.update_size()
         cb = seq.controlled_blocks[seq.num_controlled_blocks - 1]
         cb.interpolator = ip
-        cb.controller = mtc
+        cb.controller = ctrl
         if hasattr(cb, 'priority'):
             cb.priority = 0
-        cb.node_name = bytes(node.name)
+        cb.node_name = bytes(geom.name)
         cb.property_type = b''
-        cb.controller_type = b'NiTransformController'
+        cb.controller_type = b'NiVisController'
         cb.variable_1 = b''
         cb.variable_2 = b''
         # Palette offsets were resolved into the string fields long before
@@ -2749,8 +2712,7 @@ def _emulate_morphs(root, stats=None):
                 except Exception:
                     pass
 
-    made = {}          # (shape_name, morph_index) -> clone wrapper node
-    base_wrap = {}     # shape_name -> base wrapper node
+    made = {}          # (shape_name, morph_index) -> clone block
     base_toggles = {}  # (id(seq), shape_name) -> list of clone curves
 
     for entry in swaps:
@@ -2786,8 +2748,8 @@ def _emulate_morphs(root, stats=None):
             continue               # never reaches 0.5: no visible effect
 
         key = (name, idx)
-        wrapper = made.get(key)
-        if wrapper is None:
+        clone = made.get(key)
+        if clone is None:
             clone = geom.__class__()
             _copy_block_fields(geom, clone)
             cdata = gdata.__class__()
@@ -2811,18 +2773,15 @@ def _emulate_morphs(root, stats=None):
             clone.name = bytes(name) + b'Mrph' + suffix
             clone.controller = None
             clone.collision_object = None
-            # Visible flags: the wrapper's rest scale of 0 is what hides the
-            # target until its sequence scales it in.
-            clone.flags = int(geom.flags) & ~0x01
-            _palette_add(clone)
-            wrapper = _make_wrapper(clone, 0.0)
+            clone.flags = int(geom.flags) | 0x01     # hidden at rest
             parent = parents.get(id(geom))
             if parent is not None:
-                parent.add_child(wrapper)
-            made[key] = wrapper
+                parent.add_child(clone)
+            _palette_add(clone)
+            made[key] = clone
 
         seq = entry['seq']
-        _add_scale_cb(seq, wrapper, on, toggles)
+        _add_vis_cb(seq, clone, on, toggles)
         base_toggles.setdefault((id(seq), name), []).append(curve)
 
     # Base shape: visible exactly while NO target weight is >= 0.5.
@@ -2832,16 +2791,6 @@ def _emulate_morphs(root, stats=None):
         seq = seq_by_id.get(sid)
         if geom is None or seq is None:
             continue
-        wrapper = base_wrap.get(name)
-        if wrapper is None:
-            wrapper = _make_wrapper(geom, 1.0)
-            parent = parents.get(id(geom))
-            if parent is not None:
-                for ci in range(parent.num_children):
-                    if parent.children[ci] is geom:
-                        parent.children[ci] = wrapper
-                        break
-            base_wrap[name] = wrapper
         cut = sorted({t for c in curves for t in _vis_toggle_times(c)[1]})
         # evaluate combined state per interval
         def _any_on(t):
@@ -2865,7 +2814,7 @@ def _emulate_morphs(root, stats=None):
             states.append(not _any_on(mid))
         toggles = [cut[i] for i in range(len(cut))
                    if states[i + 1] != states[i]]
-        _add_scale_cb(seq, wrapper, states[0], toggles)
+        _add_vis_cb(seq, geom, states[0], toggles)
     if stats is not None:
         stats['morph_swaps'] = stats.get('morph_swaps', 0) + len(made)
 
@@ -5149,7 +5098,7 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         _match_seq_shader_types(root)
 
         # Rebuild dropped NiGeomMorpherController animation (Skyrim has no
-        # morph class) as baked target shapes + wrapper-node scale swaps.
+        # morph class) as baked target shapes + NiVisController swaps.
         # Must follow the geometry walk (clones copy CONVERTED shapes/
         # shaders) and precede _apply_rest_visibility / sequence-name
         # collection.

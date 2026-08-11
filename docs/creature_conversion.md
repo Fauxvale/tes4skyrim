@@ -725,6 +725,44 @@ as Resource Data. The per-part tree matches vanilla and is kept, but it
 cannot have been the ragdoll gate; the animationdata index corruption was
 present under every experiment of that period.
 
+<a id="animdata-plugin-collision"></a>
+### The SAME out-of-range symptom from PLUGIN COLLISION (2026-08-10)
+
+`animdata_index_check` can report out-of-range indices even when
+`_anim_file_index()` is perfectly correct, because the block and the character
+hkx are chosen by **different** mechanisms:
+
+- Every plugin deploys its creatures LOOSE to the same
+  `meshes\actors\tes4\<folder>\` path, so exactly one
+  `tes4<folder>character.hkx` survives in Data — the one from whichever
+  plugin the user actually installs.
+- The clip block describing it comes from whichever plugin merged the shared
+  `animationdatasinglefile.txt` LAST (children write through to their
+  master's copy, `_shared_singlefile_dir`).
+
+The same creature converts to a different clip/file count per plugin, because
+each plugin's CREA records reference a different subset of animations.
+Morrowind_ob's clannfear is 27 clips / 21 files; Oblivion's is 23 / 17.
+Building Morrowind_ob last put its 21-file block on top of Oblivion's
+17-file hkx, so `Equip_H2H`, `Unequip_H2H`, the `MoveForwardRun*` gaits and
+`FullyRagdollPose` were all out of range and never bound. Measured on the
+2026-08-10 output: 6 projects mismatched (clannfear, daedroth, flameatronach,
+mehrunesdagon, scamp, slaughterfish); `animdata_index_check` flagged 13
+out-of-range indices across clannfear + flameatronach.
+
+Fixed in `creature_pipeline.convert_creatures`: the sibling-manifest union is
+no longer first-writer-wins. `_block_outranks()` / `_manifest_fits()` compare
+each candidate against the character hkx that will actually be **deployed**
+for that folder, and swap only to trade a block that does NOT fit for one
+that does. Ties and unknowns keep the incumbent, so a single-plugin run is
+unchanged.
+
+**Also delete stale rival copies.** Before the write-through fix, children
+shipped their own `animationdatasinglefile.txt`; leftovers under
+`output/<child>/meshes/` will overwrite the master's corrected file on
+deployment and silently restore the bug. Only ONE copy — the master's —
+should exist.
+
 <a id="rigid-part-bind"></a>
 ### "Attached parts have no hitbox / corpse falls through ground" — it was AddRagdollToWorld (2026-08-08)
 

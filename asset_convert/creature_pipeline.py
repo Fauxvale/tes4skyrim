@@ -23,6 +23,7 @@ override system. This pipeline is for everything CREA.
 
 import json
 import os
+import re
 import shutil
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -381,6 +382,72 @@ def _shared_singlefile_dir(out_meshes_dir: str, master_dirs) -> str:
     return None
 
 
+def _character_anim_count(meshes_dir: str, folder: str) -> int:
+    """Number of animationNames in a plugin's character hkx for `folder`.
+
+    The clip-block index space (animation_data._anim_file_index) is exactly
+    this list, so it is the only thing that decides whether a block is legal
+    against a given plugin's assets.  Counts the `Animations\\*.hkx` strings
+    the same way tools/animdata_index_check.py does.  -1 when absent.
+    """
+    char = os.path.join(meshes_dir, 'actors', 'tes4', folder, 'characters',
+                        f'tes4{folder}character.hkx')
+    if not os.path.isfile(char):
+        return -1
+    try:
+        with open(char, 'rb') as f:
+            raw = f.read()
+    except OSError:
+        return -1
+    return len({m.group(0).lower()
+                for m in re.finditer(rb'[ -~]{4,}\.hkx', raw)
+                if m.group(0).lower().startswith(b'animations')})
+
+
+def _manifest_fits(manifest: dict, meshes_dir: str, folder: str) -> bool:
+    """Is this block's index space legal against `meshes_dir`'s character hkx?
+
+    A block indexes the DEDUPED animation list of the character hkx that
+    actually lands in Data (animation_data._anim_file_index), so it is legal
+    exactly when it needs no more files than that hkx lists.  Unknown hkx
+    (never built) counts as a fit — nothing better is available.
+    """
+    n = _character_anim_count(meshes_dir, folder)
+    if n < 0:
+        return True
+    need = len(dict.fromkeys(c['anim'] for c in manifest.get('clips', ())))
+    return need <= n
+
+
+def _block_outranks(cand_meshes: str, cur_meshes: str, folder: str,
+                    cur_manifest: dict, cand_manifest: dict,
+                    deployed_meshes: str, log=print) -> bool:
+    """Should the candidate plugin's block replace the one already chosen?
+
+    Judged against `deployed_meshes` — the tree whose loose
+    `actors\\tes4\\<folder>\\characters\\...hkx` is the one the game ends up
+    reading.  Every plugin writes that same path, so the block and the hkx are
+    chosen independently and can disagree; a block needing more files than the
+    surviving hkx lists leaves those clips permanently unbound (Morrowind_ob's
+    27-clip/21-file clannfear over Oblivion's 17-file hkx put Equip_H2H, the
+    run gaits and FullyRagdollPose out of range).  Replace only to trade a
+    block that does NOT fit for one that does; ties and unknowns keep the
+    incumbent, so a single-plugin run is byte-identical to before.
+    """
+    if not cur_meshes:
+        return True
+    if _manifest_fits(cur_manifest, deployed_meshes, folder):
+        return False
+    if not _manifest_fits(cand_manifest, deployed_meshes, folder):
+        return False
+    need = len(dict.fromkeys(c['anim'] for c in cur_manifest.get('clips', ())))
+    log(f'  [animdata] {folder}: incumbent block needs {need} animation files '
+        f'but the deployed character hkx lists '
+        f'{_character_anim_count(deployed_meshes, folder)}; using the copy '
+        f'from {os.path.basename(os.path.dirname(cand_meshes))} instead')
+    return True
+
+
 def convert_creatures(export_dir: str, out_meshes_dir: str,
                       skyrim_data_path: str = None,
                       names: list = None, workers: int = None,
@@ -521,25 +588,53 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
     # scan reads project_manifest.json under each plugin's actors/tes4, which
     # every plugin still ships for the creatures it owns, so it is unaffected
     # by where the singlefiles land.
+    #
+    # WHICH plugin's block wins is NOT a free choice, and "this plugin's own
+    # wins" is wrong whenever the run writes through to a master.  A clip
+    # block's second line indexes the character hkx's animationNames list
+    # (see animation_data._anim_file_index), and every plugin deploys its
+    # creature folder LOOSE to the same path — so exactly one
+    # `actors\tes4\<folder>\characters\tes4<folder>character.hkx` survives in
+    # Data, while the block that describes it comes from whichever plugin
+    # merged the shared singlefile last.  When those two disagree the indices
+    # are read against a different (usually shorter) file list and every clip
+    # past its end silently never binds.  Morrowind_ob's clannfear ships 21
+    # animations / 27 clips, Oblivion's ships 17 / 23: building Morrowind_ob
+    # last left Oblivion's 17-animation hkx deployed under a block indexing up
+    # to 20, so Equip_H2H, the run gaits and FullyRagdollPose — the death-pose
+    # source — all fell out of range (same failure mode as the 2026-08-08
+    # dead-ragdoll bug, arriving through plugin collision instead of a bad
+    # emitter).  So pair each block with the hkx that actually lands on that
+    # path: the manifest whose OWN character hkx matches wins, regardless of
+    # which plugin is being built.
     union = dict(all_manifests)
+    owner = {d: out_meshes_dir for d in all_manifests}
     plugins_root = os.path.dirname(os.path.dirname(out_meshes_dir))
     try:
         siblings = sorted(os.listdir(plugins_root))
     except OSError:
         siblings = []
     for plug in siblings:
-        sib_actors = os.path.join(plugins_root, plug, 'meshes', 'actors',
-                                  'tes4')
+        sib_meshes = os.path.join(plugins_root, plug, 'meshes')
+        sib_actors = os.path.join(sib_meshes, 'actors', 'tes4')
         if os.path.normpath(sib_actors) == os.path.normpath(actors_root) \
                 or not os.path.isdir(sib_actors):
             continue
         for d in sorted(os.listdir(sib_actors)):
-            if d in union:
-                continue
             mp = os.path.join(sib_actors, d, 'project_manifest.json')
-            if os.path.exists(mp):
-                with open(mp, encoding='utf-8') as f:
-                    union[d] = json.load(f)
+            if not os.path.exists(mp):
+                continue
+            with open(mp, encoding='utf-8') as f:
+                cand = json.load(f)
+            # The hkx that reaches Data for this folder is the one THIS run
+            # deploys when it owns the folder; otherwise the candidate's.
+            deployed = (out_meshes_dir if d in all_manifests else sib_meshes)
+            if d in union and not _block_outranks(
+                    sib_meshes, owner.get(d), d, union[d], cand,
+                    deployed, log):
+                continue
+            union[d] = cand
+            owner[d] = sib_meshes
 
     if union:
         cache_dir = os.path.join(export_dir, 'animdata_base')

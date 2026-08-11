@@ -233,3 +233,59 @@ class TestAnimHkx:
         back = load_skyrim_animation(out)
         texts = {a.text for a in back.annotations}
         assert 'FootFront' in texts and 'FootBack' in texts
+
+
+class TestSharedSinglefileBlockSelection:
+    """A clip block must describe the character hkx that actually DEPLOYS.
+
+    Every plugin writes its creatures to the same loose
+    `meshes\\actors\\tes4\\<folder>\\` path, so exactly one
+    `tes4<folder>character.hkx` survives in Data — but the animationdata block
+    describing it is picked separately, by whichever plugin merged the shared
+    singlefile last.  When the two disagree, the block's indices are read
+    against a shorter file list and every clip past its end silently never
+    binds.  That is how Morrowind_ob's 27-clip / 21-file clannfear landed on
+    top of Oblivion's 17-file hkx and left Equip_H2H, the run gaits and
+    FullyRagdollPose (the death-pose source) permanently unbound.
+    """
+
+    @staticmethod
+    def _manifest(n_files):
+        return {'project_txt': 'tes4xproject.txt',
+                'clips': [{'anim': 'Animations\\a%d.hkx' % i}
+                          for i in range(n_files)]}
+
+    def _fake_char(self, tmp_path, plugin, folder, n_files):
+        d = tmp_path / plugin / 'meshes' / 'actors' / 'tes4' / folder
+        (d / 'characters').mkdir(parents=True, exist_ok=True)
+        blob = b'\x00'.join(b'Animations\\a%d.hkx' % i
+                            for i in range(n_files))
+        (d / 'characters' / ('tes4%scharacter.hkx' % folder)).write_bytes(blob)
+        return str(tmp_path / plugin / 'meshes')
+
+    def test_oversized_block_loses_to_fitting_one(self, tmp_path):
+        from asset_convert.creature_pipeline import _block_outranks
+        big = self._fake_char(tmp_path, 'Child.esm', 'clannfear', 21)
+        small = self._fake_char(tmp_path, 'Master.esm', 'clannfear', 17)
+        # Master's hkx is the one deployed; the child's 21-file block does not
+        # fit it, the master's 17-file block does -> the master's block wins.
+        assert _block_outranks(small, big, 'clannfear',
+                               self._manifest(21), self._manifest(17),
+                               small, log=lambda *a: None) is True
+
+    def test_fitting_incumbent_is_kept(self, tmp_path):
+        from asset_convert.creature_pipeline import _block_outranks
+        big = self._fake_char(tmp_path, 'Child.esm', 'clannfear', 21)
+        small = self._fake_char(tmp_path, 'Master.esm', 'clannfear', 17)
+        # Incumbent already fits the deployed hkx — never swap it out.
+        assert _block_outranks(big, small, 'clannfear',
+                               self._manifest(17), self._manifest(21),
+                               small, log=lambda *a: None) is False
+
+    def test_every_clip_index_is_in_range(self, tmp_path):
+        """The end-to-end invariant: no clip may index past the file list."""
+        from asset_convert.animation_data import _anim_file_index
+        m = self._manifest(17)
+        idx = _anim_file_index(m)
+        n_files = len(dict.fromkeys(c['anim'] for c in m['clips']))
+        assert all(0 <= i < n_files for i in idx.values())

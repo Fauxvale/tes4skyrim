@@ -67,7 +67,7 @@ First, make sure you have Python 3.14 installed
 Once you have python, open powershell and paste the following line:
 
 ```bash
-pip install PyFFI numpy scipy shapely Pillow lz4 mapbox_earcut
+pip install PyFFI numpy scipy shapely Pillow lz4 mapbox_earcut setuptools
 ```
 
 This will install most of the following dependencies:
@@ -82,6 +82,7 @@ This will install most of the following dependencies:
 | **[Pillow](https://pypi.org/project/pillow/)** | Terrain-LOD texture compositing, object-LOD atlas normals, book inventory art. **Terrain LOD produces no tiles at all without it** | `pip install Pillow` |
 | **[lz4](https://pypi.org/project/lz4/)** | Reading Skyrim SE BSAs (v105) — how vanilla assets are fetched when `export/skyrim_assets/` has no cached copy yet | `pip install lz4` |
 | **[mapbox_earcut](https://pypi.org/project/mapbox-earcut/)** | Navmesh triangulation fallback when Delaunay fails on a piece | `pip install mapbox_earcut` |
+| **[setuptools](https://pypi.org/project/setuptools/)** | Supplies `distutils`, which PyFFI imports, but Python **removed from the stdlib in 3.12**. | `pip install setuptools` |
 | **Skyrim SE Creation Kit** | Supplies `LipGenerator.exe` (lip sync) and the Papyrus source headers every converted script compiles against | Free on Steam |
 | **xWMAEncode.exe** | xWMA voice compression | See note below |
 

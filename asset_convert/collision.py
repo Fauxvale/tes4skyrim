@@ -1973,8 +1973,35 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
         coll_obj.flags      = 137  # 0x89 = ACTIVE | D_ANIMATED | bit 7
         rb.motion_system    = 4    # MO_SYS_KEYFRAMED
         rb.deactivator_type = 1
-        rb.quality_type     = 1    # MO_QUAL_FIXED (position is deterministic)
-        rb.solver_deactivation = 1
+        # quality_type / solver_deactivation are NOT changed by the runtime
+        # release: `SetMotionType(Motion_Dynamic)` swaps only the motion type,
+        # so whatever ships in the NIF is what the body simulates with AFTER a
+        # breakaway/held trap is let go.
+        #
+        #  * A plain animated body (door, gate, portcullis) is never released
+        #    and its position is fully deterministic -> MO_QUAL_FIXED with
+        #    solver deactivation OFF, sourced from vanilla
+        #    farmhouseanimdoor01.nif.
+        #  * A BREAKAWAY / HELD-TRAP body becomes a real moving object the
+        #    instant the script releases it, and it does so while carrying
+        #    mass inside a live constraint island.  MO_QUAL_FIXED there tells
+        #    Havok the body is static, so the released chain is a ring of
+        #    mass-bearing constrained bodies all claiming to be static with
+        #    deactivation disabled -- the solver has no consistent state to
+        #    converge on and the simulation step stops completing (the
+        #    Natural Caverns / CGTrigTripwire01 hang: the game keeps running
+        #    but never renders another frame).  Vanilla's own chain trap is
+        #    the reference for the released state: trapmace01.nif ships every
+        #    Link01..11 at quality_type=4 (MO_QUAL_MOVING) with
+        #    solver_deactivation=2 (LOW), and its Mace01 head likewise.
+        #    Vilverin's ctrapswingmaceshort01 never hit this because it has
+        #    NO chain links and so no constraint island at all.
+        if breakaway_body:
+            rb.quality_type        = 4  # MO_QUAL_MOVING (post-release)
+            rb.solver_deactivation = 2  # SOLVER_DEACTIVATION_LOW
+        else:
+            rb.quality_type        = 1  # MO_QUAL_FIXED (deterministic)
+            rb.solver_deactivation = 1  # OFF
         rb.unknown_byte     = 10   # Skyrim broadphase type for animated
         # Set bit 7 (0x80) on the animated NiNode — tells Skyrim to
         # synchronise the node's transform updates with physics.
