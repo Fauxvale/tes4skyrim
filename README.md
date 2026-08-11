@@ -10,6 +10,15 @@
 
 ---
 
+> [!IMPORTANT]
+> **No Bethesda assets are included in this repository.** This project ships only
+> code — it reads the Oblivion and Skyrim data you already own, on your own machine,
+> and performs every conversion locally. **Do not redistribute converted Bethesda
+> assets.** If you want the converted mod, download this project and run it against
+> your own legally-owned copies of the games.
+
+---
+
 ## What it does
 
 This is a full data-conversion pipeline. It takes an Oblivion `.esm`/`.esp` (plus its BSA or lose file assets) and produces a working Skyrim mod. Plugin, meshes, animations, everything. Ready to drop into your `Data` folder. It's in early alpha with a long bug list, but each individual part is already more fully featured than most equivalent tools and is self-contained all in one package.
