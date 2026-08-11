@@ -364,7 +364,48 @@ def _load_state() -> dict:
             state = json.load(fh)
     except (OSError, ValueError):
         return {}
-    return state if isinstance(state, dict) else {}
+    if not isinstance(state, dict):
+        return {}
+    return _lift_global_steps(state)
+
+
+def _lift_global_steps(state: dict) -> dict:
+    """Move a legacy per-plugin record of a GLOBAL step to the shared key.
+
+    Earlier builds stamped "10. Patch Skyrim" onto every plugin in the run, so a
+    user who patched while converting Oblivion has it under `oblivion.esm` and
+    nowhere else -- leaving every other plugin re-ticking it forever.  The step
+    produces ONE shared artifact, so the newest such record is the truth for all
+    plugins; lift it once, in memory, on read.
+
+    Read-only: this never writes.  The next successful run records under the
+    shared key anyway, and rewriting the file here would mean a plain status
+    query mutates the user's state.
+    """
+    steps = state.get("steps")
+    if not isinstance(steps, dict):
+        return state
+    for key in GLOBAL_STEPS:
+        best = None
+        for plugin, entry in steps.items():
+            if plugin == GLOBAL_PLUGIN_KEY or not isinstance(entry, dict):
+                continue
+            at = entry.get(key)
+            if isinstance(at, str) and (
+                    best is None
+                    or (version_key(at) or (0, 0)) > (version_key(best) or (0, 0))):
+                best = at
+        if best is None:
+            continue
+        shared = steps.get(GLOBAL_PLUGIN_KEY)
+        if not isinstance(shared, dict):
+            shared = {}
+            steps[GLOBAL_PLUGIN_KEY] = shared
+        have = shared.get(key)
+        if not isinstance(have, str) or (version_key(best) or (0, 0)) > (
+                version_key(have) or (0, 0)):
+            shared[key] = best
+    return state
 
 
 def _save_state(state: dict) -> None:
@@ -395,13 +436,23 @@ def record_step_run(step_key: str, plugin: str | None,
     Plugins do not share one: Nehrim and Morrowind_ob live in their own
     installs, so re-running a converted plugin means restoring its own source
     directory, not assuming whichever one is currently configured.
+
+    A step in `GLOBAL_STEPS` is recorded ONCE, under the shared key, because it
+    produces one artifact for the whole load order rather than per-plugin
+    output.  Stamping it onto whichever plugins were in that run left every
+    other plugin looking like it had never run the step, so it was selected
+    again forever.
     """
     version = current_version() if version is None else version
     state = _load_state()
     steps = state.setdefault("steps", {})
-    entry  = steps.setdefault(_plugin_key(plugin), {})
+    key = GLOBAL_PLUGIN_KEY if step_key in GLOBAL_STEPS else _plugin_key(plugin)
+    entry = steps.setdefault(key, {})
     entry[step_key] = version
-    if data_path:
+    # Never record a source directory against the shared key: it belongs to no
+    # plugin, and `source_path_for` would then hand one plugin's install to
+    # another.
+    if data_path and key != GLOBAL_PLUGIN_KEY:
         state.setdefault("sources", {})[_plugin_key(plugin)] = data_path
     _save_state(state)
 
@@ -423,12 +474,34 @@ def _plugin_key(plugin: str | None) -> str:
 
 
 def steps_run_at(plugin: str | None) -> dict[str, str]:
-    """{step_key: version} for every step recorded for *plugin*."""
+    """{step_key: version} for every step recorded for *plugin*.
+
+    Steps in `GLOBAL_STEPS` are merged in from the shared key: they produce one
+    artifact covering the whole load order, so running one while converting
+    Oblivion counts for Nehrim too.  Without this merge every plugin but the one
+    it happened to run alongside sees a step that "never ran" and re-selects it
+    on every check.
+
+    A per-plugin entry left by an older build still counts -- the newer of the
+    two wins, so history recorded under the old scheme is not thrown away and
+    does not make the step look stale again.
+    """
     steps = _load_state().get("steps", {})
     merged: dict[str, str] = {}
     got = steps.get(_plugin_key(plugin))
     if isinstance(got, dict):
         merged.update({k: v for k, v in got.items() if isinstance(v, str)})
+
+    shared = steps.get(GLOBAL_PLUGIN_KEY)
+    if isinstance(shared, dict) and _plugin_key(plugin) != GLOBAL_PLUGIN_KEY:
+        for key in GLOBAL_STEPS:
+            at = shared.get(key)
+            if not isinstance(at, str):
+                continue
+            have = merged.get(key)
+            if have is None or (version_key(at) or (0, 0)) > (
+                    version_key(have) or (0, 0)):
+                merged[key] = at
     return merged
 
 
@@ -570,6 +643,26 @@ STEP_KEYS: list[tuple[str, str]] = [
 ]
 
 _LABEL_TO_KEY = {label: key for key, label in STEP_KEYS}
+_LABEL_OF     = {key: label for key, label in STEP_KEYS}
+
+# Steps that belong to NO single plugin.
+#
+# "10. Patch Skyrim" takes no `-f`: it patches the vanilla Skyrim body records
+# for the user's whole load order and writes ONE shared `Slot44 Patch.esp` at
+# the root of output/, not into any per-plugin folder.  Running it once covers
+# every plugin, so it is recorded against a single plugin-independent key
+# instead of being stamped onto whichever plugins happened to be in that run.
+#
+# Recording it per-plugin made it re-tick forever: patching while converting
+# Oblivion left Nehrim with no record of it, so the planner saw a step that had
+# never run for Nehrim and selected it again -- for every plugin the user had
+# not happened to run it alongside, despite the one shared patch already
+# existing on disk.
+GLOBAL_STEPS: frozenset[str] = frozenset({"modify_body_meshes"})
+
+# The state-file key those steps are recorded under.  `_plugin_key(None)`
+# already collapses to "*", which is exactly "belongs to no plugin".
+GLOBAL_PLUGIN_KEY = "*"
 
 
 def label_to_key(label: str) -> str | None:
@@ -639,6 +732,7 @@ def upgrade_plan(plugin: str | None) -> dict:
     current   = current_version()
     installed = installed_version_for(plugin)
     all_keys  = [key for key, _ in STEP_KEYS]
+    ran       = steps_run_at(plugin)
 
     if installed is None:
         # Nothing recorded: a first run, so everything is owed, but this is a
@@ -647,29 +741,49 @@ def upgrade_plan(plugin: str | None) -> dict:
                 "steps": [], "unknown": False, "offline": False,
                 "never_run": True}
 
-    labels = steps_between(installed, current)
-    if labels is None:
+    # Each step is judged against ITS OWN recorded version, never against one
+    # number for the whole plugin.  The state file is per-step precisely because
+    # the steps drift apart: a user who re-runs Import today and leaves Export
+    # at last week's release has one step current and one stale.
+    #
+    # Collapsing them -- asking steps_between(oldest, current) once and applying
+    # that single union to all twelve -- is what made the shortcut tick steps the
+    # user had ALREADY run at this exact version.  The oldest step drags the
+    # range down, the range's union names every step that release touched, and
+    # steps sitting at `current` get swept in with the stale ones.  The union is
+    # right for the step that is actually at `oldest`; it says nothing about a
+    # step that is already up to date.
+    keys: list[str] = []
+    unknown = False
+    for key in all_keys:
+        at = ran.get(key)
+        if at is None or version_key(at) is None:
+            # Never run (or an unparseable stamp): owed regardless of the table.
+            keys.append(key)
+            continue
+        labels = steps_between(at, current)
+        if labels is None:
+            # The range for THIS step could not be resolved.  Unknown fails
+            # toward re-running, never toward skipping.
+            unknown = True
+            keys.append(key)
+            continue
+        if _LABEL_OF.get(key) in labels:
+            keys.append(key)
+
+    if unknown:
         # Distinguish "could not ask" from "asked, and the table has a hole".
-        # Both select everything; only the first is worth telling the user to
-        # reconnect over.
+        # Both select conservatively; only the first is worth telling the user
+        # to reconnect over.
         _table, reachable = steps_table()
         return {"current": current, "installed": installed, "upgraded": True,
-                "steps": all_keys, "unknown": True, "offline": not reachable,
-                "never_run": False}
-
-    keys = [k for k in (label_to_key(l) for l in labels) if k]
-
-    # A step that never ran at all is owed regardless of what changed since.
-    ran = steps_run_at(plugin)
-    for key in all_keys:
-        if key not in ran and key not in keys:
-            keys.append(key)
-    keys = [k for k in all_keys if k in keys]
+                "steps": [k for k in all_keys if k in keys], "unknown": True,
+                "offline": not reachable, "never_run": False}
 
     return {"current": current,
             "installed": installed,
             "upgraded": version_key(installed) != version_key(current),
-            "steps": keys,
+            "steps": [k for k in all_keys if k in keys],
             "unknown": False,
             "offline": False,
             "never_run": False}
@@ -685,7 +799,12 @@ def describe_plan(plan: dict) -> str:
     cur = plan["current"]
     if plan["never_run"]:
         return f"Version {cur} - no previous conversion recorded."
-    if not plan["upgraded"] and not plan["steps"]:
+    # An empty step list IS up to date, whatever `upgraded` says.  Those two can
+    # disagree: `installed` is the oldest recorded step and now includes the
+    # shared plugin-independent ones, so a plugin whose every step is current
+    # can still show an old `installed` -- which read as "upgraded, re-run:
+    # nothing".
+    if not plan["steps"]:
         return f"Version {cur} - up to date, nothing needs re-running."
 
     label_of = dict(STEP_KEYS)
@@ -693,8 +812,10 @@ def describe_plan(plan: dict) -> str:
     if plan["unknown"]:
         why = ("could not reach GitHub for the step list"
                if plan.get("offline") else "cannot tell which steps changed")
+        # Not always every step: steps already run at this version stay
+        # unselected even when another step's range is unresolvable.
         return (f"Version {cur} (was {plan['installed']}) - {why}, "
-                f"so all are selected.")
+                f"so these are selected to be safe: {names}")
     if not plan["upgraded"]:
         return f"Version {cur} - steps never run: {names}."
     return (f"Version {cur} (was {plan['installed']}) - re-run: {names}")

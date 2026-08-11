@@ -1186,10 +1186,17 @@ def main():
     # passes the selected plugins via -f. conversion_config.json no longer
     # carries a "files" list; config.get("files") is only a legacy fallback.
     order = topological_order(args.files or config.get("files", []), tes4_data)
-    if not order:
+    if not order and not args.modify_body_meshes:
+        # "10. Patch Skyrim" is the one step that converts no plugin: it patches
+        # the user's SKYRIM load order and writes a single shared
+        # `Slot44 Patch.esp`, so the GUI runs it with no `-f` at all.  Bailing
+        # here left it silently not running -- and therefore never recorded --
+        # for anyone whose config lacks the legacy "files" list, which is every
+        # end user (nothing writes that key any more; this repo only still has
+        # one by hand).  The GUI then re-ticked the box on every check.
         print("No files to process.")
         return 0
-    print(f"  Files: {', '.join(order)}")
+    print(f"  Files: {', '.join(order) if order else '(none needed)'}")
     print()
 
     # ── Determine which steps to run ──────────────────────────────────────
@@ -1387,9 +1394,12 @@ def main():
             tes5_data, plugins=getattr(args, 'patch_plugins', None),
             output_dir=output_dir)
         # Patches the user's load order, not a converted plugin, so it is
-        # recorded once against every plugin in the run.
-        for fn in order:
-            _mark('modify_body_meshes', fn, ok)
+        # recorded ONCE under the shared key rather than stamped onto whichever
+        # plugins this run happened to include.  Recording it per-plugin left
+        # every other plugin looking like it had never run the step, so the GUI
+        # re-ticked "10. Patch Skyrim" forever even though the one shared
+        # `Slot44 Patch.esp` already existed.
+        _mark('modify_body_meshes', _version.GLOBAL_PLUGIN_KEY, ok)
         if not ok:
             success = False
         print()

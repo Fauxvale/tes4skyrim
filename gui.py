@@ -1572,13 +1572,17 @@ def gui_main():
             label_of = dict(version_info.STEP_KEYS)
             names = ", ".join(label_of.get(k, k) for k in plan["steps"])
             if plan["unknown"]:
+                # Not necessarily ALL of them: each step is resolved against its
+                # own recorded version, so a step already run at this version
+                # stays unticked even when another step's range cannot be read.
                 tip = (f"Updated to {plan['current']} from "
                        f"{plan['installed']}.\n\n"
-                       f"Which steps changed could not be determined, so all "
-                       f"are selected.")
+                       f"Which steps changed could not be determined for some "
+                       f"of these, so they are selected to be safe:\n{names}")
             elif plan["upgraded"]:
                 tip = (f"Updated {plan['installed']} → {plan['current']}.\n\n"
-                       f"Selects only the steps that upgrade changed:\n{names}")
+                       f"Selects only the steps still owed at this version:"
+                       f"\n{names}")
             else:
                 tip = (f"These steps have not been run at {plan['current']} "
                        f"for this plugin:\n{names}")

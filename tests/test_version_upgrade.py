@@ -74,6 +74,90 @@ def test_resolving_the_version_never_spawns_a_subprocess():
     assert calls == [], f"version resolution spawned: {calls}"
 
 
+# ── Annotated tags must be peeled to their commit ─────────────────────────
+# Every release tag in this repo is ANNOTATED, so refs/tags/<v> names a tag
+# OBJECT, not the commit.  Comparing that ref to HEAD can never match, so a
+# checkout sitting exactly on a release reported `<tag>+g<sha>` and read as a
+# dev build ahead of it.  record_step_run stamps that string into the state
+# file, so a step run at release 0.586 was recorded as `0.585+g<sha>` -- the
+# newest tag known LOCALLY at the time -- which ranks as 0.585 and leaves the
+# step looking permanently stale, re-ticking it on every future check.
+
+def _fake_repo(tmp_path, tag, tag_obj_sha, commit_sha, head_sha):
+    """A .git with one annotated tag, laid out the way git stores it."""
+    import zlib
+    git = tmp_path / ".git"
+    (git / "refs" / "tags").mkdir(parents=True)
+    (git / "refs" / "tags" / tag).write_text(tag_obj_sha, encoding="utf-8")
+    (git / "refs" / "heads").mkdir(parents=True)
+    (git / "refs" / "heads" / "master").write_text(head_sha, encoding="utf-8")
+    (git / "HEAD").write_text("ref: refs/heads/master\n", encoding="utf-8")
+
+    body = (f"object {commit_sha}\ntype commit\ntag {tag}\n\nRelease {tag}\n"
+            ).encode()
+    raw = b"tag " + str(len(body)).encode() + b"\x00" + body
+    obj = git / "objects" / tag_obj_sha[:2]
+    obj.mkdir(parents=True)
+    (obj / tag_obj_sha[2:]).write_bytes(zlib.compress(raw))
+    return git
+
+
+_TAG_OBJ = "cdd431bbef540fc48611612f09f9306c45a14fb5"
+_COMMIT  = "0909928f05e5bbb66db7d0d92d0d65bf0d14d4ae"
+
+
+def test_on_an_annotated_tag_reports_the_bare_release(tmp_path, monkeypatch):
+    _fake_repo(tmp_path, "0.586", _TAG_OBJ, _COMMIT, _COMMIT)
+    monkeypatch.setattr(v, "SCRIPT_DIR", tmp_path)
+    assert v._git_version() == "0.586"
+    assert v.is_dev_version("0.586") is False
+
+
+def test_past_an_annotated_tag_still_reports_a_dev_build(tmp_path, monkeypatch):
+    head = "eefacb32f4c3c400a789f6668df3790a275451df"
+    _fake_repo(tmp_path, "0.586", _TAG_OBJ, _COMMIT, head)
+    monkeypatch.setattr(v, "SCRIPT_DIR", tmp_path)
+    got = v._git_version()
+    assert got == f"0.586+g{head[:7]}"
+    assert v.is_dev_version(got) is True
+
+
+def test_peeling_an_unreadable_tag_object_falls_back(tmp_path, monkeypatch):
+    """A tag packed away by `git gc` cannot be peeled from loose objects.
+
+    That must degrade to the old `+g<sha>` form, never raise -- the GUI resolves
+    the version while building its window.
+    """
+    git = tmp_path / ".git"
+    (git / "objects").mkdir(parents=True)
+    assert v._peel_tag(git, _TAG_OBJ) == _TAG_OBJ
+    assert v._peel_tag(git, "") == ""
+
+
+def test_a_lightweight_tag_points_straight_at_its_commit(tmp_path, monkeypatch):
+    """Peeling must return a commit sha unchanged, not treat it as a tag."""
+    import zlib
+    git = tmp_path / ".git"
+    obj = git / "objects" / _COMMIT[:2]
+    obj.mkdir(parents=True)
+    raw = b"commit 5\x00hello"
+    (obj / _COMMIT[2:]).write_bytes(zlib.compress(raw))
+    assert v._peel_tag(git, _COMMIT) == _COMMIT
+
+
+def test_peeling_never_spawns_a_subprocess(tmp_path, monkeypatch):
+    """Same constraint as version resolution: zero spawns under pythonw.exe."""
+    import subprocess
+    _fake_repo(tmp_path, "0.586", _TAG_OBJ, _COMMIT, _COMMIT)
+    monkeypatch.setattr(v, "SCRIPT_DIR", tmp_path)
+    calls = []
+    for name in ("run", "Popen", "call", "check_output"):
+        monkeypatch.setattr(subprocess, name,
+                            lambda *a, _n=name, **k: calls.append(_n))
+    v._git_version()
+    assert calls == []
+
+
 # ── Update check ──────────────────────────────────────────────────────────
 
 def test_update_check_ignores_non_release_tags(monkeypatch):
@@ -214,6 +298,96 @@ def test_unknown_plugin_has_no_installed_version(state):
     assert v.installed_version_for("Never.esm") is None
 
 
+# ── Plugin-independent steps ──────────────────────────────────────────────
+# "10. Patch Skyrim" takes no `-f`: it patches the vanilla Skyrim body records
+# for the whole load order and writes ONE shared `Slot44 Patch.esp` at the root
+# of output/.  Running it once covers every plugin.  Recording it per-plugin
+# meant patching while converting Oblivion left Nehrim with no record, so the
+# planner saw a step that "never ran" and re-ticked it forever.
+
+def test_a_global_step_is_recorded_once_not_per_plugin(state):
+    v.record_step_run("modify_body_meshes", "Oblivion.esm", "0.586")
+    raw = json.loads(state.read_text(encoding="utf-8"))["steps"]
+    assert raw[v.GLOBAL_PLUGIN_KEY] == {"modify_body_meshes": "0.586"}
+    assert "oblivion.esm" not in raw
+
+
+def test_a_global_step_counts_for_a_plugin_that_never_ran_it(state, monkeypatch):
+    """THE bug: Patch Skyrim re-selected for every plugin but the one it ran
+    alongside, even though the single shared patch already existed."""
+    monkeypatch.setattr(v, "current_version", lambda: "0.586")
+    _table(monkeypatch, {"0.586": []})
+    v.record_step_run("modify_body_meshes", "Oblivion.esm", "0.586")
+    for key, _ in v.STEP_KEYS:
+        v.record_step_run(key, "Nehrim.esm", "0.586")
+
+    assert v.steps_run_at("Nehrim.esm")["modify_body_meshes"] == "0.586"
+    assert "modify_body_meshes" not in v.upgrade_plan("Nehrim.esm")["steps"]
+
+
+def test_a_global_step_is_still_owed_when_its_own_code_changed(state, monkeypatch):
+    """Sharing the record must not make the step un-re-runnable."""
+    monkeypatch.setattr(v, "current_version", lambda: "0.586")
+    _table(monkeypatch, {"0.586": ["10. Patch Skyrim"]})
+    for key, _ in v.STEP_KEYS:
+        v.record_step_run(key, "Nehrim.esm", "0.585")
+    v.record_step_run("modify_body_meshes", "Oblivion.esm", "0.585")
+
+    assert "modify_body_meshes" in v.upgrade_plan("Nehrim.esm")["steps"]
+
+
+def test_a_global_step_never_run_at_all_is_still_owed(state, monkeypatch):
+    monkeypatch.setattr(v, "current_version", lambda: "0.586")
+    _table(monkeypatch, {"0.586": []})
+    for key, _ in v.STEP_KEYS:
+        if key != "modify_body_meshes":
+            v.record_step_run(key, "Nehrim.esm", "0.586")
+    assert "modify_body_meshes" in v.upgrade_plan("Nehrim.esm")["steps"]
+
+
+def test_a_legacy_per_plugin_global_record_is_lifted_to_the_shared_key(state):
+    """State written by an older build must not keep re-ticking the step.
+
+    The old scheme stamped it onto whichever plugins were in the run, so it
+    survives under one plugin and nowhere else.  One shared artifact means the
+    newest such record is the truth for every plugin.
+    """
+    state.write_text(json.dumps({"steps": {
+        "oblivion.esm": {"modify_body_meshes": "0.584"},
+        "nehrim.esm":   {"modify_body_meshes": "0.585"},
+    }}), encoding="utf-8")
+    # The NEWEST legacy record wins, and reaches a plugin that never had one.
+    assert v.steps_run_at("Tamriel.esp")["modify_body_meshes"] == "0.585"
+
+
+def test_lifting_a_legacy_record_never_rewrites_the_file(state):
+    """A status query must not mutate the user's state."""
+    original = json.dumps({"steps": {
+        "oblivion.esm": {"modify_body_meshes": "0.584"}}})
+    state.write_text(original, encoding="utf-8")
+    v.steps_run_at("Nehrim.esm")
+    v.upgrade_plan("Nehrim.esm")
+    assert state.read_text(encoding="utf-8") == original
+
+
+def test_a_newer_per_plugin_record_beats_a_stale_shared_one(state):
+    """Neither key is blindly authoritative -- the newer version wins."""
+    state.write_text(json.dumps({"steps": {
+        v.GLOBAL_PLUGIN_KEY: {"modify_body_meshes": "0.583"},
+        "nehrim.esm":        {"modify_body_meshes": "0.586"},
+    }}), encoding="utf-8")
+    assert v.steps_run_at("Nehrim.esm")["modify_body_meshes"] == "0.586"
+
+
+def test_a_global_step_records_no_source_directory(state):
+    """The shared key belongs to no plugin, so it must not own an install path,
+    or `source_path_for` would hand one plugin's directory to another."""
+    v.record_step_run("modify_body_meshes", "Oblivion.esm", "0.586",
+                      data_path=r"D:\Obliv\Data")
+    assert v.source_path_for("Oblivion.esm") is None
+    assert v.source_path_for(v.GLOBAL_PLUGIN_KEY) is None
+
+
 # ── Source directory: plugins do not share one ────────────────────────────
 
 def test_each_plugin_remembers_its_own_data_directory(state):
@@ -302,6 +476,90 @@ def test_steps_are_returned_in_run_order(state, monkeypatch):
         v.record_step_run(key, "Oblivion.esm", "0.57")
     assert v.upgrade_plan("Oblivion.esm")["steps"] == [
         "export", "import_", "pack_zip"]
+
+
+def test_a_step_already_run_at_the_current_version_is_not_reselected(
+        state, monkeypatch):
+    """THE auto-select bug: steps are judged individually, not as one group.
+
+    A user who upgrades to 0.586, runs Import and LOD, then reopens the GUI must
+    not see Import and LOD ticked again -- they already ran at 0.586.  They did
+    see them, because the plan resolved ONE range from the OLDEST step
+    (`installed_version_for`) and applied that union to all twelve: Export still
+    sitting at 0.585 dragged the range to (0.585, 0.586], whose union names
+    every step 0.586 touched, sweeping in the two already at 0.586.
+    """
+    monkeypatch.setattr(v, "current_version", lambda: "0.586")
+    _table(monkeypatch, {"0.586": ["1. Export", "6. Import", "9. LOD"]})
+    for key, _ in v.STEP_KEYS:
+        v.record_step_run(key, "Oblivion.esm", "0.585")
+    v.record_step_run("import_", "Oblivion.esm", "0.586")
+    v.record_step_run("lod", "Oblivion.esm", "0.586")
+
+    plan = v.upgrade_plan("Oblivion.esm")
+    assert "import_" not in plan["steps"], "already run at 0.586"
+    assert "lod" not in plan["steps"], "already run at 0.586"
+    # The genuinely stale one is still owed.
+    assert "export" in plan["steps"]
+
+
+def test_end_user_bare_tags_reproduce_the_same_selection(state, monkeypatch):
+    """End users install a source drop, so every stamp is a BARE tag.
+
+    No `+g<sha>` is involved on their machine -- the per-step regression must
+    hold on plain release numbers, not only on developer describe strings.
+    """
+    monkeypatch.setattr(v, "current_version", lambda: "0.586")
+    _table(monkeypatch, {"0.586": ["3. Meshes", "6. Import"]})
+    for key, _ in v.STEP_KEYS:
+        v.record_step_run(key, "Oblivion.esm", "0.586")
+    v.record_step_run("meshes", "Oblivion.esm", "0.585")
+
+    plan = v.upgrade_plan("Oblivion.esm")
+    assert plan["steps"] == ["meshes"]
+
+
+def test_one_unresolvable_step_does_not_drag_in_the_resolvable_ones(
+        state, monkeypatch):
+    """A hole affects only the steps whose own range crosses it.
+
+    Failing toward re-running is right for the step that cannot be resolved; it
+    must not also re-select steps whose range answers cleanly.
+    """
+    # 0.586 itself is missing, so any range ENDING at it is unresolvable, while
+    # a step already AT 0.586 resolves trivially to "nothing owed".
+    monkeypatch.setattr(v, "current_version", lambda: "0.586")
+    _table(monkeypatch, {"0.585": ["1. Export"]})       # 0.586 absent
+    for key, _ in v.STEP_KEYS:
+        v.record_step_run(key, "Oblivion.esm", "0.586")
+    v.record_step_run("meshes", "Oblivion.esm", "0.584")
+
+    plan = v.upgrade_plan("Oblivion.esm")
+    assert plan["unknown"] is True
+    assert "meshes" in plan["steps"]
+    # Everything else sat at 0.586 already and owes nothing.
+    assert plan["steps"] == ["meshes"]
+
+
+def test_no_steps_reads_as_up_to_date_even_when_installed_looks_old(
+        state, monkeypatch):
+    """`upgraded` and an empty step list can disagree, and the list wins.
+
+    `installed` is the OLDEST recorded step and now includes the shared
+    plugin-independent ones, so a plugin whose every step is current can still
+    carry an old `installed` -- which printed "upgraded, re-run: nothing".
+    """
+    monkeypatch.setattr(v, "current_version", lambda: "0.586")
+    _table(monkeypatch, {"0.586": []})
+    for key, _ in v.STEP_KEYS:
+        if key != "modify_body_meshes":
+            v.record_step_run(key, "Nehrim.esm", "0.586")
+    v.record_step_run("modify_body_meshes", "Oblivion.esm", "0.58")
+
+    plan = v.upgrade_plan("Nehrim.esm")
+    assert plan["steps"] == []
+    assert "up to date" in v.describe_plan(plan)
+    assert "re-run: " not in v.describe_plan(plan)
 
 
 def test_describe_plan_is_console_safe(state, monkeypatch):
