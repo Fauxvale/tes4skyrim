@@ -41,7 +41,7 @@ silent.
 
 import struct
 
-from .text_reader import get_formid, get_int
+from .text_reader import get_float, get_formid, get_int
 
 _HEADER_SIZE = 24
 _COMPRESSED_FLAG = 0x00040000
@@ -316,6 +316,19 @@ _RB_XCLW = _Rebuild(b'XCLW', _build_xclw,
 _RB_XOWN = _Rebuild(b'XOWN', _build_xown, (('after', b'LTMP'),))
 _RB_REFR_XOWN = _Rebuild(b'XOWN', _build_xown, (('after', b'XESP'),))
 _RB_MNAM = _Rebuild(b'MNAM', _build_mnam, (('after', b'DNAM'),))
+# WRLD world-object bounds. A plugin that ADDS land outside the master's
+# worldspace must widen these or the engine clips everything beyond them: the
+# world map is rendered over exactly this rectangle, so terrain outside it is
+# simply not drawn. Tamriel.esp triples Cyrodiil's extent
+# (-262144 -> -786432) and none of it showed on the map because the override
+# kept the master's rectangle. Raw world units, same scale in TES4 and TES5 —
+# written exactly as convert_WRLD writes them.
+_RB_NAM0 = _Rebuild(b'NAM0', lambda rec: struct.pack(
+    '<ff', get_float(rec, 'NAM0.MinX'), get_float(rec, 'NAM0.MinY')),
+    (('after', b'NAMA'), ('after', b'ONAM'), ('after', b'MNAM')))
+_RB_NAM9 = _Rebuild(b'NAM9', lambda rec: struct.pack(
+    '<ff', get_float(rec, 'NAM9.MaxX'), get_float(rec, 'NAM9.MaxY')),
+    (('after', b'NAM0'), ('after', b'NAMA'), ('after', b'ONAM')))
 _RB_FLTV = _Rebuild(b'FLTV', _build_fltv, (('after', b'FNAM'),))
 _RB_SCRI_VMAD = _Rebuild(b'VMAD', _build_scri_vmad)
 # LAND vertex data, in the order convert_LAND emits it: DATA VNML VHGT VCLR,
@@ -367,6 +380,8 @@ _reg('ACHR', 'XOWN.Owner', _RB_REFR_XOWN)
 _reg('ACRE', 'XOWN.Owner', _RB_REFR_XOWN)
 _reg('WRLD', ('MNAM.UsableDimX', 'MNAM.UsableDimY', 'MNAM.NWCellX',
               'MNAM.NWCellY', 'MNAM.SECellX', 'MNAM.SECellY'), _RB_MNAM)
+_reg('WRLD', ('NAM0.MinX', 'NAM0.MinY'), _RB_NAM0)
+_reg('WRLD', ('NAM9.MaxX', 'NAM9.MaxY'), _RB_NAM9)
 _reg('GLOB', 'FLTV.Value', _RB_FLTV)
 _reg('LAND', 'VNML', _RB_LAND_VNML)
 _reg('LAND', 'VHGT', _RB_LAND_VHGT)

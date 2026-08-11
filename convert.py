@@ -861,14 +861,31 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,
             n = _worldspace_land_count(m_esm, edid)
             if best is None or n > best[0]:
                 best = (n, m_esm, m_dir, master)
-        # Whoever holds the BULK of the terrain owns the records; this plugin
-        # only wins when no master has more. An override plugin ships a WRLD
-        # override and a handful of LAND records, so counting records rather
-        # than presence is what keeps the master the source.
-        if best is not None and best[0] > own:
-            print(f"[{file_name}] Worldspace '{edid}': {best[3]} holds "
-                  f"{best[0]} LAND records vs this plugin's {max(own, 0)}; "
-                  f"sourcing records from the master")
+        # A worldspace a MASTER defines is always sourced from that master,
+        # with this plugin applied as an OVERLAY on top — never from the
+        # plugin alone, however much terrain the plugin adds.
+        #
+        # This used to give the records to whichever file held the BULK of the
+        # terrain, which silently inverted for a plugin that EXTENDS a master's
+        # worldspace instead of merely patching it. Tamriel.esp adds a landmass
+        # around Cyrodiil (99,910 LAND vs Oblivion.esm's 31,823), so the plugin
+        # won ownership and every tile was built from the plugin ALONE: all of
+        # the master's own terrain was missing from the heightmap and got
+        # edge-extended into flat plateaus, which is exactly the tile-sized
+        # discontinuity seen at the vanilla border (worst at level 32, where
+        # one tile spans 32x32 cells). The only two level-32 tiles that looked
+        # right were the ones the plugin never regenerated.
+        #
+        # The overlay path already expresses "master's terrain + this plugin's
+        # edits" correctly and is what the DLC/override case has always used;
+        # record COUNT never distinguished the two cases and should not decide
+        # ownership. `own` still matters for the case below: a worldspace no
+        # master defines at all is genuinely this plugin's own.
+        if best is not None:
+            print(f"[{file_name}] Worldspace '{edid}': defined by "
+                  f"{best[3]} ({best[0]} LAND records; this plugin adds "
+                  f"{max(own, 0)}); sourcing records from the master with "
+                  f"this plugin as an overlay")
             return best[1], [best[2]]
         if own >= 0:
             return esm_path, []

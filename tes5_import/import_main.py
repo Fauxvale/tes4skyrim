@@ -1644,7 +1644,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                                door_fids, navm_cache, land_cache)
             _phase_done('phase 4c own CELL groups')
             _build_world_groups(own, writer, navm_metas, base_model_by_fid,
-                                door_fids, navm_cache, land_cache)
+                                door_fids, navm_cache, land_cache, ctx=ctx)
             _phase_done('phase 4d own WRLD groups')
     else:
         _build_cell_groups(by_type, writer, navm_metas, base_model_by_fid,
@@ -2552,7 +2552,7 @@ def _ensure_cell_grid(cell: dict) -> None:
 def _build_world_groups(by_type: dict, writer: PluginWriter,
                         navm_metas: list = None, base_model_by_fid: dict = None,
                         door_fids: set = None, navm_cache: dict = None,
-                        land_cache: dict = None):
+                        land_cache: dict = None, ctx=None):
     """Build WRLD group hierarchy (worldspaces + exterior cells)."""
     if navm_metas is None:
         navm_metas = []
@@ -2569,7 +2569,53 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
     lands = by_type.get('LAND', [])
     pgrds = by_type.get('PGRD', [])
 
-    if not worlds:
+    # A plugin can add a whole landscape to a worldspace the MASTER owns, in
+    # which case it ships NO new WRLD of its own — its only WRLD record is an
+    # override, already emitted by the override path, so `worlds` is empty
+    # here while `cells` holds tens of thousands of brand-new exterior cells.
+    # Returning early dropped every one of them: Tamriel.esp (a heightmap
+    # plugin over Oblivion.esm's Tamriel) exports 99,946 CELL and 99,914 LAND
+    # records of which only the 4,501 that override the master's survived —
+    # 95% of the terrain silently vanished and the output was 38 MB instead of
+    # ~1 GB. The map looked unchanged in-game for exactly that reason.
+    #
+    # The parent WRLD is pulled from the converted master as an ANCHOR, the
+    # same way emit_nested_overrides anchors any type-1/6/7 group whose owning
+    # record this plugin does not override: the engine needs the WRLD record
+    # immediately before its type-1 children group to bind them, but we ship
+    # no override of the worldspace itself (we changed nothing about it).
+    # Keyed by the value `get_formid` returns for ParentWRLD, which is ALREADY
+    # remapped into output space (get_formid applies remap_formid itself) —
+    # passing it through master_output_formid would shift the load-order index
+    # a SECOND time and resolve to nothing.
+    anchor_wrld = {}        # ParentWRLD (output space) -> WRLD bytes, or b''
+    if not worlds and cells and ctx is not None:
+        master_index = getattr(ctx, 'master_index', None)
+        emitted = getattr(ctx, 'emitted_wrld', None) or {}
+        wanted = {get_formid(c, 'ParentWRLD') for c in cells}
+        wanted.discard(0)
+        for out_fid in sorted(wanted):
+            if out_fid in emitted:
+                # The override path ALREADY wrote this WRLD (with the author's
+                # own changes). Writing it again here would duplicate the
+                # FormID and the engine would keep whichever came last, so
+                # emit the children group ALONE and let that record anchor it:
+                # b'' means "group only". The override is written into the
+                # master's nesting — the same top-level WRLD group this
+                # builder appends to — so it still precedes these children.
+                anchor_wrld[out_fid] = b''
+                continue
+            rec = master_index.record(out_fid) if master_index else b''
+            if rec and rec[:4] == b'WRLD':
+                anchor_wrld[out_fid] = rec
+            else:
+                n = sum(1 for c in cells
+                        if get_formid(c, 'ParentWRLD') == out_fid)
+                print(f"  WARNING: {n} new exterior cells name worldspace "
+                      f"{out_fid:08X}, which has no converted master record "
+                      f"— they cannot be placed and are SKIPPED")
+
+    if not worlds and not anchor_wrld:
         return
 
     # Index exterior cells by worldspace
@@ -2645,17 +2691,26 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
         cell_fid = get_formid(rec, 'ParentCELL')
         pgrd_by_cell[cell_fid].append(rec)
 
-    print(f"  Building WRLD hierarchy ({len(worlds)} worldspaces)...")
+    if anchor_wrld:
+        print(f"  Building WRLD hierarchy ({len(anchor_wrld)} MASTER-owned "
+              f"worldspace(s) anchored for this plugin's own cells)...")
+    else:
+        print(f"  Building WRLD hierarchy ({len(worlds)} worldspaces)...")
     converted = 0
     # List-append + join instead of bytes += — Tamriel's children total
     # ~600 MB, and quadratic reallocation on buffers that size dominates the
     # whole phase (see _build_cell_groups).
     all_wrld_parts = []
 
-    for wrld_rec in sorted(worlds, key=lambda w: get_formid(w, 'FormID')):
-        wrld_fid = get_formid(wrld_rec, 'FormID')
+    # (source FormID, this plugin's WRLD export record or None when the record
+    # is the master's, pulled in only to anchor the children group).
+    _wrld_jobs = [(get_formid(w, 'FormID'), w) for w in worlds]
+    _wrld_jobs += [(fid, None) for fid in anchor_wrld]
+
+    for wrld_fid, wrld_rec in sorted(_wrld_jobs, key=lambda j: j[0]):
         try:
-            wrld_bytes = convert_WRLD(wrld_rec)
+            wrld_bytes = (convert_WRLD(wrld_rec) if wrld_rec is not None
+                          else anchor_wrld[wrld_fid])
             wrld_children = []
 
             wrld_cells = ext_cells_by_wrld.get(wrld_fid, [])
@@ -2810,20 +2865,30 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
                     if block_parts:
                         wrld_children.append(pack_group(4, block_label, b''.join(block_parts)))
 
-            # Wrap in world children group (type 1)
-            all_wrld_parts.append(wrld_bytes)
+            # Wrap in world children group (type 1).  The label must be the
+            # FormID of the WRLD record that precedes it: for an ANCHORED
+            # worldspace that is the record read out of the master (or, when
+            # `wrld_bytes` is empty, the override already emitted at this
+            # FormID), not this plugin's source id.
+            if wrld_bytes:
+                all_wrld_parts.append(wrld_bytes)
             if wrld_children:
-                all_wrld_parts.append(pack_group(1, struct.pack('<I', wrld_fid), b''.join(wrld_children)))
+                label_fid = (wrld_fid if wrld_rec is not None
+                             else (struct.unpack_from('<I', wrld_bytes, 12)[0]
+                                   if wrld_bytes else wrld_fid))
+                all_wrld_parts.append(pack_group(1, struct.pack('<I', label_fid), b''.join(wrld_children)))
 
             converted += 1
 
         except Exception as e:
-            print(f"  ERROR building WRLD group for {get_str(wrld_rec, 'EditorID', '?')}: {e}")
+            name = (get_str(wrld_rec, 'EditorID', '?') if wrld_rec is not None
+                    else f'master-anchored {wrld_fid:08X}')
+            print(f"  ERROR building WRLD group for {name}: {e}")
 
     if all_wrld_parts:
         writer.add_raw_group('WRLD', b''.join(all_wrld_parts))
 
-    print(f"    Worldspaces: {len(worlds)}, children: {converted}")
+    print(f"    Worldspaces: {len(_wrld_jobs)}, children: {converted}")
 
 
 def main():

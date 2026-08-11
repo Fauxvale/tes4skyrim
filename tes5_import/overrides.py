@@ -183,6 +183,15 @@ class OverrideContext:
         self.master_export = load_master_export(export_dir)
         self.stats = Counter()
         self.unmapped_keys = Counter()
+        # WRLD overrides this plugin emitted, {out FormID -> record bytes}.
+        # A plugin that adds cells to a MASTER's worldspace needs the WRLD
+        # record in front of their type-1 group, and it must be THIS record
+        # rather than the master's — emitting the master's copy as well would
+        # ship the same FormID twice and the engine keeps the LAST one, which
+        # silently reverted the author's own worldspace edits (Tamriel.esp
+        # widens NAM0/NAM9 to hold the land it adds; the stale duplicate put
+        # the vanilla bounds back and clipped the new terrain off the map).
+        self.emitted_wrld = {}
 
     def __len__(self):
         return len(self.master_export)
@@ -460,6 +469,8 @@ def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
             if ov.status not in ('emitted', 'deleted'):
                 dropped += 1
                 continue
+            if sig == 'WRLD':
+                ctx.emitted_wrld[ov.out_fid] = ov.record_bytes
             pending.append((ov.out_fid, ov.record_bytes,
                             ctx.master_index.group_path(ov.out_fid)))
 
