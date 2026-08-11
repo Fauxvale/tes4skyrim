@@ -505,9 +505,17 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
     script_src = out_root / file_name / "scripts" / "source"
     script_out = out_root / file_name / "scripts"
 
+    # Nothing to compile is SUCCESS, not failure.  A plugin can legitimately
+    # convert zero scripts -- the merged-BSA DLC plugins export zero records
+    # because their content lives in the master's export, so every phase finds
+    # an empty workload.  Every other phase already reports that as success
+    # ("No meshes found", "No sound directory found"); returning False here
+    # flipped the whole run to "Pipeline completed with errors" and showed the
+    # user a FAILED banner for a run in which nothing had gone wrong.  Only a
+    # missing compiler, missing headers, or a real compile error fails below.
     if not script_src.is_dir() or not any(script_src.glob("*.psc")):
         print(f"[{file_name}] No .psc scripts found, skipping compile")
-        return False
+        return True
 
     # Find the compiler
     compiler = SCRIPT_DIR / "external" / "papyrus-compiler" / "papyrus.exe"
@@ -1363,15 +1371,17 @@ def main():
         print("=" * 54)
         for fn in order:
             ok = phase_scripts(fn, config, output_dir=output_dir)
-            if not ok:
-                success = False
-            # Compilation is gated on `success` upstream; the step counts as
-            # run only when transpile AND compile both land.
+            # Compile only when THIS plugin transpiled cleanly.  This used to
+            # gate on the global `success`, so one earlier plugin's failure
+            # silently skipped compilation for every plugin after it -- and
+            # then marked their `scripts` step not-run, though it had never
+            # been attempted.  The step counts as run only when transpile AND
+            # compile both land for this plugin.
             compiled = False
-            if success:
+            if ok:
                 compiled = phase_compile(fn, config, output_dir=output_dir)
-                if not compiled:
-                    success = False
+            if not (ok and compiled):
+                success = False
             _mark('scripts', fn, ok and compiled)
         print()
 

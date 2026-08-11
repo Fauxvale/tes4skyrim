@@ -357,7 +357,6 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
     print(f'    QUST: {stats["qust_ok"]}/{stats["qust_total"]} stage scripts')
     print(f'    Total: {total} converted, {errs} errors, {stats["todo_count"]} TODOs')
 
-    _write_report(output_dir, stats)
     return stats
 
 
@@ -1587,28 +1586,6 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
         except Exception as e:
             stats['qust_err'] += scripted_count
             stats['errors'].append(f'QUST {edid}: {e}')
-
-
-def _write_report(output_dir: str, stats: dict):
-    """Write a conversion summary report."""
-    report_path = os.path.join(output_dir, '_CONVERSION_REPORT.txt')
-    with open(report_path, 'w', encoding='utf-8') as f:
-        f.write('TES4 Script -> Papyrus Conversion Report\n')
-        f.write('=' * 50 + '\n\n')
-        f.write(f'SCPT records: {stats["scpt_ok"]}/{stats["scpt_total"]} converted\n')
-        f.write(f'INFO fragments: {stats["info_ok"]}/{stats["info_total"]} converted\n')
-        f.write(f'QUST stage scripts: {stats["qust_ok"]}/{stats["qust_total"]} converted\n')
-        total = stats['scpt_ok'] + stats['info_ok'] + stats['qust_ok']
-        errs = stats['scpt_err'] + stats['info_err'] + stats['qust_err']
-        f.write(f'\nTotal: {total} converted, {errs} errors\n')
-        f.write(f';TODO markers: {stats["todo_count"]}\n\n')
-
-        if stats['errors']:
-            f.write('Errors:\n')
-            for err in stats['errors'][:100]:
-                f.write(f'  {err}\n')
-            if len(stats['errors']) > 100:
-                f.write(f'  ... and {len(stats["errors"]) - 100} more\n')
 
 
 # The player, in both spellings a TES4 SCRO can carry — skipped when

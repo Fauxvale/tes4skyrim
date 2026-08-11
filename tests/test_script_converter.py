@@ -1051,14 +1051,6 @@ class TestIntegration:
         assert stats['info_ok'] == 1
         assert os.path.exists(os.path.join(str(output_dir), 'TES4_TIF__AABB0001.psc'))
 
-    def test_convert_all_scripts_report_written(self, tmp_path):
-        export_dir = tmp_path / 'export'
-        export_dir.mkdir()
-        output_dir = tmp_path / 'output'
-
-        convert_all_scripts(str(export_dir), str(output_dir))
-        assert os.path.exists(os.path.join(str(output_dir), '_CONVERSION_REPORT.txt'))
-
 
 # ===========================================================================
 # Creation Kit PapyrusCompiler contracts
