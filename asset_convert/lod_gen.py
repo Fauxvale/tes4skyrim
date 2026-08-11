@@ -747,7 +747,16 @@ def _lod_meshes_for(stat: dict, output_meshes_dir: Path, master_meshes=None):
 # ---------------------------------------------------------------------------
 
 
-def _kept_tile_cells(only_cells, levels=(4, 8, 16, 32)) -> set:
+# The LOD levels OBJECT LOD is baked at. Terrain goes out to 32, but object
+# tiles stop at 16: censused across every converted worldspace, Oblivion.esm
+# ships 734/204/59 .bto at levels 4/8/16 and ZERO at level 32 (same 4/8/16-only
+# split in SEWorld and all 16 small worldspaces). Including 32 here cost a 4x
+# wider footprint — a level-32 tile spans 32x32 cells, so it dragged 2,048 cells
+# into the LODGen input to satisfy a tile that is never produced.
+_OBJ_LOD_LEVELS = (4, 8, 16)
+
+
+def _kept_tile_cells(only_cells, levels=_OBJ_LOD_LEVELS) -> set:
     """Every cell composited by a tile that `_prune_unaffected_tiles` keeps.
 
     A tile survives pruning when it covers ANY changed cell, and it composites
@@ -760,7 +769,7 @@ def _kept_tile_cells(only_cells, levels=(4, 8, 16, 32)) -> set:
     That is the whole cost being avoided: DLCBattlehornCastle changes 14 cells
     and keeps 8 of 997 tiles, having baked all 997 from ~1M references.
 
-    The largest level dominates the union (a level-32 tile spans 32x32 cells),
+    The largest level dominates the union (a level-16 tile spans 16x16 cells),
     so the result stays a wide neighbourhood, not a tight box — deliberately,
     because a coarse tile at the edit's edge really does draw those objects.
 
@@ -773,7 +782,7 @@ def _kept_tile_cells(only_cells, levels=(4, 8, 16, 32)) -> set:
     return kept
 
 
-def _kept_tile_cells_by_level(only_cells, levels=(4, 8, 16, 32)) -> dict:
+def _kept_tile_cells_by_level(only_cells, levels=_OBJ_LOD_LEVELS) -> dict:
     """Per-level footprints: {level: cells composited by that level's kept tiles}.
 
     LODGen has no switch for "bake only these tiles" — it derives the tile set
@@ -1410,6 +1419,12 @@ def _prune_unaffected_tiles(tile_dir: Path, suffix: str, only_cells) -> int:
             level, tx, ty = int(parts[-3]), int(parts[-2]), int(parts[-1])
         except (ValueError, IndexError):
             kept += 1          # unrecognised name: never delete blind
+            continue
+        if suffix == '.bto' and level not in _OBJ_LOD_LEVELS:
+            # A level the reference footprint no longer feeds. Keeping it would
+            # ship a tile whose objects were never listed, so it can only be
+            # emptier than the master's equivalent.
+            tile.unlink()
             continue
         if any((tx + dx, ty + dy) in only
                for dy in range(level) for dx in range(level)):
