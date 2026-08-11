@@ -80,6 +80,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MANIFEST_NAME = 'navmesh_cache_manifest.json'
 CACHE_DIRNAME = 'navmesh_geom_cache'
 
+# Set to 1/true to skip the automatic download (metered connections, or a user
+# who would rather generate locally).  Defined here so the GUI menu item and
+# convert.py agree on the name instead of repeating the literal -- the same
+# reason worker_budget exports WORKERS_ENV_VAR.
+NO_DOWNLOAD_ENV_VAR = 'TESCONV_NO_CACHE_DOWNLOAD'
+
 
 # ---------------------------------------------------------------------------
 # Repo / plugin helpers
@@ -245,10 +251,26 @@ def archive(plugin: str, out_dir: str, tag: str, quiet: bool = False) -> str | N
 # publish
 # ---------------------------------------------------------------------------
 
+# The repo the caches are published from.  Used when the origin remote cannot
+# be read, which is the NORMAL case for an end user: the README tells people to
+# "paste a new download over your existing folder", so most installs are an
+# unzipped source archive with no .git directory at all.  There `git remote
+# get-url origin` fails, gh_repo() returns [], api_repo() returned '' and
+# _api_releases() gave back [] -- the download silently did nothing and every
+# such user regenerated navmesh from scratch believing the feature was on.
+# A constant is correct here: the release assets genuinely live at this repo,
+# and a fork that republishes its own caches still wins via the remote.
+FALLBACK_REPO = 'bryantmh/tes4skyrim'
+
+
 def api_repo() -> str:
-    """'owner/name' for the GitHub API, from the origin remote."""
+    """'owner/name' for the GitHub API, from the origin remote.
+
+    Falls back to FALLBACK_REPO for a non-git install (see that constant) so
+    downloading works from an unzipped source archive, not just a clone.
+    """
     got = gh_repo()
-    return got[1] if len(got) == 2 else ''
+    return got[1] if len(got) == 2 else FALLBACK_REPO
 
 
 def _api_releases(timeout: int = 20) -> list:
@@ -295,13 +317,16 @@ def _download(url: str, dest: str, quiet: bool = False,
                     done += len(chunk)
                     if not quiet and done >= nxt:
                         nxt += step
+                        # Prefixed so the line is attributable in a long
+                        # conversion log -- a bare "40%" tells the user nothing
+                        # about what is downloading.
                         if total:
-                            print('    %d%% (%.1f/%.1f MB)'
+                            print('    Navmesh cache: %d%% (%.1f/%.1f MB)'
                                   % (done * 100 // total, done / (1 << 20),
                                      total / (1 << 20)), flush=True)
                         else:
-                            print('    %.1f MB' % (done / (1 << 20)),
-                                  flush=True)
+                            print('    Navmesh cache: %.1f MB'
+                                  % (done / (1 << 20)), flush=True)
         os.replace(tmp, dest)
         return True
     except Exception as exc:
@@ -377,10 +402,46 @@ def parse_cache_release_tag(name: str) -> tuple | None:
 
 
 def _version_key(tag: str) -> tuple | None:
-    try:
-        return tuple(int(p) for p in tag.split('.'))
-    except ValueError:
+    """Comparable key for a MAJOR.MINOR tag, NORMALISED TO THOUSANDTHS.
+
+    The minor field's WIDTH sets its scale -- the same trap previous_tag() and
+    the hook's next_tag() each document.  Tags through 0.58 are MAJOR.MM
+    (hundredths); 0.581 onward are MAJOR.MMM (thousandths).  Comparing the raw
+    integers makes '0.586' look 10x larger than '0.57' relative to reality, and
+    ranks '0.10' above '0.9' when 0.100 is far below 0.900.
+
+    Scaling here matters because the range check ("does this cache cover my
+    version?") is a direct comparison of these keys: an unscaled '0.57' start
+    would wrongly appear to cover version 0.100-0.569.
+
+    Two spellings that scale alike ('0.58'/'0.580', '0.10'/'0.100') are one
+    version written two ways, not two releases, so they compare EQUAL by
+    design.  No real tag pair is lost to that: the thousandths era begins at
+    0.581, so every value a 3-digit field can express below the switch is only
+    a zero-padded legacy name.
+    """
+    parts = tag.split('.')
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
         return None
+    major, minor = parts
+    # The minor field is a FRACTION written without its point: '0.9' is nine
+    # tenths, '0.58' fifty-eight hundredths, '0.586' five-eighty-six
+    # thousandths.  Scale by the field's own width rather than enumerating
+    # widths, so this stays correct if the scheme ever gets finer.  A field
+    # WIDER than thousandths must still yield a key -- returning None would
+    # make resolve_cache_release(), latest_cache_release() and auto_install()'s
+    # range check skip that release SILENTLY, indistinguishable from "no cache
+    # exists".  Integer division there loses only sub-thousandth precision,
+    # which no published tag has ever used.
+    scaled = int(minor) * 1000 // (10 ** len(minor))
+    # Scaling is deliberately NOT injective over spellings, and that is correct:
+    # two widths that scale alike are two spellings of ONE version, never two
+    # releases.  '0.10' and '0.100' both mean 100 thousandths -- and 0.100 could
+    # never be a thousandths-era tag anyway, because that era starts at 0.581
+    # (_SCHEME_SWITCH_MILS), far above 100.  Every value a 3-digit field can
+    # express below the switch is therefore just a zero-padded legacy name, so
+    # collapsing them is the intended behaviour, exactly as for '0.58'/'0.580'.
+    return (int(major), scaled)
 
 
 # Last version issued under the 2-digit MAJOR.MM scheme, in thousandths.
@@ -396,31 +457,60 @@ def previous_tag(tag: str) -> str:
     Mirrors tag-on-push.yml's numbering, so a range closes on the last version
     the cache was actually valid for rather than the one that broke it.
 
-    The step size follows the minor field's WIDTH.  Tags through 0.58 are
-    MAJOR.MM (hundredths); 0.581 onward are MAJOR.MMM (thousandths).  Legacy
-    2-digit tags must keep decrementing by a hundredth -- rewriting '0.57' as
-    '0.569' would name a release that never existed and 404 the download.  The
-    3-digit boundary steps back into the old scheme's last name: 0.580 -> 0.58.
+    The step size follows the VALUE's scheme, not the spelling's width.  Tags
+    through 0.58 are MAJOR.MM (hundredths); 0.581 onward are MAJOR.MMM
+    (thousandths).  Legacy tags must keep decrementing by a hundredth --
+    rewriting '0.57' as '0.569' would name a release that never existed and 404
+    the download.  The 3-digit boundary steps back into the old scheme's last
+    name: 0.580 -> 0.58.
+
+    Any minor width is accepted, because _version_key() accepts any: a 1-digit
+    '0.9' is a real legacy tag, and a wider field still yields a key there.  If
+    this returned *tag* unchanged for those, close_cache_release() would build
+    `cache_release_tag(start, previous_tag(new_tag))` with an upper bound equal
+    to new_tag itself -- a closed range advertising the very version that
+    SUPERSEDED it, i.e. a cache promising to serve a build it is known stale
+    for.  Stepping off the scaled value keeps the two functions in agreement.
     """
-    key = _version_key(tag)
-    if not key or len(key) != 2:
+    if _version_key(tag) is None:
         return tag
-    minor_width = len(tag.split('.')[1])
-    if minor_width == 2:
-        cents = key[0] * 100 + key[1] - 1
+    # Use the RAW digits, not _version_key: that key is normalised to
+    # thousandths for comparison, whereas the arithmetic below steps in the
+    # tag's own scheme and must see the field exactly as it was written.  The
+    # WIDTH is the scheme here, not the value -- '0.73' is a hundredths name
+    # even though 730 sits above the switch, so it must step to '0.72', never
+    # to '0.729'.
+    parts = tag.split('.')
+    major, minor = int(parts[0]), int(parts[1])
+    minor_width = len(parts[1])
+    # A 1-digit field is a legacy name too ('0.9'), and it decrements in tenths
+    # in its own spelling.  Widths beyond 3 have never been published, but must
+    # still step rather than return the input unchanged -- see the docstring:
+    # close_cache_release() would otherwise close a range on the very version
+    # that superseded it.  Both fold into the generic "step one unit at this
+    # width" below.
+    if minor_width <= 2:
+        unit = 10 ** minor_width
+        cents = major * unit + minor - 1
+        if cents < 0:
+            return tag
+        return '%d.%0*d' % (cents // unit, minor_width, cents % unit)
+    if minor_width > 3:
+        unit = 10 ** minor_width
+        wide = major * unit + minor - 1
+        if wide < 0:
+            return tag
+        return '%d.%0*d' % (wide // unit, minor_width, wide % unit)
+    mils = major * 1000 + minor - 1
+    # Below the switchover every name was 2-digit, so a step that lands
+    # there must be spelled in the old scheme: 0.581 -> 0.58, never
+    # '0.580' (never published) nor '0.579' (never existed).  Above it,
+    # every thousandth is its own real tag -- 1.000 -> 0.999 -- so the
+    # 2-digit spelling applies ONLY on the legacy side of the boundary.
+    if mils <= _SCHEME_SWITCH_MILS:
+        cents = mils // 10
         return '%d.%02d' % (cents // 100, cents % 100)
-    if minor_width == 3:
-        mils = key[0] * 1000 + key[1] - 1
-        # Below the switchover every name was 2-digit, so a step that lands
-        # there must be spelled in the old scheme: 0.581 -> 0.58, never
-        # '0.580' (never published) nor '0.579' (never existed).  Above it,
-        # every thousandth is its own real tag -- 1.000 -> 0.999 -- so the
-        # 2-digit spelling applies ONLY on the legacy side of the boundary.
-        if mils <= _SCHEME_SWITCH_MILS:
-            cents = mils // 10
-            return '%d.%02d' % (cents // 100, cents % 100)
-        return '%d.%03d' % (mils // 1000, mils % 1000)
-    return tag
+    return '%d.%03d' % (mils // 1000, mils % 1000)
 
 
 def tag_exists(tag: str) -> bool:
@@ -554,14 +644,30 @@ def close_cache_release(new_tag: str) -> str | None:
     if _version_key(start) >= _version_key(new_tag):
         return None                     # republishing the same/older version
 
-    closed = cache_release_tag(start, previous_tag(new_tag))
+    # The upper bound must not fall BELOW the start, or the closed range
+    # excludes every version -- including the one it begins at.  This is not
+    # hypothetical: previous_tag() steps in the SPELLING's scheme while the
+    # range check compares thousandths-scaled keys, so closing '0.581+' against
+    # a 2-digit successor ('0.59') steps in hundredths to '0.58' = (0, 580),
+    # one unit under the start's (0, 581).  The result, 'navmesh-cache-0.581-
+    # 0.58', matched nothing at all and silently retired a good cache.
+    #
+    # Clamping to `start` is the honest close: the release covered exactly the
+    # one version it opened at, which is precisely true when its successor is
+    # the very next release.  The guard above already rejected a successor at
+    # or below the start, so this can only ever narrow, never invert.
+    until = previous_tag(new_tag)
+    if _version_key(until) is None or _version_key(until) < _version_key(start):
+        until = start
+
+    closed = cache_release_tag(start, until)
     if closed == open_rel:
         return None
     print('Closing %s -> %s (superseded by %s)' % (open_rel, closed, new_tag))
     rc = subprocess.run(
         ['gh', 'release', 'edit', *gh_repo(), open_rel, '--tag', closed,
          '--title', 'Navmesh cache for %s-%s (not the converter)'
-         % (start, previous_tag(new_tag))],
+         % (start, until)],
         cwd=repo_root()).returncode
     if rc != 0:
         print('WARNING: could not rename %s; it will keep claiming "%s and '
@@ -703,9 +809,26 @@ def publish(plugins: list[str], tag: str, out_dir: str,
 # install
 # ---------------------------------------------------------------------------
 
+# install() return codes.  A caller that reports WHY nothing was installed
+# cannot do so from a bare 1: "built by different navmesh code" and "that file
+# is not a usable zip" send the user to completely different fixes, and naming
+# the wrong one is worse than saying nothing.  Both are non-zero, so every
+# existing `rc == 0` / `rc != 0` test keeps its meaning.
+INSTALL_OK        = 0
+INSTALL_FAILED    = 1   # unusable archive, failed download, no release, ...
+INSTALL_MISMATCH  = 2   # a valid archive built by different navmesh code
+
+
 def install(plugin: str, tag: str | None, zip_path: str | None,
             force: bool = False) -> int:
-    """Unpack a cache archive into export/<plugin>/navmesh_geom_cache/."""
+    """Unpack a cache archive into export/<plugin>/navmesh_geom_cache/.
+
+    Returns one of the INSTALL_* codes above.  Never raises for a bad archive:
+    a corrupt, truncated or 0-byte zip is exactly what a half-finished download
+    leaves behind, and letting BadZipFile escape made one such file abort
+    auto_install() entirely -- skipping the other drop-in candidates AND the
+    HTTPS fallback that would have fixed it.
+    """
     tmp_zip = None
     if zip_path is None:
         if not have_gh():
@@ -719,7 +842,7 @@ def install(plugin: str, tag: str | None, zip_path: str | None,
                       'was given.')
                 print('Run `gh auth login` once, or download %s from the '
                       'release page and pass --zip.' % asset_name(plugin))
-            return 1
+            return INSTALL_FAILED
         os.makedirs(os.path.join(repo_root(), 'temp'), exist_ok=True)
         tmp_zip = os.path.join(repo_root(), 'temp', asset_name(plugin))
         # Always resolve an explicit cache release.  Two traps otherwise:
@@ -735,41 +858,74 @@ def install(plugin: str, tag: str | None, zip_path: str | None,
             else:
                 print('ERROR: no navmesh-cache release found in this repo.')
             print('Pass --zip to install a local archive instead.')
-            return 1
+            return INSTALL_FAILED
         args = ['gh', 'release', 'download', *gh_repo(), rel_tag,
                 '--pattern', asset_name(plugin), '--output', tmp_zip,
                 '--clobber']
         print('Downloading %s...' % asset_name(plugin))
         if subprocess.run(args).returncode != 0:
             print('ERROR: download failed.')
-            return 1
+            return INSTALL_FAILED
         zip_path = tmp_zip
 
-    with zipfile.ZipFile(zip_path) as zf:
+    # Opening is the step a truncated / still-downloading / 0-byte file fails
+    # at, and it must be an ordinary failure rather than an exception: the
+    # import phase calls this inside a conversion, where a bad file in a folder
+    # must never be able to stop a build (nor hide the candidates behind it).
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except (zipfile.BadZipFile, OSError) as exc:
+        print('ERROR: %s is not a readable zip (%s) -- it may be a partial '
+              'download.' % (zip_path, exc))
+        return INSTALL_FAILED
+
+    with zf:
         try:
             manifest = json.loads(zf.read(MANIFEST_NAME))
         except KeyError:
             print('ERROR: %s has no %s -- refusing to install an '
                   'unidentified archive.' % (zip_path, MANIFEST_NAME))
-            return 1
+            return INSTALL_FAILED
+        except (ValueError, zipfile.BadZipFile, OSError) as exc:
+            # A manifest that is present but unreadable (corrupt member, bad
+            # JSON) is the same class of problem as an unopenable zip.
+            print('ERROR: %s has an unreadable %s (%s).'
+                  % (zip_path, MANIFEST_NAME, exc))
+            return INSTALL_FAILED
 
         want_tag = source_tag(plugin)
         want_col = collision_hash(plugin)
-        stale = []
-        if want_tag and manifest.get('source_tag') != want_tag:
-            stale.append('navmesh sources differ (cache was built by other code)')
-        if want_col and manifest.get('collision_hash') != want_col:
-            stale.append('collision differs (your meshes are not the publisher\'s)')
 
-        if stale:
-            print('\nWARNING: this cache does not match your tree:')
-            for s in stale:
-                print('  - %s' % s)
+        # Only a SOURCE-TAG mismatch is worth refusing over.  The tag hashes the
+        # navmesh generator itself, so a different one means every single entry
+        # is keyed by code that no longer exists and the archive is pure dead
+        # weight -- installing it buys nothing and only muddies the cache dir.
+        if want_tag and manifest.get('source_tag') != want_tag:
+            print('\nWARNING: this cache was built by different navmesh code, '
+                  'so every entry would miss.')
             print('Entries that do not match are regenerated automatically, so '
-                  'the result stays CORRECT -- you just may not save much time.')
+                  'the result stays CORRECT -- you just would not save time.')
             if not force:
                 print('Re-run with --force to install anyway.')
-                return 1
+                return INSTALL_MISMATCH
+
+        # A COLLISION mismatch must NOT block.  It was refusing for almost
+        # everyone: collision_content_hash folds in every mesh the user
+        # extracted, so it only matches someone whose game version, DLC set,
+        # mod state and extraction completeness are identical to the
+        # publisher's.  One extra or missing mesh changed the hash and the
+        # drop-in "did not work if it was in the folder" -- with the real
+        # reason (a partial-hit warning) reading like a fatal error.
+        #
+        # Invalidation is PER MESH (collision_extract.collision_digest), so a
+        # differing collision set costs only the cells that place the meshes
+        # that actually differ; the rest of the archive still hits.  Refusing
+        # the whole cache to avoid a partial one is strictly worse.
+        if want_col and manifest.get('collision_hash') != want_col:
+            print('\nNote: your meshes differ from the publisher\'s, so some '
+                  'cells will regenerate.')
+            print('The rest of the cache still applies (invalidation is per '
+                  'mesh), and the result is identical either way.')
 
         dest = cache_dir(plugin)
         os.makedirs(dest, exist_ok=True)
@@ -779,7 +935,7 @@ def install(plugin: str, tag: str | None, zip_path: str | None,
         for name in names:
             if os.path.basename(name) != name:
                 print('ERROR: archive contains a path (%s); refusing.' % name)
-                return 1
+                return INSTALL_FAILED
         print('Installing %d entries into %s...' % (len(names), dest))
         for name in names:
             with zf.open(name) as src, open(os.path.join(dest, name), 'wb') as dst:
@@ -801,7 +957,7 @@ def install(plugin: str, tag: str | None, zip_path: str | None,
     if tmp_zip and os.path.exists(tmp_zip):
         os.remove(tmp_zip)
     print('Done. Supported from tag %s.' % manifest.get('starting_tag', '?'))
-    return 0
+    return INSTALL_OK
 
 
 # ---------------------------------------------------------------------------
@@ -818,21 +974,111 @@ def dropin_dir() -> str:
     return os.path.join(repo_root(), DROPIN_DIRNAME)
 
 
-def _find_dropin(plugin: str) -> str | None:
-    """A cache zip for *plugin* sitting in navmesh_cache/, or None."""
+def find_dropins(plugin: str) -> list[str]:
+    """Every cache zip for *plugin* sitting in navmesh_cache/, best first.
+
+    Deliberately forgiving about WHERE and WHAT the file is called.  Every
+    strictness here shows up as "I put the zip in the folder and nothing
+    happened", which is the single most-reported failure of this feature and is
+    indistinguishable, from the user's side, from the cache being broken.
+
+    ALL candidates are returned, not just the best one.  Returning only
+    `hits[0]` made a single unusable file fatal to the whole feature: a
+    truncated download, a `.part` rename or a 0-byte placeholder sitting at the
+    SHALLOWEST level shadows every deeper match, install() raises BadZipFile,
+    and auto_install()'s outer handler swallows it -- so neither the good
+    nested zip nor the HTTPS download is ever tried.  The depth-3 walk added
+    exactly the nesting that makes that collision likely, so the caller must be
+    able to move on to the next candidate.
+    """
     ddir = dropin_dir()
     if not os.path.isdir(ddir):
-        return None
+        return []
     want = asset_name(plugin)
-    cand = os.path.join(ddir, want)
-    if os.path.exists(cand):
-        return cand
-    # Be forgiving about the filename: browsers rename duplicates
-    # ("...(1).zip") and users rename things.  Match on the plugin stem.
+    hits = []
+    exact = os.path.join(ddir, want)
+    if os.path.exists(exact):
+        hits.append(exact)
+
+    # Be forgiving about the filename AND the depth.  Browsers rename
+    # duplicates ("...(1).zip"), users rename things, and -- the case the old
+    # top-level-only scan missed -- extracting a download commonly leaves the
+    # asset one directory down (navmesh_cache/tes4skyrim-0.586/foo.zip), or the
+    # user drags in the whole folder they downloaded.  Walk a bounded depth so
+    # a nested drop is found without scanning an arbitrary tree.
     stem = want[:-4].lower()
-    hits = [f for f in sorted(os.listdir(ddir))
-            if f.lower().endswith('.zip') and stem in f.lower()]
-    return os.path.join(ddir, hits[0]) if hits else None
+    rest = []
+    for root, dirs, files in os.walk(ddir):
+        # depth 0 is navmesh_cache/ itself; the relative path carries a LEADING
+        # separator, so `count(os.sep)` on it is already the folder level.
+        # Prune only BELOW the documented three levels -- `>= 3` stopped at two
+        # and contradicted both this docstring and navmesh_cache/README.md.
+        depth = root[len(ddir):].count(os.sep)
+        if depth >= 3:
+            dirs[:] = []        # do not descend past level 3...
+        dirs.sort()             # ...but still scan the files AT level 3
+        for f in sorted(files):
+            if f.lower().endswith('.zip') and stem in f.lower():
+                path = os.path.join(root, f)
+                if path != exact:
+                    rest.append(path)
+    # Shallowest match first: a file the user placed directly beats one left
+    # inside an extracted folder.  The exact-name match at the top level, if it
+    # exists, already leads.
+    rest.sort(key=lambda p: (p.count(os.sep), p))
+    return hits + rest
+
+
+def _find_dropin(plugin: str) -> str | None:
+    """The single best drop-in candidate, or None.  See find_dropins()."""
+    got = find_dropins(plugin)
+    return got[0] if got else None
+
+
+def _local_version_str() -> str:
+    """This build's version for display ('0.586+geefacb3', '0.0-dev', '?')."""
+    try:
+        import version
+        return version.current_version()
+    except Exception:
+        return '?'
+
+
+def _local_version_key() -> tuple | None:
+    """(major, minor) for this build, or None if it cannot be determined.
+
+    version.current_version() returns things like '0.586' or '0.586+geefacb3'
+    (a checkout past the tag), so strip any local suffix before parsing.  None
+    means "unknown" and makes the range check permissive rather than refusing
+    everything -- a build we cannot place must still get a cache.
+
+    UNKNOWN MUST NOT PARSE AS A NUMBER.  version.DEV_VERSION is the literal
+    '0.0-dev', and the suffix strip below turns it into '0.0' -- which is a
+    perfectly valid key of (0, 0), sorts BELOW every published range start, and
+    therefore made the range check reject every release with "no published
+    cache covers this build".  That silently disabled the download for exactly
+    the population this range matching was added to serve: dev checkouts and
+    source drops cut from an untagged commit.  A version we cannot place is
+    None (permissive), never zero (excluded from everything).
+    """
+    try:
+        import version
+        raw = version.current_version() or ''
+        dev = getattr(version, 'DEV_VERSION', '0.0-dev')
+    except Exception:
+        return None
+    if not raw or raw == dev:
+        return None
+    # version.version_key() is the SAME question, already answered there, and it
+    # strips the local suffix itself (via _base_tag).  Re-implementing the split
+    # and the scaling here let the two drift: version.py scales only a 2-digit
+    # minor, whereas _version_key() scales by the field's own width, so a
+    # hypothetical '0.1234' produced a different key from each and the range
+    # check would disagree with every other version comparison in the program.
+    # One parser, one answer.
+    key = version.version_key(raw)
+    # A 0.0 base is the dev placeholder in any spelling, not a real release.
+    return None if key is None or key == (0, 0) else key
 
 
 def auto_install(plugin: str, quiet: bool = False,
@@ -860,58 +1106,159 @@ def auto_install(plugin: str, quiet: bool = False,
     try:
         from tools import navmesh_cache_hook as _hook
         if _hook.cache_matches_tag(plugin, source_tag(plugin)):
-            return False                      # already current
+            # Say so.  Silence here is indistinguishable from the feature being
+            # broken -- users reported "it does not download" for a cache that
+            # was simply already in place and working perfectly.
+            if not quiet:
+                print('  Navmesh cache: already up to date -- navmesh '
+                      'generation will be mostly skipped.')
+            return False
 
-        cand = _find_dropin(plugin)
-        if cand:
+        # EVERY candidate, not just the best one.  A truncated or 0-byte file
+        # at the shallowest level used to shadow a perfectly good nested zip
+        # and abort the whole function, taking the HTTPS fallback with it.
+        for cand in find_dropins(plugin):
             if not quiet:
                 print('  Navmesh cache: found %s, installing...'
                       % os.path.basename(cand))
-            rc = install(plugin, None, cand)
-            if not quiet:
-                print('  Navmesh cache: %s' % (
-                    'installed -- navmesh generation will be mostly skipped.'
-                    if rc == 0 else
-                    'drop-in does not match this build; generating normally.'))
-            if rc == 0:
+            try:
+                rc = install(plugin, None, cand)
+            except Exception as exc:
+                # install() handles the failures it knows about, but a drop-in
+                # is an arbitrary user-supplied file -- anything it raises must
+                # cost that ONE candidate, never the remaining ones or the
+                # download below.
+                rc = INSTALL_FAILED
+                if not quiet:
+                    print('  Navmesh cache: %s could not be read (%s).'
+                          % (os.path.basename(cand), exc))
+            if rc == INSTALL_OK:
+                if not quiet:
+                    print('  Navmesh cache: installed -- navmesh generation '
+                          'will be mostly skipped.')
                 return True
+            if not quiet:
+                # Name the ACTUAL cause.  Reporting every failure as "built by
+                # different navmesh code" sent users chasing a version mismatch
+                # when the real problem was a bad archive -- a wrong diagnosis
+                # is worse than the generic wording it replaced.
+                print('  Navmesh cache: %s' % (
+                    'that drop-in was built by different navmesh code, so '
+                    'every entry would miss; trying anything else.'
+                    if rc == INSTALL_MISMATCH else
+                    'that drop-in could not be installed; trying anything '
+                    'else.'))
 
         if not allow_download:
+            # Opting out is a deliberate choice, but still say why nothing
+            # happened -- otherwise this looks identical to the feature being
+            # broken, which is the whole class of report this path caused.
+            if not quiet:
+                print('  Navmesh cache: download disabled '
+                      '(TESCONV_NO_CACHE_DOWNLOAD); generating normally.')
+                print('    To use one offline, download %s from '
+                      'https://github.com/%s/releases and drop it in %s/'
+                      % (asset_name(plugin), api_repo(), DROPIN_DIRNAME))
             return False
 
         # ANONYMOUS HTTPS -- deliberately not gh.  Release assets on a public
         # repo need no credentials, and requiring the GitHub CLI would mean
         # almost every real user silently falls back to regenerating.
         want = source_tag(plugin)
-        asset = None
-        for rel in _api_releases():
-            if not parse_cache_release_tag(rel.get('tag_name', '')):
+        releases = _api_releases()
+        if not releases:
+            # [] means the API call FAILED (offline, proxy, rate limit) just as
+            # much as it means "no releases" -- and staying silent about it is
+            # why this reads as "the download does not work".  Say so, and point
+            # at the offline route that always works.
+            if not quiet:
+                print('  Navmesh cache: could not reach the releases API '
+                      '(offline or blocked); generating normally.')
+                print('    To use a cache offline, download %s from '
+                      'https://github.com/%s/releases and drop it in %s/'
+                      % (asset_name(plugin), api_repo(), DROPIN_DIRNAME))
+            return False
+
+        # Pick the cache release COVERING this build's version.  A cache is
+        # published as a RANGE -- 'navmesh-cache-0.586+' means "0.586 and
+        # above", closed to '0.586-0.72' once superseded -- and that range is
+        # the contract stated on the release page, so honour it here.
+        #
+        # The source tag is used as a TIE-BREAK, never as the sole gate.
+        # Requiring an exact tag match was strictly narrower than the advertised
+        # range: a user one commit past the release (any dev checkout, and every
+        # source drop cut from an untagged commit) hashed differently and was
+        # told there was no cache at all, even though the release explicitly
+        # covers their version.  Entries self-validate regardless, so the worst
+        # case of accepting a range match is a partial hit -- never wrong
+        # geometry.
+        mine = _local_version_key()
+        best = None                 # ((range_start, exact_tag_match), asset)
+        for rel in releases:
+            parsed = parse_cache_release_tag(rel.get('tag_name', ''))
+            if not parsed:
                 continue
-            # Only download a cache built by the SAME navmesh code.  The check
-            # is metadata-only, so a mismatch costs a few KB, not ~115 MB.
-            body = rel.get('body') or ''
-            marker = 'navmesh-source-tag:'
-            if marker in body and want:
-                got = body.split(marker, 1)[1]
-                got = got.split('-->', 1)[0].strip()
-                if got != want:
+            lo = _version_key(parsed[0])
+            hi = _version_key(parsed[1]) if parsed[1] else None
+            if lo is None:
+                continue
+            # Range check, skipped when the local version is unknown (a bare
+            # source drop) -- then the newest cache is the best guess.
+            if mine is not None:
+                if mine < lo:
                     continue
+                if hi is not None and mine > hi:
+                    continue
+            found = None
             for a in rel.get('assets', ()):
                 if a.get('name') == asset_name(plugin):
-                    asset = a
+                    found = a
                     break
-            if asset:
-                break
+            if not found:
+                continue
+            body = rel.get('body') or ''
+            marker = 'navmesh-source-tag:'
+            exact = False
+            if marker in body and want:
+                got = body.split(marker, 1)[1].split('-->', 1)[0].strip()
+                exact = (got == want)
+            # HIGHEST COVERING RANGE START FIRST; the source tag only breaks a
+            # tie between equally-current releases.  Ranking the tag above the
+            # range inverts that and picks an OBSOLETE cache: the source tag is
+            # not a proxy for "newer" -- it matches across distant versions
+            # whenever the navmesh code simply did not change, so an ancient
+            # release can carry a matching tag and outrank the current one.
+            # That is not hypothetical: close_cache_release() is what retires a
+            # superseded release, and its own failure path warns the release
+            # "will keep claiming '<start> and above'" -- a stale open-ended
+            # range is a state this code explicitly expects to exist.
+            rank = (lo, 1 if exact else 0)
+            if best is None or rank > best[0]:
+                best = (rank, found)
+
+        asset = best[1] if best else None
 
         if not asset:
+            if not quiet:
+                print('  Navmesh cache: no published cache covers this build '
+                      '(%s) for %s; generating normally.'
+                      % (_local_version_str(), plugin))
             return False
 
         os.makedirs(os.path.join(repo_root(), 'temp'), exist_ok=True)
         tmp = os.path.join(repo_root(), 'temp', asset_name(plugin))
         if not quiet:
-            print('  Navmesh cache: downloading %s (%.0f MB)...'
-                  % (asset['name'], asset.get('size', 0) / (1 << 20)))
+            # Announce loudly and BEFORE the transfer starts.  This is a
+            # ~115 MB download in the middle of a conversion; a user watching
+            # the log must be able to see what it is doing and why, rather than
+            # wondering whether the import has hung.
+            print('  Navmesh cache: downloading %s (%.0f MB) -- this replaces '
+                  'minutes of navmesh generation.'
+                  % (asset['name'], asset.get('size', 0) / (1 << 20)),
+                  flush=True)
         if not _download(asset['browser_download_url'], tmp, quiet=quiet):
+            if not quiet:
+                print('  Navmesh cache: download failed; generating normally.')
             return False
 
         rc = install(plugin, None, tmp)
@@ -940,7 +1287,7 @@ def main(argv=None) -> int:
         description='Publish / install the shared navmesh geometry cache.')
     sub = ap.add_subparsers(dest='cmd', required=True)
 
-    def add_plugin(p, multi=False):
+    def add_plugin(p):
         p.add_argument('--plugin', action='append', dest='plugins',
                        help='plugin folder under export/ (repeatable; '
                             'default: every plugin with a cache)')

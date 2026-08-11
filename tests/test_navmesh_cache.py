@@ -367,8 +367,11 @@ def test_install_refuses_mismatched_manifest(tmp_path, monkeypatch):
              'source_tag': 'OLD', 'collision_hash': 'OLD'}))
     monkeypatch.setattr(nc, 'source_tag', lambda p: 'NEW')
     monkeypatch.setattr(nc, 'collision_hash', lambda p: 'NEW')
-    assert nc.install('Test.esm', None, str(zpath)) == 1
-    assert nc.install('Test.esm', None, str(zpath), force=True) == 0
+    # INSTALL_MISMATCH, not a bare failure: auto_install() reports the CAUSE to
+    # the user, and "built by different navmesh code" and "that file is not a
+    # usable zip" send them to completely different fixes.
+    assert nc.install('Test.esm', None, str(zpath)) == nc.INSTALL_MISMATCH
+    assert nc.install('Test.esm', None, str(zpath), force=True) == nc.INSTALL_OK
 
 
 def test_install_certifies_only_a_matching_cache(tmp_path, monkeypatch):
@@ -450,14 +453,109 @@ def test_cache_release_never_shadows_the_code_tag():
 
 
 def test_latest_cache_release_sorts_numerically(monkeypatch):
-    """0.10 must beat 0.9, and non-cache releases must be ignored."""
+    """Sort by version, not as strings, and ignore non-cache releases.
+
+    '0.586' must beat '0.100' (string order puts '0.100' first), and the two
+    schemes must interleave correctly: 0.58 IS 0.580, so 0.586 outranks it by
+    six thousandths rather than being read as 58 vs 586.
+    """
     class _R:
         returncode = 0
-        stdout = '\n'.join(('navmesh-cache-0.9+', 'navmesh-cache-0.10+',
+        stdout = '\n'.join(('navmesh-cache-0.100+', 'navmesh-cache-0.586+',
+                            'navmesh-cache-0.58-0.585',
                             '0.55', 'some-other-release'))
 
     monkeypatch.setattr(nc.subprocess, 'run', lambda *a, **k: _R())
-    assert nc.latest_cache_release() == 'navmesh-cache-0.10+'
+    assert nc.latest_cache_release() == 'navmesh-cache-0.586+'
+
+
+def test_version_key_scales_by_minor_width():
+    """The minor field's WIDTH sets its scale -- 0.58 means 0.580.
+
+    The range check ("does this cache cover my version?") compares these keys
+    directly, so an unscaled '0.57' start would appear to cover 0.100-0.569.
+    """
+    assert nc._version_key('0.58') == nc._version_key('0.580')
+    assert nc._version_key('0.57') < nc._version_key('0.581')
+    assert nc._version_key('0.586') > nc._version_key('0.58')
+    # String order lies here; numeric order must not.
+    assert nc._version_key('0.100') > nc._version_key('0.099')
+    assert nc._version_key('not-a-version') is None
+
+
+def test_version_key_never_hides_a_wider_minor_field():
+    """A wider minor field must still yield a key, never None.
+
+    None makes resolve_cache_release(), latest_cache_release() and
+    auto_install()'s range check all skip that release SILENTLY, which is
+    indistinguishable from "no cache exists" -- the exact failure mode this
+    whole change set out to remove.  Scaling is by field WIDTH, so a 4-digit
+    tag stays comparable with every 2- and 3-digit one.
+    """
+    assert nc._version_key('1.0000') is not None
+    assert nc._version_key('0.1234') is not None
+    assert nc._version_key('1.0') == nc._version_key('1.000')
+    assert nc._version_key('0.9') == nc._version_key('0.900')
+
+
+def test_local_version_key_is_none_for_a_dev_build(monkeypatch):
+    """'0.0-dev' must read as UNKNOWN, never as the number 0.0.
+
+    version.DEV_VERSION is the literal '0.0-dev'.  Stripping the suffix leaves
+    '0.0', which parses to a perfectly valid (0, 0) -- and (0, 0) sorts BELOW
+    every published range start, so the range check rejected every release with
+    "no published cache covers this build".  That silently disabled the
+    download for dev checkouts and untagged source drops: precisely the
+    population range matching was added to serve.  None is permissive; zero is
+    excluded from everything.
+    """
+    import version as _v
+    monkeypatch.setattr(_v, 'current_version', lambda: _v.DEV_VERSION)
+    assert nc._local_version_key() is None
+    # A real tag, and a checkout past one, must still resolve.
+    monkeypatch.setattr(_v, 'current_version', lambda: '0.586')
+    assert nc._local_version_key() == nc._version_key('0.586')
+    monkeypatch.setattr(_v, 'current_version', lambda: '0.586+geefacb3')
+    assert nc._local_version_key() == nc._version_key('0.586')
+    monkeypatch.setattr(_v, 'current_version', lambda: '0.586-3-gabc123')
+    assert nc._local_version_key() == nc._version_key('0.586')
+
+
+def test_auto_install_downloads_on_a_dev_build(tmp_path, monkeypatch):
+    """An unplaceable build must still GET a cache, not be refused one.
+
+    End-to-end guard for the bug above: with a real (unmocked)
+    _local_version_key on a dev tree, auto_install must still reach a release.
+    """
+    import version as _v
+    monkeypatch.setattr(_v, 'current_version', lambda: _v.DEV_VERSION)
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(hook, 'cache_matches_tag', lambda *a, **k: False)
+    monkeypatch.setattr(nc, 'source_tag', lambda _p: 'MY_TAG')
+    monkeypatch.setattr(nc, '_api_releases', lambda: [{
+        'tag_name': 'navmesh-cache-0.586+',
+        'body': '<!-- navmesh-source-tag: OTHER -->',
+        'assets': [{'name': nc.asset_name('Test.esm'), 'size': 1 << 20,
+                    'browser_download_url': 'https://example/x.zip'}]}])
+    seen = {}
+    monkeypatch.setattr(nc, '_download',
+                        lambda url, dest, **k: seen.update(url=url) or True)
+    monkeypatch.setattr(nc, 'install', lambda *a, **k: 0)
+    assert nc.auto_install('Test.esm', quiet=True) is True
+    assert seen['url'] == 'https://example/x.zip'
+
+
+def test_find_dropin_reaches_the_documented_three_levels(tmp_path, monkeypatch):
+    """The docstring and navmesh_cache/README.md both promise three levels.
+
+    `depth >= 3` pruned BEFORE scanning level 3's files, so the real reach was
+    two -- a silent contradiction of the documented contract.
+    """
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    deep = tmp_path / nc.DROPIN_DIRNAME / 'a' / 'b' / 'c'
+    deep.mkdir(parents=True)
+    (deep / nc.asset_name('Test.esm')).write_bytes(b'zip')
+    assert nc._find_dropin('Test.esm') == str(deep / nc.asset_name('Test.esm'))
 
 
 def test_latest_cache_release_none_when_absent(monkeypatch):
@@ -557,6 +655,43 @@ def test_close_cache_release_ignores_same_or_older(monkeypatch):
     assert nc.close_cache_release('0.50') is None
 
 
+def test_close_cache_release_never_emits_an_empty_range(monkeypatch):
+    """The upper bound must never fall below the start.
+
+    previous_tag() steps in the SPELLING's scheme while the range check
+    compares thousandths-scaled keys, so closing '0.581+' against a 2-digit
+    successor stepped in hundredths to '0.58' = (0, 580) -- one unit UNDER the
+    start's (0, 581).  'navmesh-cache-0.581-0.58' then matched nothing at all,
+    silently retiring a good cache for every version including its own.
+    """
+    seen = _mock_releases(monkeypatch, 'navmesh-cache-0.581+\n')
+    closed = nc.close_cache_release('0.59')
+    assert closed == 'navmesh-cache-0.581-0.581'
+
+    lo, hi = nc.parse_cache_release_tag(closed)
+    assert nc._version_key(hi) >= nc._version_key(lo)
+    # The start version is still covered by the range that begins at it.
+    assert seen and any('edit' in c for c in seen)
+
+
+def test_version_key_agrees_with_the_program_wide_comparator():
+    """navmesh_cache._version_key and version.version_key are ONE scale.
+
+    _local_version_key() feeds version.py's key into a range check built from
+    _version_key()'s keys, so any disagreement compares two different scales.
+    They had already drifted: version.py scaled only a 2-digit minor, ranking
+    the legacy tag '0.9' as nine THOUSANDTHS -- below '0.10'.
+    """
+    import version as _v
+    for tag in ('0.9', '0.10', '0.56', '0.58', '0.580', '0.581', '0.586',
+                '0.59', '0.73', '1.000', '0.100', '0.1234'):
+        assert _v.version_key(tag) == nc._version_key(tag), tag
+    # The ordering that motivates the scaling, in both directions.
+    assert _v.version_key('0.9') > _v.version_key('0.10')
+    assert _v.version_key('0.58') == _v.version_key('0.580')
+    assert _v.version_key('0.59') > _v.version_key('0.581')
+
+
 def test_have_gh_requires_auth_not_just_presence(monkeypatch):
     """An installed-but-logged-out gh must not count as usable.
 
@@ -638,6 +773,230 @@ def test_auto_install_respects_download_opt_out(tmp_path, monkeypatch):
                         lambda: pytest.fail('must not download'))
     assert nc.auto_install('Test.esm', quiet=True,
                            allow_download=False) is False
+
+
+def test_api_repo_falls_back_without_a_git_remote(monkeypatch):
+    """A source drop has no .git, and must still be able to download.
+
+    The README tells users to "paste a new download over your existing
+    folder", so most installs are an unzipped archive.  `git remote get-url
+    origin` fails there; api_repo() used to return '' and _api_releases()
+    then returned [] -- the download silently did nothing.
+    """
+    monkeypatch.setattr(nc, 'gh_repo', lambda: [])
+    assert nc.api_repo() == nc.FALLBACK_REPO
+    assert '/' in nc.api_repo()
+
+
+def test_install_accepts_a_collision_mismatch(tmp_path, monkeypatch):
+    """Differing meshes must NOT block the install -- only differing CODE does.
+
+    collision_content_hash folds in every mesh the user extracted, so it only
+    matches someone with an identical game/DLC/mod/extraction state.  Refusing
+    on it made the drop-in "not work if it is in the folder" for nearly
+    everyone, even though invalidation is per mesh and the rest still hits.
+    """
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(nc, 'source_tag', lambda _p: 'TAG')
+    monkeypatch.setattr(nc, 'collision_hash', lambda _p: 'MY_OWN_MESHES')
+
+    zp = tmp_path / 'c.zip'
+    with zipfile.ZipFile(zp, 'w') as zf:
+        zf.writestr(nc.MANIFEST_NAME, json.dumps({
+            'plugin': 'Test.esm', 'starting_tag': '0.586',
+            'source_tag': 'TAG', 'collision_hash': 'PUBLISHERS_MESHES'}))
+        zf.writestr('a.pkl', pickle.dumps({'hash': 'h', 'verts': [],
+                                           'tris': [], 'ledges': []}))
+
+    assert nc.install('Test.esm', None, str(zp)) == 0
+    dest = nc.cache_dir('Test.esm')
+    assert os.path.exists(os.path.join(dest, 'a.pkl'))
+    # Built by this navmesh code, so it is still certified.
+    with open(os.path.join(dest, 'CACHE_TAG')) as fh:
+        assert fh.read().strip() == 'TAG'
+
+
+def test_install_still_refuses_a_source_tag_mismatch(tmp_path, monkeypatch):
+    """A cache from other navmesh code is dead weight -- keep refusing it."""
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(nc, 'source_tag', lambda _p: 'TAG')
+    monkeypatch.setattr(nc, 'collision_hash', lambda _p: None)
+
+    zp = tmp_path / 'c.zip'
+    with zipfile.ZipFile(zp, 'w') as zf:
+        zf.writestr(nc.MANIFEST_NAME, json.dumps({
+            'plugin': 'Test.esm', 'source_tag': 'OTHER_CODE'}))
+        zf.writestr('a.pkl', b'x')
+
+    assert nc.install('Test.esm', None, str(zp)) == nc.INSTALL_MISMATCH
+
+
+def test_install_reports_a_bad_zip_without_raising(tmp_path, monkeypatch):
+    """A truncated / 0-byte drop-in is a soft failure, never an exception.
+
+    It used to raise BadZipFile straight out of install().  auto_install()
+    swallowed that in its outer handler, so ONE unusable file -- a partial
+    download, a `.part`, a 0-byte placeholder -- skipped every remaining
+    drop-in candidate AND the HTTPS download that would have fixed it.
+    """
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(nc, 'source_tag', lambda _p: 'TAG')
+    monkeypatch.setattr(nc, 'collision_hash', lambda _p: None)
+
+    truncated = tmp_path / 'partial.zip'
+    truncated.write_bytes(b'PK\x03\x04not-really-a-zip')
+    assert nc.install('Test.esm', None, str(truncated)) == nc.INSTALL_FAILED
+
+    empty = tmp_path / 'empty.zip'
+    empty.write_bytes(b'')
+    assert nc.install('Test.esm', None, str(empty)) == nc.INSTALL_FAILED
+
+
+def test_auto_install_tries_every_dropin_candidate(tmp_path, monkeypatch):
+    """A bad shallow zip must not shadow a good nested one.
+
+    The depth-3 walk made this collision likely: an unusable file the user
+    dropped at the top level sorts FIRST, and returning only that candidate
+    made it fatal to the whole feature.
+    """
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(nc, 'source_tag', lambda _p: 'TAG')
+    monkeypatch.setattr(nc, 'collision_hash', lambda _p: None)
+
+    ddir = tmp_path / nc.DROPIN_DIRNAME
+    ddir.mkdir()
+    want = nc.asset_name('Test.esm')
+    # Shallowest match is junk...
+    (ddir / want).write_bytes(b'PK\x03\x04truncated')
+    # ...and the real archive sits inside an extracted folder.
+    sub = ddir / 'tes4skyrim-0.586'
+    sub.mkdir()
+    with zipfile.ZipFile(sub / want, 'w') as zf:
+        zf.writestr(nc.MANIFEST_NAME, json.dumps({
+            'plugin': 'Test.esm', 'source_tag': 'TAG',
+            'starting_tag': '0.586'}))
+        zf.writestr('cell.pkl', b'payload')
+
+    assert len(nc.find_dropins('Test.esm')) == 2
+    # Reaches the good one instead of dying on the junk one, and never falls
+    # through to the network.
+    monkeypatch.setattr(nc, '_api_releases', lambda: [])
+    assert nc.auto_install('Test.esm', quiet=True) is True
+    assert (nc.cache_dir('Test.esm') and
+            os.path.exists(os.path.join(nc.cache_dir('Test.esm'), 'cell.pkl')))
+
+
+def test_find_dropin_looks_inside_extracted_folders(tmp_path, monkeypatch):
+    """Extracting a download leaves the zip one folder down -- still find it."""
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    nested = tmp_path / nc.DROPIN_DIRNAME / 'tes4skyrim-0.586'
+    nested.mkdir(parents=True)
+    (nested / nc.asset_name('Test.esm')).write_bytes(b'zip')
+    got = nc._find_dropin('Test.esm')
+    assert got and got.endswith(nc.asset_name('Test.esm'))
+
+
+def test_find_dropin_prefers_the_shallowest_match(tmp_path, monkeypatch):
+    """A file placed directly beats one left inside an extracted folder."""
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    ddir = tmp_path / nc.DROPIN_DIRNAME
+    (ddir / 'sub').mkdir(parents=True)
+    (ddir / 'sub' / nc.asset_name('Test.esm')).write_bytes(b'deep')
+    (ddir / nc.asset_name('Test.esm')).write_bytes(b'shallow')
+    assert nc._find_dropin('Test.esm') == str(ddir / nc.asset_name('Test.esm'))
+
+
+def test_auto_install_downloads_a_cache_covering_a_later_version(
+        tmp_path, monkeypatch, capsys):
+    """'0.586+' must serve 0.590 -- "that version and above".
+
+    The old rule demanded an exact source-tag match, which is strictly narrower
+    than the range the release advertises: any build past the tag (every dev
+    checkout) was told no cache existed.
+    """
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(hook, 'cache_matches_tag', lambda *a, **k: False)
+    monkeypatch.setattr(nc, 'source_tag', lambda _p: 'MY_TAG')
+    monkeypatch.setattr(nc, '_local_version_key', lambda: (0, 590))
+    monkeypatch.setattr(nc, '_api_releases', lambda: [{
+        'tag_name': 'navmesh-cache-0.586+',
+        'body': '<!-- navmesh-source-tag: OTHER -->',
+        'assets': [{'name': nc.asset_name('Test.esm'),
+                    'size': 1 << 20,
+                    'browser_download_url': 'https://example/x.zip'}]}])
+
+    seen = {}
+    monkeypatch.setattr(nc, '_download',
+                        lambda url, dest, **k: seen.update(url=url) or True)
+    monkeypatch.setattr(nc, 'install', lambda *a, **k: 0)
+
+    assert nc.auto_install('Test.esm', quiet=False) is True
+    assert seen['url'] == 'https://example/x.zip'
+    # And it must be VISIBLE, not silent.
+    assert 'downloading' in capsys.readouterr().out.lower()
+
+
+def test_auto_install_skips_a_cache_below_its_range(tmp_path, monkeypatch):
+    """A closed range must not serve a version above its upper bound."""
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(hook, 'cache_matches_tag', lambda *a, **k: False)
+    monkeypatch.setattr(nc, 'source_tag', lambda _p: 'MY_TAG')
+    monkeypatch.setattr(nc, '_local_version_key', lambda: (0, 900))
+    monkeypatch.setattr(nc, '_api_releases', lambda: [{
+        'tag_name': 'navmesh-cache-0.57-0.585',
+        'body': '',
+        'assets': [{'name': nc.asset_name('Test.esm'), 'size': 1,
+                    'browser_download_url': 'https://example/x.zip'}]}])
+    monkeypatch.setattr(nc, '_download',
+                        lambda *a, **k: pytest.fail('must not download'))
+    assert nc.auto_install('Test.esm', quiet=True) is False
+
+
+def test_no_download_env_var_is_shared_not_duplicated():
+    """The GUI menu item and convert.py must read the SAME variable name.
+
+    Both used to spell 'TESCONV_NO_CACHE_DOWNLOAD' as a literal; a typo in
+    either would silently disable the opt-out (the checkbox would appear to do
+    nothing). Exporting one constant makes that impossible.
+    """
+    assert nc.NO_DOWNLOAD_ENV_VAR == 'TESCONV_NO_CACHE_DOWNLOAD'
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in ('gui.py', 'convert.py'):
+        with open(os.path.join(root, name), encoding='utf-8') as fh:
+            src = fh.read()
+        assert 'NO_DOWNLOAD_ENV_VAR' in src, name
+        # The bare literal must not reappear in CODE (comments may name it for
+        # the reader -- it is the documented user-facing switch).
+        code = [ln for ln in src.splitlines()
+                if nc.NO_DOWNLOAD_ENV_VAR in ln
+                and not ln.lstrip().startswith('#')]
+        assert not code, (
+            '%s hardcodes the env var in code; import NO_DOWNLOAD_ENV_VAR: %s'
+            % (name, code))
+
+
+def test_auto_install_explains_the_download_opt_out(
+        tmp_path, monkeypatch, capsys):
+    """Opting out must still say why nothing happened, and how to go offline."""
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(hook, 'cache_matches_tag', lambda *a, **k: False)
+    monkeypatch.setattr(nc, 'source_tag', lambda _p: 'TAG')
+    monkeypatch.setattr(nc, '_api_releases',
+                        lambda: pytest.fail('must not touch the network'))
+    assert nc.auto_install('Test.esm', quiet=False,
+                           allow_download=False) is False
+    out = capsys.readouterr().out
+    assert 'TESCONV_NO_CACHE_DOWNLOAD' in out
+    assert nc.DROPIN_DIRNAME in out
+
+
+def test_auto_install_announces_an_already_current_cache(
+        tmp_path, monkeypatch, capsys):
+    """Silence reads as "it does not work" -- say the cache is in place."""
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(hook, 'cache_matches_tag', lambda *a, **k: True)
+    assert nc.auto_install('Test.esm', quiet=False) is False
+    assert 'up to date' in capsys.readouterr().out.lower()
 
 
 def test_asset_name_is_stable():

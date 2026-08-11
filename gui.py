@@ -20,6 +20,7 @@ SCRIPT_DIR  = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / "conversion_config.json"
 
 from worker_budget import worker_count, cpu_total, WORKERS_ENV_VAR
+from tools.navmesh_cache import NO_DOWNLOAD_ENV_VAR
 import version as version_info
 from preflight import RC_MISSING_DEP as _RC_MISSING_DEP
 from collision_options import (
@@ -484,6 +485,11 @@ def gui_main():
         workers_default = worker_count()
     workers_default = max(1, min(workers_default, cpu_max))
 
+    # Navmesh cache download: default ON. Only an explicit saved `false` turns
+    # it off, so a config written before this option existed (or a corrupt
+    # value) leaves the speed-up enabled rather than silently disabling it.
+    cache_download_default = cfg.get("navmeshCacheDownload") is not False
+
     # ── Root window ───────────────────────────────────────────────────────────
     root = tk.Tk()
     root.title(f"TES4 Auto-Convert  {version_info.current_version()}")
@@ -584,6 +590,10 @@ def gui_main():
     output_var  = tk.StringVar(value=output_path)
     file_var    = tk.StringVar()
     workers_var = tk.IntVar(value=workers_default)
+    # Navmesh cache download: ON unless the user turned it off. Persisted, so a
+    # metered connection stays opted out across sessions rather than having to
+    # be re-set every launch.
+    cache_dl_var = tk.BooleanVar(value=cache_download_default)
     step_vars   = {key: tk.BooleanVar(value=(key in _DEFAULT_ON))
                    for key, *_ in STEPS}
     running     = threading.Event()
@@ -664,6 +674,21 @@ def gui_main():
             command=_on_workers_change)
     settings_menu.add_cascade(label=f"Workers  (max {cpu_max})",
                               menu=workers_menu)
+
+    # Settings ▸ Download navmesh cache — a checkbutton, saved immediately.
+    # Navmesh generation is the slowest import stage and the prebuilt cache
+    # turns minutes into seconds, so this is ON by default; it exists for
+    # metered/offline connections and for anyone who would rather generate
+    # locally. Turning it off does NOT disable the cache itself: a zip dropped
+    # in navmesh_cache/ is still installed, and an existing cache is still used.
+    def _on_cache_dl_change():
+        updated = load_config()
+        updated["navmeshCacheDownload"] = bool(cache_dl_var.get())
+        save_config(updated)
+
+    settings_menu.add_checkbutton(
+        label="Download navmesh cache", variable=cache_dl_var,
+        onvalue=True, offvalue=False, command=_on_cache_dl_change)
 
     # ── Converted ▸ (plugins already in output/) ──────────────────────────────
     # Picking one selects it AND ticks the steps its last conversion still owes,
@@ -2055,6 +2080,11 @@ def gui_main():
         # Propagate the chosen worker count to every child process (and the
         # multiprocessing workers they spawn) via the environment.
         run_env = {WORKERS_ENV_VAR: str(_get_workers())}
+        # Same channel for the cache opt-out. Only set when the user turned it
+        # OFF: the variable is read as "1/true means skip", so an unset value is
+        # the enabled default and inheriting a stale "1" from the parent
+        # environment can never silently disable a run the user re-enabled.
+        run_env[NO_DOWNLOAD_ENV_VAR] = '' if cache_dl_var.get() else '1'
 
         def _worker():
             _set_running(True)

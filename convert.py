@@ -400,12 +400,17 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
     # on any problem the navmesh just regenerates as it always did.
     # Opt out with TESCONV_NO_CACHE_DOWNLOAD=1 (metered connections).
     try:
-        from tools.navmesh_cache import auto_install
+        from tools.navmesh_cache import auto_install, NO_DOWNLOAD_ENV_VAR
         auto_install(file_name,
                      allow_download=os.environ.get(
-                         'TESCONV_NO_CACHE_DOWNLOAD', '') not in ('1', 'true'))
-    except Exception:
-        pass
+                         NO_DOWNLOAD_ENV_VAR, '').strip().lower()
+                     not in ('1', 'true'))
+    except Exception as exc:
+        # Never fatal -- but never silent either.  A bare `pass` here meant an
+        # import error or a broken tools/ path made the cache vanish with no
+        # trace, which is exactly what "the download does not work" looked like
+        # from the user's side.
+        print(f"  Navmesh cache: unavailable ({exc}); generating normally.")
 
     out_root = output_dir or str(SCRIPT_DIR / "output")
     os.makedirs(out_root, exist_ok=True)

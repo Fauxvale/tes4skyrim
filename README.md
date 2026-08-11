@@ -113,6 +113,7 @@ The GUI:
 - Lets you pick an output directory (saved to `conversion_config.json`)
 - Offers per-step checkboxes with **All** / **Default** shortcuts
 - Streams the pipeline log live
+- **Settings ▸ Download navmesh cache** toggles the prebuilt-cache download
 - **Tools ▸ Check Dependencies** reports what's missing before you start a run
 
 
@@ -125,11 +126,12 @@ python convert.py -f Oblivion.esm
 The output plugin and assets are written to `output/` (override with `--output-dir`).
 
 The Import step downloads a [prebuilt navmesh cache](https://github.com/bryantmh/tes4skyrim/releases)
-for you when one matches your build, turning minutes of navmesh generation into
-seconds. Offline, drop the release's `.zip`
-into `navmesh_cache/` and Import picks it up; set `TESCONV_NO_CACHE_DOWNLOAD=1`
-to skip the download on a metered connection. The conversion is identical either
-way — a cache only ever saves time, never changes the result.
+for you, turning minutes of navmesh generation into seconds. Each cache serves the
+version it was built for **and every version above it**, until a newer cache
+replaces it. Offline, drop the release's `.zip` into `navmesh_cache/` and Import
+picks it up. To skip the download on a metered connection, untick
+**Settings ▸ Download navmesh cache** in the GUI. The conversion is
+identical either way — a cache only ever saves time, never changes the result.
 
 ### Upgrading
 

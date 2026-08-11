@@ -237,12 +237,49 @@ def _git_version() -> str | None:
     head = _head_commit(git_dir)
     if not head:
         return latest
-    if tags.get(latest) == head:
-        # Annotated tags point at a tag OBJECT, not the commit, so an exact
-        # match here proves "on the tag" but a mismatch does not disprove it --
-        # hence the sha below rather than a bare claim of being ahead.
+    # Annotated tags point at a tag OBJECT, not the commit, so comparing the ref
+    # to HEAD directly never matches for one -- every release tag in this repo is
+    # annotated, so a checkout sitting exactly ON a release reported
+    # `<tag>+g<sha>` and was treated as a dev build ahead of it.  That is not
+    # cosmetic: record_step_run stamps whatever this returns into the state file,
+    # so a step run at release 0.586 was recorded as `0.585+g<sha>` (the newest
+    # tag KNOWN LOCALLY at the time, plus a suffix), which ranks as 0.585 and
+    # left the step looking permanently stale.  Peel the tag to its commit.
+    if _peel_tag(git_dir, tags.get(latest, "")) == head:
         return latest
     return f"{latest}+g{head[:7]}"
+
+
+def _peel_tag(git_dir: Path, sha: str) -> str:
+    """The commit *sha* names, following an annotated tag object to its target.
+
+    A lightweight tag already points at the commit and is returned unchanged.
+    For an annotated tag the ref names a tag object whose payload begins with
+    `object <sha>`; that line is what identifies the commit.
+
+    Reads loose objects only, and never shells out -- `_git_version`'s whole
+    contract is that it spawns nothing (the GUI resolves the version under
+    console-less pythonw.exe).  A tag packed away by `git gc` simply fails to
+    peel, which falls back to the `+g<sha>` form: the pre-existing behaviour,
+    never something worse.
+    """
+    if not sha:
+        return ""
+    path = git_dir / "objects" / sha[:2] / sha[2:]
+    try:
+        import zlib
+        raw = zlib.decompress(path.read_bytes())
+    except Exception:
+        return sha
+    header, _, body = raw.partition(b"\x00")
+    if not header.startswith(b"tag "):
+        return sha                      # a commit: lightweight tag
+    for line in body.splitlines():
+        if line.startswith(b"object "):
+            return line.split(b" ", 1)[1].decode("ascii", "ignore").strip()
+        if not line.strip():
+            break
+    return sha
 
 
 # current_version() is called on every plugin selection and on each GUI
@@ -297,13 +334,24 @@ def version_key(tag: str) -> tuple[int, int] | None:
     the same trap `tools/navmesh_cache.py` and the tag workflow each document.
     A 2-digit minor is worth ten of the new units: 0.58 IS 0.580.
 
+    The minor field is a FRACTION written without its point, so scale by its
+    own WIDTH rather than special-casing one width.  Scaling only the 2-digit
+    case ranked the legacy 1-digit tag '0.9' as nine THOUSANDTHS, i.e. below
+    '0.10' -- precisely the mis-ordering this docstring warns about, in the one
+    spelling it forgot.  It also disagreed with navmesh_cache._version_key(),
+    which scales by width, so the shared-cache range check compared keys built
+    on two different scales.  This is THE version comparator for the program;
+    navmesh_cache._local_version_key() defers to it.
+
     Accepts a raw `git describe` string so a dev checkout ranks as its tag.
     """
     base = _base_tag(tag)
     major, sep, minor = base.partition(".")
     if not sep or not major.isdigit() or not minor.isdigit():
         return None
-    return (int(major), int(minor) * (10 if len(minor) == 2 else 1))
+    # Integer division keeps a field wider than thousandths usable rather than
+    # unrankable; no published tag has ever used sub-thousandth precision.
+    return (int(major), int(minor) * 1000 // (10 ** len(minor)))
 
 
 # ---------------------------------------------------------------------------
