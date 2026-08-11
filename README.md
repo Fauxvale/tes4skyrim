@@ -55,6 +55,23 @@ conversion, and it's getting closer all the time. Contributions are very welcome
 
 A decent PC. The more cores and ram the better. The more cores, the more ram it uses. Validated with a 7950X3D and 32GB of system ram (uses a peak of ~16 GB RAM converting Oblivion.esm)
 
+First, make sure you have Python 3.14 installed
+
+> **Note** Make sure your installed python version is **3.14** or you will run into issues
+> The navmesh build requires a compiled module, for **CPython 3.14 / 64-bit Windows**
+> A `.pyd` only loads in a matching interpreter, so you run with any other version you would need to rebuild
+> That can be done with `python native/build.py`
+> which needs "Build Tools for Visual Studio" with the C++ workload installed.
+>See `native/dist/README.md`.
+
+Once you have python, open powershell and paste the following line:
+
+```bash
+pip install PyFFI numpy scipy shapely Pillow lz4 mapbox_earcut
+```
+
+This will install most of the following dependencies:
+
 | Dependency | Purpose | Install |
 |------------|---------|---------|
 | **Python 3.14** | Runs the whole pipeline | — |
@@ -68,21 +85,11 @@ A decent PC. The more cores and ram the better. The more cores, the more ram it 
 | **Skyrim SE Creation Kit** | Supplies `LipGenerator.exe` (lip sync) and the Papyrus source headers every converted script compiles against | Free on Steam |
 | **xWMAEncode.exe** | xWMA voice compression | See note below |
 
-```bash
-pip install PyFFI numpy scipy shapely Pillow lz4 mapbox_earcut
-```
+Once that is done, there are two more things you need to do. First, install the Skyrim SE Creation Kit on Steam, and then acquire xWMAEncode.exe
 
 > **xWMAEncode.exe** ships with the [Microsoft DirectX SDK (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=6812)
-> and cannot be redistributed. After installing the SDK, find it in `Utilities\bin\x86\`
-> and copy it to `external/xwmaencode/`. (You can also extract it from the SDK installer with
-> 7-Zip without a full install.)
-
-> **Note** Make sure your installed python version is **3.14** or you will run into issues
-> The navmesh build requires a compiled module, for **CPython 3.14 / 64-bit Windows**
-> A `.pyd` only loads in a matching interpreter, so you run with any other version you would need to rebuild
-> That can be done with `python native/build.py`
-> which needs "Build Tools for Visual Studio" with the C++ workload installed.
->See `native/dist/README.md`.
+> and cannot be redistributed. You should extract it from the SK installer using 7-zip to avoid having to do a full install.
+> Then, copy it to `external/xwmaencode/`. (You could also install the SDk and findAfter installing the SDK, find it in `Utilities\bin\x86\`.)
 
 The pipeline checks each phase's dependencies before it starts: anything missing
 stops that phase and every phase after it, and says what to install at the bottom
