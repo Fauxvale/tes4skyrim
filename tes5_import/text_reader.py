@@ -5,6 +5,7 @@ Each record is delimited by ---RECORD_BEGIN--- and ---RECORD_END---.
 Lines starting with # are comments. Values are unescaped.
 """
 
+import math
 import mmap
 import os
 import sys
@@ -248,15 +249,40 @@ def get_int(record: dict, key: str, default: int = 0) -> int:
         return default
 
 
+# The +/-FLT_MAX sentinel. Anything at or past it is a poison marker rather
+# than data: it is what a float field holds when a tool wrote "no value", and
+# no real record quantity in either game reaches 3.4e38.
+_FLT_MAX = 3.4028234663852886e+38
+
+
 def get_float(record: dict, key: str, default: float = 0.0) -> float:
-    """Get a float value from a record dict."""
+    """Get a float value from a record dict.
+
+    NaN and +/-FLT_MAX fall back to `default`. Neither is legal record data
+    in either game, but real plugins ship both -- TWMP Valenwood/Elsweyr has
+    505 REFRs whose DATA RotZ is literally 0x7FC00000 (NaN) or 0xFF7FFFFF
+    (-FLT_MAX), authored by whatever tool made the plugin. The export is a
+    pure dump, so those bytes arrive here verbatim and `float("nan")` parses
+    without complaint; the poison then flows into the written ESP and out
+    again into the LODGen input, where the C# parser rejects the line
+    ("Input string was not in a correct format" for NaN, "Value was either
+    too large or too small for a Single" for the FLT_MAX literal, which
+    "%.4f" expands to 40 digits) and the worldspace bakes zero .bto tiles.
+
+    Note FLT_MAX is *finite*, so an isfinite() check alone does not catch it.
+    Clamping at this choke point fixes every float consumer at once rather
+    than at each one that happens to notice.
+    """
     val = record.get(key)
     if val is None:
         return default
     try:
-        return float(val)
+        f = float(val)
     except (ValueError, TypeError):
         return default
+    if not math.isfinite(f) or abs(f) >= _FLT_MAX:
+        return default
+    return f
 
 
 # The PLAYER's ids. Both games hardcode them at the SAME values, and Skyrim.esm

@@ -193,6 +193,38 @@ def _zstr(b: bytes) -> str:
     return b.rstrip(b'\x00').decode('latin-1', errors='replace')
 
 
+# Placement values beyond this are junk, not geometry. Oblivion's largest
+# worldspace spans ~2e6 units, so a sane coordinate never comes close; the
+# bound exists to catch the +/-FLT_MAX sentinel below without rejecting any
+# real placement.
+_PLACEMENT_LIMIT = 1e9
+
+
+def _finite(v: float, default: float = 0.0) -> float:
+    """Clamp a float read straight out of record bytes.
+
+    LODGen's C# parser rejects a poisoned line and then emits NO .bto tiles
+    for the entire worldspace, so one bad REFR costs all of its object LOD.
+    Two distinct poisons appear in real plugins, and they fail differently:
+
+      NaN (0x7FC00000)  -> formats as "nan"
+                        -> "Input string was not in a correct format"
+      -FLT_MAX          -> "%.4f" expands it to a 40-digit literal that
+        (0xFF7FFFFF)       round-trips just OUTSIDE Single's range
+                        -> "Value was either too large or too small for
+                            a Single"
+
+    The second is finite, so an isfinite() check alone lets it straight
+    through -- hence the magnitude bound as well. TWMP Valenwood/Elsweyr
+    ships 505 REFRs carrying one or the other in DATA's RotZ. A MASTER's
+    record reaches this parser without passing the import-side get_float
+    clamp, so both screens are needed here too.
+    """
+    if not math.isfinite(v) or abs(v) > _PLACEMENT_LIMIT:
+        return default
+    return v
+
+
 # Parsed-ESM cache, keyed on file identity.
 #
 # generate_lod() is called ONCE PER WORLDSPACE and re-parsed the whole plugin
@@ -358,11 +390,12 @@ def _parse_esm(esm_path: Path):
             x = y = z = rx = ry = rz = 0.0
             data_sub = _sub(subs, 'DATA')
             if data_sub and len(data_sub) >= 24:
-                x, y, z, rx, ry, rz = struct.unpack_from('<6f', data_sub)
+                x, y, z, rx, ry, rz = (
+                    _finite(v) for v in struct.unpack_from('<6f', data_sub))
             scale = 1.0
             xscl = _sub(subs, 'XSCL')
             if xscl and len(xscl) >= 4:
-                scale = struct.unpack_from('<f', xscl)[0]
+                scale = _finite(struct.unpack_from('<f', xscl)[0], 1.0)
             refs.append({
                 'form_id': fid, 'flags': rec['flags'], 'base_fid': base_fid,
                 'parent_wrld': pw, 'parent_cell': pc,
