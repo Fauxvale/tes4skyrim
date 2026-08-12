@@ -754,14 +754,90 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
     return ok_count > 0
 
 
+# The CK ships the vanilla sources in one of two loose layouts, or not at all
+# (only Data/Scripts.zip).  Checked in this order; Data/Source/Scripts is both
+# the modern layout and where a zip extraction lands.
+_HEADER_DIRS = (("Source", "Scripts"), ("Scripts", "Source"))
+
+
+def _is_header_dir(d: Path) -> bool:
+    """A directory holding the vanilla headers, identified by Debug.psc."""
+    return d.is_dir() and (d / "Debug.psc").is_file()
+
+
+def _extract_scripts_zip(zip_path: Path, data_dir: Path) -> str:
+    """Unpack the Papyrus sources out of Data/Scripts.zip, in place.
+
+    Newer Creation Kit builds ship the vanilla sources ONLY as
+    Data/Scripts.zip and never unpack them, so an install with a perfectly good
+    CK still has no Data/Source/Scripts for the compiler's ``-h`` path.
+
+    The archive's own entries are already rooted at ``Source/Scripts/``, so
+    extracting relative to Data puts every header exactly where the CK itself
+    would have put it -- which is where this project, the CK, and every other
+    Papyrus tool on the machine already look.  Only the compiler's inputs are
+    taken (``.psc`` plus ``TESV_Papyrus_Flags.flg``); the archive also holds
+    DialogueViews XML we have no use for.  Existing files are never
+    overwritten, so a user's own edited header survives.
+
+    Returns the header directory on success, "" on failure.
+    """
+    import zipfile
+    dest = data_dir / "Source" / "Scripts"
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            members = [n for n in z.namelist()
+                       if n.lower().endswith((".psc", ".flg"))]
+            if not members:
+                return ""
+            dest.mkdir(parents=True, exist_ok=True)
+            for name in members:
+                # Flatten to a basename under dest: the compiler wants a flat
+                # header dir, and this also makes the extraction immune to a
+                # zip rooted differently, and to any "../" traversal entry.
+                base = os.path.basename(name.replace("\\", "/"))
+                if not base or base.startswith("."):
+                    continue
+                out = dest / base
+                if out.exists():
+                    continue
+                with z.open(name) as src, open(out, "wb") as fh:
+                    shutil.copyfileobj(src, fh)
+    except (OSError, zipfile.BadZipFile) as e:
+        # A read-only or UAC-protected install (Program Files) is the likely
+        # cause; say so rather than failing the phase with a bare "not found".
+        print(f"  WARNING: could not unpack {zip_path}: {e}")
+        return ""
+    if not _is_header_dir(dest):
+        return ""
+    return str(dest)
+
+
 def _find_skyrim_source_scripts() -> str:
-    """Find Skyrim Papyrus source scripts directory (contains Debug.psc etc.)."""
-    # Try from game path
+    """Find Skyrim Papyrus source scripts directory (contains Debug.psc etc.).
+
+    Order: the loose CK layouts, then unpacking Data/Scripts.zip in place.
+    Every caller (the compile phase, preflight, the compile-check tools) goes
+    through here, so the dependency check and the phase can never disagree
+    about whether the headers are available.
+    """
     sse_data = find_game_path("skyrimse")
-    if sse_data:
-        source_dir = Path(sse_data) / "Source" / "Scripts"
-        if source_dir.is_dir() and (source_dir / "Debug.psc").is_file():
+    if not sse_data:
+        return ""
+    data = Path(sse_data)
+    for parts in _HEADER_DIRS:
+        source_dir = data.joinpath(*parts)
+        if _is_header_dir(source_dir):
             return str(source_dir)
+
+    zip_path = data / "Scripts.zip"
+    if zip_path.is_file():
+        print(f"  Papyrus headers not unpacked; extracting {zip_path}...")
+        found = _extract_scripts_zip(zip_path, data)
+        if found:
+            n = len(list(Path(found).glob("*.psc")))
+            print(f"  Extracted {n} vanilla .psc headers to {found}")
+            return found
     return ""
 
 

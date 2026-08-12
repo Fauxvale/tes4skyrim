@@ -24,22 +24,21 @@ def find_compiler():
     raise FileNotFoundError('papyrus.exe not found')
 
 def find_skyrim_headers():
-    import winreg
-    for reg_key in [
-        r'SOFTWARE\WOW6432Node\Bethesda Softworks\Skyrim Special Edition',
-        r'SOFTWARE\Bethesda Softworks\Skyrim Special Edition',
-    ]:
-        try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_key) as k:
-                path = winreg.QueryValueEx(k, 'Installed Path')[0]
-                headers = Path(path) / 'Data' / 'Source' / 'Scripts'
-                if (headers / 'Debug.psc').exists():
-                    return str(headers)
-        except OSError:
-            pass
-    # Fallback
+    """The vanilla .psc headers, via the pipeline's own lookup.
+
+    Shared with the compile phase so this tool cannot disagree with a real
+    build about where the headers are -- it also covers the Data/Scripts/Source
+    layout and unpacks Data/Scripts.zip on CK builds that ship the sources only
+    as that archive.
+    """
+    sys.path.insert(0, str(_PROJECT_ROOT))
+    from convert import _find_skyrim_source_scripts
+    headers = _find_skyrim_source_scripts()
+    if headers:
+        return headers
+    # Fallback for a non-registry (manually copied) install.
     p = Path(r'C:\Program Files (x86)\Steam\steamapps\common\Skyrim Special Edition\Data\Source\Scripts')
-    if p.exists():
+    if (p / 'Debug.psc').exists():
         return str(p)
     raise FileNotFoundError('Cannot find Skyrim papyrus headers')
 

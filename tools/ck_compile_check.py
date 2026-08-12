@@ -32,14 +32,16 @@ CK = os.path.join(SSE, 'Papyrus Compiler', 'PapyrusCompiler.exe')
 # Data/Scripts/Source is a secondary/partial mirror on some installs.
 VANILLA_SRC = os.path.join(SSE, 'Data', 'Source', 'Scripts')
 VANILLA_SRC2 = os.path.join(SSE, 'Data', 'Scripts', 'Source')
-# Papyrus flags file — required by the compiler. Search the known locations.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Papyrus flags file — required by the compiler.  Data/Scripts.zip carries it
+# alongside the headers, so an in-place extraction lands it in the first
+# candidate.  Resolved lazily (see `flags_file`) because that extraction may
+# not have happened yet at import time.
 _FLG_CANDIDATES = [
     os.path.join(SSE, 'Data', 'Source', 'Scripts', 'TESV_Papyrus_Flags.flg'),
     os.path.join(SSE, 'Data', 'Scripts', 'Source', 'TESV_Papyrus_Flags.flg'),
     os.path.join(SSE, 'Papyrus Compiler', 'TESV_Papyrus_Flags.flg'),
 ]
-FLAGS = next((p for p in _FLG_CANDIDATES if os.path.isfile(p)), _FLG_CANDIDATES[0])
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_SRC = os.path.join(ROOT, 'script_convert', 'static_scripts')
 
 
@@ -52,8 +54,37 @@ def plugin_dirs(plugin: str) -> tuple:
 # Default plugin; `main()` rebinds these when --plugin is given.
 OUR_SRC, OUR_PEX = plugin_dirs('oblivion.esm')
 
+# Resolved once in main(), before the thread pool starts: the header lookup can
+# unpack Data/Scripts.zip, and that must not run concurrently in every worker.
+_IMPORTS = ''
+_FLAGS = _FLG_CANDIDATES[0]
+
+
+def _ensure_vanilla_src():
+    """Unpack Data/Scripts.zip if this CK shipped no loose source dir.
+
+    Delegates to the pipeline's own lookup so this tool and a real build always
+    agree on where the headers are.
+    """
+    if any(os.path.isdir(d) for d in (VANILLA_SRC, VANILLA_SRC2)):
+        return
+    sys.path.insert(0, ROOT)
+    try:
+        from convert import _find_skyrim_source_scripts
+        _find_skyrim_source_scripts()
+    except Exception as e:
+        print(f'  WARNING: could not unpack vanilla headers: {e}')
+
+
+def flags_file():
+    """The TESV_Papyrus_Flags.flg to pass as -f, after any extraction."""
+    _ensure_vanilla_src()
+    return next((p for p in _FLG_CANDIDATES if os.path.isfile(p)),
+                _FLG_CANDIDATES[0])
+
 
 def import_dirs():
+    _ensure_vanilla_src()
     dirs = [OUR_SRC, STATIC_SRC]
     for d in (VANILLA_SRC, VANILLA_SRC2):
         if os.path.isdir(d):
@@ -66,11 +97,10 @@ def compile_one(script_name: str, out_dir: str) -> tuple:
     src = os.path.join(OUR_SRC, script_name + '.psc')
     if not os.path.isfile(src):
         return (script_name, False, f'source not found: {src}')
-    imports = ';'.join(import_dirs())
     cmd = [CK, script_name + '.psc',
-           f'-import={imports}',
+           f'-import={_IMPORTS}',
            f'-output={out_dir}',
-           f'-f={os.path.basename(FLAGS)}']
+           f'-f={os.path.basename(_FLAGS)}']
     try:
         r = subprocess.run(cmd, cwd=OUR_SRC, capture_output=True, text=True,
                            timeout=120)
@@ -105,13 +135,17 @@ def main():
                     help='Parallel compiler processes')
     args = ap.parse_args()
 
-    global OUR_SRC, OUR_PEX
+    global OUR_SRC, OUR_PEX, _IMPORTS, _FLAGS
     OUR_SRC, OUR_PEX = plugin_dirs(args.plugin)
     if not os.path.isdir(OUR_SRC):
         sys.exit(f'No converted scripts for plugin {args.plugin!r}: {OUR_SRC}')
 
     if not os.path.isfile(CK):
         sys.exit(f'CK compiler not found: {CK}')
+
+    # Both may unpack Data/Scripts.zip; do it here, single-threaded, once.
+    _FLAGS = flags_file()
+    _IMPORTS = ';'.join(import_dirs())
 
     names = list(args.scripts)
     if args.list:

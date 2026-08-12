@@ -216,22 +216,24 @@ def _lipgenerator() -> 'Missing | None':
 
 
 def _papyrus_headers() -> 'Missing | None':
-    """Skyrim's own .psc headers, which every converted script compiles against."""
-    from convert import find_game_path
+    """Skyrim's own .psc headers, which every converted script compiles against.
+
+    Resolved through the compile phase's OWN lookup, which also unpacks
+    Data/Scripts.zip when the CK shipped the sources only in that archive.  So
+    this check passing means the phase will find them -- and running it here
+    means the (one-time) extraction happens during preflight rather than in the
+    middle of the Scripts phase.
+    """
+    from convert import _find_skyrim_source_scripts, find_game_path
+    if _find_skyrim_source_scripts():
+        return None
     data = find_game_path('skyrimse')
-    if data:
-        src = Path(data) / 'Source' / 'Scripts'
-        if src.is_dir() and (src / 'Debug.psc').is_file():
-            return None
-        # Older CK layouts put them in Data\Scripts\Source.
-        alt = Path(data) / 'Scripts' / 'Source'
-        if alt.is_dir() and (alt / 'Debug.psc').is_file():
-            return None
     return Missing(
         'Skyrim Papyrus source headers (Debug.psc and friends)',
         'Compiling the converted scripts -- they define every native type',
-        'Install the Skyrim SE Creation Kit (free on Steam), which unpacks them to\n'
-        '<Skyrim SE>\\Data\\Source\\Scripts\\',
+        'Install the Skyrim SE Creation Kit (free on Steam), which puts them in\n'
+        '<Skyrim SE>\\Data\\Source\\Scripts\\ or <Skyrim SE>\\Data\\Scripts.zip\n'
+        '(the .zip is unpacked automatically)',
         f'looked under {data or "(no Skyrim SE install found in the registry)"}',
     )
 

@@ -137,6 +137,33 @@ QUST because quest packages need the aliases to exist first, and the ForceGreet
 topic binding is patched in after Phase 5. Read the phase comments in
 `import_main.py` rather than trusting a copy of the list here.
 
+### Vanilla Papyrus headers: `Data/Scripts.zip` is unpacked automatically
+
+Every converted script compiles against Bethesda's own `.psc` sources, passed
+to the compiler as `-h`. The CK ships them one of three ways, and
+`convert._find_skyrim_source_scripts()` is the single lookup every caller uses
+(the Scripts phase, `preflight._papyrus_headers`, `tools/ck_compile_check.py`,
+`tools/compile_papyrus.py`) so the dependency check can never pass while the
+phase then fails to find them:
+
+1. `Data/Source/Scripts/` — the modern layout.
+2. `Data/Scripts/Source/` — an older one. Note that on some installs this
+   exists but is a *partial mirror* with no `Debug.psc`; every check tests for
+   `Debug.psc`, not just `isdir`, so a partial mirror is correctly rejected.
+3. **`Data/Scripts.zip` only.** Newer CK builds ship the sources solely as this
+   archive and never unpack it, so an install with a perfectly good CK has no
+   header directory at all. The pipeline extracts it in place (entries are
+   already rooted at `Source/Scripts/`, so it lands exactly where the CK itself
+   would have put it — where the CK and every other Papyrus tool on the machine
+   already look). ~14,300 `.psc` plus `TESV_Papyrus_Flags.flg`, ~6 s, once.
+
+Only `.psc`/`.flg` are taken (the archive also holds DialogueViews XML),
+entries are flattened to basenames, and **existing files are never
+overwritten** so a user's edited header survives. Preflight drives the lookup,
+so the one-time extraction happens during the dependency check rather than in
+the middle of the Scripts phase. A read-only install warns and falls through to
+the normal "headers not found" Missing rather than crashing.
+
 ## Skipped record types
 
 `SKIP_TYPES` in [tes5_import/constants.py](../tes5_import/constants.py) is the
