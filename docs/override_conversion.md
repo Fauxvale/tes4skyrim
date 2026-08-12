@@ -309,6 +309,111 @@ from comparing two conversion runs.
   own FormID is NOT recoverable by arithmetic: the master's conversion
   reallocates land ids, and **0 of 3,999 sampled Oblivion.esm source ids
   resolve to a real output LAND** by the load-order shift.
+- <a id="master-index-routing"></a>**WITH TWO OR MORE TES4 MASTERS, A FORMID
+  MUST BE ROUTED BY ITS INDEX BYTE — never by "which master file contains that
+  integer".** Every converted master renumbers into its OWN FormID space, so
+  two masters' id ranges overlap almost completely and a first-match scan
+  silently answers from the wrong file. `ChainedMasterIndex` used to search
+  `reversed(indices)` and take the first hit. TWMP Valenwood/Elsweyr (masters
+  Oblivion.esm, Tamriel.esp, ElsweyrAnequina.esp) hit it exactly: `0202E438`
+  is an exterior **CELL** in Tamriel.esp *and* a **WRLD**
+  (`ANQVerkarthHillsWorld`) in ElsweyrAnequina.esp. ANQ was searched first, so
+  every lookup for that Tamriel cell returned ANQ's worldspace record and
+  group path. Measured damage in the shipped ESP: a **phantom worldspace**
+  `0202E438` written into the file, **4,992 duplicate FormIDs** (4,552 REFR,
+  237 CELL, 178 LAND, plus KEYM/FACT/CONT/LIGH/WEAP/SPEL/INGR/REGN/ACHR/PACK),
+  and 4,734 of 7,489 exterior cells lost. **The game hung on the main menu with
+  no crash and no log** — the engine builds its FormID table while parsing the
+  plugin, before any cell loads, so the same id appearing twice with
+  conflicting record types and group nesting deadlocks it there.
+  - The index byte is exactly the information the old scan discarded: the
+    child's TES5 master list puts the *k*-th TES4 master at slot
+    `base_slot + k`, where `base_slot = len(masters) - tes4_master_count`.
+  - A master's own records carry **its own** index (its MAST count), which is
+    NOT the slot it occupies in the child — both files here used `02`
+    internally while ANQ needed `03` in the child. `ChainedMasterIndex`
+    translates both directions so callers never handle raw master-space ids.
+  - **Single-master plugins cannot hit this**, which is why it stayed hidden;
+    it appears the moment a plugin declares a second TES4 master.
+  - Guarded by `tests/test_master_index_routing.py`.
+  - **The same bug existed in FOUR places** — fixing one is not enough:
+    1. `override_merge.ChainedMasterIndex._find` — first-match scan.
+    2. `overrides.load_master_export` — merged every master's export on the raw
+       id, so 119,443 of 121,505 shared ids resolved to the WRONG RECORD TYPE
+       (59,770 LAND and 59,668 CELL clobbered). `0102DDE5` is a Tamriel LAND
+       and ANQ's creature `ANQCORPantherCaged`, so the terrain override was
+       diffed against a creature and the builder spliced that creature's FULL
+       and DESC into the LAND (xEdit: "record LAND contains unexpected (or out
+       of order) subrecord FULL").
+    3. `master_manifest.MasterManifest.load` — merged manifests on the raw id.
+       BOTH sides need re-keying: the KEYS are in the master's TES4 source
+       space, `fid`/`companions` in its converted OUTPUT space.
+    4. `ChainedMasterIndex.record` / `group_path` — returned the master's bytes
+       VERBATIM, so the record's own FormID, its references and its GRUP labels
+       still named the master's slot. 2,553 records were written at ids another
+       master owns as a different type ("Record [CELL:0201C4B3] in Tamriel.esp
+       is being overridden by record [REFR:0201C4B3]").
+  - **A blanket +N shift is WRONG.** A master and its child usually share their
+    low masters (Skyrim.esm 0, Oblivion.esm 1), so only the index bytes that
+    actually move may be rewritten — remap per byte, matching the master's own
+    masters BY NAME against the child's list. A uniform +1 turned every
+    Oblivion.esm reference into a Tamriel.esp one.
+- <a id="override-type-guard"></a>**AN OVERRIDE MUST RESOLVE TO A MASTER RECORD
+  OF THE SAME TYPE.** A plugin's source id can convert to an id that already
+  belongs to an unrelated record in the master's own space: ElsweyrAnequina's
+  NPC_ `0100110C` converts to `0200110C`, a REFR in Oblivion.esm. Adopting that
+  record's bytes and nesting shipped the NPC_ as a "REFR" inside a fabricated
+  top-level group (xEdit: "File contains top level group without known sort
+  order: GRUP Top 'REFR'") carrying a full NPC_ body. `OverrideContext.build`
+  now compares the base record's signature against `TYPE_MAP`'s expected output
+  signature (CREA→NPC_, CLOT→ARMO, ACRE→ACHR … are legal renames) and treats a
+  mismatch as "no master record", so the caller converts it as a new record.
+  Guarded by `tests/test_override_type_guard.py`.
+- <a id="interleaved-subrecords"></a>**INTERLEAVED SUBRECORD FAMILIES MUST KEEP
+  THEIR PAIRING.** `_apply_generic` replaces each signature as a unit at the
+  position of its first occurrence — correct for a repeating single-signature
+  run (CNAM, NAM1), fatal for a repeating STRUCT whose members each have their
+  own signature. REGN Region Areas are `RPLI RPLD` repeated
+  (`wbDefinitionsCommon.wbRegionAreas`), and the unit rule turned
+  AnvilCoastline into `RPLI RPLD RPLD RPLD RPLD RPLI RPLI RPLI` (xEdit:
+  "unexpected (or out of order) subrecord RPLD"). Such families are listed in
+  `_INTERLEAVED_FAMILIES` and substituted one occurrence at a time, in place.
+  Guarded by `tests/test_interleaved_subrecords.py`.
+- <a id="achr-base-must-be-an-actor"></a>🛑 **AN ACHR'S BASE MUST BE AN NPC_,
+  NEVER A LEVELLED LIST — THIS CRASHES THE GAME ON STARTUP.** A TES4 REFR that
+  places an LVLC becomes `ACHR → shell NPC_ → LVLN` (see `leveled_actors`), and
+  the shell is minted by the run that owns the LVLC. `build_leveled_actor_shells`
+  only sees the plugin's OWN `by_type['LVLC']`, so when a DEPENDENT plugin places
+  one of its master's leveled creatures it never mints or finds the shell: the
+  generic override path re-converts the record standalone, resolves NAME to the
+  raw LVLN, and substitutes that over the master's correct value. The engine
+  loads the reference as a `Character*`, dereferences a null base and dies —
+  `EXCEPTION_ACCESS_VIOLATION ... mov eax, [rax+0x108]` inside
+  `BGSLoadFormBuffer`, ~40 s into startup, with the offending record named in
+  the crash log's `RCX`. Fixed by registering every reachable LVLC (the
+  plugin's AND its masters', `register_leveled_bases`) and having
+  `generic_substitutions` drop NAME for such a REFR so the master's shell
+  pointer survives. Measured on TWMP Valenwood/Elsweyr: `0301A56B` pointed at
+  ANQ's LVLN `0306B333`; it now points at ANQ's shell NPC_ `030E118E`.
+- <a id="one-owned-group"></a>**A WORLDSPACE/CELL/TOPIC MAY OWN ONLY ONE
+  CHILDREN GROUP PER FILE.** Two passes append to the same top-level group —
+  `emit_nested_overrides` writes a worldspace's children, then
+  `_build_world_groups` writes the cells this plugin adds to it — so the file
+  shipped two `GRUP World Children of 0100003C` in a row (xEdit: "Found
+  additional GRUP World Children of ... Skipped Load: Merged N elements from
+  duplicate group"). The engine indexes a worldspace's children once, so the
+  second group's cells may never load. `writer._merge_owned_groups` folds
+  repeated type-1/6/7 groups with the same label into the first at save time,
+  which fixes it for every producer at once rather than at each call site.
+  All three converted plugins were affected. Guarded by
+  `tests/test_owned_group_merge.py`.
+- <a id="anchor-once"></a>**A MASTER RECORD MAY BE ANCHORED ONLY ONCE.**
+  `emit_nested_overrides` pulls an unchanged parent from the master to anchor
+  its children group; `_build_world_groups` runs afterwards and did the same
+  for the same worldspace, shipping the FormID twice (xEdit: "Skipped Load:
+  Duplicate FormID [0100003C]" from ElsweyrAnequina, which both overrides
+  Tamriel's WRLD and adds cells to it). The first pass records what it anchored
+  in `ctx.anchored_wrld` and the second emits the children group alone.
 - **LOD: a plugin can ship LOD ASSETS for a worldspace it does not DEFINE.**
   The GOTY `DLCShiveringIsles.esp` is an 85-byte header-only stub — every SI
   record was merged into `Oblivion.esm` — yet its BSA carries all of SEWorld's

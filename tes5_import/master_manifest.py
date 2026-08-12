@@ -56,6 +56,50 @@ class MissingManifestError(RuntimeError):
     """A master's companion manifest is required but absent or stale."""
 
 
+def _master_names(export_dir: str) -> list:
+    """A plugin's TES4 master names, in load order, from its export header."""
+    header = os.path.join(export_dir, '_HEADER.txt')
+    if not os.path.isfile(header):
+        return []
+    names = []
+    with open(header, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.startswith('Master['):
+                _, _, val = line.partition('=')
+                names.append(val.strip())
+    return names
+
+
+def _index_map(export_root: str, name: str, slot: int, slot_of: dict,
+               new_master_count: int) -> tuple:
+    """(source-space map, output-space map) for one master's manifest.
+
+    Both restate the master's own index bytes as the ones THIS plugin uses:
+
+      * SOURCE space (the manifest's keys) is the raw TES4 numbering. The
+        master's own records sit at its TES4 master count; lower bytes name ITS
+        masters and are matched BY NAME against this plugin's list rather than
+        assuming the two load orders line up.
+      * OUTPUT space (`fid` / `companions`) is the master's CONVERTED numbering,
+        which has the new masters (Skyrim.esm) prepended — so every index byte
+        there is the source one shifted up by `new_master_count`, and this
+        plugin's converted ids are shifted by the same amount.
+
+    Returns None when the master's export is unavailable, keeping the old
+    verbatim merge for the single-master case (no collision is possible there).
+    """
+    if not export_root:
+        return None
+    own = _master_names(os.path.join(export_root, name))
+    src = {len(own): slot}
+    for k, sub in enumerate(own):
+        target = slot_of.get(sub.lower())
+        if target is not None:
+            src[k] = target
+    out = {k + new_master_count: v + new_master_count for k, v in src.items()}
+    return src, out
+
+
 class MasterManifest:
     """Loaded manifests for one or more converted masters, keyed by source id."""
 
@@ -78,7 +122,20 @@ class MasterManifest:
         entry = self._records.get((source_formid or '').upper())
         return entry.get('companions', []) if entry else []
 
-    def load(self, path: str):
+    def load(self, path: str, index_map: dict = None):
+        """Merge one master's manifest.
+
+        `index_map` translates that master's OWN source index bytes into the
+        index bytes THIS plugin uses to name the same records. It is required
+        whenever more than one master is loaded: each manifest is keyed by its
+        own raw TES4 ids, so merging them unmapped collapses every master's id
+        space into one and the last-loaded master silently wins ids belonging
+        to an earlier one — `output_formid` then answers with a completely
+        different record's converted id. On TWMP Valenwood/Elsweyr that wrote
+        2,553 records at ids Tamriel.esp owns as another type (xEdit: "Record
+        [CELL:0201C4B3] in Tamriel.esp is being overridden by record
+        [REFR:0201C4B3]"), which hangs the engine on the main menu.
+        """
         with open(path, 'r', encoding='utf-8') as f:
             payload = json.load(f)
         if payload.get('version') != MANIFEST_VERSION:
@@ -86,16 +143,49 @@ class MasterManifest:
                 f"{path} was written by a different converter version "
                 f"(found {payload.get('version')!r}, need {MANIFEST_VERSION}). "
                 f"Re-convert the master.")
-        # Later masters win, matching load order.
-        self._records.update(payload.get('records', {}))
+        records = payload.get('records', {})
+        if index_map is None:
+            self._records.update(records)
+            return
+        # KEYS are in the master's TES4 SOURCE space; `fid`/`companions` are in
+        # its converted OUTPUT space. Both are the master's own numbering and
+        # both must be restated in this plugin's, or an override is emitted at
+        # a FormID that belongs to some other file's record.
+        src_map, out_map = index_map
+
+        def _remap(fid, table):
+            m = table.get((fid >> 24) & 0xFF)
+            return None if m is None else ((m << 24) | (fid & 0x00FFFFFF))
+
+        for key, entry in records.items():
+            try:
+                raw = int(key, 16)
+            except (TypeError, ValueError):
+                continue
+            new_key = _remap(raw, src_map)
+            if new_key is None:
+                # Names a file this plugin does not load — unreachable here.
+                continue
+            fid = _remap(entry.get('fid', 0), out_map)
+            if not fid:
+                continue
+            comps = [c for c in (_remap(c, out_map)
+                                 for c in entry.get('companions', ())) if c]
+            self._records['%08X' % new_key] = {'fid': fid,
+                                               'companions': comps}
 
 
 def load_master_manifests(masters: list, tes4_master_count: int,
-                          output_root: str) -> 'MasterManifest | None':
+                          output_root: str,
+                          export_root: str = None) -> 'MasterManifest | None':
     """Load the manifests for a plugin's TES4 masters.
 
     Only the trailing `tes4_master_count` entries of the TES5 master list are
     masters we convert; Skyrim.esm and friends are vanilla and have none.
+
+    Each manifest is re-keyed from its master's own TES4 id space into the one
+    THIS plugin uses (see MasterManifest.load) — without that, masters overwrite
+    each other's ids and overrides are emitted at another record's FormID.
 
     Raises MissingManifestError (with the command to fix it) rather than
     converting without the pairings — doing so silently duplicates every
@@ -105,15 +195,20 @@ def load_master_manifests(masters: list, tes4_master_count: int,
         return None
 
     names = masters[len(masters) - tes4_master_count:]
+    # This plugin's own TES4 source space: master k is named by index byte k.
+    slot_of = {n.lower(): i for i, n in enumerate(names)}
+    # New (vanilla) masters prepended by conversion, e.g. Skyrim.esm.
+    new_master_count = len(masters) - tes4_master_count
     manifest = MasterManifest()
     missing = []
-    for name in names:
+    for slot, name in enumerate(names):
         plugin_out = os.path.join(output_root, name, name)
         path = manifest_path(plugin_out)
         if not os.path.isfile(path):
             missing.append((name, path))
             continue
-        manifest.load(path)
+        manifest.load(path, _index_map(export_root, name, slot, slot_of,
+                                       new_master_count))
 
     if missing:
         lines = [

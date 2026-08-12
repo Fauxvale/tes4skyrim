@@ -15,8 +15,28 @@ authors never touched. Authorship now comes from diffing the two TES4 exports
 
 import os
 import struct
+import zlib
 
 _HEADER_SIZE = 24
+
+
+def _read_masters(data: bytes, hdr_size: int) -> list:
+    """The MAST names in a plugin's TES4 header, in load order.
+
+    Their COUNT is also the index byte this file's own records carry, since a
+    file's records sit immediately after its masters in load order.
+    """
+    names = []
+    i = _HEADER_SIZE
+    end = _HEADER_SIZE + hdr_size
+    while i + 6 <= end and i + 6 <= len(data):
+        sig = data[i:i + 4]
+        size = struct.unpack_from('<H', data, i + 4)[0]
+        if sig == b'MAST':
+            names.append(data[i + 6:i + 6 + size].rstrip(b'\0')
+                         .decode('latin1'))
+        i += 6 + size
+    return names
 
 
 class MasterIndex:
@@ -28,6 +48,11 @@ class MasterIndex:
         self._offsets = {}      # formid -> (signature, offset, total_size)
         self._paths = {}        # formid -> ((grup_type, label), ...)
         self._land_by_cell = {}  # cell formid -> LAND formid
+        # This file's own master list, and the index byte its OWN records carry
+        # (= that list's length). Both are needed to translate between this
+        # master's id space and a child's — see ChainedMasterIndex.
+        self.masters = []
+        self.own_index = 0
         self._load()
 
     def _load(self):
@@ -36,7 +61,10 @@ class MasterIndex:
         d = self._data
         if len(d) < 8 or d[:4] != b'TES4':
             raise ValueError(f"Not a plugin file: {self.path}")
-        start = _HEADER_SIZE + struct.unpack_from('<I', d, 4)[0]
+        hdr_size = struct.unpack_from('<I', d, 4)[0]
+        self.masters = _read_masters(d, hdr_size)
+        self.own_index = len(self.masters)
+        start = _HEADER_SIZE + hdr_size
         self._scan(start, len(d))
 
     def _scan(self, off: int, end: int, path: tuple = ()):
@@ -144,58 +172,266 @@ class MasterIndex:
         return 0
 
 
-class ChainedMasterIndex:
-    """Several converted masters queried in load order (last one wins).
+# GRUP types whose 4-byte label is a FormID (the owning record), not a
+# block/sub-block coordinate pair. xEdit wbImplementation: 1=World Children,
+# 6=Cell Children, 7=Topic Children, 8/9/10=the cell's persistent/temporary/
+# visible-when-distant child groups (all labelled with the parent CELL).
+_FORMID_LABEL_GROUPS = frozenset({1, 6, 7, 8, 9, 10})
 
-    Each MasterIndex owns its own file buffer, so offsets are only meaningful
-    against their own index — lookups delegate rather than merging offset
-    tables into one dict.
+# Subrecords in the cell tree whose payload is one or more FormIDs, with the
+# byte offsets that hold them. Verified against the xEdit TES5 definitions and
+# a census of the converted output; only these are rewritten, so a field like
+# LAND's VHGT/VNML (raw terrain bytes that can look like anything) is never
+# touched. `None` means "the whole payload is a run of u32 FormIDs".
+_FORMID_FIELDS = {
+    # Whole payload is one FormID (or a run of them).
+    b'NAME': None,    # base object / linked record
+    b'XLCN': None,    # persistent location
+    b'XOWN': None,    # owner (our writer emits a bare FormID)
+    b'XCLR': None,    # wbArrayS(XCLR, 'Regions', ...) — a RUN of FormIDs
+    b'LTMP': None,    # lighting template
+    b'XLTW': None,    # lit water
+    b'XEZN': None,    # encounter zone
+    b'XCWT': None,    # cell water
+    b'XCIM': None,    # image space
+    b'XCAS': None,    # acoustic space
+    b'XCMO': None,    # music type
+    b'XLIB': None,    # leveled item base
+    b'XATR': None,    # attach ref
+    b'XEMI': None,    # emittance
+    b'XMBR': None,    # multibound ref
+    b'XLRT': None,    # location ref type
+    b'XLRL': None,    # location reference
+    # Structs: only these byte offsets hold a FormID.
+    b'XESP': (0,),    # parent ref + 4 flag bytes
+    b'XNDP': (0,),    # navmesh ref + u16 index + pad
+    b'XTEL': (0,),    # door ref + 6 floats + flags
+    b'XLOC': (4,),    # u32 level, key FormID, flags
+    b'XPWR': (0,),    # wbStructSK(XPWR, [0], 'Water', ...)
+    b'XLKR': (0,),    # linked-ref keyword + ref
+    b'BTXT': (0,),    # LTEX + quadrant/layer
+    b'ATXT': (0,),    # LTEX + quadrant/layer
+    # DELIBERATELY ABSENT — verified against wbDefinitionsTES5.pas, these are
+    # NOT FormIDs and rewriting them corrupts real data:
+    #   XLCM  wbInteger  (level modifier)
+    #   XPRD  wbFloat    (patrol idle time)
+    #   XPPA  wbEmpty    (patrol script marker)
+    #   XRGD / XRGB      (ragdoll/biped data blobs)
+}
+
+
+def _shift_formid(fid: int, index_map: dict) -> int:
+    """Restate a FormID's index byte via `index_map`, leaving 0 (null) alone.
+
+    An index the map does not mention is left ALONE. That is the common case
+    and the important one: a master and its child usually share their own low
+    masters (Skyrim.esm at 0, Oblivion.esm at 1), so a reference to one of
+    those is already correct and moving it would silently retarget it — a
+    blanket +1 turned every Oblivion.esm reference into a Tamriel.esp one.
+    """
+    if not fid:
+        return fid
+    mapped = index_map.get((fid >> 24) & 0xFF)
+    if mapped is None:
+        return fid
+    return (mapped << 24) | (fid & 0x00FFFFFF)
+
+
+def _shift_record_formids(rec: bytes, index_map: dict) -> bytes:
+    """A converted record restated in the child's load order.
+
+    `index_map` is {master's index byte -> child's index byte}, holding ONLY
+    the bytes that actually move. Rewrites the record's own FormID in the
+    header plus every reference in a known FormID-bearing subrecord.
+    Compressed bodies are decompressed, rewritten and left DECOMPRESSED with
+    the flag cleared — the engine accepts either form, and the override builder
+    needs to read the subrecords anyway.
+    """
+    if len(rec) < _HEADER_SIZE:
+        return rec
+    sig = rec[:4]
+    size = struct.unpack_from('<I', rec, 4)[0]
+    flags = struct.unpack_from('<I', rec, 8)[0]
+    fid = struct.unpack_from('<I', rec, 12)[0]
+    body = rec[_HEADER_SIZE:_HEADER_SIZE + size]
+    if flags & 0x00040000:
+        try:
+            body = zlib.decompress(body[4:])
+        except zlib.error:
+            return rec
+        flags &= ~0x00040000
+
+    out = bytearray()
+    j = 0
+    while j + 6 <= len(body):
+        ssig = body[j:j + 4]
+        ssize = struct.unpack_from('<H', body, j + 4)[0]
+        payload = bytearray(body[j + 6:j + 6 + ssize])
+        if ssig in _FORMID_FIELDS:
+            spots = _FORMID_FIELDS[ssig]
+            offsets = (range(0, len(payload) - 3, 4) if spots is None
+                       else spots)
+            for off in offsets:
+                if off + 4 <= len(payload):
+                    v = struct.unpack_from('<I', payload, off)[0]
+                    struct.pack_into('<I', payload, off,
+                                     _shift_formid(v, index_map))
+        out += ssig + struct.pack('<H', ssize) + bytes(payload)
+        j += 6 + ssize
+    out += body[j:]        # any trailing bytes, untouched
+
+    head = bytearray(rec[:_HEADER_SIZE])
+    struct.pack_into('<I', head, 4, len(out))
+    struct.pack_into('<I', head, 8, flags)
+    struct.pack_into('<I', head, 12, _shift_formid(fid, index_map))
+    return bytes(head) + bytes(out)
+
+
+class ChainedMasterIndex:
+    """Several converted masters, addressed in the CHILD plugin's FormID space.
+
+    Every FormID reaching this class is in the child's space, where the index
+    byte names one specific master: the child's TES5 master list puts the
+    master converted from `indices[k]` at slot `base_slot + k`, so an id whose
+    high byte is that slot belongs to that master and to no other.
+
+    Routing by index byte rather than by "first file that happens to contain
+    the integer" is the whole point. Each converted master renumbers into its
+    OWN space, so two masters' id ranges overlap almost completely, and a
+    first-match scan silently answers from the wrong file. TWMP Valenwood/
+    Elsweyr hit this exactly: 0202E438 is a Tamriel.esp exterior CELL and also
+    an ElsweyrAnequina.esp WRLD (ANQVerkarthHillsWorld). The reverse-order scan
+    returned ANQ's worldspace for the Tamriel cell, so the writer emitted a
+    phantom worldspace and 4,992 duplicate FormIDs (4,552 REFR, 237 CELL, 178
+    LAND) — the same id twice with conflicting types and group nesting. The
+    engine builds its FormID table while parsing the plugin, before any cell
+    loads, so the game hung on the main menu with no crash.
+
+    A master's own records carry ITS index (its master count), which is not the
+    slot it occupies in the child. Both directions are translated here so
+    callers never have to think about whose space an id is in.
     """
 
-    def __init__(self, indices: list):
+    def __init__(self, indices: list, base_slot: int = None,
+                 child_masters: list = None):
         self._indices = list(indices)
+        # Default: masters occupy the LAST len(indices) slots of the child's
+        # master list, i.e. the TES4 masters after any prepended new ones.
+        # Callers that know the real layout pass it explicitly.
+        self._base_slot = (base_slot if base_slot is not None
+                           else len(self._indices))
+        self._by_slot = {self._base_slot + k: idx
+                         for k, idx in enumerate(self._indices)}
+        # {index -> {its index byte -> the child's}} for the record rewriter.
+        # Built from the CHILD's full master list so a name shared by both (the
+        # usual Skyrim.esm/Oblivion.esm prefix) maps to itself and is left
+        # alone; only indices that genuinely move appear here.
+        child = [n.lower() for n in (child_masters or [])]
+        self._index_maps = {}
+        for k, idx in enumerate(self._indices):
+            slot = self._base_slot + k
+            own_masters = [n.lower() for n in (idx.masters or ())]
+            m = {}
+            if idx.own_index != slot:
+                m[idx.own_index] = slot
+            for j, sub in enumerate(own_masters):
+                target = child.index(sub) if sub in child else None
+                if target is not None and target != j:
+                    m[j] = target
+            self._index_maps[id(idx)] = m
 
-    def _find(self, formid: int):
-        for idx in reversed(self._indices):
-            if formid in idx:
-                return idx
-        return None
+    def _route(self, formid: int):
+        """(index, id in that master's own space) for a child-space FormID."""
+        idx = self._by_slot.get((formid >> 24) & 0xFF)
+        if idx is None:
+            return None, 0
+        return idx, ((idx.own_index << 24) | (formid & 0x00FFFFFF))
+
+    def _to_child(self, idx, formid: int) -> int:
+        """Translate one of `idx`'s own-space ids back into the child's space."""
+        for slot, cand in self._by_slot.items():
+            if cand is idx:
+                return (slot << 24) | (formid & 0x00FFFFFF)
+        return formid
 
     def __contains__(self, formid: int) -> bool:
-        return self._find(formid) is not None
+        idx, own = self._route(formid)
+        return idx is not None and own in idx
 
     def __len__(self) -> int:
-        return len({f for idx in self._indices for f in idx._offsets})
+        return len(self.formids())
 
     def formids(self) -> set:
-        return {f for idx in self._indices for f in idx._offsets}
+        return {(slot << 24) | (f & 0x00FFFFFF)
+                for slot, idx in self._by_slot.items()
+                for f in idx._offsets
+                if (f >> 24) & 0xFF == idx.own_index}
 
     def signature(self, formid: int) -> bytes:
-        idx = self._find(formid)
-        return idx.signature(formid) if idx else b''
+        idx, own = self._route(formid)
+        return idx.signature(own) if idx else b''
 
     def record(self, formid: int) -> bytes:
-        idx = self._find(formid)
-        return idx.record(formid) if idx else b''
+        """The master's converted record, RESTATED in the child's id space.
+
+        The bytes on disk are numbered in the master's own converted space, so
+        when the child gives that master a different slot every FormID inside
+        them — the record's own id in the header, and every reference in the
+        body — names the wrong file. Shipping them verbatim emitted an override
+        at an id another master owns as a different record type: 2,553 of them
+        on TWMP Valenwood/Elsweyr, e.g. ElsweyrAnequina's REFR 0201C4B3 written
+        over Tamriel.esp's CELL 0201C4B3 (xEdit: "Record [CELL:0201C4B3] in
+        Tamriel.esp is being overridden by record [REFR:0201C4B3]"), which
+        hangs the engine on the main menu.
+
+        A master at the same slot it uses itself needs no rewrite, which is why
+        this stayed invisible until a plugin declared a SECOND TES4 master.
+        """
+        idx, own = self._route(formid)
+        if idx is None:
+            return b''
+        rec = idx.record(own)
+        imap = self._index_maps.get(id(idx))
+        return _shift_record_formids(rec, imap) if (rec and imap) else rec
 
     def group_path(self, formid: int) -> tuple:
-        idx = self._find(formid)
-        return idx.group_path(formid) if idx else ()
+        """The master's nesting, with its GRUP labels restated for the child.
+
+        A type-1/6/7 label IS a FormID (the owning WRLD/CELL), so it needs the
+        same translation the record bytes do or the override nests under a
+        group the child resolves to a different record.
+        """
+        idx, own = self._route(formid)
+        if idx is None:
+            return ()
+        path = idx.group_path(own)
+        imap = self._index_maps.get(id(idx))
+        if not imap or not path:
+            return path
+        out = []
+        for gtype, label in path:
+            if gtype in _FORMID_LABEL_GROUPS and len(label) == 4:
+                fid = struct.unpack('<I', label)[0]
+                shifted = _shift_formid(fid, imap)
+                if shifted != fid:
+                    label = struct.pack('<I', shifted)
+            out.append((gtype, label))
+        return tuple(out)
 
     def land(self, cell_formid: int) -> int:
-        """Later masters win, matching load order."""
-        for idx in reversed(self._indices):
-            fid = idx.land(cell_formid)
-            if fid:
-                return fid
-        return 0
+        """The LAND inside a cell, answered by the cell's owning master."""
+        idx, own = self._route(cell_formid)
+        if idx is None:
+            return 0
+        fid = idx.land(own)
+        return self._to_child(idx, fid) if fid else 0
 
     def find_by_edid(self, signature: bytes, edid: str) -> int:
         """Later masters win, matching load order."""
         for idx in reversed(self._indices):
             fid = idx.find_by_edid(signature, edid)
             if fid:
-                return fid
+                return self._to_child(idx, fid)
         return 0
 
 
@@ -254,4 +490,10 @@ def load_master_index(masters: list, tes4_master_count: int,
     indices = [MasterIndex(path) for _, path in resolved]
     if len(indices) == 1:
         return indices[0]
-    return ChainedMasterIndex(indices)
+    # The TES4 masters are the TRAILING entries of the TES5 master list, so the
+    # first of them sits at this slot in the child's FormID space. Routing by
+    # index byte needs the real slot, not a guess — see ChainedMasterIndex.
+    return ChainedMasterIndex(
+        indices,
+        base_slot=len(masters) - tes4_master_count,
+        child_masters=masters)

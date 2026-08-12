@@ -52,37 +52,119 @@ Override = namedtuple('Override', ['status', 'out_fid', 'record_bytes'])
 #         | 'reconvert'
 
 
-def load_master_export(export_dir: str) -> dict:
-    """The masters' export records, keyed by raw TES4 FormID.
-
-    This is the baseline for deciding what a plugin's author actually changed.
-    Diffing against the master's EXPORT (rather than against a second
-    conversion) is what makes the override path deterministic: a field neither
-    export touches is never rewritten, so it cannot drift.
-    """
+def _export_master_names(export_dir: str) -> list:
+    """This plugin's TES4 master names, in load order, from its export header."""
     header = os.path.join(export_dir, '_HEADER.txt')
     if not os.path.isfile(header):
-        return {}
+        return []
     names = []
     with open(header, 'r', encoding='utf-8') as f:
         for line in f:
             if line.startswith('Master['):
                 _, _, val = line.partition('=')
                 names.append(val.strip())
+    return names
+
+
+def load_master_export(export_dir: str) -> dict:
+    """The masters' export records, keyed by the TES4 FormID THIS PLUGIN uses.
+
+    This is the baseline for deciding what a plugin's author actually changed.
+    Diffing against the master's EXPORT (rather than against a second
+    conversion) is what makes the override path deterministic: a field neither
+    export touches is never rewritten, so it cannot drift.
+
+    **Each master's ids are re-keyed into THIS plugin's index space.** A record
+    is named by its index byte, which is the master's slot in *this* plugin's
+    master list — NOT the slot it uses in its own file. Merging the exports on
+    the raw id instead collapses every master's id space into one, so the
+    last-loaded master silently wins ids that belong to an earlier one, and the
+    override is then diffed against a record of a COMPLETELY DIFFERENT TYPE.
+
+    Measured on TWMP Valenwood/Elsweyr (masters Oblivion.esm, Tamriel.esp,
+    ElsweyrAnequina.esp): 119,443 of 121,505 shared ids resolved to the wrong
+    record type — 59,770 LAND and 59,668 CELL clobbered, mostly by ANQ's REFRs.
+    `0102DDE5` is a LAND in Tamriel.esp and the creature ANQCORPantherCaged
+    ("Black Panther Cub") in ElsweyrAnequina.esp, so the terrain override was
+    diffed against a creature and the builder spliced that creature's FULL (and
+    DESC) into the LAND. xEdit: "record LAND contains unexpected (or out of
+    order) subrecord FULL", and the engine hangs forever on the main menu.
+
+    A master's OWN records carry the index byte equal to its own master count.
+    Ids BELOW that belong to the master's own masters and are translated by
+    NAME through this plugin's list — the two orders usually agree, but relying
+    on that is the same unchecked assumption this function exists to remove.
+    """
+    names = _export_master_names(export_dir)
+    if not names:
+        return {}
+    slot_of = {n.lower(): i for i, n in enumerate(names)}
 
     root = os.path.dirname(os.path.normpath(export_dir))
     out = {}
-    for name in names:
+    for slot, name in enumerate(names):
         mdir = os.path.join(root, name)
         if not os.path.isdir(mdir):
             print(f"  WARNING: master export not found ({mdir}); "
                   f"overrides cannot be diffed against it")
             continue
+        # Index byte -> this plugin's index byte, for everything this master
+        # can name: its own records, plus each of ITS masters by name.
+        own = _export_master_names(mdir)
+        remap = {len(own): slot}
+        for k, sub in enumerate(own):
+            target = slot_of.get(sub.lower())
+            if target is not None:
+                remap[k] = target
         for rec in parse_export_directory(mdir):
             fid = rec.get('FormID')
-            if fid:
-                out[fid.upper()] = rec
+            if not fid:
+                continue
+            try:
+                raw = int(fid, 16)
+            except ValueError:
+                continue
+            mapped = remap.get((raw >> 24) & 0xFF)
+            if mapped is None:
+                # Names a file this plugin does not load: unreachable from here.
+                continue
+            out['%08X' % ((mapped << 24) | (raw & 0x00FFFFFF))] = rec
     return out
+
+
+# A converted record may legitimately carry a signature the plugin's source
+# type does not name. A REFR that places a LEVELLED CREATURE (LVLC) becomes an
+# ACHR aimed at a generated shell NPC_ (see leveled_actors), so the master's
+# converted record for a source REFR can be either. Keyed by source signature.
+_ALSO_ACCEPTED = {
+    'REFR': (b'ACHR',),
+}
+
+
+def _expected_output_sig(tes4_sig: str) -> bytes:
+    """The TES5 signature a TES4 record converts to, or b'' if unknown.
+
+    Several types are RENAMED by conversion (CREA->NPC_, CLOT->ARMO, ...), so
+    the master's record legitimately carries a different signature than the
+    plugin's source; TYPE_MAP is the single definition of those renames and is
+    reused here rather than restated.
+    """
+    if not tes4_sig:
+        return b''
+    from .constants import TYPE_MAP
+    return TYPE_MAP.get(tes4_sig, tes4_sig).encode('ascii', 'replace')
+
+
+def _signature_mismatch(tes4_sig: str, base_sig: bytes) -> bool:
+    """True when the master's record is the WRONG record to override.
+
+    See the call site: a source id can land on an unrelated master record, and
+    adopting it ships one record type's body under another's signature.
+    """
+    want = _expected_output_sig(tes4_sig)
+    if not want or base_sig == want:
+        return False
+    return base_sig not in _ALSO_ACCEPTED.get(tes4_sig, ())
 
 
 def make_deleted_record(base: bytes) -> bytes:
@@ -178,8 +260,11 @@ class OverrideContext:
         self.export_dir = export_dir
         self.master_index = load_master_index(
             masters, num_tes4_masters, output_root)
+        # export_root lets the loader re-key each manifest out of its master's
+        # own TES4 id space into the one THIS plugin names it by.
         self.master_manifest = load_master_manifests(
-            masters, num_tes4_masters, output_root)
+            masters, num_tes4_masters, output_root,
+            export_root=os.path.dirname(os.path.normpath(export_dir)))
         self.master_export = load_master_export(export_dir)
         self.stats = Counter()
         self.unmapped_keys = Counter()

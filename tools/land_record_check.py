@@ -38,6 +38,28 @@ MAX_ALPHA_LAYERS = 6
 MAX_VTXT_POS = 288      # 17*17 quadrant grid
 
 
+def _master_count(path):
+    """Number of MAST entries in a plugin header.
+
+    Also the index byte the file's own records carry, since a file's records
+    sit immediately after its masters in load order.
+    """
+    with open(path, 'rb') as fh:
+        head = fh.read(24)
+        if len(head) < 24 or head[:4] != b'TES4':
+            return 0
+        hdr = fh.read(struct.unpack_from('<I', head, 4)[0])
+    n = 0
+    i = 0
+    while i + 6 <= len(hdr):
+        sig = hdr[i:i + 4]
+        size = struct.unpack_from('<H', hdr, i + 4)[0]
+        if sig == b'MAST':
+            n += 1
+        i += 6 + size
+    return n
+
+
 def _iter_records(data):
     """Flatten the file: (sig, fid, body, wrld, cell, gtype, order, blk, sub)."""
     out = []
@@ -197,11 +219,21 @@ def main():
         return 1
 
     cells, land, ltex = load(path)
-    for m in args.masters:
+    # A master's LTEX ids are in ITS OWN FormID space; this plugin names them
+    # by the index byte of the master's slot in ITS master list. Merging them
+    # verbatim compares ids from two different spaces and reports healthy
+    # textures as dangling -- it claimed 1,734 unresolved layers in TWMP
+    # Valenwood/Elsweyr, every one of them fine. `--masters` is given in load
+    # order, so slot = (this plugin's master count - len(masters)) + position.
+    base_slot = _master_count(path) - len(args.masters)
+    for pos, m in enumerate(args.masters):
         mp = os.path.join(root, m, m)
         if os.path.isfile(mp):
             _c, _l, mltex = load(mp)
-            ltex |= mltex
+            own = _master_count(mp)
+            slot = base_slot + pos
+            ltex |= {((slot << 24) | (f & 0x00FFFFFF)) for f in mltex
+                     if (f >> 24) & 0xFF == own}
 
     if args.cell:
         want = tuple(args.cell)

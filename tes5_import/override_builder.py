@@ -55,6 +55,27 @@ _STRING_SUBRECORD = {
     'MapMarker.FULL': b'FULL',
 }
 
+# Which record types may have a _STRING_SUBRECORD field INSERTED when the
+# master's record does not already carry one. Derived from the xEdit TES5
+# record definitions (wbDefinitionsTES5.pas: the types whose wbRecord block
+# lists wbFULL / wbDESC) — 41 types take FULL, 8 take DESC, and LAND takes
+# NEITHER. Substituting into a field the master already has is always fine;
+# only INVENTING one needs this gate.
+_FULL_TYPES = frozenset(
+    b'ACTI ALCH AMMO APPA ARMO AVIF BOOK CELL CLFM CONT DIAL DOOR ENCH EXPL '
+    b'FACT FURN HAZD HDPT INGR LCTN LIGH MESG MGEF MISC MSTT NPC_ PERK PROJ '
+    b'QUST RACE SCRL SHOU SLGM SNCT SPEL TACT TREE WATR WEAP WOOP WRLD'.split())
+_DESC_TYPES = frozenset(
+    b'ALCH AMMO APPA ARMO BOOK SCRL SHOU WEAP'.split())
+
+_INSERTABLE_SUBRECORDS = {}
+for _sig in _FULL_TYPES:
+    _INSERTABLE_SUBRECORDS.setdefault(_sig, set()).add(b'FULL')
+for _sig in _DESC_TYPES:
+    _INSERTABLE_SUBRECORDS.setdefault(_sig, set()).add(b'DESC')
+_INSERTABLE_SUBRECORDS = {k: frozenset(v)
+                          for k, v in _INSERTABLE_SUBRECORDS.items()}
+
 # Indexed export lists whose Nth entry writes the Nth occurrence of a
 # subrecord in the output record. INFO responses are the big one: a translated
 # INFO repeats `TRDT NAM1 NAM2 NAM3` per response, and the translation lives in
