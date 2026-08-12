@@ -226,3 +226,33 @@ def build_leveled_actor_shells(by_type: dict, writer) -> int:
 def _index_offset() -> int:
     from .text_reader import get_formid_index_offset
     return get_formid_index_offset()
+
+
+# Raw TES4 FormIDs (this plugin's source space) known to be leveled creatures,
+# including the MASTERS'. build_leveled_actor_shells only sees the plugin's own
+# LVLC records, so a dependent plugin placing a MASTER's leveled creature is
+# invisible to it — see is_leveled_creature_base.
+_LEVELED_BASES = set()
+
+
+def register_leveled_bases(fids) -> None:
+    """Record every LVLC FormID reachable from this plugin, masters included."""
+    _LEVELED_BASES.update(fids)
+
+
+def is_leveled_creature_base(refr: dict) -> bool:
+    """True when this REFR places a leveled creature (its NAME is an LVLC).
+
+    Needed by the OVERRIDE path. A dependent plugin's REFR can place one of its
+    MASTER's LVLCs, in which case this plugin never sees the LVLC record and
+    cannot mint (or find) the shell NPC_ the master's run created — so its
+    standalone conversion resolves NAME to the raw LVLN, and an ACHR whose base
+    is not an actor crashes the engine on load.
+    """
+    if not _LEVELED_BASES:
+        return False
+    raw = (refr.get('NAME') or '').upper()
+    try:
+        return int(raw, 16) in _LEVELED_BASES
+    except (TypeError, ValueError):
+        return False

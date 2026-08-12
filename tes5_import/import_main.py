@@ -1224,10 +1224,23 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # ACHR aimed at a generated shell NPC_ whose TPLT points at the LVLN.
     # Must run after 0f (needs the generated creature races) and before the
     # CELL/WRLD builders, which read by_type['REFR'] / by_type['ACHR'].
-    from .leveled_actors import build_leveled_actor_shells
+    from .leveled_actors import (build_leveled_actor_shells,
+                                 register_leveled_bases)
+    # Every LVLC reachable from here, THIS PLUGIN'S AND ITS MASTERS'. A
+    # dependent plugin can place a master's leveled creature, and the override
+    # path must know that its NAME needs the master's shell NPC_ rather than
+    # the raw LVLN — an ACHR whose base is not an actor crashes the engine on
+    # load. Keyed by raw source FormID, the space both exports use here.
+    _lvlc_fids = {int(r['FormID'], 16) for r in by_type.get('LVLC', [])
+                  if r.get('FormID')}
+    if ctx is not None:
+        _lvlc_fids |= {int(k, 16)
+                       for k, r in (ctx.master_export or {}).items()
+                       if r.get('Signature') == 'LVLC'}
+    register_leveled_bases(_lvlc_fids)
     n_lvl_achr = build_leveled_actor_shells(by_type, writer)
     print(f"  Leveled creature placements: {n_lvl_achr} REFR -> ACHR "
-          f"via generated shell NPCs")
+          f"via generated shell NPCs ({len(_lvlc_fids)} LVLC bases known)")
     _step_done('leveled actor shells')
 
     # --- Phase 0i: index inventory item types for the outfit split ---

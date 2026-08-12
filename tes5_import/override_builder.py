@@ -557,9 +557,27 @@ def generic_substitutions(plugin_rec: dict, master_rec: dict):
     m_subs = _converted_subrecords(master_rec)
     if m_subs is None:
         return None
-    return {sig: p_subs.get(sig, [])
-            for sig in set(p_subs) | set(m_subs)
-            if p_subs.get(sig) != m_subs.get(sig)}
+    out = {sig: p_subs.get(sig, [])
+           for sig in set(p_subs) | set(m_subs)
+           if p_subs.get(sig) != m_subs.get(sig)}
+    # A REFR that places a LEVELLED CREATURE becomes an ACHR aimed at a SHELL
+    # NPC_ the MASTER's run minted (see leveled_actors) — an index a plugin run
+    # does not have, so its standalone conversion resolves NAME to the raw
+    # LVLN instead. Substituting that ships an ACHR whose base is not an actor;
+    # the engine loads it as a Character*, dereferences a null base and CRASHES
+    # on startup (TWMP 0301A56B -> ANQ's LVLN 0306B333, crash log
+    # "EXCEPTION_ACCESS_VIOLATION ... mov eax, [rax+0x108]" in
+    # BGSLoadFormBuffer). The master's NAME already points at the right shell,
+    # so keep it.
+    if out.get(b'NAME') and _places_leveled_actor(plugin_rec):
+        out.pop(b'NAME', None)
+    return out
+
+
+def _places_leveled_actor(rec: dict) -> bool:
+    """True when this REFR's base object is a TES4 leveled creature (LVLC)."""
+    from .leveled_actors import is_leveled_creature_base
+    return is_leveled_creature_base(rec)
 
 
 # --------------------------------------------------------------------------
