@@ -999,6 +999,40 @@ def test_auto_install_announces_an_already_current_cache(
     assert 'up to date' in capsys.readouterr().out.lower()
 
 
+def _fake_export(tmp_path, *plugins):
+    for name in plugins:
+        (tmp_path / 'export' / name / nc.CACHE_DIRNAME).mkdir(parents=True)
+
+
+def test_discover_plugins_publishes_only_the_hosted_three(tmp_path, monkeypatch):
+    """A local DLC / landmass cache must never reach the gate or a release.
+
+    Before this filter, discover_plugins() returned every export/*/ with a
+    cache dir, so a plugin run once for testing left a 0-entry cache that
+    failed verify() and hard-blocked every push to master.
+    """
+    monkeypatch.setattr(nc, 'repo_root', lambda: str(tmp_path))
+    _fake_export(tmp_path, 'Oblivion.esm', 'Nehrim.esm', 'Morrowind_ob.esm',
+                 'DLCShiveringIsles.esp', 'ElsweyrAnequina.esp', 'Tamriel.esp')
+
+    assert nc.discover_plugins() == ['Morrowind_ob.esm', 'Nehrim.esm',
+                                     'Oblivion.esm']
+    # The unfiltered view still sees everything -- `verify` reports local state.
+    assert 'Tamriel.esp' in nc.discover_plugins(all_plugins=True)
+
+
+def test_publishable_set_is_the_documented_three():
+    assert set(nc.PUBLISHABLE_PLUGINS) == {
+        'Oblivion.esm', 'Nehrim.esm', 'Morrowind_ob.esm'}
+
+
+def test_is_publishable_ignores_case():
+    """export/ folder names come from whatever the user typed after -f."""
+    assert nc.is_publishable('nehrim.esm')
+    assert nc.is_publishable('OBLIVION.ESM')
+    assert not nc.is_publishable('Nehrim.esp')
+
+
 def test_asset_name_is_stable():
     assert nc.asset_name('Oblivion.esm') == 'navmesh-cache-Oblivion.zip'
     assert nc.asset_name('Morrowind_ob.esm') == 'navmesh-cache-Morrowind_ob.zip'

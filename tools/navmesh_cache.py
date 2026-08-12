@@ -131,13 +131,44 @@ def collision_hash(plugin: str) -> str | None:
     return ce.collision_content_hash()
 
 
-def discover_plugins() -> list[str]:
-    """Plugins under export/ that have a navmesh cache directory."""
+# The only plugins we publish a shared cache for.  Everything else under
+# export/ is a local experiment: a DLC, a landmass mod, a half-converted ESP
+# somebody ran once.  Those caches are worthless to a downloader (nobody else
+# has that plugin) but they are NOT harmless -- discover_plugins() is what the
+# pre-push gate iterates, so a 0-entry or partially-generated cache from a
+# throwaway run fails verify() and BLOCKS the push, and a large one gets zipped
+# and uploaded as a release asset nobody wants.
+#
+# Deliberately an allowlist, not a size/entry-count heuristic: "big enough to
+# publish" would silently start shipping the next landmass mod that happens to
+# cross the threshold.  Adding a plugin here is a decision to host its cache.
+#
+# Matched case-insensitively -- export/ folder names come from whatever the
+# user typed after -f, and 'Nehrim.esm' vs 'nehrim.esm' must not change what
+# gets published.
+PUBLISHABLE_PLUGINS = ('Oblivion.esm', 'Nehrim.esm', 'Morrowind_ob.esm')
+
+
+def is_publishable(plugin: str) -> bool:
+    return plugin.lower() in {p.lower() for p in PUBLISHABLE_PLUGINS}
+
+
+def discover_plugins(all_plugins: bool = False) -> list[str]:
+    """Plugins under export/ whose navmesh cache we publish.
+
+    Restricted to PUBLISHABLE_PLUGINS by default -- this feeds the pre-push
+    gate and `publish`, and neither should ever touch a plugin we do not host.
+    Pass all_plugins=True for local inspection (`verify` with no --plugin),
+    where seeing every cache is the point and nothing gets uploaded.
+    """
     root = os.path.join(repo_root(), 'export')
     if not os.path.isdir(root):
         return []
-    return sorted(d for d in os.listdir(root)
-                  if os.path.isdir(os.path.join(root, d, CACHE_DIRNAME)))
+    found = sorted(d for d in os.listdir(root)
+                   if os.path.isdir(os.path.join(root, d, CACHE_DIRNAME)))
+    if all_plugins:
+        return found
+    return [d for d in found if is_publishable(d)]
 
 
 # ---------------------------------------------------------------------------
@@ -1290,7 +1321,9 @@ def main(argv=None) -> int:
     def add_plugin(p):
         p.add_argument('--plugin', action='append', dest='plugins',
                        help='plugin folder under export/ (repeatable; '
-                            'default: every plugin with a cache)')
+                            'default: the publishable set -- %s; `verify` '
+                            'with no --plugin reports every local cache)'
+                            % ', '.join(PUBLISHABLE_PLUGINS))
 
     p_ver = sub.add_parser('verify', help='check the local cache is publishable')
     add_plugin(p_ver)
@@ -1321,10 +1354,26 @@ def main(argv=None) -> int:
     if args.cmd == 'install':
         return install(args.plugin, args.tag, args.zip_path, args.force)
 
-    plugins = args.plugins or discover_plugins()
+    # An explicit --plugin is taken at face value (inspecting or archiving a
+    # non-published cache by hand is legitimate); the default list is the
+    # publishable set, except for `verify`, which is read-only and more useful
+    # when it reports every cache on the machine.
+    plugins = args.plugins or discover_plugins(all_plugins=args.cmd == 'verify')
     if not plugins:
         print('No plugins with a navmesh cache found under export/.')
         return 1
+
+    if args.cmd in ('archive', 'publish'):
+        skipped = [p for p in plugins if not is_publishable(p)]
+        if skipped and not args.plugins:
+            print('Skipping (not in PUBLISHABLE_PLUGINS): %s'
+                  % ', '.join(skipped))
+        plugins = [p for p in plugins if is_publishable(p)] \
+            if not args.plugins else plugins
+        if not plugins:
+            print('No publishable navmesh caches found under export/ (%s).'
+                  % ', '.join(PUBLISHABLE_PLUGINS))
+            return 1
 
     if args.cmd == 'verify':
         ok = True

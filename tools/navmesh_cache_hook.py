@@ -31,6 +31,16 @@ invalidates every entry, so the published cache MUST be rebuilt or it is dead
 weight for every downloader.  `_geom_hash` also consumes collision geometry,
 but per-mesh and via the export, so asset-side edits are not gated here.
 
+WHICH PLUGINS
+-------------
+Only the ones we actually host: `navmesh_cache.PUBLISHABLE_PLUGINS`
+(Oblivion, Nehrim, Morrowind_ob).  Every other cache under `export/` is a
+local experiment -- a DLC, a landmass mod, a plugin run once to test
+something.  Gating on those was actively harmful in both directions: a
+throwaway run leaves a 0-entry cache that fails `verify` and BLOCKS the push,
+and a large one gets zipped and uploaded as a release asset no downloader
+wants.  `discover_plugins()` filters to the publishable set for exactly this.
+
 WHY IT BLOCKS
 -------------
 A push that changes navmesh code without a matching cache leaves the published
