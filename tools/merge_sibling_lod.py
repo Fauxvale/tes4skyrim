@@ -45,8 +45,8 @@ def main() -> int:
         description="Merge the LOD tiles that sibling plugins both change.")
     ap.add_argument("--output-dir", metavar="PATH",
                     help="Output directory (default: output/ in project root)")
-    ap.add_argument("--worldspace", metavar="EDID",
-                    help="Only merge this worldspace (default: every "
+    ap.add_argument("--worldspace", nargs="+", metavar="EDID",
+                    help="Only merge these worldspaces (default: every "
                          "worldspace with a conflict)")
     ap.add_argument("--order", nargs="+", metavar="PLUGIN",
                     help="Explicit load order for the overlays, lowest "
@@ -97,11 +97,11 @@ def main() -> int:
     groups = find_sibling_groups(out_root, export_root,
                                  explicit_order=args.order)
     if args.worldspace:
-        groups = {k: v for k, v in groups.items()
-                  if k.lower() == args.worldspace.lower()}
+        wanted = {w.lower() for w in args.worldspace}
+        groups = {k: v for k, v in groups.items() if k.lower() in wanted}
         if not groups:
-            print(f"No sibling conflict in worldspace "
-                  f"'{args.worldspace}'; nothing to merge.")
+            print(f"No sibling conflict in worldspace(s) "
+                  f"'{', '.join(args.worldspace)}'; nothing to merge.")
             return 0
     if not groups:
         print("No worldspace is changed by two or more converted plugins; "

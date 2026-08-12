@@ -208,9 +208,9 @@ def test_skipping_releases_unions_every_entry_in_range(monkeypatch):
 
 
 def test_result_is_in_run_order_not_table_order(monkeypatch):
-    _table(monkeypatch, {"0.51": ["11. Pack Mod Zip", "1. Export", "6. Import"]})
+    _table(monkeypatch, {"0.51": ["10. Pack Mod Zip", "1. Export", "6. Import"]})
     assert v.steps_between("0.50", "0.51") == [
-        "1. Export", "6. Import", "11. Pack Mod Zip"]
+        "1. Export", "6. Import", "10. Pack Mod Zip"]
 
 
 def test_releases_outside_the_range_are_excluded(monkeypatch):
@@ -453,7 +453,7 @@ def test_fresh_install_is_never_run_not_an_upgrade(state, monkeypatch):
 
 def test_upgrade_selects_only_the_changed_steps(state, monkeypatch):
     monkeypatch.setattr(v, "current_version", lambda: "0.58")
-    _table(monkeypatch, {"0.58": ["6. Import", "10. Pack BSAs"]})
+    _table(monkeypatch, {"0.58": ["6. Import", "9. Pack BSAs"]})
     for key, _ in v.STEP_KEYS:
         v.record_step_run(key, "Oblivion.esm", "0.57")
 
@@ -476,21 +476,21 @@ def test_unresolvable_range_selects_everything(state, monkeypatch):
 
 
 def test_a_step_that_never_ran_is_owed_even_without_an_upgrade(state, monkeypatch):
-    """Same version, but LOD was never run -- it is still outstanding."""
+    """Same version, but Pack BSAs was never run -- it is still outstanding."""
     monkeypatch.setattr(v, "current_version", lambda: "0.58")
     _table(monkeypatch, {})
     for key, _ in v.STEP_KEYS:
-        if key != "lod":
+        if key != "pack":
             v.record_step_run(key, "Oblivion.esm", "0.58")
 
     plan = v.upgrade_plan("Oblivion.esm")
     assert plan["upgraded"] is False
-    assert plan["steps"] == ["lod"]
+    assert plan["steps"] == ["pack"]
 
 
 def test_steps_are_returned_in_run_order(state, monkeypatch):
     monkeypatch.setattr(v, "current_version", lambda: "0.58")
-    _table(monkeypatch, {"0.58": ["11. Pack Mod Zip", "1. Export", "6. Import"]})
+    _table(monkeypatch, {"0.58": ["10. Pack Mod Zip", "1. Export", "6. Import"]})
     for key, _ in v.STEP_KEYS:
         v.record_step_run(key, "Oblivion.esm", "0.57")
     assert v.upgrade_plan("Oblivion.esm")["steps"] == [
@@ -501,23 +501,23 @@ def test_a_step_already_run_at_the_current_version_is_not_reselected(
         state, monkeypatch):
     """THE auto-select bug: steps are judged individually, not as one group.
 
-    A user who upgrades to 0.586, runs Import and LOD, then reopens the GUI must
-    not see Import and LOD ticked again -- they already ran at 0.586.  They did
-    see them, because the plan resolved ONE range from the OLDEST step
-    (`installed_version_for`) and applied that union to all twelve: Export still
+    A user who upgrades to 0.586, runs Import and Scripts, then reopens the GUI
+    must not see Import and Scripts ticked again -- they already ran at 0.586.
+    They did see them, because the plan resolved ONE range from the OLDEST step
+    (`installed_version_for`) and applied that union to all of them: Export still
     sitting at 0.585 dragged the range to (0.585, 0.586], whose union names
     every step 0.586 touched, sweeping in the two already at 0.586.
     """
     monkeypatch.setattr(v, "current_version", lambda: "0.586")
-    _table(monkeypatch, {"0.586": ["1. Export", "6. Import", "9. LOD"]})
+    _table(monkeypatch, {"0.586": ["1. Export", "6. Import", "8. Scripts"]})
     for key, _ in v.STEP_KEYS:
         v.record_step_run(key, "Oblivion.esm", "0.585")
     v.record_step_run("import_", "Oblivion.esm", "0.586")
-    v.record_step_run("lod", "Oblivion.esm", "0.586")
+    v.record_step_run("scripts", "Oblivion.esm", "0.586")
 
     plan = v.upgrade_plan("Oblivion.esm")
     assert "import_" not in plan["steps"], "already run at 0.586"
-    assert "lod" not in plan["steps"], "already run at 0.586"
+    assert "scripts" not in plan["steps"], "already run at 0.586"
     # The genuinely stale one is still owed.
     assert "export" in plan["steps"]
 
@@ -686,16 +686,16 @@ def _serve(monkeypatch, releases=None, fail=False, status=None):
 
 def test_checklist_is_read_from_the_release_body(monkeypatch):
     """The release body IS the table -- no asset, nothing committed."""
-    _serve(monkeypatch, [("0.581", _body("6. Import", "10. Pack BSAs"))])
+    _serve(monkeypatch, [("0.581", _body("6. Import", "9. Pack BSAs"))])
     table, reachable = v.steps_table()
     assert reachable is True
-    assert table == {"0.581": ["6. Import", "10. Pack BSAs"]}
+    assert table == {"0.581": ["6. Import", "9. Pack BSAs"]}
 
 
 def test_steps_come_back_in_run_order(monkeypatch):
     """A body listing steps out of order still yields GUI run order."""
-    _serve(monkeypatch, [("0.581", _body("10. Pack BSAs", "1. Export"))])
-    assert v.steps_table()[0]["0.581"] == ["1. Export", "10. Pack BSAs"]
+    _serve(monkeypatch, [("0.581", _body("9. Pack BSAs", "1. Export"))])
+    assert v.steps_table()[0]["0.581"] == ["1. Export", "9. Pack BSAs"]
 
 
 def test_non_release_tags_are_ignored(monkeypatch):

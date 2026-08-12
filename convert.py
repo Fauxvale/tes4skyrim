@@ -842,222 +842,6 @@ def _find_skyrim_source_scripts() -> str:
 
 
 # ===========================================================================
-# Phase 9: GENERATE LOD
-# ===========================================================================
-
-def phase_lod(file_name: str, tes5_data: str, config: dict,
-              output_dir: str = None):
-    """Generate object LOD and terrain LOD for the converted plugin.
-
-    LOD is generated for exactly the worldspaces the SOURCE game shipped distant
-    LOD for (detected from the extracted meshes\\landscape\\lod +
-    textures\\landscapelod assets — see terrain_lod.shipped_lod_worldspaces).
-    That mirrors vanilla precisely and skips child worldspaces (Anvil, Bravil,
-    the IC districts, …) which render inside their parent's LOD grid.
-    """
-    from asset_convert.lod_gen import (generate_lod,
-                                       _textures_root as _lod_textures_root)
-    from asset_convert.terrain_lod import (generate_terrain_lod,
-                                           shipped_lod_worldspaces,
-                                           detect_terrain_worldspaces,
-                                           changed_lod_cells,
-                                           _master_names as _tes4_master_names,
-                                           _parse_land_records as _terrain_parse_land,
-                                           count_land_records as _terrain_count_land,
-                                           _find_worldspace_fid)
-
-    def _esm_defines_worldspace(path, edid):
-        raw = path.read_bytes()
-        return _find_worldspace_fid(raw, len(raw), edid) is not None
-
-    def _worldspace_land_count(path, edid):
-        """How many of this worldspace's LAND records the file actually holds.
-
-        Containing a WRLD record is NOT the same as owning the worldspace: an
-        override plugin ships a WRLD override (and DLCBattlehornCastle ships
-        10 LAND overrides) while the other ~14,700 LAND records — and every
-        landscape texture — live in the master. Routing on the WRLD record
-        alone made the plugin its own record source, so terrain LOD was baked
-        from 10 isolated cells with no surrounding terrain and no LTEX
-        textures. The bulk of the terrain is what decides.
-
-        Uses the COUNT-ONLY scan: this needs a number, and the full parse
-        decodes VHGT/VCLR and the whole layer tree for every record before
-        throwing it away (2.8 s wasted per worldspace on Tamriel, once for this
-        plugin plus once per master, across all 18 worldspaces).
-        """
-        try:
-            return _terrain_count_land(Path(path), edid)
-        except Exception:
-            return 0
-
-    out_root   = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
-    output_dir = out_root / file_name
-    if not output_dir.is_dir():
-        print(f"[{file_name}] No output directory found, skipping LOD")
-        return False
-
-    esm_path = output_dir / file_name
-    if not esm_path.exists():
-        print(f"[{file_name}] ESM not found at {esm_path}, skipping LOD")
-        return False
-
-    # Which worldspaces get LOD?
-    #   1. explicit config override wins (single worldspace),
-    #   2. otherwise the worldspaces the source shipped LOD for (the authority),
-    #   3. otherwise fall back to auto-detecting the largest root worldspace.
-    override = config.get('worldspaceEditorID')
-    if override:
-        worldspaces = [override]
-    else:
-        export_dir = SCRIPT_DIR / "export" / file_name
-        shipped = shipped_lod_worldspaces(export_dir)
-        if shipped:
-            worldspaces = [edid for edid, _fid in shipped]
-            print(f"[{file_name}] Source shipped LOD for {len(worldspaces)} "
-                  f"worldspace(s): {', '.join(worldspaces)}")
-        else:
-            ranked = detect_terrain_worldspaces(esm_path)
-            if ranked:
-                worldspaces = [ranked[0][2]]
-                print(f"[{file_name}] No shipped LOD found; falling back to "
-                      f"largest root worldspace '{ranked[0][2]}' "
-                      f"({ranked[0][0]} LAND records)")
-            else:
-                print(f"[{file_name}] No shipped LOD and no LAND records; "
-                      f"skipping LOD")
-                return True
-
-    # A plugin can ship LOD assets for a worldspace defined by one of its
-    # MASTERS rather than by itself — the GOTY DLCShiveringIsles.esp is an
-    # 85-byte header-only stub whose BSA still carries every SEWorld tile
-    # (all SI records were merged into Oblivion.esm). The generators read
-    # WRLD/CELL/LAND records out of one ESM, so for those worldspaces point
-    # them at the master's converted output, which is where the records are.
-    # Only the RECORDS move; the assets and the generated LOD stay in this
-    # plugin's own output dir, which is what it ships. The master's dir is
-    # returned alongside so anything the master's own LOD run already covers
-    # is skipped rather than duplicated here.
-    def _records_esm(edid):
-        own = (_worldspace_land_count(esm_path, edid)
-               if _esm_defines_worldspace(esm_path, edid) else -1)
-        best = None
-        for master in _tes4_master_names(SCRIPT_DIR / "export" / file_name):
-            m_dir = out_root / master
-            m_esm = m_dir / master
-            if not (m_esm.exists() and _esm_defines_worldspace(m_esm, edid)):
-                continue
-            n = _worldspace_land_count(m_esm, edid)
-            if best is None or n > best[0]:
-                best = (n, m_esm, m_dir, master)
-        # A worldspace a MASTER defines is always sourced from that master,
-        # with this plugin applied as an OVERLAY on top — never from the
-        # plugin alone, however much terrain the plugin adds.
-        #
-        # This used to give the records to whichever file held the BULK of the
-        # terrain, which silently inverted for a plugin that EXTENDS a master's
-        # worldspace instead of merely patching it. Tamriel.esp adds a landmass
-        # around Cyrodiil (99,910 LAND vs Oblivion.esm's 31,823), so the plugin
-        # won ownership and every tile was built from the plugin ALONE: all of
-        # the master's own terrain was missing from the heightmap and got
-        # edge-extended into flat plateaus, which is exactly the tile-sized
-        # discontinuity seen at the vanilla border (worst at level 32, where
-        # one tile spans 32x32 cells). The only two level-32 tiles that looked
-        # right were the ones the plugin never regenerated.
-        #
-        # The overlay path already expresses "master's terrain + this plugin's
-        # edits" correctly and is what the DLC/override case has always used;
-        # record COUNT never distinguished the two cases and should not decide
-        # ownership. `own` still matters for the case below: a worldspace no
-        # master defines at all is genuinely this plugin's own.
-        if best is not None:
-            print(f"[{file_name}] Worldspace '{edid}': defined by "
-                  f"{best[3]} ({best[0]} LAND records; this plugin adds "
-                  f"{max(own, 0)}); sourcing records from the master with "
-                  f"this plugin as an overlay")
-            return best[1], [best[2]]
-        if own >= 0:
-            return esm_path, []
-        return None, []
-
-    # A plugin routinely places its MASTERS' models in its own worldspace
-    # (Morrowind_ob uses Oblivion architecture), and those models — and their
-    # textures and generated _far.nif LOD — were converted into the master's
-    # output only. The .bto tiles this plugin bakes still reference them, so the
-    # master's assets are a lookup fallback for every worldspace, feeding BOTH
-    # master_mesh_dirs and master_texture_dirs. This is deliberately independent
-    # of `_records_esm`, which reports a master only when the master also owns
-    # the WORLDSPACE: a plugin that owns its own worldspace still borrows its
-    # masters' models, so tying mesh reuse to record ownership made
-    # ElsweyrAnequina re-derive 882 of Oblivion.esm's billboards and then drop
-    # every one of them for having no full model in its own tree.
-    master_asset_dirs = [out_root / m
-                         for m in _tes4_master_names(SCRIPT_DIR / "export"
-                                                     / file_name)
-                         if (out_root / m).is_dir()]
-
-    all_ok = True
-    for worldspace_edid in worldspaces:
-        rec_esm, extra_assets = _records_esm(worldspace_edid)
-        if rec_esm is None:
-            print(f"[{file_name}] Worldspace '{worldspace_edid}' not found in "
-                  f"{esm_path.name} or any converted master; skipping its LOD")
-            continue
-
-        # When the worldspace belongs to a MASTER, rec_esm is the master's
-        # output and this plugin's own records are an OVERLAY on top of it.
-        # Without that overlay the plugin's authored terrain and references
-        # never reach LOD: DLCBattlehornCastle regrades 10 Tamriel cells, and
-        # building LOD from the master alone left distant terrain showing the
-        # ORIGINAL ground beside the castle's new ground — one visibly ruined
-        # quadrant. Only the tiles the plugin actually touches are rebuilt;
-        # every other tile the master already generated is still correct.
-        overlays = []
-        only_cells = None
-        if rec_esm != esm_path:
-            overlays = [esm_path]
-            only_cells = changed_lod_cells(esm_path, rec_esm, worldspace_edid)
-            if not only_cells:
-                print(f"[{file_name}] No LOD-affecting changes in "
-                      f"'{worldspace_edid}'; master's LOD already correct")
-                continue
-            print(f"[{file_name}] {len(only_cells)} cell(s) changed in "
-                  f"'{worldspace_edid}'; rebuilding only the tiles they touch")
-
-        print(f"[{file_name}] Generating object LOD "
-              f"(worldspace: {worldspace_edid})...")
-        ok = generate_lod(
-            esm_path=rec_esm,
-            output_dir=output_dir,
-            worldspace_edid=worldspace_edid,
-            master_dirs=extra_assets,
-            master_mesh_dirs=master_asset_dirs,
-            master_texture_dirs=master_asset_dirs,
-            overlay_paths=overlays,
-            only_cells=only_cells,
-        )
-
-        # Terrain LOD: heightmap .btr tiles + composited landscape-texture
-        # diffuse (real LTEX textures blended per LAND alpha layers) + normals.
-        print(f"[{file_name}] Generating terrain LOD "
-              f"(worldspace: {worldspace_edid})...")
-        ok_terrain = generate_terrain_lod(
-            esm_path=rec_esm,
-            output_dir=output_dir,
-            worldspace_edid=worldspace_edid,
-            overlay_paths=overlays,
-            only_cells=only_cells,
-            # The master's landscape textures: an override plugin converts
-            # none of them into its own output, and without this every
-            # diffuse lookup misses and the tiles composite to flat grey.
-            extra_texture_roots=[_lod_textures_root(Path(d))
-                                 for d in master_asset_dirs],
-        )
-        all_ok = all_ok and ok and ok_terrain
-
-    return all_ok
-
-# ===========================================================================
 # Phase 10: PATCH SKYRIM (SLOT 44 BODY MESHES)
 # ===========================================================================
 
@@ -1463,13 +1247,29 @@ def main():
 
     if do_lod:
         print("=" * 54)
-        print("  Phase 9: GENERATE LOD")
+        print("  GENERATE LOD")
         print("=" * 54)
-        for fn in order:
-            # phase_lod's result is advisory upstream (a worldspace with no LOD
-            # is not an error), so the step is recorded as run regardless.
-            phase_lod(fn, tes5_data, config, output_dir=output_dir)
-            _mark('lod', fn, True)
+        # Delegated to tools/create_lod.py, NOT looped per plugin.
+        #
+        # LOD tiles are files on a fixed grid keyed only by worldspace and
+        # coordinate, so every plugin editing a worldspace writes the same
+        # paths. Baking once per plugin into output/<plugin>/ produced rival
+        # copies of each shared tile whose winner the mod manager picked by
+        # install order. The bake now happens ONCE for the whole load order,
+        # into the standalone AutoConvertLOD mod. `-f` therefore does not
+        # narrow it to one plugin: there is one shared artefact, and building
+        # it from a single plugin would be building it wrong.
+        _cmd = [sys.executable, "-u",
+                str(SCRIPT_DIR / "tools" / "create_lod.py")]
+        if output_dir:
+            _cmd += ["--output-dir", str(output_dir)]
+        ok = subprocess.call(_cmd) == 0
+        if not ok:
+            success = False
+        # Recorded once, under the shared key: one artefact covers every
+        # plugin, so stamping it per plugin would mark the step outstanding
+        # for whichever plugins this run did not name.
+        _mark('create_lod', _version.GLOBAL_PLUGIN_KEY, ok)
         print()
 
     if do_skyrim_patch:

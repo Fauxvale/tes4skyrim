@@ -1173,7 +1173,8 @@ def generate_lod(esm_path: Path, output_dir: Path,
                  worldspace_edid: str = 'Tamriel',
                  master_dirs=None, master_texture_dirs=None,
                  master_mesh_dirs=None,
-                 overlay_paths=None, only_cells=None) -> bool:
+                 overlay_paths=None, only_cells=None,
+                 far_nif_dirs=None) -> bool:
     """
     Full LOD generation pipeline:
       1. Write LODSettings/<worldspace>.lod
@@ -1216,6 +1217,25 @@ def generate_lod(esm_path: Path, output_dir: Path,
                            in its OWN worldspace, and their textures exist only
                            in the master's output; the .bto tiles baked here
                            still reference them, so they are copied in.
+        far_nif_dirs:      Where newly DERIVED _far.nif meshes are written, as
+                           plugin output dirs. Each model's _far.nif goes to the
+                           dir that ships its full model, so the LOD meshes stay
+                           with the plugin that owns the asset.
+
+                           This exists because the standalone LOD mod is not an
+                           asset owner. It holds LODSettings and the baked tiles
+                           — data that belongs to the whole load order — while a
+                           _far.nif is a converted MESH and belongs beside the
+                           full model it was derived from, in the plugin whose
+                           Meshes step produced it. Writing them into the LOD
+                           mod would duplicate per-plugin mesh output into a
+                           shared folder and re-derive it on every LOD run.
+
+                           The meshes are still STAGED into `output_dir` for the
+                           bake (LODGen resolves everything under one PathData
+                           root) and dropped afterwards, exactly as master
+                           meshes already are. None means write them under
+                           `output_dir` — the single-plugin behaviour.
 
     Returns True on success.
     """
@@ -1361,9 +1381,20 @@ def generate_lod(esm_path: Path, output_dir: Path,
     # A child that ships its own rock01.nif needs its OWN rock01_far.nif —
     # the master's was derived from the master's geometry, so reusing it would
     # draw the master's shape in this plugin's distant LOD.
+    #
+    # Skipped entirely in the `far_nif_dirs` (one-bake) case. That filter asks
+    # "does the master already have a _far.nif I can reuse instead of deriving
+    # my own?", which only means something when THIS plugin's tree is one of
+    # two trees in play. In the standalone-LOD-mod bake there is no "this
+    # plugin": every selected plugin contributes, `output_dir` owns no meshes at
+    # all, and each model is routed to its own owner and derived there exactly
+    # once. Applying it anyway would compare every model against an empty tree,
+    # conclude nothing is overridden, and drop from the work list every model
+    # any plugin already had a _far.nif for — including ones another plugin
+    # overrides with different geometry.
     own_meshes_root = output_dir / 'meshes'
     master_meshes = [Path(d) / 'meshes' for d in (master_mesh_dirs or [])]
-    if master_meshes:
+    if master_meshes and not far_nif_dirs:
         before = len(referenced_models)
         referenced_models = {
             m for m in referenced_models
@@ -1377,10 +1408,44 @@ def generate_lod(esm_path: Path, output_dir: Path,
                   f"{len(referenced_models)}")
 
     from .lod_far_gen import generate_missing_far_nifs
-    generate_missing_far_nifs(stats, output_dir / 'meshes',
-                               referenced_models=referenced_models,
-                               force_regen_generated=True,
-                               tex_root=output_dir / 'textures')
+    if far_nif_dirs:
+        # Derive each model's _far.nif in the plugin that ships its FULL model,
+        # then stage the result here for the bake. Routing per model rather than
+        # per run is the whole point: one worldspace draws objects from every
+        # selected plugin, so there is no single tree that owns them all, and
+        # generating from a tree that lacks the source mesh silently produces
+        # nothing at all.
+        #
+        # Later dirs win, matching load order: if two plugins ship the same
+        # path, the one that overrides it is the geometry actually placed.
+        by_dir: dict = {}
+        for model in referenced_models:
+            owner = None
+            for d in far_nif_dirs:
+                if _mesh_exists(model, Path(d) / 'meshes'):
+                    owner = Path(d)
+            if owner is not None:
+                by_dir.setdefault(owner, set()).add(model)
+
+        made = 0
+        for d, models in by_dir.items():
+            made += generate_missing_far_nifs(
+                stats, d / 'meshes', referenced_models=models,
+                force_regen_generated=True, tex_root=d / 'textures')
+            # Stage into the bake tree. _import_master_mesh records what it
+            # copies, so _drop_staged_master_meshes removes these afterwards
+            # and the LOD mod ships only tiles, never meshes.
+            for model in models:
+                _import_master_mesh(_far_nif_path(model),
+                                    output_dir / 'meshes', [d / 'meshes'])
+        if made:
+            print(f"  Derived {made} _far.nif mesh(es) into "
+                  f"{len(by_dir)} plugin tree(s)")
+    else:
+        generate_missing_far_nifs(stats, output_dir / 'meshes',
+                                  referenced_models=referenced_models,
+                                  force_regen_generated=True,
+                                  tex_root=output_dir / 'textures')
 
     # Write LOD input (all LOD-flagged objects) and run LODGenx64 once.
     # LODGen resolves every mesh under the single PathData root (output_dir),

@@ -47,13 +47,15 @@ STEPS = [
      "Convert voice files to XWM and copy sounds",               True,  True),
     ("scripts",            "--scripts-only",       "8. Scripts",
      "Convert Oblivion scripts to Papyrus",      True,  True),
-    ("lod",                "--lod-only",           "9. LOD",
-     "Generate distant LOD",               False, True),
-    ("pack",               "--pack-only",          "10. Pack BSAs",
+    ("pack",               "--pack-only",          "9. Pack BSAs",
      "Pack assets into BSA archives",             False, True),
-    ("pack_zip",           "--pack-zip-only",      "11. Pack Mod Zip",
+    ("pack_zip",           "--pack-zip-only",      "10. Pack Mod Zip",
      "Zip mod files for installation",   True,  True),
 ]
+# LOD is deliberately NOT here. It is not per-plugin work: sibling plugins share
+# a tile grid, so baking "master + this plugin" once per plugin generates the
+# contested tiles once per sibling and then throws all but one away. It is a
+# global action ("Create LOD") that runs the whole load order in one pass.
 
 _DEFAULT_ON = {k for k, *_ in STEPS}
 
@@ -84,9 +86,10 @@ GLOBAL_ACTIONS = [
     ("modify_body_meshes", "Patch Skyrim",
      "Build the ARMA slot-44 body patch for your Skyrim load order",
      "Patch Skyrim", 1),
-    ("sibling_lod", "Merge Sibling LOD",
-     "Rebake the LOD tiles that two or more converted plugins both change",
-     "Merge LOD", 1),
+    ("create_lod", "Create LOD",
+     "Generate distant LOD for the whole load order in one pass, then merge "
+     "the tiles two or more plugins both change",
+     "Create LOD", 1),
 ]
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -1800,130 +1803,426 @@ def gui_main():
 
     _refresh_patch_plugin_vars()
 
-    # ── LOD merge order ───────────────────────────────────────────────────────
-    # The order sibling plugins are overlaid in when their contested LOD tiles
-    # are rebaked. The LAST entry wins any reference two of them both change,
-    # so this is conflict resolution, not presentation.
+    # ── Create LOD selection ──────────────────────────────────────────────────
+    # What the Create LOD dialog last confirmed: which plugins to generate, in
+    # which order, and which worldspaces.
     #
-    # None means "not chosen by hand" — the merge then derives it from
-    # plugins.txt (what the game itself obeys) with anything unlisted appended
-    # alphabetically. Only a deliberate drag pins it.
-    lod_order: list[str] = []
+    # The ORDER is conflict resolution, not presentation — LOD tiles are files
+    # on a fixed grid, so the LAST plugin applied wins every tile two of them
+    # both change.
+    #
+    # Empty means "never confirmed"; the defaults below are derived fresh each
+    # time the dialog opens, so converting another plugin shows up without the
+    # user having to reset anything.
+    lod_plugins: list[str] = []      # chosen, in apply order (lowest first)
+    lod_worldspaces: list[str] = []  # chosen worldspace EDIDs
 
-    def _default_lod_order() -> list[str]:
-        """Converted plugins in plugins.txt order, unlisted appended A-Z."""
+    def _lod_out_root() -> Path:
+        return Path(output_var.get().strip() or str(SCRIPT_DIR / "output"))
+
+    def _default_lod_plugins() -> list[str]:
+        """Converted plugins in plugins.txt order, the rest appended.
+
+        Must mirror `sibling_lod.create_lod_order` exactly — this list is what
+        the user sees and drags, so deriving it differently here would show an
+        order the run does not apply and misreport which plugin wins a tile.
+        """
         try:
             from asset_convert.sibling_lod import (converted_plugins,
-                                                   plugins_txt_order)
+                                                   create_lod_order)
         except Exception:
             return []
-        out_dir = output_var.get().strip() or str(SCRIPT_DIR / "output")
-        names = converted_plugins(Path(out_dir))
-        rank = {n.lower(): i for i, n in enumerate(plugins_txt_order())}
-        listed = [n for n in names if n.lower() in rank]
-        unlisted = sorted(n for n in names if n.lower() not in rank)
-        return sorted(listed, key=lambda n: rank[n.lower()]) + unlisted
+        return create_lod_order(converted_plugins(_lod_out_root()),
+                                SCRIPT_DIR / "export")
 
-    def _open_lod_order_panel():
-        """Drag-to-reorder list deciding which sibling wins a contested tile."""
-        names = list(lod_order) if lod_order else _default_lod_order()
+    def _default_lod_worldspaces(names: list[str]) -> list[str]:
+        """Every worldspace the selected plugins would generate LOD for."""
+        try:
+            from asset_convert.sibling_lod import lod_worldspaces as _lw
+        except Exception:
+            return []
+        return _lw(names, SCRIPT_DIR / "export")
+
+    def _open_create_lod_panel(on_generate=None):
+        """Pick the plugins (left, ordered) and worldspaces (right) to build.
+
+        Two lists rather than one because they answer different questions. The
+        plugin list is ORDERED — its order decides who wins a contested tile —
+        so it is a drag-reorder list with a tick per row. The worldspace list is
+        an unordered filter, so it is plain checkboxes.
+
+        `on_generate` is called with (plugins, worldspaces) when Generate is
+        pressed; passing None makes the dialog a pure editor of the saved
+        selection, which is what the menu entry wants.
+        """
+        all_names = _default_lod_plugins()
+        # Two sets, deliberately:
+        #   `wanted`  - what the user has ticked. Their intent, edited only by
+        #               their own clicks.
+        #   `checked` - what would actually run: `wanted` minus anything greyed
+        #               out for resting on a master they turned off.
+        # Keeping them apart is what lets unticking a master grey its dependents
+        # and re-ticking it restore them, instead of the dependents' own ticks
+        # being destroyed on the way through.
+        #
+        # Start from the confirmed selection, but never hide a plugin converted
+        # since it was made: unknown names are appended in default order, so a
+        # new conversion appears (ticked) rather than silently dropping out of
+        # every future run.
+        if lod_plugins:
+            ordered = [n for n in lod_plugins if n in all_names]
+            ordered += [n for n in all_names if n not in ordered]
+            wanted = {n for n in lod_plugins if n in all_names}
+            wanted |= {n for n in all_names if n not in lod_plugins}
+        else:
+            ordered = list(all_names)
+            wanted = set(all_names)
+        checked: set[str] = set(wanted)
 
         card = tk.Frame(outer, bg=CLR["panel"],
                         highlightbackground=CLR["border"], highlightthickness=1)
+        _wheel_bound = []
 
         def _close():
+            if _wheel_bound:
+                card.unbind_all("<MouseWheel>")
             card.destroy()
 
-        title_row = tk.Frame(card, bg=CLR["panel"])
-        title_row.pack(fill=tk.X, padx=16, pady=(14, 0))
-        tk.Label(title_row, text="LOD merge order",
+        tk.Label(card, text="Create LOD",
                  bg=CLR["panel"], fg=CLR["text"],
-                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
-
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16,
+                                                     pady=(14, 0))
         tk.Label(card,
-                 text=("Drag to reorder. Lowest priority first — the plugin at "
-                       "the BOTTOM\nwins any LOD tile two of them both change."),
+                 text=("Distant LOD is generated once for the whole load "
+                       "order.\nDrag to reorder — the plugin at the BOTTOM "
+                       "wins any tile two of them both change."),
                  bg=CLR["panel"], fg=CLR["subtext"], justify=tk.LEFT,
                  font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(4, 0))
 
-        ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16, pady=8)
+        ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16,
+                                                       pady=8)
 
-        if not names:
+        if not all_names:
             tk.Label(card,
                      text="Nothing converted yet — convert a plugin first.",
                      bg=CLR["panel"], fg=CLR["subtext"],
-                     font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(0, 8))
-        else:
-            # A plain Listbox, not a stack of widgets: it already gives index
-            # -> item hit-testing (`nearest`), selection and scrolling, which
-            # is the whole mechanic a drag-reorder needs.
-            lb = tk.Listbox(card, bg=CLR["log_bg"], fg=CLR["text"],
-                            selectbackground=CLR["accent"],
-                            selectforeground="#ffffff",
-                            highlightthickness=0, borderwidth=0, activestyle="none",
-                            font=("Segoe UI", 9), width=42,
-                            height=min(14, max(4, len(names))))
-            for n in names:
-                lb.insert(tk.END, n)
-            lb.pack(fill=tk.BOTH, expand=True, padx=16)
+                     font=("Segoe UI", 9)).pack(anchor="w", padx=16,
+                                                pady=(0, 8))
+            ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16,
+                                                           pady=8)
+            ttk.Button(card, text="Close", command=_close).pack(pady=(0, 14))
+            card.update_idletasks()
+            card.place(in_=outer, anchor="center", relx=0.5, rely=0.5)
+            card.lift()
+            return
 
-            drag_from = [None]
+        cols = tk.Frame(card, bg=CLR["panel"])
+        cols.pack(fill=tk.BOTH, expand=True, padx=16)
+        cols.columnconfigure(0, weight=1, uniform="lodcol")
+        cols.columnconfigure(1, weight=1, uniform="lodcol")
 
-            def _press(e):
-                drag_from[0] = lb.nearest(e.y)
-                lb.selection_clear(0, tk.END)
-                lb.selection_set(drag_from[0])
+        # ── Left: plugins, ordered ────────────────────────────────────────────
+        left = tk.Frame(cols, bg=CLR["panel"])
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
-            def _motion(e):
-                src = drag_from[0]
-                if src is None:
-                    return
-                dst = lb.nearest(e.y)
-                if dst < 0 or dst == src:
-                    return
-                # Move one row at a time so the list follows the cursor
-                # continuously instead of jumping on release.
-                item = lb.get(src)
-                lb.delete(src)
-                lb.insert(dst, item)
-                lb.selection_clear(0, tk.END)
-                lb.selection_set(dst)
-                drag_from[0] = dst
+        lhead = tk.Frame(left, bg=CLR["panel"])
+        lhead.pack(fill=tk.X)
+        tk.Label(lhead, text="Plugins", bg=CLR["panel"], fg=CLR["text"],
+                 font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
 
-            def _release(_e):
-                drag_from[0] = None
+        # Who depends on whom, and which worldspaces each plugin brings. Both
+        # are scanned ONCE here — they read every export dir — so that every
+        # tick is a dict lookup rather than a rescan.
+        try:
+            from asset_convert.sibling_lod import (dependents_of,
+                                                   worldspaces_by_plugin,
+                                                   merge_worldspaces)
+            _deps = dependents_of(all_names, SCRIPT_DIR / "export")
+            _ws_by = worldspaces_by_plugin(all_names, SCRIPT_DIR / "export")
+        except Exception:
+            _deps = {n: set() for n in all_names}
+            _ws_by = {n: [] for n in all_names}
 
-            lb.bind("<Button-1>", _press)
-            lb.bind("<B1-Motion>", _motion)
-            lb.bind("<ButtonRelease-1>", _release)
+            def merge_worldspaces(names, by_plugin):
+                return []
 
-            def _reset():
-                lb.delete(0, tk.END)
-                for n in _default_lod_order():
-                    lb.insert(tk.END, n)
+        # A Listbox, not a stack of Checkbuttons: it already gives index ->
+        # item hit-testing (`nearest`), selection and scrolling, which is the
+        # whole mechanic a drag-reorder needs. The tick is drawn INTO the row
+        # text and toggled by clicking it, so one widget carries both the
+        # order and the on/off state without them fighting over the mouse.
+        TICK, UNTICK = "☑ ", "☐ "
 
-            def _accept():
-                # Store explicitly, even when it equals the default: the user
-                # having LOOKED and approved is itself information, and it
-                # keeps the merge stable if plugins.txt changes later.
-                lod_order[:] = list(lb.get(0, tk.END))
-                _close()
+        # A plugin whose master is unticked cannot be generated: its LOD is
+        # baked as "master + itself", so without the master there is no terrain
+        # to overlay onto. Those rows are unticked AND greyed, which is the
+        # difference between "you turned this off" and "this is unavailable".
+        disabled: set[str] = set()
 
-            btns = tk.Frame(card, bg=CLR["panel"])
-            btns.pack(fill=tk.X, padx=16, pady=(10, 0))
-            ttk.Button(btns, text="Reset to load order",
-                       command=_reset).pack(side=tk.LEFT)
+        def _recompute_disabled():
+            """Grey out everything that rests on a master the user turned off.
 
-            ttk.Separator(card, orient=tk.HORIZONTAL).pack(
-                fill=tk.X, padx=16, pady=8)
-            ttk.Button(card, text="OK", style="Accent.TButton",
-                       command=_accept).pack(pady=(0, 14))
+            `_deps[m]` is already transitive, so one pass over the plugins the
+            user has unticked covers indirect dependents too: unticking
+            Nehrim.esm greys Translation.esp without Translation ever naming
+            Nehrim's own masters.
 
-        if not names:
-            ttk.Separator(card, orient=tk.HORIZONTAL).pack(
-                fill=tk.X, padx=16, pady=8)
-            ttk.Button(card, text="OK", style="Accent.TButton",
-                       command=_close).pack(pady=(0, 14))
+            Driven by `wanted` — what the user actually clicked — rather than by
+            `checked`, which this function itself narrows. Reading `checked`
+            would make a greyed row look like a user choice on the next pass and
+            grey ITS dependents too, so a chain would keep collapsing.
+            """
+            disabled.clear()
+            for name in all_names:
+                if name not in wanted:
+                    disabled.update(_deps.get(name, ()))
+            # A plugin the user unticked themselves is OFF, not unavailable;
+            # only the fallout of someone else's master greys out.
+            disabled.difference_update(n for n in all_names if n not in wanted)
+            checked.clear()
+            checked.update(n for n in wanted if n not in disabled)
+
+        def _row(name: str) -> str:
+            # A disabled row shows an EMPTY box, like an unticked one — it is
+            # genuinely not going to run. The grey foreground applied in
+            # _redraw is what separates "unavailable" from "you turned it off".
+            return (TICK if name in checked else UNTICK) + name
+
+        plb = tk.Listbox(left, bg=CLR["log_bg"], fg=CLR["text"],
+                         selectbackground=CLR["accent"],
+                         selectforeground="#ffffff", highlightthickness=0,
+                         borderwidth=0, activestyle="none",
+                         font=("Segoe UI", 9), width=34,
+                         height=min(14, max(5, len(ordered))),
+                         exportselection=False)
+        lsb = ttk.Scrollbar(left, orient="vertical", command=plb.yview)
+        plb.configure(yscrollcommand=lsb.set)
+        plb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(4, 0))
+        lsb.pack(side=tk.RIGHT, fill=tk.Y, pady=(4, 0))
+
+        def _name_at(i: int) -> str:
+            """The plugin name in row `i`, with any tick prefix stripped.
+
+            Tolerates a bare name so the list can be populated with plain
+            strings and painted afterwards, rather than every insertion site
+            having to know the prefix format.
+            """
+            row = plb.get(i)
+            return row[2:] if row[:2] in (TICK, UNTICK) else row
+
+        def _redraw():
+            """Repaint every row's tick and grey state, preserving order.
+
+            Rewrites in place rather than clearing and re-inserting the whole
+            list, so the scroll position survives a toggle.
+            """
+            _recompute_disabled()
+            for i in range(plb.size()):
+                n = _name_at(i)
+                plb.delete(i)
+                plb.insert(i, _row(n))
+                # Greyed rows are drawn in the subtext colour so "unavailable"
+                # is visible at a glance and not just inferred from the tick.
+                plb.itemconfigure(
+                    i, foreground=(CLR["subtext"] if n in disabled
+                                   else CLR["text"]))
+            _refresh_worldspaces()
+
+        def _set_all(on: bool):
+            wanted.update(all_names) if on else wanted.clear()
+            _redraw()
+
+        ttk.Button(lhead, text="All", width=4,
+                   command=lambda: _set_all(True)).pack(side=tk.RIGHT,
+                                                        padx=(4, 0))
+        ttk.Button(lhead, text="None", width=5,
+                   command=lambda: _set_all(False)).pack(side=tk.RIGHT)
+
+        # Drag state. `moved` separates a click (toggle the tick) from a drag
+        # (reorder): without it, every reorder would also flip the tick of the
+        # row it started on.
+        drag = {"from": None, "moved": False}
+
+        def _press(e):
+            drag["from"] = plb.nearest(e.y)
+            drag["moved"] = False
+            plb.selection_clear(0, tk.END)
+            plb.selection_set(drag["from"])
+
+        def _motion(e):
+            src = drag["from"]
+            if src is None:
+                return
+            dst = plb.nearest(e.y)
+            if dst < 0 or dst == src:
+                return
+            # Move one row at a time so the list follows the cursor
+            # continuously instead of jumping on release.
+            item = plb.get(src)
+            plb.delete(src)
+            plb.insert(dst, item)
+            plb.selection_clear(0, tk.END)
+            plb.selection_set(dst)
+            drag["from"] = dst
+            drag["moved"] = True
+
+        def _release(e):
+            i = drag["from"]
+            drag["from"] = None
+            if i is None or drag["moved"] or i < 0 or i >= plb.size():
+                return
+            n = _name_at(i)
+            # A greyed row is not clickable: it is off because its master is
+            # off, and the fix is to re-tick the master, not this.
+            if n in disabled:
+                return
+            wanted.discard(n) if n in wanted else wanted.add(n)
+            _redraw()
+            plb.selection_clear(0, tk.END)
+            plb.selection_set(i)
+
+        plb.bind("<Button-1>", _press)
+        plb.bind("<B1-Motion>", _motion)
+        plb.bind("<ButtonRelease-1>", _release)
+
+        # ── Right: worldspaces ────────────────────────────────────────────────
+        right = tk.Frame(cols, bg=CLR["panel"])
+        right.grid(row=0, column=1, sticky="nsew")
+
+        rhead = tk.Frame(right, bg=CLR["panel"])
+        rhead.pack(fill=tk.X)
+        tk.Label(rhead, text="Worldspaces", bg=CLR["panel"], fg=CLR["text"],
+                 font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+
+        # The worldspaces the TICKED plugins bring, rebuilt on every toggle.
+        # A worldspace only exists in this run because some selected plugin
+        # ships LOD for it, so unticking that plugin must remove it — leaving it
+        # on screen would offer work the run cannot do.
+        #
+        # `ws_state` remembers each worldspace's tick across rebuilds, so a
+        # worldspace that disappears when its plugin is unticked comes back
+        # ticked exactly as the user left it, rather than silently resetting.
+        ws_state: dict[str, bool] = {w: True for w in
+                                     _default_lod_worldspaces(all_names)}
+        if lod_worldspaces:
+            for w in ws_state:
+                ws_state[w] = w in lod_worldspaces
+        ws_vars: list = []
+
+        ws_frame = tk.Frame(right, bg=CLR["panel"])
+        ws_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        wcanvas = tk.Canvas(ws_frame, bg=CLR["panel"], highlightthickness=0,
+                            width=220, height=300)
+        wsb = ttk.Scrollbar(ws_frame, orient="vertical", command=wcanvas.yview)
+        winner = tk.Frame(wcanvas, bg=CLR["panel"])
+        winner.bind("<Configure>",
+                    lambda e: wcanvas.configure(
+                        scrollregion=wcanvas.bbox("all")))
+        wcanvas.create_window((0, 0), window=winner, anchor="nw")
+        wcanvas.configure(yscrollcommand=wsb.set)
+        wcanvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        wsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _wheel(e):
+            wcanvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        card.bind_all("<MouseWheel>", _wheel)
+        _wheel_bound.append(True)
+
+        def _refresh_worldspaces():
+            """Rebuild the worldspace list from the currently ticked plugins."""
+            # Save what is on screen before tearing it down, or a rebuild
+            # triggered by an unrelated plugin toggle would discard the
+            # worldspace ticks the user just made.
+            for wname, wvar in ws_vars:
+                ws_state[wname] = bool(wvar.get())
+
+            names = [n for n in (_name_at(i) for i in range(plb.size()))
+                     if n in checked]
+            live = merge_worldspaces(names, _ws_by)
+
+            for child in winner.winfo_children():
+                child.destroy()
+            ws_vars.clear()
+
+            if not live:
+                tk.Label(winner,
+                         text=("No worldspace ships distant LOD\n"
+                               "for the selected plugins."),
+                         bg=CLR["panel"], fg=CLR["subtext"], justify=tk.LEFT,
+                         font=("Segoe UI", 9)).pack(anchor="w", padx=4, pady=4)
+                return
+
+            for wname in live:
+                var = tk.BooleanVar(value=ws_state.get(wname, True))
+                ws_vars.append((wname, var))
+                ttk.Checkbutton(winner, text=wname, variable=var,
+                                style="TCheckbutton").pack(anchor="w", padx=4,
+                                                           pady=1)
+
+        ttk.Button(rhead, text="All", width=4,
+                   command=lambda: [v.set(True) for _, v in ws_vars]
+                   ).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(rhead, text="None", width=5,
+                   command=lambda: [v.set(False) for _, v in ws_vars]
+                   ).pack(side=tk.RIGHT)
+
+        # Fill the list and paint the initial state. Deferred to here because
+        # _redraw calls _refresh_worldspaces, which needs the right-hand panel
+        # to exist — so both columns must be built before the first paint.
+        for n in ordered:
+            plb.insert(tk.END, n)
+        _redraw()
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16,
+                                                       pady=8)
+
+        btns = tk.Frame(card, bg=CLR["panel"])
+        btns.pack(fill=tk.X, padx=16, pady=(0, 14))
+
+        def _reset():
+            """Back to the derived default: everything on, default order."""
+            plb.delete(0, tk.END)
+            for n in _default_lod_plugins():
+                plb.insert(tk.END, n)     # text is repainted by _redraw
+            wanted.clear()
+            wanted.update(all_names)
+            for w in ws_state:
+                ws_state[w] = True
+            _redraw()
+
+        ttk.Button(btns, text="Reset", command=_reset).pack(side=tk.LEFT)
+
+        def _collect():
+            plugins = [_name_at(i) for i in range(plb.size())
+                       if _name_at(i) in checked]
+            worlds = [w for w, v in ws_vars if v.get()]
+            return plugins, worlds
+
+        def _generate():
+            plugins, worlds = _collect()
+            if not plugins:
+                _info("No Plugins", "Tick at least one plugin to generate "
+                                    "LOD for.")
+                return
+            if ws_vars and not worlds:
+                _info("No Worldspaces", "Tick at least one worldspace to "
+                                        "generate LOD for.")
+                return
+            # Store the confirmed selection even when it equals the default:
+            # the user having LOOKED and approved is itself information, and it
+            # keeps the next run stable if plugins.txt changes in between.
+            lod_plugins[:] = plugins
+            lod_worldspaces[:] = worlds
+            _close()
+            if on_generate is not None:
+                on_generate(plugins, worlds)
+
+        ttk.Button(btns, text="Generate", style="Accent.TButton",
+                   command=_generate).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", command=_close).pack(side=tk.RIGHT,
+                                                             padx=(0, 6))
 
         card.update_idletasks()
         card.place(in_=outer, anchor="center", relx=0.5, rely=0.5)
@@ -2138,13 +2437,9 @@ def gui_main():
     body_toggle_lbl.grid(row=0, column=0, sticky="w", padx=(0, 3))
     body_toggle_lbl.bind("<Button-1>", lambda _: _open_patch_plugin_panel())
 
-    order_toggle_lbl = tk.Label(
-        _links_row, text="merge order...",
-        bg=CLR["panel"], fg=CLR["subtext"],
-        font=("Segoe UI", 9, "underline"), cursor="hand2",
-    )
-    order_toggle_lbl.grid(row=0, column=1, sticky="w", padx=(3, 0))
-    order_toggle_lbl.bind("<Button-1>", lambda _: _open_lod_order_panel())
+    # No sub-link under "Create LOD": the button itself opens the selection
+    # dialog, so a second entry point to the same panel would just be a
+    # duplicate of the button beside it.
 
     # Progress bar + status, both anchored to the BOTTOM of the sidebar.
     #
@@ -2352,16 +2647,19 @@ def gui_main():
                 cmd += ["--output-dir", out_dir]
             return cmd
 
-        if key == "sibling_lod":
+        if key == "create_lod":
             cmd = [sys.executable, "-u",
-                   str(SCRIPT_DIR / "tools" / "merge_sibling_lod.py")]
+                   str(SCRIPT_DIR / "tools" / "create_lod.py")]
             if out_dir:
                 cmd += ["--output-dir", out_dir]
-            # Only when the user arranged one by hand; otherwise the tool
-            # derives it from plugins.txt itself, which keeps the default
-            # correct as their load order changes.
-            if lod_order:
-                cmd += ["--order"] + lod_order
+            # Always explicit once the dialog has been confirmed: the ORDER is
+            # the conflict resolution, so the run must apply exactly what the
+            # user saw. Before that, the tool derives both lists itself, which
+            # keeps a menu-less run correct as their load order changes.
+            if lod_plugins:
+                cmd += ["--plugins"] + lod_plugins
+            if lod_worldspaces:
+                cmd += ["--worldspaces"] + lod_worldspaces
             return cmd
 
         cmd = [sys.executable, "-u", str(SCRIPT_DIR / "convert.py"),
@@ -2457,12 +2755,17 @@ def gui_main():
             pass
         if key == "modify_body_meshes":
             parts += ["|"] + sorted(n for n, v in patch_plugin_vars if v.get())
-        if key == "sibling_lod":
+        if key == "create_lod":
             # The ORDER is an input, not a presentation detail: it decides
-            # which sibling wins a contested tile, so re-ordering invalidates a
-            # merge exactly as much as converting another plugin does. Falls
-            # back to the derived default so an edit to plugins.txt counts too.
-            parts += ["|"] + (lod_order or _default_lod_order())
+            # which plugin wins a contested tile, so re-ordering invalidates a
+            # run exactly as much as converting another plugin does. Falls back
+            # to the derived defaults so an edit to plugins.txt counts too, and
+            # the worldspace filter is folded in for the same reason — a run
+            # that skipped SEWorld is not current for one that wants it.
+            names = lod_plugins or _default_lod_plugins()
+            parts += ["|"] + names
+            parts += ["|"] + (lod_worldspaces
+                              or _default_lod_worldspaces(names))
         return "\x1f".join(parts)
 
     # The stamp each action was last completed at, so a later conversion can
@@ -2482,7 +2785,23 @@ def gui_main():
                 btn.configure(text=gshort, style="Global.TButton")
 
     def _run_global_action(key: str):
-        """Run one global action in a worker thread, logging to the main pane."""
+        """Run one global action in a worker thread, logging to the main pane.
+
+        "Create LOD" opens its selection dialog first and starts only when the
+        user presses Generate — the plugin ORDER and the worldspace set decide
+        what gets built and which plugin wins a contested tile, so it is a
+        decision to confirm, not a default to fire off.
+        """
+        if running.is_set():
+            return
+        if key == "create_lod":
+            _open_create_lod_panel(
+                on_generate=lambda _p, _w: _start_global_action(key))
+            return
+        _start_global_action(key)
+
+    def _start_global_action(key: str):
+        """Launch one global action with the selection already settled."""
         if running.is_set():
             return
         out_dir = output_var.get().strip()

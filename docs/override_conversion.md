@@ -182,6 +182,22 @@ from comparing two conversion runs.
   missing land. Subtract the plugin's own WRLD FormIDs from the set of
   worldspaces its cells name and anchor the remainder; the two job lists stay
   disjoint so no FormID is emitted twice.
+- <a id="sibling-lod-order"></a>**Sibling LOD: an UNLISTED plugin must be the
+  LOWEST priority, never the highest.** The merged-tile bake stacks every
+  sibling as an overlay and the LAST one applied wins every FormID it shares,
+  so `sibling_lod._load_order` IS the conflict resolution. It ranked plugins
+  by `plugins.txt` (correct) and then appended anything absent from that file
+  **after** the ranked ones — handing the final word to exactly the plugins
+  the user never positioned. DLCBattlehornCastle.esp (14 changed cells, not in
+  plugins.txt) thereby outranked ElsweyrAnequina.esp (1,855) and Tamriel.esp
+  (99,910) and won every tile the three shared, so merged tiles contradicted
+  the load order the game itself obeys. Sort unlisted plugins FIRST: the
+  engine's own treatment of a plugin missing from plugins.txt is not to load
+  it at all, so lowest priority is the faithful analogue. The same inversion
+  existed in `gui.py::_default_lod_order`, which seeded the drag-to-reorder
+  list — the list the user sees must mirror the order that actually runs, or
+  the panel misreports the winner and feeds a wrong `explicit` order straight
+  back in. Guarded by `tests/test_sibling_lod_order.py`.
 - <a id="terrain-overlay-scoping"></a>🛑 **An OVERLAY that does not define the
   worldspace must contribute NOTHING unscoped — never "every LAND record".**
   `terrain_lod._scan_land_file` resolves the target worldspace's FormID from the
@@ -206,6 +222,37 @@ from comparing two conversion runs.
   so an overlay's own worldspaces keep their own FormID and are excluded.
   Guarded by `tests/test_terrain_lod_scoping.py`, which builds synthetic ESMs so
   both branches stay distinguishable.
+- <a id="create-lod-order"></a>**`create_lod_order` deliberately differs from
+  `_load_order`, and the difference is CONSENT.** LOD is generated for the
+  whole load order in one pass (`tools/create_lod.py`, the GUI's *Create LOD*
+  button) and that dialog SHOWS the order, lets the user drag it, and does
+  nothing until they press Generate. So the rule is the one the user asked
+  for: everything `plugins.txt` lists comes FIRST in its own order, and
+  everything else is appended at the BOTTOM. `_load_order`'s
+  unlisted-plugins-first rule is right for a merge nobody looked at — an
+  unpositioned plugin must not silently outrank a positioned one — but wrong
+  once the list is on screen and confirmed.
+  The append is alphabetical **but constrained by masters**: a plugin never
+  sorts before one of its own masters, because a dependent's tiles are baked as
+  "master + dependent" and already contain the master's terrain, while the
+  master's own tiles contain nothing of the dependent's. Applying the master
+  last would therefore undo the dependent. On the real load order this is what
+  keeps `Translation.esp` after `Nehrim.esm` and would keep a hypothetical
+  `AAAPatch.esp` after the `Tamriel.esp` it patches, despite the alphabet.
+  Depth counts only masters that are actually in the selection, so deselecting
+  a master does not push its dependent to the bottom. Guarded by
+  `tests/test_create_lod_order.py`.
+- **The merged-LOD folder must be CLEARED per worldspace before rebaking.**
+  The bake writes only the tiles it produces this run, so anything an earlier
+  run left behind survives as an orphan and still ships — and since the folder
+  exists specifically to win the overwrite, an orphan beats the correct tile at
+  that path. After the load-order fix above, 5 `.btr` + 10 `.dds` at tile `0.0`
+  remained from a previous run while the corrected bake produced no `0.0` tile
+  at all. Clear by the worldspace's own tile glob (`<edid>.*` under
+  `meshes/terrain/<edid>` and `textures/terrain/<edid>`), never the whole
+  folder: a run covering several worldspaces would otherwise delete a sibling
+  worldspace's fresh output, and the merged object `.nif`s under `Objects/`
+  are shared and coordinate-free, so they must survive.
 - <a id="land-first-in-type-9"></a>🛑 **LAND MUST BE THE FIRST RECORD IN A
   CELL'S TEMPORARY (type-9) CHILDREN GROUP.** Census of real `Skyrim.esm`:
   **15,564 of 15,564** type-9 groups containing a LAND have it at index 0 — no

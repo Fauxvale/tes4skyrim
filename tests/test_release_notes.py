@@ -45,7 +45,7 @@ def test_phase_map_targets_are_known_steps():
     ("script_convert/converter.py",        "8. Scripts"),
     ("asset_convert/nif_converter.py",     "3. Meshes"),
     ("asset_convert/audio_converter.py",   "7. Sounds"),
-    ("asset_convert/lod_gen.py",           "9. LOD"),
+    ("asset_convert/lod_gen.py",           "Create LOD"),
     ("asset_convert/bsa_extract.py",       "2. Extract"),
     ("asset_convert/spt_reader.py",        "4. SpeedTrees"),
     ("asset_convert/hkx_convert.py",       "5. Creatures"),
@@ -142,7 +142,7 @@ def test_unmapped_path_does_not_widen_a_known_change():
     ordered, unmatched, _ = rn.steps_for_paths(
         ["asset_convert/lod_gen.py", "brand_new_package/thing.py"])
     assert unmatched == ["brand_new_package/thing.py"]
-    assert "9. LOD" in ordered
+    assert "Create LOD" in ordered
     assert "1. Export" not in ordered
 
 
@@ -162,7 +162,7 @@ def test_convert_py_narrows_to_the_changed_phase(monkeypatch):
         "@@ -580,17 +580,37 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,\n"
         "@@ -639,15 +659,28 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,\n"
     ))
-    assert rn.convert_py_steps("0.39", "0.40") == ["9. LOD"]
+    assert rn.convert_py_steps("0.39", "0.40") == ["Create LOD"]
 
 
 def test_main_is_orchestration_and_narrows_to_nothing(monkeypatch):
@@ -177,7 +177,7 @@ def test_main_is_orchestration_and_narrows_to_nothing(monkeypatch):
         "@@ -580,17 +580,37 @@ def phase_lod(file_name: str, tes5_data: str, config: dict,\n"
         "@@ -788,4 +822,4 @@ def main():\n"
     ))
-    assert rn.convert_py_steps("0.18", "0.19") == ["9. LOD"]
+    assert rn.convert_py_steps("0.18", "0.19") == ["Create LOD"]
 
 
 def test_a_main_only_change_costs_no_steps(monkeypatch):
@@ -220,8 +220,8 @@ def test_convert_py_fallback_selects_all_steps():
 
 
 def test_convert_py_uses_supplied_attribution():
-    ordered, _, _ = rn.steps_for_paths(["convert.py"], ["9. LOD"])
-    assert "9. LOD" in ordered
+    ordered, _, _ = rn.steps_for_paths(["convert.py"], ["Create LOD"])
+    assert "Create LOD" in ordered
     assert "1. Export" not in ordered
 
 

@@ -41,9 +41,23 @@ from .terrain_lod import (shipped_lod_worldspaces, _master_names,
 from .lod_gen import _kept_tile_cells_by_level
 
 
-# The mod folder the merged tiles ship in. Named so it sorts last in a mod
-# manager's alphabetical install order, which is the order that decides the
-# overwrite — the whole point of this step is to win that overwrite on purpose.
+# The standalone mod ALL generated LOD ships in.
+#
+# One folder, not one per plugin, because a LOD tile is a file on a fixed grid
+# keyed only by worldspace and coordinate: every plugin editing a worldspace
+# produces the SAME tile paths, so per-plugin output meant rival copies of one
+# file and the mod manager's install order silently picked a winner. Generating
+# once for the whole load order leaves exactly one copy of each tile, so there
+# is no overwrite to win and no merge pass to reconcile it afterwards.
+#
+# What lives here is what belongs to the whole load order: LODSettings and the
+# baked .btr/.bto/.dds tiles. Derived _far.nif meshes do NOT — they are ordinary
+# converted meshes and stay in the plugin that ships the full model they came
+# from (see lod_gen.generate_lod's `far_nif_dirs`).
+LOD_DIR_NAME = "AutoConvertLOD"
+
+# The previous merged-tile folder. Kept only so an existing install can be
+# recognised and cleaned up; nothing writes here any more.
 MERGED_DIR_NAME = "ZZZ Merged Sibling LOD"
 
 
@@ -141,7 +155,7 @@ def converted_plugins(out_root: Path) -> list[str]:
         return []
     names = []
     for p in sorted(out_root.iterdir()):
-        if not p.is_dir() or p.name == MERGED_DIR_NAME:
+        if not p.is_dir() or p.name in (LOD_DIR_NAME, MERGED_DIR_NAME):
             continue
         if (p / p.name).is_file():
             names.append(p.name)
@@ -174,6 +188,176 @@ def plugins_txt_order() -> list[str]:
     except OSError:
         return []
     return order
+
+
+def _master_rank(names: list[str], export_root: Path) -> dict[str, int]:
+    """Master DEPTH per plugin: 0 for a plugin depending on none of `names`.
+
+    Depth is what keeps a master from overwriting its own dependent's LOD. A
+    dependent's tiles are baked as "master + dependent", so they already
+    contain the master's terrain; the master's own tiles do not contain the
+    dependent's. Applying the master LAST would therefore undo the dependent —
+    so a master must always sort BEFORE anything that depends on it, however
+    the alphabet falls.
+
+    Cycles cannot occur in a real master list, but a malformed header could
+    produce one, so the walk carries its own `seen` set and reports 0 rather
+    than recursing forever.
+    """
+    depth: dict[str, int] = {}
+
+    def d(name: str, seen: frozenset = frozenset()) -> int:
+        if name in depth:
+            return depth[name]
+        if name in seen:
+            return 0
+        val = 1 + max([d(m, seen | {name})
+                       for m in _master_names(export_root / name)
+                       if m in names], default=-1)
+        depth[name] = val
+        return val
+
+    for n in names:
+        d(n)
+    return depth
+
+
+def create_lod_order(names: list[str], export_root: Path) -> list[str]:
+    """The default plugin order for a Create LOD run, lowest priority first.
+
+    Two sources, in the order the user asked for:
+
+    1. `plugins.txt` — the real Skyrim load order. Whatever it lists comes
+       FIRST, in exactly its own order, because that is the order the game
+       itself resolves these plugins in and the user chose it.
+    2. Everything else, appended at the bottom, sorted alphabetically but
+       constrained by MASTERS: a plugin never sorts before one of its own
+       masters. Alphabetical alone would let ``AAAPatch.esp`` (mastered on
+       ``Tamriel.esp``) apply first and then be overwritten by the very plugin
+       it patches; sorting by master depth first makes the dependent always
+       land after the thing it depends on.
+
+    This differs from `_load_order`, which puts unlisted plugins FIRST so an
+    unpositioned plugin can never outrank a positioned one. That rule is right
+    for a merge the user never looked at. Here the list is shown, reorderable
+    and confirmed before anything runs, so the user's stated preference —
+    plugins.txt first, the rest appended at the bottom — is what is built.
+    """
+    rank = {n.lower(): i for i, n in enumerate(plugins_txt_order())}
+    listed = sorted((n for n in names if n.lower() in rank),
+                    key=lambda n: rank[n.lower()])
+    rest = [n for n in names if n.lower() not in rank]
+    depth = _master_rank(names, export_root)
+    # .esm before .esp at equal depth, matching the engine's own split, then
+    # name for a stable, predictable tiebreak.
+    rest.sort(key=lambda n: (depth.get(n, 0),
+                             not n.lower().endswith('.esm'), n.lower()))
+    return listed + rest
+
+
+def worldspaces_by_plugin(names: list[str],
+                          export_root: Path) -> dict[str, list[str]]:
+    """{plugin: [worldspace EDID, ...]} for each of `names`.
+
+    The same authority `phase_lod` routes on — the worldspaces the SOURCE game
+    shipped distant LOD for — so the dialog offers exactly the set a run would
+    otherwise build, and unticking one genuinely removes work rather than
+    filtering a list that never matched.
+
+    Returned per plugin, not flattened, because the dialog has to recompute the
+    worldspace list as plugins are ticked on and off. Scanning the export dirs
+    is the expensive part, so it happens ONCE when the dialog opens and every
+    later toggle is a dict lookup.
+    """
+    out: dict[str, list[str]] = {}
+    for name in names:
+        try:
+            shipped = shipped_lod_worldspaces(export_root / name) or []
+        except Exception:
+            shipped = []
+        out[name] = [edid for edid, _fid in shipped]
+    return out
+
+
+def lod_worldspaces(names: list[str], export_root: Path) -> list[str]:
+    """Every worldspace the selected plugins would generate LOD for.
+
+    Ordered by first appearance across `names` so the biggest, most-edited
+    worldspaces (which is the order `shipped_lod_worldspaces` already returns
+    per plugin) surface at the top.
+    """
+    return merge_worldspaces(names, worldspaces_by_plugin(names, export_root))
+
+
+def merge_worldspaces(names, by_plugin: dict[str, list[str]]) -> list[str]:
+    """Flatten `worldspaces_by_plugin` for `names`, first appearance wins.
+
+    Split out from the scan so the dialog can re-flatten on every tick without
+    re-reading a single export directory.
+    """
+    seen: list[str] = []
+    for name in names:
+        for edid in by_plugin.get(name, ()):
+            if edid not in seen:
+                seen.append(edid)
+    return seen
+
+
+def worldspace_owner(edid: str, order: list[str], export_root: Path):
+    """The plugin whose records a worldspace's LOD is baked FROM.
+
+    The FIRST plugin in load order that shipped distant LOD for `edid` — the
+    same authority `phase_lod` routes on, so both agree on who owns what.
+
+    Ownership matters because the bake reads WRLD/CELL/LAND/REFR out of ONE
+    file and applies the rest as overlays. Sourcing from a later plugin that
+    merely EXTENDS the worldspace would drop everything the owner holds:
+    Tamriel.esp adds a landmass around Cyrodiil, and building from it alone
+    left all of Oblivion.esm's terrain missing and edge-extended into flat
+    plateaus at the vanilla border.
+    """
+    for name in order:
+        try:
+            shipped = shipped_lod_worldspaces(export_root / name) or []
+        except Exception:
+            continue
+        if any(e == edid for e, _f in shipped):
+            return name
+    return None
+
+
+def dependents_of(names: list[str], export_root: Path) -> dict[str, set[str]]:
+    """{plugin: every plugin in `names` that depends on it, transitively}.
+
+    Deselecting a plugin has to deselect everything built on top of it: a
+    dependent's LOD is baked as "master + dependent", so with the master
+    dropped there is no terrain to overlay onto and the dependent's tiles would
+    come out as its own isolated edits floating in nothing.
+
+    Transitive because the dependency that matters can be indirect —
+    Translation.esp lists only Nehrim.esm, so dropping Nehrim must drop
+    Translation even though nothing names the two together.
+    """
+    direct: dict[str, list[str]] = {
+        n: [m for m in _master_names(export_root / n) if m in names]
+        for n in names}
+
+    out: dict[str, set[str]] = {n: set() for n in names}
+    for n in names:
+        # Walk UP from each plugin to every master it rests on, and record the
+        # plugin against each. Cheaper and cycle-safe compared with walking
+        # down from every master, and a malformed header that made A master B
+        # and B master A terminates on the `seen` guard instead of recursing.
+        stack = list(direct[n])
+        seen: set[str] = set()
+        while stack:
+            m = stack.pop()
+            if m in seen or m == n:
+                continue
+            seen.add(m)
+            out[m].add(n)
+            stack.extend(direct.get(m, ()))
+    return out
 
 
 def _load_order(names: list[str], export_root: Path,
