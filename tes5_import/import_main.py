@@ -51,6 +51,7 @@ from .record_types.world import (
     convert_REFR,
     convert_WRLD,
     set_cell_locations,
+    set_cloud_bank_output,
     set_door_navmesh_links,
 )
 from .text_reader import (
@@ -609,6 +610,10 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
         output_path = os.path.join(
             output_path, os.path.basename(os.path.normpath(output_path)))
     plugin_out_dir = os.path.dirname(output_path)
+
+    # World-map cloud banks are generated per worldspace as convert_WRLD runs,
+    # sized to that worldspace's own bounds (see asset_convert/worldmap_clouds).
+    set_cloud_bank_output(plugin_out_dir)
 
     # Per-phase wall-clock reporting so slow phases are visible in the log.
     _phase_t = time.time()
@@ -2570,14 +2575,27 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
     pgrds = by_type.get('PGRD', [])
 
     # A plugin can add a whole landscape to a worldspace the MASTER owns, in
-    # which case it ships NO new WRLD of its own — its only WRLD record is an
-    # override, already emitted by the override path, so `worlds` is empty
-    # here while `cells` holds tens of thousands of brand-new exterior cells.
-    # Returning early dropped every one of them: Tamriel.esp (a heightmap
-    # plugin over Oblivion.esm's Tamriel) exports 99,946 CELL and 99,914 LAND
-    # records of which only the 4,501 that override the master's survived —
-    # 95% of the terrain silently vanished and the output was 38 MB instead of
-    # ~1 GB. The map looked unchanged in-game for exactly that reason.
+    # which case it ships NO new WRLD of its own for it — its only WRLD record
+    # is an override, already emitted by the override path, so nothing here
+    # defines the worldspace while `cells` holds tens of thousands of
+    # brand-new exterior cells. Returning early dropped every one of them:
+    # Tamriel.esp (a heightmap plugin over Oblivion.esm's Tamriel) exports
+    # 99,946 CELL and 99,914 LAND records of which only the 4,501 that
+    # override the master's survived — 95% of the terrain silently vanished
+    # and the output was 38 MB instead of ~1 GB. The map looked unchanged
+    # in-game for exactly that reason.
+    #
+    # Anchoring is decided PER WORLDSPACE, never by whether this plugin
+    # happens to own worldspaces of its own. Gating the whole block on
+    # `not worlds` was right for Tamriel.esp (a pure heightmap, zero own
+    # worldspaces) but silently broke every plugin that does BOTH — adds land
+    # to the master's Tamriel AND ships its own worldspaces. Elsweyr
+    # Anequina has 9 of its own, so `worlds` was non-empty, no anchor was
+    # built, and all 831 of its new Tamriel cells (x -32..0, y -64..-30) were
+    # dropped while its 1,054 plain overrides survived: a 100%/0% split that
+    # left the player standing on Tamriel.esp's unmatched placeholder
+    # heightmap, several thousand units off from the terrain that should be
+    # there.
     #
     # The parent WRLD is pulled from the converted master as an ANCHOR, the
     # same way emit_nested_overrides anchors any type-1/6/7 group whose owning
@@ -2589,10 +2607,13 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
     # passing it through master_output_formid would shift the load-order index
     # a SECOND time and resolve to nothing.
     anchor_wrld = {}        # ParentWRLD (output space) -> WRLD bytes, or b''
-    if not worlds and cells and ctx is not None:
+    if cells and ctx is not None:
         master_index = getattr(ctx, 'master_index', None)
         emitted = getattr(ctx, 'emitted_wrld', None) or {}
-        wanted = {get_formid(c, 'ParentWRLD') for c in cells}
+        # Worldspaces THIS plugin defines are built by the loop below from its
+        # own WRLD records; only the rest need the master's record as anchor.
+        own_wrld = {get_formid(w, 'FormID') for w in worlds}
+        wanted = {get_formid(c, 'ParentWRLD') for c in cells} - own_wrld
         wanted.discard(0)
         for out_fid in sorted(wanted):
             if out_fid in emitted:
@@ -2691,7 +2712,11 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
         cell_fid = get_formid(rec, 'ParentCELL')
         pgrd_by_cell[cell_fid].append(rec)
 
-    if anchor_wrld:
+    if anchor_wrld and worlds:
+        print(f"  Building WRLD hierarchy ({len(worlds)} own worldspace(s) "
+              f"+ {len(anchor_wrld)} MASTER-owned worldspace(s) anchored "
+              f"for this plugin's own cells)...")
+    elif anchor_wrld:
         print(f"  Building WRLD hierarchy ({len(anchor_wrld)} MASTER-owned "
               f"worldspace(s) anchored for this plugin's own cells)...")
     else:

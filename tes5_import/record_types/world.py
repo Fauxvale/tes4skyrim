@@ -54,6 +54,25 @@ _WORLD_LOCATION: dict = {}
 # (Phase 4a) and read by convert_REFR to emit XNDP.  See set_door_navmesh_links.
 _DOOR_NAVMESH_LINK: dict = {}
 
+# Output folder (the one holding `meshes\`) for generated world-map cloud
+# banks, or None to skip generating them.  See set_cloud_bank_output.
+_CLOUD_BANK_ROOT = None
+
+
+def set_cloud_bank_output(out_root):
+    """Enable per-worldspace world-map cloud banks, written under `out_root`.
+
+    Skyrim's map draws a cloud bank over the terrain.  With no WRLD MODL the
+    engine falls back to a HARDCODED mesh sized for Skyrim's Tamriel (verified
+    in SkyrimSE.exe at RVA 0x2c7e00 — see asset_convert/worldmap_clouds.py),
+    which on a small converted worldspace covers many times its landmass.
+    When this is set, convert_WRLD emits a bank scaled to each worldspace's own
+    NAM0/NAM9 rectangle and points MODL at it.  Left None (the default, e.g.
+    for unit tests) the record is written exactly as before.
+    """
+    global _CLOUD_BANK_ROOT
+    _CLOUD_BANK_ROOT = out_root
+
 
 def set_door_navmesh_links(door_links: dict):
     """Register door REFR -> (NAVM, triangle) for XNDP emission.
@@ -249,6 +268,32 @@ def build_wrld_mnam(rec: dict):
                        50000.0, 80000.0, 50.0)
 
 
+def build_wrld_cloud_modl(rec: dict, edid: str = None):
+    """Generate this worldspace's world-map cloud bank; return its MODL value.
+
+    Returns None when banks are disabled (set_cloud_bank_output never called),
+    when the record has no usable bounds, or when the vanilla source mesh is
+    unavailable -- in which case no MODL is written and the engine falls back
+    to its own hardcoded bank, i.e. exactly the pre-existing behaviour.
+
+    Shared by convert_WRLD and the override path so both emit the same mesh.
+    """
+    if not _CLOUD_BANK_ROOT:
+        return None
+    if edid is None:
+        edid = get_str(rec, 'EditorID')
+        if edid == 'Tamriel':
+            edid = 'TES4Tamriel'      # matches convert_WRLD's rename
+    if not edid or not get_str(rec, 'NAM0.MinX'):
+        return None
+    width = abs(get_float(rec, 'NAM9.MaxX') - get_float(rec, 'NAM0.MinX'))
+    height = abs(get_float(rec, 'NAM9.MaxY') - get_float(rec, 'NAM0.MinY'))
+    if width <= 0.0 or height <= 0.0:
+        return None
+    from asset_convert.worldmap_clouds import generate_cloud_bank
+    return generate_cloud_bank(edid, width, height, _CLOUD_BANK_ROOT)
+
+
 def convert_CELL(rec: dict) -> bytes:
     """Convert CELL record."""
     subs = b''
@@ -380,6 +425,20 @@ def convert_WRLD(rec: dict) -> bytes:
 
     # DNAM — land/water defaults
     subs += pack_subrecord('DNAM', struct.pack('<ff', -2048.0, 0.0))
+
+    # MODL — "Cloud Model", the mesh the WORLD MAP drapes over the terrain.
+    # xEdit places the Cloud Model struct after the LOD/land data and before the
+    # map data (MNAM), so it is written here.
+    #
+    # Neither game gives us a source for this: Oblivion has no world-map cloud
+    # layer, and vanilla Skyrim authors no MODL either (0 of 35 uncompressed
+    # Skyrim.esm WRLDs carry one).  Bethesda instead relies on the engine's
+    # hardcoded fallback — but that mesh is sized for Skyrim's Tamriel, so on a
+    # smaller converted worldspace it becomes an overcast sheet several times
+    # the landmass.  Generate one scaled to THIS worldspace instead.
+    cloud_rel = build_wrld_cloud_modl(rec, edid)
+    if cloud_rel:
+        subs += pack_string_subrecord('MODL', cloud_rel)
 
     # Map dimensions (MNAM) — after DNAM per xEdit order. Shared with the
     # override path.

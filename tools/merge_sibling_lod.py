@@ -68,6 +68,7 @@ def main() -> int:
     from asset_convert.sibling_lod import (find_sibling_groups,
                                            contested_cells,
                                            converted_plugins,
+                                           merge_cloud_bank,
                                            overwrite_report,
                                            plugins_txt_order,
                                            MERGED_DIR_NAME)
@@ -122,6 +123,17 @@ def main() -> int:
             win = "  <- wins conflicts" if i == len(plugins) else ""
             print(f"   {i}. {n}: {len(g['cells'][n])} changed cell(s){win}")
 
+        # The world-map cloud bank is a single file per worldspace, so it has
+        # the same overwrite problem as the tiles — but at the worldspace
+        # level, independent of which TILES are contested. Merge it whenever
+        # siblings share a worldspace, before the tile check below can skip.
+        if not args.dry_run:
+            cloud_rel = merge_cloud_bank(out_root, merged_dir, edid,
+                                         g['master'], plugins)
+            if cloud_rel:
+                print(f"   Merged world-map cloud bank -> {cloud_rel} "
+                      f"(union of {len(plugins) + 1} plugin bounds)")
+
         hot = contested_cells(g['cells'])
         if not hot:
             print("   No tile is claimed by more than one plugin — each "
@@ -132,6 +144,30 @@ def main() -> int:
         if args.dry_run:
             print("   (dry run — nothing baked)")
             continue
+
+        # Drop THIS worldspace's tiles from a previous run before rebaking.
+        # The bake only writes the tiles it produces this time, so a tile that
+        # was contested before and is not now — or that an earlier run emitted
+        # at the wrong coordinates — survived as an orphan and still shipped,
+        # overwriting the correct tile at that path. Observed after the load
+        # order fix: 5 .btr + 10 .dds at tile 0.0 left from an earlier run,
+        # while the corrected bake produced no 0.0 tile at all.
+        #
+        # Scoped to this worldspace's own tile names so a run covering several
+        # worldspaces never deletes a sibling worldspace's fresh output, and
+        # so the merged object .nifs (shared, coordinate-free) are untouched.
+        stale = 0
+        for sub, pat in (("meshes/terrain", f"{edid}.*"),
+                         ("textures/terrain", f"{edid}.*")):
+            d = merged_dir / sub / edid
+            if not d.is_dir():
+                continue
+            for f in d.glob(pat):
+                if f.is_file():
+                    f.unlink()
+                    stale += 1
+        if stale:
+            print(f"   Cleared {stale} tile(s) from a previous run")
 
         # Assets from the master AND every sibling: a merged tile draws objects
         # from all of them, so a model converted into only one sibling's output

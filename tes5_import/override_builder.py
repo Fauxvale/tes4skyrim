@@ -329,6 +329,30 @@ _RB_NAM0 = _Rebuild(b'NAM0', lambda rec: struct.pack(
 _RB_NAM9 = _Rebuild(b'NAM9', lambda rec: struct.pack(
     '<ff', get_float(rec, 'NAM9.MaxX'), get_float(rec, 'NAM9.MaxY')),
     (('after', b'NAM0'), ('after', b'NAMA'), ('after', b'ONAM')))
+
+
+def _build_wrld_modl(rec):
+    """WRLD MODL — the world-map cloud bank, scaled to this worldspace.
+
+    A plugin that widens a worldspace's NAM0/NAM9 rectangle changes the size
+    the cloud bank has to cover, so the bank is regenerated alongside the
+    bounds (Tamriel.esp triples Cyrodiil's extent).  Same generator the
+    from-scratch path uses, so both produce byte-identical meshes.
+
+    Returns KEEP when the bank cannot be generated, leaving whatever the master
+    had rather than writing a dangling model reference.
+    """
+    from .record_types.world import build_wrld_cloud_modl
+    rel = build_wrld_cloud_modl(rec)
+    if rel is None:
+        return KEEP
+    return rel.encode('utf-8') + b'\x00'
+
+
+# Anchored before the map data, matching convert_WRLD and xEdit's field order.
+_RB_WRLD_MODL = _Rebuild(b'MODL', _build_wrld_modl,
+                         (('before', b'MNAM'), ('before', b'ONAM'),
+                          ('before', b'NAMA')))
 _RB_FLTV = _Rebuild(b'FLTV', _build_fltv, (('after', b'FNAM'),))
 _RB_SCRI_VMAD = _Rebuild(b'VMAD', _build_scri_vmad)
 # LAND vertex data, in the order convert_LAND emits it: DATA VNML VHGT VCLR,
@@ -380,8 +404,8 @@ _reg('ACHR', 'XOWN.Owner', _RB_REFR_XOWN)
 _reg('ACRE', 'XOWN.Owner', _RB_REFR_XOWN)
 _reg('WRLD', ('MNAM.UsableDimX', 'MNAM.UsableDimY', 'MNAM.NWCellX',
               'MNAM.NWCellY', 'MNAM.SECellX', 'MNAM.SECellY'), _RB_MNAM)
-_reg('WRLD', ('NAM0.MinX', 'NAM0.MinY'), _RB_NAM0)
-_reg('WRLD', ('NAM9.MaxX', 'NAM9.MaxY'), _RB_NAM9)
+_reg('WRLD', ('NAM0.MinX', 'NAM0.MinY'), _RB_NAM0, _RB_WRLD_MODL)
+_reg('WRLD', ('NAM9.MaxX', 'NAM9.MaxY'), _RB_NAM9, _RB_WRLD_MODL)
 _reg('GLOB', 'FLTV.Value', _RB_FLTV)
 _reg('LAND', 'VNML', _RB_LAND_VNML)
 _reg('LAND', 'VHGT', _RB_LAND_VHGT)

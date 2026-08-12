@@ -31,6 +31,7 @@ another copy to keep in sync.
 from __future__ import annotations
 
 import os
+import re
 import struct
 from collections import defaultdict
 from pathlib import Path
@@ -187,7 +188,8 @@ def _load_order(names: list[str], export_root: Path,
     1. `explicit` — an order the user arranged by hand in the GUI. Absolute:
        whatever they dragged is what runs.
     2. `plugins.txt` — the real Skyrim load order, which is what the game
-       itself obeys. Anything it does not mention is appended alphabetically.
+       itself obeys. Anything it does not mention sorts BEFORE everything it
+       does, so a plugin the user never placed can never outrank one they did.
     3. Structural fallback, used only when plugins.txt is missing or lists
        none of these plugins: master-depth, then .esm before .esp, then name.
 
@@ -195,12 +197,24 @@ def _load_order(names: list[str], export_root: Path,
     alphabetical tiebreak is an ARBITRARY winner for two siblings that edit the
     same reference — "ElsweyrAnequina before Tamriel" was alphabetical accident
     rather than anything the user chose.
+
+    Unlisted plugins used to be appended AFTER the ranked ones, which handed
+    the highest priority — the last word on every contested tile — to exactly
+    the plugins the user never positioned. DLCBattlehornCastle.esp (14 changed
+    cells, absent from plugins.txt) thereby outranked ElsweyrAnequina.esp
+    (1,855 cells) and Tamriel.esp (99,910), and won every tile the three
+    shared, so merged tiles disagreed with the load order the game itself
+    obeys. Sorting them first makes an unknown plugin the LOWEST priority,
+    which is also what the engine does with a plugin that is not in the list:
+    it is not loaded at all.
     """
     if explicit:
         # Honour the user's arrangement; anything they never saw (a plugin
-        # converted since) still has to run, so it lands after in stable order.
+        # converted since) still has to run, but it sorts BEFORE their choices
+        # for the same reason as the plugins.txt case below — a plugin the
+        # user never positioned must not win a tile against one they did.
         chosen = [n for n in explicit if n in names]
-        return chosen + sorted(n for n in names if n not in chosen)
+        return sorted(n for n in names if n not in chosen) + chosen
 
     lo = [n.lower() for n in plugins_txt_order()]
     if lo:
@@ -208,7 +222,7 @@ def _load_order(names: list[str], export_root: Path,
         listed = [n for n in names if n.lower() in rank]
         if listed:
             unlisted = sorted(n for n in names if n.lower() not in rank)
-            return sorted(listed, key=lambda n: rank[n.lower()]) + unlisted
+            return unlisted + sorted(listed, key=lambda n: rank[n.lower()])
 
     depth: dict[str, int] = {}
 
@@ -378,6 +392,97 @@ _LOD_SUBDIRS = (
     ('meshes', 'terrain'),      # .btr terrain + Objects/*.bto
     ('textures', 'terrain'),    # composited diffuse/normal .dds
 )
+
+
+def _wrld_bounds(esm: Path, edid: str):
+    """(minX, minY, maxX, maxY) from a plugin's WRLD record, or None.
+
+    Reads the built ESM rather than the export so the bounds are exactly what
+    the engine will see, including anything the override path rewrote.
+    """
+    try:
+        data = esm.read_bytes()
+    except OSError:
+        return None
+    sig_ok = re.compile(rb'[A-Z0-9_]{4}')
+    off = 0
+    while True:
+        k = data.find(b'WRLD', off)
+        if k < 0:
+            return None
+        off = k + 4
+        if k + 24 > len(data):
+            return None
+        size, flags = struct.unpack('<II', data[k + 4:k + 12])
+        if size == 0 or size > 500000 or (flags & 0x00040000):
+            continue
+        body = data[k + 24:k + 24 + size]
+        j = 0
+        name = None
+        n0 = n9 = None
+        while j + 6 <= len(body):
+            sig = body[j:j + 4]
+            if not sig_ok.fullmatch(sig):
+                break
+            sz = struct.unpack('<H', body[j + 4:j + 6])[0]
+            val = body[j + 6:j + 6 + sz]
+            if sig == b'EDID':
+                name = val.rstrip(b'\0').decode('ascii', 'replace')
+            elif sig == b'NAM0' and sz == 8:
+                n0 = struct.unpack('<ff', val)
+            elif sig == b'NAM9' and sz == 8:
+                n9 = struct.unpack('<ff', val)
+            j += 6 + sz
+        if name == edid and n0 and n9:
+            return (n0[0], n0[1], n9[0], n9[1])
+
+
+def merge_cloud_bank(out_root: Path, merged_dir: Path, edid: str,
+                     master: str, plugins: list[str]) -> str:
+    """One world-map cloud bank covering the UNION of every sibling's bounds.
+
+    Same overwrite problem the LOD tiles have, one level up.  The bank is a
+    FILE at a fixed path (meshes/tes4/worldmapclouds/<worldspace>.nif) and each
+    sibling generates its own sized to ITS OWN NAM0/NAM9 rectangle -- correct
+    in isolation, wrong together.  Tamriel.esp and ElsweyrAnequina.esp both
+    extend TES4Tamriel in different directions, so whichever the mod manager
+    installs last supplies the bank for both, and it is sized for only one of
+    them.  The plugin that loses gets a deck that stops short of its terrain.
+
+    The bounds have the same problem in the record: the winning WRLD override
+    supplies NAM0/NAM9 for everyone, and the map is drawn over exactly that
+    rectangle.  So the honest fit is the union of every sibling's rectangle --
+    that is the extent the map will actually show once they are all installed.
+
+    Written into the merged folder, which installs last and wins the overwrite
+    deliberately, exactly like the merged tiles.  Returns the Data-relative
+    path written, or None when no bank could be built.
+    """
+    from .worldmap_clouds import generate_cloud_bank, cloud_model_path
+
+    boxes = []
+    for name in [master] + list(plugins):
+        esm = out_root / name / name
+        if not esm.is_file():
+            continue
+        box = _wrld_bounds(esm, edid)
+        if box:
+            boxes.append(box)
+    if not boxes:
+        return None
+
+    min_x = min(b[0] for b in boxes)
+    min_y = min(b[1] for b in boxes)
+    max_x = max(b[2] for b in boxes)
+    max_y = max(b[3] for b in boxes)
+    width = abs(max_x - min_x)
+    height = abs(max_y - min_y)
+    if width <= 0.0 or height <= 0.0:
+        return None
+
+    if not generate_cloud_bank(edid, width, height, str(merged_dir)):
+        return None
+    return cloud_model_path(edid)
 
 
 def _lod_files(plugin_dir: Path, worldspace: str) -> set[str]:
