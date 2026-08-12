@@ -192,6 +192,10 @@ class OverrideContext:
         # widens NAM0/NAM9 to hold the land it adds; the stale duplicate put
         # the vanilla bounds back and clipped the new terrain off the map).
         self.emitted_wrld = {}
+        # Records emit_nested_overrides pulled from the master as an anchor.
+        # The WRLD builder runs afterwards and must not anchor the same record
+        # again — that ships the FormID twice and the engine drops one copy.
+        self.anchored_wrld = set()
 
     def __len__(self):
         return len(self.master_export)
@@ -230,6 +234,18 @@ class OverrideContext:
             # resolve against the master.
             self.stats['no-base'] += 1
             return Override('no-base', out_fid, b'')
+
+        # The id must resolve to a record of the SAME TYPE. A plugin's source
+        # id can land on an unrelated master record — Elsweyr Anequina's NPC_
+        # 0100110C converts to 0200110C, which in Oblivion.esm's own space is
+        # a REFR — and adopting that record's bytes and nesting shipped the
+        # NPC_ as a "REFR" inside a bogus top-level GRUP (xEdit: "File contains
+        # top level group without known sort order: GRUP Top 'REFR'"). Treat a
+        # type mismatch as "no master record", so the caller converts it as the
+        # new record it actually is.
+        if _signature_mismatch(sig or rec.get('Signature') or '', base[:4]):
+            self.stats['no-base'] += 1
+            return Override('no-base', 0, b'')
 
         if int(rec.get('RecordFlags') or 0) & DELETED_FLAG:
             # The author DELETED this record. Deletion is expressed by the
@@ -320,7 +336,7 @@ OWNED_GROUP_TYPES = frozenset({1, 6, 7})
 
 
 def emit_nested_overrides(records: list, writer: PluginWriter,
-                          master_index=None) -> tuple:
+                          master_index=None, anchored_fids: set = None) -> tuple:
     """Write override records back into the master's exact GRUP nesting.
 
     A CELL is only reachable by the engine from inside its block/sub-block
@@ -405,6 +421,13 @@ def emit_nested_overrides(records: list, writer: PluginWriter,
                 emitted_at.setdefault(path, set()).add(land_fid)
 
     anchored = [0]
+    # Every record this pass pulls in from the master as an anchor. The WRLD
+    # builder runs AFTER this one and would otherwise anchor the same
+    # worldspace a second time, shipping the FormID twice (xEdit: "Skipped
+    # Load: Duplicate FormID [0100003C]") — ElsweyrAnequina wrote Tamriel's
+    # WRLD twice for exactly that reason.
+    if anchored_fids is None:
+        anchored_fids = set()
 
     def anchor_for(path: tuple, fid: int) -> bytes:
         """The owning record's bytes, pulled from the master if we lack it."""
@@ -415,6 +438,7 @@ def emit_nested_overrides(records: list, writer: PluginWriter,
         rec = master_index.record(fid)
         if rec:
             anchored[0] += 1
+            anchored_fids.add(fid)
         return rec
 
     def build(prefix: tuple, depth: int) -> bytes:
@@ -534,7 +558,7 @@ def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
                 dropped -= 1
 
     emitted, orphaned, anchored = emit_nested_overrides(
-        pending, writer, ctx.master_index)
+        pending, writer, ctx.master_index, ctx.anchored_wrld)
     msg = (f"  {label} overrides: {emitted} emitted in the master's "
            f"group nesting, {dropped} unchanged")
     if anchored:

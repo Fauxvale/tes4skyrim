@@ -67,6 +67,8 @@ Later Issues:
 
 	14 - Add optional skyrim creature remapping
 
+	15 - Creatures are wrong sizes sometimes (chicken and donkey in nehrim, elephant in anequina)
+
 Minor Issues:
 
 	2 - Improve landscape layer blending

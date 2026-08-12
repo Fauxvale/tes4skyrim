@@ -154,6 +154,68 @@ def pack_tes4_header(masters: list, num_records: int = 0,
     return pack_record('TES4', 0, flags, subs, FORM_VERSION_SSE)
 
 
+# GRUP types whose label is the FormID of the record that OWNS the group.
+# There may be at most ONE of each per owner: World Children (1), Cell Children
+# (6) and Topic Children (7).
+_OWNED_GROUP_TYPES = (1, 6, 7)
+
+
+def _merge_owned_groups(blob: bytes) -> bytes:
+    """Fold repeated owned-groups with the same label into the first one.
+
+    Two passes append to the same top-level group — the override pass writes a
+    worldspace's children, then the WRLD builder writes the cells this plugin
+    adds to it — so the file ended up with TWO `GRUP World Children of
+    0100003C` in a row. xEdit reports "Found additional GRUP World Children of
+    ... Skipped Load: Merged N elements from duplicate group", and what the
+    ENGINE does with the second copy is undefined: it indexes a worldspace's
+    children once, so the later group's cells can simply never load.
+
+    Only the top level of `blob` is scanned; a group's own contents are moved
+    verbatim, so nothing inside is reordered or reparsed.
+    """
+    if not blob:
+        return blob
+    parts = []            # [[key, bytearray]] — key None = copied through
+    index = {}
+    off, end = 0, len(blob)
+    while off + GROUP_HEADER_SIZE <= end:
+        sig = blob[off:off + 4]
+        raw = struct.unpack_from('<I', blob, off + 4)[0]
+        if sig != b'GRUP':
+            # A RECORD's size excludes its 24-byte header; a GRUP's includes
+            # it. Applying the group rule to a record truncates the walk.
+            size = GROUP_HEADER_SIZE + raw
+            if off + size > end:
+                break
+            parts.append([None, bytearray(blob[off:off + size])])
+            off += size
+            continue
+        size = raw
+        if size < GROUP_HEADER_SIZE or off + size > end:
+            break         # malformed: leave the remainder untouched
+        gtype = struct.unpack_from('<i', blob, off + 12)[0]
+        label = blob[off + 8:off + 12]
+        body = blob[off + GROUP_HEADER_SIZE:off + size]
+        key = (gtype, bytes(label)) if gtype in _OWNED_GROUP_TYPES else None
+        if key is not None and key in index:
+            parts[index[key]][1] += body
+        else:
+            if key is not None:
+                index[key] = len(parts)
+            parts.append([key, bytearray(blob[off:off + size])])
+        off += size
+
+    out = bytearray()
+    for key, data in parts:
+        if key is not None:
+            # Re-stamp the (possibly grown) size in the group header.
+            struct.pack_into('<I', data, 4, len(data))
+        out += data
+    out += blob[off:]     # trailing bytes from a malformed tail, if any
+    return bytes(out)
+
+
 def pack_obnd(x1: int = 0, y1: int = 0, z1: int = 0,
               x2: int = 0, y2: int = 0, z2: int = 0) -> bytes:
     """Pack OBND (Object Bounds) subrecord — required on most TES5 records."""
@@ -336,7 +398,7 @@ class PluginWriter:
         for sig in self._group_order():
             if sig not in self._top_groups:
                 continue
-            contents = b''.join(self._top_groups[sig])
+            contents = _merge_owned_groups(b''.join(self._top_groups[sig]))
             if contents:
                 staged[sig] = [contents]
 

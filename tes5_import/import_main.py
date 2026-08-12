@@ -2717,15 +2717,20 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
         own_wrld = {get_formid(w, 'FormID') for w in worlds}
         wanted = {get_formid(c, 'ParentWRLD') for c in cells} - own_wrld
         wanted.discard(0)
+        already_anchored = getattr(ctx, 'anchored_wrld', None) or set()
         for out_fid in sorted(wanted):
-            if out_fid in emitted:
-                # The override path ALREADY wrote this WRLD (with the author's
-                # own changes). Writing it again here would duplicate the
-                # FormID and the engine would keep whichever came last, so
-                # emit the children group ALONE and let that record anchor it:
-                # b'' means "group only". The override is written into the
-                # master's nesting — the same top-level WRLD group this
-                # builder appends to — so it still precedes these children.
+            if out_fid in emitted or out_fid in already_anchored:
+                # The override pass ALREADY wrote this WRLD — either as the
+                # author's own override (`emitted`) or pulled from the master
+                # verbatim to anchor a children group (`already_anchored`).
+                # Writing it again here would duplicate the FormID and the
+                # engine keeps whichever came last, so emit the children group
+                # ALONE and let that record anchor it: b'' means "group only".
+                # It is written into the master's nesting — the same top-level
+                # WRLD group this builder appends to — so it still precedes
+                # these children. Missing the `already_anchored` half shipped
+                # Tamriel's WRLD twice from ElsweyrAnequina (xEdit: "Skipped
+                # Load: Duplicate FormID [0100003C]").
                 anchor_wrld[out_fid] = b''
                 continue
             rec = master_index.record(out_fid) if master_index else b''

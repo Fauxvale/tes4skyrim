@@ -1090,8 +1090,19 @@ def apply_changes(master_record: bytes, changes: dict,
     # A string the master's record does not carry at all (an unnamed record the
     # plugin names). Insert after EDID, which every record leads with, so the
     # field lands in a valid position rather than after the trailing fields.
+    #
+    # Never invent a field the record type cannot hold. A mis-paired diff (an
+    # id that resolved to a record of a DIFFERENT type) otherwise splices the
+    # other type's fields in: LAND records came out as `FULL DATA VNML VHGT`
+    # and `DESC FULL DATA ...`, which xEdit rejects ("record LAND contains
+    # unexpected (or out of order) subrecord FULL") and the engine hangs on
+    # forever at the main menu. overrides.load_master_export fixes the
+    # mis-pairing at its source; this refuses to write the damage regardless.
+    base_sig = master_record[:4]
     for sub_sig, payload in pending.items():
         if sub_sig in replaced:
+            continue
+        if sub_sig not in _INSERTABLE_SUBRECORDS.get(base_sig, frozenset()):
             continue
         pos = 1 if out and out[0][0] == b'EDID' else 0
         out.insert(pos, (sub_sig, payload))
@@ -1159,6 +1170,20 @@ def apply_changes(master_record: bytes, changes: dict,
     return join_subrecords(master_record[:_HEADER_SIZE], out), applied, unmapped
 
 
+# Subrecord families that INTERLEAVE: the record is a repeating struct whose
+# members each have their own signature, so the run is A B A B A B, not AAA BBB.
+# Collapsing each signature to the position of its first occurrence (the rule
+# for genuinely repeating single-signature runs) destroys the pairing:
+# REGN AnvilCoastline came out `RPLI RPLD RPLD RPLD RPLD RPLI RPLI RPLI`
+# against the master's correct `RPLI RPLD` x4, and xEdit rejects it with
+# "record REGN contains unexpected (or out of order) subrecord RPLD".
+# Sourced from the xEdit definitions (wbDefinitionsCommon wbRegionAreas:
+# wbRArray of wbRStruct[RPLI, RPLD]).
+_INTERLEAVED_FAMILIES = (
+    frozenset({b'RPLI', b'RPLD'}),      # REGN Region Areas
+)
+
+
 def _apply_generic(out: list, substitutions: dict, claimed: set) -> list:
     """Substitute whole subrecord runs from a convert-and-diff result.
 
@@ -1166,17 +1191,44 @@ def _apply_generic(out: list, substitutions: dict, claimed: set) -> list:
     the first) so repeated subrecords cannot end up half-master, half-plugin.
     A signature the plugin's conversion drops entirely is removed; one the
     master's lacks is appended in the converter's own emission order.
+
+    An INTERLEAVED family (see _INTERLEAVED_FAMILIES) is exempt: its members
+    are substituted one occurrence at a time, in place, so the A B A B pairing
+    the engine reads the record by is preserved.
     """
+    interleaved = set()
+    for family in _INTERLEAVED_FAMILIES:
+        present = family & set(substitutions)
+        if len(present) > 1 or (present and len(family & {s for s, _ in out}) > 1):
+            interleaved |= family
+
     result = []
     done = set()
+    taken = {}
     for sig, payload in out:
         if sig in claimed or sig not in substitutions:
             result.append((sig, payload))
+            continue
+        if sig in interleaved:
+            # One-for-one, positionally: keep this occurrence's own slot.
+            n = taken.get(sig, 0)
+            taken[sig] = n + 1
+            values = substitutions[sig]
+            if n < len(values):
+                result.append((sig, values[n]))
+            # Past the end: the plugin has fewer entries, so drop this one.
+            done.add(sig)
             continue
         if sig in done:
             continue          # folded into the run written at first occurrence
         done.add(sig)
         result.extend((sig, p) for p in substitutions[sig])
+    # Interleaved members the master had fewer of than the plugin: append the
+    # remainder so no authored entry is silently lost.
+    for sig in interleaved & set(substitutions):
+        extra = substitutions[sig][taken.get(sig, 0):]
+        if extra and sig not in claimed:
+            result.extend((sig, p) for p in extra)
     for sig, payloads in substitutions.items():
         if sig not in done and sig not in claimed:
             result.extend((sig, p) for p in payloads)
