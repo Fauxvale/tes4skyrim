@@ -412,9 +412,28 @@ def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel',
     cell_water = {}
     wrld_water = {'default': None}
     cell_coords = {}       # cell FormID -> (x, y), shared across load order
-    for _path in [esm_path] + list(overlay_paths or []):
+
+    # The worldspace's FormID, taken from the file that DEFINES it. Overlays are
+    # scoped with this rather than their own lookup, because an override plugin
+    # routinely edits a master's worldspace while shipping no WRLD record — and
+    # the unscoped fallback would then sweep in every OTHER worldspace it
+    # carries. That is not hypothetical: it put all 5,796 of Morrowind_ob's
+    # Vvardenfell cells into Cyrodiil's heightmap.
+    try:
+        _base_raw = Path(esm_path).read_bytes()
+        base_wrld_fid = _find_worldspace_fid(_base_raw, len(_base_raw),
+                                             worldspace_edid)
+        del _base_raw
+    except OSError:
+        base_wrld_fid = None
+
+    for _i, _path in enumerate([esm_path] + list(overlay_paths or [])):
         _scan_land_file(Path(_path), worldspace_edid, lands, cell_water,
-                        wrld_water, cell_coords)
+                        wrld_water, cell_coords,
+                        # Only the base file may fall back to "take everything";
+                        # for an overlay that fallback is the corruption above.
+                        allow_unscoped=(_i == 0),
+                        known_wrld_fid=base_wrld_fid)
     default_wh = (wrld_water['default']
                   if wrld_water['default'] is not None else 0.0)
     return lands, cell_water, default_wh
@@ -422,13 +441,36 @@ def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel',
 
 def _scan_land_file(esm_path: Path, worldspace_edid: str,
                     lands: dict, cell_water: dict, wrld_water: dict,
-                    cell_coords: dict, count_only: bool = False):
+                    cell_coords: dict, count_only: bool = False,
+                    allow_unscoped: bool = True, known_wrld_fid=None):
     """Scan one plugin's LAND/CELL/WRLD data into the shared accumulators.
 
     A CELL record an override plugin ships carries only the fields its author
     changed, so its XCLC grid coords may be absent. Coordinates are therefore
     resolved against the coords already learned from earlier files in load
     order before falling back to this file's own.
+
+    `known_wrld_fid` is the target worldspace's FormID as resolved from the file
+    that DEFINES it. An override plugin edits a master's worldspace through the
+    master's GRUPs — its records sit under a type-1 GRUP labelled with the
+    master's WRLD FormID — while shipping no WRLD record of its own. Passing the
+    master's FormID in is what lets those edits be scoped correctly instead of
+    falling back to a wildcard.
+
+    `allow_unscoped` decides what "this file has no such WRLD record, and no
+    FormID was supplied" means.
+
+    True (the default, and correct for the file the worldspace is sourced FROM)
+    keeps the historical fallback: take every LAND record, because a file being
+    scanned for its own worldspace may name it differently, and returning
+    nothing would silently produce no terrain at all.
+
+    False is mandatory for OVERLAYS, where the same fallback is a data-
+    corruption bug: it imports the plugin's OTHER worldspaces as if they were
+    this one. Morrowind_ob.esm ships no TES4Tamriel WRLD, so all 5,796 of its
+    Vvardenfell cells were collected into Cyrodiil's heightmap, overwriting
+    5,787 of Oblivion's own Tamriel cells and stamping Vvardenfell across
+    central Cyrodiil's distant terrain.
     """
     raw = esm_path.read_bytes()
     n   = len(raw)
@@ -443,8 +485,20 @@ def _scan_land_file(esm_path: Path, worldspace_edid: str,
     target_wrld_fid = _find_worldspace_fid(raw, n, worldspace_edid)
     if target_wrld_fid is not None:
         print(f"  Filtering to worldspace '{worldspace_edid}' (FormID={target_wrld_fid:#010x})")
-    else:
+    elif known_wrld_fid is not None:
+        # This file overrides the worldspace without shipping its WRLD record.
+        # Its edits live under a type-1 GRUP labelled with the DEFINING file's
+        # FormID, so scoping on that is exact — and still excludes every other
+        # worldspace the plugin carries.
+        target_wrld_fid = known_wrld_fid
+        print(f"  Scoping {esm_path.name} to '{worldspace_edid}' via the "
+              f"defining plugin (FormID={target_wrld_fid:#010x})")
+    elif allow_unscoped:
         print(f"  WARNING: Worldspace '{worldspace_edid}' not found — collecting all LAND records")
+    else:
+        print(f"  '{worldspace_edid}' not defined by {esm_path.name} and no "
+              f"FormID known; taking no LAND from it")
+        return
 
     def _read_rec(p):
         if p + 24 > n:
@@ -877,8 +931,25 @@ def _encode_dxt1_quality(img: np.ndarray) -> bytes:
     p1 = _565_to_rgb_vec(c1)
     palette = np.stack([p0, p1, (2 * p0 + p1) // 3, (p0 + 2 * p1) // 3], axis=1)
 
-    diffs = blocks[:, :, None, :] - palette[:, None, :, :]   # (N,16,4,3)
-    codes = (diffs * diffs).sum(axis=3).argmin(axis=2)       # (N,16)
+    # Nearest palette entry per pixel, computed in CHUNKS.
+    #
+    # The whole-array form allocates (N,16,4,3) for the differences plus an
+    # (N,16,4) reduction — and `sum` promotes int32 to int64, so a 1024² tile
+    # (65,536 blocks) transiently needs ~80 MB. That is survivable alone and
+    # fatal in parallel: with one worker per core, 29 of them peaked together
+    # and every level-16 tile died on
+    # "Unable to allocate 32.0 MiB for an array with shape (65536, 16, 4)".
+    #
+    # Chunking bounds the peak per worker regardless of tile size, and the
+    # explicit int32 accumulator halves what remains. The squared distance
+    # maxes at 3*255^2 = 195,075, so int32 cannot overflow.
+    codes = np.empty((len(blocks), 16), dtype=np.uint8)
+    step = 4096
+    for s in range(0, len(blocks), step):
+        e = min(s + step, len(blocks))
+        d = blocks[s:e, :, None, :] - palette[s:e, None, :, :]   # (n,16,4,3)
+        np.multiply(d, d, out=d)
+        codes[s:e] = d.sum(axis=3, dtype=np.int32).argmin(axis=2)
 
     shifts = (np.arange(16, dtype=np.uint32) * 2)
     packed = (codes.astype(np.uint32) << shifts).sum(axis=1, dtype=np.uint32)

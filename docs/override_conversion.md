@@ -182,6 +182,30 @@ from comparing two conversion runs.
   missing land. Subtract the plugin's own WRLD FormIDs from the set of
   worldspaces its cells name and anchor the remainder; the two job lists stay
   disjoint so no FormID is emitted twice.
+- <a id="terrain-overlay-scoping"></a>🛑 **An OVERLAY that does not define the
+  worldspace must contribute NOTHING unscoped — never "every LAND record".**
+  `terrain_lod._scan_land_file` resolves the target worldspace's FormID from the
+  file it is scanning and, failing that, fell back to collecting every LAND
+  record in the file. That fallback is a defensible last resort for the file a
+  worldspace is SOURCED from. For an overlay it is silent data corruption, and
+  the one-bake LOD model made it fire routinely because it stacks every
+  dependent plugin as an overlay at once.
+  Measured on the real output: Morrowind_ob.esm ships no TES4Tamriel WRLD record
+  (it overrides cells through Oblivion.esm's GRUPs), so the fallback collected
+  **all 5,796 of its Vvardenfell cells into Cyrodiil's heightmap** — 5,787 of
+  them on coordinates Oblivion.esm legitimately owns, stamping Vvardenfell
+  across central Cyrodiil's distant terrain. Scoped: 5,796 → **0**.
+  The fix is not "return nothing when the WRLD is absent", which would throw
+  away the edits that must survive: DLCBattlehornCastle regrades 10 Tamriel
+  cells while shipping no WRLD either, and its records sit under a type-1 GRUP
+  labelled with the MASTER's WRLD FormID. So `_parse_land_records` resolves the
+  FormID once from the file that DEFINES the worldspace and passes it to every
+  overlay as `known_wrld_fid`; only the base file keeps `allow_unscoped=True`.
+  The object-LOD path (`lod_gen`) was never affected — it resolves `wrld_fid`
+  once from the MERGED worldspace table and filters every ref on `parent_wrld`,
+  so an overlay's own worldspaces keep their own FormID and are excluded.
+  Guarded by `tests/test_terrain_lod_scoping.py`, which builds synthetic ESMs so
+  both branches stay distinguishable.
 - <a id="land-first-in-type-9"></a>🛑 **LAND MUST BE THE FIRST RECORD IN A
   CELL'S TEMPORARY (type-9) CHILDREN GROUP.** Census of real `Skyrim.esm`:
   **15,564 of 15,564** type-9 groups containing a LAND have it at index 0 — no
