@@ -202,12 +202,24 @@ def parse_export_directory(export_dir: str, type_filter: set = None) -> list:
     for chunk in chunk_results:
         all_records.extend(chunk)
 
-    # Deduplicate by FormID (keep last occurrence)
+    # Deduplicate by FormID (keep last occurrence).
+    #
+    # A FormID of all zeros is NOT an identity and must never be deduplicated
+    # on: real plugins ship records with one. ElsweyrAnequina.esp has 7 LAND
+    # records whose FormID is literally 0x00000000 (confirmed by reading the
+    # original Oblivion .esp — the mod's own data, not an export defect), and
+    # collapsing them onto the single key '00000000' discarded 6 of the 7.
+    # Their cells then shipped a children group of references with no LAND in
+    # it, and since a plugin's child GRUP REPLACES the master's, the terrain
+    # under them vanished in-game while the placed clutter still rendered.
+    # Keyed by identity instead so each survives as its own record.
     seen = {}
     for i, rec in enumerate(all_records):
         fid = rec.get('FormID')
-        if fid:
+        if fid and fid.strip('0'):
             seen[fid] = i
+        else:
+            seen[('\0null', i)] = i
     if len(seen) < len(all_records):
         keep = set(seen.values())
         all_records = [rec for i, rec in enumerate(all_records) if i in keep]

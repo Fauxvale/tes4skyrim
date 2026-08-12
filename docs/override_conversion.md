@@ -164,6 +164,80 @@ from comparing two conversion runs.
   overridden, its converted bytes are pulled in VERBATIM as the anchor —
   the engine pairs a children GRUP with the record preceding it, so a group
   can never stand alone (same as xEdit's copy-as-override of a reference).
+- <a id="anchor-per-worldspace"></a>**A plugin can add NEW exterior cells to a
+  MASTER's worldspace while ALSO owning worldspaces of its own — anchoring is
+  decided PER WORLDSPACE, never per plugin.** Such a plugin ships no WRLD for
+  the master's worldspace (its only WRLD record there is an override, already
+  emitted by the override path), so `_build_world_groups` must pull the
+  master's converted WRLD in as an anchor for those cells. Gating that on
+  "this plugin has no worldspaces at all" fits a pure heightmap
+  (Tamriel.esp: 1 WRLD, itself an override of `0000003C`) but silently drops
+  every new cell of a plugin that does both: ElsweyrAnequina.esp owns 9
+  worldspaces, so the anchor was skipped and all **831** of its new Tamriel
+  cells (x −32..0, y −64..−30) vanished while its 1,054 plain overrides
+  survived — a 100%-new / 0%-override split that is the signature of this
+  defect. In-game the player stood on whatever OTHER plugin filled that
+  coordinate (onra's unmatched placeholder heightmap, several thousand units
+  off), which reads as a terrain discontinuity underfoot rather than as
+  missing land. Subtract the plugin's own WRLD FormIDs from the set of
+  worldspaces its cells name and anchor the remainder; the two job lists stay
+  disjoint so no FormID is emitted twice.
+- <a id="land-first-in-type-9"></a>🛑 **LAND MUST BE THE FIRST RECORD IN A
+  CELL'S TEMPORARY (type-9) CHILDREN GROUP.** Census of real `Skyrim.esm`:
+  **15,564 of 15,564** type-9 groups containing a LAND have it at index 0 — no
+  exceptions. Emit it after the references and the engine does not draw the
+  terrain at all. Tamriel cell (-7,-32) had its LAND at index 150 behind 150
+  REFRs and rendered as a hole in the world with its clutter still floating in
+  place. **This is what "the land is simply missing and blank, placed refs
+  still appear" means — look here first.** The defect masquerades as "a few
+  isolated cells" because a cell with no references gets LAND at index 0 by
+  accident and renders fine; only ref-heavy cells break, so it looks random.
+  A record being PRESENT and byte-identical to the original proves nothing —
+  (-7,-32)'s VHGT matched the source exactly while the cell rendered empty.
+  Three sites must all agree: both builders in `import_main` (`temporary` is
+  built LAND → REFR → ACHR, never the reverse) and the bucket sort in
+  `emit_nested_overrides`. Guarded by `tests/test_land_group_order.py`.
+- <a id="null-formid-records"></a>**A FormID of all zeros is NOT an identity —
+  never deduplicate or cache on it.** Real plugins ship records with one:
+  ElsweyrAnequina.esp has **7 LAND records whose FormID is literally
+  0x00000000**, confirmed by reading the original Oblivion `.esp`, so it is
+  the mod's own data and not an export defect (Oblivion.esm and Tamriel.esp
+  have none). Oblivion never noticed because it reaches a cell's landscape
+  through the cell's children group rather than by id. Two places in our
+  import did:
+  - `parse_export_directory` deduplicates by FormID, and all 7 collapsed onto
+    the single key `'00000000'` — **6 of 7 silently discarded** before
+    anything else ran. Key null ids by identity instead.
+  - the LAND conversion cache is `{FormID: bytes}` and is *popped* by that
+    key, so even the survivors would have fought over one entry.
+
+  `_repair_null_land_formids` then derives a real id from the PARENT CELL
+  rather than calling `alloc_formid()` — allocation is positional, so minting
+  here would shift every later id and invalidate saves (see
+  [FormID drift](../CLAUDE.md#formid-drift)); deriving is stable across runs
+  and unique per cell. **Keep the parent's load-order index byte and vary only
+  the low 24 bits.** These are export-space ids that `remap_formid` shifts
+  later, and the index byte says which plugin owns the record: a first attempt
+  OR'd in `0x0F000000` — picked to sit outside every plugin's index range so it
+  "could not collide" — and that is exactly backwards. The records came out at
+  index `0x10`, no such plugin is loaded, the engine could not resolve them,
+  and the land was still missing in-game. Symptom throughout: blank, missing
+  terrain with the cell's placed references still rendering, reported at cell
+  (-7,-32). Guarded by `tests/test_null_formid_land.py`.
+- <a id="unchanged-land-shadowing"></a>**An emitted children group must carry
+  the master's LAND when the plugin ships none of its own.** A cell's child
+  GRUP REPLACES the master's rather than merging, so overriding a single REFR
+  in an otherwise-untouched cell DELETES the terrain under it. The land is
+  dropped precisely *because* it is unchanged — `diff_records` correctly
+  reports no authored difference once the VHGT pad is normalised — so nothing
+  upstream knows the cell still needs it. Measured on ElsweyrAnequina.esp: 8
+  cells emitted a type-9 group holding one REFR or ACHR and no LAND.
+  `emit_nested_overrides` now pulls the master's LAND in via
+  `MasterIndex.land(cell_fid)`, a structural lookup (a cell owns at most one
+  LAND, and the type-6 GRUP label names the cell) — necessary because a LAND's
+  own FormID is NOT recoverable by arithmetic: the master's conversion
+  reallocates land ids, and **0 of 3,999 sampled Oblivion.esm source ids
+  resolve to a real output LAND** by the load-order shift.
 - **LOD: a plugin can ship LOD ASSETS for a worldspace it does not DEFINE.**
   The GOTY `DLCShiveringIsles.esp` is an 85-byte header-only stub — every SI
   record was merged into `Oblivion.esm` — yet its BSA carries all of SEWorld's

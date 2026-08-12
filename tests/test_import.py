@@ -2573,6 +2573,102 @@ class TestGridlessWorldspaceCellPlacement:
         assert struct.unpack_from('<ii', xclc)[:2] == (0, -1),             'stamping the default must never overwrite real coords'
 
 
+class TestMasterWorldspaceAnchorWithOwnWorldspaces:
+    """New cells in a MASTER's worldspace survive when the plugin also owns some.
+
+    ElsweyrAnequina.esp adds 831 new exterior cells to Oblivion.esm's Tamriel
+    AND ships 9 worldspaces of its own.  Anchoring used to be gated on the
+    plugin having NO worldspaces at all, which fits a pure heightmap
+    (Tamriel.esp) but dropped every new cell of a plugin that does both --
+    100% of new cells lost, 0% of overrides, the signature of the defect.
+
+    See docs/override_conversion.md#anchor-per-worldspace.
+    """
+
+    MASTER_WRLD = 0x0000003C        # Oblivion.esm's Tamriel
+
+    def _build(self):
+        from tes5_import.import_main import _build_world_groups
+
+        class _Idx:
+            """Minimal master index: serves the master's converted WRLD."""
+            def record(self, fid):
+                if fid != TestMasterWorldspaceAnchorWithOwnWorldspaces.MASTER_WRLD:
+                    return b''
+                body = b'EDID' + struct.pack('<H', 8) + b'Tamriel\x00'
+                # 24-byte header: sig(4) size(4) flags(4) fid(4) vcs(4)
+                # ver(2) unk(2) -- 8 bytes of tail, not 12.
+                return (b'WRLD' + struct.pack('<I', len(body))
+                        + struct.pack('<II', 0, fid) + b'\x00' * 8 + body)
+
+            def group_path(self, fid):
+                return ()
+
+        class _Ctx:
+            master_index = _Idx()
+            emitted_wrld = {}
+
+        writer = PluginWriter(masters=['Skyrim.esm', 'Oblivion.esm'])
+        writer.next_object_id = 0x01100000
+        # The plugin's OWN worldspace, with its own cell.
+        own_wrld = {'Signature': 'WRLD', 'FormID': '01014FE0',
+                    'EditorID': 'ANQRimmenWorld', 'DATA.Flags': '17'}
+        own_cell = {'Signature': 'CELL', 'FormID': '0101AAAA',
+                    'RecordFlags': '0', 'ParentWRLD': '01014FE0',
+                    'DATA.Flags': '0', 'XCLC.X': '3', 'XCLC.Y': '4'}
+        # A NEW cell in the MASTER's Tamriel -- the one that used to vanish.
+        master_cell = {'Signature': 'CELL', 'FormID': '0101D34F',
+                       'RecordFlags': '0', 'ParentWRLD': '0000003C',
+                       'DATA.Flags': '0', 'XCLC.X': '-30', 'XCLC.Y': '-30'}
+        by_type = {'WRLD': [own_wrld], 'CELL': [own_cell, master_cell]}
+        _build_world_groups(by_type, writer, ctx=_Ctx())
+        return writer
+
+    def _cell_coords(self, raw):
+        """Grid coords of every CELL inside a type-4/5 block group."""
+        found, stack, pos = set(), [], 0
+        while pos + 24 <= len(raw):
+            while stack and pos >= stack[-1][0]:
+                stack.pop()
+            sig = raw[pos:pos + 4]
+            if sig == b'GRUP':
+                gsize, _l, gtype = struct.unpack_from('<IiI', raw, pos + 4)[:3]
+                stack.append((pos + gsize, gtype))
+                pos += 24
+                continue
+            size = struct.unpack_from('<I', raw, pos + 4)[0]
+            if sig == b'CELL' and any(g[1] in (4, 5) for g in stack):
+                xclc = _find_subrecord(raw[pos:pos + 24 + size], b'XCLC')
+                if xclc is not None:
+                    found.add(struct.unpack_from('<ii', xclc)[:2])
+            pos += 24 + size
+        return found
+
+    def test_new_cell_in_master_worldspace_survives(self):
+        raw = b''.join(self._build()._top_groups['WRLD'])
+        assert (-30, -30) in self._cell_coords(raw),             'a new cell in the master worldspace was dropped because the '             'plugin also owns worldspaces of its own'
+
+    def test_own_worldspace_cell_still_built(self):
+        raw = b''.join(self._build()._top_groups['WRLD'])
+        assert (3, 4) in self._cell_coords(raw),             "anchoring must not displace the plugin's own hierarchy"
+
+    def test_master_worldspace_anchored_exactly_once(self):
+        """Two job lists must stay disjoint or the FormID ships twice."""
+        raw = b''.join(self._build()._top_groups['WRLD'])
+        seen, pos = 0, 0
+        while pos + 24 <= len(raw):
+            sig = raw[pos:pos + 4]
+            size = struct.unpack_from('<I', raw, pos + 4)[0]
+            if sig == b'GRUP':
+                pos += 24
+                continue
+            fid = struct.unpack_from('<I', raw, pos + 12)[0]
+            if sig == b'WRLD' and fid == self.MASTER_WRLD:
+                seen += 1
+            pos += 24 + size
+        assert seen == 1, f'master WRLD emitted {seen}x; engine keeps the last'
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])
 

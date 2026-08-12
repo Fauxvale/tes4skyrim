@@ -357,12 +357,52 @@ def emit_nested_overrides(records: list, writer: PluginWriter,
             continue
         by_path.setdefault(path, []).append(record_bytes)
 
+    # LAND FIRST in every temporary children group. Census of real Skyrim.esm:
+    # 15,564 of 15,564 type-9 groups that contain a LAND have it at index 0.
+    # Emitted after the references instead, the engine does not draw the
+    # terrain at all — Tamriel (-7,-32) had LAND at index 150 behind 150 REFRs
+    # and rendered as a hole with its clutter still floating in place.
+    # Stable: only the LAND moves, everything else keeps its relative order.
+    for path, bodies in by_path.items():
+        if path[-1][0] == 9 and any(b[:4] == b'LAND' for b in bodies):
+            bodies.sort(key=lambda b: b[:4] != b'LAND')
+
     # A record already being emitted at `prefix` serves as its own anchor.
     emitted_at = {}
     for path, bodies in by_path.items():
         for body in bodies:
             emitted_at.setdefault(path, set()).add(
                 struct.unpack_from('<I', body, 12)[0])
+
+    # A cell's children GRUP REPLACES the master's rather than merging, so any
+    # children group we emit must carry the master's LAND when this plugin is
+    # not shipping one of its own — otherwise overriding a single REFR deletes
+    # the terrain under it. The land is dropped precisely BECAUSE it is
+    # unchanged (diff_records correctly reports no authored difference: the
+    # VHGT bytes match once the uninitialised 3-byte pad is normalised), so
+    # nothing upstream knows the cell still needs it.
+    #
+    # Measured on ElsweyrAnequina.esp: 8 cells emitted a type-9 group holding
+    # one REFR or ACHR and no LAND, and in-game those cells rendered as blank
+    # missing ground with the placed references still floating on it.
+    _land_of = getattr(master_index, 'land', None)
+    if callable(_land_of):
+        for path in list(by_path):
+            if not path or path[-1][0] != 9 or len(path[-1][1]) != 4:
+                continue
+            cell_fid = struct.unpack('<I', path[-1][1])[0]
+            if any(b[:4] == b'LAND' for b in by_path[path]):
+                continue
+            land_fid = _land_of(cell_fid)
+            if not land_fid:
+                continue
+            land_rec = master_index.record(land_fid)
+            if land_rec:
+                # LAND goes FIRST in a temporary children group, matching
+                # vanilla and the normal builders; appended after the
+                # references the engine does not draw it at all.
+                by_path[path].insert(0, land_rec)
+                emitted_at.setdefault(path, set()).add(land_fid)
 
     anchored = [0]
 

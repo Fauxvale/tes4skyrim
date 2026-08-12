@@ -775,6 +775,11 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # Start well above the highest FormID to avoid collision with companion records
     writer.next_object_id = (file_index << 24) | (max_formid + 0x1000)
 
+    # Records shipped with FormID 00000000 need an id before anything indexes
+    # them. Done HERE, after max_formid is known, so the synthesized ids can
+    # live in the reserved gap that scan just opened up.
+    _repair_null_land_formids(by_type, num_tes4_masters, max_formid)
+
     # INJECTED records: Oblivion let a plugin ADD a record carrying a MASTER's
     # load-order index (see overrides.detect_injected_records). They are new
     # records — redirect them into our own space before anything converts.
@@ -2200,6 +2205,89 @@ _LAND_PARALLEL_MIN = 64
 _LAND_CHUNK = 24
 
 
+def _repair_null_land_formids(by_type: dict, own_index: int,
+                              max_formid: int) -> None:
+    """Give a LAND with FormID 00000000 an id of its own, in place.
+
+    Not a defensive check — real plugins ship them. ElsweyrAnequina.esp has 7
+    LAND records whose FormID is literally 0x00000000 (verified by reading the
+    ORIGINAL Oblivion .esp, so this is the mod's own data and not an export
+    defect); Oblivion.esm and Tamriel.esp have none. Oblivion tolerated it
+    because it reaches a cell's landscape through the cell's children group
+    rather than by id.
+
+    We cannot. The conversion caches converted land as {FormID: bytes} and
+    pops by that key, so every null-id LAND collapses onto key 0: the first
+    cell to ask consumes the single entry and the other six get nothing.
+
+    THE ID MUST BE UNIQUE ACROSS THE WHOLE PLUGIN, NOT JUST ACROSS LAND.
+    Skyrim's form table is keyed by FormID alone with no per-signature
+    namespace, so an id that is free among landscapes but taken by some other
+    record is still a duplicate. The previous attempt reused the parent CELL's
+    own id verbatim (a cell owns at most one LAND, so it looked unique) and
+    shipped 7 LAND records whose FormID equalled their CELL's — measured in the
+    built output, `0201C2A8` was both the cell at (-7,-32) and its landscape.
+    Only one form per id survives loading, the CELL won, and the landscape
+    never became a form at all: terrain blank and missing in-game while the
+    cell's placed references — which have ids of their own — still rendered.
+    An even earlier attempt OR'd in 0x0F000000 to dodge collisions, which put
+    the records at load-order index 0x10 where no plugin exists, so the engine
+    could not resolve them either.
+
+    The ids come from the RESERVED GAP between the plugin's highest real
+    FormID and `alloc_formid()`'s base, which `import_plugin` opens as
+    `max_formid + 0x1000` and nothing ever occupies: real records stop at or
+    below max_formid, companions start above the gap. Taking them from the TOP
+    of that gap downward keeps them clear of both ends.
+
+    This deliberately does NOT call `alloc_formid()`. Allocation is positional
+    — one extra call shifts every later id and invalidates saves — whereas
+    these ids are a pure function of max_formid and the record's order in the
+    export, so they are stable across runs and cost no allocations.
+    """
+    lands = by_type.get('LAND') or []
+    nulls = [r for r in lands
+             if not (r.get('FormID') or '').strip().strip('0')]
+    if not nulls:
+        return
+
+    # Every own-space id the plugin already uses, ACROSS ALL SIGNATURES.
+    taken = set()
+    for recs in by_type.values():
+        for rec in recs:
+            try:
+                fid = int((rec.get('FormID') or '0').strip(), 16)
+            except ValueError:
+                continue
+            if (fid >> 24) & 0xFF == own_index:
+                taken.add(fid & 0xFFFFFF)
+
+    index = (own_index & 0xFF) << 24
+    # Top of the reserved gap, walking down. 0x1000 wide, and a plugin has at
+    # most one null-id LAND per cell, so it cannot realistically be exhausted.
+    nxt = max_formid + 0xFFF
+    floor = max_formid + 1
+    fixed = 0
+    for rec in nulls:
+        # ParentCELL is what makes the record placeable at all; without it the
+        # land has no home and an id would not help.
+        if not (rec.get('ParentCELL') or '').strip().strip('0'):
+            continue
+        while nxt in taken and nxt >= floor:
+            nxt -= 1
+        if nxt < floor:
+            print(f"  WARNING: ran out of reserved FormIDs for null-id LAND; "
+                  f"{len(nulls) - fixed} record(s) left unrepaired")
+            break
+        taken.add(nxt)
+        rec['FormID'] = '%08X' % (index | nxt)
+        nxt -= 1
+        fixed += 1
+    if fixed:
+        print(f"  Repaired {fixed} LAND record(s) shipped with a null FormID "
+              f"(reserved ids above {max_formid:06X})")
+
+
 def _precompute_land(by_type: dict, export_dir: str) -> dict:
     """Convert every LAND record across a process pool; {fid: (ok, payload)}.
 
@@ -2486,8 +2574,12 @@ def _build_cell_groups(by_type: dict, writer: PluginWriter,
                     if persistent:
                         children_parts.append(pack_group(8, struct.pack('<I', cell_fid), b''.join(persistent)))
 
-                    # Temporary children (group type 9)
+                    # Temporary children (group type 9). LAND FIRST — see the
+                    # exterior builder below for why the order is load-bearing.
                     temporary = []
+                    for land_rec in land_by_cell.get(cell_fid, []):
+                        temporary.append(_land_bytes(land_cache, land_rec))
+                        converted += 1
                     for refr_rec in refr_by_cell.get(cell_fid, []):
                         if not is_persistent(refr_rec):
                             temporary.append(convert_REFR(refr_rec))
@@ -2496,9 +2588,6 @@ def _build_cell_groups(by_type: dict, writer: PluginWriter,
                         if not is_persistent(achr_rec):
                             temporary.append(convert_ACHR(achr_rec))
                             converted += 1
-                    for land_rec in land_by_cell.get(cell_fid, []):
-                        temporary.append(_land_bytes(land_cache, land_rec))
-                        converted += 1
                     # PGRD → NAVM (interior cells have no LAND; Z from node heights)
                     # Precomputed in parallel by _precompute_navmeshes.
                     for pgrd_rec in pgrd_by_cell.get(cell_fid, []):
@@ -2852,6 +2941,20 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
                                 cell_children.append(pack_group(8, struct.pack('<I', cell_fid), b''.join(persistent)))
 
                             temporary = []
+                            # LAND FIRST. Vanilla puts the landscape at index 0
+                            # of every temporary children group -- verified
+                            # across Oblivion.esm's converted cells and every
+                            # cell of ours that renders. Appending it after the
+                            # references instead left it at index 150 in
+                            # Tamriel (-7,-32) and the terrain did not draw at
+                            # all in-game, while the 150 REFRs on top of it
+                            # still did. Cells with no references happened to
+                            # get LAND at index 0 anyway, which is why only
+                            # ref-heavy cells showed the defect.
+                            cell_lands = land_by_cell.get(cell_fid, [])
+                            for land in cell_lands:
+                                temporary.append(_land_bytes(land_cache, land))
+                                converted += 1
                             for refr in refr_by_cell.get(cell_fid, []):
                                 if not (get_int(refr, 'RecordFlags') & 0x400):
                                     temporary.append(convert_REFR(refr))
@@ -2860,10 +2963,6 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
                                 if not (get_int(achr, 'RecordFlags') & 0x400):
                                     temporary.append(convert_ACHR(achr))
                                     converted += 1
-                            cell_lands = land_by_cell.get(cell_fid, [])
-                            for land in cell_lands:
-                                temporary.append(_land_bytes(land_cache, land))
-                                converted += 1
                             # PGRD → NAVM for exterior cells (LAND gives Z, CELL gives water)
                             # Precomputed in parallel by _precompute_navmeshes.
                             for pgrd_rec in pgrd_by_cell.get(cell_fid, []):

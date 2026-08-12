@@ -27,6 +27,7 @@ class MasterIndex:
         self._data = b''
         self._offsets = {}      # formid -> (signature, offset, total_size)
         self._paths = {}        # formid -> ((grup_type, label), ...)
+        self._land_by_cell = {}  # cell formid -> LAND formid
         self._load()
 
     def _load(self):
@@ -54,6 +55,15 @@ class MasterIndex:
                 fid = struct.unpack_from('<I', d, off + 12)[0]
                 self._offsets[fid] = (sig, off, _HEADER_SIZE + size)
                 self._paths[fid] = path
+                if sig == b'LAND':
+                    # A cell has at most one LAND, and the type-6 GRUP label
+                    # names the owning cell. Keyed here because a LAND's own
+                    # FormID is NOT recoverable by arithmetic — see land().
+                    for gtype, label in reversed(path):
+                        if gtype == 6 and len(label) == 4:
+                            self._land_by_cell[
+                                struct.unpack_from('<I', label)[0]] = fid
+                            break
                 off += _HEADER_SIZE + size
 
     def group_path(self, formid: int) -> tuple:
@@ -67,6 +77,26 @@ class MasterIndex:
         here rather than recomputed, so there is no formula to get wrong.
         """
         return self._paths.get(formid, ())
+
+    def land(self, cell_formid: int) -> int:
+        """FormID of the LAND inside a converted cell, or 0 if it has none.
+
+        LAND is the one override type whose own FormID cannot be derived from
+        its source id. Every other record either has a manifest entry or keeps
+        its id with only the load-order index shifted, but the master's
+        conversion REALLOCATES land ids (Oblivion.esm: 0 of 3,999 sampled
+        source ids resolve to a real output LAND by that arithmetic — the
+        0x00034A7D that owns cell 0x000082F3 comes out as 0x0100F8AF).
+
+        The lookup that does hold is structural: a cell owns at most one LAND,
+        and the cell's own id DOES resolve. Without this every LAND override
+        from a dependent plugin was classified 'no-base' and dropped, and
+        because a plugin's child GRUP REPLACES the master's rather than
+        merging with it, the emitted cell then shadowed the master's terrain
+        with a children group that had no LAND in it — land blank and missing
+        in-game while the cell's placed references still rendered.
+        """
+        return self._land_by_cell.get(cell_formid, 0)
 
     def __contains__(self, formid: int) -> bool:
         return formid in self._offsets
@@ -151,6 +181,14 @@ class ChainedMasterIndex:
     def group_path(self, formid: int) -> tuple:
         idx = self._find(formid)
         return idx.group_path(formid) if idx else ()
+
+    def land(self, cell_formid: int) -> int:
+        """Later masters win, matching load order."""
+        for idx in reversed(self._indices):
+            fid = idx.land(cell_formid)
+            if fid:
+                return fid
+        return 0
 
     def find_by_edid(self, signature: bytes, edid: str) -> int:
         """Later masters win, matching load order."""
