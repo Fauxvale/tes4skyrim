@@ -762,7 +762,16 @@ def convert_LAND(rec: dict) -> bytes:
     """LAND record — landscape vertex data."""
     subs = b''
 
-    # DATA flags
+    # DATA flags pass through VERBATIM. Bit 0 (0x01) = "Has Vertex
+    # Normals/Height Map", bit 4 (0x10) = "Auto-Calc Normals".
+    #
+    # A LAND with no VNML/VHGT is the author DELETING that cell's terrain --
+    # the "water only, no landscape" case -- and it is legal with or without
+    # the auto-calc bit. Skyrim.esm's records that clear bit 0: 149 at
+    # flags 28, 3 at flags 30 (these carry VCLR), and 2 at flags 12, which is
+    # exactly the value TWMP_ValenwoodImproved uses. Do NOT "normalise" these
+    # to 28: a partial census that missed the flags-12 pair made that look
+    # like a defect when it is vanilla-legal.
     data_flags = get_int(rec, 'DATA.Flags')
     subs += pack_subrecord('DATA', struct.pack('<I', data_flags))
 

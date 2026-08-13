@@ -1635,6 +1635,11 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # across a process pool (must run after Phase 3c set_cell_locations so the
     # worker state snapshot is complete).
     land_cache = _precompute_land(by_type, export_dir)
+    # The override pass converts NEW LANDs that sit under a MASTER's cell
+    # (overrides._attach_new_records); share the precompute so they are not
+    # converted a second time.
+    if ctx:
+        ctx.land_cache = land_cache
     _phase_done('phase 4b LAND conversion')
 
     world_sigs = ('CELL', 'WRLD', 'REFR', 'ACHR', 'ACRE', 'LAND', 'PGRD')

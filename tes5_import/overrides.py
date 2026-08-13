@@ -281,6 +281,12 @@ class OverrideContext:
         # The WRLD builder runs afterwards and must not anchor the same record
         # again — that ships the FormID twice and the engine drops one copy.
         self.anchored_wrld = set()
+        # {LAND source FormID -> (ok, bytes)} from the parallel precompute, set
+        # by import_plugin before the override pass. A NEW LAND nested under a
+        # master's cell (_attach_new_records) is converted from this rather
+        # than re-running convert_LAND, which is the heaviest per-record
+        # converter in the pipeline (~1 ms each).
+        self.land_cache = None
 
     def __len__(self):
         return len(self.master_export)
@@ -692,10 +698,26 @@ def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
 
 # New (non-override) records inside GRUP trees: which export key names the
 # parent, and how the child group chain under the parent is built.
+#
+# LAND belongs here for the same reason REFR does. A plugin can lay BRAND-NEW
+# terrain into a cell a MASTER owns: the cell already exists, so the plugin
+# ships no CELL of its own, but its LAND is a new record with an id in the
+# plugin's own space. Without an entry here `_attach_new_records` handed those
+# LANDs back as `unattached`, and the own-hierarchy builders then dropped every
+# one of them — `_build_world_groups` only builds worldspaces this plugin
+# defines, and their worldspace is the master's.
+#
+# Measured on TWMP_ValenwoodImproved.esp (masters Oblivion.esm + Tamriel.esp):
+# 1,754 of its 2,626 LAND records name Tamriel worldspace 0000003C with a
+# parent CELL owned by Tamriel.esp, and all 1,754 were silently discarded —
+# the output shipped 1,819 LANDs instead of 2,626. In-game that is terrain
+# that never draws while the cell's placed references still render, which is
+# exactly the "LOD objects but no land" symptom.
 _NEW_NESTED_PARENT = {
     'REFR': 'ParentCELL',
     'ACHR': 'ParentCELL',
     'ACRE': 'ParentCELL',
+    'LAND': 'ParentCELL',
     'INFO': 'ParentDIAL',
 }
 
@@ -722,6 +744,34 @@ def _is_bark_parent(rec: dict, ctx: OverrideContext) -> bool:
     _cat, _sub, _snam, is_bark = classify_topic(
         parent.get('EditorID') or '', get_int(parent, 'DATA.Type'))
     return is_bark
+
+
+def _restamp_formid(record_bytes: bytes, new_fid: int) -> bytes:
+    """Rewrite a packed record's own FormID, leaving everything else alone."""
+    out = bytearray(record_bytes)
+    struct.pack_into('<I', out, 12, new_fid)
+    return bytes(out)
+
+
+def _convert_land(rec: dict, ctx: OverrideContext) -> bytes:
+    """Converted bytes for a NEW LAND, reusing the parallel precompute.
+
+    Mirrors import_main._land_bytes: the cache is keyed by the record's own
+    (remapped) FormID and a failed precompute re-raises so the caller's
+    per-record handler reports it exactly as a serial conversion would.
+    """
+    from .record_types.world import convert_LAND
+    from .text_reader import get_formid
+
+    cache = getattr(ctx, 'land_cache', None)
+    if cache is not None:
+        entry = cache.pop(get_formid(rec, 'FormID'), None)
+        if entry is not None:
+            ok, payload = entry
+            if not ok:
+                raise RuntimeError(payload)
+            return payload
+    return convert_LAND(rec)
 
 
 def _attach_new_records(new_records: list, ctx: OverrideContext,
@@ -787,6 +837,30 @@ def _attach_new_records(new_records: list, ctx: OverrideContext,
                 from .dialog_converter import convert_INFO
                 record_bytes = convert_INFO(rec)
                 chain = ((7, struct.pack('<I', parent_out)),)
+            elif sig == 'LAND':
+                # Terrain is never persistent: it goes in the type-9 temporary
+                # children group, and FIRST within it (emit_nested_overrides
+                # re-sorts every type-9 group so the LAND leads — vanilla
+                # Skyrim.esm does this in 15,564 of 15,564 such groups, and
+                # behind the references the engine does not draw it at all).
+                #
+                # A CELL OWNS AT MOST ONE LAND. When the master's cell already
+                # has terrain, this record REPLACES it and must carry that
+                # LAND's FormID — shipping our own new id instead puts two
+                # LAND records in one cell, which the engine cannot resolve
+                # while it parses the file (main-menu hang, no crash, no log).
+                # Measured on TWMP_ValenwoodImproved: 1,754 of its cells are
+                # Tamriel.esp cells that already have a LAND, and every one
+                # got a duplicate.
+                record_bytes = _convert_land(rec, ctx)
+                label = struct.pack('<I', parent_out)
+                chain = ((6, label), (9, label))
+                master_land = 0
+                _land_of = getattr(ctx.master_index, 'land', None)
+                if callable(_land_of):
+                    master_land = _land_of(parent_out) or 0
+                if master_land:
+                    record_bytes = _restamp_formid(record_bytes, master_land)
             else:
                 conv = convert_ACHR if sig in ('ACHR', 'ACRE') else convert_REFR
                 record_bytes = conv(rec)
@@ -805,7 +879,11 @@ def _attach_new_records(new_records: list, ctx: OverrideContext,
         # type-1/6/7 group from the master when this plugin does not override
         # it, so the parent CELL/DIAL is anchored by the same generic path that
         # anchors an unchanged WRLD above a worldspace's cells.
-        new_fid = get_formid(rec, 'FormID')
+        # The id the record actually SHIPS with — a LAND replacing the
+        # master's terrain was restamped above and no longer carries the
+        # plugin's own id.
+        new_fid = (struct.unpack_from('<I', record_bytes, 12)[0]
+                   if len(record_bytes) >= 16 else get_formid(rec, 'FormID'))
         pending.append((new_fid, record_bytes, parent_path + chain))
         done += 1
     return done, unattached
