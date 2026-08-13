@@ -20,6 +20,15 @@ import zlib
 _HEADER_SIZE = 24
 
 
+def _plugin_name(path: str) -> str:
+    """The lowercased plugin filename a MasterIndex was loaded from.
+
+    Converted masters live at output/<plugin>/<plugin>, so the basename IS the
+    plugin name that other files list in their MAST entries.
+    """
+    return os.path.basename(path or '').lower()
+
+
 def _read_masters(data: bytes, hdr_size: int) -> list:
     """The MAST names in a plugin's TES4 header, in load order.
 
@@ -341,11 +350,60 @@ class ChainedMasterIndex:
             self._index_maps[id(idx)] = m
 
     def _route(self, formid: int):
-        """(index, id in that master's own space) for a child-space FormID."""
-        idx = self._by_slot.get((formid >> 24) & 0xFF)
-        if idx is None:
+        """(index, id in that master's own space) for a child-space FormID.
+
+        The index byte names the master that DEFINES the record, and that is
+        what fixes its identity and its group nesting. But a later master may
+        OVERRIDE it, and in load order the last file to define a record is the
+        one the engine uses -- so that is the version an override of ours must
+        be built on top of.
+
+        Tamriel.esp overrides Oblivion.esm's Tamriel worldspace 0100003C to
+        WIDEN its NAM0/NAM9 bounds (+/-262144 -> +/-786432) for the 99,946
+        exterior cells it adds. Routing by owner alone handed back Oblivion's
+        ORIGINAL rectangle as the base, TWMP_ValenwoodImproved's WRLD override
+        was spliced onto that, and the output reverted the worldspace to the
+        narrow bounds -- leaving 92,745 of Tamriel.esp's cells outside the
+        worldspace extent. The engine builds its cell grid from NAM0/NAM9
+        while PARSING the file, so the game hung on the main menu forever with
+        no crash and no log, and deleting the WRLD record in xEdit made it
+        load again.
+        """
+        owner_slot = (formid >> 24) & 0xFF
+        owner = self._by_slot.get(owner_slot)
+        if owner is None:
             return None, 0
-        return idx, ((idx.own_index << 24) | (formid & 0x00FFFFFF))
+        own_id = (owner.own_index << 24) | (formid & 0x00FFFFFF)
+
+        # Later masters win, exactly as load order resolves it -- but ONLY a
+        # genuine override counts. Two masters routinely use the SAME index
+        # byte for their own records (Tamriel.esp and ElsweyrAnequina.esp are
+        # both the 2nd file in their own load order), so "this later file
+        # happens to contain the same integer" is NOT evidence of an override:
+        # 0202E438 is a CELL in Tamriel.esp and the WRLD ANQVerkarthHillsWorld
+        # in ElsweyrAnequina.esp. Believing the latter emitted that worldspace
+        # TWICE and anchored a Tamriel cell's children group under it.
+        #
+        # A real override satisfies both tests:
+        #   * the overriding file lists the owner among ITS masters, so the id
+        #     means the same record in both files, and
+        #   * the record carries the owner's signature.
+        # Only the record CONTENT comes from the winning override; identity
+        # questions -- which slot an answer belongs in -- stay the OWNER's.
+        # `record()` and `group_path()` restate ids through `_index_maps`, and
+        # `land()` guards its answer on `idx.own_index` for exactly this.
+        owner_name = _plugin_name(owner.path)
+        want_sig = owner.signature(own_id)
+        for slot in sorted(self._by_slot, reverse=True):
+            if slot <= owner_slot:
+                break
+            idx = self._by_slot[slot]
+            if not any(m.lower() == owner_name for m in (idx.masters or ())):
+                continue
+            if formid in idx and (not want_sig
+                                  or idx.signature(formid) == want_sig):
+                return idx, formid
+        return owner, own_id
 
     def _to_child(self, idx, formid: int) -> int:
         """Translate one of `idx`'s own-space ids back into the child's space."""
@@ -419,12 +477,27 @@ class ChainedMasterIndex:
         return tuple(out)
 
     def land(self, cell_formid: int) -> int:
-        """The LAND inside a cell, answered by the cell's owning master."""
+        """The LAND inside a cell, answered by the file that WINS the cell.
+
+        The answer is restated in the slot of whichever master supplied it: a
+        LAND that Tamriel.esp defines carries Tamriel.esp's index byte, while
+        one it merely inherits from Oblivion.esm keeps Oblivion's. Translating
+        through the answering index unconditionally moved every inherited LAND
+        into the overriding master's slot, where no such record exists.
+        """
         idx, own = self._route(cell_formid)
         if idx is None:
             return 0
         fid = idx.land(own)
-        return self._to_child(idx, fid) if fid else 0
+        if not fid:
+            return 0
+        # `fid` is in `idx`'s own converted space; its index byte names the
+        # file that DEFINES the land, which may be one of idx's own masters.
+        if (fid >> 24) == idx.own_index:
+            return self._to_child(idx, fid)
+        # Defined further down the chain: the byte already matches the child's
+        # numbering when that master occupies the same slot in both lists.
+        return fid
 
     def find_by_edid(self, signature: bytes, edid: str) -> int:
         """Later masters win, matching load order."""
