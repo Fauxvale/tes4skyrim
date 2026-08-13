@@ -38,26 +38,31 @@ MAX_ALPHA_LAYERS = 6
 MAX_VTXT_POS = 288      # 17*17 quadrant grid
 
 
+def _master_names(path):
+    """MAST entries of a plugin header, in load order."""
+    with open(path, 'rb') as fh:
+        head = fh.read(24)
+        if len(head) < 24 or head[:4] != b'TES4':
+            return []
+        hdr = fh.read(struct.unpack_from('<I', head, 4)[0])
+    out = []
+    i = 0
+    while i + 6 <= len(hdr):
+        sig = hdr[i:i + 4]
+        size = struct.unpack_from('<H', hdr, i + 4)[0]
+        if sig == b'MAST':
+            out.append(hdr[i + 6:i + 6 + size].rstrip(b'\0').decode('latin-1'))
+        i += 6 + size
+    return out
+
+
 def _master_count(path):
     """Number of MAST entries in a plugin header.
 
     Also the index byte the file's own records carry, since a file's records
     sit immediately after its masters in load order.
     """
-    with open(path, 'rb') as fh:
-        head = fh.read(24)
-        if len(head) < 24 or head[:4] != b'TES4':
-            return 0
-        hdr = fh.read(struct.unpack_from('<I', head, 4)[0])
-    n = 0
-    i = 0
-    while i + 6 <= len(hdr):
-        sig = hdr[i:i + 4]
-        size = struct.unpack_from('<H', hdr, i + 4)[0]
-        if sig == b'MAST':
-            n += 1
-        i += 6 + size
-    return n
+    return len(_master_names(path))
 
 
 def _iter_records(data):
@@ -206,8 +211,9 @@ def main():
     ap.add_argument('--output-dir', default=os.path.join(SCRIPT_DIR, 'output'))
     ap.add_argument('--cell', nargs=2, type=int, metavar=('X', 'Y'),
                     help='Report one grid cell in full detail')
-    ap.add_argument('--masters', nargs='*', default=['Oblivion.esm'],
-                    help='Converted masters to resolve LTEX against')
+    ap.add_argument('--masters', nargs='*', default=None,
+                    help="Converted masters to resolve LTEX against "
+                         "(default: this plugin's own MAST list)")
     ap.add_argument('--max', type=int, default=25,
                     help='Max problem cells to list (default 25)')
     args = ap.parse_args()
@@ -219,12 +225,22 @@ def main():
         return 1
 
     cells, land, ltex = load(path)
+    # Defaulting to a single hard-coded master mis-scoped every plugin with a
+    # longer list: TWMP_Valenwood_Elsweyr has four (Skyrim, Oblivion, Tamriel,
+    # Anequina), so LTEXes owned by Tamriel/Anequina were compared against
+    # nothing and reported unresolved on thousands of cells. Vanilla masters
+    # we never convert (Skyrim.esm) simply have no output and are skipped by
+    # the isfile() check below.
+    if args.masters is None:
+        args.masters = _master_names(path)
     # A master's LTEX ids are in ITS OWN FormID space; this plugin names them
     # by the index byte of the master's slot in ITS master list. Merging them
     # verbatim compares ids from two different spaces and reports healthy
     # textures as dangling -- it claimed 1,734 unresolved layers in TWMP
     # Valenwood/Elsweyr, every one of them fine. `--masters` is given in load
     # order, so slot = (this plugin's master count - len(masters)) + position.
+    # `--masters` is a trailing slice of the load order when given explicitly;
+    # the default IS the whole list, so it starts at slot 0.
     base_slot = _master_count(path) - len(args.masters)
     for pos, m in enumerate(args.masters):
         mp = os.path.join(root, m, m)
