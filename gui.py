@@ -20,6 +20,14 @@ SCRIPT_DIR  = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / "conversion_config.json"
 
 from worker_budget import worker_count, cpu_total, WORKERS_ENV_VAR
+
+# The cache opt-out variable name is owned by tools/navmesh_cache.py so the GUI
+# and convert.py cannot drift apart (see test_no_download_env_var_is_shared...).
+# `tools/` needs its __init__.py for this to resolve from any cwd -- without it
+# the directory is only a NAMESPACE package, and a module-scope import here was
+# fatal to the entire GUI. Under gui.pyw (pythonw, no console) the traceback is
+# invisible, so the window simply never appeared; convert.py survived only
+# because it imports this lazily inside a function.
 from tools.navmesh_cache import NO_DOWNLOAD_ENV_VAR
 import version as version_info
 from preflight import RC_MISSING_DEP as _RC_MISSING_DEP
