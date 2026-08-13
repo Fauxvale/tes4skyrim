@@ -420,6 +420,37 @@ class OverrideContext:
 OWNED_GROUP_TYPES = frozenset({1, 6, 7})
 
 
+def _group_sort_key(step: tuple):
+    """Ordering key for one GRUP nesting step, matching vanilla's file order.
+
+    A worldspace's children group holds the PERSISTENT cell (its own type-6
+    group, labelled by that cell's FormID) followed by the exterior blocks
+    (type 4). Vanilla puts the persistent cell FIRST: in the converted
+    Oblivion.esm, Tamriel's type-1 group opens with CELL 01023777 and its
+    type-6 group, and only then the 21 type-4 blocks.
+
+    Sorting by (group type, label bytes) put it LAST instead, because 6 > 4.
+    The engine walks a worldspace's block tree to build the cell grid and
+    reaches the persistent cell through that walk; finding an unexpected
+    type-6 group after the blocks left TWMP_ValenwoodImproved hanging on the
+    main menu, and deleting the exterior blocks in xEdit made it load.
+
+    Within the blocks, order by the UNSIGNED 16-bit halves of the label with
+    **X major, Y minor**. The label packs Y into the LOW word, so sorting on
+    its own word order yields the TRANSPOSE and lets X descend mid-list; the
+    engine's parse-time grid walk never terminates on such a run. See
+    import_main._grid_sort_key for the Skyrim.esm census and the symptom.
+    """
+    gtype, label = step[0], bytes(step[1])
+    if gtype in OWNED_GROUP_TYPES:
+        # Persistent cell / topic groups lead, in FormID order.
+        return (0, gtype, 0, 0, label)
+    if gtype in (4, 5) and len(label) == 4:
+        y, x = struct.unpack('<HH', label)
+        return (1, gtype, x, y, b'')
+    return (1, gtype, 0, 0, label)
+
+
 def emit_nested_overrides(records: list, writer: PluginWriter,
                           master_index=None, anchored_fids: set = None) -> tuple:
     """Write override records back into the master's exact GRUP nesting.
@@ -557,8 +588,7 @@ def emit_nested_overrides(records: list, writer: PluginWriter,
         # in from the master as an anchor, immediately before the group.
         rest = [c for c in deeper
                 if c[depth][0] not in OWNED_GROUP_TYPES or c in owned.values()]
-        for child in sorted(rest,
-                            key=lambda p: (p[depth][0], bytes(p[depth][1]))):
+        for child in sorted(rest, key=lambda p: _group_sort_key(p[depth])):
             inner = build(child, depth + 1)
             if not inner:
                 continue

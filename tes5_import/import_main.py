@@ -2130,8 +2130,9 @@ def _gather_navm_jobs(by_type: dict, door_fids: set = None):
             block_label = struct.pack('<hh', grid_y // 32, grid_x // 32)
             sub_label = struct.pack('<hh', grid_y // 8, grid_x // 8)
             ext_blocks[block_label][sub_label].append(cell)
-        for block_label in sorted(ext_blocks.keys()):
-            for sub_label in sorted(ext_blocks[block_label].keys()):
+        for block_label in sorted(ext_blocks.keys(), key=_grid_sort_key):
+            for sub_label in sorted(ext_blocks[block_label].keys(),
+                                    key=_grid_sort_key):
                 for cell_rec in sorted(
                         ext_blocks[block_label][sub_label],
                         key=lambda c: (get_int(c, 'XCLC.Y'), get_int(c, 'XCLC.X'))):
@@ -2636,6 +2637,31 @@ def _build_cell_groups(by_type: dict, writer: PluginWriter,
     print(f"    Interior cells: {len(interior_cells)}, children: {converted}")
 
 
+def _grid_sort_key(label: bytes):
+    """Vanilla ordering key for an exterior block / sub-block GRUP label.
+
+    The label is `struct.pack('<hh', Y, X)` -- Y in the LOW word -- and vanilla
+    orders the groups by the UNSIGNED 16-bit halves with **X major, Y minor**.
+    Census of the real Skyrim.esm: all 168 blocks of worldspace 0000003C are
+    sorted by unsigned (X, Y) and by no other key; the same holds for every
+    sub-block and for all 37 worldspaces in the file.
+
+    Sorting on the label's own word order gives (Y, X) -- the TRANSPOSE -- and
+    that is what shipped: TWMP_ValenwoodImproved emitted its Tamriel blocks as
+    (-1,0), (-2,-3), (-2,-2), (-1,-2), (-2,-1), (-1,-1), where X descends and
+    re-ascends. The engine walks this list to build the worldspace's cell grid
+    while PARSING the file, so a non-monotonic run never terminates: the game
+    hung on the main menu with no crash and no log, xEdit called the file
+    clean, and deleting exterior blocks in xEdit made it load again -- each
+    deletion shortens the list until what remains happens to be monotonic.
+
+    Never census our own converted output for this: it carries the same bug,
+    which is precisely how the transposed key was mistaken for vanilla's.
+    """
+    y, x = struct.unpack('<HH', label)
+    return (x, y)
+
+
 def _ensure_cell_grid(cell: dict) -> None:
     """Give a non-persistent exterior CELL explicit grid coords if it has none.
 
@@ -2935,9 +2961,18 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
                     sub_label = struct.pack('<hh', sub_y, sub_x)
                     ext_blocks[block_label][sub_label].append(cell)
 
-                for block_label in sorted(ext_blocks.keys()):
+                # Vanilla orders exterior blocks by the UNSIGNED 16-bit halves
+                # of the label, Y major then X -- census of Oblivion.esm's
+                # converted Tamriel: all 21 blocks are in exactly this order
+                # (Y = 0,1,-3,-2,-1 and within each Y, X = 0,1,2,-2,-1), and
+                # the same holds for every sub-block. Sorting the PACKED BYTES
+                # instead compares little-endian bytes left to right, which is
+                # neither signed nor unsigned order and interleaves the
+                # negative rows.
+                for block_label in sorted(ext_blocks.keys(), key=_grid_sort_key):
                     block_parts = []
-                    for sub_label in sorted(ext_blocks[block_label].keys()):
+                    for sub_label in sorted(ext_blocks[block_label].keys(),
+                                            key=_grid_sort_key):
                         sub_parts = []
                         for cell_rec in sorted(ext_blocks[block_label][sub_label],
                                                key=lambda c: (get_int(c, 'XCLC.Y'), get_int(c, 'XCLC.X'))):

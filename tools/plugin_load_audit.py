@@ -23,6 +23,18 @@ Checks, per plugin:
      -> xEdit "Found additional GRUP World Children of ... Merged N elements"
   8. an ACHR's base must be an actor, never a leveled list (LVLN) — the engine
      loads it as a Character*, dereferences a null base and CRASHES on startup
+  9. at most ONE LAND per cell. Two landscapes in one cell is unresolvable
+     while the engine builds its form table, so the game hangs on the main
+     menu with no crash and no log — and xEdit still calls the file clean.
+ 10. exterior block/sub-block groups ascend by UNSIGNED (X, Y), X major, with
+     no duplicate label. The engine walks this list to build a worldspace's
+     cell grid while PARSING the file, so a run where X descends and
+     re-ascends never terminates: main-menu hang, no crash, no log, and xEdit
+     reports the file as clean. The label packs Y in the LOW word, so sorting
+     on its own word order gives the TRANSPOSE — which is what shipped and
+     what kept TWMP_ValenwoodImproved from loading. Authority is the real
+     Skyrim.esm (168/168 blocks of 0000003C, all 37 worldspaces); never
+     census our own output, which carried the same bug.
 
 Exit status is the number of problems, so it can gate a build.
 
@@ -64,6 +76,9 @@ def audit(path, label):
     owned_groups = Counter()
     achr_bases = {}          # ACHR formid -> its NAME target
     local_sigs = {}          # formid -> signature, for the ACHR base check
+    cell_lands = {}          # cell formid -> the LAND inside it (max one)
+    # (enclosing group id) -> [block labels in file order], for the grid sort
+    grid_siblings = {}
 
     def note(kind, detail):
         problems[kind] += 1
@@ -77,10 +92,36 @@ def audit(path, label):
             yield ssig, body[j + 6:j + 6 + z]
             j += 6 + z
 
-    def walk(i, end, depth=0):
+    def check_grid_order(siblings):
+        """Block/sub-block groups must ascend by unsigned (X, Y), X major.
+
+        The label is `pack('<hh', Y, X)`, so the engine's key is the SECOND
+        word then the first. A descent mid-list, or a repeated label, stalls
+        the parse-time grid walk -> main-menu hang with no crash and no log.
+        """
+        if len(siblings) < 2:
+            return
+        keys = [struct.unpack('<HH', lbl)[::-1] for lbl in siblings]
+        if keys != sorted(keys):
+            runs = 1 + sum(1 for a, b in zip(keys, keys[1:]) if b < a)
+            def sgn(k):
+                return tuple(struct.unpack('<h', struct.pack('<H', v))[0]
+                             for v in k)
+            note('grid-groups-out-of-order',
+                 f'{len(keys)} groups in {runs} ascending runs, '
+                 f'e.g. {[sgn(k) for k in keys[:6]]}')
+        dupes = [k for k, n in Counter(keys).items() if n > 1]
+        if dupes:
+            note('duplicate-grid-group',
+                 f'{len(dupes)} repeated labels, e.g. '
+                 f'{[tuple(struct.unpack("<h", struct.pack("<H", v))[0] for v in k) for k in dupes[:4]]}')
+
+    def walk(i, end, depth=0, cell=None):
+        siblings = []     # type-4/5 labels at THIS nesting level, in file order
         while i < end:
             if i + 24 > end:
                 note('trailing-bytes', f'{end - i} bytes at 0x{i:X}')
+                check_grid_order(siblings)
                 return
             sig = d[i:i + 4]
             size = struct.unpack_from('<I', d, i + 4)[0]
@@ -94,7 +135,12 @@ def audit(path, label):
                     tops.append(lbl.decode('latin1'))
                 if gt in OWNED_GROUP_TYPES:
                     owned_groups[(gt, bytes(lbl))] += 1
-                walk(i + 24, i + size, depth + 1)
+                if gt in (4, 5) and len(lbl) == 4:
+                    siblings.append(bytes(lbl))
+                inner_cell = cell
+                if gt in (6, 8, 9) and len(lbl) == 4:
+                    inner_cell = struct.unpack('<I', lbl)[0]
+                walk(i + 24, i + size, depth + 1, inner_cell)
                 i += size
                 continue
             if not all(48 <= c <= 90 or c == 95 for c in sig):
@@ -129,6 +175,17 @@ def audit(path, label):
             if sig == b'LAND' and names and names[0] != b'DATA':
                 note('land-not-starting-at-DATA',
                      f'{fid:08X}: {names[0].decode()}')
+            if sig == b'LAND' and cell is not None:
+                # A cell owns AT MOST ONE landscape. Two LAND records in one
+                # cell is unresolvable while the engine parses the file: it
+                # hangs on the main menu with no crash and no log, and xEdit
+                # still reports the file as clean.
+                if cell in cell_lands:
+                    note('two-LAND-in-one-cell',
+                         f'cell {cell:08X}: {cell_lands[cell]:08X} and '
+                         f'{fid:08X}')
+                else:
+                    cell_lands[cell] = fid
             if sig == b'REGN':
                 seq = [s for s in names if s in (b'RPLI', b'RPLD')]
                 ok = len(seq) % 2 == 0 and all(
@@ -143,6 +200,7 @@ def audit(path, label):
                         achr_bases[fid] = struct.unpack('<I', val)[0]
                         break
             i += 24 + size
+        check_grid_order(siblings)
 
     hs = struct.unpack_from('<I', d, 4)[0]
     walk(24 + hs, len(d))

@@ -159,6 +159,88 @@ def pack_tes4_header(masters: list, num_records: int = 0,
 # (6) and Topic Children (7).
 _OWNED_GROUP_TYPES = (1, 6, 7)
 
+# Exterior block (4) and sub-block (5) groups. Their label packs the grid as
+# `struct.pack('<hh', Y, X)` -- Y in the LOW word -- and the engine requires
+# the siblings to ascend by UNSIGNED (X, Y), X major. See
+# import_main._grid_sort_key for the Skyrim.esm census.
+_GRID_GROUP_TYPES = (4, 5)
+
+
+def _grid_key(label: bytes):
+    y, x = struct.unpack('<HH', label)
+    return (x, y)
+
+
+def _merge_grid_groups(body: bytes) -> bytes:
+    """Merge duplicate block/sub-block groups in `body` and re-sort them.
+
+    Concatenating two owned-group bodies is not enough on its own. The
+    override pass and the WRLD builder each emit a worldspace's exterior
+    blocks ALREADY SORTED, so folding their type-1 groups together yields one
+    group holding two ascending runs -- and a duplicate type-4 group wherever
+    both passes touched the same block.
+
+    The engine walks this list to build the worldspace's cell grid while
+    PARSING the file. A run where X descends and re-ascends never terminates:
+    the game hangs on the main menu with no crash and no log, and xEdit still
+    calls the file clean. Measured before this merge: Tamriel.esp shipped 121
+    block groups in 15 ascending runs with 14 duplicate labels;
+    ElsweyrAnequina.esp 8 in 2 runs with 3 duplicates.
+
+    Groups of the same type and label are folded into one and their contents
+    merged recursively, so a sub-block that both passes wrote also collapses
+    to a single group. Records and other group types are copied through in
+    place, and a malformed tail is left untouched.
+    """
+    if not body:
+        return body
+    parts = []            # [[key, header+contents]] — key None = copy through
+    index = {}
+    off, end = 0, len(body)
+    while off + GROUP_HEADER_SIZE <= end:
+        sig = body[off:off + 4]
+        raw = struct.unpack_from('<I', body, off + 4)[0]
+        if sig != b'GRUP':
+            size = GROUP_HEADER_SIZE + raw
+            if off + size > end:
+                break
+            parts.append([None, bytearray(body[off:off + size])])
+            off += size
+            continue
+        size = raw
+        if size < GROUP_HEADER_SIZE or off + size > end:
+            break
+        gtype = struct.unpack_from('<i', body, off + 12)[0]
+        label = bytes(body[off + 8:off + 12])
+        key = ((gtype, label)
+               if gtype in _GRID_GROUP_TYPES and len(label) == 4 else None)
+        if key is not None and key in index:
+            parts[index[key]][1] += body[off + GROUP_HEADER_SIZE:off + size]
+        else:
+            if key is not None:
+                index[key] = len(parts)
+            parts.append([key, bytearray(body[off:off + size])])
+        off += size
+
+    # Sort ONLY the grid groups, leaving every other element where it sits:
+    # the persistent cell's type-6 group must keep its place at the front.
+    grid_at = [i for i, (key, _d) in enumerate(parts) if key is not None]
+    if grid_at:
+        ordered = sorted((parts[i] for i in grid_at),
+                         key=lambda p: _grid_key(p[0][1]))
+        for slot, item in zip(grid_at, ordered):
+            parts[slot] = item
+
+    out = bytearray()
+    for key, data in parts:
+        if key is not None:
+            inner = _merge_grid_groups(bytes(data[GROUP_HEADER_SIZE:]))
+            data = bytearray(data[:GROUP_HEADER_SIZE]) + inner
+            struct.pack_into('<I', data, 4, len(data))
+        out += data
+    out += body[off:]
+    return bytes(out)
+
 
 def _merge_owned_groups(blob: bytes) -> bytes:
     """Fold repeated owned-groups with the same label into the first one.
@@ -171,13 +253,18 @@ def _merge_owned_groups(blob: bytes) -> bytes:
     ENGINE does with the second copy is undefined: it indexes a worldspace's
     children once, so the later group's cells can simply never load.
 
-    Only the top level of `blob` is scanned; a group's own contents are moved
-    verbatim, so nothing inside is reordered or reparsed.
+    Only the top level of `blob` is scanned, EXCEPT for a group that actually
+    absorbed a duplicate: both passes emit a worldspace's exterior blocks
+    already sorted, so the folded body holds two ascending runs (and a
+    duplicate type-4 group per block both passes touched). The engine's
+    parse-time grid walk needs one monotonic run, so a merged body is handed
+    to `_merge_grid_groups`. A group with no duplicate is moved verbatim.
     """
     if not blob:
         return blob
     parts = []            # [[key, bytearray]] — key None = copied through
     index = {}
+    merged = set()        # keys that absorbed at least one duplicate
     off, end = 0, len(blob)
     while off + GROUP_HEADER_SIZE <= end:
         sig = blob[off:off + 4]
@@ -200,6 +287,7 @@ def _merge_owned_groups(blob: bytes) -> bytes:
         key = (gtype, bytes(label)) if gtype in _OWNED_GROUP_TYPES else None
         if key is not None and key in index:
             parts[index[key]][1] += body
+            merged.add(key)
         else:
             if key is not None:
                 index[key] = len(parts)
@@ -209,6 +297,11 @@ def _merge_owned_groups(blob: bytes) -> bytes:
     out = bytearray()
     for key, data in parts:
         if key is not None:
+            if key in merged:
+                # Two sorted runs were concatenated above: fold the duplicate
+                # blocks together and restore one ascending (X, Y) run.
+                inner = _merge_grid_groups(bytes(data[GROUP_HEADER_SIZE:]))
+                data = bytearray(data[:GROUP_HEADER_SIZE]) + inner
             # Re-stamp the (possibly grown) size in the group header.
             struct.pack_into('<I', data, 4, len(data))
         out += data
