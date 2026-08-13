@@ -659,3 +659,51 @@ occurrence substitution misaligns.
 Note a legitimately unchanged entry is not a bug — Nehrim's NQ09 is still
 German in Translation.esp itself, so keeping the master's value there is
 correct.
+
+## A PGRD is never an override: it converts to a NEW NAVM
+
+**Symptom: a plugin's landmass looks complete but nothing in it can path — no
+navmesh anywhere the plugin edited one of the master's cells.**
+
+The override rule is "take the master's converted record and substitute the
+author's changed fields." That rule has no meaning for a pathgrid: a PGRD
+converts to a **NAVM**, a brand-new record carrying its own freshly allocated
+FormID. There is nothing of the master's to patch, so a PGRD is routed as a
+NEW record ALWAYS — even when the plugin edits a pathgrid the master also
+defines. `OverrideContext.build` returns `None` for `PGRD` before any other
+check, and `_attach_new_records` nests the generated navmesh under the master's
+cell in the type-9 temporary group, exactly like a new LAND.
+
+PGRD used to sit in `OVERRIDE_UNMAPPABLE_TYPES` (with ROAD) and was counted as
+"inexpressible" and dropped. Because the drop happened in the override pass,
+the navmesh generator was never even asked for those cells:
+
+| Plugin | NAVM before | NAVM after |
+|---|---|---|
+| ElsweyrAnequina.esp | 547 | 1,409 |
+| ElsweyrPelletine.esp | 152 | 1,227 |
+| TWMP_Valenwood_Elsweyr.esp | 0 | 40 |
+
+Anequina exports 1,351 pathgrids; 863 of them edit Oblivion.esm's Tamriel
+cells, and every one lost its navmesh. Coverage went from 487 to 1,349 of
+1,351 cells. The two remaining are correctly declined by `convert_PGRD` (one
+node with no PGRI link, and a 2-node grid that yields no triangles).
+
+Two details that make this work and are easy to get wrong:
+
+* **Do NOT restamp the NAVM to a master FormID.** A new LAND *is* restamped —
+  a cell owns at most one LAND, so replacing the master's terrain must reuse
+  its id or the engine sees two. A navmesh is the opposite: it is additional,
+  the master has no counterpart to replace, and restamping would collide with
+  the master's own navmesh for that cell.
+* **Register the meta in `navm_metas`.** NAVI is a singleton index of every
+  navmesh in the file; a NAVM that ships correctly but is missing from NAVI is
+  invisible to the pathing engine. The group builders register their own cells,
+  so anything nested into the master's hierarchy must register itself
+  (`ctx.navm_metas`, set by `import_plugin` alongside `ctx.land_cache`).
+
+The geometry itself is reused, not recomputed: `_navm_of` looks the cell up in
+the `_precompute_navmeshes` cache by `(ParentCELL, PGRD)` — the same key
+`_gather_navm_jobs` builds — so this costs no extra generation time.
+
+ROAD remains genuinely unmappable: it converts to nothing at all.

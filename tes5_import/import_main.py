@@ -1691,6 +1691,15 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # converted a second time.
     if ctx:
         ctx.land_cache = land_cache
+        # Same deal for navmeshes: a PGRD that edits one of the MASTER's cells
+        # still produces a brand-new NAVM, and that navmesh is nested under the
+        # master's cell by the override pass rather than by the group builders.
+        # It needs the precomputed geometry (keyed by (cell_fid, pgrd_fid)) and
+        # somewhere to register its meta so the NAVI singleton lists it — a
+        # navmesh missing from NAVI is invisible to the pathing engine even
+        # when the NAVM record itself ships correctly.
+        ctx.navm_cache = navm_cache
+        ctx.navm_metas = navm_metas
     _phase_done('phase 4b LAND conversion')
 
     world_sigs = ('CELL', 'WRLD', 'REFR', 'ACHR', 'ACRE', 'LAND', 'PGRD')

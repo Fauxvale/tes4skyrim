@@ -31,9 +31,20 @@ from .writer import PluginWriter, pack_group
 
 # Types whose override CANNOT be expressed against the master's output because
 # conversion does not produce a corresponding record to substitute into
-# (PGRD/ROAD become generated NAVM/nothing). These are counted and reported,
-# never silently dropped.
-OVERRIDE_UNMAPPABLE_TYPES = frozenset({'PGRD', 'ROAD'})
+# (ROAD converts to nothing at all). These are counted and reported, never
+# silently dropped.
+#
+# PGRD is NOT in this set. A pathgrid converts to a NAVM, which is a BRAND NEW
+# record with its own FormID — it patches nothing in the master, so "no record
+# to substitute into" never applied to it. Treating it as unmappable dropped
+# the pathgrid before it ever reached the navmesh generator, and because the
+# drop happened in the override pass the generator never saw a job for it:
+# ElsweyrAnequina overrides 863 of Oblivion.esm's Tamriel cells and every one
+# lost its navmesh, shipping 487 navmeshed cells where 1,351 pathgrids exist.
+# The CELL/LAND/REFR all converted fine, so the landmass looked complete while
+# nothing in it could path. An overriding PGRD is routed like a new LAND
+# instead — nested under the master's cell in the type-9 temporary group.
+OVERRIDE_UNMAPPABLE_TYPES = frozenset({'ROAD'})
 
 # Record header flag bit 5. Both games use it, and the meaning is the same:
 # the author DELETED this record. xEdit treats bit 5 as 'Deleted' for every
@@ -308,6 +319,18 @@ class OverrideContext:
           no-base    the master's conversion has no record to override
           no-path    the type's conversion output has no record to patch
         """
+        # A PGRD is never an override in OUTPUT space, even when this plugin
+        # edits the master's pathgrid: it converts to a NAVM carrying a NEW
+        # FormID, so there is nothing of the master's to patch. Route it as a
+        # new record ALWAYS — `_attach_new_records` nests the generated navmesh
+        # under the master's cell. Returning an Override here instead marked it
+        # inexpressible and dropped it, which is why every master cell a plugin
+        # touched lost its navmesh (863 Tamriel cells in ElsweyrAnequina).
+        # The author's edited pathgrid is the one that converts, so the
+        # navmesh reflects their changes rather than the master's original.
+        if sig == 'PGRD':
+            return None
+
         master_rec = self.master_record(rec)
         if master_rec is None:
             return None
@@ -718,6 +741,7 @@ _NEW_NESTED_PARENT = {
     'ACHR': 'ParentCELL',
     'ACRE': 'ParentCELL',
     'LAND': 'ParentCELL',
+    'PGRD': 'ParentCELL',
     'INFO': 'ParentDIAL',
 }
 
@@ -772,6 +796,27 @@ def _convert_land(rec: dict, ctx: OverrideContext) -> bytes:
                 raise RuntimeError(payload)
             return payload
     return convert_LAND(rec)
+
+
+def _navm_of(rec: dict, ctx: OverrideContext) -> tuple:
+    """(navm_bytes, meta) for a PGRD, from the parallel navmesh precompute.
+
+    Keyed by (ParentCELL, PGRD) in the plugin's own FormID space — exactly the
+    key `_gather_navm_jobs` built and the group builders look up, so a pathgrid
+    nested under a master's cell reuses the same generated geometry instead of
+    re-running the (scipy-bound, ~seconds-per-cell) generator.
+
+    Returns (b'', {}) when the precompute produced nothing for this cell, which
+    is normal: convert_PGRD declines a pathgrid too sparse to form a ribbon.
+    """
+    from .text_reader import get_formid
+
+    cache = getattr(ctx, 'navm_cache', None)
+    if not cache:
+        return b'', {}
+    key = (get_formid(rec, 'ParentCELL'), get_formid(rec, 'FormID'))
+    navm_bytes, meta = cache.get(key, (None, None))
+    return (navm_bytes or b''), (meta or {})
 
 
 def _attach_new_records(new_records: list, ctx: OverrideContext,
@@ -861,6 +906,34 @@ def _attach_new_records(new_records: list, ctx: OverrideContext,
                     master_land = _land_of(parent_out) or 0
                 if master_land:
                     record_bytes = _restamp_formid(record_bytes, master_land)
+            elif sig == 'PGRD':
+                # The navmesh was already generated in parallel by
+                # _precompute_navmeshes and is keyed by (cell, pgrd) in the
+                # plugin's OWN FormID space — the same key the group builders
+                # use. Unlike LAND this is NOT restamped to a master id: a NAVM
+                # is a new record the master has no counterpart for, so it keeps
+                # the id the precompute allocated (restamping would collide with
+                # the master's own navmesh for that cell).
+                record_bytes, meta = _navm_of(rec, ctx)
+                if not record_bytes:
+                    # No geometry (too few pathgrid nodes to form a ribbon) —
+                    # convert_PGRD already declined it. Not an error.
+                    continue
+                # Registering the meta is what puts this navmesh in NAVI. The
+                # group builders do it for their own cells; nothing else does
+                # it for one nested into the master's hierarchy.
+                metas = getattr(ctx, 'navm_metas', None)
+                if metas is not None:
+                    metas.append(meta)
+                    for _xb, _xm in meta.get('extra_navms', ()):
+                        metas.append(_xm)
+                label = struct.pack('<I', parent_out)
+                chain = ((6, label), (9, label))
+                # A cell split into several navmeshes ships the extras in the
+                # same children group.
+                for _xb, _xm in meta.get('extra_navms', ()):
+                    pending.append((struct.unpack_from('<I', _xb, 12)[0], _xb,
+                                    parent_path + chain))
             else:
                 conv = convert_ACHR if sig in ('ACHR', 'ACRE') else convert_REFR
                 record_bytes = conv(rec)
