@@ -7,11 +7,11 @@ folder is COMMITTED, prebuilt, at TESGameSelect/dist/. Nothing needs generating;
 it only needs wrapping so it installs like any other converted plugin.
 
 The archive mirrors what `convert.py --pack-zip-only` produces for a converted
-plugin — output/<name>.zip, contents rooted as a Data folder — so a user
-installs it exactly the same way and a mod manager sees the same shape.
+plugin — output/Finished Mods/<name>.zip, contents rooted as a Data folder — so
+a user installs it exactly the same way and a mod manager sees the same shape.
 
 Usage:
-  python tools/package_start_mod.py                  # -> output/TESGameSelect.zip
+  python tools/package_start_mod.py     # -> output/Finished Mods/TESGameSelect.zip
   python tools/package_start_mod.py --output-dir PATH
 """
 
@@ -22,6 +22,8 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
+
+from output_layout import finished_dir
 
 MOD_NAME = "TESGameSelect"
 
@@ -42,8 +44,7 @@ def package(out_root: Path) -> int:
         print(f"ERROR: {DIST_DIR} is empty — nothing to package.")
         return 1
 
-    out_root.mkdir(parents=True, exist_ok=True)
-    zip_path = out_root / f"{MOD_NAME}.zip"
+    zip_path = finished_dir(out_root) / f"{MOD_NAME}.zip"
 
     print("=" * 54)
     print("  PACKAGE START MOD")

@@ -868,14 +868,16 @@ def phase_modify_body_meshes(tes5_data: str = None, plugins: list = None,
 
     plugins = plugins or ["Skyrim.esm"]
     out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
-    # Straight into output/, NOT into a per-plugin folder. This step takes no
-    # `-f` and patches the vanilla Skyrim body records for the whole load
-    # order, so it belongs to no single conversion. Hardcoding "Oblivion.esm"
-    # put it somewhere `--pack-only -f <other plugin>` never looks: converting
-    # Nehrim created an otherwise-empty output/Oblivion.esm/ holding just this
-    # file, and it shipped with nothing.
-    out_root.mkdir(parents=True, exist_ok=True)
-    out_path = out_root / "Slot44 Patch.esp"
+    # Into "Finished Mods", NOT a per-plugin folder. This step takes no `-f` and
+    # patches the vanilla Skyrim body records for the whole load order, so it
+    # belongs to no single conversion. Hardcoding "Oblivion.esm" put it
+    # somewhere `--pack-only -f <other plugin>` never looks: converting Nehrim
+    # created an otherwise-empty output/Oblivion.esm/ holding just this file,
+    # and it shipped with nothing. It is installed loose rather than zipped —
+    # one plugin with no assets is not worth an archive — so it sits beside the
+    # zips as a finished artefact in its own right.
+    from output_layout import finished_dir
+    out_path = finished_dir(out_root) / "Slot44 Patch.esp"
 
     plugin_paths = []
     for name in plugins:
@@ -937,10 +939,11 @@ def phase_pack(file_name: str, config: dict, output_dir: str = None):
 def phase_pack_zip(file_name: str, config: dict, output_dir: str = None):
     """Zip the converted plugin (.esm/.esl/.esp) and .bsa files for distribution.
 
-    The zip is placed adjacent to the per-file output folder (i.e. inside
-    output_dir, alongside output_dir/file_name/) and named "<file_name>.zip".
+    The zip lands in output_dir/"Finished Mods"/ — with every other installable
+    artefact — and is named "<file_name>.zip".
     """
     import zipfile
+    from output_layout import finished_dir
 
     out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
     src_root = out_root / file_name
@@ -948,7 +951,7 @@ def phase_pack_zip(file_name: str, config: dict, output_dir: str = None):
         print(f"[{file_name}] Source not found: {src_root}, skipping zip pack")
         return False
 
-    zip_path = out_root / f"{file_name}.zip"
+    zip_path = finished_dir(out_root) / f"{file_name}.zip"
 
     packed = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:

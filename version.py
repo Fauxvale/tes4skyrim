@@ -641,9 +641,15 @@ STEP_KEYS: list[tuple[str, str]] = [
     # Global actions. Numberless on purpose: they are not positions in the
     # per-plugin pipeline, they are one-off jobs covering the whole load order,
     # and the GUI presents them as buttons rather than numbered checkboxes.
-    ("package_start_mod",  "Package Start Mod"),
-    ("modify_body_meshes", "Patch Skyrim"),
+    #
+    # ORDER MATTERS and is not free to tidy: it must match gui.GLOBAL_ACTIONS
+    # (which reads left-to-right, top-to-bottom off the sidebar buttons) and
+    # release_notes.STEP_ORDER, both asserted in test_version_upgrade.py. So
+    # rearranging the buttons moves these too.
     ("create_lod",         "Create LOD"),
+    ("pack_lod",           "Pack LOD"),
+    ("modify_body_meshes", "Patch Skyrim"),
+    ("package_start_mod",  "Package Start Mod"),
 ]
 
 _LABEL_TO_KEY = {label: key for key, label in STEP_KEYS}
@@ -668,8 +674,11 @@ _LABEL_OF     = {key: label for key, label in STEP_KEYS}
 # every plugin that edits a worldspace, so baking them per plugin generates the
 # contested tiles once per sibling and then discards all but one. It reconciles
 # SEVERAL plugins against each other, so it belongs to none of them.
+#
+# "Pack LOD" inherits it: it zips that one shared folder into one shared
+# archive, so it is no more per-plugin than the bake it packages.
 GLOBAL_STEPS: frozenset[str] = frozenset({"modify_body_meshes", "create_lod",
-                                          "package_start_mod"})
+                                          "package_start_mod", "pack_lod"})
 
 # The state-file key those steps are recorded under.  `_plugin_key(None)`
 # already collapses to "*", which is exactly "belongs to no plugin".

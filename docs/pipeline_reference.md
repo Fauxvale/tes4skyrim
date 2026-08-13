@@ -254,8 +254,39 @@ TESConversion/
   external/               # third-party binaries (see README license table)
   tests/ tools/ docs/ references/ temp/
   export/                 # cached exports (gitignored)
-  output/                 # converted plugins (gitignored)
+  output/                 # WORKING area (gitignored)
+    <plugin>/             #   one folder per converted plugin
+    AutoConvertLOD/       #   the baked LOD mod (tools/create_lod.py)
+    Finished Mods/        #   everything the user INSTALLS -- see below
 ```
+
+### `output/Finished Mods/`
+
+`output/` is a workspace, not a delivery folder: per-plugin working folders, the
+baked LOD mod, caches and manifests all live there and none of it is what the
+user installs. The installable artefacts used to sit at the same level, mixed in,
+so finding the handful of files that actually ship meant knowing which entries
+were products and which were scaffolding.
+
+Everything installable is collected in `output/Finished Mods/` instead:
+
+| Artefact | Written by |
+|---|---|
+| `<plugin>.zip` | `convert.py --pack-zip-only` (`phase_pack_zip`) |
+| `AutoConvertLOD.zip` | `tools/pack_lod.py` |
+| `TESGameSelect.zip` | `tools/package_start_mod.py` |
+| `Slot44 Patch.esp` | `convert.py --modify-body-meshes` (loose — one plugin with no assets is not worth an archive) |
+
+The folder name lives in `output_layout.py` (`FINISHED_DIR_NAME`), spelled once
+because it contains a space and is user-facing. Its `finished_dir(out_root)`
+helper creates the folder on demand — a run that packages nothing leaves no empty
+folder promising deliverables. **Read-only checks must use the constant, not the
+helper**: `gui._global_artifact` only asks whether an artefact exists, and calling
+the helper there would create the folder just by opening the GUI.
+
+Nothing here is ever mistaken for a converted plugin: `sibling_lod.converted_plugins`
+requires `<folder>/<folder>` to exist and `gui.scan_converted` requires a
+manifest, and this folder satisfies neither.
 
 ## Verifying output in SSEEdit
 

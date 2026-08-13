@@ -76,20 +76,27 @@ _DEFAULT_ON = {k for k, *_ in STEPS}
 # the side-by-side sidebar buttons. `row` groups them into sidebar rows.
 # (key, label, tooltip, short, row)
 GLOBAL_ACTIONS = [
-    # Row 0: full width. Depends on nothing else — the starter mod is committed
-    # prebuilt, so it can be packaged before anything has been converted.
-    ("package_start_mod", "Package Start Mod",
-     "Zip the prebuilt TESGameSelect starter mod (the new-game world "
-     "selector) into output/, ready to install like any converted plugin",
-     "Start Mod", 0),
-    # Row 1: the two that consume converted output, side by side.
+    # Row 0: bake the LOD, then wrap it. Left-to-right IS the order they run in,
+    # and "Pack LOD" has nothing to zip until "Create LOD" has produced it.
+    ("create_lod", "Create LOD",
+     "Generate distant LOD for the whole load order in one pass, into the "
+     "standalone output/AutoConvertLOD mod",
+     "Create LOD", 0),
+    ("pack_lod", "Pack LOD",
+     "Zip the generated AutoConvertLOD folder into output/Finished Mods, "
+     "ready to install like any converted plugin",
+     "Pack LOD", 0),
+    # Row 1.
     ("modify_body_meshes", "Patch Skyrim",
      "Build the ARMA slot-44 body patch for your Skyrim load order",
      "Patch Skyrim", 1),
-    ("create_lod", "Create LOD",
-     "Generate distant LOD for the whole load order in one pass, then merge "
-     "the tiles two or more plugins both change",
-     "Create LOD", 1),
+    # Depends on nothing else — the starter mod is committed prebuilt, so it can
+    # be packaged before anything has been converted.
+    ("package_start_mod", "Package Start Mod",
+     "Zip the prebuilt TESGameSelect starter mod (the new-game world "
+     "selector) into output/Finished Mods, ready to install like any "
+     "converted plugin",
+     "Start Mod", 1),
 ]
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -2397,10 +2404,11 @@ def gui_main():
     gf = ttk.Frame(sidebar, style="Panel.TFrame")
     gf.pack(fill=tk.X, padx=14, pady=(0, 6))
 
-    # Laid out by the `row` field. EVERY row keeps the same two columns, so a
-    # row holding one action fills only its own half and the lone button comes
-    # out the same width as the pair below it — spanning the full width made it
-    # read as the most important action here, which it is not.
+    # Laid out by the `row` field: position in GLOBAL_ACTIONS decides the
+    # column. EVERY row keeps the same two uniform columns, so every button is
+    # the same width and a row holding one action fills only its own half —
+    # spanning the full width made a lone button read as the most important
+    # action here, which none of them is.
     global_btns: dict[str, ttk.Button] = {}
     _rows: dict[int, list] = {}
     for _act in GLOBAL_ACTIONS:
@@ -2437,9 +2445,11 @@ def gui_main():
     body_toggle_lbl.grid(row=0, column=0, sticky="w", padx=(0, 3))
     body_toggle_lbl.bind("<Button-1>", lambda _: _open_patch_plugin_panel())
 
-    # No sub-link under "Create LOD": the button itself opens the selection
-    # dialog, so a second entry point to the same panel would just be a
-    # duplicate of the button beside it.
+    # Column 0 of this row is under "Patch Skyrim", the last row's left-hand
+    # button, which is the only action with a selection to make from here.
+    # "Create LOD" needs no sub-link — the button itself opens the selection
+    # dialog, so a second entry point to the same panel would just duplicate it
+    # — and neither packaging action has anything to choose.
 
     # Progress bar + status, both anchored to the BOTTOM of the sidebar.
     #
@@ -2647,6 +2657,13 @@ def gui_main():
                 cmd += ["--output-dir", out_dir]
             return cmd
 
+        if key == "pack_lod":
+            cmd = [sys.executable, "-u",
+                   str(SCRIPT_DIR / "tools" / "pack_lod.py")]
+            if out_dir:
+                cmd += ["--output-dir", out_dir]
+            return cmd
+
         if key == "create_lod":
             cmd = [sys.executable, "-u",
                    str(SCRIPT_DIR / "tools" / "create_lod.py")]
@@ -2712,10 +2729,19 @@ def gui_main():
         for it.
         """
         out_dir = output_var.get().strip() or str(SCRIPT_DIR / "output")
+        # FINISHED_DIR_NAME, not finished_dir(): this only ASKS whether the
+        # artefact is there, and the helper would create the folder as a side
+        # effect — opening the GUI would leave an empty "Finished Mods"
+        # promising deliverables nothing has produced.
+        from output_layout import FINISHED_DIR_NAME
+        finished = Path(out_dir) / FINISHED_DIR_NAME
         if key == "package_start_mod":
-            return Path(out_dir) / "TESGameSelect.zip"
+            return finished / "TESGameSelect.zip"
         if key == "modify_body_meshes":
-            return Path(out_dir) / "Slot44 Patch.esp"
+            return finished / "Slot44 Patch.esp"
+        if key == "pack_lod":
+            from asset_convert.sibling_lod import LOD_DIR_NAME
+            return finished / f"{LOD_DIR_NAME}.zip"
         return None
 
     def _global_stamp(key: str) -> str:
@@ -2745,6 +2771,27 @@ def gui_main():
             # Whether the zip EXISTS is not folded in here: _global_is_current
             # already tests the artefact directly, so this only has to describe
             # the inputs that would make an existing zip stale.
+            return "\x1f".join(src)
+
+        if key == "pack_lod":
+            # Depends on the BAKED LOD folder, not on the converted plugin set:
+            # the zip is a copy of that folder, so it goes stale exactly when
+            # Create LOD rewrites a tile and at no other time. Converting an
+            # unrelated plugin re-lights Create LOD, and packing follows only
+            # once that has actually rebaked something.
+            #
+            # Size+mtime per file, not content: the folder is thousands of
+            # tiles and hashing them would cost more than the zip itself.
+            from asset_convert.sibling_lod import LOD_DIR_NAME
+            lod_dir = Path(out_dir) / LOD_DIR_NAME
+            try:
+                src = sorted(
+                    f"{p.relative_to(lod_dir).as_posix()}:{st.st_size}:"
+                    f"{int(st.st_mtime)}"
+                    for p in lod_dir.rglob('*') if p.is_file()
+                    for st in (p.stat(),))
+            except OSError:
+                src = []
             return "\x1f".join(src)
 
         parts = []

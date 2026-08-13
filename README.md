@@ -125,6 +125,12 @@ python convert.py -f Oblivion.esm
 
 The output plugin and assets are written to `output/` (override with `--output-dir`).
 
+Everything you actually **install** is collected in **`output/Finished Mods/`** —
+each converted plugin's `.zip`, the LOD archive, the starter mod, and the loose
+`Slot44 Patch.esp`. The rest of `output/` is the working area the pipeline builds
+them from (one folder per plugin, the baked `AutoConvertLOD/`, caches and
+manifests); you do not need to install anything from there directly.
+
 The Import step downloads a [prebuilt navmesh cache](https://github.com/bryantmh/tes4skyrim/releases)
 for you, turning minutes of navmesh generation into seconds. Each cache serves the
 version it was built for **and every version above it**, until a newer cache
@@ -203,7 +209,10 @@ python convert.py -f Oblivion.esm --sounds-only        # Copy/convert sound file
 python convert.py -f Oblivion.esm --scripts-only       # Transpile scripts → Papyrus
 python convert.py -f Oblivion.esm --lod-only           # Generate object & terrain LOD (slow)
 python convert.py -f Oblivion.esm --pack-only          # Pack output assets into Skyrim BSAs
+python convert.py -f Oblivion.esm --pack-zip-only      # Zip plugin + BSAs → output/Finished Mods/
 python convert.py --modify-body-meshes                 # Build ARMA slot-44 patch (takes no -f)
+python tools/create_lod.py                             # Bake ALL LOD once (takes no -f)
+python tools/pack_lod.py                               # Zip the baked LOD mod
 python tools/package_start_mod.py                      # Zip the TESGameSelect starter mod
 python tools/merge_sibling_lod.py --dry-run            # Report LOD tiles two converted mods both claim
 python convert.py -f Oblivion.esm --mesh-bounds-only   # Rescan mesh bounds → OBND cache
@@ -260,19 +269,24 @@ These are the steps as presented (and run) by the GUI, in order:
 | 6 | **Import** | Read the text cache and write the TES5 binary ESM/ESP — all record transformations happen here. |
 | 7 | **Sounds** | Convert voice files to XWM and copy sound files. |
 | 8 | **Scripts** | Transpile Oblivion scripts to Papyrus and compile. |
-| 9 | **LOD** | *(opt-in, off by default)* Generate object and terrain LOD meshes. |
-| 10 | **Pack BSAs** | *(opt-in, off by default)* Pack the converted assets into Skyrim BSA archives. |
-| 11 | **Pack Mod Zip** | Zip the plugin(s) and BSAs into a single archive for installation. |
+| 9 | **Pack BSAs** | *(opt-in, off by default)* Pack the converted assets into Skyrim BSA archives. |
+| 10 | **Pack Mod Zip** | Zip the plugin(s) and BSAs into a single archive for installation. |
 
-Three further actions belong to **no single plugin**, so they are buttons under
+LOD is **not** in that list. LOD tiles sit on a fixed grid shared by every plugin
+that edits a worldspace, so baking them per plugin would generate each contested
+tile once per plugin and then throw all but one away. It is a Global action
+instead, baked once for the whole load order.
+
+Four actions belong to **no single plugin**, so they are buttons under
 **Global** in the sidebar rather than numbered steps. Each runs once and covers
 everything you have converted:
 
 | Action | What happens |
 |--------|--------------|
-| **Start Mod** | Zip the prebuilt TESGameSelect starter mod (see *Starting a converted game*) to `output/TESGameSelect.zip`. |
-| **Patch Skyrim** | Build the ARMA slot-44 body patch for your whole Skyrim load order (*select plugins...* chooses which). |
-| **Merge LOD** | Rebake the LOD tiles that two or more converted plugins both change, into `output/ZZZ Merged Sibling LOD/`. Only needed when you install more than one converted mod covering the same worldspace — **install that folder after the mods it merges**. *merge order...* sets which plugin wins a contested tile (defaults to your `plugins.txt` order). |
+| **Create LOD** | Generate all object and terrain LOD in one pass, into a standalone `output/AutoConvertLOD/` mod. The button opens a panel choosing which plugins and worldspaces to include; the plugin order decides which one wins a contested tile (defaults to your `plugins.txt` order). **Install it after the mods it covers.** |
+| **Pack LOD** | Zip `output/AutoConvertLOD/` into `output/Finished Mods/AutoConvertLOD.zip` for installation. |
+| **Patch Skyrim** | Build the ARMA slot-44 body patch for your whole Skyrim load order (*select plugins...* chooses which), as `output/Finished Mods/Slot44 Patch.esp`. |
+| **Start Mod** | Zip the prebuilt TESGameSelect starter mod (see *Starting a converted game*) to `output/Finished Mods/TESGameSelect.zip`. |
 
 A Global button greys out with a check once its result is current, and lights up
 again when something it depends on changes.

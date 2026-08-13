@@ -261,6 +261,13 @@ _REQUIREMENTS = {
 
     'meshes': [
         lambda: _pip('pyffi', 'PyFFI', 'Reading and writing NIF meshes'),
+        # PyFFI imports `distutils`, which Python REMOVED from the stdlib in
+        # 3.12; setuptools is what puts it back. Probed by the module it
+        # supplies rather than by 'setuptools', because that is what actually
+        # has to import -- and probed here, with PyFFI, since a missing
+        # distutils fails at PyFFI's import, not at any use of setuptools.
+        lambda: _pip('distutils', 'setuptools',
+                     'Supplies distutils for PyFFI on Python 3.12+'),
         lambda: _pip('numpy', 'numpy', 'Mesh, skin and collision math'),
         lambda: _pip('scipy', 'scipy', 'Collision convex hulls and skin retargeting'),
         lambda: _pip('lz4', 'lz4', 'Reading vanilla Skyrim SE BSAs for reference assets'),
@@ -337,6 +344,11 @@ _REQUIREMENTS = {
     ],
 
     'pack_zip': [],
+
+    # Both zip with the stdlib and need nothing installed, listed for the same
+    # reason 'pack_zip' is: an empty list states "checked, needs nothing",
+    # where a missing key would only mean "never considered".
+    'pack_lod': [],
 }
 
 # Human-readable phase names, matching the GUI's step labels.
@@ -353,6 +365,7 @@ PHASE_LABELS = {
     'skyrim_patch': 'Patch Skyrim',
     'pack_bsa':     'Pack BSAs',
     'pack_zip':     'Pack Mod Zip',
+    'pack_lod':     'Pack LOD',
 }
 
 

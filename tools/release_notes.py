@@ -52,17 +52,30 @@ STEP_ORDER = [
     # Global actions: not numbered, because they are not positions in the
     # per-plugin pipeline. Each runs once for the whole load order and the GUI
     # offers them as buttons rather than step checkboxes.
-    "Package Start Mod",
-    "Patch Skyrim",
+    #
+    # Their ORDER here mirrors the GUI's button grid and version.STEP_KEYS --
+    # test_version_upgrade.py asserts all three agree -- so rearranging the
+    # buttons moves these too.
+    #
     # LOD is here, not in the numbered list: tiles live on a grid every plugin
     # in a worldspace shares, so it is generated once for the whole load order
-    # rather than once per plugin.
+    # rather than once per plugin. Packing it follows immediately, the way
+    # "10. Pack Mod Zip" follows the per-plugin steps.
     "Create LOD",
+    "Pack LOD",
+    "Patch Skyrim",
+    "Package Start Mod",
 ]
 
 # Steps that only repackage what earlier steps produced.  Added automatically
 # whenever any producing step fires, never a reason to run on their own.
 PACKAGING_STEPS = ["9. Pack BSAs", "10. Pack Mod Zip"]
+
+# "Pack LOD" is the same idea for the standalone LOD mod, but it repackages ONE
+# step's output rather than the per-plugin pipeline's, so it is triggered by
+# that step alone instead of by anything at all being rebuilt.
+LOD_PACKAGING_STEP = "Pack LOD"
+LOD_PRODUCING_STEP = "Create LOD"
 
 # (regex over the repo-relative path, steps it forces).  First match wins per
 # rule list order, but every matching rule contributes -- a path may need
@@ -126,6 +139,13 @@ RULES: list[tuple[str, list[str]]] = [
     # ── Non-pipeline: never a reason to re-run anything ───────────────────
     (r"^docs/",                   []),
     (r"^tests/",                  []),
+    # ...except the three tools that ARE global actions, not debug utilities.
+    # Listed BEFORE the blanket tools/ rule (first match wins): a change to one
+    # of these changes the artefact the user installs, so it makes that action's
+    # output stale exactly as a stage module does.
+    (r"^tools/create_lod\.py$",       ["Create LOD"]),
+    (r"^tools/pack_lod\.py$",         ["Pack LOD"]),
+    (r"^tools/package_start_mod\.py$", ["Package Start Mod"]),
     (r"^tools/",                  []),
     (r"^references/",             []),
     (r"^external/",               []),
@@ -332,10 +352,17 @@ def steps_for_paths(paths: list[str],
 
     # Packaging only matters once something it packages was rebuilt.  Global
     # actions each write a STANDALONE artefact the BSA/zip steps never read --
-    # "Patch Skyrim" its ARMA patch, "Package Start Mod" its own zip -- so
-    # neither may drag packaging in on its own.
-    if steps - {"Patch Skyrim", "Package Start Mod"}:
+    # "Patch Skyrim" its ARMA patch, "Package Start Mod" its own zip, "Create
+    # LOD" its own mod folder -- so none may drag per-plugin packaging in on
+    # its own.
+    if steps - {"Patch Skyrim", "Package Start Mod", LOD_PRODUCING_STEP,
+                LOD_PACKAGING_STEP}:
         steps.update(PACKAGING_STEPS)
+
+    # A rebaked LOD folder makes its zip stale, exactly as a rebuilt plugin
+    # makes the per-plugin zip stale.
+    if LOD_PRODUCING_STEP in steps:
+        steps.add(LOD_PACKAGING_STEP)
 
     ordered = [s for s in STEP_ORDER if s in steps]
     return ordered, unmatched, (gui_touched and not steps)
