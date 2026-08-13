@@ -108,13 +108,38 @@ def _iter_records(raw: bytes):
             p += 24 + data_size
 
 
+# Keyed on (path, mtime_ns, size) like lod_gen._PARSED_ESM_CACHE. The result is
+# a pure function of the file and carries NO worldspace scoping, yet the terrain
+# stage rebuilt it once per worldspace (plus once per overlay, per worldspace) —
+# 18 full reads of a 613 MB ESM for Oblivion.esm alone. Bounded by the number of
+# plugins in one run, so it does not grow with worldspace count.
+_LTEX_MAP_CACHE: dict = {}
+
+
 def build_ltex_texture_map(esm_path: Path) -> dict:
     """Return {LTEX FormID(int) -> {'diffuse': path, 'normal': path}}.
 
     Paths are relative to the Data folder (e.g. 'tes4\\landscape\\foo.dds').
     Resolved via LTEX.TNAM -> TXST.TX00/TX01.
+
+    Memoised per file. A COPY is returned every call: `generate_terrain_lod`
+    merges overlays with `ltex_map.update(...)`, which would otherwise write the
+    overlay's entries into the cached master map and leak them into every later
+    worldspace.
     """
-    raw = Path(esm_path).read_bytes()
+    esm_path = Path(esm_path)
+    try:
+        st = esm_path.stat()
+        key = (str(esm_path).lower(), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None:
+        hit = _LTEX_MAP_CACHE.get(key)
+        if hit is not None:
+            # Shallow copy: the inner dicts are never mutated, only replaced.
+            return dict(hit)
+
+    raw = esm_path.read_bytes()
     txst = {}   # TXST FormID -> (tx00, tx01)
     ltex_tnam = {}  # LTEX FormID -> TXST FormID
     for sig, fid, body in _iter_records(raw):
@@ -131,6 +156,9 @@ def build_ltex_texture_map(esm_path: Path) -> dict:
     for lfid, tfid in ltex_tnam.items():
         tx00, tx01 = txst.get(tfid, ('', ''))
         out[lfid] = {'diffuse': tx00, 'normal': tx01}
+    if key is not None:
+        _LTEX_MAP_CACHE[key] = out
+        return dict(out)
     return out
 
 

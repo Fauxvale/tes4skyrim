@@ -47,6 +47,74 @@ CELL_SIZE   = 4096.0   # Skyrim units per cell
 VERTS_SIDE  = 33       # vertices per cell side in TES5 LAND records (32 intervals)
 DELTA_SCALE = 8.0      # each int8 delta = 8 Skyrim units of height
 
+# ---------------------------------------------------------------------------
+# Plugin byte cache
+# ---------------------------------------------------------------------------
+# `_parse_land_records` is worldspace-scoped, so its RESULT cannot be shared
+# between worldspaces — but the bytes it scans can. One call reads the whole
+# plugin twice (once to locate the WRLD FormID, once per file in `_scan_land_file`),
+# and the terrain stage runs it once per worldspace: 18 worldspaces x 613 MB was
+# ~22 GB of repeat I/O for Oblivion.esm alone, plus a re-read per overlay each time.
+#
+# Deliberately holds ONE file only. These buffers are hundreds of MB and the
+# parent process publishes `lands` into shared memory while workers spawn, so a
+# multi-entry cache would add a second full plugin to the peak exactly when
+# footprint matters most. Worldspaces are processed one plugin-set at a time, so
+# a single slot still turns every repeat read within a worldspace into a hit.
+_RAW_CACHE_KEY = None
+_RAW_CACHE_BUF = None
+
+
+def _plugin_bytes(esm_path: Path) -> bytes:
+    """Read a plugin's bytes, reusing the last file read (keyed on mtime+size)."""
+    global _RAW_CACHE_KEY, _RAW_CACHE_BUF
+    esm_path = Path(esm_path)
+    try:
+        st = esm_path.stat()
+        key = (str(esm_path).lower(), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return esm_path.read_bytes()
+    if key == _RAW_CACHE_KEY and _RAW_CACHE_BUF is not None:
+        return _RAW_CACHE_BUF
+    # Drop the old buffer BEFORE reading the new one so the two never coexist.
+    _RAW_CACHE_KEY = None
+    _RAW_CACHE_BUF = None
+    buf = esm_path.read_bytes()
+    _RAW_CACHE_KEY = key
+    _RAW_CACHE_BUF = buf
+    return buf
+
+
+def _drop_plugin_bytes():
+    """Release the cached plugin buffer (call before spawning worker pools)."""
+    global _RAW_CACHE_KEY, _RAW_CACHE_BUF
+    _RAW_CACHE_KEY = None
+    _RAW_CACHE_BUF = None
+    _WRLD_FID_CACHE.clear()
+
+
+# (path, mtime, size, edid) -> raw WRLD FormID or None. `_find_worldspace_fid`
+# is a full linear scan of the plugin, and `_parse_land_records` ran it twice
+# for the same (file, edid) on every worldspace: once to resolve the defining
+# plugin's id, then again inside `_scan_land_file`. Measured 0.64 s of the 2.36 s
+# parse on Oblivion.esm. Cleared with the byte cache so a rebuilt plugin cannot
+# serve a stale id.
+_WRLD_FID_CACHE: dict = {}
+
+
+def _worldspace_fid_cached(esm_path: Path, raw: bytes, edid: str):
+    """`_find_worldspace_fid` memoised per (plugin file, worldspace EditorID)."""
+    try:
+        st = Path(esm_path).stat()
+        key = (str(esm_path).lower(), st.st_mtime_ns, st.st_size, edid)
+    except OSError:
+        return _find_worldspace_fid(raw, len(raw), edid)
+    if key in _WRLD_FID_CACHE:
+        return _WRLD_FID_CACHE[key]
+    val = _find_worldspace_fid(raw, len(raw), edid)
+    _WRLD_FID_CACHE[key] = val
+    return val
+
 LOD_LEVELS  = [4, 8, 16, 32]
 
 # Diffuse DDS size per LOD level.  A level-N tile spans N cells; it is only ever
@@ -443,9 +511,9 @@ def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel',
     # nothing in another.
     try:
         from .lod_gen import _formid_remap_table
-        _base_raw = Path(esm_path).read_bytes()
-        _raw_fid = _find_worldspace_fid(_base_raw, len(_base_raw),
-                                        worldspace_edid)
+        _base_raw = _plugin_bytes(Path(esm_path))
+        _raw_fid = _worldspace_fid_cached(Path(esm_path), _base_raw,
+                                          worldspace_edid)
         del _base_raw
         if _raw_fid is None:
             base_wrld_fid = None
@@ -500,7 +568,7 @@ def _scan_land_file(esm_path: Path, worldspace_edid: str,
     5,787 of Oblivion's own Tamriel cells and stamping Vvardenfell across
     central Cyrodiil's distant terrain.
     """
-    raw = esm_path.read_bytes()
+    raw = _plugin_bytes(Path(esm_path))
     n   = len(raw)
 
     # FormIDs are normalised into the load-order-wide space before anything is
@@ -528,7 +596,7 @@ def _scan_land_file(esm_path: Path, worldspace_edid: str,
     # ALREADY normalised, because it comes from a DIFFERENT file (the one that
     # defines the worldspace). Comparing it against this file's raw ids is
     # exactly the cross-file mistake the normalisation exists to prevent.
-    _found = _find_worldspace_fid(raw, n, worldspace_edid)
+    _found = _worldspace_fid_cached(esm_path, raw, worldspace_edid)
     target_wrld_fid = None if _found is None else g(_found)
     if target_wrld_fid is not None:
         print(f"  Filtering to worldspace '{worldspace_edid}' (FormID={target_wrld_fid:#010x})")
@@ -583,6 +651,18 @@ def _scan_land_file(esm_path: Path, worldspace_edid: str,
                 next_wrld = cur_wrld_fid
                 if g_type == 1:          # world children: label = parent WRLD FormID
                     next_wrld = g(struct.unpack_from('<I', g_label)[0])
+                    # Everything harvested below a type-1 GRUP (CELL water, LAND,
+                    # and the cell_coords they resolve through) is gated on
+                    # `cur_wrld_fid == target_wrld_fid`, so a FOREIGN worldspace's
+                    # subtree can only ever contribute records that are then
+                    # discarded. Skipping it whole is what stops the scan walking
+                    # all 1.17M records of the plugin to reach 142 LAND records.
+                    # Only valid when the target is known: with target_wrld_fid
+                    # None the unscoped fallback deliberately takes everything.
+                    if (target_wrld_fid is not None
+                            and next_wrld != target_wrld_fid):
+                        p += g_size
+                        continue
                 elif g_type == 6:        # cell children (persistent+temp block): label = parent CELL FormID
                     next_cell = g(struct.unpack_from('<I', g_label)[0])
                 elif g_type in (8, 9):   # persistent (8) / temporary (9) cell subgroup
@@ -2056,6 +2136,11 @@ def generate_terrain_lod(esm_path: Path, output_dir: Path,
 
     # Descending level = descending cost.
     work.sort(key=lambda w: -w[2])
+
+    # Every scan of this plugin is finished; the cached file buffer is hundreds
+    # of MB and must not be resident while the shared block is filled and the
+    # workers spawn. The next worldspace simply re-reads (one read, then hits).
+    _drop_plugin_bytes()
 
     # Publish `lands` ONCE into shared memory instead of pickling a private
     # copy into every worker. See the _SharedLands comment: the old
