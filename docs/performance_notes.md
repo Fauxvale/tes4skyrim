@@ -215,6 +215,77 @@ properly parallel. Two findings:
   `(path, mtime, size)`. The overlay merge mutates all four returned
   structures, so `generate_lod` shallow-copies them when overlays exist;
   without that the second worldspace inherits the first one's merged state.
+
+- <a id="lod-overlay-scoping"></a>**Overlays were attached by master chain, not
+  by what they actually edit.** `create_lod` gave a worldspace every selected
+  plugin that depends on its owner — which is what a plugin is ALLOWED to touch,
+  not what it DOES. On the 12-plugin selection that stacked all 9 of
+  Oblivion.esm's dependents onto all 18 of its worldspaces: **162 overlay
+  attachments, 114 s of parsing, 4 s of it useful**. Most dependents edit exactly
+  one worldspace and three edit none of Oblivion's at all. Scoping on
+  `sibling_lod.touched_worldspace_fids` (one linear GRUP walk; bodies never
+  parsed) cuts it to **7 attachments**, and the whole planning phase to ~10 s.
+
+  Two caches make the rest cheap: the parsed-ESM memo now holds **the base AND
+  its overlays** (it kept one entry, so the two evicted each other and the
+  overlay stack was re-parsed every worldspace), and `create_lod` resolves every
+  worldspace FormID an owner is responsible for from **one** read of its bytes.
+
+  🛑 **Scope must be judged per file, from its own records only.** A raw FormID
+  is meaningless across plugins — the index byte offsets into each file's OWN
+  master list, so Morrowind_ob.esm's `02xxxxxx` and Tamriel.esp's `02xxxxxx` are
+  both *self* and name unrelated records. The two collide on **4 CELL FormIDs**;
+  resolving one plugin's cells against another's table reads that coincidence as
+  183 overrides and drags Morrowind **interior** clutter into Cyrodiil's distant
+  terrain. Guarded by `tests/test_lod_overlay_scope.py`. See
+  [[project_master_index_routing]].
+
+  Scoping removes the 183 phantom refs as a side effect, but the merge itself
+  needed the real fix — see below.
+- <a id="lands-shared-memory"></a>🛑 **`lands` IS SHARED WITH THE TILE WORKERS,
+  NEVER COPIED PER WORKER — AND LOW CPU WITH HIGH RAM IS THE TELL.**
+  (found 2026-08-12, reported by the user as "taking forever, cpu usage low,
+  ram near 100%")
+
+  `generate_terrain_lod` passed `lands` to the pool via `initializer=`, which
+  **pickles it once per worker**. On Windows (spawn) that is a private copy in
+  every process. The data is far bigger than it looks: **~24 KB per cell**,
+  dominated by the 17x17 float32 opacity grids, NOT the heights.
+
+  | worldspace | LAND records | packed | x29 workers |
+  |---|---|---|---|
+  | Tamriel (Oblivion.esm alone) | 14,686 | 329 MB | ~9.5 GB |
+  | Tamriel + 6 overlays | 110,260 | **1,205 MB** | **~35 GB** |
+
+  Measured mid-run on a 31 GB machine: 25 python processes, **22.9 GB resident,
+  1.2 GB free, 13.4 GB of pagefile**. The box was swapping, which is why the
+  symptom was **low CPU** while the stage crawled — the instinct to blame
+  compute is wrong here.
+
+  Fixed by publishing ONE copy through `multiprocessing.shared_memory`; each
+  worker maps it and rebuilds numpy **views** (`_SharedLands`). After: **4.8-6.7
+  GB peak with all 29 workers and 15 GB free.** Do NOT "fix" this by cutting
+  `worker_count()` — the workers were never the problem, the per-worker copy was.
+
+  Three traps, all found by testing:
+  - **`decode_land_layers` returns `(ltex_fid, grid)` 2-tuples**, not
+    `(layer, fid, grid)`. It sorts by layer and DROPS the index, so **list order
+    is the only thing carrying blend order** — a packer that rebuilt from a dict
+    would silently reorder terrain texture blending.
+  - **Size the block, then fill it in place** (`_lands_layout` + `_write_lands`).
+    Packing into a `bytearray` first holds a second full copy in the parent —
+    1.2 GB — exactly while 29 workers spawn.
+  - **Drop the parent's `lands` after packing** and keep the `SharedMemory`
+    handle in a module global in the worker: if it is garbage collected the
+    mapping goes with it and every view becomes invalid memory. `close()` AND
+    `unlink()` in a `finally`, or the segment leaks once per worldspace.
+
+  Sharing is only worth anything if it is lossless: verified by generating one
+  worldspace single-process and again through the pool — **498 files, 0
+  byte-different**. Guarded by `tests/test_terrain_lod_shared_lands.py`.
+
+  Note `worker_count()` is CPU-derived with **no memory awareness**, so any
+  future stage that hands workers a large structure hits this same wall.
 - **The serial LAND parse runs once PER WORLDSPACE**, and Oblivion.esm ships
   **18** of them, so the same ESM is re-scanned ~18 times before each
   worldspace's tile pool starts. Tamriel alone has **14,686 LAND records**.

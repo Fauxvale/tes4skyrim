@@ -222,6 +222,47 @@ from comparing two conversion runs.
   so an overlay's own worldspaces keep their own FormID and are excluded.
   Guarded by `tests/test_terrain_lod_scoping.py`, which builds synthetic ESMs so
   both branches stay distinguishable.
+- <a id="lod-formid-normalisation"></a>**🔴 THE LOD MERGE RESOLVES FORMIDS
+  THROUGH EACH FILE'S OWN MASTER LIST — RAW IDS ARE NOT COMPARABLE.**
+  (found 2026-08-12)
+
+  This is the same defect the importer fixed in four places (see the
+  master-index routing entry above), and it was still live in the LOD stage.
+  `generate_lod` merges overlays into one reference pool keyed by FormID, and
+  `_scan_land_file`/`_scan_cell_coords` accumulate several files into one
+  cell table — all on the RAW id. But the index byte is an offset into the
+  file's OWN `MAST` list, so the same integer names different records in
+  different plugins, and one record has different integers in different
+  plugins. Both directions broke:
+
+  - **False merges.** Morrowind_ob.esm and Tamriel.esp both declare
+    `[Skyrim, Oblivion]` and are therefore both `02` = self. They collide on
+    **4 CELL FormIDs** — Morrowind *interiors* against Tamriel *exteriors* —
+    which pulled **183 Morrowind interior objects into Cyrodiil's distant
+    terrain**. Another **1,278** references collided between plugins that are
+    not each other's masters.
+  - **Missed merges, the expensive half.** `ElsweyrAnequina.esp` is its own
+    `02`, but in `TWMP_Valenwood_Elsweyr.esp` slot `02` is `Tamriel.esp` and
+    ANQ sits at `03`. VE places **52,100** references onto ANQ base objects,
+    written `03xxxxxx`; looked up raw against ANQ's `02xxxxxx` stats they
+    resolved **0 of 52,100**, so every one of those objects silently had no LOD
+    mesh. Measured A/B: `0` before, `52,100` after. VE also went from
+    `+401,589 added / ~0 replaced` to `+399,110 / ~2,479` — records it was
+    duplicating are now correctly recognised as overrides.
+
+  `lod_gen._formid_remap_table` rewrites each file's index bytes to a
+  process-wide byte that names the same FILE in every plugin, so
+  `(global_byte << 24) | local_id` is comparable across the load order and
+  still fits an int (a local id is only 24 bits). Every id crossing a file
+  boundary is normalised: record ids, GRUP labels, `REFR.NAME` base pointers,
+  `known_wrld_fid`, and `_scan_cell_coords` keys. **A blanket +N shift is
+  wrong** for the same reason it was wrong in the importer — files share their
+  low masters, so only bytes that actually move may be rewritten, matched BY
+  NAME.
+
+  Guarded by `tests/test_lod_overlay_scope.py` (the ANQ slot-shift case
+  included). Synthetic test plugins must declare a `MAST` list or every id
+  resolves to the file itself.
 - <a id="create-lod-order"></a>**`create_lod_order` deliberately differs from
   `_load_order`, and the difference is CONSENT.** LOD is generated for the
   whole load order in one pass (`tools/create_lod.py`, the GUI's *Create LOD*
@@ -358,6 +399,58 @@ from comparing two conversion runs.
     actually move may be rewritten — remap per byte, matching the master's own
     masters BY NAME against the child's list. A uniform +1 turned every
     Oblivion.esm reference into a Tamriel.esp one.
+- <a id="exterior-block-order"></a>**🔴 EXTERIOR BLOCKS ASCEND BY UNSIGNED
+  (X, Y), X MAJOR — AND THE TWO PASSES MUST MERGE INTO ONE RUN.**
+  (found 2026-08-12, confirmed in-game)
+
+  The block/sub-block GRUP label packs the grid as `struct.pack('<hh', Y, X)`
+  — **Y in the LOW word**. Sorting on the label's own word order therefore
+  yields `(Y, X)`, the TRANSPOSE of what the engine wants, and that is what
+  shipped for months.
+
+  The engine walks a worldspace's type-4 block list to build its cell grid
+  **while PARSING the file**, before any cell loads. A list where X descends
+  and re-ascends never terminates: the game hangs on the main menu with **no
+  crash and no log**, and **xEdit reports the file as completely clean**.
+
+  Symptom trail on `TWMP_ValenwoodImproved.esp`, whose Tamriel blocks came out
+  `(-1,0), (-2,-3), (-2,-2), (-1,-2), (-2,-1), (-1,-1)` — three ascending runs:
+  - Deleting exterior blocks in xEdit made it load; the bisect was
+    **cumulative**, because each deletion shortens the list until what remains
+    happens to be monotonic. This is why no single block is "the" culprit and
+    why hunting for a bad record inside them finds nothing.
+  - **Resaving in xEdit did NOT fix it** — xEdit re-sorts on its own key and
+    writes the same order back.
+
+  Two separate defects had to be fixed:
+  1. `import_main._grid_sort_key` / `overrides._group_sort_key` returned
+     `(y, x)`. Both now return `(x, y)`.
+  2. The override pass and the WRLD builder each emit a `GRUP World Children`
+     for the same worldspace, **each internally sorted**. `_merge_owned_groups`
+     folded them by concatenating bodies, producing one group with **two
+     ascending runs** plus a duplicate type-4 group per block both passes
+     touched (Tamriel.esp: 121 blocks in 15 runs, 14 duplicate labels;
+     ElsweyrAnequina.esp: 8 in 2 runs, 3 duplicates). `writer._merge_grid_groups`
+     now folds duplicate block/sub-block groups recursively and restores a
+     single ascending run, leaving the persistent cell's type-6 group first.
+
+  **Authority is the real `Skyrim.esm`**: all 168 blocks of worldspace
+  `0000003C` are sorted by unsigned (X, Y) and by **no other** candidate key,
+  as are every sub-block and all 37 worldspaces. **Never census our own
+  converted output for this** — it carried the same bug, which is exactly how
+  the transposed key was mistaken for vanilla's in the original docstring.
+
+  Guarded by `tests/test_exterior_block_order.py` and
+  `tests/test_merge_grid_groups.py`; `tools/plugin_load_audit.py` check #10
+  reports both `grid-groups-out-of-order` and `duplicate-grid-group`.
+
+  **Ruled out along the way** (all measured clean — don't re-chase): duplicate
+  FormIDs, dangling refs, NaN/Inf floats, cell grid-vs-block filing, owned-group
+  anchoring, LAND-per-cell and LAND FormID-vs-master-cell agreement, NAVI/NVMI
+  consistency (301/301), CELL override content (only 170 XCLW deltas, no flag
+  changes), and `XESP -> 00000014` (a parent no file defines — a real
+  conformance bug, but present in *working* plugins and absent from one of the
+  failing blocks, so not this).
 - <a id="override-type-guard"></a>**AN OVERRIDE MUST RESOLVE TO A MASTER RECORD
   OF THE SAME TYPE.** A plugin's source id can convert to an id that already
   belongs to an unrelated record in the master's own space: ElsweyrAnequina's

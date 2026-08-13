@@ -213,7 +213,16 @@ def changed_lod_cells(plugin_esm: Path, master_esm: Path,
 
     raw = Path(plugin_esm).read_bytes()
     n = len(raw)
-    target = _find_worldspace_fid(raw, n, worldspace_edid)
+    # `coords` is keyed by NORMALISED FormID (it merges two files), so this
+    # file's own ids must be normalised before they are looked up in it.
+    from .lod_gen import _formid_remap_table
+    gmap = _formid_remap_table(Path(plugin_esm))
+
+    def g(fid: int) -> int:
+        return gmap[fid >> 24] | (fid & 0x00FFFFFF)
+
+    _t = _find_worldspace_fid(raw, n, worldspace_edid)
+    target = None if _t is None else g(_t)
     changed = set()
 
     def scan(start, end, cur_cell, cur_wrld):
@@ -227,13 +236,13 @@ def changed_lod_cells(plugin_esm: Path, master_esm: Path,
                 label = raw[p + 8:p + 12]
                 nxt_cell, nxt_wrld = cur_cell, cur_wrld
                 if g_type == 1:
-                    nxt_wrld = struct.unpack_from('<I', label)[0]
+                    nxt_wrld = g(struct.unpack_from('<I', label)[0])
                 elif g_type == 6:
-                    nxt_cell = struct.unpack_from('<I', label)[0]
+                    nxt_cell = g(struct.unpack_from('<I', label)[0])
                 scan(p + 24, p + g_size, nxt_cell, nxt_wrld)
                 p += g_size
                 continue
-            fid = struct.unpack_from('<I', raw, p + 12)[0]
+            fid = g(struct.unpack_from('<I', raw, p + 12)[0])
             if sig == b'CELL':
                 cur_cell = fid
             elif sig in (b'LAND', b'REFR'):
@@ -284,7 +293,16 @@ def count_land_records(esm_path: Path, worldspace_edid: str) -> int:
 
 
 def _scan_cell_coords(esm_path: Path, coords: dict):
-    """Collect {cell FormID -> (x, y)} from every CELL carrying XCLC."""
+    """Collect {cell FormID -> (x, y)} from every CELL carrying XCLC.
+
+    Keys are NORMALISED load-order-wide FormIDs. Every caller accumulates
+    several files into one `coords` dict, and a raw id is meaningful only inside
+    the file it came from — the index byte indexes THAT file's master list. Two
+    plugins' 02s routinely name unrelated records, so raw keys let one plugin's
+    cell silently inherit another's grid coordinates.
+    """
+    from .lod_gen import _formid_remap_table
+    gmap = _formid_remap_table(Path(esm_path))
     raw = esm_path.read_bytes()
     n = len(raw)
     p = 24 + struct.unpack_from('<I', raw, 4)[0]
@@ -299,7 +317,8 @@ def _scan_cell_coords(esm_path: Path, coords: dict):
                 p += size
                 continue
             if sig == b'CELL':
-                fid = struct.unpack_from('<I', raw, p + 12)[0]
+                _f = struct.unpack_from('<I', raw, p + 12)[0]
+                fid = gmap[_f >> 24] | (_f & 0x00FFFFFF)
                 body = raw[p + 24:p + 24 + size]
                 o = 0
                 while o + 6 <= len(body):
@@ -419,11 +438,20 @@ def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel',
     # the unscoped fallback would then sweep in every OTHER worldspace it
     # carries. That is not hypothetical: it put all 5,796 of Morrowind_ob's
     # Vvardenfell cells into Cyrodiil's heightmap.
+    # Normalised into the load-order-wide space, because it is handed to the
+    # OVERLAY scans to compare against THEIR ids. A raw id from one file means
+    # nothing in another.
     try:
+        from .lod_gen import _formid_remap_table
         _base_raw = Path(esm_path).read_bytes()
-        base_wrld_fid = _find_worldspace_fid(_base_raw, len(_base_raw),
-                                             worldspace_edid)
+        _raw_fid = _find_worldspace_fid(_base_raw, len(_base_raw),
+                                        worldspace_edid)
         del _base_raw
+        if _raw_fid is None:
+            base_wrld_fid = None
+        else:
+            _bmap = _formid_remap_table(Path(esm_path))
+            base_wrld_fid = _bmap[_raw_fid >> 24] | (_raw_fid & 0x00FFFFFF)
     except OSError:
         base_wrld_fid = None
 
@@ -475,14 +503,33 @@ def _scan_land_file(esm_path: Path, worldspace_edid: str,
     raw = esm_path.read_bytes()
     n   = len(raw)
 
+    # FormIDs are normalised into the load-order-wide space before anything is
+    # keyed on them. `cell_coords` and the caller's `lands`/`cell_water` are
+    # shared across every file in the stack, and a raw id is only meaningful
+    # inside the file it came from — the index byte is an offset into THAT
+    # file's master list. Two plugins' 02s routinely name unrelated records
+    # (Morrowind_ob.esm and Tamriel.esp collide on 4 CELL ids), which without
+    # this makes one plugin's cell adopt another's grid coordinates.
+    from .lod_gen import _formid_remap_table
+    _gmap = _formid_remap_table(Path(esm_path))
+
+    def g(fid: int) -> int:
+        return _gmap[fid >> 24] | (fid & 0x00FFFFFF)
+
     # We need CELL grid coords alongside each LAND.
     # Strategy: track current CELL grid coords via a lightweight group scanner.
     # Group type 6  = cell children group (label = cell FormID).
     # Group type 1  = world children group (label = parent WRLD FormID).
     # We only collect LAND records that belong to the target worldspace.
 
-    # Find target worldspace FormID first (fast linear scan)
-    target_wrld_fid = _find_worldspace_fid(raw, n, worldspace_edid)
+    # Find target worldspace FormID first (fast linear scan).
+    #
+    # Normalised, like everything else keyed here — and `known_wrld_fid` is
+    # ALREADY normalised, because it comes from a DIFFERENT file (the one that
+    # defines the worldspace). Comparing it against this file's raw ids is
+    # exactly the cross-file mistake the normalisation exists to prevent.
+    _found = _find_worldspace_fid(raw, n, worldspace_edid)
+    target_wrld_fid = None if _found is None else g(_found)
     if target_wrld_fid is not None:
         print(f"  Filtering to worldspace '{worldspace_edid}' (FormID={target_wrld_fid:#010x})")
     elif known_wrld_fid is not None:
@@ -505,7 +552,7 @@ def _scan_land_file(esm_path: Path, worldspace_edid: str,
             return None, p + 1
         sig  = raw[p:p+4].decode('latin-1', errors='replace')
         size = struct.unpack_from('<I', raw, p+4)[0]
-        fid  = struct.unpack_from('<I', raw, p+12)[0]
+        fid  = g(struct.unpack_from('<I', raw, p+12)[0])
         body = raw[p+24: p+24+size]
         return (sig, fid, body), p+24+size
 
@@ -535,9 +582,9 @@ def _scan_land_file(esm_path: Path, worldspace_edid: str,
                 next_cell = cur_cell_fid
                 next_wrld = cur_wrld_fid
                 if g_type == 1:          # world children: label = parent WRLD FormID
-                    next_wrld = struct.unpack_from('<I', g_label)[0]
+                    next_wrld = g(struct.unpack_from('<I', g_label)[0])
                 elif g_type == 6:        # cell children (persistent+temp block): label = parent CELL FormID
-                    next_cell = struct.unpack_from('<I', g_label)[0]
+                    next_cell = g(struct.unpack_from('<I', g_label)[0])
                 elif g_type in (8, 9):   # persistent (8) / temporary (9) cell subgroup
                     # LAND records live in type-9; carry cur_cell_fid through unchanged
                     pass
@@ -605,6 +652,21 @@ def _scan_land_file(esm_path: Path, worldspace_edid: str,
                                 land = _decode_land(body, _sub)
                                 if land is not None:
                                     lands[coords] = land
+                                elif not allow_unscoped:
+                                    # An OVERLAY's LAND with no VHGT is the
+                                    # author DELETING that cell's terrain --
+                                    # "water only, no landscape" (DATA flags
+                                    # clear bit 0x01; vanilla writes 28).
+                                    # Skipping it left the MASTER's heightmap
+                                    # in the dict, so distant terrain kept
+                                    # rendering ground the plugin removed.
+                                    # Drop the cell so the tile bakes as water.
+                                    # `allow_unscoped` is (_i == 0) in the
+                                    # caller, so this fires for overlays only:
+                                    # the base file has no earlier terrain to
+                                    # erase, and a malformed record there must
+                                    # not silently delete a cell.
+                                    lands.pop(coords, None)
                 p = np_
 
     # Skip TES4/TES5 file header
@@ -1591,8 +1653,197 @@ def _heightmap_normal_rgb(heights: np.ndarray, out_px: int) -> np.ndarray:
 # Per-tile worker — pool initializer + task function
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Shared-memory `lands`
+# ---------------------------------------------------------------------------
+#
+# `lands` was handed to the pool through `initializer=`, which PICKLES IT ONCE
+# PER WORKER. On Windows (spawn) that is a private copy in every process: at
+# ~24 KB per cell (the 17x17 float32 opacity grids dominate, not the heights)
+# Tamriel's 14,686 records are ~0.36 GB, so 29 workers held ~10 GB of identical
+# data. Measured on the user's 31 GB machine mid-run: 25 python processes,
+# 22.9 GB resident, 1.2 GB free and 13.4 GB of pagefile — the box was swapping,
+# which is why CPU sat LOW while the stage crawled.
+#
+# The data is strictly read-only, so one copy is enough. Everything is packed
+# into a single flat buffer published via multiprocessing.shared_memory; each
+# worker maps it (no copy, no unpickling) and rebuilds numpy VIEWS over that
+# buffer on demand. Per-worker cost drops from ~0.36 GB to a few MB of index.
+#
+# Layout, all little-endian and 4-byte aligned:
+#   heights : float32 (33, 33)          per cell
+#   colors  : uint8   (33, 33, 3)       per cell
+#   layers  : base {quad: fid} + alpha [(layer, fid, 17x17 float32)]
+# The index maps (cell_x, cell_y) -> byte offsets, and is small enough to pickle
+# to each worker normally.
+_SHM_ALIGN = 4
+
+
+def _lands_layout(lands: dict):
+    """Compute the byte layout of `lands` without materialising it.
+
+    Returns (total_size, plan), where plan is a list of
+    `(key, h_off, c_off, base, [(quad, [(fid, off, shape), ...])])`.
+
+    Split from the write so the buffer can be sized exactly and filled DIRECTLY
+    into shared memory. Building a bytearray first would hold a second full
+    copy in the parent — 1.2 GB on Tamriel-with-overlays, at the very moment 29
+    workers are being spawned.
+    """
+    size = 0
+
+    def _reserve(nbytes: int) -> int:
+        nonlocal size
+        off = size
+        size += nbytes
+        if size % _SHM_ALIGN:
+            size += _SHM_ALIGN - size % _SHM_ALIGN
+        return off
+
+    plan = []
+    for key, v in lands.items():
+        h_off = _reserve(VERTS_SIDE * VERTS_SIDE * 4)
+        c_off = _reserve(VERTS_SIDE * VERTS_SIDE * 3)
+        layers = v.get('layers') or {}
+        alpha_plan = []
+        for quad, entries in (layers.get('alpha') or {}).items():
+            packed = []
+            for fid, grid in entries:
+                packed.append((fid, _reserve(grid.size * 4), grid.shape))
+            alpha_plan.append((quad, packed))
+        plan.append((key, h_off, c_off, dict(layers.get('base') or {}),
+                     alpha_plan))
+    return size, plan
+
+
+def _write_lands(lands: dict, plan, mv: memoryview):
+    """Fill `mv` from `lands` following `plan`, and build the worker index."""
+    index = {}
+    for key, h_off, c_off, base, alpha_plan in plan:
+        v = lands[key]
+        h = np.ascontiguousarray(v['heights'], dtype=np.float32)
+        mv[h_off:h_off + h.nbytes] = h.view(np.uint8).reshape(-1).data
+        c = np.ascontiguousarray(v['colors'], dtype=np.uint8)
+        mv[c_off:c_off + c.nbytes] = c.reshape(-1).data
+        alpha_idx = {}
+        for quad, packed in alpha_plan:
+            entries = (v.get('layers') or {}).get('alpha', {})[quad]
+            out = []
+            for (fid, off, shape), (_f, grid) in zip(packed, entries):
+                g = np.ascontiguousarray(grid, dtype=np.float32)
+                mv[off:off + g.nbytes] = g.view(np.uint8).reshape(-1).data
+                out.append((fid, off, shape))
+            alpha_idx[quad] = out
+        index[key] = (h_off, c_off, base, alpha_idx)
+    return index
+
+
+def _pack_lands(lands: dict):
+    """Pack `lands` into one flat buffer + a picklable index.
+
+    Returns (buffer: bytearray, index: dict). The index holds only offsets and
+    small scalars, so it pickles cheaply to every worker.
+
+    Kept for tests and the single-process path; the pool writes straight into
+    shared memory via `_lands_layout` + `_write_lands` instead, to avoid holding
+    a second copy in the parent.
+    """
+    buf = bytearray()
+    index = {}
+
+    def _put(arr) -> int:
+        off = len(buf)
+        buf.extend(arr.tobytes())
+        if len(buf) % _SHM_ALIGN:
+            buf.extend(bytes(_SHM_ALIGN - len(buf) % _SHM_ALIGN))
+        return off
+
+    for key, v in lands.items():
+        h_off = _put(np.ascontiguousarray(v['heights'], dtype=np.float32))
+        c_off = _put(np.ascontiguousarray(v['colors'], dtype=np.uint8))
+        layers = v.get('layers') or {}
+        # `decode_land_layers` returns alpha entries as (ltex_fid, grid), sorted
+        # into ATXT layer order with the layer index already dropped — see
+        # terrain_lod_textures.decode_land_layers. The order IS the data, so it
+        # is preserved verbatim here.
+        alpha_idx = {}
+        for quad, entries in (layers.get('alpha') or {}).items():
+            packed = []
+            for fid, grid in entries:
+                packed.append((fid,
+                               _put(np.ascontiguousarray(grid,
+                                                         dtype=np.float32)),
+                               grid.shape))
+            alpha_idx[quad] = packed
+        index[key] = (h_off, c_off, dict(layers.get('base') or {}), alpha_idx)
+    return buf, index
+
+
+def _unpack_cell(mv: memoryview, entry):
+    """Rebuild one cell's dict as numpy VIEWS over the shared buffer."""
+    h_off, c_off, base, alpha_idx = entry
+    heights = np.frombuffer(mv, dtype=np.float32, count=VERTS_SIDE * VERTS_SIDE,
+                            offset=h_off).reshape(VERTS_SIDE, VERTS_SIDE)
+    colors = np.frombuffer(mv, dtype=np.uint8, count=VERTS_SIDE * VERTS_SIDE * 3,
+                           offset=c_off).reshape(VERTS_SIDE, VERTS_SIDE, 3)
+    alpha = {}
+    for quad, entries in alpha_idx.items():
+        out = []
+        for fid, off, shape in entries:
+            n = int(np.prod(shape))
+            out.append((fid,
+                        np.frombuffer(mv, dtype=np.float32, count=n,
+                                      offset=off).reshape(shape)))
+        alpha[quad] = out
+    return {'heights': heights, 'colors': colors,
+            'layers': {'base': base, 'alpha': alpha}}
+
+
+class _SharedLands:
+    """dict-like read-only view of the packed `lands`, backed by shared memory.
+
+    Only the cells a worker actually touches are materialised, and each is a
+    set of views over the shared buffer — so the arrays themselves are never
+    copied into the process.
+    """
+
+    __slots__ = ('_mv', '_index', '_cache')
+
+    def __init__(self, mv, index):
+        self._mv = mv
+        self._index = index
+        self._cache = {}
+
+    def __contains__(self, key):
+        return key in self._index
+
+    def __len__(self):
+        return len(self._index)
+
+    def __iter__(self):
+        return iter(self._index)
+
+    def keys(self):
+        return self._index.keys()
+
+    def get(self, key, default=None):
+        if key not in self._index:
+            return default
+        return self[key]
+
+    def __getitem__(self, key):
+        hit = self._cache.get(key)
+        if hit is None:
+            hit = _unpack_cell(self._mv, self._index[key])
+            self._cache[key] = hit
+        return hit
+
+
 # Per-process global set by _worker_init; avoids pickling lands on every task.
 _worker_lands      = None
+# Kept alive for the process lifetime: if the SharedMemory handle is garbage
+# collected the mapping goes with it and every view becomes invalid memory.
+_worker_shm        = None
 _worker_mesh_dir   = None
 _worker_tex_dir    = None
 _worker_ltex_map   = None
@@ -1603,11 +1854,25 @@ _worker_default_wh = 0.0
 
 def _worker_init(lands, mesh_dir_s, tex_dir_s, ltex_map, tex_root_s,
                  cell_water, default_wh):
-    """Called once per worker process to stash shared read-only data."""
+    """Called once per worker process to stash shared read-only data.
+
+    `lands` is either a plain dict (single-process fallback) or the tuple
+    `(shm_name, nbytes, index)`, in which case the buffer is MAPPED rather than
+    copied — see the _SharedLands comment above.
+    """
     global _worker_lands, _worker_mesh_dir, _worker_tex_dir
     global _worker_ltex_map, _worker_tex_root
-    global _worker_cell_water, _worker_default_wh
-    _worker_lands      = lands
+    global _worker_cell_water, _worker_default_wh, _worker_shm
+    if isinstance(lands, tuple):
+        from multiprocessing import shared_memory
+        shm_name, nbytes, index = lands
+        # Held in a module global for the process lifetime; dropping it would
+        # unmap the block out from under every view built on it.
+        _worker_shm = shared_memory.SharedMemory(name=shm_name)
+        _worker_lands = _SharedLands(
+            memoryview(_worker_shm.buf)[:nbytes], index)
+    else:
+        _worker_lands  = lands
     _worker_mesh_dir   = Path(mesh_dir_s)
     _worker_tex_dir    = Path(tex_dir_s)
     _worker_ltex_map   = ltex_map
@@ -1792,23 +2057,59 @@ def generate_terrain_lod(esm_path: Path, output_dir: Path,
     # Descending level = descending cost.
     work.sort(key=lambda w: -w[2])
 
+    # Publish `lands` ONCE into shared memory instead of pickling a private
+    # copy into every worker. See the _SharedLands comment: the old
+    # `initargs=(lands, ...)` cost ~0.36 GB per worker on Tamriel, so a full
+    # pool held ~10 GB of identical data and the machine swapped.
     per_level_ok = {}
     warn_count = 0
-    with ProcessPoolExecutor(
-        max_workers=n_workers,
-        initializer=_worker_init,
-        initargs=(lands, str(mesh_dir), str(tex_dir), ltex_map,
-                  [str(r) for r in tex_roots], cell_water, default_wh),
-    ) as pool:
-        # chunksize=1: tiles differ in cost by ~20x, so batching would hand one
-        # worker a run of expensive tiles and undo the ordering above.
-        for (tag, ok, err), item in zip(
-                pool.map(_process_tile, work, chunksize=1), work):
-            if ok:
-                per_level_ok[item[2]] = per_level_ok.get(item[2], 0) + 1
-            else:
-                warn_count += 1
-                print(f"  WARNING: {tag}: {err}")
+    _shm = None
+    try:
+        if n_workers > 1:
+            from multiprocessing import shared_memory
+            # Size the block first, then fill it DIRECTLY. Packing into a
+            # bytearray and copying would hold a second full copy in the parent
+            # (1.2 GB on Tamriel-with-overlays) exactly while 29 workers spawn.
+            _size, _plan = _lands_layout(lands)
+            _shm = shared_memory.SharedMemory(create=True, size=max(_size, 1))
+            _index = _write_lands(lands, _plan, memoryview(_shm.buf)[:_size])
+            del _plan
+            print(f"  Shared {_size/1e6:.0f} MB of LAND data across "
+                  f"{n_workers} worker(s) (one copy, not {n_workers}).")
+            lands_arg = (_shm.name, _size, _index)
+            # The parent's own copy is dead once it is in shared memory, and
+            # holding it doubles the footprint for the whole bake. `lands` is
+            # not read again below — the workers go through the shared block.
+            lands = None
+        else:
+            lands_arg = lands
+
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_worker_init,
+            initargs=(lands_arg, str(mesh_dir), str(tex_dir), ltex_map,
+                      [str(r) for r in tex_roots], cell_water, default_wh),
+        ) as pool:
+            # chunksize=1: tiles differ in cost by ~20x, so batching would hand
+            # one worker a run of expensive tiles and undo the ordering above.
+            for (tag, ok, err), item in zip(
+                    pool.map(_process_tile, work, chunksize=1), work):
+                if ok:
+                    per_level_ok[item[2]] = per_level_ok.get(item[2], 0) + 1
+                else:
+                    warn_count += 1
+                    print(f"  WARNING: {tag}: {err}")
+    finally:
+        # Workers are gone by here (the `with` joined them), so the block can be
+        # released. Both calls are needed: close() unmaps this process's view,
+        # unlink() frees the OS-level segment — without it the shared memory
+        # would leak for the lifetime of the run, once per worldspace.
+        if _shm is not None:
+            _shm.close()
+            try:
+                _shm.unlink()
+            except FileNotFoundError:
+                pass
 
     total_tiles = sum(per_level_ok.values())
     for level in LOD_LEVELS:

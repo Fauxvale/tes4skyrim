@@ -80,15 +80,26 @@ def changed_cells_in_worldspace(plugin_esm: Path, master_esm: Path,
     cells; the plugin's own are folded in here. Passing it in keeps the master
     scanned once per group rather than once per sibling.
     """
+    # Both sides normalised: `target` comes from the MASTER's id space and is
+    # compared against the PLUGIN's GRUP labels, and `coords` accumulates cells
+    # from both files. A raw id means nothing outside its own file.
+    from .lod_gen import _formid_remap_table
     m_raw = master_esm.read_bytes()
-    target = _find_worldspace_fid(m_raw, len(m_raw), edid)
-    if target is None:
-        return set()
+    _t = _find_worldspace_fid(m_raw, len(m_raw), edid)
     del m_raw
+    if _t is None:
+        return set()
+    _mmap = _formid_remap_table(master_esm)
+    target = _mmap[_t >> 24] | (_t & 0x00FFFFFF)
 
     _scan_cell_coords(plugin_esm, coords)
     raw = plugin_esm.read_bytes()
     n = len(raw)
+    gmap = _formid_remap_table(plugin_esm)
+
+    def g(fid: int) -> int:
+        return gmap[fid >> 24] | (fid & 0x00FFFFFF)
+
     changed: set = set()
 
     def scan(start, end, cur_cell, cur_wrld):
@@ -102,13 +113,13 @@ def changed_cells_in_worldspace(plugin_esm: Path, master_esm: Path,
                 label = raw[p + 8:p + 12]
                 nxt_cell, nxt_wrld = cur_cell, cur_wrld
                 if g_type == 1:
-                    nxt_wrld = struct.unpack_from('<I', label)[0]
+                    nxt_wrld = g(struct.unpack_from('<I', label)[0])
                 elif g_type == 6:
-                    nxt_cell = struct.unpack_from('<I', label)[0]
+                    nxt_cell = g(struct.unpack_from('<I', label)[0])
                 scan(p + 24, p + g_size, nxt_cell, nxt_wrld)
                 p += g_size
                 continue
-            fid = struct.unpack_from('<I', raw, p + 12)[0]
+            fid = g(struct.unpack_from('<I', raw, p + 12)[0])
             if sig == b'CELL':
                 cur_cell = fid
             elif sig in (b'LAND', b'REFR'):
@@ -123,6 +134,73 @@ def changed_cells_in_worldspace(plugin_esm: Path, master_esm: Path,
 
     scan(24 + struct.unpack_from('<I', raw, 4)[0], n, 0, 0)
     return changed
+
+
+def touched_worldspace_fids(plugin_esm: Path) -> set:
+    """Every worldspace FormID `plugin_esm` actually has WRLD/CELL/LAND/REFR under.
+
+    Answers the question the master chain cannot: a plugin DEPENDING on the
+    worldspace's owner is not the same as it EDITING that worldspace. Attaching
+    an overlay that touches nothing costs a full parse of the file per
+    worldspace and contributes zero records.
+
+    Measured on the current 12-plugin selection: all 9 Oblivion.esm dependents
+    were stacked onto all 18 of its worldspaces (162 overlay parses, 114 s), yet
+    most touch exactly ONE worldspace. Scoping on this leaves 7 useful parses.
+
+    Records are attributed by their enclosing type-1 GRUP label, which is the
+    DEFINING file's WRLD FormID, so an override plugin that edits a master's
+    worldspace without shipping a WRLD record of its own is still detected.
+    A plugin's own WRLD records count too, so a file that defines a worldspace
+    but has yet to place anything in it is not mistaken for uninvolved.
+
+    Judged from THIS FILE'S OWN records only — a plugin's scope is what it
+    itself places, never what another file's numbering implies. The returned
+    ids are NORMALISED (`lod_gen._formid_remap_table`) so they can be compared
+    against a worldspace id resolved from a different file.
+
+    Both halves matter. A raw FormID's index byte offsets into its own file's
+    master list, so Morrowind_ob.esm's 02xxxxxx and Tamriel.esp's 02xxxxxx are
+    both "self" and name unrelated records; the two collide on 4 CELL ids, and
+    resolving one plugin's cells against the other's table reads that
+    coincidence as 183 overrides, dragging Morrowind INTERIOR objects into
+    Cyrodiil's distant terrain.
+
+    One linear header walk; record bodies are skipped, never parsed.
+    """
+    from .lod_gen import _formid_remap_table
+    plugin_esm = Path(plugin_esm)
+    gmap = _formid_remap_table(plugin_esm)
+    raw = plugin_esm.read_bytes()
+    n = len(raw)
+    found: set = set()
+
+    def g(fid: int) -> int:
+        return gmap[fid >> 24] | (fid & 0x00FFFFFF)
+
+    def scan(start, end, cur_wrld):
+        p = start
+        while p < end and p + 24 <= n:
+            sig = raw[p:p + 4]
+            size = struct.unpack_from('<I', raw, p + 4)[0]
+            if sig == b'GRUP':
+                g_type = struct.unpack_from('<I', raw, p + 12)[0]
+                nxt = cur_wrld
+                if g_type == 1:
+                    nxt = g(struct.unpack_from('<I', raw, p + 8)[0])
+                scan(p + 24, p + size, nxt)
+                p += size
+                continue
+            if sig == b'WRLD':
+                found.add(g(struct.unpack_from('<I', raw, p + 12)[0]))
+            elif cur_wrld and sig in (b'CELL', b'LAND', b'REFR'):
+                found.add(cur_wrld)
+            p += 24 + size
+
+    if n < 24:
+        return found
+    scan(24 + struct.unpack_from('<I', raw, 4)[0], n, 0)
+    return found
 
 
 def _master_chain(name: str, export_root: Path, known: list[str]) -> set[str]:

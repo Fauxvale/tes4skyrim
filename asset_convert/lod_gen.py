@@ -193,6 +193,101 @@ def _zstr(b: bytes) -> str:
     return b.rstrip(b'\x00').decode('latin-1', errors='replace')
 
 
+# ---------------------------------------------------------------------------
+# Cross-plugin FormID identity
+# ---------------------------------------------------------------------------
+#
+# A raw FormID is meaningful only INSIDE the file it came from. Its top byte is
+# an index into that file's OWN master list, so the same number names unrelated
+# records in different plugins: Morrowind_ob.esm and Tamriel.esp both use 02 for
+# THEMSELVES, and they collide on 4 CELL FormIDs. Merging overlays on the raw id
+# therefore invents overrides out of numeric coincidence — those 4 collisions
+# dragged 183 Morrowind INTERIOR objects into Cyrodiil's distant terrain, and
+# among the plugins that genuinely share TES4Tamriel another 1,278 references
+# collide between plugins that are not each other's masters.
+#
+# The fix is the one the importer already applies when writing overrides (see
+# docs/override_conversion.md, "the same bug existed in FOUR places"): resolve
+# every id to (owning FILE, local id) by looking the index byte up in the file's
+# master list BY NAME, and merge on that pair instead.
+#
+# This mirrors the engine. Skyrim resolves a plugin's index bytes through that
+# plugin's own master list at load time; two files' 02s are the same record only
+# when both 02s name the same file.
+_MASTERS_CACHE: dict = {}
+
+
+def _plugin_masters(esm_path: Path) -> list:
+    """The plugin's MAST list, lowercased, in declaration order.
+
+    Slot i of the returned list is what index byte i means inside this file;
+    the file itself owns index `len(masters)`.
+    """
+    key = str(esm_path).lower()
+    hit = _MASTERS_CACHE.get(key)
+    if hit is not None:
+        return hit
+    masters = []
+    try:
+        with open(esm_path, 'rb') as fh:
+            head = fh.read(24)
+            if len(head) == 24 and head[:4] == b'TES4':
+                body = fh.read(struct.unpack_from('<I', head, 4)[0])
+                p = 0
+                while p + _SUB_HDR <= len(body):
+                    tag = body[p:p + 4]
+                    sz = struct.unpack_from('<H', body, p + 4)[0]
+                    if tag == b'MAST':
+                        masters.append(
+                            _zstr(body[p + _SUB_HDR:p + _SUB_HDR + sz]).lower())
+                    p += _SUB_HDR + sz
+    except OSError:
+        pass
+    _MASTERS_CACHE[key] = masters
+    return masters
+
+
+# Every plugin name seen while normalising, in first-seen order. The index into
+# this list becomes a record's GLOBAL index byte, so ids from different files
+# stay comparable as plain ints (dict keys, and the `by_fid` merge) without
+# carrying tuples through the hot loops or the LODGen writer.
+#
+# Process-wide and append-only: an id normalised for one worldspace must mean
+# the same thing in the next, and `_PARSED_ESM_CACHE` hands the same normalised
+# structures to every worldspace.
+_GLOBAL_FILES: list = []
+_GLOBAL_FILE_IDX: dict = {}
+
+
+def _global_file_index(name: str) -> int:
+    """Stable small integer for a plugin name, assigned on first sight."""
+    name = name.lower()
+    idx = _GLOBAL_FILE_IDX.get(name)
+    if idx is None:
+        idx = len(_GLOBAL_FILES)
+        _GLOBAL_FILES.append(name)
+        _GLOBAL_FILE_IDX[name] = idx
+    return idx
+
+
+def _formid_remap_table(esm_path: Path):
+    """256-entry table mapping this file's index bytes to GLOBAL index bytes.
+
+    Slot i of the plugin's master list names the file its index byte i refers
+    to; anything past the list is the plugin itself. Looking that name up in
+    `_GLOBAL_FILES` gives a byte that means the same file in every plugin, so
+    `(global_byte << 24) | local_id` is comparable across the load order.
+
+    A local id is only ever 24 bits, so the high byte is free to re-stamp.
+    """
+    masters = _plugin_masters(esm_path)
+    own = esm_path.name.lower()
+    return tuple(
+        _global_file_index(masters[i] if i < len(masters) else own) << 24
+        for i in range(256)
+    )
+
+
 # Placement values beyond this are junk, not geometry. Oblivion's largest
 # worldspace spans ~2e6 units, so a sane coordinate never comes close; the
 # bound exists to catch the +/-FLT_MAX sentinel below without rejecting any
@@ -233,14 +328,23 @@ def _finite(v: float, default: float = 0.0) -> float:
 # re-deriving byte-for-byte identical data.
 #
 # Keyed on (path, mtime_ns, size) so a rebuilt ESM is re-parsed rather than
-# served stale.  Only the most recent file is kept: the caller walks one plugin
-# (plus its overlays) per run, so a 1-entry cache hits on every worldspace
-# without pinning several hundred MB per extra plugin.
+# served stale.
+#
+# The cache holds the BASE plugin and its OVERLAYS together. It used to keep a
+# single entry, which made the two uses evict each other: the overlay merge
+# below parses every overlay once per worldspace, so a 1-entry cache serving
+# only the base still re-parsed ~930 MB of overlays 18 times — 114 s measured on
+# the 12-plugin selection, of which 4 s was useful.
+#
+# The bound is the number of plugins in one run (a dozen), not a byte budget:
+# these are compact index structures, not the file bytes, and the raw `bytes`
+# object is released inside `_parse_esm` as soon as the scan finishes.
 #
 # The returned structures are treated as READ-ONLY by callers — write_lodgen_input
 # builds its own per-worldspace views and generate_lod merges overlays into a
 # COPY (see _merge_overlay below); if that ever stops being true this must hand
-# out deep copies instead.
+# out deep copies instead.  The overlay merge in particular MUST NOT mutate what
+# it is handed now that the same object is served to the next worldspace.
 _PARSED_ESM_CACHE: dict = {}
 
 
@@ -254,7 +358,10 @@ def _parse_esm_cached(esm_path: Path):
     hit = _PARSED_ESM_CACHE.get(key)
     if hit is None:
         hit = _parse_esm(esm_path)
-        _PARSED_ESM_CACHE.clear()
+        # Drop any stale generation of this same file (rebuilt between runs)
+        # while keeping the other plugins, which are still wanted.
+        for k in [k for k in _PARSED_ESM_CACHE if k[0] == key[0]]:
+            del _PARSED_ESM_CACHE[k]
         _PARSED_ESM_CACHE[key] = hit
     return hit
 
@@ -267,9 +374,23 @@ def _parse_esm(esm_path: Path):
       stats:       {form_id: {edid, flags, model, lod4, lod8, lod16}}
       refs:        [{form_id, flags, base_fid, parent_wrld, parent_cell,
                      x,y,z, rx,ry,rz, scale}]
+
+    Every FormID returned is NORMALISED: its index byte is rewritten to a
+    global one that names the same file in every plugin (see
+    `_formid_remap_table`). Raw ids cannot be compared across plugins — the
+    index byte is per file — so without this the overlay merge treats numeric
+    coincidences as overrides.
     """
     raw = esm_path.read_bytes()
     n   = len(raw)
+
+    # Index byte -> global index byte, already shifted into place.
+    gmap = _formid_remap_table(esm_path)
+    lo = 0x00FFFFFF
+
+    def g(fid: int) -> int:
+        """Normalise one FormID into the global space."""
+        return gmap[fid >> 24] | (fid & lo)
 
     worldspaces = {}
     cells       = {}
@@ -290,12 +411,14 @@ def _parse_esm(esm_path: Path):
         grp_type = struct.unpack_from('<I', raw, start+12)[0]
         label    = raw[start+8:start+12]
 
+        # GRUP labels are FormIDs in this file's own space, exactly like the
+        # record ids they point at, so they normalise the same way.
         pw = parent_wrld
         pc = parent_cell
         if grp_type == 1:                   # world children
-            pw = struct.unpack_from('<I', label)[0]
+            pw = g(struct.unpack_from('<I', label)[0])
         elif grp_type in (6, 8, 9, 10):     # cell children
-            pc = struct.unpack_from('<I', label)[0]
+            pc = g(struct.unpack_from('<I', label)[0])
 
         while p < end and p < n:
             if p + 4 > n:
@@ -313,14 +436,14 @@ def _parse_esm(esm_path: Path):
                     break
                 _dispatch(rec, pw, pc)
                 if rec['sig'] == 'CELL':
-                    pc = rec['form_id']
+                    pc = g(rec['form_id'])
                 elif rec['sig'] == 'WRLD':
-                    pw = rec['form_id']
+                    pw = g(rec['form_id'])
                 p = next_p
 
     def _dispatch(rec, pw, pc):
         sig = rec['sig']
-        fid = rec['form_id']
+        fid = g(rec['form_id'])
         subs = rec['subs']
 
         if sig == 'WRLD':
@@ -386,7 +509,11 @@ def _parse_esm(esm_path: Path):
             base_fid = 0
             name = _sub(subs, 'NAME')
             if name and len(name) >= 4:
-                base_fid = struct.unpack_from('<I', name)[0]
+                # NAME points at the placed base object (STAT/TREE/...), which
+                # very often lives in a MASTER — the single most collision-prone
+                # field in the merge, and the one that decides which mesh a
+                # distant object draws.
+                base_fid = g(struct.unpack_from('<I', name)[0])
             x = y = z = rx = ry = rz = 0.0
             data_sub = _sub(subs, 'DATA')
             if data_sub and len(data_sub) >= 24:
@@ -1269,7 +1396,11 @@ def generate_lod(esm_path: Path, output_dir: Path,
     for ov_path in (overlay_paths or []):
         ov_path = Path(ov_path)
         print(f"  Applying override plugin: {ov_path.name}")
-        o_wrld, o_cells, o_stats, o_refs = _parse_esm(ov_path)
+        # Cached: this runs once per WORLDSPACE, and the overlay stack is
+        # re-parsed in full every time. Only read here — the merge below mutates
+        # the base's copies, never the `o_*` structures — so serving the same
+        # objects to the next worldspace is safe.
+        o_wrld, o_cells, o_stats, o_refs = _parse_esm_cached(ov_path)
         worldspaces.update(o_wrld)
         cells.update(o_cells)
         stats.update(o_stats)

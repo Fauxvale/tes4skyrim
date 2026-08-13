@@ -71,7 +71,10 @@ def main() -> int:
     from asset_convert.sibling_lod import (converted_plugins, create_lod_order,
                                            lod_worldspaces, worldspace_owner,
                                            merge_cloud_bank, _master_chain,
+                                           touched_worldspace_fids,
                                            LOD_DIR_NAME)
+    from asset_convert.terrain_lod import _find_worldspace_fid
+    from asset_convert.lod_gen import _formid_remap_table
 
     out_root = (Path(args.output_dir) if args.output_dir
                 else SCRIPT_DIR / "output")
@@ -114,6 +117,50 @@ def main() -> int:
     # Resolve every worldspace to its owner and overlay stack before generating
     # anything, so a bad selection is reported as a plan rather than discovered
     # halfway through an hour of baking.
+    # WRLD-FormID lookups, memoised per (owner, edid). Several worldspaces share
+    # an owner — Oblivion.esm owns 18 — and resolving each one independently
+    # meant re-reading its 613 MB. The jobs below are built in worldspace order,
+    # not owner order, so the file's bytes are held only for the duration of one
+    # owner's lookups and the resolved FormIDs are what persist.
+    _fid_cache: dict = {}
+
+    def _worldspace_fid(esm: Path, edid: str):
+        key = (str(esm).lower(), edid.lower())
+        if key in _fid_cache:
+            return _fid_cache[key]
+        # NORMALISED, because it is compared against ids from OTHER plugins
+        # (`touched_worldspace_fids`), and a raw id is only meaningful inside
+        # the file it came from.
+        gmap = _formid_remap_table(esm)
+        raw = esm.read_bytes()
+        try:
+            # Resolve every worldspace this owner is responsible for while its
+            # bytes are in hand, so one read serves all of them.
+            for w in wanted:
+                k = (str(esm).lower(), w.lower())
+                if k not in _fid_cache:
+                    f = _find_worldspace_fid(raw, len(raw), w)
+                    _fid_cache[k] = (None if f is None
+                                     else gmap[f >> 24] | (f & 0x00FFFFFF))
+        finally:
+            del raw
+        return _fid_cache.get(key)
+
+    # Which worldspaces does each plugin actually put records in? Depending on a
+    # worldspace's owner is not the same as editing that worldspace, and an
+    # overlay contributing nothing still costs a full ESM parse per worldspace
+    # in BOTH generators. Scanned once per plugin here, then reused below.
+    touched = {}
+    for name in plugins:
+        esm = out_root / name / name
+        if esm.is_file():
+            try:
+                touched[name] = touched_worldspace_fids(esm)
+            except OSError:
+                touched[name] = None      # unreadable -> never filter it out
+        else:
+            touched[name] = None
+
     jobs = []
     for edid in wanted:
         owner = worldspace_owner(edid, plugins, export_root)
@@ -135,6 +182,27 @@ def main() -> int:
         # pull its FormIDs into Cyrodiil's tiles.
         contributors = [n for n in plugins if n != owner
                         and owner in _master_chain(n, export_root, plugins)]
+
+        # ...and of those, only the ones that actually have records in THIS
+        # worldspace. The dependency gate above is about what a plugin is
+        # ALLOWED to touch; this is about what it DOES touch. Morrowind_ob.esm
+        # rests on Oblivion.esm and so passes the gate for all 18 of its
+        # worldspaces, while placing nothing in any of them — 18 parses of a
+        # 206 MB file to merge zero records.
+        #
+        # A plugin whose ESM could not be read is kept rather than dropped: the
+        # cost of an unnecessary overlay is time, the cost of a missing one is
+        # lost LOD.
+        wrld_fid = _worldspace_fid(owner_esm, edid)
+        if wrld_fid is not None:
+            scoped = [n for n in contributors
+                      if touched.get(n) is None or wrld_fid in touched[n]]
+            if len(scoped) != len(contributors):
+                skipped = [n for n in contributors if n not in scoped]
+                print(f"  '{edid}': {len(skipped)} dependent(s) place nothing "
+                      f"here, not overlaid ({', '.join(skipped)})")
+            contributors = scoped
+
         overlays = [out_root / n / n for n in contributors
                     if (out_root / n / n).is_file()]
         jobs.append((edid, owner, owner_esm, overlays, contributors))

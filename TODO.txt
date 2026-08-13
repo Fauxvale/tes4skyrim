@@ -101,3 +101,5 @@ Minor Issues:
 
 	16 - Tripwire doesn't visibly break. and Log trap doesn't visibly roll
 
+	17 - Pandora compatibility
+

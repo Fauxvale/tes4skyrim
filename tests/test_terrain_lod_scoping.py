@@ -54,9 +54,17 @@ def _cell(fid: int, gx: int, gy: int, with_land: bool = True) -> bytes:
     return cell + _grup(struct.pack('<I', fid), 6, land)
 
 
-def _plugin(worldspaces) -> bytes:
-    """A minimal ESM. `worldspaces` is [(wrld_fid, edid_or_None, [cells])]."""
-    out = _rec(b'TES4', 0, b'')
+def _plugin(worldspaces, masters=('Skyrim.esm', 'Oblivion.esm')) -> bytes:
+    """A minimal ESM. `worldspaces` is [(wrld_fid, edid_or_None, [cells])].
+
+    A MAST list is declared because FormIDs are now resolved through it: the
+    index byte is an offset into THIS file's masters, so a file claiming none
+    would own every id it mentions and `0100003C` would stop meaning
+    Oblivion.esm's Tamriel. The default matches every real converted plugin.
+    """
+    hdr = b''.join(_sub(b'MAST', m.encode() + b'\0') + _sub(b'DATA', bytes(8))
+                   for m in masters)
+    out = _rec(b'TES4', 0, hdr)
     body = b''
     for wfid, edid, cells in worldspaces:
         if edid is not None:
@@ -66,6 +74,17 @@ def _plugin(worldspaces) -> bytes:
 
 
 TARGET_FID = 0x0100003C
+
+# `known_wrld_fid` is resolved from the plugin that DEFINES the worldspace and
+# handed to scans of OTHER files, so it travels in the normalised space (see
+# lod_gen._formid_remap_table). With the standard master list above, index byte
+# 01 is Oblivion.esm; `_norm` states that mapping explicitly rather than
+# hard-coding whatever integer the global table happens to assign.
+def _norm(fid: int, masters=('Skyrim.esm', 'Oblivion.esm')) -> int:
+    from asset_convert.lod_gen import _global_file_index
+    owner = (masters[fid >> 24] if (fid >> 24) < len(masters) else None)
+    assert owner is not None, 'test ids should name a declared master'
+    return _global_file_index(owner.lower()) << 24 | (fid & 0x00FFFFFF)
 
 
 @pytest.fixture
@@ -87,7 +106,8 @@ class TestOverlayScoping:
         ])
         lands = {}
         _scan_land_file(esm, 'TES4Tamriel', lands, {}, {'default': None}, {},
-                        allow_unscoped=False, known_wrld_fid=TARGET_FID)
+                        allow_unscoped=False,
+                        known_wrld_fid=_norm(TARGET_FID))
         assert lands == {}, (
             "an overlay's own worldspace must never be imported into the "
             "target worldspace")
@@ -118,7 +138,8 @@ class TestOverlayScoping:
         ])
         lands = {}
         _scan_land_file(esm, 'TES4Tamriel', lands, {}, {'default': None}, {},
-                        allow_unscoped=False, known_wrld_fid=TARGET_FID)
+                        allow_unscoped=False,
+                        known_wrld_fid=_norm(TARGET_FID))
         assert set(lands) == {(1, 2)}, (
             'an override of the target worldspace must still be collected, '
             'and only that')
