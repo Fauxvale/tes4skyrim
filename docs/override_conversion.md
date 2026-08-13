@@ -451,6 +451,65 @@ from comparing two conversion runs.
   changes), and `XESP -> 00000014` (a parent no file defines — a real
   conformance bug, but present in *working* plugins and absent from one of the
   failing blocks, so not this).
+- <a id="reference-handle-cap"></a>**🔴 A NON-ESM PLUGIN MAKES EVERY REFERENCE
+  PERSISTENT — AND THE ENGINE CAPS HANDLES AT 2²⁰ = 1,048,576.**
+  (found 2026-08-12; the cause of the TWMP_Valenwood_Elsweyr main-menu hang)
+
+  **This is a SECOND, independent cause of the no-crash/no-log main-menu hang**,
+  and it is not a malformed record — every structural check passes and xEdit
+  reports the file clean, exactly like the block-order bug above. The difference
+  is that here *nothing is wrong with the file at all*: it is the load order as
+  a whole that exceeds an engine limit.
+
+  The rule: a plugin **not flagged ESM** has every reference it contains treated
+  as **persistent — always active, regardless of where the player is**. Temporary
+  refs, which an ESM would load on demand per cell, are permanently resident and
+  each occupies one of the engine's 1,048,576 reference handles. The handle table
+  is built while the files are parsed, before any cell loads, so overrunning it
+  hangs at the main menu with **no crash and no Papyrus log** (Papyrus does not
+  start until past the menu, so those logs cannot see this class of failure).
+
+  Measured on the four plugins that reproduced it:
+
+  | Plugin | REFR | ACHR |
+  |---|---|---|
+  | `TWMP_Valenwood_Elsweyr.esp` | 818,294 | 11 |
+  | `ElsweyrAnequina.esp` | 161,541 | 1,306 |
+  | `ElsweyrPelletine.esp` | 45,066 | 281 |
+  | `Tamriel.esp` (terrain only) | 554 | 0 |
+  | **Total** | **1,025,455** | **1,598** |
+
+  **1,027,053 references = 97.9% of the cap from four plugins alone**, before
+  `Skyrim.esm` contributes a single handle. Valenwood_Elsweyr alone is 80% of
+  the total, which is why it is the plugin that appears to "refuse to load": it
+  is simply the one that tips the sum over.
+
+  **The fix is the ESM flag, and the flag must go on the plugin that HOLDS the
+  references.** Flagging only its masters does nothing for it — the
+  persistent-ref rule is per plugin, applied to that plugin's own references,
+  and master-ness is not inherited by dependents. Conversely **every plugin in
+  the dependency chain must be flagged together**, because a master must load
+  before its dependents and an ESM may not master a plain ESP. Here the chain is
+  `Tamriel` / `ElsweyrAnequina` → `TWMP_Valenwood_Elsweyr` → `ElsweyrPelletine`.
+
+  **Filenames stay `.esp`.** The engine keys master-ness off the header flag,
+  not the extension, while every dependent names its masters by exact filename
+  in `MAST` — renaming `Tamriel.esp` → `Tamriel.esm` would invalidate the master
+  list of all three plugins that depend on it. An ESM-flagged `.esp` is legal and
+  loads as a master.
+
+  Applied with `python tools/make_master.py <chain, lowest first>`, which sets
+  bit `0x00000001` at byte 8 of the TES4 header **in place** — 4 bytes rewritten,
+  no record reserialized, so file size is unchanged and **no FormID drift**. It
+  reads each `MAST` list and refuses with exit 2, naming the missing files and
+  printing a correctly ordered fix command, rather than producing an invalid
+  load order.
+
+  **Caveat, unverified in-game:** refs are no longer force-persistent, so
+  anything relying on a ref being reachable while its cell is unloaded — script
+  targets on distant objects, quest aliases, cross-cell enable parents — may now
+  fail where it previously worked by accident. Refs that genuinely must stay
+  loaded need their persistent flag set explicitly.
 - <a id="override-type-guard"></a>**AN OVERRIDE MUST RESOLVE TO A MASTER RECORD
   OF THE SAME TYPE.** A plugin's source id can convert to an id that already
   belongs to an unrelated record in the master's own space: ElsweyrAnequina's

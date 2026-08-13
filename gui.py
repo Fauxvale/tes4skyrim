@@ -86,17 +86,25 @@ GLOBAL_ACTIONS = [
      "Zip the generated AutoConvertLOD folder into output/Finished Mods, "
      "ready to install like any converted plugin",
      "Pack LOD", 0),
-    # Row 1.
-    ("modify_body_meshes", "Patch Skyrim",
-     "Build the ARMA slot-44 body patch for your Skyrim load order",
-     "Patch Skyrim", 1),
+    # Row 1. Not tied to one plugin: the ESM flag has to be applied to a whole
+    # dependency chain at once, because an ESM may not master a plain ESP.
+    ("make_master", "Convert to Master",
+     "Flag converted plugins as masters (ESM). A plugin that is NOT a master "
+     "has every reference it contains treated as always-active, and the engine "
+     "caps those at 1,048,576 — past that the game hangs on the main menu with "
+     "no crash and no log. Applies to a whole master chain at once",
+     "To Master", 1),
     # Depends on nothing else — the starter mod is committed prebuilt, so it can
     # be packaged before anything has been converted.
     ("package_start_mod", "Package Start Mod",
      "Zip the prebuilt TESGameSelect starter mod (the new-game world "
      "selector) into output/Finished Mods, ready to install like any "
      "converted plugin",
-     "Start Mod", 1),
+     "Pack Start Mod", 1),
+    # Row 2.
+    ("modify_body_meshes", "Patch Skyrim",
+     "Build the ARMA slot-44 body patch for your Skyrim load order",
+     "Patch Skyrim", 2),
 ]
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -1824,8 +1832,51 @@ def gui_main():
     lod_plugins: list[str] = []      # chosen, in apply order (lowest first)
     lod_worldspaces: list[str] = []  # chosen worldspace EDIDs
 
+    # "Convert to Master": the plugins to flag ESM. Empty means "never
+    # confirmed", same convention as the LOD lists above.
+    master_plugins: list[str] = []
+
     def _lod_out_root() -> Path:
         return Path(output_var.get().strip() or str(SCRIPT_DIR / "output"))
+
+    def _plugin_masters(name: str) -> list[str]:
+        """The MAST list of a converted plugin, or [] if it cannot be read."""
+        try:
+            sys.path.insert(0, str(SCRIPT_DIR / "tools"))
+            from make_master import read_header, resolve
+            _flags, masters = read_header(
+                resolve(name, str(_lod_out_root())))
+            return masters
+        except Exception:
+            return []
+
+    def _default_master_plugins() -> list[str]:
+        """Converted plugins that are worth flagging ESM, masters first.
+
+        Ordered so a plugin always follows the masters it depends on: the tool
+        rejects a batch that would leave an ESM mastering a plain ESP, and this
+        is also the order the user must install them in.
+        """
+        try:
+            from asset_convert.sibling_lod import converted_plugins
+            names = sorted(converted_plugins(_lod_out_root()))
+        except Exception:
+            return []
+        deps = {n: [m for m in _plugin_masters(n) if m in set(names)]
+                for n in names}
+        ordered, seen = [], set()
+
+        def _visit(n, stack=()):
+            if n in seen or n in stack:   # cycle: leave it where it lands
+                return
+            for m in deps.get(n, ()):
+                _visit(m, stack + (n,))
+            seen.add(n)
+            ordered.append(n)
+
+        for n in names:
+            _visit(n)
+        return ordered
 
     def _default_lod_plugins() -> list[str]:
         """Converted plugins in plugins.txt order, the rest appended.
@@ -1849,6 +1900,186 @@ def gui_main():
         except Exception:
             return []
         return _lw(names, SCRIPT_DIR / "export")
+
+    def _open_make_master_panel(on_apply=None):
+        """Pick which converted plugins to flag as masters (ESM).
+
+        Ticking a plugin auto-ticks the masters it depends on, because the tool
+        refuses a batch that would leave an ESM mastering a plain ESP — an
+        invalid load order, since a master must load first. Doing it here means
+        the user sees the whole chain before anything is written rather than
+        getting a refusal after pressing Apply.
+
+        `on_apply` is called when Apply is pressed; None makes this a pure
+        editor of the saved selection.
+        """
+        all_names = _default_master_plugins()
+        deps = {n: [m for m in _plugin_masters(n) if m in set(all_names)]
+                for n in all_names}
+
+        try:
+            sys.path.insert(0, str(SCRIPT_DIR / "tools"))
+            from make_master import read_header, resolve, FLAG_ESM
+            is_esm = {}
+            for n in all_names:
+                try:
+                    flags, _m = read_header(resolve(n, _lod_out_root()))
+                    is_esm[n] = bool(flags & FLAG_ESM)
+                except Exception:
+                    is_esm[n] = False
+        except Exception:
+            is_esm = {n: False for n in all_names}
+
+        # Default selection: anything not already a master. A plugin that is
+        # already flagged stays ticked so the picture reads as the FINAL state
+        # rather than "what will change".
+        wanted = set(master_plugins) & set(all_names) if master_plugins \
+            else set(all_names)
+
+        card = tk.Frame(outer, bg=CLR["panel"],
+                        highlightbackground=CLR["border"], highlightthickness=1)
+        _wheel_bound = []
+
+        def _close():
+            if _wheel_bound:
+                card.unbind_all("<MouseWheel>")
+            card.destroy()
+
+        tk.Label(card, text="Convert to Master",
+                 bg=CLR["panel"], fg=CLR["text"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16,
+                                                     pady=(14, 0))
+        tk.Label(card,
+                 text=("A plugin that is not a master has EVERY reference it "
+                       "contains treated as\nalways-active. The engine caps "
+                       "those at 1,048,576 — past that the game hangs\non the "
+                       "main menu with no crash and no log. Flagging a large "
+                       "worldspace\nplugin ESM lets its references load per "
+                       "cell instead.\n\nTicking a plugin also ticks the "
+                       "masters it depends on: a master must load\nfirst, so "
+                       "an ESM may not master a plain ESP."),
+                 bg=CLR["panel"], fg=CLR["subtext"], justify=tk.LEFT,
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(4, 0))
+
+        ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16,
+                                                       pady=8)
+
+        if not all_names:
+            tk.Label(card,
+                     text="Nothing converted yet — convert a plugin first.",
+                     bg=CLR["panel"], fg=CLR["subtext"],
+                     font=("Segoe UI", 9)).pack(anchor="w", padx=16,
+                                                pady=(0, 8))
+            ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16,
+                                                           pady=8)
+            ttk.Button(card, text="Close", command=_close).pack(pady=(0, 14))
+            card.update_idletasks()
+            card.place(in_=outer, anchor="center", relx=0.5, rely=0.5)
+            card.lift()
+            return
+
+        list_frame = tk.Frame(card, bg=CLR["panel"])
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=16)
+
+        canvas = tk.Canvas(list_frame, bg=CLR["panel"], highlightthickness=0,
+                           width=460, height=min(300, 26 * len(all_names)))
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=CLR["panel"])
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _wheel(e):
+            canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        card.bind_all("<MouseWheel>", _wheel)
+        _wheel_bound.append(True)
+
+        warn = tk.Label(card, text="", bg=CLR["panel"], fg=CLR["yellow"],
+                        justify=tk.LEFT, font=("Segoe UI", 9))
+        warn.pack(anchor="w", padx=16, pady=(6, 0))
+
+        row_vars: dict[str, tk.BooleanVar] = {}
+
+        def _validate():
+            """Warn if the ticked set would leave an ESM mastering an ESP."""
+            sel = {n for n, v in row_vars.items() if v.get()}
+            bad = []
+            for n in sel:
+                for m in deps.get(n, ()):
+                    if m not in sel and not is_esm.get(m):
+                        bad.append(f"{n} needs {m}")
+            warn.configure(
+                text=("⚠ " + "; ".join(bad[:3]) +
+                      ("" if len(bad) <= 3 else f" (+{len(bad) - 3} more)"))
+                if bad else "")
+            return not bad
+
+        def _on_toggle(name):
+            """Tick a plugin -> tick its masters. Untick -> untick dependents."""
+            if row_vars[name].get():
+                stack = [name]
+                while stack:
+                    cur = stack.pop()
+                    for m in deps.get(cur, ()):
+                        if not row_vars[m].get():
+                            row_vars[m].set(True)
+                            stack.append(m)
+            else:
+                changed = True
+                while changed:
+                    changed = False
+                    for n, v in row_vars.items():
+                        if v.get() and any(not row_vars[m].get()
+                                           for m in deps.get(n, ())):
+                            v.set(False)
+                            changed = True
+            _validate()
+
+        for name in all_names:
+            row = tk.Frame(inner, bg=CLR["panel"])
+            row.pack(fill=tk.X, anchor="w", pady=1)
+            var = tk.BooleanVar(value=name in wanted)
+            row_vars[name] = var
+            ttk.Checkbutton(row, text=name, variable=var,
+                            style="TCheckbutton",
+                            command=lambda n=name: _on_toggle(n)
+                            ).pack(side=tk.LEFT, padx=12)
+            if is_esm.get(name):
+                tk.Label(row, text="already ESM", bg=CLR["panel"],
+                         fg=CLR["green"], font=("Segoe UI", 8)
+                         ).pack(side=tk.LEFT, padx=(4, 0))
+            if deps.get(name):
+                tk.Label(row, text="masters: " + ", ".join(deps[name]),
+                         bg=CLR["panel"], fg=CLR["subtext"],
+                         font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(6, 0))
+
+        _validate()
+
+        ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16,
+                                                       pady=8)
+
+        btns = tk.Frame(card, bg=CLR["panel"])
+        btns.pack(pady=(0, 14))
+
+        def _apply():
+            if not _validate():
+                return
+            master_plugins[:] = [n for n in all_names if row_vars[n].get()]
+            _close()
+            if on_apply is not None:
+                on_apply()
+
+        ttk.Button(btns, text="Apply", style="Accent.TButton",
+                   command=_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=_close).pack(side=tk.LEFT,
+                                                             padx=4)
+
+        card.update_idletasks()
+        card.place(in_=outer, anchor="center", relx=0.5, rely=0.5)
+        card.lift()
 
     def _open_create_lod_panel(on_generate=None):
         """Pick the plugins (left, ordered) and worldspaces (right) to build.
@@ -2379,8 +2610,8 @@ def gui_main():
     # plugin, Cancel stops them, Clear tidies their log — and putting Global in
     # the middle of it split that group in half.
     #
-    # These two take no plugin at all: they run once over everything converted
-    # so far. Separate concern, so they get their own captioned block at the
+    # These take no plugin at all: they run once over everything converted so
+    # far. Separate concern, so they get their own captioned block at the
     # bottom rather than sitting among the per-plugin controls.
     #
     # Uses the shared _sep() rather than a hand-rolled Separator so its spacing
@@ -2664,6 +2895,14 @@ def gui_main():
                 cmd += ["--output-dir", out_dir]
             return cmd
 
+        if key == "make_master":
+            cmd = [sys.executable, "-u",
+                   str(SCRIPT_DIR / "tools" / "make_master.py")]
+            cmd += master_plugins or _default_master_plugins()
+            if out_dir:
+                cmd += ["--output-dir", out_dir]
+            return cmd
+
         if key == "create_lod":
             cmd = [sys.executable, "-u",
                    str(SCRIPT_DIR / "tools" / "create_lod.py")]
@@ -2710,6 +2949,17 @@ def gui_main():
             stamp = _global_stamp(key)
         except Exception:
             return False
+        if key == "make_master":
+            # No artefact to point at, but the flags themselves are the
+            # evidence: done exactly when every selected plugin reads back as
+            # ESM, however it got that way (this session, an earlier one, or
+            # the CLI tool). A rebuilt plugin comes back unflagged and re-lights
+            # the button on its own.
+            done = bool(stamp) and all(
+                part.endswith(":1") for part in stamp.split("\x1f"))
+            if done:
+                _last_global_stamp[key] = stamp
+            return done
         if _last_global_stamp.get(key) == stamp:
             return True
         # No stamp from this session: fall back to the recorded run, which is
@@ -2742,6 +2992,8 @@ def gui_main():
         if key == "pack_lod":
             from asset_convert.sibling_lod import LOD_DIR_NAME
             return finished / f"{LOD_DIR_NAME}.zip"
+        # make_master produces no file — it flips a bit inside plugins that
+        # already exist. Its stamp reads the flags directly instead.
         return None
 
     def _global_stamp(key: str) -> str:
@@ -2794,6 +3046,23 @@ def gui_main():
                 src = []
             return "\x1f".join(src)
 
+        if key == "make_master":
+            # The ESM flag IS the result, so the stamp reads it back off disk.
+            # The button greys out once every selected plugin is flagged and
+            # lights up again the moment one is not -- including a rebuild,
+            # which writes a fresh unflagged plugin over a flagged one.
+            names = master_plugins or _default_master_plugins()
+            out = []
+            for n in names:
+                try:
+                    sys.path.insert(0, str(SCRIPT_DIR / "tools"))
+                    from make_master import read_header, resolve, FLAG_ESM
+                    flags, _m = read_header(resolve(n, out_dir))
+                    out.append(f"{n}:{1 if flags & FLAG_ESM else 0}")
+                except Exception:
+                    out.append(f"{n}:?")
+            return "\x1f".join(out)
+
         parts = []
         try:
             from asset_convert.sibling_lod import converted_plugins
@@ -2844,6 +3113,13 @@ def gui_main():
         if key == "create_lod":
             _open_create_lod_panel(
                 on_generate=lambda _p, _w: _start_global_action(key))
+            return
+        if key == "make_master":
+            # Confirm first: this rewrites plugins in place and changes how
+            # every reference in them is loaded, so the set is a decision to
+            # confirm rather than a default to fire off.
+            _open_make_master_panel(
+                on_apply=lambda: _start_global_action(key))
             return
         _start_global_action(key)
 
