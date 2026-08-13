@@ -246,6 +246,74 @@ def _shift_formid(fid: int, index_map: dict) -> int:
     return (mapped << 24) | (fid & 0x00FFFFFF)
 
 
+def _shift_vmad(payload: bytes, index_map: dict) -> bytes:
+    """VMAD with every OBJECT-property FormID restated for the child.
+
+    VMAD cannot go in `_FORMID_FIELDS`: its FormIDs sit at positions that
+    depend on the preceding variable-length script and property NAMES, so no
+    fixed offset table can reach them. It has to be walked.
+
+    Skipping it shipped the master's own ids verbatim inside an override whose
+    header WAS restated. Measured 2026-08-12 on ElsweyrPelletine.esp: the
+    override of ElsweyrAnequina's QUST 02061ABC (ANQMerchantsGuild04) was
+    written at 03061ABC, correctly, while its VMAD still bound
+    `TES4Unlock_ANQMCG04Bookkeeper` to 020E0E24 — index 02 is Tamriel.esp in
+    the child, so the GLOB property resolved into the wrong FILE. 23 such
+    properties across 7 QF_ scripts.
+
+    Parsed defensively: a payload this does not fully understand is returned
+    UNCHANGED rather than half-rewritten, since a partial rewrite would corrupt
+    a script binding rather than merely mis-target one property.
+    """
+    if len(payload) < 7:
+        return payload
+    try:
+        ver, fmt, nscripts = struct.unpack_from('<hhH', payload, 0)
+        if ver != 5 or fmt != 2:
+            return payload
+        buf = bytearray(payload)
+        p = 6
+
+        def _props(pos, count):
+            for _ in range(count):
+                ln = struct.unpack_from('<H', buf, pos)[0]
+                pos += 2 + ln
+                ptype = buf[pos]
+                pos += 2                       # type + status
+                if ptype == 1:                 # object: u32 unused + FormID
+                    v = struct.unpack_from('<I', buf, pos + 4)[0]
+                    struct.pack_into('<I', buf, pos + 4,
+                                     _shift_formid(v, index_map))
+                    pos += 8
+                elif ptype in (2, 3, 4, 5):    # string/int/float/bool
+                    if ptype == 2:
+                        sl = struct.unpack_from('<H', buf, pos)[0]
+                        pos += 2 + sl
+                    else:
+                        pos += 4
+                elif ptype == 11:              # array of objects
+                    n = struct.unpack_from('<I', buf, pos)[0]
+                    pos += 4
+                    for _ in range(n):
+                        v = struct.unpack_from('<I', buf, pos + 4)[0]
+                        struct.pack_into('<I', buf, pos + 4,
+                                         _shift_formid(v, index_map))
+                        pos += 8
+                else:
+                    raise ValueError('unhandled VMAD property type %d' % ptype)
+            return pos
+
+        for _ in range(nscripts):
+            ln = struct.unpack_from('<H', buf, p)[0]
+            p += 2 + ln + 1                    # name + flags byte
+            n = struct.unpack_from('<H', buf, p)[0]
+            p += 2
+            p = _props(p, n)
+        return bytes(buf)
+    except (struct.error, ValueError, IndexError):
+        return payload
+
+
 def _shift_record_formids(rec: bytes, index_map: dict) -> bytes:
     """A converted record restated in the child's load order.
 
@@ -276,7 +344,9 @@ def _shift_record_formids(rec: bytes, index_map: dict) -> bytes:
         ssig = body[j:j + 4]
         ssize = struct.unpack_from('<H', body, j + 4)[0]
         payload = bytearray(body[j + 6:j + 6 + ssize])
-        if ssig in _FORMID_FIELDS:
+        if ssig == b'VMAD':
+            payload = bytearray(_shift_vmad(bytes(payload), index_map))
+        elif ssig in _FORMID_FIELDS:
             spots = _FORMID_FIELDS[ssig]
             offsets = (range(0, len(payload) - 3, 4) if spots is None
                        else spots)

@@ -14,19 +14,35 @@ of runtime failures before shipping.
 Usage:
   python tools/vmad_property_typecheck.py --plugin Oblivion.esm
   python tools/vmad_property_typecheck.py --plugin Morrowind_ob.esm --verbose
+  python tools/vmad_property_typecheck.py --plugin ElsweyrPelletine.esp --cross-master
 
-KNOWN LIMITATION: properties are resolved by NAME against this plugin only, so
-a property that binds to a MASTER's record (a vanilla Skyrim Race named Orc, a
-Weather named Rain) is reported against whatever same-named record this plugin
-happens to own. Ambiguity inside one plugin is filtered; cross-master collisions
-are not. Confirm a small residue against the record's actual VMAD FormID before
-treating it as a real defect.
+The NAME pass above resolves a property name against this plugin only, so a
+property bound to a MASTER's record is reported against whatever same-named
+record this plugin happens to own. Ambiguity inside one plugin is filtered.
+
+`--cross-master` closes that gap from the other direction, and finds a defect
+the name pass structurally cannot see: it reads each property's ACTUAL FormID
+out of the VMAD, splits off the index byte, resolves that byte through THIS
+plugin's MAST list by name, and looks the local id up in that master's own
+output. A FormID copied verbatim from a master keeps the index byte that master
+used, and the same byte means a different file here -- so the property silently
+binds to whatever unrelated record happens to occupy that id.
+
+Measured (2026-08-12, ElsweyrPelletine.esp): `Faction ANQCORCorintheFaction`
+carried 020247E2, where 02 = Tamriel.esp in Pelletine's MAST list, resolving to
+a LAND record; the intended FACT of the same local id lives in
+ElsweyrAnequina.esp at index 03. The type pass reported 0 failures because no
+record named ANQCORCorintheFaction exists in Pelletine at all. In game the
+property read None, GetCrimeGoldViolent() aborted every call, and the script's
+unconditional RegisterForSingleUpdate(0.5) re-armed forever.
+See project_raw_formid_meaningless_across_plugins / project_master_index_routing.
 """
 import argparse
 import os
 import re
 import struct
 import sys
+import zlib
 from collections import Counter, defaultdict
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -120,6 +136,211 @@ def _read_vmad_bindings(path):
     return bound
 
 
+def _masters(path):
+    """MAST names in load order; the index byte offsets into this list."""
+    with open(path, 'rb') as fh:
+        head = fh.read(24)
+        if len(head) < 24 or head[:4] != b'TES4':
+            return []
+        body = fh.read(struct.unpack_from('<I', head, 4)[0])
+    out, pos = [], 0
+    while pos + 6 <= len(body):
+        sig = body[pos:pos + 4]
+        size = struct.unpack_from('<H', body, pos + 4)[0]
+        pos += 6
+        if sig == b'MAST':
+            out.append(body[pos:pos + size].rstrip(b'\0').decode('latin-1'))
+        pos += size
+    return out
+
+
+def _record_index(path):
+    """local formid -> [(signature, editorid), ...] for every record.
+
+    A list, not a single entry: a converted plugin can carry the SAME local id
+    under two signatures (ElsweyrAnequina 075923 is both a REFR and the QUST
+    ANQHuntersGuild01). Keeping only the first hit reports whichever the walk
+    reached first and invents mis-routings that do not exist, so the caller is
+    given every candidate and accepts the property if ANY of them fits.
+    """
+    data = open(path, 'rb').read()
+    out = defaultdict(list)
+    pos, n = 0, len(data)
+    while pos + 24 <= n:
+        sig = data[pos:pos + 4]
+        if sig == b'GRUP':
+            pos += 24
+            continue
+        size, flags, fid = struct.unpack_from('<III', data, pos + 4)
+        body = data[pos + 24:pos + 24 + size]
+        if flags & 0x00040000:
+            try:
+                body = zlib.decompress(body[4:])
+            except zlib.error:
+                body = b''
+        edid, q = None, 0
+        while q + 6 <= len(body):
+            s2 = body[q:q + 4]
+            sz2 = struct.unpack_from('<H', body, q + 4)[0]
+            q += 6
+            if s2 == b'EDID':
+                edid = body[q:q + sz2].split(b'\0')[0].decode('latin-1')
+                break
+            q += sz2
+        out[fid & 0xFFFFFF].append((sig.decode('latin-1'), edid))
+        pos += 24 + size
+    return out
+
+
+def _vmad_property_formids(path):
+    """(script, property, formid) for every OBJECT property bound in a VMAD.
+
+    Same walk as _read_vmad_bindings, but keeps the FormID instead of
+    discarding it -- that id is the whole subject of the cross-master check.
+    """
+    data = open(path, 'rb').read()
+    out, pos = [], 0
+    while True:
+        i = data.find(b'VMAD', pos)
+        if i < 0:
+            break
+        pos = i + 4
+        size = struct.unpack_from('<H', data, i + 4)[0]
+        v = data[i + 6:i + 6 + size]
+        if len(v) < 8:
+            continue
+        found = []
+        try:
+            ver, fmt, nscripts = struct.unpack_from('<hhH', v, 0)
+            if ver != 5 or fmt != 2 or not 0 <= nscripts <= 50:
+                continue
+            p = 6
+            for _ in range(nscripts):
+                ln = struct.unpack_from('<H', v, p)[0]
+                p += 2
+                sname = v[p:p + ln].decode('ascii', 'replace')
+                p += ln + 1
+                nprops = struct.unpack_from('<H', v, p)[0]
+                p += 2
+                for _ in range(nprops):
+                    pl = struct.unpack_from('<H', v, p)[0]
+                    p += 2
+                    pname = v[p:p + pl].decode('ascii', 'replace')
+                    p += pl
+                    ptype = v[p]
+                    p += 2
+                    if ptype == 1:
+                        fid = struct.unpack_from('<I', v, p + 4)[0]
+                        found.append((sname, pname, fid))
+                        p += 8
+                    elif ptype in (2, 3, 4, 5):
+                        p += 4
+                    elif ptype == 11:
+                        n = struct.unpack_from('<I', v, p)[0]
+                        p += 4 + n * 8
+                    else:
+                        raise ValueError('unhandled property type')
+        except Exception:
+            continue
+        out.extend(found)
+    return out
+
+
+def _report_cross_master(plugin, src, limit, verbose):
+    """Resolve each bound property's real FormID through the MAST list.
+
+    A mis-routed index byte points the property at an unrelated record, which
+    the name-based pass cannot see because the intended record is not in this
+    plugin at all.
+    """
+    out_dir = os.path.join(ROOT, 'output')
+    esm = os.path.join(out_dir, plugin, plugin)
+    masters = _masters(esm)
+
+    # Declared Papyrus type per (script, property), for the compatibility test.
+    decl = re.compile(r'^\s*([A-Za-z_]\w*)\s+Property\s+(\w+)', re.M)
+    declared = {}
+    for fn in sorted(os.listdir(src)):
+        if not fn.endswith('.psc'):
+            continue
+        text = open(os.path.join(src, fn), encoding='utf-8',
+                    errors='replace').read()
+        for m in decl.finditer(text):
+            declared[(fn[:-4].lower(), m.group(2))] = m.group(1)
+
+    cache = {}
+
+    def index_for(name):
+        """Record index of a master, read from ITS OWN converted output."""
+        if name not in cache:
+            path = os.path.join(out_dir, name, name)
+            cache[name] = _record_index(path) if os.path.exists(path) else None
+        return cache[name]
+
+    own = _record_index(esm)
+    checked = 0
+    bad = []
+    unresolved = Counter()
+    for sname, pname, fid in _vmad_property_formids(esm):
+        if fid == 0:
+            continue
+        idx, local = fid >> 24, fid & 0xFFFFFF
+        ptype = declared.get((sname.lower(), pname))
+        if ptype is None or ptype in _PERMISSIVE or ptype.startswith('TES4_'):
+            continue
+        accepts = _ACCEPTS.get(ptype)
+        if accepts is None:
+            continue
+        # A plugin's own records sit immediately AFTER its masters, so index
+        # == len(masters) is this file itself, not a master. Treating that as
+        # a master index reports every self-reference as mis-routed.
+        if idx == len(masters):
+            src_name, table = plugin, own
+        elif idx < len(masters):
+            src_name, table = masters[idx], index_for(masters[idx])
+            if table is None:
+                unresolved[masters[idx]] += 1
+                continue
+        else:
+            # Beyond the MAST list and not this file: nothing can resolve it.
+            bad.append((sname, pname, ptype, f'{fid:08X}',
+                        f'<index {idx:02X} out of range>', '<unresolvable>',
+                        None))
+            continue
+        hits = table.get(local)
+        checked += 1
+        if not hits:
+            bad.append((sname, pname, ptype, f'{fid:08X}', src_name,
+                        '<no such record>', None))
+            continue
+        # The id binds if ANY record answering to it has a compatible type.
+        if not any(sig in accepts for sig, _ in hits):
+            sig, edid = hits[0]
+            if len(hits) > 1:
+                sig = '/'.join(sorted({s for s, _ in hits}))
+            bad.append((sname, pname, ptype, f'{fid:08X}', src_name, sig, edid))
+
+    print()
+    print(f'cross-master: object properties resolved: {checked}')
+    print(f'cross-master: mis-routed / unbindable:    {len(bad)}')
+    if unresolved:
+        print()
+        print('masters not built, skipped:')
+        for name, n in unresolved.most_common():
+            print(f'  {name:<40} {n:>6} properties')
+    if bad:
+        print()
+        print(f'{"script":<44} {"property":<28} {"declared":<14} '
+              f'{"formid":<9} {"resolves in":<28} {"actual"}')
+        print('-' * 145)
+        for sname, pname, ptype, fid, src_name, sig, edid in bad[:limit]:
+            act = sig if edid is None else f'{sig} {edid}'
+            print(f'{sname:<44} {pname:<28} {ptype:<14} {fid:<9} '
+                  f'{src_name:<28} {act}')
+        if len(bad) > limit and not verbose:
+            print(f'... {len(bad) - limit} more (use --max/-v)')
+
+
 def _report_unbound(plugin, src, limit, verbose):
     """Declared-but-UNBOUND object properties -- the other way a property Nones.
 
@@ -186,6 +407,10 @@ def main():
     ap.add_argument('--unbound', action='store_true',
                     help='also report properties the .psc DECLARES but no '
                          'VMAD binds (they read None and abort the function)')
+    ap.add_argument('--cross-master', action='store_true',
+                    help="resolve each bound property's real FormID through "
+                         'this plugin MAST list, catching an index byte '
+                         'copied verbatim from a master')
     ap.add_argument('--max', type=int, default=25)
     args = ap.parse_args()
 
@@ -272,6 +497,9 @@ def main():
             print(f'== {p} <- {a} ({n}) ==')
             for fn, pname in detail[(p, a)][:args.max]:
                 print(f'  {fn}: {pname}')
+
+    if args.cross_master:
+        _report_cross_master(args.plugin, src, args.max, args.verbose)
 
     if args.unbound:
         _report_unbound(args.plugin, src, args.max, args.verbose)

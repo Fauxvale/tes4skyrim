@@ -929,12 +929,29 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # reports the overriding EditorID — the same precedence CrossRefGraph uses
     # below (they must agree or the importer resolves a different property set
     # than the .psc was generated against).
+    #
+    # **Key a master's record on its master_export KEY, not on rec['FormID'].**
+    # The record was parsed from the master's OWN export, so its `FormID` field
+    # is in THAT file's index space; `load_master_export` re-keys the dict into
+    # this plugin's space precisely because the two disagree whenever a master
+    # has a different master count than we do. Everything downstream feeds this
+    # map's ids to `get_formid`, which applies OUR blanket +offset — valid only
+    # for an id already in our space.
+    #
+    # Measured (2026-08-12, ElsweyrPelletine.esp): FACT ANQCORCorintheFaction is
+    # `010247E2` in ElsweyrAnequina.esp (1 master, so `01` is Anequina itself)
+    # and re-keyed to `020247E2` for Pelletine (4 masters, `02` = Anequina).
+    # Keying on the raw field registered `010247E2`; +1 made `020247E2` in TES5
+    # space, which is **Tamriel.esp** — a LAND record. The VM bound the Faction
+    # property to that LAND, so `GetCrimeGoldViolent()` returned None and
+    # TES4_PELCornitheRepDetectScript's OnUpdate aborted every 0.5s forever
+    # (864 stack frames in one 3-minute session). No `cannot be bound` line is
+    # logged for this: the id resolves to a REAL record, just the wrong one.
     fid_to_edid = {}
-    _edid_sources = [ctx.master_export.values()] if (
+    _edid_sources = [ctx.master_export.items()] if (
         ctx and getattr(ctx, 'master_export', None)) else []
-    _edid_sources.append(all_records)
-    for rec in [r for src in _edid_sources for r in src]:
-        fid_str = rec.get('FormID', '')
+    _edid_sources.append((r.get('FormID', ''), r) for r in all_records)
+    for fid_str, rec in [p for src in _edid_sources for p in src]:
         edid_str = rec.get('EditorID', '')
         if fid_str and edid_str:
             try:
@@ -959,15 +976,49 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # here than it did when the .psc was written.  Masters FIRST: the plugin's
     # own records are applied second and overwrite them, so an overriding
     # record is the version this graph reports.
-    _xref_sources = [ctx.master_export.values()] if (
+    #
+    # Master records are keyed on their master_export KEY for the same reason
+    # fid_to_edid is (see above): the raw `FormID` field is in the MASTER's
+    # index space, and every id this graph hands back is eventually run through
+    # `remap_formid`, which applies OUR offset. `unique_placed_ref` below is a
+    # live example — it feeds `raw_hex` straight into remap_formid, so a
+    # master's actor would rebind to whatever record our offset lands on.
+    # Re-keying here keeps the whole graph internally consistent: record_type,
+    # record_scri and the placed-ref index are all keyed by the SAME id string.
+    _xref_sources = [ctx.master_export.items()] if (
         ctx and getattr(ctx, 'master_export', None)) else []
-    _xref_sources.append(all_records)
-    for rec in [r for src in _xref_sources for r in src]:
-        fid_str = rec.get('FormID', '')
+    _xref_sources.append((r.get('FormID', ''), r) for r in all_records)
+    # A master record's id fields (SCRI, NAME) are in the MASTER's space too,
+    # and this graph chains them: record_scri[fid] -> script_formid_to_edid[scri],
+    # record_base[fid] -> the base's own entry. Re-keying only the outer key
+    # would leave those chains pointing at ids no key in this graph uses, so
+    # every master-owned SCRI/base lookup would miss. Translate them the same
+    # way — via the record's OWN key, whose index byte shift is the correction
+    # `load_master_export` already computed for that master.
+    def _rekey_ref(ref_hex, own_raw, own_key):
+        """Apply the same index-byte correction the record's own key carries."""
+        if not ref_hex or own_raw is None:
+            return ref_hex
+        try:
+            ref = int(ref_hex, 16)
+        except (ValueError, TypeError):
+            return ref_hex
+        shift = ((own_key >> 24) & 0xFF) - ((own_raw >> 24) & 0xFF)
+        if not shift:
+            return ref_hex
+        return '%08X' % ((((ref >> 24) & 0xFF) + shift) << 24 | (ref & 0xFFFFFF))
+
+    for fid_str, rec in [p for src in _xref_sources for p in src]:
         edid_str = rec.get('EditorID', '')
         sig = rec.get('Signature', '')
         if not fid_str:
             continue
+        # Non-zero only for a master record whose key was re-keyed above.
+        try:
+            _own_key = int(fid_str, 16)
+            _own_raw = int(rec.get('FormID', '') or fid_str, 16)
+        except (ValueError, TypeError):
+            _own_key = _own_raw = None
         if edid_str:
             edid_low = edid_str.lower()
             xref.edid_to_formid[edid_low] = fid_str
@@ -986,7 +1037,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                 except ValueError:
                     pass
         # Attached-script + placed-ref base chains (get_extends_class, ref typing)
-        scri = rec.get('SCRI', '')
+        scri = _rekey_ref(rec.get('SCRI', ''), _own_raw, _own_key)
         if scri:
             xref.record_scri[fid_str] = scri
         if sig in ('NPC_', 'CREA'):
@@ -1004,7 +1055,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                 p = rec.get(f'AIPackage[{i}]', '')
                 if not p:
                     break
-                packs.append(p)
+                packs.append(_rekey_ref(p, _own_raw, _own_key))
                 i += 1
             if packs:
                 xref.actor_packages[fid_str] = packs
@@ -1016,7 +1067,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                 except ValueError:
                     pass
         if sig in ('ACHR', 'ACRE', 'REFR'):
-            name_fid = rec.get('NAME', '')
+            name_fid = _rekey_ref(rec.get('NAME', ''), _own_raw, _own_key)
             if name_fid:
                 xref.record_base[fid_str] = name_fid
     # Populate per-script variable tables + ref-as-int analysis so the object
