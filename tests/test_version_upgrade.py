@@ -276,6 +276,39 @@ def test_every_global_action_is_a_global_step():
         assert key in v.GLOBAL_STEPS
 
 
+def test_pack_default_setting_gates_the_packing_steps():
+    """Settings > Pack by default decides whether the packing pair starts ticked.
+
+    Only that pair moves: turning the setting off must not disturb any other
+    step's default.
+    """
+    import gui
+    on  = gui.default_on_steps(True)
+    off = gui.default_on_steps(False)
+    assert set(gui.PACKING_STEPS) <= on
+    assert not (set(gui.PACKING_STEPS) & off)
+    assert on - off == set(gui.PACKING_STEPS)
+
+
+def test_upgrade_plan_cannot_re_tick_packing_when_the_setting_is_off():
+    """The upgrade plan must be filtered through the Pack-by-default setting.
+
+    Selecting a plugin auto-applies its upgrade plan, and a plan legitimately
+    includes the packing steps whenever packaging code changed.  Applying it
+    unfiltered re-ticked the two boxes the setting had just cleared -- the
+    setting appeared to do nothing, because merely picking a plugin undid it.
+    """
+    import gui
+    plan_steps = ["export", "meshes", "pack", "pack_zip"]
+
+    ticked = set(plan_steps) & gui.default_on_steps(False)
+    assert ticked == {"export", "meshes"}
+
+    # With the setting ON the plan is applied verbatim, so a genuine packaging
+    # upgrade still selects the work it owes.
+    assert set(plan_steps) & gui.default_on_steps(True) == set(plan_steps)
+
+
 def test_labels_match_release_notes_step_order():
     """The labels version.py maps are exactly the ones release_notes emits."""
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))

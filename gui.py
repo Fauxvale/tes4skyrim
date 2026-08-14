@@ -66,7 +66,33 @@ STEPS = [
 # contested tiles once per sibling and then throws all but one away. It is a
 # global action ("Create LOD") that runs the whole load order in one pass.
 
-_DEFAULT_ON = {k for k, *_ in STEPS}
+# The two packing steps. They are the only steps whose default tick state is a
+# user SETTING (Settings ▸ Pack by default) rather than a constant: packing is
+# the tail of the pipeline and anyone iterating on a conversion re-runs the
+# earlier steps dozens of times without ever wanting a BSA or a zip rebuilt.
+# Turning the setting off makes "Default" (and a fresh launch) leave them clear
+# without also hiding them — they stay tickable for the run that does want them.
+PACKING_STEPS = ("pack", "pack_zip")
+
+# Persisted under this key in conversion_config.json. Absent (or any non-false
+# value) means ON, so a config written before this option existed keeps the old
+# behaviour instead of silently dropping the packing steps from a run.
+PACK_DEFAULT_CONFIG_KEY = "packStepsDefaultOn"
+
+
+def default_on_steps(pack_default: bool = True) -> set:
+    """Step keys that start ticked, given the Pack-by-default setting.
+
+    Every step is on by default; the packing pair is additionally gated on
+    `pack_default`. Note this deliberately does NOT read the `default_on` column
+    of STEPS — that column drives the "did the user keep the default selection?"
+    check in the runner, which is a separate question from what the checkboxes
+    start at.
+    """
+    keys = {k for k, *_ in STEPS}
+    if not pack_default:
+        keys -= set(PACKING_STEPS)
+    return keys
 
 # ── Global actions ────────────────────────────────────────────────────────────
 # Work that belongs to NO single plugin: it takes no `-f`, runs once for the
@@ -551,6 +577,10 @@ def gui_main():
     # value) leaves the speed-up enabled rather than silently disabling it.
     cache_download_default = cfg.get("navmeshCacheDownload") is not False
 
+    # Pack BSAs / Pack Mod Zip start ticked unless the user turned this off.
+    # Same "only an explicit false disables it" rule as the cache option above.
+    pack_default = cfg.get(PACK_DEFAULT_CONFIG_KEY) is not False
+
     # ── Root window ───────────────────────────────────────────────────────────
     root = tk.Tk()
     root.title(f"TES4 Auto-Convert  {version_info.current_version()}")
@@ -688,7 +718,11 @@ def gui_main():
     # metered connection stays opted out across sessions rather than having to
     # be re-set every launch.
     cache_dl_var = tk.BooleanVar(value=cache_download_default)
-    step_vars   = {key: tk.BooleanVar(value=(key in _DEFAULT_ON))
+    # Whether the packing steps start ticked. Read once here for the initial
+    # checkbox state, then live in the var so "Default" follows the setting.
+    pack_default_var = tk.BooleanVar(value=pack_default)
+    _initial_on = default_on_steps(pack_default_var.get())
+    step_vars   = {key: tk.BooleanVar(value=(key in _initial_on))
                    for key, *_ in STEPS}
     running     = threading.Event()
     cancel_evt  = threading.Event()  # set to request cancellation
@@ -783,6 +817,23 @@ def gui_main():
     settings_menu.add_checkbutton(
         label="Download navmesh cache", variable=cache_dl_var,
         onvalue=True, offvalue=False, command=_on_cache_dl_change)
+
+    # Settings ▸ Pack BSAs / Mod Zip by default — persisted, and applied to the
+    # live checkboxes as soon as it is toggled so the setting's effect is
+    # visible immediately rather than only after the next launch. It only moves
+    # the two packing boxes; every other step keeps whatever the user has set.
+    def _on_pack_default_change():
+        updated = load_config()
+        on = bool(pack_default_var.get())
+        updated[PACK_DEFAULT_CONFIG_KEY] = on
+        save_config(updated)
+        for key in PACKING_STEPS:
+            step_vars[key].set(on)
+        _update_run_btn()
+
+    settings_menu.add_checkbutton(
+        label="Pack BSAs / Mod Zip by default", variable=pack_default_var,
+        onvalue=True, offvalue=False, command=_on_pack_default_change)
 
     # ── Converted ▸ (plugins already in output/) ──────────────────────────────
     # Picking one selects it AND ticks the steps its last conversion still owes,
@@ -1583,8 +1634,9 @@ def gui_main():
         _update_run_btn()
 
     def _set_default():
+        on = default_on_steps(pack_default_var.get())
         for key, v in step_vars.items():
-            v.set(key in _DEFAULT_ON)
+            v.set(key in on)
         _update_run_btn()
 
     def _set_none():
@@ -1612,11 +1664,21 @@ def gui_main():
     _plan_applied = set()
 
     def _apply_upgrade_plan():
+        """Tick exactly the steps the plan says this plugin still owes.
+
+        Filtered through the Pack-by-default setting: the plan answers "what
+        code changed since this plugin was last converted", which for a
+        packaging change legitimately includes the packing steps -- but the
+        setting is the user saying "never tick those for me automatically".
+        Without this filter, selecting a plugin (which auto-applies the plan)
+        silently re-ticked the boxes the setting had just cleared.
+        """
         plan = _upgrade_plan[0]
         if not plan or not plan.get("steps"):
             return
+        wanted = set(plan["steps"]) & default_on_steps(pack_default_var.get())
         for key, v in step_vars.items():
-            v.set(key in plan["steps"])
+            v.set(key in wanted)
         _update_run_btn()
 
     upgrade_btn = ttk.Button(sh, text="Upgrade", width=9,
@@ -3497,7 +3559,15 @@ def gui_main():
         def _worker():
             _set_running(True)
             try:
+                # The one-process fast path fires when the selection IS the
+                # default one. That default now depends on the Pack-by-default
+                # setting, so it is computed the same way the checkboxes are:
+                # with packing off, "everything except the two packing steps"
+                # is still a default selection and still runs as a single
+                # pipeline invocation rather than degrading to one process per
+                # step.
                 default_set = {k for k, *rest in STEPS if rest[3]}
+                default_set &= default_on_steps(pack_default_var.get())
                 active_set  = set(steps)
                 ret = 0
                 # If selection == default set and a file is specified and no
