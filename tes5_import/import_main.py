@@ -52,6 +52,7 @@ from .record_types.world import (
     convert_WRLD,
     set_cell_locations,
     set_cloud_bank_output,
+    set_world_land_extents,
     set_door_navmesh_links,
 )
 from .text_reader import (
@@ -2776,6 +2777,36 @@ def _ensure_cell_grid(cell: dict) -> None:
     cell['XCLC.Y'] = '0'
 
 
+def _land_extents_by_wrld(ext_cells_by_wrld: dict) -> dict:
+    """WRLD FormID -> (min_x, min_y, max_x, max_y) of its real terrain.
+
+    Measured from the exterior cell GRID, which is the authored ground truth
+    for where a worldspace's land actually is.  Cell (gx, gy) spans
+    gx*4096 .. (gx+1)*4096, so the far edge of the last cell is (max+1)*4096.
+
+    Persistent cells are excluded: they carry the worldspace's persistent refs
+    rather than terrain, are commonly parked at a dummy (0,0), and would drag
+    the extent toward the origin on any worldspace whose land does not include
+    it -- which is exactly the mis-centring this function exists to avoid.
+    """
+    extents = {}
+    for wrld_fid, cells in ext_cells_by_wrld.items():
+        xs = []
+        ys = []
+        for cell in cells:
+            if get_int(cell, 'RecordFlags') & 0x400:      # persistent
+                continue
+            if not get_str(cell, 'XCLC.X'):
+                continue
+            xs.append(get_int(cell, 'XCLC.X'))
+            ys.append(get_int(cell, 'XCLC.Y'))
+        if not xs:
+            continue
+        extents[wrld_fid] = (min(xs) * 4096.0, min(ys) * 4096.0,
+                             (max(xs) + 1) * 4096.0, (max(ys) + 1) * 4096.0)
+    return extents
+
+
 def _build_world_groups(by_type: dict, writer: PluginWriter,
                         navm_metas: list = None, base_model_by_fid: dict = None,
                         door_fids: set = None, navm_cache: dict = None,
@@ -2872,6 +2903,15 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
         wrld_fid = get_formid(cell, 'ParentWRLD')
         if wrld_fid:
             ext_cells_by_wrld[wrld_fid].append(cell)
+
+    # The world-map cloud bank has to be sized and centred on the worldspace's
+    # REAL LAND, which is the set of exterior cells right here -- not on MNAM.
+    # MNAM is authored map-camera framing and a converted plugin's can simply
+    # disagree with its terrain: NehrimWorldspace's MNAM rectangle sits 26,624
+    # units south of its land's centre and its north edge cuts 16,384 units of
+    # real land off, so a deck built from it is both mis-centred and too small.
+    # The cells cannot disagree with themselves.
+    set_world_land_extents(_land_extents_by_wrld(ext_cells_by_wrld))
 
     # Index children by parent cell
     refr_by_cell = defaultdict(list)

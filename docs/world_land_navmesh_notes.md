@@ -1008,3 +1008,87 @@ outright: **4.2 s** for the whole export.
   - MISC=(-5,-5,0,5,5,8), KEYM=(-3,-3,0,3,3,3), WEAP=(-5,-5,0,5,5,30), STAT=(-50,-50,0,50,50,80)
   - ARMO=(-15,-10,0,15,10,30), NPC_/CREA=(-12,-12,0,12,12,60), LIGH=(-6,-6,0,6,6,20)
   - Other types get (-5,-5,0,5,5,5) as fallback
+
+## World-map cloud banks (WRLD MODL) — sized to the LAND
+
+Skyrim's world map draws a bank of cloud sheets over the terrain. The mesh is
+picked by a three-step fallback in the engine (`SkyrimSE.exe` RVA `0x2c7e00`,
+the only cross-reference to the string): the PARENT worldspace's cloud model
+when WRLD `DATA` bit 2 ("Use Map Data") is set, else this worldspace's own
+`MODL` (xEdit's `wbRStruct('Cloud Model', [wbGenericModel])`, written between
+DNAM and MNAM), else a HARDCODED `Meshes\Sky\SkyrimWorldMapCloudBank.nif`.
+
+Oblivion has no world-map cloud layer and vanilla Skyrim authors no MODL
+either (0 of 35 uncompressed Skyrim.esm WRLDs carry one), so without this every
+converted worldspace inherits a bank sized for Skyrim's Tamriel.
+`asset_convert/worldmap_clouds.py` emits one per worldspace and points MODL at
+`meshes\tes4\worldmapclouds\<edid>.nif` (under `tes4\`, never `sky\`, so a
+generated bank can never shadow the vanilla file the weather system loads by
+name).
+
+### Size and centre come from the exterior CELL GRID, not from MNAM or NAM0/NAM9
+
+Per axis the deck is given **Bethesda's own deck-to-land ratio** — the stock
+910,445 sheet against Skyrim's 487,424 x 385,024 land, i.e. **1.868x on X and
+2.365x on Y** — and centred on the land rectangle's midpoint. Feeding Skyrim's
+own land back in reproduces the stock scale of exactly **8.0 / 8.0**, which is
+the control that validates the rule.
+
+Both inputs are measured from the worldspace's non-persistent exterior cells
+(`tes5_import.import_main._land_extents_by_wrld`; cell `(gx,gy)` spans
+`gx*4096 .. (gx+1)*4096`). Persistent cells are excluded — they hold the
+worldspace's persistent refs, are commonly parked at a dummy `(0,0)`, and drag
+the extent toward the origin.
+
+🛑 **MNAM is authored map-camera framing and a converted plugin's can simply be
+WRONG about its own terrain.** NehrimWorldspace's MNAM rectangle is centred
+26,624 units SOUTH of its land and its north edge clips 16,384 units of real
+land off. Sizing or centring off it produces a deck that is both offset and
+undersized. MNAM, then NAM0/NAM9, remain fallbacks only for a worldspace that
+contributes no cells.
+
+### The sheets must be stretched PER AXIS, and the UVs stretched with them
+
+A NIF node `scale` is a single float, so it can only size the (square) stock
+sheet off its longer side. Nehrim's land is portrait (92 x 101 cells) where
+Skyrim's is landscape, so a uniform scale hangs far more cloud across the short
+axis than the tall one needs. The stretch is therefore baked into the VERTICES
+with each node's `scale` set to 1.0 — node scale and vertex scale multiply, so
+leaving it at the stock 8.0 applies the factor twice.
+
+🛑 **The clouds are a TEXTURE (`textures\sky\SkyrimCloudsMap01.dds`), not vertex
+alpha.** Stretching vertices while leaving UVs alone keeps the cloud pattern
+pinned to the same FRACTION of the sheet at any size, so the dense border band
+lands wherever it likes relative to the terrain and no amount of resizing moves
+it. UVs are scaled by the same world-span factor (`sx / 8.0`, since the
+vertices already absorbed the stock node scale — scaling by `sx` directly
+over-tiles by 8x). Verified by texel density: units-per-UV must come out
+identical to stock (75858 / 94209 / 45791 / 192743 for High/Mid/Top/Low).
+
+Only the horizontal axes are touched. Vertex Z (the sheet's own relief) and the
+nodes' Z translations (cloud ALTITUDES: 0 / 1000 / 1500 / 12500) are preserved;
+scaling those would sink the deck into terrain or launch it out of frame. The
+bounding sphere is updated unconditionally, since X/Y always change.
+
+### Sibling worldspaces: union the LAND, not the WRLD records
+
+`sibling_lod.merge_cloud_bank` writes ONE bank covering every contributor, into
+the merged LOD folder that installs last and wins the overwrite deliberately.
+
+🛑 **The union must be measured from each plugin's cells** (`_wrld_land_bounds`
++ `_wrld_formid`, reading XCLC out of the built ESM). A dependent overrides the
+master's WRLD record WITHOUT touching MNAM/NAM0/NAM9, so all five TES4Tamriel
+contributors report the identical rectangle `X[-241664,245760]` and a
+record-based union collapses to the master's 487,424 x 434,176 — against a real
+combined land span of **1,572,864 x 1,183,744**, a deck 3.2x too small. That is
+exactly the overwrite bug the function exists to prevent.
+
+### Benign: two copies of each bank exist
+
+`create_lod.py` calls `merge_cloud_bank` for every worldspace, including ones
+with no contributors, so a solo plugin gets a second copy under
+`output/AutoConvertLOD/`. Both resolve to the same Data-relative path and the
+LOD copy wins. This is harmless — but note that **`--import-only` refreshes only
+the per-plugin copy**, so after an import-side change the game still loads the
+older AutoConvertLOD mesh until a LOD run regenerates it. Verify the copy that
+actually wins before concluding a cloud-bank change had no effect.

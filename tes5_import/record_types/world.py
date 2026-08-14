@@ -58,6 +58,11 @@ _DOOR_NAVMESH_LINK: dict = {}
 # banks, or None to skip generating them.  See set_cloud_bank_output.
 _CLOUD_BANK_ROOT = None
 
+# WRLD FormID -> (min_x, min_y, max_x, max_y) world units of the worldspace's
+# real terrain, measured from its exterior cell grid.  See
+# set_world_land_extents.
+_WORLD_LAND_EXTENT: dict = {}
+
 # Above this magnitude, float32 `a -= 2*pi` no longer changes `a`, because
 # 2*pi has fallen below the ULP.  2**24 * 2*pi is already ~1e8 iterations.
 _ANGLE_STALL = (2 ** 24) * 2.0 * math.pi
@@ -116,6 +121,20 @@ def set_cloud_bank_output(out_root):
     """
     global _CLOUD_BANK_ROOT
     _CLOUD_BANK_ROOT = out_root
+
+
+def set_world_land_extents(extents: dict):
+    """Register WRLD FormID -> real land rectangle, for the cloud banks.
+
+    The bank must be sized and centred on the terrain the player actually
+    sees.  MNAM is the map-camera framing an author typed in, and on a
+    converted plugin it can simply be wrong: NehrimWorldspace's MNAM sits
+    26,624 units south of its land's centre and clips 16,384 units of real
+    land off the north edge, which makes a deck built from it both offset and
+    undersized.  The exterior cell grid is the authored ground truth.
+    """
+    _WORLD_LAND_EXTENT.clear()
+    _WORLD_LAND_EXTENT.update(extents or {})
 
 
 def set_door_navmesh_links(door_links: dict):
@@ -330,12 +349,40 @@ def build_wrld_cloud_modl(rec: dict, edid: str = None):
             edid = 'TES4Tamriel'      # matches convert_WRLD's rename
     if not edid or not get_str(rec, 'NAM0.MinX'):
         return None
-    width = abs(get_float(rec, 'NAM9.MaxX') - get_float(rec, 'NAM0.MinX'))
-    height = abs(get_float(rec, 'NAM9.MaxY') - get_float(rec, 'NAM0.MinY'))
+    from asset_convert.worldmap_clouds import (generate_cloud_bank,
+                                               compute_center, framed_rect)
+
+    # Size and place against the worldspace's REAL LAND -- the exterior cell
+    # grid, registered by set_world_land_extents.  That is the terrain the map
+    # draws and the only rectangle that cannot disagree with itself.
+    #
+    # MNAM (the authored map-camera framing) is the fallback, not the primary,
+    # because a converted plugin's MNAM can be plain wrong about its own
+    # terrain: NehrimWorldspace's MNAM rectangle is centred 26,624 units south
+    # of its land and its north edge cuts 16,384 units of real land off.  Both
+    # of those show up in game exactly as reported -- a deck offset away from
+    # the landmass, and too small for it.  NAM0/NAM9 is the last resort.
+    rect = _WORLD_LAND_EXTENT.get(get_formid(rec, 'FormID'))
+    if rect is None and get_str(rec, 'MNAM.NWCellX'):
+        rect = framed_rect(get_int(rec, 'MNAM.NWCellX'),
+                           get_int(rec, 'MNAM.NWCellY'),
+                           get_int(rec, 'MNAM.SECellX'),
+                           get_int(rec, 'MNAM.SECellY'))
+    if rect is None:
+        rect = (get_float(rec, 'NAM0.MinX'), get_float(rec, 'NAM0.MinY'),
+                get_float(rec, 'NAM9.MaxX'), get_float(rec, 'NAM9.MaxY'))
+
+    min_x, min_y, max_x, max_y = rect
+    width = abs(max_x - min_x)
+    height = abs(max_y - min_y)
     if width <= 0.0 or height <= 0.0:
         return None
-    from asset_convert.worldmap_clouds import generate_cloud_bank
-    return generate_cloud_bank(edid, width, height, _CLOUD_BANK_ROOT)
+    # The rectangle is not centred on the worldspace origin, and the stock
+    # bank is -- so the sheet has to be moved onto the terrain or the far
+    # side of the origin runs out from under the clouds.
+    center = compute_center(min_x, min_y, max_x, max_y)
+    return generate_cloud_bank(edid, width, height, _CLOUD_BANK_ROOT,
+                               center=center, land_rect=rect)
 
 
 def convert_CELL(rec: dict) -> bytes:

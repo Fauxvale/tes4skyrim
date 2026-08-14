@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import re
 import struct
+import zlib
 from collections import defaultdict
 from pathlib import Path
 
@@ -726,6 +727,103 @@ _LOD_SUBDIRS = (
 )
 
 
+def _wrld_land_bounds(esm: Path, wrld_fid: int):
+    """(minX, minY, maxX, maxY) of a plugin's real terrain in worldspace
+    `wrld_fid`, measured from its exterior CELL grid, or None.
+
+    Why not the WRLD record: a dependent plugin overrides the master's WRLD
+    without touching MNAM/NAM0/NAM9, so every sibling reports the SAME
+    rectangle and the "union" collapses to the master's.  Measured on the real
+    outputs, all five TES4Tamriel contributors return X[-241664,245760]
+    (487424 x 434176) while their combined land actually spans 1572864 x
+    1183744 -- a deck 3.2x too small, which is precisely the overwrite bug
+    merge_cloud_bank exists to prevent.
+
+    Cells are read straight out of the built ESM: CELL records carry XCLC
+    (grid X, grid Y) and sit inside the GRUP tree under their worldspace.
+    Persistent cells (RecordFlags 0x400) are skipped -- they hold the
+    worldspace's persistent refs, are commonly parked at a dummy (0,0), and
+    would drag the extent toward the origin.
+    """
+    try:
+        data = esm.read_bytes()
+    except OSError:
+        return None
+
+    min_gx = min_gy = None
+    max_gx = max_gy = None
+    cur_world = None
+    i = 0
+    n = len(data)
+    while i + 24 <= n:
+        sig = data[i:i + 4]
+        if sig == b'GRUP':
+            size, label, gtype = struct.unpack('<I4si', data[i + 4:i + 16])
+            # type 1 = worldspace children; the label is the WRLD FormID.
+            if gtype == 1:
+                cur_world = struct.unpack('<I', label)[0]
+            i += 24
+            continue
+        size, flags = struct.unpack('<II', data[i + 4:i + 12])
+        if sig == b'CELL' and cur_world == wrld_fid and not (flags & 0x400):
+            body = data[i + 24:i + 24 + size]
+            if flags & 0x00040000:
+                try:
+                    body = zlib.decompress(body[4:])
+                except Exception:
+                    body = b''
+            j = 0
+            while j + 6 <= len(body):
+                sub = body[j:j + 4]
+                sz = struct.unpack('<H', body[j + 4:j + 6])[0]
+                if sub == b'XCLC' and sz >= 8:
+                    gx, gy = struct.unpack('<ii', body[j + 6:j + 14])
+                    min_gx = gx if min_gx is None else min(min_gx, gx)
+                    max_gx = gx if max_gx is None else max(max_gx, gx)
+                    min_gy = gy if min_gy is None else min(min_gy, gy)
+                    max_gy = gy if max_gy is None else max(max_gy, gy)
+                    break
+                j += 6 + sz
+        i += 24 + size
+
+    if min_gx is None:
+        return None
+    return (min_gx * 4096.0, min_gy * 4096.0,
+            (max_gx + 1) * 4096.0, (max_gy + 1) * 4096.0)
+
+
+def _wrld_formid(esm: Path, edid: str):
+    """FormID of the WRLD named `edid` in a built ESM, or None."""
+    try:
+        data = esm.read_bytes()
+    except OSError:
+        return None
+    off = 0
+    while True:
+        k = data.find(b'WRLD', off)
+        if k < 0:
+            return None
+        off = k + 4
+        if k + 24 > len(data):
+            return None
+        size, flags, fid = struct.unpack('<IiI', data[k + 4:k + 16])
+        if size == 0 or size > 500000 or (flags & 0x00040000):
+            continue
+        body = data[k + 24:k + 24 + size]
+        j = 0
+        while j + 6 <= len(body):
+            sub = body[j:j + 4]
+            if not re.fullmatch(rb'[A-Z0-9_]{4}', sub):
+                break
+            sz = struct.unpack('<H', body[j + 4:j + 6])[0]
+            if sub == b'EDID':
+                name = body[j + 6:j + 6 + sz].rstrip(b'\0')
+                if name.decode('ascii', 'replace') == edid:
+                    return fid
+                break
+            j += 6 + sz
+
+
 def _wrld_bounds(esm: Path, edid: str):
     """(minX, minY, maxX, maxY) from a plugin's WRLD record, or None.
 
@@ -751,7 +849,7 @@ def _wrld_bounds(esm: Path, edid: str):
         body = data[k + 24:k + 24 + size]
         j = 0
         name = None
-        n0 = n9 = None
+        n0 = n9 = mnam = None
         while j + 6 <= len(body):
             sig = body[j:j + 4]
             if not sig_ok.fullmatch(sig):
@@ -764,9 +862,21 @@ def _wrld_bounds(esm: Path, edid: str):
                 n0 = struct.unpack('<ff', val)
             elif sig == b'NAM9' and sz == 8:
                 n9 = struct.unpack('<ff', val)
+            elif sig == b'MNAM' and sz >= 16:
+                mnam = struct.unpack('<hhhh', val[8:16])
             j += 6 + sz
-        if name == edid and n0 and n9:
-            return (n0[0], n0[1], n9[0], n9[1])
+        if name == edid:
+            # The map frames MNAM's NW/SE cell corners, which on Skyrim itself
+            # is only a third of the NAM0/NAM9 landmass rectangle -- the rest
+            # is unexplorable filler the map never shows.  Prefer it, and fall
+            # back to NAM0/NAM9 only when the corners are absent.
+            if mnam:
+                from .worldmap_clouds import framed_rect
+                rect = framed_rect(mnam[0], mnam[1], mnam[2], mnam[3])
+                if rect:
+                    return rect
+            if n0 and n9:
+                return (n0[0], n0[1], n9[0], n9[1])
 
 
 def merge_cloud_bank(out_root: Path, merged_dir: Path, edid: str,
@@ -790,14 +900,25 @@ def merge_cloud_bank(out_root: Path, merged_dir: Path, edid: str,
     deliberately, exactly like the merged tiles.  Returns the Data-relative
     path written, or None when no bank could be built.
     """
-    from .worldmap_clouds import generate_cloud_bank, cloud_model_path
+    from .worldmap_clouds import (generate_cloud_bank, cloud_model_path,
+                                  compute_center)
 
+    # Union of every sibling's real LAND, not of their WRLD records: a
+    # dependent overrides the WRLD without touching MNAM/NAM, so record-based
+    # bounds are identical for all of them and the union collapses to the
+    # master's (see _wrld_land_bounds).  Fall back to the record only when a
+    # plugin contributes no cells of its own.
     boxes = []
     for name in [master] + list(plugins):
         esm = out_root / name / name
         if not esm.is_file():
             continue
-        box = _wrld_bounds(esm, edid)
+        box = None
+        fid = _wrld_formid(esm, edid)
+        if fid is not None:
+            box = _wrld_land_bounds(esm, fid)
+        if box is None:
+            box = _wrld_bounds(esm, edid)
         if box:
             boxes.append(box)
     if not boxes:
@@ -812,7 +933,13 @@ def merge_cloud_bank(out_root: Path, merged_dir: Path, edid: str,
     if width <= 0.0 or height <= 0.0:
         return None
 
-    if not generate_cloud_bank(edid, width, height, str(merged_dir)):
+    # Centred on the UNION's midpoint for the same reason it is sized off the
+    # union: that is the rectangle the map actually draws once every sibling
+    # is installed, and it is not centred on the worldspace origin.
+    center = compute_center(min_x, min_y, max_x, max_y)
+    if not generate_cloud_bank(edid, width, height, str(merged_dir),
+                               center=center,
+                               land_rect=(min_x, min_y, max_x, max_y)):
         return None
     return cloud_model_path(edid)
 

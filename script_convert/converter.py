@@ -944,29 +944,26 @@ class ScriptConverter:
             # abDefaultProcessingOnly=false), so it obeys both the lock and
             # the BlockActivation this script now applies — but OnActivate is
             # dispatched before either refusal, so the script replays the
-            # Oblivion bypass itself: an NPC activator gets the default open
-            # (lock lifted around it and faithfully restored), players fall
-            # through to the consume body and the authored lock UI.
+            # Oblivion bypass itself: an NPC activator gets the default open,
+            # players fall through to the consume body and the authored lock
+            # UI.  The relock is DEFERRED to OnClose (emitted below): locking
+            # in the same script frame as the Activate risks aborting the
+            # open animation mid-play, and TES4's authored lock state only
+            # meaningfully applies to the closed door anyway.
             if (blocks_activation and extends == 'ObjectReference'
                     and merge_key == BLOCK_MAP['onactivate'][0]):
                 out.append('  If (GetBaseObject() as Door) && '
                            '(akActionRef as Actor) && '
                            'akActionRef != Game.GetPlayer()')
                 out.append('    ; TES4 parity: AI door-use ignores this '
-                           'script and the lock.  The lock LEVEL survives '
-                           'both our unlock and the engine\'s own '
-                           'owner-unlock, so the authored lock is restored '
-                           'after every AI passage.')
+                           'script and the lock; the authored lock is '
+                           'restored when the door next closes.')
                 out.append('    If GetOpenState() >= 3')
-                out.append('      Int TES4_relockLevel = GetLockLevel()')
+                out.append('      TES4_pendingRelock = GetLockLevel()')
                 out.append('      If IsLocked()')
                 out.append('        Lock(false)')
                 out.append('      EndIf')
                 out.append('      Activate(akActionRef, true)')
-                out.append('      If TES4_relockLevel > 0')
-                out.append('        Lock(true)')
-                out.append('        SetLockLevel(TES4_relockLevel)')
-                out.append('      EndIf')
                 out.append('    EndIf')
                 out.append('    Return')
                 out.append('  EndIf')
@@ -1407,6 +1404,23 @@ class ScriptConverter:
         # door preamble emitted in the block loop above.
         if blocks_activation:
             out = self._inject_block_activation(out)
+
+        # Companion to the door preamble: the deferred relock.  TES4 has no
+        # OnClose event, so this can never collide with an authored block.
+        if (blocks_activation and extends == 'ObjectReference'
+                and BLOCK_MAP['onactivate'][0] in merged_blocks):
+            out.append('Int TES4_pendingRelock = 0')
+            out.append('')
+            out.append('Event OnClose(ObjectReference akActionRef)')
+            out.append('  ; Restore the authored lock lifted for an AI door '
+                       'passage (see OnActivate).')
+            out.append('  If TES4_pendingRelock > 0')
+            out.append('    Lock(true)')
+            out.append('    SetLockLevel(TES4_pendingRelock)')
+            out.append('    TES4_pendingRelock = 0')
+            out.append('  EndIf')
+            out.append('EndEvent')
+            out.append('')
 
         # Balance If/EndIf within event blocks (some TES4 scripts have extra EndIf)
         out = self._balance_if_endif(out)
