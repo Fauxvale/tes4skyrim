@@ -934,24 +934,40 @@ class ScriptConverter:
             else:
                 out.append(merge_key)
 
-            # Oblivion's AI door-open BYPASSES both locks and OnActivate
-            # scripts — the CharacterGen back gate is level-100 locked with a
-            # "nobody can open this gate" consume script, and Glenroy still
-            # opens it by pathing.  Skyrim's AI door-open is a plain
-            # activation (ActionActivateDoneHandler calls ActivateRef with
-            # abDefaultProcessingOnly=false, verified in the AE exe), so it
-            # obeys the BlockActivation this script now applies.  OnActivate
-            # is still dispatched before the blocked bail-out, so the script
-            # replays the Oblivion bypass itself: an NPC activator gets the
-            # default open, players fall through to the consume body.
+            # Oblivion's AI door-open BYPASSES locks and OnActivate scripts —
+            # the CharacterGen back gate is level-100 locked with a "nobody
+            # can open this gate" consume script, and Glenroy still opens it
+            # by pathing.  Skyrim's AI door-open is a plain activation
+            # (verified in the AE exe: the actor door state machine raises
+            # the open action for any closed pathing door without reading the
+            # lock, then ActionActivateDoneHandler calls ActivateRef with
+            # abDefaultProcessingOnly=false), so it obeys both the lock and
+            # the BlockActivation this script now applies — but OnActivate is
+            # dispatched before either refusal, so the script replays the
+            # Oblivion bypass itself: an NPC activator gets the default open
+            # (lock lifted around it and faithfully restored), players fall
+            # through to the consume body and the authored lock UI.
             if (blocks_activation and extends == 'ObjectReference'
                     and merge_key == BLOCK_MAP['onactivate'][0]):
                 out.append('  If (GetBaseObject() as Door) && '
                            '(akActionRef as Actor) && '
                            'akActionRef != Game.GetPlayer()')
                 out.append('    ; TES4 parity: AI door-use ignores this '
-                           'script; open without re-entering OnActivate.')
-                out.append('    Activate(akActionRef, true)')
+                           'script and the lock.  The lock LEVEL survives '
+                           'both our unlock and the engine\'s own '
+                           'owner-unlock, so the authored lock is restored '
+                           'after every AI passage.')
+                out.append('    If GetOpenState() >= 3')
+                out.append('      Int TES4_relockLevel = GetLockLevel()')
+                out.append('      If IsLocked()')
+                out.append('        Lock(false)')
+                out.append('      EndIf')
+                out.append('      Activate(akActionRef, true)')
+                out.append('      If TES4_relockLevel > 0')
+                out.append('        Lock(true)')
+                out.append('        SetLockLevel(TES4_relockLevel)')
+                out.append('      EndIf')
+                out.append('    EndIf')
                 out.append('    Return')
                 out.append('  EndIf')
 
@@ -8038,8 +8054,8 @@ def sctx_onactivate_consumes(sctx: str) -> bool:
 
     Text-level twin of ScriptConverter._onactivate_consumes for callers that
     hold the SCTX source rather than parsed blocks (tes5_import uses it to
-    decide which locked doors the AI must be able to open).  A script with no
-    OnActivate block at all consumes nothing.
+    spot barrier doors whose lock level must stay AI-passable).  A script
+    with no OnActivate block at all consumes nothing.
     """
     blocks = [('onactivate', '', m.group(1).splitlines())
               for m in _ONACTIVATE_BLOCK_RE.finditer(sctx or '')]

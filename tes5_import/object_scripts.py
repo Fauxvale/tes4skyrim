@@ -98,13 +98,14 @@ _PLAYER_BASE_FORMID = 0x07
 _GETPARENTREF_BASES: set = set()
 
 # DOOR base FormIDs (raw export hex strings) whose TES4 script CONSUMES
-# activation (OnActivate with no unconditional bare `Activate`).  Their
-# converted scripts BlockActivation, which player-proofs the door on its own —
-# and Skyrim's AI cannot open locked doors at all (Oblivion's AI door-open
-# bypassed both the lock and the script).  convert_REFR therefore drops the
-# level-100 keyless lock on placed refs of these bases: the lock is redundant
-# for the player and fatal for NPC pathing (the CharacterGen back gate that
-# Glenroy must open).  Pickable locks (level < 100) and keyed locks are kept.
+# activation (OnActivate with no unconditional bare `Activate`).  convert_REFR
+# keeps a level-100 keyless lock on these as MASTER (100) instead of Requires
+# Key (255): Skyrim's pathfinder excludes 255 doors outright (live-process
+# probe: Glenroy stood pathless at the 255 CharacterGen back gate, door state
+# machine never ticking), while a Master lock routes through and the script's
+# OnActivate preamble performs the unlock/open/relock.  The label difference
+# is invisible in practice — these doors are activation-blocked, so the
+# player can never reach the lockpick UI either way.
 _CONSUME_DOOR_BASES: set = set()
 
 
@@ -305,8 +306,8 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
             if re.search(r'\bgetparentref\b', sctx, re.IGNORECASE):
                 _GETPARENTREF_BASES.add(rec_fid_str)
 
-            # See _CONSUME_DOOR_BASES: these doors' converted scripts block
-            # activation, so their keyless barrier locks must not survive.
+            # See _CONSUME_DOOR_BASES: their keyless level-100 locks must
+            # stay AI-passable (Master), not Requires Key.
             if sig == 'DOOR' and sctx_onactivate_consumes(sctx):
                 _CONSUME_DOOR_BASES.add(rec_fid_str)
 

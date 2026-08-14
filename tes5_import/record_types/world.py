@@ -633,23 +633,19 @@ def convert_REFR(rec: dict) -> bytes:
         subs += pack_subrecord('XTEL', struct.pack('<IffffffI', xtel_door, px, py, pz, rx, ry, rz, 0))
 
     # Lock — XLOC is 20 bytes in TES5: Level(1)+pad(3)+Key(4)+Flags(1)+pad(3)+pad(8)
+    # Transferred faithfully; TES4 level 100 becomes Requires Key (255) — see
+    # map_lock_level.  AI passage through locked barrier doors is granted via
+    # OWNERSHIP (the synthesized XOWN below), never by weakening the lock.
+    barrier_door = False
     lock_level = get_int(rec, 'XLOC.Level', -1)
     if lock_level >= 0:
-        tes5_level = map_lock_level(lock_level)
         lock_key = get_formid(rec, 'XLOC.Key')
         lock_flags = get_int(rec, 'XLOC.Flags')
-        # A level-100 KEYLESS lock on a door whose script consumes activation
-        # is a pure barrier, not pickable content: the converted script
-        # BlockActivation()s the door, which already keeps the player out.
-        # Oblivion's AI door-open bypassed the lock (Glenroy opens the
-        # level-100 CharacterGen back gate by pathing); Skyrim's AI cannot
-        # open a locked door at all, so keeping the lock strands every NPC
-        # whose package routes through it.  Drop it; the block remains.
-        from ..object_scripts import base_is_consume_door
-        barrier_lock = (lock_level == 100 and not lock_key
-                        and base_is_consume_door(rec.get('NAME', '')))
-        if not barrier_lock:
-            subs += pack_subrecord('XLOC', struct.pack('<BxxxIBxxx8x', tes5_level, lock_key, lock_flags))
+        tes5_level = map_lock_level(lock_level, leveled=bool(lock_flags & 0x4))
+        if tes5_level == 255 and not lock_key:
+            from ..object_scripts import base_is_consume_door
+            barrier_door = base_is_consume_door(rec.get('NAME', ''))
+        subs += pack_subrecord('XLOC', struct.pack('<BxxxIBxxx8x', tes5_level, lock_key, lock_flags))
 
     # XLCN — Persistent Location. Only persistent refs carry it (they are the
     # quest-target-eligible ones); it lets the quest/map-marker system place a
@@ -691,6 +687,19 @@ def convert_REFR(rec: dict) -> bytes:
 
     # Ownership (XOWN)
     xown = get_formid(rec, 'XOWN.Owner')
+    if not xown and barrier_door:
+        # Requires-Key keyless barrier door with a consume script: Skyrim's
+        # AI only passes a locked door it OWNS or holds the key for (vanilla
+        # 255 doors NPCs path through are exactly those — guards with gate
+        # keys, homeowners), while Oblivion's AI ignored locks entirely, so
+        # the CharacterGen back gate stranded Glenroy.  Owning these doors to
+        # the plugin-origin faction — which every converted actor of a root
+        # master already joins, and which carries no crime data — grants all
+        # of them the engine's own owner exemption.  The player is not a
+        # member: the lock reads Requires Key and activation stays blocked.
+        # The OnActivate preamble restores the lock after each AI passage.
+        from .actors import get_origin_faction_fid
+        xown = get_origin_faction_fid()
     if xown:
         subs += pack_formid_subrecord('XOWN', xown)
 

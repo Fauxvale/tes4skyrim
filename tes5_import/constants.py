@@ -207,8 +207,20 @@ LOD_SIZE_THRESHOLD = 256
 # marker — castle walls, large towers, major ruins.
 WORLD_MAP_SIZE_THRESHOLD = 1024
 
-def map_lock_level(tes4_level: int) -> int:
-    if tes4_level <= 20:
+def map_lock_level(tes4_level: int, leveled: bool = False) -> int:
+    """TES4 lock level -> TES5 lock level.
+
+    Both games separate pickable lock tiers from "this needs a key", but
+    encode the key-required state differently: TES4 uses level 100 (UESP: a
+    level-100 lock "can only be opened with the proper key"; Oblivion.esm has
+    353 locks at exactly 100 and none above), while TES5 keeps 100 as an
+    ordinary pickable Master lock and uses 255 for Requires Key.  A LEVELED
+    lock (XLOC flag 0x4) scales with the player instead of reading its level
+    byte as a tier, so it never maps to Requires Key.
+    """
+    if tes4_level >= 100 and not leveled:
+        return 255  # Requires Key
+    elif tes4_level <= 20:
         return 1   # Novice
     elif tes4_level <= 40:
         return 25  # Apprentice
