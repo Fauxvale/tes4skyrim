@@ -9,6 +9,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -2771,6 +2772,130 @@ def gui_main():
     #   WARNING: Python version / "-" rules -> warn (run continues)
     _banner = [None]
 
+    # A run's failure verdicts, in the words each producer actually prints.
+    # Matched on the lower-cased line so every one of them is red regardless of
+    # what else the sentence contains.
+    #
+    # NOTE these are VERDICTS, never bare words.  A plain "failed" substring is
+    # wrong: the compile phase prints "154/154 succeeded, 0 failed", and a
+    # COUNT of failures -- especially a count of zero -- is not a failure.  This
+    # is the same trap the "errors" not in l guard below already exists for.
+    _FAIL_MARKERS = (
+        "completed with errors",
+        "traceback (most recent call last)",
+        "stopped - missing dependency",
+        "fatal error",
+        "fatal:",
+    )
+    # "N failed" / "N failures" / "N errors": a count line.  Red only when the
+    # number is non-zero, neutral when it is zero, so a clean run's tally never
+    # reads as a failure.
+    # "12 more failures" / "4 compile errors" are still counts, so allow a
+    # couple of adjectives between the number and the noun.
+    _COUNT_RE = re.compile(
+        r"(?<![\w.])(\d+)\s+(?:\w+\s+){0,2}?(?:failed|failures?|errors?)(?![\w])")
+
+    def _count_verdict(l: str):
+        """'err' if a count line reports >0, 'ok' if it reports 0, else None."""
+        hits = _COUNT_RE.findall(l)
+        if not hits:
+            return None
+        return "err" if any(int(n) for n in hits) else "ok"
+    # Stages that ran fine and had nothing to do.  Informational, never a
+    # failure -- these exit 0.
+    _NOTHING_MARKERS = (
+        "nothing to generate",
+        "nothing to do",
+        "nothing to convert",
+        "nothing to pack",
+        "nothing to patch",
+        "nothing to audit",
+        "no work to do",
+    )
+
+    # A standalone FAILED verdict: the runners' "  FAILED (exit 1)" and the
+    # summary's "- import: FAILED for Oblivion.esm".  Anchored so it cannot fire
+    # on a tally like "0 failed" -- a count is always PRECEDED by its number,
+    # which this refuses to match.
+    # Trailing forms: "FAILED", "FAILED (exit 1)", "FAILED for X", "FAILED: X",
+    # "FAILED/skipped", and "<thing> failed." mid-sentence.  Anchored on what
+    # PRECEDES `failed` too, so a tally ("0 failed") -- always preceded by its
+    # number -- can never reach it.
+    _FAILED_RE = re.compile(
+        r"(?:^|[:\-]\s*|\s)fail(?:ed|ure)"
+        r"(?:\s*[(:/,.;]|\s+for\b|\s+-\s|\s*$)")
+
+    # Recoverable: the stage says so in the same breath as the failure and then
+    # carries on, exiting 0.  These must NOT be red -- a red line the user
+    # cannot act on trains them to ignore red.  Checked before the hard-failure
+    # rule, so "download failed; generating normally" is orange, not red.
+    _RECOVERED_RE = re.compile(
+        r"falling back|fall back|generating normally|will be (?:copied|skipped)"
+        r"|is allowed to continue|continuing|ignored|retrying|using .* instead")
+
+    # Deliberately-skipped work.  Deliberately narrow: bare "skip" also shows up
+    # in tallies ("ok=5 skip=2 fail=0") and in routine per-record chatter, which
+    # must stay neutral or every run turns orange.  Only a sentence that leads
+    # with the skip, or explicitly says it is skipping something, counts.
+    _SKIP_RE = re.compile(
+        r"^\s*(?:\[[^\]]+\]\s*)?skipp?(?:ing|ed)\b"
+        r"|\bskipping\s+(?:the\s+)?[\w.\-]+\s+(?:generation|phase|stage|step)"
+        r"|[:\-;]\s*skipp?(?:ing|ed)\b"
+        r"|,\s*skipping\b|\bnot\s+overlaid\b")
+
+    def _is_recovered_line(l: str) -> bool:
+        return bool(_RECOVERED_RE.search(l))
+
+    def _is_failure_line(l: str) -> bool:
+        if any(m in l for m in _FAIL_MARKERS):
+            return True
+        return bool(_FAILED_RE.search(l)) and _count_verdict(l) != "ok"
+
+    def _is_nothing_line(l: str) -> bool:
+        return any(m in l for m in _NOTHING_MARKERS)
+
+    # Every error line seen since the current run started, in order, so the end
+    # of a failed run can restate them.  The log scrollback is thousands of
+    # lines long and the user should never have to hunt upward through it to
+    # find out WHAT failed.  Capped so a stage that fails per-file (thousands of
+    # meshes) cannot flood the summary or the memory holding it.
+    _run_errors: list = []
+    _ERR_SUMMARY_CAP = 40
+
+    def _reset_run_errors():
+        _run_errors.clear()
+
+    def _record_error(line: str, tag: str):
+        """Remember an error line for the end-of-run summary.
+
+        Called from _log, so it sees output from BOTH runners (the single
+        convert.py invocation and the per-step loop) and from every child
+        process, without either having to opt in.
+        """
+        if tag != "err":
+            return
+        text = line.strip()
+        if not text:
+            return
+        # The final verdict lines are printed by the summary itself; recording
+        # them would echo "FAILED" back inside its own error list.
+        if text.strip(" -") in ("FAILED", "DONE", "CANCELLED"):
+            return
+        low = text.lower()
+        if low.startswith("failed (exit "):
+            return
+        # convert.py's own verdict, and the summary block it now prints under
+        # it, are restatements of the failure -- not additional errors.  Left
+        # in, every run's summary opened with "Pipeline completed with errors."
+        # summarising itself.
+        if low.startswith(("pipeline completed with errors",
+                           "error summary", "stopped - missing dependency")):
+            return
+        if text.strip("- ") == "" or set(text) == {"-"}:
+            return
+        if len(_run_errors) < _ERR_SUMMARY_CAP + 1:
+            _run_errors.append(text)
+
     def _classify(line: str) -> str:
         l = line.lower()
         stripped = line.strip()
@@ -2794,25 +2919,90 @@ def gui_main():
             return "err"
         if line.startswith("===") or "phase" in l[:20]:
             return "head"
+        # Failure verdicts come FIRST, before the generic "complete"/"error"
+        # rules below.  "Pipeline completed with errors." used to fall past the
+        # err rule (guarded on "errors" not in l, so plural error counts like
+        # "0 errors" stay uncoloured) and land on the "complete" rule -- the
+        # single most important line in the run was painted GREEN.  A line that
+        # states the run failed is red no matter what other words it carries.
+        # A tally ("154/154 succeeded, 0 failed", "3 errors") is judged by its
+        # NUMBER, before any word-based rule can see the word "failed" in it.
+        _cnt = _count_verdict(l)
+        if _cnt is not None:
+            return "err" if _cnt == "err" else (
+                "ok" if ("succeeded" in l or "success" in l) else None)
+        # A failure the stage RECOVERED from ("download failed; generating
+        # normally") is orange, not red -- it is checked first so the hard-fail
+        # rule below cannot claim it.  Red is reserved for what actually broke
+        # the run; colouring recoverable notices red trains the user to ignore
+        # red altogether.
+        if _is_recovered_line(l):
+            return "warn"
+        if _is_failure_line(l):
+            return "err"
+        # "Nothing to generate" is not an error: the stage ran, found no work,
+        # and exited 0.  Orange, so it reads as "look at this" without being
+        # mistaken for a failure.
+        if _is_nothing_line(l):
+            return "warn"
+        # Deliberately-skipped work is informational, never a failure.
+        if _SKIP_RE.search(l):
+            return "warn"
         if "error" in l and "errors" not in l:
             return "err"
         if "warning" in l or "warn" in l:
             return "warn"
-        if line.strip() in ("done", "ok") or "complete" in l or "success" in l:
+        # Compare LOWER-cased: the runners' own verdict line is "  DONE", which
+        # never matched the lower-case-only literals here and so printed
+        # uncoloured while its FAILED counterpart is red.
+        if l.strip() in ("done", "ok") or "complete" in l or "success" in l:
             return "ok"
-        if line.startswith("Running:") or line.startswith("["):
+        # `cmd` is the command echo ONLY.  This used to also return "cmd" for
+        # any line starting "[", but a census of the pipeline's bracketed
+        # prefixes finds only stage/plugin tags -- [{file_name}], [LOD],
+        # [TerrainLOD], [skin_replacement] -- and no bracketed timestamps at
+        # all.  So that branch styled ordinary stage output as a command and, by
+        # claiming the line, denied it the warn/err styling it had earned.
+        if line.startswith("Running:"):
             return "cmd"
         return None
 
     def _log(line: str):
         log_text.configure(state=tk.NORMAL)
         tag = _classify(line)
+        _record_error(line, tag)
         if tag:
             log_text.insert(tk.END, line + "\n", tag)
         else:
             log_text.insert(tk.END, line + "\n")
         log_text.see(tk.END)
         log_text.configure(state=tk.DISABLED)
+
+    def _log_error_summary():
+        """Print the collected errors under the FAILED verdict.
+
+        Runs on the UI thread after the queue has drained, so it lands at the
+        very bottom of the log with every error already recorded.  A failed run
+        with no captured error lines still prints a line saying so, rather than
+        leaving a bare FAILED with no explanation.
+        """
+        _log("")
+        _log("-" * 54)
+        if not _run_errors:
+            _log("  ERROR SUMMARY: no error lines were captured -- check the "
+                 "stage output above for the failure.")
+            _log("-" * 54)
+            return
+        shown = _run_errors[:_ERR_SUMMARY_CAP]
+        extra = len(_run_errors) - len(shown)
+        _log(f"  ERROR SUMMARY ({len(_run_errors)}"
+             f"{'+' if extra else ''} error line"
+             f"{'' if len(_run_errors) == 1 else 's'}):")
+        for text in shown:
+            _log(f"    - {text}")
+        if extra:
+            _log(f"    ... and {extra} more (see the log above)")
+        _log("-" * 54)
 
     def _clear_log():
         log_text.configure(state=tk.NORMAL)
@@ -3182,6 +3372,11 @@ def gui_main():
         _log("")
 
         q = queue.Queue()
+        _reset_run_errors()
+        # See the pipeline runner: the summary is emitted by the drain once the
+        # queue is empty, never by the worker (whose last lines are still in
+        # flight when it exits).
+        _want_summary = [False]
 
         def _drain():
             try:
@@ -3191,6 +3386,9 @@ def gui_main():
                 pass
             if running.is_set():
                 root.after(50, _drain)
+            elif _want_summary[0]:
+                _want_summary[0] = False
+                _log_error_summary()
 
         run_env = {WORKERS_ENV_VAR: str(_get_workers())}
 
@@ -3206,6 +3404,7 @@ def gui_main():
                       else "  DONE" if ret == 0
                       else f"  FAILED (exit {ret})")
             finally:
+                _want_summary[0] = ret not in (0, -2)
                 if ret == 0:
                     # Stamp only on success: a failed or cancelled run must
                     # leave the button lit, not quietly mark the work done.
@@ -3262,6 +3461,13 @@ def gui_main():
         _log("")
 
         q = queue.Queue()
+        _reset_run_errors()
+        # Set by the worker when the run ends in failure.  The summary is
+        # emitted by the DRAIN, not the worker: the worker finishes while its
+        # last lines are still sitting in the queue, so printing there would put
+        # the summary above the errors it summarises -- and _run_errors would
+        # not yet contain them.
+        _want_summary = [False]
 
         def _drain_queue():
             try:
@@ -3273,6 +3479,11 @@ def gui_main():
             # Continue draining while running
             if running.is_set():
                 root.after(50, _drain_queue)
+            elif _want_summary[0]:
+                # Final pass: the worker is done and the queue is empty, so
+                # every error line has been through _log and recorded.
+                _want_summary[0] = False
+                _log_error_summary()
 
         # Propagate the chosen worker count to every child process (and the
         # multiprocessing workers they spawn) via the environment.
@@ -3338,7 +3549,18 @@ def gui_main():
                 elif ret == 0:
                     q.put("  DONE")
                 else:
-                    q.put("  FAILED")
+                    q.put(f"  FAILED (exit {ret})")
+                # Flag BEFORE clearing `running`, so the drain pass that sees
+                # the run finished is guaranteed to see this too.
+                _want_summary[0] = ret not in (0, -2)
+            except Exception as exc:
+                # The launcher itself broke (bad command build, OS refusal).
+                # Without this the run ended with NO verdict line at all -- the
+                # log just stopped and the button went idle.
+                q.put("")
+                q.put(f"ERROR: {exc}")
+                q.put("  FAILED")
+                _want_summary[0] = True
             finally:
                 root.after(0, lambda: _set_running(False))
 
