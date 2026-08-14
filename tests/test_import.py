@@ -3669,9 +3669,14 @@ class TestWeatherConversion:
         class W:
             def __init__(self):
                 self.next = 0x01000000
+                self.records = []
             def alloc_formid(self):
                 self.next += 1
                 return self.next
+            # A 3D sound now mints a real falloff SOPM instead of taking the
+            # non-attenuating 2D model (see the ONAM note in convert_SOUN).
+            def add_record(self, sig, data):
+                self.records.append((sig, data))
 
         def sndr_gnam(flags):
             rec = {'Signature': 'SOUN', 'FormID': '00000400', 'RecordFlags': '0',

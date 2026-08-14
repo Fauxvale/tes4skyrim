@@ -1202,6 +1202,21 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     from .record_types.dialog_misc import reset_sound_descriptors
     reset_sound_descriptors()
 
+    # SOUN identity index (EditorID + filename per TES4 SOUN id).  WTHR
+    # converts in Phase 2, before the SOUN phase, so the weather-sound
+    # classifier cannot read the SOUN records themselves.  The MASTER's SOUNs
+    # are indexed first: a dependent plugin's weathers routinely cite
+    # Oblivion.esm's own AMB* beds, and without them every such entry would
+    # classify as unknown and be dropped (CLAUDE.md 'master-export blindness').
+    # Pure indexing — nothing is allocated here.
+    from .record_types.dialog_misc import (reset_soun_identity,
+                                           load_soun_identity)
+    reset_soun_identity()
+    if ctx and getattr(ctx, 'master_export', None):
+        load_soun_identity([r for r in ctx.master_export.values()
+                            if r.get('Signature') == 'SOUN'])
+    load_soun_identity(by_type.get('SOUN', []))
+
     # Region registry: convert_REGN (phase 1) records which weather regions
     # emitted, and the CELL builders later filter XCLR against it.
     from .record_types.world import reset_emitted_regions
@@ -1861,6 +1876,16 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
         {get_formid(r, 'FormID') & 0x00FFFFFF for r in by_type.get('SOUN', [])})
     if n_dsnd:
         print(f"  Door sound descriptors bound: {n_dsnd} doors")
+    # WTHR SNAM holds TES4 SOUN ids for the same reason (Phase 2 precedes the
+    # descriptors). TES5 weather sounds are SNDR slots; left as SOUN ids the
+    # engine dereferences a record that carries no descriptor payload and the
+    # sky plays the wrong sound entirely.
+    from .record_types.dialog_misc import patch_weather_sounds
+    n_wsnd = patch_weather_sounds(
+        writer,
+        {get_formid(r, 'FormID') & 0x00FFFFFF for r in by_type.get('SOUN', [])})
+    if n_wsnd:
+        print(f"  Weather sound descriptors bound: {n_wsnd} weathers")
     # Creature voice types: allocated LAST so no other generated FormID moves,
     # then patched into the already-written creature actors and races.
     from .creature_races import (build_creature_voice_types,

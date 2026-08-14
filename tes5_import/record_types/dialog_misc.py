@@ -91,6 +91,12 @@ def get_sndr_for_soun(soun_fid: int) -> int:
 
 # Vanilla Skyrim SOPM constants (verified against references/Skyrim.esm SOPM dump)
 _SOPM_2D = 0x000B5183            # SOMDialogue2D — non-attenuating, for menu/2D sounds
+
+# Falloff for a 3D sound whose TES4 record authored no max attenuation
+# distance.  1800 units is vanilla Skyrim's most common mono model
+# (SOMMono01800, 285 SNDRs).  Never use _SOPM_2D here — see the ONAM note in
+# convert_SOUN for the worldspace-wide siege-engine thump that caused.
+_DEFAULT_3D_MAX_DIST = 1800.0
 _SOPM_ONAM_CHANNELS = bytes.fromhex(
     '646400003232323264000000640064000064000000640064')
 # ANAM: unknown[4] minDistance(f32) maxDistance(f32) curve[5] unknown[3]
@@ -203,6 +209,40 @@ def get_sndr_for_soun(soun_fid: int) -> int:
     return _SNDR_FOR_SOUN.get(soun_fid & 0x00FFFFFF, 0)
 
 
+# TES4 SOUN id (low 24 bits) -> (EditorID, FNAM filename).  WTHR converts
+# before the SOUN phase, so the weather sound classifier cannot read the SOUN
+# record itself; this index is loaded up front from the export (and from the
+# MASTER export, so a plugin whose weathers cite master-owned sounds still
+# classifies them — see CLAUDE.md 'master-export blindness').
+_SOUN_IDENTITY = {}
+
+
+def reset_soun_identity() -> None:
+    """Clear the SOUN identity index at the start of an import run."""
+    _SOUN_IDENTITY.clear()
+
+
+def load_soun_identity(records) -> None:
+    """Index (EditorID, filename) for every SOUN record in *records*.
+
+    Safe to call more than once; later calls add without clobbering, so the
+    plugin's own SOUNs are loaded after the master's and win on collision.
+    """
+    for rec in records:
+        fid = get_formid(rec, 'FormID')
+        if not fid:
+            continue
+        _SOUN_IDENTITY[fid & 0x00FFFFFF] = (
+            get_str(rec, 'EditorID') or '',
+            get_str(rec, 'FNAM.Filename') or '',
+        )
+
+
+def get_soun_identity(soun_fid: int) -> tuple:
+    """(EditorID, filename) for a TES4 SOUN id, or ('', '') when unknown."""
+    return _SOUN_IDENTITY.get(soun_fid & 0x00FFFFFF, ('', ''))
+
+
 def _shipped_name(name: str) -> str:
     """The on-disk name convert_sounds writes for a source audio file.
 
@@ -309,7 +349,10 @@ def convert_SOUN(rec: dict, writer=None) -> tuple:
         # transfers as a raw value with no rescaling.
         static_atten = get_int(rec, f'{pfx}.StaticAttenuation') or 0
 
-        is_2d = bool(tes4_flags & (_TES4_SND_2D | _TES4_SND_MENU_SOUND))
+        # Only the 2D bit means "not positional".  Menu Sound (bit 5) is a UI
+        # ROUTING flag and says nothing about spatialization — see the category
+        # note below for what conflating the two did.
+        is_2d = bool(tes4_flags & _TES4_SND_2D)
 
         sndr_fid = writer.alloc_formid()
         # Actors reference this descriptor by TES4 SOUN id; they are already
@@ -327,8 +370,21 @@ def convert_SOUN(rec: dict, writer=None) -> tuple:
         # AudioCategorySFX it sits in the wrong mix bus, ignores the ambience
         # slider/ducking, and Oblivion's weather winds played LOUD over
         # everything.  One-shots and 3D sounds stay SFX (0x172A1).
+        #
+        # THE 2D TEST IS BIT 6 ALONE.  It used to accept Menu Sound (bit 5)
+        # as well, but xEdit (wbDefinitionsTES4 'Flags') lists them as
+        # SEPARATE flags — bit 5 'Menu Sound' is a UI routing hint, bit 6 '2D'
+        # is what actually means non-positional.  Three Nehrim sounds are
+        # LOOP|MENU without 2D — AMBFireSmallLP, AMBFireMediumLP and a forest
+        # birds loop — all genuinely POSITIONAL world sounds attached to fire
+        # pits.  Promoting them to the global ambience bus detached them from
+        # their emitter, so a fire pit crackled (and birds chirped) across the
+        # entire worldspace at constant volume, in clear weather, nowhere near
+        # any fire.  Confirmed by attaching to the live game: the loaded
+        # descriptor TES4_AMBFireSmallLP_SNDR carried GNAM 0x0007F80B
+        # (AudioCategoryAMB) with LNAM loop 0x08.
         is_loop = bool(tes4_flags & _TES4_SND_LOOP)
-        if is_loop and bool(tes4_flags & (_TES4_SND_2D | _TES4_SND_MENU_SOUND)):
+        if is_loop and is_2d:
             sndr_subs += pack_formid_subrecord('GNAM', 0x0007F80B)
         else:
             sndr_subs += pack_formid_subrecord('GNAM', 0x000172A1)
@@ -337,13 +393,31 @@ def convert_SOUN(rec: dict, writer=None) -> tuple:
         for anam in _sound_anam_paths(filename):
             sndr_subs += pack_string_subrecord('ANAM', anam)
         # ONAM = Sound Output Model. Required — CK reports 'Sound Output Model
-        # missing' if absent.  2D/menu sounds are not positional, so they take
-        # the vanilla non-attenuating model; everything else gets a SOPM built
-        # from this sound's own TES4 falloff distances.
-        if is_2d or max_dist <= 0:
+        # missing' if absent.  Only a genuinely 2D sound takes the vanilla
+        # non-attenuating model; everything else gets a SOPM built from this
+        # sound's own TES4 falloff distances.
+        #
+        # A 3D SOUND WITH max=0 MUST NOT FALL BACK TO THE 2D MODEL.  In
+        # Oblivion an unset max distance means "use the engine's default
+        # falloff", NOT "audible everywhere" — but _SOPM_2D is
+        # SOMDialogue2D, which does not attenuate at all, so such a sound
+        # played at full volume across the whole worldspace.  Nehrim's
+        # siege-engine set-piece is authored exactly this way
+        # (ambsiegeenginestep / _idle_lp / _foward_lp: 3D, max=0), which put a
+        # repeating mechanical THUMP over open countryside far from any siege
+        # engine.  Vanilla Skyrim never ships a positional loop on a
+        # non-attenuating model: its SNDRs overwhelmingly use finite mono
+        # falloffs (SOMMono01400 x428 incl. Player1st, 01800 x285, 02000 x225),
+        # and the non-attenuating models are reserved for UI and 2D dialogue.
+        # So an absent distance takes _DEFAULT_3D_MAX_DIST, matching vanilla's
+        # most common falloff rather than disabling attenuation.
+        if is_2d:
             onam_fid = _SOPM_2D
         else:
-            onam_fid = _build_sopm(writer, min_dist, max_dist, stereo=False)
+            onam_fid = _build_sopm(
+                writer, min_dist,
+                max_dist if max_dist > 0 else _DEFAULT_3D_MAX_DIST,
+                stereo=False)
         sndr_subs += pack_formid_subrecord('ONAM', onam_fid)
         # LNAM = Loop Data struct (4 bytes): byte[0]=Unknown, byte[1]=Looping enum,
         # byte[2]=Unknown, byte[3]=Rumble.  Looping enum: 0x00=None, 0x08=Loop.
@@ -1082,6 +1156,290 @@ def _wthr_dalc(rec: dict) -> bytes:
     return out
 
 
+# WTHR SNAM sound-type enum, identical in both games (xEdit wbWeatherSounds,
+# shared by wbDefinitionsTES4/TES5): 0=Default 1=Precipitation 2=Wind 3=Thunder.
+_WTHR_SND_PRECIP, _WTHR_SND_WIND, _WTHR_SND_THUNDER = 1, 2, 3
+
+# TES4 SOUN EditorID substrings that identify what a weather bed actually is.
+# Oblivion weather sound entries are overwhelmingly authored as Type 0
+# ('Default') regardless of content — 33 of Nehrim's 53 entries — because
+# Oblivion's Default channel is just "play this while the weather is active".
+# Skyrim's Default channel means the same thing, which is exactly the problem:
+# it plays UNCONDITIONALLY and UNDUCKED for as long as the weather holds.
+# Skyrim expects rain on Precipitation (which the engine gates on the
+# precipitation fade envelope) and wind on Wind, so the authored intent has to
+# be recovered from the sound itself.
+_WTHR_SND_KEYWORDS = (
+    (_WTHR_SND_THUNDER, ('thunder', 'lightning', 'donner', 'blitz')),
+    (_WTHR_SND_PRECIP, ('rain', 'regen', 'snow', 'schnee', 'sleet', 'hail',
+                        'storm', 'sturm', 'drizzle')),
+    (_WTHR_SND_WIND, ('wind', 'gust', 'breeze', 'boe')),
+)
+
+# Sounds that are not weather at all.  Oblivion routinely parks a location's
+# ambience bed on the WEATHER record — fire pits, dungeon drones, creature and
+# machinery loops — because in Oblivion a weather sound only plays while that
+# weather is active in that region, which makes it a cheap area-ambience hook.
+# Skyrim has a dedicated mechanism for this (ASPC acoustic spaces / ambient
+# REFR loops), and its weather channel is global to the whole sky: anything
+# left here plays everywhere the weather does.  That is what put fire
+# crackling, dungeon drones and animal noises into open Nehrim countryside.
+#
+# Verified against the real Skyrim.esm (SSE, 84 weathers, 30 SNAM entries):
+# EVERY vanilla weather sound is rain, snow, wind, thunder, or a deliberate
+# 2D set-piece bed.  There is not one fire, creature or dungeon loop among
+# them.  Anything matching here is dropped rather than converted.
+_WTHR_SND_NON_WEATHER = (
+    'fire', 'feuer', 'flame', 'flamme', 'lava', 'magma', 'torch', 'fackel',
+    'dungeon', 'hoehle', 'cave', 'crypt', 'sewer', 'kanal',
+    'water', 'wasser', 'river', 'fluss', 'waterfall', 'sea', 'meer', 'ocean',
+    'wave', 'welle', 'brook', 'bach', 'drip', 'tropf',
+    'creature', 'animal', 'tier', 'pig', 'schwein', 'bird', 'vogel',
+    'insect', 'cricket', 'grille', 'wolf', 'howl', 'heul',
+    'machine', 'maschine', 'mill', 'muehle', 'forge', 'schmiede',
+    'crowd', 'menge', 'market', 'markt', 'tavern', 'taverne',
+    'void', 'universum', 'space', 'portal', 'magic', 'magie',
+)
+
+
+def _wthr_sound_class(edid: str, filename: str):
+    """Classify a TES4 weather sound entry.
+
+    Returns the TES5 SNAM type to write, or None when the sound is not
+    weather at all and must be dropped.  Both the EditorID and the sound's
+    file path are searched, because Nehrim names several beds only in the
+    path (``fx\\nehrim\\windhoehle01.wav`` is a cave wind, not weather).
+    """
+    hay = f'{edid} {filename}'.lower().replace('\\', '/')
+    # Non-weather wins over everything: 'windhoehle' is a cave, not wind.
+    if any(k in hay for k in _WTHR_SND_NON_WEATHER):
+        return None
+    for stype, keys in _WTHR_SND_KEYWORDS:
+        if any(k in hay for k in keys):
+            return stype
+    # Unrecognised. Oblivion's own weather beds are all named for what they
+    # are, so an unmatched sound is far more likely to be another borrowed
+    # ambience loop than a weather bed we failed to name — and a wrong sound
+    # here plays across the entire sky.  Drop it: vanilla ships 63 of 84
+    # weathers with NO sound at all, so silence is the vanilla-normal state.
+    return None
+
+
+_TES4_WTHR_PLEASANT = 0x01
+_TES4_WTHR_CLOUDY = 0x02
+_TES4_WTHR_RAINY = 0x04
+_TES4_WTHR_SNOW = 0x08
+
+
+def _wthr_is_fair(rec: dict) -> bool:
+    """True when this TES4 weather is a fair-weather sky (clear/cloudy/fog).
+
+    Unlike Skyrim — where 78 of 84 weathers set all four classification bits,
+    making the field meaningless — Oblivion authors the bits precisely, so the
+    Pleasant/Cloudy bits alone identify a fair sky.
+
+    Classification 0 is NOT fair: it means UNCLASSIFIED, and Oblivion uses it
+    for the Oblivion-plane storm skies (OblivionStormTamriel, OblivionSigil,
+    OblivionElectrical, SE09SummoningWeather...), which are thunderstorms with
+    authored thunder.  Treating 0 as fair silenced all nine of them.  Fall back
+    to the authored thunder frequency, which is the same signal _wthr_precipitation
+    already trusts to pick a storm particle system: it is inverted in both
+    games (255 = never), and vanilla Oblivion thunderstorms ship 188/132/100/24.
+    """
+    flags = get_int(rec, 'DATA.Classification')
+    if flags & (_TES4_WTHR_RAINY | _TES4_WTHR_SNOW):
+        return False
+    if flags & (_TES4_WTHR_PLEASANT | _TES4_WTHR_CLOUDY):
+        return True
+    # Unclassified: a sky that authors thunder is a storm, not a fair sky.
+    return get_int(rec, 'DATA.ThunderFrequency', 255) >= 255
+
+
+def _wthr_sounds(rec: dict) -> bytes:
+    """Build the WTHR SNAM entries from the TES4 sound list.
+
+    The FormID written is the TES4 SOUN id — a placeholder resolved to the
+    real SNDR descriptor by patch_weather_sounds after Phase 3.
+
+    FAIR-WEATHER SKIES GET NO BED AT ALL.  Oblivion hangs a looping wind on
+    Clear, Cloudy, Fog, Snow and DefaultWeather alike, and because Oblivion's
+    weather sound is region-scoped that reads as local colour there.  Skyrim's
+    weather channel is global and continuous, so the same entry becomes wind
+    howling over the entire province in bright sunshine that never once stops
+    — the 'incessant wind' symptom.
+
+    Vanilla Skyrim never does this.  Census of the real Skyrim.esm (SSE): of
+    the 21 weathers carrying any sound, EVERY one is a rain, storm, snow or
+    overcast sky, or a scripted set-piece (Sovngarde, Blackreach, Helgen,
+    WorldMap).  Not a single plain fair-weather sky has an ambient bed; 62 of
+    84 weathers are silent outright.  Skyrim's fair-weather wind comes from
+    region ambience and ASPC acoustic spaces instead, which are positional and
+    intermittent — exactly the 'occasional and environmental' behaviour that
+    is wanted, and which the weather channel cannot produce.
+    """
+    if _wthr_is_fair(rec):
+        return b''
+    out = b''
+    seen = set()
+    for i in range(get_int(rec, 'SoundCount')):
+        sfid = get_formid(rec, f'Sound[{i}].FormID')
+        if not sfid:
+            continue
+        edid, fname = get_soun_identity(sfid)
+        stype = _wthr_sound_class(edid, fname)
+        if stype is None:
+            continue
+        # Oblivion lists each thunder variant separately and relies on its own
+        # random-variant picker; in Skyrim one descriptor already holds every
+        # variant as repeated ANAMs, so duplicate entries would just stack the
+        # same bed on itself and play it N times louder.
+        key = (sfid, stype)
+        if key in seen:
+            continue
+        seen.add(key)
+        out += pack_subrecord('SNAM', struct.pack('<II', sfid, stype))
+    return out
+
+
+def patch_weather_sounds(writer, own_soun_ids=None) -> int:
+    """Rewrite every WTHR SNAM from its TES4 SOUN id to the SNDR descriptor.
+
+    TES5 weather sounds reference a sound DESCRIPTOR, not a SOUN: xEdit's
+    shared wbWeatherSounds is `wbFormIDCK('Sound', [SNDR, SOUN, NULL])`, and a
+    census of the real Skyrim.esm (SSE) shows 11 of the 12 distinct weather
+    sound targets are SNDR.  The single SOUN target (AMBWindLightLP, 0x12EA2)
+    is a LEGACY record that still carries its own FNAM + SNDD payload, so it
+    is self-describing.
+
+    Ours are not.  convert_SOUN emits `EDID + OBND + SDSC` only — all the
+    audio data lives on the companion SNDR — so a weather pointing at one
+    hands the engine a descriptor-shaped read with no descriptor behind it.
+    That is what produced the wrong-sound symptom (fire crackling and animal
+    noises in open Nehrim countryside): the weather bed is not the sound the
+    plugin authored, it is whatever the mis-typed dereference lands on.
+
+    WTHR is written in Phase 2, before Phase 3 creates the descriptors, so
+    convert_WTHR stores the SOUN id and this resolves it — the same
+    placeholder-then-patch approach actors.patch_actor_sounds uses for CSDI
+    and items.patch_door_sounds for the DOOR slots.  Allocating during Phase 2
+    instead would shift every later generated FormID.
+
+    *own_soun_ids* is the low-24 id set of the SOUN records THIS plugin
+    converts; anything outside it (an override build's master-owned records,
+    already holding real SNDR ids) is left untouched, exactly as
+    patch_door_sounds does.
+
+    A slot whose SOUN produced no descriptor is DROPPED rather than left
+    pointing at the wrong record type — 63 of the 84 vanilla weathers ship no
+    sound at all, so an empty sound list is the vanilla-normal state.
+    """
+    mapping = _SNDR_FOR_SOUN
+    if not mapping:
+        return 0
+    own = own_soun_ids if own_soun_ids is not None else set(mapping)
+    records = writer._top_groups.get('WTHR') or []
+    patched = 0
+    bound = set()          # descriptors a weather actually uses (retuned below)
+    for i, blob in enumerate(records):
+        if b'SNAM' not in blob:
+            continue
+        out = bytearray(blob[:24])
+        pos = 24
+        changed = False
+        while pos + 6 <= len(blob):
+            sig = blob[pos:pos + 4]
+            size = struct.unpack_from('<H', blob, pos + 4)[0]
+            chunk = blob[pos:pos + 6 + size]
+            pos += 6 + size
+            if sig == b'SNAM' and size == 8:
+                soun, stype = struct.unpack_from('<II', chunk, 6)
+                if (soun & 0x00FFFFFF) not in own:
+                    out += chunk          # not ours to resolve — leave alone
+                    continue
+                sndr = mapping.get(soun & 0x00FFFFFF, 0)
+                if sndr != soun:
+                    changed = True
+                if sndr:
+                    bound.add(sndr)
+                    out += chunk[:6] + struct.pack('<II', sndr, stype)
+                continue           # no descriptor -> drop the slot entirely
+            out += chunk
+        if not changed:
+            continue
+        struct.pack_into('<I', out, 4, len(out) - 24)   # data size
+        records[i] = bytes(out)
+        patched += 1
+    _retune_weather_descriptors(writer, bound)
+    return patched
+
+
+# AudioCategoryAMB / AudioCategorySFX (Skyrim.esm SNCT 0x0007F80B / 0x000172A1).
+_AUDIO_CAT_AMB = 0x0007F80B
+_AUDIO_CAT_SFX = 0x000172A1
+
+
+def _retune_weather_descriptors(writer, bound) -> int:
+    """Route every descriptor a weather uses into the ambience category.
+
+    convert_SOUN files a sound as ambience only when TES4 marked it 2D, which
+    is the right default for a sound in isolation.  A weather bed is different:
+    the weather channel plays it across the whole sky for as long as the
+    weather holds, so it IS ambience whatever its 2D flag says.  Oblivion's
+    rain and region-wind loops are authored 3D (AMBRainLP flags=0x10 is LOOP
+    with no 2D bit), so they were landing in AudioCategorySFX — the wrong mix
+    bus, which ignores the ambience slider and does not duck under dialogue or
+    combat.  That is the 'incessant, never-ducking, far too loud' half of the
+    symptom; the wrong-sound half is the SOUN/SNDR mis-typing above.
+
+    Census of the real Skyrim.esm (SSE): of the 12 descriptors its weathers
+    reference, every looping bed is AudioCategoryAMB, AudioCategoryAMBr or
+    AudioCategoryMuteSubmerged.  Only the one-shot thunder cracks
+    (AMBWeatherThunderDistant/Extra, LNAM loop byte 0) stay on SFX, so a
+    non-looping descriptor is left exactly as convert_SOUN filed it.
+    """
+    if not bound:
+        return 0
+    records = writer._top_groups.get('SNDR') or []
+    retuned = 0
+    for i, blob in enumerate(records):
+        if len(blob) < 24:
+            continue
+        if struct.unpack_from('<I', blob, 12)[0] not in bound:
+            continue
+        # Only looping beds move; one-shots (thunder) are SFX in vanilla too.
+        looping = False
+        pos = 24
+        while pos + 6 <= len(blob):
+            sig = blob[pos:pos + 4]
+            size = struct.unpack_from('<H', blob, pos + 4)[0]
+            if sig == b'LNAM' and size == 4 and blob[pos + 7]:
+                looping = True
+                break
+            pos += 6 + size
+        if not looping:
+            continue
+        out = bytearray(blob[:24])
+        pos = 24
+        changed = False
+        while pos + 6 <= len(blob):
+            sig = blob[pos:pos + 4]
+            size = struct.unpack_from('<H', blob, pos + 4)[0]
+            chunk = blob[pos:pos + 6 + size]
+            pos += 6 + size
+            if (sig == b'GNAM' and size == 4
+                    and struct.unpack_from('<I', chunk, 6)[0] == _AUDIO_CAT_SFX):
+                out += chunk[:6] + struct.pack('<I', _AUDIO_CAT_AMB)
+                changed = True
+                continue
+            out += chunk
+        if not changed:
+            continue
+        struct.pack_into('<I', out, 4, len(out) - 24)
+        records[i] = bytes(out)
+        retuned += 1
+    return retuned
+
+
 def convert_WTHR(rec: dict, writer=None) -> tuple:
     """WTHR — Weather conversion.  Returns (wthr_bytes, [imgs_bytes, ...]).
 
@@ -1220,13 +1578,13 @@ def convert_WTHR(rec: dict, writer=None) -> tuple:
         disabled &= ~(1 << layer)
     subs += pack_uint32_subrecord('NAM1', disabled & 0xFFFFFFFF)
 
-    # Sounds — SNAM (after NAM1 per xEdit)
-    sc = get_int(rec, 'SoundCount')
-    for i in range(sc):
-        sfid = get_formid(rec, f'Sound[{i}].FormID')
-        stype = get_int(rec, f'Sound[{i}].Type')
-        if sfid:
-            subs += pack_subrecord('SNAM', struct.pack('<II', sfid, stype))
+    # Sounds — SNAM (after NAM1 per xEdit).  The FormID written here is this
+    # weather's TES4 SOUN id: WTHR converts in Phase 2, before Phase 3 mints
+    # the SNDR descriptors, so it is a PLACEHOLDER that patch_weather_sounds
+    # resolves later (the same approach actors.patch_actor_sounds uses for
+    # CSDI and items.patch_door_sounds for the DOOR slots).  Allocating here
+    # instead would shift every later generated FormID.
+    subs += _wthr_sounds(rec)
 
     # IMSP — Image Spaces (sunrise/day/sunset/night), each pointing at the
     # matching time-of-day IMGS built from this weather's TES4 HDR block.
