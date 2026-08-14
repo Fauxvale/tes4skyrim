@@ -21,7 +21,7 @@ converters then splice the VMAD in right after EDID (Skyrim order: EDID VMAD OBN
 
 import re
 
-from script_convert.converter import ScriptConverter
+from script_convert.converter import ScriptConverter, sctx_onactivate_consumes
 from script_convert.constants import (_safe_property_name, papyrus_script_name,
                                       resolve_property_formid,
                                       wants_placed_reference,
@@ -97,10 +97,25 @@ _PLAYER_BASE_FORMID = 0x07
 # mid-air, and the same held for the tripwire.
 _GETPARENTREF_BASES: set = set()
 
+# DOOR base FormIDs (raw export hex strings) whose TES4 script CONSUMES
+# activation (OnActivate with no unconditional bare `Activate`).  Their
+# converted scripts BlockActivation, which player-proofs the door on its own —
+# and Skyrim's AI cannot open locked doors at all (Oblivion's AI door-open
+# bypassed both the lock and the script).  convert_REFR therefore drops the
+# level-100 keyless lock on placed refs of these bases: the lock is redundant
+# for the player and fatal for NPC pathing (the CharacterGen back gate that
+# Glenroy must open).  Pickable locks (level < 100) and keyed locks are kept.
+_CONSUME_DOOR_BASES: set = set()
+
 
 def base_uses_parent_ref(base_fid: str) -> bool:
     """True if this base record's TES4 script calls GetParentRef."""
     return base_fid in _GETPARENTREF_BASES
+
+
+def base_is_consume_door(base_fid: str) -> bool:
+    """True if this DOOR base's TES4 script consumes activation."""
+    return base_fid in _CONSUME_DOOR_BASES
 
 
 def get_object_vmad(record_fid: int) -> bytes:
@@ -239,6 +254,7 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
     """
     _OBJECT_VMAD.clear()
     _GETPARENTREF_BASES.clear()
+    _CONSUME_DOOR_BASES.clear()
     offset = get_formid_index_offset()
     scpt_by_fid = _collect_scpts(by_type, xref)
 
@@ -288,6 +304,11 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
             # belong to a base that reads it back as a linked ref.
             if re.search(r'\bgetparentref\b', sctx, re.IGNORECASE):
                 _GETPARENTREF_BASES.add(rec_fid_str)
+
+            # See _CONSUME_DOOR_BASES: these doors' converted scripts block
+            # activation, so their keyless barrier locks must not survive.
+            if sig == 'DOOR' and sctx_onactivate_consumes(sctx):
+                _CONSUME_DOOR_BASES.add(rec_fid_str)
 
             obj_props = props_memo.get(scri)
             if obj_props is None:

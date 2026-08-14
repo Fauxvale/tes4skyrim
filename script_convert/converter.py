@@ -917,6 +917,12 @@ class ScriptConverter:
                 guard = f'{state_guard} && {guard}' if guard else state_guard
             merged_blocks[merge_key].append((guard, block_lines))
 
+        # Whether this script's OnActivate CONSUMES activation (see
+        # _onactivate_consumes) — drives both the door preamble below and the
+        # BlockActivation injection after the block loop.
+        blocks_activation = (extends in ('ObjectReference', 'Actor')
+                            and self._onactivate_consumes(blocks))
+
         for merge_key in block_order:
             segments = merged_blocks[merge_key]
             # merge_key is already the event_begin string (or the block_type if unmapped)
@@ -927,6 +933,27 @@ class ScriptConverter:
                            else f';TODO: Unknown event block: {merge_key}')
             else:
                 out.append(merge_key)
+
+            # Oblivion's AI door-open BYPASSES both locks and OnActivate
+            # scripts — the CharacterGen back gate is level-100 locked with a
+            # "nobody can open this gate" consume script, and Glenroy still
+            # opens it by pathing.  Skyrim's AI door-open is a plain
+            # activation (ActionActivateDoneHandler calls ActivateRef with
+            # abDefaultProcessingOnly=false, verified in the AE exe), so it
+            # obeys the BlockActivation this script now applies.  OnActivate
+            # is still dispatched before the blocked bail-out, so the script
+            # replays the Oblivion bypass itself: an NPC activator gets the
+            # default open, players fall through to the consume body.
+            if (blocks_activation and extends == 'ObjectReference'
+                    and merge_key == BLOCK_MAP['onactivate'][0]):
+                out.append('  If (GetBaseObject() as Door) && '
+                           '(akActionRef as Actor) && '
+                           'akActionRef != Game.GetPlayer()')
+                out.append('    ; TES4 parity: AI door-use ignores this '
+                           'script; open without re-entering OnActivate.')
+                out.append('    Activate(akActionRef, true)')
+                out.append('    Return')
+                out.append('  EndIf')
 
             for guard, block_lines in segments:
                 body = []
@@ -1346,6 +1373,24 @@ class ScriptConverter:
         # in `out` already for the restore to land inside it.
         if self._suppressed_fall_damage:
             out = self._append_fall_damage_restore(out, extends)
+
+        # TES4 contract: the PRESENCE of an OnActivate block REPLACES default
+        # activation — the body runs INSTEAD of open/loot/talk, and only a
+        # bare `Activate` (already converted to Activate(akActionRef, true),
+        # which bypasses the block) performs it.  Papyrus OnActivate is
+        # notification-only, so without blocking, default processing ran
+        # anyway: the dead Emperor opened a loot menu over his "speak to
+        # Baurus" redirect, and every empty-body "nobody can open this" door
+        # script consumed nothing.  Vanilla Skyrim's defaultBlockActivation
+        # applies the same call from OnLoad.
+        #
+        # Only applied when some path through the TES4 body actually CONSUMES
+        # the activation (no unconditional top-level `Activate`): a pure
+        # passthrough like AutoClosingDoor gains nothing from blocking.  AI
+        # door traffic through blocked doors is preserved by the OnActivate
+        # door preamble emitted in the block loop above.
+        if blocks_activation:
+            out = self._inject_block_activation(out)
 
         # Balance If/EndIf within event blocks (some TES4 scripts have extra EndIf)
         out = self._balance_if_endif(out)
@@ -2947,6 +2992,60 @@ class ScriptConverter:
             out.append('  TES4Polyfill.RestoreFallDamage(akTarget)')
             out.append('EndEvent')
             out.append('')
+        return out
+
+    @staticmethod
+    def _onactivate_consumes(blocks) -> bool:
+        """True when an OnActivate body has a path that CONSUMES activation.
+
+        In TES4 the block replaces default activation, so any path that does
+        not execute a bare `Activate` swallows the click.  A body whose bare
+        `Activate` sits at nesting depth 0 runs it on every path — a pure
+        passthrough (AutoClosingDoor et al.) that needs no blocking.  Only a
+        missing or conditionally-guarded `Activate` needs BlockActivation for
+        Skyrim to honour the consume.  (`X.Activate` — activating some OTHER
+        ref — is not a passthrough and does not count.)
+        """
+        consumes = False
+        for btype, _bf, blines in blocks:
+            if btype != 'onactivate':
+                continue
+            depth = 0
+            top_level_activate = False
+            for raw in blines:
+                line = raw.split(';', 1)[0].strip().lower()
+                if not line:
+                    continue
+                if re.match(r'if\b', line):
+                    depth += 1
+                elif re.match(r'endif\b', line):
+                    depth = max(0, depth - 1)
+                elif depth == 0 and re.match(r'activate\b', line):
+                    top_level_activate = True
+            if not top_level_activate:
+                consumes = True
+        return consumes
+
+    @staticmethod
+    def _inject_block_activation(out: list) -> list:
+        """Insert BlockActivation(true) on 3D load.
+
+        Called for ObjectReference/Actor scripts whose OnActivate consumes the
+        activation — see the caller comment for the TES4 semantics this
+        restores.  Vanilla defaultBlockActivation.psc applies the call from
+        OnLoad ("block activation upon loading"), so the call rides an
+        existing OnLoad when one was emitted (inserted before any gating If,
+        since blocking must be unconditional), else a fresh OnLoad is
+        appended.
+        """
+        for i, line in enumerate(out):
+            if line.strip() == 'Event OnLoad()':
+                out.insert(i + 1, '  BlockActivation(true)')
+                return out
+        out.append('Event OnLoad()')
+        out.append('  BlockActivation(true)')
+        out.append('EndEvent')
+        out.append('')
         return out
 
     def _block_filter_guard(self, block_type: str,
@@ -7927,3 +8026,23 @@ class ScriptConverter:
         return f'"{s}"'
 
 
+
+
+_ONACTIVATE_BLOCK_RE = re.compile(
+    r'^[ \t]*begin[ \t]+onactivate\b[^\r\n]*\r?\n(.*?)^[ \t]*end\b',
+    re.IGNORECASE | re.MULTILINE | re.DOTALL)
+
+
+def sctx_onactivate_consumes(sctx: str) -> bool:
+    """True when a raw TES4 script source has a consuming OnActivate block.
+
+    Text-level twin of ScriptConverter._onactivate_consumes for callers that
+    hold the SCTX source rather than parsed blocks (tes5_import uses it to
+    decide which locked doors the AI must be able to open).  A script with no
+    OnActivate block at all consumes nothing.
+    """
+    blocks = [('onactivate', '', m.group(1).splitlines())
+              for m in _ONACTIVATE_BLOCK_RE.finditer(sctx or '')]
+    if not blocks:
+        return False
+    return ScriptConverter._onactivate_consumes(blocks)

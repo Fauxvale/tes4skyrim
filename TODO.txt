@@ -69,8 +69,6 @@ Later Issues:
 
 	15 - Creatures are wrong sizes sometimes (chicken and donkey in nehrim, elephant in anequina)
 
-	16 - Discord integration with changelog
-
 Minor Issues:
 
 	2 - Improve landscape layer blending
@@ -96,8 +94,6 @@ Minor Issues:
 	12 - Minor issues with 44 patch plugin
 
 	13 - Taskbar and app icon
-
-	14 - Cleanup output log and update colors
 	
 	15 - Missing location topics (Anvil)
 

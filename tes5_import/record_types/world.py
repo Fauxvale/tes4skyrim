@@ -613,6 +613,12 @@ def convert_REFR(rec: dict) -> bytes:
     if name_fid:
         subs += pack_formid_subrecord('NAME', name_fid)
 
+    # TES4 XACT/ONAM ("Open by Default") are deliberately NOT transferred:
+    # in Skyrim they make the door SPAWN open, but Oblivion doors carrying
+    # them still spawn closed (in-game verified — every CG portcullis stood
+    # open at load).  TES4 opens such doors via the AI bypass instead; see
+    # the consume-door handling at XLOC below.
+
     # Teleport door (XTEL)
     xtel_door = get_formid(rec, 'XTEL.Door')
     if xtel_door:
@@ -632,7 +638,18 @@ def convert_REFR(rec: dict) -> bytes:
         tes5_level = map_lock_level(lock_level)
         lock_key = get_formid(rec, 'XLOC.Key')
         lock_flags = get_int(rec, 'XLOC.Flags')
-        subs += pack_subrecord('XLOC', struct.pack('<BxxxIBxxx8x', tes5_level, lock_key, lock_flags))
+        # A level-100 KEYLESS lock on a door whose script consumes activation
+        # is a pure barrier, not pickable content: the converted script
+        # BlockActivation()s the door, which already keeps the player out.
+        # Oblivion's AI door-open bypassed the lock (Glenroy opens the
+        # level-100 CharacterGen back gate by pathing); Skyrim's AI cannot
+        # open a locked door at all, so keeping the lock strands every NPC
+        # whose package routes through it.  Drop it; the block remains.
+        from ..object_scripts import base_is_consume_door
+        barrier_lock = (lock_level == 100 and not lock_key
+                        and base_is_consume_door(rec.get('NAME', '')))
+        if not barrier_lock:
+            subs += pack_subrecord('XLOC', struct.pack('<BxxxIBxxx8x', tes5_level, lock_key, lock_flags))
 
     # XLCN — Persistent Location. Only persistent refs carry it (they are the
     # quest-target-eligible ones); it lets the quest/map-marker system place a

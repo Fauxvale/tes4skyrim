@@ -168,6 +168,15 @@ def export_REFR(rec: Record) -> list:
         flags_offset = 12 if len(xloc.data) >= 13 else 8
         lines.append(f"XLOC.Flags={xloc.data[flags_offset]}")
 
+    # Action flag (u32: 0x1 Use Default, 0x2 Activate, 0x4 Open,
+    # 0x8 Open by Default) and the ONAM "Open by Default" marker — the pair
+    # Oblivion puts on door refs that start open (raised portcullises etc.).
+    xact = get_subrecord(rec, "XACT")
+    if xact and len(xact.data) >= 4:
+        lines.append(f"XACT.ActionFlag={struct.unpack_from('<I', xact.data, 0)[0]}")
+    if get_subrecord(rec, "ONAM") is not None:
+        lines.append("ONAM.OpenByDefault=1")
+
     # Map Marker
     xmrk = get_subrecord(rec, "XMRK")
     if xmrk:

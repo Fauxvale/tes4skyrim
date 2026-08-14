@@ -51,14 +51,32 @@ missing user install.
 extraction-only licence), redistributable, and extracts all three formats.
 `ffmpeg` is already bundled on the same LGPL basis, with its `COPYING.LGPLv2.1`
 committed beside it ([external/ffmpeg/](external/ffmpeg/)) — so this adds no new
-licensing question, just another entry beside it:
+licensing question, just another entry beside it.
+
+**Ship `7z.exe` + `7z.dll`, NOT `7za.exe`.** Measured against 7-Zip 26.02
+(2026-06-25 build) and verified by listing a real `.rar`:
+
+| Candidate | Size | RAR support |
+|---|---|---|
+| `7za.exe` (standalone, from `7zXXXX-extra.7z`) | 1.27 MB | **NO** — its format list is 7z/bzip2/gzip/zip only; fails with `Cannot open the file as archive` |
+| **`7z.exe` + `7z.dll`** | **2.37 MB** (0.55 + 1.82) | **YES** — Rar, Rar5, and codecs Rar1/2/3/5 |
+
+The standalone `7za.exe` looks like the obvious pick and is the wrong one: RAR
+lives in `7z.dll`, so the pair is mandatory. The two files were copied to an
+isolated directory and used to list `Skyrim esp-40005-0-1.rar` correctly, so the
+pair genuinely is self-contained — no registry keys, no install, no `Codecs/`
+subfolder.
 
 ```
 external/7zip/
-  7za.exe                 # standalone console binary
-  License.txt             # 7-Zip LGPL + unRAR licence
+  7z.exe                  # 0.55 MB — console front end
+  7z.dll                  # 1.82 MB — format/codec library, INCLUDING RAR + RAR5
+  License.txt             # 7-Zip LGPL + unRAR extraction-only licence
   BUILD.md                # version + provenance, matching external/ffmpeg/
 ```
+
+**2.37 MB total**, which is modest next to what the repo already commits:
+`hkxcmd.exe` alone is 10.0 MB, `BSArch.exe` 1.86 MB, `ffmpeg.exe` 1.05 MB.
 
 The `.rar` support this buys is why no Python RAR wrapper is needed. Every one
 of them (`rarfile`, `unrar`, `libarchive-c`, `patool`) is a *shim* that loads a
@@ -69,17 +87,17 @@ it.
 
 | Format | Handler | Needs |
 |---|---|---|
-| `.zip` | stdlib `zipfile` (fast path), `7za.exe` fallback | nothing |
-| `.7z` | bundled `7za.exe` | nothing |
-| `.rar` | bundled `7za.exe` | nothing |
+| `.zip` | stdlib `zipfile` (fast path), `7z.exe` fallback | nothing |
+| `.7z` | bundled `7z.exe` | nothing |
+| `.rar` | bundled `7z.exe` | nothing |
 | `.bsa` | existing `extract_bsa()` | nothing |
 
 Stdlib `zipfile` stays the `.zip` path because it streams members natively and
-needs no subprocess. `7za.exe` is invoked with `l -slt` to list and `x` to
+needs no subprocess. `7z.exe` is invoked with `l -slt` to list and `x` to
 extract, through the existing `subprocess_flags.POPEN_FLAGS` so no console
 window appears under `pythonw`.
 
-**One consequence to respect:** `7za.exe` extracts to a directory rather than
+**One consequence to respect:** `7z.exe` extracts to a directory rather than
 streaming member-by-member. Extraction targets a temp dir under `export/`,
 then files are routed into place, so the layout rule and `_safe_join` still
 apply to every path — the archive is never trusted to write where it likes.
