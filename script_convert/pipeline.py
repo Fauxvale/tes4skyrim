@@ -123,7 +123,20 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
     # for every mesh and no trap ever gets its SetMotionType release — see
     # CrossRefGraph.needs_havok_release.
     from tes5_import.mesh_bounds import load_mesh_bounds
+    from asset_convert.collision_extract import bounds_cache_is_current
     _bounds_cache = os.path.join(export_dir, 'mesh_bounds_cache.json')
+    # A cache from before the HELD bit existed loads fine and answers 0 for
+    # every mesh, so the release silently vanishes from every converted script.
+    # This step cannot rebuild it (--scripts-only runs with no mesh scan), so
+    # say so instead of emitting quietly-wrong scripts.
+    if not bounds_cache_is_current(_bounds_cache):
+        print("  WARNING: mesh bounds cache is missing or predates the current "
+              "schema.\n"
+              "           Breakaway/trap havok releases will NOT be emitted "
+              "(planks and traps\n"
+              "           will hang instead of falling).  Run the import or "
+              "meshes step to\n"
+              f"           rebuild it: {_bounds_cache}")
     load_mesh_bounds(_bounds_cache, quiet=True)
 
     # Deploy static scripts (TES4Polyfill + shared service-menu fragments) so

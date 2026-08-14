@@ -336,6 +336,45 @@ def bounds_from_data(data):
     )
 
 
+# Schema version of mesh_bounds_cache.json, stored under _BOUNDS_SCHEMA_KEY.
+#
+# Bump this whenever an entry gains a field or a field changes meaning.  Any
+# cache written before versioning, or at a lower version, is REGENERATED rather
+# than trusted: entries are plain lists, so a missing trailing field is
+# indistinguishable from a computed zero and the reader cannot tell a stale
+# cache from a complete one.
+#
+# That exact hole cost a shipped bug.  `physics_flags_from_data` gained the
+# HELD bit (bit 1) on 2026-08-05, but the scan only ran when the cache file was
+# ABSENT, so Nehrim kept its 2026-08-02 cache forever: 0 of its 11,946 meshes
+# carried the bit, `needs_havok_release` answered False for every one, and no
+# converted `playgroup` ever emitted TES4Polyfill.ReleaseBreakaway.
+# mwallplankbreakaway01's planks hung in mid-air.  Oblivion's cache happened to
+# be rebuilt an hour after that commit, so the same meshes worked there — which
+# is why this looked like a Nehrim-only mesh bug rather than a stale cache.
+BOUNDS_SCHEMA_VERSION = 2
+_BOUNDS_SCHEMA_KEY = '__schema__'
+
+
+def bounds_cache_is_current(bounds_cache: str) -> bool:
+    """True if *bounds_cache* exists AND was written at the current schema.
+
+    Callers gate the rescan on this instead of os.path.exists, so a cache
+    predating a field addition is refreshed instead of silently serving
+    incomplete entries.
+    """
+    try:
+        with open(bounds_cache, encoding='utf-8') as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    entry = raw.get(_BOUNDS_SCHEMA_KEY)
+    try:
+        return int(entry[0]) >= BOUNDS_SCHEMA_VERSION
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
 def physics_flags_from_data(data) -> int:
     """Physics facts the IMPORTER needs about a converted mesh, as bit flags.
 
@@ -364,8 +403,11 @@ def physics_flags_from_data(data) -> int:
     their clip exactly — but it is also the tripwire's break group.  The mesh
     knows which it is; the group name does not.
 
-    Shipped as the OPTIONAL 7th element of a bounds-cache entry; absent means
-    0, so pre-existing 6-element caches stay readable.
+    Shipped as the 7th element of a bounds-cache entry.  A cache written before
+    this field existed has 6-element entries that are indistinguishable from
+    "computed, and the flags happened to be 0", so absence CANNOT be read as
+    zero — that silently disabled the havok release for every mesh in any
+    plugin whose cache predated the field (see BOUNDS_SCHEMA_VERSION).
     """
     has_dynamic = False
     has_constraint = False
@@ -849,8 +891,13 @@ def scan_mesh_data(mesh_dir: str, collision_cache: str, bounds_cache: str,
         fh.write(_serialize(col_results))
 
     os.makedirs(os.path.dirname(os.path.abspath(bounds_cache)), exist_ok=True)
+    payload = {k: list(v) for k, v in bnd_results.items()}
+    # Stamp the schema so a later run can tell a complete cache from one
+    # written before an entry field existed (see BOUNDS_SCHEMA_VERSION).  The
+    # key is not a mesh path, so readers that iterate entries must skip it.
+    payload[_BOUNDS_SCHEMA_KEY] = [BOUNDS_SCHEMA_VERSION]
     with open(bounds_cache, 'w', encoding='utf-8') as fh:
-        json.dump({k: list(v) for k, v in bnd_results.items()}, fh)
+        json.dump(payload, fh)
 
     # NOTE: door_panel_axis_cache.json is NOT written here — door geometry
     # must come from the ORIGINAL NIF's Close-sequence pose, and this scan

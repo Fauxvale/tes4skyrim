@@ -201,11 +201,31 @@ Keying off the group name cannot work: `forward` is **491 of Oblivion's 850**
 keep following their clip exactly — yet it is *also* the tripwire's break group.
 The mesh knows which is which; the name does not.
 
-Gotcha: the bounds cache only regenerates when **missing**, so a physics-flag
-change looks like a no-op until you delete `export/<plugin>/mesh_bounds_cache.json`
-(and `collision_cache.bin` — one scan fills both). The script stage also has to
-load that cache in **both** the parent and the spawned workers (Windows spawn
-does not inherit module state), or every lookup silently answers 0.
+**The bounds cache is SCHEMA-VERSIONED — bump the version when you add a field**
+(2026-08-14). `mesh_bounds_cache.json` carries a `"__schema__": [N]` entry, and
+`collision_extract.bounds_cache_is_current()` treats any cache written at a
+lower version — or with no stamp at all — as missing, so it regenerates instead
+of being trusted. Bump `BOUNDS_SCHEMA_VERSION` in the same commit as any change
+to an entry's fields.
+
+This is not hypothetical tidiness; skipping it shipped a bug. Entries are plain
+lists, so a cache written before a field existed parses cleanly and reads as
+**zero** for that field, which is indistinguishable from a computed zero. The
+scan used to run only when the file was **absent**, so when bit 1 (HELD) shipped
+on 2026-08-05 Nehrim simply kept its 2026-08-02 cache: 0 of its 11,946 meshes
+carried the bit, `needs_havok_release` answered False for every one, and **no**
+converted `playgroup` emitted `TES4Polyfill.ReleaseBreakaway`.
+`mwallplankbreakaway01`'s planks stopped falling. Oblivion's cache happened to
+be rebuilt an hour after that commit, so the *same mesh* still worked there —
+which made it look like a Nehrim mesh bug rather than a stale cache. Diagnostic
+that settles it in one step: compare the entry length for the same path key
+across two plugins' caches (`[…, 2]` vs a bare 6-element list).
+
+`--scripts-only` cannot rebuild the cache (it runs with no mesh scan), so
+`script_convert/pipeline.py` prints a loud warning when the cache is stale
+rather than silently emitting scripts with no release. The script stage also
+has to load that cache in **both** the parent and the spawned workers (Windows
+spawn does not inherit module state), or every lookup silently answers 0.
 
 **Layer 14 (`OL_TRAP`) on the striking body is LOAD-BEARING — never remap it.**
 `_remap_world_filter` passes 14 through unchanged and must keep doing so: it is

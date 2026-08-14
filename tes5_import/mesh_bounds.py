@@ -53,6 +53,10 @@ def load_mesh_bounds(cache_path: str, quiet: bool = False) -> int:
     try:
         with open(cache_path, encoding='utf-8') as fh:
             raw = json.load(fh)
+        # '__schema__' carries the cache version, not a mesh — see
+        # collision_extract.BOUNDS_SCHEMA_VERSION.  It is not a path key, so it
+        # can never be looked up, but it must not become a bounds entry either.
+        raw = {k: v for k, v in raw.items() if k != '__schema__'}
         _MESH_BOUNDS = {k: tuple(v[:6]) for k, v in raw.items()}
         _MESH_PHYSICS = {k: int(v[6]) for k, v in raw.items() if len(v) > 6}
         if not quiet:

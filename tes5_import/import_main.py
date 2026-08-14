@@ -1160,16 +1160,24 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # separate step for this.
     # Cache lives in the export directory: export/<plugin>/mesh_bounds_cache.json
     from .mesh_bounds import load_mesh_bounds
-    from asset_convert.collision_extract import load_collision, scan_mesh_data
+    from asset_convert.collision_extract import (load_collision, scan_mesh_data,
+                                                 bounds_cache_is_current)
     cache_path = os.path.join(export_dir, 'mesh_bounds_cache.json')
     col_path = os.path.join(export_dir, 'collision_cache.bin')
     mesh_dir = os.path.join(plugin_out_dir, 'meshes')
     # One scan produces BOTH caches: the two analyses share a NIF parse that
     # costs far more than either of them (see scan_mesh_data).  Runs when
     # EITHER cache is missing, since a single pass fills both anyway.
-    if (not os.path.exists(cache_path) or not os.path.exists(col_path)) \
+    #
+    # A bounds cache that EXISTS but predates the current entry schema counts
+    # as missing.  Entries are plain lists, so a cache written before a field
+    # was added parses cleanly and reads as all-zeroes for that field — which
+    # is how Nehrim served flag-less entries for every mesh long after the
+    # HELD bit shipped, leaving breakaway planks and traps unreleased.
+    if (not bounds_cache_is_current(cache_path) or not os.path.exists(col_path)) \
             and os.path.isdir(mesh_dir):
-        print(f"  Mesh bounds/collision cache not found, scanning {mesh_dir}...")
+        print(f"  Mesh bounds/collision cache missing or stale, "
+              f"scanning {mesh_dir}...")
         scan_mesh_data(mesh_dir, col_path, cache_path)
     load_mesh_bounds(cache_path)
     load_collision(col_path)
