@@ -100,11 +100,23 @@ NAVMESH_FUNCS = {
 }
 
 HOOK_MARKER = '# >>> navmesh-cache-gate >>>'
+# git feeds the refs being pushed on STDIN, one
+# "<local ref> <local sha> <remote ref> <remote sha>" line each.  The gate has
+# to prompt and publish interactively, so python gets </dev/null -- which means
+# python can never read that list itself.  Read it HERE, where stdin is still
+# intact, and forward each remote ref as a --ref argument.  (Passing them on
+# stdin and redirecting were mutually exclusive; this hook previously did both
+# and so gated EVERY push, on every branch, instead of only master.)
 HOOK_SNIPPET = '''%s
 # Added by tools/navmesh_cache_hook.py --install
 # Blocks a push to master that changes navmesh generation unless the shared
 # geometry cache has been rebuilt, then publishes it as a release asset.
-python tools/navmesh_cache_hook.py --pre-push "$@" </dev/null || exit 1
+navmesh_refs=''
+while read -r _local_ref _local_sha _remote_ref _remote_sha; do
+    [ -n "$_remote_ref" ] && navmesh_refs="$navmesh_refs --ref $_remote_ref"
+done
+# shellcheck disable=SC2086
+python tools/navmesh_cache_hook.py --pre-push $navmesh_refs "$@" </dev/null || exit 1
 # <<< navmesh-cache-gate <<<
 ''' % HOOK_MARKER
 
@@ -304,21 +316,42 @@ def run_publish(tag: str | None = None, dry_run: bool = False) -> int:
                       dry_run=dry_run)
 
 
-def pre_push(argv: list[str]) -> int:
-    """git pre-push entry point.  Only gates pushes that update master."""
-    # git feeds "<local ref> <local sha> <remote ref> <remote sha>" on stdin.
-    # When stdin is unavailable (the snippet redirects </dev/null so the hook
-    # can prompt), fall back to gating any push.
-    updating_master = True
+def _is_master_ref(ref: str) -> bool:
+    """Does this remote ref name master itself (not a branch merely ending in it)?"""
+    return ref == 'master' or ref == 'refs/heads/master'
+
+
+def pushed_refs(argv: list[str]) -> 'list[str] | None':
+    """The remote refs this push updates, or None if they could not be read.
+
+    The shell snippet reads git's stdin (the only place the ref list exists)
+    and forwards each remote ref as `--ref <name>`, because python itself is
+    run with </dev/null so the gate can prompt.  Stdin is still consulted as a
+    fallback so a hook installed by an older version keeps working.
+    """
+    refs = [argv[i + 1] for i, a in enumerate(argv)
+            if a == '--ref' and i + 1 < len(argv)]
+    if refs:
+        return refs
     try:
-        lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
-        if lines:
-            updating_master = any(l.split()[2].endswith('refs/heads/master')
-                                  for l in lines if len(l.split()) >= 3)
+        if not sys.stdin.isatty():
+            lines = [l.split() for l in sys.stdin.read().splitlines() if l.strip()]
+            got = [p[2] for p in lines if len(p) >= 3]
+            if got:
+                return got
     except Exception:
         pass
+    return None
 
-    if not updating_master:
+
+def pre_push(argv: list[str]) -> int:
+    """git pre-push entry point.  Only gates pushes that update master."""
+    # An unreadable ref list must gate rather than skip: a false block costs one
+    # --no-verify, a false pass ships a dead cache to every downloader.
+    refs = pushed_refs(argv)
+    if refs is not None and not any(_is_master_ref(r) for r in refs):
+        print('navmesh-cache: not pushing master (%s); skipping the gate.'
+              % ', '.join(refs))
         return 0
 
     gated, touched, stale = check(verbose=True)
@@ -360,6 +393,16 @@ def pre_push(argv: list[str]) -> int:
     return 0
 
 
+HOOK_END = '# <<< navmesh-cache-gate <<<'
+
+
+def _existing_block(text: str) -> str:
+    """The installed gate block, marker to marker, as it appears in *text*."""
+    start = text.index(HOOK_MARKER)
+    end = text.index(HOOK_END, start) + len(HOOK_END)
+    return text[start:end]
+
+
 def install_hook() -> int:
     hooks = os.path.join(nc.repo_root(), '.git', 'hooks')
     path = os.path.join(hooks, 'pre-push')
@@ -368,7 +411,17 @@ def install_hook() -> int:
         with open(path, 'r', encoding='utf-8', errors='replace') as fh:
             existing = fh.read()
         if HOOK_MARKER in existing:
-            print('Already installed in %s' % path)
+            # Replace an existing block rather than reporting "already
+            # installed": that left a hook whose snippet predates a fix (the
+            # ref-forwarding one especially) silently in place forever.
+            block = _existing_block(existing)
+            if block == HOOK_SNIPPET.strip('\n'):
+                print('Already installed and up to date in %s' % path)
+                return 0
+            existing = existing.replace(block, HOOK_SNIPPET.strip('\n'), 1)
+            with open(path, 'w', encoding='utf-8', newline='\n') as fh:
+                fh.write(existing)
+            print('Updated the navmesh cache gate in %s' % path)
             return 0
 
     if not existing:

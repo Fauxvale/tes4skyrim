@@ -19,13 +19,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .game_paths import win_join
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
-from subprocess_flags import POPEN_FLAGS  # noqa: E402
+from subprocess_flags import POPEN_FLAGS, windows_cmd  # noqa: E402
 
 # LODGen 3.0.36.0. This replaced the 2.2.0.0 build of the same name, which
 # let an unparseable model throw out of a worker thread and take the whole
@@ -551,6 +553,12 @@ def _parse_esm(esm_path: Path):
 # LOD mesh resolution helpers
 # ---------------------------------------------------------------------------
 
+# Model/texture paths throughout this module come from the game's own binary
+# formats and are always backslash-separated regardless of host OS.  See
+# asset_convert/game_paths.py for why a plain `root / rel` is wrong off Windows.
+_win_join = win_join
+
+
 def _far_nif_path(model_path: str) -> str:
     """Return the expected _far.nif path for a given model path."""
     if not model_path:
@@ -582,7 +590,7 @@ def _mesh_exists(path: str, output_meshes_dir: Path) -> bool:
     rel = path.lower().replace('/', '\\').lstrip('\\')
     if rel.startswith('meshes\\'):
         rel = rel[len('meshes\\'):]
-    return (output_meshes_dir / rel).exists()
+    return _win_join(output_meshes_dir, rel).exists()
 
 
 # LODGenx64 casts every LOD mesh's root block to NiNode without checking. A
@@ -606,7 +614,7 @@ def _mesh_screen_path(path: str, output_meshes_dir: Path) -> Path:
     rel = path.lower().replace('/', '\\').lstrip('\\')
     if rel.startswith('meshes\\'):
         rel = rel[len('meshes\\'):]
-    return output_meshes_dir / rel
+    return _win_join(output_meshes_dir, rel)
 
 
 def _lod_mesh_is_safe(path: str, output_meshes_dir: Path) -> bool:
@@ -865,10 +873,10 @@ def _import_master_mesh(rel: str, output_meshes_dir: Path,
     if r.startswith('meshes\\'):
         r = r[len('meshes\\'):]
     for mdir in (master_meshes or []):
-        src = Path(mdir) / r
+        src = _win_join(Path(mdir), r)
         if not src.exists():
             continue
-        dst = output_meshes_dir / r
+        dst = _win_join(output_meshes_dir, r)
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
@@ -905,11 +913,11 @@ def _overrides_master_model(model: str, own_meshes_root: Path,
         return False
     if rel.startswith('meshes\\'):
         rel = rel[len('meshes\\'):]
-    own = own_meshes_root / rel
+    own = _win_join(own_meshes_root, rel)
     if not own.is_file():
         return False
     for mm in master_meshes:
-        src = Path(mm) / rel
+        src = _win_join(Path(mm), rel)
         if not src.is_file():
             continue
         if own.stat().st_size != src.stat().st_size:
@@ -1351,7 +1359,7 @@ def run_lodgen(lodgen_input: Path, output_dir: Path) -> bool:
     print(f"  Running: {' '.join(cmd)}")
     # Capture output so it reaches the GUI log instead of a popped-up console
     # window (which never exists under the console-less GUI launcher).
-    result = subprocess.run(cmd, cwd=str(LODGEN_EXE.parent),
+    result = subprocess.run(windows_cmd(cmd), cwd=str(LODGEN_EXE.parent),
                             capture_output=True, text=True, **POPEN_FLAGS)
     if result.stdout:
         print(result.stdout, end="")
@@ -1818,17 +1826,17 @@ def _fill_missing_lod_textures(bto_dir: Path, tex_root: Path,
     left to the master and only genuinely absent ones are handled here.
     """
     def _in_master(rel):
-        return any((mr / rel).exists() for mr in (master_tex_roots or []))
+        return any(_win_join(mr, rel).exists() for mr in (master_tex_roots or []))
 
     missing = sorted(r for r in _bto_texture_refs(bto_dir)
-                     if not (tex_root / r).exists() and not _in_master(r))
+                     if not _win_join(tex_root, r).exists() and not _in_master(r))
     if not missing:
         return
 
     synth = 0
     unresolved = []
     for rel in missing:
-        dest = tex_root / rel
+        dest = _win_join(tex_root, rel)
         if not rel.endswith('_n.dds'):
             # Nothing to copy: a master-shipped path was filtered out above,
             # so anything reaching here exists in no tree we know of.
@@ -1842,11 +1850,11 @@ def _fill_missing_lod_textures(bto_dir: Path, tex_root: Path,
         # model baked into our LOD keeps its textures in the master's output,
         # and using its real normal beats falling back to a flat one.
         def _find(name):
-            p = tex_root / name
+            p = _win_join(tex_root, name)
             if p.exists():
                 return p
             for mr in (master_tex_roots or []):
-                q = mr / name
+                q = _win_join(mr, name)
                 if q.exists():
                     return q
             return p          # non-existent local path (callers test .exists())

@@ -51,6 +51,8 @@ import struct
 import sys
 from pathlib import Path
 
+from .game_paths import win_join
+
 
 def _nif_format():
     """Lazy pyffi import so tes5_import can use grass_model_dest() without
@@ -87,6 +89,13 @@ def grass_model_dest(model_path):
     tree is flattened with a ``tes4_`` prefix.
     """
     base = model_path.replace('/', '\\').rsplit('\\', 1)[-1].lower()
+    # Backslash, not forward slash: this return value is ALSO written
+    # verbatim as the GRAS record's own MODL subrecord (see
+    # tes5_import/record_types/items.py convert_GRAS) -- that is the TES5
+    # binary format's own path convention, independent of the host OS, and
+    # must stay backslash-separated regardless of platform. Filesystem
+    # callers (grass_profile.run) are responsible for splitting it into real
+    # path components themselves.
     return 'landscape\\grass\\tes4_' + base
 
 
@@ -267,14 +276,18 @@ def run(export_dir, output_meshes_root):
     paths = load_grass_model_paths(export_dir)
     processed = modified = missing = 0
     for rel in sorted(paths):
-        nif = output_meshes_root / 'tes4' / rel
+        # rel is backslash-form (see load_grass_model_paths), so it needs an
+        # explicit split -- see asset_convert/game_paths.py.
+        nif = win_join(output_meshes_root / 'tes4', rel)
         if not nif.exists():
             missing += 1
             continue
         processed += 1
         if apply_grass_profile(nif):
             modified += 1
-        dest = output_meshes_root / grass_model_dest(rel)
+        # grass_model_dest() returns backslash-form (it doubles as the GRAS
+        # MODL value written into the binary record -- see its docstring).
+        dest = win_join(output_meshes_root, grass_model_dest(rel))
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(nif, dest)
     return processed, modified, missing
