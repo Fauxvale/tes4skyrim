@@ -69,6 +69,8 @@ Later Issues:
 
 	15 - Creatures are wrong sizes sometimes (chicken and donkey in nehrim, elephant in anequina)
 
+	16 - Discord integration with changelog
+
 Minor Issues:
 
 	2 - Improve landscape layer blending

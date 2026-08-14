@@ -1907,7 +1907,7 @@ def gui_main():
             from asset_convert.sibling_lod import lod_worldspaces as _lw
         except Exception:
             return []
-        return _lw(names, SCRIPT_DIR / "export")
+        return _lw(names, SCRIPT_DIR / "export", _lod_out_root())
 
     def _open_make_master_panel(on_apply=None):
         """Pick which converted plugins to flag as masters (ESM).
@@ -2179,15 +2179,18 @@ def gui_main():
         # Who depends on whom, and which worldspaces each plugin brings. Both
         # are scanned ONCE here — they read every export dir — so that every
         # tick is a dict lookup rather than a rescan.
+        _ws_why: dict = {}
         try:
-            from asset_convert.sibling_lod import (dependents_of,
-                                                   worldspaces_by_plugin,
-                                                   merge_worldspaces)
+            from asset_convert.sibling_lod import (
+                dependents_of, worldspaces_by_plugin_diagnosed,
+                merge_worldspaces)
             _deps = dependents_of(all_names, SCRIPT_DIR / "export")
-            _ws_by = worldspaces_by_plugin(all_names, SCRIPT_DIR / "export")
-        except Exception:
+            _ws_by, _ws_why = worldspaces_by_plugin_diagnosed(
+                all_names, SCRIPT_DIR / "export", _lod_out_root())
+        except Exception as _exc:
             _deps = {n: set() for n in all_names}
             _ws_by = {n: [] for n in all_names}
+            _ws_why = {"": f"Worldspace scan failed: {_exc}"}
 
             def merge_worldspaces(names, by_plugin):
                 return []
@@ -2392,11 +2395,22 @@ def gui_main():
             ws_vars.clear()
 
             if not live:
-                tk.Label(winner,
-                         text=("No worldspace ships distant LOD\n"
-                               "for the selected plugins."),
-                         bg=CLR["panel"], fg=CLR["subtext"], justify=tk.LEFT,
-                         font=("Segoe UI", 9)).pack(anchor="w", padx=4, pady=4)
+                # Say WHY, per plugin. "No worldspace ships distant LOD" is a
+                # symptom shared by every failure mode, and it is outright
+                # wrong for the commonest one — assets never extracted — which
+                # sent users looking for a plugin problem that did not exist.
+                why = [_ws_why[n] for n in names if n in _ws_why]
+                why += [v for k, v in _ws_why.items() if k == ""]
+                text = ("No selected plugin has worldspace terrain\n"
+                        "to generate LOD from.")
+                if why:
+                    text = "\n\n".join(why[:6])
+                    if len(why) > 6:
+                        text += f"\n\n(+{len(why) - 6} more)"
+                lbl = tk.Label(winner, text=text, bg=CLR["panel"],
+                               fg=CLR["subtext"], justify=tk.LEFT,
+                               wraplength=210, font=("Segoe UI", 9))
+                lbl.pack(anchor="w", padx=4, pady=4)
                 return
 
             for wname in live:
@@ -3088,8 +3102,31 @@ def gui_main():
             # that skipped SEWorld is not current for one that wants it.
             names = lod_plugins or _default_lod_plugins()
             parts += ["|"] + names
-            parts += ["|"] + (lod_worldspaces
-                              or _default_lod_worldspaces(names))
+            # The worldspace filter is an input too, but ONLY the user's
+            # explicit pick is cheap to read. Falling back to the derived
+            # default here used to call _default_lod_worldspaces, which now
+            # parses every converted ESM (Oblivion.esm alone is 613 MB) —
+            # 0.01s -> 1.63s on a path that runs for every global button
+            # BEFORE the window first paints, which is the blank-screen
+            # startup stall.
+            #
+            # A stamp only has to CHANGE when the inputs change, never to
+            # contain them. When the user has not pinned a worldspace set, the
+            # derived set is a pure function of the converted ESMs, so their
+            # identity (mtime+size) invalidates exactly as precisely at a
+            # fraction of the cost.
+            if lod_worldspaces:
+                parts += ["|"] + list(lod_worldspaces)
+            else:
+                out_root = Path(out_dir)
+                sig = []
+                for n in names:
+                    try:
+                        st = (out_root / n / n).stat()
+                        sig.append(f"{n}:{st.st_size}:{st.st_mtime_ns}")
+                    except OSError:
+                        sig.append(f"{n}:-")
+                parts += ["|"] + sig
         return "\x1f".join(parts)
 
     # The stamp each action was last completed at, so a later conversion can

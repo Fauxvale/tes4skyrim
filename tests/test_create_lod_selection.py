@@ -159,5 +159,139 @@ class TestMergeWorldspaces:
         assert merge_worldspaces(['Ghost.esp'], {'A.esp': ['W1']}) == []
 
 
+class TestModAddedWorldspacesAreOffered:
+    """Shipped LOD assets are NOT the authority on what deserves LOD.
+
+    Only Bethesda baked LOD offline. A third-party landmass ships none, so a
+    shipped-asset scan returned zero worldspaces for exactly the plugins that
+    most need LOD generated — the dialog showed nothing and the bake skipped
+    them with "no selected plugin ships LOD for it".
+    """
+
+    def test_terrain_without_shipped_lod_is_still_offered(self, monkeypatch,
+                                                          tmp_path):
+        """The reported bug: a mod-added worldspace must appear."""
+        from asset_convert import terrain_lod
+
+        d = tmp_path / 'ElsweyrAnequina.esp'
+        d.mkdir()
+        out = tmp_path / 'out'
+        (out / 'ElsweyrAnequina.esp').mkdir(parents=True)
+        (out / 'ElsweyrAnequina.esp' / 'ElsweyrAnequina.esp').write_bytes(b'x')
+
+        monkeypatch.setattr(terrain_lod, 'shipped_lod_worldspaces',
+                            lambda _d: [])
+        monkeypatch.setattr(terrain_lod, 'detect_terrain_worldspaces',
+                            lambda _e: [(1879, 0x3C, 'ANQWorld')])
+
+        ws, why = terrain_lod.lod_capable_worldspaces(d, out)
+        assert [e for e, _f in ws] == ['ANQWorld']
+        assert why is None
+
+    def test_shipped_ranks_before_generated_and_dedupes(self, monkeypatch,
+                                                        tmp_path):
+        from asset_convert import terrain_lod
+
+        d = tmp_path / 'Oblivion.esm'
+        d.mkdir()
+        out = tmp_path / 'out'
+        (out / 'Oblivion.esm').mkdir(parents=True)
+        (out / 'Oblivion.esm' / 'Oblivion.esm').write_bytes(b'x')
+
+        monkeypatch.setattr(terrain_lod, 'shipped_lod_worldspaces',
+                            lambda _d: [('TES4Tamriel', 0x3C)])
+        monkeypatch.setattr(
+            terrain_lod, 'detect_terrain_worldspaces',
+            lambda _e: [(9, 0x3C, 'TES4Tamriel'), (5, 0x99, 'Toddland')])
+
+        ws, _why = terrain_lod.lod_capable_worldspaces(d, out)
+        assert [e for e, _f in ws] == ['TES4Tamriel', 'Toddland']
+
+    def test_a_plugin_with_no_worldspaces_is_explained(self, monkeypatch,
+                                                       tmp_path):
+        """A quest-only ESP defines none, so there is nothing to offer.
+
+        Note this is about defining no WORLDSPACE at all. A worldspace that
+        exists but is empty IS offered: it simply bakes no tiles, and gating
+        on content meant counting LAND records, which cost a walk of 1.17
+        million records purely to rank a list.
+        """
+        from asset_convert import terrain_lod
+
+        d = tmp_path / 'Quest.esp'
+        d.mkdir()
+        out = tmp_path / 'out'
+        (out / 'Quest.esp').mkdir(parents=True)
+        (out / 'Quest.esp' / 'Quest.esp').write_bytes(b'x')
+
+        monkeypatch.setattr(terrain_lod, 'shipped_lod_worldspaces',
+                            lambda _d: [])
+        monkeypatch.setattr(terrain_lod, 'detect_terrain_worldspaces',
+                            lambda _e: [])
+
+        ws, why = terrain_lod.lod_capable_worldspaces(d, out)
+        assert ws == []
+        assert 'no worldspace' in why
+
+    def test_owner_falls_back_to_terrain_when_nobody_shipped(self, shipped,
+                                                             tmp_path):
+        """The bake must not skip a mod-added worldspace."""
+        from asset_convert import sibling_lod, terrain_lod
+
+        out = tmp_path / 'out'
+        (out / 'Mod.esp').mkdir(parents=True)
+        (out / 'Mod.esp' / 'Mod.esp').write_bytes(b'x')
+        terrain_lod.detect_terrain_worldspaces = \
+            lambda _e: [(400, 0x7, 'ModWorld')]
+        try:
+            assert sibling_lod.worldspace_owner(
+                'ModWorld', ['Mod.esp'], Path('.'), out) == 'Mod.esp'
+        finally:
+            del terrain_lod.detect_terrain_worldspaces
+
+    def test_shipped_owner_still_wins_over_a_terrain_extender(self, shipped,
+                                                             tmp_path):
+        """Oblivion.esm must keep TES4Tamriel, not lose it to Tamriel.esp."""
+        shipped['Oblivion.esm'] = ['TES4Tamriel']
+        order = ['Tamriel.esp', 'Oblivion.esm']
+        assert worldspace_owner('TES4Tamriel', order, Path('.'),
+                                tmp_path) == 'Oblivion.esm'
+
+    def test_unexported_plugin_says_export(self, tmp_path):
+        from asset_convert.terrain_lod import lod_capable_worldspaces
+        ws, why = lod_capable_worldspaces(tmp_path / 'Ghost.esp')
+        assert ws == []
+        assert 'not exported' in why and '--export-only' in why
+
+    def test_reason_map_only_covers_empty_plugins(self, monkeypatch, tmp_path):
+        """A plugin that resolved worldspaces contributes no reason."""
+        from asset_convert import terrain_lod
+        from asset_convert.sibling_lod import worldspaces_by_plugin_diagnosed
+
+        def _fake(export_dir, out_root=None):
+            if Path(export_dir).name == 'Good.esm':
+                return [('W1', 1)], None
+            return [], 'Bad.esp: nope.'
+
+        monkeypatch.setattr(terrain_lod, 'lod_capable_worldspaces', _fake)
+        by, why = worldspaces_by_plugin_diagnosed(
+            ['Good.esm', 'Bad.esp'], tmp_path)
+        assert by == {'Good.esm': ['W1'], 'Bad.esp': []}
+        assert list(why) == ['Bad.esp']
+
+    def test_a_raising_scan_is_reported_not_swallowed(self, monkeypatch,
+                                                     tmp_path):
+        from asset_convert import terrain_lod
+        from asset_convert.sibling_lod import worldspaces_by_plugin_diagnosed
+
+        def _boom(export_dir, out_root=None):
+            raise OSError('disk gone')
+
+        monkeypatch.setattr(terrain_lod, 'lod_capable_worldspaces', _boom)
+        by, why = worldspaces_by_plugin_diagnosed(['A.esp'], tmp_path)
+        assert by == {'A.esp': []}
+        assert 'disk gone' in why['A.esp']
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])
