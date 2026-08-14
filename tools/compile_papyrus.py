@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+from subprocess_flags import windows_cmd  # noqa: E402
 
 def find_compiler():
     p = _PROJECT_ROOT / 'external' / 'papyrus-compiler' / 'papyrus.exe'
@@ -29,11 +31,16 @@ def find_skyrim_headers():
     Shared with the compile phase so this tool cannot disagree with a real
     build about where the headers are -- it also covers the Data/Scripts/Source
     layout and unpacks Data/Scripts.zip on CK builds that ship the sources only
-    as that archive.
+    as that archive.  Off Windows, where winreg does not exist, that lookup
+    resolves the install from conversion_config.json's tes5DataPath instead.
     """
     sys.path.insert(0, str(_PROJECT_ROOT))
-    from convert import _find_skyrim_source_scripts
-    headers = _find_skyrim_source_scripts()
+    from convert import _find_skyrim_source_scripts, load_config
+    try:
+        cfg = load_config()
+    except (FileNotFoundError, OSError):
+        cfg = {}
+    headers = _find_skyrim_source_scripts(cfg)
     if headers:
         return headers
     # Fallback for a non-registry (manually copied) install.
@@ -47,7 +54,7 @@ def compile_one(args):
     cmd = [compiler, 'compile', '-i', str(f), '-o', str(out_dir), '-h', headers]
     if polyfill_dir:
         cmd.extend(['-h', polyfill_dir])
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    r = subprocess.run(windows_cmd(cmd), capture_output=True, text=True, timeout=15)
     if r.returncode != 0:
         combined = r.stdout + '\n' + r.stderr
         for line in combined.split('\n'):

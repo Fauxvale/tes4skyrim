@@ -32,6 +32,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .game_paths import win_join
+
 # 4096 game units per cell; landscape diffuse repeats every 2 cells in Skyrim.
 # Oblivion authored the same, so one .dds spans a 2x2 cell region at UV [0,1].
 TILE_REPEAT_CELLS = 2.0
@@ -258,7 +260,9 @@ def _load_texture_rgb(rel_path: str, tex_root, size: int = 64):
         if rp.lower().startswith('textures\\'):
             rp = rp[len('textures\\'):]
         for root in roots:
-            fpath = Path(root) / rp
+            # rp is backslash-form (it comes from the TXST record's TX00/TX01),
+            # so it needs an explicit split -- see asset_convert/game_paths.py.
+            fpath = win_join(root, rp)
             if not fpath.exists():
                 continue
             try:

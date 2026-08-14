@@ -70,7 +70,8 @@ _PSC_ERR_RE = re.compile(r'^.*?([^\\/:]+\.psc):\d+:\d+:\s*(.*)$')
 _MAX_BATCH_RETRIES = 25
 
 # Suppress console windows when spawned from a console-less parent (pythonw/.pyw)
-from subprocess_flags import POPEN_FLAGS as _POPEN_FLAGS, configure_multiprocessing
+from subprocess_flags import (POPEN_FLAGS as _POPEN_FLAGS,
+                              configure_multiprocessing, windows_cmd)
 from process_job import create_pool_job, describe_limit
 from worker_budget import worker_count
 from collision_options import (
@@ -98,8 +99,26 @@ def load_config(config_path: str = None) -> dict:
         return json.load(f)
 
 
-def find_game_path(game: str) -> str:
-    """Auto-detect game data path from registry."""
+_CONFIG_PATH_KEYS = {"oblivion": "tes4DataPath", "skyrimse": "tes5DataPath"}
+
+
+def find_game_path(game: str, config: dict = None) -> str:
+    """Auto-detect a game's Data path.
+
+    Windows behaviour is unchanged: the registry is consulted and this is
+    normally all that's needed. Off Windows `winreg` doesn't exist, so that
+    lookup is a no-op there -- the equivalent is an explicit path in
+    conversion_config.json's tes4DataPath/tes5DataPath, checked FIRST (this
+    also lets a Windows user override a registry entry that points at the
+    wrong install). Empty/absent by default, so on Windows this changes
+    nothing.
+    """
+    if config:
+        key = _CONFIG_PATH_KEYS.get(game)
+        if key:
+            configured = config.get(key, "") or ""
+            if configured and os.path.isdir(configured):
+                return configured
     try:
         import winreg
         keys = {
@@ -128,8 +147,8 @@ def find_game_path(game: str) -> str:
 
 def get_paths(config: dict) -> tuple:
     """Get TES4 and TES5 data paths."""
-    tes4 = config.get("tes4DataPath", "") or find_game_path("oblivion")
-    tes5 = config.get("tes5DataPath", "") or find_game_path("skyrimse")
+    tes4 = find_game_path("oblivion", config)
+    tes5 = find_game_path("skyrimse", config)
     return tes4, tes5
 
 
@@ -524,7 +543,7 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
         return False
 
     # Find Skyrim source headers (Data\Source\Scripts has native type defs)
-    skyrim_headers = _find_skyrim_source_scripts()
+    skyrim_headers = _find_skyrim_source_scripts(config)
     if not skyrim_headers:
         print(f"[{file_name}] ERROR: Skyrim Papyrus source headers not found")
         print("  Expected at: <Skyrim SE>\\Data\\Source\\Scripts\\")
@@ -604,7 +623,7 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
         c = [str(compiler), "compile", "-nocache",
              "-i", str(in_dir), "-o", str(script_out)] + _header_args()
         try:
-            r = subprocess.run(c, capture_output=True, text=True,
+            r = subprocess.run(windows_cmd(c), capture_output=True, text=True,
                                timeout=1800, cwd=str(SCRIPT_DIR), **_POPEN_FLAGS)
         except Exception as e:
             return (False, [f"batch: {e}"], set())
@@ -645,7 +664,7 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
         for d in master_src_dirs:
             c += ["-h", str(d)]     # the masters' converted script types
         try:
-            r = subprocess.run(c, capture_output=True, text=True,
+            r = subprocess.run(windows_cmd(c), capture_output=True, text=True,
                                timeout=60, cwd=str(SCRIPT_DIR), **_POPEN_FLAGS)
             if r.returncode == 0 and pex_path.is_file():
                 return (True, "")
@@ -813,7 +832,7 @@ def _extract_scripts_zip(zip_path: Path, data_dir: Path) -> str:
     return str(dest)
 
 
-def _find_skyrim_source_scripts() -> str:
+def _find_skyrim_source_scripts(config: dict = None) -> str:
     """Find Skyrim Papyrus source scripts directory (contains Debug.psc etc.).
 
     Order: the loose CK layouts, then unpacking Data/Scripts.zip in place.
@@ -821,7 +840,7 @@ def _find_skyrim_source_scripts() -> str:
     through here, so the dependency check and the phase can never disagree
     about whether the headers are available.
     """
-    sse_data = find_game_path("skyrimse")
+    sse_data = find_game_path("skyrimse", config)
     if not sse_data:
         return ""
     data = Path(sse_data)
