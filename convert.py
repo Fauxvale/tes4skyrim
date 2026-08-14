@@ -1347,8 +1347,35 @@ def main():
     except Exception as exc:
         print(f"Note: could not record conversion state ({exc}).")
 
-    print("Pipeline complete." if success else "Pipeline completed with errors.")
-    return 0 if success else 1
+    if success:
+        print("Pipeline complete.")
+        return 0
+
+    # A failed run ends with thousands of lines of stage output above it, so
+    # restate WHICH steps failed right next to the verdict.  `_step_ok` is the
+    # authoritative record -- every phase stamps it -- so this reports what
+    # actually failed rather than scraping the log for the word "error".
+    failed = [(step_key, fn)
+              for step_key, per_file in _step_ok.items()
+              for fn, ok in per_file.items() if not ok]
+    print()
+    print("-" * 54)
+    if failed:
+        print(f"  ERROR SUMMARY ({len(failed)} failed step"
+              f"{'' if len(failed) == 1 else 's'}):")
+        for step_key, fn in failed:
+            where = ("all plugins" if fn == _version.GLOBAL_PLUGIN_KEY
+                     else fn)
+            print(f"    - {step_key}: FAILED for {where}")
+    else:
+        # A step that returned False without being stamped, or a failure
+        # raised outside the per-step marks.  Say so rather than printing an
+        # empty summary that reads like nothing went wrong.
+        print("  ERROR SUMMARY: a stage reported failure; see the stage "
+              "output above for details.")
+    print("-" * 54)
+    print("Pipeline completed with errors.")
+    return 1
 
 
 if __name__ == "__main__":

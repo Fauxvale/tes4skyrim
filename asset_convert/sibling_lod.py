@@ -333,38 +333,60 @@ def create_lod_order(names: list[str], export_root: Path) -> list[str]:
     return listed + rest
 
 
-def worldspaces_by_plugin(names: list[str],
-                          export_root: Path) -> dict[str, list[str]]:
+def worldspaces_by_plugin(names: list[str], export_root: Path,
+                          out_root: Path = None) -> dict[str, list[str]]:
     """{plugin: [worldspace EDID, ...]} for each of `names`.
 
-    The same authority `phase_lod` routes on — the worldspaces the SOURCE game
-    shipped distant LOD for — so the dialog offers exactly the set a run would
-    otherwise build, and unticking one genuinely removes work rather than
-    filtering a list that never matched.
+    The same authority `worldspace_owner` routes on, so the dialog offers
+    exactly the set a run would build and unticking one genuinely removes work.
+
+    `out_root` is what makes MOD-ADDED worldspaces visible: a plugin that adds
+    a landmass ships no LOD assets, so without the converted ESM to read
+    terrain from it looks like it has no worldspaces at all. Optional only so
+    callers that genuinely want the shipped-only set can omit it.
 
     Returned per plugin, not flattened, because the dialog has to recompute the
-    worldspace list as plugins are ticked on and off. Scanning the export dirs
-    is the expensive part, so it happens ONCE when the dialog opens and every
-    later toggle is a dict lookup.
+    worldspace list as plugins are ticked on and off. Scanning is the expensive
+    part, so it happens ONCE when the dialog opens and every later toggle is a
+    dict lookup.
     """
-    out: dict[str, list[str]] = {}
-    for name in names:
-        try:
-            shipped = shipped_lod_worldspaces(export_root / name) or []
-        except Exception:
-            shipped = []
-        out[name] = [edid for edid, _fid in shipped]
+    out, _reasons = worldspaces_by_plugin_diagnosed(names, export_root,
+                                                    out_root)
     return out
 
 
-def lod_worldspaces(names: list[str], export_root: Path) -> list[str]:
+def worldspaces_by_plugin_diagnosed(names: list[str], export_root: Path,
+                                    out_root: Path = None):
+    """`worldspaces_by_plugin` plus why each empty plugin came back empty.
+
+    Returns ({plugin: [edid, ...]}, {plugin: reason}). Only plugins with
+    nothing to offer appear in the reason map.
+    """
+    from .terrain_lod import lod_capable_worldspaces
+
+    out: dict[str, list[str]] = {}
+    reasons: dict[str, str] = {}
+    for name in names:
+        try:
+            found, why = lod_capable_worldspaces(export_root / name, out_root)
+        except Exception as exc:
+            found, why = [], f"{name}: scan failed ({exc})."
+        out[name] = [edid for edid, _fid in found]
+        if why:
+            reasons[name] = why
+    return out, reasons
+
+
+def lod_worldspaces(names: list[str], export_root: Path,
+                    out_root: Path = None) -> list[str]:
     """Every worldspace the selected plugins would generate LOD for.
 
     Ordered by first appearance across `names` so the biggest, most-edited
     worldspaces (which is the order `shipped_lod_worldspaces` already returns
     per plugin) surface at the top.
     """
-    return merge_worldspaces(names, worldspaces_by_plugin(names, export_root))
+    return merge_worldspaces(names, worldspaces_by_plugin(names, export_root,
+                                                          out_root))
 
 
 def merge_worldspaces(names, by_plugin: dict[str, list[str]]) -> list[str]:
@@ -381,11 +403,16 @@ def merge_worldspaces(names, by_plugin: dict[str, list[str]]) -> list[str]:
     return seen
 
 
-def worldspace_owner(edid: str, order: list[str], export_root: Path):
+def worldspace_owner(edid: str, order: list[str], export_root: Path,
+                     out_root: Path = None):
     """The plugin whose records a worldspace's LOD is baked FROM.
 
-    The FIRST plugin in load order that shipped distant LOD for `edid` — the
-    same authority `phase_lod` routes on, so both agree on who owns what.
+    The FIRST plugin in load order that can supply `edid`'s terrain. Shipped
+    LOD assets alone were the old test, which silently skipped every worldspace
+    a MOD adds — those ship no LOD, so the bake printed "no selected plugin
+    ships LOD for it" and generated nothing for entire landmasses. Ownership
+    now falls back to "defines the worldspace with terrain in its converted
+    ESM", which is the property the bake actually needs.
 
     Ownership matters because the bake reads WRLD/CELL/LAND/REFR out of ONE
     file and applies the rest as overlays. Sourcing from a later plugin that
@@ -394,14 +421,57 @@ def worldspace_owner(edid: str, order: list[str], export_root: Path):
     left all of Oblivion.esm's terrain missing and edge-extended into flat
     plateaus at the vanilla border.
     """
-    for name in order:
-        try:
-            shipped = shipped_lod_worldspaces(export_root / name) or []
-        except Exception:
-            continue
-        if any(e == edid for e, _f in shipped):
-            return name
-    return None
+    return owner_map([edid], order, export_root, out_root).get(edid)
+
+
+def _shipped_edids(export_dir: Path) -> frozenset:
+    """EDIDs a plugin shipped LOD assets for."""
+    try:
+        return frozenset(e for e, _f in
+                         (shipped_lod_worldspaces(export_dir) or []))
+    except Exception:
+        return frozenset()
+
+
+def _defined_edids(esm: Path) -> frozenset:
+    """EDIDs of every ROOT worldspace defined in a converted ESM."""
+    from .terrain_lod import detect_terrain_worldspaces
+    try:
+        return frozenset(e for _sz, _f, e in detect_terrain_worldspaces(esm))
+    except Exception:
+        return frozenset()
+
+
+def owner_map(edids, order: list[str], export_root: Path,
+              out_root: Path = None) -> dict:
+    """{worldspace EDID: owning plugin}, resolved in ONE pass over the order.
+
+    Two-pass precedence, and the order of the passes is the point: a plugin
+    that SHIPPED LOD for a worldspace outranks any later plugin that merely
+    defines it. That is what keeps Oblivion.esm owning TES4Tamriel rather than
+    Tamriel.esp, which only extends it — sourcing from the extender would drop
+    all of Oblivion's terrain. Pass 2 then covers mod-added worldspaces, which
+    ship no LOD at all and used to be skipped entirely.
+
+    Resolving the whole load order at once rather than per worldspace: the
+    per-worldspace form re-listed every plugin's export dir for each of 80
+    worldspaces.
+    """
+    wanted = set(edids)
+    out: dict = {}
+    for name in order:                      # pass 1: shipped LOD wins
+        for e in _shipped_edids(export_root / name) & wanted:
+            out.setdefault(e, name)
+    if out_root is not None:
+        for name in order:                  # pass 2: defined in the ESM
+            rest = wanted - out.keys()
+            if not rest:
+                break
+            esm = Path(out_root) / name / name
+            if esm.is_file():
+                for e in _defined_edids(esm) & rest:
+                    out.setdefault(e, name)
+    return out
 
 
 def dependents_of(names: list[str], export_root: Path) -> dict[str, set[str]]:

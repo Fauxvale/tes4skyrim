@@ -171,13 +171,24 @@ applied nothing and the CharacterGen conversation stalled forever.)
 6. A web search for other authoritative sources.
 7. The Papyrus logs from the last in-game run — read them to diagnose a runtime
    symptom (see the directory-purpose table under Hard prohibitions).
-8. Failing all the above, add comprehensive logging so the user's next run
+8. <a id="attach-to-the-live-game"></a>**The LIVE game process — for any hang or
+   freeze, ask the user to leave it running and attach to it.** Beats every
+   source above when there is no crash log. `Get-Process` (one thread Running +
+   CPU climbing + memory FLAT = infinite loop) then `cdb.exe -pv -p <pid>`
+   (non-invasive) for `~* k` stacks, `u`, `dd`. Steam's `.text` is packed on
+   disk but DECRYPTED IN MEMORY, so the live process disassembles even though
+   the file does not — and its RVAs match the running build, which GOG/AE's do
+   not. Recipe and worked example: `project_refr_angle_normalize_hang`.
+9. Failing all the above, add comprehensive logging so the user's next run
    captures everything needed. Make it thorough — one wasted round trip costs the
    user a full build-and-play cycle, and their time is far more valuable than
    yours.
 
 Never attribute a bug to LE-vs-SSE mesh format differences — verify engine
 theories externally first.
+
+**A "CLEAN" audit is not an alibi** — if every check passes and the symptom is
+real, suspect a VALUE the engine chokes on, not a STRUCTURE it rejects.
 
 ### <a id="code-review"></a>🛑 Code review: RUN THE CLAIM, DON'T READ IT
 
@@ -291,6 +302,11 @@ real data, or a failing-then-passing test.
   whether they tested something, and never rebut a reported result with file
   timestamps or a reconstructed timeline. (Reading Papyrus logs to *diagnose* is
   encouraged — using them to dispute the user's report is not.)
+- **On a hang, ask EARLY for the game to be left running with the bug onscreen**
+  ("don't close it, I can attach to it") — it is nearly free for the user and
+  pins the exact faulting state. Asking is a request, not a question about the
+  fix, so it is not stopping: keep working while you wait. See
+  [the live game process](#attach-to-the-live-game).
 - **BUILD EVERY FILE YOUR CHANGES TOUCH, before reporting back.** The user should
   be able to launch the game and verify immediately — never leave them to work out
   which stage to re-run, and never hand back a change that only compiles in

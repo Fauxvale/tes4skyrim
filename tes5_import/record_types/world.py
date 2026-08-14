@@ -58,6 +58,50 @@ _DOOR_NAVMESH_LINK: dict = {}
 # banks, or None to skip generating them.  See set_cloud_bank_output.
 _CLOUD_BANK_ROOT = None
 
+# Above this magnitude, float32 `a -= 2*pi` no longer changes `a`, because
+# 2*pi has fallen below the ULP.  2**24 * 2*pi is already ~1e8 iterations.
+_ANGLE_STALL = (2 ** 24) * 2.0 * math.pi
+
+
+def _safe_angle(a: float) -> float:
+    r"""A rotation the engine's normalizer can actually terminate on.
+
+    Skyrim normalizes a placed reference's angles into [0, 2*pi) with an
+    uncapped float32 loop (SkyrimSE 1.6.1170 +0x2d8e43..+0x2d8e6f, recovered by
+    attaching to a live frozen process):
+
+        while (a <  0   ) a += 2*pi;    # +0x2d8e50
+        while (a >  2*pi) a -= 2*pi;    # +0x2d8e66
+
+    There is no iteration cap. Once |a| is large enough that `a -= 2*pi` is a
+    no-op under float32 rounding, the loop CANNOT EXIT: one core spins at 100%
+    forever, memory stays flat, nothing faults, so there is no CTD and no crash
+    log. That is a hard hang the moment the cell attaches.
+
+    TWMP_Valenwood_Elsweyr ships 2,610 such references (RotZ values like
+    7.0958e+28, 8.06e+34), all in south-west Valenwood -- the exact region that
+    freezes on approach. The values are in the ORIGINAL mod: `tes4_export` dumps
+    RotZ verbatim (record_types/world.py:128) and the export text carries
+    `RotZ=7.095834960709653e+28`. Oblivion's own normalizer tolerated them;
+    Skyrim's does not, so the conversion has to sanitize.
+
+    NaN/Inf are equally fatal: every comparison against NaN is false, so both
+    loops fall through and the unnormalized value is stored and propagated.
+
+    Reduced by fmod (exact, and independent of magnitude) rather than clamped,
+    so a merely-large-but-meaningful angle keeps its true orientation.
+    """
+    if a != a or a in (float('inf'), float('-inf')):
+        return 0.0
+    if abs(a) > _ANGLE_STALL:
+        a = math.fmod(a, 2.0 * math.pi)
+        # fmod of a huge float carries no real orientation information, and an
+        # f32 round-trip of the result can still land outside the range, so
+        # anything that survives as non-finite or still-large becomes 0.
+        if a != a or abs(a) > _ANGLE_STALL:
+            return 0.0
+    return a
+
 
 def set_cloud_bank_output(out_root):
     """Enable per-worldspace world-map cloud banks, written under `out_root`.
@@ -575,9 +619,9 @@ def convert_REFR(rec: dict) -> bytes:
         px = get_float(rec, 'XTEL.PosX')
         py = get_float(rec, 'XTEL.PosY')
         pz = get_float(rec, 'XTEL.PosZ')
-        rx = get_float(rec, 'XTEL.RotX')
-        ry = get_float(rec, 'XTEL.RotY')
-        rz = get_float(rec, 'XTEL.RotZ')
+        rx = _safe_angle(get_float(rec, 'XTEL.RotX'))
+        ry = _safe_angle(get_float(rec, 'XTEL.RotY'))
+        rz = _safe_angle(get_float(rec, 'XTEL.RotZ'))
         # TES5 XTEL is 32 bytes: Door(4) + Pos(12) + Rot(12) + Flags(4)
         # Flags: 0x0001 = No Alarm. Always 0 for converted doors.
         subs += pack_subrecord('XTEL', struct.pack('<IffffffI', xtel_door, px, py, pz, rx, ry, rz, 0))
@@ -671,9 +715,9 @@ def convert_REFR(rec: dict) -> bytes:
     px = get_float(rec, 'PosX')
     py = get_float(rec, 'PosY')
     pz = get_float(rec, 'PosZ')
-    rx = get_float(rec, 'RotX')
-    ry = get_float(rec, 'RotY')
-    rz = get_float(rec, 'RotZ')
+    rx = _safe_angle(get_float(rec, 'RotX'))
+    ry = _safe_angle(get_float(rec, 'RotY'))
+    rz = _safe_angle(get_float(rec, 'RotZ'))
 
     # Furniture origin compensation: marker-bearing models are re-origined
     # to the floor (+shift inside the NIF), so their placed references drop
@@ -744,9 +788,9 @@ def convert_ACHR(rec: dict) -> bytes:
     px = get_float(rec, 'PosX')
     py = get_float(rec, 'PosY')
     pz = get_float(rec, 'PosZ')
-    rx = get_float(rec, 'RotX')
-    ry = get_float(rec, 'RotY')
-    rz = get_float(rec, 'RotZ')
+    rx = _safe_angle(get_float(rec, 'RotX'))
+    ry = _safe_angle(get_float(rec, 'RotY'))
+    rz = _safe_angle(get_float(rec, 'RotZ'))
     subs += pack_subrecord('DATA', struct.pack('<ffffff', px, py, pz, rx, ry, rz))
 
     flags = get_int(rec, 'RecordFlags')

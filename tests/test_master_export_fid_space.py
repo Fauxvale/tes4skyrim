@@ -223,3 +223,69 @@ def test_shift_vmad_returns_unparsable_payload_untouched():
     junk = b'\x05\x00\x02\x00\x01\x00' + b'\xff' * 3      # truncated
     assert _shift_vmad(junk, {2: 3}) == junk
     assert _shift_vmad(b'', {2: 3}) == b''
+
+
+# ---------------------------------------------------------------------------
+# Skyrim normalizes a placed ref's angles with an UNCAPPED float32 loop
+# (SkyrimSE 1.6.1170 +0x2d8e43..+0x2d8e6f):
+#     while (a < 0)    a += 2*pi
+#     while (a > 2*pi) a -= 2*pi
+# Once `a -= 2*pi` is a no-op in float32 the loop never exits: one core spins
+# forever, memory flat, nothing faults, so there is no CTD and no crash log.
+# TWMP_Valenwood_Elsweyr shipped 2,610 such REFRs in south-west Valenwood.
+# ---------------------------------------------------------------------------
+
+import math
+
+
+def _f32_stalls(a):
+    """True if the engine's loop cannot make progress on this angle."""
+    if a != a or a in (float('inf'), float('-inf')):
+        return True
+    step = struct.unpack('<f', struct.pack('<f', 2.0 * math.pi))[0]
+    cur = struct.unpack('<f', struct.pack('<f', a))[0]
+    if cur > step:
+        return struct.unpack('<f', struct.pack('<f', cur - step))[0] == cur
+    if cur < 0.0:
+        return struct.unpack('<f', struct.pack('<f', cur + step))[0] == cur
+    return False
+
+
+def test_safe_angle_defuses_every_hanging_value():
+    from tes5_import.record_types.world import _safe_angle
+
+    # Real RotZ values measured in TWMP_Valenwood_Elsweyr.esp.
+    shipped = [7.095834960709653e+28, 8.06219e+34, 1.81787e+31, 4.92116e+30,
+               6.50309e+28, 7.21492e+22, 4.15833e+21, 2.64534e+20,
+               2.66517e+14, 3.62712e+12, 2.32282e+11, -4.31602e+08]
+    for a in shipped:
+        assert _f32_stalls(a), 'test value %g should hang the engine' % a
+        assert not _f32_stalls(_safe_angle(a)), \
+            '_safe_angle(%g) still hangs' % a
+
+
+def test_safe_angle_handles_nan_and_inf():
+    """NaN makes every comparison false, so the loop stores it unnormalized."""
+    from tes5_import.record_types.world import _safe_angle
+
+    assert _safe_angle(float('nan')) == 0.0
+    assert _safe_angle(float('inf')) == 0.0
+    assert _safe_angle(float('-inf')) == 0.0
+
+
+def test_safe_angle_leaves_ordinary_rotations_untouched():
+    """A legal angle must survive bit-exact -- this runs on every REFR."""
+    from tes5_import.record_types.world import _safe_angle
+
+    for a in (0.0, 1.5, -3.0, math.pi, 6.28, -0.007819279097020626, 1e7):
+        assert _safe_angle(a) == a
+
+
+def test_safe_angle_preserves_orientation_not_just_safety():
+    """Reduction is fmod, so the angle still points the same way."""
+    from tes5_import.record_types.world import _safe_angle
+
+    a = 3.62712e+12
+    out = _safe_angle(a)
+    assert not _f32_stalls(out)
+    assert abs(math.fmod(a, 2 * math.pi) - out) < 1e-6

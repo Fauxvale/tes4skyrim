@@ -155,11 +155,25 @@ def convert_speedtrees(source_file, extract_dir='export', output_dir='output'):
 
     spt_stats = {'spt_conversion': {'ok': 0, 'fail': 0, 'skip': 0}}
     spt_src = extract_dir / source_name / 'trees'
+    # A dependent plugin authors TREE records for art its MASTER ships, so the
+    # masters' trees/ dirs are searched for any .spt this export lacks. Read
+    # from the export header rather than a fixed list -- the chain differs per
+    # plugin (Valenwood: Oblivion, Tamriel, Anequina).
+    master_tree_dirs = []
+    header = extract_dir / source_name / '_HEADER.txt'
+    if header.is_file():
+        for line in open(header, encoding='utf-8', errors='replace'):
+            if line.startswith('Master['):
+                name = line.partition('=')[2].strip()
+                d = extract_dir / name / 'trees'
+                if d.is_dir():
+                    master_tree_dirs.append(d)
     if spt_src.exists():
         spt_dst = plugin_dir / 'meshes' / 'tes4' / 'speedtrees'
         # tree textures ship via the generic texture copy (textures/tes4/trees/)
         spt_stats['spt_conversion'] = spt_converter.convert_spt_directory(
-            spt_src, spt_dst, export_dir=extract_dir / source_name)
+            spt_src, spt_dst, export_dir=extract_dir / source_name,
+            master_tree_dirs=master_tree_dirs)
     else:
         print(f"  No trees/ directory found at {spt_src}")
 

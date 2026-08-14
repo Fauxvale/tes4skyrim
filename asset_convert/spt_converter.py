@@ -464,7 +464,8 @@ def _convert_job(args):
 
 def convert_spt_directory(src_dir: Path, dst_dir: Path,
                           export_dir: Path | None = None,
-                          workers: int | None = None) -> dict:
+                          workers: int | None = None,
+                          master_tree_dirs=None) -> dict:
     """Convert all .spt files under src_dir into NIFs in dst_dir.
 
     One NIF per TREE record (named <editorid>.nif, seeded and textured from
@@ -479,6 +480,8 @@ def convert_spt_directory(src_dir: Path, dst_dir: Path,
         dst_dir:    e.g. output/Oblivion.esm/meshes/tes4/speedtrees
         export_dir: dir containing TREE.txt and textures/ (default: src_dir parent)
         workers:    process count (default: cpu_count - 1)
+        master_tree_dirs: this plugin's masters' `trees/` dirs, searched for
+            .spt files its own TREE records name but its export does not ship.
     """
     src_dir = Path(src_dir)
     dst_dir = Path(dst_dir)
@@ -487,12 +490,42 @@ def convert_spt_directory(src_dir: Path, dst_dir: Path,
         workers = _WORKER_COUNT
 
     spt_files = sorted(src_dir.rglob('*.spt'))
+    manifest = load_tree_manifest(export_dir)
+
+    # A dependent plugin's TREE records name .spt files its MASTER ships -- the
+    # record is authored here, the art is not. Globbing only this plugin's
+    # trees/ leaves those records pointing at a NIF nobody writes.
+    #
+    # Measured 2026-08-12 on TWMP_Valenwood_Elsweyr: 4 TREE records name
+    # shrubelderberry / shrubboxwood / shrubvinemaplesu /
+    # shrubgenericbuckthornsu, all of which live in Oblivion.esm's trees/.
+    # They account for 21,877 placements concentrated in cells X -53..-12,
+    # Y -57..-4 -- so a whole region of forest had no mesh to draw.
+    # (CLAUDE.md "IF THE PLUGIN HAS MASTERS, SUSPECT MASTER-EXPORT BLINDNESS".)
+    have = {p.stem.lower() for p in spt_files}
+    borrowed = 0
+    for stem in sorted(set(manifest) - have):
+        for mdir in (master_tree_dirs or []):
+            cand = Path(mdir) / (stem + '.spt')
+            if cand.is_file():
+                spt_files.append(cand)
+                borrowed += 1
+                break
+    if borrowed:
+        print(f'  [SPT] {borrowed} .spt borrowed from master tree dir(s) for '
+              f'TREE records this plugin authors but does not ship art for')
+
     if not spt_files:
         print(f'  [SPT] No .spt files found in {src_dir}')
         return {'ok': 0, 'fail': 0, 'skip': 0}
 
-    manifest = load_tree_manifest(export_dir)
     tex_idx = _tex_index(export_dir / 'textures' / 'trees')
+    # A borrowed .spt's leaf texture lives in the master's tree textures too.
+    for mdir in (master_tree_dirs or []):
+        mtex = Path(mdir).parent / 'textures' / 'trees'
+        if mtex.is_dir():
+            for stem, sub in _tex_index(mtex).items():
+                tex_idx.setdefault(stem, sub)
 
     # jobs for the pool: pass everything by value so workers need no globals
     jobs = []

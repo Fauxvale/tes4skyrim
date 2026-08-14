@@ -18,6 +18,7 @@ Heights are in Skyrim units (1 unit ≈ 1.4 cm).  Cell size = 4096 units.
 
 import io
 import math
+import mmap
 import os
 import struct
 import sys
@@ -165,84 +166,114 @@ def _find_worldspace_fid(raw: bytes, n: int, edid: str):
 
 
 def detect_terrain_worldspaces(esm_path: Path, include_children: bool = False):
-    """Rank ROOT worldspaces in an ESM by how many LAND records they own.
+    """ROOT worldspaces in an ESM, largest first.
 
     Filenames don't tell us the worldspace EditorID (Oblivion.esm's worldspace
-    is 'TES4Tamriel'; Nehrim.esm's is 'NehrimWorldspace', not 'Nehrim'), and a
-    plugin may hold dozens of worldspaces of which only a few carry terrain.
+    is 'TES4Tamriel'; Nehrim.esm's is 'NehrimWorldspace', not 'Nehrim'), so the
+    WRLD records have to be read.
 
     Child worldspaces (those with a WNAM 'Parent Worldspace') render using their
     parent's terrain LOD grid — e.g. AnvilWorld/BravilWorld sit inside the
-    Tamriel LOD even though they carry a handful of overlay LAND records of their
-    own. Generating separate LOD for them is wrong, so by default they are
-    excluded (their LAND is not rolled into the parent either; only the parent's
-    own terrain gets LOD). Pass include_children=True to list every LAND owner.
+    Tamriel LOD — so generating separate LOD for them is wrong and they are
+    excluded by default. Pass include_children=True to list every worldspace.
 
-    Scans the group hierarchy and returns
-        [(land_count, wrld_fid, edid), ...]  sorted most-terrain-first.
+    Reads ONLY the top-level WRLD block: the WRLD records themselves and the
+    size of each one's child group. It deliberately does NOT walk into cell
+    children to count LAND records. That count was pure ranking information,
+    and paying for it meant stepping through 1.17 MILLION records in Python —
+    0.42s for Oblivion.esm and ~1.6s across a load order, which is a visible
+    UI stall. A worldspace with no terrain simply produces no tiles, so there
+    was never anything to gate on. Reading the headers alone is ~0.001s.
+
+    Returns [(size_hint, wrld_fid, edid), ...] sorted largest-first, where
+    size_hint is the byte size of the worldspace's child group — a monotonic
+    stand-in for "how much is in it", used only for display order.
     """
-    raw = esm_path.read_bytes()
-    n   = len(raw)
+    fh = open(esm_path, 'rb')
+    try:
+        try:
+            raw = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        except (ValueError, OSError):
+            raw = fh.read()      # empty file, or a filesystem that won't map
+        try:
+            return _scan_wrld_block(raw, include_children)
+        finally:
+            if isinstance(raw, mmap.mmap):
+                raw.close()
+    finally:
+        fh.close()
+
+
+def _scan_wrld_block(raw, include_children: bool):
+    """The WRLD-block reader behind `detect_terrain_worldspaces`."""
+    n = len(raw)
+    if n < 24:
+        return []
 
     edid_by_fid   = {}     # wrld_fid -> EditorID
     parent_by_fid = {}     # wrld_fid -> parent WRLD FormID (WNAM), 0 = root
-    land_by_wrld  = {}     # wrld_fid -> LAND count
+    size_by_fid   = {}     # wrld_fid -> byte size of its child group
 
-    def _sub(body, tag):
-        tag4 = tag.encode()
+    def _sub(body, tag4):
         p = 0
         while p + 6 <= len(body):
-            s = body[p:p+4]
             sz = struct.unpack_from('<H', body, p+4)[0]
-            if s == tag4:
+            if body[p:p+4] == tag4:
                 return body[p+6:p+6+sz]
             p += 6 + sz
         return None
 
-    def scan(start, end, cur_wrld_fid):
-        p = start
-        while p < end and p < n:
-            if p + 4 > n:
-                break
-            if raw[p:p+4] == b'GRUP':
-                if p + 24 > n:
+    # Top-level groups are laid out end to end after the file header; only the
+    # one labelled 'WRLD' holds worldspaces, and every WRLD record in the file
+    # is inside it.
+    p = 24 + struct.unpack_from('<I', raw, 4)[0]
+    while p + 24 <= n:
+        if raw[p:p+4] != b'GRUP':
+            break
+        g_size = struct.unpack_from('<I', raw, p+4)[0]
+        if g_size < 24:
+            break                                  # malformed; don't spin
+        if raw[p+8:p+12] != b'WRLD':
+            p += g_size
+            continue
+
+        q, cur = p + 24, None
+        while q + 24 <= n and q < p + g_size:
+            if raw[q:q+4] == b'GRUP':
+                g2 = struct.unpack_from('<I', raw, q+4)[0]
+                if g2 < 24:
                     break
-                g_size  = struct.unpack_from('<I', raw, p+4)[0]
-                g_type  = struct.unpack_from('<I', raw, p+12)[0]
-                g_label = raw[p+8:p+12]
-                next_wrld = cur_wrld_fid
-                if g_type == 1:      # world children: label = parent WRLD FormID
-                    next_wrld = struct.unpack_from('<I', g_label)[0]
-                scan(p+24, p+g_size, next_wrld)
-                p += g_size
+                # A type-1 group is this worldspace's children; its label is
+                # the owning WRLD FormID, so it attributes even when a file
+                # interleaves records and groups unexpectedly.
+                if struct.unpack_from('<I', raw, q+12)[0] == 1:
+                    owner = struct.unpack_from('<I', raw, q+8)[0] or cur
+                    if owner is not None:
+                        size_by_fid[owner] = size_by_fid.get(owner, 0) + g2
+                q += g2
             else:
-                if p + 24 > n:
-                    break
-                sig  = raw[p:p+4]
-                size = struct.unpack_from('<I', raw, p+4)[0]
-                fid  = struct.unpack_from('<I', raw, p+12)[0]
-                if sig == b'WRLD':
-                    body = raw[p+24:p+24+size]
-                    edid = _sub(body, 'EDID')
+                size = struct.unpack_from('<I', raw, q+4)[0]
+                fid  = struct.unpack_from('<I', raw, q+12)[0]
+                if raw[q:q+4] == b'WRLD':
+                    body = raw[q+24:q+24+size]
+                    edid = _sub(body, b'EDID')
                     if edid:
                         edid_by_fid[fid] = edid.rstrip(b'\x00').decode(
                             'latin-1', errors='replace')
-                    wnam = _sub(body, 'WNAM')
+                    wnam = _sub(body, b'WNAM')
                     if wnam and len(wnam) >= 4:
                         parent_by_fid[fid] = struct.unpack_from('<I', wnam)[0]
-                elif sig == b'LAND' and cur_wrld_fid:
-                    land_by_wrld[cur_wrld_fid] = land_by_wrld.get(cur_wrld_fid, 0) + 1
-                p += 24 + size
-
-    hdr_size = struct.unpack_from('<I', raw, 4)[0]
-    scan(24 + hdr_size, n, 0)
+                    cur = fid
+                q += 24 + size
+        break
 
     ranked = []
-    for fid, cnt in land_by_wrld.items():
+    for fid in edid_by_fid:
         parent = parent_by_fid.get(fid, 0)
         if parent and not include_children:
-            continue   # child worldspace → uses the parent's LOD grid
-        ranked.append((cnt, fid, edid_by_fid.get(fid, f'{fid:08X}')))
+            continue   # child worldspace -> uses the parent's LOD grid
+        ranked.append((size_by_fid.get(fid, 0), fid,
+                       edid_by_fid.get(fid, f'{fid:08X}')))
     ranked.sort(key=lambda t: (-t[0], t[2].lower()))
     return ranked
 
@@ -397,6 +428,70 @@ def _scan_cell_coords(esm_path: Path, coords: dict):
                         break
                     o += 6 + sz
             p += 24 + size
+
+
+def lod_capable_worldspaces(export_dir: Path, out_root: Path = None):
+    """Every worldspace a plugin should get distant LOD for.
+
+    Shipped LOD assets are NOT the authority, and treating them as one was the
+    original defect: only Bethesda baked LOD offline. A third-party landmass
+    mod ships none — there is nothing to extract, and never will be — so a
+    shipped-asset scan reported zero worldspaces for exactly the plugins that
+    most need LOD generated (ElsweyrAnequina.esp, Tamriel.esp and
+    TWMP_Valenwood_Elsweyr.esp all scanned as "ships no LOD" and silently
+    contributed nothing, in the dialog AND in the bake).
+
+    The authority is the CONVERTED ESM's WRLD records. Which worldspaces
+    deserve LOD is already decided by `detect_terrain_worldspaces`, which
+    excludes CHILD worldspaces (a WNAM parent means it renders on the parent's
+    LOD grid). That is the discriminator; do not add a second one. A worldspace
+    with nothing in it simply bakes no tiles, so gating on content buys
+    nothing — and gating on the WRLD "Small World" flag is actively wrong, as
+    mod authors set it inconsistently and it drops real landmasses (Nehrim's
+    Arktwend, ElsweyrAnequina's ANQVerkarthHillsWorld).
+
+    Returns (worldspaces, reason); `reason` is None unless nothing qualified.
+    """
+    export_dir = Path(export_dir)
+    name = export_dir.name
+
+    shipped = []
+    if export_dir.is_dir():
+        try:
+            shipped = shipped_lod_worldspaces(export_dir) or []
+        except Exception:
+            shipped = []
+
+    # Worldspaces defined in the converted output. This is what makes
+    # mod-added landmasses visible to the dialog and to the bake.
+    generated = []
+    if out_root is not None:
+        esm = Path(out_root) / name / name
+        if esm.is_file():
+            try:
+                generated = [(edid, fid)
+                             for _sz, fid, edid in detect_terrain_worldspaces(esm)]
+            except Exception:
+                generated = []
+
+    # Shipped first (Bethesda's own ranking by tile count), then anything with
+    # terrain the source never baked. De-duplicated on EDID, since a plugin can
+    # both ship LOD for a worldspace and add terrain to it.
+    out, seen = [], set()
+    for edid, fid in list(shipped) + generated:
+        if edid not in seen:
+            seen.add(edid)
+            out.append((edid, fid))
+
+    if out:
+        return out, None
+    if not export_dir.is_dir():
+        return [], (f"{name}: not exported yet — run the Export stage "
+                    f"(convert.py -f {name} --export-only).")
+    if out_root is not None and not (Path(out_root) / name / name).is_file():
+        return [], (f"{name}: not converted yet — run the Import stage "
+                    f"(convert.py -f {name} --import-only).")
+    return [], f"{name}: defines no worldspace, so there is no LOD to bake."
 
 
 def shipped_lod_worldspaces(export_dir: Path):

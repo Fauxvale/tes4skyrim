@@ -69,7 +69,7 @@ def main() -> int:
                                        _textures_root as _lod_textures_root)
     from asset_convert.terrain_lod import generate_terrain_lod
     from asset_convert.sibling_lod import (converted_plugins, create_lod_order,
-                                           lod_worldspaces, worldspace_owner,
+                                           lod_worldspaces, owner_map,
                                            merge_cloud_bank, _master_chain,
                                            touched_worldspace_fids,
                                            LOD_DIR_NAME)
@@ -110,7 +110,7 @@ def main() -> int:
         print(f"    {i}. {name}{win}")
 
     wanted = (list(args.worldspaces) if args.worldspaces
-              else lod_worldspaces(plugins, export_root))
+              else lod_worldspaces(plugins, export_root, out_root))
     print(f"  Worldspaces ({len(wanted)}): {', '.join(wanted) or '(none)'}")
     print()
 
@@ -161,11 +161,16 @@ def main() -> int:
         else:
             touched[name] = None
 
+    # Every worldspace's owner in ONE pass over the load order, rather than
+    # `worldspace_owner` per worldspace re-listing every plugin each time.
+    owners = owner_map(wanted, plugins, export_root, out_root)
+
     jobs = []
     for edid in wanted:
-        owner = worldspace_owner(edid, plugins, export_root)
+        owner = owners.get(edid)
         if owner is None:
-            print(f"  '{edid}': no selected plugin ships LOD for it; skipping")
+            print(f"  '{edid}': no selected plugin supplies terrain for it; "
+                  f"skipping")
             continue
         owner_esm = out_root / owner / owner
         if not owner_esm.is_file():

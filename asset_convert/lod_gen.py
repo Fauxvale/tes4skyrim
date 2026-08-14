@@ -609,12 +609,17 @@ _NIF_ROOT_SAFE_CACHE = {}
 _MISSING = object()
 
 
-def _lod_mesh_is_safe(path: str, output_meshes_dir: Path) -> bool:
-    """False if this mesh's root block would crash LODGen's NiNode cast."""
+def _mesh_screen_path(path: str, output_meshes_dir: Path) -> Path:
+    """Absolute path `_lod_mesh_is_safe` screens for a listed model path."""
     rel = path.lower().replace('/', '\\').lstrip('\\')
     if rel.startswith('meshes\\'):
         rel = rel[len('meshes\\'):]
-    full = _win_join(output_meshes_dir, rel)
+    return _win_join(output_meshes_dir, rel)
+
+
+def _lod_mesh_is_safe(path: str, output_meshes_dir: Path) -> bool:
+    """False if this mesh's root block would crash LODGen's NiNode cast."""
+    full = _mesh_screen_path(path, output_meshes_dir)
     key = str(full).lower()
     cached = _NIF_ROOT_SAFE_CACHE.get(key)
     if cached is not None:
@@ -623,6 +628,89 @@ def _lod_mesh_is_safe(path: str, output_meshes_dir: Path) -> bool:
     safe = _root_is_ninode(full)
     _NIF_ROOT_SAFE_CACHE[key] = safe
     return safe
+
+
+def _screenable_mesh_paths(refs, stats, cell_wrld, wrld_fid, keep_cells):
+    """Unique mesh paths the LODGen-input loop will screen, for prefetching.
+
+    Mirrors that loop's filters (worldspace, kept-tile footprint, LOD flags) so
+    the prefetch reads the same files and nothing more. Emits the FULL model
+    plus its `_far.nif` tier paths — `_lod_meshes_for` also stages master
+    meshes as a side effect, so it must not be called here; a tier path that
+    turns out not to be used simply resolves to a missing file, which
+    `_root_is_ninode` already handles.
+    """
+    from .lod_far_gen import _tier_path, _TIER8, _TIER16
+    out = []
+    seen_base = set()
+    for ref in refs:
+        if ref['parent_wrld'] != wrld_fid:
+            if cell_wrld.get(ref['parent_cell'], 0) != wrld_fid:
+                continue
+        if keep_cells is not None:
+            if (int(math.floor(ref['x'] / 4096.0)),
+                    int(math.floor(ref['y'] / 4096.0))) not in keep_cells:
+                continue
+        base_fid = ref['base_fid']
+        if base_fid in seen_base:
+            continue
+        seen_base.add(base_fid)
+        stat = stats.get(base_fid)
+        if not stat:
+            continue
+        model = stat.get('model', '')
+        if not model:
+            continue
+        if not (stat.get('flags', 0) & (_FLAG_DISTANT_LOD | _FLAG_WORLD_MAP)):
+            continue
+        out.append(model)
+        for explicit in ('lod4', 'lod8', 'lod16'):
+            if stat.get(explicit):
+                out.append(stat[explicit])
+        if not (stat.get('lod4') or stat.get('lod8') or stat.get('lod16')):
+            far = _far_nif_path(model)
+            out.append(far)
+            out.append(str(_tier_path(Path(far), _TIER8['suffix'])))
+            out.append(str(_tier_path(Path(far), _TIER16['suffix'])))
+    return out
+
+
+def _prescreen_meshes(paths, output_meshes_dir: Path, workers: int = 16):
+    """Warm `_NIF_ROOT_SAFE_CACHE` for `paths` using parallel header reads.
+
+    Screening is a ~200-byte header read per unique mesh, so the cost is
+    entirely file-open LATENCY, not CPU: profiling Tamriel's `write_lodgen_input`
+    showed 13.5 s of which 11.5 s was `_io.open` across 2,582 serial opens
+    (~4.4 ms each) while every core sat idle. Issuing them concurrently
+    overlaps that latency.
+
+    THREADS, not processes: this is pure I/O plus a tiny parse, the results must
+    land in this process's cache, and a pool would pay spawn cost per worldspace
+    to move ~200-byte payloads.
+
+    Purely a warm-up — every entry is computed by the same `_root_is_ninode`
+    the serial path uses, and any mesh missed here is simply screened on demand
+    later. Order-independent, so it cannot affect FormIDs or output bytes.
+    """
+    todo = []
+    seen = set()
+    for p in paths:
+        if not p:
+            continue
+        full = _mesh_screen_path(p, output_meshes_dir)
+        key = str(full).lower()
+        if key in _NIF_ROOT_SAFE_CACHE or key in seen:
+            continue
+        seen.add(key)
+        todo.append((key, full))
+    if len(todo) < 2:
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    n = max(1, min(workers, len(todo)))
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        for (key, _full), safe in zip(
+                todo, ex.map(lambda t: _root_is_ninode(t[1]), todo)):
+            _NIF_ROOT_SAFE_CACHE[key] = safe
 
 
 # Block types LODGen can safely cast to NiNode (NiNode and its subclasses as
@@ -1077,6 +1165,18 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
     # screening its meshes fully parses them. Doing that per REFERENCE instead
     # of per base is what made this loop appear to hang.
     base_cache = {}
+
+    # Warm the mesh-safety cache concurrently before the serial loop below.
+    # The loop screens each unique base's meshes with a header read, and those
+    # reads are latency-bound: 11.5 s of Tamriel's 13.5 s here was `_io.open`
+    # alone, serialised one mesh at a time. Only the paths that are certain to
+    # be screened are prefetched (the model plus its _far.nif tiers, derived
+    # with the same helpers the loop uses); anything else still resolves
+    # on demand, so this can only remove work, never change which meshes are
+    # judged safe.
+    _prescreen_meshes(_screenable_mesh_paths(refs, stats, cell_wrld, wrld_fid,
+                                             keep_cells),
+                      output_meshes_dir)
 
     for ref in refs:
         # Must be in our worldspace
