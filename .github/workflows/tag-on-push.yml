@@ -156,3 +156,32 @@ jobs:
             --latest
 
           echo "Created release \`$TAG\`." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Announce the release on Discord
+        # Only for CODE releases.  The navmesh cache publishes its own
+        # `navmesh-cache-*` releases, but it does so from
+        # tools/navmesh_cache.py on a developer machine (the pre-push hook, or
+        # `navmesh_cache_hook.py --run`) -- never from a workflow.  Nothing in
+        # this job runs for a cache publish, so no tag-name filter is needed
+        # here: the separation is structural, not a rule that could drift.
+        #
+        # Never fails the job.  The tag and the Release already exist by this
+        # point and are what actually matter; a Discord outage must not paint
+        # a successful release red, and re-running the job would only hit the
+        # "HEAD is already tagged" guard and skip everything anyway.
+        continue-on-error: true
+        if: steps.tag.outputs.created != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TAG: ${{ steps.tag.outputs.created }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
+            echo "DISCORD_WEBHOOK_URL is not set -- skipping the announcement."
+            exit 0
+          fi
+          python tools/discord_release_notify.py \
+            --notes "$RUNNER_TEMP/release-body.txt" \
+            --tag "$TAG" \
+            --repo "$REPO"
