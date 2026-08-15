@@ -271,8 +271,15 @@ def _make_root():
 
     tkinterdnd2 works by subclassing Tk and loading the tkdnd Tcl package, so
     it has to be chosen HERE, at root creation, rather than bolted on later.
+
+    The fallback imports tkinter LOCALLY. `tk` is bound inside gui_main(), not
+    at module scope, so reaching for a bare `tk.Tk()` here raised NameError on
+    every machine without tkinterdnd2 -- and because main() relaunches under
+    pythonw, that traceback had no console to print to and the window simply
+    never appeared. Anyone with the package installed (the author) never saw it.
     """
     global DND_AVAILABLE
+    import tkinter
     try:
         from tkinterdnd2 import TkinterDnD
         root = TkinterDnD.Tk()
@@ -280,7 +287,7 @@ def _make_root():
         return root
     except Exception:
         # Missing package, or a tkdnd that failed to load on this platform.
-        return tk.Tk()
+        return tkinter.Tk()
 
 
 def parse_dropped_paths(data: str) -> list:
