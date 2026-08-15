@@ -621,6 +621,192 @@ Json CmdHookStats(const Json&) {
     return Ok(std::move(r));
 }
 
+// ------------------------------------------------------- clean-room tests ----
+//
+// These back tools/quest_labtest.py: move to an empty cell, bring the actors
+// under test in, run one thing, put everything back. See
+// docs/ingame_test_methodology.md.
+//
+// Everything here is composed from the engine's OWN console commands rather
+// than from a reconstructed TESObjectREFR layout. That is deliberate and is the
+// same reasoning as `prid`-based selection: a wrong struct offset does not fail
+// loudly, it corrupts memory or reads garbage, and the resulting symptoms are
+// indistinguishable from a conversion bug -- the single most expensive failure
+// this tool can produce, because it sends both sides hunting ghosts in the data.
+
+// Spawns tracked copies of a base form.
+//
+// `placeatme` does NOT report the reference it created -- not through its
+// return value and not through console output (verified against the command
+// tables and UESP). So the created ref is identified by DIFFING the cell's
+// contents: the caller spawns into the empty test cell, and the new reference
+// is whatever `moveto`-able ref of that base did not exist a moment ago.
+//
+// The honest limitation, reported rather than hidden: without a reference
+// enumerator we cannot name the new ref from inside the engine, so `refs` is
+// empty and `tracked` is false unless the client supplies the id it observed.
+// `cleanup` then falls back to the client's own list. This is why the Python
+// side records what it spawned instead of trusting us to.
+Json CmdSpawn(const Json& args) {
+    const Json& f = args["form_id"];
+    const std::uint32_t base = f.isNumber() ? f.asU32() : ResolveFormRef(f.asString());
+    if (!base) return Err("E_NOT_FOUND", "could not resolve 'form_id'");
+
+    int count = args.has("count") ? args["count"].asInt(1) : 1;
+    if (count < 1) count = 1;
+
+    {
+        std::lock_guard<std::mutex> lk(g_sessionMutex);
+        if (static_cast<int>(g_spawned.size()) + count > g_spawnCap)
+            return Err("E_GUARDED",
+                       "spawn cap reached; call cleanup before spawning more");
+    }
+
+    return OnMainThread([&]() -> Json {
+        char cmd[96];
+        std::snprintf(cmd, sizeof(cmd), "player.placeatme %08X %d", base, count);
+        ConsoleResult cr = RunConsoleCommand(cmd, 0);
+        if (!cr.ok)
+            return Err("E_INTERNAL", cr.error.empty() ? "placeatme failed" : cr.error);
+
+        Json r = Json::Object();
+        r.set("base", Json(static_cast<double>(base)));
+        r.set("count", Json(count));
+        r.set("output", Json(cr.output));
+        // No enumerator: say so instead of implying the spawn is tracked.
+        r.set("refs", Json::Array());
+        r.set("tracked", Json(false));
+        r.set("note", Json("placeatme does not report the created reference; "
+                           "record it client-side (or disable/markfordelete by "
+                           "selection) so cleanup can remove it"));
+        return Ok(std::move(r));
+    }, 15000);
+}
+
+// Removes references this session created.
+//
+// Takes an explicit `refs` list because the engine side cannot discover what
+// `placeatme` made (see CmdSpawn). Each is disabled and marked for delete --
+// the pair the engine itself uses; `markfordelete` alone leaves the 3D loaded
+// until the cell resets.
+Json CmdCleanup(const Json& args) {
+    std::vector<std::uint32_t> refs;
+    const Json& list = args["refs"];
+    if (list.isArray()) {
+        for (size_t i = 0; i < list.size(); ++i) {
+            const Json& v = list.at(i);
+            const std::uint32_t id = v.isNumber() ? v.asU32()
+                                                  : ResolveFormRef(v.asString());
+            if (id) refs.push_back(id);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_sessionMutex);
+        for (auto id : g_spawned) refs.push_back(id);
+    }
+    if (refs.empty()) {
+        Json r = Json::Object();
+        r.set("removed", Json(0));
+        r.set("note", Json("nothing tracked; pass 'refs' to remove explicitly"));
+        return Ok(std::move(r));
+    }
+
+    return OnMainThread([&]() -> Json {
+        int removed = 0, failed = 0;
+        for (auto id : refs) {
+            ConsoleResult a = RunConsoleCommand("disable", id);
+            ConsoleResult b = RunConsoleCommand("markfordelete", id);
+            if (a.ok && b.ok) ++removed; else ++failed;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_sessionMutex);
+            g_spawned.clear();
+        }
+        Json r = Json::Object();
+        r.set("removed", Json(removed));
+        r.set("failed", Json(failed));
+        return Ok(std::move(r));
+    }, 20000);
+}
+
+// Moves a reference to the player (into the test cell) or back to a position.
+//
+// The point of doing this engine-side rather than as two console calls is that
+// the read of the CURRENT position and the move happen in ONE main-thread trip,
+// so the game cannot advance between them. A position captured a frame before
+// the move is not the position the ref was actually at when it moved -- and
+// that difference is exactly what makes `restore` a guess instead of an undo.
+Json CmdMoveRef(const Json& args) {
+    const Json& f = args["ref"];
+    const std::uint32_t ref = f.isNumber() ? f.asU32() : ResolveFormRef(f.asString());
+    if (!ref) return Err("E_NOT_FOUND", "could not resolve 'ref'");
+
+    const bool toPlayer = !args.has("x");
+
+    return OnMainThread([&]() -> Json {
+        Json before = Json::Object();
+        const char* axes[3] = {"x", "y", "z"};
+        for (int i = 0; i < 3; ++i) {
+            char q[32];
+            std::snprintf(q, sizeof(q), "getpos %s", axes[i]);
+            ConsoleResult cr = RunConsoleCommand(q, ref);
+            before.set(axes[i], Json(cr.output));
+        }
+
+        bool ok = true;
+        if (toPlayer) {
+            ConsoleResult cr = RunConsoleCommand("moveto player", ref);
+            ok = cr.ok;
+        } else {
+            for (int i = 0; i < 3; ++i) {
+                if (!args.has(axes[i])) continue;
+                char c[64];
+                std::snprintf(c, sizeof(c), "setpos %s %s", axes[i],
+                              args[axes[i]].asString().c_str());
+                if (!RunConsoleCommand(c, ref).ok) ok = false;
+            }
+        }
+
+        Json r = Json::Object();
+        r.set("ref", Json(static_cast<double>(ref)));
+        r.set("moved_to_player", Json(toPlayer));
+        r.set("before", std::move(before));
+        r.set("ok", Json(ok));
+        return Ok(std::move(r));
+    }, 15000);
+}
+
+// Blocks until the game answers again after a load screen.
+//
+// `coc` starts a load, and every command issued during it fails with E_LOADING.
+// Polling a cheap read-only command is the honest test: there is no verified UI
+// singleton to read a loading flag from, and a guessed pointer would report
+// plausible garbage.
+Json CmdWaitReady(const Json& args) {
+    const int timeoutMs = args.has("timeout_ms") ? args["timeout_ms"].asInt(20000)
+                                                 : 20000;
+    const DWORD start = GetTickCount();
+    while (static_cast<int>(GetTickCount() - start) < timeoutMs) {
+        Json probe = OnMainThread([&]() -> Json {
+            ConsoleResult cr = RunConsoleCommand("player.getav health", 0);
+            Json r = Json::Object();
+            r.set("output", Json(cr.output));
+            return Ok(std::move(r));
+        }, 2000);
+        if (probe.has("result") && !probe["result"]["output"].asString().empty()) {
+            Json r = Json::Object();
+            r.set("ready", Json(true));
+            r.set("waited_ms", Json(static_cast<double>(GetTickCount() - start)));
+            return Ok(std::move(r));
+        }
+        Sleep(500);
+    }
+    Json r = Json::Object();
+    r.set("ready", Json(false));
+    r.set("waited_ms", Json(static_cast<double>(GetTickCount() - start)));
+    return Ok(std::move(r));
+}
+
 Json CmdStatus(const Json&) {
     if (!IsGameLoaded()) {
         Json r = Json::Object();
@@ -684,7 +870,14 @@ std::string HandleRequest(const std::string& line) {
     else if (cmd == "hookstats")    resp = CmdHookStats(args);
     else if (cmd == "console_log")  resp = CmdConsoleLog(args);
     else if (cmd == "status")       resp = CmdStatus(args);
-    else resp = Err("E_UNSUPPORTED", "unknown command: " + cmd);
+    else if (cmd == "spawn")        resp = CmdSpawn(args);
+    else if (cmd == "cleanup")      resp = CmdCleanup(args);
+    else if (cmd == "moveref")      resp = CmdMoveRef(args);
+    else if (cmd == "wait_ready")   resp = CmdWaitReady(args);
+    // Distinct from E_UNSUPPORTED (a command this runtime cannot resolve):
+    // this plugin build simply does not have the command, so a newer client can
+    // fall back to a console-based path instead of reporting a hard failure.
+    else resp = Err("E_UNKNOWN_CMD", "unknown command: " + cmd);
 
     if (req.has("id")) resp.set("id", req["id"]);
     resp.set("elapsed_ms", Json(static_cast<int>(GetTickCount() - t0)));

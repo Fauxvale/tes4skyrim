@@ -41,7 +41,7 @@ Later Issues:
 	
 	2 - Refine weathers further. They still feel a bit off. Need exact values to tweak
 
-	3 - Allow running process on zip (mod)
+	3 - Ajust zip step to pack loose files if bsas are out of date or not generated
 
 	4 - Fix walking up stairs
 

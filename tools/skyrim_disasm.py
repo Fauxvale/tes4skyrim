@@ -25,8 +25,20 @@ Usage:
     # follow calls/jumps found while disassembling
     python tools/skyrim_disasm.py --disasm 0x1234567 --count 200 --show-targets
 
+    # the SAME analysis against the RUNNING game (--live)
+    python tools/skyrim_disasm.py --live --find TopicInfo
+    python tools/skyrim_disasm.py --live --vtable MenuTopicManager
+
 Default exe path is auto-detected from the registry-installed SSE, override with
 --exe.
+
+🛑 THE STEAM EXE ON DISK IS DRM-PACKED — its `.text` is encrypted (entropy 8.00)
+and static analysis of it yields garbage.  The GOG/AE copy disassembles
+statically, but its RVAs do NOT match the build being played.  `--live` solves
+both: the running process has `.text` DECRYPTED in memory, and its RVAs are by
+construction the ones the running build uses, so an address found here can be
+handed straight to the bridge (`hook`, `call`, `resolve`).  Prefer `--live`
+whenever the game is up.
 """
 
 import argparse
@@ -173,6 +185,132 @@ class Binary:
         return list(self.md.disasm(code, self.base + rva))[:count]
 
 
+class LiveBinary(Binary):
+    """`Binary`'s analysis surface, backed by the RUNNING process.
+
+    The Steam build on disk is DRM-packed: its `.text` is encrypted, so every
+    RTTI/vtable answer read from the file is garbage.  The loader decrypts it
+    in memory, so the live process is both READABLE and — unlike the GOG copy —
+    at the RVAs the running build actually uses.  That means an address found
+    here can be handed straight to the bridge with no translation.
+
+    The image is materialised ONCE into a flat, RVA-indexed buffer (offset ==
+    RVA, so `rva_to_off`/`off_to_rva` are the identity).  Every inherited
+    method reads `self.data`, so all of `Binary`'s RTTI and vtable logic works
+    verbatim.  Regions that are not committed read back as zeros rather than
+    failing the whole dump — a scan must not die because one page is unmapped.
+
+    Read via ReadProcessMemory, NOT through the bridge's `readmem`: that caps
+    at 4 KB per request, and a 30 MB image would be ~8,000 pipe round trips.
+    """
+
+    PROCESS_VM_READ = 0x0010
+    PROCESS_QUERY_INFORMATION = 0x0400
+
+    def __init__(self, pid: int = 0, chunk: int = 1 << 20):
+        import ctypes
+        from ctypes import wintypes
+        self._ct = ctypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        self._k32 = k32
+        pid = pid or self._find_pid()
+        self.pid = pid
+        h = k32.OpenProcess(self.PROCESS_VM_READ | self.PROCESS_QUERY_INFORMATION,
+                            False, pid)
+        if not h:
+            raise SystemExit(f'OpenProcess({pid}) failed: '
+                             f'{ctypes.get_last_error()} (run as the same user)')
+        self._h = h
+        self.base, size = self._module_range()
+        self.path = f'<live pid {pid}>'
+        self.data = self._dump(self.base, size, chunk)
+        # offset == rva for a virtual image
+        self._sections = [(0, len(self.data), 0, '.live')]
+        self.md = Cs(CS_ARCH_X86, CS_MODE_64)
+        self.md.detail = True
+
+    @staticmethod
+    def _find_pid() -> int:
+        import subprocess
+        out = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             "(Get-Process -Name SkyrimSE -ErrorAction SilentlyContinue |"
+             " Select-Object -First 1).Id"],
+            capture_output=True, text=True).stdout.strip()
+        if not out.isdigit():
+            raise SystemExit('SkyrimSE is not running (needed for --live)')
+        return int(out)
+
+    def _module_range(self):
+        """(base, size) of the SkyrimSE.exe image in the target."""
+        ctypes = self._ct
+        from ctypes import wintypes
+        psapi = ctypes.WinDLL('psapi', use_last_error=True)
+
+        class MODULEINFO(ctypes.Structure):
+            _fields_ = [('lpBaseOfDll', ctypes.c_void_p),
+                        ('SizeOfImage', wintypes.DWORD),
+                        ('EntryPoint', ctypes.c_void_p)]
+
+        # Explicit argtypes: without them ctypes narrows the 64-bit HMODULE to
+        # an int and OverflowErrors on a high image base.
+        psapi.EnumProcessModules.argtypes = [wintypes.HANDLE,
+                                             ctypes.POINTER(ctypes.c_void_p),
+                                             wintypes.DWORD,
+                                             ctypes.POINTER(wintypes.DWORD)]
+        psapi.GetModuleInformation.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
+                                               ctypes.c_void_p, wintypes.DWORD]
+        mods = (ctypes.c_void_p * 1024)()
+        needed = wintypes.DWORD()
+        if not psapi.EnumProcessModules(self._h, mods,
+                                        ctypes.sizeof(mods),
+                                        ctypes.byref(needed)):
+            raise SystemExit('EnumProcessModules failed')
+        # Module 0 is always the executable image itself.
+        mi = MODULEINFO()
+        if not psapi.GetModuleInformation(self._h, mods[0], ctypes.byref(mi),
+                                          ctypes.sizeof(mi)):
+            raise SystemExit('GetModuleInformation failed')
+        return int(mi.lpBaseOfDll), int(mi.SizeOfImage)
+
+    def _dump(self, base: int, size: int, chunk: int) -> bytes:
+        ctypes = self._ct
+        buf = ctypes.create_string_buffer(chunk)
+        read = ctypes.c_size_t(0)
+        out = bytearray()
+        addr = base
+        end = base + size
+        while addr < end:
+            n = min(chunk, end - addr)
+            ok = self._k32.ReadProcessMemory(
+                self._h, ctypes.c_void_p(addr), buf, n, ctypes.byref(read))
+            if ok and read.value:
+                out += buf.raw[:read.value]
+                if read.value < n:          # partial: pad the hole
+                    out += b'\0' * (n - read.value)
+            else:
+                # Uncommitted / guarded region -- zero-fill and keep going, or
+                # one bad page would cost the entire scan.
+                out += b'\0' * n
+            addr += n
+        return bytes(out)
+
+    def __del__(self):
+        try:
+            if getattr(self, '_h', None):
+                self._k32.CloseHandle(self._h)
+        except Exception:
+            pass
+
+    # -- address conversion (offset == rva for a virtual image) -------------
+
+    def rva_to_off(self, rva: int):
+        return rva if 0 <= rva < len(self.data) else None
+
+    def off_to_rva(self, off: int):
+        return off if 0 <= off < len(self.data) else None
+
+
 def _fmt(binary: Binary, insns, show_targets=False):
     lines = []
     targets = []
@@ -197,14 +335,26 @@ def main():
     ap.add_argument('--slot', type=int, help='with --vtable: disassemble this slot')
     ap.add_argument('--disasm', help='disassemble at this RVA (hex ok)')
     ap.add_argument('--count', type=int, default=60)
+    ap.add_argument('--live', action='store_true',
+                    help='analyse the RUNNING process instead of the file on '
+                         'disk (REQUIRED for the Steam build, whose on-disk '
+                         '.text is DRM-encrypted; also gives RVAs that match '
+                         'the running build exactly)')
+    ap.add_argument('--pid', type=int, default=0,
+                    help='with --live: target pid (default: find SkyrimSE)')
     ap.add_argument('--show-targets', action='store_true',
                     help='list call/jmp targets found')
     args = ap.parse_args()
 
-    if not os.path.exists(args.exe):
-        sys.exit(f'not found: {args.exe}')
-    b = Binary(args.exe)
-    print(f'{os.path.basename(args.exe)}  imagebase={b.base:#x}')
+    if args.live:
+        b = LiveBinary(args.pid)
+        print(f'LIVE pid={b.pid}  imagebase={b.base:#x}  '
+              f'image={len(b.data) / (1 << 20):.1f} MB')
+    else:
+        if not os.path.exists(args.exe):
+            sys.exit(f'not found: {args.exe}')
+        b = Binary(args.exe)
+        print(f'{os.path.basename(args.exe)}  imagebase={b.base:#x}')
 
     if args.find:
         names = b.find_rtti_names(args.find)

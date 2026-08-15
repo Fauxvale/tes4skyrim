@@ -52,6 +52,39 @@ constexpr std::uint64_t kConsoleExecute = 21954;
 // the compiler the console itself uses.
 constexpr std::uint64_t kCompilerNameTable = 368092;
 
+// TESForm* TESForm::LookupByID(std::uint32_t formId)
+//
+// 🛑 THIS IS WHAT MAKES A REF-TARGETED COMMAND ACTUALLY TARGET THE REF.
+//
+// The console dispatcher takes the target reference in r9 and threads it into
+// BOTH the compile and the run (verified by disassembling the live process):
+//
+//   dispatch(rcx=Script, rdx=ctx, r8d=compilerType, r9=target)
+//     mov r14, r9        ; save target
+//     mov r8,  r14       ; -> ConsoleExecute's arg3   (compile)
+//     mov rdx, r14       ; -> runner's arg2           (run)
+//
+// This plugin used to pass nullptr there and select the reference by running
+// `prid <id>` as a SEPARATE ExecOne first. That does not work: each ExecOne is
+// its own compile+execute, so the selection does not survive into the next
+// call. Proven with a controlled test on the player -- after `prid 00000014`,
+// a bare `getpos x` printed NOTHING while `player.getpos x` printed a real
+// value. Every ref-targeted command was silently acting on no target, and
+// because the dispatcher still returned success it looked like it had worked.
+// `moveto player` on a quest actor reported ok and moved nothing.
+//
+// Found WITHOUT guessing an id (see the warning at the top of this file): the
+// Papyrus native name string "GetForm" is referenced by its registration site,
+// whose bound implementation is a two-instruction thunk --
+//     mov ecx, r9d ; jmp <LookupByID>
+// -- and that jump target is this function. Verified live before use: 0x14,
+// 0x1A032A17 and 0x7 all return real pointers, and a bogus id returns 0, which
+// is the self-validating behaviour a blind signature scan cannot give you.
+//
+// 1.6.1170 rva 0x1e01a0 -> id 14617 + 0x0, which resolves to 0x1a0b70 on the
+// GOG 1.6.659 build.
+constexpr std::uint64_t kLookupFormByID = 14617;
+
 // 🛑 THE CONSOLE'S FULL DISPATCHER -- compile AND run.
 //
 // `kConsoleExecute` ONLY COMPILES. Its tail is `call <compile finalizer>;

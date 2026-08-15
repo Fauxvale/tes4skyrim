@@ -57,7 +57,11 @@ def handle(req: dict) -> dict:
     if cmd == "status":
         return {"id": rid, "ok": False, "code": "E_NO_GAME",
                 "error": "no game loaded"}
-    return {"id": rid, "ok": False, "code": "E_UNSUPPORTED",
+    # E_UNKNOWN_CMD, not E_UNSUPPORTED: this build simply lacks the command, so
+    # a newer client can fall back to a console-based path. E_UNSUPPORTED means
+    # the runtime could not resolve the capability at all, which is not
+    # recoverable and must not be retried.
+    return {"id": rid, "ok": False, "code": "E_UNKNOWN_CMD",
             "error": f"unknown command: {cmd}"}
 
 
@@ -131,8 +135,8 @@ def main() -> int:
                 b.request("nope")
                 check("unknown command errors", False, "expected BridgeError")
             except BridgeError as exc:
-                check("unknown command -> E_UNSUPPORTED",
-                      exc.code == "E_UNSUPPORTED", exc.code)
+                check("unknown command -> E_UNKNOWN_CMD",
+                      exc.code == "E_UNKNOWN_CMD", exc.code)
 
             # Ordering: ids must come back paired with their requests.
             ids_ok = True

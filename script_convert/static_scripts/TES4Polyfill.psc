@@ -206,6 +206,82 @@ Function SetAngle(ObjectReference akRef, String axis, Float afValue) Global
 EndFunction
 
 ; ==========================================================================
+; Combat
+; ==========================================================================
+
+; TES4 StartCombat FORCES the fight: the actor attacks the target regardless
+; of aggression, disposition or faction relations.  CharacterGen's finale
+; depends on that -- the final assassin has base aggression 0, his only
+; faction (MythicDawnCGAssassin) has no hostile relations, the Emperor's
+; faction Friends it at +50 -- yet `CGAssassinFinal.startcombat
+; UrielSeptimRef` must still cut the Emperor down.
+;
+; Skyrim's StartCombat is only a suggestion the combat AI re-evaluates at
+; once: an actor with Aggression 0 exits combat immediately (vanilla's own
+; turn-hostile fragment, MS08 "In My Time Of Need", pairs
+; `MS08SaadiaFaction.SetEnemy(PlayerFaction)` with
+; `SetAV("Aggression", 1)` for exactly this reason), and a target the actor
+; has no hostile reaction to is dropped as invalid.
+;
+; So supply the two things the combat AI needs, then force it:
+;   - floor Aggression at 1 ("attacks Enemies").  Tier 1 never widens to
+;     neutrals, so this cannot make the actor attack bystanders.
+;   - make the pair FACTION enemies through the two conversion-owned
+;     factions the import writes for exactly this purpose
+;     (TES4ForceCombatAttackers is record-side Enemy of
+;     TES4ForceCombatVictims, both directions).  This is the vanilla
+;     runtime-hostility idiom generalised to an arbitrary victim, and it
+;     works for ANY actors.  The earlier attempt used relationship rank -4,
+;     which only exists between UNIQUE actors — the CharacterGen final
+;     assassin is non-unique, the rank write silently no-opped, and
+;     StartCombat dropped the friendly Emperor as an invalid target.
+;
+; The memberships persist until death or an explicit stopcombat, matching
+; TES4 StartCombat (fight until someone dies or a script stands them down).
+; Cross-pair contamination (attacker A hostile to victim B forced in a
+; different scene) is accepted: forced attackers are overwhelmingly scene
+; actors that die in their scene, and TES4's own disposition damage from
+; StartCombat leaked comparably.
+Function ForceCombat(Actor akAttacker, Actor akTarget, Faction akAttackers, Faction akVictims) Global
+  If akAttacker == None || akTarget == None
+    Return
+  EndIf
+  If akAttackers != None && akVictims != None
+    akAttacker.AddToFaction(akAttackers)
+    akTarget.AddToFaction(akVictims)
+  EndIf
+  If akAttacker.GetActorValue("Aggression") < 1.0
+    akAttacker.SetActorValue("Aggression", 1)
+  EndIf
+  akAttacker.StartCombat(akTarget)
+EndFunction
+
+; TES4 "PlayerFaction" converts to a plugin faction the RUNTIME player was
+; never a member of — membership lives on Skyrim's own Player NPC (0x7),
+; which the conversion does not touch.  So a scripted relation flip against
+; the converted PlayerFaction reaches nobody.  Mirror those flips onto the
+; vanilla PlayerFaction (Skyrim.esm 0x000DB1), the faction the real player
+; actually belongs to.  aiMode: 1 = enemy, 0 = neutral, 2 = friend.
+Function MirrorPlayerFactionRelation(Faction akOther, Int aiMode) Global
+  If akOther == None
+    Return
+  EndIf
+  Faction pf = Game.GetFormFromFile(0x000DB1, "Skyrim.esm") as Faction
+  If pf == None
+    Return
+  EndIf
+  If aiMode == 1
+    akOther.SetEnemy(pf, false, false)
+  ElseIf aiMode == 0
+    ; Explicitly clearing a relation: SetEnemy with both "neutral" bools
+    ; writes Neutral, the same idiom the faction-reaction conversion uses.
+    akOther.SetEnemy(pf, true, true)
+  Else
+    akOther.SetAlly(pf, true, true)
+  EndIf
+EndFunction
+
+; ==========================================================================
 ; Crime / Faction
 ; ==========================================================================
 

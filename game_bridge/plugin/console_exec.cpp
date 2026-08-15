@@ -172,8 +172,35 @@ namespace {
 // because a false success is far worse than a clear error.
 
 
-// Runs one command line with no selected reference.
-bool ExecOne(const std::string& cmd, std::string* err) {
+// Resolves a FormID to the TESForm* the dispatcher wants as its target.
+//
+// Returns nullptr for 0 (meaning "no target", which is correct for a plain
+// command) and for an id the engine does not know -- LookupByID itself returns
+// null there, which is why this is self-validating rather than a guess.
+void* LookupForm(std::uint32_t formId) {
+    if (!formId || !g_addr.lookupFormByID) return nullptr;
+    using LookupByID_t = void* (*)(std::uint32_t);
+    auto fn = reinterpret_cast<LookupByID_t>(g_addr.lookupFormByID);
+    void* form = nullptr;
+    __try {
+        form = fn(formId);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        form = nullptr;
+    }
+    return form;
+}
+
+// Runs one command line against an optional target reference.
+//
+// 🛑 `target` is NOT optional decoration -- it is the ONLY way a command acts
+// on a reference. Passing nullptr while selecting via a separate `prid` call
+// does not work: each ExecOne is its own compile+execute and the console's
+// selection does not survive between them. Verified with a controlled test --
+// after `prid 00000014`, a bare `getpos x` printed nothing while
+// `player.getpos x` printed a real value. Commands still returned success, so
+// the failure was invisible: `moveto player` on a quest actor reported ok and
+// moved nothing at all.
+bool ExecOne(const std::string& cmd, std::string* err, void* target = nullptr) {
     void* script = AllocScriptObject(cmd);
     if (!script) {
         if (err) *err = "could not allocate script object";
@@ -218,7 +245,8 @@ bool ExecOne(const std::string& cmd, std::string* err) {
             // and manages the console-mode flag itself. Verified live to return
             // real output ("GameSetting fJumpHeightMin >> 76.00").
             auto fn = reinterpret_cast<ConsoleDispatch_t>(g_dispatch);
-            fn(script, reinterpret_cast<void*>(ctx), kCompilerTypeConsole, nullptr);
+            // r9 = target: threaded into BOTH the compile and the run.
+            fn(script, reinterpret_cast<void*>(ctx), kCompilerTypeConsole, target);
             // Its bool return reports "did the console consume this", not "did
             // the command succeed" -- a successful `getgs` returns 0 and a
             // misspelled command returns 1. So success cannot be read from it.
@@ -235,7 +263,7 @@ bool ExecOne(const std::string& cmd, std::string* err) {
             // cannot be located still runs commands, but note this path
             // produces NO output -- see ids.h.
             auto fn = reinterpret_cast<ConsoleExecute_t>(g_addr.consoleExecute);
-            ok = fn(reinterpret_cast<void*>(ctx), script, nullptr, kCompilerTypeConsole);
+            ok = fn(reinterpret_cast<void*>(ctx), script, target, kCompilerTypeConsole);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (err) *err = "engine raised an exception executing the command";
@@ -277,11 +305,15 @@ bool ScriptInject(const std::string& body,
         return false;
     }
 
+    // Resolved ONCE and passed as every statement's target. Previously this ran
+    // a `prid` as a separate statement, which does not carry into the ones that
+    // follow -- so an injected body targeting a reference silently acted on
+    // nothing (see ExecOne).
+    void* target = nullptr;
     if (refFormId) {
-        char sel[32];
-        std::snprintf(sel, sizeof(sel), "prid %08X", refFormId);
-        if (!ExecOne(sel, err)) {
-            if (err && err->empty()) *err = "could not select reference";
+        target = LookupForm(refFormId);
+        if (!target) {
+            if (err) *err = "could not resolve reference (unknown form id)";
             if (failedIndex) *failedIndex = 0;
             return false;
         }
@@ -314,7 +346,7 @@ bool ScriptInject(const std::string& body,
                 // Capture per statement so a probe can read each answer, not
                 // just learn whether the whole body succeeded.
                 ConsoleCaptureBegin();
-                bool lineOk = ExecOne(line, &lineErr);
+                bool lineOk = ExecOne(line, &lineErr, target);
                 const std::string captured = ConsoleCaptureEnd();
 
                 // A misspelled statement runs and prints "not found"; without
@@ -359,21 +391,26 @@ bool ConsoleExecute(const std::string& cmd, std::uint32_t refFormId, std::string
         return false;
     }
 
-    // Reference selection goes through the console's own `prid`, rather than
-    // resolving a TESObjectREFR* ourselves and passing it as the target
-    // argument. Same end state, but it costs no struct-layout assumptions and
-    // no form-table walking -- and it is exactly what a human typing into the
-    // console would do.
+    // The reference is passed as the dispatcher's TARGET, not selected with a
+    // separate `prid` command.
+    //
+    // The old `prid`-first approach was silently broken: each ExecOne is its
+    // own compile+execute, so the console selection never reached the command
+    // that followed it. Every ref-targeted command ran against no target and
+    // still reported success -- `moveto player` on a quest actor moved nothing
+    // while claiming to have worked, which is the exact false-success class
+    // this file exists to avoid. No struct layout is assumed here either: the
+    // engine's own LookupByID hands back the pointer.
+    void* target = nullptr;
     if (refFormId) {
-        char sel[32];
-        std::snprintf(sel, sizeof(sel), "prid %08X", refFormId);
-        if (!ExecOne(sel, err)) {
-            if (err && err->empty()) *err = "could not select reference";
+        target = LookupForm(refFormId);
+        if (!target) {
+            if (err) *err = "could not resolve reference (unknown form id)";
             return false;
         }
     }
 
-    return ExecOne(cmd, err);
+    return ExecOne(cmd, err, target);
 }
 
 }  // namespace bridge

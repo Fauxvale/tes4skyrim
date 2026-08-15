@@ -258,6 +258,11 @@ bool GameAddresses::Init(std::uint32_t runtimeVersion) {
     scriptSetText  = Resolve("Script::SetText", ids::kScriptSetText, nullptr);
     memAlloc       = Resolve("MemAlloc",       ids::kMemAlloc,       nullptr);
 
+    // Without this, a ref-targeted command silently runs against NO target --
+    // it reports success and does nothing (see ids.h). That is the difference
+    // between moving a quest's real reference and moving nothing at all.
+    lookupFormByID = Resolve("TESForm::LookupByID", ids::kLookupFormByID, nullptr);
+
     // Stable ID 21874 is absent from the 1.6.1170 database, so this normally
     // resolves through its signature. Calling the real constructor is required:
     // it runs a base-class ctor and writes non-zero fields that a memset cannot

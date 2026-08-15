@@ -168,13 +168,40 @@ Tailing the file (`tools/papyrus_tail.py`) is still supported and complementary
 | `get_record` | `{form_id, fields?}` | decoded field values as the **engine** currently holds them (post-load-order, not what the ESM on disk says) |
 | `set_record` | `{form_id, field, value}` | `{old, new}` — live edit of a loaded form (see *Hot reload* for what sticks) |
 
-### Actors / spawning
+### Actors / spawning / clean-room testing
+
+Implemented. These back `tools/quest_labtest.py` — see
+`docs/ingame_test_methodology.md`.
 
 | cmd | args | returns |
 |---|---|---|
-| `spawn` | `{form_id, count?, at?}` | `{refs: [...]}` — tracked; every spawn is recorded for `cleanup` |
-| `cleanup` | `{scope?}` | `{removed}` — deletes everything this session spawned |
-| `actor_state` | `{ref}` | position, 3D-loaded flag, animation graph state, current state machine node |
+| `spawn` | `{form_id, count?}` | `{base, count, output, refs, tracked, note}` |
+| `cleanup` | `{refs?}` | `{removed, failed}` — disable + markfordelete |
+| `moveref` | `{ref, x?, y?, z?}` | `{before, moved_to_player, ok}` |
+| `wait_ready` | `{timeout_ms?}` | `{ready, waited_ms}` |
+| `actor_state` | `{ref}` | *(not implemented)* position, 3D-loaded flag, graph state |
+
+These are composed from the engine's **own console commands** rather than from a
+reconstructed `TESObjectREFR` layout — the same reasoning as `prid`-based
+selection. A wrong struct offset does not fail loudly; it corrupts memory or
+reads garbage, and the symptoms are indistinguishable from a conversion bug.
+
+🛑 **`spawn` cannot report the reference it created.** `placeatme` returns it
+neither through its return value nor through console output, and there is no
+verified reference enumerator here. So `refs` comes back **empty** with
+`tracked: false` and a `note` saying so, rather than implying the spawn is
+recoverable — `cleanup` takes an explicit `refs` list from the client instead.
+A spawn you cannot delete silently bloats the save, so this is stated rather
+than papered over.
+
+`moveref` reads the current position and moves in **one main-thread trip**, so
+the recorded `before` is the position the ref actually had at the moment it
+moved. A position captured a frame earlier is not that, and that gap is what
+makes a later restore a guess rather than an undo.
+
+`wait_ready` polls a cheap read-only command rather than reading a loading flag:
+there is no verified UI singleton here, and a guessed pointer reports plausible
+garbage.
 
 ### The readback layer (the reason this exists)
 

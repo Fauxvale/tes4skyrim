@@ -238,6 +238,46 @@ class Bridge:
             args["ref"] = ref
         return self.request("inject", **args)
 
+    # ------------------------------------------------ clean-room testing --
+    # These back tools/quest_labtest.py. See docs/ingame_test_methodology.md.
+
+    def spawn(self, form_id: str | int, count: int = 1) -> dict:
+        """Spawn copies of a base form, for clean-room tests.
+
+        NOTE: `placeatme` does not report the reference it creates, so the
+        caller must record what appeared if it wants `cleanup` to remove it.
+        The response says so explicitly rather than implying the spawn is
+        tracked -- a spawn you cannot delete silently bloats the save.
+        """
+        return self.request("spawn", form_id=form_id, count=count)
+
+    def cleanup(self, refs: list[str | int] | None = None) -> dict:
+        """Disable + markfordelete the given (or tracked) references."""
+        return self.request("cleanup", refs=list(refs or []))
+
+    def moveref(self, ref: str | int, x: str | None = None,
+                y: str | None = None, z: str | None = None) -> dict:
+        """Move a reference to the player, or back to an explicit position.
+
+        Reads the CURRENT position and moves in one main-thread trip, so the
+        recorded `before` is the position the ref actually had at the moment it
+        moved -- which is what makes a later restore an undo rather than a
+        guess.
+        """
+        args: dict = {"ref": ref}
+        for k, v in (("x", x), ("y", y), ("z", z)):
+            if v is not None:
+                args[k] = v
+        return self.request("moveref", **args)
+
+    def wait_ready(self, timeout_ms: int = 20000) -> dict:
+        """Block until the game answers again after a load screen.
+
+        `coc` starts a load and every command issued during it fails with
+        E_LOADING, so anything following a cell change must wait on this.
+        """
+        return self.request("wait_ready", timeout_ms=timeout_ms)
+
     # -------------------------------------------------- raw probing --------
     # These let a theory about engine internals be tested from Python against
     # the LIVE process, with no rebuild and no game restart. That round trip
