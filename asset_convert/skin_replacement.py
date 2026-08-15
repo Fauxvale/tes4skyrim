@@ -50,6 +50,30 @@ _SKIN_TEX_TO_BODY_NIF = [
     ('underwear', 'malebody_0.nif',  'femalebody_0.nif'),
 ]
 
+_HANDS_FEET_NIFS = frozenset({
+    'malehands_0.nif', 'femalehands_0.nif',
+    'malefeet_0.nif', 'femalefeet_0.nif',
+})
+
+# Bones NOTHING but a torso is weighted to.  Deliberately excludes upperarm and
+# forearm (gauntlets and bracers reach them) and calf and thigh (boots do), so
+# this only ever fires on geometry that genuinely spans the chest.
+_TORSO_ONLY_BONES = ('spine', 'clavicle', 'neck')
+
+
+def _is_torso_skin(skin) -> bool:
+    """True if this skin instance is weighted to the chest."""
+    for bi in range(getattr(skin, 'num_bones', 0)):
+        bone = skin.bones[bi]
+        if bone is None:
+            continue
+        name = bytes(bone.name).rstrip(b'\x00').decode(
+            'latin-1', errors='replace').lower()
+        if any(k in name for k in _TORSO_ONLY_BONES):
+            return True
+    return False
+
+
 def _forward_skin_verts(block) -> list | None:
     """Return world-space vertex positions of a body-skin block.
 
@@ -109,6 +133,24 @@ def collect_skin_info(data,  src_path: str = '') -> dict:
                         if keyword in tex:
                             nif_name = female_nif if is_female else male_nif
                             break
+                    # The texture name is the author's label; the skin bones are
+                    # what the geometry IS.  Nehrim ships 18 wearables whose
+                    # TORSO skin carries a foot or hand texture — the Silverlight
+                    # cuirass ("Foot:Body", 3321 verts, weighted to Spine/
+                    # Clavicle/Neck/Pelvis, textured characters\imperial\female\
+                    # footfemale) and the whole female Eyren set.  The keyword
+                    # picked the hands/feet body NIF, which has no torso, so the
+                    # stripped chest was never spliced back and the armour
+                    # rendered as plates with see-through gaps.
+                    #
+                    # Spine/clavicle/neck are the only bones tested on purpose:
+                    # a gauntlet legitimately reaches the forearm and a boot the
+                    # calf, and including those produced 9 false positives on
+                    # correctly-named vanilla gauntlets, while these three
+                    # produced zero.
+                    if nif_name in _HANDS_FEET_NIFS and _is_torso_skin(skin):
+                        nif_name = ('femalebody_0.nif' if is_female
+                                    else 'malebody_0.nif')
                     if nif_name:
                         break
 
