@@ -1,6 +1,14 @@
 # Mod Archive Ingest — Drag-and-Drop a Mod Archive
 
-**Status:** planned, not implemented.
+**Status:** IMPLEMENTED 2026-08-14 (FOMOD deferred — see §4).
+
+Shipped: `asset_convert/{archive,source_registry,mod_ingest}.py`,
+`convert.py::resolve_plugin_path` + `--import-mod`/`--list-mods`/`--remove-mod`,
+the GUI `Mods` menu, source-scope selector and sidebar drop zone,
+`external/7zip/`, and `tests/test_mod_ingest.py` (43 tests).
+FOMOD option dialogs are NOT built: an archive carrying `fomod/ModuleConfig.xml`
+imports its whole payload root, which is correct for every mod that does not
+gate files behind installer options.
 
 Today the pipeline can only convert a plugin that already sits in the Oblivion
 `Data` directory, and it only sources that plugin's assets from `.bsa` archives

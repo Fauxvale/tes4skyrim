@@ -258,6 +258,64 @@ def scan_plugins(data_path: str) -> list:
     return plugins
 
 
+EXPORT_DIR = SCRIPT_DIR / "export"
+
+# Set by _make_root(): True once the tkdnd runtime is loaded and the sidebar
+# can accept dropped files. Without it the window still works -- Mods > Import
+# is the same feature by a different door -- so nothing here may be fatal.
+DND_AVAILABLE = False
+
+
+def _make_root():
+    """The Tk root, drag-and-drop capable when tkinterdnd2 is installed.
+
+    tkinterdnd2 works by subclassing Tk and loading the tkdnd Tcl package, so
+    it has to be chosen HERE, at root creation, rather than bolted on later.
+    """
+    global DND_AVAILABLE
+    try:
+        from tkinterdnd2 import TkinterDnD
+        root = TkinterDnD.Tk()
+        DND_AVAILABLE = True
+        return root
+    except Exception:
+        # Missing package, or a tkdnd that failed to load on this platform.
+        return tk.Tk()
+
+
+def parse_dropped_paths(data: str) -> list:
+    """Split a tkdnd <Drop> payload into real filesystem paths.
+
+    tkdnd hands over a Tcl list: paths with spaces are wrapped in braces
+    ("{C:/My Mods/a.zip} C:/b.zip"), and a single unbraced path may still
+    contain spaces. Tk's own splitlist handles the quoting rules correctly, but
+    it needs a widget to call through, so this falls back to a manual parse.
+    """
+    if not data:
+        return []
+    out, buf, depth = [], '', 0
+    for ch in data:
+        if ch == '{':
+            depth += 1
+            if depth == 1:
+                continue
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                out.append(buf)
+                buf = ''
+                continue
+        elif ch == ' ' and depth == 0:
+            if buf:
+                out.append(buf)
+                buf = ''
+            continue
+        buf += ch
+    if buf:
+        out.append(buf)
+    return [p for p in (s.strip() for s in out) if p]
+
+
 def scan_converted(output_path: str) -> list:
     """Plugins already converted into `output_path`, sorted.
 
@@ -582,7 +640,10 @@ def gui_main():
     pack_default = cfg.get(PACK_DEFAULT_CONFIG_KEY) is not False
 
     # ── Root window ───────────────────────────────────────────────────────────
-    root = tk.Tk()
+    # tkinterdnd2 supplies drag-and-drop by replacing the Tk root class. It is
+    # OPTIONAL: without it the window still opens and Mods > Import... still
+    # works, so a missing package can never stop the app from starting.
+    root = _make_root()
     root.title(f"TES4 Auto-Convert  {version_info.current_version()}")
     # Slightly taller than the old 900 to fit the Global action row below the
     # steps. The progress bar needs no extra height of its own: it is anchored
@@ -607,6 +668,10 @@ def gui_main():
                        troughcolor=CLR["panel"], borderwidth=0, relief="flat")
     S("TFrame",        background=CLR["bg"])
     S("Panel.TFrame",  background=CLR["panel"])
+    # The sidebar while a mod archive is hovering over it. Only the background
+    # shifts: a ttk.Frame cannot draw a border without a relief that would
+    # reflow every child, and a visible reflow on hover reads as a glitch.
+    S("Drop.TFrame",   background=CLR["global_btn"])
 
     S("TLabel",        background=CLR["bg"],    foreground=CLR["text"])
     S("Sub.TLabel",    background=CLR["bg"],    foreground=CLR["subtext"],
@@ -845,6 +910,13 @@ def gui_main():
     def _select_converted(name: str):
         """Point the GUI at an already-converted plugin and plan its re-run.
 
+        A plugin imported from a mod archive has no data directory at all: it
+        lives in export/<plugin>/ and is reached by switching the source scope
+        instead.  Checked FIRST, because such a plugin will never be found in
+        the Oblivion folder and would otherwise be rejected as "not a plugin in
+        the Oblivion data directory" -- leaving it listed here but impossible
+        to actually re-run.
+
         Plugins do NOT share a data directory -- Nehrim and Morrowind_ob each
         live in their own install -- so selecting one has to restore the
         directory it was actually converted from.  Without this, picking Nehrim
@@ -852,19 +924,13 @@ def gui_main():
         real plugin" check in _run_clicked, even though Nehrim converts fine
         from its own directory.
         """
-        source_dir = version_info.source_path_for(name)
-        if source_dir and os.path.isdir(source_dir) and source_dir != tes4_var.get():
-            tes4_var.set(source_dir)
-            _on_tes4_change(source_dir)     # rescans plugins for the new dir
-
-        if all_plugins and name not in all_plugins:
-            # Either nothing was recorded for this plugin (converted before the
-            # source was tracked) or its install has since moved.
+        # One lookup for every source kind: an imported mod, or whichever
+        # registered folder actually holds this plugin.
+        if not _select_source_for_plugin(name):
             _info("Source Not Found",
-                  f"{name!r} is in the output folder, but its source plugin is "
-                  f"not in:\n\n{tes4_var.get()}\n\n"
-                  "Point the Oblivion data directory at the install that has "
-                  "it, then pick it again.")
+                  f"{name!r} is in the output folder, but no source has it.\n\n"
+                  "Add the folder it came from with the + button beside "
+                  "Source, then pick it again.")
             return
 
         _commit(name)
@@ -889,6 +955,33 @@ def gui_main():
     # current without polling the filesystem on a timer.
     converted_menu.bind("<Map>", lambda _e: _rebuild_converted_menu())
     _rebuild_converted_menu()
+
+    # ── Mods ▸ import a mod archive as a conversion source ────────────────────
+    # The discoverable half of the feature: dragging an archive onto the sidebar
+    # does the same thing, but drag-and-drop needs an optional package and is
+    # invisible until you try it, so this menu is the path that always works.
+    mods_menu = _menubutton("Mods")
+
+    def _import_mod_archive():
+        path = filedialog.askopenfilename(
+            title="Select a mod archive",
+            filetypes=[("Mod archives", "*.zip *.7z *.rar"),
+                       ("All files", "*.*")])
+        if path:
+            _begin_import(path)
+
+    def _import_mod_folder():
+        path = filedialog.askdirectory(title="Select an extracted mod folder")
+        if path:
+            _begin_import(path)
+
+    mods_menu.add_command(label="Import Mod Archive…",
+                          command=_import_mod_archive)
+    mods_menu.add_command(label="Import Mod Folder…",
+                          command=_import_mod_folder)
+    mods_menu.add_separator()
+    mods_menu.add_command(label="Manage Imported Mods…",
+                          command=lambda: _manage_mods())
 
     # ── Tools ─────────────────────────────────────────────────────────────────
     tools_menu = _menubutton("Tools")
@@ -1327,40 +1420,92 @@ def gui_main():
     _sep()
 
     # ── Oblivion data directory ───────────────────────────────────────────────
-    dir_frame = ttk.Frame(sidebar, style="Panel.TFrame")
-    dir_frame.pack(fill=tk.X, padx=14, pady=(0, 8))
 
-    def _on_tes4_change(path):
-        """Refresh plugin list when Oblivion data dir changes."""
-        plugins = scan_plugins(path)
-        all_plugins[:] = plugins
-        file_combo["values"] = plugins
-        if plugins:
-            # Prefer Oblivion.esm if present
-            preferred = None
-            for p in plugins:
-                if p.lower() == 'oblivion.esm':
-                    preferred = p
-                    break
-            file_var.set(preferred if preferred else plugins[0])
-        else:
-            file_var.set("")
-        # The old directory's pick is meaningless now; don't let focus-out
-        # snap the field back to a plugin that no longer exists.
-        last_valid[0] = file_var.get()
-        _save_dir_to_config()
+    # ── Source ────────────────────────────────────────────────────────────────
+    # ONE list of every place plugins come from: each game folder (Oblivion,
+    # Nehrim, a second install) and each imported mod archive. They are the
+    # same concept -- somewhere plugins live -- so they are one control.
+    #
+    # This replaces the single "Oblivion Data Directory" path box, which forced
+    # anyone with two installs to keep retyping one field, and made whichever
+    # path was in the box at conversion time get recorded as that plugin's
+    # origin (Oblivion.esm ended up stamped against the Nehrim folder).
+    sf = ttk.Frame(sidebar, style="Panel.TFrame")
+    sf.pack(fill=tk.X, padx=14, pady=(0, 8))
+    src_head = ttk.Frame(sf, style="Panel.TFrame")
+    src_head.pack(fill=tk.X)
+    ttk.Label(src_head, text="Source", style="PanelSub.TLabel").pack(
+        side=tk.LEFT, anchor="w")
+    src_hint = ttk.Label(src_head, text="", style="PanelSub.TLabel")
+    src_hint.pack(side=tk.RIGHT, anchor="e")
 
-    _path_row(dir_frame, "Oblivion Data Directory", tes4_var,
-              browse_dir=True, on_change=_on_tes4_change)
+    src_row = ttk.Frame(sf, style="Panel.TFrame")
+    src_row.pack(fill=tk.X, pady=(2, 0))
+    src_row.columnconfigure(0, weight=1)
+    scope_var = tk.StringVar(value="")
+    scope_combo = ttk.Combobox(src_row, state="readonly", width=26)
+    scope_combo.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+    # Parallel to scope_combo["values"]: display label -> source id.
+    scope_ids: list = []
+    # Every source dict from the registry, keyed by id, so the plugin list and
+    # the per-plugin directory lookup share one definition.
+    scope_rows: dict = {}
+
+    def _add_source_dir():
+        """Register another game Data folder as a source."""
+        path = filedialog.askdirectory(
+            initialdir=tes4_var.get() or str(SCRIPT_DIR),
+            title="Select a game Data folder")
+        if not path:
+            return
+        found = scan_plugins(path)
+        if not found:
+            if not _confirm(
+                    "Add Source",
+                    f"No .esm/.esp plugins found in:\n\n{path}\n\n"
+                    "Add it anyway?", yes="Add", no="Cancel"):
+                return
+        from asset_convert import source_registry
+        source_registry.add_directory(EXPORT_DIR, path)
+        _refresh_scopes(select=f"dir:{os.path.normcase(os.path.normpath(path))}")
+        _apply_scope()
+
+    def _remove_source():
+        """Unregister the selected source. Folders on disk are never deleted."""
+        row = scope_rows.get(scope_var.get())
+        if not row:
+            return
+        if row["kind"] == "mod":
+            _manage_mods()
+            return
+        if len(_dir_sources()) <= 1:
+            _info("Remove Source",
+                  "This is the only game folder left. Add another before "
+                  "removing it.")
+            return
+        if not _confirm("Remove Source",
+                        f"Stop listing this folder?\n\n{row['path']}\n\n"
+                        "Nothing on disk is deleted.",
+                        yes="Remove", no="Cancel"):
+            return
+        from asset_convert import source_registry
+        source_registry.remove_directory(EXPORT_DIR, row["path"])
+        _refresh_scopes()
+        _apply_scope()
+
+    ttk.Button(src_row, text="+", width=2, command=_add_source_dir).grid(
+        row=0, column=1)
+    ttk.Button(src_row, text="−", width=2, command=_remove_source).grid(
+        row=0, column=2, padx=(3, 0))
 
     # ── Plugin selector ───────────────────────────────────────────────────────
     pf = ttk.Frame(sidebar, style="Panel.TFrame")
     pf.pack(fill=tk.X, padx=14, pady=(0, 8))
     ttk.Label(pf, text="Plugin File", style="PanelSub.TLabel").pack(anchor="w")
     initial_plugins = scan_plugins(tes4_path)
-    # Master list of every plugin in the data dir.  file_combo["values"] holds
-    # only what the current search text matches, so the unfiltered set has to
-    # live somewhere the filter can always restore from.
+    # Master list of every plugin in the CURRENT scope.  file_combo["values"]
+    # holds only what the current search text matches, so the unfiltered set
+    # has to live somewhere the filter can always restore from.
     all_plugins = list(initial_plugins)
     file_combo = ttk.Combobox(pf, textvariable=file_var,
                                values=initial_plugins, width=30)
@@ -1373,6 +1518,195 @@ def gui_main():
     # True while the entry text is a search fragment rather than a committed
     # plugin name.  Set the moment the user starts typing, cleared on commit.
     searching = [False]
+
+    def _all_sources():
+        """Every source: registered folders + the configured one + mods."""
+        try:
+            from asset_convert import source_registry
+            return source_registry.all_sources(
+                EXPORT_DIR, extra_dirs=[tes4_var.get()])
+        except Exception:
+            path = tes4_var.get()
+            return ([{'id': 'dir:' + os.path.normcase(os.path.normpath(path)),
+                      'kind': 'directory', 'label': os.path.basename(path),
+                      'path': path}] if path else [])
+
+    def _dir_sources():
+        return [r for r in _all_sources() if r["kind"] == "directory"]
+
+    def _refresh_scopes(select=None):
+        """Rebuild the Source dropdown; optionally switch to `select`."""
+        rows = _all_sources()
+        scope_rows.clear()
+        labels, ids = [], []
+        for row in rows:
+            scope_rows[row["id"]] = row
+            if row["kind"] == "directory":
+                count = len(scan_plugins(row["path"]))
+                detail = f"{count} plugin{'s' if count != 1 else ''}"
+            elif row.get("asset_only"):
+                # Counting "1 plugin" for a texture pack that has none is a
+                # lie the user would act on; say what it actually is.
+                detail = "assets only"
+            else:
+                count = len(row.get("plugins") or [])
+                detail = f"{count} plugin{'s' if count != 1 else ''}"
+            labels.append(f"{row['label']}  ({detail})")
+            ids.append(row["id"])
+        scope_ids[:] = ids
+        scope_combo["values"] = labels
+
+        want = select if select in scope_rows else scope_var.get()
+        if want not in scope_rows:
+            want = ids[0] if ids else ""
+        scope_var.set(want)
+        if want in ids:
+            scope_combo.current(ids.index(want))
+            row = scope_rows[want]
+            # The full path is what distinguishes two folders both called
+            # "Data"; the dropdown only has room for the install name.
+            src_hint.configure(
+                text=("mod archive" if row["kind"] == "mod"
+                      else _shorten_path(row["path"])))
+
+    def _shorten_path(path, limit=34):
+        p = str(path)
+        return p if len(p) <= limit else "..." + p[-(limit - 3):]
+
+    def _apply_scope(select_plugin=None):
+        """Repopulate the plugin list from the active source."""
+        row = scope_rows.get(scope_var.get())
+        if not row:
+            plugins = []
+        elif row["kind"] == "directory":
+            plugins = scan_plugins(row["path"])
+            # Keep tes4_var pointing at the ACTIVE folder: every downstream
+            # consumer (the run command, config, version stamping) still reads
+            # it, so switching source has to move it too.
+            if tes4_var.get() != row["path"]:
+                tes4_var.set(row["path"])
+                _save_dir_to_config()
+        else:
+            plugins = list(row.get("plugins") or [])
+
+        all_plugins[:] = plugins
+        file_combo["values"] = plugins
+
+        if select_plugin and select_plugin in plugins:
+            file_var.set(select_plugin)
+        elif file_var.get() not in plugins:
+            preferred = next(
+                (p for p in plugins if p.lower() == 'oblivion.esm'), None)
+            file_var.set(preferred or (plugins[0] if plugins else ""))
+        last_valid[0] = file_var.get()
+        searching[0] = False
+
+    def _select_source_for_plugin(name):
+        """Switch to whichever source actually holds `name`. True if found.
+
+        Used by Converted > so re-running a plugin restores its real origin
+        instead of whatever folder happens to be selected.
+        """
+        try:
+            from asset_convert import source_registry
+            entry = source_registry.get(EXPORT_DIR, name)
+        except Exception:
+            entry = None
+        if entry:
+            _refresh_scopes(select=f"mod:{entry.get('group_id')}")
+            _apply_scope(select_plugin=entry.get("plugin") or name)
+            return True
+
+        # A directory source: prefer the one recorded for this plugin, else
+        # the first registered folder that actually contains it.
+        recorded = version_info.source_path_for(name)
+        candidates = ([recorded] if recorded else []) + \
+                     [r["path"] for r in _dir_sources()]
+        for path in candidates:
+            if path and os.path.isfile(os.path.join(path, name)):
+                _refresh_scopes(
+                    select="dir:" + os.path.normcase(os.path.normpath(path)))
+                _apply_scope(select_plugin=name)
+                return True
+        return False
+
+    def _capabilities_for_selection():
+        """What the selected plugin can actually do, or None for 'everything'.
+
+        A plugin in a game folder is assumed fully capable -- its BSAs are not
+        catalogued until the extract step runs, so guessing would be wrong.
+        Only an imported mod has a measured content list.
+        """
+        try:
+            from asset_convert import mod_ingest, source_registry
+            name = file_var.get()
+            entry = source_registry.get(EXPORT_DIR, name)
+        except Exception:
+            return None
+        if not entry:
+            return None
+        caps = entry.get("capabilities")
+        if isinstance(caps, dict):
+            return caps
+        # Imported before capabilities were recorded: measure the tree now
+        # rather than falling back to "allow everything", which would offer
+        # steps the mod has no content for.
+        try:
+            return mod_ingest.capabilities_for(
+                EXPORT_DIR / (entry.get("plugin") or name),
+                has_plugin=bool(entry.get("plugin")))
+        except Exception:
+            return None
+
+    def _apply_step_availability():
+        """Grey out steps the selected source has no content for."""
+        caps = _capabilities_for_selection()
+        if caps is None:
+            for key, (cb, lbl, tip) in step_widgets.items():
+                cb.configure(state="normal")
+                lbl.configure(text=tip)
+            _update_run_btn()
+            return
+
+        try:
+            from asset_convert import mod_ingest
+            usable = mod_ingest.available_steps(caps)
+        except Exception:
+            return
+
+        for key, (cb, lbl, tip) in step_widgets.items():
+            if key in usable:
+                cb.configure(state="normal")
+                lbl.configure(text=tip)
+            else:
+                # Untick as well as disable: a step left ticked but greyed
+                # would still be collected by _run_clicked.
+                step_vars[key].set(False)
+                cb.configure(state="disabled")
+                lbl.configure(text=_why_unavailable(key, caps))
+        _update_run_btn()
+
+    def _why_unavailable(key, caps):
+        """Why a step is greyed, in the user's terms rather than 'disabled'."""
+        if key == "extract":
+            return "already extracted on import"
+        from asset_convert import mod_ingest
+        needs = mod_ingest.STEP_REQUIREMENTS.get(key, ())
+        if needs == ("plugin",):
+            return "needs a plugin"
+        missing = ", ".join(n for n in needs if not caps.get(n))
+        return f"no {missing}" if missing else "nothing to convert"
+
+    def _on_scope_selected(_evt=None):
+        idx = scope_combo.current()
+        if 0 <= idx < len(scope_ids):
+            scope_var.set(scope_ids[idx])
+        _apply_scope()
+        _refresh_scopes(select=scope_var.get())
+        _apply_step_availability()
+        _refresh_upgrade_notice()
+
+    scope_combo.bind("<<ComboboxSelected>>", _on_scope_selected)
 
     _CB = str(file_combo)
     _POPDOWN = f"ttk::combobox::PopdownWindow {_CB}"
@@ -1508,6 +1842,9 @@ def gui_main():
         # Each plugin carries its own conversion history, so the upgrade notice
         # is per-plugin and has to follow the selection.
         _refresh_upgrade_notice()
+        # ...as does which steps it can run: an asset-only mod has no plugin,
+        # so Export/Import/Scripts would run on nothing.
+        _apply_step_availability()
 
     def _on_selected(_evt=None):
         _commit(file_var.get())
@@ -1597,16 +1934,15 @@ def gui_main():
               browse_dir=True, on_change=_on_tes5_change)
 
     # ── Field order ───────────────────────────────────────────────────────────
-    # Display order: Oblivion dir, Skyrim dir, Output dir, then Plugin File.
-    # The three directories are set once and rarely touched again; the plugin is
-    # what changes run to run, so it reads last, nearest the steps it drives.
+    # Display order: Source, Skyrim dir, Output dir, then Plugin File.
+    # Skyrim/Output are set once and rarely touched again; Source and Plugin
+    # change run to run, so Plugin reads last, nearest the steps it drives.
     #
     # Re-packed here rather than by moving the blocks themselves: the plugin
     # selector carries ~200 lines of combobox search/focus handling that the
-    # directory callbacks close over (_on_tes4_change repopulates file_combo),
-    # so reordering the source would mean reordering those dependencies too.
-    # Pack order alone decides layout, so restating it is the whole change.
-    for _blk in (dir_frame, tes5_frame, out_frame):
+    # source callbacks close over, so reordering the block itself would mean
+    # reordering those dependencies too. Pack order alone decides layout.
+    for _blk in (sf, tes5_frame, out_frame):
         _blk.pack_forget()
         _blk.pack(fill=tk.X, padx=14, pady=(0, 8))
     # Last directory before the rule sits flush against it; _sep owns that gap.
@@ -1628,15 +1964,24 @@ def gui_main():
     sh.pack(fill=tk.X, padx=14, pady=(0, 4))  # flush to the rule above
     ttk.Label(sh, text="Pipeline Steps", style="PanelSub.TLabel").pack(side=tk.LEFT)
 
+    def _runnable(key: str) -> bool:
+        """False for a step the selected source has no content for.
+
+        All/Default must not re-tick a greyed step -- the run would collect it
+        and the phase would work on nothing.
+        """
+        cb = step_widgets.get(key, (None,))[0]
+        return cb is None or str(cb.cget("state")) != "disabled"
+
     def _set_all():
-        for v in step_vars.values():
-            v.set(True)
+        for key, v in step_vars.items():
+            v.set(_runnable(key))
         _update_run_btn()
 
     def _set_default():
         on = default_on_steps(pack_default_var.get())
         for key, v in step_vars.items():
-            v.set(key in on)
+            v.set(key in on and _runnable(key))
         _update_run_btn()
 
     def _set_none():
@@ -2617,14 +2962,20 @@ def gui_main():
 
     # Build step checkboxes
     _mesh_step_row = None
+    # key -> (checkbutton, description label). Kept so a step the selected
+    # source cannot run (an asset-only mod has no plugin to export) can be
+    # disabled rather than silently running on nothing.
+    step_widgets: dict = {}
     for step in STEPS:
         key, label, tip = step[0], step[2], step[3]
         row = ttk.Frame(sidebar, style="Panel.TFrame")
         row.pack(fill=tk.X, padx=14, pady=1)
-        ttk.Checkbutton(row, text=label, variable=step_vars[key],
-                        command=_update_run_btn).pack(side=tk.LEFT)
-        ttk.Label(row, text=tip, style="PanelSub.TLabel").pack(
-            side=tk.LEFT, padx=(6, 0))
+        cb = ttk.Checkbutton(row, text=label, variable=step_vars[key],
+                             command=_update_run_btn)
+        cb.pack(side=tk.LEFT)
+        tip_lbl = ttk.Label(row, text=tip, style="PanelSub.TLabel")
+        tip_lbl.pack(side=tk.LEFT, padx=(6, 0))
+        step_widgets[key] = (cb, tip_lbl, tip)
         if key == "meshes":
             _mesh_step_row = row
 
@@ -3071,6 +3422,318 @@ def gui_main():
         log_text.delete("1.0", tk.END)
         log_text.configure(state=tk.DISABLED)
 
+    # ── Mod archive import ────────────────────────────────────────────────────
+    # Entry points: Mods > Import..., and dropping an archive on the sidebar.
+    # Both land here.
+
+    def _begin_import(path: str):
+        """Inspect `path` on a worker thread, then show the confirm dialog.
+
+        Inspection is threaded because a 400 MB archive takes real time to list
+        and the UI thread must not freeze while it does. NOTHING is written
+        until the user confirms.
+        """
+        if running.is_set():
+            _info("Busy", "A conversion is running. Wait for it to finish "
+                          "before importing a mod.")
+            return
+
+        status_var.set(f"Reading {os.path.basename(path)}...")
+        result = {}
+
+        def _work():
+            try:
+                from asset_convert import mod_ingest
+                result["manifest"] = mod_ingest.inspect(path)
+            except Exception as exc:            # IngestError and anything else
+                result["error"] = exc
+
+        def _done(thread):
+            if thread.is_alive():
+                root.after(80, lambda: _done(thread))
+                return
+            status_var.set("Ready")
+            if "error" in result:
+                _info("Cannot Import",
+                      f"{os.path.basename(path)}\n\n{result['error']}")
+                return
+            _confirm_import(path, result["manifest"])
+
+        th = threading.Thread(target=_work, daemon=True)
+        th.start()
+        root.after(80, lambda: _done(th))
+
+    def _confirm_import(path, manifest):
+        """Show what was found and let the user choose plugins, then ingest."""
+        card = tk.Frame(outer, bg=CLR["panel"],
+                        highlightbackground=CLR["border"], highlightthickness=1)
+
+        def _close():
+            card.grab_release()
+            card.destroy()
+
+        tk.Label(card, text="Import Mod", bg=CLR["panel"], fg=CLR["text"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16,
+                                                     pady=(14, 0))
+        ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16,
+                                                       pady=8)
+
+        layout = (f"Data folder: {manifest.payload_root}"
+                  if manifest.payload_root else "Payload at archive root")
+        info = [os.path.basename(str(manifest.path)), layout,
+                manifest.summary()]
+        if manifest.bsas:
+            info.append(f"{len(manifest.bsas)} BSA(s) will be extracted")
+        if manifest.nested:
+            info.append(f"{len(manifest.nested)} nested archive(s)")
+        if manifest.ambiguous_data:
+            info.append("NOTE: several equally-shallow Data folders; "
+                        f"using {manifest.payload_root}")
+        tk.Label(card, text="\n".join(info), bg=CLR["panel"],
+                 fg=CLR["subtext"], font=("Segoe UI", 9), justify=tk.LEFT,
+                 anchor="w", wraplength=420).pack(anchor="w", padx=16)
+
+        # Which plugins to register. Defaults to all -- both TWMP archives ship
+        # two, and taking only one silently loses half the mod.
+        # An asset-only mod (texture/mesh pack) has none: say so rather than
+        # showing an empty "Plugins" heading.
+        picks = []
+        if manifest.plugins:
+            tk.Label(card, text="Plugins", bg=CLR["panel"], fg=CLR["text"],
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=16,
+                                                        pady=(10, 2))
+            for rel in manifest.plugins:
+                var = tk.BooleanVar(value=True)
+                picks.append((rel, var))
+                tk.Checkbutton(card, text=os.path.basename(rel), variable=var,
+                               bg=CLR["panel"], fg=CLR["text"],
+                               selectcolor=CLR["btn"],
+                               activebackground=CLR["panel"],
+                               activeforeground=CLR["text"],
+                               font=("Segoe UI", 9), anchor="w",
+                               highlightthickness=0, borderwidth=0).pack(
+                    anchor="w", padx=24)
+        else:
+            tk.Label(card,
+                     text="No plugin — assets only.\n"
+                          "Export, Import, Scripts and Creatures will be "
+                          "unavailable for this mod.",
+                     bg=CLR["panel"], fg=CLR["subtext"],
+                     font=("Segoe UI", 9), justify=tk.LEFT, anchor="w",
+                     wraplength=420).pack(anchor="w", padx=16, pady=(10, 0))
+
+        # Masters that have no export yet. This is the project's classic silent
+        # failure -- a mod whose master was never converted imports "fine" and
+        # resolves every master-owned record to nothing.
+        missing = _missing_masters_for(manifest)
+        if missing:
+            tk.Label(card,
+                     text="Missing masters — convert these FIRST:\n  "
+                          + "\n  ".join(sorted(missing)),
+                     bg=CLR["panel"], fg=CLR["red"], font=("Segoe UI", 9),
+                     justify=tk.LEFT, anchor="w", wraplength=420).pack(
+                anchor="w", padx=16, pady=(10, 0))
+
+        keep_var = tk.BooleanVar(value=True)
+        if not manifest.is_folder:
+            try:
+                size_mb = manifest.path.stat().st_size / 1024 ** 2
+            except OSError:
+                size_mb = 0
+            tk.Checkbutton(
+                card,
+                text=f"Keep a copy of the archive ({size_mb:.0f} MB) so steps "
+                     f"can be re-run later",
+                variable=keep_var, bg=CLR["panel"], fg=CLR["subtext"],
+                selectcolor=CLR["btn"], activebackground=CLR["panel"],
+                activeforeground=CLR["text"], font=("Segoe UI", 9),
+                anchor="w", highlightthickness=0, borderwidth=0,
+                wraplength=400, justify=tk.LEFT).pack(anchor="w", padx=16,
+                                                      pady=(10, 0))
+
+        btns = ttk.Frame(card, style="Panel.TFrame")
+        btns.pack(anchor="e", padx=16, pady=(14, 14))
+
+        def _go():
+            chosen = [rel for rel, var in picks if var.get()]
+            keep = bool(keep_var.get())
+            _close()
+            # Only a mod that HAS plugins can have none selected. An
+            # asset-only mod legitimately passes an empty list.
+            if manifest.plugins and not chosen:
+                _info("Import Mod", "No plugins selected.")
+                return
+            _run_import(manifest.path, manifest, chosen or None, keep)
+
+        ttk.Button(btns, text="Cancel", command=_close).pack(side=tk.RIGHT,
+                                                             padx=(6, 0))
+        ttk.Button(btns, text="Import", style="Accent.TButton",
+                   command=_go).pack(side=tk.RIGHT)
+
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        card.grab_set()
+
+    def _missing_masters_for(manifest):
+        """Masters of the archive's plugins that have no export/<master>/ yet.
+
+        Read straight out of the archive, so the warning appears BEFORE the
+        import rather than after a failed conversion.
+        """
+        try:
+            import tempfile
+
+            from asset_convert import archive as _archive
+            from convert import get_masters_from_binary
+        except Exception:
+            return set()
+
+        missing = set()
+        with tempfile.TemporaryDirectory(prefix="tesconv_mast_") as tmp:
+            for rel in manifest.plugins:
+                try:
+                    src = (manifest.path / manifest.payload_root / rel
+                           if manifest.is_folder else None)
+                    if src is not None:
+                        target = src
+                    else:
+                        member = (f"{manifest.payload_root}/{rel}"
+                                  if manifest.payload_root else rel)
+                        target = _archive.extract_one(
+                            manifest.path, member,
+                            os.path.join(tmp, os.path.basename(rel)))
+                    for master in get_masters_from_binary(str(target)):
+                        if not (EXPORT_DIR / master).is_dir():
+                            missing.add(master)
+                except Exception:
+                    continue
+        return missing
+
+    def _run_import(path, manifest, chosen, keep_archive):
+        """Do the ingest on a worker thread, streaming progress to the log."""
+        _clear_log()
+        _log(f"Importing {os.path.basename(str(path))}")
+        _set_running(True)
+        _start_timer()
+        q = queue.Queue()
+        outcome = {}
+
+        def _work():
+            try:
+                from asset_convert import mod_ingest
+                outcome["results"] = mod_ingest.ingest(
+                    path, EXPORT_DIR, plugin_members=chosen,
+                    keep_archive=keep_archive, manifest=manifest,
+                    log=q.put)
+            except Exception as exc:
+                outcome["error"] = exc
+
+        def _drain(thread):
+            try:
+                while True:
+                    _log(q.get_nowait())
+            except queue.Empty:
+                pass
+            if thread.is_alive():
+                root.after(60, lambda: _drain(thread))
+                return
+            _set_running(False)
+            _stop_timer()
+            if "error" in outcome:
+                _log(f"  FAILED: {outcome['error']}")
+                _info("Import Failed", str(outcome["error"]))
+                return
+            names = sorted(outcome.get("results") or {})
+            _log(f"  Imported: {', '.join(names)}")
+            # Switch the plugin selector to the mod just imported -- that is
+            # what the user wants to convert next.
+            try:
+                from asset_convert import source_registry
+                entry = source_registry.get(EXPORT_DIR, names[0]) if names else None
+                # Source ids are prefixed ("mod:<group_id>"); passing the bare
+                # group_id silently fails to match and leaves the old source
+                # selected, so the user has to switch by hand.
+                gid = entry.get("group_id") if entry else None
+                _refresh_scopes(select=f"mod:{gid}" if gid else None)
+                _apply_scope(select_plugin=names[0] if names else None)
+            except Exception:
+                _refresh_scopes()
+                _apply_scope()
+            _apply_step_availability()
+            _refresh_upgrade_notice()
+
+        th = threading.Thread(target=_work, daemon=True)
+        th.start()
+        root.after(60, lambda: _drain(th))
+
+    def _manage_mods():
+        """List imported mods, with a Remove action for each."""
+        try:
+            from asset_convert import source_registry
+            groups = source_registry.groups(EXPORT_DIR)
+        except Exception as exc:
+            _info("Imported Mods", f"Could not read the mod registry:\n\n{exc}")
+            return
+
+        if not groups:
+            _info("Imported Mods",
+                  "No mods imported yet.\n\n"
+                  "Use Mods > Import Mod Archive…, or drag an archive onto "
+                  "the left panel.")
+            return
+
+        card = tk.Frame(outer, bg=CLR["panel"],
+                        highlightbackground=CLR["border"], highlightthickness=1)
+
+        def _close():
+            card.grab_release()
+            card.destroy()
+
+        tk.Label(card, text="Imported Mods", bg=CLR["panel"], fg=CLR["text"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16,
+                                                     pady=(14, 0))
+        ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16,
+                                                       pady=8)
+
+        body = ttk.Frame(card, style="Panel.TFrame")
+        body.pack(fill=tk.BOTH, padx=16)
+
+        def _remove(plug_names):
+            if not _confirm(
+                    "Remove Imported Mod",
+                    "Delete the imported copy of:\n\n  "
+                    + "\n  ".join(plug_names)
+                    + "\n\nThis removes their export folders. The original "
+                      "archive on disk is not touched.",
+                    yes="Remove", no="Cancel"):
+                return
+            from asset_convert import mod_ingest
+            for name in plug_names:
+                try:
+                    mod_ingest.remove(name, EXPORT_DIR)
+                except Exception as exc:
+                    _log(f"  Could not remove {name}: {exc}")
+            _close()
+            _refresh_scopes()
+            _apply_scope()
+            _manage_mods()
+
+        for _gid, label, plugs in groups:
+            row = ttk.Frame(body, style="Panel.TFrame")
+            row.pack(fill=tk.X, pady=3)
+            tk.Label(row, text=f"{label}\n  " + "\n  ".join(plugs),
+                     bg=CLR["panel"], fg=CLR["subtext"],
+                     font=("Segoe UI", 9), justify=tk.LEFT,
+                     anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+            ttk.Button(row, text="Remove", style="Danger.TButton",
+                       command=lambda p=list(plugs): _remove(p)).pack(
+                side=tk.RIGHT, padx=(8, 0))
+
+        ttk.Button(card, text="Close", command=_close).pack(anchor="e",
+                                                            padx=16,
+                                                            pady=(14, 14))
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        card.grab_set()
+
     _timer_job = [None]
     _timer_start = [0.0]
 
@@ -3497,9 +4160,13 @@ def gui_main():
             return
 
         # The plugin box is typable, so the text may not name a real plugin.
+        # `all_plugins` tracks the ACTIVE source, so an imported mod's plugins
+        # pass this check; the message has to name the right source too.
         if all_plugins and fname not in all_plugins:
+            row = scope_rows.get(scope_var.get()) or {}
             _info("Unknown Plugin",
-                  f"{fname!r} is not a plugin in the Oblivion data directory.\n"
+                  f"{fname!r} is not a plugin in "
+                  f"{row.get('label') or 'the selected source'}.\n"
                   "Pick one from the list.")
             return
 
@@ -3638,8 +4305,103 @@ def gui_main():
         # Start draining the queue in the UI thread
         root.after(50, _drain_queue)
 
-    # Startup: the plugin combo is already populated, so an upgrade is visible
+    # ── Sidebar drop zone ────────────────────────────────────────────────────
+    # The WHOLE sidebar accepts a dropped mod archive, so there is no small
+    # target to hunt for. Registered last: dropping runs the same import the
+    # Mods menu does, and every handler it needs exists by now.
+    def _install_dropzone():
+        if not DND_AVAILABLE:
+            return
+        try:
+            from tkinterdnd2 import DND_FILES
+        except Exception:
+            return
+
+        # tkdnd delivers <<DragLeave>> unreliably as the pointer crosses child
+        # widgets, so the highlight is guarded by a depth counter and force-
+        # reset on drop and on focus loss. Without that the sidebar can stay
+        # stuck in its highlighted state after the pointer has gone.
+        depth = [0]
+        saved_cursor = [None]
+
+        def _paint(on: bool):
+            try:
+                sidebar.configure(style="Drop.TFrame" if on
+                                  else "Panel.TFrame")
+                if on:
+                    if saved_cursor[0] is None:
+                        saved_cursor[0] = sidebar.cget("cursor")
+                    sidebar.configure(cursor="hand2")
+                else:
+                    sidebar.configure(cursor=saved_cursor[0] or "")
+                    saved_cursor[0] = None
+            except tk.TclError:
+                pass
+
+        def _enter(_e=None):
+            depth[0] += 1
+            _paint(True)
+            return "copy"
+
+        def _leave(_e=None):
+            depth[0] = max(0, depth[0] - 1)
+            if depth[0] == 0:
+                _paint(False)
+
+        def _reset(_e=None):
+            depth[0] = 0
+            _paint(False)
+
+        def _drop(event):
+            _reset()
+            paths = parse_dropped_paths(getattr(event, "data", "") or "")
+            if not paths:
+                return
+            if len(paths) > 1:
+                _info("Import Mod",
+                      "Drop one mod archive at a time.")
+                return
+            path = paths[0]
+            if not os.path.exists(path):
+                _info("Import Mod", f"Not found:\n\n{path}")
+                return
+            # A folder is a valid mod source; any other non-archive is not.
+            if not os.path.isdir(path):
+                from asset_convert import archive as _archive
+                if not _archive.is_archive(path):
+                    _info("Import Mod",
+                          f"{os.path.basename(path)} is not a mod archive.\n\n"
+                          "Drop a .zip, .7z or .rar, or an extracted mod "
+                          "folder.")
+                    return
+            _begin_import(path)
+
+        try:
+            sidebar.drop_target_register(DND_FILES)
+            sidebar.dnd_bind("<<DropEnter>>", _enter)
+            sidebar.dnd_bind("<<DropLeave>>", _leave)
+            sidebar.dnd_bind("<<Drop>>", _drop)
+        except Exception:
+            return
+        root.bind("<FocusOut>", _reset, add="+")
+
+    _install_dropzone()
+
+    # Startup: seed the source list from the folders this project already knows
+    # about (the configured tes4DataPath plus every folder a past conversion
+    # ran from), so someone with two installs sees both immediately rather
+    # than having to re-add the second by hand.
+    try:
+        from asset_convert import source_registry as _sr
+        _sr.migrate_known_directories(EXPORT_DIR, extra_dirs=[tes4_var.get()])
+    except Exception:
+        pass
+
+    # The plugin combo is already populated, so an upgrade is visible
     # (and pre-selected) before the user touches anything.
+    _refresh_scopes()
+    _apply_scope(select_plugin=file_var.get())
+    _apply_step_availability()
     _refresh_upgrade_notice()
     _update_run_btn()
     # Seed the global buttons from what has already been run, so a session that

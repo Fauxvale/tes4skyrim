@@ -83,6 +83,7 @@ This will install most of the following dependencies:
 | **[lz4](https://pypi.org/project/lz4/)** | Reading Skyrim SE BSAs (v105) — how vanilla assets are fetched when `export/skyrim_assets/` has no cached copy yet | `pip install lz4` |
 | **[mapbox_earcut](https://pypi.org/project/mapbox-earcut/)** | Navmesh triangulation fallback when Delaunay fails on a piece | `pip install mapbox_earcut` |
 | **[setuptools](https://pypi.org/project/setuptools/)** | Supplies `distutils`, which PyFFI imports, but Python **removed from the stdlib in 3.12**. | `pip install setuptools` |
+| **[tkinterdnd2](https://pypi.org/project/tkinterdnd2/)** | *Optional.* Dragging a mod archive onto the GUI; **Mods ▸ Import** works without it | `pip install tkinterdnd2` |
 | **Skyrim SE Creation Kit** | Supplies `LipGenerator.exe` (lip sync) and the Papyrus source headers every converted script compiles against | Free on Steam |
 | **xWMAEncode.exe** | xWMA voice compression | See note below |
 
@@ -109,12 +110,33 @@ python gui.py
 The GUI:
 
 - Auto-detects your Oblivion data directory from the Windows registry
-- Scans it for all `.esm` / `.esp` plugins
+- **Source** lists every game folder (Oblivion, Nehrim, ...) and every imported
+  mod; `+` and `−` add and remove folders
+- Scans the selected source for all `.esm` / `.esp` plugins
 - Lets you pick an output directory (saved to `conversion_config.json`)
 - Offers per-step checkboxes with **All** / **Default** shortcuts
 - Streams the pipeline log live
 - **Settings ▸ Download navmesh cache** toggles the prebuilt-cache download
 - **Tools ▸ Check Dependencies** reports what's missing before you start a run
+
+### Converting a downloaded mod
+
+Drag a `.zip` / `.7z` / `.rar` onto the left panel, or use **Mods ▸ Import Mod
+Archive…**, and it becomes a source like any folder in the list. Loose files,
+BSAs and nested archives are all handled; nothing is written to your Oblivion
+install. A mod with no plugin (a texture pack) imports too — the steps that need
+one are greyed out.
+
+A copy of the archive is kept under `export/<plugin>/_source/` so steps can be
+re-run after you delete the download. **Mods ▸ Manage Imported Mods…** removes
+them. If a master has not been converted yet, the import says so.
+
+```bash
+python convert.py --import-mod "C:\Downloads\SomeMod.rar"
+python convert.py -f SomeMod.esp          # then convert it normally
+python convert.py --list-mods
+python convert.py --remove-mod SomeMod.esp
+```
 
 
 Or run the full pipeline from the command line:

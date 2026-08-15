@@ -122,6 +122,19 @@ def _pip(mod: str, pkg: str, purpose: str, extra: str = '') -> 'Missing | None':
     return Missing(pkg, purpose, f'pip install {pkg}', extra)
 
 
+def _has_imported_mods() -> bool:
+    """True if any plugin was imported from a mod archive.
+
+    Keeps the 7-Zip requirement conditional: someone converting only
+    Data-directory plugins never needs it, so its absence must not abort them.
+    """
+    try:
+        from asset_convert import source_registry
+        return bool(source_registry.plugins(SCRIPT_DIR / 'export'))
+    except Exception:
+        return False
+
+
 def _have_native(mod: str) -> bool:
     """True if the compiled navmesh extension for THIS interpreter is present.
 
@@ -293,6 +306,12 @@ _REQUIREMENTS = {
     'extract': [
         lambda: _pip('lz4', 'lz4', 'Reading LZ4-compressed Skyrim SE BSAs when '
                                    'fetching vanilla assets'),
+        # Only needed to re-import a mod archive; a Data-directory plugin
+        # extracts its BSAs with the built-in reader and never touches this.
+        lambda: (_bundled_exe('external/7zip/7z.exe', '7z.exe',
+                              'Reading imported mod archives '
+                              '(.zip/.7z/.rar)')
+                 if _has_imported_mods() else None),
     ],
 
     'meshes': [

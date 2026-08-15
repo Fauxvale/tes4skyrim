@@ -195,6 +195,26 @@ call order) would fix this properly and is not yet done.
 3. **Assets** (`asset_convert`) — BSA extraction, NIF/texture/SpeedTree/sound
    conversion, LOD generation, BSA packing.
 
+### The extract stage has two sources
+
+`phase_extract` branches on `export/sources.json`:
+
+- a plugin **imported from a mod archive** re-runs its ingest
+  (`asset_convert/mod_ingest.py::reingest`), unpacking from the archive copy
+  retained under `export/<plugin>/_source/`;
+- **everything else** extracts the BSAs beside it in the Oblivion Data
+  directory, exactly as before.
+
+Both produce the same `export/<plugin>/{meshes,textures,sound,trees,misc}`
+tree, so no later stage knows which ran. A plugin's binary is located by
+`convert.py::resolve_plugin_path` — the Data directory, or the imported copy —
+and **every** path that used to be `os.path.join(tes4_data, name)` must go
+through it. With no imported mods the registry is absent and behaviour is
+byte-for-byte what it was (`tests/test_mod_ingest.py` asserts this).
+
+See [mod_archive_ingest_plan.md](mod_archive_ingest_plan.md) for the layout
+rule, nesting, precedence and path-safety contract.
+
 `import_main.py` runs a long phase sequence (Phase 0 pre-scans through Phase 5
 dialogue). Ordering matters — e.g. PACK is written in its own Phase 3b2 after
 QUST because quest packages need the aliases to exist first, and the ForceGreet

@@ -152,6 +152,185 @@ def get_paths(config: dict) -> tuple:
     return tes4, tes5
 
 
+def resolve_plugin_path(file_name: str, tes4_data: str,
+                        export_dir: str = None) -> str:
+    """Absolute path to a plugin's TES4 binary.
+
+    A plugin imported from a mod archive (see `asset_convert/mod_ingest.py`)
+    keeps its binary at `export/<plugin>/_source/<plugin>` and is registered in
+    `export/sources.json`; anything else lives in the Oblivion Data directory
+    exactly as it always has.
+
+    EVERY place that used to build `os.path.join(tes4_data, name)` must go
+    through here -- one missed call site and an imported mod half-works
+    (exported but not extracted, or listed but not convertible).
+    """
+    export_dir = export_dir or str(SCRIPT_DIR / "export")
+    try:
+        from asset_convert import source_registry
+        imported = source_registry.plugin_binary(export_dir, file_name)
+        if imported:
+            return str(imported)
+    except Exception:
+        # A broken/absent registry must never stop a normal Data-directory
+        # conversion -- that is the whole additive guarantee.
+        pass
+    return os.path.join(tes4_data or "", file_name)
+
+
+def _mod_commands(args, export_dir: str, tes4_data: str) -> int:
+    """Handle --list-mods / --import-mod / --remove-mod, then exit.
+
+    These manage conversion SOURCES rather than converting anything, so they
+    never touch the pipeline.
+    """
+    from asset_convert import mod_ingest, source_registry
+
+    if args.list_mods:
+        groups = source_registry.groups(export_dir)
+        if not groups:
+            print("No imported mods. Add one with:\n"
+                  "  python convert.py --import-mod <archive|folder>")
+            return 0
+        print(f"Imported mods ({len(groups)}):")
+        for _gid, label, plugs in groups:
+            print(f"  {label}")
+            for name in plugs:
+                entry = source_registry.get(export_dir, name) or {}
+                counts = entry.get("counts") or {}
+                total = sum(counts.values())
+                if not entry.get("plugin"):
+                    # Asset-only mod: no plugin is the normal state, not a
+                    # missing file.
+                    kinds = ", ".join(
+                        k for k in ("meshes", "textures", "sound", "trees")
+                        if (entry.get("capabilities") or {}).get(k))
+                    print(f"    - {name}  (no plugin"
+                          + (f"; {kinds}" if kinds else "") + ")")
+                    continue
+                binary = source_registry.plugin_binary(export_dir, name)
+                mark = "" if binary else "   [binary MISSING]"
+                print(f"    - {name}"
+                      + (f"  ({total} files)" if total else "")
+                      + mark)
+        return 0
+
+    if args.remove_mod:
+        if mod_ingest.remove(args.remove_mod, export_dir):
+            print(f"Removed {args.remove_mod}")
+            return 0
+        print(f"{args.remove_mod!r} is not an imported mod. "
+              f"See --list-mods.")
+        return 1
+
+    # --import-mod
+    src = args.import_mod
+    if not os.path.exists(src):
+        print(f"ERROR: not found: {src}")
+        return 1
+    try:
+        manifest = mod_ingest.inspect(src)
+    except mod_ingest.IngestError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    print(f"Archive : {manifest.path.name}")
+    print(f"Layout  : "
+          + (f"Data folder '{manifest.payload_root}'" if manifest.payload_root
+             else "archive root"))
+    print(f"Contents: {manifest.summary()}")
+    if manifest.ambiguous_data:
+        print("WARNING: several equally-shallow Data folders "
+              f"({', '.join(manifest.ambiguous_data)}); using the first.")
+    if manifest.bsas:
+        print(f"BSAs    : {len(manifest.bsas)}")
+    if manifest.nested:
+        print(f"Nested  : {len(manifest.nested)} archive(s)")
+    print(f"Plugins : {', '.join(manifest.plugins)}")
+
+    try:
+        results = mod_ingest.ingest(
+            src, export_dir,
+            plugin_members=args.plugin_member,
+            keep_archive=not args.no_keep_archive,
+            manifest=manifest)
+    except mod_ingest.IngestError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    # Masters must already be converted or the import silently produces a
+    # broken plugin -- warn loudly rather than letting it fail deep in import.
+    missing = _missing_master_exports(results, export_dir, tes4_data)
+    if missing:
+        print()
+        print("WARNING: these masters have no export yet:")
+        for master, users in sorted(missing.items()):
+            print(f"  {master}  (needed by {', '.join(sorted(users))})")
+        print("Convert them FIRST, or the import will resolve their records "
+              "to nothing:")
+        print(f"  python convert.py -f {sorted(missing)[0]}")
+
+    first = sorted(results)[0]
+    quoted = f'"{first}"' if ' ' in first else first
+    caps = (results[first] or {}).get('capabilities') or {}
+    print()
+    if caps.get('plugin', True):
+        print("Imported. Convert it with:")
+        print(f"  python convert.py -f {quoted}")
+    else:
+        # No plugin means no export/import/scripts -- naming those steps here
+        # would send the user straight into a no-op run.
+        steps = sorted(mod_ingest.available_steps(caps)
+                       & {'meshes', 'speedtrees', 'sounds'})
+        flags = ' '.join(f'--{s.replace("_", "-")}-only' for s in steps)
+        print("Imported (asset-only mod -- no plugin to export or import).")
+        print("Convert its assets with:")
+        print(f"  python convert.py -f {quoted} {flags}".rstrip())
+    return 0
+
+
+def _is_asset_only(file_name: str, export_dir: str) -> bool:
+    """True for an imported mod that ships assets but NO plugin.
+
+    Texture/mesh replacers and resource packs are legitimate mods with nothing
+    to export or import (e.g. "Tamriel Landscape Pack" is one BSA of 2,018
+    meshes/textures/trees). Their asset phases run normally; the record phases
+    have no binary to read and are skipped rather than failed.
+    """
+    try:
+        from asset_convert import source_registry
+        entry = source_registry.get(export_dir, file_name)
+    except Exception:
+        return False
+    if not entry:
+        return False
+    caps = entry.get('capabilities')
+    if isinstance(caps, dict) and 'plugin' in caps:
+        return not caps['plugin']
+    return not entry.get('plugin')
+
+
+def _missing_master_exports(results, export_dir: str, tes4_data: str) -> dict:
+    """{master_name: {plugins needing it}} for masters lacking an export dir.
+
+    A plugin's masters resolve as SIBLING directories under export/ (see
+    tes5_import/overrides.py:load_master_export), so a missing one is the
+    project's classic silent-failure mode.
+    """
+    from asset_convert import source_registry
+
+    missing = {}
+    for name in results:
+        binary = source_registry.plugin_binary(export_dir, name)
+        if not binary:
+            continue
+        for master in get_masters_from_binary(str(binary)):
+            if os.path.isdir(os.path.join(export_dir, master)):
+                continue
+            missing.setdefault(master, set()).add(name)
+    return missing
+
+
 def get_masters_from_binary(filepath: str) -> list:
     """Read master list from a TES4 binary file header."""
     import struct as st
@@ -189,7 +368,7 @@ def topological_order(files: list, tes4_data: str) -> list:
     # Build dependency graph from binary headers
     deps = {}
     for name in file_names:
-        source = os.path.join(tes4_data, name)
+        source = resolve_plugin_path(name, tes4_data)
         if os.path.isfile(source):
             deps[name] = get_masters_from_binary(source)
         else:
@@ -224,8 +403,9 @@ def phase_export(file_name: str, tes4_data: str, export_dir: str,
 
     out_dir = os.path.join(export_dir, file_name)
 
-    # Find the source file
-    source = os.path.join(tes4_data, file_name)
+    # Find the source file -- the Oblivion Data directory, or an imported mod's
+    # retained binary under export/<plugin>/_source/.
+    source = resolve_plugin_path(file_name, tes4_data, export_dir)
     if not os.path.isfile(source):
         print(f"[{file_name}] ERROR: Source file not found: {source}")
         return False
@@ -266,10 +446,28 @@ def phase_export(file_name: str, tes4_data: str, export_dir: str,
 
 def phase_extract(file_name: str, tes4_data: str, config: dict,
                   output_dir: str = None):
-    """Extract BSA archives for a plugin into export/<name>/."""
-    from asset_convert.asset_pipeline import extract_bsas
+    """Get a plugin's assets into export/<name>/.
 
+    Two sources, one output shape:
+      * a plugin imported from a mod archive re-runs its ingest (which already
+        produced the same tree the BSA extractor would have);
+      * everything else extracts the BSAs beside it in the Oblivion Data dir,
+        exactly as before.
+    """
     extract_dir = str(SCRIPT_DIR / "export")
+
+    from asset_convert import source_registry
+    if source_registry.get(extract_dir, file_name):
+        from asset_convert import mod_ingest
+        print(f"[{file_name}] Re-importing mod archive...")
+        try:
+            mod_ingest.reingest(file_name, extract_dir)
+        except mod_ingest.IngestError as exc:
+            print(f"[{file_name}] ERROR: {exc}")
+            return False
+        return True
+
+    from asset_convert.asset_pipeline import extract_bsas
 
     print(f"[{file_name}] Extracting BSA archives...")
     extract_bsas(
@@ -1032,6 +1230,24 @@ def main():
                         help="Pack output assets into Skyrim SE BSA archives")
     parser.add_argument("--pack-zip-only",       action="store_true",
                         help="Zip converted plugin/BSA files for distribution")
+    # ── Mod archive import ───────────────────────────────────────────────────
+    # Importing is not a pipeline phase: it registers a NEW conversion source
+    # and exits, after which `-f <plugin>` converts it like any other plugin.
+    parser.add_argument("--import-mod",          metavar="ARCHIVE",
+                        help="Import a mod archive (.zip/.7z/.rar) or an "
+                             "already-extracted mod folder as a conversion "
+                             "source, then exit")
+    parser.add_argument("--plugin-member",       nargs="+", metavar="PATH",
+                        help="With --import-mod: which plugin(s) inside the "
+                             "archive to register (default: all found)")
+    parser.add_argument("--no-keep-archive",     action="store_true",
+                        help="With --import-mod: do not retain a copy of the "
+                             "archive (re-importing then needs the original)")
+    parser.add_argument("--list-mods",           action="store_true",
+                        help="List imported mod archives and exit")
+    parser.add_argument("--remove-mod",          metavar="PLUGIN",
+                        help="Remove an imported mod (deletes its export "
+                             "folder and registry entry), then exit")
     parser.add_argument("--mesh-subdirs",        nargs="+", metavar="SUBDIR",
                         help="Limit mesh conversion to these root subfolders "
                              "(e.g. architecture clutter). Default: all.")
@@ -1062,6 +1278,12 @@ def main():
     os.makedirs(export_dir, exist_ok=True)
     os.makedirs(os.path.join(export_dir, "mappings"), exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
+
+    # ── Mod-archive management ───────────────────────────────────────────────
+    # These register/inspect conversion SOURCES and exit; they convert nothing,
+    # so they run before any pipeline setup.
+    if args.list_mods or args.import_mod or args.remove_mod:
+        return _mod_commands(args, export_dir, tes4_data)
 
     print("=" * 54)
     print("  TES4 -> TES5 Conversion Pipeline")
@@ -1164,11 +1386,22 @@ def main():
         _step_ok.setdefault(step_key, {})[fn] = (
             _step_ok.get(step_key, {}).get(fn, True) and ok)
 
-    if do_export:
+    # An asset-only mod (a texture/mesh replacer imported from an archive) has
+    # no plugin binary, so the record phases have nothing to read. Drop those
+    # files from the plugin-only phases rather than letting each one fail on a
+    # missing source; their asset phases still run normally.
+    _asset_only = {fn for fn in order if _is_asset_only(fn, export_dir)}
+    order_with_plugin = [fn for fn in order if fn not in _asset_only]
+    if _asset_only:
+        print(f"  Asset-only (no plugin): {', '.join(sorted(_asset_only))}")
+        print("    -> skipping Export/Import/Scripts/Creatures for these")
+        print()
+
+    if do_export and order_with_plugin:
         print("=" * 54)
         print("  Phase 1: EXPORT TES4 RECORDS")
         print("=" * 54)
-        for fn in order:
+        for fn in order_with_plugin:
             ok = phase_export(fn, tes4_data, export_dir, config)
             _mark('export', fn, ok)
             if not ok:
@@ -1213,22 +1446,22 @@ def main():
                 success = False
         print()
 
-    if do_creatures:
+    if do_creatures and order_with_plugin:
         print("=" * 54)
         print("  Phase 5: CONVERT CREATURES")
         print("=" * 54)
-        for fn in order:
+        for fn in order_with_plugin:
             ok = phase_creatures(fn, tes5_data, config, output_dir=output_dir)
             _mark('creatures', fn, ok)
             if not ok:
                 success = False
         print()
 
-    if do_import:
+    if do_import and order_with_plugin:
         print("=" * 54)
         print("  Phase 6: BUILD TES5 PLUGIN")
         print("=" * 54)
-        for fn in order:
+        for fn in order_with_plugin:
             ok = phase_import(fn, tes4_data, tes5_data, export_dir, config,
                               output_dir=output_dir)
             _mark('import_', fn, ok)
@@ -1247,11 +1480,11 @@ def main():
                 success = False
         print()
 
-    if do_scripts:
+    if do_scripts and order_with_plugin:
         print("=" * 54)
         print("  Phase 8: CONVERT SCRIPTS")
         print("=" * 54)
-        for fn in order:
+        for fn in order_with_plugin:
             ok = phase_scripts(fn, config, output_dir=output_dir)
             # Compile only when THIS plugin transpiled cleanly.  This used to
             # gate on the global `success`, so one earlier plugin's failure

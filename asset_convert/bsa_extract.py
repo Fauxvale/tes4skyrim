@@ -228,6 +228,38 @@ def _should_extract_file(filepath):
     return True
 
 
+# The top-level asset folders that keep their own name under export/<plugin>/.
+# Anything else is filed under misc/ (Oblivion's DistantLOD\, Docs\, ...).
+ASSET_CATEGORIES = ('meshes', 'trees', 'textures', 'sound')
+
+
+def split_category(filepath):
+    """Split an asset path into (category, rest-of-path).
+
+    ONE definition, shared by BSA extraction and mod-archive ingest: a loose
+    file and the same file inside a BSA must land in exactly the same place, or
+    every stage downstream sees two different trees for the same mod.
+
+    `rest` keeps its original separators; callers split it themselves, because
+    BSA paths are always Windows-style backslash regardless of host OS.
+    """
+    lower = str(filepath).lower().replace('/', '\\')
+    for cat in ASSET_CATEGORIES:
+        if lower.startswith(cat + '\\'):
+            return cat, str(filepath)[len(cat) + 1:]
+    return 'misc', str(filepath)
+
+
+def categorize(filepath):
+    """`split_category` as one forward-slash relative path.
+
+    e.g. 'Meshes\\foo\\bar.nif' -> 'meshes/foo/bar.nif'.
+    """
+    category, rest = split_category(filepath)
+    parts = [p for p in rest.replace('\\', '/').split('/') if p]
+    return '/'.join([category] + parts)
+
+
 # Manifest file tracks what BSAs have been extracted
 MANIFEST_NAME = '.bsa_extract_manifest.json'
 
@@ -370,17 +402,7 @@ def extract_bsa(bsa_path, extract_dir, force=False, source_name=None):
             stats['skipped'] += 1
             continue
 
-        fp_lower = filepath.lower().replace('/', '\\')
-        if fp_lower.startswith('meshes\\'):
-            category, rest = 'meshes', filepath[len('meshes\\'):]
-        elif fp_lower.startswith('trees\\'):
-            category, rest = 'trees', filepath[len('trees\\'):]
-        elif fp_lower.startswith('textures\\'):
-            category, rest = 'textures', filepath[len('textures\\'):]
-        elif fp_lower.startswith('sound\\'):
-            category, rest = 'sound', filepath[len('sound\\'):]
-        else:
-            category, rest = 'misc', filepath
+        category, rest = split_category(filepath)
 
         # BSA internal paths are always Bethesda/Windows-style backslash-
         # separated, regardless of host OS -- os.sep is '/' on Linux, so a
