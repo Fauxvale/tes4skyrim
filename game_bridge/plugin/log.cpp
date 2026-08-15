@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <shlobj.h>
 
+#include <share.h>
+
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>
@@ -31,7 +33,13 @@ void OpenLog() {
         path = L"TESGameBridge.log";
     }
 
-    _wfopen_s(&g_file, path.c_str(), L"w");
+    // _SH_DENYNO, not _wfopen_s. _wfopen_s takes the file EXCLUSIVELY, so the
+    // log could not be read while the game was running -- precisely when it is
+    // needed, since it is the only record of why a capability failed to
+    // resolve. (2026-08-14: diagnosing an unresolved Address Library meant
+    // asking the user to quit the game first.) _wfsopen keeps the same
+    // fflush-per-line behaviour but lets other processes read concurrently.
+    g_file = _wfsopen(path.c_str(), L"w", _SH_DENYNO);
     if (g_file) {
         SYSTEMTIME st;
         GetLocalTime(&st);

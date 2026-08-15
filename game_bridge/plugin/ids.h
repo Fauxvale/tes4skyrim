@@ -52,6 +52,36 @@ constexpr std::uint64_t kConsoleExecute = 21954;
 // the compiler the console itself uses.
 constexpr std::uint64_t kCompilerNameTable = 368092;
 
+// 🛑 THE CONSOLE'S FULL DISPATCHER -- compile AND run.
+//
+// `kConsoleExecute` ONLY COMPILES. Its tail is `call <compile finalizer>;
+// mov al,1; ret`, so a caller that stops there gets a truthful-looking
+// `returned: 1` with no output and no effect. That false success cost this
+// project two separate debugging sessions.
+//
+// This function is the one the console itself calls, and it does the whole job
+// (verified by disassembling the LIVE Steam 1.6.1170 process, not GOG):
+//
+//   dispatch(rcx = Script, rdx = ?, r8d = compilerType, r9 = target)
+//     rbp = TLS block ; save [rbp+0x768] ; [rbp+0x768] = 0x14   (source marker)
+//     call ConsoleExecute(ctx, Script, target, type)            (COMPILES)
+//     if (ok && Script->bytecodeLen != 0):
+//         byte [rbp+0x600] = 1        <-- console-mode: makes handlers PRINT
+//         call runner(Script, target) <-- THIS is what actually executes
+//         byte [rbp+0x600] = 0
+//     [rbp+0x768] = saved
+//
+// Calling this instead of ConsoleExecute gets execution, the console-mode flag
+// and its restore all handled by the engine, exactly as a typed command does.
+//
+// It is NOT resolved by a stable ID or a raw signature. Both would be guesses
+// about a function whose only job is to wrap kConsoleExecute. Instead it is
+// found STRUCTURALLY: scan .text for a `call kConsoleExecute` whose following
+// bytes match the "compile ok -> set 0x600 -> call runner" shape, then walk
+// back to that function's prologue. That derivation is self-checking (the
+// console-mode store must be there) and survives any build where
+// kConsoleExecute itself resolves. See FindConsoleDispatch in console_exec.cpp.
+
 // Havok class registry entries, used by the ragdoll probe to identify objects
 // by their hkClass pointer rather than by guessing at struct layout.
 constexpr std::uint64_t kHkClassRigidBody      = 386860;
@@ -59,13 +89,19 @@ constexpr std::uint64_t kHkClassRagdollInstance = 387372;
 
 // Script object construction.
 //
-// The engine allocates 0x80 bytes and calls Script::ctor, which stores the
-// vtable and zeroes the members. We do the same thing using the vtable directly
-// rather than calling the constructor, because Script::ctor's stable ID (21874)
-// exists in the 1.6.659 database but NOT in 1.6.1170 -- calling through a
-// missing ID would jump to address 0.
+// The engine allocates 0x80 bytes and calls Script::ctor. We MUST call the real
+// constructor -- reproducing it by hand does not work:
 //
-// Both of these DO resolve on 1.6.1170 (verified against both databases).
+//   Script::ctor (0x2fc5d0 on 1.6.659) first calls a BASE-CLASS constructor
+//   (0x19e330), which touches thread-local state and stores its own vtable,
+//   then writes several fields including `mov byte [rbx+0x1A], 0x13` -- a
+//   non-zero type/flags byte. The earlier "memset to zero, store the vtable"
+//   substitute skipped both, and the console executor faulted on the
+//   half-built object (SEH-caught: "engine raised an exception").
+//
+// Its stable ID 21874 exists on 1.6.659 but is ABSENT from 1.6.1170, so it is
+// resolved by SIGNATURE (kSigScriptCtor below) -- verified unique in .text.
+constexpr std::uint64_t kScriptCtor   = 21874;   // 0x2fc5d0 -> (absent on 1170)
 constexpr std::uint64_t kScriptVtable = 191694;  // 0x166e680 -> 0x17c1618
 constexpr std::uint64_t kMemAlloc     = 68115;   // 0xc390a0  -> 0xcc40c0
 constexpr std::size_t   kScriptSize   = 0x80;    // from the console's own alloc
@@ -100,5 +136,55 @@ constexpr const char* kSigCompileAndRun =
 constexpr const char* kSigConsoleExecute =
     "48 8B C4 57 48 81 EC C0 00 00 00 48 C7 44 24 20 FE FF FF FF "
     "48 89 58 08 48 89 70 10 41 8B D9 48 8B FA";
+
+// Console::Print(const char* fmt, ...) -- the console's own print entry point.
+//
+// FOUND VIA RTTI, not guesswork. Static call-counting fails here (the callers
+// reach it indirectly), which is why an earlier pass wrongly concluded it could
+// not be identified safely. The reliable route:
+//
+//   1. TypeDescriptor ".?AVConsole@@"            (rva 0x1f0e4b8 on 1.6.659)
+//   2. -> CompleteObjectLocator                  (rva 0x1a1c960)
+//   3. -> the Console vtable                     (rva 0x179c060)
+//   4. vtable[11] is a 5-instruction thunk at 0x89b340:
+//        mov  rcx, [rip+...]   ; the Console singleton (id 401203)
+//        mov  r8,  rdx         ; caller's text becomes arg3
+//        lea  rdx, [rip+...]   ; -> the literal "> %s"   <-- PROOF
+//        jmp  0x89b480         ; tail-call the real printer
+//
+// The "> %s" format string is the console's echo prefix, which identifies this
+// beyond doubt. Hooking it captures everything a command prints.
+constexpr std::uint64_t kConsolePrint = 51105;   // 0x89b340 -> 0x8f75d0
+
+// The thunk shape above, with the two rip-relative operands wildcarded.
+// Verified: exactly ONE match in .text on GOG 1.6.659.
+constexpr const char* kSigConsolePrint =
+    "48 8B 0D ?? ?? ?? ?? 4C 8B C2 48 8D 15 ?? ?? ?? ?? E9";
+
+// SkyrimScript::Logger::Log(const char* msg, ...) -- the sink EVERY Papyrus
+// message passes through (Debug.Trace, Debug.Notification, VM errors).
+//
+// Found by RTTI, like Console::Print:
+//   TypeDescriptor ".?AVLogger@SkyrimScript@@"  (rva 0x1f12078 on 1.6.659)
+//     -> CompleteObjectLocator -> vtable        (rva 0x17b5b70, id 216736)
+//     -> vtable[1] = Log                        (rva 0x945290)
+//
+// The prologue saves rdx into rdi before anything else, which is what pins the
+// message to arg2.
+constexpr std::uint64_t kPapyrusLog = 53551;   // 0x945290 -> 0x9a43d0
+
+// Script::ctor prologue:
+//   push rbx / sub rsp,20 / mov rbx,rcx / call <base ctor> / mov ecx,[rip+?]
+//   lea rax,[rip+?] (the Script vtable) / mov [rbx],rax / xor r8d,r8d
+//   mov [rbx+0x60],r8
+//
+// The three rel32/disp32 operands are wildcarded because they move every build;
+// the surrounding opcodes do not. Verified against GOG 1.6.659: exactly ONE
+// match in .text, at 0x1402fc5d0 -- which is also the address stable ID 21874
+// gives, and the `lea` it contains points at kScriptVtable (0x166e680), so the
+// signature, the ID and the vtable all corroborate each other.
+constexpr const char* kSigScriptCtor =
+    "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? "
+    "48 8D 05 ?? ?? ?? ?? 48 89 03 45 33 C0 4C 89 43 60";
 
 }  // namespace bridge::ids

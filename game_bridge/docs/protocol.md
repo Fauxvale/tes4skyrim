@@ -86,8 +86,73 @@ Commands that touch **only** the filesystem or plugin-local state (`ping`,
 |---|---|---|
 | `console` | `{command, ref?}` | `{output}` — runs a console command, optionally with a selected reference (the `ref` is the console's implicit `this`) |
 
-Console output is captured by hooking the console print path, so `getpos`,
-`getav`, etc. return their text rather than only appearing on screen.
+**Console output capture** is a detour on `Console::Print`. The hook is
+verified live: a command typed into the in-game console reliably increments
+`console_print_hits` and its text lands in the ring (`console_log`).
+
+### 🛑 Printing is gated on a THREAD-LOCAL byte
+
+Every printing ObScript handler compiles to:
+
+```
+mov ecx,[g_tlsIndex] ; mov rax,gs:[0x58] ; mov edx,0x600
+mov rax,[rax+rcx*8]  ; cmp byte [rdx+rax],0 ; je skip-the-print
+```
+
+The real console sets that byte while dispatching a typed command. A command
+run straight through `ConsoleExecute` never does, so it executes and prints
+**nothing** — which looks exactly like a dead hook. Forcing the byte on took the
+print hook from 10 hits to 15,293 in one session.
+
+The plugin discovers the flag by scanning for that idiom and taking the
+**operand consensus** over every inlined copy (253 matches; 248 agree on offset
+`0x600`, 5 use `0x5D8`), then sets it on the executing thread only, around each
+command. Setting it on every thread FROZE the game — background threads are not
+supposed to reach that path.
+
+### 🛑 `ConsoleExecute` COMPILES; it does not run
+
+Verified by disassembling the **live Steam process** (`tools/live_disasm.py`),
+not the GOG build: `ConsoleExecute`'s tail is `call <compile finalizer>;
+mov al,1; ret`. It returns success having only produced bytecode. The console
+then performs a separate execution step. A caller that stops at `ConsoleExecute`
+gets `returned: 1`, zero output, and no effect — the false-success this
+subsystem has been bitten by twice.
+
+`console_log` exists to make these failures decidable: it is an always-on ring
+that records console output regardless of who caused it, so "the hook is dead"
+and "the command printed nothing" stop being the same observation.
+
+Finding the target needed RTTI, not call-counting — an earlier pass wrongly
+concluded it could not be identified safely, because the plausible candidates
+have 0–1 *direct* callers (the real one is reached indirectly):
+
+    TypeDescriptor ".?AVConsole@@"  ->  CompleteObjectLocator
+      ->  Console vtable (rva 0x179c060 on 1.6.659)
+      ->  vtable[11]: a 5-instruction thunk that loads the Console singleton
+          and tail-jumps to the printer, carrying a `lea rdx, ["> %s"]`
+
+That `"> %s"` literal is the console's echo prefix and is the proof of
+identity. Stable id **51105**, with a signature fallback verified unique.
+
+### Papyrus VM capture
+
+A second, independent hook on `SkyrimScript::Logger::Log` (stable id **53551**,
+found by the same RTTI route via `.?AVLogger@SkyrimScript@@`) captures every
+message the VM emits — `Debug.Trace`, notifications, and VM errors.
+
+| cmd | args | returns |
+|---|---|---|
+| `vmlog` | `{arm?, limit?}` | `{lines, count, source}` — `arm` starts a slice; a later call returns everything emitted in between |
+
+`inject` arms this automatically and returns a `papyrus` array with exactly the
+lines its script produced. That is the whole autonomous loop in one call, and
+it is strictly better than tailing the log file for attribution: no cursor
+arithmetic, no racing the game's buffered writes, no guessing which lines are
+yours.
+
+Tailing the file (`tools/papyrus_tail.py`) is still supported and complementary
+— it sees history and anything emitted while nothing was armed.
 
 ### Papyrus
 

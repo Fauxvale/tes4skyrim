@@ -14,10 +14,11 @@
 
 #include <windows.h>
 
-#include <cstring>
+#include <type_traits>
 
 #include "addresses.h"
 #include "commands.h"
+#include "game.h"
 #include "log.h"
 #include "main_thread.h"
 #include "pipe_server.h"
@@ -45,6 +46,23 @@ void StartBridge() {
         // Still start the server: `capabilities` must be answerable so the
         // client can report precisely what is missing instead of just timing out.
     }
+
+    // Console output capture. Optional: a failure here leaves commands
+    // runnable but unreadable, which is reported through `capabilities`
+    // rather than blocking startup.
+    InstallConsoleCapture(g_addr.consolePrint);
+    // Without the console-mode flag, handlers never print, so the capture hook
+    // above has nothing to capture. Discovery is a signature-consensus scan;
+    // failure degrades to commands-run-but-unreadable, reported in hookstats.
+    DiscoverConsoleModeFlag();
+    // The console's compile+run dispatcher. ConsoleExecute alone only compiles,
+    // so without this every command is a silent no-op that reports success.
+    InitConsoleDispatch();
+    InstallPapyrusCapture(g_addr.papyrusLog);
+    // Watches the game's own console calls to learn the execution context that
+    // ConsoleExecute's arg1 requires -- without it, commands compile but never
+    // run. See game.h.
+    InstallExecContextCapture(g_addr.compileAndRun);
 
     g_taskPumpLive = true;
 
@@ -84,22 +102,38 @@ void OnSKSEMessage(SKSEMessagingInterface::Message* msg) {
 
 extern "C" {
 
-__declspec(dllexport) SKSEPluginVersionData SKSEPlugin_Version = [] {
-    SKSEPluginVersionData v{};
-    v.dataVersion = SKSEPluginVersionData::kVersion;
-    v.pluginVersion = kPluginVersion;
-    std::strncpy(v.name, kPluginName, sizeof(v.name) - 1);
-    std::strncpy(v.author, "TESConversion", sizeof(v.author) - 1);
+// MUST be a static (constant) initializer, not a lambda or any other dynamic
+// one. SKSE reads this struct with LOAD_LIBRARY_AS_IMAGE_RESOURCE, which maps
+// the DLL as raw data and runs NO CRT initializers -- so it sees whatever bytes
+// are in .data on disk. A dynamic initializer leaves those bytes zero, and
+// SKSE's first check is `if (!dataVersion) return "disabled, bad version data"`.
+// The failure is silent at build time and only appears in skse64.log.
+//
+// versionIndependence: we read game structures, so we are bound to the
+// post-1.6.629 layout. Declaring it makes SKSE refuse to load us on older
+// runtimes rather than reading the same offsets and getting different fields.
+// compatibleVersions is left zeroed -- with AddressLibraryPostAE that means
+// "any post-AE runtime with an Address Library", which is the intent.
+__declspec(dllexport) SKSEPluginVersionData SKSEPlugin_Version = {
+    SKSEPluginVersionData::kVersion,  // dataVersion
+    kPluginVersion,                   // pluginVersion
+    "TESGameBridge",                  // name[256]
+    "TESConversion",                  // author[256]
+    "",                               // supportEmail[252]
+    0,                                // versionIndependenceEx
+    SKSEPluginVersionData::kVersionIndependent_AddressLibraryPostAE |
+        SKSEPluginVersionData::kVersionIndependent_StructsPost629,
+    {0},                              // compatibleVersions
+    0,                                // seVersionRequired
+};
 
-    // We read game structures, so we are bound to the post-1.6.629 layout.
-    // Declaring this makes SKSE refuse to load us on older runtimes rather than
-    // letting us read the same offsets and get different fields.
-    v.versionIndependence = SKSEPluginVersionData::kVersionIndependent_AddressLibraryPostAE |
-                            SKSEPluginVersionData::kVersionIndependent_StructsPost629;
-    v.compatibleVersions[0] = 0;  // any post-AE runtime with an Address Library
-    v.seVersionRequired = 0;
-    return v;
-}();
+// Guards the rule above. If someone reintroduces a dynamic initializer, the
+// struct stops being constant-initializable and this fails the BUILD rather
+// than shipping a DLL that SKSE silently rejects at startup.
+static_assert(std::is_trivially_copyable<SKSEPluginVersionData>::value,
+              "SKSEPlugin_Version must stay a POD written straight into .data: "
+              "SKSE reads it via LOAD_LIBRARY_AS_IMAGE_RESOURCE and runs no "
+              "initializers.");
 
 __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* skse) {
     OpenLog();

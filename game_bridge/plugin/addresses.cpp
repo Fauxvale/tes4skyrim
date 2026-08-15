@@ -24,7 +24,7 @@ std::uintptr_t ModuleBase() {
     return base;
 }
 
-static bool TextRange(std::uintptr_t& begin, std::uintptr_t& end) {
+bool TextRange(std::uintptr_t& begin, std::uintptr_t& end) {
     static std::uintptr_t b = 0, e = 0;
     if (!b) {
         auto base = ModuleBase();
@@ -105,13 +105,28 @@ std::string DataPluginsDir() {
 }  // namespace
 
 bool VersionDb::Load(std::uint32_t runtimeVersion) {
-    // SKSE packs version as (major<<24)|(minor<<16)|(patch<<8)
-    const unsigned maj   = (runtimeVersion >> 24) & 0xFF;
-    const unsigned min   = (runtimeVersion >> 16) & 0xFF;
-    const unsigned patch = (runtimeVersion >> 8)  & 0xFF;
+    // SKSE packs the runtime version as
+    //     (major & 0xFF) << 24 | (minor & 0xFF) << 16 | (build & 0xFFF) << 4 | (sub & 0xF)
+    // -- see skse64_common/skse_version.h (MAKE_EXE_VERSION_EX / GET_EXE_VERSION_*).
+    //
+    // BUILD IS 12 BITS, NOT 8. Treating it as an 8-bit field shifted by 8 makes
+    // 1.6.1170 (0x01064920) decode as build 73, so the plugin looked for a
+    // versionlib-1-6-73-0.bin that does not exist -- every stable ID then
+    // resolved to 0 and only the two entries with signature fallbacks worked.
+    const unsigned maj   = (runtimeVersion & 0xFF000000u) >> 24;
+    const unsigned min   = (runtimeVersion & 0x00FF0000u) >> 16;
+    const unsigned build = (runtimeVersion & 0x0000FFF0u) >> 4;
+    const unsigned sub   = (runtimeVersion & 0x0000000Fu);
 
+    // `sub` is the storefront (0 Bethesda/Steam, 1 GOG, 2 Epic). Address Library
+    // ships the Steam database as -0 and GOG/Epic under their own suffix, so try
+    // the exact one first and fall back to -0 rather than giving up.
     char name[128];
-    std::snprintf(name, sizeof(name), "versionlib-%u-%u-%u-0.bin", maj, min, patch);
+    if (sub != 0) {
+        std::snprintf(name, sizeof(name), "versionlib-%u-%u-%u-%u.bin", maj, min, build, sub);
+        if (LoadFile(DataPluginsDir() + name)) return true;
+    }
+    std::snprintf(name, sizeof(name), "versionlib-%u-%u-%u-0.bin", maj, min, build);
     return LoadFile(DataPluginsDir() + name);
 }
 
@@ -179,7 +194,9 @@ std::uintptr_t VersionDb::Get(std::uint64_t id) const {
 
 // ------------------------------------------------------------- signatures ----
 
-std::uintptr_t ScanSignature(const char* pattern) {
+std::vector<std::uintptr_t> ScanSignatureAll(const char* pattern,
+                                             std::size_t maxMatches) {
+    std::vector<std::uintptr_t> out;
     std::vector<int> bytes;  // -1 == wildcard
     for (const char* p = pattern; *p;) {
         if (*p == ' ') { ++p; continue; }
@@ -187,10 +204,10 @@ std::uintptr_t ScanSignature(const char* pattern) {
         bytes.push_back(static_cast<int>(std::strtoul(p, nullptr, 16)));
         while (*p && *p != ' ') ++p;
     }
-    if (bytes.empty()) return 0;
+    if (bytes.empty()) return out;
 
     std::uintptr_t begin = 0, end = 0;
-    if (!TextRange(begin, end)) return 0;
+    if (!TextRange(begin, end)) return out;
 
     const size_t n = bytes.size();
     for (std::uintptr_t a = begin; a + n <= end; ++a) {
@@ -199,9 +216,22 @@ std::uintptr_t ScanSignature(const char* pattern) {
         for (size_t i = 0; i < n; ++i) {
             if (bytes[i] >= 0 && m[i] != static_cast<std::uint8_t>(bytes[i])) { hit = false; break; }
         }
-        if (hit) return a;
+        if (hit) {
+            out.push_back(a);
+            if (out.size() >= maxMatches) break;
+        }
     }
-    return 0;
+    return out;
+}
+
+std::uintptr_t ScanSignature(const char* pattern) {
+    const auto all = ScanSignatureAll(pattern, 1);
+    return all.empty() ? 0 : all.front();
+}
+
+std::uintptr_t ResolveStableId(std::uint64_t id) {
+    if (!id || !g_versionDb.loaded()) return 0;
+    return g_versionDb.Get(id);
 }
 
 std::uintptr_t Resolve(const char* debugName, std::uint64_t stableId, const char* signature) {
@@ -228,6 +258,17 @@ bool GameAddresses::Init(std::uint32_t runtimeVersion) {
     scriptSetText  = Resolve("Script::SetText", ids::kScriptSetText, nullptr);
     memAlloc       = Resolve("MemAlloc",       ids::kMemAlloc,       nullptr);
 
+    // Stable ID 21874 is absent from the 1.6.1170 database, so this normally
+    // resolves through its signature. Calling the real constructor is required:
+    // it runs a base-class ctor and writes non-zero fields that a memset cannot
+    // reproduce (see ids.h).
+    scriptCtor     = Resolve("Script::ctor",   ids::kScriptCtor,     ids::kSigScriptCtor);
+
+    // Console output capture. Not part of `core`: without it commands still
+    // run, they just cannot be read back.
+    consolePrint   = Resolve("Console::Print", ids::kConsolePrint, ids::kSigConsolePrint);
+    papyrusLog     = Resolve("Papyrus Logger::Log", ids::kPapyrusLog, nullptr);
+
     // A data address, not code -- signature scanning does not apply.
     scriptVtable   = Resolve("Script::vtable", ids::kScriptVtable,   nullptr);
 
@@ -236,7 +277,8 @@ bool GameAddresses::Init(std::uint32_t runtimeVersion) {
     // Console execution is the bridge's core capability. Everything else can
     // degrade to a reported E_UNSUPPORTED, but without these four the plugin
     // has nothing useful to offer, so say so loudly rather than half-loading.
-    const bool core = consoleExecute && scriptSetText && memAlloc && scriptVtable;
+    const bool core =
+        consoleExecute && scriptSetText && memAlloc && scriptVtable && scriptCtor;
     Log("addresses: core console capability %s", core ? "OK" : "UNAVAILABLE");
     return core;
 }

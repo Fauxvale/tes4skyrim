@@ -47,8 +47,24 @@ private:
 // Pattern syntax: "48 8B 05 ?? ?? ?? ?? 48 85 C0"
 std::uintptr_t ScanSignature(const char* pattern);
 
+// Every match, up to maxMatches. For patterns that occur once per call site
+// (e.g. an inlined check repeated across many handlers), where the point is a
+// CONSENSUS over the operands rather than a single address.
+std::vector<std::uintptr_t> ScanSignatureAll(const char* pattern,
+                                             std::size_t maxMatches);
+
+// Resolves an Address Library stable id against the loaded database. Exposed
+// so a probe can name engine functions by id from Python, without the plugin
+// needing a hardcoded entry for every address someone wants to look at.
+std::uintptr_t ResolveStableId(std::uint64_t id);
+
 // Module base / .text bounds of SkyrimSE.exe.
 std::uintptr_t ModuleBase();
+
+// Bounds of the main module's .text. Exposed so a caller can do its own
+// structural scan (e.g. locating a function by the shape of its call sites)
+// rather than trusting a raw signature.
+bool TextRange(std::uintptr_t& begin, std::uintptr_t& end);
 
 // Resolve by stable ID, falling back to a signature. Returns 0 if both fail;
 // callers must treat 0 as "capability unavailable" and report E_UNSUPPORTED
@@ -66,7 +82,10 @@ struct GameAddresses {
     std::uintptr_t compileAndRun     = 0;   // id 21964 (inner step; unused by default)
 
     // Script object construction.
+    std::uintptr_t consolePrint      = 0;   // id 51105 (output capture)
+    std::uintptr_t papyrusLog        = 0;   // id 53551 (VM output capture)
     std::uintptr_t scriptVtable      = 0;   // id 191694
+    std::uintptr_t scriptCtor        = 0;   // id 21874 (1170: signature only)
     std::uintptr_t scriptSetText     = 0;   // id 21883
     std::uintptr_t scriptDtor        = 0;
     std::uintptr_t memAlloc          = 0;   // id 68115

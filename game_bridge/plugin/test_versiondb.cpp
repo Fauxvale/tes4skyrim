@@ -39,12 +39,55 @@ const Expect kExpected1170[] = {
     {107327, 0x14e00c0, "AddressLib smoke test"},
 };
 
+// The filename VersionDb::Load derives from a packed runtime version. This is
+// pure arithmetic, so it is testable without the game -- and it is where the
+// 2026-08-14 bug lived: build was decoded as 8 bits shifted by 8 instead of
+// 12 bits shifted by 4, so 1.6.1170 looked for versionlib-1-6-73-0.bin, no
+// database loaded, and every stable ID silently resolved to 0.
+struct VersionCase {
+    std::uint32_t packed;
+    unsigned      maj, min, build, sub;
+    const char*   label;
+};
+
+// Values from references/skse64-master/skse64_common/skse_version.h.
+const VersionCase kVersionCases[] = {
+    {0x01064920, 1, 6, 1170, 0, "1.6.1170 (Steam -- the build in use)"},
+    {0x010646A0, 1, 6, 1130, 0, "1.6.1130"},
+    {0x01062750, 1, 6,  629, 0, "1.6.629"},
+    {0x010613D0, 1, 6,  317, 0, "1.6.317 (AE)"},
+    {0x01050610, 1, 5,   97, 0, "1.5.97"},
+    {0x01064921, 1, 6, 1170, 1, "1.6.1170 GOG (sub=1)"},
+};
+
+int TestVersionDecode() {
+    std::printf("runtime version decode\n");
+    int failures = 0;
+    for (const auto& c : kVersionCases) {
+        const unsigned maj   = (c.packed & 0xFF000000u) >> 24;
+        const unsigned min   = (c.packed & 0x00FF0000u) >> 16;
+        const unsigned build = (c.packed & 0x0000FFF0u) >> 4;
+        const unsigned sub   = (c.packed & 0x0000000Fu);
+        const bool ok = maj == c.maj && min == c.min && build == c.build && sub == c.sub;
+        if (!ok) ++failures;
+        std::printf("  %-5s 0x%08lX -> %u.%u.%u sub %u  %s\n",
+                    ok ? "PASS" : "FAIL",
+                    static_cast<unsigned long>(c.packed), maj, min, build, sub, c.label);
+    }
+    std::printf("\n");
+    return failures;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    // The decode check needs no database, so run it first and always.
+    int decodeFailures = TestVersionDecode();
+
     if (argc < 2) {
         std::printf("usage: %s <path-to-versionlib.bin>\n", argv[0]);
-        return 2;
+        std::printf("(ran the version-decode checks only)\n");
+        return decodeFailures ? 1 : 2;
     }
 
     const std::string dbPath = argv[1];
@@ -81,6 +124,7 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(e.rva));
     }
 
+    failures += decodeFailures;
     std::printf("\n%s (%d failure(s))\n", failures ? "FAILED" : "OK", failures);
     return failures ? 1 : 0;
 }

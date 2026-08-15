@@ -22,7 +22,8 @@ if not exist obj mkdir obj
 
 echo [build] compiling...
 cl /nologo /c /EHa /std:c++17 /O2 /MD /W3 /DNDEBUG ^
-   plugin.cpp commands.cpp console_exec.cpp script_object.cpp ^
+   plugin.cpp commands.cpp console_exec.cpp console_capture.cpp ^
+   papyrus_capture.cpp detour.cpp rawmem.cpp generic_hook.cpp script_object.cpp ^
    game.cpp addresses.cpp pipe_server.cpp main_thread.cpp json.cpp log.cpp ^
    /Fo:obj\
 if errorlevel 1 (

@@ -4,7 +4,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
+#include <vector>
 
 #include "addresses.h"
 #include "ids.h"
@@ -33,16 +35,91 @@ std::mutex        g_consoleMutex;
 std::string       g_captureBuffer;
 bool              g_capturing = false;
 
-// Set by the console-print hook while a captured command is running.
+// An ALWAYS-ON ring of recent console output, independent of g_capturing.
+//
+// Scoped capture alone can only see prints produced by a command the bridge
+// itself issued. Anything the game prints on its own -- a command typed into
+// the in-game console, or an engine message -- was silently dropped, so
+// "console output is empty" could not be told apart from "the print hook is
+// not firing". Keeping a bounded history makes console output readable at any
+// time and makes that distinction decidable from Python (see `console_log`).
+std::deque<std::string> g_consoleRing;
+std::mutex              g_ringMutex;
+// `sqv` on a real quest emits one line per alias -- 64 for CharacterGen alone,
+// before the quest-state block that is usually the point. A small ring silently
+// truncates exactly the interesting part, so this is sized for the biggest
+// single command anyone runs, not for a typical one.
+constexpr std::size_t   kConsoleRingMax = 4000;
+// Monotonic count of every line ever captured. `total` cannot be used to tell
+// how much a command produced once the ring is full (it stops growing), which
+// makes output look empty when it is merely rotated -- a bug this exact ring
+// caused within an hour of being added.
+std::uint64_t           g_ringSeq = 0;
+
+// Set by the console-print hook. Runs on the game's thread, so it must stay
+// cheap and must never block on the pipe.
 void CaptureLine(const char* text) {
-    if (!g_capturing || !text) return;
+    if (!text) return;
+    {
+        std::lock_guard<std::mutex> lk(g_ringMutex);
+        if (g_consoleRing.size() >= kConsoleRingMax) g_consoleRing.pop_front();
+        g_consoleRing.emplace_back(text);
+        ++g_ringSeq;
+    }
+    if (!g_capturing) return;
     g_captureBuffer += text;
     g_captureBuffer.push_back('\n');
 }
 
 }  // namespace
 
+std::vector<std::string> ConsoleLogRecent(std::size_t limit) {
+    std::lock_guard<std::mutex> lk(g_ringMutex);
+    const std::size_t n = (limit && limit < g_consoleRing.size()) ? limit
+                                                                 : g_consoleRing.size();
+    return std::vector<std::string>(g_consoleRing.end() - static_cast<long>(n),
+                                    g_consoleRing.end());
+}
+
+std::size_t ConsoleLogCount() {
+    std::lock_guard<std::mutex> lk(g_ringMutex);
+    return g_consoleRing.size();
+}
+
+std::uint64_t ConsoleLogSeq() {
+    std::lock_guard<std::mutex> lk(g_ringMutex);
+    return g_ringSeq;
+}
+
 void ConsoleCaptureAppend(const char* text) { CaptureLine(text); }
+
+// Scoped capture around a single call, for callers that drive the executor
+// themselves (script injection runs statement by statement and wants each
+// statement's own answer, not one merged blob).
+//
+// The caller MUST already hold whatever serialisation applies -- these do not
+// lock, because ScriptInject runs entirely inside one main-thread task and
+// taking g_consoleMutex here would deadlock against RunConsoleCommand.
+void ConsoleCaptureBegin() {
+    g_captureBuffer.clear();
+    g_capturing = true;
+}
+
+std::string ConsoleCaptureEnd() {
+    g_capturing = false;
+    return g_captureBuffer;
+}
+
+// The engine's own report that a command name did not resolve.
+//
+// The dispatcher's return value cannot be used for this: a successful `getgs`
+// returns 0 while a misspelled command returns 1. This printed line is the only
+// signal the engine gives, and without checking it every typo looks like a
+// success -- which makes EVERY result untrustworthy, not just the bad one.
+bool ConsoleOutputIndicatesUnknownCommand(const std::string& out) {
+    return out.find("Script command \"") != std::string::npos &&
+           out.find("\" not found") != std::string::npos;
+}
 
 ConsoleResult RunConsoleCommand(const std::string& command, std::uint32_t refFormId) {
     ConsoleResult out;
@@ -73,6 +150,13 @@ ConsoleResult RunConsoleCommand(const std::string& command, std::uint32_t refFor
     out.ok = ok;
     out.output = g_captureBuffer;
     out.error = err;
+
+    // A misspelled command runs, prints "not found", and would otherwise be
+    // reported as a success -- so a caller could never trust ANY result.
+    if (out.ok && ConsoleOutputIndicatesUnknownCommand(out.output)) {
+        out.ok = false;
+        out.error = "unknown console command";
+    }
     return out;
 }
 
@@ -81,7 +165,39 @@ ConsoleResult RunConsoleCommand(const std::string& command, std::uint32_t refFor
 std::uint32_t g_runtimeVersion = 0;
 bool          g_gameLoaded = false;   // updated from SKSE messages
 
-bool IsGameLoaded() { return g_gameLoaded; }
+// 🛑 The SKSE PostLoadGame message is NOT sufficient on its own.
+//
+// `coc <cell>` from the main menu boots a playable session WITHOUT that message
+// ever arriving, so the flag stays false while a player exists, has a position,
+// and answers console commands. Reporting "main menu" then makes every caller
+// skip the work it came to do -- and the bridge's whole point is that `coc`
+// reaches a test cell without a save.
+//
+// So the flag is a fast path, and a successful console probe is the fallback:
+// `player.getav health` prints only when a player actually exists.
+bool IsGameLoaded() {
+    if (g_gameLoaded) return true;
+    if (!g_addr.consoleExecute) return false;
+
+    // Cheap and read-only. Cached briefly so `status` polling cannot turn into
+    // a console command per call.
+    static DWORD lastCheck = 0;
+    static bool  lastResult = false;
+    const DWORD now = GetTickCount();
+    if (lastResult && now - lastCheck < 2000) return true;
+    if (now - lastCheck < 500) return lastResult;
+    lastCheck = now;
+
+    extern bool ConsoleExecute(const std::string& cmd, std::uint32_t refFormId,
+                               std::string* err);
+    g_captureBuffer.clear();
+    g_capturing = true;
+    std::string err;
+    ConsoleExecute("player.getav health", 0, &err);
+    g_capturing = false;
+    lastResult = !g_captureBuffer.empty();
+    return lastResult;
+}
 std::uint32_t RuntimeVersion() { return g_runtimeVersion; }
 
 bool IsInLoadingScreen() {
