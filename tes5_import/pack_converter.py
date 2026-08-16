@@ -169,13 +169,31 @@ SPEED_WALK, SPEED_JOG, SPEED_RUN, SPEED_FASTWALK = 0, 1, 2, 3
 # greet or chatter -- the "NPCs quip every few seconds, anywhere, even mid-
 # scripted-sequence" defect.
 #
-# Vanilla Skyrim does the opposite: 192 distinct values across 5,961 packages,
-# the single most common being 0x0000 (1,411 = 23.7%, all ambient interrupts
-# OFF), and 39.7% have "Hellos to player" CLEAR.  With no TES4 source field,
-# the faithful choice is the one that does not invent per-package behaviour and
-# does not force chatter on: leave the interrupts unset and let Oblivion's own
-# global GMST pacing govern, exactly as Oblivion did.
-DEFAULT_INTERRUPT = 0x0000
+# The over-correction to 0x0000 caused the OPPOSITE defect: actors locked in a
+# package stopped responding to COMBAT.  The CharacterGen ambushes stood in a
+# swords-out staring match until the player threw the first punch, because
+# these flags gate more than chatter -- 0x04 "Observe combat behavior", 0x10
+# "Reaction to player actions" and 0x40 "Aggro Radius Behavior" authorise the
+# actor to break off the package and fight.  A census of Skyrim.esm's 5,961
+# packages shows 0x0000 is NOT a neutral default: the 1,411 vanilla packages
+# carrying it are scene lockdowns by name (dunCGAlduinBaitStayAtLinkedRef-
+# NoCombat, pelagiusHoldPosSleepIgnoreCombat, CWFinaleEnemyLeaderWaitFor-
+# Execution, MQ206PaarthurnaxCombatHoldPosition, DefaultMasterPackageNo-
+# Interrupt, MQ106GuardsFleePatrol...), while ordinary live-your-life packages
+# authorise the behaviour bits (observe-combat is set on 64.2%, aggro-radius
+# on 56.3%, reaction-to-player on 56.4%).
+#
+# TES4 packages never gate combat response at all (its only lever is the
+# Defensive Combat flag, which we deliberately drop — see
+# project_defensive_combat_flag), so the faithful default is: COMBAT bits ON
+# (an actor in a package still fights, exactly as in Oblivion), everything
+# VOCAL OFF.  That includes 0x10 "Reaction to player actions": it authorises
+# spoken reaction comments, and a converted scene actor barking one over a
+# scripted Say line disturbs conversation timing — the same reason the
+# chatter bits (hellos/random conversations/idle chatter/corpse greets) stay
+# governed by Oblivion's global GMST pacing rather than per-package
+# authorisation.
+DEFAULT_INTERRUPT = 0x0044  # observe combat 0x04 | aggro radius 0x40
 
 # Furniture object types (TES5 wbObjectTypeEnum) used to decide whether a TES4
 # UseItemAt target is "sit-like".

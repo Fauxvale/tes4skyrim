@@ -592,15 +592,24 @@ def generate_driver_psc(plan, say_durations: dict = None) -> str:
         return ''
     say_durations = say_durations or {}
 
-    def _wait(hop_or_head, topic_edid):
+    def _fallback(hop_or_head, topic_edid):
+        """Length TES4Polyfill.SayLine assumes if the line the engine picks
+        has no measured voice file (it normally returns the real length)."""
         if hop_or_head is not None:
             d = say_durations.get(f'info:{hop_or_head:08X}')
             if d:
-                return min(float(d), 15.0) + _LINE_BEAT
+                return min(float(d), 15.0)
         d = say_durations.get((topic_edid or '').lower())
         if d:
-            return min(float(d), 10.0) + _LINE_BEAT
-        return _FALLBACK_LINE_SECONDS + _LINE_BEAT
+            return min(float(d), 10.0)
+        return _FALLBACK_LINE_SECONDS
+
+    def _say(actor, topic, hop_or_head, topic_edid):
+        # SayLine blocks until the engine has begun the line and returns its
+        # real length (+ tail); waiting that out is what Oblivion's scheduler
+        # did between lines.  A dropped line returns 0 and the chain moves on.
+        return (f'        Utility.Wait(TES4Polyfill.SayLine({actor}, {topic}, '
+                f'{_fallback(hop_or_head, topic_edid):.2f}) + {_LINE_BEAT})')
 
     lines = [
         f'ScriptName {plan["script_name"]} extends Quest',
@@ -630,15 +639,11 @@ def generate_driver_psc(plan, say_durations: dict = None) -> str:
                 f'{chain["head_fid"]:08X}',
                 f'    if {cond}']
         body += done_sets
-        body.append(f'        Conv{i}A.Say(Conv{i}T0)')
-        head_wait = _wait(chain['head_fid'], 'HELLO')
-        body.append(f'        Utility.Wait({head_wait:.2f})')
+        body.append(_say(f'Conv{i}A', f'Conv{i}T0', chain['head_fid'], 'HELLO'))
         for k, hop in enumerate(chain['hops']):
             spk = 'A' if hop['speaker'] == 'A' else 'B'
-            body.append(f'        Conv{i}{spk}.Say(Conv{i}T{k + 1})')
-            if k + 1 < len(chain['hops']):
-                body.append(f'        Utility.Wait('
-                            f'{_wait(hop["info_fid"], hop["topic_edid"]):.2f})')
+            body.append(_say(f'Conv{i}{spk}', f'Conv{i}T{k + 1}',
+                             hop['info_fid'], hop['topic_edid']))
         body.append('    endif')
         bodies.append('\n'.join(body))
 

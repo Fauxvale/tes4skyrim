@@ -425,6 +425,89 @@ def _create_message_menu_records(writer: PluginWriter, plan: dict) -> dict:
     return name_to_fid
 
 
+def _create_chargen_menu_records(writer: PluginWriter, plan: dict) -> dict:
+    """MESG pages for the TES4 chargen menus (ShowBirthsignMenu/ShowClassMenu).
+
+    Same layout as _create_message_menu_records; the plan comes from
+    message_menus.build_chargen_menus, the SAME function the script pipeline
+    runs, so the Message properties in the emitted .psc bind to exactly
+    these records and the page/button order matches the converter's Show()
+    chain arithmetic.
+
+    FIXED FormIDs, deliberately NOT alloc_formid(): the allocator is a bare
+    +1 counter, so allocating here would shift every id allocated after this
+    step (all generated dialogue, navmeshes, ...) and scramble existing
+    saves.  writer.chargen_fid_base sits mid-way into the reserved gap
+    import_plugin opens between the plugin's highest real FormID and the
+    allocator base — clear of real records below, companions above, and the
+    null-LAND repair working down from the gap's top.
+    """
+    name_to_fid = {}
+    k = 0
+    for key in sorted(plan):
+        for name, title, buttons in plan[key]['pages']:
+            fid = writer.chargen_fid_base + k
+            k += 1
+            subs = pack_string_subrecord('EDID', name)
+            subs += pack_string_subrecord('DESC', title)
+            subs += pack_subrecord('INAM', struct.pack('<I', 0))
+            subs += pack_subrecord('DNAM', struct.pack('<I', 1))
+            for button in buttons:
+                subs += pack_string_subrecord('ITXT', button)
+            writer.add_record('MESG', pack_record('MESG', fid, 0, subs))
+            name_to_fid[name] = fid
+
+    # Choice-persistence GLOBs at fixed slots ABOVE the page window (base+0x40,
+    # +0x41) so a changed page count can never move them.  The menu emission
+    # writes (picked index + 1) here; the dialogue-condition conversion reads
+    # it back for GetIsPlayerBirthsign / GetPCIsClass (see
+    # dialog_conditions.set_chargen_choice) — this is what makes the Emperor's
+    # post-birthsign line match the sign the player actually picked.
+    assert k <= 0x40, f'chargen menu pages overflow the fixed-id window ({k})'
+    for slot, key in ((0x40, 'birthsign'), (0x41, 'class')):
+        menu = plan.get(key)
+        if not menu:
+            continue
+        gname = menu['choice_global']
+        fid = writer.chargen_fid_base + slot
+        subs = pack_string_subrecord('EDID', gname)
+        subs += pack_subrecord('FNAM', struct.pack('<B', ord('s')))
+        subs += pack_subrecord('FLTV', struct.pack('<f', 0.0))
+        writer.add_record('GLOB', pack_record('GLOB', fid, 0, subs))
+        name_to_fid[gname] = fid
+    return name_to_fid
+
+
+def _create_force_combat_factions(writer: PluginWriter) -> dict:
+    """The conversion-owned enemy-faction pair TES4Polyfill.ForceCombat uses.
+
+    TES4 StartCombat forces a fight regardless of aggression, disposition or
+    faction state; Skyrim's combat AI drops a target it has no hostile
+    reaction to.  Relationship rank -4 was tried as the hostile reaction and
+    silently no-ops between non-unique actors (the CharacterGen final
+    assassin).  Runtime AddToFaction into a record-side Enemy pair is the
+    vanilla hostility idiom and works for ANY actors: ForceCombat puts the
+    attacker in TES4ForceCombatAttackers, the victim in
+    TES4ForceCombatVictims, and the mutual XNAM Enemy makes StartCombat
+    stick.
+
+    Fixed FormIDs (base+0x42/0x43 in the reserved gap) — allocating would
+    shift every later id and corrupt saves.
+    """
+    atk_fid = writer.chargen_fid_base + 0x42
+    vic_fid = writer.chargen_fid_base + 0x43
+    for fid, edid, other in ((atk_fid, 'TES4ForceCombatAttackers', vic_fid),
+                             (vic_fid, 'TES4ForceCombatVictims', atk_fid)):
+        subs = pack_string_subrecord('EDID', edid)
+        # XNAM: Faction, Modifier 0, Group Combat Reaction 1 = Enemy.
+        subs += pack_subrecord('XNAM', struct.pack('<IiI', other, 0, 1))
+        # DATA flags: bit 0 = Hidden From PC.
+        subs += pack_subrecord('DATA', struct.pack('<I', 0x1))
+        writer.add_record('FACT', pack_record('FACT', fid, 0, subs))
+    return {'TES4ForceCombatAttackers': atk_fid,
+            'TES4ForceCombatVictims': vic_fid}
+
+
 def _create_ambient_gmst_overrides(writer: PluginWriter, by_type: dict):
     """Carry Oblivion's GLOBAL ambient-dialogue pacing across.
 
@@ -775,6 +858,13 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     file_index = len(masters)  # Our file's index in the TES5 master list
     # Start well above the highest FormID to avoid collision with companion records
     writer.next_object_id = (file_index << 24) | (max_formid + 0x1000)
+    # Fixed-id window for the chargen menu MESGs (_create_chargen_menu_records)
+    # in the middle of the reserved gap: real records stop at or below
+    # max_formid, companions start at +0x1000, and the null-LAND repair takes
+    # from the gap's TOP downward — mid-gap collides with neither, and fixed
+    # ids mean adding these records cannot shift any allocated id (no
+    # FormID drift, saves survive).
+    writer.chargen_fid_base = (file_index << 24) | (max_formid + 0x800)
 
     # Records shipped with FormID 00000000 need an id before anything indexes
     # them. Done HERE, after max_formid is known, so the synthesized ids can
@@ -910,6 +1000,38 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     print(f"  Button menus: {len(message_mesgs)} MESG records for "
           f"{len(message_plan)} scripts")
     _step_done('button menu MESGs')
+
+    # Chargen menus (ShowBirthsignMenu / ShowClassMenu → modal Message
+    # pages).  Same shared-plan contract as the button menus above; the
+    # records live at FIXED ids in the reserved FormID gap (see
+    # writer.chargen_fid_base) so adding them cannot shift any allocated id.
+    from script_convert.message_menus import build_chargen_menus
+    _spel_map = {int(r['FormID'], 16) & 0xFFFFFF: r['EditorID']
+                 for r in by_type.get('SPEL', [])
+                 if r.get('FormID') and r.get('EditorID')}
+    chargen_plan = build_chargen_menus(by_type.get('BSGN', []),
+                                       by_type.get('CLAS', []), _spel_map)
+    _SC.chargen_menus = chargen_plan
+    chargen_mesgs = _create_chargen_menu_records(writer, chargen_plan)
+    if chargen_mesgs:
+        _WELL_KNOWN_PROPERTIES.update(chargen_mesgs)
+        print(f"  Chargen menus: {len(chargen_mesgs)} MESG pages+globals "
+              f"(fixed ids from {writer.chargen_fid_base:08X})")
+    # Route the dead TES4 chargen-identity condition functions through the
+    # choice globals the menus write (GetIsPlayerBirthsign 224, GetPCIsClass
+    # 129 → GetGlobalValue == index+1).
+    from .dialog_conditions import set_chargen_choice
+    set_chargen_choice({})   # reset between plugins
+    for func_idx, key in ((224, 'birthsign'), (129, 'class')):
+        menu = chargen_plan.get(key)
+        if menu and menu['choice_global'] in chargen_mesgs:
+            set_chargen_choice(
+                {func_idx: (chargen_mesgs[menu['choice_global']],
+                            menu['fid_to_index'])}, merge=True)
+    # The ForceCombat enemy-faction pair is needed by ANY plugin that scripts
+    # a StartCombat, chargen menus or not.
+    _WELL_KNOWN_PROPERTIES.update(_create_force_combat_factions(writer))
+    _step_done('chargen menu MESGs')
 
     # --- Phase 0b2: Build FormID → EditorID map for VMAD property resolution ---
     # Scripts reference external records via SCRO FormIDs. To populate VMAD

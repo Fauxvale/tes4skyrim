@@ -1385,12 +1385,14 @@ class TestServiceConversion:
                'Response[0].EmotionValue': '50',
                'Response[0].ResponseNumber': '1',
                'Response[0].ResponseText': 'Take a look.'}
-        result = convert_INFO(rec, service_menu='barter')
-        assert b'TES4_ShowBarterMenu' in result
-        result = convert_INFO(rec, service_menu='training')
-        assert b'TES4_ShowTrainingMenu' in result
-        # Without a service menu there is no VMAD at all
-        assert b'VMAD' not in convert_INFO(rec)
+        # Every INFO carries its own TES4_TIF__ fragment (the service-menu
+        # call is appended to that fragment by script_convert); the shared
+        # static scripts are only for the synthesized fallback INFO.
+        for kind in ('barter', 'training', ''):
+            result = convert_INFO(rec, service_menu=kind)
+            assert b'VMAD' in result
+            assert b'TES4_TIF__00062116' in result
+            assert b'TES4_ShowBarterMenu' not in result
 
     def test_vendor_item_keywords(self):
         """Sellable items carry the VendorItem* keyword the vendor factions
@@ -1468,10 +1470,13 @@ class TestServiceConversion:
         dial_group = b''.join(writer._top_groups['DIAL'])
         # Player prompt replaces the raw 'Barter' FULL
         assert b'What have you got for sale?' in dial_group
-        # Both the original line and the synthetic fallback carry the shared
-        # barter fragment (the script name appears 3x per VMAD: attached
-        # script, fragment FileName, fragment ScriptName)
-        assert dial_group.count(b'TES4_ShowBarterMenu') == 6
+        # The synthetic fallback carries the shared barter fragment (the
+        # script name appears 4x in its VMAD: attached script, fragment
+        # FileName, and the Begin and End fragment ScriptNames); the original
+        # line keeps its own TES4_TIF__ fragment, to which script_convert
+        # appends the menu call.
+        assert dial_group.count(b'TES4_ShowBarterMenu') == 4
+        assert b'TES4_TIF__00062116' in dial_group
         assert b'Take a look.' in dial_group
 
     def test_greeting_choice_reaches_response_topic(self):
@@ -2822,9 +2827,27 @@ class TestAmbientChatterPacing:
         assert DEFAULT_INTERRUPT != 0xFFFF, \
             "0xFFFF is the CK's 'set all interrupt flags'; it forces every " \
             "NPC to be allowed to break off any activity to chatter"
-        # Bit 0 is "Hellos to player"; vanilla Skyrim leaves it clear on 39.7%
-        # of packages and TES4 provides nothing to derive it from.
-        assert not (DEFAULT_INTERRUPT & 0x01)
+        # CHATTER bits stay off — hellos (0x01), random conversations (0x02),
+        # corpse greets (0x08), idle chatter (0x80): TES4 paces these through
+        # global GMSTs, never per package.
+        assert not (DEFAULT_INTERRUPT & (0x01 | 0x02 | 0x08 | 0x80))
+
+    def test_interrupt_flags_authorise_combat_behaviour(self):
+        """The 0x0000 over-correction froze combat response: vanilla reserves
+        all-zero interrupts for scene lockdowns (dunCGAlduinBaitStayAtLinked-
+        RefNoCombat, pelagiusHoldPosSleepIgnoreCombat, CWFinaleEnemyLeader-
+        WaitForExecution...), while ordinary packages authorise the behaviour
+        bits (observe-combat set on 64.2% of Skyrim.esm's 5,961 packages).
+        With them denied the CharacterGen ambushes stood in a swords-out
+        staring match until the player threw the first punch — TES4 packages
+        never gate combat response at all."""
+        from tes5_import.pack_converter import DEFAULT_INTERRUPT
+        assert DEFAULT_INTERRUPT & 0x04, 'Observe combat behavior must be on'
+        assert DEFAULT_INTERRUPT & 0x40, 'Aggro Radius Behavior must be on'
+        # 0x10 "Reaction to player actions" authorises spoken reaction
+        # comments — a scene actor barking one over a scripted Say line
+        # disturbs conversation timing, so it stays OFF with the chatter bits.
+        assert not (DEFAULT_INTERRUPT & 0x10)
 
     def test_pkdt_writes_the_interrupt_field(self):
         import struct
@@ -2996,24 +3019,15 @@ class TestQuestJournalPlatformText:
 
 
 class TestSayLineDurations:
-    """A converted Say() timer is charged the line's own MEASURED length.
+    """Measured voice-line lengths feed the converted Say() timers.
 
-    Papyrus Say() is fire-and-forget: it does not block or queue, and does
-    nothing when no INFO under the topic qualifies. The owning script polls and
-    re-issues Say() while its guard reads `timer <= 0`, but the INFO's End
-    fragment — which advances the conversation — only runs when the line
-    FINISHES. The timer's one job is to cover that window.
-
-    Both extremes have been tried in game and each fails:
-      * ZERO — the poller re-Says every tick, restarting the line so its
-        fragment never runs (Valen Dreth repeats taunt 1 forever).
-      * A large PARK only the fragment can clear — no line means no fragment, so
-        it strands and the scene HALTS (CharacterGen's prison-cell gap/stall).
-    The line's own length is the smallest value that covers the window, and the
-    fragment clears it the moment the line really ends, so it adds no silence.
+    TES4Polyfill.SayLine blocks until the engine has begun the line and
+    returns THAT line's measured length (`info:<FID>`, reported by the INFO's
+    Begin fragment); the per-topic maximum is only the fallback for a line with
+    no voice file, and is what the call site passes as SayLine's last argument.
     """
 
-    def test_call_site_charges_the_measured_line_length(self):
+    def test_call_site_fallback_is_the_topics_measured_maximum(self):
         from script_convert.converter import (ScriptConverter,
                                               SAY_LINE_SECONDS)
         from script_convert.cross_ref import CrossRefGraph
@@ -3021,30 +3035,12 @@ class TestSayLineDurations:
         saved = ScriptConverter.say_durations
         try:
             ScriptConverter.say_durations = {'chargentaunt2': 14.63}
-            # Never zero — that re-Says the line every tick.
-            assert conv._say_seconds('Self.Say(CharGenTaunt2)') == 14.63
+            assert conv._say_fallback_seconds('Self.Say(CharGenTaunt2)') == 14.63
             # Unmeasured topics fall back to the generic stand-in, still > 0.
-            assert conv._say_seconds('Self.Say(X)') == SAY_LINE_SECONDS
+            assert conv._say_fallback_seconds('Self.Say(X)') == SAY_LINE_SECONDS
             assert SAY_LINE_SECONDS > 0
         finally:
             ScriptConverter.say_durations = saved
-
-    def test_parked_timer_read_back_does_not_leak_the_sentinel(self):
-        """`convTimer = timer - .5` must not propagate the park value."""
-        from script_convert.converter import ScriptConverter
-        from script_convert.cross_ref import CrossRefGraph
-        conv = ScriptConverter(CrossRefGraph())
-        conv._parked_timers.add('timer')
-        # a subtraction means "no extra wait"
-        assert conv._resolve_parked_timer_expr('timer - 0.5') == '0'
-        # a bare read likewise
-        assert conv._resolve_parked_timer_expr('timer') == '0'
-        # an ADD is a deliberate beat: it must be REDIRECTED out of the timer
-        # (which decays while the line plays) into the pending-beat companion,
-        # signalled by the __BEAT__ marker the assignment emitter rewrites
-        assert conv._resolve_parked_timer_expr('timer + 10') == '__BEAT__10'
-        # unrelated expressions are untouched
-        assert conv._resolve_parked_timer_expr('foo + 1') == 'foo + 1'
 
     def test_mp3_duration_reads_frame_headers(self, tmp_path):
         """A silent MPEG-1 Layer III CBR stream of known length."""
@@ -3056,190 +3052,6 @@ class TestSayLineDurations:
         p = tmp_path / 'x.mp3'
         p.write_bytes(frame * n)
         assert abs(mp3_duration(str(p)) - n * 1152 / 44100) < 0.01
-
-
-class TestSayTimerRaceFree:
-    """Say pacing handshake: park at the call site, release in the End
-    fragment, beats carried in a decay-proof companion (2026-07-25).
-
-    Three defects drove this design, in order:
-      1. A flat/measured wait ADDED to the engine's own wait (the engine
-         already runs the End fragment when the line finishes).
-      2. A relative release raced the other scripts polling the same timer —
-         four actors on independent 0.5s updates plus the quest script
-         decrementing every 0.1s — so a different handoff stalled each run.
-      3. A `>= park` guard never fired, because the owning loop counts the
-         timer DOWN while the line plays: a 60s park is ~50 after a 10s line.
-         Valen Dreth said his first line and then stalled forever.
-    """
-
-    PARK = 60.0
-    THRESH = 20.0
-
-    def _run(self, line_len, beat=0.0, dt=0.1):
-        """Simulate call site -> countdown -> End fragment."""
-        timer, pending = self.PARK, beat      # park, Say(), stage the beat
-        elapsed = 0.0
-        while elapsed < line_len:             # loop decays the timer
-            if timer > 0:
-                timer -= dt
-            elapsed += dt
-        if timer > self.THRESH:               # End fragment releases
-            timer, pending = pending, 0.0
-        return timer
-
-    def test_releases_for_every_real_line_length(self):
-        """The guard must survive decay: Oblivion lines run 0.65s to ~30s."""
-        for line_len in (0.65, 3.0, 10.29, 14.6, 30.0):
-            assert abs(self._run(line_len)) < 1e-9,                 f'{line_len}s line did not release the timer'
-
-    def test_beat_survives_any_line_length(self):
-        """A staged pause must arrive intact however long the line ran."""
-        for line_len in (0.65, 10.29, 30.0):
-            assert abs(self._run(line_len, beat=2.5) - 2.5) < 1e-9
-            assert abs(self._run(line_len, beat=10.0) - 10.0) < 1e-9
-
-    def test_release_is_idempotent(self):
-        """A second fire must not re-arm the timer or go negative."""
-        released = self._run(3.0)
-        assert released <= self.THRESH   # guard no longer fires
-        assert released == 0.0
-
-    def test_beat_property_name_is_shared_by_both_emitters(self):
-        """Call site and fragment must derive the identical companion name."""
-        from script_convert.converter import ScriptConverter
-        assert ScriptConverter.beat_property('timer') == 'timerPendingBeat'
-        assert (ScriptConverter.beat_property('CharacterGen.convTimer')
-                == 'CharacterGen.convTimerPendingBeat')
-
-
-class TestSayTimerRaces:
-    """The setstage-CharacterGen intermittency (2026-07-25).
-
-    "Sometimes actors play their lines and sometimes they do not" had three
-    independent causes, all in the park/release handshake around Say().
-    """
-
-    def _owners(self, sctx, extra=None):
-        from script_convert.pipeline import build_say_timer_owners
-        by_type = {'SCPT': [{'EditorID': 'CharGenQuest', 'FormID': '0002480B',
-                             'SCTX': sctx}],
-                   'QUST': [{'EditorID': 'Charactergen', 'FormID': '0002466E',
-                             'SCRI': '0002480B'}]}
-        if extra:
-            for sig, recs in extra.items():
-                by_type.setdefault(sig, []).extend(recs)
-        return build_say_timer_owners(by_type)
-
-    def test_say_with_a_trailing_flag_keeps_its_topic(self):
-        """`Say <topic> 1`'s topic must not be eaten by the target group.
-
-        SayTo takes a TARGET before the topic and Say does not, so an optional
-        `(?:\\w+[\\s,]+)?` target group greedily consumed the topic of every
-        `Say <topic> 1` and captured the trailing flag as the topic ("1").
-        120+ topics were left with no release owner — every Daedric shrine
-        speech, the Boethia champions, the SE quest chatter — so their parked
-        timers were never cleared and each scene died after ONE line.
-        """
-        ow = self._owners('set CharacterGen.convTimer to Say CharGenMain 1')
-        assert '1' not in ow, 'the trailing Say flag was captured as the topic'
-        assert 'chargenmain' in ow
-
-    def test_sayto_still_skips_its_target_argument(self):
-        ow = self._owners(
-            'set CharacterGen.convTimer to SayTo BaurusRef, CharGenMain 1')
-        assert 'chargenmain' in ow
-        assert 'baurusref' not in ow
-
-    def test_a_match_never_runs_past_the_end_of_its_line(self):
-        """SCTX is one escaped blob; `\\s` let a match swallow the next lines."""
-        ow = self._owners('set CharacterGen.convTimer to Say CharGenMain 1\n'
-                          'else\n'
-                          'setstage CharacterGen 20\n'
-                          'endif')
-        for junk in ('else', 'endif', 'setstage', 'charactergen'):
-            assert junk not in ow, f'{junk!r} was captured as a topic'
-
-    def test_a_non_quest_prefix_is_not_bound_as_a_quest(self):
-        """`set <REFR>.timer to Say <topic>` has no quest to bind.
-
-        MS27CarvingWall is a placed REFR, so emitting `Quest Property
-        MS27CarvingWall` made the fragment fail to compile ("field or property
-        `timer` not found"). A dotted target is only quest-scoped when the
-        prefix really is a QUST EditorID.
-        """
-        ow = self._owners('set MS27CarvingWall.timer to Say MS27Voice')
-        assert 'ms27voice' not in ow
-
-    def test_countdown_of_a_parked_timer_cannot_resurrect_the_park(self):
-        """The decrement is a read-modify-write on an async-cleared variable.
-
-        The owning script counts the timer down on its own update while the
-        line's End fragment clears it to 0 from the engine's dialogue thread.
-        Papyrus has no atomicity, so a release landing between the read and the
-        write stored `park - dt` and RE-PARKED a timer that was already
-        released. Every INFO here is gated on an exact convCount, so the chain
-        did not resume late — it stopped dead.
-        """
-        from script_convert.converter import ScriptConverter
-        from script_convert.cross_ref import CrossRefGraph
-        src = ('scn CharGenQuest\n'
-               'float convTimer\n'
-               'short speaker\n'
-               'begin gamemode\n'
-               '\tif convTimer > 0\n'
-               '\t\tset convTimer to convTimer - getSecondsPassed\n'
-               '\tendif\n'
-               '\tif speaker == 1 && convTimer <= 0\n'
-               '\t\tset convTimer to BaurusRef.SayTo player CharGenVoice 1\n'
-               '\tendif\n'
-               'end\n')
-        out = ScriptConverter(CrossRefGraph()).convert_standalone(
-            'CharGenQuest', src, 'Quest', editor_id='CharGenQuest')
-        # the naive read-modify-write must be gone
-        assert 'convTimer = convTimer - 0.1' not in out
-        # ...replaced by a snapshot whose write-back is abandoned if the value
-        # moved while the statement ran
-        assert 'convTimer == _tes4TickconvTimer' in out
-        assert 'convTimer = _tes4TickconvTimer - 0.1' in out
-
-    def test_countdown_snapshot_matches_an_int_timer_type(self):
-        """TES4 let a `short` hold a Say duration; Float locals break that."""
-        from script_convert.converter import ScriptConverter
-        from script_convert.cross_ref import CrossRefGraph
-        src = ('scn X\n'
-               'short sayLen\n'
-               'begin gamemode\n'
-               '\tif sayLen > 0\n'
-               '\t\tset sayLen to sayLen - getSecondsPassed\n'
-               '\telse\n'
-               '\t\tset sayLen to say SomeTopic\n'
-               '\tendif\n'
-               'end\n')
-        out = ScriptConverter(CrossRefGraph()).convert_standalone(
-            'X', src, 'ObjectReference', editor_id='X')
-        assert 'Float _tes4TicksayLen' not in out
-        assert 'Int _tes4TicksayLen' in out
-
-    def test_park_never_blocks_the_polling_loop(self):
-        """No Utility.Wait at a park site.
-
-        An earlier watchdog polled for the line to start, which blocked the very
-        OnUpdate that owns the countdown (and deferred the actor scripts' next
-        RegisterForSingleUpdate), stalling the timer it was meant to protect.
-        """
-        from script_convert.converter import ScriptConverter
-        from script_convert.cross_ref import CrossRefGraph
-        src = ('scn CGGlenroyScript\n'
-               'short target\n'
-               'begin gamemode\n'
-               'if CharacterGen.speaker == 3 && CharacterGen.convTimer <= 0\n'
-               '\tset CharacterGen.convTimer to Say CharGenMain 1\n'
-               'endif\n'
-               'end\n')
-        out = ScriptConverter(CrossRefGraph()).convert_standalone(
-            'CGGlenroyScript', src, 'Actor', editor_id='CGGlenroyScript')
-        assert 'Utility.Wait' not in out
 
 
 class TestActorScriptOnPlacedRef:
@@ -3362,10 +3174,16 @@ class TestLoadGatedPollStart:
         assert 'RegisterForSingleUpdate' in onload
 
     def test_oncellattach_and_onload_both_present(self):
-        """OnCellAttach still handles streaming in; OnLoad covers the rest."""
+        """OnCellAttach still handles streaming in; OnLoad covers the rest.
+
+        There must be NO OnCellDetach unregister: detach events for the old
+        cell can land after OnLoad already re-armed the poll in the new one
+        and kill a loaded actor's loop (CharacterGen escorts going mute).
+        The arm-first Is3DLoaded() gate in OnUpdate stops the loop instead.
+        """
         out = self._emit('scn T\nbegin gamemode\nset x to 1\nend\n')
         assert 'Event OnCellAttach()' in out
-        assert 'Event OnCellDetach()' in out
+        assert 'UnregisterForUpdate()' not in out
 
 
 # ---------------------------------------------------------------------------
@@ -3907,59 +3725,12 @@ class TestSkyMeshShaders:
         assert sky_object_type_for('') is None
 
 
-class TestSayTimerRelease:
-    """Every line under a PARKED topic must be able to release the timer.
-
-    A converted Say() parks its conversation timer (the engine already blocks
-    for the audio, so charging a duration would make the two waits ADD). The
-    topic's End fragment clears it when the line really finishes. Two bugs made
-    that release unreachable and stalled CharacterGen for good:
-
-      1. A QUEST script writing its own timer with no prefix (`set convTimer to
-         BaurusRef.SayTo ...` in CharGenQuest) was classified as SPEAKER-scoped
-         purely because the name had no dot, emitting
-         `(akSpeakerRef as TES4_CharGenQuest)` — casting an actor to a Quest
-         script always yields None, so the write silently did nothing.
-      2. The fragment was only generated/attached for an INFO that HAD a result
-         script, but 87% of the INFOs under a parked topic (5,450 of 6,248)
-         have none. Those lines parked the timer forever.
-
-    The emitted order (script_convert/pipeline.py, `_write_info_fragments`)
-    satisfies three constraints at once, each traced to an in-game failure:
-    counter step, then release, then the rest of the body — all inside the
-    sequence gate — plus an unconditional release after the gate for the
-    rejected path. The release is idempotent, so the accepted path running it
-    twice is harmless.
+class TestInfoFragmentContracts:
+    """Contracts on the GENERATED TES4_TIF__ fragments (skipped without a
+    build).  Every INFO carries a Begin/End pair for TES4Polyfill.SayLine, the
+    result script runs in the End fragment, and the line-over hook is the last
+    thing the End fragment does.
     """
-
-    def _owners(self):
-        from script_convert.pipeline import build_say_timer_owners
-        scpt = {'EditorID': 'CharGenQuest', 'FormID': '0002480B',
-                'SCTX': 'begin gamemode\n'
-                        'set convTimer to BaurusRef.SayTo player CharGenVoice 1\n'
-                        'end'}
-        qust = {'EditorID': 'Charactergen', 'FormID': '0002466E',
-                'SCRI': '0002480B'}
-        return build_say_timer_owners({'SCPT': [scpt], 'QUST': [qust]})
-
-    def test_quest_script_bare_timer_is_quest_scoped(self):
-        """The owner must resolve to the QUEST, not the speaker."""
-        owner = self._owners().get('chargenvoice')
-        assert owner is not None
-        assert owner[0] == 'quest', (
-            'a quest script\'s own timer must bind a quest property; casting '
-            'akSpeakerRef to a Quest script yields None and drops the write')
-        assert owner[1].split('.', 1)[0].lower() == 'charactergen'
-
-    def test_speaker_local_timer_still_casts_the_speaker(self):
-        """An actor script's own timer must NOT be redirected to a quest."""
-        from script_convert.pipeline import build_say_timer_owners
-        scpt = {'EditorID': 'ValenDrethScript', 'FormID': '0001FC44',
-                'SCTX': 'begin gamemode\n'
-                        'set timer to SayTo player, CharGenTaunt2 1\n'
-                        'end'}
-        owner = build_say_timer_owners({'SCPT': [scpt], 'QUST': []})
-        assert owner['chargentaunt2'][0] == 'speaker'
 
     def _fragments(self):
         import os
@@ -3971,126 +3742,48 @@ class TestSayTimerRelease:
                 continue
             lines = open(os.path.join(src, fn),
                          encoding='utf-8', errors='replace').read().splitlines()
-            if any('; line ended' in ln for ln in lines):
-                yield fn, lines
+            yield fn, lines
 
-    @staticmethod
-    def _gate_depth(lines):
-        """Yield (line, depth) with depth>0 inside a sequence gate."""
-        import re
-        depth = 0
-        for ln in lines:
-            if "still this line's turn" in ln:
-                yield ln, depth
-                depth += 1
-            elif re.match(r'\s*EndIf\b', ln, re.IGNORECASE) and depth:
-                depth -= 1
-                yield ln, depth
-            else:
-                yield ln, depth
 
-    def test_release_is_reachable_on_the_rejected_path(self):
-        """A gated fragment must ALSO release OUTSIDE the gate.
-
-        A line whose turn has passed still has to free the timer. With the
-        release only inside the `still this line's turn` gate, CharacterGen
-        stopped dead at `FRAG 00032B0A cnt=8 needs 7 accepted=False`: quest
-        stage 12 re-seeded convCount while line 7 was still playing, the
-        fragment was rejected, and nothing ever cleared convTimer.
-
-        The gated copy is NOT a defect — constraint 3 requires a release before
-        the body's SetStage, and the write is idempotent. What matters is that
-        an unconditional one exists too.
-        """
-        offenders = []
+    def test_every_fragment_has_the_line_hooks(self):
         checked = 0
+        offenders = []
         for fn, lines in self._fragments():
-            if not any("still this line's turn" in ln for ln in lines):
-                continue
             checked += 1
-            if not any('; line ended' in ln and d == 0
-                       for ln, d in self._gate_depth(lines)):
+            text = '\n'.join(lines)
+            if ('Function Fragment_1(ObjectReference akSpeakerRef)' not in text
+                    or 'TES4Polyfill.LineBegan(akSpeakerRef,' not in text
+                    or 'TES4Polyfill.LineEnded(akSpeakerRef,' not in text):
                 offenders.append(fn)
-        assert checked, 'expected some gated fragments to release a say timer'
-        assert not offenders, (
-            'these gated fragments release the timer ONLY inside the sequence '
-            'gate, so a rejected line never frees it and the conversation '
-            'stalls:\n' + '\n'.join(offenders[:10]))
+        assert checked, 'expected generated fragments'
+        assert not offenders, offenders[:10]
 
-    def test_counter_step_precedes_the_release(self):
-        """Inside the gate, the counter closes before the timer frees.
-
-        The owning script's poll guard is `speaker == N && convTimer <= 0` and
-        the gate is `convCount == K`. Releasing the timer while the COUNTER
-        still reads K lets the owner re-Say the same line (`RENAULT FIRE
-        cnt=15` twice), which re-arms the timer. Stepping the counter first
-        closes the gate against that re-fire.
-        """
-        import re
-        # The step the gate tests: `<c> = <c> + n`, not any convCount write.
-        step_pat = re.compile(
-            r'^\s*(\S*convCount)\s*=\s*\1\s*[-+]', re.IGNORECASE)
+    def test_line_ended_is_the_last_statement_of_the_end_fragment(self):
+        """A poll waiting on this speaker proceeds the moment LineEnded runs,
+        so every state write of the result must already have landed."""
         offenders = []
-        checked = 0
         for fn, lines in self._fragments():
-            gated = [ln for ln, d in self._gate_depth(lines) if d > 0]
-            rel = next((i for i, ln in enumerate(gated)
-                        if '; line ended' in ln), None)
-            step = next((i for i, ln in enumerate(gated)
-                         if step_pat.match(ln)), None)
-            if rel is None or step is None:
+            try:
+                start = next(i for i, ln in enumerate(lines)
+                             if ln.startswith('Function Fragment_0('))
+            except StopIteration:
+                offenders.append(fn)
                 continue
-            checked += 1
-            if step > rel:
-                offenders.append(f'{fn}: {gated[step].strip()}')
-        assert checked, 'expected some gated fragments to step a counter'
-        assert not offenders, (
-            'these fragments step the sequence counter AFTER releasing the '
-            'timer, so the owning script re-fires the same line:\n'
-            + '\n'.join(offenders[:10]))
+            body = [ln for ln in lines[start + 1:]]
+            end = next(i for i, ln in enumerate(body) if ln.strip() == 'EndFunction')
+            stmts = [ln.strip() for ln in body[:end] if ln.strip()]
+            if not stmts or not stmts[-1].startswith('TES4Polyfill.LineEnded('):
+                offenders.append(fn)
+        assert not offenders, offenders[:10]
 
-    def test_release_precedes_setstage_in_the_body(self):
-        """The timer must already be free when the body's SetStage runs.
-
-        SetStage executes that stage's fragment INLINE and those call
-        `EvaluatePackage()`, which arbitrates against whatever is committed at
-        that instant. With convTimer still 7.63 the engine picked
-        CGRenoteOpenSecretDoor and kicked it back to CGRenoteWalkToMarkerB in
-        the same second — a race on engine latency that worked one run and
-        failed the next.
-
-        A SetStage on some OTHER quest shares no state with the timer's owner,
-        so only same-owner calls are constrained (see `_setstage_on_owner`).
-        """
+    def test_fragments_never_write_a_conversation_timer(self):
+        """Timers belong to the calling script (SayLine returns the value);
+        a fragment writing one is the old owner-analysis design leaking back."""
         import re
-        offenders = []
-        checked = 0
-        for fn, lines in self._fragments():
-            rel = next((i for i, ln in enumerate(lines)
-                        if '; line ended' in ln), None)
-            if rel is None:
-                continue
-            # `<owner>.convTimer = ...` or `(x as Script).convtimer = ...`
-            m = re.search(r'([\w.)]+)\.convtimer\s*=', lines[rel],
-                          re.IGNORECASE)
-            if not m:
-                continue
-            owner = m.group(1).lower()
-            same = re.compile(r'^\s*' + re.escape(owner) + r'\.SetStage\s*\(',
-                              re.IGNORECASE)
-            first = next((i for i, ln in enumerate(lines)
-                          if same.match(ln)), None)
-            if first is None:
-                continue
-            checked += 1
-            if rel > first:
-                offenders.append(f'{fn}: {lines[first].strip()}')
-        assert checked, (
-            'expected some fragments to SetStage on the timer\'s own quest')
-        assert not offenders, (
-            'these fragments call SetStage before releasing the timer, so the '
-            'stage fragment\'s EvaluatePackage() arbitrates against an armed '
-            'convTimer:\n' + '\n'.join(offenders[:10]))
+        pat = re.compile(r'^\s*[\w.]*\b(convTimer|\w*PendingBeat)\s*=\s*0\b', re.IGNORECASE)
+        offenders = [fn for fn, lines in self._fragments()
+                     if any('; line ended' in ln or pat.match(ln) for ln in lines)]
+        assert not offenders, offenders[:10]
 
     def test_state_writes_precede_setstage_within_the_body(self):
         """Inside the body, speaker/target/counter land before any SetStage.
@@ -5636,3 +5329,86 @@ class TestPlayerFormIDIsReferenceOnly:
         from tes5_import.text_reader import remap_formid
         assert remap_formid(0x07, 1) == 0x07
         assert remap_formid(0x07, 1, is_own_id=True) == 0x01000007
+
+
+class TestMeshBoundsCacheSchema:
+    """A bounds cache written before an entry field existed must be REBUILT.
+
+    Entries are plain lists, so a pre-field cache parses cleanly and reads as
+    zero for the missing field — indistinguishable from a computed zero.  That
+    is how Nehrim kept a 2026-08-02 cache after the HELD bit (bit 1) shipped on
+    2026-08-05: 0 of 11,946 meshes carried the bit, needs_havok_release
+    answered False for every one, and no converted `playgroup` emitted
+    TES4Polyfill.ReleaseBreakaway — mwallplankbreakaway01's planks hung in the
+    air instead of falling.
+    """
+
+    def _write(self, tmpdir, payload):
+        import json
+        p = os.path.join(tmpdir, 'mesh_bounds_cache.json')
+        with open(p, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh)
+        return p
+
+    def test_preschema_cache_reports_stale(self):
+        """The exact shape of the shipped bug: 6-element entries, no stamp."""
+        from asset_convert.collision_extract import bounds_cache_is_current
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {'tes4/dungeons/caves/mines/'
+                                 'mwallplankbreakaway01.nif':
+                                 [-13, -136, -87, 9, 148, 85]})
+            assert bounds_cache_is_current(p) is False
+
+    def test_stamped_cache_reports_current(self):
+        from asset_convert.collision_extract import (bounds_cache_is_current,
+                                                     BOUNDS_SCHEMA_VERSION)
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {'tes4/a.nif': [0, 0, 0, 1, 1, 1, 2],
+                                 '__schema__': [BOUNDS_SCHEMA_VERSION]})
+            assert bounds_cache_is_current(p) is True
+
+    def test_older_schema_version_reports_stale(self):
+        """Bumping the version must invalidate caches written at the old one."""
+        from asset_convert.collision_extract import (bounds_cache_is_current,
+                                                     BOUNDS_SCHEMA_VERSION)
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {'tes4/a.nif': [0, 0, 0, 1, 1, 1, 2],
+                                 '__schema__': [BOUNDS_SCHEMA_VERSION - 1]})
+            assert bounds_cache_is_current(p) is False
+
+    def test_missing_and_corrupt_cache_report_stale(self):
+        from asset_convert.collision_extract import bounds_cache_is_current
+        with tempfile.TemporaryDirectory() as td:
+            assert bounds_cache_is_current(
+                os.path.join(td, 'nope.json')) is False
+            bad = os.path.join(td, 'bad.json')
+            with open(bad, 'w', encoding='utf-8') as fh:
+                fh.write('{not json')
+            assert bounds_cache_is_current(bad) is False
+
+    def test_schema_key_is_not_loaded_as_a_mesh(self):
+        """The stamp is not a path key and must never become a bounds entry."""
+        from asset_convert.collision_extract import BOUNDS_SCHEMA_VERSION
+        from tes5_import.mesh_bounds import (load_mesh_bounds, get_mesh_obnd,
+                                             get_mesh_physics_flags)
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {'tes4/a.nif': [0, 0, 0, 1, 1, 1, 2],
+                                 '__schema__': [BOUNDS_SCHEMA_VERSION]})
+            assert load_mesh_bounds(p, quiet=True) == 1
+            assert get_mesh_obnd('__schema__') is None
+            assert get_mesh_physics_flags('tes4/a.nif') == 2
+
+    def test_scan_stamps_the_schema(self):
+        """Whatever scan_mesh_data writes must read back as current."""
+        from asset_convert.collision_extract import (scan_mesh_data,
+                                                     bounds_cache_is_current)
+        with tempfile.TemporaryDirectory() as td:
+            meshes = os.path.join(td, 'meshes')
+            os.makedirs(meshes)
+            bounds = os.path.join(td, 'mesh_bounds_cache.json')
+            col = os.path.join(td, 'collision_cache.bin')
+            # No NIFs: the scan bails early and writes nothing, so the cache
+            # must still read as stale rather than falsely certifying itself.
+            scan_mesh_data(meshes, col, bounds)
+            if os.path.exists(bounds):
+                assert bounds_cache_is_current(bounds) is True

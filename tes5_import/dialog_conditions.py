@@ -412,6 +412,59 @@ _COMPARE = {
 }
 
 
+# --- TES4 chargen-identity conditions → menu-choice globals -------------------
+# TES4 func -> (choice GLOB output FormID, {param fid24 -> menu index}).
+# GetIsPlayerBirthsign (224) is dead in Skyrim (the index is reused for
+# GetVATSMode) and GetPCIsClass (129) can never be true (the player never has
+# a TES4 CLAS).  The converted ShowBirthsignMenu/ShowClassMenu write the
+# picked menu index + 1 into a GLOB (0 = not chosen), so these conditions
+# become GetGlobalValue(<choice>) ==/!= index+1 — the Emperor's "Your stars
+# are not mine. Today the <sign>..." lines are 13 INFOs each gated on one
+# sign, and without this the first INFO always won regardless of the pick.
+# Populated per plugin by import_main; empty when the plugin has no
+# BSGN/CLAS records (224 then falls through to _FUNC_DROP as before).
+_CHARGEN_CHOICE: dict = {}
+
+
+def set_chargen_choice(mapping: dict, merge: bool = False):
+    if not merge:
+        _CHARGEN_CHOICE.clear()
+    _CHARGEN_CHOICE.update(mapping)
+
+
+def _chargen_choice_ctda(type_byte: int, data: bytes, func_idx: int,
+                         param1: int) -> 'bytes | None':
+    """The GetGlobalValue translation described at _CHARGEN_CHOICE."""
+    glob_fid, index_map = _CHARGEN_CHOICE[func_idx]
+    idx = index_map.get(param1 & 0xFFFFFF)
+    if idx is None:
+        return None
+    op = (type_byte >> 5) & 0x7
+    if type_byte & CTDA_USE_GLOBAL or op not in _COMPARE:
+        return None
+    comp = struct.unpack_from('<f', data, 4)[0]
+    # The TES4 condition compares a 0/1 identity result; find which outcomes
+    # pass and re-express against the choice global.
+    truth_passes = _COMPARE[op](1.0, comp)
+    false_passes = _COMPARE[op](0.0, comp)
+    choice = float(idx + 1)
+    if truth_passes and false_passes:
+        new_op, comp_val = 3, 0.0          # >= 0: always true, keeps OR groups
+    elif truth_passes:
+        new_op, comp_val = 0, choice       # == index+1
+    elif false_passes:
+        new_op, comp_val = 1, choice       # != index+1
+    else:
+        new_op, comp_val = 0, -1.0         # never true, faithfully
+    new_type = (new_op << 5) | (type_byte & CTDA_OR)
+    comp_raw = struct.unpack('<I', struct.pack('<f', comp_val))[0]
+    return struct.pack('<B3xIHHIIII I',
+                       new_type, comp_raw,
+                       74, 0,              # GetGlobalValue
+                       glob_fid, 0,
+                       0, 0, 0xFFFFFFFF)
+
+
 def convert_ctda(raw: bytes, offset: 'int | None' = None,
                  run_on_target_ref: 'int | None' = None,
                  drop_run_on_target: bool = False) -> 'bytes | None':
@@ -462,6 +515,9 @@ def convert_ctda(raw: bytes, offset: 'int | None' = None,
         # Fall through to the shared packer below so RunOn handling stays in
         # one place.
         param1, param2 = 0x00000014, 0
+
+    if func_idx in _CHARGEN_CHOICE:
+        return _chargen_choice_ctda(type_byte, data, func_idx, param1)
 
     if func_idx in _FUNC_DROP:
         return None
@@ -644,7 +700,53 @@ def convert_ctda_list_with_strings(rec: dict, script_vars: dict = None,
     if out and (out[-1][0][0] & CTDA_OR):
         fixed = bytes([out[-1][0][0] & ~CTDA_OR]) + out[-1][0][1:]
         out[-1] = (fixed, out[-1][1])
-    return out
+    return sort_vm_conditions_last(out)
+
+
+def sort_vm_conditions_last(pairs: list) -> list:
+    """Stable-partition (CTDA, CIS2) pairs so VM-variable reads evaluate LAST.
+
+    GetVMQuestVariable(629)/GetVMScriptVariable(630) are not ordinary
+    conditions: each evaluation crosses from the main thread into the Papyrus
+    VM (lock + script-object variable lookup by mangled name), where every
+    engine-native condition is a plain field read.  The engine walks a
+    topic's INFOs evaluating each one's conditions IN ORDER until the first
+    failure, so a VM read placed before the cheap identity gates runs for
+    every candidate INFO on every Say — CharGenMain carries 59 INFOs whose
+    convCount VM read preceded its GetIsID, and all four escort speakers
+    share one voice type, so nothing upstream filtered: every Say paid ~59
+    VM round-trips on the main thread.  That is the visible hitch each time
+    a converted NPC speaks.
+
+    AND-joined conditions are order-independent (all must pass), so moving
+    whole condition units is semantics-preserving.  The unit is the OR-GROUP:
+    a run of conditions chained by the Or flag (bit 0) forms one boolean
+    unit and must never be split or interleaved.  Groups keep their relative
+    order within each class (stable), cheap classes first.
+    """
+    if len(pairs) < 2:
+        return pairs
+    groups, cur = [], []
+    for pair in pairs:
+        cur.append(pair)
+        if not (pair[0][0] & CTDA_OR):
+            groups.append(cur)
+            cur = []
+    if cur:  # defensive: a trailing Or-flagged run is closed by the caller
+        groups.append(cur)
+
+    def _has_vm_read(group):
+        for ctda, _cis2 in group:
+            if struct.unpack_from('<H', ctda, 8)[0] in (
+                    GET_VM_SCRIPT_VARIABLE, GET_VM_QUEST_VARIABLE):
+                return True
+        return False
+
+    cheap = [g for g in groups if not _has_vm_read(g)]
+    vm = [g for g in groups if _has_vm_read(g)]
+    if not cheap or not vm:
+        return pairs
+    return [p for g in cheap + vm for p in g]
 
 
 def _convert_script_var_ctda(raw: bytes, script_vars: dict, offset: int,

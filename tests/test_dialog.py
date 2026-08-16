@@ -299,6 +299,66 @@ class TestCTDAConversion:
         for func in (104, 224, 249, 264):
             assert convert_ctda(_tes4_ctda(func=func), offset=0) is None
 
+    def test_chargen_fallback_strips_only_the_choice_gate(self):
+        """The fail-open fallback for an all-gated chargen topic: a copy of
+        the first gated INFO with a new FormID and ONLY the choice-global
+        CTDA removed.  Without it, any miss in the choice chain hid the
+        Emperor's whole post-birthsign topic (all 13 INFOs failed together)
+        and the quest soft-locked at stage 44."""
+        from tes5_import.dialog_converter import _strip_chargen_choice_gate
+        from tes5_import.writer import (pack_record, pack_subrecord,
+                                        pack_string_subrecord)
+        glob_fid = 0x0118E177
+        gate = struct.pack('<B3xIHHIIII I', 0,
+                           struct.unpack('<I', struct.pack('<f', 6.0))[0],
+                           74, 0, glob_fid, 0, 0, 0, 0xFFFFFFFF)
+        keep = struct.pack('<B3xIHHIIII I', 0,
+                           struct.unpack('<I', struct.pack('<f', 44.0))[0],
+                           58, 0, 0x0102466E, 0, 0, 0, 0xFFFFFFFF)
+        subs = pack_string_subrecord('NAM1', 'Your stars are not mine.')
+        subs += pack_subrecord('CTDA', keep)
+        subs += pack_subrecord('CTDA', gate)
+        rec = pack_record('INFO', 0x01032472, 0, subs)
+        out = _strip_chargen_choice_gate(rec, 0x0118E160, {glob_fid})
+        assert out, 'fallback build failed'
+        # New FormID, one CTDA gone, the stage gate and text intact.
+        assert struct.unpack_from('<I', out, 12)[0] == 0x0118E160
+        assert out.count(b'CTDA') == 1
+        assert struct.unpack_from('<I', rec, 4)[0] - 38 == \
+            struct.unpack_from('<I', out, 4)[0]   # 6+32 bytes removed
+        assert b'Your stars are not mine.' in out
+
+    def test_chargen_choice_conditions_read_the_menu_global(self):
+        """GetIsPlayerBirthsign (224) is dead in Skyrim, so the Emperor's 13
+        'Your stars are not mine. Today the <sign>...' INFOs all fell to the
+        first one regardless of the pick.  With the chargen-menu plan
+        registered, the condition becomes GetGlobalValue(<choice GLOB>) ==
+        menu index + 1 — the same value the converted ShowBirthsignMenu
+        writes on selection."""
+        from tes5_import.dialog_conditions import set_chargen_choice
+        glob_fid = 0x0118E177
+        set_chargen_choice({224: (glob_fid, {0x01FD93: 5})})
+        try:
+            one = 0x3F800000    # 1.0f raw
+            # == 1 (the authored form): passes only when the sign matches.
+            out = convert_ctda(_tes4_ctda(func=224, p1=0x0001FD93, comp=one),
+                               offset=1)
+            assert out is not None
+            assert struct.unpack_from('<H', out, 8)[0] == 74  # GetGlobalValue
+            assert struct.unpack_from('<I', out, 12)[0] == glob_fid
+            assert struct.unpack_from('<f', out, 4)[0] == 6.0  # index 5 + 1
+            assert (out[0] >> 5) == 0                          # ==
+            # == 0 (negated): must become != index+1.
+            out = convert_ctda(_tes4_ctda(func=224, p1=0x0001FD93, comp=0),
+                               offset=1)
+            assert (out[0] >> 5) == 1                          # !=
+            assert struct.unpack_from('<f', out, 4)[0] == 6.0
+            # A sign that never made the menu: condition dropped as before.
+            assert convert_ctda(_tes4_ctda(func=224, p1=0x0001AAAA, comp=one),
+                                offset=1) is None
+        finally:
+            set_chargen_choice({})
+
     def test_disposition_becomes_relationship_rank(self):
         """GetDisposition maps onto Skyrim's relationship rank, not dropped.
 
@@ -1353,6 +1413,61 @@ class TestPluginAuthoredRaceConditionsSurvive:
         assert got != [DEFAULT_RACE]
 
 
+class TestVmConditionsEvaluateLast:
+    """GetVMQuestVariable(629)/GetVMScriptVariable(630) cross into the Papyrus
+    VM per evaluation, and the engine walks a topic's INFOs evaluating each
+    one's conditions in order until the first failure — so a VM read placed
+    before the cheap native gates runs for every candidate INFO on every
+    Say() (CharGenMain: 59 INFOs, one visible main-thread hitch per line).
+    AND-joined units are order-independent, so the converter moves VM reads
+    last; an OR-group is one unit and must move (or stay) whole.
+    """
+
+    @staticmethod
+    def _raw(func: int, p1: int, p2: int, or_flag: bool = False) -> str:
+        import struct
+        return (bytes([0x01 if or_flag else 0x00]) + bytes(3)
+                + struct.pack('<f', 1.0)
+                + struct.pack('<I', func)
+                + struct.pack('<I', p1)
+                + struct.pack('<I', p2)
+                + bytes(4)).hex()
+
+    def _convert(self, raws):
+        from tes5_import.dialog_conditions import convert_ctda_list_with_strings
+        rec = {'FormID': '01000001', 'ConditionCount': str(len(raws))}
+        for i, raw in enumerate(raws):
+            rec[f'Condition[{i}].Raw'] = raw
+        # quest 0x2466E with var index 1 named convCount (the strings path)
+        script_vars = {0x2466E: {1: 'convCount'}}
+        out = convert_ctda_list_with_strings(rec, script_vars, 1)
+        import struct
+        return [struct.unpack_from('<H', c, 8)[0] for c, _s in out]
+
+    def test_quest_variable_read_moves_after_getisid(self):
+        funcs = self._convert([
+            self._raw(79, 0x2466E, 1),      # GetQuestVariable -> 629 (VM)
+            self._raw(72, 0x23F2B, 0),      # GetIsID (native)
+        ])
+        assert funcs == [72, 629]
+
+    def test_or_group_containing_vm_read_moves_whole(self):
+        funcs = self._convert([
+            self._raw(79, 0x2466E, 1, or_flag=True),  # VM, ORed with next
+            self._raw(58, 0x2466E, 0),                # GetStage, same group
+            self._raw(72, 0x23F2B, 0),                # GetIsID (native)
+        ])
+        # the OR pair stays intact and moves after the standalone native
+        assert funcs == [72, 629, 58]
+
+    def test_native_only_lists_are_untouched(self):
+        funcs = self._convert([
+            self._raw(58, 0x2466E, 0),
+            self._raw(72, 0x23F2B, 0),
+        ])
+        assert funcs == [58, 72]
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])
 
@@ -1604,14 +1719,18 @@ class TestNpcConversationChains:
         plan = self._plan()
         psc = generate_driver_psc(plan, {'info:000AAA31': 3.0})
         assert psc.startswith('ScriptName TES4NPCConvTest extends Quest')
-        assert 'Conv0A.Say(Conv0T0)' in psc
-        assert 'Conv0B.Say(Conv0T1)' in psc
-        assert 'Conv0A.Say(Conv0T2)' in psc
+        # Each hop goes through TES4Polyfill.SayLine, which blocks until the
+        # engine has begun the line and returns its real length; the driver
+        # waits that out plus the 0.6s beat.  The measured length is only the
+        # FALLBACK argument (a line with no voice file).
+        assert 'Utility.Wait(TES4Polyfill.SayLine(Conv0A, Conv0T0, 4.00) + 0.6)' in psc
+        assert 'TES4Polyfill.SayLine(Conv0B, Conv0T1, 3.00) + 0.6' in psc
+        assert 'TES4Polyfill.SayLine(Conv0A, Conv0T2, 4.00) + 0.6' in psc
+        assert '.Say(' not in psc
         assert 'Conv0Q0.GetStage() == 26' in psc
         # Unbound-property guards: a binding divergence disables the chain
         # instead of aborting the poll function.
         assert 'Conv0T0 != None' in psc and 'Conv0Q0 != None' in psc
-        assert 'Utility.Wait(3.60)' in psc     # measured 3.0 + 0.6 beat
 
     def test_property_bindings_mirror_the_psc(self):
         """Every Conv* property the psc declares must be bound by

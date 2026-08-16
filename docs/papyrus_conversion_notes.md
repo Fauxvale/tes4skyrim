@@ -520,12 +520,26 @@ widespread: **115 Returns across 96 scripts**, including quest drivers
 `MS04`/`MS09`/`MS14`). `MG05RockScript` fires one shock bolt per tick and uses
 `return` to serialize six — it fired exactly one bolt, ever.
 
-`_reregister_before_returns()` re-arms the poll before every bare `Return` in an
-emitted GameMode body, using the same form the fall-through path uses:
-`Is3DLoaded()`-gated for object/actor scripts (whose poll is *meant* to stop on
-unload), unconditional otherwise. A value-returning `Return <x>` (OBSE user
-function) is not matched. The emitter's own `!IsRunning()` guard already
-re-registered before its Return and is untouched.
+The poll is armed at three places, each for a different reason (2026-08-16):
+
+* **top of `OnUpdate`: `RegisterForSingleUpdate(5.0)` — abort insurance
+  ONLY.** A runtime error mid-body aborts the event; without this the poll
+  died for the rest of the game. 🛑 It must NOT be the real interval:
+  `RegisterForSingleUpdate` counts from *now*, so a top arm at `interval`
+  starts the next pass `interval` after this one **started**, and a pass whose
+  body takes longer than that (MQ01Script's tutorial poll does ~15 latent
+  natives per 0.1s tick) overlaps itself; each overlap slows the VM, and the
+  pile grows without bound. Measured in game (Papyrus stack dump at the start
+  of CharacterGen): **251 concurrent `TES4_MQ01Script.OnUpdate` stacks**, End
+  fragments of 1–2s lines running 19–24s late, conversations with 10s+ gaps
+  and repeated lines. That was the "excruciating" prison scene.
+* **every TES4 `return` in the body**: `RegisterForSingleUpdate(<interval>)`
+  spliced before `Return` (`_poll_return_prefix`), `Is3DLoaded()`-gated for
+  object/actor scripts. A value-returning `Return <x>` (OBSE user function) is
+  not touched; the `!IsRunning()` guard keeps the 5s insurance (a quest that
+  is not running need not poll faster); the dialogue gate re-arms at 0.5s.
+* **bottom of the body: `RegisterForSingleUpdate(<interval>)`** — the cadence,
+  measured from the END of the pass, so passes never overlap.
 
 ### `begin MenuMode` — the BARE form is not the menu-ID form (2026-07-31)
 
@@ -601,6 +615,45 @@ button box of its own (cross-script polling of TES4's global button state —
 a handful of sites) still reads `-1`, explicitly dead rather than miswired.
 Format specifiers inside a button-box's text (`"...%.0f Drakes?" cost "Yes"
 "No"`) survive literally: MESG DESC is static text.
+
+### A modal menu in a POLLED body must block the whole pass (2026-08-15)
+
+`ShowBirthsignMenu` / `ShowClassMenu` convert to a `Message.Show()` chain
+(`message_menus.build_chargen_menus`). TES4's chargen menus were modal to the
+**entire GameMode pass**: the statement written after `ShowBirthsignMenu` did
+not run until the player had chosen. Papyrus only parks *the thread that
+called* `Show()`, so the poll's next tick — 0.1s later, on another thread —
+re-enters the same body **while the menu is still open**.
+
+A re-entrancy latch alone is not enough. The first form latched the menu but
+let the latched-out pass **fall through to the authored tail**, which for
+CharacterGen ran `setstage 44` mid-menu. Stage 44's fragment force-greets the
+Emperor (`UrielSeptimRef.evp`) at a player still locked in the menu, so the
+greet is evaluated and consumed with nobody able to receive it: the menu
+closes onto an Emperor with nothing pending, and chargen soft-locks with the
+player free-roaming mid-scene.
+
+Verified live through the game bridge rather than by reading: driving
+`setstage charactergen 43` advanced the stage to 44 **instantly** while
+`TES4ChargenBirthsignChoice` was still 0 — the menu had not yet returned a
+choice. That single readback is what separated this from the (superficially
+identical) "menu shows twice" symptom the latch was originally added for.
+
+So the emission is **context-dependent**:
+
+* **Polled body** (`_current_event == 'Event OnUpdate()'`) — a latched-out
+  pass `Return`s. The tick defers entirely; the pass that owns the menu runs
+  the authored tail itself once `Show()` returns. Safe because the poll
+  re-arms at the TOP of `OnUpdate`, so returning cannot kill the loop.
+* **One-shot site** (quest-stage fragment, `OnActivate`) — keeps the
+  fall-through `If !busy` form. Nothing repeating re-enters it, so the latch
+  can only trip on a genuine race, and there a `Return` would **drop** the
+  authored tail rather than defer it. CharacterGen stage 87 is exactly that
+  shape: `MQ02.SetStage(20)`, the end-of-chargen topic unlocks and the
+  autosave all follow its class menu.
+
+The general rule: when a converted call blocks, ask whether its caller
+repeats. A `Return` is only correct where something will call again.
 
 ### A "no equivalent → 0" fallback can shadow a working handler (2026-07-31)
 
@@ -911,68 +964,164 @@ an inert comment. `ModDisposition` (414) is a genuine engine removal, with the
   body is routinely the only thing that ever calls `Enable()` on that same
   reference. See "The self-enable deadlock" below.
 
-### Say() timers
+### Say() timers — `TES4Polyfill.SayLine` (2026-08-16)
 
-**A converted `Say`/`SayTo` timer holds the line's MEASURED length**
-(`say_durations`, else `SAY_LINE_SECONDS`). Papyrus `Say()` is fire-and-forget —
-it does not block or queue, and silently does nothing when no INFO under the
-topic qualifies ([CK wiki, Say - ObjectReference](https://ck.uesp.net/wiki/Say_-_ObjectReference)).
-The owning script polls and re-issues `Say()` while its guard reads
-`timer <= 0`, but the INFO's End FRAGMENT — which advances the conversation —
-only runs when the line FINISHES. The timer's one job is to cover that window.
+**The single design fact.** TES4's `Say`/`SayTo` were **synchronous**: the
+engine picked the INFO, started the audio and **returned its length before the
+next script line ran**, so every scripted conversation is written as
 
-Both extremes have been tested IN GAME and both fail: **zero** makes the poller
-re-Say every tick, restarting the line so its fragment never runs (Valen Dreth
-repeats taunt 1 forever); a large **"park" that only the End fragment can
-clear** strands whenever a line is dropped, halting the scene (CharacterGen's
-prison-cell ~20s gaps and stalls). The line's own length is the smallest value
-covering the window, and the fragment clears it the moment the line really ends
-— so it adds no silence, and a dropped line drains via the owning script's
-countdown instead of stopping the quest.
+```
+if CharacterGen.speaker == 4 && CharacterGen.convTimer <= 0
+    set CharacterGen.convTimer to SayTo player, CharGenMain 1   ; := line length
+endif
+```
 
-#### Release the timer LAST, after the body advances the state
+and every other participant waits on that one countdown. Papyrus `Say()` is
+fire-and-forget and returns nothing. Every previous conversion tried to
+*estimate* the missing number (a topic-max charge at the call site, a "park"
+sentinel released by the End fragment, an OnBegin re-charge, per-owner
+property bindings, a decay-proof beat companion, a race-safe decrement, an
+`If T <= 0` override guard, three End-fragment ordering constraints, quest-
+scoped release …) and each estimate had an edge where a line was cut, repeated,
+dropped or held. **The rewrite stops estimating: the length comes from the
+engine.**
 
-**A Say() INFO End fragment must RELEASE the conversation timer LAST — after the
-body advances the sequence state.** The release re-opens the owning script's poll
-guard (`If <quest>.speaker == 2 && <quest>.convTimer <= 0`, or Valen Dreth's
-`ElseIf talk == 1`); the BODY (`convCount + 1`, `speaker = 0`, `SetStage(18)`) is
-what that guard reads. Releasing first opens the guard while the OLD state still
-stands, so the poller re-fires the SAME line — a runtime trace shows
-`RENAULT FIRE cnt=15` → fragment accepted → `RENAULT FIRE cnt=15`.
+#### The mechanism
 
-Two symptoms, one cause:
+* **Every INFO carries a Begin+End fragment pair** (`TES4_TIF__<fid>`, VMAD
+  flags 0x03; `build_vmad_info_fragment` and `_info_batch` are both
+  unconditional so the two sides can never disagree). Their fixed job:
+  `Fragment_1` (OnBegin) → `TES4Polyfill.LineBegan(akSpeakerRef, <measured
+  length of THIS line>)`; `Fragment_0` (OnEnd) → the TES4 result script, then
+  `TES4Polyfill.LineEnded(akSpeakerRef)` **last**. The hooks carry only the
+  speaker — no owner analysis, no property binding, nothing to miss.
+* State lives in four script Actor Values **on the speaker** (`Variable07`
+  claim, `Variable08` claim deadline, `Variable09` playing line's length,
+  `Variable10` speaking deadline; deadlines in game time, see the polyfill).
+* A converted `set T to [ref.]Say[To] … topic [+ n]` becomes
+  ```
+  T = <topic max + 1>                    ; closes this poll's own guard for the ~2s a SayLine can take
+  T = TES4Polyfill.SayLine(<speaker>, <topic>, <topic max>) [+ n]
+  ```
+  `SayLine` **blocks until the engine has begun the line** and returns that
+  line's real length **+ SAY_TAIL (1.0s)**. The tail must cover the time
+  between the measured audio length and the End fragment actually running
+  (dispatch + the engine's trailing hold + inter-response gaps). **0.4 was
+  tried in game and lines REPEATED** — so the End overhead is larger than
+  0.4s and the "no repeat is possible" reasoning was wrong somewhere; the
+  `TES4Say` traces (below) exist to measure it. Other levers that shorten the
+  gap without touching the tail: a Say-driving script polls at **0.1s** (its
+  `T <= 0` guard is what starts the next line; it was 0.5s), and SayLine's
+  return lands at Begin, not at the call. Then the script continues at once, exactly
+  as after TES4's `set T to Say`. A Say nothing qualifies for returns **0**
+  after a 2s start timeout and the caller's own poll retries — Oblivion's
+  behaviour too. Before Saying it waits while the speaker is in the player's
+  dialogue menu (Oblivion froze GameMode in menus) or still speaking a tracked
+  line (Skyrim silently drops a Say on a talking actor; Oblivion cut the line),
+  and it keeps **one waiter per speaker** (a second SayLine returns 0.5 and the
+  poll comes back). A `short` timer rounds UP (`Math.Ceiling`).
+* **Fragments never write timers.** The owning script's countdown is a plain
+  `T = T - dt` again; a fixed override right after the Say (`set convTimer to
+  12`) replaces the length before any countdown, exactly as in Oblivion; a
+  `set Q.convTimer to Q.convTimer + 2` in an End result lands on the live
+  countdown's tail as an after-line pause; `convTimer - .4` "cut him off"
+  trims it. None of that needs machinery any more.
+* **An ACTOR script's poll skips the pass while the player is in a dialogue
+  menu with anyone** — `Self.IsInDialogueWithPlayer() ||
+  TES4Polyfill.PlayerIsInDialogue()` (Oblivion's GameMode never ran while a
+  menu was open). Skyrim has no "is the player in dialogue" query, so
+  `LineBegan` stamps the speaker of any line spoken inside the player's menu
+  on the player (`Variable05/06` = FormID hi/lo) and `PlayerIsInDialogue`
+  asks that actor. Two in-game failures drove it: the Emperor's
+  `speaker == 4 && convTimer <= 0` poll fired during his stage-42 greeting
+  (the greeting's End result is what sets `speaker = 0`), its SayLine waited
+  for the menu and then spoke a stale "come closer" line exactly as stage
+  44's force-greet arrived, which was consumed by a talking actor; and
+  Baurus's stage-19 torch line fired INTO the player's conversation with the
+  Emperor because a reply's result set stage 19 while the menu was open.
+  Quest polls are NOT gated (the conversation countdown lives there; freezing
+  it in 2026-08-14 shifted every beat).
+* **Diagnostics are built in.** Every SayLine / LineBegan / LineEnded writes
+  a `TES4Say …` `Debug.Trace` with real-time stamps; `python
+  tools/say_trace_stats.py` turns the Papyrus log into Say→Begin latency,
+  End overhead vs measured length (what SAY_TAIL must cover), pre-waits,
+  drops and the dead-air gap between lines. Read those before touching the
+  tail.
+* Bare `Say`/`SayTo` (no assignment) stay plain fire-and-forget `Say()`
+  (Nehrim's 727 hand-timed speech state machines). The measure-then-deliver
+  pair (`set L to ref.Say T` / `ref.Say T`) collapses to the SayLine alone.
+* The NPC-to-NPC driver (`tes5_import/npc_conversations.py`) uses the same
+  primitive: `Utility.Wait(TES4Polyfill.SayLine(A, T, fallback) + 0.6)`.
 
-1. **Renault never presses the secret wall switch at CharacterGen stage 18** —
-   the duplicate Say re-armed `convTimer` to 8.33, holding stage 18 open past the
-   `EvaluatePackage()` the stage fragment had just issued, so
-   `CGRenoteOpenSecretDoor` was never selected. The door is actually opened by
-   the SWITCH's script (`CGPrisonSecretWallSwitchSCRIPT`, gated
-   `isActionRef RenoteRef`) setting `charactergen.secretDoor = 1`, which the
-   quest script's `stage 18 && secretDoor == 1 && convTimer <= 0` needs to reach
-   19.
-2. **Valen Dreth repeats a taunt** — his `talk` flag never advances (TES4's
-   `tauntStage` is declared but never incremented), so only the re-armed timer
-   stopped him looping.
+#### Why results stay in the END fragment
 
-Fixed in `script_convert/pipeline.py` `_info_batch` (6,432 fragments); guarded by
-`TestSayTimerRelease::test_release_comes_after_the_body_advances_the_sequence`.
+Oblivion ran an INFO's result script when the line **finished**. The evidence
+is the CS wiki's own scripted-conversation recipe (`How do you set up a
+scripted conversation between two or more NPCs?`): it has each result write
+`set <quest>.convTimer to <duration of sound file +/- a few seconds>` "to
+further refine the timing between this dialogue and the next, and allowing for
+momentary pauses" — an after-line pause, which is only meaningful if the
+result runs at the end (at line start `set T to Say` would overwrite it). MQ04's
+`set MQ04.convTimer to MQ04.convTimer + 2 / + 3 / + 10` beats and CharGen's
+`convTimer - .4  ; cut him off` are the same idiom. So OnBegin only reports;
+the sequence gate (`_sequence_gate`, applied only when the body itself steps
+the counter it is conditioned on) still protects against a mid-line re-seed.
 
-**The retime case needs no special handling.** `CharGenMain 0x32B0C` does
-`convTimer = convTimer - .4` ("cut him off"). Oblivion ran that while the line was
-STILL PLAYING, shortening a live countdown; our fragment runs when the line has
-already ENDED, so the base is 0 and `0 - .4` is negative — which every `<= 0`
-guard reads as "release now", the same outcome. Do not add machinery to preserve
-it.
+#### Measured in game (2026-08-16, CharacterGen 30-50, `TES4Say` traces)
 
-#### Keep it a countdown
+* Say→Begin latency **0.14–0.26s** when the engine takes the line.
+* End overhead (End fragment vs measured audio) **0.4–0.72s** for single
+  lines — so a 0.4 tail was genuinely too small and 1.0 leaves ~0.3s.
+* **The player can skip a menu line** (click through) and **exit the menu**
+  mid-line; Skyrim then runs the skipped line's End and the next line's
+  Begin in the SAME frame, End sometimes second. An unconditional clear in
+  `LineEnded` wiped the flag of the line that had just started; the speaker's
+  own poll saw him idle, and its `Say()` **INTERRUPTED the live line — a Say
+  on a talking actor is not always dropped, it can cut the line, and the cut
+  line's End result is lost** (`CGEmperor09`'s `setstage 43` → birthsign
+  menu never opened). Hence the length-matched clear.
+* A Goodbye reply keeps playing after the menu closes; `IsInDialogueWithPlayer`
+  goes false at once. Hence `PlayerIsInDialogue()` also holds while the last
+  dialogue speaker is still speaking, and QUEST polls are gated too (stage
+  `45 → 50` fired from the quest poll mid-dialogue and sent Baurus in).
+* **The Papyrus VM starves easily** (`Update budget: 1.2ms` per frame in the
+  log). With the dialogue gate on every poll (~210 quest polls at 0.1s +
+  every actor poll), from the START of CharacterGen the End fragments of 1–2s
+  lines ran **11–17s late**, the VM dumped stacks, SayLine's 10s busy margin
+  expired first and "Yessir" played twice. Only scripts that speak carry the
+  gate now (153 in Oblivion), the busy deadline is length+30s (it only bounds
+  a lost End), the pre-charge is capped at 3.5s (it is shared with the other
+  participants' guards), and the start timeout is 1.5s nominal (each
+  iteration is a VM turn, so it stretches with load). Same code from a stage-30
+  save had 0.4–0.7s End overhead — load, not logic, was the difference.
+* Right after an ambush, `Say(CharGenMain)` on Glenroy was refused for ~20s
+  while his HELLO greeting bark did play (combat/search state — traces now log
+  `inCombat`/`weaponDrawn`); the first Say after a busy wait was dropped
+  because the End fragment was still returning — hence the 0.25s wait.
 
-**The `convTimer`-style timer is an ordinary self-clearing COUNTDOWN in TES4**
-(`if convTimer > 0 : convTimer = convTimer - getSecondsPassed`; every consumer
-just tests `<= 0`). Keep it that way. Never convert it into something whose
-default state is "stuck until an event fires".
+#### What was measured (Oblivion.esm)
 
-Comments in this area are unreliable sediment from earlier designs — trust the
-code and the in-game results, not the surrounding prose.
+397 timer-assigned Say sites in 207 scripts over 275 topics (+28 in QUST stage
+results, 1 in an INFO result); 409 bare Say sites; Nehrim: 0 timer-assigned,
+727 bare. Only 6 INFO results write a Say timer (MQ04's three beats, the
+CharGen `- .4`, one `= 1`, one unrelated `timer = 0`).
+
+#### Traps
+
+* `Utility.GetCurrentRealTime()` restarts with the process, so a deadline
+  stamped in one session is garbage in the next — deadlines are game-time
+  days at the current TimeScale (`_GameDays`).
+* A dead SayLine thread (mod update, script removed) would hold the per-speaker
+  claim; the claim is renewed every 0.1s and expires 5s after the last
+  renewal, so it can never strand a speaker.
+* A lost End (actor killed or unloaded mid-line) expires the speaking state
+  `length + tail + 2s` after Begin — a stale busy flag costs one line's length,
+  never a stall.
+* If OnBegin ever fired *before* the audio started by more than SAY_TAIL, the
+  guard would reopen while the audio still played and the same speaker's next
+  SayLine would wait on the busy flag (bounded) before Saying — no repeat is
+  possible because the state has advanced by then, but the pause would show.
+  Raise `SAY_TAIL` in `TES4Polyfill.psc` if that is ever observed.
 
 ## Magic / condition helpers
 

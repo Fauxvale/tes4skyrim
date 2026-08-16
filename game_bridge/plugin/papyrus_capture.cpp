@@ -22,9 +22,9 @@
 //     -> CompleteObjectLocator -> vtable        (rva 0x17b5b70)
 //     -> vtable[1] = Log                        (rva 0x945290, id 53551)
 //
-// Signature: Log(this, const char* message, ...) -- verified from the
-// prologue, which saves rdx (arg2, the message) into rdi before touching
-// anything else.
+// Signature: Log(this, const char* message) -- the prologue saves rdx (arg2,
+// the message) into rdi before touching anything else, and the message is
+// written to the file VERBATIM (it is not a printf template; see LogDetour).
 
 #include <windows.h>
 
@@ -45,7 +45,17 @@ namespace bridge {
 
 namespace {
 
-using LogFn = void (*)(void* self, const char* msg, ...);
+// Log(this, const char* text): the message arrives ALREADY FORMATTED.
+//
+// It is NOT printf-style.  An earlier version of this hook assumed varargs,
+// vsnprintf'd the "template" and called through with ("%s", text) -- and
+// because Log writes its second argument verbatim, every Papyrus line the
+// game wrote to Papyrus.0.log while the bridge was loaded became the literal
+// string "%s" (measured 2026-08-16: 27,839 of 27,880 lines in a session
+// log).  The whole diagnostic channel was destroyed for the user while the
+// bridge's own ring showed the right text.  Record and pass through the
+// pointer untouched.
+using LogFn = void (*)(void* self, const char* text);
 
 LogFn g_original = nullptr;
 bool  g_installed = false;
@@ -60,7 +70,7 @@ std::deque<std::string> g_recent;     // always-on ring, for after-the-fact read
 // thousands of lines a second; an unbounded buffer would be a memory leak that
 // only shows up during exactly the long debugging session this tool is for.
 constexpr std::size_t kMaxArmed  = 4000;
-constexpr std::size_t kMaxRecent = 400;
+constexpr std::size_t kMaxRecent = 2000;
 
 void Record(const char* text) {
     if (!text || !*text) return;
@@ -72,47 +82,13 @@ void Record(const char* text) {
     if (g_armed && g_lines.size() < kMaxArmed) g_lines.emplace_back(text);
 }
 
-void __cdecl LogDetour(void* self, const char* msg, ...) {
-    // Format first: callers pass printf-style arguments, and capturing the
-    // unformatted template would record "%s" instead of the actual value.
-    //
-    // vsnprintf returns the length it WOULD have written, so an oversized
-    // message is detected rather than silently truncated -- a truncated
-    // capture that differs from what the game logged would quietly mislead
-    // exactly when a long line (a stack dump) is the interesting one.
-    char stackBuf[2048];
-    std::string heapBuf;
-    const char* text = stackBuf;
-
-    va_list args;
-    va_start(args, msg);
-    va_list copy;
-    va_copy(copy, args);
-    const int n = std::vsnprintf(stackBuf, sizeof(stackBuf), msg ? msg : "", args);
-    va_end(args);
-
-    if (n >= static_cast<int>(sizeof(stackBuf))) {
-        heapBuf.resize(static_cast<std::size_t>(n) + 1);
-        std::vsnprintf(heapBuf.data(), heapBuf.size(), msg ? msg : "", copy);
-        heapBuf.resize(static_cast<std::size_t>(n));
-        text = heapBuf.c_str();
-    } else if (n < 0) {
-        text = "";
-    } else {
-        stackBuf[n] = '\0';
-    }
-    va_end(copy);
-
+void __cdecl LogDetour(void* self, const char* text) {
     InterlockedIncrement(&g_hits);
-    if (*text) Record(text);
-
-    // Always call through: the game's own log file must stay complete, both so
-    // papyrus_tail.py keeps working and so nothing is hidden from the user.
-    //
-    // Pass the ALREADY-FORMATTED text through "%s" so a '%' inside a script's
-    // own output cannot be reinterpreted as a format specifier (which would
-    // read garbage off the stack).
-    if (g_original) g_original(self, "%s", text);
+    if (text && *text) Record(text);
+    // Always call through, with the ORIGINAL pointer: the game's own log file
+    // must stay complete and exact, both so papyrus_tail.py keeps working and
+    // so nothing is hidden from the user.
+    if (g_original) g_original(self, text);
 }
 
 // SkyrimScript::Logger::Log prologue, read from the disassembly:

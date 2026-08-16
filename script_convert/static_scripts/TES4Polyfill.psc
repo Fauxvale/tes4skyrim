@@ -649,3 +649,247 @@ Function DestroyAfterAnimation(ObjectReference akRef) Global
   Utility.Wait(1.0)
   akRef.SetDestroyed(true)
 EndFunction
+
+; ==========================================================================
+; Spoken lines: TES4 `set T to [ref.]Say[To] [target,] Topic`
+; ==========================================================================
+;
+; TES4's Say/SayTo were SYNCHRONOUS: the engine picked the INFO, started the
+; audio and RETURNED ITS LENGTH before the next script line ran, so a polled
+; conversation is written as
+;
+;     if speaker == 4 && convTimer <= 0
+;         set convTimer to SayTo player, CharGenMain     ; := line length
+;     endif
+;
+; and every other participant waits on the same countdown.  Papyrus Say() is
+; fire-and-forget and returns nothing, so the length has to come from the
+; engine's OWN signal that the line is under way: the INFO's OnBegin fragment.
+; Every converted INFO carries a Begin+End fragment whose fixed job is to call
+; LineBegan / LineEnded here; the state lives in script Actor Values ON THE
+; SPEAKER, so no property binding and no per-quest owner analysis is needed:
+;
+;     Variable06  real time the current line began (diagnostics)
+;     Variable07  claim token while a SayLine is in progress for this speaker
+;     Variable08  claim deadline (game time, days) - a stale claim expires
+;     Variable09  length of the line now playing (0 = not speaking)
+;     Variable10  speaking deadline (game time) - a lost End fragment expires
+;   and on the PLAYER, Variable05/06 = hi/lo halves of the FormID of the last
+;   actor to speak a line inside the player's dialogue menu (PlayerIsInDialogue).
+;   Every SayLine / LineBegan / LineEnded writes a "TES4Say ..." Debug.Trace
+;   with real-time stamps: the Papyrus log (or the bridge's vmlog) then gives
+;   the engine's Say->Begin and Begin->End latencies against the measured
+;   length, which is what SAY_TAIL must cover.
+;
+; SayLine restores the TES4 contract exactly: it BLOCKS until the engine has
+; begun the line, then returns that line's real length (+ SAY_TAIL, which
+; covers the End fragment's dispatch latency), and the caller's script goes on
+; immediately - the countdown, the `speaker` handoff and any `set convTimer to
+; convTimer + 2` pause the End result adds all behave as they did in Oblivion.
+; A Say nothing under the topic qualifies for returns 0 after SAY_START_WAIT,
+; and the caller's own poll simply retries - which is what Oblivion did too.
+;
+; Waits, in order:
+;   * the speaker is in the player's dialogue menu -> wait (Oblivion froze
+;     GameMode while any menu was open; a Say on an actor in dialogue is lost
+;     or, per the CK wiki, can crash);
+;   * the speaker is still speaking a tracked line -> wait for its End
+;     (Oblivion cut the line; Skyrim silently DROPS the new Say instead, and
+;     with it the result script that advances the scene);
+;   * one waiter per speaker: a second SayLine while one is pending returns
+;     a short backoff instead of queueing a duplicate.
+
+; Seconds added to the returned line length.  This is most of the dead air
+; between consecutive lines (the rest is the caller's poll tick and the
+; engine's Say -> audio latency).  It must cover the time between the measured
+; audio length and the End fragment actually running (the fragment's dispatch,
+; the engine's trailing hold, inter-response gaps of a multi-response line);
+; when it does not, the guard reopens before the End result has advanced the
+; conversation state.  0.4 was tried in game (2026-08-16) and lines REPEATED,
+; so the End overhead is evidently larger than that; the "TES4Say LineEnded
+; ... measured= actual=" traces report the true overhead per line -- set this
+; from those, not from a guess.
+Float Function SAY_TAIL() Global
+  Return 1.0
+EndFunction
+
+Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbackLength) Global
+  Actor a = akSpeaker as Actor
+  If a == None || akTopic == None || (a as Form).GetFormID() == 0x14
+    ; Not an actor we can track (a talking activator, the player): open loop.
+    If akSpeaker != None && akTopic != None
+      akSpeaker.Say(akTopic)
+    EndIf
+    Return afFallbackLength + SAY_TAIL()
+  EndIf
+  Float now = Utility.GetCurrentGameTime()
+  If a.GetActorValue("Variable07") > 0.0 && now < a.GetActorValue("Variable08")
+    Return 0.5   ; another SayLine already owns this speaker's next line; poll again shortly
+  EndIf
+  ; Claim the speaker.  SetActorValue lands on the game thread a frame later,
+  ; so two callers arriving in the same frame both read "free" above; the
+  ; token + re-read after a frame lets exactly one of them keep the claim.
+  Float token = Utility.RandomFloat(1.0, 1000000.0)
+  Float claimDays = _GameDays(5.0)   ; a claim not renewed for 5s is stale
+  a.SetActorValue("Variable07", token)
+  a.SetActorValue("Variable08", now + claimDays)
+  Utility.Wait(0.05)
+  If a.GetActorValue("Variable07") != token
+    Return 0.5
+  EndIf
+  Debug.Trace("TES4Say request " + _Who(a) + " topic " + akTopic + " t=" + Utility.GetCurrentRealTime())
+  ; Wait out the player's dialogue menu and any line still playing.
+  Float waited = 0.0
+  While waited < 600.0 && (a.IsInDialogueWithPlayer() || _IsSpeaking(a))
+    Utility.Wait(0.15)
+    waited += 0.15
+    a.SetActorValue("Variable08", Utility.GetCurrentGameTime() + claimDays)
+  EndWhile
+  If waited > 0.0
+    ; The line we waited for ends when its End fragment RETURNS; LineEnded is
+    ; that fragment's last statement, so a Say issued the instant the flag
+    ; clears reaches an actor the engine still counts as talking and is
+    ; dropped (measured 2026-08-16: every post-wait Say dropped).  Let the
+    ; fragment finish.
+    Utility.Wait(0.25)
+  EndIf
+  ; Request the line and wait for the engine to begin it (LineBegan stores
+  ; the length in Variable09).
+  a.SetActorValue("Variable09", 0.0)
+  Float t0 = Utility.GetCurrentRealTime()
+  a.Say(akTopic)
+  ; Nominal 1.5s: the engine begins a line it accepts within ~0.15-0.26s
+  ; (measured), and each iteration is a VM turn, so under load the real
+  ; wait stretches with everything else.
+  Float t = 0.0
+  While t < 1.5 && a.GetActorValue("Variable09") == 0.0
+    Utility.Wait(0.05)
+    t += 0.05
+  EndWhile
+  Float len = a.GetActorValue("Variable09")
+  a.SetActorValue("Variable07", 0.0)
+  If len <= 0.0
+    Debug.Trace("TES4Say dropped " + _Who(a) + " topic " + akTopic + " waited=" + waited + " inCombat=" + a.IsInCombat() + " weaponDrawn=" + a.IsWeaponDrawn() + " alerted=" + a.IsAlerted() + " t=" + Utility.GetCurrentRealTime())
+    Return 0.0   ; dropped: nothing under the topic qualified (or the engine refused it)
+  EndIf
+  If len < 0.02
+    len = afFallbackLength   ; began, but the line has no measured voice file
+  EndIf
+  Debug.Trace("TES4Say began " + _Who(a) + " topic " + akTopic + " len=" + len + " startLatency=" + (Utility.GetCurrentRealTime() - t0) + " waited=" + waited + " t=" + Utility.GetCurrentRealTime())
+  Return len + SAY_TAIL()
+EndFunction
+
+; OnBegin fragment hook: the engine has selected this INFO and started it.
+Function LineBegan(ObjectReference akSpeakerRef, Float afLength) Global
+  Actor a = akSpeakerRef as Actor
+  If a == None || (a as Form).GetFormID() == 0x14
+    Return
+  EndIf
+  Float len = afLength
+  If len <= 0.0
+    len = 0.01                 ; unknown length: still marks "speaking"
+  EndIf
+  a.SetActorValue("Variable09", len)
+  ; Speaking deadline: VERY generous.  It only exists so a LOST End (actor
+  ; killed or unloaded mid-line) cannot strand the speaker as busy forever;
+  ; a late one must always hold a re-Say off.  Measured 2026-08-16 under a
+  ; starved VM (start of CharacterGen): End fragments of 1-2s lines ran
+  ; 11-17s late, a 10s margin expired first, and the speaker's own poll
+  ; re-Said the line ("Yessir" twice).
+  Float bound = afLength
+  If bound <= 0.0
+    bound = 10.0
+  EndIf
+  a.SetActorValue("Variable10", Utility.GetCurrentGameTime() + _GameDays(bound + 30.0))
+  a.SetActorValue("Variable06", Utility.GetCurrentRealTime())
+  ; A line spoken IN THE PLAYER'S DIALOGUE MENU: remember the speaker on the
+  ; player, so PlayerIsInDialogue() can ask that actor whether the menu is
+  ; still open (Skyrim has no direct "is the player in dialogue" query).
+  If akSpeakerRef.IsInDialogueWithPlayer()
+    Int fid = (akSpeakerRef as Form).GetFormID()
+    Actor p = Game.GetPlayer()
+    p.SetActorValue("Variable05", Math.Floor(fid / 65536) as Float)
+    p.SetActorValue("Variable06", (fid - Math.Floor(fid / 65536) * 65536) as Float)
+  EndIf
+  Debug.Trace("TES4Say LineBegan " + _Who(a) + " len=" + afLength + " inDialogue=" + akSpeakerRef.IsInDialogueWithPlayer() + " t=" + Utility.GetCurrentRealTime())
+EndFunction
+
+; OnEnd fragment hook: the line (all of its responses) has finished -- or was
+; cut.  Clears the speaking flag ONLY if it still belongs to THIS line.
+;
+; The player can skip a menu line (click through the greeting) or exit the
+; menu; the skipped line's End fragment and the next line's Begin fragment
+; then run in the same frame, and End can land SECOND.  An unconditional
+; clear then wiped the flag of the line that had just started; the speaker's
+; own poll saw him idle, its Say() INTERRUPTED the live line, and that line's
+; End result -- CharGenEmperor09's `setstage 43` -- was lost (measured
+; 2026-08-16, three of three runs showed the ordering, one soft-locked).  The
+; fragment knows its own length, so match on it: a mismatch means a newer
+; line owns the flag and it is left alone.
+Function LineEnded(ObjectReference akSpeakerRef, Float afLength = -1.0) Global
+  Actor a = akSpeakerRef as Actor
+  If a == None || (a as Form).GetFormID() == 0x14
+    Return
+  EndIf
+  Float began = a.GetActorValue("Variable06")
+  Float cur = a.GetActorValue("Variable09")
+  Bool mine = afLength < 0.0 || Math.abs(cur - afLength) < 0.006 || (afLength <= 0.0 && cur <= 0.02)
+  If mine
+    a.SetActorValue("Variable09", 0.0)
+  EndIf
+  Debug.Trace("TES4Say LineEnded " + _Who(a) + " measured=" + afLength + " playing=" + cur + " cleared=" + mine + " actual=" + (Utility.GetCurrentRealTime() - began) + " t=" + Utility.GetCurrentRealTime())
+EndFunction
+
+; True while the player is in a dialogue menu with anyone -- Oblivion's
+; GameMode never ran then, so converted actor polls skip their pass.  Called
+; every poll tick by every actor script, so it must be CHEAP: two AV reads
+; when nobody has stamped a dialogue speaker, and the stamp is cleared as
+; soon as that speaker reports the menu closed, so the GetForm +
+; IsInDialogueWithPlayer pair only runs while a dialogue is actually open.
+Bool Function PlayerIsInDialogue() Global
+  Actor p = Game.GetPlayer()
+  Float hi = p.GetActorValue("Variable05")
+  Float lo = p.GetActorValue("Variable06")
+  If hi <= 0.0 && lo <= 0.0
+    Return False
+  EndIf
+  If hi >= 32768.0
+    p.SetActorValue("Variable05", 0.0)   ; a runtime-created (FF) reference: cannot be rebuilt as an Int
+    p.SetActorValue("Variable06", 0.0)
+    Return False
+  EndIf
+  ObjectReference r = Game.GetForm((hi as Int) * 65536 + (lo as Int)) as ObjectReference
+  If r != None && r.IsInDialogueWithPlayer()
+    Return True
+  EndIf
+  ; A Goodbye reply keeps playing after the menu closes (and the player can
+  ; leave mid-line): Oblivion's menu stayed up until the line was over, so
+  ; hold the polls until the last dialogue speaker has finished it.
+  Actor ra = r as Actor
+  If ra != None && _IsSpeaking(ra)
+    Return True
+  EndIf
+  p.SetActorValue("Variable05", 0.0)
+  p.SetActorValue("Variable06", 0.0)
+  Return False
+EndFunction
+
+Bool Function _IsSpeaking(Actor a) Global
+  Return a.GetActorValue("Variable09") > 0.0 && Utility.GetCurrentGameTime() < a.GetActorValue("Variable10")
+EndFunction
+
+String Function _Who(Actor a) Global
+  Return "actor " + (a as Form).GetFormID()   ; names need SKSE; the id maps through the manifest
+EndFunction
+
+; Real seconds -> game-time days at the current TimeScale.  Deadlines are kept
+; in GAME time because GetCurrentRealTime restarts with the process: a stamp
+; saved in one session compares against a different clock in the next.
+Float Function _GameDays(Float afSeconds) Global
+  GlobalVariable ts = Game.GetFormFromFile(0x0000003A, "Skyrim.esm") as GlobalVariable
+  Float scale = 20.0
+  If ts != None && ts.GetValue() > 0.0
+    scale = ts.GetValue()
+  EndIf
+  Return afSeconds * scale / 86400.0
+EndFunction

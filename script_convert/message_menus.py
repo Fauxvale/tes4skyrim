@@ -92,3 +92,135 @@ def build_message_plan(scpt_records: list) -> dict:
         if sites and edid:
             plan[edid.lower()] = sites
     return plan
+
+
+# ---------------------------------------------------------------------------
+# TES4 chargen menus (ShowBirthsignMenu / ShowClassMenu)
+# ---------------------------------------------------------------------------
+#
+# TES4's chargen menus were MODAL: the game paused until the player chose,
+# and scripted scenes depend on that beat.  CharacterGen stage 43 is the
+# canonical case — the Emperor's birthsign INFOs carry an authored Goodbye
+# (the modal menu takes over from there) and stage 44 re-force-greets him to
+# continue the conversation.  With the menus converted to no-ops the player
+# was dumped into a free-roam gap in the middle of the scene, where any other
+# pending force-greet (Baurus's torch GREETING, legal for stages 40-80) could
+# steal them and desync the conversation.  Message.Show() is Skyrim's modal
+# equivalent: it parks the calling thread AND pauses gameplay until a button
+# is clicked, restoring both the choice and the authored pacing.
+#
+# The plan is data-driven from the plugin's own BSGN/CLAS records so any
+# plugin with birthsigns/classes gets its own menus; a plugin without them
+# keeps the no-op conversion.
+
+CHARGEN_BIRTHSIGN_EDID = 'TES4Msg_ChargenBirthsign_%02d'
+CHARGEN_CLASS_EDID = 'TES4Msg_ChargenClass_%02d'
+# GLOB records persisting the player's menu choice as (menu index + 1); 0 =
+# not chosen yet.  The converter's menu emission writes them on selection and
+# the dialogue-condition conversion reads them back: TES4 GetIsPlayerBirthsign
+# (func 224, dead in Skyrim) / GetPCIsClass (129, dead — the player never has
+# a TES4 class) become GetGlobalValue(<choice>) == index+1, which is how the
+# Emperor's post-birthsign line matches the sign actually picked.
+CHARGEN_BIRTHSIGN_GLOBAL = 'TES4ChargenBirthsignChoice'
+CHARGEN_CLASS_GLOBAL = 'TES4ChargenClassChoice'
+# Every page but the last carries this many real choices plus a trailing
+# "More ..." button in slot PAGE_OPTIONS; the last page holds up to
+# MAX_BUTTONS real choices.  Global choice index = sum of prior pages'
+# PAGE_OPTIONS + the clicked button — the emitted script chains pages with
+# exactly this arithmetic, so page composition here is a cross-module
+# contract with the converter's ShowBirthsignMenu/ShowClassMenu emission.
+PAGE_OPTIONS = MAX_BUTTONS - 1
+
+
+def _paged(edid_fmt: str, title: str, labels: list) -> list:
+    """[(mesg_edid, title, buttons)] pages over `labels` (see PAGE_OPTIONS)."""
+    pages = []
+    i = 0
+    n = 1
+    while i < len(labels):
+        rest = len(labels) - i
+        if rest <= MAX_BUTTONS:
+            take, more = rest, False
+        else:
+            take, more = PAGE_OPTIONS, True
+        pages.append((edid_fmt % n, title,
+                      list(labels[i:i + take]) + (['More ...'] if more else [])))
+        i += take
+        n += 1
+    return pages
+
+
+def build_chargen_menus(bsgn_records: list, clas_records: list,
+                        spel_edid_by_fid24: dict) -> dict:
+    """Shared birthsign/class menu plan.
+
+    The importer authors one MESG per page; the converter emits the Show()
+    chain plus, for birthsigns, the chosen sign's AddSpell calls (TES4
+    ShowBirthsignMenu granted the sign's spells — BSGN lists them, and the
+    spells themselves are converted SPEL records referenced here by
+    EditorID).  Classes have no expressible effect in Skyrim (skills and
+    attributes are gone), so the class menu is choice-and-pacing only.
+
+    Both sides MUST derive identical page EDIDs and button order, so
+    everything is sorted by display name.
+    """
+    plan = {}
+    signs = []
+    for rec in bsgn_records:
+        full = rec.get('FULL') or rec.get('EditorID') or ''
+        if not full:
+            continue
+        spells = []
+        i = 0
+        while True:
+            fid = rec.get(f'Spell[{i}]')
+            if fid is None:
+                break
+            edid = spel_edid_by_fid24.get(int(fid, 16) & 0xFFFFFF)
+            if edid:
+                spells.append(edid)
+            i += 1
+        try:
+            fid24 = int(rec.get('FormID', '0'), 16) & 0xFFFFFF
+        except ValueError:
+            fid24 = 0
+        signs.append((full, spells, fid24))
+    signs.sort(key=lambda s: s[0].lower())
+    if signs:
+        plan['birthsign'] = {
+            'pages': _paged(CHARGEN_BIRTHSIGN_EDID,
+                            'Under which sign were you born?',
+                            [s[0] for s in signs]),
+            'actions': [s[1] for s in signs],
+            # BSGN fid24 -> menu index, for GetIsPlayerBirthsign conditions.
+            'fid_to_index': {s[2]: i for i, s in enumerate(signs) if s[2]},
+            'choice_global': CHARGEN_BIRTHSIGN_GLOBAL,
+        }
+
+    classes = []
+    for rec in clas_records:
+        # TES4 CLAS DATA.Flags bit 0 = Playable; only those ever appear in
+        # ShowClassMenu.
+        try:
+            playable = int(rec.get('DATA.Flags', '0')) & 0x1
+        except ValueError:
+            playable = 0
+        full = rec.get('FULL') or ''
+        if playable and full:
+            try:
+                fid24 = int(rec.get('FormID', '0'), 16) & 0xFFFFFF
+            except ValueError:
+                fid24 = 0
+            classes.append((full, fid24))
+    names = sorted({c[0] for c in classes}, key=str.lower)
+    if classes:
+        index_of = {n.lower(): i for i, n in enumerate(names)}
+        plan['class'] = {
+            'pages': _paged(CHARGEN_CLASS_EDID, 'Choose your class.', names),
+            'actions': [[] for _ in names],
+            # Two CLAS records sharing a display name share the menu slot.
+            'fid_to_index': {fid: index_of[full.lower()]
+                             for full, fid in classes if fid},
+            'choice_global': CHARGEN_CLASS_GLOBAL,
+        }
+    return plan

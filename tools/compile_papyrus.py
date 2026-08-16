@@ -52,8 +52,9 @@ def find_skyrim_headers():
 def compile_one(args):
     f, compiler, out_dir, headers, polyfill_dir = args
     cmd = [compiler, 'compile', '-i', str(f), '-o', str(out_dir), '-h', headers]
-    if polyfill_dir:
-        cmd.extend(['-h', polyfill_dir])
+    for extra in (polyfill_dir or '').split(';'):
+        if extra:
+            cmd.extend(['-h', extra])
     r = subprocess.run(windows_cmd(cmd), capture_output=True, text=True, timeout=15)
     if r.returncode != 0:
         combined = r.stdout + '\n' + r.stderr
@@ -72,6 +73,9 @@ def main():
     parser.add_argument('--src', default=str(_PROJECT_ROOT / 'output' / 'oblivion.esm' / 'scripts' / 'source'))
     parser.add_argument('--out', default=str(_PROJECT_ROOT / 'temp' / 'pex'))
     parser.add_argument('--headers', default=None)
+    parser.add_argument('--extra-headers', default=None,
+                        help='additional header dir (e.g. output/<plugin>/scripts/source '
+                             'when compiling a subset that names other converted types)')
     parser.add_argument('--errors-detail', action='store_true', help='Show sample file per error category')
     parser.add_argument('--workers', type=int, default=max(1, (os.cpu_count() or 4) - 1))
     args = parser.parse_args()
@@ -84,6 +88,8 @@ def main():
 
     # Use polyfill dir so scripts can import TES4Polyfill
     polyfill_dir = str(src_dir) if (src_dir / 'TES4Polyfill.psc').exists() else None
+    if args.extra_headers:
+        polyfill_dir = f'{polyfill_dir};{args.extra_headers}' if polyfill_dir else args.extra_headers
 
     files = sorted(src_dir.glob('*.psc'))
     print(f'Compiling {len(files)} files with {args.workers} workers...')

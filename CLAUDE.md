@@ -106,7 +106,6 @@ caching, skipped record types, the export text format, and the directory layout.
 - **Always record new learnings** in this file or, more likely, the relevant `docs/` file.
 - Docs can be wrong: they sometimes describe fixes that were never implemented.
   Grep the source before claiming a mechanism exists, and fix the doc.
-- If using subagents, ONLY use the lower tier Sonnet or Haiku models. NEVER Opus. Limit additional agents to only 2 at a time.
 - When building test scripts, always output as they go so that if the time goes past the hard 120 second timeout limit you still get some output. When running the real pipeline and not a test script this limit doesn't apply. For example when you are done with your work and rebuilding.
 - **LISTEN CAREFULLY to EXACTLY what the user's prompt says**. Seek to understand any implementation ideas instead of using your pre-conceived notions
 - If you need to continue iterating on an idea with only marginal improvments in some areas and regressions in another, your idea is likely incorrect and you need to find another one
@@ -483,7 +482,7 @@ relevant doc when working in that area.
 ### Scripts
 | Doc | Covers |
 |---|---|
-| [papyrus_conversion_notes.md](docs/papyrus_conversion_notes.md) | TES4→Papyrus mapping, paired on/off soft-lock trap, Say() timers and fragment release order, syntax traps, OBSE constructs |
+| [papyrus_conversion_notes.md](docs/papyrus_conversion_notes.md) | TES4→Papyrus mapping, paired on/off soft-lock trap, **Say() timers = `TES4Polyfill.SayLine` (engine-reported line length; fragments never write timers)**, syntax traps, OBSE constructs |
 | [Script_Conversion_Plan.md](docs/Script_Conversion_Plan.md) | Script conversion scope, counts, block/variable distributions |
 | [quest_script_conversion_audit.md](docs/quest_script_conversion_audit.md) | Which quest scripts have been read against their originals (don't re-audit), defects found, and verified-correct behaviours not to "fix" |
 | [skse_conversion_audit.md](docs/skse_conversion_audit.md) | SKSE/OBSE function coverage audit |

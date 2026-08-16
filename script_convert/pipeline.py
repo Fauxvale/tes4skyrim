@@ -4,6 +4,7 @@ import argparse
 import os
 import re
 import struct
+import time
 
 from tes5_import.text_reader import parse_export_file
 from worker_budget import worker_count
@@ -39,10 +40,10 @@ def _new_stats() -> dict:
 
 def _script_worker_init(xref, output_dir, info_reveals, service_topics,
                         stage_reveals, say_durations=None,
-                        say_timer_owners=None, topic_by_dial=None,
-                        beat_fields_by_owner=None, quest_script_vars=None,
+                        quest_script_vars=None,
                         quest_edid_by_fid=None, topic_unlock_globals=None,
-                        message_menus=None, mesh_bounds_cache=None):
+                        message_menus=None, mesh_bounds_cache=None,
+                        chargen_menus=None):
     # Windows spawns workers, so module-level caches loaded in the parent do
     # NOT carry over — each worker reloads the mesh-bounds cache or every
     # needs_havok_release() lookup answers 0 and no trap gets its release.
@@ -53,22 +54,22 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
                        info_reveals=info_reveals,
                        service_topics=service_topics,
                        stage_reveals=stage_reveals,
-                       say_timer_owners=say_timer_owners or {},
-                       topic_by_dial=topic_by_dial or {},
                        quest_script_vars=quest_script_vars or {},
                        quest_edid_by_fid=quest_edid_by_fid or {})
     # Class-level, so every ScriptConverter a worker builds sees the measured
-    # voice-line lengths that converted Say() timers are charged with.
+    # voice-line lengths (per INFO for the Begin fragments, per topic for the
+    # SayLine fallback).
     ScriptConverter.say_durations = say_durations or {}
-    ScriptConverter.beat_fields_by_owner = beat_fields_by_owner or {}
-    # Per-topic timer target + any deliberate beat, applied by the End fragment.
-    ScriptConverter.say_timer_owners = say_timer_owners or {}
     # DIAL EditorID -> unlock global, so a script `AddTopic X` opens the same
     # gate the INFO/QUST fragments do.
     ScriptConverter.topic_unlock_globals = topic_unlock_globals or {}
     # script EditorID -> button-MessageBox MESG plan; the importer writes the
     # records this makes the converter reference (message_menus.py).
     ScriptConverter.message_menus = message_menus or {}
+    # ShowBirthsignMenu/ShowClassMenu → modal Message pages + per-choice
+    # spell grants (message_menus.build_chargen_menus; importer authors the
+    # MESG records at fixed FormIDs).
+    ScriptConverter.chargen_menus = chargen_menus or {}
 
 
 def _script_worker_run(job):
@@ -102,19 +103,44 @@ def _chunk(records: list, size: int):
 # High-level conversion functions
 # ===========================================================================
 
-def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -> dict:
-    """Convert all TES4 scripts from export directory to Papyrus .psc files.
+def build_script_context(export_dir: str, output_dir: str) -> dict:
+    """Everything a script-conversion worker needs, built ONCE per plugin.
 
-    Args:
-        export_dir: Path to export/Oblivion.esm (contains .txt files)
-        output_dir: Path to write .psc files
-        workers: Number of worker threads (default: cpu_count-1)
-
-    Returns dict with conversion statistics.
+    Returns {'initargs': tuple for _script_worker_init, 'scpt_work': [...],
+    'info_work': [...], 'qust_work': [...], 'stats': dict}.  Shared by
+    convert_all_scripts (the pipeline stage) and tools/convert_scripts_subset.py
+    (a filtered rebuild of named scripts for iteration), so a subset build is
+    the SAME conversion as the full one — same say-timer owners, unlock plan,
+    durations and menu plans — never a parallel approximation of it.
     """
-    if workers is None:
-        workers = worker_count()
-
+    # 🛑 START FROM AN EMPTY DIRECTORY.  Which scripts the conversion produces
+    # changes with the plan and with the source records, and nothing used to
+    # delete the ones that stopped being generated — so they SURVIVED in
+    # output/ and kept being attached.  Measured 2026-08-15: scoping
+    # speaker-kind Say-timer owners stopped generating 10,268 bogus INFO
+    # fragments, but the stale .psc/.pex stayed on disk, so Uriel Septim's
+    # GREETING went on binding a fragment that cast him to two scripts he does
+    # not carry: the line kept its subtitle on screen and never advanced to
+    # its remaining two responses.
+    #
+    # Wiping is the honest form of that guarantee.  Every alternative
+    # (prefix lists, mtime "written this run" checks) needs a growing set of
+    # exceptions for the static scripts deployed alongside the generated ones,
+    # and each exception is another way to keep a stale file.  After a wipe,
+    # anything present IS something this run produced.  Both source and
+    # compiled output are cleared: a stale .pex is worse than a stale .psc,
+    # because the VM loads it whether or not the source is still there.
+    if os.path.isdir(output_dir):
+        import shutil
+        shutil.rmtree(output_dir)
+    pex_dir = os.path.dirname(output_dir)
+    if os.path.isdir(pex_dir):
+        for _n in os.listdir(pex_dir):
+            if _n.lower().endswith('.pex'):
+                try:
+                    os.remove(os.path.join(pex_dir, _n))
+                except OSError:
+                    pass
     os.makedirs(output_dir, exist_ok=True)
 
     # Mesh physics facts, so a converted `playgroup` can ask whether the object
@@ -198,7 +224,7 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
     # property bindings and GLOB records written into the ESM.
     from tes5_import.dialog_unlocks import build_unlock_plan
     by_type = {}
-    for sig in ('DIAL', 'INFO', 'QUST', 'SCPT'):
+    for sig in ('DIAL', 'INFO', 'QUST', 'SCPT', 'NPC_'):
         path = os.path.join(export_dir, f'{sig}.txt')
         by_type[sig] = parse_export_file(path) if os.path.exists(path) else []
     unlock_plan = build_unlock_plan(by_type)
@@ -232,54 +258,24 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
 
     info_reveals = unlock_plan['info_reveals']
 
-    # Which conversation timer each Say-driven topic parks, and the topic name
-    # behind each DIAL FormID.  Needed HERE, before the filter below, because
-    # an INFO under a parked topic must produce a fragment even when it has no
-    # result script of its own.
-    say_timer_owners = build_say_timer_owners(by_type)
-    topic_by_dial = {d.get('FormID', ''): (d.get('EditorID') or '').lower()
-                     for d in by_type.get('DIAL', []) if d.get('FormID')}
-
-    def _info_makes_output(rec):
-        if rec.get('ResultScript', '').strip():
-            return True
-        # A line under a topic whose timer was PARKED must emit a fragment to
-        # release it, script or not.  Requiring a result script dropped 87% of
-        # them (5,450 of 6,248): the parked timer was then never cleared and
-        # the conversation stopped for good on the first script-less line —
-        # CharacterGen died on Glenroy's "Baurus, lock the door behind us".
-        if say_timer_owners.get(topic_by_dial.get(rec.get('ParentDIAL', ''), '')):
-            return True
-        try:
-            return (int(rec.get('FormID', ''), 16) & 0xFFFFFF) in info_reveals
-        except (TypeError, ValueError):
-            return False
-
-    info_work = [r for r in by_type.get('INFO', []) if _info_makes_output(r)]
+    # EVERY INFO produces a fragment (Begin/End line hooks for
+    # TES4Polyfill.SayLine, plus its result script / unlocks / service menu
+    # when it has them) — see _info_batch.  The importer writes a VMAD on
+    # every INFO to match; there is deliberately no "which INFOs" plan for the
+    # two sides to disagree on.
+    info_work = [r for r in by_type.get('INFO', []) if r.get('FormID')]
     qust_work = [r for r in by_type.get('QUST', []) if r.get('EditorID', '')]
-
-    jobs = ([('scpt', c) for c in _chunk(scpt_work, 48)]
-            + [('info', c) for c in _chunk(info_work, 128)]
-            + [('qust', c) for c in _chunk(qust_work, 8)])
     print(f'  Converting {len(scpt_work)} SCPT / {len(info_work)} INFO / '
-          f'{len(qust_work)} QUST scripts ({len(jobs)} jobs)...')
+          f'{len(qust_work)} QUST scripts...')
 
-    # Measured spoken-line lengths for converted Say() timers. A converted
-    # polling conversation that re-Says before the previous line ends is
-    # silently dropped by the engine (and loses its End fragment), so these
-    # must be real durations, not a constant.
+    # Measured spoken-line lengths: each INFO's Begin fragment reports its
+    # own line's length to TES4Polyfill.SayLine, and the per-topic maximum is
+    # the fallback for a line with no voice file.
     from script_convert.say_durations import scan_voice_durations
     say_durations = scan_voice_durations(export_dir)
     if say_durations:
-        print(f'    voice durations: {len(say_durations)} topics measured '
-              f'(Say() timers)')
-
-    # (say_timer_owners / topic_by_dial are built above, before the INFO filter
-    # that consumes them.)
-    beat_fields_by_owner = build_beat_fields_by_owner(by_type)
-    if say_timer_owners:
-        print(f'    say timers: {len(say_timer_owners)} topics drive a quest '
-              f'conversation timer (per-line correction)')
+        print(f'    voice durations: {len(say_durations)} lines/topics '
+              f'measured (Say() timers)')
 
     quest_script_vars = build_quest_script_vars(by_type)
     quest_edid_by_fid = {int(r.get('FormID','0'),16) & 0xFFFFFF:
@@ -341,11 +337,59 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
         print(f'    Button menus: {n_sites} MessageBox sites in '
               f'{len(message_menus)} scripts')
 
+    # Chargen menu plan (ShowBirthsignMenu / ShowClassMenu → modal
+    # Message.Show() pages) — shared with the importer, which authors the
+    # MESG records at fixed FormIDs (message_menus.build_chargen_menus).
+    from .message_menus import build_chargen_menus
+    chargen_menus = {}
+    _bsgn_p = os.path.join(export_dir, 'BSGN.txt')
+    _clas_p = os.path.join(export_dir, 'CLAS.txt')
+    if os.path.exists(_bsgn_p) or os.path.exists(_clas_p):
+        _spel_map = {}
+        _spel_p = os.path.join(export_dir, 'SPEL.txt')
+        if os.path.exists(_spel_p):
+            for _r in parse_export_file(_spel_p):
+                _f, _e = _r.get('FormID'), _r.get('EditorID')
+                if _f and _e:
+                    _spel_map[int(_f, 16) & 0xFFFFFF] = _e
+        chargen_menus = build_chargen_menus(
+            parse_export_file(_bsgn_p) if os.path.exists(_bsgn_p) else [],
+            parse_export_file(_clas_p) if os.path.exists(_clas_p) else [],
+            _spel_map)
+        if chargen_menus:
+            print('    Chargen menus: ' + ', '.join(
+                f"{k} ({len(v['actions'])} options, {len(v['pages'])} pages)"
+                for k, v in sorted(chargen_menus.items())))
+
     initargs = (xref, output_dir, info_reveals, service_topics,
                 unlock_plan['stage_reveals'], say_durations,
-                say_timer_owners, topic_by_dial, beat_fields_by_owner,
                 quest_script_vars, quest_edid_by_fid, topic_unlock_globals,
-                message_menus, _bounds_cache)
+                message_menus, _bounds_cache, chargen_menus)
+    return {'initargs': initargs, 'scpt_work': scpt_work,
+            'info_work': info_work, 'qust_work': qust_work, 'stats': stats}
+
+
+def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -> dict:
+    """Convert all TES4 scripts from export directory to Papyrus .psc files.
+
+    Args:
+        export_dir: Path to export/Oblivion.esm (contains .txt files)
+        output_dir: Path to write .psc files
+        workers: Number of worker threads (default: cpu_count-1)
+
+    Returns dict with conversion statistics.
+    """
+    if workers is None:
+        workers = worker_count()
+
+    ctx = build_script_context(export_dir, output_dir)
+    initargs = ctx['initargs']
+    stats = ctx['stats']
+    scpt_work, info_work, qust_work = (ctx['scpt_work'], ctx['info_work'],
+                                       ctx['qust_work'])
+    jobs = ([('scpt', c) for c in _chunk(scpt_work, 48)]
+            + [('info', c) for c in _chunk(info_work, 128)]
+            + [('qust', c) for c in _chunk(qust_work, 8)])
     if workers <= 1 or len(jobs) <= 2:
         _script_worker_init(*initargs)
         for job in jobs:
@@ -596,133 +640,6 @@ _SERVICE_MENU_CALL = {
 }
 
 
-# `set <timer> to [<ref>.]Say <topic> [flag]`
-#           or  `set <timer> to [<ref>.]SayTo <target> <topic> [flag]`
-#
-# The keyword decides the ARITY, so it has to be captured: SayTo takes a target
-# BEFORE the topic, Say does not.  An `(?:\w+[\s,]+)?` optional-target group
-# cannot tell the two apart and greedily consumed the topic of every `Say
-# <topic> 1` form, capturing the trailing "say the line even if the speaker is
-# not the player's target" FLAG as the topic ("1").  That silently denied a
-# release owner to 120+ topics — every Daedric shrine speech, the Boethia
-# champions, SE quest chatter, MQ13/MQ06 speeches — so their parked timers were
-# never cleared and each conversation stopped after ONE line.
-#
-# `[^\S\n]` (not `\s`) keeps every match on a single line: SCTX is one long
-# escaped blob, and `\s` let a match run past the end of a statement and pick up
-# `else`/`endif`/`setstage` from following lines as the "topic".
-_SAY_TIMER_RE = re.compile(
-    r'set\s+([\w.]+)\s+to[^\S\n]+(?:[\w]+\.)?(say(?:to)?)'
-    r'[^\S\n,]*[\s,][^\S\n,]*(\w+)'
-    r'(?:[^\S\n,]*[,][^\S\n,]*|[^\S\n]+)(\w+)?',
-    re.IGNORECASE)
-
-
-def _say_timer_topic(m: 're.Match') -> str:
-    """The TOPIC captured by _SAY_TIMER_RE, honouring Say vs SayTo arity.
-
-    SayTo's first argument is the dialogue TARGET and the second is the topic;
-    Say's first argument IS the topic.  A trailing numeric flag is never a
-    topic, so a digit in the topic slot means the optional group matched the
-    flag instead and the earlier group holds the real topic.
-    """
-    kw, first, second = m.group(2).lower(), m.group(3), m.group(4)
-    if kw == 'sayto' and second and not second.isdigit():
-        return second
-    return first
-
-
-def build_say_timer_owners(by_type: dict) -> dict:
-    """topic (lowercase) -> the Papyrus timer expression to clear when a line
-    of that topic FINISHES.
-
-    Oblivion wrote `set CharacterGen.convTimer to SayTo player, CharGenMain 1`
-    — the timer held the line's own length purely so the NEXT speaker's
-    `convTimer <= 0` guard would not fire until this line finished.  The owning
-    script counts it DOWN every tick, so it is self-clearing.
-
-    The conversion keeps that countdown (the call site charges the measured
-    length, see converter._say_seconds) and uses the End fragment only to
-    CORRECT it to the line that actually played, plus apply any deliberate beat.
-    The timer must never DEPEND on the fragment: `Say()` does nothing when no
-    INFO under the topic passes its conditions, so a fragment-only release turns
-    a dropped line into a halted conversation.
-    """
-    # script EditorID (lower) -> the QUST EditorID that runs it.  A quest
-    # script's bare `set convTimer to ...` names a variable on the QUEST, so
-    # its End fragment must bind a quest property rather than cast the speaker.
-    _script_edid = {(r.get('FormID') or '').upper(): (r.get('EditorID') or '')
-                    for r in by_type.get('SCPT', [])}
-    quest_script_owner = {}
-    for rec in by_type.get('QUST', []):
-        sname = _script_edid.get((rec.get('SCRI') or '').upper(), '')
-        qname = rec.get('EditorID') or ''
-        if sname and qname:
-            quest_script_owner[sname.lower()] = qname
-
-    # Every QUST EditorID, so a dotted timer target can be told apart from one
-    # prefixed by a placed reference (see the `.` branch below).
-    quest_edids = {(r.get('EditorID') or '').lower()
-                   for r in by_type.get('QUST', []) if r.get('EditorID')}
-
-    owners = {}
-    for rec in by_type.get('SCPT', []):
-        txt = (rec.get('SCTX') or '').replace('\\r\\n', '\n')
-        edid = rec.get('EditorID') or ''
-        for m in _SAY_TIMER_RE.finditer(txt):
-            target, topic = m.group(1), _say_timer_topic(m).lower()
-            # A deliberate beat (`set convTimer to convTimer + 2.5`) that the
-            # script applies right after this Say. Oblivion charged it on top
-            # of the line's length, so it belongs AFTER the line — the End
-            # fragment applies it, because anything written at the call site
-            # decays under the loop's countdown while the line plays.
-            short = target.split('.')[-1]
-            beat = 0.0
-            bm = re.search(r'set\s+[\w.]*\b' + re.escape(short) +
-                           r'\b\s+to\s+[\w.]*\b' + re.escape(short) +
-                           r'\b\s*\+\s*([\d.]+)', txt, re.IGNORECASE)
-            if bm:
-                try:
-                    beat = float(bm.group(1))
-                except ValueError:
-                    beat = 0.0
-            if '.' in target and target.split('.')[0].lower() in quest_edids:
-                # Quest-scoped (`CharacterGen.convTimer`): bind a property to
-                # that quest in the fragment.
-                owners.setdefault(topic, ('quest', target, beat))
-            elif '.' in target:
-                # A dotted target whose prefix is NOT a quest — `set
-                # MS27CarvingWall.timer to Say MS27Voice`, where MS27CarvingWall
-                # is a placed REFR and the timer lives on that object's own
-                # script.  Binding it as a quest property emitted
-                # `Quest Property MS27CarvingWall` and the fragment failed to
-                # compile ("field or property `timer` not found"), because a bare
-                # Quest has no converted script members.  There is no reliable
-                # handle from a TopicInfo fragment to an arbitrary third-party
-                # reference, so leave it unowned: the call site's park still
-                # holds the loop off and the dropped-line watchdog bounds it.
-                continue
-            elif edid and edid.lower() in quest_script_owner:
-                # A QUEST script writing its OWN timer with no prefix
-                # (`set convTimer to BaurusRef.SayTo ...` in CharGenQuest).
-                # It is script-local in TES4 syntax but the timer lives on the
-                # QUEST, so it must bind a quest property — casting the SPEAKER
-                # to a Quest script yields None, the write is silently dropped
-                # and the parked timer is NEVER released.  That one
-                # misclassification killed every CharGenVoice line, which is
-                # where CharacterGen stopped after "Baurus, lock the door".
-                owners.setdefault(
-                    topic,
-                    ('quest', f'{quest_script_owner[edid.lower()]}.{target}',
-                     beat))
-            elif edid:
-                # Script-local (`timer` on ValenDrethScript): the timer lives
-                # on the SPEAKER's own script, which a TopicInfo fragment
-                # reaches by casting akSpeakerRef to that script type.
-                owners.setdefault(topic, ('speaker', f'{edid}|{target}', beat))
-    return owners
-
-
 def build_quest_script_vars(by_type: dict) -> dict:
     """quest fid (low-24) -> {script-local var index: name}.
 
@@ -763,101 +680,16 @@ def build_quest_script_vars(by_type: dict) -> dict:
     return out
 
 
-def build_beat_fields_by_owner(by_type: dict) -> dict:
-    """owner EditorID (lower) -> {timer fields needing a pending-beat property}.
-
-    A script that pauses between lines writes `set SomeQuest.convTimer to
-    SomeQuest.convTimer + 2.5`.  The converter redirects that to a
-    `convTimerPendingBeat` companion (the timer itself is counted DOWN while
-    the line plays, so a value stored there is eroded before the End fragment
-    can read it back) — but the companion has to be DECLARED on SomeQuest's
-    script, which a different converter run produces.  Scanning the whole
-    export up front makes that independent of conversion order and safe across
-    the process pool.
-    """
-    owners: dict = {}
-    for rec in by_type.get('SCPT', []):
-        txt = (rec.get('SCTX') or '').replace('\\r\\n', '\n')
-        script_name = (rec.get('EditorID') or '').lower()
-        for m in _SAY_TIMER_RE.finditer(txt):
-            target = m.group(1)
-            owner, field = (target.rsplit('.', 1) if '.' in target
-                            else (script_name, target))
-            if not owner:
-                continue
-            pat = (r'set\s+[\w.]*\b' + re.escape(field) + r'\b\s+to\s+'
-                   r'[\w.]*\b' + re.escape(field) + r'\b\s*\+\s*[\d.]+')
-            if re.search(pat, txt, re.IGNORECASE):
-                owners.setdefault(owner.lower(), set()).add(field)
-    # Re-key from the RECORD's EditorID (`charactergen`) to the EditorID of the
-    # SCRIPT that record runs (`chargenquest`), because that is the script the
-    # property must be declared on and the name each converter matches itself
-    # against.
-    scri_by_edid = {}
-    script_edid = {}
-    for rec in by_type.get('SCPT', []):
-        script_edid[(rec.get('FormID') or '').upper()] = rec.get('EditorID') or ''
-    for sig in ('QUST', 'NPC_', 'CREA', 'ACHR', 'ACRE', 'REFR'):
-        for rec in by_type.get(sig, []):
-            e = (rec.get('EditorID') or '').lower()
-            scri = (rec.get('SCRI') or '').upper()
-            if e and scri:
-                scri_by_edid[e] = script_edid.get(scri, '')
-    # A key that is already a SCRIPT name (script-local timer) stays as-is;
-    # only a RECORD name is redirected to the script it runs.
-    known_scripts = {v.lower() for v in script_edid.values() if v}
-    out: dict = {}
-    for rec_edid, fields in owners.items():
-        key = rec_edid
-        if rec_edid not in known_scripts:
-            key = (scri_by_edid.get(rec_edid) or rec_edid).lower()
-        out.setdefault(key, set()).update(fields)
-    return out
-
-
-def _owner_has_beat(spec: str, kind: str) -> bool:
-    """Does the script owning this Say timer declare a pending-beat companion?
-
-    Mirrors the declaration rule in ScriptConverter (`beat_fields_by_owner`,
-    keyed by SCRIPT EditorID) so a fragment never references a property that
-    was not emitted.
-    """
-    by_owner = ScriptConverter.beat_fields_by_owner or {}
-    if kind == 'quest':
-        owner, field = spec.split('.', 1)
-    else:
-        owner, field = spec.split('|', 1)
-    return field.lower() in {f.lower() for f in by_owner.get(owner.lower(), ())}
-
 
 _GET_QUEST_VARIABLE = 79        # TES4 func index; param2 = script-local index
 
 
-def _same_quest(rec: dict, quest_edid: str) -> bool:
-    """True when this INFO's GetQuestVariable condition names `quest_edid`."""
-    names = _WORKER_CTX.get('quest_edid_by_fid') or {}
-    i = -1
-    while True:
-        i += 1
-        raw = rec.get(f'Condition[{i}].Raw')
-        if raw is None:
-            return False
-        try:
-            d = bytes.fromhex(raw)
-        except ValueError:
-            continue
-        if len(d) < 20 or struct.unpack_from('<H', d, 8)[0] != _GET_QUEST_VARIABLE:
-            continue
-        qfid = struct.unpack_from('<I', d, 12)[0] & 0x00FFFFFF
-        if (names.get(qfid, '') or '').lower() == quest_edid.lower():
-            return True
-    return False
-
-
 def _seq_counter_condition(rec: dict):
-    """(var_name, int_value) from this INFO's `GetQuestVariable <q>.<v> == N`
-    condition, or None. Equality only — a `>=`/`<` gate is not a sequencer."""
+    """(quest_edid, var_name, int_value) from this INFO's
+    `GetQuestVariable <q>.<v> == N` condition, or None. Equality only — a
+    `>=`/`<` gate is not a sequencer."""
     script_vars = _WORKER_CTX.get('quest_script_vars') or {}
+    names = _WORKER_CTX.get('quest_edid_by_fid') or {}
     i = -1
     while True:
         i += 1
@@ -878,12 +710,13 @@ def _seq_counter_condition(rec: dict):
         quest_fid = struct.unpack_from('<I', d, 12)[0] & 0x00FFFFFF
         var_idx = struct.unpack_from('<I', d, 16)[0]
         name = script_vars.get(quest_fid, {}).get(var_idx)
-        if name:
-            return name, int(comp)
+        quest = names.get(quest_fid, '')
+        if name and quest:
+            return quest, name, int(comp)
     return None
 
 
-def _sequence_gate(rec: dict, owner: tuple) -> str:
+def _sequence_gate(rec: dict) -> str:
     """`<quest>.<var> == <n>` guard for a polled-conversation INFO, else ''.
 
     These conversations are a sequencer: each INFO is gated on an exact counter
@@ -893,35 +726,27 @@ def _sequence_gate(rec: dict, owner: tuple) -> str:
     in CharacterGen alone), and those stages fire off package completion —
     which lands whenever the actor arrives, not when the line ends.
 
-    `Say()` is asynchronous, so a re-seed can land while a line is still
-    playing. The in-flight line's End fragment then applies `+1` to the
-    RE-SEEDED value and overshoots: CharacterGen stage 12 sets convCount=8 for
-    "What's this prisoner doing here?" while line 7 is still audible, line 7's
-    fragment makes it 9, and the cell-door exchange never plays (verified from
-    a runtime trace: `FRAG 00032B0A cnt=8` -> `cnt=9 spk=0`).
-
-    Oblivion could not hit this: `SayTo` returned the duration synchronously, so
-    the walk conversation always finished before the actor reached the marker.
+    A re-seed can land while a line is still playing. The in-flight line's End
+    fragment then applies `+1` to the RE-SEEDED value and overshoots:
+    CharacterGen stage 12 sets convCount=8 for "What's this prisoner doing
+    here?" while line 7 is still audible, line 7's fragment makes it 9, and the
+    cell-door exchange never plays (verified from a runtime trace:
+    `FRAG 00032B0A cnt=8` -> `cnt=9 spk=0`).
 
     Guarding the fragment on the counter the INFO itself requires makes the
-    re-seed authoritative — a line whose turn has passed applies nothing.
+    re-seed authoritative — a line whose turn has passed applies nothing. The
+    gate is only APPLIED when the body actually steps that counter (see
+    _split_counter_step): a line the quest script advances for is not a
+    sequencer and must never be gated.
     """
-    if not owner or owner[0] != 'quest':
-        return ''
     var = _seq_counter_condition(rec)
     if not var:
         return ''
-    quest_prop, _field = owner[1].split('.', 1)
-    name, value = var
-    # The counter and the timer are DIFFERENT variables on the same quest
-    # script (convCount vs convTimer) — the link between them is the quest, so
-    # that is what must match, not the field name.
-    if not _same_quest(rec, quest_prop):
-        return ''
+    quest, name, value = var
     # The VARIABLE name needs the same sanitising the converter gives every
     # property it declares — TES4 allows names Papyrus reserves (`endstate`,
     # MS40) and a raw name here is a parser error.
-    return (f'{_safe_property_name(quest_prop)}.'
+    return (f'{_safe_property_name(quest)}.'
             f'{_safe_property_name(name)} == {value}')
 
 
@@ -945,20 +770,6 @@ def _is_state_write(line: str) -> bool:
         return False
     base = m.group('base')
     return base is None or base.lower() == m.group('lhs').lower()
-
-
-def _setstage_on_owner(lines: list, timer_ref: str) -> bool:
-    """True when the body calls SetStage on the quest that owns the timer.
-
-    Only then can the inline stage fragment's `EvaluatePackage()` see a stale
-    timer; a SetStage on some OTHER quest shares no state with it.
-    """
-    owner = (timer_ref or '').rsplit('.', 1)[0].strip().lower()
-    if not owner:
-        return False
-    pat = re.compile(r'^\s*' + re.escape(owner) + r'\.SetStage\s*\(',
-                     re.IGNORECASE)
-    return any(pat.match(ln) for ln in lines)
 
 
 def _split_counter_step(lines: list, seq_gate: str) -> tuple:
@@ -1067,9 +878,23 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 service_topics: dict = None):
     """Convert a batch of INFO records into TopicInfo fragment .psc files.
 
+    EVERY INFO gets a fragment script `TES4_TIF__<fid>` (the importer writes
+    the matching VMAD on every INFO — build_vmad_info_fragment, flags 0x03):
+
+        Fragment_1 (OnBegin)  TES4Polyfill.LineBegan(akSpeakerRef, <length>)
+        Fragment_0 (OnEnd)    [unlock globals] [TES4 result script]
+                              [service menu]  TES4Polyfill.LineEnded(akSpeakerRef)
+
+    The Begin/End hooks are how a converted `set T to Say topic` learns that
+    the engine has started the line and how long it is (see
+    TES4Polyfill.SayLine); they carry the speaker only, so no property is
+    bound and no INFO can be missed.  The TES4 result script stays in the End
+    fragment: Oblivion ran an INFO's result when the line FINISHED (the CS
+    wiki's own scripted-conversation recipe writes `set Q.convTimer to <pause>`
+    in results as an after-line pause, which only works at end).
+
     info_reveals ({info_fid24: [unlock global names]}) marks AddTopic revealer
-    INFOs: their OnEnd fragment sets the unlock globals (a fragment is
-    generated even when the INFO has no result script). Must stay in sync with
+    INFOs: their End fragment sets the unlock globals. Must stay in sync with
     the VMADs the importer writes (same unlock plan).
 
     service_topics ({dial_formid_str: 'barter'|'training'}) marks the service-
@@ -1077,71 +902,28 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
     """
     info_reveals = info_reveals or {}
     service_topics = service_topics or {}
-    timer_owners = _WORKER_CTX.get('say_timer_owners') or {}
-    topic_by_dial = _WORKER_CTX.get('topic_by_dial') or {}
+    say_durations = ScriptConverter.say_durations or {}
 
     for rec in records:
         result_script = rec.get('ResultScript', '')
         has_script = bool(result_script and result_script.strip())
         formid = rec.get('FormID', '')
+        if not formid:
+            continue
         try:
             fid24 = int(formid, 16) & 0xFFFFFF
         except (TypeError, ValueError):
             fid24 = 0
         reveals = info_reveals.get(fid24, [])
         service_kind = service_topics.get(rec.get('ParentDIAL', ''), '')
-        # This INFO's own measured length, and the conversation timer its topic
-        # drives — see build_say_timer_owners. Emitting `<timer> = <secs>` in
-        # the End fragment replaces the call site's worst-case estimate with
-        # the length of the line that actually played.
-        timer_fix = False
-        timer_ref = ''
-        timer_beat_ref = ''
-        topic_name = topic_by_dial.get(rec.get('ParentDIAL', ''), '')
-        owner = timer_owners.get(topic_name)
-        seq_gate = _sequence_gate(rec, owner)
-        # Correct the conversation timer this topic drives to THIS line's own
-        # measured length. The call site charged the topic's worst case (it
-        # cannot know which INFO will win); the engine runs this fragment when
-        # the line ENDS, so here the exact line is known.
-        #
-        # This is a pacing CORRECTION, not a release: the timer is an ordinary
-        # countdown (Oblivion's `if convTimer > 0 : convTimer -=
-        # getSecondsPassed`), so it drains on its own and a line that never
-        # plays simply costs its charged duration instead of stalling the
-        # scene. An earlier scheme parked a sentinel here and depended on this
-        # fragment to clear it, which made "line dropped" mean "conversation
-        # halted" — the CharacterGen prison-cell silence.
-        #
-        # Assigning an absolute value (never `timer - x`) keeps it idempotent:
-        # several actor scripts poll the SAME quest timer on independent 0.5s
-        # updates while the quest script decrements it every 0.1s, and `Say()`
-        # is asynchronous, so a relative adjustment races and can double-apply.
-        owner_prop = ''
-        if owner:
-            kind, spec = owner[0], owner[1]
-            if kind == 'quest':
-                owner_prop, field = spec.split('.', 1)
-                ref = f'{_safe_property_name(owner_prop)}.{field}'
-            else:
-                script_edid, field = spec.split('|', 1)
-                cls = papyrus_script_name(script_edid)
-                ref = f'(akSpeakerRef as {cls}).{field}'
-            # The deliberate pause the owning script stacks after this line, if
-            # any. Oblivion charged those ON TOP of the line's length. Consume
-            # it only when the owner actually HAS one — referencing a companion
-            # that was never declared fails to compile.
-            timer_ref = ref
-            if _owner_has_beat(spec, kind):
-                timer_beat_ref = ScriptConverter.beat_property(ref)
-            # The line is over; let the next speaker start on the next tick.
-            # The value is committed at the END of the fragment (see below) —
-            # releasing it before the body advances the sequence state lets the
-            # owning script's poll re-fire the SAME line.
-            timer_fix = True
-        if not has_script and not reveals and not timer_fix:
-            # Script-less service-menu INFOs use the shared static scripts.
-            continue
+        # This line's own measured length (all of its responses, played back
+        # to back).  0 when the line has no voice file: SayLine then falls
+        # back to the topic's longest line.
+        try:
+            length = float(say_durations.get(f'info:{formid.upper()}') or 0.0)
+        except (TypeError, ValueError):
+            length = 0.0
+        seq_gate = _sequence_gate(rec)
 
         if has_script:
             stats['info_total'] += 1
@@ -1164,16 +946,6 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             for gname in reveals:
                 declared.add(gname.lower())
                 out_lines.append(f'GlobalVariable Property {gname} Auto')
-            # Only the quest-scoped form needs a bound property; the speaker
-            # form casts akSpeakerRef and declares nothing.
-            if owner_prop:
-                # Must be typed as the quest's CONVERTED script class, not
-                # `Quest` — convTimer lives on the generated script.
-                safe_owner = _safe_property_name(owner_prop)
-                if safe_owner.lower() not in declared:
-                    declared.add(safe_owner.lower())
-                    otype = xref.get_quest_script_type(owner_prop)
-                    out_lines.append(f'{otype} Property {safe_owner} Auto')
             if prop_refs:
                 # Merge case-variant keys, most specific type wins — the same
                 # rule the QUST-stage and standalone emitters already apply.
@@ -1201,54 +973,23 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                     out_lines.append(f'{ptype} Property {safe} Auto')
             if declared:
                 out_lines.append('')
+
+            # OnBegin: the engine has selected this line and started it.
+            out_lines += [
+                'Function Fragment_1(ObjectReference akSpeakerRef)',
+                f'  TES4Polyfill.LineBegan(akSpeakerRef, {length:g})',
+                'EndFunction',
+                '',
+            ]
+
+            # OnEnd: the line has finished.  Unlock the AddTopic-revealed
+            # topics first (right before the topic menu refreshes), then the
+            # TES4 result, then the "line over" hook LAST — a poll waiting on
+            # this speaker must see the result's state writes before it can
+            # issue the next line.
             out_lines.append('Function Fragment_0(ObjectReference akSpeakerRef)')
-            # Unlock the AddTopic-revealed topics first — OnEnd fires when the
-            # line finishes, right before the topic menu refreshes.
             for gname in reveals:
                 out_lines.append(f'  {gname}.SetValue(1)')
-            # THREE constraints, each one demonstrated by an in-game failure:
-            #
-            #  1. The release must be UNCONDITIONAL — reachable even when the
-            #     sequence gate REJECTS this line.  A line whose turn has
-            #     passed still has to free the timer.  Putting the release
-            #     inside the gate stopped CharacterGen dead at
-            #     `FRAG 00032B0A cnt=8 needs 7 accepted=False`: stage 12
-            #     re-seeded convCount mid-line, the fragment was rejected, and
-            #     nothing ever cleared convTimer.
-            #  2. The poll guard must not re-fire this line.  The guard is
-            #     `speaker == N && convTimer <= 0`, and the gate is
-            #     `convCount == K`, so releasing the timer while the COUNTER
-            #     still reads K lets the owner re-Say the same line
-            #     (`RENAULT FIRE cnt=15` twice), which re-arms the timer.
-            #  3. The timer must already be released when the body's
-            #     `SetStage` runs.  SetStage executes that stage's fragment
-            #     INLINE and those fragments call `EvaluatePackage()`, which
-            #     arbitrates against whatever is committed at that instant.
-            #     With convTimer still 7.63 the engine picked
-            #     CGRenoteOpenSecretDoor and kicked it straight back to
-            #     CGRenoteWalkToMarkerB in the SAME second — a race on engine
-            #     latency, so it worked one run and failed the next.
-            #
-            # All three hold by ordering the gate body as:
-            #     <counter step>   — closes the gate against a re-fire (2)
-            #     <release>        — timer free before any SetStage (3)
-            #     <rest of body>   — speaker/target, then SetStage
-            # plus an unconditional release after the gate for the rejected
-            # case (1).  The release is idempotent, so running it twice on the
-            # accepted path is harmless.
-            #
-            # A body that RETIMES the beat still works.  Oblivion ran this
-            # while the line was playing, so `convTimer - .4` cut short a live
-            # countdown; here the base is already 0 and `0 - .4` is negative,
-            # which every `<= 0` guard reads as "release now" — same outcome.
-            release = []
-            if timer_fix:
-                if timer_beat_ref:
-                    release.append(f'{timer_ref} = {timer_beat_ref}'
-                                   '  ; line ended (+ stacked beat)')
-                    release.append(f'{timer_beat_ref} = 0')
-                else:
-                    release.append(f'{timer_ref} = 0  ; line ended')
             body_lines = _state_writes_before_setstage(body_lines)
             # A polled-conversation line whose turn has already passed (a quest
             # stage re-seeded the counter mid-line) must apply NOTHING, or its
@@ -1256,53 +997,30 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             #
             # ONLY when THIS fragment owns the handoff, i.e. its own body steps
             # the counter the gate tests (`convCount = convCount + 1`).  That
-            # step is the AUTHORED marker of a sequencer: the counter advances
-            # when the line ENDS, so re-asserting its value at End time is a
-            # true "is it still my turn?" check.
-            #
-            # When the QUEST SCRIPT advances the variable instead, it does so
-            # as it STARTS each line (`set waittimer to X.SayTo ...` then
-            # `set JiubSpeak to 3`).  Oblivion's SayTo was synchronous so the
-            # value still matched when the result script ran; Skyrim's Say() is
-            # async, so by the time the End fragment fires the variable has
-            # ALREADY advanced and the gate can never be true.  Gating there
-            # silently discards the whole body: Morroblivion's Jiub set
-            # `Guard01Stage = 1` inside an `If JiubSpeak == 2` that was 3 by
-            # then, so the guard never got his move package and never walked
-            # to the player (log: FRAG 01F8E969 fires, Guard01Stage stays 0).
+            # step is the AUTHORED marker of a sequencer.  When the QUEST
+            # SCRIPT advances the variable instead, it does so as it STARTS
+            # each line (`set waittimer to X.SayTo ...` then `set JiubSpeak to
+            # 3`) and the value has already moved on by the time this End
+            # fragment runs; gating there would discard the whole body
+            # (Morroblivion's Jiub set `Guard01Stage = 1` inside an
+            # `If JiubSpeak == 2` that was 3 by then, so the guard never got
+            # his move package and never walked to the player).
             counter_step, rest_body = _split_counter_step(body_lines, seq_gate)
             if seq_gate and body_lines and counter_step:
-                counter, rest = counter_step, rest_body
                 # The quest's stage advance must survive a REJECTED turn — see
                 # _split_stage_advances. Only the counter/speaker state writes
                 # stay inside the gate.
-                gated_rest, stage_advances = _split_stage_advances(rest)
-                out_lines.append(f'  If {seq_gate}  ; still this line\'s turn')
-                out_lines.extend('  ' + b for b in counter)
-                out_lines.extend('  ' + r for r in release)
+                gated_rest, stage_advances = _split_stage_advances(rest_body)
+                out_lines.append(f"  If {seq_gate}  ; still this line's turn")
+                out_lines.extend('  ' + b for b in counter_step)
                 out_lines.extend('  ' + b for b in gated_rest)
                 out_lines.append('  EndIf')
-                # Rejected path: the gate did nothing, so the timer is still
-                # armed and must be freed here (constraint 1).
-                out_lines.extend('  ' + r for r in release)
-                # Unconditional, and AFTER the release (constraint 3): the
-                # stage fragment's EvaluatePackage arbitrates against the
-                # committed timer state.
                 out_lines.extend(stage_advances)
             else:
-                # Ungated: there is no counter to close the guard with, but the
-                # timer must still be free before any SetStage hands control to
-                # the engine (constraint 3).  Release first when the body calls
-                # SetStage on the timer's OWN quest, otherwise keep the release
-                # last so the body's state writes land first (constraint 2).
-                if _setstage_on_owner(body_lines, timer_ref):
-                    out_lines.extend('  ' + r for r in release)
-                    out_lines.extend(body_lines)
-                else:
-                    out_lines.extend(body_lines)
-                    out_lines.extend('  ' + r for r in release)
+                out_lines.extend(body_lines)
             if service_kind:
                 out_lines.append(_SERVICE_MENU_CALL[service_kind])
+            out_lines.append(f'  TES4Polyfill.LineEnded(akSpeakerRef, {length:g})')
             out_lines.append('EndFunction')
             out_lines.append('')
 
@@ -1488,6 +1206,7 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
             # gamepad text and a keyboard text, and emitting the objective calls
             # per entry displayed the same objective twice.
             objective_emitted = set()
+            uses_chargen_latch = False
             for stage_idx, log_idx, log_text, script_src, complete_flag, stage_arr_idx, log_arr_idx in fragments:
                 # Load per-stage SCROs for this fragment
                 _preload_stage_scro_refs(conv, rec, xref, stage_arr_idx, log_arr_idx)
@@ -1534,10 +1253,18 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 if script_src and script_src.strip():
                     body_lines = conv.convert_fragment(script_src, 'Quest')
                     out_lines.extend(body_lines)
+                    # convert_fragment resets per-fragment state; accumulate
+                    # the chargen-menu latch across all of this QF's fragments.
+                    uses_chargen_latch = (uses_chargen_latch
+                                          or conv._uses_chargen_menus)
                 out_lines.append('EndFunction')
                 out_lines.append('')
 
             # Insert property declarations after ScriptName line
+            if uses_chargen_latch:
+                # Script-scope re-entrancy latch for the modal chargen menus
+                # (see the converter's ShowBirthsignMenu emission).
+                out_lines.insert(2, 'Bool TES4_ChargenMenuBusy = False')
             quest_globals = sorted({g for (q, _s), gs in stage_reveals.items()
                                     if q == edid.lower() for g in gs})
             for gi, gname in enumerate(quest_globals):
@@ -1790,13 +1517,20 @@ def build_vmad_quest_fragments(quest_edid: str, stage_fragments: list[tuple[int,
 
 def build_vmad_info_fragment(info_formid: str, property_values: dict = None,
                              script_name: str = None) -> bytes:
-    """Build VMAD binary for an INFO record with a result script fragment.
+    """Build VMAD binary for an INFO record's fragment script.
+
+    Every INFO carries BOTH fragments (flags 0x03): `Fragment_1` (OnBegin) and
+    `Fragment_0` (OnEnd) — the line hooks TES4Polyfill.SayLine relies on, see
+    _info_batch.  A flag bit with no matching function in the .pex makes the
+    engine bind a missing function, so the emitter and this builder must never
+    disagree: both are unconditional.
 
     Args:
         info_formid: INFO FormID string (e.g. "00012345")
         property_values: optional dict {property_name: formid} for script properties
         script_name: override the per-INFO TES4_TIF__ name with a shared static
-            fragment script (e.g. TES4_ShowBarterMenu for service-menu INFOs)
+            fragment script (e.g. TES4_ShowBarterMenu for the service-menu
+            fallback INFO); the static scripts define both fragments too.
 
     Returns VMAD binary data.
     """
@@ -1826,11 +1560,25 @@ def build_vmad_info_fragment(info_formid: str, property_values: dict = None,
     #   LenString(U16) FileName
     #   For each set bit in Flags, one fragment: S8 Unknown + LenString ScriptName + LenString FragmentName
     # Fragment count is implicit (popcount of Flags bits 0-1).
+    #
+    # 🛑 THE ENTRIES ARE POSITIONAL, NOT NAME-BOUND.  The engine walks the set
+    # flag bits in order (bit0 OnBegin, then bit1 OnEnd) and binds the Nth
+    # entry to the Nth set bit; the FragmentName string is arbitrary.  Verified
+    # against a real Skyrim.esm: of the 250 INFOs carrying BOTH, some name them
+    # ('Fragment_0','Fragment_1') and others ('Fragment_1','Fragment_0') or
+    # ('Fragment_1','Fragment_2') — the order of the ENTRIES is what decides,
+    # so the Begin entry must be written FIRST.  Writing them the other way
+    # round runs the End body when the line starts and vice versa.
     buf += struct.pack('<b', 2)        # Extra bind data version = 2
-    buf += struct.pack('<B', 0x02)     # Flags = OnEnd (1 fragment)
+    buf += struct.pack('<B', 0x03)     # bit0=OnBegin, bit1=OnEnd
     buf += _pack_wstring(script_name)  # FileName
 
-    # Fragment 0 — OnEnd
+    # OnBegin entry FIRST (bit0) — reports the line's start and length.
+    buf += struct.pack('<B', 1)
+    buf += _pack_wstring(script_name)
+    buf += _pack_wstring('Fragment_1')
+
+    # OnEnd entry (bit1) — the result script, then the line-over hook.
     buf += struct.pack('<B', 1)        # Unknown (always 1 in vanilla Skyrim.esm)
     buf += _pack_wstring(script_name)  # ScriptName
     buf += _pack_wstring('Fragment_0') # FragmentName

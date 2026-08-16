@@ -478,13 +478,22 @@ End
         result = converter.convert_standalone('UpdateScript', source, 'ObjectReference', 'UpdateScript')
         assert 'Event OnUpdate()' in result
         assert 'RegisterForSingleUpdate' in result
-        # Object/actor GameMode loops are gated on load state (OnCellAttach start /
-        # OnCellDetach stop) so that not every scripted object in the game begins
-        # ticking the moment the save loads.
+        # Object/actor GameMode loops are gated on load state (OnCellAttach
+        # start) so that not every scripted object in the game begins ticking
+        # the moment the save loads.
         assert 'Event OnCellAttach()' in result
-        assert 'Event OnCellDetach()' in result
         # The OnUpdate re-registration only continues while still loaded.
         assert 'If (Is3DLoaded())' in result
+        # NO OnCellDetach unregister: cell-transition events have no
+        # guaranteed order, so the old cell's detach could land after
+        # OnLoad/OnCellAttach re-armed the poll for the new cell and kill a
+        # loaded actor's loop mid-scene (CharacterGen escorts going mute).
+        # The Is3DLoaded() arm gate winds the loop down by itself.
+        assert 'UnregisterForUpdate()' not in result
+        # Arm-first: the re-register must be the FIRST thing OnUpdate does,
+        # so a runtime abort anywhere in the body cannot kill the poll.
+        body = result.split('Event OnUpdate()', 1)[1].split('EndEvent', 1)[0]
+        assert body.index('RegisterForSingleUpdate') < body.index('x = 1')
 
     def test_gamemode_loop_starts_when_already_loaded(self, converter):
         """OnCellAttach alone is not enough to start a GameMode poll.
@@ -1440,9 +1449,40 @@ class TestSingletonFixes:
         assert ';TODO' not in result
 
     def test_setfactionreaction_negative_makes_enemy(self, converter):
+        """A negative flip writes the Group Combat Reaction enum and nothing
+        else — combat initiation is the ENGINE's job once the packages
+        authorise combat behaviour (pack_converter.DEFAULT_INTERRUPT).  The
+        FactionWar member-pairing push was removed: it sampled actors
+        probabilistically and paired them with relationship ranks that
+        silently no-op between non-unique actors."""
         result = converter._convert_line(
             'setfactionreaction FacA FacB -100', 'ObjectReference')
         assert 'FacA.SetEnemy(FacB, false, false)' in result
+        assert 'FactionWar' not in result
+
+    def test_setfactionreaction_strong_positive_becalms(self, converter):
+        result = converter._convert_line(
+            'setfactionreaction FacA FacB 100', 'ObjectReference')
+        assert 'FacA.SetAlly(FacB, true, true)' in result
+        assert 'FactionPeace' not in result
+
+    def test_playerfaction_flip_is_mirrored_to_vanilla(self, converter):
+        """The runtime player is never a member of the CONVERTED PlayerFaction
+        (membership lives on Skyrim's own Player NPC), so a flip against it
+        must also land on vanilla PlayerFaction to reach the actual player.
+        Mode is an int: 1 enemy, 0 neutral, 2 friend — the neutral clear must
+        mirror too (CharacterGen stage 23 stands the assassins down from
+        hunting the player with `setfactionreaction MythicDawnCG
+        PlayerFaction 0`)."""
+        result = converter._convert_line(
+            'setfactionreaction FacA PlayerFaction -100', 'ObjectReference')
+        assert 'TES4Polyfill.MirrorPlayerFactionRelation(FacA, 1)' in result
+        result = converter._convert_line(
+            'setfactionreaction FacA PlayerFaction 0', 'ObjectReference')
+        assert 'TES4Polyfill.MirrorPlayerFactionRelation(FacA, 0)' in result
+        result = converter._convert_line(
+            'setfactionreaction FacA PlayerFaction 100', 'ObjectReference')
+        assert 'TES4Polyfill.MirrorPlayerFactionRelation(FacA, 2)' in result
 
     def test_setfactionreaction_variable_amount_branches(self, converter):
         """A non-literal amount still has to reach a real enum tier."""
@@ -1530,51 +1570,313 @@ End
         assert 'RegisterForSleep' not in result
 
 
+class TestInfoFragmentVmadLayout:
+    """Every INFO VMAD declares BOTH fragments: Fragment_1 (OnBegin) and
+    Fragment_0 (OnEnd) -- the line hooks TES4Polyfill.SayLine relies on.
+
+    Fragment entries are POSITIONAL: the engine binds the Nth entry to the
+    Nth set flag bit, so the Begin entry must be written FIRST.  Verified
+    against Skyrim.esm, where the 250 both-fragment INFOs use every naming
+    order -- only position is load-bearing.
+    """
+
+    @staticmethod
+    def parse(d):
+        import struct
+        pos = 4
+        n = struct.unpack_from('<H', d, pos)[0]
+        pos += 2
+        for _ in range(n):
+            ln = struct.unpack_from('<H', d, pos)[0]
+            pos += 2 + ln + 1
+            pc = struct.unpack_from('<H', d, pos)[0]
+            pos += 2
+            for _ in range(pc):
+                pl = struct.unpack_from('<H', d, pos)[0]
+                pos += 2 + pl
+                t = d[pos]
+                pos += 2
+                pos += 8 if t == 1 else 4
+        pos += 1                      # extra bind data version
+        flags = d[pos]
+        pos += 1
+        ln = struct.unpack_from('<H', d, pos)[0]
+        pos += 2 + ln
+        frags = []
+        for _ in range(bin(flags).count('1')):
+            pos += 1
+            ln = struct.unpack_from('<H', d, pos)[0]
+            pos += 2 + ln
+            ln = struct.unpack_from('<H', d, pos)[0]
+            frags.append(d[pos + 2:pos + 2 + ln].decode())
+            pos += 2 + ln
+        return flags, frags, pos, len(d)
+
+    def test_vmad_sets_both_bits_and_writes_begin_entry_first(self):
+        flags, frags, used, total = self.parse(
+            build_vmad_info_fragment('00032B0B', {'CharacterGen': 0x0102466E}))
+        assert flags == 0x03, 'bit0 (OnBegin) and bit1 (OnEnd) must both be set'
+        assert frags == ['Fragment_1', 'Fragment_0'], \
+            'the OnBegin entry must come FIRST -- binding is positional'
+        assert used == total          # no trailing garbage
+
+    def test_shared_static_script_gets_both_too(self):
+        flags, frags, used, total = self.parse(
+            build_vmad_info_fragment('', script_name='TES4_ShowBarterMenu'))
+        assert flags == 0x03 and frags == ['Fragment_1', 'Fragment_0']
+        assert used == total
+
+
+class TestInfoFragmentEmission:
+    """The generated TES4_TIF__ script: Begin reports the line's own measured
+    length, End runs the result and then the line-over hook LAST."""
+
+    def _emit(self, tmp_path, rec, durations=None, quest_vars=None,
+              quest_names=None):
+        from script_convert import pipeline
+        from script_convert.converter import ScriptConverter
+        from script_convert.cross_ref import CrossRefGraph
+        saved = ScriptConverter.say_durations
+        ScriptConverter.say_durations = durations or {}
+        pipeline._WORKER_CTX['quest_script_vars'] = quest_vars or {}
+        pipeline._WORKER_CTX['quest_edid_by_fid'] = quest_names or {}
+        stats = pipeline._new_stats()
+        try:
+            pipeline._info_batch([rec], str(tmp_path), CrossRefGraph(), stats)
+        finally:
+            ScriptConverter.say_durations = saved
+        assert not stats['errors'], stats['errors']
+        return (tmp_path / f"TES4_TIF__{rec['FormID']}.psc").read_text()
+
+    def test_scriptless_line_gets_begin_and_end_hooks(self, tmp_path):
+        psc = self._emit(tmp_path, {'FormID': '00032469'},
+                         {'info:00032469': 12.62})
+        begin = psc.split('Function Fragment_1', 1)[1].split('EndFunction')[0]
+        end = psc.split('Function Fragment_0', 1)[1].split('EndFunction')[0]
+        assert 'TES4Polyfill.LineBegan(akSpeakerRef, 12.62)' in begin
+        assert 'TES4Polyfill.LineEnded(akSpeakerRef, 12.62)' in end
+
+    def test_unmeasured_line_reports_zero(self, tmp_path):
+        psc = self._emit(tmp_path, {'FormID': '00000ABC'})
+        assert 'TES4Polyfill.LineBegan(akSpeakerRef, 0)' in psc
+
+    def test_result_runs_before_line_ended(self, tmp_path):
+        """A poll waiting on this speaker (SayLine's busy wait) proceeds the
+        moment LineEnded runs, so the result's state writes must be visible
+        by then -- the hook is the LAST statement of the End fragment."""
+        psc = self._emit(tmp_path, {
+            'FormID': '00032B0B',
+            'ResultScript': 'set characterGen.speaker to 3',
+        })
+        end = psc.split('Function Fragment_0', 1)[1]
+        assert end.index('speaker = 3') < end.index('TES4Polyfill.LineEnded')
+        assert 'Fragment_1' in psc
+
+    def test_fragment_never_writes_a_timer(self, tmp_path):
+        """Fragments carry the speaker only; the conversation timer belongs to
+        the calling script (TES4Polyfill.SayLine returns its value)."""
+        psc = self._emit(tmp_path, {'FormID': '00032B0B'})
+        assert 'convTimer' not in psc and 'Property' not in psc
+
+
+class TestMultiResponseLineDuration:
+    """An INFO's responses play back to back: the line length is their SUM.
+
+    Taking the MAX under-charged every multi-response INFO, so the owning
+    script's `timer <= 0` gate reopened mid-line and the poller re-Said over
+    the still-playing line.  The engine drops a Say on an actor already
+    talking, so the remaining responses are never heard.
+
+    Measured in game 2026-08-15: Uriel Septim's CharacterGen greeting is
+    5.51 + 1.59 + 5.51 = 12.62s but was charged 5.51 -- he spoke two of his
+    three responses and the quest never left stage 42.
+    """
+
+    def _scan(self, tmp_path, files):
+        import os
+        from script_convert import say_durations as sd
+        d = tmp_path / "sound" / "voice" / "ob.esm" / "imperial" / "m"
+        d.mkdir(parents=True)
+        for nm in files:
+            (d / nm).write_bytes(b"")
+        real = sd.mp3_duration
+        sd.mp3_duration = lambda p: files[os.path.basename(p)]
+        try:
+            return sd.scan_voice_durations(str(tmp_path), use_cache=False)
+        finally:
+            sd.mp3_duration = real
+
+    def test_responses_are_summed_not_maxed(self, tmp_path):
+        got = self._scan(tmp_path, {
+            "q_greeting_00032469_1.mp3": 5.51,
+            "q_greeting_00032469_2.mp3": 1.59,
+            "q_greeting_00032469_3.mp3": 5.51,
+        })
+        assert abs(got["info:00032469"] - 12.61) < 0.02
+
+    def test_topic_max_is_over_whole_lines(self, tmp_path):
+        """The call-site fallback must cover the longest LINE, so a topic
+        whose longest line is multi-response reports the summed length."""
+        got = self._scan(tmp_path, {
+            "q_greeting_00032469_1.mp3": 5.51,
+            "q_greeting_00032469_2.mp3": 1.59,
+            "q_greeting_00032469_3.mp3": 5.51,
+            "q_greeting_000AAAAA_1.mp3": 9.0,
+        })
+        assert abs(got["greeting"] - 12.61) < 0.02
+
+
 class TestSayTimerConversion:
-    def test_getsecondspassed_matches_update_interval(self, converter):
+    def test_getsecondspassed_measures_real_elapsed_time(self, converter):
+        """getSecondsPassed drains timers in MEASURED real time.
+
+        The old emission substituted the registration interval as a constant,
+        which assumed every tick took exactly that long — under VM load ticks
+        run late and every counted timer drained slower than real time, so
+        all conversation pacing floated with load (and changed whenever the
+        poll cadence changed).  The prologue measures the actual elapsed
+        time per pass instead; the clamp resets it across suspensions
+        (unload/menu/save-load), which TES4's GameMode never counted.
+        """
         src = ('Scriptname TestTick\n\nfloat timer\n\n'
                'begin gamemode\nset timer to timer - GetSecondsPassed\nend\n')
         result = converter.convert_standalone('TestTick', src, 'Quest',
                                               'TestTick')
-        # the substituted constant must equal the RegisterForSingleUpdate arg
-        import re as _re
-        m = _re.search(r'RegisterForSingleUpdate\(([\d.]+)\)', result)
-        assert m, result
-        assert f'timer - {m.group(1)}' in result
+        assert 'Float TES4_SecondsPassed' in result
+        assert 'Utility.GetCurrentRealTime()' in result
+        assert 'timer - TES4_SecondsPassed' in result
+        # the prologue must run before the body's first decrement
+        body = result.split('Event OnUpdate()', 1)[1]
+        assert body.index('TES4_LastTick = TES4_Now') \
+            < body.index('timer - TES4_SecondsPassed')
 
-    def test_say_timer_is_charged_before_the_say_call(self, converter):
-        """The charge must precede Say(), or a short line re-fires.
+    def test_getsecondspassed_outside_a_poll_keeps_the_constant(self, converter):
+        """A script with no GameMode/ScriptEffectUpdate block has no prologue,
+        so the substitution must stay a literal there."""
+        src = ('Scriptname TestNoPoll\n\nfloat timer\n\n'
+               'begin onActivate\nset timer to timer - GetSecondsPassed\nend\n')
+        result = converter.convert_standalone('TestNoPoll', src,
+                                              'ObjectReference', 'TestNoPoll')
+        assert 'TES4_SecondsPassed' not in result
 
-        Say() is asynchronous and the INFO's End fragment (which zeroes the
-        timer and advances `speaker`) runs on the engine's dialogue thread. With
-        the charge AFTER the call, a short line's fragment lands first and the
-        charge then RESURRECTS the released timer — the same speaker's guard
-        reopens and re-Says the line, so the counter never moves. That is the
-        intermittent "NPC says a line twice" bug (CharacterGen lines 12/13).
+    def test_say_assignment_becomes_a_blocking_sayline(self, converter):
+        """`set T to ref.Say topic` -> T := TES4Polyfill.SayLine(ref, topic, fallback).
 
-        The stale-charge risk of ordering it first is covered by the fragment's
-        sequence gate (pipeline._sequence_gate).
+        TES4 returned the selected line's length synchronously and the script
+        went on at once; SayLine blocks until the engine has BEGUN the line and
+        returns that line's real length (+ tail).  The pre-charge closes this
+        poll's own `T <= 0` guard for the ~2s a SayLine can take, so a second
+        poll tick cannot start a duplicate.
         """
         converter._property_refs['ThadonRef'] = 'Actor'
         result = converter._convert_line(
             'set timer to ThadonRef.Say DeathSpeech01', 'Quest')
-        assert result.index('timer =') < result.index('ThadonRef.Say('), result
+        lines = [l.strip() for l in result.split('\n')]
+        assert lines[0].startswith('timer = 3.5')        # pre-charge, capped
+        assert lines[1] == 'timer = TES4Polyfill.SayLine(ThadonRef, DeathSpeech01, 3)'
+        # nothing else Says the line
+        assert result.count('.Say(') == 0
 
-    def test_say_assignment_gets_line_duration(self, converter):
-        """A converted Say() timer holds the line's length, never zero.
+    def test_sayline_uses_the_topics_measured_maximum_as_fallback(self, converter):
+        from script_convert.converter import ScriptConverter
+        saved = ScriptConverter.say_durations
+        ScriptConverter.say_durations = {'chargentaunt2': 14.63}
+        try:
+            result = converter._convert_line(
+                'set timer to SayTo player CharGenTaunt2 1', 'Actor')
+        finally:
+            ScriptConverter.say_durations = saved
+        assert 'TES4Polyfill.SayLine(Self, CharGenTaunt2, 14.63)' in result
+        assert 'timer = 3.5' in result                    # pre-charge is capped at 3.5
 
-        Say() is fire-and-forget and the owning script polls; with a zero timer
-        the poller re-Says the same line every tick, restarting it so its End
-        fragment never runs (Valen Dreth's taunts repeat line 1 forever). The
-        fragment clears the timer when the line truly ends, so it adds no
-        silence.
-        """
+    def test_authored_offset_survives(self, converter):
         converter._property_refs['ThadonRef'] = 'Actor'
         result = converter._convert_line(
-            'set timer to ThadonRef.Say DeathSpeech01', 'Quest')
-        assert 'ThadonRef.Say(' in result
-        assert 'timer = 0.0' not in result
-        assert 'timer = 3' in result
+            'set timer to (ThadonRef.Say DeathSpeech01) + 2', 'Quest')
+        assert 'TES4Polyfill.SayLine(ThadonRef, DeathSpeech01, 3) + 2' in result
+
+    def test_short_timer_rounds_the_length_up(self, converter):
+        """A TES4 `short` holding a Say length truncates in Papyrus; ceil so
+        the tail that covers the End fragment's latency survives."""
+        converter._var_types['saylen'] = 'Int'
+        converter._property_refs['ThadonRef'] = 'Actor'
+        result = converter._convert_line(
+            'set saylen to ThadonRef.Say DeathSpeech01', 'Quest')
+        assert 'saylen = Math.Ceiling(TES4Polyfill.SayLine(ThadonRef, DeathSpeech01, 3))' in result
+
+    def test_measure_then_deliver_pair_speaks_once(self, converter):
+        """Oblivion's `set L to ref.Say T` / `ref.Say T` idiom: SayLine both
+        measures and delivers, so the bare delivery is dropped."""
+        converter._property_refs['ArmandRef'] = 'Actor'
+        lines = [
+            converter._convert_line('set InfoLength to ArmandRef.Say TG01Armand1', 'Quest'),
+            converter._convert_line('ArmandRef.SayTo Player TG01Armand1', 'Quest'),
+        ]
+        out = converter._postprocess_lines(lines)
+        joined = '\n'.join(out)
+        assert joined.count('SayLine(') == 1
+        assert '.Say(' not in joined
+
+    def test_polls_are_suspended_while_the_player_is_in_dialogue(self, converter):
+        """TES4 GameMode never ran while a menu was open.  Actor AND quest
+        polls skip the pass while the player is in dialogue with anyone (or
+        that actor is still speaking the Goodbye line), so a poll cannot
+        Say() over a live menu line or fire a stage that sends another actor
+        in over it (both measured in game, CharacterGen 42-50)."""
+        src = ('scn T\n\nshort x\n\nbegin gamemode\nset x to 1\n'
+               'sayto player SomeTopic\nend\n')
+        actor = converter.convert_standalone('T', src, 'Actor', 'T')
+        body = actor.split('Event OnUpdate()', 1)[1]
+        # own dialogue OR any dialogue (Baurus's torch line fired into the
+        # player's conversation with the Emperor)
+        assert ('If IsInDialogueWithPlayer() || '
+                'TES4Polyfill.PlayerIsInDialogue()') in body
+        assert body.index('IsInDialogueWithPlayer') < body.index('x = 1')
+        # Quest polls are gated too (stage 45->50 fired from the quest poll
+        # while the player was still in the Emperor's dialogue and sent
+        # Baurus in over it); the countdown pausing in a menu is Oblivion's
+        # own behaviour now that SayLine returns real line lengths.
+        quest = converter.convert_standalone('T', src, 'Quest', 'T')
+        qbody = quest.split('Event OnUpdate()', 1)[1]
+        assert 'If TES4Polyfill.PlayerIsInDialogue()' in qbody
+        assert 'If IsInDialogueWithPlayer()' not in qbody
+        # A poll that never speaks is NOT gated: the gate on ~210 quest polls
+        # starved the VM (End fragments 11-17s late -> repeats).
+        silent = ('scn T\n\nshort x\n\nbegin gamemode\nset x to 1\nend\n')
+        for ext in ('Actor', 'Quest'):
+            out = converter.convert_standalone('T', silent, ext, 'T')
+            assert 'PlayerIsInDialogue' not in out
+
+    def test_say_driving_script_polls_fast(self, converter):
+        """The `T <= 0` guard is what starts the next line, so the poll tick
+        is dead air between lines: a script with a timer-Say ticks at 0.25s
+        (0.1 for all of them overloaded the VM and lengthened the gaps); an
+        ordinary actor script keeps 0.5."""
+        say = ('scn T\n\nfloat t\n\nbegin gamemode\n'
+               'if t <= 0\nset t to Say SomeTopic\nendif\nend\n')
+        out = converter.convert_standalone('T', say, 'Actor', 'T')
+        assert 'RegisterForSingleUpdate(0.25)' in out
+        plain = ('scn T\n\nshort x\n\nbegin gamemode\nset x to 1\nend\n')
+        out = converter.convert_standalone('T', plain, 'Actor', 'T')
+        assert 'RegisterForSingleUpdate(0.5)' in out
+
+    def test_countdown_and_overrides_are_plain(self, converter):
+        """The timer is an ordinary countdown again: no park-safe decrement,
+        no guarded override, no beat companion.  TES4 semantics need none of
+        them once SayLine returns the length at line START (an override right
+        after the Say replaces the length before any countdown, exactly as
+        `set convTimer to 12` did in Oblivion)."""
+        src = ('Scriptname T\n\nfloat convTimer\n\nbegin gamemode\n'
+               'if convTimer > 0\n set convTimer to convTimer - getSecondsPassed\nendif\n'
+               'if convTimer <= 0\n set convTimer to Say SomeTopic\n'
+               ' set convTimer to 12\n set convTimer to convTimer + 2.5\nendif\n'
+               'end\n')
+        result = converter.convert_standalone('T', src, 'Actor', 'T')
+        assert 'convTimer = convTimer - TES4_SecondsPassed' in result
+        assert '_tes4Tick' not in result
+        assert 'PendingBeat' not in result
+        assert 'convTimer = 12' in result and 'If convTimer <= 0  ; not while' not in result
+        assert 'convTimer = convTimer + 2.5' in result
 
 
 class TestFilterGuardTes4Type:
@@ -1771,11 +2073,21 @@ class TestLocalVariableShadowsPlayer:
 
 class TestEarlyReturnKeepsPolling:
     """TES4 `return` ends only THIS FRAME's GameMode pass — the script runs
-    again next frame.  Papyrus OnUpdate is one-shot and self-rescheduling, so a
-    Return that skips the trailing RegisterForSingleUpdate stops the script for
-    the rest of the game.  115 such Returns existed across 96 scripts;
-    MG05RockScript fires one shock bolt per tick and used `return` to serialize
-    six, so it fired exactly one bolt ever.
+    again next frame.  Papyrus OnUpdate is one-shot and self-rescheduling, so:
+
+    * the poll is armed FIRST with a LONG (5s) abort-insurance interval, so a
+      RUNTIME ABORT in the body ("Cannot call X on a None object" ends the
+      event at that line) cannot kill the poll for the rest of the game;
+    * every early `Return` re-arms at the REAL interval itself (115 such
+      Returns existed across 96 scripts; MG05RockScript fires one shock bolt
+      per tick and used `return` to serialize six);
+    * the bottom arm sets the cadence, measured from the END of the pass.
+
+    🛑 The top arm must NOT be the real interval.  RegisterForSingleUpdate
+    counts from now, so a top arm at `interval` starts the next pass
+    `interval` after this one STARTED; a pass longer than that overlaps
+    itself and the pile grows without bound (measured 2026-08-16: 251
+    concurrent TES4_MQ01Script.OnUpdate stacks, the whole VM starved).
     """
 
     SRC = """Scriptname TestEarlyReturn
@@ -1788,25 +2100,39 @@ set foo to 1
 End
 """
 
-    def test_quest_script_rearms_before_return(self, converter):
+    def test_quest_script_top_arm_is_long_insurance_only(self, converter):
         out = converter.convert_standalone('T', self.SRC, 'Quest', 'T')
         body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
-        # Drop the !IsRunning() guard, whose Return already re-registered.
-        body = body.split('EndIf', 1)[1]
-        idx = body.index('Return')
-        assert 'RegisterForSingleUpdate(0.5)' in body[:idx], \
-            'early Return must re-arm the poll first'
+        # The 5s insurance arm precedes both the IsRunning() guard and the
+        # body, so an abort cannot stop the loop -- but the real interval is
+        # never armed from the top.
+        assert body.index('RegisterForSingleUpdate(5.0)')             < body.index('IsRunning()')
+        assert body.count('RegisterForSingleUpdate(5.0)') == 1
+        assert body.lstrip().startswith('RegisterForSingleUpdate(5.0)')
+
+    def test_early_return_re_arms_at_the_real_interval(self, converter):
+        out = converter.convert_standalone('T', self.SRC, 'Quest', 'T')
+        body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
+        # (the IsRunning() gate's own Return keeps the 5s insurance: a quest
+        # that is not running need not poll faster)
+        ret = body.index('Return', body.index('foo == 0'))
+        # the statement immediately before the authored Return is the arm
+        before = body[:ret].rstrip().splitlines()[-1].strip()
+        assert before == 'RegisterForSingleUpdate(0.5)'
+        # and the bottom arm is still there
+        assert body.rstrip().endswith('RegisterForSingleUpdate(0.5)')
 
     def test_object_script_uses_the_load_gated_form(self, converter):
-        """An object/actor script's poll is MEANT to stop on unload, so the
-        re-register must carry the same gate the fall-through path uses — not
-        an unconditional call that would keep ticking."""
+        """An object/actor script's poll is MEANT to stop on unload, so both
+        the insurance arm and the spliced re-arm carry the load gate — not an
+        unconditional call that would keep ticking forever."""
         out = converter.convert_standalone('T', self.SRC, 'ObjectReference',
                                            'T')
         body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
         idx = body.index('Return')
         before = body[:idx]
-        assert 'If (Is3DLoaded())' in before
+        assert before.count('If (Is3DLoaded())') == 2
+        assert 'RegisterForSingleUpdate(5.0)' in before
         assert 'RegisterForSingleUpdate(0.5)' in before
 
     def test_value_returning_function_untouched(self, converter):
@@ -1814,6 +2140,207 @@ End
         early-out, and must not have a poll re-arm spliced in front of it."""
         converter._udf_returns = True
         assert converter._convert_line('return', 'Quest') == 'Return 0'
+
+
+class TestNoPollFreeze:
+    """A poll that never SPEAKS is never frozen: the 2026-08-14 attempt froze
+    every poll (Utility.IsInMenuMode / TES4_LastSpeaker) and shifted every
+    conversation beat; the 2026-08-16 dialogue gate on every poll starved the
+    VM.  Only scripts with a Say/SayTo carry TES4Polyfill.PlayerIsInDialogue
+    (see TestSayTimerConversion)."""
+
+    SRC = """Scriptname T
+short foo
+begin gamemode
+set foo to 1
+End
+"""
+
+    def test_silent_polls_are_not_frozen(self, converter):
+        for extends in ('Quest', 'ObjectReference', 'Actor'):
+            out = converter.convert_standalone('T', self.SRC, extends, 'T')
+            assert 'IsInMenuMode' not in out
+            assert 'TES4_LastSpeaker' not in out
+            assert 'PlayerIsInDialogue' not in out
+
+
+class TestChargenMenus:
+    """ShowBirthsignMenu/ShowClassMenu → modal Message pages (see
+    message_menus.build_chargen_menus).  TES4's menus paused the game and
+    scripted scenes depend on that beat: CharacterGen's Emperor carries an
+    authored Goodbye at the birthsign point and re-force-greets afterwards —
+    a no-op dumped the player into a free-roam gap mid-scene where Baurus's
+    pending torch force-greet could steal them."""
+
+    PLAN = {
+        'birthsign': {
+            'pages': [('TES4Msg_ChargenBirthsign_01', 'Title',
+                       ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I',
+                        'More ...']),
+                      ('TES4Msg_ChargenBirthsign_02', 'Title', ['J', 'K'])],
+            'actions': [['SpellA'], [], [], [], [], [], [], [], [],
+                        ['SpellJ1', 'SpellJ2'], []],
+        },
+    }
+
+    def test_menu_emission(self, converter):
+        converter.chargen_menus = self.PLAN
+        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        assert 'TES4Msg_ChargenBirthsign_01.Show()' in out
+        # page chaining: "More ..." is button 9, global index = 9*page+button
+        assert 'If TES4_menuPick1 == 9' in out
+        assert '9 + TES4Msg_ChargenBirthsign_02.Show()' in out
+        # the chosen sign's spells are granted
+        assert 'If TES4_menuPick1 == 0' in out
+        assert 'Game.GetPlayer().AddSpell(SpellA, false)' in out
+        assert 'ElseIf TES4_menuPick1 == 9' in out
+        assert 'Game.GetPlayer().AddSpell(SpellJ1, false)' in out
+        # properties minted for VMAD binding
+        assert converter._property_refs['TES4Msg_ChargenBirthsign_01'] == 'Message'
+        assert converter._property_refs['SpellA'] == 'Spell'
+
+    def test_menu_is_reentrancy_latched(self, converter):
+        """Message.Show() parks only its own thread; an OnUpdate tick queued
+        behind the open menu re-enters the body while the menu is STILL OPEN
+        (the poll re-arms at the top of OnUpdate, so the next tick lands
+        0.1s later on another thread).
+
+        That pass must RETURN, not fall through.  TES4's menu was modal to
+        the whole GameMode pass: the `setstage 44` on the next source line
+        did not run until the player had chosen.  Falling through ran it
+        mid-menu, and stage 44's fragment force-greets the Emperor
+        (`UrielSeptimRef.evp`) at a player still locked in the menu — the
+        greet is consumed with nobody able to receive it, so the menu closes
+        onto a silent Emperor and CharacterGen soft-locks.  Verified live
+        through the game bridge (2026-08-15): stage 43 advanced to 44
+        instantly while the choice global was still 0.
+        """
+        converter.chargen_menus = self.PLAN
+        converter._current_event = 'Event OnUpdate()'
+        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        assert 'If TES4_ChargenMenuBusy' in out
+        assert 'TES4_ChargenMenuBusy = True' in out
+        assert 'TES4_ChargenMenuBusy = False' in out
+        # A latched-out pass returns before reaching the menu...
+        assert out.index('If TES4_ChargenMenuBusy') < out.index('Return')
+        assert out.index('Return') < out.index('.Show()')
+        # ...and the latch is only taken once the guard has passed.
+        assert out.index('TES4_ChargenMenuBusy = True') < out.index('.Show()')
+        assert converter._uses_chargen_menus
+
+    def test_oneshot_menu_site_falls_through(self, converter):
+        """A ONE-SHOT site (quest-stage fragment, OnActivate) must NOT
+        Return on a latched-out pass: nothing repeating re-enters it, so the
+        latch can only trip on a genuine race, and a Return would DROP the
+        authored tail instead of deferring it.  CharacterGen stage 87 puts
+        `MQ02.SetStage(20)`, the end-of-chargen topic unlocks and the
+        autosave after its class menu — skipping those is worse than showing
+        the menu twice."""
+        converter.chargen_menus = self.PLAN
+        converter._current_event = 'Function Fragment_Stage_0087_Item_0()'
+        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        assert 'If !TES4_ChargenMenuBusy' in out
+        assert 'Return' not in out
+        assert out.rstrip().endswith('EndIf')
+        assert out.index('If !TES4_ChargenMenuBusy') < out.index('.Show()')
+
+    def test_menu_persists_choice_to_global(self, converter):
+        """The pick lands in the choice GLOB as index+1 (0 = unchosen) so
+        the rewritten GetIsPlayerBirthsign conditions can match it — the
+        Emperor's 'Your stars are not mine. Today the <sign>...' line must
+        agree with the sign actually picked.  A failed pick (Show() -1)
+        must never be persisted: the SetValue is guarded, and the dialogue
+        side keeps an ungated fallback line for the unchosen case."""
+        plan = {'birthsign': dict(self.PLAN['birthsign'],
+                                  choice_global='TES4ChargenBirthsignChoice')}
+        converter.chargen_menus = plan
+        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        assert 'TES4ChargenBirthsignChoice.SetValue(TES4_menuPick1 + 1)' in out
+        assert out.index('If TES4_menuPick1 >= 0') \
+            < out.index('.SetValue(TES4_menuPick1 + 1)')
+        assert (converter._property_refs['TES4ChargenBirthsignChoice']
+                == 'GlobalVariable')
+
+    def test_menu_show_retries_on_display_failure(self, converter):
+        """Show() returns -1 when the box cannot display (a menu/dialogue
+        transition still in flight — this menu opens 0.1s after an
+        authored Goodbye closes the conversation).  The emission retries
+        briefly instead of swallowing the player's choice."""
+        converter.chargen_menus = self.PLAN
+        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        assert 'While TES4_menuPick1 < 0 && TES4_menuRetry1 < 20' in out
+        assert 'Utility.Wait(0.5)' in out
+
+    def test_no_plan_stays_noop(self, converter):
+        """A plugin without BSGN records keeps the inert conversion."""
+        converter.chargen_menus = {}
+        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        assert 'Show()' not in out
+        assert ';NE: ShowBirthsignMenu' in out
+
+    def test_pagination_contract(self):
+        """Both sides derive identical pages: 13 labels → 9 + More, then 4."""
+        from script_convert.message_menus import _paged
+        pages = _paged('P_%02d', 'T', [chr(65 + i) for i in range(13)])
+        assert len(pages) == 2
+        assert pages[0][2][-1] == 'More ...'
+        assert len(pages[0][2]) == 10 and len(pages[1][2]) == 4
+
+
+class TestStartCombatIsForced:
+    """TES4 StartCombat forces the fight regardless of aggression, disposition
+    or faction relations; Skyrim's native is only a nudge the combat AI drops
+    when the actor's Aggression is 0 or the target is not hostile to it
+    (CharacterGen stage 74: the aggression-0 final assassin, whose only
+    faction the Emperor's faction Friends, must still kill the Emperor).
+    TES4Polyfill.ForceCombat supplies the preconditions before the native.
+    """
+
+    def test_npc_startcombat_routes_through_forcecombat(self, converter):
+        """ForceCombat carries the conversion-owned enemy-faction pair: the
+        earlier relationship-rank approach silently no-ops between
+        non-unique actors (the final assassin is non-unique), so the pair
+        hostility comes from AddToFaction into record-side mutual enemies."""
+        src = ('scn T\n\nbegin gamemode\n'
+               '\tCGAssassinFinal.startcombat UrielSeptimRef\nend\n')
+        out = converter.convert_standalone('T', src, 'Quest', 'T')
+        assert ('TES4Polyfill.ForceCombat(' in out
+                and 'TES4ForceCombatAttackers, TES4ForceCombatVictims)' in out)
+        assert '.StartCombat(' not in out
+        # faction properties minted for VMAD binding to the import's records
+        assert 'Faction Property TES4ForceCombatAttackers Auto' in out
+        assert 'Faction Property TES4ForceCombatVictims Auto' in out
+
+    def test_player_attacker_keeps_plain_native(self, converter):
+        """The player's combat is player-driven; forcing would brand the
+        target the player's archenemy for the rest of the save."""
+        src = ('scn T\n\nbegin gamemode\n'
+               '\tplayer.startcombat BanditRef\nend\n')
+        out = converter.convert_standalone('T', src, 'Quest', 'T')
+        assert 'TES4Polyfill.ForceCombat(' not in out
+        assert '.StartCombat(' in out
+
+    def test_bare_startcombat_in_a_non_actor_script_casts_self(self, converter):
+        """Nehrim's UNUSED MQ33Sarantha02Script (attached to nothing, so it
+        extends ObjectReference) does `StartCombat, Player`.  ForceCombat's
+        parameter is Actor-typed and Papyrus refuses an ObjectReference there
+        (Checker error: cannot convert type ... to type Actor), which took the
+        whole plugin's compile pass to 3738/3739."""
+        src = ('scn T\n\nbegin gamemode\n'
+               '\tStartCombat, Player\nend\n')
+        out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+        assert 'TES4Polyfill.ForceCombat((Self as Actor), Game.GetPlayer()' in out
+        # An actor script keeps the plain Self
+        out = converter.convert_standalone('T', src, 'Actor', 'T')
+        assert 'TES4Polyfill.ForceCombat(Self, Game.GetPlayer()' in out
+
+    def test_moddisposition_hostile_idiom_is_forced_too(self, converter):
+        """`ModDisposition <target> -100` is the same "attack now" idiom and
+        has the same aggression-0 failure mode."""
+        src = ('scn T\n\nbegin gamemode\n'
+               '\tUngolimRef.ModDisposition player -100\nend\n')
+        out = converter.convert_standalone('T', src, 'Quest', 'T')
+        assert 'TES4Polyfill.ForceCombat(' in out
 
 
 class TestJailIsNotExpulsion:
