@@ -669,13 +669,15 @@ EndFunction
 ; LineBegan / LineEnded here; the state lives in script Actor Values ON THE
 ; SPEAKER, so no property binding and no per-quest owner analysis is needed:
 ;
+;     Variable04  running average of this speaker's End overhead (adaptive tail)
 ;     Variable06  real time the current line began (diagnostics)
 ;     Variable07  claim token while a SayLine is in progress for this speaker
 ;     Variable08  claim deadline (game time, days) - a stale claim expires
 ;     Variable09  length of the line now playing (0 = not speaking)
 ;     Variable10  speaking deadline (game time) - a lost End fragment expires
 ;   and on the PLAYER, Variable05/06 = hi/lo halves of the FormID of the last
-;   actor to speak a line inside the player's dialogue menu (PlayerIsInDialogue).
+;   actor to speak a line inside the player's dialogue menu (PlayerIsInDialogue)
+;   and Variable04 = the game-wide End-overhead average.
 ;   Every SayLine / LineBegan / LineEnded writes a "TES4Say ..." Debug.Trace
 ;   with real-time stamps: the Papyrus log (or the bridge's vmlog) then gives
 ;   the engine's Say->Begin and Begin->End latencies against the measured
@@ -701,16 +703,53 @@ EndFunction
 
 ; Seconds added to the returned line length.  This is most of the dead air
 ; between consecutive lines (the rest is the caller's poll tick and the
-; engine's Say -> audio latency).  It must cover the time between the measured
-; audio length and the End fragment actually running (the fragment's dispatch,
-; the engine's trailing hold, inter-response gaps of a multi-response line);
-; when it does not, the guard reopens before the End result has advanced the
-; conversation state.  0.4 was tried in game (2026-08-16) and lines REPEATED,
-; so the End overhead is evidently larger than that; the "TES4Say LineEnded
-; ... measured= actual=" traces report the true overhead per line -- set this
-; from those, not from a guess.
-Float Function SAY_TAIL() Global
-  Return 1.0
+; engine's Say -> audio latency).  It has to cover the ENGINE'S OWN OVERHEAD
+; between the measured audio length and the End fragment running (fragment
+; dispatch, trailing hold, inter-response gaps): if the guard reopens before
+; the End result has advanced the conversation state, the same speaker's next
+; SayLine waits on the busy flag and no line repeats, but a stray Say can
+; cost the next speaker a drop timeout.
+;
+; The overhead is stable per machine but not knowable in advance (measured
+; 2026-08-16 on the user's setup: median 0.35s, p90 0.54s single-response;
+; 11-24s under a starved VM), so it is MEASURED: LineEnded records each
+; line's overhead into a per-speaker running average (Variable04) and a
+; global one on the player, and the tail is that estimate plus a margin,
+; clamped.  A fixed 1.0s cost 0.6s of silence on every line; a fixed 0.4s
+; repeated lines when the VM was slow.
+Float Function SAY_TAIL_MIN() Global
+  Return 0.35
+EndFunction
+Float Function SAY_TAIL_MAX() Global
+  Return 2.5
+EndFunction
+Float Function SAY_TAIL_MARGIN() Global
+  Return 0.2
+EndFunction
+Float Function SAY_TAIL_DEFAULT() Global
+  Return 0.8       ; until anything has been measured
+EndFunction
+
+; The tail for this speaker's next line: its own measured End overhead if it
+; has one, else the game-wide one, else the default -- plus the margin.
+Float Function _TailFor(Actor a) Global
+  Float est = 0.0
+  If a != None
+    est = a.GetActorValue("Variable04")
+  EndIf
+  If est <= 0.0
+    est = Game.GetPlayer().GetActorValue("Variable04")
+  EndIf
+  If est <= 0.0
+    Return SAY_TAIL_DEFAULT()
+  EndIf
+  Float tail = est + SAY_TAIL_MARGIN()
+  If tail < SAY_TAIL_MIN()
+    tail = SAY_TAIL_MIN()
+  ElseIf tail > SAY_TAIL_MAX()
+    tail = SAY_TAIL_MAX()
+  EndIf
+  Return tail
 EndFunction
 
 Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbackLength) Global
@@ -720,7 +759,7 @@ Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbac
     If akSpeaker != None && akTopic != None
       akSpeaker.Say(akTopic)
     EndIf
-    Return afFallbackLength + SAY_TAIL()
+    Return afFallbackLength + SAY_TAIL_DEFAULT()
   EndIf
   Float now = Utility.GetCurrentGameTime()
   If a.GetActorValue("Variable07") > 0.0 && now < a.GetActorValue("Variable08")
@@ -775,8 +814,9 @@ Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbac
   If len < 0.02
     len = afFallbackLength   ; began, but the line has no measured voice file
   EndIf
-  Debug.Trace("TES4Say began " + _Who(a) + " topic " + akTopic + " len=" + len + " startLatency=" + (Utility.GetCurrentRealTime() - t0) + " waited=" + waited + " t=" + Utility.GetCurrentRealTime())
-  Return len + SAY_TAIL()
+  Float tail = _TailFor(a)
+  Debug.Trace("TES4Say began " + _Who(a) + " topic " + akTopic + " len=" + len + " tail=" + tail + " startLatency=" + (Utility.GetCurrentRealTime() - t0) + " waited=" + waited + " t=" + Utility.GetCurrentRealTime())
+  Return len + tail
 EndFunction
 
 ; OnBegin fragment hook: the engine has selected this INFO and started it.
@@ -834,10 +874,29 @@ Function LineEnded(ObjectReference akSpeakerRef, Float afLength = -1.0) Global
   Float began = a.GetActorValue("Variable06")
   Float cur = a.GetActorValue("Variable09")
   Bool mine = afLength < 0.0 || Math.abs(cur - afLength) < 0.006 || (afLength <= 0.0 && cur <= 0.02)
+  Float actual = Utility.GetCurrentRealTime() - began
   If mine
     a.SetActorValue("Variable09", 0.0)
+    ; Learn this machine's End overhead from a line that played through
+    ; (a skipped/cut line ends early and says nothing about the overhead).
+    Float over = actual - afLength
+    If afLength > 0.02 && over >= 0.0 && over < 5.0
+      Float prev = a.GetActorValue("Variable04")
+      If prev <= 0.0
+        a.SetActorValue("Variable04", over)
+      Else
+        a.SetActorValue("Variable04", prev * 0.6 + over * 0.4)
+      EndIf
+      Actor p = Game.GetPlayer()
+      prev = p.GetActorValue("Variable04")
+      If prev <= 0.0
+        p.SetActorValue("Variable04", over)
+      Else
+        p.SetActorValue("Variable04", prev * 0.8 + over * 0.2)
+      EndIf
+    EndIf
   EndIf
-  Debug.Trace("TES4Say LineEnded " + _Who(a) + " measured=" + afLength + " playing=" + cur + " cleared=" + mine + " actual=" + (Utility.GetCurrentRealTime() - began) + " t=" + Utility.GetCurrentRealTime())
+  Debug.Trace("TES4Say LineEnded " + _Who(a) + " measured=" + afLength + " playing=" + cur + " cleared=" + mine + " actual=" + actual + " t=" + Utility.GetCurrentRealTime())
 EndFunction
 
 ; True while the player is in a dialogue menu with anyone -- Oblivion's

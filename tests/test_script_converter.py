@@ -1772,7 +1772,7 @@ class TestSayTimerConversion:
         result = converter._convert_line(
             'set timer to ThadonRef.Say DeathSpeech01', 'Quest')
         lines = [l.strip() for l in result.split('\n')]
-        assert lines[0].startswith('timer = 3.5')        # pre-charge, capped
+        assert lines[0].startswith('timer = 2')          # pre-charge, capped
         assert lines[1] == 'timer = TES4Polyfill.SayLine(ThadonRef, DeathSpeech01, 3)'
         # nothing else Says the line
         assert result.count('.Say(') == 0
@@ -1787,7 +1787,7 @@ class TestSayTimerConversion:
         finally:
             ScriptConverter.say_durations = saved
         assert 'TES4Polyfill.SayLine(Self, CharGenTaunt2, 14.63)' in result
-        assert 'timer = 3.5' in result                    # pre-charge is capped at 3.5
+        assert 'timer = 2  ;' in result                    # pre-charge is capped at 2.0
 
     def test_authored_offset_survives(self, converter):
         converter._property_refs['ThadonRef'] = 'Actor'

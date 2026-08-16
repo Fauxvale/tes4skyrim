@@ -1004,15 +1004,18 @@ engine.**
   T = TES4Polyfill.SayLine(<speaker>, <topic>, <topic max>) [+ n]
   ```
   `SayLine` **blocks until the engine has begun the line** and returns that
-  line's real length **+ SAY_TAIL (1.0s)**. The tail must cover the time
-  between the measured audio length and the End fragment actually running
-  (dispatch + the engine's trailing hold + inter-response gaps). **0.4 was
-  tried in game and lines REPEATED** — so the End overhead is larger than
-  0.4s and the "no repeat is possible" reasoning was wrong somewhere; the
-  `TES4Say` traces (below) exist to measure it. Other levers that shorten the
-  gap without touching the tail: a Say-driving script polls at **0.1s** (its
-  `T <= 0` guard is what starts the next line; it was 0.5s), and SayLine's
-  return lands at Begin, not at the call. Then the script continues at once, exactly
+  line's real length **+ an adaptive tail**. The tail must cover the engine's
+  own overhead between the measured audio length and the End fragment running
+  (dispatch + trailing hold + inter-response gaps); it is stable per machine
+  but unknowable in advance (measured here: median 0.35s, p90 0.54s; 11–24s
+  under a starved VM), so `LineEnded` records each played-through line's
+  overhead into a per-speaker running average (`Variable04`, plus a
+  game-wide one on the player) and the tail is that estimate + 0.2s, clamped
+  to [0.35, 2.5] (0.8 until anything is measured). A fixed 1.0s cost 0.6s of
+  silence on every line (~1.5s audible gaps); a fixed 0.4 repeated lines when
+  the VM was slow. Say-driving scripts poll at 0.25s and the pre-charge is
+  capped at 2.0s (it is shared with the other speakers' guards, so a stray
+  Say costs them at most that). Then the script continues at once, exactly
   as after TES4's `set T to Say`. A Say nothing qualifies for returns **0**
   after a 2s start timeout and the caller's own poll retries — Oblivion's
   behaviour too. Before Saying it waits while the speaker is in the player's

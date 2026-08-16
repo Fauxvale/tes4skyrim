@@ -393,7 +393,7 @@ class ScriptConverter:
         # it is SHARED with every other participant's guard, so keep it short:
         # a Say nothing qualifies for otherwise held the next speaker off for
         # the topic's whole longest line.
-        pre = min(fallback + 1.0, 3.5)
+        pre = min(fallback + 1.0, 2.0)
         call = f'TES4Polyfill.SayLine({speaker}, {topic}, {fallback:g})'
         if self._var_types.get(target.lower().split('.')[-1]) == 'Int':
             # A TES4 `short` holding a Say length: round UP so the tail survives.
