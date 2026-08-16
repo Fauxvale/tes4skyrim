@@ -615,8 +615,18 @@ def _rewrite_tex_path(raw_bytes):
     prefix, documented "used mainly for making _far.nifs"). We do not ship a
     lowres tree — the converted textures live at the normal path — so the
     segment is dropped and the reference resolves to the real texture.
+
+    A leading 'data\\' is an authoring slip Oblivion tolerates (it resolves
+    paths from the Data folder either way) and Skyrim does not. Measured across
+    Nehrim's 12,437 source meshes: 4 distinct textures in 10 meshes, among them
+    dwarven\\rock02.dds in 7. Left in, the reference came out as
+    'Textures\\tes4\\data\\textures\\...' — nothing there, AND the prune then
+    deleted the real texture, because the manifest key never matched the
+    shipped path.
     """
     path = raw_bytes.decode('utf-8', errors='replace').replace('/', '\\')
+    if path.lower().startswith('data\\'):
+        path = path[len('data\\'):]
     low = path.lower()
 
     if low.startswith('textures\\'):
