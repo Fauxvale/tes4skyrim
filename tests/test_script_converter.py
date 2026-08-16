@@ -1772,7 +1772,7 @@ class TestSayTimerConversion:
         result = converter._convert_line(
             'set timer to ThadonRef.Say DeathSpeech01', 'Quest')
         lines = [l.strip() for l in result.split('\n')]
-        assert lines[0].startswith('timer = 2')          # pre-charge, capped
+        assert lines[0].startswith('timer = 1.75')       # pre-charge
         assert lines[1] == 'timer = TES4Polyfill.SayLine(ThadonRef, DeathSpeech01, 3)'
         # nothing else Says the line
         assert result.count('.Say(') == 0
@@ -1787,7 +1787,152 @@ class TestSayTimerConversion:
         finally:
             ScriptConverter.say_durations = saved
         assert 'TES4Polyfill.SayLine(Self, CharGenTaunt2, 14.63)' in result
-        assert 'timer = 2  ;' in result                    # pre-charge is capped at 2.0
+        # The pre-charge is FIXED at SAY_START_WAIT + 0.25 -- it covers the
+        # window SayLine can block for, not the line, so a 14.63s line does not
+        # hold the guard for 14.63s the way the old length-scaled charge did.
+        assert 'timer = 1.75  ;' in result
+
+    def test_precharge_outlasts_saylines_start_timeout(self):
+        """The pre-charge must cover the whole window SayLine can BLOCK for.
+
+        SayLine returns fast on a line the engine accepts, but on a DROPPED
+        line it waits SAY_START_WAIT and returns 0.0.  If the pre-charge is
+        shorter, the caller's `T <= 0` guard reopens while SayLine is still
+        blocked and a second poll tick re-enters -- the duplicate-line class
+        the pre-charge exists to prevent.  Keep the two in step.
+        """
+        import re as _re
+        from script_convert.converter import SAY_START_WAIT
+        src = open('script_convert/static_scripts/TES4Polyfill.psc',
+                   encoding='utf-8').read()
+        m = _re.search(
+            r'Float Function SAY_START_WAIT\(\) Global\s*\n\s*Return\s+([\d.]+)',
+            src)
+        assert m, 'SAY_START_WAIT not found in TES4Polyfill.psc'
+        assert float(m.group(1)) == SAY_START_WAIT, (
+            f'converter SAY_START_WAIT={SAY_START_WAIT} but the polyfill waits {m.group(1)}')
+
+    def test_sayline_returns_length_only_no_tail(self):
+        """SayLine must NOT add a tail to the value it returns.
+
+        The tail is the engine's End-fragment overhead.  Adding it to the
+        return value charged it to the CALLER'S COUNTDOWN, i.e. as silence
+        after every line -- and 26 of the 31 audible gaps in the 2026-08-16
+        recording handed off to a DIFFERENT actor, for whom the padding buys
+        nothing.  It belongs in _IsSpeaking, where only a re-Say on the same
+        actor pays it.
+        """
+        src = open('script_convert/static_scripts/TES4Polyfill.psc',
+                   encoding='utf-8').read()
+        body = src[src.index('Float Function SayLine('):]
+        body = body[:body.index(chr(10) + 'EndFunction')]
+        assert 'Return len + tail' not in body
+        assert 'Return len' in body
+        # and the grace it replaced must be enforced on the speaker instead
+        assert 'Variable03' in src, 'the End-grace stamp is gone'
+        isspeaking = src[src.index('Bool Function _IsSpeaking('):]
+        isspeaking = isspeaking[:isspeaking.index(chr(10) + 'EndFunction')]
+        assert 'SAY_GRACE()' in isspeaking, (
+            '_IsSpeaking must hold the post-End grace, or a re-Say can be dropped')
+
+    def test_stage_timer_guard_waits_one_pass_at_the_new_stage(self, converter):
+        """`GetStage()==N && <timer> <= 0` must not fire the pass stage N arrives.
+
+        The timer is charged by stage N's OWN fragment, and nothing orders that
+        charge before the guard is first tested.  The timer's resting state is
+        <= 0 (and it goes NEGATIVE whenever a line is dropped), so the guard is
+        already satisfied the instant stage N is set.
+
+        Measured 2026-08-16 (temp/chargen_rec_4.log): CharacterGen sat at
+        convTimer = -0.076 for four seconds after a dropped line, so
+        `GetStage()==16 && convTimer<=0` fired the moment stage 16 arrived.
+        SetStage(17) ran, the force-greet took the player into the menu, and
+        the Emperor's stage-16 line never played -- INFO 00032B11 is gated on
+        `GetStage CharacterGen == 16` and is the only CharGenVoice entry for
+        that stage, so at 17 nothing qualifies at all.
+        """
+        src = ('scn T\n\nfloat convTimer\n\nbegin gamemode\n'
+               'if getstage CharacterGen == 16 && convTimer <= 0\n'
+               'setstage CharacterGen 17\n'
+               'endif\nend\n')
+        out = converter.convert_standalone('T', src, 'Quest', 'T')
+        guard = [l for l in out.split('\n') if 'GetStage() == 16' in l]
+        assert guard, out
+        assert 'TES4_LastStage_CharacterGen == 16' in guard[0], guard[0]
+        # declared as -1 so the FIRST pass at any stage cannot satisfy it
+        assert 'Int TES4_LastStage_CharacterGen = -1' in out
+        # and updated at the END of the poll, after every guard above it
+        body = out[out.index('Event OnUpdate()'):]
+        upd = body.index('TES4_LastStage_CharacterGen = CharacterGen.GetStage()')
+        assert upd > body.index('GetStage() == 16'), 'latch updated before the guard'
+
+    def test_one_latch_per_quest_regardless_of_spelling(self, converter):
+        """TES4 spells the same quest both ways in one file.
+
+        CharacterGen's own poll uses `characterGen` on some lines and
+        `CharacterGen` on others.  Keying the latch on the raw spelling emitted
+        TWO variables for one quest, and a guard could compare against the one
+        the poll tail never updated -- so the guard would never open and the
+        beat would hang.  Papyrus is case-insensitive, so the duplicate
+        declarations COMPILED; only an in-game stall would have shown it.
+        """
+        src = ('scn T\n\nfloat convTimer\n\nbegin gamemode\n'
+               'if getstage characterGen == 16 && convTimer <= 0\n'
+               'setstage characterGen 17\n'
+               'endif\n'
+               'if getstage CharacterGen == 45 && convTimer <= 0\n'
+               'setstage CharacterGen 46\n'
+               'endif\nend\n')
+        out = converter.convert_standalone('T', src, 'Quest', 'T')
+        decls = [l for l in out.split('\n') if l.startswith('Int TES4_LastStage')]
+        assert len(decls) == 1, decls
+        updates = [l for l in out.split('\n')
+                   if 'TES4_LastStage' in l and '.GetStage()' in l
+                   and not l.strip().startswith('If')]
+        assert len(updates) == 1, updates
+        # both guards must reference that single latch
+        guards = [l for l in out.split('\n') if l.strip().startswith('If ')
+                  and 'TES4_LastStage' in l]
+        assert len(guards) == 2, guards
+        name = decls[0].split()[1]
+        assert all(name in g for g in guards), guards
+
+    def test_stage_guard_without_a_timer_is_untouched(self, converter):
+        """Only the timer-gated shape races; a plain stage test must not change."""
+        src = ('scn T\n\nshort x\n\nbegin gamemode\n'
+               'if getstage CharacterGen == 16\nset x to 1\nendif\nend\n')
+        out = converter.convert_standalone('T', src, 'Quest', 'T')
+        assert 'TES4_LastStage' not in out
+
+    def test_sayline_waits_out_another_actors_line(self):
+        """A Say issued while ANOTHER actor is mid-line is refused by Skyrim.
+
+        The caller then sits out the whole SAY_START_WAIT and returns 0.0, and
+        its poll retries a tick later -- the 2-3s cluster of gaps.  Measured
+        2026-08-16: 13 of 17 drops in temp/chargen_rec_5.log had a DIFFERENT
+        actor speaking while the dropped actor was silent, because each
+        participant's guard is `speaker == N && convTimer <= 0` and convTimer
+        counts the AUDIO length, so it reaches zero before the previous
+        speaker's End fragment has run.
+
+        Waiting is strictly cheaper than being refused: the wait ends when the
+        other line does, a refusal costs the full timeout plus a retry.
+        """
+        src = open('script_convert/static_scripts/TES4Polyfill.psc',
+                   encoding='utf-8').read()
+        body = src[src.index('Float Function SayLine('):]
+        body = body[:body.index(chr(10) + 'EndFunction')]
+        assert '_OtherLineInProgress()' in body, (
+            'SayLine must wait out another actor before issuing its Say')
+        # the record has to be both SET when a line begins and RELEASED when it
+        # ends early, or a skipped line strands the next speaker
+        began = src[src.index('Function LineBegan('):]
+        began = began[:began.index(chr(10) + 'EndFunction')]
+        assert 'Variable07' in began, 'LineBegan must record the game-wide line'
+        ended = src[src.index('Function LineEnded('):]
+        ended = ended[:ended.index(chr(10) + 'EndFunction')]
+        assert 'Variable07", 0.0' in ended, (
+            'LineEnded must release the record, or a skipped line stalls the next')
 
     def test_authored_offset_survives(self, converter):
         converter._property_refs['ThadonRef'] = 'Actor'
@@ -1849,13 +1994,17 @@ class TestSayTimerConversion:
 
     def test_say_driving_script_polls_fast(self, converter):
         """The `T <= 0` guard is what starts the next line, so the poll tick
-        is dead air between lines: a script with a timer-Say ticks at 0.25s
-        (0.1 for all of them overloaded the VM and lengthened the gaps); an
-        ordinary actor script keeps 0.5."""
+        is dead air between lines: a script with a timer-Say ticks at 0.15s;
+        an ordinary actor script keeps 0.5.
+
+        0.1 for all of them once overloaded the VM and LENGTHENED the gaps,
+        but that was measured while SayLine still blocked on two fixed
+        Utility.Wait calls and fragments blocked the dispatch path.  With
+        those gone the contention is gone too."""
         say = ('scn T\n\nfloat t\n\nbegin gamemode\n'
                'if t <= 0\nset t to Say SomeTopic\nendif\nend\n')
         out = converter.convert_standalone('T', say, 'Actor', 'T')
-        assert 'RegisterForSingleUpdate(0.25)' in out
+        assert 'RegisterForSingleUpdate(0.15)' in out
         plain = ('scn T\n\nshort x\n\nbegin gamemode\nset x to 1\nend\n')
         out = converter.convert_standalone('T', plain, 'Actor', 'T')
         assert 'RegisterForSingleUpdate(0.5)' in out

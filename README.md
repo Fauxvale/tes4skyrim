@@ -10,6 +10,10 @@
 
 ---
 
+**This project is pre-alpha. Expect issues.** Conversions are incomplete, and some features are only half implemented. Bugs are common across every stage, and output can change or break between releases. Make sure to back up your saves before installing converted content
+
+---
+
 > [!IMPORTANT]
 > **No Bethesda assets are included in this repository.** This project ships only
 > code — it reads the Oblivion and Skyrim data you already own, on your own machine,

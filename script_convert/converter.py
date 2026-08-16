@@ -39,6 +39,11 @@ _SLEEP_READ_RE = re.compile(r'\b(?:ispcsleeping|isplayersleeping|getpcissleeping
 # back to this when the line has no voice file at all.  See the "Say() timers"
 # section of docs/papyrus_conversion_notes.md.
 SAY_LINE_SECONDS = 3.0
+# SayLine's start timeout: how long it waits for the engine's OnBegin fragment
+# before declaring the line dropped.  Mirrors SAY_START_WAIT in
+# TES4Polyfill.psc and bounds how long a SayLine call can block, which is what
+# the say-timer pre-charge has to outlast.
+SAY_START_WAIT = 1.5
 # Papyrus method name for an OBSE user-defined function (`begin Function{...}`).
 # One fixed name per script: OBSE allowed exactly one Function block per script
 # and `Call <ScriptName> args` names the SCRIPT, never the function.
@@ -317,6 +322,9 @@ class ScriptConverter:
         self._uses_timer = False
         self._uses_say_timer = False
         self._uses_say = False
+        # Per-script: a latch registered while converting one script must not
+        # leak a declaration into the next (see _guard_stage_timer).
+        self._stage_latches = {}
         # Set while a GameMode poll body is being converted: the arm a TES4
         # `return` must emit before `Return` (see the OnUpdate emitter).
         self._poll_return_prefix = ''
@@ -324,6 +332,9 @@ class ScriptConverter:
         self._var_renames: dict[str, str] = {}  # orig_lower -> safe_name
         self._var_types: dict[str, str] = {}  # lower_name -> papyrus_type
         self._current_event: str = ''  # Current event header for context-aware conversion
+        # quest name -> latch variable holding the stage seen on the
+        # PREVIOUS poll pass (see _guard_stage_timer).
+        self._stage_latches: dict = {}
         self._line_comments: list[str] = []  # Comments accumulated during expression conversion
         # True once this script emitted TES4Polyfill.SuppressFallDamage() (the
         # ResetFallDamageTimer conversion).  It raises a GLOBAL game setting,
@@ -363,6 +374,93 @@ class ScriptConverter:
 
     _SAY_CALL_RE = re.compile(r'^\s*(?P<recv>.+?)\.Say\((?P<topic>[^()]*)\)\s*$')
 
+    # Events that run on the engine's own dispatch path, where a blocking
+    # Say would stall the engine rather than just this script's tick.  A
+    # quest-stage / INFO fragment is compiled as `Function Fragment_*`, so
+    # match that too.
+    _DISPATCH_EVENTS = ('onpackagestart', 'onpackageend', 'onpackagechange',
+                        'onhit', 'oncombatstatechanged', 'onactivate',
+                        'ondeath', 'ondying', 'onload', 'oncellattach',
+                        'onlocationchange')
+
+    def _say_may_block(self) -> bool:
+        """True when a blocking SayLine is safe here (a poll, not a callback)."""
+        ev = (self._current_event or '').lower()
+        if 'onupdate' in ev:
+            return True
+        if 'fragment' in ev:
+            return False
+        return not any(e in ev for e in self._DISPATCH_EVENTS)
+
+    # `<quest>.GetStage() == N` ... `<timer> <= 0` in ONE condition.  Both
+    # orders occur, and other terms may sit between them.
+    _STAGE_TIMER_GUARD_RE = re.compile(
+        r'^(?P<indent>\s*)If\s+(?P<cond>.*?\b(?P<q>[A-Za-z_]\w*)\.GetStage\(\)\s*=='
+        r'\s*(?P<stage>\d+)\b.*?)\s*$', re.IGNORECASE)
+    _TIMER_ZERO_RE = re.compile(
+        r'\b(?P<timer>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*<=\s*0(?:\.0*)?\b')
+
+    def _guard_stage_timer(self, line: str) -> str:
+        """Close the stage-arrival race on `GetStage()==N && <timer> <= 0`.
+
+        \U0001f6d1 THE TIMER IS CHARGED BY STAGE N'S OWN FRAGMENT, and nothing makes
+        that charge land before this guard is first tested.  If the previous
+        beat left the timer at or below zero -- which is its NORMAL resting
+        state, and it also goes negative whenever a line is dropped -- then the
+        instant stage N arrives the guard is ALREADY satisfied and the body
+        runs before stage N's fragment has said anything.
+
+        Measured 2026-08-16 (temp/chargen_rec_4.log, 14:47:14-18): CharacterGen
+        sat at convTimer = -0.076 for four seconds after Renault's line was
+        dropped, so `GetStage()==16 && convTimer<=0` fired the moment stage 16
+        was set.  SetStage(17) ran, the force-greet pulled the player into the
+        menu, and the Emperor's stage-16 line was never spoken -- INFO 00032B11
+        ("You ... I've seen you") is gated on `GetStage CharacterGen == 16` and
+        is the ONLY CharGenVoice entry for that stage, so once the stage reads
+        17 nothing qualifies at all.
+
+        The fix is a stage-arrival latch: remember the stage this quest was on
+        when we last saw it, and require at least one poll pass at stage N
+        before honouring the guard.  That pass is what lets stage N's fragment
+        run and charge the timer.  25 guards of this shape exist in the
+        Oblivion build; the CharacterGen ones are simply the ones that show.
+        """
+        if 'GetStage()' not in line or '<=' not in line:
+            return line
+        m = self._STAGE_TIMER_GUARD_RE.match(line)
+        if not m:
+            return line
+        if not self._TIMER_ZERO_RE.search(m.group('cond')):
+            return line
+        quest = m.group('q')
+        stage = m.group('stage')
+        # One latch variable per quest, declared once by the caller.
+        var = self._stage_latch_var(quest)
+        indent = m.group('indent')
+        cond = m.group('cond')
+        return (f'{indent}If {cond} && {var} == {stage}'
+                f'  ; stage-arrival latch: stage {stage} seen a full pass, '
+                f'so its fragment has run')
+
+    def _stage_latch_var(self, quest: str) -> str:
+        """Name of the "stage we saw last pass" latch for `quest`, registering
+        it so the emitter declares and updates it.
+
+        Keyed CASE-INSENSITIVELY: TES4 scripts spell the same quest both ways
+        in one file (CharacterGen's poll uses `characterGen` on some lines and
+        `CharacterGen` on others).  Keying on the raw spelling emitted TWO
+        latches for one quest, and a guard could then compare against the one
+        the poll tail never updated -- the guard would never open.  Papyrus is
+        case-insensitive, so the duplicate declarations compiled and the fault
+        would only have shown in game.
+        """
+        key = quest.lower()
+        var = self._stage_latches.get(key)
+        if var is None:
+            var = f'TES4_LastStage_{quest}'
+            self._stage_latches[key] = var
+        return var
+
     def _emit_say_line(self, target: str, say_call: str, delay: str) -> str:
         """`set T to [ref.]Say[To] ... topic [+ n]` -> a TES4Polyfill.SayLine call.
 
@@ -389,12 +487,27 @@ class ScriptConverter:
         speaker = m.group('recv').strip()
         topic = m.group('topic').strip()
         fallback = self._say_fallback_seconds(say_call)
-        # The pre-charge only has to outlast SayLine's own start timeout, and
-        # it is SHARED with every other participant's guard, so keep it short:
-        # a Say nothing qualifies for otherwise held the next speaker off for
-        # the topic's whole longest line.
-        pre = min(fallback + 1.0, 2.0)
-        call = f'TES4Polyfill.SayLine({speaker}, {topic}, {fallback:g})'
+        # The pre-charge closes this poll's own `T <= 0` guard for as long as
+        # SayLine can still be BLOCKED, so a second tick cannot re-enter.
+        #
+        # The bound is SayLine's own start timeout (SAY_START_WAIT, 1.5s), NOT
+        # the line length: on a line the engine ACCEPTS it returns after the
+        # measured 0.18s median / 0.84s max (2026-08-16, 76 lines), and on a
+        # DROPPED line it waits the full timeout and returns 0.0.  The old
+        # `min(fallback + 1.0, 2.0)` scaled with the line instead, so a long
+        # line charged 2.0s of closed guard even though SayLine had already
+        # returned -- dead air on the timer of every line in the topic.
+        pre = SAY_START_WAIT + 0.25
+        # ð A BLOCKING SayLine IS ONLY SAFE IN A POLL.  It waits for the
+        # engine's OnBegin fragment -- 0.18s median, up to SAY_START_WAIT when
+        # the line is refused.  In OnUpdate that costs this script's own tick.
+        # On the ENGINE'S DISPATCH PATH (a quest-stage or INFO fragment, or an
+        # OnPackageStart/End, OnHit, OnCombatStateChanged callback) it stalls
+        # the transition itself: the stage cannot advance, the package cannot
+        # swap.  That is the stutter that accompanies a line at a STAGE CHANGE
+        # rather than a polled line.  Those sites fire and don't wait.
+        call_fn = 'SayLine' if self._say_may_block() else 'SayLineNoWait'
+        call = f'TES4Polyfill.{call_fn}({speaker}, {topic}, {fallback:g})'
         if self._var_types.get(target.lower().split('.')[-1]) == 'Int':
             # A TES4 `short` holding a Say length: round UP so the tail survives.
             return (f'{target} = {int(pre + 0.999)}  ; TES4 Say: closed until the line is under way\n'
@@ -1254,6 +1367,16 @@ class ScriptConverter:
             for bline in gamemode_body:
                 converted = self._convert_line(bline, extends)
                 out.append(f'  {converted}')
+            # Stage-arrival latches: record the stage each guarded quest is on
+            # NOW, so the next pass can tell "we have already seen this stage"
+            # from "it just arrived".  Emitted at the very END of the body so
+            # every guard above compared against the PREVIOUS pass's value.
+            # See _guard_stage_timer for the race this closes.
+            for _, _var in sorted(self._stage_latches.items()):
+                # _var is TES4_LastStage_<quest as first spelled>; reuse that
+                # spelling for the read so the emitted line matches the source.
+                _qname = _var[len('TES4_LastStage_'):]
+                out.append(f'  {_var} = {_qname}.GetStage()')
             self._poll_return_prefix = ''
             _emit_arm()
             out.append('EndEvent')
@@ -1939,6 +2062,15 @@ class ScriptConverter:
             # exactly TES4's order, which executed `setstage 44` in the same
             # frame it opened the menu.
             out.extend(['', 'Bool TES4_ChargenMenuBusy = False'])
+        # Stage-arrival latches used by _guard_stage_timer.  -1 so the FIRST
+        # pass at a stage never satisfies `latch == N`: the guard then waits
+        # one pass, which is what lets that stage's fragment charge the timer.
+        if self._stage_latches:
+            out.append('')
+            for _, _var in sorted(self._stage_latches.items()):
+                _qname = _var[len('TES4_LastStage_'):]
+                out.append(f'Int {_var} = -1'
+                           f'  ; stage of {_qname} on the previous poll pass')
         return '\n'.join(out)
 
     def _mesg_for_box(self, text, buttons) -> str:
@@ -2063,6 +2195,12 @@ class ScriptConverter:
         self._reset()
         self._cell_families = saved_families
         self._property_refs = saved_refs
+        # A fragment body runs on the ENGINE'S DISPATCH PATH: a quest stage
+        # cannot advance, and an INFO cannot finish, while the fragment is
+        # still executing.  A blocking SayLine there stalls the transition
+        # itself -- the stutter that accompanies a line at a stage change.
+        # _say_may_block() reads this to emit SayLineNoWait instead.
+        self._current_event = 'Fragment'
         lines = source.replace('\r\n', '\n').replace('\r', '\n').split('\n')
         result = []
         for raw_line in lines:
@@ -2717,6 +2855,9 @@ class ScriptConverter:
         self._uses_timer = False
         self._uses_say_timer = False
         self._uses_say = False
+        # Per-script: a latch registered while converting one script must not
+        # leak a declaration into the next (see _guard_stage_timer).
+        self._stage_latches = {}
         # Set while a GameMode poll body is being converted: the arm a TES4
         # `return` must emit before `Return` (see the OnUpdate emitter).
         self._poll_return_prefix = ''
@@ -2876,13 +3017,20 @@ class ScriptConverter:
         if self._uses_getsecondspassed:
             return '0.1'
         # A script that drives a spoken line with a timer (`set T to Say ...`)
-        # ticks at 0.25s: its `T <= 0` guard is what starts the next line, so
-        # the tick is dead air between lines (TES4 ran it every frame) — but
-        # 0.1s for every such script measurably lengthened the gaps instead
-        # (2026-08-16): the Papyrus VM has ~1.2ms per frame and the extra
-        # passes queued behind each other, delaying SayLine's own Begin poll.
+        # ticks fast: its `T <= 0` guard is what starts the next line, so the
+        # tick is pure dead air between lines (TES4 ran it every frame).
+        #
+        # 0.1s was tried on 2026-08-16 and measurably LENGTHENED the gaps, so
+        # it was set to 0.25s.  That measurement was taken when every SayLine
+        # also blocked on Utility.Wait(0.05) for its claim handshake and
+        # Utility.Wait(0.25) after any busy wait, and when fragments blocked
+        # the dispatch path -- the VM was saturated by the Say path itself and
+        # extra poll passes queued behind it.  All three are gone, so the
+        # contention that made a faster tick counterproductive is gone with
+        # them, and 0.15s buys back most of the tick latency without
+        # returning to the 0.1s that was measured as too aggressive.
         if self._uses_say_timer:
-            return '0.25'
+            return '0.15'
         if self._uses_timer:
             return '0.25'
         return '0.5'
@@ -3215,6 +3363,7 @@ class ScriptConverter:
         stripped = self._unquote_identifiers(stripped)
 
         result = self._convert_line_inner(stripped, extends)
+        result = self._guard_stage_timer(result)
 
         # Opens a block AFTER the line itself was converted, so a
         # SetFunctionValue sitting on the `if` line is judged at its own depth.

@@ -798,6 +798,72 @@ _STAGE_ADVANCE_RE = re.compile(
     r'^(\s*)([A-Za-z_]\w*)\.SetStage\((\d+)\)\s*(;.*)?$', re.IGNORECASE)
 
 
+# `<quest>.speaker = N` / `<quest>.target = N` -- the TURN HANDOFF of a polled
+# conversation.  Deliberately narrow: a bare literal assignment to a field
+# whose name says it selects the next talker.
+_HANDOFF_WRITE_RE = re.compile(
+    r'^\s*\w[\w.]*\.(?:speaker|target)\s*=\s*'
+    r'(?:-?[\d.]+|[A-Za-z_]\w*)\s*(;.*)?$', re.IGNORECASE)
+
+
+def _split_turn_handoff(counter_step, gated_rest):
+    """Split the turn handoff out of an End-fragment body.
+
+    Returns (handoff, remainder): the counter step plus any speaker/target
+    literal writes, and everything else in original order.
+
+    THE HANDOFF CANNOT WAIT FOR OnEnd.  TES4's Say was SYNCHRONOUS -- it
+    returned the line's length, so the result script set `convCount` /
+    `speaker` and charged `convTimer` IN THE SAME FRAME THE LINE STARTED.
+    The next speaker's guard (`speaker == N && convTimer <= 0`) was then
+    already open, held off only by the timer -- the pacing the author wrote.
+
+    Emitting the handoff in the End fragment makes every line pay a serial
+    round trip: the next speaker cannot even LOOK until the previous line
+    has completely finished.  Measured 2026-08-16 (temp/chargen_rec_5.log):
+
+        79.11  LineBegan Renault len=2.06     <- line starts
+        81.54  LineEnded Renault              <- 2.43s later
+        81.57  request   Baurus ("Yessir.")   <- only now does he ask
+
+    Moving ONLY these writes to OnBegin restores the TES4 timing.  Stage
+    advances, AddTopic unlocks and item/faction changes stay in OnEnd: those
+    are consequences of the line having been DELIVERED, not of whose turn
+    it is.
+    """
+    handoff = list(counter_step)
+    rest = []
+    for line in gated_rest:
+        if _HANDOFF_WRITE_RE.match(line):
+            handoff.append(line)
+        else:
+            rest.append(line)
+    return handoff, rest
+
+
+def _stepped_gate(seq_gate, counter_step):
+    """The sequence gate rewritten for AFTER the counter step has applied.
+
+    Fragment_1 (OnBegin) now performs the handoff, so by the time
+    Fragment_0 (OnEnd) runs the counter has already moved.  `convCount == 8`
+    would be false and the REST of the body -- item grants, faction changes,
+    the author's other result-script writes -- would be silently dropped.
+    Shift the compared value by the same delta the step applies.
+    """
+    m = re.match(r'(.*?==\s*)(-?[\d.]+)\s*$', seq_gate or '')
+    if not m or not counter_step:
+        return seq_gate
+    step = re.search(r'([-+])\s*([\d.]+)', counter_step[0].split('=', 1)[1])
+    if not step:
+        return seq_gate
+    delta = float(step.group(2))
+    if step.group(1) == '-':
+        delta = -delta
+    val = float(m.group(2)) + delta
+    txt = str(int(val)) if val == int(val) else ('%g' % val)
+    return m.group(1) + txt
+
+
 def _split_stage_advances(body: list) -> tuple:
     """Split a sequenced fragment body into (gated writes, stage advances).
 
@@ -975,12 +1041,26 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 out_lines.append('')
 
             # OnBegin: the engine has selected this line and started it.
-            out_lines += [
-                'Function Fragment_1(ObjectReference akSpeakerRef)',
-                f'  TES4Polyfill.LineBegan(akSpeakerRef, {length:g})',
-                'EndFunction',
-                '',
-            ]
+            #
+            # The TURN HANDOFF belongs here, not in OnEnd: TES4's synchronous
+            # Say let the result script hand the turn over in the frame the
+            # line STARTED, so the next speaker's guard was already open and
+            # only `convTimer` paced him.  See _split_turn_handoff.
+            _begin_handoff = []
+            if seq_gate and body_lines:
+                _cs, _rest = _split_counter_step(body_lines, seq_gate)
+                if _cs:
+                    _gr, _ = _split_stage_advances(_rest)
+                    _begin_handoff, _ = _split_turn_handoff(_cs, _gr)
+            out_lines.append('Function Fragment_1(ObjectReference akSpeakerRef)')
+            out_lines.append(
+                f'  TES4Polyfill.LineBegan(akSpeakerRef, {length:g})')
+            if _begin_handoff:
+                out_lines.append(f"  If {seq_gate}  ; still this line's turn")
+                out_lines.extend('  ' + b for b in _begin_handoff)
+                out_lines.append('  EndIf')
+            out_lines.append('EndFunction')
+            out_lines.append('')
 
             # OnEnd: the line has finished.  Unlock the AddTopic-revealed
             # topics first (right before the topic menu refreshes), then the
@@ -1011,10 +1091,17 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 # _split_stage_advances. Only the counter/speaker state writes
                 # stay inside the gate.
                 gated_rest, stage_advances = _split_stage_advances(rest_body)
-                out_lines.append(f"  If {seq_gate}  ; still this line's turn")
-                out_lines.extend('  ' + b for b in counter_step)
-                out_lines.extend('  ' + b for b in gated_rest)
-                out_lines.append('  EndIf')
+                # The counter step and speaker/target writes already ran in
+                # Fragment_1 (OnBegin); repeating them here would apply the
+                # `+ 1` twice and skip a line.  What remains must gate on the
+                # STEPPED value, or it would all be silently discarded.
+                _, end_rest = _split_turn_handoff(counter_step, gated_rest)
+                if end_rest:
+                    out_lines.append(
+                        f"  If {_stepped_gate(seq_gate, counter_step)}"
+                        f"  ; turn still ours (counter stepped in OnBegin)")
+                    out_lines.extend('  ' + b for b in end_rest)
+                    out_lines.append('  EndIf')
                 out_lines.extend(stage_advances)
             else:
                 out_lines.extend(body_lines)

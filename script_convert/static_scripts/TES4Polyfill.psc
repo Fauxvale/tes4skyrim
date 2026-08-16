@@ -669,6 +669,7 @@ EndFunction
 ; LineBegan / LineEnded here; the state lives in script Actor Values ON THE
 ; SPEAKER, so no property binding and no per-quest owner analysis is needed:
 ;
+;     Variable03  real time this speaker's last End fragment ran (grace stamp)
 ;     Variable04  running average of this speaker's End overhead (adaptive tail)
 ;     Variable06  real time the current line began (diagnostics)
 ;     Variable07  claim token while a SayLine is in progress for this speaker
@@ -677,17 +678,21 @@ EndFunction
 ;     Variable10  speaking deadline (game time) - a lost End fragment expires
 ;   and on the PLAYER, Variable05/06 = hi/lo halves of the FormID of the last
 ;   actor to speak a line inside the player's dialogue menu (PlayerIsInDialogue)
-;   and Variable04 = the game-wide End-overhead average.
+;   and Variable04 = the game-wide End-overhead average, and Variable07 =
+;   the real time the line now playing ANYWHERE ends (_OtherLineInProgress:
+;   Skyrim refuses a Say while another actor is mid-line).
 ;   Every SayLine / LineBegan / LineEnded writes a "TES4Say ..." Debug.Trace
 ;   with real-time stamps: the Papyrus log (or the bridge's vmlog) then gives
 ;   the engine's Say->Begin and Begin->End latencies against the measured
-;   length, which is what SAY_TAIL must cover.
+;   length.
 ;
 ; SayLine restores the TES4 contract exactly: it BLOCKS until the engine has
-; begun the line, then returns that line's real length (+ SAY_TAIL, which
-; covers the End fragment's dispatch latency), and the caller's script goes on
-; immediately - the countdown, the `speaker` handoff and any `set convTimer to
-; convTimer + 2` pause the End result adds all behave as they did in Oblivion.
+; begun the line, then returns THAT LINE'S REAL LENGTH AND NOTHING MORE, and
+; the caller's script goes on immediately - the countdown, the `speaker`
+; handoff and any `set convTimer to convTimer + 2` pause the End result adds
+; all behave as they did in Oblivion.  The End-overhead grace that used to be
+; added to the return value is held in _IsSpeaking instead, so it is paid only
+; by a re-Say on the same actor and never by a handoff to the next speaker.
 ; A Say nothing under the topic qualifies for returns 0 after SAY_START_WAIT,
 ; and the caller's own poll simply retries - which is what Oblivion did too.
 ;
@@ -701,22 +706,45 @@ EndFunction
 ;   * one waiter per speaker: a second SayLine while one is pending returns
 ;     a short backoff instead of queueing a duplicate.
 
-; Seconds added to the returned line length.  This is most of the dead air
-; between consecutive lines (the rest is the caller's poll tick and the
-; engine's Say -> audio latency).  It has to cover the ENGINE'S OWN OVERHEAD
-; between the measured audio length and the End fragment running (fragment
-; dispatch, trailing hold, inter-response gaps): if the guard reopens before
-; the End result has advanced the conversation state, the same speaker's next
-; SayLine waits on the busy flag and no line repeats, but a stray Say can
-; cost the next speaker a drop timeout.
+; Seconds added to the returned line length.
+;
+; ð THE TAIL IS NOT DEAD AIR ANY MORE.  It used to be added to the value
+; SayLine returns, i.e. charged to the CALLER'S COUNTDOWN, so every line was
+; followed by a silence of one tail before the script even looked for the next
+; line.  Measured 2026-08-16 (temp/chargen_rec_5.log, 90 transitions): of the
+; 31 audible gaps, 26 handed off to a DIFFERENT actor -- median 1.49s -- and
+; for those the tail buys nothing at all, because it exists only to stop the
+; SAME actor being re-Said while the engine still counts him as talking.
+;
+; So the tail is no longer returned.  It is enforced where it is actually
+; needed instead: _IsSpeaking() holds a re-Say off until this speaker's End
+; fragment has run plus the measured overhead (see the grace check there), and
+; SayLine's pre-wait blocks on that.  A handoff to another actor pays nothing.
 ;
 ; The overhead is stable per machine but not knowable in advance (measured
-; 2026-08-16 on the user's setup: median 0.35s, p90 0.54s single-response;
+; 2026-08-16 on the user's setup: median 0.37s, p90 0.54s single-response;
 ; 11-24s under a starved VM), so it is MEASURED: LineEnded records each
 ; line's overhead into a per-speaker running average (Variable04) and a
-; global one on the player, and the tail is that estimate plus a margin,
-; clamped.  A fixed 1.0s cost 0.6s of silence on every line; a fixed 0.4s
-; repeated lines when the VM was slow.
+; global one on the player.
+; How long SayLine waits for the engine's OnBegin fragment before declaring
+; the line dropped.  This BOUNDS how long a SayLine call can block, so the
+; say-timer pre-charge the converter emits must outlast it -- converter.py
+; keeps SAY_START_WAIT in step.  Nominal: the engine begins a line it accepts
+; within ~0.15-0.26s (measured), and each iteration is a VM turn, so under
+; load the real wait stretches with everything else.
+Float Function SAY_START_WAIT() Global
+  Return 1.5
+EndFunction
+
+; How long to wait for the engine to BEGIN a line before treating it as
+; refused.  Measured: an accepted line begins in 0.15-0.31s (n=76, 2026-08-16),
+; so 0.4s covers every accepted case with margin while cutting the cost of a
+; refusal from 1.5s to 0.4s.  That matters because a caller waiting on a
+; refused line also blocks the actor whose turn it really is -- see the loop in
+; SayLine for the measured case (Glenroy's "Usual mixup with the Watch").
+Float Function SAY_ACCEPT_WAIT() Global
+  Return 0.4
+EndFunction
 Float Function SAY_TAIL_MIN() Global
   Return 0.35
 EndFunction
@@ -752,6 +780,46 @@ Float Function _TailFor(Actor a) Global
   Return tail
 EndFunction
 
+; NON-BLOCKING SayLine, for callers on the ENGINE'S DISPATCH PATH.
+;
+; ð NEVER BLOCK A FRAGMENT OR AN ENGINE CALLBACK.  SayLine waits for the
+; engine's OnBegin fragment, which takes 0.18s median but up to SAY_START_WAIT
+; (1.5s) when the line is refused.  In an OnUpdate poll that wait costs only
+; that script's own tick.  In a QUEST STAGE FRAGMENT, an INFO fragment, or an
+; OnPackageEnd / OnPackageStart / OnHit / OnCombatStateChanged callback it
+; stalls the engine's own dispatch -- the stage transition, the package swap
+; or the hit reaction cannot complete until the Say resolves.  That is the
+; "massive stutter as a new line starts" the user reported: it accompanies a
+; STAGE CHANGE (CharacterGen's Fragment_Stage_0016 / _0044 both blocked), not
+; an ordinary polled line, which is why only some lines stutter.
+;
+; So on those paths we fire the line and DO NOT WAIT.  The countdown gets the
+; caller's authored fallback (the topic's measured longest response, supplied
+; by the converter) instead of the engine's exact length.  The speaker is
+; still claimed and still tracked by LineBegan/LineEnded, so nothing can
+; re-Say over the line -- only the RETURNED length is an estimate rather than
+; a measurement, and only for these few sites.
+Float Function SayLineNoWait(ObjectReference akSpeaker, Topic akTopic, Float afFallbackLength) Global
+  If akSpeaker == None || akTopic == None
+    Return afFallbackLength
+  EndIf
+  Actor a = akSpeaker as Actor
+  If a == None || (a as Form).GetFormID() == 0x14
+    akSpeaker.Say(akTopic)
+    Return afFallbackLength
+  EndIf
+  ; Respect a line already in flight exactly as SayLine does: issuing a Say
+  ; over a live line drops it AND loses that line's End result.
+  If a.IsInDialogueWithPlayer() || _IsSpeaking(a)
+    Return 0.5   ; busy: the caller's poll retries, same as a contended SayLine
+  EndIf
+  a.SetActorValue("Variable09", 0.0)
+  a.Say(akTopic)
+  Debug.Trace("TES4Say nowait " + _Who(a) + " topic " + akTopic + " fallback=" + afFallbackLength + " t=" + Utility.GetCurrentRealTime())
+  Return afFallbackLength
+EndFunction
+
+
 Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbackLength) Global
   Actor a = akSpeaker as Actor
   If a == None || akTopic == None || (a as Form).GetFormID() == 0x14
@@ -759,7 +827,7 @@ Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbac
     If akSpeaker != None && akTopic != None
       akSpeaker.Say(akTopic)
     EndIf
-    Return afFallbackLength + SAY_TAIL_DEFAULT()
+    Return afFallbackLength
   EndIf
   Float now = Utility.GetCurrentGameTime()
   If a.GetActorValue("Variable07") > 0.0 && now < a.GetActorValue("Variable08")
@@ -768,40 +836,65 @@ Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbac
   ; Claim the speaker.  SetActorValue lands on the game thread a frame later,
   ; so two callers arriving in the same frame both read "free" above; the
   ; token + re-read after a frame lets exactly one of them keep the claim.
+  ;
+  ; The re-read only needs ONE FRAME to have passed, and Utility.Wait(0.0)
+  ; yields exactly that.  It used to be Wait(0.05), which yields for at least
+  ; 50ms and was paid on EVERY line -- part of the per-line cost the
+  ; 2026-08-16 recording measured as a 0.73s median between a line's End and
+  ; the next Say being issued.
   Float token = Utility.RandomFloat(1.0, 1000000.0)
   Float claimDays = _GameDays(5.0)   ; a claim not renewed for 5s is stale
   a.SetActorValue("Variable07", token)
   a.SetActorValue("Variable08", now + claimDays)
-  Utility.Wait(0.05)
+  Utility.Wait(0.0)
   If a.GetActorValue("Variable07") != token
     Return 0.5
   EndIf
   Debug.Trace("TES4Say request " + _Who(a) + " topic " + akTopic + " t=" + Utility.GetCurrentRealTime())
   ; Wait out the player's dialogue menu and any line still playing.
+  ; Wait for the speaker to be free.  _IsSpeaking covers BOTH a live line and
+  ; the post-End grace, so there is no separate settle wait any more: the old
+  ; flat Utility.Wait(0.25) after every busy wait was pure dead air on top of
+  ; a condition that is now exact.  0.05 steps because the loop exits on an
+  ; AV stamp, not on a race with the fragment.
+  ; The other-speaker wait is CAPPED.  _IsSpeaking on our own actor may wait
+  ; as long as it likes (that line is ours and its End is coming), but another
+  ; actor's line is only a reason to hold off, never a reason to stall: cap it
+  ; at SAY_START_WAIT so this can never cost more than the drop it replaces,
+  ; and so one unrelated ambient line cannot hold up a whole conversation.
+  Float otherCap = SAY_ACCEPT_WAIT()
   Float waited = 0.0
-  While waited < 600.0 && (a.IsInDialogueWithPlayer() || _IsSpeaking(a))
-    Utility.Wait(0.15)
-    waited += 0.15
+  While waited < 600.0 && (a.IsInDialogueWithPlayer() || _IsSpeaking(a) \
+                           || (waited < otherCap && _OtherLineInProgress()))
+    Utility.Wait(0.05)
+    waited += 0.05
     a.SetActorValue("Variable08", Utility.GetCurrentGameTime() + claimDays)
   EndWhile
-  If waited > 0.0
-    ; The line we waited for ends when its End fragment RETURNS; LineEnded is
-    ; that fragment's last statement, so a Say issued the instant the flag
-    ; clears reaches an actor the engine still counts as talking and is
-    ; dropped (measured 2026-08-16: every post-wait Say dropped).  Let the
-    ; fragment finish.
-    Utility.Wait(0.25)
-  EndIf
   ; Request the line and wait for the engine to begin it (LineBegan stores
   ; the length in Variable09).
   a.SetActorValue("Variable09", 0.0)
   Float t0 = Utility.GetCurrentRealTime()
   a.Say(akTopic)
-  ; Nominal 1.5s: the engine begins a line it accepts within ~0.15-0.26s
-  ; (measured), and each iteration is a VM turn, so under load the real
-  ; wait stretches with everything else.
+  ; The engine begins a line it ACCEPTS within 0.15-0.31s (measured
+  ; 2026-08-16, n=76: med 0.15, max 0.31).  Anything still silent well past
+  ; that was refused, and every further tick is pure dead air on a line that
+  ; will never play -- while it also blocks the speaker whose turn it
+  ; genuinely is, because a Say is refused while another actor is mid-line.
+  ;
+  ; 🛑 THIS COSTS THE REAL NEXT SPEAKER, NOT JUST THE CALLER.  Measured in
+  ; temp/chargen_rec_5.log: Renault's line ended at 118.386 and his own poll
+  ; re-fired at 118.364 -- the turn had passed to Glenroy, but `speaker` is
+  ; handed over inside the End FRAGMENT, so for the ~0.4s until that ran
+  ; Renault's `speaker == 2 && convTimer <= 0` guard was still open.  His
+  ; doomed request then sat until 120.828 and Glenroy's "Usual mixup with the
+  ; Watch" was held to a 2.35s gap when its neighbours were 0.3-0.8s.
+  ;
+  ; So the wait scales to what an accepted line actually needs.  A dropped
+  ; line now costs ~0.4s instead of 1.5s.  SAY_START_WAIT stays the bound the
+  ; pre-charge is sized against, because a caller may still block that long
+  ; when the VM is starved -- this only stops us WAITING OUT a refusal.
   Float t = 0.0
-  While t < 1.5 && a.GetActorValue("Variable09") == 0.0
+  While t < SAY_ACCEPT_WAIT() && a.GetActorValue("Variable09") == 0.0
     Utility.Wait(0.05)
     t += 0.05
   EndWhile
@@ -814,9 +907,13 @@ Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbac
   If len < 0.02
     len = afFallbackLength   ; began, but the line has no measured voice file
   EndIf
-  Float tail = _TailFor(a)
-  Debug.Trace("TES4Say began " + _Who(a) + " topic " + akTopic + " len=" + len + " tail=" + tail + " startLatency=" + (Utility.GetCurrentRealTime() - t0) + " waited=" + waited + " t=" + Utility.GetCurrentRealTime())
-  Return len + tail
+  Debug.Trace("TES4Say began " + _Who(a) + " topic " + akTopic + " len=" + len + " startLatency=" + (Utility.GetCurrentRealTime() - t0) + " waited=" + waited + " t=" + Utility.GetCurrentRealTime())
+  ; ð LENGTH ONLY -- no tail.  TES4's Say returned the line's length and
+  ; nothing more, and the caller's countdown is meant to expire when the audio
+  ; does.  Adding the tail here padded EVERY line with a silence that only a
+  ; same-actor re-Say ever needed; _IsSpeaking's grace window enforces that
+  ; case directly.
+  Return len
 EndFunction
 
 ; OnBegin fragment hook: the engine has selected this INFO and started it.
@@ -830,6 +927,19 @@ Function LineBegan(ObjectReference akSpeakerRef, Float afLength) Global
     len = 0.01                 ; unknown length: still marks "speaking"
   EndIf
   a.SetActorValue("Variable09", len)
+  a.SetActorValue("Variable03", 0.0)   ; a live line supersedes the End grace
+  ; Game-wide "a line is in progress" record, kept on the PLAYER so any
+  ; SayLine can consult it without knowing the other participants.  Skyrim
+  ; refuses a Say while ANOTHER actor is mid-line, and the caller then burns
+  ; the whole SAY_START_WAIT before finding out (measured 2026-08-16: 13 of
+  ; 17 drops in temp/chargen_rec_5.log happened with a DIFFERENT actor
+  ; speaking and the dropped actor silent).  Storing the deadline lets the
+  ; pre-wait below hold off instead of being refused.
+  Actor gp = Game.GetPlayer()
+  Float until = Utility.GetCurrentRealTime() + len
+  If until > gp.GetActorValue("Variable07")
+    gp.SetActorValue("Variable07", until)
+  EndIf
   ; Speaking deadline: VERY generous.  It only exists so a LOST End (actor
   ; killed or unloaded mid-line) cannot strand the speaker as busy forever;
   ; a late one must always hold a re-Say off.  Measured 2026-08-16 under a
@@ -877,6 +987,15 @@ Function LineEnded(ObjectReference akSpeakerRef, Float afLength = -1.0) Global
   Float actual = Utility.GetCurrentRealTime() - began
   If mine
     a.SetActorValue("Variable09", 0.0)
+    ; Stamp the moment this line's End ran.  _IsSpeaking treats the next
+    ; _TailFor(a) seconds as still-speaking, which is where the old SAY_TAIL
+    ; padding now lives -- charged only to a re-Say on THIS actor, never to a
+    ; handoff.
+    a.SetActorValue("Variable03", Utility.GetCurrentRealTime())
+    ; Release the game-wide record NOW.  It was stamped optimistically as
+    ; began+length; a line the player skips ends early, and holding the next
+    ; speaker off for audio that already stopped would be dead air.
+    Game.GetPlayer().SetActorValue("Variable07", 0.0)
     ; Learn this machine's End overhead from a line that played through
     ; (a skipped/cut line ends early and says nothing about the overhead).
     Float over = actual - afLength
@@ -933,8 +1052,72 @@ Bool Function PlayerIsInDialogue() Global
   Return False
 EndFunction
 
+; True while a re-Say on THIS actor would be dropped or would cut a live line.
+;
+; Two states count as speaking:
+;   * a tracked line is playing (Variable09 > 0), bounded by the lost-End
+;     deadline in Variable10;
+;   * the line's End fragment has JUST run and the engine still counts him as
+;     talking -- the grace window.  Variable03 holds the real time the End
+;     fragment finished, and the tail (this actor's measured End overhead) is
+;     how long after that a Say is still refused.
+;
+; The grace is what SAY_TAIL used to buy by padding the caller's countdown.
+; Holding it HERE instead means only a re-Say on the same actor pays it; a
+; handoff to a different speaker starts immediately.  That was 26 of the 31
+; audible gaps in the 2026-08-16 recording.
+; True while ANY tracked line is still playing anywhere.
+;
+; Skyrim refuses a Say issued while another actor is mid-line: the engine
+; drops it silently, so SayLine sits out its whole SAY_START_WAIT and returns
+; 0.0, and the caller's poll retries a tick later.  That is the 2-3s cluster
+; of gaps -- measured 2026-08-16, 13 of 17 drops in temp/chargen_rec_5.log
+; had a DIFFERENT actor speaking while the dropped actor was silent, e.g.
+;   90.56 drop Emperor  | others speaking: Renault
+;   95.29 drop Renault  | others speaking: Emperor
+; the conversation relay racing itself, because each participant's guard is
+; `speaker == N && convTimer <= 0` and convTimer counts the AUDIO length --
+; it reaches zero while the previous speaker's End fragment has yet to run.
+;
+; Waiting is strictly better than being refused: the wait ends the moment the
+; other line finishes, whereas a refusal costs the full timeout AND a retry.
+Bool Function _OtherLineInProgress() Global
+  Float until = Game.GetPlayer().GetActorValue("Variable07")
+  If until <= 0.0
+    Return False
+  EndIf
+  Return Utility.GetCurrentRealTime() < until
+EndFunction
+
 Bool Function _IsSpeaking(Actor a) Global
-  Return a.GetActorValue("Variable09") > 0.0 && Utility.GetCurrentGameTime() < a.GetActorValue("Variable10")
+  If a.GetActorValue("Variable09") > 0.0 && Utility.GetCurrentGameTime() < a.GetActorValue("Variable10")
+    Return True
+  EndIf
+  Float ended = a.GetActorValue("Variable03")
+  If ended <= 0.0
+    Return False
+  EndIf
+  Return (Utility.GetCurrentRealTime() - ended) < SAY_GRACE()
+EndFunction
+
+; How long after a line's End fragment a re-Say on the SAME actor is still
+; refused.
+;
+; ð MEASURED, NOT GUESSED.  This used to be _TailFor(a) -- the full
+; End-overhead average plus margin, about 0.57s -- inherited from when the
+; same number padded the caller's countdown.  The 2026-08-16 recording says
+; that is far too large: across 59 same-actor transitions the next Say
+; succeeded as little as 0.00s after LineEnded and NOT ONE was dropped.  Once
+; the End fragment has run the engine accepts the next line immediately.
+;
+; The reason the old SAY_TAIL genuinely mattered is a different one: it was on
+; the CALLER'S TIMER, so a late End let the countdown expire while the line
+; was still playing and the poll re-Said it (the duplicated "Yessir").  That
+; case is now covered directly by Variable09 + the Variable10 deadline, which
+; are exact.  So this only has to bridge the frame between LineEnded running
+; and the engine's own talking flag clearing.
+Float Function SAY_GRACE() Global
+  Return 0.05
 EndFunction
 
 String Function _Who(Actor a) Global
