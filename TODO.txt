@@ -101,3 +101,4 @@ Minor Issues:
 
 	17 - Pandora compatibility
 
+	19 - Leaving a force-greet conversation can soft-lock
