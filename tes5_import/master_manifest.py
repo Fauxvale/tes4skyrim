@@ -2,15 +2,14 @@
 
 Converting one TES4 record often creates several TES5 records: an ARMO gets an
 ARMA armature, an NPC_ gets an OTFT outfit and a VTYP voice type, an AMMO gets
-a PROJ projectile. Those companions take FormIDs from `writer.alloc_formid()`,
-a bare sequential counter, so their identity depends on the exact order the
-whole file was converted in.
+a PROJ projectile. Those companions take FormIDs from `writer.derive_formid()`.
 
 A plugin that OVERRIDES such a record must point at the MASTER's companions —
 minting its own would duplicate content the master already has, and the
-duplicates then compete with the originals. Re-deriving them is not an option:
-the plugin's run converts a few thousand records, not the master's ~700k, so
-the counter lands somewhere completely different.
+duplicates then compete with the originals. Re-deriving them in the plugin's
+own run does NOT reproduce the master's ids: derive_formid hashes into a
+window chosen from the CURRENT plugin's authored ids and tags it with that
+plugin's load-order index, and neither matches the master's.
 
 So the master's import records the pairing at the moment it is created and
 writes it next to the converted plugin. The plugin's import reads it. Nothing

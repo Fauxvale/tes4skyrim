@@ -370,7 +370,7 @@ def _init_dispatch():
         'WATR': convert_WATR,
         # WTHR is NOT in the generic dispatch: it mints four IMGS companions
         # for its HDR tone mapping, so it runs in its own serial phase
-        # (import_main Phase 2b) where writer.alloc_formid() is deterministic.
+        # (import_main Phase 2b) where record order is deterministic.
         'CLMT': convert_CLMT,
     })
 

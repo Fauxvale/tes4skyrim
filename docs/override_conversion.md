@@ -323,11 +323,11 @@ from comparing two conversion runs.
   - the LAND conversion cache is `{FormID: bytes}` and is *popped* by that
     key, so even the survivors would have fought over one entry.
 
-  `_repair_null_land_formids` then derives a real id from the PARENT CELL
-  rather than calling `alloc_formid()` — allocation is positional, so minting
-  here would shift every later id and invalidate saves (see
-  [FormID drift](../CLAUDE.md#formid-drift)); deriving is stable across runs
-  and unique per cell. **Keep the parent's load-order index byte and vary only
+  `_repair_null_land_formids` then takes ids from the top of the reserved gap
+  above the plugin's highest real FormID, walking down in export order. These
+  are the one positionally-assigned ids left in the converter (see
+  [FormIDs are hashed](../CLAUDE.md#formid-drift)); they are stable run to run
+  and unique per cell, but inserting a null-id LAND renumbers the later ones. **Keep the parent's load-order index byte and vary only
   the low 24 bits.** These are export-space ids that `remap_formid` shifts
   later, and the index byte says which plugin owns the record: a first attempt
   OR'd in `0x0F000000` — picked to sit outside every plugin's index range so it

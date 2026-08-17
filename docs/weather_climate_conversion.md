@@ -362,10 +362,10 @@ medians: Strength 0.5, Distance 0, Range 10000, and the modal Sky/Blur enum
 16920 = "No Sky, Radius 4" — the sky is explicitly EXCLUDED from the blur
 pass.
 
-Because WTHR mints a companion record, it is **not** in the generic dispatch;
-it runs in its own serial phase (`import_main` Phase 2b) so
-`writer.alloc_formid()` stays deterministic. Group order is
-`IMGS -> WTHR -> CLMT`, matching the reference direction.
+Because WTHR mints companion records, it is **not** in the generic dispatch;
+it runs in its own serial phase (`import_main` Phase 2b) so record order stays
+deterministic. Group order is `IMGS -> WTHR -> CLMT`, matching the reference
+direction.
 
 ### EditorID collision
 
@@ -451,11 +451,11 @@ redirect at every referrer**, not a skip in Phase 2b. Four referrers exist:
 4. `WTHR` itself — the record is not emitted, and **its four IMGS companions
    must not be minted**
 
-Point 4 is the [FormID-drift](../CLAUDE.md#formid-drift) hazard: Phase 2b
-allocates 4 IMGS per weather before every later companion-allocating phase, so
-toggling this option shifts every subsequently allocated FormID and breaks
-existing saves. The option must be treated as a new-game-only setting, exactly
-like enabling weather conversion itself.
+Point 4 costs nothing in FormIDs: companion ids are
+[hashed from the source weather](../CLAUDE.md#formid-drift), so skipping a
+weather's IMGS leaves every other record's id untouched. Toggling the option
+still changes which records exist, so it remains a new-game-only setting,
+exactly like enabling weather conversion itself.
 
 ## REGN weather — where Cyrodiil's weather variety actually lives
 

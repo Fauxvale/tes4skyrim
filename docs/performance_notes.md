@@ -340,9 +340,10 @@ properly parallel. Two findings:
   shifts, mesh bounds). Process pools must replay them via an initializer — see
   `tes5_import/navm_worker.py` and `tes5_import/convert_worker.py`.
 - **Determinism contract**: the output ESM must be byte-reproducible. Process
-  results in submission order (`ex.map`, not `as_completed`) and keep any
-  `writer.alloc_formid()` callers serial. Verify with `tools/esm_diff.py A.esm
-  B.esm` (distinguishes real diffs from reorders).
+  results in submission order (`ex.map`, not `as_completed`) and keep record
+  EMISSION serial — derived ids no longer depend on call order, but group order
+  still does. Verify with `tools/esm_diff.py A.esm B.esm` (distinguishes real
+  diffs from reorders).
 - **Export format workers re-read from mmap**: `tes4_export` scans record
   offsets only (`read_file(..., parse_subs=False)`) and workers re-read/format
   from their own mmap — never pickle `Record` objects across process boundaries.

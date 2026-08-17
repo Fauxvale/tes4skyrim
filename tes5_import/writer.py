@@ -405,20 +405,18 @@ class PluginWriter:
         self._top_groups = {}
         self._record_count = 0
         self._next_object_id = 0x800
-        self._lock = threading.Lock()  # guards alloc_formid and add_record
+        self._lock = threading.Lock()  # guards derive_formid and add_record
         self.own_index = len(self.masters)
 
         # --- Companion manifest -------------------------------------------
         # Converting a record often generates COMPANION records (ARMO -> ARMA,
-        # NPC_ -> OTFT/VTYP, AMMO -> PROJ, ...) whose FormIDs come from
-        # alloc_formid(), a bare sequential counter. A plugin that overrides
-        # such a record must reuse the MASTER's companions, not mint its own —
-        # and it can only do that if the master's run recorded which companion
-        # belongs to which source record.
+        # NPC_ -> OTFT/VTYP, AMMO -> PROJ, ...). A plugin that overrides such a
+        # record must reuse the MASTER's companions, not mint its own — and it
+        # can only do that if the master's run recorded which companion belongs
+        # to which source record.
         #
-        # Rather than touch all 39 alloc_formid() call sites, the writer
-        # records the pairing itself: converters run inside
-        # `converting(source_formid)` and every id allocated during that window
+        # The writer records the pairing itself: converters run inside
+        # `converting(source_formid)` and every id derived during that window
         # is attributed to that source record. No inference, no guessing.
         self._manifest = {}          # source TES4 fid (hex str) -> {...}
         self._converting = None
@@ -493,16 +491,12 @@ class PluginWriter:
     def derive_formid(self, site: str, key) -> int:
         """FormID for a GENERATED record, as a pure function of its source.
 
-        The counter-based alloc_formid() decides an id by WHEN it was called,
-        so any change to how many ids a site consumes renumbers everything
-        after it. That breaks save games, and it breaks them differently on
-        every machine and every converter version.
-
-        This decides an id by WHAT the record is instead. `site` names the kind
-        of generated record ('OTFT', 'ARMA', ...) and `key` identifies what it
-        was generated FROM — normally the source TES4 FormID, which is authored
-        data that never moves. Same source record + same site => same id, on
-        every machine, in every build, regardless of what else changed.
+        An id is decided by WHAT the record is, never by when it was allocated.
+        `site` names the kind of generated record ('OTFT', 'ARMA', ...) and
+        `key` identifies what it was generated FROM — normally the source TES4
+        FormID, which is authored data that never moves. Same source record +
+        same site => same id, on every machine, in every build, regardless of
+        what else changed.
 
         The key MUST be authored data (a source FormID, an EditorID from the
         export). Never a value our own conversion computes — a merged mesh

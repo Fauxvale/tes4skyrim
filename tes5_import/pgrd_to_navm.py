@@ -880,7 +880,7 @@ def convert_PGRD(rec: dict, writer=None,
 
     Args:
         rec:                Parsed PGRD record dict.
-        writer:             PluginWriter (supplies alloc_formid()).
+        writer:             PluginWriter (supplies derive_formid()).
         land_rec:           LAND record for the cell (VHGT height field).
         cell_rec:           CELL record (water height, grid coords).
         refr_recs:          REFR records in this cell (exclusion footprints).

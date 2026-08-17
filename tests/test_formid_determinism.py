@@ -1,29 +1,10 @@
-"""FormID allocation determinism — the save-game compatibility contract.
+"""FormID determinism — the save-game compatibility contract.
 
-`PluginWriter.alloc_formid()` is a bare sequential counter, so a generated
-record's FormID is decided ENTIRELY by the ORDER its allocation call happens in.
-Two runs on the same export must therefore make the same allocation calls in the
-same sequence, or every companion record (ARMA, PROJ, OTFT, SNDR, GLOB, NAVM,
-VTYP, ...) lands on a different id and every user's save game breaks: a save
-stores FormIDs, so a shifted id silently rebinds a saved object to a different
-record.
-
-Nothing about that is enforced by the type system, and the failure is invisible
-in a single run -- the plugin looks perfect, it is only *different* from the
-last build. These tests lock the two mechanisms that actually threaten it:
-
-  1. Set iteration order.  CPython randomises str/bytes hashing per process
-     (PYTHONHASHSEED), so `for x in {'a', 'b'}` yields a different order in
-     different runs. A set-of-strings driving an allocation loop is the classic
-     bug. Sets of ints are stable in practice but are still sorted here.
-  2. Pool completion order.  `as_completed`/`imap_unordered` yield in whatever
-     order workers finish -- wall-clock noise -- so consuming them to allocate
-     ids (or to order records) is nondeterministic by construction.
-
-Verified 2026-08-09 end-to-end: Oblivion.esm (613 MB), Morrowind_ob.esm (206 MB,
-exercises the masters/injected-record path) and DLCBattlehornCastle.esp each
-built byte-for-byte identical under two different PYTHONHASHSEED values. These
-tests are the cheap guard that keeps it that way.
+A save stores FormIDs, so a generated record that lands on a different id
+between builds silently rebinds every saved object that referenced it.
+`PluginWriter.derive_formid(site, key)` hashes the id from the record's SOURCE,
+so allocation order cannot move it; the tests below pin that, plus the record
+ORDER of the output, which must still be reproducible byte for byte.
 """
 
 import ast
@@ -53,15 +34,20 @@ def _rel(path):
 
 
 # ---------------------------------------------------------------------------
-# 1. alloc_formid() must not be reached from a bare set/dict iteration
+# 1. Record emission must not be driven by a bare set/dict iteration
 # ---------------------------------------------------------------------------
 
-def _calls_alloc_formid(node):
-    """True if this subtree calls .alloc_formid()."""
+def _emits_a_record(node):
+    """True if this subtree adds a record to the writer.
+
+    derive_formid() fixes an id regardless of call order, but the ORDER records
+    are written in still has to be reproducible: the output ESM is compared
+    byte for byte, and a set-driven loop reorders the group between runs.
+    """
     for sub in ast.walk(node):
         if (isinstance(sub, ast.Call)
                 and isinstance(sub.func, ast.Attribute)
-                and sub.func.attr == 'alloc_formid'):
+                and sub.func.attr in ('add_record', 'add_records')):
             return True
     return False
 
@@ -93,34 +79,30 @@ def _is_order_safe_iter(node):
     return True
 
 
-def test_alloc_formid_is_never_driven_by_set_iteration():
-    """A set-of-strings feeding an allocation loop shifts ids between runs.
+def test_record_emission_is_never_driven_by_set_iteration():
+    """A set-of-strings feeding an emission loop reorders records between runs.
 
-    Set iteration order depends on PYTHONHASHSEED, so allocating inside
-    `for name in some_set:` gives each name a different FormID run to run.
-    Every such loop in tes5_import is wrapped in sorted() today; this test
-    fails the moment one is not.
+    Set iteration order depends on PYTHONHASHSEED, so emitting inside
+    `for name in some_set:` writes the group in a different order run to run
+    and the output ESM stops being byte-reproducible. Every such loop in
+    tes5_import is wrapped in sorted() today; this fails the moment one is not.
     """
     offenders = []
     for path in _py_files(IMPORT_PKG):
         tree = _parse(path)
         for node in ast.walk(tree):
-            if not isinstance(node, (ast.For, ast.comprehension)):
+            if not isinstance(node, ast.For):
                 continue
-            target_iter = node.iter
-            if _is_order_safe_iter(target_iter):
+            if _is_order_safe_iter(node.iter):
                 continue
-            body = node.body if isinstance(node, ast.For) else []
-            if not body:
-                continue
-            if any(_calls_alloc_formid(stmt) for stmt in body):
+            if any(_emits_a_record(stmt) for stmt in node.body):
                 offenders.append(
-                    f'{_rel(path)}:{node.lineno} — alloc_formid() inside an '
+                    f'{_rel(path)}:{node.lineno} — record emitted inside an '
                     f'unsorted set iteration')
     assert not offenders, (
-        'FormID allocation driven by set iteration (order varies with '
-        'PYTHONHASHSEED, so generated FormIDs shift between runs and break '
-        'save games). Wrap the iterable in sorted():\n  '
+        'Record emission driven by set iteration (order varies with '
+        'PYTHONHASHSEED, so the output ESM differs between runs). Wrap the '
+        'iterable in sorted():\n  '
         + '\n  '.join(offenders))
 
 
@@ -131,10 +113,9 @@ def test_alloc_formid_is_never_driven_by_set_iteration():
 def test_no_completion_order_pool_consumption_in_import():
     """`as_completed`/`imap_unordered` yield in wall-clock finish order.
 
-    Consuming a pool that way to build records or allocate ids makes the output
-    depend on machine load. The import pipeline uses `ex.map`, which preserves
-    submission order, and pre-allocates navmesh FormIDs serially BEFORE dispatch
-    (import_main._precompute_navmeshes). Keep it that way.
+    Consuming a pool that way to build records makes the output depend on
+    machine load. The import pipeline uses `ex.map`, which preserves submission
+    order. Keep it that way.
     """
     offenders = []
     for path in _py_files(IMPORT_PKG):
@@ -159,7 +140,7 @@ def test_directory_listings_are_sorted():
 
     parse_export_directory sorts os.listdir() so the record list -- and hence
     every conversion loop built on it -- is stable. An unsorted listing that
-    feeds conversion would reorder records and shift every allocated FormID.
+    feeds conversion would reorder records in the output.
     """
     offenders = []
     for path in _py_files(IMPORT_PKG):
@@ -184,8 +165,6 @@ def test_directory_listings_are_sorted():
 # 4. Derived FormIDs are a pure function of their SOURCE record
 # ---------------------------------------------------------------------------
 #
-# A counter decides an id by WHEN it was called, so any change to how many ids
-# a site consumes renumbers everything after it — the drift that breaks saves.
 # derive_formid decides an id by WHAT the record is, so nothing about ordering,
 # volume or machine can move it.
 
@@ -209,9 +188,8 @@ def test_derived_ids_are_stable_across_writers():
 def test_derived_ids_do_not_depend_on_allocation_ORDER():
     """The whole point: call order must not decide an id.
 
-    This is the exact inverse of the old counter contract. A site that starts
-    allocating a second id, a new site added anywhere, or a reordered export
-    must all leave existing ids untouched.
+    A site that starts allocating a second id, a new site added anywhere, or a
+    reordered export must all leave existing ids untouched.
     """
     from tes5_import.writer import PluginWriter
 

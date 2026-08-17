@@ -39,7 +39,8 @@ caching, skipped record types, the export text format, and the directory layout.
 ### Process
 
 - **Do one bug at a time.** Make the edits before moving to the next. If you find
-  another bug while investigating, fix it too.
+  another bug while FIXING, fix it too — but if the task was a question, a plan,
+  an analysis, or a doc edit, REPORT it and do not write code.
 - **Work in the order the prompt presents.** Highest priority first.
 - **Never stop mid-task to report or ask.** Finish everything, verify, then reply.
 - **All fixes must be generic.** Never patch to satisfy a single record or file.
@@ -85,9 +86,12 @@ caching, skipped record types, the export text format, and the directory layout.
   output — `tools/` scripts take arguments and produce general output, so they are
   reusable next time.
 - **Always record new learnings** in this file or, more likely, the relevant `docs/` file.
+- **KEEP THIS FILE EXTREMELY TERSE.** Every rule is the shortest sentence that
+  states it. No rationale, history, worked examples, or "rewritten on <date>"
+  notes — those go in `docs/`, linked. Editing a rule means it gets SHORTER.
 - Docs can be wrong: they sometimes describe fixes that were never implemented.
   Grep the source before claiming a mechanism exists, and fix the doc.
-- When building test scripts, always output as they go so that if the time goes past the hard 120 second timeout limit you still get some output. When running the real pipeline and not a test script this limit doesn't apply. For example when you are done with your work and rebuilding.
+- Test scripts must print as they go, so a 120s timeout still yields output.
 - **LISTEN CAREFULLY to EXACTLY what the user's prompt says**. Seek to understand any implementation ideas instead of using your pre-conceived notions
 - If you need to continue iterating on an idea with only marginal improvments in some areas and regressions in another, your idea is likely incorrect and you need to find another one
 - **Look for the AUTHORED indicator** If you need to resort to heuristics, your approach is most likely incorrect. Remember, everything in the original plugin works for a reason
@@ -97,50 +101,30 @@ caching, skipped record types, the export text format, and the directory layout.
 
 ### <a id="regression-read-the-commits"></a>🛑 IF IT IS A REGRESSION, READ THE COMMITS
 
-**"This used to work" / "this is a recent regression" means the cause is ON A
-`+` LINE IN A RECENT DIFF. Go read the diffs. That is the entire method.**
+**"This used to work" means the cause is ON A `+` LINE IN A RECENT DIFF.**
 
 ```bash
 git log --oneline --since=3.days                 # candidates
 git show <sha> -- script_convert/ tes5_import/   # READ THE + LINES
 ```
 
-Read the changed *logic* and ask "what does this make the output do
-differently?" A regression cannot come from code that did not change, so the
-broken code is sitting in that window waiting to be read.
+Read every candidate diff BEFORE rebuilding at an old commit, writing a probe
+script, or re-examining the same record again — those all waste the cycle and
+the probe is usually wrong. "Nothing changed in this window" is a broken tool,
+not proof.
 
-**Do NOT do any of these before you have read every candidate diff:**
-
-- **Rebuilding the plugin at an old commit to A/B artifacts.** Minutes per
-  build, and `git checkout <sha> -- <paths>` **WRITES THE INDEX** — it silently
-  staged 30 files and violated the never-stage rule.
-- **Writing probe scripts to dump and compare records.** The probe is usually
-  wrong. One reported records "identical" while the raw bytes went 21120 → 786.
-- **Re-examining the same record from new angles.** That is a loop, not
-  progress.
-- **Concluding "nothing changed in this window, so it must be older."** That is
-  almost always a broken tool or the wrong artifact — not proof.
-
-**A generated `.psc`/`.pex` is an artifact too.** `--import-only` does NOT
-regenerate scripts, so a script-side regression stays invisible until
-`--scripts-only` runs. If the symptom is behavioural, suspect the generated
-Papyrus and read `script_convert/` diffs.
-
-(2026-08-06: the user said "check the commits" in their first message and
-repeated it five more times while I kept measuring instead. Hours lost. The bug
-was one readable hunk in `script_convert/pipeline.py` — a sequence gate wrapped
-around a fragment body including its `SetStage`, so an out-of-turn fragment
-applied nothing and the CharacterGen conversation stalled forever.)
+A generated `.psc`/`.pex` is an artifact too: `--import-only` does NOT
+regenerate scripts, so a behavioural regression means reading
+`script_convert/` diffs and running `--scripts-only`.
 
 ### Verifying your work
 
 **Always check theories against several of these** before acting:
 
-1. The Skyrim executable at `D:\Other Games\Skyrim Anniversary Edition\SkyrimSE.exe`
-   — this is the GOG/AE build and is **NOT DRM-packed**, so it disassembles
-   statically. (Only the *Steam* copy is encrypted, `.text` entropy 8.00 — don't
-   confuse the two and conclude the exe is unreadable.) Crash logs from the Steam
-   build map across via the Address Library (stable ID → per-build RVA). Don't be wary of dissassembly. It doesn't have to be the last resort!
+1. The Skyrim exe at `D:\Other Games\Skyrim Anniversary Edition\SkyrimSE.exe`
+   — GOG/AE, **not DRM-packed**, so it disassembles statically (the *Steam*
+   copy is encrypted). Crash logs map across via the Address Library.
+   Disassembly is a first resort, not a last one.
 2. The Oblivion/Nehrim install at `D:\Other Games\Nehrim At Fate's Edge\Data`.
 3. xEdit source at `references/xEdit` — `Core/` documents the binary structure of
    every record type. This is the first stop for any format question. Or if working with meshes, go to the Nifskope source at `references/Nifskope`
@@ -152,18 +136,13 @@ applied nothing and the CharacterGen conversation stalled forever.)
 6. A web search for other authoritative sources.
 7. The Papyrus logs from the last in-game run — read them to diagnose a runtime
    symptom (see the directory-purpose table under Hard prohibitions).
-8. <a id="attach-to-the-live-game"></a>**The LIVE game process — for any hang or
-   freeze, ask the user to leave it running and attach to it.** Beats every
-   source above when there is no crash log. `Get-Process` (one thread Running +
-   CPU climbing + memory FLAT = infinite loop) then `cdb.exe -pv -p <pid>`
-   (non-invasive) for `~* k` stacks, `u`, `dd`. Steam's `.text` is packed on
-   disk but DECRYPTED IN MEMORY, so the live process disassembles even though
-   the file does not — and its RVAs match the running build, which GOG/AE's do
-   not. Recipe and worked example: `project_refr_angle_normalize_hang`.
-9. Failing all the above, add comprehensive logging so the user's next run
-   captures everything needed. Make it thorough — one wasted round trip costs the
-   user a full build-and-play cycle, and their time is far more valuable than
-   yours.
+8. <a id="attach-to-the-live-game"></a>**The LIVE game process — for any hang,
+   ask the user to leave it running and attach.** Beats everything above when
+   there is no crash log; the live Steam process disassembles (decrypted in
+   memory) with RVAs matching the running build. Recipe:
+   `project_refr_angle_normalize_hang`.
+9. Failing all the above, add thorough logging for the user's next run — one
+   wasted round trip costs them a full build-and-play cycle.
 
 Never attribute a bug to LE-vs-SSE mesh format differences — verify engine
 theories externally first.
@@ -191,19 +170,10 @@ real data, or a failing-then-passing test.
   `rm`. `git reset` destroys the user's own staging.
 
   <a id="staging-is-single-use"></a>**Authorization to stage is SINGLE-USE and
-  CHUNK-SCOPED.** An explicit "go ahead and stage" covers **that one staging
-  action and nothing after it**. It does not carry to your next edit, the next
-  turn, or the end of the session — the next time you want to stage, you need a
-  new explicit instruction. Specifically:
-  - **Stage HUNKS, never whole files.** Stage only the chunks you just wrote.
-    A file you edited almost always contains the user's own uncommitted work
-    too, and `git add <file>` silently swallows it into your commit's scope.
-    Use `git apply --cached` with a patch limited to your hunks.
-  - **NEVER `git add -A` / `-u` / `.`** — no exceptions, ever.
-  - **Never re-stage "to be helpful"** after a later edit. Staging you were not
-    asked for a second time is a violation even if the first one was authorized.
-  - If you are unsure whether the authorization still applies, it does not.
-    Leave the index alone and say so in your final report.
+  CHUNK-SCOPED** — it covers that one action, not your next edit or turn. Stage
+  HUNKS via `git apply --cached`, never whole files (they carry the user's own
+  work). **NEVER `git add -A` / `-u` / `.`** If unsure whether authorization
+  still applies, it does not.
 - **NEVER go snooping in the live, heavily-modded SSE install.** It is full of
   other mods' assets, so nothing you find there tells you anything about this
   converter. In particular: **never inspect it to check whether your changes were
@@ -216,79 +186,49 @@ real data, or a failing-then-passing test.
   | Oblivion / Nehrim LE install | BSA files and NIFs | anything Skyrim-side |
   | The modded SSE install | **Papyrus logs, and reading `Skyrim.esm`** | everything else, especially verifying deployment |
 - **Never run the full pytest suite** — only the tests for files you changed.
-- **KEEP EVERY TEST COMMAND / SCRIPT UNDER 120 SECONDS. Never set a long timeout.** If a command
-  needs minutes, you have picked the wrong scope — narrow it instead: one cell,
-  not a worldspace; 2-3 NIFs, not a tree; one record type, not the whole plugin;
-  the per-cell tool (`navmesh_tri_check --cell X`) instead of the batch sweep.
-  Most tools take `--cell` / `--max N` / `--workers` for exactly this. A long
-  timeout burns the user's wall-clock and usually hides a scoping mistake; if
-  something genuinely cannot be scoped down, say so instead of waiting on it.
-- If file recovery is in progress, make zero writes to the affected drive; ask
-  first before any bulk operation.
-- **NEVER stop in the middle of an incomplete task to give a mid-session update**
-  I don't want to know. I want you to complete the task you have been given
+- **KEEP EVERY TEST COMMAND / SCRIPT UNDER 120 SECONDS. Never set a long
+  timeout.** Narrow the scope instead: one cell, not a worldspace; 2-3 NIFs,
+  not a tree; one record type, not the whole plugin. Most tools take `--cell` /
+  `--max N` / `--workers` for exactly this. If something genuinely cannot be
+  scoped down, say so instead of waiting on it. **Does NOT apply to real
+  pipeline runs** (`convert.py --import-only` etc.), which take as long as they
+  take — see [BUILD EVERY FILE](#build-every-file).
+- **NEVER stop mid-task for a status update** — see [no stopping](#no-stopping).
 
 ### Working with the user
 
 - **NEVER STOP TO GIVE A MID-SESSION STATUS REPORT.** Not "here's where I am",
   not "should I continue?", not a summary of progress so far. Finish the whole task, then report once. A status update mid-task is a failure, not politeness. If something the user has asked for remains unsolved, YOU ARE NOT DONE!
 
-  <a id="no-stopping"></a>**The stop rule has NO exceptions. Low confidence is
-  not one.** Every violation of this rule in practice has come from the same
-  place: being wrong two or three times in a row, losing confidence, and
-  reaching for confirmation before "wasting" another build cycle. That instinct
-  feels like diligence. It is the exact failure this rule exists to prevent —
-  the moment you most want to stop is the moment stopping costs the user most.
-  The tradeoff is ALREADY DECIDED: **the user would rather you finish and be
-  wrong than stop and ask.** Do not re-derive that decision. It is not yours.
+  <a id="no-stopping"></a>**Low confidence is NOT an exception.** The tradeoff
+  is already decided: **the user would rather you finish and be wrong than stop
+  and ask.** Being wrong repeatedly obligates you to keep going — go back to
+  "Verifying your work", find a DIFFERENT mechanism, and build it.
 
-  These are all violations, no matter how they are phrased:
-  - "I'd rather confirm the diagnosis before proceeding, given my track record"
-  - "Two paths here, which do you want?" (pick the better one and say why in the
-    final report)
-  - "Want me to X, or stop at Y?" — just do X
-  - Ending a turn with findings + a question instead of findings + a finished fix
-  - "I haven't started it — say the word and I'll go" — you had the word already
-  - A summary that *reads* complete but leaves the task unfixed
-  - **"I found the real cause but haven't built the fix"** — the diagnosis is
-    the easy half. Build it.
-  - **Confessing a bad track record as the reason to stop** ("I've been wrong
-    five times, I won't claim a sixth without validating"). This is the most
-    seductive form because it sounds like integrity. It is a stop.
+  All stops, however phrased: "which do you want?" (pick one), "want me to X?"
+  (do X), findings + a question instead of findings + a fix, "I found the cause
+  but haven't built it" (build it), and <a id="honesty-costume"></a>**confessing
+  a bad track record as the reason to stop — a stop in the costume of honesty
+  is still a stop.**
 
-  <a id="honesty-costume"></a>**A STOP IN THE COSTUME OF HONESTY IS STILL A
-  STOP.** (2026-08-05, sixth violation in one session.) After five wrong theories
-  on silent creatures, the correct root cause was found — zero IPDS/IPCT/FSTP/
-  FSTS records — written up, and then *handed back unbuilt* with "I'd rather tell
-  you that plainly than hand you another 'verified' rebuild that turns out silent
-  again." The user's reply: "NEVER STOP NEVER STOP NEVER STOP... WHY DO YOU KEEP
-  STOPPING?" Naming your own unreliability does not buy permission to quit — it
-  is the low-confidence trigger with better prose. **One finished task is worth
-  more than every apology combined.**
-
-  **Uncertainty is reported, never resolved by asking.** If you are unsure,
-  state the assumption plainly IN THE FINAL REPORT, having already done the
-  work under it. If two approaches are viable, implement the one you'd defend
-  and note the alternative at the end. If part of the task is genuinely blocked,
-  finish every unblocked part, then say exactly what was blocked and why.
-  A question is only ever permitted when proceeding would be UNSAFE or
-  DESTRUCTIVE (deleting the user's data, force-pushing, writing during a
-  recovery) — never because you are unsure whether your fix is right.
-
-  **Being wrong repeatedly does not earn a check-in — it obligates you to keep
-  going.** Go back to the sources in "Verifying your work", find a DIFFERENT
-  mechanism, implement it, build it, and report once at the end.
+  **Uncertainty is reported, never resolved by asking.** State the assumption in
+  the FINAL REPORT, having done the work under it. Finish every unblocked part
+  and say what was blocked. A question is only ever permitted when proceeding
+  would be UNSAFE or DESTRUCTIVE (deleting data, force-pushing,
+  [causing FormID drift](#formid-drift)) — never because you are unsure
+  whether your fix is right. Asking the user to DO something is a request, not
+  a stop — but **only when they are the ONLY one who can do it** (leave the
+  game running, play a build). Anything you could do yourself, DO. The user's
+  time is worth far more than yours.
 - **Measure the invariant the user asked for, not a proxy for it.**
 - **Trust the user's in-game test results as ground truth.** Never question
   whether they tested something, and never rebut a reported result with file
   timestamps or a reconstructed timeline. (Reading Papyrus logs to *diagnose* is
   encouraged — using them to dispute the user's report is not.)
 - **On a hang, ask EARLY for the game to be left running with the bug onscreen**
-  ("don't close it, I can attach to it") — it is nearly free for the user and
-  pins the exact faulting state. Asking is a request, not a question about the
-  fix, so it is not stopping: keep working while you wait. See
-  [the live game process](#attach-to-the-live-game).
-- **BUILD EVERY FILE YOUR CHANGES TOUCH, before reporting back.** The user should
+  ("don't close it, I can attach to it") — nearly free for the user, and it pins
+  the exact faulting state. See [the live game process](#attach-to-the-live-game).
+- <a id="build-every-file"></a>**BUILD EVERY FILE YOUR CHANGES TOUCH, before reporting back.** The user should
   be able to launch the game and verify immediately — never leave them to work out
   which stage to re-run, and never hand back a change that only compiles in
   theory. Map the files you edited to stages and run each one into `output/`:
@@ -313,13 +253,13 @@ real data, or a failing-then-passing test.
   edit, run the targeted tests, and re-read your own diff FIRST.
 - **A FULL `--meshes-only` REBUILD IS LONG AND EXPENSIVE (~20,000 meshes, many
   minutes at 100% CPU). Never launch one lightly.** Rebuild ONLY the meshes your
-  change actually affects. Ressrve the full stage for changes that genuinely touch every mesh, and say so when you run one.
+  change affects. Reserve the full stage for changes that genuinely touch every
+  mesh, and say so when you run one.
 - **Build the mesh the user named, in the PLUGIN the user named** If they say a mesh is a Nehrim issue, rebuild it under `Nehrim.esm` even if there is a same-named mesh under `Oblivion.esm`
-- **Never run two CPU-saturating jobs at once.** While a build is running, do not
-  start pytest, a mesh sweep, or a second build — they fight for every core, both
-  take longer, and the machine becomes unusable. Wait for the completion
-  notification, then run the next thing. While waiting, WAIT — don't burn tokens
-  on filler work.
+- **Never run two CPU-saturating jobs at once.** The order is **targeted tests
+  first, then builds, one at a time.** While one runs, do not start pytest, a
+  mesh sweep, or a second build — wait for the completion notification, then
+  run the next. While waiting, WAIT — don't burn tokens on filler work.
 - **While iterating on a repeated failure, don't write tests, update docs, or ANYTHING until
   the fix is CONFIRMED in-game.** Each round trip costs the user a full
   build-and-play cycle, so spend it on the diagnosis and the candidate fix only.
@@ -365,15 +305,18 @@ real data, or a failing-then-passing test.
   Rules and measured results: [docs/performance_notes.md](docs/performance_notes.md).
 - **Never exhaust memory**: some pool tools load the ~2.1 GB export index per
   worker. Cap `--workers` or run single-process.
-- **<a id="formid-drift"></a>NEVER CAUSE FORMID DRIFT — AND SAY SO IF YOU DO.**
-  `alloc_formid()` is a bare `+1` counter, so an id is set purely by its call's
-  POSITION: add/remove/reorder ONE earlier allocation and every later id shifts,
-  silently corrupting every save. Add new generators at the END, never delete a
-  "dead" allocation, never unwrap a `sorted()` around a set. If a change shifts
-  ids anyway, **lead the final report with it** (types, rough count, why it was
-  unavoidable) — never bury it, never accept drift for tidiness. Guarded by
-  `tests/test_formid_determinism.py`; details and the per-file fragility map:
-  [performance_notes.md#formid-fragility-map](docs/performance_notes.md#formid-fragility-map).
+- **<a id="formid-drift"></a>FORMIDS ARE HASHED, NOT COUNTED.**
+  `derive_formid(site, key)`. Allocation order is irrelevant — add generators
+  anywhere.
+  - **`key` must be AUTHORED data** (source FormID, EditorID, TES4 model path),
+    never a value we compute — that moves ids and breaks saves.
+  - 🛑 **NEVER SHIP DRIFT WITHOUT ASKING FIRST.** Moving even one existing id
+    breaks saves. Measure the count, STOP, and ask — this is the unsafe-action
+    exception to [never stopping](#no-stopping), not a report-it-afterwards.
+    Changing the hash input, region, or `FORMID_SCHEME_VERSION` renumbers
+    everything.
+  Guarded by `tests/test_formid_determinism.py`; details:
+  [performance_notes.md](docs/performance_notes.md#formid-determinism--the-save-game-contract-rewritten-2026-08-17).
 
 ### Output paths
 
@@ -383,11 +326,8 @@ overwrite a folder with a file, not that a file is locked.
 
 ### <a id="shared-navmesh-cache"></a>The shared navmesh cache
 
-Navmesh generation is the slowest import stage. Results are cached per cell in
-`export/<plugin>/navmesh_geom_cache/*.pkl`, and that cache is **published as a
-GitHub Release asset** so downloaders don't regenerate it — not committed
-(git keeps every version of a churning binary forever) and not Git LFS (free
-tier: 1 GB bandwidth per *month*, about three clones).
+Navmesh generation is the slowest import stage; per-cell results are cached and
+published as a GitHub Release asset.
 
 ```bash
 python tools/navmesh_cache.py verify  --plugin Oblivion.esm   # publishable?
@@ -396,31 +336,13 @@ python tools/navmesh_cache_hook.py --install                  # gate pushes
 python tools/navmesh_cache_hook.py --run                      # publish manually
 ```
 
-- **NEVER ship `collision_cache.bin`.** It maps Oblivion mesh *paths* to
-  verbatim Havok collision triangles lifted from Bethesda's NIFs — derived
-  asset data keyed by asset name. Only the generated `navmesh_geom_cache`
-  pickles (hash + verts + tris + ledges, our own output) go in the archive, and
-  the manifest carries just a one-way hash of the collision cache to prove a
-  local build matches. Same reason archiving names the cache dir explicitly:
-  globbing `export/**/*.pkl` would sweep in the ~2.1 GB index pickles.
-- **Invalidation is per mesh, not per file.** Each cell's hash folds in the
-  collision digest of only the meshes *that cell places*
-  (`collision_extract.collision_digest`), so replacing a few meshes costs only
-  the cells that use them. It used to hash the whole collision file, where one
-  changed mesh invalidated all ~8,200 Oblivion entries.
-- **The cache tag must stay machine-independent.** It hashes the navmesh
-  sources only. It previously folded in `collision_cache.bin`'s *mtime*, which
-  is machine-local and survives neither git nor an unzip — every downloader
-  computed a different tag and the shared cache would have missed 100% of the
-  time. Never reintroduce mtime, absolute paths, or worker counts into any
-  cache key.
-- **`CACHE_TAG` is written only by a real, failure-free generation pass.**
-  Computing the tag must never stamp it, or reading the tag would certify a
-  stale cache as fresh. A stale entry always regenerates, so a wrong cache is
-  *slow*, never *incorrect*.
-- The pre-push gate only runs on **direct pushes to master** (a PR merged in
-  GitHub's UI runs no local hook) — CI cannot validate a cache built from
-  gitignored `export/` data. Use `--run` for the PR case.
+- **NEVER ship `collision_cache.bin`** — it holds Bethesda's Havok triangles
+  keyed by asset path. Only our own `navmesh_geom_cache` pickles go in.
+- **Never put mtime, absolute paths, or worker counts in a cache key** — they
+  are machine-local, so every downloader misses.
+
+Why, and the invalidation/tag contracts:
+[world_land_navmesh_notes.md](docs/world_land_navmesh_notes.md#the-shared-navmesh-cache--design-rationale).
 
 ---
 

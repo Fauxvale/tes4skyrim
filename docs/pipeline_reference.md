@@ -152,37 +152,24 @@ either way.
 - Processing `Knights.esp` reuses the cached `Oblivion.esm` export + mappings.
 - `--no-cache` forces a re-export.
 
-### 🔴 Generated FormIDs are NOT stable across builds — an old save is not a valid test bed
+### Generated FormIDs are stable across builds
 
-`writer.alloc_formid()` is a plain sequential counter, so every record the
-importer *invents* (as opposed to converting from TES4) takes the next number in
-one shared stream. Adding or removing records anywhere early shifts everything
-after it. On Nehrim that stream holds **25,891 records**:
+Every record the importer *invents* (ARMA, OTFT, NAVM, VTYP, SNDR, …) gets its
+id from `writer.derive_formid(site, key)`, which hashes the SOURCE record's
+authored identity. Adding, removing or reordering generated records leaves
+every other id untouched, so an existing save stays valid across a rebuild.
 
-| | |
-|---|---|
-| REFR | 11,111 |
-| NAVM | 3,350 |
-| ARMA | 2,215 |
-| OTFT | 1,754 |
-| IDLE / STAT / SNDR / DLBR | 1,386 / 1,248 / 1,045 / 916 |
-| VTYP | 116 |
+Two things still renumber a plugin and require a new game:
 
-Skyrim persists an actor's inventory and a reference's state in the save once it
-has been loaded. Re-run `--import-only` after a change that emits a different
-number of early records — 2026-08-08 the voice fix added 28 VTYP and the
-female-only-armature fix added 5 ARMA — and every OTFT, ARMA and REFR after them
-moves. A save made against the previous ESM then resolves an actor's stored
-equipment to FormIDs that now mean something else, and the actor **stands there
-naked** even though the outfit, the armature and the meshes are all correct.
-That exact false alarm cost a debugging cycle: `ErothinKampfmagier01` verified
-clean at every level (5-piece outfit, armature present, meshes on disk,
-BSDismember partition 32, `_0`/`_1` pair complete) and was still naked in game.
+- Changing the hash input, the derived region, or `FORMID_SCHEME_VERSION`.
+- Changing which authored records exist (a different source plugin version).
 
-**Always test an ESM change on a NEW GAME.** `resetinventory` on the actor is the
-quick confirmation — if it dresses, the save was stale, not the build. Making
-the allocation deterministic (keyed on the source record rather than on
-call order) would fix this properly and is not yet done.
+Full contract: [performance_notes.md](performance_notes.md#formid-determinism--the-save-game-contract-rewritten-2026-08-17).
+
+Historical note: this used to be a bare `+1` counter, and a shifted id made
+`ErothinKampfmagier01` appear **naked** in an old save with the outfit,
+armature and meshes all correct — a false alarm that cost a debugging cycle.
+If you see that class of symptom now, it is NOT id drift; look elsewhere.
 
 ## Stages
 

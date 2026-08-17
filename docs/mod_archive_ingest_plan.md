@@ -522,8 +522,8 @@ Synthetic in-memory zips, well under the 120 s limit.
 
 ## 8. Risks and decisions
 
-- **FormID drift: none.** Ingest touches no `alloc_formid()` call site; it only
-  moves bytes into `export/`.
+- **FormID drift: none.** Ingest mints no records at all; it only moves bytes
+  into `export/`.
 - **Determinism.** Members iterate in **sorted order**, not archive order, so
   equivalent archives produce identical trees.
 - **Case.** Elsweyr ships `Meshes\`/`Textures\` capitalised; all matching is

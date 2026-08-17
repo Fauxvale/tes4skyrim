@@ -857,13 +857,10 @@ the winning one, so an empty NVPP would replace the vanilla precomputed-path/
 road network. `navi_builder.read_master_nvpp` re-ships the newest vanilla blob
 from the registry-detected SSE install.
 
-**FormID-allocation stability.** The old code allocated the NAVI's FormID from
-`writer.alloc_formid()`; switching to the fixed singleton id removed that
-allocation and SHIFTED every later-allocated FormID (all generated
-DIAL/INFO/DLBR/DLVW/LCTN/SNDR records — thousands) relative to previously
-shipped builds, which scrambles any existing save's script/dialogue state. The
-import now burns one id at the same point to keep the layout stable. Never
-add or remove an `alloc_formid()` call without accounting for this.
+**The NAVI takes the fixed singleton id** `0x00012FB4`, not a generated one.
+Generated ids are hashed from their source record, so removing the NAVI's own
+allocation moves nothing else — an earlier burn-one-id workaround, needed when
+ids came from a positional counter, is gone.
 
 **Reachability tool**: `python tools/navmesh/reach.py <esm> --from-ref <fid>
 --to-ref <fid> [--cell <fid> --components]` — decodes every NAVM, builds the
@@ -1092,3 +1089,42 @@ LOD copy wins. This is harmless — but note that **`--import-only` refreshes on
 the per-plugin copy**, so after an import-side change the game still loads the
 older AutoConvertLOD mesh until a LOD run regenerates it. Verify the copy that
 actually wins before concluding a cloud-bank change had no effect.
+
+## The shared navmesh cache — design rationale
+
+Navmesh generation is the slowest import stage. Results are cached per cell in
+`export/<plugin>/navmesh_geom_cache/*.pkl` and published as a **GitHub Release
+asset** so downloaders don't regenerate them. Not committed (git keeps every
+version of a churning binary forever) and not Git LFS (free tier is 1 GB
+bandwidth per *month* — about three clones).
+
+Commands are in [CLAUDE.md](../CLAUDE.md#shared-navmesh-cache).
+
+**Never ship `collision_cache.bin`.** It maps Oblivion mesh *paths* to verbatim
+Havok collision triangles lifted from Bethesda's NIFs — derived asset data keyed
+by asset name. Only the generated `navmesh_geom_cache` pickles (hash + verts +
+tris + ledges, our own output) go in the archive; the manifest carries a one-way
+hash of the collision cache to prove a local build matches. For the same reason
+archiving names the cache dir explicitly: globbing `export/**/*.pkl` would sweep
+in the ~2.1 GB index pickles.
+
+**Invalidation is per mesh, not per file.** Each cell's hash folds in the
+collision digest of only the meshes *that cell places*
+(`collision_extract.collision_digest`), so replacing a few meshes costs only the
+cells that use them. It used to hash the whole collision file, where one changed
+mesh invalidated all ~8,200 Oblivion entries.
+
+**The cache tag must stay machine-independent.** It hashes the navmesh sources
+only. It previously folded in `collision_cache.bin`'s *mtime*, which is
+machine-local and survives neither git nor an unzip — every downloader computed
+a different tag and the shared cache would have missed 100% of the time. Never
+reintroduce mtime, absolute paths, or worker counts into any cache key.
+
+**`CACHE_TAG` is written only by a real, failure-free generation pass.**
+Computing the tag must never stamp it, or reading the tag would certify a stale
+cache as fresh. A stale entry always regenerates, so a wrong cache is *slow*,
+never *incorrect*.
+
+**The pre-push gate only runs on direct pushes to master** (a PR merged in
+GitHub's UI runs no local hook) — CI cannot validate a cache built from
+gitignored `export/` data. Use `--run` for the PR case.

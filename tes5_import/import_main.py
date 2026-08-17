@@ -434,13 +434,13 @@ def _create_chargen_menu_records(writer: PluginWriter, plan: dict) -> dict:
     these records and the page/button order matches the converter's Show()
     chain arithmetic.
 
-    FIXED FormIDs, deliberately NOT alloc_formid(): the allocator is a bare
-    +1 counter, so allocating here would shift every id allocated after this
-    step (all generated dialogue, navmeshes, ...) and scramble existing
-    saves.  writer.chargen_fid_base sits mid-way into the reserved gap
-    import_plugin opens between the plugin's highest real FormID and the
-    allocator base — clear of real records below, companions above, and the
-    null-LAND repair working down from the gap's top.
+    FIXED FormIDs from a reserved window rather than derive_formid(): these
+    ids are a contiguous, order-significant page/button block, which a hash
+    cannot give.  writer.chargen_fid_base sits mid-way into the reserved gap
+    import_plugin opens above the plugin's highest real FormID — clear of real
+    records below and of the null-LAND repair working down from the gap's top.
+    The window is reserved with reserve_source_ids() so no derived id can hash
+    onto it.
     """
     name_to_fid = {}
     k = 0
@@ -861,9 +861,8 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # Fixed-id window for the chargen menu MESGs (_create_chargen_menu_records)
     # in the middle of the reserved gap: real records stop at or below
     # max_formid, companions start at +0x1000, and the null-LAND repair takes
-    # from the gap's TOP downward — mid-gap collides with neither, and fixed
-    # ids mean adding these records cannot shift any allocated id (no
-    # FormID drift, saves survive).
+    # from the gap's TOP downward — mid-gap collides with neither. Reserved
+    # below so no derived id hashes onto the window.
     writer.chargen_fid_base = (file_index << 24) | (max_formid + 0x800)
 
     # Derived ids are hashed across the plugin's whole id space, so every id a
@@ -1027,7 +1026,8 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # Chargen menus (ShowBirthsignMenu / ShowClassMenu → modal Message
     # pages).  Same shared-plan contract as the button menus above; the
     # records live at FIXED ids in the reserved FormID gap (see
-    # writer.chargen_fid_base) so adding them cannot shift any allocated id.
+    # writer.chargen_fid_base) because the page/button block must be
+    # contiguous and ordered.
     from script_convert.message_menus import build_chargen_menus
     _spel_map = {int(r['FormID'], 16) & 0xFFFFFF: r['EditorID']
                  for r in by_type.get('SPEL', [])
@@ -1539,11 +1539,10 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
 
     # Serial on purpose: this whole phase is ~1.5s of GIL-bound Python, so a
     # thread pool adds no speed — but it DID make the output nondeterministic:
-    # converters that allocate companion records (ARMA, aimed-MGEF clones, …)
-    # called writer.alloc_formid() in thread-completion order, so companion
-    # FormIDs and record order shuffled between runs. A plain loop keeps the
-    # ESM byte-reproducible. (The genuinely heavy conversion work — text parse,
-    # LAND, navmeshes — runs in process pools elsewhere.)
+    # converters that emit companion records (ARMA, aimed-MGEF clones, …) added
+    # them in thread-completion order, so record order shuffled between runs. A
+    # plain loop keeps the ESM byte-reproducible. (The genuinely heavy
+    # conversion work — text parse, LAND, navmeshes — runs in pools elsewhere.)
     for sig, target_sig, rec in work_items:
         converter = IMPORT_DISPATCH[sig]
         try:
@@ -1623,8 +1622,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # Skyrim has no per-weather HDR field: tone mapping lives in an imagespace
     # the weather points at, so each converted weather mints four IMGS (one
     # per time of day) from its TES4 HNAM block.  Serial, like the other
-    # companion-allocating phases, so writer.alloc_formid() stays
-    # deterministic.
+    # companion-emitting phases, so record order stays deterministic.
     from .record_types.dialog_misc import convert_WTHR, set_nam0_normalization
     wthr_records = by_type.get('WTHR', [])
     if wthr_records:
@@ -2552,16 +2550,19 @@ def _repair_null_land_formids(by_type: dict, own_index: int,
     the records at load-order index 0x10 where no plugin exists, so the engine
     could not resolve them either.
 
-    The ids come from the RESERVED GAP between the plugin's highest real
-    FormID and `alloc_formid()`'s base, which `import_plugin` opens as
-    `max_formid + 0x1000` and nothing ever occupies: real records stop at or
-    below max_formid, companions start above the gap. Taking them from the TOP
-    of that gap downward keeps them clear of both ends.
+    The ids come from the RESERVED GAP above the plugin's highest real FormID,
+    which `import_plugin` opens as `max_formid + 0x1000` and nothing else ever
+    occupies: real records stop at or below max_formid, companions start above
+    the gap. Taking them from the TOP of that gap downward keeps them clear of
+    both ends.
 
-    This deliberately does NOT call `alloc_formid()`. Allocation is positional
-    — one extra call shifts every later id and invalidates saves — whereas
-    these ids are a pure function of max_formid and the record's order in the
-    export, so they are stable across runs and cost no allocations.
+    These ids are assigned POSITIONALLY (a counter walking down the gap in
+    export order), which is the one place the converter still keys an id on
+    something other than authored data: inserting a null-id LAND would
+    renumber the ones after it. Hashing the parent CELL instead would fix that
+    but MOVES ALL 7 EXISTING IDS in ElsweyrAnequina.esp, so it is deliberately
+    NOT done — the drift costs more than the fragility. Do not "fix" this
+    without deciding to renumber.
     """
     lands = by_type.get('LAND') or []
     nulls = [r for r in lands
