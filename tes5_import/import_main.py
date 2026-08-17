@@ -1382,9 +1382,13 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     _script_vars = build_script_var_map(by_type, _master_export)
     _sv_owner = build_scriptvar_owner_map(by_type, fid_to_edid)
     pack_plan = PackagePlan()
+    # The MASTERS' packages, quests, actors and placements go in too: a
+    # dependent plugin's actors mostly run THEIR MASTER'S packages, and an
+    # unresolved package/actor/quest silently drops the actor back to its
+    # standing Sandbox schedule (see PackagePlan.build).
     pack_plan.build(by_type,
                     {get_formid(r, 'FormID') for r in by_type.get('QUST', [])},
-                    _sv_owner)
+                    _sv_owner, _master_export)
     print(f"  Package plan: {pack_plan.summary()}")
 
     # Quest packages live on a QUST alias (ALPC), not in the actor's PKID list.
@@ -1394,30 +1398,44 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     from .pack_converter import PackContext
     # REFR -> base signature, so UseItemAt can tell furniture (sit) from a
     # switch/lever/door (activate).  Built from the base records already parsed.
+    # Every map here is keyed on the RAW LOW-24 FormID, which is identical in
+    # the master's index space and ours, so a master's record can be seeded
+    # straight from its own `FormID` field with no remapping. The masters go in
+    # FIRST so this plugin's own records win. Without them a package targeting
+    # one of the master's refs resolves to no signature at all, and
+    # _operate_target / the actor-Find branch fall through to the default.
+    def _iter_bases(sigs):
+        for _sig in sigs:
+            if _master_export:
+                for _r in _master_export.values():
+                    if _r.get('Signature') == _sig:
+                        yield _sig, _r
+            for _r in by_type.get(_sig, []):
+                yield _sig, _r
+
     _base_sig = {}
-    for _sig in ('ACTI', 'FURN', 'DOOR', 'CONT', 'STAT', 'MISC', 'LIGH'):
-        for _r in by_type.get(_sig, []):
-            try:
-                _base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _sig
-            except ValueError:
-                pass
+    for _sig, _r in _iter_bases(('ACTI', 'FURN', 'DOOR', 'CONT', 'STAT',
+                                 'MISC', 'LIGH')):
+        try:
+            _base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _sig
+        except ValueError:
+            pass
     _ref_base_sig = {}
-    for _sig in ('REFR',):
-        for _r in by_type.get(_sig, []):
-            _b = _r.get('NAME')
-            if not _b:
-                continue
-            try:
-                _bs = _base_sig.get(int(_b, 16) & 0xFFFFFF)
-                if _bs:
-                    _ref_base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _bs
-            except ValueError:
-                pass
+    for _sig, _r in _iter_bases(('REFR',)):
+        _b = _r.get('NAME')
+        if not _b:
+            continue
+        try:
+            _bs = _base_sig.get(int(_b, 16) & 0xFFFFFF)
+            if _bs:
+                _ref_base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _bs
+        except ValueError:
+            pass
     # Placed ACTORS, so a Find/UseItemAt package can tell "seek this actor"
     # from "operate this object" (CGAssassinsAmbushAToGlenroy targets
     # Glenroy's ACHR — see pack_converter's actor-Find branch).
     for _sig, _bs in (('ACHR', 'NPC_'), ('ACRE', 'CREA')):
-        for _r in by_type.get(_sig, []):
+        for _, _r in _iter_bases((_sig,)):
             try:
                 _ref_base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _bs
             except ValueError:

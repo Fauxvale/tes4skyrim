@@ -32,8 +32,31 @@ This is exactly the gate Oblivion used, so reading it back gives us the same
 import re
 import struct
 
-from .text_reader import (get_formid, get_int, get_str,
+from .text_reader import (get_formid, get_int, get_str, remap_formid,
+                          get_formid_index_offset,
                           PLAYER_REF_FID as PLAYER_FID)
+
+
+def _master_records(master_export, *sigs):
+    """Yield (own-space FormID, record) for the masters' records of `sigs`.
+
+    A master record's `FormID` FIELD is in the MASTER's index space, so
+    `get_formid()` — which applies OUR offset — returns the wrong id for it.
+    `load_master_export` already re-keyed the dict into the space THIS plugin
+    names the master by, so the KEY is the correct source id; shift it the same
+    way get_formid would and every id this module produces stays in one space.
+    """
+    if not master_export:
+        return
+    want = frozenset(sigs)
+    offset = get_formid_index_offset()
+    for key, rec in master_export.items():
+        if rec.get('Signature') not in want:
+            continue
+        try:
+            yield remap_formid(int(key, 16), offset), rec
+        except (TypeError, ValueError):
+            continue
 
 # TES4 condition functions whose first parameter is a quest FormID.
 QUEST_PARAM_FUNCS = frozenset({
@@ -233,12 +256,33 @@ class PackagePlan:
     # -- build ----------------------------------------------------------
 
     def build(self, by_type: dict, quest_fids: set,
-              scriptvar_owner: dict = None) -> None:
+              scriptvar_owner: dict = None, master_export: dict = None) -> None:
+        """Wire packages to quests and aliases.
+
+        `master_export` is the MASTERS' export records and is REQUIRED for a
+        plugin with masters. A dependent plugin's actors overwhelmingly run
+        THEIR MASTER'S packages (1,637 of ElsweyrAnequina.esp's 2,454 AIPackage
+        references), and every lookup below is a resolution step: a package that
+        is not in `packs`, an actor whose ACHR is not in `base_to_ref`, or a
+        quest that is not in `quest_fids` simply drops out, so the actor falls
+        back to its standing Sandbox schedule and the quest package never runs.
+
+        Masters are added FIRST throughout, so this plugin's own record — an
+        override included — overwrites the master's on the same key.
+        """
         packs = {}
+        for fid, rec in _master_records(master_export, 'PACK'):
+            packs[fid] = rec
         for rec in by_type.get('PACK', []):
             fid = get_formid(rec, 'FormID')
             if fid:
                 packs[fid] = rec
+
+        # The masters' quests own the masters' packages. Keyed low-24 below, so
+        # this only has to be the same id space as everything else here.
+        quest_fids = set(quest_fids)
+        quest_fids.update(fid for fid, _ in
+                          _master_records(master_export, 'QUST'))
 
         scriptvar_owner = scriptvar_owner or {}
 
@@ -282,15 +326,30 @@ class PackagePlan:
         # GetScriptVariable condition names.  Actors with no ACHR (levelled
         # spawns) can't take a quest alias; their packages stay on the base
         # record's PKID list.
+        # The masters' placements are indexed first, then this plugin's own —
+        # `setdefault` semantics ("first ACHR wins") are preserved WITHIN each
+        # source, but an own placement of the same base overwrites the master's,
+        # since it is the one this plugin actually converts.
         base_to_ref = {}
+        for _fid, r in _master_records(master_export, 'ACHR', 'ACRE'):
+            base = get_formid(r, 'NAME')
+            if base and base not in base_to_ref:
+                base_to_ref[base] = _fid
+        own_refs = {}
         for sig in ('ACHR', 'ACRE'):
             for r in by_type.get(sig, []):
                 base = get_formid(r, 'NAME')
-                if base and base not in base_to_ref:
-                    base_to_ref[base] = get_formid(r, 'FormID')
+                if base and base not in own_refs:
+                    own_refs[base] = get_formid(r, 'FormID')
+        base_to_ref.update(own_refs)
 
-        for rec in by_type.get('NPC_', []) + by_type.get('CREA', []):
-            afid = get_formid(rec, 'FormID')
+        # Actors: the masters' first, so an override of a master's actor (which
+        # is what re-points its AIPackage list) replaces the master's entry.
+        actor_recs = [(fid, r) for fid, r
+                      in _master_records(master_export, 'NPC_', 'CREA')]
+        actor_recs += [(get_formid(r, 'FormID'), r)
+                       for r in by_type.get('NPC_', []) + by_type.get('CREA', [])]
+        for afid, rec in actor_recs:
             n = get_int(rec, 'AIPackageCount')
             plist = [get_formid(rec, f'AIPackage[{i}]') for i in range(n)]
             plist = [p for p in plist if p]
