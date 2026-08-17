@@ -50,6 +50,21 @@ class TestTexturePathRewriting:
         result = _rewrite_tex_path(b'Textures\\Armor\\Iron\\Cuirass.dds')
         assert 'tes4' in result.lower()
 
+    def test_data_prefix_is_stripped(self):
+        """An authoring slip Oblivion tolerates and Skyrim does not.
+
+        Measured in Nehrim's source meshes: 4 distinct textures across 10
+        meshes, dwarven\\rock02.dds in 7 of them.  Left in, the reference came
+        out under a 'data' folder that does not exist, AND the prune deleted
+        the real texture because the key never matched the shipped path.
+        """
+        result = _rewrite_tex_path(b'data\\textures\\dwarven\\rock02.dds')
+        assert result == 'Textures\\tes4\\dwarven\\rock02.dds'
+
+    def test_data_prefix_with_forward_slashes(self):
+        result = _rewrite_tex_path(b'Data/Textures/dwarven/rock01.dds')
+        assert result == 'Textures\\tes4\\dwarven\\rock01.dds'
+
 
 class TestBoneMapping:
     """Test bone name remapping."""
