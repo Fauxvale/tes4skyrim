@@ -532,7 +532,8 @@ class PackContext:
     """
 
     def __init__(self, plan=None, script_vars=None, greeting_topic=0,
-                 ref_base_sig=None):
+                 ref_base_sig=None,
+                 ref_cell=None, pack_runner_cells=None):
         self.plan = plan
         self.script_vars = script_vars or {}
         # Converted FormID of the GREETING topic (TES4 DIAL 0x000000C8).  A
@@ -543,9 +544,33 @@ class PackContext:
         # UseItemAt has to know whether its target is furniture (sit) or
         # something to operate (activate); see _choose().
         self.ref_base_sig = ref_base_sig or {}
+        # raw24 REFR/ACHR fid -> its ParentCELL, and raw24 PACK fid -> the set
+        # of cells the actors running it stand in.  Together these answer "can
+        # this actor walk there" — see location_reachable().
+        self.ref_cell = ref_cell or {}
+        self.pack_runner_cells = pack_runner_cells or {}
 
     def base_sig_of(self, ref_fid: int) -> str:
         return self.ref_base_sig.get(ref_fid & 0x00FFFFFF, '')
+
+
+    def location_reachable(self, pack_fid: int, ref_fid: int) -> bool:
+        """Can the actor running this package WALK to this reference?
+
+        Only a same-cell destination is reachable: Skyrim's Escort/Travel
+        procedures need a navmesh route, and there is none between two
+        interiors.  Unknown either side -> True, so a missing index never
+        silently downgrades a package that was fine.
+        """
+        if not self.ref_cell:
+            return True
+        dest = self.ref_cell.get(ref_fid & 0x00FFFFFF)
+        if dest is None:
+            return True
+        cells = self.pack_runner_cells.get(pack_fid & 0x00FFFFFF)
+        if not cells:
+            return True
+        return dest in cells
 
     def quest_of(self, pack_fid: int):
         if self.plan is None:
@@ -701,7 +726,28 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
         # stalled with the player locked out of controls.  Route it to ESCORT,
         # which has both slots.  23 Oblivion packages do this, several
         # quest-critical (MQ16MartinFollowPCToPalace, MS26FollowItiusToJail).
-        if _has_location(rec) and get_formid(rec, 'PLDT.Location'):
+        # ...but ONLY when the destination is somewhere the actor can actually
+        # walk to from where it stands.  Skyrim's Escort makes the DESTINATION
+        # the goal; if that destination is in a different cell there is no
+        # navmesh path to it, the procedure produces no route, and the actor
+        # stands still forever — which is a worse failure than never arriving.
+        #
+        # Verified live on Nehrim MQ00 (2026-08-17): Celebro stands in
+        # StartCelle while MQ00CelebroPosition01 sits in SchattenrufMinePart01
+        # (`player.getdistance` on the marker reads FLT_MAX — unloaded cell).
+        # He was selected, unparalysed, SpeedMult 100, alias filled, condition
+        # passing, and moved 5 units in 6 seconds.
+        #
+        # The split is authored and clean.  Same-cell destinations (9 in
+        # Oblivion) are the arrival-driven ones this reroute exists for —
+        # CGEmperorToMarkerB ending CharacterGen stage 16.  Cross-cell ones
+        # (8 in Oblivion, 1 in Nehrim) are all "follow me somewhere else"
+        # quests by name: MQ16MartinFollowPCToPalace, MG01ErthorFollowPlayer,
+        # MazogaFollowToFishermansRock, FGD07AjumFollow.  Those must FOLLOW;
+        # the PLDT is where the following ends, not a place to walk to alone.
+        if (_has_location(rec) and get_formid(rec, 'PLDT.Location')
+                and ctx.location_reachable(pack_fid,
+                                           get_formid(rec, 'PLDT.Location'))):
             i = Inputs(ESCORT)
             i.set('target', tgt)
             i.set('location', loc)

@@ -327,3 +327,44 @@ def test_shared_base_keeps_script_and_adds_ref(monkeypatch):
     assert moved == 1
     assert os_._OBJECT_VMAD.get(0x0000BC72) == b'VMAD\x04\x00base'
     assert os_._OBJECT_VMAD.get(0x0000A29D) == b'VMAD\x04\x00base'
+
+
+def test_cross_cell_follow_stays_follow_not_escort():
+    """A TES4 Follow whose PLDT is in ANOTHER cell must stay Follow.
+
+    A Follow carrying a destination is rerouted to Skyrim's Escort so the
+    package can ARRIVE and fire OnPackageEnd (CGEmperorToMarkerB ends
+    CharacterGen stage 16). But Escort makes the DESTINATION the goal, and
+    there is no navmesh route between two interiors — so a cross-cell
+    destination leaves the actor with no path and he never moves at all.
+
+    Verified live on Nehrim MQ00 (2026-08-17): Celebro stands in StartCelle,
+    MQ00CelebroPosition01 is in SchattenrufMinePart01, and he moved 5 units in
+    6 seconds with the alias filled, condition passing, SpeedMult 100 and
+    Paralysis 0.
+
+    The split is authored: same-cell destinations are the arrival-driven ones
+    (9 in Oblivion); cross-cell ones are "follow me elsewhere" quests by name
+    (MQ16MartinFollowPCToPalace, MG01ErthorFollowPlayer, FGD07AjumFollow).
+    """
+    from tes5_import.pack_converter import _choose, PackContext, T4_FOLLOW
+    from tes5_import.pack_templates import ESCORT, FOLLOW
+
+    rec = {'Signature': 'PACK', 'FormID': '00000E9D',
+           'EditorID': 'MQ00CalebroPackage02', 'PKDT.Type': str(T4_FOLLOW),
+           'PKDT.Flags': '8192', 'PLDT.Type': '0',
+           'PLDT.Location': '000010D1', 'PLDT.Radius': '0',
+           'PTDT.Type': '0', 'PTDT.Target': '00000014', 'PTDT.Count': '200'}
+
+    cross = PackContext(ref_cell={0x0010D1: 0x000F21},
+                        pack_runner_cells={0x000E9D: {0x000B9B}})
+    assert _choose(rec, cross, 0x00000E9D).t is FOLLOW, \
+        'cross-cell Escort has no navmesh route; the actor never moves'
+
+    # Same cell keeps the arrival behaviour the reroute exists for.
+    same = PackContext(ref_cell={0x0010D1: 0x000B9B},
+                       pack_runner_cells={0x000E9D: {0x000B9B}})
+    assert _choose(rec, same, 0x00000E9D).t is ESCORT
+
+    # An unknown cell must NOT silently downgrade a package that was fine.
+    assert _choose(rec, PackContext(), 0x00000E9D).t is ESCORT

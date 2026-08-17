@@ -1460,8 +1460,55 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                 _ref_base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _bs
             except ValueError:
                 pass
+    # Where every placed thing STANDS, and where each package's runners stand.
+    # A TES4 Follow that names a destination in ANOTHER cell must not become a
+    # Skyrim Escort: Escort walks to the destination, and there is no navmesh
+    # route between two interiors, so the actor never moves (Nehrim MQ00 —
+    # Celebro in StartCelle, his marker in SchattenrufMinePart01).  See
+    # PackContext.location_reachable.
+    _ref_cell = {}
+    for _sig, _r in _iter_bases(('REFR', 'ACHR', 'ACRE')):
+        _c = _r.get('ParentCELL')
+        if not _c:
+            continue
+        try:
+            _ref_cell[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = \
+                int(_c, 16) & 0xFFFFFF
+        except ValueError:
+            pass
+    _base_cell = {}
+    for _sig in ('ACHR', 'ACRE'):
+        for _, _r in _iter_bases((_sig,)):
+            _b, _c = _r.get('NAME'), _r.get('ParentCELL')
+            if not _b or not _c:
+                continue
+            try:
+                _base_cell.setdefault(int(_b, 16) & 0xFFFFFF, set()).add(
+                    int(_c, 16) & 0xFFFFFF)
+            except ValueError:
+                pass
+    _pack_runner_cells = {}
+    for _sig, _r in _iter_bases(('NPC_', 'CREA')):
+        try:
+            _cells = _base_cell.get(int(_r.get('FormID', '0'), 16) & 0xFFFFFF)
+        except ValueError:
+            continue
+        if not _cells:
+            continue
+        _n = int(_r.get('AIPackageCount', '0') or 0)
+        for _i in range(_n):
+            _p = _r.get(f'AIPackage[{_i}]')
+            if not _p:
+                continue
+            try:
+                _pack_runner_cells.setdefault(
+                    int(_p, 16) & 0xFFFFFF, set()).update(_cells)
+            except ValueError:
+                pass
     pack_ctx = PackContext(plan=pack_plan, script_vars=_script_vars,
-                           ref_base_sig=_ref_base_sig)
+                           ref_base_sig=_ref_base_sig,
+                           ref_cell=_ref_cell,
+                           pack_runner_cells=_pack_runner_cells)
     _step_done('package plan')
 
     # --- Phase 0h: placed leveled creatures (REFR→LVLC) ---
