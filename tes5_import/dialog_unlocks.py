@@ -402,7 +402,7 @@ def create_unlock_globals(writer, plan: dict) -> dict:
                                       pack_subrecord)
     name_to_fid = {}
     for name in sorted(set(plan['gated'].values())):
-        fid = writer.alloc_formid()
+        fid = writer.derive_formid('UNLOCK_GLOB', name)
         subs = pack_string_subrecord('EDID', name)
         subs += pack_subrecord('FNAM', b'f')
         subs += pack_subrecord('FLTV', _struct.pack('<f', 0.0))

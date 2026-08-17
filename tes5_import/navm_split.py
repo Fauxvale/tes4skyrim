@@ -227,7 +227,18 @@ def split_disconnected_interiors(navm_cache: dict, writer) -> int:
         for ti, c in enumerate(comp):
             comp_tris[c].append(ti)
         root_fid = meta['fid']
-        fids = [root_fid] + [writer.alloc_formid() for _ in range(ncomp - 1)]
+        # Component ORDER is derived (it falls out of triangle connectivity, so
+        # any change upstream of triangulation renumbers it). Key each sibling
+        # on the authored data it contains instead: the sorted door REFRs its
+        # triangles touch, which are TES4 ids and survive re-triangulation.
+        # Components with no door fall back to the ordinal — still stable for a
+        # fixed input, and those meshes carry no door state to lose.
+        fids = [root_fid]
+        for c in range(1, ncomp):
+            tset = set(comp_tris[c])
+            doors = sorted({fid for (ti, fid) in nv.doors if ti in tset})
+            ckey = (key, tuple(doors)) if doors else (key, 'comp%d' % c)
+            fids.append(writer.derive_formid('NAVM_SPLIT', ckey))
         comp_fid_of_tri = [fids[c] for c in comp]
         tri_local = {}
         for tris in comp_tris:

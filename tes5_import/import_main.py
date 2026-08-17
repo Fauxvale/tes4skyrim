@@ -323,7 +323,7 @@ def _create_tes4_special_records(writer: PluginWriter):
     them as property values, eliminating the "fill in CK" step.
     """
     # TES4Fame — GlobalVariable (Float, initial 0.0)
-    fame_fid = writer.alloc_formid()
+    fame_fid = writer.derive_formid('GLOB', 'TES4Fame')
     fame_subs = pack_string_subrecord('EDID', 'TES4Fame')
     fame_subs += pack_subrecord('FNAM', struct.pack('<B', ord('f')))
     fame_subs += pack_subrecord('FLTV', struct.pack('<f', 0.0))
@@ -331,7 +331,7 @@ def _create_tes4_special_records(writer: PluginWriter):
     _WELL_KNOWN_PROPERTIES['TES4Fame'] = fame_fid
 
     # TES4Infamy — GlobalVariable (Float, initial 0.0)
-    infamy_fid = writer.alloc_formid()
+    infamy_fid = writer.derive_formid('GLOB', 'TES4Infamy')
     infamy_subs = pack_string_subrecord('EDID', 'TES4Infamy')
     infamy_subs += pack_subrecord('FNAM', struct.pack('<B', ord('f')))
     infamy_subs += pack_subrecord('FLTV', struct.pack('<f', 0.0))
@@ -347,7 +347,7 @@ def _create_tes4_special_records(writer: PluginWriter):
     # vanilla "Items Stolen" stat would be wrong twice over: it counts items
     # rather than gold, and the engine bumps it on every theft, so the TG rank
     # gates would trip without ever visiting a fence.
-    fenced_fid = writer.alloc_formid()
+    fenced_fid = writer.derive_formid('GLOB', 'TES4GoldFenced')
     fenced_subs = pack_string_subrecord('EDID', 'TES4GoldFenced')
     fenced_subs += pack_subrecord('FNAM', struct.pack('<B', ord('f')))
     fenced_subs += pack_subrecord('FLTV', struct.pack('<f', 0.0))
@@ -363,7 +363,7 @@ def _create_tes4_special_records(writer: PluginWriter):
     # writers, so the state is shadowed here: Game.DisablePlayerControls() and
     # Game.EnablePlayerControls() each also write this global, and the read
     # returns it.
-    ctrl_fid = writer.alloc_formid()
+    ctrl_fid = writer.derive_formid('GLOB', 'TES4ControlsDisabled')
     ctrl_subs = pack_string_subrecord('EDID', 'TES4ControlsDisabled')
     ctrl_subs += pack_subrecord('FNAM', struct.pack('<B', ord('s')))
     ctrl_subs += pack_subrecord('FLTV', struct.pack('<f', 0.0))
@@ -380,7 +380,7 @@ def _create_tes4_special_records(writer: PluginWriter):
     # the engine accumulates no crime gold at all.  Its CRVA also used the wrong
     # struct layout and left every crime worth 0.  See convert_FACT in
     # record_types/actors.py for the layout and the vanilla-census amounts.
-    crime_fid = writer.alloc_formid()
+    crime_fid = writer.derive_formid('FACT', 'TES4CyrodiilCrimeFaction')
     crime_subs = pack_string_subrecord('EDID', 'TES4CyrodiilCrimeFaction')
     crime_subs += pack_string_subrecord('FULL', 'Cyrodiil Crime Faction')
     # DATA: Can Be Owner (bit 15) + Track Crime (bit 6)
@@ -413,7 +413,7 @@ def _create_message_menu_records(writer: PluginWriter, plan: dict) -> dict:
     name_to_fid = {}
     for edid_low in sorted(plan):
         for name, text, buttons in plan[edid_low]:
-            fid = writer.alloc_formid()
+            fid = writer.derive_formid('SCRIPT_MESG', name)
             subs = pack_string_subrecord('EDID', name)
             subs += pack_string_subrecord('DESC', text)
             subs += pack_subrecord('INAM', struct.pack('<I', 0))
@@ -539,7 +539,7 @@ def _create_ambient_gmst_overrides(writer: PluginWriter, by_type: dict):
         subs = pack_string_subrecord('EDID', edid)
         subs += pack_subrecord('DATA', struct.pack('<f', value))
         writer.add_record('GMST', pack_record(
-            'GMST', writer.alloc_formid(), 0, subs))
+            'GMST', writer.derive_formid('GMST', edid), 0, subs))
         written.append(f"{edid}={value:g}"
                        + ('' if edid in authored else ' (exe default)'))
     print(f"  Ambient dialogue pacing (GMST): {', '.join(written)}")
@@ -579,7 +579,7 @@ def _create_vtyp_records(writer: PluginWriter, export_dir: str = None):
         fid = edid_to_fid.get(vtyp_edid)
         if fid is not None:
             return fid
-        fid = writer.alloc_formid()
+        fid = writer.derive_formid('VTYP', vtyp_edid)
         dnam = 3 if gender == 'Female' else 1
         subs = pack_string_subrecord('EDID', vtyp_edid)
         subs += pack_subrecord('DNAM', struct.pack('<B', dnam))
@@ -865,6 +865,26 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # ids mean adding these records cannot shift any allocated id (no
     # FormID drift, saves survive).
     writer.chargen_fid_base = (file_index << 24) | (max_formid + 0x800)
+
+    # Derived ids are hashed across the plugin's whole id space, so every id a
+    # real record already owns must be blocked first or a companion can land on
+    # top of one. Reserve the authored ids, the chargen window and the
+    # null-LAND repair range before anything calls derive_formid().
+    reserved = set()
+    for rec in all_records:
+        fid_raw = int(rec.get('FormID', '0'), 16)
+        if (fid_raw >> 24) & 0xFF == num_tes4_masters:
+            reserved.add((file_index << 24) | (fid_raw & 0x00FFFFFF))
+    reserved.update((file_index << 24) | (max_formid + 0x800 + k)
+                    for k in range(0x800))
+    # The synthesized NPC-conversation head topics (dialog_converter's
+    # _CONV_FAKE_FID_BASE) take ids from a FIXED high base rather than from
+    # derive_formid, so nothing else knows about them: without this the header
+    # is written below them and a derived id can hash straight onto one.
+    from .dialog_converter import CONV_FAKE_FID_BASE, CONV_FAKE_FID_COUNT
+    reserved.update((file_index << 24) | (CONV_FAKE_FID_BASE + k)
+                    for k in range(CONV_FAKE_FID_COUNT))
+    writer.reserve_source_ids(reserved)
 
     # Records shipped with FormID 00000000 need an id before anything indexes
     # them. Done HERE, after max_formid is known, so the synthesized ids can
@@ -1929,12 +1949,9 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # escort packages started and the actor just stood; the only movement left
     # was the off-screen teleport failsafe).  See navi_builder.py.
     if navm_metas:
-        # Burn one FormID where the old freshly-allocated NAVI id used to be:
-        # thousands of records (all generated DIAL/INFO/DLBR/DLVW/LCTN/SNDR)
-        # are allocated after this point, and dropping the alloc shifted every
-        # one of them relative to previously shipped builds — which scrambles
-        # any existing save's Papyrus/dialogue state bound to those FormIDs.
-        writer.alloc_formid()
+        # (The FormID once burned here held a position in the POSITIONAL
+        # counter so later ids would not shift. Derived ids are hashed from
+        # their source now, so nothing downstream depends on this position.)
         n_edge = sum(len(m.get('edge_link_fids') or ()) for m in navm_metas)
         n_door = sum(len(m.get('door_refs') or ()) for m in navm_metas)
         from .navi_builder import read_master_nvpp
@@ -2110,6 +2127,16 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     mpath = write_manifest(output_path, os.path.basename(export_dir),
                            writer.manifest())
     print(f"  Wrote {mpath} ({len(writer.manifest())} source records)")
+
+    # Derived-FormID telemetry. Collisions are expected to be a fraction of a
+    # percent; a spike means the derived region is filling up or a key has
+    # gone non-unique, both of which are worth seeing before shipping.
+    ds = writer.derive_stats()
+    if ds['derived']:
+        pct = 100.0 * ds['collisions'] / ds['derived']
+        print(f"  Derived FormIDs: {ds['derived']:,} hashed from source, "
+              f"{ds['collisions']} collisions ({pct:.3f}%), "
+              f"max {ds['max_probe']} rehash")
 
     file_size = os.path.getsize(output_path)
     print(f"Wrote {output_path} ({file_size:,} bytes)")
@@ -2677,9 +2704,12 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
     # PathingCell parent FormID (→ navmesh-load null-deref crash).
     formid_offset = get_formid_index_offset()
 
-    # Deterministic FormID assignment (matches serial alloc_formid order).
+    # FormIDs derived from each navmesh's SOURCE (cell + pathgrid), so they no
+    # longer depend on the order this list happens to be gathered in. Navmesh
+    # ids ARE save-persisted (measured: 564 NAVM ids in a real save's FormID
+    # array, carrying obstacle/door pathing state), so they must stay stable.
     for job in jobs:
-        job['navm_fid'] = writer.alloc_formid()
+        job['navm_fid'] = writer.derive_formid('NAVM', job['key'])
 
     n_workers = _navm_worker_count(len(jobs))
     geom_cache = _navmesh_geom_cache(collision_cache)

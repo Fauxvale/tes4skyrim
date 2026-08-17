@@ -181,48 +181,216 @@ def test_directory_listings_are_sorted():
 
 
 # ---------------------------------------------------------------------------
-# 4. The allocator itself stays a plain sequential counter
+# 4. Derived FormIDs are a pure function of their SOURCE record
 # ---------------------------------------------------------------------------
+#
+# A counter decides an id by WHEN it was called, so any change to how many ids
+# a site consumes renumbers everything after it — the drift that breaks saves.
+# derive_formid decides an id by WHAT the record is, so nothing about ordering,
+# volume or machine can move it.
 
-def test_alloc_formid_is_sequential_and_reproducible():
-    """Same call sequence -> same ids, and ids never depend on record content.
+def test_derived_ids_are_stable_across_writers():
+    """Two independent conversions must agree — this is the interop property.
 
-    If alloc_formid ever derived an id from a name/hash instead of the counter,
-    string hash randomisation would move ids between runs.
+    Every user converts the mod themselves. If two people's conversions gave a
+    generated record different ids, neither could share a save or a patch.
     """
     from tes5_import.writer import PluginWriter
 
     def run():
         w = PluginWriter(masters=['Skyrim.esm'], is_esm=True)
-        w.next_object_id = 0x01001000
-        return [w.alloc_formid() for _ in range(50)]
+        return [w.derive_formid(site, key) for site, key in
+                [('OTFT', 0x1A2B3), ('ARMA', 0x1A2B3), ('NAVM', (7, 9)),
+                 ('GLOB', 'TES4Fame')]]
 
-    first = run()
-    assert first == run(), 'alloc_formid is not reproducible across writers'
-    assert first == list(range(0x01001000, 0x01001000 + 50)), \
-        'alloc_formid must be a bare +1 sequential counter'
+    assert run() == run()
 
 
-def test_allocation_order_alone_decides_formids():
-    """Two writers making the same calls in a different ORDER must diverge.
+def test_derived_ids_do_not_depend_on_allocation_ORDER():
+    """The whole point: call order must not decide an id.
 
-    This is the property that makes the ordering tests above load-bearing: it
-    documents that reordering allocation calls (by editing conversion order, or
-    by adding an earlier allocation) renumbers everything downstream.
+    This is the exact inverse of the old counter contract. A site that starts
+    allocating a second id, a new site added anywhere, or a reordered export
+    must all leave existing ids untouched.
     """
     from tes5_import.writer import PluginWriter
 
-    def run(order):
-        w = PluginWriter(masters=['Skyrim.esm'], is_esm=True)
-        w.next_object_id = 0x01000800
-        return {name: w.alloc_formid() for name in order}
+    a = PluginWriter(masters=['Skyrim.esm'], is_esm=True)
+    first = {k: a.derive_formid('OTFT', k) for k in (10, 20, 30)}
 
-    a = run(['armor', 'proj', 'outfit'])
-    b = run(['proj', 'armor', 'outfit'])
-    assert a != b, (
-        'Allocation order must decide FormIDs — if this ever passes trivially, '
-        'the ordering guards above are no longer meaningful')
-    assert a['outfit'] == b['outfit']  # unchanged position -> unchanged id
+    b = PluginWriter(masters=['Skyrim.esm'], is_esm=True)
+    # Reverse order, and interleave a brand-new site that did not exist before.
+    for k in (30, 20, 10):
+        b.derive_formid('NEWSITE', k)
+    second = {k: b.derive_formid('OTFT', k) for k in (30, 20, 10)}
+
+    assert first == second, (
+        'derived ids shifted when allocation order changed or a new site was '
+        'added — this is FormID drift, and it breaks every existing save')
+
+
+def test_derived_ids_never_land_on_an_authored_record():
+    """A companion colliding with a real record silently destroys one of them."""
+    from tes5_import.writer import PluginWriter, DERIVED_ID_BASE
+
+    w = PluginWriter(masters=['Skyrim.esm'], is_esm=True)
+    # Reserve a big authored block INSIDE the derived region, then allocate
+    # across it; nothing may be handed out on top of a reserved id.
+    reserved = {(1 << 24) | (DERIVED_ID_BASE + i) for i in range(5000)}
+    w.reserve_source_ids(reserved)
+    got = [w.derive_formid('X', i) for i in range(2000)]
+    assert not (set(got) & reserved)
+    assert len(set(got)) == len(got), 'derive_formid handed out a duplicate id'
+
+
+def test_derived_ids_are_stable_under_hash_randomisation():
+    """PYTHONHASHSEED must not reach the id.
+
+    Python's own hash() is randomised per process, so using it would give every
+    machine different FormIDs — the exact failure the tests above exist to
+    prevent. derive_formid uses md5 for this reason.
+    """
+    import subprocess
+    import sys
+
+    code = (
+        'from tes5_import.writer import PluginWriter;'
+        'w=PluginWriter(masters=["Skyrim.esm"]);'
+        'print([w.derive_formid(s,k) for s,k in '
+        '[("OTFT",1),("ARMA",("a","b")),("GLOB","TES4Fame")]])'
+    )
+    outs = []
+    for seed in ('0', '1', '424242'):
+        env = dict(os.environ, PYTHONHASHSEED=seed)
+        outs.append(subprocess.run([sys.executable, '-c', code], env=env,
+                                   capture_output=True, text=True,
+                                   cwd=REPO).stdout.strip())
+    assert outs[0] and len(set(outs)) == 1,         f'derived ids vary with PYTHONHASHSEED: {outs}'
+
+
+def test_hedr_next_object_id_clears_every_derived_id():
+    """HEDR must sit above every OBJECT ID in the file, derived ones included.
+
+    The engine mints runtime-created forms from HEDR's next-object-id upward,
+    so a value below an existing record hands a runtime form an id that record
+    already owns. The comparison has to happen on the OBJECT ID (low 24 bits):
+    _next_object_id carries the plugin's index byte, so comparing it directly
+    against a derived id lets 0x0118E937 "beat" 0x00FFC374 and ship a header
+    below real records.
+    """
+    from tes5_import.writer import PluginWriter
+
+    w = PluginWriter(masters=['Skyrim.esm'], is_esm=True)
+    w.next_object_id = (1 << 24) | 0x18E937      # as import_plugin sets it
+    highest = 0
+    for i in range(500):
+        highest = max(highest, w.derive_formid('X', i) & 0x00FFFFFF)
+
+    hedr = w._high_water_id() & 0x00FFFFFF
+    assert hedr > highest, (
+        f'HEDR object id {hedr:06X} is below the highest derived object id '
+        f'{highest:06X} — the engine would reuse it for a runtime form')
+
+
+def test_derived_region_avoids_the_plugin_s_dense_id_block():
+    """The hash window is chosen from the data, not hardcoded.
+
+    A constant window cannot suit every plugin: authored ids sit wherever the
+    mod author put them. A hardcoded 0x400000 landed inside Morroblivion's
+    occupied space (collisions 3.27% vs 0.10%), and hashing the whole space
+    instead landed in Oblivion's dense low block (7.26%). This pins the fix:
+    given ids packed into one region, the window must be chosen elsewhere.
+    """
+    from tes5_import.writer import PluginWriter
+
+    w = PluginWriter(masters=['Skyrim.esm'], is_esm=True)
+    # A plugin whose ids fill 0x000000-0x200000 densely, like Oblivion's.
+    w.reserve_source_ids({(1 << 24) | i for i in range(0, 0x200000, 2)})
+
+    assert w._derived_base >= 0x200000, (
+        f'derived window at {w._derived_base:06X} overlaps the dense authored '
+        f'block below 0x200000')
+    assert w._derived_span > 0x100000, 'window is implausibly small'
+
+    # And allocating from it must stay collision-light.
+    for i in range(5000):
+        w.derive_formid('X', i)
+    st = w.derive_stats()
+    assert st['collisions'] / st['derived'] < 0.02, (
+        f"collision rate {100.0 * st['collisions'] / st['derived']:.2f}% — the "
+        f"window was placed in occupied space")
+
+
+def test_derived_region_choice_is_deterministic():
+    """Two machines must choose the SAME window, or ids differ everywhere."""
+    from tes5_import.writer import PluginWriter
+
+    ids = {(1 << 24) | i for i in range(0, 0x180000, 3)}
+    a = PluginWriter(masters=['Skyrim.esm'], is_esm=True)
+    a.reserve_source_ids(set(ids))
+    b = PluginWriter(masters=['Skyrim.esm'], is_esm=True)
+    b.reserve_source_ids(set(ids))
+
+    assert (a._derived_base, a._derived_span) == (b._derived_base,
+                                                  b._derived_span)
+    assert [a.derive_formid('S', i) for i in range(200)] ==            [b.derive_formid('S', i) for i in range(200)]
+
+
+def test_derived_ids_leave_runtime_headroom():
+    """The engine needs free ids ABOVE the file's records to allocate from.
+
+    Every runtime-created form (dropped item, summon, placed object) takes an
+    id from the header's next-object-id upward. Hashing derived ids all the way
+    to the 24-bit ceiling left Nehrim.esm just 174 free ids and Oblivion.esm
+    2,360 — vanilla Skyrim.esm leaves 16.7M. A long playthrough would run the
+    pool dry.
+    """
+    from tes5_import.writer import PluginWriter, _RUNTIME_HEADROOM
+
+    w = PluginWriter(masters=['Skyrim.esm'], is_esm=True)
+    w.reserve_source_ids({(1 << 24) | i for i in range(0, 0x180000, 2)})
+    highest = 0
+    for i in range(20000):
+        highest = max(highest, w.derive_formid('X', i) & 0x00FFFFFF)
+
+    free = 0x00FFFFFF - highest
+    assert free >= _RUNTIME_HEADROOM - 0x10000, (
+        f'only {free:,} object ids left above the highest derived record — '
+        f'the engine allocates runtime forms from there')
+
+
+def test_fixed_id_windows_are_reserved_before_hashing():
+    """Ids minted OUTSIDE derive_formid must still be reserved.
+
+    The synthesized NPC-conversation topics take FormIDs from a fixed high
+    base (dialog_converter.CONV_FAKE_FID_BASE) instead of the hash. Nothing
+    else knows they exist, so unless import_plugin reserves the window: the
+    header is written BELOW them (15 DIALs shipped above HEDR at 0xF40000),
+    and a derived record can hash straight onto one.
+    """
+    from tes5_import.writer import PluginWriter
+    from tes5_import.dialog_converter import (CONV_FAKE_FID_BASE,
+                                              CONV_FAKE_FID_COUNT)
+
+    w = PluginWriter(masters=['Skyrim.esm'], is_esm=True)
+    window = {(1 << 24) | (CONV_FAKE_FID_BASE + k)
+              for k in range(CONV_FAKE_FID_COUNT)}
+    w.reserve_source_ids({(1 << 24) | i for i in range(0, 0x100000, 4)}
+                         | window)
+
+    got = {w.derive_formid('X', i) for i in range(4000)}
+    assert not (got & window), 'a derived id landed on a reserved fixed id'
+
+    highest = max(f & 0x00FFFFFF for f in window)
+    assert (w._high_water_id() & 0x00FFFFFF) > highest, (
+        'HEDR is below the fixed-id window, so the engine would mint a '
+        'runtime form onto one of those records')
+
+
+def test_scheme_version_is_declared():
+    """Bumping this is how a deliberate id-layout change gets recorded."""
+    from tes5_import.writer import FORMID_SCHEME_VERSION
+    assert isinstance(FORMID_SCHEME_VERSION, int)
 
 
 if __name__ == '__main__':

@@ -184,7 +184,7 @@ def convert_LTEX(rec: dict, writer=None) -> tuple:
     txst_fid = 0
     txst_bytes = None
     if icon_path and writer:
-        txst_fid = writer.alloc_formid()
+        txst_fid = writer.derive_formid('LTEX_TXST', get_formid(rec, 'FormID'))
         txst_subs = b''
         txst_edid = f"TES4_{edid}_TXST" if edid else f"TES4_LTEX_{get_formid(rec, 'FormID'):08X}_TXST"
         txst_subs += pack_string_subrecord('EDID', txst_edid)

@@ -256,7 +256,9 @@ def detect_injected_records(all_records: list, master_export: dict,
             continue          # our own record, not master-indexed
         if (rec.get('FormID') or '').upper() in master_export:
             continue          # a real override of a master record
-        injected[fid_raw] = writer.alloc_formid()
+        # Keyed on the raw TES4 id: an injected record keeps a stable identity
+        # across builds, which other plugins and existing saves both rely on.
+        injected[fid_raw] = writer.derive_formid('INJECTED', fid_raw)
     return injected
 
 

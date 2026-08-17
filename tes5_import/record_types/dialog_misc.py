@@ -124,7 +124,10 @@ def _build_sopm(writer, min_dist: float, max_dist: float, stereo: bool) -> int:
     if key in cache:
         return cache[key]
 
-    fid = writer.alloc_formid()
+    # SHARED across every SOUN with the same attenuation, so it cannot key off
+    # one source record. The key is the rounded TES4 min/max distances, which
+    # are authored values carried straight from the export.
+    fid = writer.derive_formid('SOPM', key)
     kind = 'Stereo' if stereo else 'Mono'
     subs = pack_string_subrecord(
         'EDID', f'TES4_SOM{kind}{round(max_dist):05d}_{round(min_dist):05d}')
@@ -354,7 +357,7 @@ def convert_SOUN(rec: dict, writer=None) -> tuple:
         # note below for what conflating the two did.
         is_2d = bool(tes4_flags & _TES4_SND_2D)
 
-        sndr_fid = writer.alloc_formid()
+        sndr_fid = writer.derive_formid('SNDR', get_formid(rec, 'FormID'))
         # Actors reference this descriptor by TES4 SOUN id; they are already
         # written, so the CSDI placeholders get patched afterwards (see
         # actors.patch_actor_sounds).
@@ -1462,7 +1465,8 @@ def convert_WTHR(rec: dict, writer=None) -> tuple:
     if writer is not None:
         imgs_fids = []
         for time in range(4):
-            fid = writer.alloc_formid()
+            fid = writer.derive_formid('WTHR_IMGS',
+                                       (get_formid(rec, 'FormID'), time))
             imgs_fids.append(fid)
             imgs_bytes.append(_wthr_imgs(rec, fid, time))
 

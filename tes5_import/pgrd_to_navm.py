@@ -1078,7 +1078,10 @@ def convert_PGRD(rec: dict, writer=None,
 
     # The ledge links name THIS navmesh, so its FormID must exist first.
     if navm_fid is None:
-        navm_fid = writer.alloc_formid()
+        # Same key as the bulk pre-pass (_precompute_navmeshes) so the serial
+        # fallback and the parallel path agree on a cell's navmesh id.
+        navm_fid = writer.derive_formid(
+            'NAVM', (cell_fid, get_formid(rec, 'FormID')))
 
     nvnm = _pack_nvnm(verts3d, tris, adj, tri_flags,
                       wrld_fid, cell_fid, grid_x, grid_y, is_exterior,

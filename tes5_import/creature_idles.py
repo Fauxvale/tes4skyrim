@@ -109,7 +109,9 @@ def _idle(writer, edid: str, dnam: str, enam: str, parent: int,
     """One IDLE record (subrecord order: EDID CTDA* DNAM ENAM ANAM DATA);
     ANAM = (parent, previous sibling). ctda: bytes or list of bytes.
     Returns the new FormID."""
-    fid = writer.alloc_formid()
+    # `edid` is TES4<folder><suffix> from the _LEAVES constant — a stable
+    # name, not an ordinal, so it keys the derived id directly.
+    fid = writer.derive_formid('CREA_IDLE', edid)
     subs = pack_string_subrecord('EDID', edid)
     for c in ([ctda] if isinstance(ctda, bytes) else (ctda or [])):
         subs += pack_subrecord('CTDA', c)

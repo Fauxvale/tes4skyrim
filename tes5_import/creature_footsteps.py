@@ -104,14 +104,14 @@ def _build_one(writer, folder: str, tag_sndrs: dict) -> int:
     for tag in sorted(tag_sndrs):
         sndr = tag_sndrs[tag]
         if sndr not in ipds_of:
-            ipct_fid = writer.alloc_formid()
+            ipct_fid = writer.derive_formid('IPCT', (folder, sndr))
             subs = pack_string_subrecord('EDID', f'TES4{base}{tag}Impact')
             subs += pack_subrecord('DATA', _IPCT_DATA)
             subs += pack_subrecord('DODT', _IPCT_DODT)
             subs += pack_formid_subrecord('SNAM', sndr)
             writer.add_record('IPCT', pack_record('IPCT', ipct_fid, 0, subs))
 
-            ipds_fid = writer.alloc_formid()
+            ipds_fid = writer.derive_formid('IPDS', (folder, sndr))
             subs = pack_string_subrecord('EDID', f'TES4{base}{tag}ImpactSet')
             for mat in _FOOTSTEP_MATERIALS:
                 subs += pack_subrecord('PNAM',
@@ -119,7 +119,7 @@ def _build_one(writer, folder: str, tag_sndrs: dict) -> int:
             writer.add_record('IPDS', pack_record('IPDS', ipds_fid, 0, subs))
             ipds_of[sndr] = ipds_fid
 
-        fstp_fid = writer.alloc_formid()
+        fstp_fid = writer.derive_formid('FSTP', (folder, tag))
         subs = pack_string_subrecord('EDID', f'TES4{base}{tag}Footstep')
         subs += pack_formid_subrecord('DATA', ipds_of[sndr])
         subs += pack_string_subrecord('ANAM', tag)
@@ -129,7 +129,7 @@ def _build_one(writer, folder: str, tag_sndrs: dict) -> int:
     # Same footstep list for every gait — vanilla creature sets reuse the same
     # FSTPs across walk/run/sprint/sneak and only trim the swim list.
     n = len(fstp_fids)
-    fsts_fid = writer.alloc_formid()
+    fsts_fid = writer.derive_formid('FSTS', folder)
     subs = pack_string_subrecord('EDID', f'TES4{base}FootstepSet')
     # XCNT order: walking, running, sprinting, sneaking, swimming
     subs += pack_subrecord('XCNT', struct.pack('<IIIII', n, n, n, n, 0))

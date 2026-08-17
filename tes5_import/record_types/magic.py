@@ -923,7 +923,7 @@ def build_av_variants(mgef_records: list, effect_records: list, writer) -> int:
         if not name:
             continue
         archetype = get_archetype(code)
-        fid = writer.alloc_formid()
+        fid = writer.derive_formid('MGEF_AV', (code, av))
 
         subs = pack_string_subrecord('EDID', f'TES4{code}{name}')
         full = get_str(src, 'FULL')
@@ -1014,7 +1014,7 @@ def build_seff_variants(mgef_records: list, effect_records: list, writer,
             # No converted script — the plain SEFF record still stands in, so
             # the effect keeps its duration and HasMagicEffect still answers.
             continue
-        fid = writer.alloc_formid()
+        fid = writer.derive_formid('MGEF_SEFF', (scpt, etype))
         name = fid_to_edid.get(scpt, scpt)
 
         subs = pack_string_subrecord('EDID', f'TES4SEFF{name}{etype or "Self"}')
@@ -1165,7 +1165,7 @@ def bound_script_variant(mgef_fid: int, assoc_item: int, writer) -> int:
         # garbage counter slots.
         struct.pack_into('<H', data, _O_COUNTER_COUNT, 0)
 
-        fid = writer.alloc_formid()
+        fid = writer.derive_formid('MGEF_BOUND', (mgef_fid, assoc_item))
         subs = pack_string_subrecord('EDID', f'TES4{edid}Scripted')
         subs += pack_subrecord(
             'VMAD',

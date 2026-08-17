@@ -13,8 +13,51 @@ Subrecord header: 6 bytes
 """
 
 import contextlib
+import hashlib
 import struct
 import threading
+
+# --- Derived FormID region -------------------------------------------------
+# Generated records (ARMA, OTFT, NAVM, ...) get ids hashed from their SOURCE
+# record rather than from a counter — see PluginWriter.derive_formid.
+#
+# The window is CHOSEN PER PLUGIN from where its authored ids actually are
+# (reserve_source_ids scans them and calls _choose_derived_region). A fixed
+# window cannot work: a plugin's ids sit wherever its author put them.
+# Measured largest sparse runs — no two agree, and a constant that suits one
+# lands in another's dense block:
+#
+#   Oblivion.esm      190000..1000000   (15.1M free)
+#   Nehrim.esm        250000..1000000   (14.4M free)
+#   Morrowind_ob.esm  880000..F00000    ( 6.8M free)   <- ids fill the range,
+#                                        384,366 of them above 0x800000
+#
+# A hardcoded 0x400000 put the window inside Morroblivion's occupied space and
+# collisions rose 34x (3.27% vs 0.10%); hashing the whole space instead made
+# Oblivion worse (7.26%), because it then hashes into that file's dense low
+# block. Only "the emptiest run in THIS plugin" is right for all of them.
+#
+# These remain the fallback for a writer used without reserve_source_ids
+# (tests, small tools). Ids never go below 0x000800 — the engine reserves that
+# block (the player is 0x14).
+DERIVED_ID_BASE = 0x400000
+DERIVED_ID_SPAN = 0xBFF000
+_DERIVED_ID_FLOOR = 0x000800
+
+# Object ids at or above this are never handed to a derived record. The engine
+# mints every RUNTIME-created form (dropped items, summons, placed objects,
+# spawned actors) from the header's next-object-id upward, so a file that
+# hashes ids right up to the ceiling leaves a playthrough almost nothing to
+# allocate from. Measured before this cap: Nehrim.esm left 174 free ids and
+# Oblivion.esm 2,360 — vanilla Skyrim.esm leaves 16.7M (NextID=FF000F93).
+# 1M reserved is ~6% of the space and still leaves ~15M for hashing.
+_RUNTIME_HEADROOM = 0x100000
+
+# Bumping this deliberately renumbers every derived record. It exists so a
+# future id-layout change is an explicit, visible decision rather than an
+# accident: changing the hash input or the region silently breaks every
+# existing save, so the version is what documents that it was intended.
+FORMID_SCHEME_VERSION = 1
 
 RECORD_HEADER_SIZE = 24
 GROUP_HEADER_SIZE = 24
@@ -380,6 +423,14 @@ class PluginWriter:
         self._manifest = {}          # source TES4 fid (hex str) -> {...}
         self._converting = None
 
+        # --- Derived FormIDs (see derive_formid) ---------------------------
+        self._derived = {}           # key tuple -> allocated id
+        self._derived_taken = set()  # every id handed out or reserved
+        self._derived_base = DERIVED_ID_BASE
+        self._derived_span = DERIVED_ID_SPAN
+        self._derive_collisions = 0
+        self._derive_max_probe = 0
+
     @property
     def next_object_id(self):
         return self._next_object_id
@@ -387,6 +438,139 @@ class PluginWriter:
     @next_object_id.setter
     def next_object_id(self, val):
         self._next_object_id = val
+
+    def reserve_source_ids(self, ids):
+        """Mark authored FormIDs as taken so derived ids never land on them.
+
+        Derived ids are hashed across the plugin's whole id space, which is the
+        same space the converted source records occupy. Without this the hash
+        could place a companion exactly on top of a real record — one of the two
+        silently disappears. Must be called before any derive_formid().
+
+        Also picks the hash window from where those ids actually sit, so the
+        window is a property of the plugin rather than a constant that happens
+        to suit one file (see the region comment at the top of this module).
+        """
+        self._derived_taken.update(ids)
+        self._choose_derived_region()
+
+    def _choose_derived_region(self):
+        """Point the hash at this plugin's emptiest stretch of object ids.
+
+        Scans occupancy in 64K blocks and takes the longest run of blocks that
+        are under 1% full. Deterministic: it reads only the authored ids, which
+        are the same on every machine, so the chosen window — and therefore
+        every derived id — is identical everywhere.
+        """
+        BLOCK = 0x10000
+        # Stop short of the ceiling so the engine keeps a runtime allocation
+        # pool (see _RUNTIME_HEADROOM).
+        NBLOCKS = (0x1000000 - _RUNTIME_HEADROOM) // BLOCK
+        occ = [0] * NBLOCKS
+        for fid in self._derived_taken:
+            blk = (fid & 0x00FFFFFF) // BLOCK
+            if blk < NBLOCKS:          # ids in the reserved tail don't matter
+                occ[blk] += 1
+
+        sparse = BLOCK // 100                      # <1% occupied
+        best_len = best_start = 0
+        run = 0
+        for i in range(NBLOCKS):
+            if occ[i] < sparse and i * BLOCK >= _DERIVED_ID_FLOOR:
+                run += 1
+                if run > best_len:
+                    best_len, best_start = run, i - run + 1
+            else:
+                run = 0
+
+        if best_len:
+            self._derived_base = best_start * BLOCK
+            self._derived_span = best_len * BLOCK
+        # else: keep the module defaults — a plugin with no sparse run at all
+        # still works, just with more rehashing.
+
+
+    def derive_formid(self, site: str, key) -> int:
+        """FormID for a GENERATED record, as a pure function of its source.
+
+        The counter-based alloc_formid() decides an id by WHEN it was called,
+        so any change to how many ids a site consumes renumbers everything
+        after it. That breaks save games, and it breaks them differently on
+        every machine and every converter version.
+
+        This decides an id by WHAT the record is instead. `site` names the kind
+        of generated record ('OTFT', 'ARMA', ...) and `key` identifies what it
+        was generated FROM — normally the source TES4 FormID, which is authored
+        data that never moves. Same source record + same site => same id, on
+        every machine, in every build, regardless of what else changed.
+
+        The key MUST be authored data (a source FormID, an EditorID from the
+        export). Never a value our own conversion computes — a merged mesh
+        name, a rounded distance, a resolved path — or changing that logic
+        silently moves the id and breaks saves.
+
+        Collisions are resolved by REHASHING with a salt rather than probing to
+        the next free slot: a probe would make an id depend on which other keys
+        exist, reintroducing exactly the coupling this removes. Rehashing keeps
+        an id a function of its own key plus the (rare) set of keys that
+        collide with it.
+        """
+        k = (site, key)
+        with self._lock:
+            existing = self._derived.get(k)
+            if existing is not None:
+                return existing
+
+            payload = f'{site}\x00{key!r}'.encode('utf-8')
+            probe = 0
+            while True:
+                salt = b'' if probe == 0 else b'\x00%d' % probe
+                digest = hashlib.md5(payload + salt).digest()
+                offset = struct.unpack('<I', digest[:4])[0] % self._derived_span
+                fid = (self.own_index << 24) | (self._derived_base + offset)
+                if fid not in self._derived_taken:
+                    break
+                probe += 1
+                if probe == 1:
+                    self._derive_collisions += 1
+                if probe > 64:
+                    raise RuntimeError(
+                        f'derive_formid could not place {site}/{key!r} after '
+                        f'64 rehashes — the derived id space is too full')
+            self._derive_max_probe = max(self._derive_max_probe, probe)
+            self._derived_taken.add(fid)
+            self._derived[k] = fid
+            if self._converting:
+                self._manifest[self._converting]['companions'].append(fid)
+        return fid
+
+    def derive_stats(self) -> dict:
+        """Collision telemetry for the derived-id allocator."""
+        return {'derived': len(self._derived),
+                'collisions': self._derive_collisions,
+                'max_probe': self._derive_max_probe}
+
+    def _high_water_id(self) -> int:
+        """HEDR next-object-id: above every id this file uses.
+
+        The engine mints runtime forms from here upward, so it must clear the
+        derived region as well as the authored records — otherwise a
+        runtime-created form reuses a generated record's id.
+        """
+        # Both sides must be compared in the SAME space or the max() is
+        # meaningless: _next_object_id carries the plugin's index byte, so a
+        # low-24 derived value can never win against it however large it is.
+        # Compare on the object id alone, then restore the index byte the file
+        # has always written (Oblivion.esm itself writes 01194582; xEdit reads
+        # the field as an opaque u32 and does not mask it).
+        index_byte = self._next_object_id & 0xFF000000
+        own = self._next_object_id & 0x00FFFFFF
+        highest = own
+        for fid in self._derived_taken:
+            low = fid & 0x00FFFFFF
+            if low >= highest:
+                highest = low + 1
+        return index_byte | min(highest, 0x00FFFFFF)
 
     @contextlib.contextmanager
     def converting(self, source_formid: str, output_formid: int = 0):
@@ -403,15 +587,6 @@ class PluginWriter:
             yield
         finally:
             self._converting = prev
-
-    def alloc_formid(self) -> int:
-        """Allocate a new FormID for generated records (ARMA, TXST, etc.). Thread-safe."""
-        with self._lock:
-            fid = self._next_object_id
-            self._next_object_id += 1
-            if self._converting:
-                self._manifest[self._converting]['companions'].append(fid)
-        return fid
 
     def manifest(self) -> dict:
         """source TES4 FormID -> {'fid': converted id, 'companions': [ids]}."""
@@ -510,7 +685,7 @@ class PluginWriter:
                 header = pack_tes4_header(
                     self.masters,
                     num_records=total_count,
-                    next_object_id=self._next_object_id,
+                    next_object_id=self._high_water_id(),
                     author=self.author,
                     description=self.description,
                     is_esm=self.is_esm,

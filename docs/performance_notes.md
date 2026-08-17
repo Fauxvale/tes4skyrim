@@ -356,120 +356,113 @@ properly parallel. Two findings:
 - **Pool tools can exhaust memory**: some load the ~2.1 GB export index PER
   WORKER. Cap `--workers` or run single-process for those.
 
-## FormID determinism — the save-game contract (audited 2026-08-09)
+## FormID determinism — the save-game contract (rewritten 2026-08-17)
 
 A save game stores **FormIDs**. If a rebuild gives a generated record a
 different id, every save silently rebinds that object to whatever now holds the
-id — so **generated FormIDs must be identical run to run, and must not move
-when unrelated code changes.**
+id. And because every user converts the mod themselves, two people's builds
+must agree or they cannot share a save or a patch.
 
-`PluginWriter.alloc_formid()` (`tes5_import/writer.py:252`) is a bare `+1`
-counter. It carries no identity: an id is decided **purely by the position of
-its allocation call in the global sequence**. Two consequences:
+So the requirement is stronger than "deterministic on one machine":
 
-1. Same call sequence → same ids. Verified byte-for-byte.
-2. **Insert or remove ONE earlier allocation and every later id shifts by one.**
+> **Same source plugin + same converter version → the same FormIDs, on any
+> machine, with no shared state.** Ids must also survive a converter update.
 
-### Audit result: currently deterministic (verified, not assumed)
+### Two id classes
 
-Every `alloc_formid()` call site is reached through `sorted()` or list-order
-iteration; there is no builtin `hash()` anywhere in the pipeline (only hashlib);
-every `os.listdir`/`glob` in `tes5_import` is sorted; pools use `ex.map`
-(submission order) and navmesh ids are pre-allocated serially *before* dispatch.
-The allocator base, `max_formid + 0x1000` (`import_main.py:761-771`), is a
-`max()` over all records — order-independent.
+**Source records keep their TES4 id**, index-shifted into the output's load
+order by `text_reader.remap_formid`. Nothing hashes or reallocates them. This
+is what lets converted mods interoperate: a patch written against Oblivion's
+`0001A2B3` still resolves.
 
-End-to-end proof: built each plugin twice under different `PYTHONHASHSEED`
-values (`1` vs `424242`/`555555`/`99999`) — **byte-for-byte identical**:
+**Generated records derive their id from their source**, via
+`PluginWriter.derive_formid(site, key)` (`tes5_import/writer.py`). `site` names
+the kind of record ('OTFT', 'ARMA', 'NAVM'), `key` identifies what it was
+generated FROM — normally the source TES4 FormID. The id is
+`md5(site, key)` mapped into `DERIVED_ID_BASE`.. and is therefore a pure
+function of authored data: independent of call order, record volume, machine,
+and of every unrelated change in the converter.
 
-| Plugin | Size | Path exercised |
-|---|---|---|
-| `Oblivion.esm` | 613,807,139 B | full record set, navmesh + LAND pools |
-| `Morrowind_ob.esm` | 206,162,203 B | **masters** — overrides + injected records |
-| `DLCBattlehornCastle.esp` | 7,899 B | small dependent plugin |
+This replaced a bare `+1` counter whose ids were decided purely by **call
+position** — so adding, removing or reordering any allocation, or a site
+allocating one more id than before, renumbered everything after it.
 
-Guarded by `tests/test_formid_determinism.py` (static AST guards, verified to
-fire on a deliberate canary — they are not vacuous).
+### The one rule for new generated records
 
-### <a id="formid-fragility-map"></a>Where a code change WILL renumber FormIDs
+**The key must be AUTHORED data** — a source FormID, an EditorID from the
+export, a TES4 model path. **Never a value our own conversion computes**: a
+merged mesh name, a rounded output distance, a resolved path, a component
+index. Those change when our logic changes, and the id moves with them.
 
-These are ordering-sensitive by design. Editing them is legal, but it **breaks
-existing saves**, so it belongs in a deliberate "saves reset" change, not a
-drive-by refactor.
+Shared companions (one record serving many sources) key off the shared thing's
+authored identity, not the first source that reached it — e.g. the book
+inventory STAT keys on the source model path, `SOPM` on the TES4 min/max
+distances, `IPCT`/`IPDS` on the source SOUN.
 
-**A. Anything that adds/removes/reorders an allocation.** All ~50 sites shift
-everything allocated after them:
+`navm_split.py` is the instructive case: component *order* falls out of
+triangle connectivity (derived), so each split sibling keys on the sorted
+**door REFRs its triangles touch** — authored ids that survive
+re-triangulation.
 
-| File | Generates |
-|---|---|
-| `record_types/equipment.py` (324, 447, 624, 804) | weapon STAT, **ARMA**, **PROJ**, book INAM |
-| `record_types/actors.py` (273, 869, 929, 991, 1017, 1118, 1133) | **OTFT**, origin/vendor/trainer FACT, FLST, CLAS clone |
-| `record_types/magic.py` (926, 1017, 1168) | AV / SEFF / bound-script MGEF variants |
-| `record_types/dialog_misc.py` (121, 314) | SOPM, **SNDR** |
-| `record_types/world.py` (106) | LTEX **TXST** |
-| `creature_races.py` (232, 304, 728, 740, 922-923) | creature VTYP, BPTD, MOVT, skin ARMA, RACE |
-| `creature_footsteps.py` (107-132) | IPCT / IPDS / FSTP / FSTS |
-| `creature_idles.py` (112) | creature IDLE tree |
-| `dialog_converter.py` (1847, 1884, 2006, 2434, 2617, 2924, 3013) | DIAL / INFO / **DLBR** / **DLVW** |
-| `dialog_unlocks.py` (405) | unlock **GLOB** per gated topic |
-| `locations.py` (189, 279) | **LCTN** |
-| `magic_effects.py` (126) | aimed-MGEF variants |
-| `leveled_actors.py` (205) | leveled-actor shells |
-| `navm_split.py` (230), `pgrd_to_navm.py` (1058) | **NAVM** |
-| `overrides.py` (166) | injected-record redirects |
-| `import_main.py` (324-497) | fame/infamy/fenced/crime GLOBs, GMSTs |
+### Collisions
 
-**`import_main.py:1626` is a deliberate no-op allocation — never "clean it up".**
-It burns one id where the old freshly-allocated NAVI FormID used to sit. NAVI is
-now the fixed singleton `0x00012FB4`, so the alloc is functionally dead — but
-thousands of generated DIAL/INFO/DLBR/DLVW/LCTN/SNDR records are allocated after
-it, and removing it shifts every one of them by one relative to shipped builds,
-scrambling any save's dialogue/Papyrus state. It is the clearest example of rule
-A: an allocation's *existence* is load-bearing even when its *result* is unused.
+Hashing into a finite space collides. Resolution **rehashes with a salt**
+rather than probing to the next free slot: a probe would make an id depend on
+which other keys exist, reintroducing the coupling this design removes.
+`reserve_source_ids()` blocks every authored id first, so a companion can never
+land on a real record.
 
-**B. Phase order in `import_main.py`.** Phase 1 is a serial loop
-(`import_main.py:1267`, "Serial on purpose") *specifically* to keep allocation
-order stable — the comment there records that a thread pool once shuffled
-companion FormIDs. Reordering phases, moving a `build_*` call, or making Phase 1
-concurrent renumbers everything. The creature voice/footstep/BPTD builders are
-allocated **last on purpose** (`import_main.py:1731` onward) so adding one
-cannot move any earlier id — **put new generators there.**
+Measured on Oblivion.esm's real source ids, 26,800 derived records:
+**28 collisions (0.10%), max 1 rehash.**
 
-**C. The sorted() calls that look redundant.** The `sorted()` wrapping a set at
-`creature_races.py:231` / `:276`, `dialog_unlocks.py:404`, `magic.py:917` /
-`:1011`, and the sorted-key loops in `locations.py` / `navm_split.py`, are all
-load-bearing. "Simplifying" one to a bare set
-reintroduces `PYTHONHASHSEED` dependence — the ids then differ **between runs on
-the same machine**, the worst form of this bug.
+Residual risk: if a future converter version adds a record that happens to
+collide with an existing one, one of the two moves. Per-record and rare, versus
+the old scheme where *any* change moved *everything*.
 
-**D. Conversion-order inputs.** `text_reader.parse_export_directory`
-(`sorted(os.listdir)` + `ex.map`) fixes record order; `by_type[sig]` lists
-inherit it. Changing export file naming, dedup (keep-last), or pool result
-assembly reorders records and therefore ids.
+### Which record types must be stable — measured, not assumed
 
-**E. The allocator base.** `max_formid + 0x1000` — a new record with a higher
-TES4 id, or changing the `0x1000` gap, moves the whole generated range.
+Ground truth is a real save's FormID array. `tools/save_formid_scan.py`
+decompresses an SSE `.ess` (LZ4) and reports it; cross-referenced against the
+built ESM (0 unmatched of 14,368):
+
+| Type | ids in save | Type | ids in save |
+|---|---|---|---|
+| REFR | 5,794 | GLOB | 567 |
+| ACHR | 2,349 | **NAVM** | **564** |
+| PACK | 1,179 | DIAL | 450 |
+| CELL | 1,115 | QUST | 384 |
+
+Plus MESG 41, OTFT 11, DLVW 4, VTYP 1, IPDS 1.
+
+**NAVM is save-persisted** — the engine records navmesh obstacle/door pathing
+state against it. So there is **no "build-internal" class** that may be
+allocated sequentially: an earlier plan to exempt NAVM/DLVW/IPDS from hashing
+would have silently broken 564 navmesh state entries per save. Everything
+derived is hashed.
+
+### `FORMID_SCHEME_VERSION`
+
+Bumping it (in `writer.py`) deliberately renumbers every derived record. It
+exists so an id-layout change is an explicit decision — changing the hash
+input, the site names, or the region silently invalidates every existing save,
+and the version is what records that it was intended.
 
 ### If a change WILL shift ids: tell the user, up front
 
 Drift is the user's call, not a detail to absorb — the cost lands on players,
-not on the build. Prefer the non-drifting route (add at the END, reuse an
-existing record, leave the allocation alone). If drift is genuinely unavoidable,
-finish the work, then **lead the final report with it**:
-
-1. Say it explicitly and up front — never buried at the bottom, never omitted
-   because the change is otherwise correct.
-2. State the blast radius: which record types renumber, and roughly how many.
-3. Say why it was unavoidable, and which non-drifting alternative you rejected.
-4. Never accept drift for a refactor, tidy-up or "simplification". If the only
-   benefit is cleanliness, the answer is no.
+not on the build. Prefer the non-drifting route (key off authored data, reuse
+an existing record). If drift is genuinely unavoidable, finish the work, then
+**lead the final report with it**: say it explicitly, state which record types
+renumber and roughly how many, say why it was unavoidable, and which
+alternative you rejected. Never accept drift for a refactor or tidy-up.
 
 This is a reporting duty, not a licence to stop mid-task.
 
-**Before shipping a change in these areas**, rebuild and diff with
-`tools/esm_diff.py old.esm new.esm` (it separates real diffs from reorders). To
-check pure reproducibility, build twice with different `PYTHONHASHSEED` and
-`cmp` the output — it must be byte-identical.
+Guarded by `tests/test_formid_determinism.py`, which checks stability across
+writers, independence from allocation order, non-collision with authored ids,
+and — via a subprocess at three `PYTHONHASHSEED` values — that Python's
+randomised `hash()` never reaches an id.
+
 
 ## Process containment — orphaned workers (learned 2026-07-29)
 

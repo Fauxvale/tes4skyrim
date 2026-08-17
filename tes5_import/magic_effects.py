@@ -123,7 +123,7 @@ def aimed_variant(mgef_fid: int, tes4_code: str, writer) -> int:
         # must be zeroed or the CK reads garbage counter slots.
         struct.pack_into('<I', data, _OFF_COUNTER_COUNT, 0)
 
-        fid = writer.alloc_formid()
+        fid = writer.derive_formid('MGEF_AIMED', key)
         subs = pack_string_subrecord('EDID', f'TES4{tes4_code}{edid}Aimed')
         full = _tes4_names.get(tes4_code)
         if full:

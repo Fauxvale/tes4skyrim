@@ -321,7 +321,7 @@ def convert_WEAP(rec: dict, writer=None) -> bytes:
     wnam_fid = 0
     if model and writer is not None:
         edid = get_str(rec, 'EditorID', '')
-        wnam_fid = writer.alloc_formid()
+        wnam_fid = writer.derive_formid('WEAP_STAT', get_formid(rec, 'FormID'))
         stat_bytes = _build_weapon_1stperson_stat(edid, _prefix_path(model), wnam_fid)
         writer.add_record('STAT', stat_bytes)
     if wnam_fid:
@@ -444,7 +444,7 @@ def convert_ARMO(rec: dict, is_clothing: bool = False, writer=None) -> bytes:
     # Vanilla census (Skyrim.esm, 766 ARMA): 4 carry MOD3 only and 0 carry
     # neither, so a female-only armature is legal and an empty one never is.
     if writer is not None and (male_model or female_model):
-        arma_fid = writer.alloc_formid()
+        arma_fid = writer.derive_formid('ARMA', get_formid(rec, 'FormID'))
         arma_bytes = _build_arma(rec, arma_fid, tes5_biped, armor_type,
                                  is_shield=is_shield)
         writer.add_record('ARMA', arma_bytes)
@@ -621,7 +621,7 @@ def convert_AMMO(rec: dict, writer=None) -> bytes:
     # TES4 has no separate PROJ records; we synthesise one per AMMO.
     if writer is not None:
         edid = get_str(rec, 'EditorID', '')
-        proj_fid = writer.alloc_formid()
+        proj_fid = writer.derive_formid('PROJ', get_formid(rec, 'FormID'))
         proj_model = _prefix_path(model) if model else _prefix_path('Weapons\\Iron\\Arrow.NIF')
         proj_bytes = _build_arrow_proj(edid, proj_model, speed, proj_fid)
         writer.add_record('PROJ', proj_bytes)
@@ -801,7 +801,12 @@ def convert_BOOK(rec: dict, writer=None) -> bytes:
                 cache = writer._book_inam_stats = {}
             inam_fid = cache.get(base)
             if inam_fid is None:
-                inam_fid = writer.alloc_formid()
+                # SHARED across every book using this mesh, so it cannot key
+                # off one book's FormID. `base` is derived (inv_basename_map
+                # resolves collisions against the whole model list), so key on
+                # the authored source model path instead — that is TES4 data
+                # and does not move when our naming logic changes.
+                inam_fid = writer.derive_formid('BOOK_INVART', model.lower())
                 inv_model = 'clutter\\books\\inv\\' + base + '.nif'
                 stat_bytes = _build_model_stat('InvArt_' + base,
                                                _prefix_path(inv_model), inam_fid)

@@ -1837,7 +1837,7 @@ def _make_generic_quest(writer, edid: str, full: str,
         if existing:
             print(f"    reusing master's {edid} ({existing:08X})")
             return existing
-    fid = writer.alloc_formid()
+    fid = writer.derive_formid('SYNTH_QUST', edid)
     q = pack_string_subrecord('EDID', edid)
     q += pack_string_subrecord('FULL', full)
     q += pack_subrecord('DNAM', struct.pack('<HBBII', 0x0011, 0, 0, 0, 0))
@@ -1874,7 +1874,7 @@ def _make_player_script_quest(writer, master_index=None) -> int:
             print(f"    reusing master's {edid} ({existing:08X})")
             return existing
 
-    fid = writer.alloc_formid()
+    fid = writer.derive_formid('SYNTH_QUST', edid)
     alias_id = 0
     # Skyrim subrecord order is EDID VMAD FULL DNAM — unanimous across all 912
     # vanilla QUSTs that carry a VMAD.
@@ -1905,7 +1905,13 @@ def _make_player_script_quest(writer, master_index=None) -> int:
 # Fake source-space DIAL FormIDs for the synthesized conversation-head topics
 # (npc_conversations.py).  High in the 24-bit object space so they can never
 # collide with a real plugin record; verified against the loaded DIALs anyway.
-_CONV_FAKE_FID_BASE = 0x00F40000
+CONV_FAKE_FID_BASE = 0x00F40000
+# Upper bound on synthesized chains, so import_plugin can RESERVE the whole
+# window before hashing starts (these ids bypass derive_formid, so nothing
+# else would know they are taken — the header then lands below them and a
+# derived record can hash onto one).
+CONV_FAKE_FID_COUNT = 0x1000
+_CONV_FAKE_FID_BASE = CONV_FAKE_FID_BASE
 
 
 def _register_conversation_chains(plan, dials, infos, offset):
@@ -1936,6 +1942,12 @@ def _register_conversation_chains(plan, dials, infos, offset):
         head = info_by_fid.get(chain['head_fid'])
         if head is None:
             continue
+        if chain['index'] >= CONV_FAKE_FID_COUNT:
+            raise ValueError(
+                f"NPC-conversation chain index {chain['index']} exceeds the "
+                f"reserved fake-FormID window of {CONV_FAKE_FID_COUNT}; raise "
+                f"CONV_FAKE_FID_COUNT (import_plugin reserves exactly this "
+                f"many, so a larger index lands on an unreserved id).")
         fake = _CONV_FAKE_FID_BASE + chain['index']
         fake_by_index[chain['index']] = fake
         head['ParentDIAL'] = f'{fake:08X}'
@@ -1996,8 +2008,8 @@ def _make_conversation_quest(writer, plan, synth_topic_fids, bark_topic_fids,
         if t0:
             props[f'Conv{i}T0'] = t0
 
-    fid = writer.alloc_formid()
     edid = plan['quest_edid']
+    fid = writer.derive_formid('SYNTH_QUST', edid)
     q = pack_string_subrecord('EDID', edid)
     q += pack_subrecord('VMAD', build_vmad_quest_fragments(
         edid, [], None,
@@ -2412,7 +2424,7 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
     # --- One DLVW per owning quest ---
     all_dlvw = b''
     for qfid, branches in view_branches.items():
-        dlvw_fid = writer.alloc_formid()
+        dlvw_fid = writer.derive_formid('DLVW', qfid)
         all_dlvw += make_dlvw(dlvw_fid, f'TES4View_{qfid:08X}', qfid,
                               branches, view_topics.get(qfid, []))
         stats['views'] += 1
@@ -2595,7 +2607,7 @@ def _build_one_topic(dial_rec, info_by_dial, writer, offset,
             is_linked = True
             stats['script_topic_unlisted'] = \
                 stats.get('script_topic_unlisted', 0) + 1
-        dlbr_fid = writer.alloc_formid()
+        dlbr_fid = writer.derive_formid('DLBR', dial_fid)
         dlbr_edid = (f'TES4_{edid}_Branch' if edid
                      else f'TES4_DLBR_{dlbr_fid:08X}')
         dlbr_bytes = make_dlbr(dlbr_fid, dlbr_edid, owner_qfid, dial_fid,
@@ -2932,7 +2944,7 @@ def _build_bark_pass(bark_dials, info_by_dial, writer,
             this_dial_fid = src_fid
             claimed.add(src_fid)
         else:
-            this_dial_fid = writer.alloc_formid()
+            this_dial_fid = writer.derive_formid('BARK_DIAL', key)
         this_edid = f"{g['edid']}_{owner_qfid:08X}" if g['edid'] else \
             f"TES4Bark_{subtype}_{owner_qfid:08X}"
         # Remember this quest's GREETING so a ForceGreet package can open it.
@@ -3083,7 +3095,7 @@ def _build_service_fallback_info(writer, service_kind: str,
                                  service_gate_bytes: bytes) -> bytes:
     """A minimal always-passing (for service NPCs) INFO that opens the menu."""
     from script_convert.pipeline import build_vmad_info_fragment
-    info_fid = writer.alloc_formid()
+    info_fid = writer.derive_formid('SERVICE_INFO', service_kind)
     s = pack_subrecord('VMAD', build_vmad_info_fragment(
         '', script_name=SERVICE_MENU_SCRIPTS[service_kind]))
     s += pack_subrecord('ENAM', struct.pack('<HH', 0, 0))

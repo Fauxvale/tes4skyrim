@@ -31,6 +31,13 @@ class FakeWriter:
         self._next += 1
         return self._next
 
+    def derive_formid(self, site, key):
+        if not hasattr(self, '_derived'):
+            self._derived = {}
+        k = (site, repr(key))
+        if k not in self._derived:
+            self._derived[k] = self.alloc_formid()
+        return self._derived[k]
     def add_record(self, sig, blob):
         self._top_groups.setdefault(sig, []).append(blob)
 

@@ -36,6 +36,13 @@ class FakeWriter:
         return fid
 
 
+    def derive_formid(self, site, key):
+        if not hasattr(self, '_derived'):
+            self._derived = {}
+        k = (site, repr(key))
+        if k not in self._derived:
+            self._derived[k] = self.alloc_formid()
+        return self._derived[k]
 # ---------------------------------------------------------------------------
 # LAND VHGT decoding
 # ---------------------------------------------------------------------------

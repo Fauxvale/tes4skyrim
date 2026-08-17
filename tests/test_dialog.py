@@ -107,6 +107,15 @@ class _FakeWriter:
         self._next += 1
         return self._next
 
+    def derive_formid(self, site, key):
+        # Test double: derived ids need only be stable per
+        # (site, key) and distinct, like the real allocator.
+        if not hasattr(self, '_derived'):
+            self._derived = {}
+        k = (site, repr(key))
+        if k not in self._derived:
+            self._derived[k] = self.alloc_formid()
+        return self._derived[k]
     def add_record(self, sig, rec_bytes):
         self.records.append((sig, rec_bytes))
 

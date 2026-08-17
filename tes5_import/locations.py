@@ -186,7 +186,7 @@ def _build_worldspace_locations(by_type: dict, marker_names: dict,
         if not world_fid or not name:
             continue
 
-        lctn_fid = writer.alloc_formid()
+        lctn_fid = writer.derive_formid('LCTN_WORLD', world_fid)
         edid_base = ''.join(c for c in name if c.isalnum())
         edid = f'TES4{edid_base}Location'
         # A worldspace named after its sole marker ("The Fringe") would
@@ -276,7 +276,7 @@ def build_marker_locations(by_type: dict, writer) -> tuple:
             continue
 
         name = get_str(rec, 'MapMarker.FULL')
-        lctn_fid = writer.alloc_formid()
+        lctn_fid = writer.derive_formid('LCTN_MARKER', marker_fid)
 
         edid_base = ''.join(c for c in name if c.isalnum()) or f'{marker_fid:08X}'
         edid = f'TES4{edid_base}Location'

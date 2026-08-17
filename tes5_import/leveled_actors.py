@@ -202,7 +202,7 @@ def build_leveled_actor_shells(by_type: dict, writer) -> int:
         lvln_fid = get_formid(lvlc, 'FormID')
         shell_fid = shell_by_lvlc.get(lvln_fid)
         if shell_fid is None:
-            shell_fid = writer.alloc_formid()
+            shell_fid = writer.derive_formid('LVLN_SHELL', lvln_fid)
             race = _shell_race(lvlc, crea_by_fid, npc_by_fid, lvlc_by_fid)
             edid = (get_str(lvlc, 'EditorID') or f'LVLN{lvln_fid:08X}') + '_Lvl'
             writer.add_record('NPC_', _build_shell(shell_fid, lvln_fid, race, edid))

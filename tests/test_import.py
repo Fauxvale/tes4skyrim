@@ -398,13 +398,16 @@ class TestConverters:
                'DATA.ArmorRating': '20', 'DATA.Value': '100', 'DATA.Weight': '30.0',
                'Male.BipedModel.MODL': 'Armor\\Iron\\M.nif'}
         writer = PluginWriter(masters=['Skyrim.esm'])
-        writer.next_object_id = 0x01002000
         result = convert_ARMO(rec, writer=writer)
         # ARMO should have MODL subrecord referencing the ARMA
         assert self._has_subrecord(result, 'MODL')
         modl_data = self._get_subrecord_data(result, 'MODL')
         arma_ref = struct.unpack('<I', modl_data)[0]
-        assert arma_ref == 0x01002000
+        # The ARMA's id is DERIVED from the source ARMO, not taken from a
+        # counter — so it is whatever hashing 'ARMA' + this FormID gives, and
+        # a second writer must independently produce the same id.
+        assert arma_ref == PluginWriter(
+            masters=['Skyrim.esm']).derive_formid('ARMA', 0x300)
         # Writer should have an ARMA record
         assert 'ARMA' in writer._top_groups
         assert len(writer._top_groups['ARMA']) == 1
@@ -656,6 +659,15 @@ class TestConverters:
             def alloc_formid(self):
                 self._next += 1
                 return self._next
+            def derive_formid(self, site, key):
+                # Test double: derived ids need only be stable per
+                # (site, key) and distinct, like the real allocator.
+                if not hasattr(self, '_derived'):
+                    self._derived = {}
+                k = (site, repr(key))
+                if k not in self._derived:
+                    self._derived[k] = self.alloc_formid()
+                return self._derived[k]
             def add_record(self, sig, data):
                 self.records.append((sig, data))
         w = _FakeWriter()
@@ -3491,6 +3503,15 @@ class TestWeatherConversion:
             def alloc_formid(self):
                 self.next += 1
                 return self.next
+            def derive_formid(self, site, key):
+                # Test double: derived ids need only be stable per
+                # (site, key) and distinct, like the real allocator.
+                if not hasattr(self, '_derived'):
+                    self._derived = {}
+                k = (site, repr(key))
+                if k not in self._derived:
+                    self._derived[k] = self.alloc_formid()
+                return self._derived[k]
             # A 3D sound now mints a real falloff SOPM instead of taking the
             # non-attenuating 2D model (see the ONAM note in convert_SOUN).
             def add_record(self, sig, data):
@@ -3836,6 +3857,15 @@ class TestWeatherImageSpace:
             self.next_fid += 1
             return self.next_fid
 
+        def derive_formid(self, site, key):
+            # Test double: derived ids need only be stable per
+            # (site, key) and distinct, like the real allocator.
+            if not hasattr(self, '_derived'):
+                self._derived = {}
+            k = (site, repr(key))
+            if k not in self._derived:
+                self._derived[k] = self.alloc_formid()
+            return self._derived[k]
     # (min, max) per field across the 213 vanilla imagespaces a Skyrim.esm
     # WEATHER actually references (interior/dungeon ones excluded).
     VANILLA_RANGES = [
@@ -4057,6 +4087,15 @@ class TestVanillaMgefDataSize:
                 self.fid += 1
                 return self.fid
 
+            def derive_formid(self, site, key):
+                # Test double: derived ids need only be stable per
+                # (site, key) and distinct, like the real allocator.
+                if not hasattr(self, '_derived'):
+                    self._derived = {}
+                k = (site, repr(key))
+                if k not in self._derived:
+                    self._derived[k] = self.alloc_formid()
+                return self._derived[k]
             def add_record(self, rec_type, data):
                 self.records.append((rec_type, data))
 
@@ -4243,6 +4282,15 @@ class TestMgefConversion:
                 self.n += 1
                 return self.n
 
+            def derive_formid(self, site, key):
+                # Test double: derived ids need only be stable per
+                # (site, key) and distinct, like the real allocator.
+                if not hasattr(self, '_derived'):
+                    self._derived = {}
+                k = (site, repr(key))
+                if k not in self._derived:
+                    self._derived[k] = self.alloc_formid()
+                return self._derived[k]
             def add_record(self, sig, b):
                 self.recs.append((sig, b))
 
@@ -4340,6 +4388,15 @@ class TestMgefConversion:
                 self.fid += 1
                 return self.fid
 
+            def derive_formid(self, site, key):
+                # Test double: derived ids need only be stable per
+                # (site, key) and distinct, like the real allocator.
+                if not hasattr(self, '_derived'):
+                    self._derived = {}
+                k = (site, repr(key))
+                if k not in self._derived:
+                    self._derived[k] = self.alloc_formid()
+                return self._derived[k]
             def add_record(self, rec_type, data):
                 self.records.append((rec_type, data))
 

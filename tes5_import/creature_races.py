@@ -229,7 +229,7 @@ def build_creature_voice_types(writer) -> int:
     """
     _CREA_VOICE_MAP.clear()
     for folder in sorted(set(_CREA_FOLDER_MAP.values())):
-        fid = writer.alloc_formid()
+        fid = writer.derive_formid('CREA_VTYP', folder)
         subs = pack_string_subrecord(
             'EDID', f'TES4Cr{folder.capitalize()}Voice')
         subs += pack_subrecord('DNAM', struct.pack('<B', _CREATURE_VTYP_DNAM))
@@ -307,7 +307,7 @@ def build_creature_body_parts(writer) -> int:
             s += pack_subrecord('NAM5', b'')
             return s
 
-        fid = writer.alloc_formid()
+        fid = writer.derive_formid('CREA_BPTD', folder)
         subs = pack_string_subrecord(
             'EDID', f'TES4{folder.capitalize()}BodyPartData')
         subs += pack_string_subrecord('MODL', skel)
@@ -731,7 +731,8 @@ def _build_movts(writer, folder: str, proj: dict,
         subs += pack_string_subrecord('MNAM', mnam)
         subs += pack_subrecord('SPED', sped)
         subs += pack_subrecord('INAM', _MOVT_INAM)
-        writer.add_record('MOVT', pack_record('MOVT', writer.alloc_formid(),
+        writer.add_record('MOVT', pack_record(
+            'MOVT', writer.derive_formid('MOVT', (folder, mnam)),
                                               0, subs))
 
 
@@ -743,7 +744,9 @@ def _build_skin(writer, folder: str, bodies: list, race_fid: int,
     merges every Oblivion body part into one <creature>.nif so a single ARMA
     covers the whole animal (see merge_creature_body / DogRace census)."""
     body = bodies[0]
-    arma_fid = writer.alloc_formid()
+    # `bodies` are the source CREA's TES4 NIFZ model paths (authored), not
+    # our merged output name, so this key survives changes to mesh merging.
+    arma_fid = writer.derive_formid('CREA_ARMA', (folder, tuple(bodies)))
     stem = os.path.splitext(body)[0]
     subs = b''
     subs += pack_string_subrecord('EDID', f'TES4{edid_base}{stem}AA')
@@ -925,8 +928,8 @@ def build_creature_races(by_type: dict, writer, export_dir: str,
 
         key = (folder, tuple(bodies))
         if key not in made:
-            race_fid = writer.alloc_formid()
-            skin_fid = writer.alloc_formid()
+            race_fid = writer.derive_formid('CREA_RACE', key)
+            skin_fid = writer.derive_formid('CREA_SKIN', key)
             edid = get_str(rec, 'EditorID') or folder
             edid_base = ''.join(c for c in edid if c.isalnum()) or folder
             full = get_str(rec, 'FULL') or edid

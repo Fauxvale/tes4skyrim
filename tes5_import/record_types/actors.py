@@ -268,9 +268,10 @@ def _flatten_cscr(records: list) -> int:
     return patched
 
 
-def _build_outfit(writer, edid: str, outfit_fids: list) -> int:
+def _build_outfit(writer, edid: str, outfit_fids: list,
+                  source_fid: int = 0) -> int:
     """Emit the OTFT companion record for an actor and return its FormID."""
-    otft_fid = writer.alloc_formid()
+    otft_fid = writer.derive_formid('OTFT', source_fid or edid)
     subs = pack_string_subrecord('EDID', edid)
     # INAM — item FormIDs packed as consecutive 4-byte LE uint32
     subs += pack_subrecord(
@@ -866,7 +867,7 @@ def create_origin_faction(writer) -> int:
     can never affect crime, combat reaction, or the barter menu.
     """
     global _origin_faction_fid
-    _origin_faction_fid = writer.alloc_formid()
+    _origin_faction_fid = writer.derive_formid('FACT', 'TES4PluginOriginFaction')
     subs = pack_string_subrecord('EDID', 'TES4PluginOriginFaction')
     subs += pack_subrecord('DATA', struct.pack('<I', 0))
     writer.add_record('FACT', pack_record('FACT', _origin_faction_fid, 0, subs))
@@ -926,7 +927,9 @@ def _vendor_flst_subs(svc_mask: int) -> bytes:
 
 def _write_vendor_faction(writer, edid: str, flst_fid: int, venc_fid: int = 0) -> int:
     """Create a vendor FACT (VEND → flst, optional VENC → chest) and return its FormID."""
-    fact_fid = writer.alloc_formid()
+    # `edid` is unique per faction (TES4VendorFaction_<mask> or
+    # TES4Merchant_<actor fid>), both derived from authored data.
+    fact_fid = writer.derive_formid('VENDOR_FACT', edid)
     subs = pack_string_subrecord('EDID', edid)
     subs += pack_string_subrecord('FULL', 'Merchant')
     # DATA: Vendor (0x4000) only — matches vanilla service factions
@@ -988,7 +991,7 @@ def create_vendor_factions(by_type: dict, writer) -> None:
     for svc_mask in sorted(unique_services):
         if not _keywords_for_services(svc_mask):
             continue
-        flst_fid = writer.alloc_formid()
+        flst_fid = writer.derive_formid('VENDOR_FLST', svc_mask)
         writer.add_record('FLST', pack_record('FLST', flst_fid, 0,
                                               _vendor_flst_subs(svc_mask)))
         flst_by_svc[svc_mask] = flst_fid
@@ -1014,7 +1017,7 @@ def create_vendor_factions(by_type: dict, writer) -> None:
     # marker, so it can never compete with the real vendor faction the engine
     # resolves for the barter menu.
     global _merchant_marker_faction_fid
-    _merchant_marker_faction_fid = writer.alloc_formid()
+    _merchant_marker_faction_fid = writer.derive_formid('FACT', 'TES4MerchantFaction')
     marker = pack_string_subrecord('EDID', 'TES4MerchantFaction')
     marker += pack_string_subrecord('FULL', 'Merchant')
     marker += pack_subrecord('DATA', struct.pack('<I', 0))
@@ -1115,7 +1118,7 @@ def create_trainer_records(by_type: dict, writer) -> None:
 
     # One faction marks every trainer; the generated Training topic is gated
     # on GetInFaction(this). Flags 0 like vanilla JobTrainerFaction.
-    _trainer_faction_fid = writer.alloc_formid()
+    _trainer_faction_fid = writer.derive_formid('FACT', 'TES4JobTrainerFaction')
     f = pack_string_subrecord('EDID', 'TES4JobTrainerFaction')
     f += pack_string_subrecord('FULL', 'Trainer')
     f += pack_subrecord('DATA', struct.pack('<I', 0))
@@ -1130,7 +1133,7 @@ def create_trainer_records(by_type: dict, writer) -> None:
         key = (src_fid, teaches_idx, max_level)
         clone_fid = clone_cache.get(key)
         if not clone_fid:
-            clone_fid = writer.alloc_formid()
+            clone_fid = writer.derive_formid('TRAINER_CLAS', key)
             edid = (f'TES4Trainer{TES5_SKILL_ORDER[teaches_idx]}'
                     f'{max_level}_{src_fid & 0xFFFFFF:06X}')
             writer.add_record('CLAS', convert_CLAS(
@@ -1354,7 +1357,7 @@ def convert_NPC_(rec: dict, writer=None) -> bytes:
     if writer is not None and outfit_fids:
         subs += pack_formid_subrecord(
             'DOFT', _build_outfit(writer, (edid or 'NPC') + '_Outfit',
-                                  outfit_fids))
+                                  outfit_fids, get_formid(rec, 'FormID')))
 
     # DPLT — default package list: the vanilla fallback AI most NPCs carry
     subs += pack_formid_subrecord('DPLT', DPLT_NPC_LIST)
@@ -1548,7 +1551,7 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
     if writer is not None and outfit_fids:
         subs += pack_formid_subrecord(
             'DOFT', _build_outfit(writer, (edid or 'CREA') + '_Outfit',
-                                  outfit_fids))
+                                  outfit_fids, get_formid(rec, 'FormID')))
 
     # DPLT — default package list, like every vanilla creature (EncWolf etc.)
     subs += pack_formid_subrecord('DPLT', DPLT_CREATURE_LIST)
