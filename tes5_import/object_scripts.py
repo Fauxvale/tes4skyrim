@@ -143,11 +143,30 @@ def _remap(fid: int, offset: int) -> int:
     return remap_formid(fid, offset)
 
 
-def _collect_scpts(by_type: dict, xref) -> dict:
-    """SCPT FormID -> (EditorID, SCTX source, extends class)."""
+def _collect_scpts(by_type: dict, xref, master_export: dict = None) -> dict:
+    """SCPT FormID -> (EditorID, SCTX source, extends class).
+
+    `master_export` is the MASTERS' export records and is REQUIRED for a plugin
+    with masters: a dependent plugin routinely attaches one of ITS MASTER'S
+    scripts to its own records (33 of ElsweyrAnequina.esp's, every one of them
+    resolvable only from the master), and every consumer here drops a record
+    whose SCRI misses this index — so the record gets NO VMAD at all and nothing
+    is logged.  The masters go in FIRST so an override of a master script wins.
+
+    **Key a master's record on its master_export KEY, not on rec['FormID'].**
+    The record was parsed from the master's OWN export, so its `FormID` field is
+    in THAT file's index space, while every `SCRI` looked up against this index
+    is in THIS plugin's space — the space `load_master_export` re-keyed the dict
+    into.  Keying on the raw field would miss whenever a master has a different
+    master count than we do (and could collide with an unrelated record).
+    """
     scpt_by_fid: dict[str, tuple] = {}
-    for rec in by_type.get('SCPT', []):
-        fid = rec.get('FormID', '')
+    sources = []
+    if master_export:
+        sources.append((k, r) for k, r in master_export.items()
+                       if r.get('Signature') == 'SCPT')
+    sources.append((r.get('FormID', ''), r) for r in by_type.get('SCPT', []))
+    for fid, rec in (p for src in sources for p in src):
         sctx = rec.get('SCTX', '')
         if not fid or not sctx or not sctx.strip():
             continue
@@ -156,7 +175,8 @@ def _collect_scpts(by_type: dict, xref) -> dict:
     return scpt_by_fid
 
 
-def build_quest_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
+def build_quest_script_plan(by_type: dict, xref, fid_to_edid: dict,
+                            master_export: dict = None) -> int:
     """Resolve every QUST's attached TES4 quest script (SCRI) to a
     (script_name, bound-properties) plan for convert_QUST to splice into the
     quest VMAD.  Without this the converted TES4_<QuestScript>.pex is never
@@ -168,7 +188,7 @@ def build_quest_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
     """
     _QUEST_SCRIPT.clear()
     offset = get_formid_index_offset()
-    scpt_by_fid = _collect_scpts(by_type, xref)
+    scpt_by_fid = _collect_scpts(by_type, xref, master_export)
 
     for rec in by_type.get('QUST', []):
         scri = rec.get('SCRI', '')
@@ -203,7 +223,8 @@ def get_magic_effect_vmad(scpt_fid: str) -> bytes:
     return _MAGIC_EFFECT_VMAD.get(scpt_fid, b'')
 
 
-def build_magic_effect_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
+def build_magic_effect_script_plan(by_type: dict, xref, fid_to_edid: dict,
+                                   master_export: dict = None) -> int:
     """Resolve every magic-effect script (SCHR.Type 256) to a packed VMAD.
 
     A TES4 `SEFF` effect names its script per EFFECT — `ScriptEffect[i].FormID`
@@ -217,7 +238,7 @@ def build_magic_effect_script_plan(by_type: dict, xref, fid_to_edid: dict) -> in
     """
     _MAGIC_EFFECT_VMAD.clear()
     offset = get_formid_index_offset()
-    scpt_by_fid = _collect_scpts(by_type, xref)
+    scpt_by_fid = _collect_scpts(by_type, xref, master_export)
 
     # Only the scripts actually referenced by an effect are worth resolving —
     # _resolve_props re-runs the whole converter per script.
@@ -243,7 +264,8 @@ def build_magic_effect_script_plan(by_type: dict, xref, fid_to_edid: dict) -> in
     return len(_MAGIC_EFFECT_VMAD)
 
 
-def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
+def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict,
+                             master_export: dict = None) -> int:
     """Compute and cache the VMAD for every object record with an attached SCPT.
 
     by_type: {signature: [record dicts]} from the export.
@@ -257,7 +279,7 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
     _GETPARENTREF_BASES.clear()
     _CONSUME_DOOR_BASES.clear()
     offset = get_formid_index_offset()
-    scpt_by_fid = _collect_scpts(by_type, xref)
+    scpt_by_fid = _collect_scpts(by_type, xref, master_export)
 
     from .constants import TYPE_MAP
 
@@ -325,12 +347,12 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
                 'VMAD', build_vmad_object_script(script_name, obj_props))
             count += 1
 
-    n_player = build_player_alias_plan(by_type, xref, fid_to_edid)
+    n_player = build_player_alias_plan(by_type, xref, fid_to_edid, master_export)
     if n_player:
         print(f"  Player-base scripts rehosted on a PlayerRef quest alias: "
               f"{n_player}")
 
-    n_moved = _relocate_actor_scripts_to_refs(by_type, offset)
+    n_moved = _relocate_actor_scripts_to_refs(by_type, offset, master_export)
     if n_moved:
         print(f"  Actor scripts relocated to placed refs (reference events / "
               f"self-ref calls / "
@@ -338,7 +360,8 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
     return count
 
 
-def build_player_alias_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
+def build_player_alias_plan(by_type: dict, xref, fid_to_edid: dict,
+                            master_export: dict = None) -> int:
     """Plan the rehosting of PLAYER-BASE scripts onto a PlayerRef quest alias.
 
     Oblivion let a plugin script the player by attaching a SCPT to the player's
@@ -365,7 +388,7 @@ def build_player_alias_plan(by_type: dict, xref, fid_to_edid: dict) -> int:
     """
     _PLAYER_ALIAS_SCRIPTS.clear()
     offset = get_formid_index_offset()
-    scpt_by_fid = _collect_scpts(by_type, xref)
+    scpt_by_fid = _collect_scpts(by_type, xref, master_export)
 
     for rec in by_type.get('NPC_', []):
         try:
@@ -458,7 +481,8 @@ def _script_uses_reference_event(sctx: str) -> bool:
                for m in _BEGIN_BLOCK_RE.finditer(sctx))
 
 
-def _relocate_actor_scripts_to_refs(by_type: dict, offset: int) -> int:
+def _relocate_actor_scripts_to_refs(by_type: dict, offset: int,
+                                    master_export: dict = None) -> int:
     """Move an actor's script VMAD from the base NPC_/CREA to its placed ACHR.
 
     Three independent reasons an actor script MUST live on the reference:
@@ -506,8 +530,16 @@ def _relocate_actor_scripts_to_refs(by_type: dict, offset: int) -> int:
             wanted_low.add(ref & 0x00FFFFFF)
 
     # Base actors (raw low-24) whose script handles a reference-only event.
-    scpt_src = {r.get('FormID', ''): r.get('SCTX', '')
-                for r in by_type.get('SCPT', [])}
+    # The MASTERS' scripts are indexed too (keyed on the master_export key, this
+    # plugin's space — see _collect_scpts): a dependent plugin's actor can carry
+    # one of its master's scripts, and missing it means the relocation never
+    # happens, so every reason in the docstring above silently applies.
+    scpt_src = {}
+    if master_export:
+        scpt_src.update({k: r.get('SCTX', '') for k, r in master_export.items()
+                         if r.get('Signature') == 'SCPT'})
+    scpt_src.update({r.get('FormID', ''): r.get('SCTX', '')
+                     for r in by_type.get('SCPT', [])})
     event_bases = set()
     for sig in ('NPC_', 'CREA'):
         for rec in by_type.get(sig, []):

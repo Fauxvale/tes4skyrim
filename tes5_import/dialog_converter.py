@@ -1733,7 +1733,8 @@ def build_say_topic_dispositions(by_type: dict) -> dict:
     return out
 
 
-def build_npc_to_vtyp_map(by_type: dict, num_new_masters: int) -> dict:
+def build_npc_to_vtyp_map(by_type: dict, num_new_masters: int,
+                          master_export: dict = None) -> dict:
     """NPC/CREA FormID (remapped) -> VTYP FormID, from the VOICE the NPC
     actually used in Oblivion.
 
@@ -1744,6 +1745,18 @@ def build_npc_to_vtyp_map(by_type: dict, num_new_masters: int) -> dict:
     literal race gave those NPCs a VTYP whose voice folder is empty, so every
     line was silent. Follow the same VNAM chain the engine uses so the
     assigned VTYP is the folder the recordings really live in.
+
+    `master_export` adds the MASTERS' actors. A dependent plugin writes dialogue
+    for its master's NPCs (15 speakers in ElsweyrPelletine.esp), and a speaker
+    with no entry here reaches _topic_voice_types/_build_injected_ctdas as
+    nothing, so the line falls back to a default voice type. The masters' RACEs
+    are supplied by the CALLER through `by_type` (it prepends them to 'RACE'),
+    so only the actor side is read from here.
+
+    **A master's actor is keyed on its master_export KEY, not rec['FormID'].**
+    The record came from the master's OWN export, so its `FormID` field sits in
+    THAT file's index space; the key is the id in ours, which is what every
+    consumer of this map looks up.
     """
     from .skyrim_overrides import TES4_RACE_FID_TO_EDID, VOICE_TYPE_MAP
     # RACE fid24 -> per-gender voice race fid24 (0/missing = the race itself).
@@ -1770,23 +1783,32 @@ def build_npc_to_vtyp_map(by_type: dict, num_new_masters: int) -> dict:
 
     npc_to_vtyp = {}
     offset = num_new_masters
-    for sig in ('NPC_', 'CREA'):
-        for rec in by_type.get(sig, []):
-            # Shift exactly as the record converters do, for any source index —
-            # an override keeps its master's index and must still land on the
-            # same key the converter stamps.
-            remapped = remap_formid(int(rec.get('FormID', '0'), 16), offset,
-                                    is_own_id=True)
-            gender = 'Female' if (get_int(rec, 'ACBS.Flags') & 1) else 'Male'
-            race_fid = get_formid(rec, 'RNAM.Race') & 0x00FFFFFF
-            voice_race_fid = race_voice.get(race_fid, {}).get(gender, race_fid)
-            race_edid = (race_edids.get(voice_race_fid)
-                         or TES4_RACE_FID_TO_EDID.get(voice_race_fid,
-                                                      'Imperial'))
-            vtyp = (VOICE_TYPE_MAP.get((race_edid, gender))
-                    or VOICE_TYPE_MAP.get(('Imperial', gender), 0))
-            if vtyp:
-                npc_to_vtyp[remapped] = vtyp
+    # (source id string, record) pairs. The masters come FIRST so this plugin's
+    # own records — an override included — overwrite them on the same key.
+    actor_sources = []
+    if master_export:
+        actor_sources.append((k, r) for k, r in master_export.items()
+                             if r.get('Signature') in ('NPC_', 'CREA'))
+    actor_sources.append((r.get('FormID', '0'), r) for sig in ('NPC_', 'CREA')
+                         for r in by_type.get(sig, []))
+    for fid_str, rec in (p for src in actor_sources for p in src):
+        # Shift exactly as the record converters do, for any source index —
+        # an override keeps its master's index and must still land on the
+        # same key the converter stamps.
+        try:
+            remapped = remap_formid(int(fid_str, 16), offset, is_own_id=True)
+        except (TypeError, ValueError):
+            continue
+        gender = 'Female' if (get_int(rec, 'ACBS.Flags') & 1) else 'Male'
+        race_fid = get_formid(rec, 'RNAM.Race') & 0x00FFFFFF
+        voice_race_fid = race_voice.get(race_fid, {}).get(gender, race_fid)
+        race_edid = (race_edids.get(voice_race_fid)
+                     or TES4_RACE_FID_TO_EDID.get(voice_race_fid,
+                                                  'Imperial'))
+        vtyp = (VOICE_TYPE_MAP.get((race_edid, gender))
+                or VOICE_TYPE_MAP.get(('Imperial', gender), 0))
+        if vtyp:
+            npc_to_vtyp[remapped] = vtyp
     return npc_to_vtyp
 
 

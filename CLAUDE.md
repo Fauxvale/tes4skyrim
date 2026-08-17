@@ -1,36 +1,17 @@
 # TES4-to-TES5 Conversion Project — AI Context
 
-> # 🛑 READ THIS BEFORE YOU END ANY TURN 🛑
+> # 🛑 READ BEFORE ENDING ANY TURN 🛑
 >
-> **DO NOT STOP UNTIL THE TASK IS FIXED, BUILT, AND VERIFIED.**
+> **Asked a QUESTION? Answer it. Don't write code.** Me proposing an approach
+> is not permission to build it. Build only on "do it" / "implement" / "fix".
 >
-> If you are about to send a message that contains any of these, **delete it and
-> go back to work** — every one is a STOP in disguise:
+> **Given a TASK? Finish it — fixed, built, verified.** No mid-task status,
+> no "want me to X?", no diagnosis without the fix. Low confidence and being
+> wrong repeatedly oblige you to keep going; they never earn a check-in.
+> A stop dressed as honesty is still a stop. Report uncertainty at the END.
+> Ask only if proceeding is unsafe or destructive — never "is my fix right?".
 >
-> - "I have not fixed this yet" / "I haven't started it"
-> - "I'm not going to claim ..." / "I'd rather tell you plainly ..."
-> - "The concrete next step is ..." / "The fix would be ..."
-> - "Tell me to go and I'll ..." / "Want me to X or Y?"
-> - A "what remains" or "where this leaves it" section
-> - A diagnosis with no implementation
->
-> **A diagnosis is NOT a deliverable. The fix is.**
->
-> **The trigger is ALWAYS low confidence** — being wrong 2, 3, or 6 times in a
-> row makes stopping feel responsible. It is not. Being wrong repeatedly
-> **obligates you to keep going**, it never earns a check-in. The tradeoff is
-> already decided and is NOT yours to re-derive: **the user would rather you
-> finish and be wrong than stop and ask.**
->
-> Framing a stop as honesty, humility, or respect for the user's time is still a
-> stop, and it is the version the user is angriest about. Report uncertainty in
-> the FINAL report, after the work is done.
->
-> The ONLY permitted question is one where proceeding would be **unsafe or
-> destructive**. Never "is my fix right?".
->
-> See [Working with the user](#no-stopping) and the memory
-> `feedback_never_stop_until_done`.
+> Details: [Working with the user](#no-stopping) · `feedback_never_stop_until_done`
 
 Convert TES4 (Oblivion) master/plugin files to TES5 (Skyrim) format.
 
@@ -112,6 +93,7 @@ caching, skipped record types, the export text format, and the directory layout.
 - **Look for the AUTHORED indicator** If you need to resort to heuristics, your approach is most likely incorrect. Remember, everything in the original plugin works for a reason
 - **Pay close attention to performance** This needs to run quickly on a modest PC. If your new code makes a step run significantly slower than it did before you **MUST optimize**. Python first optimizations, and then native C++ if necessary.
 - If the user gives multiple constraints to a bug, your fix MUST satisfy ALL of them
+- If the user asks for a plan or analysis. DO NOT BUILD until you have the goahead. Overeager code development is the opposite of helpful
 
 ### <a id="regression-read-the-commits"></a>🛑 IF IT IS A REGRESSION, READ THE COMMITS
 

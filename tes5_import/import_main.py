@@ -946,7 +946,10 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
         if _master_races:
             _vtyp_by_type = dict(by_type)
             _vtyp_by_type['RACE'] = _master_races + by_type.get('RACE', [])
-    npc_to_vtyp = build_npc_to_vtyp_map(_vtyp_by_type, num_new_masters)
+    # The masters' ACTORS go in as well: this plugin writes dialogue for its
+    # master's NPCs, and a speaker with no VTYP falls back to a default voice.
+    npc_to_vtyp = build_npc_to_vtyp_map(_vtyp_by_type, num_new_masters,
+                                        ctx.master_export if ctx else None)
     from .record_types.actors import set_npc_voice_map
     set_npc_voice_map(npc_to_vtyp)
     _step_done('npc voice map')
@@ -1207,10 +1210,16 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # Papyrus script + FormID bindings for the script's external references.
     # Without this the OnActivate/OnLoad/GameMode handlers never run in-game
     # (altars showed no message/effect, nirnroots never stopped their sound).
+    # The MASTERS' SCPTs are indexed too: a dependent plugin routinely attaches
+    # one of ITS MASTER'S scripts to its own records, and a SCRI that misses the
+    # index drops the record's VMAD entirely (see _collect_scpts).
+    _scpt_master_export = ctx.master_export if ctx else None
     from .object_scripts import build_object_script_plan, build_quest_script_plan
-    n_obj_scripts = build_object_script_plan(by_type, xref, fid_to_edid)
+    n_obj_scripts = build_object_script_plan(by_type, xref, fid_to_edid,
+                                             _scpt_master_export)
     print(f"  Object scripts: attached {n_obj_scripts} SCPT scripts to records via VMAD")
-    n_qust_scripts = build_quest_script_plan(by_type, xref, fid_to_edid)
+    n_qust_scripts = build_quest_script_plan(by_type, xref, fid_to_edid,
+                                             _scpt_master_export)
     print(f"  Quest scripts: planned {n_qust_scripts} SCRI attachments for QUST VMADs")
     _step_done('object/quest script plans')
 
@@ -1246,7 +1255,8 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     _effect_recs = [r for sig in ('SPEL', 'ENCH', 'ALCH', 'INGR', 'SGST')
                     for r in by_type.get(sig, [])]
     n_av = build_av_variants(_mgefs, _effect_recs, writer)
-    n_mescript = build_magic_effect_script_plan(by_type, xref, fid_to_edid)
+    n_mescript = build_magic_effect_script_plan(by_type, xref, fid_to_edid,
+                                                _scpt_master_export)
     n_seff = build_seff_variants(_mgefs, _effect_recs, writer,
                                  {f'{k:08X}': v for k, v in fid_to_edid.items()})
     # An enchanted TES4 BOOK is a scroll, and Skyrim's SCRL carries its effects
@@ -1751,9 +1761,13 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # Base-object model index for navmesh static-footprint carving. Only
     # blocking base types contribute; keyed by raw low-24 FormID so lookups
     # work regardless of load-order remapping.
-    base_model_by_fid = _build_base_model_index(by_type)
+    # The MASTERS' bases are indexed too — a dependent plugin mostly places
+    # THEIR statics and doors, and a missing base carves nothing (see the
+    # docstrings).
+    _navm_master_export = ctx.master_export if ctx else None
+    base_model_by_fid = _build_base_model_index(by_type, _navm_master_export)
     # Raw low-24 DOOR base FormIDs, so the navmesh can choke + link at doorways.
-    door_fids = _build_door_fid_set(by_type)
+    door_fids = _build_door_fid_set(by_type, _navm_master_export)
     # NAVM metadata accumulated across interior + exterior cells, used to build
     # the single top-level NAVI (Navmesh Info Map) the engine needs.
     navm_metas: list = []
@@ -2186,39 +2200,63 @@ def _navm_model_key(model: str) -> str:
     return p
 
 
-def _build_base_model_index(by_type: dict) -> dict:
+def _build_base_model_index(by_type: dict, master_export: dict = None) -> dict:
     """Map raw low-24 base-object FormID -> normalised model key.
 
     Only blocking base types are indexed, so navmesh carving never removes
     triangles under doors, lights, or markers.
+
+    `master_export` is the MASTERS' export records and is REQUIRED for a plugin
+    with masters: a dependent plugin overwhelmingly places its MASTER's statics
+    (83% of TWMP_ValenwoodImproved.esp's 129,371 placements name a base that
+    exists only in Oblivion.esm).  Without them every such REFR resolves to no
+    model key and carves NOTHING out of the navmesh, so actors path straight
+    through the master's buildings and rocks.  The masters go in FIRST so this
+    plugin's own records — including an override of a master's base — win the key.
     """
     index = {}
-    for sig in _NAVM_BLOCKING_BASE_TYPES:
-        for rec in by_type.get(sig, []):
-            model = get_str(rec, 'Model.MODL') or get_str(rec, 'MODL')
-            if not model:
-                continue
-            fid_str = rec.get('FormID')
-            if not fid_str:
-                continue
-            try:
-                low = int(fid_str, 16) & 0x00FFFFFF
-            except ValueError:
-                continue
-            index[low] = _navm_model_key(model)
+    sources = []
+    if master_export:
+        sources.append(r for r in master_export.values()
+                       if r.get('Signature') in _NAVM_BLOCKING_BASE_TYPES)
+    sources.append(r for sig in _NAVM_BLOCKING_BASE_TYPES
+                   for r in by_type.get(sig, []))
+    for rec in (r for src in sources for r in src):
+        model = get_str(rec, 'Model.MODL') or get_str(rec, 'MODL')
+        if not model:
+            continue
+        fid_str = rec.get('FormID')
+        if not fid_str:
+            continue
+        try:
+            low = int(fid_str, 16) & 0x00FFFFFF
+        except ValueError:
+            continue
+        index[low] = _navm_model_key(model)
     return index
 
 
-def _build_door_fid_set(by_type: dict) -> dict:
+def _build_door_fid_set(by_type: dict, master_export: dict = None) -> dict:
     """Map raw low-24 DOOR base FormID -> normalised model key.
 
     The model key ('tes4/<lower model path>.nif') matches the door_centers_cache
     keys so _collect_doors can panel-centre each door (REFR pivot is the hinge,
     not the doorway).  Membership of the map still doubles as the "is this a
     DOOR base" test.
+
+    The MASTERS' DOORs are indexed too, for the same reason as
+    _build_base_model_index: a dependent plugin places the master's door models
+    (2,165 of TWMP_ValenwoodImproved.esp's placements), and because membership
+    here IS the "is this a DOOR" test, missing them means the navmesh neither
+    chokes nor links at those doorways.  Masters first so an override wins.
     """
     out = {}
-    for rec in by_type.get('DOOR', []):
+    sources = []
+    if master_export:
+        sources.append(r for r in master_export.values()
+                       if r.get('Signature') == 'DOOR')
+    sources.append(by_type.get('DOOR', []))
+    for rec in (r for src in sources for r in src):
         fid_str = rec.get('FormID')
         if not fid_str:
             continue
