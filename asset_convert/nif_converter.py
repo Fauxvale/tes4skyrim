@@ -3682,7 +3682,9 @@ def _add_bsx_flags(root, has_constraints=False):
 
 
 def _sanitize_geometry_data(data):
-    """Zero out non-finite floats in render geometry.
+    """Repair geometry Oblivion tolerates and the Skyrim-side tools do not.
+
+    Two defects, both authored, both fatal further down the line.
 
     A handful of Oblivion source meshes ship NaN data (anvildooruc02.nif has
     9 NaN UVs, middlecandlestickfloor03fake.nif has 2 — one mesh in each of
@@ -3695,11 +3697,61 @@ def _sanitize_geometry_data(data):
     non-finite normals/tangents/bitangents become +Z; a non-finite bound
     sphere is recomputed after vertices are fixed.
 
+    The second is a shape that declares vertices and ships none — see the
+    comment on that branch. It is cleared to a genuinely empty shape, because
+    without positions there is nothing to repair it with.
+
     Returns the number of components fixed.
     """
     fixed = 0
     for block in data.blocks:
         if not isinstance(block, NifFormat.NiGeometryData):
+            continue
+
+        # A shape that declares vertices and then ships NONE of them.
+        # `LeyawiinLowerDoor01` in leyawiinhouselower01.nif is the measured
+        # case: num_vertices=16, has_vertices=False, yet normals, colours, UVs
+        # and 6 triangles all still index 16 of them. Oblivion tolerates it
+        # (there is nothing to draw, so it draws nothing); anything that walks
+        # the faces and reaches for a vertex does not.
+        #
+        # LODGen is what found it: RemoveUnseenFaces indexes straight into the
+        # empty list, throws ArgumentOutOfRangeException, and the run ends with
+        # exit 548 and NO .bto tiles — one broken shape costs an entire
+        # worldspace its object LOD. Measured: 1 of Nehrim's 1552 _far.nif.
+        #
+        # Cleared rather than repaired, because there is nothing to repair
+        # with: without vertex positions the triangles have no geometry to
+        # describe. The shape already drew nothing, so it loses nothing.
+        if block.num_vertices and not getattr(block, 'has_vertices', False):
+            block.num_vertices = 0
+            block.vertices.update_size()
+            for flag, arr in (('has_normals', 'normals'),
+                              ('has_vertex_colors', 'vertex_colors')):
+                if getattr(block, flag, False):
+                    setattr(block, flag, False)
+                    getattr(block, arr).update_size()
+            if hasattr(block, 'uv_sets'):
+                block.num_uv_sets = 0
+                block.uv_sets.update_size()
+            block.num_triangles = 0
+            # 🔴 BOTH geometry layouts, and the strips are the one that bites.
+            # The measured case is `NiTriStripsData`, which has no `triangles`
+            # array at all — it stores STRIPS. A first version of this cleared
+            # only `triangles`, so the strips survived, the strips-to-triangles
+            # conversion downstream turned them back into 6 triangles, and the
+            # shape shipped with zero vertices and six faces indexing vertex 15.
+            # LODGen happened to tolerate that; the next tool would not.
+            if hasattr(block, 'triangles'):
+                block.num_triangle_points = 0
+                block.has_triangles = False
+                block.triangles.update_size()
+            if hasattr(block, 'points'):
+                block.num_strips = 0
+                block.has_points = False
+                block.strip_lengths.update_size()
+                block.points.update_size()
+            fixed += 1
             continue
 
         if getattr(block, 'has_vertices', False) and block.num_vertices:
