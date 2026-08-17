@@ -625,6 +625,21 @@ def _lod_mesh_is_safe(path: str, output_meshes_dir: Path) -> bool:
     if cached is not None:
         return cached
 
+    if not full.exists():
+        # 🔴 NOT cached, and that is the whole point.  Absence is TRANSIENT
+        # here: the caller stages a mesh into this tree
+        # (`_import_master_mesh`) and screens it immediately afterwards, so a
+        # verdict taken before staging would be served from the cache after it
+        # and drop a mesh that is now sitting there perfectly readable.
+        #
+        # This is what broke object LOD for every worldspace once `output_dir`
+        # became the shared LOD mod rather than the plugin's own output: at
+        # prefetch time that tree is EMPTY, so every mesh cached as unsafe and
+        # each worldspace ended with "No LOD references found".  It was
+        # invisible before, because the plugin's own meshes were already in
+        # `output_dir` and only master-owned ones were ever staged.
+        return False
+
     safe = _root_is_ninode(full)
     _NIF_ROOT_SAFE_CACHE[key] = safe
     return safe
@@ -675,7 +690,8 @@ def _screenable_mesh_paths(refs, stats, cell_wrld, wrld_fid, keep_cells):
     return out
 
 
-def _prescreen_meshes(paths, output_meshes_dir: Path, workers: int = 16):
+def _prescreen_meshes(paths, output_meshes_dir: Path, workers: int = 16,
+                      source_meshes=None):
     """Warm `_NIF_ROOT_SAFE_CACHE` for `paths` using parallel header reads.
 
     Screening is a ~200-byte header read per unique mesh, so the cost is
@@ -691,6 +707,20 @@ def _prescreen_meshes(paths, output_meshes_dir: Path, workers: int = 16):
     Purely a warm-up — every entry is computed by the same `_root_is_ninode`
     the serial path uses, and any mesh missed here is simply screened on demand
     later. Order-independent, so it cannot affect FormIDs or output bytes.
+
+    🔴 A mesh that exists in NEITHER tree is skipped rather than cached as
+    unsafe.  The serial loop stages master-owned meshes into
+    `output_meshes_dir` and screens them right after, so caching "missing =
+    unsafe" up front would answer the later question with a stale verdict.
+    That is exactly what cost every worldspace its object LOD once
+    `output_dir` became the shared LOD mod (see `_lod_mesh_is_safe`).
+
+    `source_meshes` is where the serial loop stages FROM. Screening the source
+    is equivalent to screening the staged copy — `_import_master_mesh` uses
+    `shutil.copy2`, so the two are byte-identical — and it is what keeps the
+    warm-up worth doing at all in the shared-LOD-mod case, where nothing is in
+    `output_meshes_dir` yet. Resolution mirrors `_import_master_mesh`: this
+    tree first, then the source dirs in order, first hit wins.
     """
     todo = []
     seen = set()
@@ -702,7 +732,20 @@ def _prescreen_meshes(paths, output_meshes_dir: Path, workers: int = 16):
         if key in _NIF_ROOT_SAFE_CACHE or key in seen:
             continue
         seen.add(key)
-        todo.append((key, full))
+        read_from = full
+        if not full.exists():
+            rel = p.lower().replace('/', '\\').lstrip('\\')
+            if rel.startswith('meshes\\'):
+                rel = rel[len('meshes\\'):]
+            read_from = None
+            for mdir in (source_meshes or []):
+                cand = _win_join(Path(mdir), rel)
+                if cand.exists():
+                    read_from = cand
+                    break
+            if read_from is None:
+                continue          # nowhere yet — let the serial path decide
+        todo.append((key, read_from))
     if len(todo) < 2:
         return
     from concurrent.futures import ThreadPoolExecutor
@@ -1174,9 +1217,14 @@ def write_lodgen_input(esm_path: Path, output_dir: Path,
     # with the same helpers the loop uses); anything else still resolves
     # on demand, so this can only remove work, never change which meshes are
     # judged safe.
+    #
+    # `master_meshes` has to come along: the loop STAGES from there into this
+    # tree and screens right afterwards, so a warm-up that only looked here
+    # would cache "missing" for every mesh not yet staged — which is precisely
+    # how the shared LOD mod lost object LOD in all 18 worldspaces.
     _prescreen_meshes(_screenable_mesh_paths(refs, stats, cell_wrld, wrld_fid,
                                              keep_cells),
-                      output_meshes_dir)
+                      output_meshes_dir, source_meshes=master_meshes)
 
     for ref in refs:
         # Must be in our worldspace
