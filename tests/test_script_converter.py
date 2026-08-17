@@ -5,6 +5,7 @@ Tests for tools/oblivion_to_papyrus.py — TES4 script → Papyrus conversion.
 import os
 import struct
 import tempfile
+from pathlib import Path
 
 import pytest
 import sys
@@ -483,7 +484,12 @@ End
         # the moment the save loads.
         assert 'Event OnCellAttach()' in result
         # The OnUpdate re-registration only continues while still loaded.
-        assert 'If (Is3DLoaded())' in result
+        # Routed through SafeGameModeGate, NOT a bare Is3DLoaded(): that call
+        # throws on a reference held in a container (no native object bound)
+        # and the throw aborts the event before it can re-arm, killing the
+        # poll permanently.  See TES4Polyfill.SafeGameModeGate.
+        assert 'If (TES4Polyfill.SafeGameModeGate(Self))' in result
+        assert 'If (Is3DLoaded())' not in result
         # NO OnCellDetach unregister: cell-transition events have no
         # guaranteed order, so the old cell's detach could land after
         # OnLoad/OnCellAttach re-armed the poll for the new cell and kill a
@@ -524,28 +530,29 @@ End
         assert 'Event OnInit()' in result, \
             'a GameMode poll must also start for an already-loaded reference'
         init = result.split('Event OnInit()', 1)[1].split('EndEvent', 1)[0]
-        assert 'If (Is3DLoaded())' in init, \
+        assert 'If (TES4Polyfill.SafeGameModeGate(Self))' in init, \
             'OnInit registration must stay gated (anti-storm)'
         assert 'RegisterForSingleUpdate' in init
 
-    def test_self_enable_deadlock_is_a_known_open_regression(self, converter):
-        """The self-enable idiom deadlocks under the CURRENT gate. Known.
+    def test_gamemode_gate_is_cell_scoped_not_3d_scoped(self, converter):
+        """The poll gate must survive a reference having no 3D.
 
-        Oblivion's standard scripted entrance is an initially-disabled
-        placement whose OWN GameMode block enables it on a cue.  A poll gated
-        on Is3DLoaded() can never start on such a reference (no 3D while
-        disabled), so the Enable() that would give it 3D never runs.  That
-        stranded ~200 Nehrim refs, Celebro (the intro companion) among them.
+        Oblivion's GameMode is cell-scoped: an attached cell ticks its refs
+        whether or not they are visible.  Two idioms depend on it, and a
+        3D-only gate deadlocks both:
 
-        A cell-attachment gate (TES4Polyfill.ShouldRunGameMode, still shipped)
-        fixes it, but landing it regressed CharacterGen: Valen Dreth stopped
-        moving to his taunt marker and stopped delivering his first lines.  The
-        gate was therefore REVERTED to Is3DLoaded() and the deadlock is a known
-        open regression, not an accident.
+        * self-ENABLE — an initially-disabled placement whose own GameMode body
+          calls Enable().  No 3D while disabled, so the poll never starts and
+          the Enable() that would grant 3D never runs (~200 Nehrim refs,
+          Celebro the intro companion among them).
+        * self-DISABLE — Nehrim MQ00LichtScript Disable()s itself in state 0,
+          then five seconds later runs the plugin's only `SetStage MQ00 2`,
+          whose result script holds the only EnablePlayerControls.  Under a 3D
+          gate the quest pins at stage 1 and the player never regains control.
 
-        This test pins the current behaviour so the revert cannot be undone
-        silently.  Re-applying the cell gate SHOULD break this test — at which
-        point re-test CharacterGen in-game before keeping the change.
+        The gate keeps the container guard (GetParentCell() first, so
+        Is3DLoaded() is never called on a held item), so this asserts the
+        polyfill call is emitted, not a bare Is3DLoaded().
         """
         source = """ScriptName EnableScript
 
@@ -558,9 +565,18 @@ End
         result = converter.convert_standalone('EnableScript', source,
                                               'ObjectReference', 'EnableScript')
         init = result.split('Event OnInit()', 1)[1].split('EndEvent', 1)[0]
-        assert 'If (Is3DLoaded())' in init
-        assert 'TES4Polyfill.ShouldRunGameMode(Self)' not in result, \
-            'cell gate is reverted — re-test CharacterGen before restoring it'
+        assert 'If (TES4Polyfill.SafeGameModeGate(Self))' in init
+        assert 'Is3DLoaded()' not in result, \
+            'the gate must go through the polyfill, never a bare 3D test'
+
+        polyfill = (Path(__file__).resolve().parents[1] / 'script_convert' /
+                    'static_scripts' / 'TES4Polyfill.psc').read_text(
+                        encoding='utf-8', errors='replace')
+        body = polyfill.split('Bool Function SafeGameModeGate', 1)[1] \
+                       .split('EndFunction', 1)[0]
+        assert 'IsAttached()' in body, \
+            'SafeGameModeGate fell back to a 3D-only test — see the ' \
+            'self-disable deadlock (Nehrim MQ00, controls never re-enabled)'
 
     def test_gamemode_oninit_not_duplicated(self, converter):
         """A script with its own OnInit must not get a second one."""
@@ -1637,7 +1653,16 @@ class TestInfoFragmentEmission:
         from script_convert.converter import ScriptConverter
         from script_convert.cross_ref import CrossRefGraph
         saved = ScriptConverter.say_durations
+        saved_topics = ScriptConverter.say_topics
         ScriptConverter.say_durations = durations or {}
+        # These cases test what a fragment CONTAINS, not whether one is
+        # emitted (info_needs_fragment decides that, and drops a line with no
+        # result script whose topic no script drives).  Give the record a
+        # parent topic and mark that topic script-driven, so the emitter takes
+        # the same path a real scripted line does.
+        rec = dict(rec)
+        rec.setdefault('ParentDIAL', '000000AA')
+        ScriptConverter.say_topics = set(saved_topics) | {'000000AA'}
         pipeline._WORKER_CTX['quest_script_vars'] = quest_vars or {}
         pipeline._WORKER_CTX['quest_edid_by_fid'] = quest_names or {}
         stats = pipeline._new_stats()
@@ -1645,6 +1670,7 @@ class TestInfoFragmentEmission:
             pipeline._info_batch([rec], str(tmp_path), CrossRefGraph(), stats)
         finally:
             ScriptConverter.say_durations = saved
+            ScriptConverter.say_topics = saved_topics
         assert not stats['errors'], stats['errors']
         return (tmp_path / f"TES4_TIF__{rec['FormID']}.psc").read_text()
 
@@ -2280,7 +2306,7 @@ End
         body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
         idx = body.index('Return')
         before = body[:idx]
-        assert before.count('If (Is3DLoaded())') == 2
+        assert before.count('If (TES4Polyfill.SafeGameModeGate(Self))') == 2
         assert 'RegisterForSingleUpdate(5.0)' in before
         assert 'RegisterForSingleUpdate(0.5)' in before
 
@@ -3562,3 +3588,81 @@ class TestObjRefSharedFunctionsNeverCastToActor:
                 f'bare receiverless call will not compile: {line}'
             assert '(Self as Actor).AddItem' not in line, \
                 'must not reintroduce the None-yielding cast'
+
+
+class TestInfoFragmentSkipping:
+    """Only INFOs whose fragment DOES something get one.
+
+    The engine BINDS an INFO's fragment script when it selects that line --
+    loading and linking the .pex before anything is spoken -- so a fragment
+    with no behaviour is a cost paid on the dialogue path itself.  Every INFO
+    used to get one (19,278 .pex against vanilla Skyrim's ~5,500).
+    """
+
+    def _emit(self, tmp_path, rec, say_topics=(), info_reveals=None,
+              service_topics=None):
+        from script_convert import pipeline
+        from script_convert.converter import ScriptConverter
+        from script_convert.cross_ref import CrossRefGraph
+        saved = ScriptConverter.say_topics
+        ScriptConverter.say_topics = set(say_topics)
+        stats = pipeline._new_stats()
+        try:
+            pipeline._info_batch([rec], str(tmp_path), CrossRefGraph(), stats,
+                                 info_reveals or {}, service_topics or {})
+        finally:
+            ScriptConverter.say_topics = saved
+        assert not stats['errors'], stats['errors']
+        return (tmp_path / f"TES4_TIF__{rec['FormID']}.psc").exists()
+
+    def test_plain_player_line_gets_no_fragment(self, tmp_path):
+        """A menu line with no result script needs no fragment: the player
+        picked it, so no SayLine is waiting on Begin/End timing."""
+        assert not self._emit(tmp_path,
+                              {'FormID': '00001111', 'ParentDIAL': '000000AA'})
+
+    def test_script_driven_topic_keeps_its_timing_fragment(self, tmp_path):
+        """SayLine blocks until OnBegin reports the line started, so a topic a
+        script drives via Say/SayTo MUST keep its fragment."""
+        assert self._emit(tmp_path,
+                          {'FormID': '00002222', 'ParentDIAL': '000000AA'},
+                          say_topics={'000000AA'})
+
+    def test_result_script_keeps_its_fragment(self, tmp_path):
+        assert self._emit(tmp_path, {'FormID': '00003333',
+                                     'ParentDIAL': '000000BB',
+                                     'ResultScript': 'set MyQuest.x to 1'})
+
+    def test_comment_only_result_script_is_not_a_reason(self, tmp_path):
+        """A result script of nothing but comments produces no code, so the
+        fragment would be empty."""
+        assert not self._emit(tmp_path, {'FormID': '00004444',
+                                         'ParentDIAL': '000000BB',
+                                         'ResultScript': '; nothing here\n'})
+
+    def test_unlock_revealer_keeps_its_fragment(self, tmp_path):
+        assert self._emit(tmp_path,
+                          {'FormID': '00005555', 'ParentDIAL': '000000BB'},
+                          info_reveals={0x005555: ['TES4Unlock_Topic']})
+
+    def test_service_topic_keeps_its_fragment(self, tmp_path):
+        assert self._emit(tmp_path,
+                          {'FormID': '00006666', 'ParentDIAL': '000000CC'},
+                          service_topics={'000000CC': 'barter'})
+
+    def test_emitter_and_importer_agree(self):
+        """🛑 The .pex emitter and the VMAD writer must never disagree: a flag
+        bit with no function behind it makes the engine bind a missing
+        function.  Both call info_needs_fragment, so assert it is decisive for
+        the same record either side asks about."""
+        from script_convert.pipeline import info_needs_fragment
+        from script_convert.converter import ScriptConverter
+        saved = ScriptConverter.say_topics
+        ScriptConverter.say_topics = {'000000AA'}
+        try:
+            driven = {'FormID': '00007777', 'ParentDIAL': '000000AA'}
+            plain = {'FormID': '00008888', 'ParentDIAL': '000000FF'}
+            assert info_needs_fragment(driven) is True
+            assert info_needs_fragment(plain) is False
+        finally:
+            ScriptConverter.say_topics = saved

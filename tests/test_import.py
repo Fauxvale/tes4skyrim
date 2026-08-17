@@ -1397,14 +1397,21 @@ class TestServiceConversion:
                'Response[0].EmotionValue': '50',
                'Response[0].ResponseNumber': '1',
                'Response[0].ResponseText': 'Take a look.'}
-        # Every INFO carries its own TES4_TIF__ fragment (the service-menu
+        # A SERVICE line carries its own TES4_TIF__ fragment (the service-menu
         # call is appended to that fragment by script_convert); the shared
         # static scripts are only for the synthesized fallback INFO.
-        for kind in ('barter', 'training', ''):
+        for kind in ('barter', 'training'):
             result = convert_INFO(rec, service_menu=kind)
             assert b'VMAD' in result
             assert b'TES4_TIF__00062116' in result
             assert b'TES4_ShowBarterMenu' not in result
+
+        # With NO service menu this line has nothing for a fragment to do --
+        # no result script, and its topic is not script-driven -- so it gets
+        # none.  The engine binds an INFO's fragment when it selects the line,
+        # so an empty one is a cost paid on the dialogue path itself; see
+        # script_convert.pipeline.info_needs_fragment.
+        assert b'VMAD' not in convert_INFO(rec, service_menu='')
 
     def test_vendor_item_keywords(self):
         """Sellable items carry the VendorItem* keyword the vendor factions
@@ -3108,16 +3115,16 @@ class TestActorScriptOnPlacedRef:
         transport) is pure GameMode with no bare self-reference call, so it
         triggered neither other relocation reason and never ran.
 
-        It was REVERTED alongside the ShouldRunGameMode gate (commit 4a802e2)
-        when that pair regressed CharacterGen.  A GameMode block still
+        It was REVERTED alongside the poll gate (commit 4a802e2) when that pair
+        was blamed for a CharacterGen regression.  A GameMode block still
         relocates whenever it ALSO makes a bare self-reference call — which is
         the common case (Celebro's `enable`) — so only pure-GameMode scripts
         are affected.
 
-        This test pins the current behaviour so the revert cannot be undone
-        silently; re-test CharacterGen in-game before restoring `gamemode`.
-        See test_self_enable_deadlock_is_a_known_open_regression in
-        tests/test_script_converter.py for the other half of the same revert.
+        The gate half of that revert has since been undone (the gate is
+        cell-scoped again; see test_gamemode_gate_is_cell_scoped_not_3d_scoped
+        in tests/test_script_converter.py).  This relocation half is still
+        reverted, so the test continues to pin current behaviour.
         """
         from tes5_import.object_scripts import (
             _script_uses_reference_event, _script_uses_self_reference_call)

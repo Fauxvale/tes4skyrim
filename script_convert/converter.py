@@ -288,6 +288,17 @@ class ScriptConverter:
     # pipeline; a topic with no entry falls back to SAY_LINE_SECONDS.
     say_durations: dict = {}
 
+    # DIAL FormIDs (upper hex) whose topic a TES4 script drives via Say/SayTo.
+    # These are the only topics whose INFOs need Begin/End timing fragments --
+    # TES4Polyfill.SayLine blocks until OnBegin reports the line started and
+    # reads its length from OnEnd, while a line the PLAYER picks never goes
+    # through SayLine at all.  Filled once per run by pipeline's
+    # scan_say_topic_fids() and passed explicitly into every worker (spawned
+    # processes do not inherit it); consumed by pipeline.info_needs_fragment(),
+    # which the fragment emitter and the importer's VMAD writer BOTH call so
+    # the two can never disagree about which INFOs carry a fragment.
+    say_topics: set = set()
+
     # DIAL EditorID (lower) -> `TES4Unlock_<topic>` GlobalVariable name, from
     # tes5_import.dialog_unlocks.build_unlock_plan. Populated once per run by
     # the pipeline. `AddTopic X` on a GATED topic opens that topic's gate, the
@@ -1479,12 +1490,10 @@ class ScriptConverter:
                 # scripted object in the game starts ticking at load" failure —
                 # an unconditional OnInit register is what did that.
                 #
-                # KNOWN GAP (re-opened deliberately): an initially-disabled
-                # reference has no 3D, so a 3D-gated poll never starts, and on
-                # ~200 Nehrim refs the poll body is the only thing that ever
-                # calls Enable() on that same reference.  The cell-attachment
-                # gate that fixed this (TES4Polyfill.ShouldRunGameMode) broke
-                # CharacterGen and was reverted; see _GAMEMODE_GATE.
+                # An initially-disabled reference has no 3D, and on ~200 Nehrim
+                # refs the poll body is the only thing that ever calls Enable()
+                # on that same reference.  SafeGameModeGate is therefore
+                # cell-scoped, not 3D-scoped; see _GAMEMODE_GATE.
                 #
                 # But OnInit ALONE is not enough once the script lives on the
                 # placed reference (which reference events like OnPackageEnd
@@ -3004,14 +3013,40 @@ class ScriptConverter:
     # would run, used at every site that arms the OnUpdate poll for an
     # object/actor script.
     #
-    # REVERTED to Is3DLoaded() while a CharacterGen regression is bisected:
-    # Valen Dreth stopped moving to his taunt marker and stopped delivering his
-    # first lines after the cell-attachment gate landed.  The self-enable
-    # deadlock the cell gate was introduced to fix (Nehrim's Celebro, ~200
-    # disabled refs) is REAL and is re-opened by this revert — see
-    # TES4Polyfill.ShouldRunGameMode(), which is still shipped and unused.
-    # Do not re-apply the cell gate without re-testing CharacterGen in-game.
-    _GAMEMODE_GATE = 'Is3DLoaded()'
+    # The gate is CELL-SCOPED (attached parent cell), matching TES4, with
+    # Is3DLoaded() only as a fast path.  It must satisfy TWO independent
+    # requirements, and an implementation meeting just one is silently broken:
+    #
+    # 1. Never throw on a held item (see the container note below).
+    # 2. Stay true for a reference with no 3D.  A disabled ref, or one whose
+    #    own poll body calls Disable(), keeps ticking in TES4.  Gating on 3D
+    #    alone deadlocks both the self-ENABLE idiom (~200 Nehrim refs incl.
+    #    Celebro) and the self-DISABLE one — Nehrim MQ00LichtScript disables
+    #    itself, then five seconds later fires the plugin's only
+    #    `SetStage MQ00 2`, whose result script holds the only
+    #    EnablePlayerControls.  A 3D gate pins that quest at stage 1 with the
+    #    player's controls locked forever.
+    #
+    # This was once reverted to a 3D-only gate to chase a CharacterGen
+    # regression (Valen Dreth not reaching his taunt marker).  That was a
+    # misattribution: Dreth is fixed by the UNGATED OnLoad emitted above, which
+    # this gate does not affect.
+    # 🛑 NOT a bare Is3DLoaded().  An item sitting INSIDE A CONTAINER has no
+    # 3D and no parent cell, and calling Is3DLoaded() on it raises
+    #   "Unable to call Is3DLoaded - no native object bound to the script
+    #    object, or object is of incorrect type"
+    # which ABORTS THE WHOLE OnUpdate EVENT AT THAT LINE -- including the
+    # RegisterForSingleUpdate that keeps the poll alive.  The script is then
+    # dead for the rest of the save.  Measured in the user's Papyrus.0.log
+    # (2026-08-17): 17 aborted OnInit/OnUpdate passes on the CharacterGen
+    # Blades equipment inside Glenroy (1A032A16) and Renault (1A032A15).
+    #
+    # TES4Polyfill.SafeGameModeGate does the container test FIRST
+    # (GetParentCell() == None is safe on an inventory item and never throws)
+    # and only calls Is3DLoaded() on a reference that is actually in a cell.
+    # 1,111 converted scripts gate their poll re-arm on this, so a throw here
+    # is a silent, permanent loop death across the whole plugin.
+    _GAMEMODE_GATE = 'TES4Polyfill.SafeGameModeGate(Self)'
 
     def _get_update_interval(self) -> str:
         if self._uses_getsecondspassed:

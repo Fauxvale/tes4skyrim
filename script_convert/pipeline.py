@@ -43,7 +43,7 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
                         quest_script_vars=None,
                         quest_edid_by_fid=None, topic_unlock_globals=None,
                         message_menus=None, mesh_bounds_cache=None,
-                        chargen_menus=None):
+                        chargen_menus=None, say_topics=None):
     # Windows spawns workers, so module-level caches loaded in the parent do
     # NOT carry over — each worker reloads the mesh-bounds cache or every
     # needs_havok_release() lookup answers 0 and no trap gets its release.
@@ -60,6 +60,11 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
     # voice-line lengths (per INFO for the Begin fragments, per topic for the
     # SayLine fallback).
     ScriptConverter.say_durations = say_durations or {}
+    # Topics a script drives via Say/SayTo.  Windows SPAWNS workers, so this
+    # must be passed in explicitly -- a set built in the parent while scanning
+    # scripts does not survive into the child, and an empty set here would
+    # make info_needs_fragment() drop the timing fragments that SayLine needs.
+    ScriptConverter.say_topics = set(say_topics or ())
     # DIAL EditorID -> unlock global, so a script `AddTopic X` opens the same
     # gate the INFO/QUST fragments do.
     ScriptConverter.topic_unlock_globals = topic_unlock_globals or {}
@@ -277,6 +282,14 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
         print(f'    voice durations: {len(say_durations)} lines/topics '
               f'measured (Say() timers)')
 
+    # Which topics a script drives via Say/SayTo -- the ONLY INFOs that need a
+    # timing fragment for TES4Polyfill.SayLine.  Computed here, before the
+    # worker pool, so every process sees the same set (see scan_say_topics).
+    say_topics = scan_say_topic_fids(by_type)
+    ScriptConverter.say_topics = say_topics
+    print(f'    script-driven topics: {len(say_topics)} '
+          f'(their INFOs keep Say() timing fragments)')
+
     quest_script_vars = build_quest_script_vars(by_type)
     quest_edid_by_fid = {int(r.get('FormID','0'),16) & 0xFFFFFF:
                          (r.get('EditorID') or '')
@@ -364,7 +377,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
     initargs = (xref, output_dir, info_reveals, service_topics,
                 unlock_plan['stage_reveals'], say_durations,
                 quest_script_vars, quest_edid_by_fid, topic_unlock_globals,
-                message_menus, _bounds_cache, chargen_menus)
+                message_menus, _bounds_cache, chargen_menus, say_topics)
     return {'initargs': initargs, 'scpt_work': scpt_work,
             'info_work': info_work, 'qust_work': qust_work, 'stats': stats}
 
@@ -982,6 +995,15 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             fid24 = 0
         reveals = info_reveals.get(fid24, [])
         service_kind = service_topics.get(rec.get('ParentDIAL', ''), '')
+        # Skip INFOs whose fragment would do nothing.  The engine BINDS an
+        # INFO's fragment script when it selects that line -- loading and
+        # linking the .pex before a word is spoken -- so a fragment with no
+        # behaviour is a per-line cost paid on the dialogue path.  Must stay
+        # in lockstep with the importer's VMAD writer: both call this.
+        if not info_needs_fragment(rec, info_reveals, service_topics):
+            stats['info_total'] += 1
+            stats['info_ok'] += 1
+            continue
         # This line's own measured length (all of its responses, played back
         # to back).  0 when the line has no voice file: SayLine then falls
         # back to the topic's longest line.
@@ -1600,6 +1622,143 @@ def build_vmad_quest_fragments(quest_edid: str, stage_fragments: list[tuple[int,
                 buf += struct.pack('<HhI', 0, -1, fid)
 
     return bytes(buf)
+
+
+# `[set X to] [ref.]Say[To] [target] <TopicEDID> [flags]` in raw TES4 script
+# text.  Both forms are matched in one pass; which capture holds the topic
+# depends on whether this was SayTo (target first) or Say (topic first).
+_TES4_SAY_RE = re.compile(
+    r'\b(?:\w+\s*\.\s*)?say(to)?\s+(\w+)(?:\s+(\w+))?', re.IGNORECASE)
+
+
+def scan_say_topic_fids(by_type: dict) -> set:
+    """DIAL FormIDs (upper hex, as INFO.ParentDIAL stores them) whose topic a
+    script drives via Say/SayTo.
+
+    Keyed by FORMID, not EditorID: an INFO record carries only
+    `ParentDIAL=000000AA`, so the emitter would otherwise have to resolve a
+    name it does not have.  Resolving here also means the lookup in
+    info_needs_fragment() is a plain set membership test.
+    """
+    names = scan_say_topics(by_type)
+    if not names:
+        return set()
+    out = set()
+    for rec in by_type.get('DIAL', []):
+        edid = (rec.get('EditorID') or '').strip().lower()
+        fid = (rec.get('FormID') or '').strip().upper()
+        if edid and fid and edid in names:
+            out.add(fid)
+    return out
+
+
+def scan_say_topics(by_type: dict) -> set:
+    """Topic EditorIDs (lowercase) that a TES4 script drives via Say/SayTo.
+
+    Computed ONCE, before the worker pool starts, because the fragment
+    emitter and the VMAD writer run in DIFFERENT PROCESSES -- a set filled
+    while converting SCPT records is invisible to the process converting
+    INFO records, so this cannot be collected as a side effect of conversion.
+
+    Every candidate is validated against the real DIAL EditorIDs: the naive
+    regex also matches English prose ("say it was spiked", "say anything"),
+    and Oblivion's script comments are full of it.  Requiring the token to
+    name an actual topic removes those without needing a comment-aware
+    parser -- measured on Oblivion.esm: 98 raw candidates -> 31 real topics.
+    """
+    dial_edids = {(r.get('EditorID') or '').strip().lower()
+                  for r in by_type.get('DIAL', [])}
+    dial_edids.discard('')
+    if not dial_edids:
+        return set()
+
+    topics = set()
+    for kind in ('SCPT', 'INFO', 'QUST'):
+        for rec in by_type.get(kind, []):
+            # Field names differ per record type in the export: a SCPT keeps
+            # its body in SCTX, an INFO's result script is ResultScript, and a
+            # QUST stage's is also ResultScript.  Checking all of them on
+            # every record is cheaper than branching and cannot miss one.
+            for field in ('SCTX', 'ResultScript', 'ScriptText'):
+                text = rec.get(field) or ''
+                if not text:
+                    continue
+                for raw in text.splitlines():
+                    line = raw.split(';', 1)[0]
+                    for m in _TES4_SAY_RE.finditer(line):
+                        is_to = bool(m.group(1))
+                        first, second = m.group(2), m.group(3)
+                        # SayTo names the TARGET first, then the topic.
+                        for cand in ((second, first) if is_to else (first,)):
+                            if cand and cand.lower() in dial_edids:
+                                topics.add(cand.lower())
+                                break
+    return topics
+
+
+def info_needs_fragment(rec: dict, info_reveals: dict = None,
+                        service_topics: dict = None) -> bool:
+    """Does this INFO need a Papyrus fragment script at all?
+
+    🛑 THE SINGLE SOURCE OF TRUTH.  The fragment EMITTER (_info_batch) and the
+    VMAD WRITER (tes5_import.dialog_converter) must agree exactly: a VMAD flag
+    bit with no function behind it makes the engine bind a missing function,
+    and a .pex nothing attaches is dead weight.  Both call THIS.
+
+    WHY NOT ALWAYS (the 2026-08-17 stutter fix)
+    -------------------------------------------
+    Every INFO used to get one, so the plugin shipped 19,278 per-INFO .pex
+    files against vanilla Skyrim's ~5,500 -- 100% of INFOs carrying a fragment
+    where vanilla carries one on 17.6%, and 141 bytes of VMAD per INFO against
+    vanilla's 14.
+
+    That costs time ON THE LINE-SELECTION PATH: when the engine picks a
+    dialogue line it must bind that INFO's fragment -- load the .pex, link it,
+    resolve its properties -- BEFORE anything is spoken.  Measured against the
+    user's report, this matches every symptom the other theories could not:
+    it fires on plain NPC activation (no script of ours runs, but the greeting's
+    fragment is still bound), on topic selection, and on Say(); it happens even
+    when the voice file is MISSING, because binding precedes playback; it warms
+    up on repeat, because a bound script stays loaded; and consecutive lines
+    that reuse an already-loaded fragment do not stutter.
+
+    54% of the fragments (10,417) contained nothing but the LineBegan/LineEnded
+    timing calls.  Those are only meaningful for a topic a converted SCRIPT
+    drives through TES4Polyfill.SayLine, which blocks until OnBegin reports the
+    line started.  A line the PLAYER picks never goes through SayLine, so its
+    timing-only fragment was pure per-line cost with no behaviour attached.
+
+    So a fragment is emitted only when it actually DOES something:
+      * the INFO has a TES4 result script to run;
+      * it reveals AddTopic unlock globals;
+      * it opens a service (barter/training) menu;
+      * or its topic is script-driven, so SayLine needs the Begin/End hooks.
+    """
+    from script_convert.converter import ScriptConverter
+    info_reveals = info_reveals or {}
+    service_topics = service_topics or {}
+
+    result_script = (rec.get('ResultScript') or '').strip()
+    if result_script:
+        code = [ln for ln in result_script.splitlines()
+                if ln.strip() and not ln.strip().startswith(';')]
+        if code:
+            return True
+
+    try:
+        fid24 = int(rec.get('FormID') or '0', 16) & 0xFFFFFF
+    except (TypeError, ValueError):
+        fid24 = 0
+    if fid24 and fid24 in info_reveals:
+        return True
+
+    parent = (rec.get('ParentDIAL') or '').strip()
+    if parent and parent in service_topics:
+        return True
+
+    # Script-driven topic: SayLine reads the line's start and length from the
+    # Begin/End fragments, so these must keep theirs.
+    return bool(parent) and parent.upper() in ScriptConverter.say_topics
 
 
 def build_vmad_info_fragment(info_formid: str, property_values: dict = None,

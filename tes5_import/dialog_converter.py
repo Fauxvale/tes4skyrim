@@ -1411,20 +1411,38 @@ def convert_INFO(rec: dict, *, injected_ctdas: bytes = b'',
     if edid:
         subs += pack_string_subrecord('EDID', edid)
 
-    # VMAD — EVERY INFO carries its TES4_TIF__<fid> fragment script (Begin/End
-    # line hooks for TES4Polyfill.SayLine; script_convert generates one per
-    # INFO), with the result script's properties, the AddTopic unlock globals
-    # and the service-menu call bound when the line has them.  Unconditional
-    # on purpose: the emitter and the importer used to each decide "which
-    # INFOs need a fragment" and disagreed more than once — a flag bit with no
-    # .pex function behind it, or a function nothing attaches.
+    # VMAD — the TES4_TIF__<fid> fragment script, when this INFO needs one.
+    #
+    # 🛑 The condition is `info_needs_fragment`, the SAME function
+    # script_convert's emitter calls.  The two used to each decide "which
+    # INFOs need a fragment" independently and disagreed more than once — a
+    # flag bit with no .pex function behind it, or a function nothing
+    # attaches — so this must never be re-derived locally.
+    #
+    # It is no longer unconditional: the engine BINDS an INFO's fragment when
+    # it SELECTS that line (load + link the .pex, resolve properties) before
+    # anything is spoken, so a fragment with no behaviour is a cost paid on
+    # the dialogue path itself.  See info_needs_fragment for the measurements.
     info_fid = get_str(rec, 'FormID') or ''
     result_script = get_str(rec, 'ResultScript')
     code_lines = []
     if result_script:
         code_lines = [ln for ln in result_script.strip().splitlines()
                       if ln.strip() and not ln.strip().startswith(';')]
-    if info_fid:
+    # reveal_props / service_menu are this INFO's ALREADY-RESOLVED answers to
+    # the "reveals unlock globals?" and "opens a service menu?" questions that
+    # info_needs_fragment otherwise looks up in its maps, so pass them as
+    # single-entry maps rather than re-deriving them here.
+    from script_convert.pipeline import info_needs_fragment
+    _fid24 = 0
+    try:
+        _fid24 = int(info_fid, 16) & 0xFFFFFF
+    except (TypeError, ValueError):
+        pass
+    _reveals = {_fid24: list(reveal_props)} if reveal_props else {}
+    _services = ({(get_str(rec, 'ParentDIAL') or ''): service_menu}
+                 if service_menu else {})
+    if info_fid and info_needs_fragment(rec, _reveals, _services):
         from script_convert.pipeline import build_vmad_info_fragment
         prop_vals = (_build_info_script_properties(result_script, xref,
                                                    well_known_props)
@@ -2044,6 +2062,17 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
     prefix} so the audio pipeline can name extracted voice files the way the
     Skyrim engine will look them up (owning quest EDID + topic EDID).
     """
+
+    # Which topics a script drives via Say/SayTo.  The IMPORT stage runs
+    # independently of the script stage (`--import-only` never invokes it), so
+    # this must be recomputed here rather than inherited: an empty set would
+    # make info_needs_fragment() drop the Begin/End fragments SayLine depends
+    # on, silently breaking every scripted conversation's timing.  Both stages
+    # derive it from the same export with the same function, so they agree.
+    from script_convert.converter import ScriptConverter
+    from script_convert.pipeline import scan_say_topic_fids
+    if not ScriptConverter.say_topics:
+        ScriptConverter.say_topics = scan_say_topic_fids(by_type)
 
     _lip_texts.clear()
     dials = by_type.get('DIAL', [])

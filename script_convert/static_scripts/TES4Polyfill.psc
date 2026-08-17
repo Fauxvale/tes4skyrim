@@ -39,15 +39,45 @@ EndFunction
 ; disabled ref and false for anything outside the active grid.  That preserves
 ; the anti-storm property the 3D gate was introduced for (references in detached
 ; cells still never tick); it only stops treating "invisible" as "not there".
-Bool Function ShouldRunGameMode(ObjectReference akRef) Global
+; The GameMode poll gate, used by every converted OnUpdate.
+;
+; NOT a bare Is3DLoaded().  An item INSIDE A CONTAINER has no 3D and no
+; parent cell, and calling Is3DLoaded() on it raises
+;   "Unable to call Is3DLoaded - no native object bound to the script object"
+; which ABORTS THE WHOLE EVENT at that line -- including the
+; RegisterForSingleUpdate that keeps the poll alive, so the script is dead for
+; the rest of the save.  Seen in the user's Papyrus log (2026-08-17) on the
+; CharacterGen Blades equipment held by Glenroy and Renault.
+;
+; GetParentCell() is safe on an inventory item (it simply returns None), so
+; testing that FIRST lets us skip the unsafe call entirely for held items.
+;
+; AND NOT Is3DLoaded() ALONE EITHER — the two requirements above are
+; independent, and satisfying only the container one re-opens the self-disable
+; deadlock.  A script whose own poll body calls Disable() (or that sits on an
+; initially-disabled 0x800 ref) drops its 3D at that instant, so a 3D-gated
+; re-arm never fires again and every later state of that script is unreachable.
+;
+; Nehrim MQ00LichtScript is the worked example: state 0 Disable()s the light,
+; state 1 (five seconds later) is the only SetStage MQ00 2 in the plugin, and
+; stage 2's result script is the only EnablePlayerControls.  With a 3D gate the
+; quest pins at stage 1 and the player never regains control.
+Bool Function SafeGameModeGate(ObjectReference akRef) Global
   If (akRef == None)
     Return False
   EndIf
+  ; No parent cell => in a container / not placed in the world.  Never call
+  ; Is3DLoaded() on such a reference.
+  Cell parentCell = akRef.GetParentCell()
+  If (parentCell == None)
+    Return False
+  EndIf
+  ; Cell-scoped, matching TES4: an attached cell ticks its refs whether or not
+  ; they are visible.  Is3DLoaded() is checked first only as a fast path.
   If (akRef.Is3DLoaded())
     Return True
   EndIf
-  Cell parentCell = akRef.GetParentCell()
-  Return parentCell && parentCell.IsAttached()
+  Return parentCell.IsAttached()
 EndFunction
 
 ; ==========================================================================
@@ -681,10 +711,14 @@ EndFunction
 ;   and Variable04 = the game-wide End-overhead average, and Variable07 =
 ;   the real time the line now playing ANYWHERE ends (_OtherLineInProgress:
 ;   Skyrim refuses a Say while another actor is mid-line).
-;   Every SayLine / LineBegan / LineEnded writes a "TES4Say ..." Debug.Trace
-;   with real-time stamps: the Papyrus log (or the bridge's vmlog) then gives
-;   the engine's Say->Begin and Begin->End latencies against the measured
-;   length.
+;   🛑 NO Debug.Trace ON THIS PATH.  Every SayLine / LineBegan / LineEnded used
+;   to write a "TES4Say ..." trace.  Papyrus builds the whole concatenated
+;   string -- including the Utility.GetCurrentRealTime() calls and the
+;   IsInCombat/IsWeaponDrawn/IsAlerted queries inside it -- BEFORE Debug.Trace
+;   decides whether logging is even enabled, so the cost was paid on every
+;   line whether or not the user had Papyrus logging on.  Removed 2026-08-17
+;   while hunting the per-line stutter.  If a Say path ever needs tracing
+;   again, gate it behind a compile-time flag so a shipping build pays nothing.
 ;
 ; SayLine restores the TES4 contract exactly: it BLOCKS until the engine has
 ; begun the line, then returns THAT LINE'S REAL LENGTH AND NOTHING MORE, and
@@ -732,6 +766,31 @@ EndFunction
 ; keeps SAY_START_WAIT in step.  Nominal: the engine begins a line it accepts
 ; within ~0.15-0.26s (measured), and each iteration is a VM turn, so under
 ; load the real wait stretches with everything else.
+; ---------------------------------------------------------------- tracing --
+;
+; Say-path diagnostics, OFF in every shipped build.
+;
+; 🛑 NEVER call Debug.Trace directly on the Say path.  Papyrus evaluates a
+; call's arguments BEFORE the callee decides to discard them, so a trace like
+;   Debug.Trace("... " + _Who(a) + " ... " + Utility.GetCurrentRealTime())
+; pays for the FormID lookup, the native time query and the whole string
+; concatenation on every line even when Papyrus logging is disabled.  Six such
+; traces used to sit in SayLine/LineBegan/LineEnded and ran on every spoken
+; line in the game.
+;
+; Routing them through this one function makes the cost a single Bool test
+; against a constant, which the compiler folds away when SAY_TRACE() is False.
+; Flip SAY_TRACE to True ONLY for a local diagnostic build.
+Bool Function SAY_TRACE() Global
+  Return False
+EndFunction
+
+Function _SayTrace(String asTag, Float afValue) Global
+  If SAY_TRACE()
+    Debug.Trace("TES4Say " + asTag + " " + afValue)
+  EndIf
+EndFunction
+
 Float Function SAY_START_WAIT() Global
   Return 1.5
 EndFunction
@@ -815,7 +874,6 @@ Float Function SayLineNoWait(ObjectReference akSpeaker, Topic akTopic, Float afF
   EndIf
   a.SetActorValue("Variable09", 0.0)
   a.Say(akTopic)
-  Debug.Trace("TES4Say nowait " + _Who(a) + " topic " + akTopic + " fallback=" + afFallbackLength + " t=" + Utility.GetCurrentRealTime())
   Return afFallbackLength
 EndFunction
 
@@ -850,7 +908,6 @@ Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbac
   If a.GetActorValue("Variable07") != token
     Return 0.5
   EndIf
-  Debug.Trace("TES4Say request " + _Who(a) + " topic " + akTopic + " t=" + Utility.GetCurrentRealTime())
   ; Wait out the player's dialogue menu and any line still playing.
   ; Wait for the speaker to be free.  _IsSpeaking covers BOTH a live line and
   ; the post-End grace, so there is no separate settle wait any more: the old
@@ -874,6 +931,7 @@ Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbac
   ; the length in Variable09).
   a.SetActorValue("Variable09", 0.0)
   Float t0 = Utility.GetCurrentRealTime()
+  _SayTrace("SAY", 0.0)
   a.Say(akTopic)
   ; The engine begins a line it ACCEPTS within 0.15-0.31s (measured
   ; 2026-08-16, n=76: med 0.15, max 0.31).  Anything still silent well past
@@ -901,13 +959,11 @@ Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbac
   Float len = a.GetActorValue("Variable09")
   a.SetActorValue("Variable07", 0.0)
   If len <= 0.0
-    Debug.Trace("TES4Say dropped " + _Who(a) + " topic " + akTopic + " waited=" + waited + " inCombat=" + a.IsInCombat() + " weaponDrawn=" + a.IsWeaponDrawn() + " alerted=" + a.IsAlerted() + " t=" + Utility.GetCurrentRealTime())
     Return 0.0   ; dropped: nothing under the topic qualified (or the engine refused it)
   EndIf
   If len < 0.02
     len = afFallbackLength   ; began, but the line has no measured voice file
   EndIf
-  Debug.Trace("TES4Say began " + _Who(a) + " topic " + akTopic + " len=" + len + " startLatency=" + (Utility.GetCurrentRealTime() - t0) + " waited=" + waited + " t=" + Utility.GetCurrentRealTime())
   ; ð LENGTH ONLY -- no tail.  TES4's Say returned the line's length and
   ; nothing more, and the caller's countdown is meant to expire when the audio
   ; does.  Adding the tail here padded EVERY line with a silence that only a
@@ -926,6 +982,7 @@ Function LineBegan(ObjectReference akSpeakerRef, Float afLength) Global
   If len <= 0.0
     len = 0.01                 ; unknown length: still marks "speaking"
   EndIf
+  _SayTrace("BEGIN", afLength)
   a.SetActorValue("Variable09", len)
   a.SetActorValue("Variable03", 0.0)   ; a live line supersedes the End grace
   ; Game-wide "a line is in progress" record, kept on the PLAYER so any
@@ -961,7 +1018,6 @@ Function LineBegan(ObjectReference akSpeakerRef, Float afLength) Global
     p.SetActorValue("Variable05", Math.Floor(fid / 65536) as Float)
     p.SetActorValue("Variable06", (fid - Math.Floor(fid / 65536) * 65536) as Float)
   EndIf
-  Debug.Trace("TES4Say LineBegan " + _Who(a) + " len=" + afLength + " inDialogue=" + akSpeakerRef.IsInDialogueWithPlayer() + " t=" + Utility.GetCurrentRealTime())
 EndFunction
 
 ; OnEnd fragment hook: the line (all of its responses) has finished -- or was
@@ -981,6 +1037,7 @@ Function LineEnded(ObjectReference akSpeakerRef, Float afLength = -1.0) Global
   If a == None || (a as Form).GetFormID() == 0x14
     Return
   EndIf
+  _SayTrace("END", afLength)
   Float began = a.GetActorValue("Variable06")
   Float cur = a.GetActorValue("Variable09")
   Bool mine = afLength < 0.0 || Math.abs(cur - afLength) < 0.006 || (afLength <= 0.0 && cur <= 0.02)
@@ -1015,7 +1072,6 @@ Function LineEnded(ObjectReference akSpeakerRef, Float afLength = -1.0) Global
       EndIf
     EndIf
   EndIf
-  Debug.Trace("TES4Say LineEnded " + _Who(a) + " measured=" + afLength + " playing=" + cur + " cleared=" + mine + " actual=" + actual + " t=" + Utility.GetCurrentRealTime())
 EndFunction
 
 ; True while the player is in a dialogue menu with anyone -- Oblivion's
@@ -1120,9 +1176,6 @@ Float Function SAY_GRACE() Global
   Return 0.05
 EndFunction
 
-String Function _Who(Actor a) Global
-  Return "actor " + (a as Form).GetFormID()   ; names need SKSE; the id maps through the manifest
-EndFunction
 
 ; Real seconds -> game-time days at the current TimeScale.  Deadlines are kept
 ; in GAME time because GetCurrentRealTime restarts with the process: a stamp
