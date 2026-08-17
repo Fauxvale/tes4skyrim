@@ -43,6 +43,7 @@ from asset_convert.skin_replacement import (
     splice_body_geometry,
     strip_body_skin_geometry,
     is_underwear_only,
+    _is_torso_skin,
 )
 from asset_convert.nif_converter import (
     _walk_node,
@@ -319,6 +320,50 @@ class TestCollectSkinInfo:
 # 4. Body NIF loading
 # ===========================================================================
 @skipif_no_body
+class TestTorsoSkinOverride:
+    """A texture keyword is the author's label; the bones are what it IS.
+
+    Nehrim ships 18 wearables whose torso skin carries a foot or hand texture —
+    the Silverlight cuirass ("Foot:Body", 3321 verts, weighted to Spine/
+    Clavicle/Neck/Pelvis, textured `characters\\imperial\\female\\footfemale`)
+    and the whole female Eyren set. The keyword picked the hands/feet body NIF,
+    which has no torso, so the stripped chest was never spliced back and the
+    armour rendered as plates with see-through gaps.
+    """
+
+    class _Bone:
+        def __init__(self, name):
+            self.name = name.encode('latin-1')
+
+    class _Skin:
+        def __init__(self, names):
+            self.bones = [TestTorsoSkinOverride._Bone(n) for n in names]
+            self.num_bones = len(self.bones)
+
+    def test_spine_marks_a_torso(self):
+        skin = self._Skin(['NPC Spine1 [Spn1]', 'NPC L Clavicle [LClv]',
+                           'NPC Neck [Neck]'])
+        assert _is_torso_skin(skin)
+
+    def test_a_gauntlet_reaching_the_forearm_is_not_a_torso(self):
+        """The false positive that forced the bone list to stay narrow.
+
+        Including upperarm/forearm flagged 9 correctly-named vanilla gauntlets;
+        spine/clavicle/neck flagged none.
+        """
+        skin = self._Skin(['NPC L Hand [LHnd]', 'NPC L Forearm [LLar]',
+                           'NPC L UpperArm [LUar]'])
+        assert not _is_torso_skin(skin)
+
+    def test_a_boot_reaching_the_calf_is_not_a_torso(self):
+        skin = self._Skin(['NPC L Foot [Lft ]', 'NPC L Calf [LClf]',
+                           'NPC L Thigh [LThg]'])
+        assert not _is_torso_skin(skin)
+
+    def test_an_empty_skin_is_not_a_torso(self):
+        assert not _is_torso_skin(self._Skin([]))
+
+
 class TestLoadBodyGeom:
     def test_malebody_loads(self):
         entries = load_body_geom("malebody_0.nif")
