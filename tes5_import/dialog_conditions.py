@@ -335,6 +335,11 @@ _VM_VAR_FUNCS = {
     GET_SCRIPT_VARIABLE: GET_VM_SCRIPT_VARIABLE,
     GET_QUEST_VARIABLE: GET_VM_QUEST_VARIABLE,
 }
+# CIS2 name for a script variable that does not exist: no converted script
+# ever declares it, so the read yields 0 — the value TES4's GetScriptVariable
+# returns for a scriptless ref or a missing variable.  See
+# _convert_script_var_ctda.
+_UNRESOLVED_VAR_SENTINEL = '::TES4NoSuchVariable_var'
 
 
 def papyrus_var_name(var: str) -> str:
@@ -658,9 +663,9 @@ def convert_ctda_list_with_strings(rec: dict, script_vars: dict = None,
     the caller from the SCPT records), letting us re-emit the condition as
     GetVMScriptVariable + a CIS2 naming the Papyrus property.
 
-    Conditions whose variable we cannot resolve are DROPPED rather than emitted
-    against the dead legacy function — a condition that can never be true would
-    silently disable the package it gates.
+    Conditions whose variable we cannot resolve are emitted against a sentinel
+    name that no script declares, so they read 0 — exactly what TES4 returns
+    for a missing variable (see _convert_script_var_ctda).
     """
     if offset is None:
         offset = get_formid_index_offset()
@@ -763,8 +768,19 @@ def _convert_script_var_ctda(raw: bytes, script_vars: dict, offset: int,
 
     ref = _remap_formid(param1, offset)
     name = script_vars.get(param1 & 0x00FFFFFF, {}).get(param2)
-    if not name:
-        return None
+    if name:
+        cis2 = papyrus_var_name(name)
+    else:
+        # No such script variable on that ref/quest — the base has no script,
+        # the script has no variable at that index, or the ref was deleted
+        # (param1 = 0).  Oblivion's GetScriptVariable returns 0 in every one
+        # of those cases, and Skyrim's GetVMScriptVariable returns 0 for a
+        # name no attached script declares — so a NEVER-declared name
+        # reproduces the TES4 value exactly, and the authored comparison and
+        # Or-flag keep doing their job.  Dropping the condition instead
+        # failed OPEN: SE08's five Xedilian victims force-greeted and fled
+        # unconditionally, and 14 jailor packages ran with the player free.
+        cis2 = _UNRESOLVED_VAR_SENTINEL
 
     if type_byte & CTDA_USE_GLOBAL:
         comp_raw = _remap_formid(comp_raw, offset)
@@ -785,7 +801,7 @@ def _convert_script_var_ctda(raw: bytes, script_vars: dict, offset: int,
                        _VM_VAR_FUNCS[func], 0,
                        ref, 0,
                        run_on, reference, 0xFFFFFFFF)
-    return ctda, papyrus_var_name(name)
+    return ctda, cis2
 
 
 # --- Builders for the Skyrim-required injected conditions ----------------------

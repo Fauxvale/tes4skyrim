@@ -78,6 +78,17 @@ def set_quest_packages(pack_fids) -> None:
     _QUEST_PACKAGES.update(pack_fids)
 
 
+# source pack fid -> [chain pack fid, ...]: a hunt expanded into a Follow
+# chain (pack_converter.hunt_chain_targets).  The chain runs BEFORE its source
+# in every list that carried the source.
+_PACKAGE_CHAINS = {}
+
+
+def set_package_chains(chains: dict) -> None:
+    _PACKAGE_CHAINS.clear()
+    _PACKAGE_CHAINS.update(chains)
+
+
 def npc_packages(pack_fids) -> list:
     """The PKID list for a converted NPC: its own packages, in TES4 order.
 
@@ -89,4 +100,11 @@ def npc_packages(pack_fids) -> list:
     MASTER-owned package collide with a same-low-24 plugin quest package and be
     dropped from the actor's schedule entirely.
     """
-    return [f for f in pack_fids if f and f not in _QUEST_PACKAGES]
+    out = []
+    for f in pack_fids:
+        if not f or f in _QUEST_PACKAGES:
+            continue
+        out.extend(c for c in _PACKAGE_CHAINS.get(f, ()) if c not in
+                   _QUEST_PACKAGES)
+        out.append(f)
+    return out

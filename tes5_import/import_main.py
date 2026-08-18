@@ -1402,7 +1402,8 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # outrank the actor's standing schedule, so the alias indices have to be
     # decided BEFORE either QUST or PACK is written — both read this one plan.
     from .pack_aliases import (PackagePlan, build_script_var_map,
-                               build_scriptvar_owner_map)
+                               build_scriptvar_owner_map,
+                               build_script_assigned_packages)
     from .packages import load_package_types
     _master_export = ctx.master_export if ctx else None
     load_package_types(by_type, _master_export)
@@ -1414,109 +1415,52 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # dependent plugin's actors mostly run THEIR MASTER'S packages, and an
     # unresolved package/actor/quest silently drops the actor back to its
     # standing Sandbox schedule (see PackagePlan.build).
+    # `AddScriptPackage` forces a package onto an actor that does not list it,
+    # and Skyrim has no equivalent call — so those packages have to reach the
+    # actor's quest alias as ALPCs or arbitration can never pick them.
+    _script_assigned = build_script_assigned_packages(by_type, fid_to_edid,
+                                                      _master_export)
+    print(f"  Script-forced packages (AddScriptPackage) bound to an alias: "
+          f"{len(_script_assigned)}")
     pack_plan.build(by_type,
                     {get_formid(r, 'FormID') for r in by_type.get('QUST', [])},
-                    _sv_owner, _master_export)
+                    _sv_owner, _master_export, _script_assigned)
     print(f"  Package plan: {pack_plan.summary()}")
 
-    # Quest packages live on a QUST alias (ALPC), not in the actor's PKID list.
-    from .packages import set_quest_packages
-    set_quest_packages(pack_plan.owner_quest.keys())
-
-    from .pack_converter import PackContext
-    # REFR -> base signature, so UseItemAt can tell furniture (sit) from a
-    # switch/lever/door (activate).  Built from the base records already parsed.
-    # Every map here is keyed on the RAW LOW-24 FormID, which is identical in
-    # the master's index space and ours, so a master's record can be seeded
-    # straight from its own `FormID` field with no remapping. The masters go in
-    # FIRST so this plugin's own records win. Without them a package targeting
-    # one of the master's refs resolves to no signature at all, and
-    # _operate_target / the actor-Find branch fall through to the default.
-    def _iter_bases(sigs):
-        for _sig in sigs:
-            if _master_export:
-                for _r in _master_export.values():
-                    if _r.get('Signature') == _sig:
-                        yield _sig, _r
-            for _r in by_type.get(_sig, []):
-                yield _sig, _r
-
-    _base_sig = {}
-    for _sig, _r in _iter_bases(('ACTI', 'FURN', 'DOOR', 'CONT', 'STAT',
-                                 'MISC', 'LIGH')):
-        try:
-            _base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _sig
-        except ValueError:
-            pass
-    _ref_base_sig = {}
-    for _sig, _r in _iter_bases(('REFR',)):
-        _b = _r.get('NAME')
-        if not _b:
-            continue
-        try:
-            _bs = _base_sig.get(int(_b, 16) & 0xFFFFFF)
-            if _bs:
-                _ref_base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _bs
-        except ValueError:
-            pass
-    # Placed ACTORS, so a Find/UseItemAt package can tell "seek this actor"
-    # from "operate this object" (CGAssassinsAmbushAToGlenroy targets
-    # Glenroy's ACHR — see pack_converter's actor-Find branch).
-    for _sig, _bs in (('ACHR', 'NPC_'), ('ACRE', 'CREA')):
-        for _, _r in _iter_bases((_sig,)):
-            try:
-                _ref_base_sig[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = _bs
-            except ValueError:
-                pass
-    # Where every placed thing STANDS, and where each package's runners stand.
-    # A TES4 Follow that names a destination in ANOTHER cell must not become a
-    # Skyrim Escort: Escort walks to the destination, and there is no navmesh
-    # route between two interiors, so the actor never moves (Nehrim MQ00 —
-    # Celebro in StartCelle, his marker in SchattenrufMinePart01).  See
-    # PackContext.location_reachable.
-    _ref_cell = {}
-    for _sig, _r in _iter_bases(('REFR', 'ACHR', 'ACRE')):
-        _c = _r.get('ParentCELL')
-        if not _c:
-            continue
-        try:
-            _ref_cell[int(_r.get('FormID', '0'), 16) & 0xFFFFFF] = \
-                int(_c, 16) & 0xFFFFFF
-        except ValueError:
-            pass
-    _base_cell = {}
-    for _sig in ('ACHR', 'ACRE'):
-        for _, _r in _iter_bases((_sig,)):
-            _b, _c = _r.get('NAME'), _r.get('ParentCELL')
-            if not _b or not _c:
-                continue
-            try:
-                _base_cell.setdefault(int(_b, 16) & 0xFFFFFF, set()).add(
-                    int(_c, 16) & 0xFFFFFF)
-            except ValueError:
-                pass
-    _pack_runner_cells = {}
-    for _sig, _r in _iter_bases(('NPC_', 'CREA')):
-        try:
-            _cells = _base_cell.get(int(_r.get('FormID', '0'), 16) & 0xFFFFFF)
-        except ValueError:
-            continue
-        if not _cells:
-            continue
-        _n = int(_r.get('AIPackageCount', '0') or 0)
-        for _i in range(_n):
-            _p = _r.get(f'AIPackage[{_i}]')
-            if not _p:
-                continue
-            try:
-                _pack_runner_cells.setdefault(
-                    int(_p, 16) & 0xFFFFFF, set()).update(_cells)
-            except ValueError:
-                pass
+    from .pack_converter import PackContext, hunt_chain_targets
+    from .pack_indexes import build_pack_indexes
+    # Everything the converter asks about targets/locations (ref and base
+    # kinds, placements, interior cells, where each package's runners stand)
+    # is built in pack_indexes so tools/pack_audit.py measures the SAME
+    # routing this import performs.  Master records go in first.
     pack_ctx = PackContext(plan=pack_plan, script_vars=_script_vars,
-                           ref_base_sig=_ref_base_sig,
-                           ref_cell=_ref_cell,
-                           pack_runner_cells=_pack_runner_cells)
+                           **build_pack_indexes(by_type, _master_export))
+
+    # A Find at an actor BASE with several placements ("hunt any FGC06Goblin")
+    # becomes a CHAIN of Follow packages, one per placed target, that runs
+    # ahead of the source package in every list carrying it — the alias ALPC
+    # list (PackagePlan) and the actor's own PKID list (packages).  The seek
+    # ids are derived from authored ids (source PACK + target ref), so adding
+    # or reordering targets never moves an existing id.
+    _chains = {}
+    for _rec in by_type.get('PACK', []):
+        _src = get_formid(_rec, 'FormID')
+        _refs = hunt_chain_targets(_rec, pack_ctx, _src)
+        if _refs:
+            _chains[_src] = [
+                (writer.derive_formid('PACK', (_rec.get('FormID', ''),
+                                               f'{_ref:08X}')), _ref)
+                for _ref in _refs]
+    pack_ctx.hunt_chains = _chains
+    pack_plan.expand_packages({k: [c for c, _ in v]
+                               for k, v in _chains.items()})
+    from .packages import set_quest_packages, set_package_chains
+    set_package_chains({k: [c for c, _ in v] for k, v in _chains.items()})
+    if _chains:
+        print(f"  Hunt chains: {len(_chains)} Find-at-actor-base packages -> "
+              f"{sum(len(v) for v in _chains.values())} Follow links")
+    # Quest packages live on a QUST alias (ALPC), not in the actor's PKID list.
+    set_quest_packages(pack_plan.owner_quest.keys())
     _step_done('package plan')
 
     # --- Phase 0h: placed leveled creatures (REFR→LVLC) ---
@@ -1800,7 +1744,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # aliases have to exist before the packages that reference them are written.
     pack_records = by_type.get('PACK', [])
     if pack_records and 'PACK' not in all_skip:
-        from .pack_converter import convert_PACK
+        from .pack_converter import convert_PACK_records
         print(f"  Converting {len(pack_records)} PACK records...")
         for rec in pack_records:
             try:
@@ -1812,7 +1756,8 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                         writer.add_record('PACK', ov.record_bytes)
                         converted += 1
                     continue
-                writer.add_record('PACK', convert_PACK(rec, pack_ctx))
+                for _pack_bytes in convert_PACK_records(rec, pack_ctx):
+                    writer.add_record('PACK', _pack_bytes)
                 converted += 1
             except Exception as e:
                 print(f"  ERROR converting PACK "

@@ -28,6 +28,7 @@ map exactly, which degrade, and why).
 import struct
 
 from .pack_templates import (
+    ACQUIRE,
     ESCORT,
     EAT,
     FLEE_TO,
@@ -36,6 +37,7 @@ from .pack_templates import (
     HOLD_POSITION,
     PKDT_TYPE_PACKAGE,
     SANDBOX,
+    SIT,
     SIT_TARGET,
     ACTIVATE,
     SLEEP,
@@ -52,7 +54,7 @@ from .pack_templates import (
     Template,
 )
 from .dialog_conditions import convert_ctda_list_with_strings
-from .text_reader import (get_formid, get_int, get_str,
+from .text_reader import (get_formid, get_int, get_str, remap_formid,
                           PLAYER_REF_FID, PLAYER_BASE_FID)
 
 from .writer import (
@@ -74,6 +76,14 @@ def _targets_player(rec: dict) -> bool:
     below has to accept both or it silently takes the generic path.
     """
     return get_formid(rec, 'PTDT.Target') in (PLAYER_REF_FID, PLAYER_BASE_FID)
+
+# Fallback SEARCH area for an Object-ID target when no interior cell can be
+# named (see PackContext.search_ground): a wide radius around the actor's own
+# position, so it roams the area rather than being pinned to its spawn by the
+# default type-3 "near editor location" radius 0.  Type 12 "near self" with a
+# 3000 radius is the vanilla predator package's own Hunt Location
+# (DefaultPredatorPackage slot 4); WEJS21HunterWander uses type 2 radius 5000.
+_SEARCH_NEAR_SELF = (12, 0, 3000)
 
 # --- TES4 PKDT.Type ------------------------------------------------------
 T4_FIND = 0
@@ -195,9 +205,13 @@ SPEED_WALK, SPEED_JOG, SPEED_RUN, SPEED_FASTWALK = 0, 1, 2, 3
 # authorisation.
 DEFAULT_INTERRUPT = 0x0044  # observe combat 0x04 | aggro radius 0x40
 
-# Furniture object types (TES5 wbObjectTypeEnum) used to decide whether a TES4
-# UseItemAt target is "sit-like".
-FURNITURE_SIGS = frozenset({'FURN', 'CHAI', 'BED '})
+# TES4 record signatures a package target's BASE can carry, by what the actor
+# does with one.  ('CHAI'/'BED ' used to be listed here, but those are TES5
+# wbObjectTypeEnum names, never TES4 signatures — only FURN can match.)
+FURNITURE_SIGS = frozenset({'FURN'})
+# Carriable items: what a TES4 Find(Object ID) picks UP -> TES5 Acquire.
+ITEM_SIGS = frozenset({'WEAP', 'ARMO', 'CLOT', 'BOOK', 'INGR', 'ALCH', 'MISC',
+                       'KEYM', 'LIGH', 'SGST', 'SLGM', 'AMMO', 'APPA'})
 
 # Base types that an actor OPERATES rather than approaches: a lever, switch,
 # crumbling wall, or door.  A TES4 package aimed at one of these means "go and
@@ -232,7 +246,12 @@ def _operate_target(rec: dict, ctx: 'PackContext') -> bool:
         return False
     ptype = get_int(rec, 'PKDT.Type', -1)
     if ptype == T4_USEITEMAT:
-        return sig not in FURNITURE_SIGS
+        # A static is "operated" too: Relmyna studying her atronach STAT
+        # (SE09RelmynaStudyAtronach) walks up to it and stays; Activate on a
+        # STAT is a harmless no-op that leaves the actor there.  Carriable
+        # items are NOT — activating Sinderion's mortar (MS39, an APPA ref)
+        # would pick it up, so those take the sandbox fallback in _choose.
+        return sig in OPERABLE_SIGS or sig == 'STAT'
     if ptype == T4_FIND:
         return sig in OPERABLE_SIGS
     return False
@@ -279,6 +298,8 @@ class Inputs:
                 out += pack_subrecord('PLDT', v if isinstance(v, bytes)
                                       else _null_location())
             elif atype in (T_SINGLEREF, T_TARGETSEL):
+                if isinstance(v, tuple):        # (type, target, count)
+                    v = _target(*v)
                 out += pack_subrecord('PTDA', v if isinstance(v, bytes)
                                       else _null_target())
             elif atype == T_TOPIC:
@@ -316,6 +337,74 @@ OBJTYPE_FOOD = 15
 OBJTYPE_CHAIR = 27
 OBJTYPE_BED = 26
 
+# TES4 PTDT type-2 "Object Type" -> TES5 wbObjectTypeEnum.  The TWO ENUMS
+# DIFFER (xEdit wbDefinitionsTES4.pas ~3110 vs wbDefinitionsTES5.pas 2636):
+# TES4 has Apparatus at 2 and Clothing at 5, so every entry after Activators
+# is shifted, and TES4 keeps NPCs/Creatures/Soul Gems as kinds Skyrim folds
+# into "Actors: Any" or has no word for.  A TES4 value copied through as-is
+# lands on the wrong kind — TES4 "Furniture" (12) is TES5 "Ammo".
+TES4_TO_TES5_OBJECT_TYPE = {
+    0: 0,    # None
+    1: 1,    # Activators
+    2: 0,    # Apparatus            -> (no TES5 kind)
+    3: 2,    # Armor
+    4: 3,    # Books
+    5: 17,   # Clothing             -> All: Wearable (Skyrim clothes are ARMO)
+    6: 4,    # Containers
+    7: 5,    # Doors
+    8: 6,    # Ingredients
+    9: 7,    # Lights
+    10: 8,   # Miscellaneous
+    11: 9,   # Flora
+    12: 10,  # Furniture
+    13: 11,  # Weapons: Any
+    14: 12,  # Ammo
+    15: 25,  # NPCs                 -> Actors: Any
+    16: 25,  # Creatures            -> Actors: Any
+    17: 0,   # Soul Gems            -> (no TES5 kind)
+    18: 13,  # Keys
+    19: 14,  # Alchemy
+    20: 15,  # Food
+    21: 16,  # All: Combat Wearable
+    22: 17,  # All: Wearable
+    23: 18,  # Weapons: None
+    24: 19,  # Weapons: Melee
+    25: 20,  # Weapons: Ranged
+    26: 21,  # Spells: Any
+    27: 22,  # Spells: Range Target
+    28: 23,  # Spells: Range Touch
+    29: 24,  # Spells: Range Self
+    30: 21, 31: 21, 32: 21, 33: 21, 34: 21, 35: 21,   # Spells: School X -> Any
+}
+# The TES4 object types an actor can pick UP (Find -> Acquire), sit ON, or
+# hunt/seek — the type-2 twin of ITEM_SIGS / FURNITURE_SIGS / ACTOR_SIGS.
+TES4_OBJTYPE_ITEMS = frozenset({3, 4, 5, 8, 9, 10, 13, 14, 17, 18, 19, 20,
+                                21, 22, 23, 24, 25})
+TES4_OBJTYPE_FURNITURE = frozenset({12})
+TES4_OBJTYPE_ACTORS = frozenset({15, 16})
+
+
+def object_criteria_kind(t_type: int, value: int, sig: str = '') -> str:
+    """'actor' / 'item' / 'furniture' / '' for a PTDT criteria: a type-1
+    Object ID (judged by its base's signature) or a type-2 Object Type
+    (judged by the TES4 enum)."""
+    if t_type == 1:
+        if sig in ACTOR_SIGS:
+            return 'actor'
+        if sig in ITEM_SIGS:
+            return 'item'
+        if sig in FURNITURE_SIGS:
+            return 'furniture'
+        return ''
+    if t_type == 2:
+        if value in TES4_OBJTYPE_ACTORS:
+            return 'actor'
+        if value in TES4_OBJTYPE_ITEMS:
+            return 'item'
+        if value in TES4_OBJTYPE_FURNITURE:
+            return 'furniture'
+    return ''
+
 
 def _target(ttype: int, target: int, count: int) -> bytes:
     """A PTDA payload: (type u32, target/formid i32, count i32)."""
@@ -341,11 +430,16 @@ def build_object_type_target(obj_type: int) -> bytes:
 
 
 def build_location(loc_type: int, value: int, radius: int) -> bytes:
-    """TES4 PLDT -> TES5 PLDT.  Types 0..5 are the same enum in both games,
-    and vanilla Skyrim uses every one we need (type 1 'in cell' appears 448x),
-    so this is a copy, not an approximation."""
+    """TES4 PLDT -> TES5 PLDT.  Location types 0..5 are the same enum in both
+    games, and vanilla Skyrim uses every one we lean on (type 1 'in cell'
+    appears 448x), so this is a copy, not an approximation.  Type 5's payload
+    is an object-TYPE enum, and THAT enum differs between the games (see
+    TES4_TO_TES5_OBJECT_TYPE), so it is translated; the caller passes the raw
+    TES4 value."""
     if loc_type < 0 or loc_type > 5:
         return _null_location()
+    if loc_type == 5:
+        value = TES4_TO_TES5_OBJECT_TYPE.get(int(value), 0)
     return struct.pack('<iIi', loc_type, value & 0xFFFFFFFF, radius)
 
 
@@ -370,6 +464,10 @@ def build_target(t_type: int, target: int) -> bytes:
     """
     if t_type < 0 or t_type > 2:
         return _null_target()
+    if t_type == 2:
+        # An object TYPE, not a FormID: the TES4 enum value, translated (the
+        # caller passes the raw TES4 value — see resolve_target).
+        target = TES4_TO_TES5_OBJECT_TYPE.get(int(target), 0)
     return struct.pack('<iIi', t_type, target & 0xFFFFFFFF, 0)
 
 
@@ -532,9 +630,20 @@ class PackContext:
     """
 
     def __init__(self, plan=None, script_vars=None, greeting_topic=0,
-                 ref_base_sig=None,
-                 ref_cell=None, pack_runner_cells=None):
+                 ref_base_sig=None, base_sig=None, base_placements=None,
+                 interior_cells=None,
+                 ref_cell=None, pack_runner_cells=None,
+                 pack_runner_refs=None, actor_pos=None):
         self.plan = plan
+        # raw24 PACK fid -> the raw24 ACHR/ACRE refs that run it, and raw24
+        # ACHR/ACRE -> (x, y, z): a hunt's seek chain is ordered nearest-first
+        # from the hunter's own placement (hunt_chain_targets).
+        self.pack_runner_refs = pack_runner_refs or {}
+        self.actor_pos = actor_pos or {}
+        # source PACK fid -> [(seek PACK fid, target ref fid), ...] for the
+        # hunts expanded into a Follow chain (import_main fills this from
+        # hunt_chain_targets + writer.derive_formid).
+        self.hunt_chains = {}
         self.script_vars = script_vars or {}
         # Converted FormID of the GREETING topic (TES4 DIAL 0x000000C8).  A
         # ForceGreet package opens THIS -- Oblivion's force-greet raised the
@@ -544,6 +653,21 @@ class PackContext:
         # UseItemAt has to know whether its target is furniture (sit) or
         # something to operate (activate); see _choose().
         self.ref_base_sig = ref_base_sig or {}
+        # raw24 BASE fid -> its own signature ('NPC_', 'CREA', 'WEAP', ...).
+        # A PTDT of type 1 (Object ID) names a base record, not a placed ref,
+        # and the base's KIND decides the procedure: an actor base is a
+        # hunt/visit, an item base is an Acquire, a furniture base a Sit.
+        self.base_sig = base_sig or {}
+        # raw24 BASE fid -> tuple of (placed ref fid [remapped], raw24 cell)
+        # for every ACHR/ACRE/REFR of that base.  Answers two questions about
+        # an Object-ID target: "is there exactly ONE of these placed" (then the
+        # Object ID names that ref, see sole_placement) and "which cell do
+        # they live in" (the hunting/search ground, see search_ground).
+        self.base_placements = base_placements or {}
+        # raw24 fids of INTERIOR cells.  A PLDT type-1 "in cell" location is
+        # only ever an interior in vanilla (448/448 in Skyrim.esm); an
+        # exterior cell is never handed to it.
+        self.interior_cells = interior_cells or set()
         # raw24 REFR/ACHR fid -> its ParentCELL, and raw24 PACK fid -> the set
         # of cells the actors running it stand in.  Together these answer "can
         # this actor walk there" — see location_reachable().
@@ -553,6 +677,69 @@ class PackContext:
     def base_sig_of(self, ref_fid: int) -> str:
         return self.ref_base_sig.get(ref_fid & 0x00FFFFFF, '')
 
+    def sig_of_base(self, base_fid: int) -> str:
+        return self.base_sig.get(base_fid & 0x00FFFFFF, '')
+
+    def is_actor_base(self, fid: int) -> bool:
+        return self.sig_of_base(fid) in ACTOR_SIGS
+
+    def sole_placement(self, base_fid: int) -> int:
+        """The ONE placed ref of this base, or 0 when there are none/several.
+
+        An Object-ID target with exactly one placement in the plugin IS that
+        reference — the two spellings are equivalent by construction, so the
+        package can be given the reference and routed exactly like a
+        specific-reference target (alias, Travel-to-ref).
+        """
+        refs = self.base_placements.get(base_fid & 0x00FFFFFF)
+        if refs and len(refs) == 1:
+            return refs[0][0]
+        return 0
+
+    def _unique_interior(self, cells) -> int:
+        """The single interior cell in `cells`, else 0."""
+        if cells and len(cells) == 1:
+            cell = next(iter(cells))
+            if cell in self.interior_cells:
+                return cell
+        return 0
+
+    def search_ground(self, pack_fid: int, base_fid: int = 0,
+                      ref_fid: int = 0, radius: int = 0):
+        """Where to look for a criteria/item target with no authored location.
+
+        TES4's Find/UseItemAt with no PLDT searches the loaded area.  Skyrim's
+        Find/Sandbox procedures need a Location, and vanilla's own "search
+        this whole place" idiom is PLDT type 1 ("in cell", interiors only):
+        MQ202SandboxInRatway sweeps the whole Ratway that way,
+        MS09Stage25JonAcquireNote searches a whole house.  The authored ground
+        is where the TARGETS are placed; if they are spread over several cells
+        (or the base is script-spawned and placed nowhere), the runners' own
+        cell; failing an interior on either side, a wide radius around the
+        actor's own position (vanilla WEJS21HunterWander / the predator
+        package's Hunt Location, type 12 "near self").
+        """
+        placements = (self.base_placements.get(base_fid & 0x00FFFFFF) or ()
+                      if base_fid else ())
+        cells = {c for _r, c in placements if c}
+        if ref_fid and self.ref_cell.get(ref_fid & 0x00FFFFFF):
+            cells = {self.ref_cell[ref_fid & 0x00FFFFFF]}
+        cell = self._unique_interior(cells)
+        if not cell:
+            cell = self._unique_interior(
+                self.pack_runner_cells.get(pack_fid & 0x00FFFFFF))
+        if cell:
+            return build_location(1, remap_formid(cell), 0)
+        if radius > 0:
+            return _location(_SEARCH_NEAR_SELF[0], 0, radius)
+        return _location(*_SEARCH_NEAR_SELF)
+
+    def runner_origin(self, pack_fid: int):
+        """The (x, y, z) the package's single runner stands at, else None."""
+        refs = self.pack_runner_refs.get(pack_fid & 0x00FFFFFF)
+        if refs and len(refs) == 1:
+            return self.actor_pos.get(next(iter(refs)))
+        return None
 
     def location_reachable(self, pack_fid: int, ref_fid: int) -> bool:
         """Can the actor running this package WALK to this reference?
@@ -595,6 +782,11 @@ def resolve_target(rec: dict, ctx: PackContext, pack_fid: int) -> bytes:
     t_type = get_int(rec, 'PTDT.Type', -1)
     if t_type < 0:
         return _null_target()
+    if t_type == 2:
+        # export_PACK writes an Object-Type target as the DECIMAL enum value;
+        # get_formid would read "12" as hex and then shift it into our
+        # load-order index.  build_target translates the TES4 enum.
+        return build_target(2, get_int(rec, 'PTDT.Target', 0))
     target = get_formid(rec, 'PTDT.Target')
 
     # "The player", however TES4 spelled it, is the SPECIFIC REFERENCE
@@ -629,9 +821,26 @@ def resolve_location(rec: dict, ctx: PackContext, pack_fid: int) -> bytes:
     loc_type = get_int(rec, 'PLDT.Type', -1)
     if loc_type < 0:
         return _null_location()
+    if loc_type == 5:
+        # "Near any object of this TYPE".  Skyrim's engine does not resolve
+        # type 4/5 locations (measured live 2026-08-18: a type-4 location
+        # patched into a running package left the actor standing), so the
+        # search area stands in: the runners' interior cell, else a radius
+        # around the actor itself.
+        return ctx.search_ground(pack_fid, radius=get_int(rec, 'PLDT.Radius'))
     value = get_formid(rec, 'PLDT.Location')
     radius = get_int(rec, 'PLDT.Radius', 0)
 
+    if loc_type == 4 and value:
+        # "Near any object of this BASE".  When the plugin places exactly one,
+        # that IS the reference: say so as a type-0 location, the form
+        # Skyrim uses 4,048 times.  Otherwise the placements' cell (type 4
+        # itself is dead in the engine, see above).
+        ref = ctx.sole_placement(value)
+        if ref:
+            loc_type, value = 0, ref
+        else:
+            return ctx.search_ground(pack_fid, value, radius=radius)
     if loc_type == 0:
         if not value:
             return _null_location()   # empty "near reference" slot (see resolve_target)
@@ -652,6 +861,84 @@ def _has_target(rec: dict) -> bool:
 # ---------------------------------------------------------------------------
 # TES4 type -> template + inputs
 # ---------------------------------------------------------------------------
+
+def _authored_or_search_ground(rec: dict, ctx: PackContext, pack_fid: int,
+                               base: int, loc: bytes, ref: int = 0) -> bytes:
+    """The area a criteria Find works in: the authored PLDT when the package
+    has one, else the target's own ground (see search_ground)."""
+    if _has_location(rec) and get_formid(rec, 'PLDT.Location'):
+        return loc
+    return ctx.search_ground(pack_fid, base, ref)
+
+
+def _find_object_criteria(rec: dict, ctx: PackContext, pack_fid: int,
+                          loc: bytes, tgt: bytes, kind: str,
+                          base: int = 0) -> Inputs:
+    """TES4 Find whose target is a CRITERIA rather than a reference: a type-1
+    Object ID naming a BASE record with several placements (or none), or a
+    type-2 Object Type — "go and find one of THESE".
+
+    The criteria's KIND (object_criteria_kind) picks the procedure — this is
+    what TES4's single Find package did implicitly:
+
+      * an ACTOR base is a HUNT (or a search for someone): FGC06's three
+        fighters Find FGC06Goblin (nine placed, 1,400 units away and ~350
+        below them on another level of the mine), FGD08's Blackwood Company
+        Find their goblins, FGC01's lions Find the rats.  Oblivion walked the
+        actor to the nearest one and let faction hostility start the fight.
+        The SEEKING is done by the Follow chain import_main plans from
+        hunt_chain_targets (one Follow per placed target, nearest first, gated
+        on alive/enabled/same cell); THIS record is the chain's TAIL — a
+        wander-only Sandbox in the prey's cell (vanilla MQ202SandboxInRatway)
+        for when no target is left to follow.  Measured live 2026-08-18: the
+        Sandbox alone keeps the fighters within ~300 units of spawn, and a
+        PLDT type-4 "Object ID" location leaves them standing.
+      * an ITEM base is a pick-up: Oblivion's Find picks the item up (the
+        beggars' food Finds, Bruscus Dannus's dropped-weapon Finds, the
+        goblins' totem-staff Finds).  Skyrim's Acquire template is exactly
+        "search this area, walk to a matching item, take it", and its criteria
+        slot takes a type-1 base in vanilla (MQ101RalofGetDoorKey).
+        PTDT.Count is how many to find (FGD08 count 11 for 11 goblins,
+        FGC06 count 10 for 9), so it is Acquire's "num to acquire".
+      * a FURNITURE base is a sit: Skyrim's Sit template searches the area
+        for a chair matching a criteria that vanilla also spells as a type-1
+        FURN base (MG06Stage99MirabelleGetIntoFurniture).
+      * anything else (a container/door base to activate, a plant to harvest)
+        keeps the sandbox fallback: no vanilla template pairs Find with
+        Activate that has any instances.
+    """
+    ground = _authored_or_search_ground(rec, ctx, pack_fid, base, loc)
+    if kind == 'actor':
+        i = Inputs(SANDBOX)
+        i.set('location', ground)
+        i.set('allow_wandering', 1)
+        # A hunt is not a social errand: no sitting, no idle markers, no
+        # furniture — those are what park a sandboxing actor in one spot.
+        i.set('allow_sitting', 0)
+        i.set('allow_idle_markers', 0)
+        i.set('allow_special_furniture', 0)
+        i.set('allow_eating', 0)
+        i.set('allow_sleeping', 0)
+        i.set('allow_conversation', 0)
+        return i
+    if kind == 'item':
+        i = Inputs(ACQUIRE)
+        i.set('location', ground)
+        i.set('target', tgt)
+        i.set('count', max(1, get_int(rec, 'PTDT.Count', 0) or 0))
+        return i
+    if kind == 'furniture':
+        i = Inputs(SIT)
+        i.set('location', ground)
+        i.set('chair_target', tgt)
+        return i
+    i = Inputs(SANDBOX)
+    i.set('location', loc)
+    i.set('allow_wandering', 1)
+    i.set('allow_sitting', 1)
+    i.set('allow_idle_markers', 1)
+    return i
+
 
 def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
     """Pick the Skyrim template for a TES4 package and fill its inputs.
@@ -849,8 +1136,29 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
                 i = Inputs(ACTIVATE)
                 i.set('target', tgt)
                 return i
-            i = Inputs(SIT_TARGET)
-            i.set('target', tgt)
+            sig = ctx.base_sig_of(get_formid(rec, 'PTDT.Target'))
+            # Furniture (and a ref whose base is unknown to us) sits; a
+            # carriable item ref (Sinderion's mortar) can be neither sat on
+            # nor activated without picking it up, so it falls through to the
+            # sandbox at the package's own location, which is where the item
+            # stands anyway.
+            if not sig or sig in FURNITURE_SIGS:
+                i = Inputs(SIT_TARGET)
+                i.set('target', tgt)
+                return i
+        # "Use any furniture / any of THIS furniture here" is Skyrim's Sit
+        # template with the same criteria (DA14StartSamSit: type 2 Furniture;
+        # MG06Stage99MirabelleGetIntoFurniture: type 1 FURN base).  The other
+        # object-type uses (read any book, practise with any melee weapon,
+        # the aaaPreachToken/aaaObeisanceToken idle tokens) have no
+        # target-taking Skyrim template and keep the sandbox below.
+        if _has_target(rec) and object_criteria_kind(
+                get_int(rec, 'PTDT.Type', -1), get_int(rec, 'PTDT.Target', 0),
+                ctx.sig_of_base(get_formid(rec, 'PTDT.Target'))
+                ) == 'furniture':
+            i = Inputs(SIT)
+            i.set('location', loc)
+            i.set('chair_target', tgt)
             return i
         i = Inputs(SANDBOX)
         i.set('location', loc)
@@ -887,21 +1195,60 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
             i = Inputs(ACTIVATE)
             i.set('target', tgt)
             return i
-        # "Find" an ACTOR is a seek: go to where that actor is.  At
-        # CharacterGen stage >= 24 the ambush assassins each Find a Blade
-        # (CGAssassinsAmbushAToGlenroy/Baurus/Renote, distance 200) — that
-        # package is what carries them out of the ambush room, through its
-        # teleport door and off the mezzanine drop into the fight; the
-        # sandbox fallback left them standing in the room forever.  Skyrim's
-        # Travel procedure with a "near reference" location is the seek half
-        # of Find (the "use" tail does not apply to an actor), and the ref
-        # routes through a quest alias exactly as resolve_target does.
-        # PTDT.Count on a Find is the approach DISTANCE (see build_target's
-        # census note), so it becomes the location radius.
         target = get_formid(rec, 'PTDT.Target')
-        if target and ctx.base_sig_of(target) in ACTOR_SIGS:
+        t_type = get_int(rec, 'PTDT.Type', -1)
+        # A type-1 target (Object ID) names a BASE record: "find any one of
+        # THESE".  When the plugin places exactly one of them, that spelling
+        # IS the reference (FindFathisUlesTTh22x2 -> FathisUlesRef,
+        # MQ15MinotaurFindMythicDawn1 -> the single MQ15MythicDawnLowM01
+        # placement), and the package routes exactly as a specific-reference
+        # target would — through the quest alias when it has one.
+        if t_type == 1 and target and ctx.is_actor_base(target):
+            ref = ctx.sole_placement(target)
+            if ref:
+                t_type, target = 0, ref
+        # A specific-reference target: what the actor does with it depends
+        # on what it IS.  At CharacterGen stage >= 24 the ambush assassins
+        # each Find a Blade (CGAssassinsAmbushAToGlenroy/Baurus/Renote,
+        # distance 200) — that package is what carries them out of the ambush
+        # room, through its teleport door and off the mezzanine drop into the
+        # fight; the sandbox fallback left them standing in the room forever.
+        ref_sig = ctx.base_sig_of(target) if t_type == 0 and target else ''
+        if ref_sig in FURNITURE_SIGS:
+            # Find THIS bench/throne = go and sit on it (DEDyusSitInThrone,
+            # AnvilTreeSit12x5) — the same as UseItemAt at furniture.
+            i = Inputs(SIT_TARGET)
+            i.set('target', tgt)
+            return i
+        if ref_sig in ITEM_SIGS:
+            # Find THIS item = go and pick it up (the goblin leaders' totem
+            # staffs, TG11LibraryGuard06Cleanup's misc): Skyrim's Acquire with
+            # a specific-reference criteria, as MS09Stage25JonAcquireNote
+            # spells it.  The search area has to CONTAIN the item: the
+            # authored PLDT if there is one, else the item's own cell.
+            i = Inputs(ACQUIRE)
+            i.set('location',
+                  _authored_or_search_ground(rec, ctx, pack_fid, 0, loc,
+                                             ref=target))
+            i.set('target', tgt)
+            i.set('count', max(1, get_int(rec, 'PTDT.Count', 0) or 0))
+            return i
+        if ref_sig and ref_sig not in OPERABLE_SIGS:
+            # Find a specific ACTOR (or any other placed thing — a STAT
+            # marker such as SEBlackrootFindPrisoner03Target, 101 of them)
+            # is a seek: GO TO WHERE IT IS.  Skyrim's Travel procedure with a
+            # "near reference" location is the seek half of Find (the "use"
+            # tail does not apply), and the ref routes through a quest alias
+            # exactly as resolve_target does.  PTDT.Count on a Find at a
+            # specific ref is the approach DISTANCE (see build_target's
+            # census note), so it becomes the location radius; on an
+            # Object-ID target it is a COUNT ("find 10 goblins") and means
+            # nothing as a distance, so a resolved Object ID keeps radius 0
+            # (the engine's own arrival distance).
             t4_radius = get_int(rec, 'PTDT.Count', 0) or 0
             t4_radius = max(0, min(int(t4_radius), 4096))
+            if get_int(rec, 'PTDT.Type', -1) == 1:
+                t4_radius = 0
             alias = ctx.alias_for(pack_fid, target)
             i = Inputs(TRAVEL)
             i.set('location',
@@ -911,6 +1258,15 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
             if use_horse:
                 i.set('ride_horse', 1)
             return i
+        if t_type == 1 and target:
+            return _find_object_criteria(
+                rec, ctx, pack_fid, loc, tgt,
+                object_criteria_kind(1, target, ctx.sig_of_base(target)),
+                base=target)
+        if t_type == 2:
+            return _find_object_criteria(
+                rec, ctx, pack_fid, loc, tgt,
+                object_criteria_kind(2, get_int(rec, 'PTDT.Target', 0)))
         # Otherwise: travel to the location, then sandbox there.  The "locate
         # this object" tail has no TES5 standalone equivalent.
         i = Inputs(SANDBOX)
@@ -1010,10 +1366,7 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
     # GetScriptVariable condition becomes GetVMScriptVariable + a CIS2 naming
     # the Papyrus property — see dialog_conditions; the legacy function is dead
     # in Skyrim, so without this the package could never fire.
-    for ctda, cis2 in convert_ctda_list_with_strings(rec, ctx.script_vars):
-        subs += pack_subrecord('CTDA', ctda)
-        if cis2:
-            subs += pack_string_subrecord('CIS2', cis2)
+    subs += _source_conditions(rec, ctx)
 
     owner = ctx.quest_of(pack_fid)
     if owner:
@@ -1049,6 +1402,138 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
 # pack fid -> owning quest fid, for packages whose ForceGreet Topic input still
 # holds the 0 placeholder. Drained by patch_forcegreet_topics.
 _FORCEGREET_PENDING: dict = {}
+
+
+# --- Hunt = Find at an actor BASE with several placements ------------------
+#
+# Oblivion's Find(Object ID = FGC06Goblin, count 10) walks the actor to the
+# NEAREST living goblin, again and again.  Skyrim has no procedure that seeks
+# "any of this base": a Sandbox only wanders locally (measured live 2026-08-18
+# on FGC06 — all three fighters were RUNNING their hunt package and stayed
+# within ~300 units of spawn while the goblins sat 1,400 units away and 350
+# below), and a PLDT type-4 "Object ID" location leaves the actor standing
+# (patched into the live package: no movement at all).  What Skyrim does have
+# is Follow-a-reference, so the one TES4 package becomes a CHAIN of Follow
+# packages, one per placed target, nearest first, each gated on that target
+# being alive, enabled and in the hunter's cell.  The engine walks the chain
+# by itself: kill goblin #1 and its GetDead gate fails, so #2 wins.  The
+# source package (the roam Sandbox) stays as the tail.
+
+MAX_HUNT_CHAIN = 24
+
+
+def hunt_chain_targets(rec: dict, ctx: PackContext, pack_fid: int) -> list:
+    """The placed refs a Find-at-actor-BASE package seeks, nearest first from
+    the hunter's own placement; [] when this package is not such a hunt (or
+    the base has fewer than two placements — one resolves to the ref, see
+    _choose)."""
+    if get_int(rec, 'PKDT.Type', -1) != T4_FIND:
+        return []
+    if get_int(rec, 'PTDT.Type', -1) != 1 or _targets_player(rec):
+        return []
+    base = get_formid(rec, 'PTDT.Target')
+    if not base or not ctx.is_actor_base(base):
+        return []
+    placements = ctx.base_placements.get(base & 0x00FFFFFF) or ()
+    if len(placements) < 2:
+        return []
+    refs = [r for r, _c in placements]
+    origin = ctx.runner_origin(pack_fid)
+    if origin:
+        def _d2(ref):
+            pos = ctx.actor_pos.get(ref & 0x00FFFFFF)
+            if pos is None:
+                return float('inf')
+            return sum((a - b) ** 2 for a, b in zip(pos, origin))
+        refs.sort(key=_d2)
+    if len(refs) > MAX_HUNT_CHAIN:
+        print(f"  NOTE: hunt {get_str(rec, 'EditorID')} seeks "
+              f"{len(refs)} placements; chaining the nearest "
+              f"{MAX_HUNT_CHAIN}")
+        refs = refs[:MAX_HUNT_CHAIN]
+    return refs
+
+
+def _run_on_ref_ctda(func: int, ref: int, comp: float,
+                     operator: int = 0x00) -> bytes:
+    """A TES5 CTDA `func <op> comp` evaluated ON `ref` (RunOn = Reference)."""
+    comp_raw = struct.unpack('<I', struct.pack('<f', comp))[0]
+    return struct.pack('<B3xIHHIIII I', operator, comp_raw, func, 0,
+                       0, 0, 2, ref, 0xFFFFFFFF)
+
+
+def _subject_ctda(func: int, param1: int, comp: float,
+                  operator: int = 0x00) -> bytes:
+    comp_raw = struct.unpack('<I', struct.pack('<f', comp))[0]
+    return struct.pack('<B3xIHHIIII I', operator, comp_raw, func, 0,
+                       param1, 0, 0, 0, 0xFFFFFFFF)
+
+
+CTDA_GET_IN_SAME_CELL = 32   # GetInSameCell(ref)   (same index in TES4/TES5)
+CTDA_GET_DISABLED = 35       # GetDisabled
+CTDA_GET_DEAD = 46           # GetDead
+
+
+def _source_conditions(rec: dict, ctx: PackContext) -> bytes:
+    out = b''
+    for ctda, cis2 in convert_ctda_list_with_strings(rec, ctx.script_vars):
+        out += pack_subrecord('CTDA', ctda)
+        if cis2:
+            out += pack_string_subrecord('CIS2', cis2)
+    return out
+
+
+def _seek_record(rec: dict, ctx: PackContext, src_fid: int, seek_fid: int,
+                 ref: int, k: int) -> bytes:
+    """One link of a hunt chain: Follow `ref` while it is alive, enabled and
+    in the hunter's cell, under the source package's own gates."""
+    edid = get_str(rec, 'EditorID')
+    subs = b''
+    if edid:
+        subs += pack_string_subrecord('EDID', f'{edid}Seek{k:02d}')
+    owner = ctx.quest_of(src_fid)
+    flags, speed = convert_flags(get_int(rec, 'PKDT.Flags'), T4_FOLLOW,
+                                 quest_gated=owner is not None)
+    subs += pack_subrecord('PKDT', build_pkdt(flags, speed))
+    subs += pack_subrecord('PSDT', build_psdt(rec))
+    subs += _source_conditions(rec, ctx)
+    # AND-gates on the target: `GetInSameCell` is evaluated on the HUNTER
+    # (its param is the target), the other two ON the target reference.
+    subs += pack_subrecord('CTDA', _subject_ctda(CTDA_GET_IN_SAME_CELL, ref,
+                                                 1.0))
+    subs += pack_subrecord('CTDA', _run_on_ref_ctda(CTDA_GET_DISABLED, ref,
+                                                    0.0))
+    subs += pack_subrecord('CTDA', _run_on_ref_ctda(CTDA_GET_DEAD, ref, 0.0))
+    if owner:
+        subs += pack_formid_subrecord('QNAM', owner)
+    inputs = Inputs(FOLLOW)
+    alias = ctx.alias_for(src_fid, ref)
+    inputs.set('target', build_alias_target(alias) if alias is not None
+               else build_target(0, ref))
+    if get_int(rec, 'PKDT.Flags', 0) & T4_USE_HORSE:
+        inputs.set('ride_horse', 1)
+    t = inputs.t
+    subs += pack_subrecord('PKCU', struct.pack('<III', len(t.inputs),
+                                               t.formid, t.version))
+    subs += inputs.emit()
+    for marker in (b'POBA', b'POEA', b'POCA'):
+        subs += pack_subrecord(marker.decode(), b'')
+        subs += pack_formid_subrecord('INAM', 0)
+        subs += pack_subrecord('PDTO', struct.pack('<II', 0, 0))
+    return pack_record('PACK', seek_fid, get_int(rec, 'RecordFlags'), subs)
+
+
+def convert_PACK_records(rec: dict, ctx: PackContext = None) -> list:
+    """Every TES5 PACK record one TES4 PACK becomes: the hunt chain's seek
+    links (when import_main planned one, see PackContext.hunt_chains) followed
+    by the package itself."""
+    ctx = ctx or PackContext()
+    src_fid = get_formid(rec, 'FormID')
+    out = []
+    for k, (seek_fid, ref) in enumerate(ctx.hunt_chains.get(src_fid, ()), 1):
+        out.append(_seek_record(rec, ctx, src_fid, seek_fid, ref, k))
+    out.append(convert_PACK(rec, ctx))
+    return out
 
 # TES4 condition functions whose param1 is a QUEST FormID.
 _QUEST_PARAM_FUNCS = frozenset({

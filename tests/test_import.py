@@ -2311,6 +2311,132 @@ class TestCKWarningFixes:
         assert (ltype, lfid) == (0, 0x00023E71)
         assert lradius == 200, 'PTDT.Count is the approach distance'
 
+    def test_find_at_actor_base_type_wanders_the_cell_to_hunt(self):
+        """A TES4 "Find" naming an actor BASE TYPE with several placements
+        must roam the cell they live in.
+
+        `PTDT.Type=1` at an NPC_/CREA base means "go find one of THESE".
+        FGC06Courier's three fighters Find FGC06Goblin: nine goblins, all in
+        DesolateMine, ~350 units BELOW the fighters on another level.  Only
+        Sandbox wanders, and vanilla's own "sweep this whole place for
+        enemies" idiom is a Sandbox with Allow Wandering alone and a PLDT
+        type-1 "in cell" location (MQ202SandboxInRatway).  A spherical
+        sandbox is truncated to a cylinder (fSandboxCylinderBottom -100), so a
+        "near self, radius N" location never takes them DOWN to the goblins.
+
+        The cell FormID must be REMAPPED into the output's index space: the
+        first cut wrote the raw 0x00028869, which is no record at all in
+        Skyrim.esm, so the location resolved to nothing and the fighters
+        stood still (measured live 2026-08-17).
+        """
+        from tes5_import.pack_converter import _choose, PackContext, T4_FIND
+        from tes5_import.pack_templates import SANDBOX, TRAVEL
+        from tes5_import.text_reader import set_formid_index_offset
+        set_formid_index_offset(1)
+        try:
+            rec = {'Signature': 'PACK', 'FormID': '000292CD',
+                   'EditorID': 'FGC06RiennaGoblinHunt',
+                   'PKDT.Type': str(T4_FIND), 'PKDT.Flags': '4096',
+                   'PTDT.Type': '1', 'PTDT.Target': '0002888E',
+                   'PTDT.Count': '10'}
+            goblins = tuple((0x01048F40 + k, 0x028869) for k in range(9))
+            ctx = PackContext(base_sig={0x02888E: 'CREA'},
+                              base_placements={0x02888E: goblins},
+                              interior_cells={0x028869},
+                              pack_runner_cells={0x0292CD: {0x028869}})
+            inp = _choose(rec, ctx, 0x010292CD)
+            assert inp.t is SANDBOX
+
+            loc = inp.values[SANDBOX.slot('location')]
+            ltype, lfid, lradius = struct.unpack('<iIi', loc)
+            assert (ltype, lfid, lradius) == (1, 0x01028869, 0), \
+                "the goblins' cell, REMAPPED, is the hunting ground"
+            assert inp.values[SANDBOX.slot('allow_wandering')] == 1, \
+                'a hunter that cannot wander never finds the goblins'
+            # The things that park a sandboxing actor in one spot must be off.
+            for off in ('allow_sitting', 'allow_idle_markers',
+                        'allow_special_furniture', 'allow_conversation'):
+                assert inp.values[SANDBOX.slot(off)] == 0, off
+
+            # An EXTERIOR cell is never an "in cell" location (448/448
+            # vanilla uses are interiors): fall back to a wide search radius
+            # around the actor itself.
+            ctx_ext = PackContext(base_sig={0x02888E: 'CREA'},
+                                  base_placements={0x02888E: goblins},
+                                  interior_cells=set(),
+                                  pack_runner_cells={0x0292CD: {0x028869}})
+            ext = _choose(rec, ctx_ext, 0x010292CD)
+            assert ext.t is SANDBOX
+            eloc = struct.unpack('<iIi', ext.values[SANDBOX.slot('location')])
+            assert eloc[0] == 12 and eloc[2] > 0, 'near self, wide radius'
+
+            # A base placed exactly ONCE resolves to that reference — the
+            # Object-ID spelling IS the ref — and the package seeks it like a
+            # specific-reference Find (Travel near the ref).  This covers both
+            # the social call (FindFathisUlesTTh22x2, Bittneld visiting
+            # Emfrid) and the single-target hunt (MQ15MinotaurFindMythicDawn1).
+            visit = {'Signature': 'PACK', 'FormID': '0002A38D',
+                     'EditorID': 'BittneldtheCurseBringerVisitEmfrid',
+                     'PKDT.Type': str(T4_FIND), 'PKDT.Flags': '2',
+                     'PTDT.Type': '1', 'PTDT.Target': '000234B7',
+                     'PTDT.Count': '0', 'PSDT.Time': '18'}
+            vctx = PackContext(base_sig={0x0234B7: 'NPC_'},
+                               base_placements={0x0234B7: ((0x01023B02,
+                                                            0x000804),)},
+                               ref_base_sig={0x023B02: 'NPC_'},
+                               interior_cells={0x000804},
+                               pack_runner_cells={0x02A38D: {0x99}})
+            vinp = _choose(visit, vctx, 0x0102A38D)
+            assert vinp.t is TRAVEL
+            vloc = vinp.values[TRAVEL.slot('location')]
+            assert struct.unpack('<iIi', vloc) == (0, 0x01023B02, 0), \
+                'travel to the one Emfrid placed; count is not a distance'
+        finally:
+            set_formid_index_offset(0)
+
+    def test_find_object_id_item_acquires_and_furniture_sits(self):
+        """A TES4 Find at an ITEM base picks the item up (Acquire); at a
+        furniture base it sits (Sit).  Both take the type-1 PTDT as-is —
+        vanilla spells the same criteria that way (MQ101RalofGetDoorKey,
+        MG06Stage99MirabelleGetIntoFurniture) — and PTDT.Count on an
+        Object-ID Find is the NUMBER to find, i.e. Acquire's num-to-acquire.
+        The search area is the authored PLDT when there is one, else the
+        cell the items are placed in."""
+        from tes5_import.pack_converter import _choose, PackContext, T4_FIND
+        from tes5_import.pack_templates import ACQUIRE, SIT
+        from tes5_import.text_reader import set_formid_index_offset
+        set_formid_index_offset(1)
+        try:
+            staff = {'Signature': 'PACK', 'FormID': '00001111',
+                     'EditorID': 'CreatureGoblinLeaderFindHeadA',
+                     'PKDT.Type': str(T4_FIND), 'PKDT.Flags': '4',
+                     'PTDT.Type': '1', 'PTDT.Target': '00002222',
+                     'PTDT.Count': '2'}
+            ctx = PackContext(base_sig={0x002222: 'WEAP'},
+                              base_placements={0x002222: ((0x01003333, 0x4444),
+                                                          (0x01003334, 0x4444))},
+                              interior_cells={0x4444})
+            inp = _choose(staff, ctx, 0x01001111)
+            assert inp.t is ACQUIRE
+            assert struct.unpack('<iIi', inp.values[ACQUIRE.slot('target')]) \
+                == (1, 0x01002222, 0)
+            assert inp.values[ACQUIRE.slot('count')] == 2
+            assert struct.unpack('<iIi', inp.values[ACQUIRE.slot('location')]) \
+                == (1, 0x01004444, 0), 'search the cell the staffs are in'
+
+            pew = dict(staff, **{'PTDT.Target': '00005555', 'PTDT.Count': '0',
+                                 'PLDT.Type': '0', 'PLDT.Location': '00006666',
+                                 'PLDT.Radius': '512'})
+            fctx = PackContext(base_sig={0x005555: 'FURN'})
+            finp = _choose(pew, fctx, 0x01001111)
+            assert finp.t is SIT
+            assert struct.unpack('<iIi', finp.values[SIT.slot('chair_target')]) \
+                == (1, 0x01005555, 0)
+            assert struct.unpack('<iIi', finp.values[SIT.slot('location')]) \
+                == (0, 0x01006666, 512), 'the authored search area wins'
+        finally:
+            set_formid_index_offset(0)
+
     def test_defensive_combat_is_not_ignore_combat(self):
         """TES4 Defensive Combat must NOT become TES5 Ignore Combat.
 
