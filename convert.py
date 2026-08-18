@@ -482,7 +482,7 @@ def phase_extract(file_name: str, tes4_data: str, config: dict,
 # ===========================================================================
 
 def phase_assets(file_name: str, config: dict, output_dir: str = None,
-                 mesh_subdirs=None, winding_fix=None):
+                 mesh_subdirs=None, winding_fix=None, parallax=False):
     """Convert extracted NIF assets and copy textures to output (meshes only).
 
     `winding_fix` tri-states the collision winding repair: True/False force it,
@@ -510,6 +510,7 @@ def phase_assets(file_name: str, config: dict, output_dir: str = None,
         extract_dir=extract_dir,
         output_dir=out_dir,
         mesh_subdirs=mesh_subdirs,
+        parallax=parallax,
     )
     total = sum(v for v in stats.values() if isinstance(v, int))
     print(f"[{file_name}] Meshes complete ({total} items processed)")
@@ -1267,6 +1268,14 @@ def main():
     winding.add_argument("--no-collision-winding-fix", dest="collision_winding_fix",
                          action="store_false", default=None,
                          help="Disable the collision winding repair.")
+    # Parallax (asset_convert/parallax.py). Deliberately opt-in and NOT a
+    # per-plugin default: a correct parallax shape renders wrong under vanilla
+    # SSE, and the converter cannot tell what the player will run it under.
+    parser.add_argument("--parallax", action="store_true",
+                        help="Carry Oblivion's parallax across as Skyrim "
+                             "height maps. REQUIRES Community Shaders or ENB "
+                             "in the player's setup -- under vanilla SSE the "
+                             "affected surfaces render wrong. Off by default.")
 
     args = parser.parse_args()
 
@@ -1426,7 +1435,8 @@ def main():
         for fn in order:
             ok = phase_assets(fn, config, output_dir=output_dir,
                               mesh_subdirs=getattr(args, 'mesh_subdirs', None),
-                              winding_fix=args.collision_winding_fix)
+                              winding_fix=args.collision_winding_fix,
+                              parallax=args.parallax)
             # A filtered mesh run converts only some subfolders, so it must not
             # certify the Meshes step as fully rebuilt at this version.
             if not getattr(args, 'mesh_subdirs', None):

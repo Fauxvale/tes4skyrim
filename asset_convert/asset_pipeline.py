@@ -44,8 +44,50 @@ def extract_bsas(source_file, data_path, extract_dir='export', force=False):
     return result
 
 
+_PARALLAX_NOTICE = """\
+PARALLAX — READ THIS BEFORE PLAYING
+===================================
+
+This conversion was built with --parallax, so Oblivion's own parallax surfaces
+(dungeon walls, rock, architecture) ship as Skyrim height maps.
+
+YOU NEED ONE OF THESE INSTALLED:
+
+  * Community Shaders  (verified in game with this conversion), or
+  * ENB
+
+WITHOUT ONE, THOSE SURFACES RENDER WRONG. Not flat -- wrong: the texture
+visibly swims across the geometry as the camera moves. Tested on vanilla SSE,
+and the "SSE Parallax Shader Fix" did NOT repair it. If you do not run
+Community Shaders or an ENB, rebuild without --parallax; you lose the effect
+and everything renders correctly.
+
+WHAT WAS CONVERTED
+
+Oblivion marks a surface for parallax per shape and keeps the height field in
+the diffuse texture's alpha channel. Every shape carrying that mark whose
+texture actually holds height data was rebuilt as a Skyrim heightmap shape,
+with the height written out beside the diffuse as <name>_p.dds (BC4).
+
+Shapes marked for parallax whose texture holds NO height data were left alone.
+That is not a gap in the conversion: over half of Oblivion's flagged textures
+ship no alpha channel at all, so Oblivion itself renders no parallax on them
+either. Building a height map there would have invented data and produced the
+swimming surface described above.
+"""
+
+
+def _write_parallax_notice(plugin_dir):
+    """Ship the Community-Shaders requirement WITH the mod, not just in a repo
+    README nobody downloading the output ever sees."""
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / 'PARALLAX-READ-ME.txt').write_text(
+        _PARALLAX_NOTICE, encoding='utf-8')
+    print('  Wrote PARALLAX-READ-ME.txt (Community Shaders / ENB required)')
+
+
 def convert_meshes(source_file, extract_dir='export', output_dir='output',
-                   mesh_subdirs=None):
+                   mesh_subdirs=None, parallax=False):
     """Convert extracted NIFs and copy textures into `output_dir/<source_name>/`.
     Assumes BSA extraction has already been run (extract_bsas).
 
@@ -55,6 +97,9 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
         output_dir:   Final output root (files placed under output_dir/<source_name>/).
         mesh_subdirs: Optional list of root mesh subfolders to include (e.g.
                       ['architecture', 'clutter']). None means all subfolders.
+        parallax:     Carry Oblivion's parallax across as Skyrim height maps.
+                      Off by default — see asset_convert/parallax.py; the
+                      output needs Community Shaders or ENB.
 
     Returns a dict with keys: 'mesh_conversion', 'textures_copied', 'other_copied'.
     """
@@ -90,7 +135,10 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
             fix_textures=True, remap_skeleton=None,
             subdir_filter=mesh_subdirs,
             wearable_plan=plan,
+            parallax=parallax,
         )
+        if parallax:
+            _write_parallax_notice(plugin_dir)
         # The textures the converted meshes reference, harvested as they were
         # written.  Persisted because the prune runs in a later phase (after LOD
         # and speedtrees add their own meshes), possibly a separate invocation.

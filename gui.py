@@ -811,6 +811,11 @@ def gui_main():
     winding_var = tk.BooleanVar(value=_winding_default(file_var.get()))
     winding_user_set = {"v": False}
 
+    # Parallax carry-over.  Always starts OFF and never tracks the plugin: the
+    # question it answers is about the PLAYER's Skyrim setup (Community Shaders
+    # or ENB present), which nothing here can detect.
+    parallax_var = tk.BooleanVar(value=False)
+
     def _sync_winding_default(*_):
         if not winding_user_set["v"]:
             winding_var.set(_winding_default(file_var.get()))
@@ -3033,6 +3038,30 @@ def gui_main():
     _attach_tooltip(_winding_chk, _WINDING_TIP)
     _attach_tooltip(_winding_hint, _WINDING_TIP)
 
+    # Parallax carry-over, the other Meshes sub-option.  No per-plugin default
+    # and no auto-on: whether the output renders correctly depends on the
+    # PLAYER's setup, not on the plugin, so only they can answer it.
+    _parallax_row = ttk.Frame(sidebar, style="Panel.TFrame")
+    _parallax_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_winding_row)
+    _parallax_chk = ttk.Checkbutton(_parallax_row, text="Convert parallax",
+                                    variable=parallax_var,
+                                    style="TCheckbutton")
+    _parallax_chk.pack(side=tk.LEFT, padx=(20, 0))
+    _parallax_hint = ttk.Label(_parallax_row, text="needs Community Shaders",
+                               style="PanelSub.TLabel")
+    _parallax_hint.pack(side=tk.LEFT, padx=(6, 0))
+
+    _PARALLAX_TIP = (
+        "Carries Oblivion's own parallax (depth on dungeon walls, rock and "
+        "architecture) across to Skyrim.\n\n"
+        "ONLY turn this on if you play with Community Shaders or an ENB.\n\n"
+        "Without one, the affected surfaces do not just look flat -- the "
+        "texture visibly swims across them as you move. Tested: the SSE "
+        "Parallax Shader Fix does not repair it."
+    )
+    _attach_tooltip(_parallax_chk, _PARALLAX_TIP)
+    _attach_tooltip(_parallax_hint, _PARALLAX_TIP)
+
     # ── Action buttons ────────────────────────────────────────────────────────
     # 12px above, matching a separator's gap: the step rows are packed tight
     # (pady=1 each), so without it the Run button crowds the last checkbox and
@@ -3834,6 +3863,8 @@ def gui_main():
             # Always explicit: the checkbox is the user's answer, whether it
             # came from the per-plugin default or from them ticking the box.
             cmd.append(_winding_flag())
+            if parallax_var.get():
+                cmd.append("--parallax")
         return cmd
 
     # ── Global actions ────────────────────────────────────────────────────────
@@ -4208,6 +4239,9 @@ def gui_main():
             _log(f"Mesh subdirs: {', '.join(selected_subdirs)}")
         if "meshes" in steps:
             _log(f"Collision winding fix: {'on' if winding_var.get() else 'off'}")
+            _log(f"Parallax: {'on' if parallax_var.get() else 'off'}"
+                 + (" (Community Shaders or ENB required in game)"
+                    if parallax_var.get() else ""))
         _log("")
 
         q = queue.Queue()
