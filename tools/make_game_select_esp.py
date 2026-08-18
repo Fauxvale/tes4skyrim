@@ -99,16 +99,18 @@ QUEST_TYPE_NONE = 0
 FUNC_GET_GLOBAL_VALUE = 74
 
 PROLOGUE = (
-    "The threads of prophecy gather, and fate has not yet chosen its weave.\n\n"
-    "Countless worlds turn upon this moment, each with a door standing open and "
-    "no one yet walking through it. An Emperor dreams of a stranger in a cell. A "
-    "prisoner wakes to the smell of ash and salt. A cart rolls toward Helgen. A "
-    "land without gods waits for someone who owes them nothing.\n\n"
-    "All of them are true until you choose. Where do the threads of prophecy "
-    "bind you?"
+    "The threads of prophecy gather, but fate has not yet chosen its weave.\n\n"
+    "A cart of prisoners rolls toward death.\n"
+    "An Emperor dreams of a stranger in a cell.\n"
+    "A ship makes port in a land of ash.\n"
+    "A godless land waits for no one.\n\n"
+    "Where does fate bind you?"
 )
 
-# Button order here MUST match the GAME_* constants in TESGameSelectQuest.psc.
+# Button order here MUST match the GAME_* constants in TESGameSelectQuest.psc:
+# Skyrim=0, Oblivion=1, Morroblivion=2, Nehrim=3. Reordering this list without
+# renumbering those constants silently launches the WRONG GAME — the button
+# index is the only thing tying a button to a game.
 # A hidden button does NOT renumber the others — Message.Show() returns the
 # button's own index regardless of which conditions passed (vanilla's
 # dunMiddenHandSculptureSCRIPT depends on exactly this) — so index == game id.
@@ -118,10 +120,10 @@ PROLOGUE = (
 # unconditional. That guarantees the menu always has at least one valid choice
 # and can never trap the player with nothing to click.
 BUTTONS = [
-    ('Skyrim  -  the cart rolls toward Helgen',           None),
-    ('Cyrodiil  -  an Emperor has dreamt of you',         FID_GLOB_OBLIVION),
-    ('Nehrim  -  a land that owes the gods nothing',      FID_GLOB_NEHRIM),
-    ('Vvardenfell  -  an old prophecy stirs in the ash',  FID_GLOB_MORROBLIVION),
+    ("Skyrim  -  Your name is written upon the executioner's block", None),
+    ("Cyrodiil  -  The Emperor has dreamt of you",                 FID_GLOB_OBLIVION),
+    ("Vvardenfell  -  A prophecy of old foretold your birth",     FID_GLOB_MORROBLIVION),
+    ("Nehrim  -  You were not chosen. You must make for yourself a name",      FID_GLOB_NEHRIM),
 ]
 
 GLOBALS = [

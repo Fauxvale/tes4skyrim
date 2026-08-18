@@ -108,8 +108,8 @@ Int Property ChosenGame = 0 Auto Conditional
 ; Game identifiers, in the button order the MESG declares.
 Int Property GAME_SKYRIM       = 0 AutoReadOnly
 Int Property GAME_OBLIVION     = 1 AutoReadOnly
-Int Property GAME_NEHRIM       = 2 AutoReadOnly
-Int Property GAME_MORROBLIVION = 3 AutoReadOnly
+Int Property GAME_MORROBLIVION = 2 AutoReadOnly
+Int Property GAME_NEHRIM       = 3 AutoReadOnly
 
 ; Number of games offered, counting Skyrim. 1 means "Skyrim only" — no menu.
 Int gameCount
