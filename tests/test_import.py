@@ -519,6 +519,39 @@ class TestConverters:
         sig = result[:4].decode('ascii')
         assert sig == 'NPC_'
 
+    def test_crea_base_scale_to_nam6(self):
+        """TES4 CREA BNAM 'Base Scale' -> TES5 NPC_ NAM6 'Height'.
+
+        A creature is sized per-record in TES4, not by its race. Hardcoding
+        NAM6 to 1.0 shipped every creature at one size: Anequina's bull
+        elephant (3.5) came out small and Nehrim's chickens (0.4) huge.
+        """
+        base = {'Signature': 'CREA', 'FormID': '00000601', 'RecordFlags': '0',
+                'EditorID': 'TestElephant', 'FULL': 'Elephant',
+                'ACBS.Flags': '0', 'ACBS.Level': '3', 'ACBS.CalcMin': '1',
+                'ACBS.CalcMax': '10', 'ACBS.BarterGold': '0',
+                'FactionCount': '0', 'ItemCount': '0', 'AIPackageCount': '0',
+                'AIDT.Aggression': '0', 'AIDT.Confidence': '30',
+                'AIDT.Services': '0',
+                'DATA.CombatSkill': '15', 'DATA.MagicSkill': '0',
+                'DATA.StealthSkill': '20', 'DATA.Health': '20',
+                'DATA.Strength': '30', 'DATA.Intelligence': '10'}
+
+        for authored, expected in (('3.5', 3.5),        # bull elephant
+                                   ('0.4000000059604645', 0.4),  # chicken
+                                   ('0.800000011920929', 0.8)):  # donkey
+            rec = dict(base, **{'BNAM.BaseScale': authored})
+            nam6 = self._get_subrecord_data(convert_CREA(rec), 'NAM6')
+            assert len(nam6) == 4
+            assert struct.unpack('<f', nam6)[0] == pytest.approx(expected)
+
+        # No BNAM, or a nonsense value, means no scaling.
+        for rec in (base,
+                    dict(base, **{'BNAM.BaseScale': '0.0'}),
+                    dict(base, **{'BNAM.BaseScale': '-2.0'})):
+            nam6 = self._get_subrecord_data(convert_CREA(rec), 'NAM6')
+            assert struct.unpack('<f', nam6)[0] == pytest.approx(1.0)
+
     def test_ench(self):
         rec = {'Signature': 'ENCH', 'FormID': '00000700', 'RecordFlags': '0',
                'EditorID': 'TestEnch', 'ENIT.Type': '2', 'ENIT.Charge': '100',

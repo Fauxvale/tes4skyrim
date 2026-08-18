@@ -232,6 +232,11 @@ def _build_crea_acbs(rec):
     return _crea_acbs(rec)
 
 
+def _build_crea_nam6(rec):
+    from .record_types.actors import _crea_nam6
+    return _crea_nam6(rec)
+
+
 def _build_bod2(rec):
     from .record_types.equipment import build_armo_bod2
     return build_armo_bod2(rec, is_clothing=rec.get('Signature') == 'CLOT')
@@ -330,6 +335,10 @@ class _Rebuild:
 _RB_NPC_DNAM = _Rebuild(b'DNAM', _build_npc_dnam)
 _RB_NPC_ACBS = _Rebuild(b'ACBS', _build_npc_acbs)
 _RB_CREA_ACBS = _Rebuild(b'ACBS', _build_crea_acbs)
+# CREA base scale -> NPC_ height. NAM6 sits between NAM5 and NAM7 in the
+# TES5 NPC_ order; anchor off NAM5 so an override that ADDS the subrecord
+# puts it in the right place.
+_RB_CREA_NAM6 = _Rebuild(b'NAM6', _build_crea_nam6, (('after', b'NAM5'),))
 _RB_BOD2 = _Rebuild(b'BOD2', _build_bod2)
 _RB_XCLL = _Rebuild(b'XCLL', _build_xcll, (('before', b'LTMP'),))
 _RB_XCLW = _Rebuild(b'XCLW', _build_xclw,
@@ -415,6 +424,7 @@ _reg('NPC_', ('DATA.Endurance', 'ACBS.Flags', 'ACBS.Level', 'ACBS.CalcMin',
               'ACBS.CalcMax'), _RB_NPC_ACBS)
 _reg('CREA', ('ACBS.Flags', 'ACBS.Level', 'ACBS.CalcMin', 'ACBS.CalcMax'),
      _RB_CREA_ACBS)
+_reg('CREA', 'BNAM.BaseScale', _RB_CREA_NAM6)
 _reg('ARMO', ('BMDT.GeneralFlags', 'BMDT.BipedFlags'), _RB_BOD2)
 _reg('CLOT', ('BMDT.GeneralFlags', 'BMDT.BipedFlags'), _RB_BOD2)
 _reg('CELL', _XCLL_KEYS, _RB_XCLL)

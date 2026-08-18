@@ -480,6 +480,37 @@ def _crea_flags(tes4_flags: int) -> int:
     return out
 
 
+def _crea_nam6(rec: dict) -> bytes:
+    """TES5 NPC_ NAM6 'Height' from the TES4 CREA BNAM 'Base Scale'.
+
+    Shared by convert_CREA and the override path.
+
+    TES4 sizes a creature with a PER-RECORD BNAM base scale; only humanoids
+    take their height from the RACE (Male/Female Height in RACE DATA). The
+    creature converter used the NPC_ default of 1.0 here, so every creature
+    shipped at 1.0x no matter what it was authored at: Anequina's bull
+    elephant (BNAM 3.5) rendered a third of its size and Nehrim's chickens
+    (0.4) two and a half times theirs. 754 of the 1903 CREA records across
+    Oblivion/Nehrim/Anequina carry a non-1.0 BNAM.
+
+    NAM6 is the direct equivalent — both engines multiply the base height by
+    the placed ref's XSCL, so the per-ref scale (already preserved by
+    convert_ACHR) keeps layering exactly as it did in TES4. Vanilla uses the
+    field the same way, up to 3.3 on a giant and down to 0.6.
+
+    The scale must live HERE and not on the generated creature RACE: one race
+    is shared by every CREA with the same mesh folder, so a race-level height
+    would collapse the elephant bull/cow/calf to a single size.
+    """
+    scale = get_float(rec, 'BNAM.BaseScale', 1.0)
+    # A missing BNAM, or a nonsense authored value, means "no scaling". Every
+    # CREA in the four test plugins carries one and none is <= 0, but the
+    # converter never assumes a plugin is well-formed.
+    if scale <= 0.0:
+        scale = 1.0
+    return struct.pack('<f', scale)
+
+
 def _crea_acbs(rec: dict) -> bytes:
     """Build TES5 ACBS payload (24 bytes) from a TES4 CREA record.
 
@@ -1527,7 +1558,7 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
     # sound array (31/31) also carries NAM8 — a creature without it has sound
     # descriptors the engine never voices.
     subs += pack_subrecord('NAM5', _NAM5_UNKNOWN)
-    subs += pack_subrecord('NAM6', struct.pack('<f', 1.0))   # height
+    subs += pack_subrecord('NAM6', _crea_nam6(rec))          # height
     subs += pack_subrecord('NAM7', struct.pack('<f', 50.0))  # weight
     subs += pack_uint32_subrecord('NAM8', _SOUND_LEVEL_NORMAL)
 

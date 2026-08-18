@@ -3,7 +3,6 @@ Major Issues for V1:
 		Oblivion: Attempting to start an arena match fails. I select the dialog option, but the quest doesn't advance
 		Morroblivion: can't get fighters guild quest after joining
 		Cheydinhall fighters guild: I give the weapons away, but the NPCs stand still and don't fight with me
-		sqv charactergen 59 - Glenroy fails to open gate
 		sqv charactergen 74 - Assassin fails to become hostile and kill the emperor
 		I should not be able to loot the emperor's body
 
@@ -57,8 +56,6 @@ Later Issues:
 
 	9 - Make horses rideable
 
-	10 - Speed up child LOD gen and add menu option
-
 	11 - Potential remapping of low level formids like how player (07) or gold (f) already do
 
 	12 - Add progress bar for navmesh step
@@ -67,8 +64,6 @@ Later Issues:
 
 	14 - Add optional skyrim creature remapping
 
-	15 - Creatures are wrong sizes sometimes (chicken and donkey in nehrim, elephant in anequina)
-
 Minor Issues:
 
 	2 - Improve landscape layer blending
@@ -76,8 +71,6 @@ Minor Issues:
 	3 - Replace Prison marker with the skyrim equivalent as we are doing with the other markers
 
 	4 - Harvested plants don't make a sound. Intentional?
-
-	5 - Update world map cloud mesh and texture
 
 	6 - Convert Skyrim LE meshes to Skyrim SE format
 
