@@ -1425,3 +1425,57 @@ unmapped pinned the player at level 1 forever.
 > Check `Data/Scripts.zip`, not `Data/Scripts/Source/`, when asking whether a
 > Papyrus native exists: the latter is where mods install their own headers, and
 > in this install its `Game.psc` is 454 lines against vanilla's 266.
+
+## Actor promotion must follow the DECLARING type, not the "feels like an actor" test (2026-08-18)
+
+**Symptom:** the Imperial City Arena softlocked. The player arranged a match with
+Owyn, walked up the ramp, and the announcer never spoke — so `Arena.GateDownFight`
+was never set, the gates never opened, and nothing could advance.
+
+**Cause:** the dedicated `Say` handler resolved its receiver with
+`_resolve_self_ref(..., actor_func=True)`, which PROMOTES the receiver's property
+to `Actor`. But `Say` is declared on **ObjectReference**:
+
+```
+ObjectReference.Say(Topic akTopicToSay, Actor akActorToSpeakAs = None,
+                    bool abSpeakInPlayersHead = false)
+```
+
+Oblivion exercises that breadth. A census of Oblivion.esm's `Say`/`SayTo`
+receivers found **144 calls on 21 non-actor references**: every Daedric shrine
+(ACTI), Clavicus' dog statue (MISC), and — the arena case — four **XMarker
+(STAT)** refs the announcer talks through: `ArenaMatchPlayerRef`,
+`ArenaGalleryMarkerRef`, `ICArenaPlayerMarkerRef`, `ICMonsterFightPlayerRef`.
+The announcer is not an NPC standing somewhere; it is an invisible marker
+positioned in the arena that the topic is played from.
+
+Declared `Actor Property`, those refuse to bind ("cannot be bound because
+`<fid>` is not the right type"), the property comes back **None**, and the first
+call on it aborts the whole function. In `ArenaAnnouncerScript` that first call
+is `ArenaMatchPlayerRef.GetDistance(Player)` on the very first gate, so the
+entire `OnUpdate` body was dead every tick.
+
+This is the same failure the `Unlock` handler already documents. Four handlers
+had it:
+
+| Handler | Real declaration | Non-actor subjects in Oblivion.esm |
+|---|---|---|
+| `say` / `sayto` / `saycustom` | `ObjectReference.Say` | arena XMarkers, Daedric shrines, dog statue |
+| `cast` | `Spell.Cast(ObjectReference akSource, …)` | `SEHaskillSummonMarker`, `MG05ShockMark1`, `SE05SpellMarker1-3` |
+| `pms` / `sms` | `EffectShader.Play/Stop(ObjectReference)` | `SEXedPuzStatue1-5` |
+| `getpos`/`getangle`/`setpos`/`setangle`, `moveto` | all on `ObjectReference` | the Xeddefen puzzle statues, summon markers |
+
+All now use `_resolve_objref_ref`. Whole-plugin `Actor Property`-bound-to-a-
+non-actor count went **54 → 3**, and the 3 survivors are `LVLC` refs called with
+`evp`, which spawn actors — correct as-is.
+
+**The rule:** promote to `Actor` only when the Papyrus method is declared on
+`Actor` and nowhere up the chain. `ObjectReference` is the base type, so anything
+declared there must resolve with `_resolve_objref_ref` — no matter how strongly
+the TES4 call reads like something only an actor would do. `Say` reads exactly
+like an actor-only call and is not one.
+
+**Audit for the whole class** (map REFR/ACHR/ACRE EditorID → base record type,
+then flag every `Actor Property <name>` whose named ref has a non-NPC_/CREA
+base) — worth re-running after touching any handler that passes
+`actor_func=True`.

@@ -2267,7 +2267,7 @@ class ScriptConverter:
         _dedup_window = 3
         _stop_re = re.compile(
             r'^\s*(If|ElseIf|Else|EndIf|While|EndWhile|Return|'
-            r'Event|EndEvent|Function|EndFunction)|; TES4 Say: closed',
+            r'Event|EndEvent|Function|EndFunction)\b|; TES4 Say: closed',
             re.IGNORECASE)
         _skip = set()
         for idx, line in enumerate(_flat):
@@ -2710,7 +2710,73 @@ class ScriptConverter:
                 lines[idx] = _cast_recv_re.sub(_cast_receiver, lines[idx])
 
         lines = self._shadow_controls_writes(lines)
+        lines = self._hoist_quest_start_above_writes(lines)
         return lines
+
+    # `<Quest>.Start()` and a write to a property of that same quest's script.
+    _QUEST_START_RE = re.compile(r'^(\s*)(\w+)\.Start\(\)\s*(;.*)?$')
+    _QUEST_PROP_WRITE_RE = re.compile(r'^(\s*)(\w+)\.(\w+)\s*=(?!=)')
+    # Lines that make reordering unsafe: anything that branches, returns, or
+    # otherwise means the two statements may not be in one straight run.
+    _HOIST_STOP_RE = re.compile(
+        r'^\s*(If|ElseIf|Else|EndIf|While|EndWhile|Return|'
+        r'Event|EndEvent|Function|EndFunction|State|EndState)\b',
+        re.IGNORECASE)
+
+    def _hoist_quest_start_above_writes(self, lines: list) -> list:
+        """Move `Q.Start()` ABOVE property writes to Q that precede it.
+
+        **A TES4->TES5 semantic difference, not a style fix.**  In Oblivion,
+        `set Q.Var to 1` writes a quest variable that persists whether or not
+        the quest is running, and a later `StartQuest Q` does not disturb it --
+        so the authored idiom "seed the variables, then start the quest" is
+        safe and extremely common.  In Skyrim, `Quest.Start()` on a STOPPED
+        quest initialises its scripts, resetting every `Auto` property to its
+        default.  Converted literally, every seeded value is silently wiped by
+        the `Start()` that follows it.
+
+        That is what softlocked the Imperial City Arena: the match INFO sets
+        `Arena.ReadyMatch = 1` and then calls `Arena.Start()` four lines later
+        (`Arena` is `Stop()`ped after every match by its own stage 10), so
+        ReadyMatch was always back to 0 by the time the announcer polled it.
+        The announcer's first gate is `ReadyMatch == 1`, so it never spoke,
+        `GateDownFight` was never set, the gates never opened.  Measured
+        2026-08-18: **131 clobbered writes across 65 scripts** -- the arena
+        matches, the arena betting (ArenaSpectator), FGC01, MS16B and more.
+
+        The reordering is only applied within one straight-line run: a branch,
+        loop or return between the write and the `Start()` means the two may
+        not both execute, so the sequence is left exactly as authored.
+        """
+        out = list(lines)
+        n = len(out)
+        idx = 0
+        while idx < n:
+            m = self._QUEST_START_RE.match(out[idx])
+            if not m:
+                idx += 1
+                continue
+            indent, quest = m.group(1), m.group(2)
+            # Walk BACK to the first write to this same quest, stopping at
+            # anything that breaks the straight-line run.
+            first = None
+            j = idx - 1
+            while j >= 0:
+                if self._HOIST_STOP_RE.match(out[j]):
+                    break
+                w = self._QUEST_PROP_WRITE_RE.match(out[j])
+                if w and w.group(2) == quest:
+                    first = j     # a write to a DIFFERENT quest is no barrier
+                j -= 1
+            if first is None:
+                idx += 1
+                continue
+            # Hoist the Start() to just above the earliest clobbered write, so
+            # the seeded values are written into the freshly started quest.
+            start_line = out.pop(idx)
+            out.insert(first, start_line)
+            idx += 1
+        return out
 
     _CONTROLS_WRITE_RE = re.compile(
         r'^(\s*)Game\.(Disable|Enable)PlayerControls\(\)\s*(;.*)?$')
@@ -5792,7 +5858,13 @@ class ScriptConverter:
                 papyrus = f'GetPosition{axis}'
             else:
                 papyrus = f'GetAngle{axis}'
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            # GetPositionX/GetAngleX and friends are declared on
+            # ObjectReference, so the subject must not be promoted to Actor --
+            # TES4 reads and writes the position/angle of plain scenery
+            # (SEXedPuzStatue1-5 are STATs the Xeddefen puzzle rotates).  An
+            # `Actor Property` on a STAT never binds, so the read came back
+            # None and the puzzle could not track its own statues.
+            ref = self._resolve_objref_ref(ref_name, extends)
             return f'{ref}.{papyrus}()' if ref_name else f'{papyrus}()'
 
         # SetPos/SetAngle: axis param -> SetPosition(x,y,z) / SetAngle(x,y,z)
@@ -5800,7 +5872,7 @@ class ScriptConverter:
             parts = args_str.split(None, 1) if args_str else ['X', '0']
             axis = parts[0].upper() if parts else 'X'
             value = self._convert_expression(parts[1], extends) if len(parts) > 1 else '0'
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            ref = self._resolve_objref_ref(ref_name, extends)
             if fname_low == 'setpos':
                 axes = {'X': (value, f'{ref}.GetPositionY()', f'{ref}.GetPositionZ()'),
                         'Y': (f'{ref}.GetPositionX()', value, f'{ref}.GetPositionZ()'),
@@ -6331,10 +6403,15 @@ class ScriptConverter:
             if shader_name:
                 safe = _safe_property_name(shader_name)
                 self._property_refs[safe] = 'EffectShader'
-                ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+                # EffectShader.Play/Stop take an **ObjectReference**, so the
+                # subject must not be promoted to Actor: TES4 casts these
+                # shaders on markers and statues (SEXedPuzStatue1-5, the SE05
+                # spell markers), and an `Actor Property` on a STAT/ACTI refuses
+                # to bind -- the property is None and the shader never plays.
+                ref = self._resolve_objref_ref(ref_name, extends)
                 dur = self._convert_expression(duration, extends)
                 return f'{safe}.Play({ref}, {dur})'
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            ref = self._resolve_objref_ref(ref_name, extends)
             return f'Self.Play({ref})'
         if fname_low in ('sms', 'stopmagicshadervisuals'):
             parts = args_str.strip().split() if args_str else []
@@ -6342,9 +6419,9 @@ class ScriptConverter:
             if shader_name:
                 safe = _safe_property_name(shader_name)
                 self._property_refs[safe] = 'EffectShader'
-                ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+                ref = self._resolve_objref_ref(ref_name, extends)
                 return f'{safe}.Stop({ref})'
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            ref = self._resolve_objref_ref(ref_name, extends)
             return f'Self.Stop({ref})'
         if fname_low == 'triggerhitshader':
             return 'Game.TriggerScreenBlood(3)'
@@ -7052,7 +7129,20 @@ class ScriptConverter:
                 topic = self._convert_expression(pparts[0], extends) if pparts else 'None'
                 if pparts:
                     self._mark_topic_property(pparts[0].strip())
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            # Say is declared on ObjectReference, NOT Actor
+            # (`ObjectReference.Say(Topic, Actor akActorToSpeakAs = None,
+            # bool abSpeakInPlayersHead = false)`), and TES4 exercises that
+            # breadth: a census of Oblivion.esm's Say/SayTo receivers found 144
+            # calls on 21 NON-actor references -- every Daedric shrine
+            # (ACTI), Clavicus' dog statue (MISC), and the four XMarker (STAT)
+            # speakers the Arena announcer talks through (ArenaMatchPlayerRef,
+            # ArenaGalleryMarkerRef, ICArenaPlayerMarkerRef,
+            # ICMonsterFightPlayerRef).  Promoting the receiver to Actor made
+            # each of those declare `Actor Property`, which the VM refuses to
+            # bind -- the property came back None and the FIRST call on it
+            # aborted the function, killing the whole announcer chain.  Same
+            # failure mode as Unlock above; resolve as an ObjectReference.
+            ref = self._resolve_objref_ref(ref_name, extends)
             return f'{ref}.Say({topic})'
 
         # Functions whose Papyrus equivalent takes fewer args - drop the extra
@@ -7626,7 +7716,13 @@ class ScriptConverter:
                     self._property_refs[parts[0].strip()] = 'Spell'
                 elif _cur != 'Spell':
                     spell = f'({spell} as Spell)'
-            source = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            # Spell.Cast(ObjectReference akSource, ObjectReference akTarget)
+            # -- the caster is an ObjectReference.  TES4 fires spells from
+            # invisible marker refs (SEHaskillSummonMarker, MG05ShockMark1,
+            # SE05SpellMarker1-3, SEOrderPriestCastingMarker ...), all STATs;
+            # promoting the source to Actor left an unbindable `Actor Property`
+            # and the spell was never cast.
+            source = self._resolve_objref_ref(ref_name, extends)
             if len(parts) > 1:
                 target = self._convert_expression(parts[1], extends)
                 return f'{spell}.Cast({source}, {target})'
@@ -7921,7 +8017,13 @@ class ScriptConverter:
             if parts and re.fullmatch(r'\w+', parts[0]) and target == parts[0]:
                 self._property_refs.setdefault(parts[0], 'ObjectReference')
             offsets = ', '.join(parts[1:4]) if len(parts) > 1 else ''
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            # MoveTo is declared on ObjectReference (`MoveTo(ObjectReference
+            # akTarget, ...)`), and TES4 moves scenery with it as readily as
+            # actors -- SEHaskillSummonMarker is a STAT the summon spell
+            # relocates.  Promoting the subject to Actor left an `Actor
+            # Property` the VM refuses to bind on a STAT, so the marker stayed
+            # None and never moved.
+            ref = self._resolve_objref_ref(ref_name, extends)
             if offsets:
                 return f'{ref}.MoveTo({target}, {offsets})'
             return f'{ref}.MoveTo({target})'
