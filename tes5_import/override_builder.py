@@ -205,7 +205,7 @@ def join_subrecords(header: bytes, subs: list) -> bytes:
 
 
 def _encode_string(value: str) -> bytes:
-    return (value or '').encode('utf-8') + b'\x00'
+    return (value or '').encode('cp1252', errors='replace') + b'\x00'
 
 
 # --------------------------------------------------------------------------

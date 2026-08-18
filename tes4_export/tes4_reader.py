@@ -235,10 +235,16 @@ def get_all_subrecords(rec: Record, sig: str) -> list:
 
 
 def get_string(sub: Subrecord) -> str:
-    """Extract a null-terminated string from a subrecord."""
+    """Extract a null-terminated string from a subrecord.
+
+    TES4 plugins store text as cp1252 (Windows-1252), not UTF-8. Decoding as
+    UTF-8 turns every high byte into U+FFFD, destroying curly punctuation
+    (0x92) and German umlauts (0xE4/0xF6/0xFC/0xDF) beyond recovery -- the
+    export text is the only input the import stage gets.
+    """
     if sub is None:
         return ""
-    return sub.data.rstrip(b"\x00").decode("utf-8", errors="replace")
+    return sub.data.rstrip(b"\x00").decode("cp1252", errors="replace")
 
 
 def get_formid_str(form_id: int) -> str:

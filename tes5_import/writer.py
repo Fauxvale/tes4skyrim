@@ -77,8 +77,14 @@ def pack_subrecord(sig: str, data: bytes) -> bytes:
 
 
 def pack_string_subrecord(sig: str, value: str) -> bytes:
-    """Pack a null-terminated string subrecord."""
-    data = value.encode('utf-8') + b'\x00'
+    """Pack a null-terminated string subrecord.
+
+    TES5 plugins store text as cp1252 (Windows-1252) -- the same encoding
+    TES4 uses, and xEdit's default (wbEncoding := wbMBCSEncoding(1252)).
+    Writing UTF-8 turns one authored character into a multi-byte run that
+    the engine renders as one garbage glyph per byte.
+    """
+    data = value.encode('cp1252', errors='replace') + b'\x00'
     return pack_subrecord(sig, data)
 
 
