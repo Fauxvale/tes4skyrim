@@ -822,6 +822,7 @@ def _rebuild_qust_targets(plugin_rec, master_rec, old_subs):
     only which objective references which alias.
     """
     from .dialog_converter import _target_live_at_stage, _pc_stage_texts
+    from .objective_text import short_objective
     from .text_reader import get_str
 
     alias_by_fid = {}
@@ -885,7 +886,11 @@ def _rebuild_qust_targets(plugin_rec, master_rec, old_subs):
         seen_stages.add(stage_idx)
         out.append((b'QOBJ', struct.pack('<H', stage_idx)))
         out.append((b'FNAM', struct.pack('<I', 0)))
-        out.append((b'NNAM', _encode_string(txt)))
+        # The HUD objective is the SHORT line, not the long log entry — the
+        # same swap convert_QUST and quest_objective_texts make. This is the
+        # THIRD site deriving NNAM from Stage[].Log[].Text; all three must
+        # agree or a translation plugin's objectives diverge from its master's.
+        out.append((b'NNAM', _encode_string(short_objective(txt))))
         emitted = set()
         for alias_id, tflags, raws in remapped:
             if alias_id in emitted:

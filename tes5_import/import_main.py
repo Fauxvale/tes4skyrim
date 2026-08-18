@@ -1343,6 +1343,14 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     load_furniture_models(os.path.join(export_dir, 'meshes'), by_type)
     _step_done('furniture seats')
 
+    # --- Phase 0f: Load the short quest-objective (NNAM) table ---
+    # Skyrim's objective HUD shows a SHORT imperative line, not the long
+    # journal entry TES4 authored; the curated table supplies it. Ships with
+    # the repo (not derived from the export), so this is a plain load.
+    from .objective_text import load_objective_text
+    load_objective_text()
+    _step_done('objective text')
+
     # --- Phase 0e2: Door open/close sounds authored in the MESH -----------
     # Oblivion accepts a door's sound on the record OR as `sound:` text keys
     # in the model; Skyrim only has the record, so the mesh-authored names get

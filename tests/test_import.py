@@ -5476,3 +5476,119 @@ class TestMeshBoundsCacheSchema:
             scan_mesh_data(meshes, col, bounds)
             if os.path.exists(bounds):
                 assert bounds_cache_is_current(bounds) is True
+
+
+class TestObjectiveText:
+    """The short quest-objective (NNAM) table.
+
+    Skyrim renders two quest strings: the long CNAM log entry in the journal
+    and a short imperative NNAM line on the objective HUD. TES4 authored only
+    one, so tes5_import/data/objective_short_text.json supplies the short form.
+    See tes5_import/objective_text.py.
+    """
+
+    def test_table_loads(self):
+        from tes5_import.objective_text import load_objective_text
+        assert load_objective_text(quiet=True) > 6000
+
+    def test_every_entry_within_the_engine_cap(self):
+        """The objective field does NOT wrap -- it drops the tail. A shipped
+        entry over the cap would be silently truncated on screen."""
+        import json
+        from tes5_import.objective_text import _DATA_PATH, OBJECTIVE_MAX_CHARS
+        with open(_DATA_PATH, encoding='utf-8') as fh:
+            entries = json.load(fh)['entries']
+        over = {k: v for k, v in entries.items()
+                if len(v) > OBJECTIVE_MAX_CHARS}
+        assert not over, f"{len(over)} entries exceed {OBJECTIVE_MAX_CHARS}"
+
+    def test_lookup_enforces_the_cap(self):
+        """The cap is enforced at lookup, not merely trusted from the file, so
+        a hand-edited table cannot push an over-long string into NNAM."""
+        from tes5_import import objective_text as ot
+        ot._SHORT = {ot._key('src'): 'x' * 200}
+        assert len(ot.short_objective('src')) == ot.OBJECTIVE_MAX_CHARS
+        ot.load_objective_text(quiet=True)
+
+    def test_unknown_text_falls_back_unchanged(self):
+        """A plugin the table was not built for keeps the old behaviour."""
+        from tes5_import.objective_text import (load_objective_text,
+                                                short_objective)
+        load_objective_text(quiet=True)
+        novel = 'a journal entry that is certainly not in the curated table'
+        assert short_objective(novel) == novel
+
+    def test_key_is_whitespace_normalised(self):
+        """Keys collapse runs of whitespace, so a source string that differs
+        only in spacing still resolves."""
+        import json
+        from tes5_import.objective_text import (_DATA_PATH,
+                                                load_objective_text,
+                                                short_objective)
+        load_objective_text(quiet=True)
+        with open(_DATA_PATH, encoding='utf-8') as fh:
+            src = next(iter(json.load(fh)['entries']))
+        assert short_objective(src.replace(' ', '   ')) == short_objective(src)
+
+    def test_no_entry_is_a_noop(self):
+        """An entry earns its place only by CHANGING the line; identical text
+        would be pure weight, since the fallback yields the same string."""
+        import json
+        from tes5_import.objective_text import _DATA_PATH, _key
+        with open(_DATA_PATH, encoding='utf-8') as fh:
+            entries = json.load(fh)['entries']
+        noop = [k for k, v in entries.items() if _key(k) == _key(v)]
+        assert not noop, f"{len(noop)} no-op entries"
+
+    def test_table_keys_match_the_converter_derivation(self):
+        """THE COUPLING THAT WOULD BREAK SILENTLY.
+
+        quest_objective_texts applies _pc_stage_texts first -- dropping gamepad
+        journal variants and expanding &sUActnX; control tokens -- and the
+        table was built from that POST-processed text. If either transform
+        changes, lookups start missing and every objective quietly reverts to
+        the long journal paragraph with nothing logged.
+        """
+        from tes5_import.dialog_converter import quest_objective_texts
+        from tes5_import.objective_text import (load_objective_text,
+                                                short_objective)
+        load_objective_text(quiet=True)
+        rec = {
+            'StageCount': '2',
+            'Stage[0].Index': '10',
+            'Stage[0].LogCount': '1',
+            'Stage[0].Log[0].Text':
+                "Fimmion gave me Uungor's lucky grapes. I should bring "
+                "them to him.",
+            'Stage[1].Index': '20',
+            'Stage[1].LogCount': '1',
+            'Stage[1].Log[0].Text': 'not in the table, falls back',
+        }
+        out = quest_objective_texts(rec)
+        assert out[0] == 'Bring the lucky grapes to Uungor'
+        assert out[1] == 'not in the table, falls back'
+        assert short_objective(rec['Stage[0].Log[0].Text']) == out[0]
+
+    def test_all_three_nnam_sites_use_the_table(self):
+        """THREE places derive NNAM from Stage[].Log[].Text, and all of them
+        must apply the short-objective swap:
+
+          * convert_QUST                          (dialog_converter)
+          * quest_objective_texts                 (dialog_converter)
+          * _rebuild_qust_targets                 (override_builder)
+
+        The third was missed when this shipped, so Translation.esp wrote 15
+        objectives holding the full journal paragraph (max 393 chars) while its
+        master held the short line. Grep-level guard: any new NNAM emission
+        must route through short_objective.
+        """
+        import inspect
+        from tes5_import import dialog_converter, override_builder
+        for mod in (dialog_converter, override_builder):
+            src = inspect.getsource(mod)
+            for line in src.splitlines():
+                if "'NNAM'" in line or "b'NNAM'" in line:
+                    # Declarations/spec tables carry no text payload.
+                    if 'pack_string_subrecord' in line or '_encode_string' in line:
+                        assert 'short_objective' in line, \
+                            f"NNAM written without short_objective: {line.strip()}"

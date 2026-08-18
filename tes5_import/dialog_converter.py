@@ -46,6 +46,7 @@ from collections import defaultdict
 
 from .text_reader import get_formid_index_offset, remap_formid
 from .constants import ENGINE_GLOBAL_FORMIDS
+from .objective_text import short_objective
 from .writer import pack_group
 from .record_types.common import (
     get_formid,
@@ -726,11 +727,16 @@ def _pc_stage_texts(texts: list) -> list:
 
 
 def quest_objective_texts(rec: dict) -> list:
-    """The NNAM journal text of each objective convert_QUST emits, in order.
+    """The NNAM objective text of each objective convert_QUST emits, in order.
 
-    Skyrim shows the OBJECTIVE (NNAM) in the journal, not the stage log entry
-    (CNAM), but both are derived from the same TES4 `Stage[].Log[].Text`. The
-    override builder needs this exact sequence to retranslate NNAM, so the
+    Skyrim shows the OBJECTIVE (NNAM) on the HUD, not the stage log entry
+    (CNAM). Both start from the same TES4 `Stage[].Log[].Text`, but NNAM is a
+    SHORT second-person imperative while CNAM is the long retrospective log
+    entry — vanilla never reuses one as the other. TES4 authored only the long
+    form, so `short_objective` swaps in the curated line (falling back to the
+    long text when the table has no entry). See objective_text.py.
+
+    The override builder needs this exact sequence to retranslate NNAM, so the
     derivation lives here and both callers share it — reimplementing it in the
     override spec is how the two drift apart.
 
@@ -752,7 +758,7 @@ def quest_objective_texts(rec: dict) -> list:
         if not txt:
             continue
         seen_stages.add(stage_idx)
-        out.append(txt)
+        out.append(short_objective(txt))
     return out
 
 
@@ -925,7 +931,11 @@ def convert_QUST(rec: dict, fid_to_edid: dict = None,
         seen_stages.add(stage_idx)
         subs += pack_subrecord('QOBJ', struct.pack('<H', stage_idx))
         subs += pack_uint32_subrecord('FNAM', 0)
-        subs += pack_string_subrecord('NNAM', txt)
+        # The HUD objective is the SHORT line, not the long log entry that
+        # CNAM (above) carries — see objective_text.py. Must stay identical to
+        # quest_objective_texts(), which the override builder uses to rebuild
+        # this same run for a translation plugin.
+        subs += pack_string_subrecord('NNAM', short_objective(txt))
 
         live = [(a, f) for a, f, raws in targets
                 if _target_live_at_stage(raws, stage_idx)]
