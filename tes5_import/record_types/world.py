@@ -1191,32 +1191,280 @@ def convert_WATR(rec: dict) -> bytes:
     return pack_record('WATR', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
 
+# ---------------------------------------------------------------------------
+# Effect shader texture substitution
+# ---------------------------------------------------------------------------
+# Oblivion's renderer synthesises a membrane from the DATA colour fields alone,
+# so a texture-less EFSH is ordinary there: 42 of Oblivion.esm's 102 records
+# name neither a fill (ICON) nor a particle (ICO2) texture.  Skyrim's samples a
+# fill texture and modulates it through a gradient palette (NAM8/NAM9) — a
+# concept TES4 has no field for — so the same record ported faithfully has
+# nothing to sample and composites as opaque black over the actor.  Vanilla
+# Skyrim leaves only 4 of its 169 shaders fully texture-less.
+#
+# Fix: when the source names no texture, borrow the texture set from the
+# vanilla shader built for the same job.  The TES4 EditorID is the authored
+# indicator — `effectEnchant<School>` and `effect<Element>Shield` say exactly
+# which vanilla family the record belongs to — so the match keys off the name,
+# never off a colour heuristic.  The source's own colours still drive the DATA
+# fields; only the texture paths come from vanilla.
+#
+# (fill ICON, particle ICO2, membrane palette NAM8, particle palette NAM9)
+_TX_ENCH_ARMOR = ('Effects\\VaporTile01.dds', 'Effects\\FXFireAtlas02.dds',
+                  'Effects\\Gradients\\GradShockEnchArmor.dds',
+                  'Effects\\Gradients\\GradFireExplosion.dds')
+_TX_ENCH_FLAME = ('Effects\\EnchFlameProject01.dds', '',
+                  'Effects\\Gradients\\GradFlameEnch.dds', '')
+_TX_FROST      = ('Effects\\CloudTileFrostSmall.dds', 'Effects\\MagicIceWisps.dds',
+                  'Effects\\Gradients\\GradFrostIceForm.dds', '')
+_TX_FIRE       = ('Effects\\VaporTile01.dds', 'Effects\\FXFireAtlas02.dds',
+                  'Effects\\Gradients\\GradFrostIceFormOrange.dds',
+                  'Effects\\Gradients\\GradFireExplosion.dds')
+_TX_SHOCK      = ('Effects\\ShockTile01.dds', 'Effects\\ShockParticles02.dds',
+                  'Effects\\Gradients\\GradShockHit.dds', '')
+_TX_POISON     = ('Effects\\CloudTileFrostSmall.dds', 'Effects\\MagicIceWisps.dds',
+                  'Effects\\Gradients\\GradPoisonForm.dds', '')
+_TX_SHIELD     = ('Effects\\DarkSwirls.dds', 'Effects\\ShieldParticles.dds',
+                  'Effects\\Gradients\\GradShockHit.dds', '')
+_TX_ILLUSION   = ('', 'Effects\\MagicSquiggles01.dds', '', '')
+_TX_RESTORE    = ('', 'Effects\\FXGlowySparks.dds', '', '')
+_TX_TURNUNDEAD = ('Effects\\VaporTile02.dds', 'Effects\\FXFireAtlas02.dds', '',
+                  'Effects\\Gradients\\GradTurnMagic.dds')
+_TX_DRAIN      = ('Effects\\DarkSwirls.dds', 'Effects\\MagicCaustic01.dds', '', '')
+_TX_TELEKINESIS = ('', 'Effects\\SmallGlowSwirls.dds', '',
+                   'Effects\\Gradients\\GradTelekinesis01.dds')
+
+# Matched longest-first against the TES4 EditorID, case-insensitively, so
+# `effectEnchantDestruction` binds to the destruction entry and not to the
+# generic `effectEnchant` one.
+_EFSH_TEXTURE_SUBS = (
+    ('effectenchantdestruction', _TX_ENCH_FLAME),
+    ('effectenchantrestoration', _TX_ENCH_ARMOR),
+    ('effectenchantconjuration', _TX_ENCH_ARMOR),
+    ('effectenchantalteration',  _TX_ENCH_ARMOR),
+    ('effectenchantmysticism',   _TX_ENCH_ARMOR),
+    ('effectenchantillusion',    _TX_ILLUSION),
+    ('effectenchantturnundead',  _TX_TURNUNDEAD),
+    ('effectenchantpoison',      _TX_POISON),
+    ('effectresistnormalweapons', _TX_SHIELD),
+    ('effectfortifymagicka',     _TX_ENCH_ARMOR),
+    ('effectfortifyfatigue',     _TX_ENCH_ARMOR),
+    ('effectfortifyhealth',      _TX_RESTORE),
+    ('effectrestorehealth',      _TX_RESTORE),
+    ('effecttelekinesis',        _TX_TELEKINESIS),
+    ('effectdemoralize',         _TX_ILLUSION),
+    ('effectfrostshield',        _TX_FROST),
+    ('effectshockshield',        _TX_SHOCK),
+    ('effectfireshield',         _TX_FIRE),
+    ('effectturnundead',         _TX_TURNUNDEAD),
+    ('effectdestruction',        _TX_ENCH_FLAME),
+    ('effectenchant',            _TX_ENCH_ARMOR),
+    ('effectsoultrap',           _TX_RESTORE),
+    ('effectweakness',           _TX_DRAIN),
+    ('effectdisease',            _TX_POISON),
+    ('effectfortify',            _TX_ENCH_ARMOR),
+    ('effectrestore',            _TX_RESTORE),
+    ('effectpoison',             _TX_POISON),
+    ('effectfrenzy',             _TX_ILLUSION),
+    ('effectsilence',            _TX_ILLUSION),
+    ('effectdamage',             _TX_DRAIN),
+    ('effectdrain',              _TX_DRAIN),
+    ('effectshield',             _TX_SHIELD),
+    ('effectcharm',              _TX_ILLUSION),
+    ('effectcalm',               _TX_ILLUSION),
+    ('effectrally',              _TX_ILLUSION),
+    ('effectcommand',            _TX_ILLUSION),
+    ('effectlock',               _TX_ILLUSION),
+    ('effectopen',               _TX_ILLUSION),
+    ('frostshader',              _TX_FROST),
+    ('watershader',              _TX_FROST),
+    ('chimeeffect',              _TX_RESTORE),
+    ('ordershader',              _TX_ILLUSION),
+)
+
+# Whatever a plugin names its shader, a membrane with no fill texture renders
+# black, so an unrecognised EditorID still needs a texture set rather than
+# nothing.  The enchant-armour set is the least specific of the vanilla
+# families and reads as a neutral shimmer.
+_TX_DEFAULT = _TX_ENCH_ARMOR
+
+# TES4 DATA.Flags bit 0 = "No Membrane Shader": such a record draws particles
+# only, so it needs no fill texture and gets no substitution.
+_T4_NO_MEMBRANE = 0x01
+
+
+def _substitute_textures(edid: str, flags: int):
+    """Vanilla texture set for a texture-less TES4 shader, or None."""
+    if flags & _T4_NO_MEMBRANE:
+        return None
+    name = (edid or '').lower()
+    for key, tx in _EFSH_TEXTURE_SUBS:
+        if key in name:
+            return tx
+    return _TX_DEFAULT
+
+
 def convert_EFSH(rec: dict) -> bytes:
+    """EFSH — Effect Shader.
+
+    TES5 DATA is 400 bytes and prefix-compatible with TES4's 224: every field
+    up to and including the three colour keys sits at an identical offset in
+    both games, so the source block is copied field-for-field and only the
+    TES5-only tail (holes, addon models, particle rotation, animated frames,
+    the widened U32 flags, texture scales) is filled with vanilla defaults.
+
+    Writing a short DATA is not an option: vanilla Skyrim ships 400 bytes on
+    152 of 169 records, and the engine reads the tail regardless of the
+    subrecord's declared length.
+    """
     subs = b''
     edid = get_str(rec, 'EditorID')
     if edid:
         subs += pack_string_subrecord('EDID', edid)
-    icon = get_str(rec, 'ICON')
-    if icon:
-        subs += pack_string_subrecord('ICON', _prefix_path(icon))
-    ico2 = get_str(rec, 'ICO2')
-    if ico2:
-        subs += pack_string_subrecord('ICO2', _prefix_path(ico2))
 
-    # DATA — TES5 EFSH DATA is larger but compatible at the start
-    flags = get_int(rec, 'DATA.Flags')
-    data = bytearray(128)
-    data[0] = flags
-    fr = get_int(rec, 'DATA.FillColorR')
-    fg = get_int(rec, 'DATA.FillColorG')
-    fb = get_int(rec, 'DATA.FillColorB')
-    data[16] = fr; data[17] = fg; data[18] = fb
-    struct.pack_into('<f', data, 20, get_float(rec, 'DATA.FillAlphaFadeInTime'))
-    struct.pack_into('<f', data, 24, get_float(rec, 'DATA.FillAlphaFull'))
-    struct.pack_into('<f', data, 28, get_float(rec, 'DATA.FillAlphaFadeOutTime'))
-    struct.pack_into('<f', data, 32, get_float(rec, 'DATA.FillAlphaPersistPercent'))
-    struct.pack_into('<f', data, 36, get_float(rec, 'DATA.FillAlphaPulseAmp'))
-    struct.pack_into('<f', data, 40, get_float(rec, 'DATA.FillAlphaPulseFreq'))
+    flags8 = get_int(rec, 'DATA.Flags')
+    icon = get_str(rec, 'ICON')
+    ico2 = get_str(rec, 'ICO2')
+    nam8 = ''
+    nam9 = ''
+    # Converted TES4 textures live under our own tes4\ namespace; substituted
+    # ones are vanilla Skyrim assets that ship in Skyrim's BSAs, so prefixing
+    # those would point at files we never wrote and render black all over
+    # again.  `borrowed` tracks which case this record is in.
+    borrowed = False
+    if not icon and not ico2:
+        tx = _substitute_textures(edid, flags8)
+        if tx:
+            icon, ico2, nam8, nam9 = tx
+            borrowed = True
+
+    def _tex(p):
+        if not p:
+            return ''
+        return p if borrowed else _prefix_path(p)
+
+    # ICON/ICO2 are SetRequired on the TES4 record and present on every vanilla
+    # TES5 one; NAM7 (holes) has no TES4 source and stays empty.
+    subs += pack_string_subrecord('ICON', _tex(icon))
+    subs += pack_string_subrecord('ICO2', _tex(ico2))
+    subs += pack_string_subrecord('NAM7', '')
+    if nam8:
+        subs += pack_string_subrecord('NAM8', _tex(nam8))
+    if nam9:
+        subs += pack_string_subrecord('NAM9', _tex(nam9))
+
+    data = bytearray(400)
+
+    def put_f(off, key, default=0.0):
+        struct.pack_into('<f', data, off, get_float(rec, key, default))
+
+    def put_u(off, key, default=0):
+        struct.pack_into('<I', data, off, get_int(rec, key, default))
+
+    def put_rgb(off, key):
+        data[off] = get_int(rec, key + 'R') & 0xFF
+        data[off + 1] = get_int(rec, key + 'G') & 0xFF
+        data[off + 2] = get_int(rec, key + 'B') & 0xFF
+        data[off + 3] = 0
+
+    data[0] = flags8 & 0xFF
+    # Membrane shader blend state.  Defaults are the xEdit-documented ones, so
+    # a truncated 96-byte source still yields a sane membrane.
+    put_u(4, 'DATA.MemSBlend', 5)
+    put_u(8, 'DATA.MemBlendOp', 1)
+    put_u(12, 'DATA.MemZFunc', 3)
+    put_rgb(16, 'DATA.FillColor')
+    put_f(20, 'DATA.FillAlphaFadeInTime')
+    put_f(24, 'DATA.FillAlphaFull')
+    put_f(28, 'DATA.FillAlphaFadeOutTime')
+    put_f(32, 'DATA.FillAlphaPersistPercent')
+    put_f(36, 'DATA.FillAlphaPulseAmp')
+    put_f(40, 'DATA.FillAlphaPulseFreq', 1.0)
+    put_f(44, 'DATA.FillTextureAnimSpeedU')
+    put_f(48, 'DATA.FillTextureAnimSpeedV')
+    put_f(52, 'DATA.EdgeEffectWidth', 1.0)
+    put_rgb(56, 'DATA.EdgeColor')
+    put_f(60, 'DATA.EdgeAlphaFadeInTime')
+    put_f(64, 'DATA.EdgeAlphaFull')
+    put_f(68, 'DATA.EdgeAlphaFadeOutTime')
+    put_f(72, 'DATA.EdgeAlphaPersistPercent')
+    put_f(76, 'DATA.EdgeAlphaPulseAmp')
+    put_f(80, 'DATA.EdgeAlphaPulseFreq', 1.0)
+    put_f(84, 'DATA.FillFullAlphaRatio', 1.0)
+    put_f(88, 'DATA.EdgeFullAlphaRatio', 1.0)
+    put_u(92, 'DATA.MemDestBlend', 6)
+    # Particle shader
+    put_u(96, 'DATA.PartSBlend', 5)
+    put_u(100, 'DATA.PartBlendOp', 1)
+    put_u(104, 'DATA.PartZFunc', 4)
+    put_u(108, 'DATA.PartDestBlend', 6)
+    put_f(112, 'DATA.PartBirthRampUp')
+    put_f(116, 'DATA.PartFullBirthTime')
+    put_f(120, 'DATA.PartBirthRampDown')
+    put_f(124, 'DATA.PartFullBirthRatio', 1.0)
+    put_f(128, 'DATA.PartPersistBirthRatio', 1.0)
+    put_f(132, 'DATA.PartLifetime', 1.0)
+    put_f(136, 'DATA.PartLifetimeDelta')
+    put_f(140, 'DATA.PartInitSpeedNormal')
+    put_f(144, 'DATA.PartAccelNormal')
+    put_f(148, 'DATA.PartInitVel1')
+    put_f(152, 'DATA.PartInitVel2')
+    put_f(156, 'DATA.PartInitVel3')
+    put_f(160, 'DATA.PartAccel1')
+    put_f(164, 'DATA.PartAccel2')
+    put_f(168, 'DATA.PartAccel3')
+    put_f(172, 'DATA.PartScaleKey1', 1.0)
+    put_f(176, 'DATA.PartScaleKey2', 1.0)
+    put_f(180, 'DATA.PartScaleKey1Time')
+    put_f(184, 'DATA.PartScaleKey2Time', 1.0)
+    put_rgb(188, 'DATA.ColorKey1')
+    put_rgb(192, 'DATA.ColorKey2')
+    put_rgb(196, 'DATA.ColorKey3')
+    put_f(200, 'DATA.ColorKey1Alpha', 1.0)
+    put_f(204, 'DATA.ColorKey2Alpha', 1.0)
+    put_f(208, 'DATA.ColorKey3Alpha', 1.0)
+    put_f(212, 'DATA.ColorKey1Time')
+    put_f(216, 'DATA.ColorKey2Time', 0.5)
+    put_f(220, 'DATA.ColorKey3Time', 1.0)
+
+    # --- TES5-only tail (offset 224+): no TES4 source, vanilla defaults. ---
+    # Particle rotation (224-240) and Addon Models (244) stay 0/absent.
+    struct.pack_into('<f', data, 264, 1.0)   # Holes - End Val
+    # Edge width in alpha units + its colour mirror the edge block above, which
+    # is what vanilla shaders carrying an edge effect do.
+    struct.pack_into('<f', data, 268, get_float(rec, 'DATA.EdgeEffectWidth', 1.0))
+    data[272] = get_int(rec, 'DATA.EdgeColorR') & 0xFF
+    data[273] = get_int(rec, 'DATA.EdgeColorG') & 0xFF
+    data[274] = get_int(rec, 'DATA.EdgeColorB') & 0xFF
+    struct.pack_into('<I', data, 280, 1)     # Texture Count U
+    struct.pack_into('<I', data, 284, 1)     # Texture Count V
+    struct.pack_into('<f', data, 288, 1.0)   # Addon Models - Fade In Time
+    struct.pack_into('<f', data, 292, 1.0)   # Addon Models - Fade Out Time
+    struct.pack_into('<f', data, 296, 1.0)   # Addon Models - Scale Start
+    struct.pack_into('<f', data, 300, 1.0)   # Addon Models - Scale End
+    struct.pack_into('<f', data, 304, 1.0)   # Addon Models - Scale In Time
+    struct.pack_into('<f', data, 308, 1.0)   # Addon Models - Scale Out Time
+    # Fill colour keys 2 and 3: TES4 has one fill colour, so all three keys
+    # carry it and the membrane holds a steady colour instead of fading to
+    # black across the key ramp.
+    put_rgb(316, 'DATA.FillColor')
+    put_rgb(320, 'DATA.FillColor')
+    struct.pack_into('<f', data, 324, 1.0)   # Colour key 1 scale
+    struct.pack_into('<f', data, 328, 1.0)   # Colour key 2 scale
+    struct.pack_into('<f', data, 332, 1.0)   # Colour key 3 scale
+    struct.pack_into('<f', data, 336, 0.0)   # Colour key 1 time
+    struct.pack_into('<f', data, 340, 0.5)   # Colour key 2 time
+    struct.pack_into('<f', data, 344, 1.0)   # Colour key 3 time
+    struct.pack_into('<f', data, 348, 1.0)   # Colour Scale
+    # Frame count 1 keeps a non-animated particle on its single frame.
+    struct.pack_into('<I', data, 372, 1)     # Frame Count
+    # The U32 flags field is what TES5 actually reads; the U8 at offset 0 is
+    # marked unused in the TES5 definition.  TES4 bits 0/3/4/5 keep their
+    # meaning, so the low byte carries over directly.
+    struct.pack_into('<I', data, 384, flags8 & 0xFF)
+    struct.pack_into('<f', data, 388, 1.0)   # Texture Scale U
+    struct.pack_into('<f', data, 392, 1.0)   # Texture Scale V
+
     subs += pack_subrecord('DATA', bytes(data))
 
     return pack_record('EFSH', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)

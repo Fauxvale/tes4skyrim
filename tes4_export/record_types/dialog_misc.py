@@ -436,32 +436,105 @@ def export_WATR(rec: Record) -> list:
 
 
 def export_EFSH(rec: Record) -> list:
+    """Effect Shader.
+
+    TES4 DATA is 224 bytes and prefix-compatible with TES5's 400-byte one:
+    flags, membrane blend state, the fill and edge blocks, the two full-alpha
+    ratios, membrane dest blend, the whole particle block and the three colour
+    keys all sit at identical offsets in both games (verified against the
+    xEdit TES4/TES5 definitions and a real Oblivion.esm).  Everything past
+    offset 224 is TES5-only (holes, addon models, rotation, animated frames).
+
+    Two vanilla records ship a truncated 96-byte DATA, so every field past the
+    membrane block is emitted only when the source is long enough to hold it.
+    """
     lines = []
     emit_string(lines, "EditorID", get_subrecord(rec, "EDID"))
     emit_icon(lines, "ICON", rec, "ICON")
     emit_icon(lines, "ICO2", rec, "ICO2")
     data = get_subrecord(rec, "DATA")
-    if data and len(data.data) >= 96:
-        d = data.data
+    if not data:
+        return lines
+    d = data.data
+    n = len(d)
+
+    def f(name, off):
+        if off + 4 <= n:
+            lines.append(f"DATA.{name}={struct.unpack_from('<f', d, off)[0]}")
+
+    def u(name, off):
+        if off + 4 <= n:
+            lines.append(f"DATA.{name}={struct.unpack_from('<I', d, off)[0]}")
+
+    def rgb(name, off):
+        if off + 3 <= n:
+            lines.append(f"DATA.{name}R={d[off]}")
+            lines.append(f"DATA.{name}G={d[off + 1]}")
+            lines.append(f"DATA.{name}B={d[off + 2]}")
+
+    if n >= 1:
         lines.append(f"DATA.Flags={d[0]}")
-        lines.append(f"DATA.MemSBlend={struct.unpack_from('<I', d, 4)[0]}")
-        lines.append(f"DATA.MemBlendOp={struct.unpack_from('<I', d, 8)[0]}")
-        lines.append(f"DATA.MemZFunc={struct.unpack_from('<I', d, 12)[0]}")
-        lines.append(f"DATA.FillColorR={d[16]}")
-        lines.append(f"DATA.FillColorG={d[17]}")
-        lines.append(f"DATA.FillColorB={d[18]}")
-        lines.append(f"DATA.FillAlphaFadeInTime={struct.unpack_from('<f', d, 20)[0]}")
-        lines.append(f"DATA.FillAlphaFull={struct.unpack_from('<f', d, 24)[0]}")
-        lines.append(f"DATA.FillAlphaFadeOutTime={struct.unpack_from('<f', d, 28)[0]}")
-        lines.append(f"DATA.FillAlphaPersistPercent={struct.unpack_from('<f', d, 32)[0]}")
-        lines.append(f"DATA.FillAlphaPulseAmp={struct.unpack_from('<f', d, 36)[0]}")
-        lines.append(f"DATA.FillAlphaPulseFreq={struct.unpack_from('<f', d, 40)[0]}")
-        lines.append(f"DATA.FillTextureAnimSpeedU={struct.unpack_from('<f', d, 44)[0]}")
-        lines.append(f"DATA.FillTextureAnimSpeedV={struct.unpack_from('<f', d, 48)[0]}")
-        lines.append(f"DATA.EdgeEffectWidth={struct.unpack_from('<f', d, 52)[0]}")
-        lines.append(f"DATA.EdgeColorR={d[56]}")
-        lines.append(f"DATA.EdgeColorG={d[57]}")
-        lines.append(f"DATA.EdgeColorB={d[58]}")
+    # Membrane shader blend state
+    u("MemSBlend", 4)
+    u("MemBlendOp", 8)
+    u("MemZFunc", 12)
+    # Fill/texture effect
+    rgb("FillColor", 16)
+    f("FillAlphaFadeInTime", 20)
+    f("FillAlphaFull", 24)
+    f("FillAlphaFadeOutTime", 28)
+    f("FillAlphaPersistPercent", 32)
+    f("FillAlphaPulseAmp", 36)
+    f("FillAlphaPulseFreq", 40)
+    f("FillTextureAnimSpeedU", 44)
+    f("FillTextureAnimSpeedV", 48)
+    # Edge effect.  Offset 52 is the fall-off ("Edge Effect Width" in older
+    # docs); the remaining edge alpha ramp mirrors the fill block.
+    f("EdgeEffectWidth", 52)
+    rgb("EdgeColor", 56)
+    f("EdgeAlphaFadeInTime", 60)
+    f("EdgeAlphaFull", 64)
+    f("EdgeAlphaFadeOutTime", 68)
+    f("EdgeAlphaPersistPercent", 72)
+    f("EdgeAlphaPulseAmp", 76)
+    f("EdgeAlphaPulseFreq", 80)
+    f("FillFullAlphaRatio", 84)
+    f("EdgeFullAlphaRatio", 88)
+    u("MemDestBlend", 92)
+    # Particle shader
+    u("PartSBlend", 96)
+    u("PartBlendOp", 100)
+    u("PartZFunc", 104)
+    u("PartDestBlend", 108)
+    f("PartBirthRampUp", 112)
+    f("PartFullBirthTime", 116)
+    f("PartBirthRampDown", 120)
+    f("PartFullBirthRatio", 124)
+    f("PartPersistBirthRatio", 128)
+    f("PartLifetime", 132)
+    f("PartLifetimeDelta", 136)
+    f("PartInitSpeedNormal", 140)
+    f("PartAccelNormal", 144)
+    f("PartInitVel1", 148)
+    f("PartInitVel2", 152)
+    f("PartInitVel3", 156)
+    f("PartAccel1", 160)
+    f("PartAccel2", 164)
+    f("PartAccel3", 168)
+    f("PartScaleKey1", 172)
+    f("PartScaleKey2", 176)
+    f("PartScaleKey1Time", 180)
+    f("PartScaleKey2Time", 184)
+    # Colour keys
+    rgb("ColorKey1", 188)
+    rgb("ColorKey2", 192)
+    rgb("ColorKey3", 196)
+    f("ColorKey1Alpha", 200)
+    f("ColorKey2Alpha", 204)
+    f("ColorKey3Alpha", 208)
+    f("ColorKey1Time", 212)
+    f("ColorKey2Time", 216)
+    f("ColorKey3Time", 220)
     return lines
 
 
