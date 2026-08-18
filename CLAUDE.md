@@ -382,6 +382,7 @@ relevant doc when working in that area.
 | [QUEST_AUDIT.md](docs/QUEST_AUDIT.md) | Quest completability audit via the walkthrough emulator (2026-07-17, all 390 QUSTs) |
 | [creature_conversion.md](docs/creature_conversion.md) | CREA→actor: behavior graphs, HKX skeleton/animation/ragdoll, creature records |
 | [creature_race_equivalence.md](docs/creature_race_equivalence.md) | Oblivion creature ↔ vanilla Skyrim race map (exact/near tiers) for a possible "use the vanilla creature" option; which creatures have NO equivalent |
+| [vanilla_creature_swap_plan.md](docs/vanilla_creature_swap_plan.md) | PLAN (unimplemented): override-ESP + GUI to swap exact-match creatures to vanilla; race identity = (folder, NIFZ body set), NOT folder |
 | [horse_rideability_plan.md](docs/horse_rideability_plan.md) | Rideable horses: RACE Mount Data, horse/rider graph pair, rider-animation sourcing |
 
 ### Scripts
