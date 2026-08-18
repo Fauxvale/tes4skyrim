@@ -136,7 +136,7 @@ creatures that must stay apart. The split is:
 | **Armour / clothing** | Nehrim giant `giantarmorsteel`, skeleton `bhelmet`/`skdbcuirass` | **yes** | Equipment on an identical body. Oblivion's 51 skeletons are **one** creature in 4 armour configs. |
 | **Hair / beard style** | `giantbeardred` vs `giantbeardblond`, `mane` vs `manelong` vs `maneroman` | **yes** | Cosmetic only. |
 | **Different base body** | `wolfbody` vs `dogbody` vs `fox`, `sheep` vs `sheep04` | **NO** | A different animal or a different breed mesh. |
-| **Structural feature** | ram `ramhornl/r`, unicorn `Horn.NIF`, buck `antlar8point` | **NO** | Changes what the creature *is*, not how it is decorated. |
+| **Structural feature** | unicorn `Horn.NIF`, buck `antlar8point`, mammoth tusks | **NO** | Changes what the creature *is*, not how it is decorated. (Ram horns are NOT in this class — see below.) |
 
 **Rule: group by BASE BODY MESH; ignore attachments — with an explicit
 structural-parts allowlist that is never ignored.**
@@ -150,11 +150,13 @@ COSMETIC = ('saddle', 'bridle', 'packsaddle', 'cargo', 'harness',
             'skirt', 'sporran', 'belt', 'amulet', 'robe', 'fleece')
 
 # STRUCTURAL: never strip. Presence changes the creature's identity.
-STRUCTURAL = ('horn',        # ram vs sheep, UNICORN vs grey horse
+STRUCTURAL = ('horn.nif',    # UNICORN vs grey horse (exact filename, see below)
               'antlar',      # buck vs doe
               'tusk',        # mammoth variants
               'jelly',       # bull netch vs betty netch
               'wing', 'fluegel')
+# NOT structural: 'ramhorn*'. See the ram note below — it is decoration, and
+# it is shared with goblins, so a bare 'horn' substring is actively wrong.
 ```
 
 Measured effect of the rule (base-body grouping vs raw part sets):
@@ -162,7 +164,7 @@ Measured effect of the rule (base-body grouping vs raw part sets):
 | Group | Raw body sets | Base bodies | Result |
 |---|---|---|---|
 | Oblivion `skeleton` | 4 | **1** | 51 records, one race, 4 armour configs collapsed |
-| Oblivion `sheep` | 2 | **1 + ram** | ram stays separate via `horn` |
+| Oblivion `sheep` | 2 | **1** | Oblivion has no ram creature — all 16 are FULL="Sheep" |
 | Oblivion `horse` | 15 | **5** | one per colour — matching vanilla's 5 skins |
 | Nehrim `hillgiant` | 14 | **~3** | beard/armour collapsed, dark-skin variant kept |
 | Nehrim `dog` | 3 | **3** | wolf / dog / fox all preserved |
@@ -172,11 +174,74 @@ Measured effect of the rule (base-body grouping vs raw part sets):
 1. **`DAHircineUnicorn` is a grey horse plus `Horn.NIF`.** Strip "horn" as
    cosmetic and Hircine's unicorn silently becomes an ordinary horse. `horn` is
    on the structural list for this reason (and the ram, below).
-2. **A ram is a sheep plus `ramhornl/r.nif`.** Same mesh, same fleeces — only the
-   horns differ. It must NOT collapse into the ewe. Nehrim additionally has a
-   *black* ram (`sheep04.nif` + horns), so colour and structure compose: black
-   sheep, black ram, white sheep, white ram are four distinct rows on two base
-   bodies.
+2. **`horn` must be matched as the exact filename `horn.nif`, NOT as a
+   substring.** A substring match also catches `ramhornl/r.nif`, and those are
+   not what they look like — see the ram correction below.
+
+#### ⚠ Correction: THE RAM IS NOT A CREATURE (2026-08-18)
+
+An earlier draft made "ram vs sheep" the headline example of a structural
+variant. **That was wrong**, and the export proves it:
+
+- Every Oblivion ram record — `CreatureSheepRam`, `SakeepaSheepRam`,
+  `UurasSheepRam`, `WeynonPriorySheepRam` — has `FULL` = **"Sheep"**. Not "Ram".
+  Oblivion has no ram creature; UESP has no ram page for the same reason.
+- `ramhornl.nif` / `ramhornr.nif` are **decoration**, and they are not even
+  sheep-specific: they are worn by **goblins** (`CGGoblinThiefShaman`, and the
+  `GoblinTribeLeaderA–G` war chiefs) as headgear.
+
+So ram horns behave exactly like a helmet, and Oblivion's 16 sheep are **one**
+creature. A `'horn'` substring rule would have split the sheep pointlessly *and*
+split the goblin war chiefs off from ordinary goblins — which is why the
+structural list now matches the exact filename `horn.nif` (the unicorn) instead.
+
+**Nehrim is the genuine exception.** It authored real rams with their own names:
+`01SchafBock` (FULL "Schafbock" = ram) and `01SchafSchwarzBock` (FULL "Schwarzer
+Schafbock" = black ram), plus `28TollwuetigerWidder` ("Widder" = ram). There the
+distinction is authored in the NAME, not inferred from a mesh part — so **use the
+FULL name as the tiebreak when a plugin actually names its variants**, rather
+than reading meaning into part files.
+
+#### The STRICT rule: swap only the variant that actually matches
+
+When a creature has several variants and vanilla has a counterpart for only
+some, **swap only those; leave the rest generated.** Do not flatten the
+unmatched variants onto the nearest vanilla skin.
+
+Worked example — Nehrim's chickens. It ships 11 meshes on one skeleton: hens
+(`standardchicken`, `…1`, `…2`), roosters (`rooster`, `…1`, `…2`,
+`roosterwhite`) and chicks (`littlechicken`, `…1`, `…2`), and the FULL names
+distinguish them (`Huhn` / `Hahn` / `Küken`). Vanilla Skyrim has exactly **one**
+chicken skin (`SkinChicken` `0x000A919C`) — no rooster, no chick. So:
+
+| Variant | Records | Action |
+|---|---|---|
+| hen (`standardchicken*`) | 6 | **swap** → `ChickenRace` |
+| rooster (`rooster*`) | 5 | keep generated |
+| chick (`littlechicken*`) | 4 | keep generated |
+
+**Measured cost of the strict rule across both plugins: 9 records** (Nehrim's
+roosters and chicks). Nothing else is affected, because everywhere else vanilla
+has either all the variants or none:
+
+| Group | Swapped | Left generated |
+|---|---|---|
+| bear (Obl 14 / Neh 10) | all — vanilla has brown + black | 0 |
+| deer (Obl 9 / Neh 7) | all — buck→`ElkRace`, doe→`DeerRace` | 0 |
+| dog (Obl 31 / Neh 28) | dog, wolf, fox | 10 SI hounds (already excluded) |
+| chicken (Neh) | 6 hens | **9 roosters + chicks** |
+| sheep (Neh) | 13 mammoths | 12 sheep/ram/black sheep (never matched) |
+| rat | 1 rabbit → `HareRace` | 36 rats (`SkeeverRace` is `near`, excluded) |
+
+Two consequences worth stating:
+
+1. **There is no "lossy but exact" category.** A row either has a true vanilla
+   counterpart or it does not, so no row needs to default OFF and nothing is
+   silently degraded.
+2. **Mixed-asset flocks are accepted.** A vanilla hen will stand beside a
+   converted rooster with different animation and footstep quality. They are
+   different birds, so this reads as intentional; flattening them into identical
+   hens would not.
 
 #### How the swap then handles colour
 
@@ -189,11 +254,17 @@ Two options, to decide at implementation time:
   paint→`SkinHorseBlacknWhiteHide`). The `NPC_` override carries `WNAM`, so the
   actor can name its own skin while sharing `HorseRace`. **Verify that
   `NPC_.WNAM` overrides the race skin before relying on this.**
-- **B (fallback): one colour for all.** Every swapped horse becomes the vanilla
-  default. Simpler, visibly wrong in a stable of mixed horses.
+**Option B ("one colour for everything") is rejected** — a stable of identical
+horses is a visible regression, and the user has ruled it out. Colour must be
+carried whenever vanilla has a counterpart skin.
 
-The same question applies to bears (brown/black both exist vanilla-side, so A is
-easy) and to Nehrim's black sheep (vanilla goat has no black variant — B).
+Where vanilla has **no** counterpart (Nehrim's black sheep vs the goat, which has
+no black variant; the 11 chicken meshes vs one vanilla hen), the row is **lossy**
+and must be flagged as such in the UI rather than silently flattened — see the
+chicken note above. A lossy row should default to OFF.
+
+Bears are the easy case: vanilla ships brown, black and snow, so all of
+Oblivion's and Nehrim's bear colours map one-to-one.
 
 ### 2.1 Evidence bar for adding a row
 
@@ -212,11 +283,42 @@ empty cell is a valid answer and the whole table is opt-in.
 
 Three tiers, and the distinction matters for the UI divider:
 
-| Tier | Source | FormIDs | Master needed |
-|---|---|---|---|
-| A | Skyrim.esm | **verified** (44 entries, all checked against the dump) | Skyrim.esm (always present) |
-| B | Dawnguard / Dragonborn | **NOT verified — no dump available** | yes, declared in the ESP header |
-| C | no vanilla equivalent | — | stays generated |
+| Tier | Source | FormIDs | Master needed | Availability |
+|---|---|---|---|---|
+| A | Skyrim.esm | **verified** against the dump | Skyrim.esm | always |
+| B | Dawnguard / Dragonborn | **NOT verified — no dump** | yes | usually (AE/legendary) |
+| C | **Creation Club** (`ccbgssse*.esl/.esm`) | **NOT verified — no dump** | yes | **only if the user owns it** |
+| D | **Beyond Skyrim** (`BSAssets.esm`, `BSHeartland.esm`) | **NOT verified — no dump** | yes | **only if installed** |
+| E | no equivalent in any source | — | — | stays generated |
+
+**Tier C gating.** CC plugins have fixed filenames, so availability is a plain
+`os.path.isfile(Data/<name>)` check. A CC row whose file is absent is **greyed
+out in the UI, cannot be ticked, and is never written into the ESP** — it must
+not become a dangling master. The same treatment applies to tier B when a user
+lacks the DLC. Files that matter here:
+
+| File | Gives |
+|---|---|
+| `ccbgssse040-advobgobs.esl` | Goblin — covers **95 Oblivion records** |
+| `ccbgssse003-zombies.esl` | true Zombie — ~120 records across Oblivion+Nehrim |
+| `ccbgssse025-advdsgs.esm` | Golden Saint, Dark Seducer, **Elytra (35)** — the only source for the SI cast |
+| `ccbgssse036-petbwolf.esl` | Bone Wolf — Morroblivion's undead wolves |
+| `ccbgssse067-daedinv.esm` | Ayleid Lich — better than the rejected `DragonPriestRace` |
+| `BSAssets.esm` | **Goblin (122), minotaur (38), scamp (34), ogre (27), imp (22)** |
+| `BSHeartland.esm` | **Daedroth (20)**, Cyrodiil river troll, CYR skeleton/wisp |
+
+Tiers C and D are worth supporting precisely because they reach creatures **no
+other source can**: goblins, elytra, minotaurs, scamps, ogres and the Shivering
+Isles daedra are among the largest "no equivalent" groups in the whole table.
+
+**Beyond Skyrim outranks the others where it overlaps.** BS: Cyrodiil is a
+deliberate recreation of *Cyrodiil's* creatures in the Skyrim engine — the same
+animals our plugins ship — so for goblin/minotaur/imp/scamp/ogre/daedroth it is
+the truest match available. Preference order when several tiers offer one
+creature: **Beyond Skyrim → Skyrim.esm → CC/DLC.** The exception is creatures
+vanilla genuinely has (skeleton, wisp): `SkeletonRace`/`WispRace` are exact,
+verified and dependency-free, so they stay the default and the `CYR*` equivalents
+are offered only as alternatives.
 
 Tier B is now only **Riekling** (Morroblivion `iceminion`/`iceraider`) — the
 Netch, Ash Spawn and Bristleback rows were removed as wrong; see the corrections
@@ -340,11 +442,18 @@ one. Same dark `CLR[...]` palette, same centred `tk.Frame` card, same
 │                          │  ☑ Mammoth       → MammothRace     12  │
 │                          │ ── Dragonborn.esm ───────────────────  │
 │                          │  ☐ Riekling      → DLC2RieklingRace 5  │
-│                          │  ☐ Netch         → DLC2NetchRace    5  │
+│                          │  ☐ Boar          → DLC2BoarRace    13  │
+│                          │ ── Beyond Skyrim ────────────────────  │
+│                          │  ☐ Goblin        → BSKGoblinRace  122  │
+│                          │  ☐ Minotaur      → CYRMinotaur     38  │
+│                          │  ☐ Scamp         → BSKScampRace    34  │
+│                          │ ── Creation Club ────────────────────  │
+│                          │  ☐ Elytra        → CC025 Elytra    35  │
+│                          │  ☒ Zombie  (requires ccbgssse003)   60  │ ← greyed
 │                          │ ── No equivalent (always generated) ──  │
 │                          │    Grummite, Gnarl, Clannfear …        │
 ├──────────────────────────┴────────────────────────────────────────┤
-│ ⚠ Requires Dragonborn.esm — will be added as a master.            │
+│ ⚠ Requires Dragonborn.esm, BSAssets.esm — added as masters.       │
 │                                    [ Create ESP ]  [ Cancel ]     │
 └───────────────────────────────────────────────────────────────────┘
 ```
@@ -359,8 +468,15 @@ Behaviour:
 - **Dividers** — group by required master (`Skyrim.esm`, `Dawnguard.esm`,
   `Dragonborn.esm`), as suggested. A trailing non-interactive "No equivalent"
   group makes the unfilled entries visible rather than merely absent.
-- **DLC groups start unticked** and show the warning line when ticked; if the ESM
-  is missing from the Data folder, grey the group out with "not installed".
+- **DLC and Creation Club groups start unticked** and show the warning line when
+  ticked. A row whose plugin file is **not present in `Data/`** is rendered
+  greyed with "requires <filename>", cannot be ticked, and is excluded from the
+  build — never write a master the user does not have. Detection is a plain
+  `os.path.isfile` on the fixed filename (see §3). This covers Creation Club
+  (`ccbgssse*`) and Beyond Skyrim (`BSAssets.esm`, `BSHeartland.esm`) alike.
+- **Where two tiers offer the same creature**, show the preferred one (Beyond
+  Skyrim first for Cyrodiil natives, Skyrim.esm for creatures vanilla has) and
+  list the other as a sub-choice rather than a second competing row.
 - Selection persists in the GUI settings dict alongside `master_plugins` /
   `lod_plugins`.
 

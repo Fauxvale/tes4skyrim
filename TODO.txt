@@ -1,8 +1,6 @@
 Major Issues for V1:
 	1 - Iterate on quest and dialog conversion until everything is playable starting with Oblivion Main Quest
-		Oblivion: Attempting to start an arena match fails. I select the dialog option, but the quest doesn't advance
 		Morroblivion: can't get fighters guild quest after joining
-		Cheydinhall fighters guild: I give the weapons away, but the NPCs stand still and don't fight with me
 		sqv charactergen 74 - Assassin fails to become hostile and kill the emperor
 		I should not be able to loot the emperor's body
 
