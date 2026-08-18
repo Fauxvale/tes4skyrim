@@ -86,6 +86,8 @@ caching, skipped record types, the export text format, and the directory layout.
   output — `tools/` scripts take arguments and produce general output, so they are
   reusable next time.
 - **Always record new learnings** in this file or, more likely, the relevant `docs/` file.
+- **Findings go in `docs/`, NOT just memory.** Memory is per-machine; a doc is
+  the only copy another computer sees.
 - **KEEP THIS FILE EXTREMELY TERSE.** Every rule is the shortest sentence that
   states it. No rationale, history, worked examples, or "rewritten on <date>"
   notes — those go in `docs/`, linked. Editing a rule means it gets SHORTER.
@@ -383,6 +385,8 @@ relevant doc when working in that area.
 | [creature_conversion.md](docs/creature_conversion.md) | CREA→actor: behavior graphs, HKX skeleton/animation/ragdoll, creature records |
 | [creature_race_equivalence.md](docs/creature_race_equivalence.md) | Oblivion creature ↔ vanilla Skyrim race map (exact/near tiers) for a possible "use the vanilla creature" option; which creatures have NO equivalent |
 | [vanilla_creature_swap_plan.md](docs/vanilla_creature_swap_plan.md) | PLAN (unimplemented): override-ESP + GUI to swap exact-match creatures to vanilla; race identity = (folder, NIFZ body set), NOT folder |
+| [vanilla_item_swap_plan.md](docs/vanilla_item_swap_plan.md) | PLAN (unimplemented): item/ingredient/clutter swap; model-swap vs full-reference modes, OBND size+orientation gate, PIL preview renderer |
+| [item_swap_table.md](docs/item_swap_table.md) | Per-item MISC/INGR swap recommendations with measured size ratios and verdicts (OK/SCALE/ROT/REJECT) |
 | [horse_rideability_plan.md](docs/horse_rideability_plan.md) | Rideable horses: RACE Mount Data, horse/rider graph pair, rider-animation sourcing |
 
 ### Scripts
