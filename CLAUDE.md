@@ -374,6 +374,7 @@ relevant doc when working in that area.
 |---|---|
 | [package_ai_contracts.md](docs/package_ai_contracts.md) | CTDA param remapping (the crash rule), PTDA Distance, Ambush→approach, force-greet packages, quest priority band |
 | [package_conversion_plan.md](docs/package_conversion_plan.md) | PACK template model + vanilla census (implemented — the design behind `pack_converter.py`) |
+| [package_conversion_audit.md](docs/package_conversion_audit.md) | Full PACK audit (2026-08-17): 5 measured gaps (PTDT type-1 unhandled, master-blind PackagePlan, 48 ungated packages) + what is verified correct |
 | [dialogue_conversion_notes.md](docs/dialogue_conversion_notes.md) | DIAL/INFO/QUST/DLBR/DLVW implementation, voice type routing, AddTopic unlocks, GetIsID injection |
 | [dialogue_engine_contracts.md](docs/dialogue_engine_contracts.md) | Verified engine rules for dialogue routing |
 | [dialogue_transfer_gaps.md](docs/dialogue_transfer_gaps.md) | Measured gaps: what Oblivion dialogue does NOT survive conversion, with counts from both emulators |

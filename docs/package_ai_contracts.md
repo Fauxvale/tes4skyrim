@@ -5,6 +5,8 @@ packages and condition items. Implemented in `tes5_import/pack_converter.py`,
 `pack_templates.py`, `packages.py`, and `dialog_conditions`. For the original
 design analysis see [package_conversion_plan.md](package_conversion_plan.md)
 (note: its "PACK is in SKIP_TYPES" status header is stale — PACK is converted).
+For measured OPEN gaps and the list of things verified correct (so they are not
+re-litigated), see [package_conversion_audit.md](package_conversion_audit.md).
 
 ## CTDA parameter remapping — the crash rule
 

@@ -2368,10 +2368,11 @@ def gui_main():
                 card.unbind_all("<MouseWheel>")
             card.destroy()
 
-        tk.Label(card, text="Convert to Master",
+        title_row = tk.Frame(card, bg=CLR["panel"])
+        title_row.pack(fill=tk.X, padx=16, pady=(14, 0))
+        tk.Label(title_row, text="Convert to Master",
                  bg=CLR["panel"], fg=CLR["text"],
-                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16,
-                                                     pady=(14, 0))
+                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
         tk.Label(card,
                  text=("A plugin that is not a master has EVERY reference it "
                        "contains treated as\nalways-active. The engine caps "
@@ -2460,6 +2461,19 @@ def gui_main():
                             v.set(False)
                             changed = True
             _validate()
+
+        def _set_all(on: bool):
+            """All -> every plugin (masters included, so nothing dangles);
+            None -> nothing (so no dependent is left without its master)."""
+            for v in row_vars.values():
+                v.set(on)
+            _validate()
+
+        ttk.Button(title_row, text="All", width=4,
+                   command=lambda: _set_all(True)).pack(side=tk.RIGHT,
+                                                        padx=(4, 0))
+        ttk.Button(title_row, text="None", width=5,
+                   command=lambda: _set_all(False)).pack(side=tk.RIGHT)
 
         for name in all_names:
             row = tk.Frame(inner, bg=CLR["panel"])
