@@ -815,6 +815,7 @@ def gui_main():
     # question it answers is about the PLAYER's Skyrim setup (Community Shaders
     # or ENB present), which nothing here can detect.
     parallax_var = tk.BooleanVar(value=False)
+    tex_only_var = tk.BooleanVar(value=False)
 
     def _sync_winding_default(*_):
         if not winding_user_set["v"]:
@@ -3062,6 +3063,41 @@ def gui_main():
     _attach_tooltip(_parallax_chk, _PARALLAX_TIP)
     _attach_tooltip(_parallax_hint, _PARALLAX_TIP)
 
+    # Textures only, a sub-option OF parallax: it exists so PGPatcher can
+    # do the mesh side across the player's whole load order, and without
+    # parallax on it would just be a texture copy with the meshes missing.
+    # Enabled/disabled follows the parallax box for exactly that reason.
+    _texonly_row = ttk.Frame(sidebar, style="Panel.TFrame")
+    _texonly_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_parallax_row)
+    _texonly_chk = ttk.Checkbutton(_texonly_row, text="Textures only",
+                                   variable=tex_only_var,
+                                   style="TCheckbutton")
+    _texonly_chk.pack(side=tk.LEFT, padx=(40, 0))
+    _texonly_hint = ttk.Label(_texonly_row, text="for PGPatcher",
+                              style="PanelSub.TLabel")
+    _texonly_hint.pack(side=tk.LEFT, padx=(6, 0))
+
+    _TEXONLY_TIP = (
+        "Ships the textures and their height maps, but NO meshes.\n\n"
+        "For PGPatcher (ParallaxGen), which patches meshes across your "
+        "whole load order and can also upgrade them to complex material "
+        "-- neither of which a single-plugin conversion can see.\n\n"
+        "The meshes are still read: Oblivion's parallax flag lives in the "
+        "mesh, and it is the only evidence that a texture carries a "
+        "height map at all."
+    )
+    _attach_tooltip(_texonly_chk, _TEXONLY_TIP)
+    _attach_tooltip(_texonly_hint, _TEXONLY_TIP)
+
+    def _sync_texonly(*_a):
+        on = parallax_var.get()
+        _texonly_chk.state(['!disabled'] if on else ['disabled'])
+        if not on:
+            tex_only_var.set(False)
+
+    parallax_var.trace_add('write', _sync_texonly)
+    _sync_texonly()
+
     # ── Action buttons ────────────────────────────────────────────────────────
     # 12px above, matching a separator's gap: the step rows are packed tight
     # (pady=1 each), so without it the Run button crowds the last checkbox and
@@ -3865,6 +3901,8 @@ def gui_main():
             cmd.append(_winding_flag())
             if parallax_var.get():
                 cmd.append("--parallax")
+                if tex_only_var.get():
+                    cmd.append("--textures-only")
         return cmd
 
     # ── Global actions ────────────────────────────────────────────────────────
@@ -4242,6 +4280,8 @@ def gui_main():
             _log(f"Parallax: {'on' if parallax_var.get() else 'off'}"
                  + (" (Community Shaders or ENB required in game)"
                     if parallax_var.get() else ""))
+            if tex_only_var.get():
+                _log("Textures only: no meshes written (for PGPatcher)")
         _log("")
 
         q = queue.Queue()
