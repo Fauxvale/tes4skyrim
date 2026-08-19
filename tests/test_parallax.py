@@ -760,3 +760,289 @@ class TestParallaxShapeConstruction:
         assert len(jobs) == 1
         assert jobs[0]['height_rel'] == 'Textures\\tes4\\rocks\\stone_p.dds'
         assert Path(jobs[0]['src']).read_bytes() == HEIGHT_DDS
+
+
+# ---------------------------------------------------------------------------
+# Output conditioning: Mitchell halve -> Gaussian blur -> tone curve -> BC4.
+#
+# Skyrim's parallax sampling is coarser than Oblivion's, so every map is
+# smoothed.  What makes that safe without recalibrating is the ORDER:
+# normalise_height fits onto a MEASURED property of its input, so it still
+# lands on TARGET_FLAT_SHARE after the halving and the blur.
+# ---------------------------------------------------------------------------
+
+def _bc1_palette(c0, c1, four_colour):
+    """The four RGB triples a BC1 block names, in index order."""
+    def rgb(c):
+        return (((c >> 11) & 0x1F) * 255 // 31,
+                ((c >> 5) & 0x3F) * 255 // 63,
+                (c & 0x1F) * 255 // 31)
+    a, b = rgb(c0), rgb(c1)
+    if four_colour:
+        return [a, b,
+                tuple((2 * a[i] + b[i]) // 3 for i in range(3)),
+                tuple((a[i] + 2 * b[i]) // 3 for i in range(3))]
+    return [a, b, tuple((a[i] + b[i]) // 2 for i in range(3)), None]
+
+
+def _decode_colour_block(blk, always_four_colour):
+    """The 16 texels of one 8-byte BC1 / DXT5-colour block."""
+    c0, c1, idx = struct.unpack('<HHI', blk)
+    pal = _bc1_palette(c0, c1, always_four_colour or c0 > c1)
+    return [pal[(idx >> (2 * i)) & 3] for i in range(16)]
+
+
+def _dxt5_with_colour_blocks(w, h, colour_blocks):
+    """DXT5 whose colour halves are given verbatim; alpha is a real gradient."""
+    abits = 0
+    for i in range(16):
+        abits |= (i % 8) << (i * 3)
+    alpha = bytes((250, 10)) + abits.to_bytes(6, 'little')
+    n = ((w + 3) // 4) * ((h + 3) // 4)
+    out = bytearray(_dds_header(w, h, b'DXT5'))
+    for i in range(n):
+        out += alpha + colour_blocks[i % len(colour_blocks)]
+    return bytes(out)
+
+
+class TestHalveAndBlur:
+
+    def test_mitchell_weights_sum_to_one(self):
+        assert parallax._MITCHELL_WEIGHTS.sum() == pytest.approx(1.0, abs=1e-6)
+
+    def test_halving_gives_half_dimensions(self):
+        w, h, plane = parallax.mitchell_halve(64, 32, bytearray(64 * 32))
+        assert (w, h) == (32, 16)
+        assert len(plane) == 32 * 16
+
+    def test_a_flat_field_survives_halving_unchanged(self):
+        flat = bytearray([137]) * (32 * 32)
+        _, _, out = parallax.mitchell_halve(32, 32, flat)
+        assert set(out) == {137}, 'Mitchell rang on a constant field'
+
+    def test_a_flat_field_survives_the_blur_unchanged(self):
+        flat = bytearray([90]) * (32 * 32)
+        out = parallax.gaussian_blur(32, 32, flat, 4.0)
+        assert set(out) == {90}, 'blur leaked at the clamped edges'
+
+    def test_the_blur_reduces_variation(self):
+        checker = bytearray(
+            (0 if (x // 2 + y // 2) % 2 else 255)
+            for y in range(32) for x in range(32))
+        before = max(checker) - min(checker)
+        out = parallax.gaussian_blur(32, 32, checker, 4.0)
+        assert max(out) - min(out) < before
+
+    def test_blur_radius_scales_with_width(self):
+        assert parallax.blur_radius_for(1000) == pytest.approx(
+            parallax.BLUR_RADIUS_PER_1000)
+        assert (parallax.blur_radius_for(2048)
+                == pytest.approx(2 * parallax.blur_radius_for(1024)))
+
+    def test_a_tiny_radius_is_a_no_op(self):
+        plane = bytearray(range(64)) * 16
+        assert parallax.gaussian_blur(64, 16, plane, 0.2) is plane
+
+    def test_the_height_map_ships_at_half_the_diffuse_size(self, tmp_path):
+        src = tmp_path / 'stone.dds'
+        src.write_bytes(HEIGHT_DDS)
+        out = tmp_path / 'stone_p.dds'
+        assert parallax.build_height_map(str(src), str(out))
+        blob = out.read_bytes()
+        assert (struct.unpack_from('<I', blob, 16)[0]
+                == struct.unpack_from('<I', HEIGHT_DDS, 16)[0] // 2)
+        assert (struct.unpack_from('<I', blob, 12)[0]
+                == struct.unpack_from('<I', HEIGHT_DDS, 12)[0] // 2)
+
+
+class TestGlobalDepthScale:
+    """scale_depth: one affine map, the SAME one for every texture.
+
+    128 is the neutral plane in Community Shaders -- it pivots the height on
+    0.5 in AdjustDisplacementNormalized and starts the POM ray at half of
+    maxHeight -- so compressing toward 128 reduces displacement in both
+    directions without turning a groove into a bump.
+    """
+
+    def test_the_neutral_level_is_a_fixed_point(self):
+        out = parallax.scale_depth(bytearray([parallax.NEUTRAL_LEVEL]), 0.5)
+        assert out[0] == parallax.NEUTRAL_LEVEL
+
+    def test_excursion_is_scaled_by_the_factor(self):
+        a = bytearray([28, 128, 228])
+        out = parallax.scale_depth(a, 0.5)
+        assert list(out) == [78, 128, 178]
+
+    def test_relative_depth_between_maps_survives(self):
+        # the whole reason this is global: a plaster wall must stay flatter
+        # than a cave wall
+        mild = bytearray([118, 128, 138])
+        deep = bytearray([68, 128, 188])
+        m = parallax.scale_depth(mild, 0.5)
+        d = parallax.scale_depth(deep, 0.5)
+        before = (max(deep) - min(deep)) / (max(mild) - min(mild))
+        after = (max(d) - min(d)) / (max(m) - min(m))
+        assert after == pytest.approx(before, abs=0.01)
+
+    def test_relative_structure_within_a_map_survives(self):
+        a = bytearray([0, 50, 100, 150, 200, 250])
+        out = parallax.scale_depth(a, 0.4)
+        gaps = [out[i + 1] - out[i] for i in range(len(out) - 1)]
+        assert max(gaps) - min(gaps) <= 1, gaps
+
+    def test_grooves_stay_grooves(self):
+        # below neutral must stay below, above must stay above
+        a = bytearray([26, 179])
+        out = parallax.scale_depth(a, 0.5)
+        assert out[0] < parallax.NEUTRAL_LEVEL < out[1]
+
+    def test_factor_one_is_a_no_op(self):
+        a = bytearray([10, 20, 30])
+        assert parallax.scale_depth(a, 1.0) is a
+
+    def test_the_authored_band_comes_down(self):
+        # the author's TES4N2HGenerator clamps to 26..179 and the shipped pack
+        # measures 30..179; halving must land it well inside that
+        a = bytearray([26, 179])
+        out = parallax.scale_depth(a, 0.5)
+        assert max(out) - min(out) < (179 - 26)
+
+
+class TestDiffuseAlphaStrip:
+
+    # c0 > c1 already, so DXT1 reads the block exactly as DXT5 did
+    FOUR_COLOUR = struct.pack('<HHI', 0xF800, 0x001F, 0x1B1B1B1B)
+
+    def test_four_colour_blocks_survive_texel_for_texel(self):
+        dds = _dxt5_with_colour_blocks(4, 4, [self.FOUR_COLOUR])
+        out = parallax.strip_alpha_to_bc1(dds)
+        assert out[84:88] == b'DXT1'
+        assert (_decode_colour_block(out[128:136], False)
+                == _decode_colour_block(self.FOUR_COLOUR, True))
+
+    def test_a_swapped_block_decodes_to_the_same_texels(self):
+        # c0 < c1 would mean 3-colour + TRANSPARENT in DXT1; the repair swaps
+        # the endpoints and flips every index, and must be exact
+        blk = struct.pack('<HHI', 0x001F, 0xF800, 0x0000E41B)
+        dds = _dxt5_with_colour_blocks(4, 4, [blk])
+        out = parallax.strip_alpha_to_bc1(dds)
+        c0, c1, _ = struct.unpack('<HHI', out[128:136])
+        assert c0 > c1, 'left in DXT1 3-colour mode'
+        assert (_decode_colour_block(out[128:136], False)
+                == _decode_colour_block(blk, True))
+
+    def test_a_solid_block_never_becomes_transparent(self):
+        # c0 == c1: every palette entry is that colour, but DXT1 index 3 would
+        # be transparent black, so the indices must be zeroed
+        blk = struct.pack('<HHI', 0x07E0, 0x07E0, 0xFFFFFFFF)
+        dds = _dxt5_with_colour_blocks(4, 4, [blk])
+        out = parallax.strip_alpha_to_bc1(dds)
+        assert struct.unpack_from('<I', out, 132)[0] == 0
+        assert (_decode_colour_block(out[128:136], False)
+                == _decode_colour_block(blk, True))
+
+    def test_the_payload_halves(self):
+        dds = _dxt5_with_colour_blocks(16, 16, [self.FOUR_COLOUR])
+        out = parallax.strip_alpha_to_bc1(dds)
+        assert len(out) - 128 == (len(dds) - 128) // 2
+
+    def test_the_whole_mip_chain_comes_across(self):
+        # 8x8 -> 4x4 -> 2x2 -> 1x1 is one block each below the top's four
+        dds = bytearray(_dds_header(8, 8, b'DXT5', mips=4))
+        for _ in range(4 + 1 + 1 + 1):
+            dds += b'\x00' * 8 + self.FOUR_COLOUR
+        out = parallax.strip_alpha_to_bc1(bytes(dds))
+        assert struct.unpack_from('<I', out, 28)[0] == 4
+        assert len(out) == 128 + (4 + 1 + 1 + 1) * 8
+
+    def test_a_dxt1_input_is_left_alone(self):
+        dds = _dds_header(4, 4, b'DXT1') + b'\x00' * 8
+        assert parallax.strip_alpha_to_bc1(dds) is None
+
+    def test_only_diffuses_with_a_height_map_are_stripped(self, tmp_path):
+        dxt5 = _dxt5_with_colour_blocks(4, 4, [self.FOUR_COLOUR])
+        (tmp_path / 'carried.dds').write_bytes(dxt5)
+        (tmp_path / 'carried_p.dds').write_bytes(b'placeholder')
+        (tmp_path / 'plain.dds').write_bytes(dxt5)
+
+        converted, skipped, kept, saved = parallax.strip_diffuse_alpha(
+            str(tmp_path))
+
+        assert converted == 1 and saved > 0
+        assert (tmp_path / 'carried.dds').read_bytes()[84:88] == b'DXT1'
+        assert (tmp_path / 'plain.dds').read_bytes() == dxt5, \
+            'stripped a diffuse that never carried height'
+        assert (tmp_path / 'carried_p.dds').read_bytes() == b'placeholder'
+
+    def test_running_it_twice_changes_nothing(self, tmp_path):
+        (tmp_path / 'x.dds').write_bytes(
+            _dxt5_with_colour_blocks(4, 4, [self.FOUR_COLOUR]))
+        (tmp_path / 'x_p.dds').write_bytes(b'p')
+        parallax.strip_diffuse_alpha(str(tmp_path))
+        once = (tmp_path / 'x.dds').read_bytes()
+        converted, skipped, _, _ = parallax.strip_diffuse_alpha(
+            str(tmp_path))
+        assert converted == 0 and skipped == 1
+        assert (tmp_path / 'x.dds').read_bytes() == once
+
+
+# ---------------------------------------------------------------------------
+# --textures-only: PGPatcher patches the meshes across the player's whole load
+# order, so we ship only what it cannot derive -- the height field hidden in
+# Oblivion's diffuse alpha.  The meshes must still be READ, because the
+# APPLY_HILIGHT2 flag is the only evidence that a diffuse carries one.
+# ---------------------------------------------------------------------------
+
+def _source_nif(nif, tmp_path, apply_mode):
+    """A real on-disk Oblivion NIF with one shape, beside its texture tree."""
+    src = _tree(tmp_path / 'src', HEIGHT_DDS)
+    data = nif.Data(version=0x14000005, user_version=11, user_version_2=11)
+    # pyffi defaults this to 0 = ENDIAN_BIG, and then nothing can read the file
+    # back: every field after the header byte comes out byte-swapped.
+    data.header.endian_type = 1
+    root = nif.NiNode()
+    root.name = b'Scene Root'
+    shape = _shape(nif, apply_mode)
+    root.num_children = 1
+    root.children.update_size()
+    root.children[0] = shape
+    data.roots = [root]
+    with open(src, 'wb') as f:
+        data.write(f)
+    return src
+
+
+class TestTexturesOnly:
+
+    def _run(self, nif, tmp_path, textures_only):
+        from asset_convert import nif_converter as nc
+        nc._PARALLAX_ALPHA_CACHE.clear()
+        src = _source_nif(nif, tmp_path, parallax.APPLY_HILIGHT2)
+        dst = tmp_path / 'out' / 'meshes' / 'tes4' / 'a.nif'
+        r = nc.convert_nif(str(src), str(dst), parallax=True,
+                           textures_only=textures_only)
+        height = (tmp_path / 'out' / 'Textures' / 'tes4' / 'rocks'
+                  / 'stone_p.dds')
+        return r, dst, height
+
+    def test_the_height_map_is_still_written(self, nif, tmp_path):
+        r, _, height = self._run(nif, tmp_path, True)
+        assert not r['error'], r['error']
+        assert height.is_file(), 'the one thing this mode exists to produce'
+        assert height.read_bytes()[:4] == b'DDS '
+
+    def test_no_mesh_is_written(self, nif, tmp_path):
+        _, dst, _ = self._run(nif, tmp_path, True)
+        assert not dst.exists(), 'shipped a mesh in textures-only mode'
+
+    def test_the_mesh_is_still_counted_as_converted(self, nif, tmp_path):
+        # batch_convert's accounting must not silently read zero
+        r, _, _ = self._run(nif, tmp_path, True)
+        assert r['converted'] is True
+        assert r['parallax']['parallax_shapes'] == 1
+
+    def test_the_default_still_writes_both(self, nif, tmp_path):
+        r, dst, height = self._run(nif, tmp_path, False)
+        assert not r['error'], r['error']
+        assert dst.is_file(), 'the normal path stopped shipping meshes'
+        assert height.is_file()

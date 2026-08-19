@@ -41,6 +41,8 @@ import math
 import os
 import struct
 
+import numpy as np
+
 # Oblivion's parallax switch on NiTexturingProperty.
 APPLY_HILIGHT2 = 4
 
@@ -351,6 +353,122 @@ def _encode_bc4_block(vals) -> bytes:
     return bytes((hi, lo)) + bits.to_bytes(6, 'little')
 
 
+# --------------------------------------------------------------------------
+# Output conditioning: half size, then blur, then the tone curve.
+#
+# Skyrim's parallax sampling is COARSER than Oblivion's -- verified in game by
+# the author, who reports that an unsmoothed Oblivion height field reads as
+# "comic" under Skyrim's stepping.  So every map is blurred, not just the ones
+# a detector flags.
+#
+# The order matters and is the reason nothing needs recalibrating:
+# `normalise_height` is not a fixed curve, it is a fit onto a MEASURED property
+# of its input (the share of area within +/-FLAT_BAND of the median).  Run it
+# LAST, on the pixels that actually ship, and it still lands on
+# TARGET_FLAT_SHARE whatever the halving and the blur did to the field.
+#
+# Halving is also a straight win on the slowest step: `encode_bc4_dds` is pure
+# Python, one 4x4 block at a time, inside the mesh workers -- a quarter of the
+# pixels is a quarter of the blocks.
+# --------------------------------------------------------------------------
+
+# Blur radius in texels per 1000 texels of OUTPUT width, i.e. resolution
+# relative.  A fixed pixel radius would hit a 512 map about eight times harder
+# than a 4096 one, and this content ships both.  Radius is the kernel's
+# half-width; sigma is a third of it, the usual truncation.
+#
+# 5.0 was the first in-game test and came back NOT ENOUGH -- Skyrim's parallax
+# stepping still read as "comic".  The author asked for "at least 15, if not
+# 20"; this takes the top of that range, because each retry costs them a full
+# build-and-play cycle and an over-soft height field still reads as depth
+# while an under-blurred one keeps the artifact.  Override per run with
+# `tools/parallax_check.py regen --blur N` rather than editing this.
+BLUR_RADIUS_PER_1000 = 20.0
+
+# Linear size divisor applied before the blur.  A height field carries no fine
+# detail worth keeping at diffuse resolution -- and see the encoder note above.
+HEIGHT_DOWNSCALE = 2
+
+# Mitchell-Netravali (B = C = 1/3) resampled for an exact 2x reduction: output
+# texel i is centred on input 2i + 0.5, so the tap offsets are constant and the
+# weights can be a literal.  Chosen over Lanczos deliberately -- Lanczos is too
+# sharp for a height field that is already slightly soft, which is the whole
+# point of the blur that follows.  The negative lobes are why the result is
+# clipped back into 0..255.
+_MITCHELL_TAPS = (-3, -2, -1, 0, 1, 2, 3)
+_MITCHELL_WEIGHTS = np.array(
+    [-5.0 / 288, 1.0 / 36, 77.0 / 288, 4.0 / 9, 77.0 / 288, 1.0 / 36,
+     -5.0 / 288], dtype=np.float32)
+
+
+def _as_array(w, h, plane):
+    return np.frombuffer(bytes(plane), dtype=np.uint8).reshape(h, w)
+
+
+def _to_plane(arr):
+    return bytearray(np.clip(arr + 0.5, 0, 255).astype(np.uint8).tobytes())
+
+
+def mitchell_halve(w, h, plane):
+    """Halve a single-channel plane with a Mitchell filter.
+
+    Separable and accumulated tap by tap rather than gathered into one big
+    array: a 4096-square map would otherwise materialise a
+    (4096, 2048, 7) float32 intermediate -- 234 MB, in each of nine workers.
+    """
+    nw, nh = max(1, w // 2), max(1, h // 2)
+    if nw == w and nh == h:
+        return w, h, plane
+    a = _as_array(w, h, plane).astype(np.float32)
+
+    tmp = np.zeros((h, nw), dtype=np.float32)
+    xs = 2 * np.arange(nw)
+    for d, wt in zip(_MITCHELL_TAPS, _MITCHELL_WEIGHTS):
+        tmp += wt * a[:, np.clip(xs + d, 0, w - 1)]
+
+    out = np.zeros((nh, nw), dtype=np.float32)
+    ys = 2 * np.arange(nh)
+    for d, wt in zip(_MITCHELL_TAPS, _MITCHELL_WEIGHTS):
+        out += wt * tmp[np.clip(ys + d, 0, h - 1), :]
+
+    return nw, nh, _to_plane(out)
+
+
+def blur_radius_for(width: int, per_1000: float = None) -> float:
+    """Resolution-relative blur radius for a map this wide."""
+    if per_1000 is None:
+        per_1000 = BLUR_RADIUS_PER_1000
+    return per_1000 * width / 1000.0
+
+
+def gaussian_blur(w, h, plane, radius: float):
+    """Separable Gaussian with edge clamping.
+
+    Padded slices rather than fancy indexing -- contiguous slicing is several
+    times faster, and the kernel can reach 20 taps on a 4096 source.
+    """
+    if radius < 0.5 or w < 2 or h < 2:
+        return plane
+    r = int(math.ceil(radius))
+    sigma = radius / 3.0
+    xs = np.arange(-r, r + 1, dtype=np.float32)
+    k = np.exp(-(xs * xs) / (2.0 * sigma * sigma))
+    k /= k.sum()
+
+    a = _as_array(w, h, plane).astype(np.float32)
+    pad = np.pad(a, ((0, 0), (r, r)), mode='edge')
+    tmp = np.zeros_like(a)
+    for i, wt in enumerate(k):
+        tmp += wt * pad[:, i:i + w]
+
+    pad = np.pad(tmp, ((r, r), (0, 0)), mode='edge')
+    out = np.zeros_like(tmp)
+    for i, wt in enumerate(k):
+        out += wt * pad[i:i + h, :]
+
+    return _to_plane(out)
+
+
 def _downsample(w, h, plane):
     """Box-filter to half size, for the mip chain."""
     nw, nh = max(1, w // 2), max(1, h // 2)
@@ -407,6 +525,182 @@ def encode_bc4_dds(w: int, h: int, plane, mipmaps: bool = True) -> bytes:
                      (0x400000 | 0x8 if len(levels) > 1 else 0))
     dx10 = struct.pack('<IIIII', _DXGI_BC4_UNORM, 3, 0, 1, 0)
     return bytes(hdr) + dx10 + b''.join(levels)
+
+
+def _mip_chain(w, h, count):
+    dims = []
+    for _ in range(max(1, count)):
+        dims.append((w, h))
+        if w == 1 and h == 1:
+            break
+        w, h = max(1, w // 2), max(1, h // 2)
+    return dims
+
+
+def _bc1_repair_modes(colour):
+    """Make DXT3/DXT5 colour blocks legal as DXT1.  `colour` is (n, 8) uint8.
+
+    DXT1 reads a block with ``c0 <= c1`` as three colours plus TRANSPARENT
+    black; DXT3/DXT5 colour blocks are always four opaque colours.  Both
+    repairs below are exact -- no texel changes colour:
+
+      c0 <  c1  swap the endpoints and flip the low bit of every 2-bit index
+                (0<->1, 2<->3).  The swapped palette names the same four
+                colours in a different order, so the flip restores each texel.
+      c0 == c1  every palette entry already equals c0, whatever the indices
+                say, so zeroing them reproduces the block and steps around the
+                transparent slot.
+    """
+    n = colour.shape[0]
+    u16 = colour.view('<u2').reshape(n, 4)
+    c0, c1 = u16[:, 0], u16[:, 1]
+    idx = np.ascontiguousarray(colour[:, 4:8]).view('<u4').reshape(n)
+
+    less = c0 < c1
+    equal = c0 == c1
+    nc0 = np.where(less, c1, c0).astype('<u2')
+    nc1 = np.where(less, c0, c1).astype('<u2')
+    nidx = np.where(less, idx ^ np.uint32(0x55555555), idx).astype('<u4')
+    nidx = np.where(equal, np.uint32(0), nidx).astype('<u4')
+
+    out = np.empty((n, 8), dtype=np.uint8)
+    out[:, 0:2] = nc0.view(np.uint8).reshape(n, 2)
+    out[:, 2:4] = nc1.view(np.uint8).reshape(n, 2)
+    out[:, 4:8] = nidx.view(np.uint8).reshape(n, 4)
+    return out.tobytes()
+
+
+def strip_alpha_to_bc1(data: bytes):
+    """Re-container a DXT3/DXT5 diffuse as DXT1, dropping the alpha channel.
+
+    This is NOT a recompression.  A DXT3/DXT5 block is 8 bytes of alpha
+    followed by 8 bytes of colour in exactly BC1's colour-block layout, so the
+    colour half is copied verbatim and the endpoints keep the values the
+    original encoder chose.  Dithering and perceptual error metrics have
+    nothing to act on: nothing is being quantised, and decoding to RGB just to
+    re-quantise would LOSE quality rather than gain it.
+
+    Only ever called for a diffuse whose alpha was classified ``height`` and
+    carried out to a `_p` map, so the channel being dropped is a height field,
+    never transparency.
+
+    Returns DDS bytes, or None if `data` is not DXT3/DXT5 (a DXT1 input is
+    already stripped, which makes a re-run a no-op).
+    """
+    if len(data) < 128 or data[:4] != _DDS_MAGIC:
+        return None
+    if not (struct.unpack_from('<I', data, 80)[0] & _DDPF_FOURCC):
+        return None
+    fourcc = data[84:88]
+    payload = 128
+    if fourcc == _FOURCC_DX10:
+        if len(data) < 148:
+            return None
+        dxgi = struct.unpack_from('<I', data, 128)[0]
+        payload = 148
+        if dxgi in _DXGI_BC2:
+            fourcc = _FOURCC_DXT3
+        elif dxgi in _DXGI_BC3:
+            fourcc = _FOURCC_DXT5
+        else:
+            return None
+    if fourcc not in (_FOURCC_DXT3, _FOURCC_DXT5):
+        return None
+
+    h = struct.unpack_from('<I', data, 12)[0]
+    w = struct.unpack_from('<I', data, 16)[0]
+    if not w or not h:
+        return None
+
+    levels = []
+    off = payload
+    for mw, mh in _mip_chain(w, h, struct.unpack_from('<I', data, 28)[0]):
+        n = ((mw + 3) // 4) * ((mh + 3) // 4)
+        end = off + n * 16
+        if end > len(data):
+            break
+        blocks = np.frombuffer(data[off:end], dtype=np.uint8).reshape(n, 16)
+        levels.append(_bc1_repair_modes(np.ascontiguousarray(blocks[:, 8:16])))
+        off = end
+    if not levels:
+        return None
+
+    hdr = bytearray(data[:128])
+    flags = struct.unpack_from('<I', hdr, 8)[0] | 0x80000    # LINEARSIZE
+    flags &= ~0x8                                            # not PITCH
+    flags = (flags | 0x20000) if len(levels) > 1 else (flags & ~0x20000)
+    struct.pack_into('<I', hdr, 8, flags)
+    struct.pack_into('<I', hdr, 20, len(levels[0]))          # linear size
+    struct.pack_into('<I', hdr, 28, len(levels))             # mip count
+    struct.pack_into('<I', hdr, 76, 32)                      # pf size
+    struct.pack_into('<I', hdr, 80, _DDPF_FOURCC)            # no alpha flags
+    hdr[84:88] = _FOURCC_DXT1
+    struct.pack_into('<I', hdr, 108, 0x1000 |
+                     (0x400000 | 0x8 if len(levels) > 1 else 0))
+    return bytes(hdr) + b''.join(levels)
+
+
+def strip_diffuse_alpha(tex_root, keep=()) -> 'tuple[int, int, int, int]':
+    """Drop the height-carrying alpha from every converted diffuse.
+
+    The presence of `<name>_p.dds` beside `<name>.dds` IS the record that this
+    texture's alpha was a height field — the mesh stage already decided that
+    and wrote the map.  Keying off it needs no plumbing from the workers, and
+    makes a non-parallax build a no-op by construction.
+
+    `keep` is the set of texture paths some shape reads as OPACITY (collected
+    by the mesh stage; paths relative to the plugin's texture root, lowercased
+    with backslashes).  A shape blending or testing against the channel is
+    evidence it is not a height field there, whatever the texture-level
+    classifier said, so those are left as they are.
+
+    Runs AFTER the texture copy, like the landscape-normal fix, so a re-copy
+    cannot resurrect the DXT5 versions.
+
+    Returns (converted, skipped, kept, bytes_saved).
+    """
+    keep = {k.replace('/', '\\').lower() for k in (keep or ())}
+    root = os.path.abspath(str(tex_root))
+    converted = skipped = kept = saved = 0
+    for dirpath, _, files in os.walk(root):
+        have = {f.lower() for f in files}
+        for fn in files:
+            low = fn.lower()
+            if not low.endswith('.dds') or low.endswith('_p.dds'):
+                continue
+            if low[:-4] + '_p.dds' not in have:
+                continue
+            path = os.path.join(dirpath, fn)
+            if keep:
+                # The mesh stage names textures the way the NIFs do
+                # (`textures\tes4\...`), so compare on that tail.
+                rel = os.path.relpath(path, root).replace('/', '\\').lower()
+                if ('textures\\tes4\\' + rel) in keep or rel in keep:
+                    kept += 1
+                    continue
+            try:
+                with open(path, 'rb') as f:
+                    data = f.read()
+            except OSError:
+                continue
+            blob = strip_alpha_to_bc1(data)
+            if blob is None:
+                skipped += 1
+                continue
+            tmp = f'{path}.{os.getpid()}.tmp'
+            try:
+                with open(tmp, 'wb') as f:
+                    f.write(blob)
+                os.replace(tmp, path)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                continue
+            saved += len(data) - len(blob)
+            converted += 1
+    return converted, skipped, kept, saved
 
 
 def height_path(diffuse_rel: str) -> str:
@@ -900,6 +1194,64 @@ def normalise_height(texels, strength: float = 1.0,
     return out
 
 
+# --------------------------------------------------------------------------
+# The global depth scale.
+#
+# Everything above this point is a CORRECTION: it detects a map that is wrong
+# and leaves the rest bit-identical, which protects a mod author's own
+# calibration.  This is different again -- it runs on EVERY map, and it is the
+# SAME transform for all of them, because Oblivion's authored depth reads far
+# too bumpy under Skyrim's parallax however well it was calibrated for
+# Oblivion.
+#
+# GLOBAL is the whole point.  Normalising each map to its own target amplitude
+# would make a plaster wall exactly as deep as a cave wall and throw away the
+# relief the author actually authored (the same trap `normalise_height` warns
+# about under `strength`).  One factor for every map keeps every relationship
+# between two textures intact and only bounds how far the shader pushes.
+#
+# 128 is the pivot, and it is not a guess: Community Shaders pivots the height
+# on 0.5 twice over -- `AdjustDisplacementNormalized` returns
+# `(displacement - 0.5) * scale + 0.5 + offset`, and the POM ray starts at
+# `minHeight = maxHeight * 0.5`.  Above 128 a surface pushes OUT, below it
+# pushes IN, so compressing toward 128 reduces displacement in both directions
+# without turning grooves into bumps.
+#
+# This is the same operation as the Output Levels in the author's own
+# TES4N2HGenerator (Output Black 26 / Output White 165, clamp 26..179) -- and
+# those maps measure 30..179 in the shipped pack, so the band is already there,
+# just calibrated for Oblivion's much gentler offset mapping.
+#
+# The factor has NO vanilla anchor to census: our vanilla reference cache holds
+# zero `_p.dds`, Bethesda having all but dropped parallax for SSE.  0.6 is the
+# value the author confirmed in game (2026-08-19) after 0.5 read a touch flat;
+# on the reference wall it takes the authored amplitude 145 down to about 76.
+# Retune by eye with `tools/parallax_check.py regen --depth F`.
+NEUTRAL_LEVEL = 128
+DEPTH_SCALE = 0.6
+
+
+def scale_depth(texels, factor: float = None, centre: int = NEUTRAL_LEVEL):
+    """Compress every height field toward the shader's neutral plane.
+
+    One affine map, identical for every texture:
+
+        v' = centre + (v - centre) * factor
+
+    so relative depth WITHIN a map and BETWEEN maps both survive exactly; only
+    the absolute excursion shrinks.  `factor` 1.0 (or None -> DEPTH_SCALE)
+    leaves the field alone; 0.5 halves how far the surface travels.
+    """
+    if not texels:
+        return texels
+    f = DEPTH_SCALE if factor is None else float(factor)
+    if f == 1.0:
+        return texels
+    lut = bytes(max(0, min(255, int(round(centre + (v - centre) * f))))
+                for v in range(256))
+    return bytearray(lut[v] for v in texels)
+
+
 def height_report(texels):
     """(median, amplitude, percent below mid-grey) — the three numbers the
     good/bad split is made on, so a build log can show its working."""
@@ -912,7 +1264,9 @@ def height_report(texels):
 
 def build_height_map(src_dds: str, out_path: str, strength: float = 1.0,
                      max_range: int = DEFAULT_MAX_RANGE,
-                     target_range: int = DEFAULT_TARGET_RANGE) -> bool:
+                     target_range: int = DEFAULT_TARGET_RANGE,
+                     blur_per_1000: float = None,
+                     depth: float = None) -> bool:
     """Write the diffuse's alpha channel out as a BC4 height map.
 
     Called from the mesh converter once per height texture.  Mesh conversion is
@@ -931,8 +1285,17 @@ def build_height_map(src_dds: str, out_path: str, strength: float = 1.0,
     if plane is None:
         return False
     w, h, texels = plane
-    blob = encode_bc4_dds(w, h, normalise_height(
-        texels, strength, max_range, TARGET_MEDIAN, target_range))
+    if HEIGHT_DOWNSCALE == 2:
+        w, h, texels = mitchell_halve(w, h, texels)
+    texels = gaussian_blur(w, h, texels, blur_radius_for(w, blur_per_1000))
+    # Tone curve before the band: it fits onto a MEASURED share of the
+    # field, and fit_to_band is linear, so the calibrated TARGET_FLAT_SHARE
+    # survives the rescale untouched.
+    texels = normalise_height(texels, strength, max_range, TARGET_MEDIAN,
+                              target_range)
+    # Global depth scale, same factor on every map -- see scale_depth.
+    texels = scale_depth(texels, depth)
+    blob = encode_bc4_dds(w, h, texels)
 
     d = os.path.dirname(out_path)
     if d:

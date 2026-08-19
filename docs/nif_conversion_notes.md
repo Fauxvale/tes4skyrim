@@ -1038,6 +1038,178 @@ Tuning does NOT need a mesh rebuild — the meshes never change, only the
 [--strength F] [--only SUBSTRING]`, which rewrites the maps in seconds and
 reports per texture whether the cap bit or the map was left alone.
 
+### Output conditioning: halve → blur → curve → BC4 (added 2026-08-19)
+
+**Skyrim's parallax sampling is coarser than Oblivion's.** Verified in game by
+the author: an unsmoothed Oblivion height field reads as "comic" under Skyrim's
+stepping. So *every* map is smoothed, not just the ones a detector flags.
+
+The chain in `build_height_map` is, in order:
+
+1. **`mitchell_halve`** — half linear size, Mitchell-Netravali (B = C = 1/3),
+   resampled for an exact 2× reduction so the tap offsets are constant and the
+   seven weights are a literal (`-5/288, 1/36, 77/288, 4/9, …`, summing to 1).
+   **Lanczos was ruled out deliberately** — too sharp for a field that is
+   already slightly soft, which is the whole point of the blur that follows.
+2. **`gaussian_blur`** — radius `BLUR_RADIUS_PER_1000 = 5.0` texels per 1000
+   texels of *output* width, i.e. resolution relative; σ = radius/3. A fixed
+   pixel radius would hit a 512 map about eight times harder than a 4096 one
+   and this content ships both. Below ~100 px output width the radius falls
+   under 0.5 and the blur is skipped — small maps are left alone by design.
+3. **`normalise_height`** — the tone curve, **last**.
+4. **`encode_bc4_dds`**.
+
+#### 🔴 The order is why nothing needed recalibrating
+
+`normalise_height` is not a fixed curve, it is a **fit onto a measured property
+of its input** (share of area within ±`FLAT_BAND` of the median, target
+`TARGET_FLAT_SHARE`). Run it LAST, on the texels that actually ship, and it
+still lands on the calibrated target whatever the halving and the blur did to
+the field. Putting the blur *after* the curve would silently give back part of
+the in-game-approved depth.
+
+Halving is also a straight **speed win** on the slowest step: `encode_bc4_dds`
+is pure Python, one 4×4 block at a time, inside the mesh workers — a quarter of
+the pixels is a quarter of the blocks. Both new passes are numpy and accumulate
+tap by tap rather than gathering, because a 4096-square map would otherwise
+materialise a 234 MB intermediate in each of nine workers.
+
+Measured on `anvilcastledoor01.dds` (4096×8192, 42 MB), `temp/bench_chain.py`:
+
+| step | s |
+|---|---|
+| `decode_alpha_plane` | 8.45 |
+| `mitchell_halve` | 1.78 |
+| `gaussian_blur` (r = 10.2) | 0.47 |
+| `normalise_height` | 0.38 |
+| `encode_bc4_dds` at half | 4.60 |
+| **new chain** | **15.68** |
+| `encode_bc4_dds` at full — what the old chain paid | 18.00 |
+| **old chain** | **26.45** |
+
+So the conditioning is **41% cheaper per texture**, not more expensive: the
+encoder saves 13.4 s and the two new passes cost 2.25 s. `decode_alpha_plane`
+is now the single biggest cost and is still pure Python — the next place to
+look if this ever needs to be faster.
+
+### Diffuse → BC1: a block strip, not a recompression (added 2026-08-19)
+
+Once the height is out in a `_p` map the diffuse has no use for its alpha, and
+DXT1 is half the size. **This is not a re-encode.** Every height-carrying
+diffuse is DXT5 — `classify_alpha` rejects DXT1 and uncompressed outright, and
+`_MIN_LEVELS` rejects every DXT3 source — and a DXT5 block is 8 bytes of alpha
+followed by 8 bytes of colour **in exactly BC1's colour-block layout**. So the
+colour half is copied verbatim, keeping the endpoints the original encoder
+chose.
+
+**Dithering and perceptual error metrics therefore have nothing to act on**:
+nothing is being quantised. Decoding to RGB to re-compress with dithering would
+*lose* quality, not gain it.
+
+The one real difference is DXT1's 3-colour mode. Two exact repairs, neither
+changing a texel's colour (`_bc1_repair_modes`):
+
+| source block | repair |
+|---|---|
+| `c0 > c1` | copy verbatim — already a legal 4-colour DXT1 block |
+| `c0 < c1` | swap the endpoints, XOR the index word with `0x55555555` (0↔1, 2↔3) — the swapped palette names the same four colours |
+| `c0 == c1` | zero the indices. Every palette entry already equals `c0`, and DXT1 index 3 would be **transparent black** |
+
+Verified on real Nehrim textures: first 64 blocks decode identically, file
+exactly halved (170 KB → 85 KB).
+
+#### The gate: a shape that BLENDS with the alpha vetoes the strip
+
+`strip_diffuse_alpha` runs after the texture copy (same reason as the
+landscape-normal fix) and keys on the presence of `<name>_p.dds` beside
+`<name>.dds` — the mesh stage already decided that texture carried height, so
+no plumbing is needed and a non-parallax build is a no-op by construction.
+
+But a texture-level classification is not the whole answer. If some *other*
+shape reads that diffuse's alpha as opacity, that is evidence the channel is
+not a height field there, whatever the classifier said. `_process_geometry`
+records those diffuses in `alpha_opacity_diffuse` (a set, carried separately
+from the `parallax` Counter) and the strip skips them.
+
+Measured on the author's NTATU/Qarl parallax mod: 39,201 shapes, 134 textures
+classified `height`, of which **1** — `architecture\chorrol\interior\
+forgeembers01.dds` — is read as opacity by a non-parallax shape. One in forty
+thousand, but the converter runs on plugins nobody has measured, so the gate is
+generic rather than a bet on that number.
+
+### The global depth scale (added 2026-08-19)
+
+Oblivion's authored depth reads far too bumpy under Skyrim whatever the map was
+calibrated for, so **every** map is compressed toward the neutral plane:
+
+    v' = 128 + (v - 128) * DEPTH_SCALE          # 0.6, confirmed in game
+
+**128 is not a guess.** Community Shaders pivots the height on 0.5 twice over —
+`AdjustDisplacementNormalized` returns `(displacement - 0.5) * scale + 0.5 +
+offset`, and the POM ray starts at `minHeight = maxHeight * 0.5`. Above 128 a
+surface pushes OUT, below it pushes IN, so compressing toward 128 reduces
+displacement in both directions and a groove never flips into a bump.
+
+#### 🔴 GLOBAL, not per-map — the trap that was nearly built
+
+The first cut normalised every map to a fixed target amplitude. That is wrong:
+it makes a plaster wall exactly as deep as a cave wall and throws away the
+relief the author actually authored — the same trap `normalise_height` already
+warns about under `strength`. One factor for every texture keeps every
+relationship between two surfaces intact and only bounds the excursion.
+
+Prior art confirms the shape of the fix. The author's own `TES4N2HGenerator`
+ends its pipeline with Output Levels (Output Black 26 / Output White 165, clamp
+26..179) — the same global band operation — and the shipped NTATU/Qarl pack
+measures 30..179, so `clamp_max` is visible in the data. Those values are
+calibrated for Oblivion's much gentler offset mapping, which is why Skyrim needs
+a further factor on top rather than a different band.
+
+Not taken from that tool: its Contrast (150) and Balance. Shape correction is
+already done by `TARGET_FLAT_SHARE`, calibrated in game; two S-curves stacked
+would fight each other.
+
+#### Why this one has no detector
+
+Everything above the halve/blur/depth block is a CORRECTION — it decides a map
+is defective and leaves everything else bit-identical, which is what protects a
+mod author's own calibration. These three are a SYSTEM ADAPTATION and run
+unconditionally, from any source, because the target engine samples differently:
+
+| step | when |
+|---|---|
+| amplitude cap (163) | outliers only |
+| median floor (45) | sunk maps only |
+| tone curve | only if the cap fired |
+| **halve, blur, `scale_depth`** | **always, every map, every source** |
+
+`build_height_map` is the single funnel — the mesh converter and
+`parallax_check.py regen` are its only two callers, and it is the only thing
+that calls `encode_bc4_dds`. There is no second route by which a `_p.dds` can
+come into being.
+
+### `--textures-only`: hand the mesh side to PGPatcher (added 2026-08-19)
+
+`convert.py -f <plugin> --meshes-only --parallax --textures-only` reads and
+analyses every NIF and writes **none** of them; only the textures ship, height
+maps included.
+
+The reason is that there is a better mesh patcher than us for this job.
+**PGPatcher** (ParallaxGen) runs over the player's finished load order, so it
+sees every plugin at once, and it can also upgrade a shape to ENB's
+complex-material system — which Community Shaders reads too. Neither is
+knowable from inside a single-plugin conversion. What PGPatcher cannot do is
+recover a height field out of Oblivion's diffuse alpha, and that is exactly
+what we keep.
+
+The meshes still have to be READ: whether a diffuse carries height is only
+knowable from the shape's own `APPLY_HILIGHT2` flag, the authored intent. So
+the analysis is unchanged and only the emit is dropped — `convert_nif` returns
+right after `_harvest_textures`, through the same `_finish_result` the normal
+path uses, so `batch_convert`'s accounting does not silently read zero.
+Animation-object projects, grass models and book inventory art are skipped too,
+being mesh products.
+
 ### Implementation notes
 - `classify_alpha` returns a **category** (`height` / `binary` / `bimodal` /
   `empty` / `no_alpha` / `unreadable`), not a bool, so the build log can say

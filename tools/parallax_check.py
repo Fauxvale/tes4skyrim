@@ -23,6 +23,11 @@ Usage:
   python tools/parallax_check.py verify [plugin] [--output-dir DIR]
                                         [--subdir X] [--max N] [--workers N]
                                         [--all]
+  python tools/parallax_check.py regen [plugin] [--output-dir DIR]
+                                       [--strength F] [--max-range N]
+                                       [--target-range N] [--blur N]
+                                       [--depth F]
+                                       [--only SUBSTRING] [--workers N]
   python tools/parallax_check.py pack <textures dir> [--all]
 
 `verify` only parses output meshes whose raw bytes contain '_p.dds'.  That is
@@ -358,13 +363,33 @@ def verify(plugin, output_dir, subdir, mx, workers, show_all):
     return 0 if ok else 2
 
 
-def regen(plugin, output_dir, strength, max_range, target_range, only):
+def _regen_one(job):
+    """Rebuild one height map.  Module level and argument-only so it pickles
+    into a process pool -- the maps are fully independent of one another."""
+    src, dst, strength, max_range, target_range, blur, depth = job
+    plane = px.decode_alpha_plane(Path(src).read_bytes())
+    rng = (max(plane[2]) - min(plane[2])) if plane else 0
+    written = px.build_height_map(src, dst, strength=strength,
+                                  max_range=max_range,
+                                  target_range=target_range,
+                                  blur_per_1000=blur, depth=depth)
+    return dst, written, rng
+
+
+def regen(plugin, output_dir, strength, max_range, target_range, only,
+          blur=None, workers=None, depth=None):
     """Rewrite the shipped height maps from their source diffuse.
 
-    Tuning the amplitude does not change a single mesh — only the `_p.dds`
-    files — so this exists to avoid a multi-thousand-mesh rebuild per
-    experiment.  Each shipped `<name>_p.dds` is regenerated from the
-    `<name>.dds` in the export texture tree.
+    Retuning the amplitude or the blur does not change a single mesh -- only
+    the `_p.dds` files -- so this exists to avoid a multi-thousand-mesh rebuild
+    per experiment.  Each shipped `<name>_p.dds` is regenerated from the
+    `<name>.dds` in the EXPORT texture tree, which the diffuse BC1 strip never
+    touches, so it stays repeatable however often the output is rebuilt.
+
+    Parallel because it has to be: on a 4K texture pack the per-map cost is
+    seconds (decode 8.5 s + encode 4.6 s on a 4096x8192 source, measured), and
+    1906 maps single-threaded is hours rather than the "seconds" this was
+    originally written for on Nehrim's 38.
     """
     root = Path(output_dir) / plugin
     tex_root = root / 'Textures'
@@ -376,45 +401,51 @@ def regen(plugin, output_dir, strength, max_range, target_range, only):
         print(f'no height maps under {tex_root}'
               + (f' matching {only!r}' if only else ''))
         return 1
-    print(f'regenerating {len(maps)} height map(s) — strength {strength}'
-          + (f', detect >{max_range}' if max_range else '')
-          + (f', correct to {target_range}' if target_range else ''))
-    ok = fail = untouched = 0
+
+    jobs, missing = [], []
     for m in maps:
-        rel = m.relative_to(tex_root)          # tes4\folder\name_p.dds
+        rel = m.relative_to(tex_root)          # tes4/folder/name_p.dds
         parts = list(rel.parts)
         if parts and parts[0].lower() == 'tes4':
             parts = parts[1:]
         parts[-1] = parts[-1][:-len('_p.dds')] + '.dds'
         src = src_root.joinpath(*parts)
         if not src.is_file():
-            print(f'  MISSING SOURCE for {rel}: {src}')
-            fail += 1
+            missing.append((rel, src))
             continue
-        # report per texture whether the cap actually bit, so "which ones did
-        # you change" never has to be guessed at
-        plane = px.decode_alpha_plane(src.read_bytes())
-        rng = (max(plane[2]) - min(plane[2])) if plane else 0
-        capped = bool(max_range and rng > max_range) or strength < 1.0
-        if px.build_height_map(str(src), str(m), strength=strength,
-                               max_range=max_range,
-                               target_range=target_range):
-            ok += 1
-            if capped:
-                tgt = target_range or max_range
-                shown = min(strength, (tgt / rng) if tgt and rng
-                            else strength)
-                print(f'  {rel}   amplitude {rng} -> x{shown:.2f}')
+        jobs.append((str(src), str(m), strength, max_range, target_range,
+                     blur, depth))
+
+    n_workers = workers or max(1, cpu_count() - 1)
+    shown_blur = px.BLUR_RADIUS_PER_1000 if blur is None else blur
+    print(f'regenerating {len(jobs)} height map(s) — strength {strength}'
+          + (f', detect >{max_range}' if max_range else '')
+          + (f', correct to {target_range}' if target_range else '')
+          + f', blur {shown_blur}/1000'
+          + f', depth x{px.DEPTH_SCALE if depth is None else depth}'
+          + f', {n_workers} workers', flush=True)
+    for rel, src in missing:
+        print(f'  MISSING SOURCE for {rel}: {src}')
+
+    ok = untouched = 0
+    fail = len(missing)
+    done = 0
+    with Pool(n_workers) as pool:
+        for dst, written, rng in pool.imap_unordered(_regen_one, jobs, 8):
+            done += 1
+            if written:
+                ok += 1
+                if not (bool(max_range and rng > max_range) or strength < 1.0):
+                    untouched += 1
             else:
-                untouched += 1
-                print(f'  {rel}   amplitude {rng} — unchanged')
-        else:
-            fail += 1
-            print(f'  FAILED {rel}')
+                fail += 1
+                print(f'  FAILED {dst}')
+            if done % 200 == 0:
+                print(f'  {done}/{len(jobs)} ...', flush=True)
+
     print(f'\n{ok} written ({untouched} left at authored amplitude), '
           f'{fail} failed')
-    if strength != 1.0:
-        print('Remember: --pack-only afterwards if you play from the BSAs.')
+    print('Remember: --pack-only afterwards if you play from the BSAs.')
     return 0 if not fail else 2
 
 
@@ -542,6 +573,8 @@ def main():
     plugin, subdir, output_dir = 'Nehrim.esm', None, 'output'
     mx, workers, show_all = 0, max(1, cpu_count() - 1), '--all' in a
     strength, max_range, only = 1.0, px.DEFAULT_MAX_RANGE, None
+    blur = None
+    depth = None
     target_range = px.DEFAULT_TARGET_RANGE
     rest = a[1:]
     i = 0
@@ -555,6 +588,10 @@ def main():
             target_range = int(rest[i + 1]); i += 2
         elif x == '--only':
             only = rest[i + 1]; i += 2
+        elif x == '--blur':
+            blur = float(rest[i + 1]); i += 2
+        elif x == '--depth':
+            depth = float(rest[i + 1]); i += 2
         elif x == '--max':
             mx = int(rest[i + 1]); i += 2
         elif x == '--workers':
@@ -572,7 +609,7 @@ def main():
         return census(plugin, subdir, mx, workers, show_all)
     if mode == 'regen':
         return regen(plugin, output_dir, strength, max_range, target_range,
-                     only)
+                     only, blur, workers, depth)
     return verify(plugin, output_dir, subdir, mx, workers, show_all)
 
 

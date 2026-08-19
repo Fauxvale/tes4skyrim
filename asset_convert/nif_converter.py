@@ -1879,6 +1879,19 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
                 stats.get('hilight2_alpha_dropped', 0) + 1
         else:
             ts.bs_properties[1] = alpha_prop
+            # This shape READS the diffuse's alpha -- as blend weight or as a
+            # test threshold, either way as opacity.  That is evidence the
+            # channel is not a height field here, whatever the texture-level
+            # classifier decided, so the diffuse must keep its alpha and may
+            # not be stripped to BC1 later.  Measured on the author's Nehrim
+            # parallax mod: 1 shape of 39,201, but the converter runs on
+            # plugins nobody has measured.
+            _dif = tex_set.textures[0] if tex_set.textures else None
+            if _dif and stats is not None:
+                if isinstance(_dif, bytes):
+                    _dif = _dif.decode('utf-8', errors='replace')
+                stats.setdefault('_alpha_opacity_diffuse', set()).add(
+                    _dif.replace('/', '\\').lower())
 
     # Re-emit the harvested UV animation onto whichever shader we settled on.
     _attach_tex_transform_ctrls(ts.bs_properties[0], tex_transforms)
@@ -5785,7 +5798,7 @@ def merge_creature_body(part_paths, dst_path, skeleton_path=None):
 
 def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
                 src_meshes_dir=None, creature=False, wearable_plan=None,
-                parallax=False):
+                parallax=False, textures_only=False):
     """Convert a single Oblivion NIF to Skyrim format.
 
     Already-Skyrim versions are copied to dst_path unchanged.
@@ -5800,6 +5813,10 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     disables weight-variant output entirely.
 
     parallax: carry Oblivion's parallax across (opt-in — see _apply_parallax).
+
+    textures_only: read and analyse every mesh, write NONE of them.  The
+    height maps still get built, because the decision to build one needs the
+    mesh's own APPLY_HILIGHT2 flag — see the mode's rationale in batch_convert.
     """
     result = {
         'converted': False,
@@ -5929,7 +5946,7 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # would give PlayAnimation a dead state) are already gone, and before the
     # write so the BGED ships in the file.  See asset_convert/hkx_animobject.py.
     _seq_names = collect_sequence_names(data)
-    if _seq_names:
+    if _seq_names and not textures_only:
         # A graph-bound mesh must ship NO empty text keys: the generator
         # strchr()s every key value on activation and an empty NiString loads
         # as a NULL pointer (see _strip_empty_text_keys — the Spiddal Stick /
@@ -5973,6 +5990,13 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # the finished blocks, so the pipeline can drop every texture nothing ships
     # a reference to without re-reading the whole output tree afterwards.
     _harvest_textures(data, result['textures'])
+
+    if textures_only:
+        # Everything above still ran: the shape was read, its APPLY_HILIGHT2
+        # flag consulted, its diffuse measured, and the BC4 height map written.
+        # Only the mesh itself is not emitted — PGPatcher does that side, in
+        # the player's real load order where it can see every plugin.
+        return _finish_result(result, stats)
 
     # Write to a buffer first — some NIFs have version-incompatible blocks
     # (e.g. NiGeomMorpherController morph arrays) that fail at Skyrim version.
@@ -6042,6 +6066,15 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
             with open(_root + '_1' + _ext, 'wb') as f:
                 f.write(w1_bytes if w1_bytes is not None else buf.getvalue())
 
+    return _finish_result(result, stats)
+
+
+def _finish_result(result, stats):
+    """Roll `stats` up into the worker's result dict.
+
+    Its own function because --textures-only returns before the mesh is ever
+    written, and both exits owe batch_convert the same accounting.
+    """
     result['converted'] = True
     result['strips_fixed'] = stats['strips_fixed'] > 0
     result['properties_converted'] = stats['properties_converted'] > 0
@@ -6056,18 +6089,34 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     _px = {k: v for k, v in stats.items() if k.startswith('parallax_')}
     if _px:
         result['parallax'] = _px
+    # Carried separately from the counters above: this one is a SET of texture
+    # paths, and `parallax` is merged with Counter.update().
+    _au = stats.get('_alpha_opacity_diffuse')
+    if _au:
+        result['alpha_opacity_diffuse'] = _au
     return result
 
 
 def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
                   remap_skeleton=None, subdir_filter=None, wearable_plan=None,
-                  parallax=False):
+                  parallax=False, textures_only=False):
     """Convert all NIF files in mesh_dir to Skyrim format, writing to output_dir.
 
     Skip reason codes:
       VER  — unsupported NIF version (too old / unrecognised)
       RD   — read failure (corrupt, truncated, unknown block types)
       WR   — write failure (version-incompatible blocks, e.g. NiGeomMorpherController)
+
+    textures_only: analyse every mesh, emit none of them.  For the parallax
+    path there is a better mesh patcher than us — **PGPatcher** (ParallaxGen)
+    runs over the player's finished load order, so it sees every plugin at
+    once and can also upgrade a shape to ENB's complex-material system, which
+    Community Shaders reads too.  Our job then reduces to the one thing it
+    cannot do: recover the height field out of Oblivion's diffuse alpha.
+
+    The meshes still have to be READ.  Whether a diffuse carries a height map
+    is only knowable from the shape's own APPLY_HILIGHT2 flag — the authored
+    intent — so the analysis is the same and only the emit is dropped.
 
     Args:
         subdir_filter: If provided, an iterable of root subfolder names (e.g.
@@ -6121,6 +6170,9 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
         'textures_used': set(),
         # Per-category parallax accounting, empty unless parallax=True.
         'parallax': _collections.Counter(),
+        # Diffuse textures some shape reads as opacity — see the alpha branch
+        # in _process_geometry.  Their alpha is never stripped to BC1.
+        'alpha_opacity_diffuse': set(),
     }
 
     # Collect (rel_path, reason) for every skipped file
@@ -6136,7 +6188,8 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
 
     work_args = [
         (str(nif_file), str(out_base / nif_file.relative_to(mesh_path)),
-         fix_textures, remap_skeleton, str(mesh_path), wearable_plan, parallax)
+         fix_textures, remap_skeleton, str(mesh_path), wearable_plan,
+         parallax, textures_only)
         for nif_file in nif_files
     ]
 
@@ -6144,6 +6197,8 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
         stats['warn_counts'].update(r.get('warn_counts', {}))
         stats['textures_used'].update(r.get('textures', ()))
         stats['parallax'].update(r.get('parallax') or {})
+        stats['alpha_opacity_diffuse'].update(
+            r.get('alpha_opacity_diffuse') or ())
         if r.get('error'):
             stats['errors'] += 1
             rel = str(Path(nif_str).relative_to(mesh_path))
@@ -6248,14 +6303,15 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
 
 def _batch_worker(args):
     (nif_str, out_path, fix_textures, remap_skeleton, src_meshes_dir,
-     wearable_plan, parallax) = args
+     wearable_plan, parallax, textures_only) = args
     global _worker_warn_log
     _worker_warn_log = []
     try:
         r = convert_nif(nif_str, out_path,
                         fix_textures=fix_textures, remap_skeleton=remap_skeleton,
                         src_meshes_dir=src_meshes_dir,
-                        wearable_plan=wearable_plan, parallax=parallax)
+                        wearable_plan=wearable_plan, parallax=parallax,
+                        textures_only=textures_only)
         r['warn_counts'] = _categorize_pyffi_warnings(_worker_warn_log)
         return ('ok', nif_str, r)
     except Exception as e:

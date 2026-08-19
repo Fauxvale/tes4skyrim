@@ -87,7 +87,7 @@ def _write_parallax_notice(plugin_dir):
 
 
 def convert_meshes(source_file, extract_dir='export', output_dir='output',
-                   mesh_subdirs=None, parallax=False):
+                   mesh_subdirs=None, parallax=False, textures_only=False):
     """Convert extracted NIFs and copy textures into `output_dir/<source_name>/`.
     Assumes BSA extraction has already been run (extract_bsas).
 
@@ -100,6 +100,10 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
         parallax:     Carry Oblivion's parallax across as Skyrim height maps.
                       Off by default — see asset_convert/parallax.py; the
                       output needs Community Shaders or ENB.
+        textures_only: Read and analyse the meshes, ship none of them; only the
+                      textures (with their `_p` height maps) go to output.  For
+                      PGPatcher, which patches meshes across the player's whole
+                      load order — see nif_converter.batch_convert.
 
     Returns a dict with keys: 'mesh_conversion', 'textures_copied', 'other_copied'.
     """
@@ -136,6 +140,7 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
             subdir_filter=mesh_subdirs,
             wearable_plan=plan,
             parallax=parallax,
+            textures_only=textures_only,
         )
         if parallax:
             _write_parallax_notice(plugin_dir)
@@ -159,7 +164,7 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
     # grass shader profile and a copy under meshes\landscape\grass\, the
     # location every working GRAS record uses (see grass_profile module doc).
     # -----------------------------------------------------------------------
-    if mesh_src.exists():
+    if mesh_src.exists() and not textures_only:
         processed, modified, missing = grass_profile.run(
             extract_dir / source_name, plugin_dir / 'meshes')
         stats['grass_profile'] = {
@@ -188,6 +193,21 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
         checked, fixed = landscape_normals.run(tex_dst / 'landscape')
         stats['landscape_normals_fixed'] = fixed
         print(f"  Landscape normals: {checked} checked, {fixed} DXT1->DXT5 fixed")
+
+        # A diffuse whose alpha was carried out to a `_p` height map has no
+        # use for that channel any more, and DXT1 is half the size.  Keyed on
+        # the `_p` file the mesh stage wrote, so this is a no-op unless
+        # --parallax ran.  After the copy, for the same reason as above.
+        from . import parallax as _parallax
+        _n, _skip, _kept, _saved = _parallax.strip_diffuse_alpha(
+            tex_dst, keep=stats.get('mesh_conversion', {}).get(
+                'alpha_opacity_diffuse', ()))
+        if _n or _skip or _kept:
+            stats['parallax_diffuse_bc1'] = _n
+            print(f"  Parallax diffuse: {_n} DXT5->DXT1 "
+                  f"({_saved / (1024 * 1024):.1f} MB saved)"
+                  + (f", {_kept} kept (read as opacity)" if _kept else "")
+                  + (f", {_skip} already stripped" if _skip else ""))
 
     return stats
 
