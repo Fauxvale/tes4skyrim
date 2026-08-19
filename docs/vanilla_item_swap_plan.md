@@ -10,6 +10,14 @@ no skeleton, no behavior graph, no ragdoll, no ARMA/race chain.
 The two hard problems are different ones: **size/orientation mismatch** and
 **deciding what actually matches**.
 
+**Covers three categories**, all sharing one modal and one output ESP:
+
+| Category | Table | Mechanism |
+|---|---|---|
+| Items (MISC / INGR / food) | [item_swap_table.md](item_swap_table.md) — measured here | override record or REFR (§1) |
+| Creatures | [creature_race_equivalence.md](creature_race_equivalence.md) | override `NPC_.RNAM` |
+| **Weather** | [weather_climate_conversion.md](weather_climate_conversion.md#vanilla-substitution-map-oblivion-wthr---vanilla-skyrim-wthr) — **already written and verified** | FormID redirect at every referrer (§4b) |
+
 ---
 
 ## 1. Two swap modes
@@ -235,8 +243,71 @@ Extend the swap modal (same card/`CLR[...]` styling as
 
 ---
 
+## 4b. Weather — a third swap category, already mapped
+
+[weather_climate_conversion.md](weather_climate_conversion.md#vanilla-substitution-map-oblivion-wthr---vanilla-skyrim-wthr)
+already contains a **complete, verified substitution map** for exactly this
+feature: 18 Oblivion weathers mapped to vanilla Skyrim WTHR records, derived from
+the authored discriminators on both sides (`DATA.Classification`, `WindSpeed`,
+`ThunderFrequency`, `SunGlare`, `FNAM` fog distances) read from the real dumps.
+**Do not re-derive it** — read that section and drive the option from it.
+
+It belongs in this plan because it is the same feature wearing a different hat:
+one more category in the same modal, emitted into the same override ESP.
+
+### What is different about weather
+
+| | Creatures / Items | **Weather** |
+|---|---|---|
+| Mechanism | override the record, repoint one field | **redirect every referrer; do not emit the record at all** |
+| Referrers | placed REFR/ACHR | `CLMT.WLST`, `REGN.RDWT`, script `Weather` properties, and the WTHR itself |
+| Size gate | OBND ratio (§2) | not applicable — weather has no geometry |
+| Extra win | better art | **skips the whole NAM0 luminance-normalisation and IMGS-minting path** |
+
+Four consequences worth carrying into the implementation, all already stated in
+the weather doc:
+
+1. **It is a FormID redirect, not a record override.** A vanilla weather is
+   *referenced*, never copied, so the substituted WTHR is simply not emitted and
+   all four referrer sites are repointed.
+2. **Script properties bind by EditorID**
+   (`script_convert/converter.py`), so a substituted weather must resolve to the
+   *vanilla* EditorID or the property silently fails to bind. This is the one
+   failure mode that produces no error — it just stops working.
+3. **The four IMGS companions must not be minted** for a substituted weather.
+   This costs no FormID drift because companion ids are
+   [hashed from the source weather](../CLAUDE.md#formid-drift), so skipping them
+   leaves every other id untouched.
+4. **New-game-only setting.** Toggling it changes which records exist, exactly
+   like enabling weather conversion at all.
+
+### Deliberate non-matches (already decided — do not "improve" these)
+
+The weather doc rejects, with reasons: all the **Oblivion-realm skies**
+(`OblivionStormTamriel`, `OblivionStormOblivion`, `OblivionElectrical`,
+`OblivionSigil`, …) — the red/black Deadlands sky is the most recognisable
+weather in the game and vanilla has nothing near it, *and* `OblivionStormTamriel`
+is what the gate scripts `ForceActive`, so substituting it changes what the
+scripted sequence puts over the sky. Also rejected: quest/set-piece skies
+(`CamoranWeather`, `MS14Sky`, `SE09SummoningWeather`) and `DefaultWeather`.
+
+`SkyrimStormSnow` `0x000C8221` is listed there as a *reference only* — Oblivion
+authors no thundering snow, so nothing maps to it. It must not become a
+substitution target for the plain `Snow` rows.
+
+### UI
+
+Weather is a category in the same modal, gated the same way — but with **no size
+column** (nothing to measure) and **no Mode A/B choice** (redirect is the only
+mechanism). The preview is a swatch of the weather's sky/fog colours rather than
+a mesh render, which the NAM0 colour table supplies directly.
+
 ## 5. Work order
 
+0. **Weather first — it is the cheapest.** Its map already exists and is
+   verified, it needs no renderer, no size gate and no new table work: wire the
+   redirect at the four referrer sites (§4b). Highest ratio of finished-design to
+   remaining-work in the whole plan.
 1. `tools/item_swap_report.py` — cross-type candidate generator + size/orientation
    gate; prints accept / rescale / reject-with-reason. Argument-driven, per the
    tools rule.
