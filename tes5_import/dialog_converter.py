@@ -2784,6 +2784,15 @@ def _convert_topic_infos(child_infos, owner_qfid, ctx):
             # conditionless beggar lines on beggars). Skyrim has no quest-level
             # dialogue gate, so the owning quest's conditions ride on each INFO.
             quest_cond_bytes = ctx['quest_dialog_ctdas'].get(info_qfid, b'')
+            # QUST-level conditions are copied onto every INFO the quest
+            # owns, but they were converted against the QUST (which has no
+            # ParentDIAL), so the speak-as drop could not see them there.
+            # ArenaAnnouncer carries GetIsPlayableRace; a STAT is not a
+            # playable race, so all 30 announcer lines stayed silent even
+            # after their GetIsID/GetIsVoiceType gates were handled.
+            if quest_cond_bytes and _is_speak_as(info_rec):
+                quest_cond_bytes = _drop_non_actor_speaker_ctdas(
+                    quest_cond_bytes)
             if quest_cond_bytes:
                 ctx['stats']['quest_cond_gated'] += 1
             # Inherited greeting timing gate — but ONLY when this INFO doesn't
@@ -3147,6 +3156,54 @@ def _build_service_fallback_info(writer, service_kind: str,
     return pack_record('INFO', info_fid, 0, s)
 
 
+def _is_speak_as(info_rec: dict) -> bool:
+    """True when this INFO belongs to a speak-as topic."""
+    from .dialog_conditions import is_speak_as_record
+    return is_speak_as_record(info_rec)
+
+
+def _drop_non_actor_speaker_ctdas(cond_bytes: bytes) -> bytes:
+    """Remove subject-run actor-identity CTDAs from a packed condition block.
+
+    Used only on QUST-level conditions inherited by a speak-as INFO, whose
+    speaker is a non-actor reference (see _NON_ACTOR_SPEAKER_DROP).  Walks the
+    packed CTDA/CIS2 subrecords, drops the offending conditions with any CIS2
+    that trails them, and clears a dangling OR flag on whatever ends up last --
+    the same OR repair convert_ctda_list does.
+    """
+    from .dialog_conditions import _NON_ACTOR_SPEAKER_DROP, CTDA_OR, CTDA_RUN_ON_TARGET
+    from .record_types.common import pack_subrecord
+    kept, pos = [], 0
+    while pos + 6 <= len(cond_bytes):
+        sig = cond_bytes[pos:pos + 4]
+        size = struct.unpack_from('<H', cond_bytes, pos + 4)[0]
+        data = cond_bytes[pos + 6:pos + 6 + size]
+        pos += 6 + size
+        if sig == b'CTDA' and len(data) >= 32:
+            type_byte = data[0]
+            func = struct.unpack_from('<H', data, 8)[0]
+            run_on = struct.unpack_from('<I', data, 20)[0]
+            if (func in _NON_ACTOR_SPEAKER_DROP and run_on == 0
+                    and not (type_byte & CTDA_RUN_ON_TARGET)):
+                # Skip a CIS2/CIS1 that belongs to this condition.
+                if (pos + 6 <= len(cond_bytes)
+                        and cond_bytes[pos:pos + 4] in (b'CIS1', b'CIS2')):
+                    nsz = struct.unpack_from('<H', cond_bytes, pos + 4)[0]
+                    pos += 6 + nsz
+                continue
+        kept.append((sig, data))
+    if not kept:
+        return b''
+    # Repair: a trailing OR flag with nothing after it is invalid.
+    for idx in range(len(kept) - 1, -1, -1):
+        if kept[idx][0] == b'CTDA':
+            sig, data = kept[idx]
+            if data[0] & CTDA_OR:
+                kept[idx] = (sig, bytes([data[0] & ~CTDA_OR]) + data[1:])
+            break
+    return b''.join(pack_subrecord(sig, data) for sig, data in kept)
+
+
 def _build_injected_ctdas(info_rec, is_bark, npc_to_vtyp, topic_vtyps,
                           topic_npc_fids, quest_gate_bytes, unlock_gate_bytes,
                           offset, stats, sibling_factions=None,
@@ -3160,7 +3217,17 @@ def _build_injected_ctdas(info_rec, is_bark, npc_to_vtyp, topic_vtyps,
     """
     # Voice types: from this INFO's own GetIsID NPCs, else the topic's voice set.
     own_npcs = read_getisid_fids(info_rec, offset=offset, positive_only=True)
-    if own_npcs:
+    # A SPEAK-AS topic is spoken by the emitting reference -- an XMarker STAT,
+    # a shrine ACTI, a door -- and a non-actor has NO voice type, so this gate
+    # can never pass and every line in the topic is silent.  Keyed on the
+    # TOPIC, never the NPC: SEThadon is a real actor who also lends his
+    # identity to a marker-spoken shout, and keying on him stripped gates from
+    # lines he speaks himself.  See talking_activators.py.
+    from .dialog_conditions import is_speak_as_record
+    _speak_as_info = is_speak_as_record(info_rec)
+    if _speak_as_info:
+        vtyps = set()
+    elif own_npcs:
         vtyps = {npc_to_vtyp[n] for n in own_npcs if n in npc_to_vtyp}
     else:
         # Generic INFO: inherit the topic's voice types (greetings included).

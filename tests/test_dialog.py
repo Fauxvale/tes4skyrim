@@ -1807,3 +1807,108 @@ class TestForceGreetOncePerDay:
                                                 T5_ONCE_PER_DAY)
         flags, _ = convert_flags(T4_ONCE_PER_DAY, 2, True, quest_gated=True)
         assert not (flags & T5_ONCE_PER_DAY)
+
+
+class TestSaySpeakAsIdentityGate:
+    """Actor-identity gates must fail OPEN inside a speak-as topic.
+
+    TES4 `ArenaMatchPlayerRef.Say Announcer 1 ArenaMouth 1` resolves the
+    speaker to ArenaMouth, so the INFO's `GetIsID ArenaMouth` passes.  Skyrim's
+    Say has no speak-as argument: the speaker stays the emitting XMarker, which
+    has no base NPC, no voice type and no race, so those gates can never pass.
+    No INFO is selected and the line is SILENT while the caller's timers run on
+    (the Arena announcer said nothing yet the gates opened).
+
+    Keyed on the TOPIC, never the NPC -- SEThadon is a real actor who speaks
+    his own lines AND lends his identity to a marker-spoken shout.
+    See tes5_import/talking_activators.py.
+    """
+
+    ARENA_ANNOUNCER_DIAL = 0x046652
+
+    def _ctda(self, func, param1, run_on_target=False):
+        import struct
+        return struct.pack('<B3xIIII', 0x02 if run_on_target else 0x00,
+                           struct.unpack('<I', struct.pack('<f', 1.0))[0],
+                           func, param1, 0)
+
+    def _info(self, dial=None, raws=()):
+        rec = {'ParentDIAL': f'{dial:08X}'} if dial is not None else {}
+        for i, r in enumerate(raws):
+            rec[f'Condition[{i}].Raw'] = r.hex()
+        return rec
+
+    def test_identity_gate_dropped_in_speak_as_topic(self):
+        from tes5_import import dialog_conditions as dc
+        dc.set_speak_as_topics({self.ARENA_ANNOUNCER_DIAL})
+        try:
+            out = dc.convert_ctda(self._ctda(72, 0x00046653), offset=0,
+                                  in_speak_as_topic=True)
+            assert out is None
+        finally:
+            dc.set_speak_as_topics(set())
+
+    def test_playable_race_gate_dropped_in_speak_as_topic(self):
+        """The QUST-level gate ArenaAnnouncer carries."""
+        from tes5_import import dialog_conditions as dc
+        out = dc.convert_ctda(self._ctda(254, 0), offset=0,
+                              in_speak_as_topic=True)
+        assert out is None
+
+    def test_identity_gate_survives_outside_a_speak_as_topic(self):
+        """A normal speaker keeps its authored identity gate."""
+        from tes5_import import dialog_conditions as dc
+        out = dc.convert_ctda(self._ctda(72, 0x0001C1A2), offset=0,
+                              in_speak_as_topic=False)
+        assert out is not None
+
+    def test_thadons_own_lines_are_untouched(self):
+        """SEThadon lends his identity to a marker shout in ANOTHER topic;
+        that must not weaken the lines he delivers himself."""
+        from tes5_import import dialog_conditions as dc
+        dc.set_speak_as_topics({0x07B20F})       # some other, speak-as topic
+        try:
+            rec = self._info(dial=0x0000D2,      # Thadon's own topic
+                             raws=[self._ctda(72, 0x00012106)])
+            assert dc.is_speak_as_record(rec) is False
+            out = dc.convert_ctda(self._ctda(72, 0x00012106), offset=0,
+                                  in_speak_as_topic=dc.is_speak_as_record(rec))
+            assert out is not None
+        finally:
+            dc.set_speak_as_topics(set())
+
+    def test_target_run_identity_is_not_touched_by_this_rule(self):
+        """RunOnTarget identities have their own, separate handling."""
+        from tes5_import import dialog_conditions as dc
+        out = dc.convert_ctda(self._ctda(72, 0x00046653, run_on_target=True),
+                              offset=0, in_speak_as_topic=True)
+        assert out is not None
+
+    def test_is_speak_as_record_reads_the_parent_topic(self):
+        from tes5_import import dialog_conditions as dc
+        dc.set_speak_as_topics({self.ARENA_ANNOUNCER_DIAL})
+        try:
+            assert dc.is_speak_as_record(
+                self._info(dial=self.ARENA_ANNOUNCER_DIAL)) is True
+            assert dc.is_speak_as_record(self._info(dial=0x0000C8)) is False
+            assert dc.is_speak_as_record({}) is False
+        finally:
+            dc.set_speak_as_topics(set())
+
+    def test_scanner_finds_the_announcer_topic_not_the_npc(self):
+        from tes5_import.talking_activators import scan_speak_as_topics
+        by_type = {
+            'DIAL': [{'FormID': '00046652', 'EditorID': 'Announcer'}],
+            'NPC_': [{'FormID': '00046653', 'EditorID': 'ArenaMouth'}],
+            'SCPT': [{'SCTX': 'ArenaMatchPlayerRef.Say Announcer 1 '
+                              'ArenaMouth 1'}],
+        }
+        assert scan_speak_as_topics(by_type) == {0x046652}
+
+    def test_scanner_ignores_a_plain_say(self):
+        from tes5_import.talking_activators import scan_speak_as_topics
+        by_type = {
+            'DIAL': [{'FormID': '000000C8', 'EditorID': 'GREETING'}],
+            'SCPT': [{'SCTX': 'SomeRef.Say GREETING'}],
+        }
+        assert scan_speak_as_topics(by_type) == set()

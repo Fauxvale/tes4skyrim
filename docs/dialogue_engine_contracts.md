@@ -172,3 +172,45 @@ to be started)"*, so it starts a stopped quest. Censused on Skyrim.esm, 0 of
 table, scan `.text` for RIP-relative `lea` instructions whose target is the
 table's RVA — there are only four such references for the two dialogue tables,
 which is what made `TESTopic::LoadForm` easy to isolate.
+
+## Speak-as lines: `Say()` on a voiced stand-in, with the in-head flag (2026-08-19)
+
+TES4's `Say <topic> <force-subtitles> <speak-as NPC> <in-head>` speaks a line
+THROUGH a marker/shrine/door AS some NPC. Skyrim's `Say` has no speak-as
+argument and keys voice lookup on the speaker, and a bare XMarker STAT has no
+voice type -- so the engine finds no voice folder and plays nothing.
+
+**What works, measured in-game:** mint a TACT carrying that NPC's converted
+VTYP, place it at the emitter's authored position, and call a plain
+`Say(topic, None, abInHead)` on it. `abSpeakInPlayersHead` is Skyrim's own
+third parameter and is the faithful conversion of TES4's fourth argument --
+the voice comes from inside the player's head at full volume, which is how
+Oblivion delivered the Arena announcer, the Daedric princes and Mankar
+Camoran. See `tes5_import/speaker_activators.py`, `TES4Polyfill.SayScene`.
+
+🛑 **Do not get clever with the delivery.** Two alternatives were built and
+both KILLED THE AUDIO outright, which is strictly worse than any subtitle
+defect:
+
+* **A one-action SCEN per call site.** Scenes do tick a non-actor's line
+  (`BGSSceneActionDialogue`), so the reasoning looked sound -- delivered
+  through a scene, the lines produced no audio at all.
+* **`Activate()` on the talking activator.** This *is* vanilla's idiom
+  (`DA08WhisperingDoorScript`, `DA05QuestingBeastGhostScript`, DA10's
+  `TalkingMace.GetRef().Activate(...)` -- and no vanilla script calls `Say()`
+  on a TACT). But vanilla activates a TACT the PLAYER has walked up to, which
+  is not what a polled announcer line is; converted call sites got no audio.
+
+🛑 **Never emulate the in-head flag with `MoveTo(player)`.** That was an
+invention: it teleports the marker out of its authored position permanently
+(nothing moves it back) and costs the line its audio. Vanilla's one
+repositioning case (DA05, following a ghost's head) uses `SetPosition`.
+
+**Known open defect:** a scripted `Say()` on a NON-ACTOR does not retire its
+subtitle -- measured live, a direct `Say` on the announcer's TACT played its
+audio and left the subtitle onscreen indefinitely. The engine's countdown /
+`SubtitleManager::KillSubtitles` path is `TESObjectREFR` vtable slot 0x40
+(rva 0x2d9d80, SkyrimSE 1.6.1170), which nothing drives for a plain
+reference. **No verified fix exists**; the two attempts above cost the audio
+and were reverted. Audio is the higher-value behaviour, so the stuck subtitle
+stands until a fix is demonstrated in-game rather than reasoned about.

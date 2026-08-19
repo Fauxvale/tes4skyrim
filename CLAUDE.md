@@ -95,6 +95,11 @@ caching, skipped record types, the export text format, and the directory layout.
   Grep the source before claiming a mechanism exists, and fix the doc.
 - Test scripts must print as they go, so a 120s timeout still yields output.
 - **LISTEN CAREFULLY to EXACTLY what the user's prompt says**. Seek to understand any implementation ideas instead of using your pre-conceived notions
+- **A MECHANISM THE USER NAMES IS THE LEAD. BUILD IT TO COMPLETION.**
+  Never abandon it for a cheaper substitute, and never because it is
+  "invasive" / "touches too much" / "needs new records" — **COST IS NEVER A
+  REASON, ONLY CORRECTNESS IS.** If it truly cannot work, PROVE it with a
+  measurement and say so; never silently swap in something smaller.
 - If you need to continue iterating on an idea with only marginal improvments in some areas and regressions in another, your idea is likely incorrect and you need to find another one
 - **Look for the AUTHORED indicator** If you need to resort to heuristics, your approach is most likely incorrect. Remember, everything in the original plugin works for a reason
 - **Pay close attention to performance** This needs to run quickly on a modest PC. If your new code makes a step run significantly slower than it did before you **MUST optimize**. Python first optimizations, and then native C++ if necessary.
@@ -378,7 +383,7 @@ relevant doc when working in that area.
 | [package_conversion_plan.md](docs/package_conversion_plan.md) | PACK template model + vanilla census (implemented — the design behind `pack_converter.py`) |
 | [package_conversion_audit.md](docs/package_conversion_audit.md) | Full PACK audit (2026-08-17): 5 measured gaps (PTDT type-1 unhandled, master-blind PackagePlan, 48 ungated packages) + what is verified correct |
 | [dialogue_conversion_notes.md](docs/dialogue_conversion_notes.md) | DIAL/INFO/QUST/DLBR/DLVW implementation, voice type routing, AddTopic unlocks, GetIsID injection |
-| [dialogue_engine_contracts.md](docs/dialogue_engine_contracts.md) | Verified engine rules for dialogue routing |
+| [dialogue_engine_contracts.md](docs/dialogue_engine_contracts.md) | Verified engine rules for dialogue routing; **speak-as lines = `Say(topic, None, inHead)` on a voiced TACT stand-in** |
 | [dialogue_transfer_gaps.md](docs/dialogue_transfer_gaps.md) | Measured gaps: what Oblivion dialogue does NOT survive conversion, with counts from both emulators |
 | [ambient_dialogue_channel_plan.md](docs/ambient_dialogue_channel_plan.md) | Oblivion's 3 delivery channels vs Skyrim's 2; constant quipping, NPC-to-NPC topics in the player menu; **the NPC-to-NPC conversation scheduler Skyrim lacks** and the driver quest that replays quest-advancing chains |
 | [QUEST_AUDIT.md](docs/QUEST_AUDIT.md) | Quest completability audit via the walkthrough emulator (2026-07-17, all 390 QUSTs) |
@@ -392,7 +397,7 @@ relevant doc when working in that area.
 ### Scripts
 | Doc | Covers |
 |---|---|
-| [papyrus_conversion_notes.md](docs/papyrus_conversion_notes.md) | TES4→Papyrus mapping, paired on/off soft-lock trap, **Say() timers = `TES4Polyfill.SayLine` (engine-reported line length; fragments never write timers)**, syntax traps, OBSE constructs |
+| [papyrus_conversion_notes.md](docs/papyrus_conversion_notes.md) | TES4→Papyrus mapping, paired on/off soft-lock trap, **Say() timers = `TES4Polyfill.SayLine` (engine-reported line length; fragments never write timers)**, **StopQuest = `Stop()` (a run-bit global was tried and REVERTED)**, syntax traps, OBSE constructs |
 | [Script_Conversion_Plan.md](docs/Script_Conversion_Plan.md) | Script conversion scope, counts, block/variable distributions |
 | [quest_script_conversion_audit.md](docs/quest_script_conversion_audit.md) | Which quest scripts have been read against their originals (don't re-audit), defects found, and verified-correct behaviours not to "fix" |
 | [skse_conversion_audit.md](docs/skse_conversion_audit.md) | SKSE/OBSE function coverage audit |

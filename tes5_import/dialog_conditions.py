@@ -28,12 +28,37 @@ CTDA_USE_GLOBAL = 0x04    # comparison value is a GLOB FormID, not a float
 
 # --- Dialogue-critical function indices (identical in both games) --------------
 FUNC_GET_IS_ID = 72            # GetIsID(ref)
+
+# DIAL FormIDs (24-bit) whose INFOs are reached ONLY through a TES4
+# `Say <topic> <flag> <speak-as NPC> <flag>`.  Filled once per run by
+# set_speak_as_topics(); see convert_ctda and talking_activators.py.
+_SPEAK_AS_TOPICS: frozenset = frozenset()
+
+
+def set_speak_as_topics(fids) -> None:
+    """Register the run's speak-as topics (24-bit TES4 DIAL FormIDs)."""
+    global _SPEAK_AS_TOPICS
+    _SPEAK_AS_TOPICS = frozenset(f & 0x00FFFFFF for f in (fids or ()))
+
+
+def get_speak_as_topics() -> frozenset:
+    return _SPEAK_AS_TOPICS
+
+
 FUNC_GET_IN_FACTION = 71       # GetInFaction(fact)
 FUNC_GET_STAGE = 58            # GetStage(quest)
 FUNC_GET_STAGE_DONE = 59       # GetStageDone(quest, stage)
 FUNC_GET_QUEST_RUNNING = 56    # GetQuestRunning(quest)
 FUNC_GET_GLOBAL_VALUE = 74     # GetGlobalValue(glob)
 FUNC_GET_IS_VOICE_TYPE = 426   # GetIsVoiceType(vtyp)  — TES5-only, no TES4 source
+
+# Conditions that interrogate the SPEAKER as an actor.  A speak-as topic is
+# spoken by a non-actor reference, which has no base NPC, no voice type and no
+# race, so each of these is unsatisfiable there (and only there).
+_NON_ACTOR_SPEAKER_DROP = frozenset({
+    72,    # GetIsID          -- compares the speaker's base form
+    254,   # GetIsPlayableRace-- rides in from the QUST-level condition copy
+})
 
 # Run-on-Target conditions that must NOT be retargeted onto a specific
 # reference. GetIsID asks "WHICH ACTOR is this?" and answers by comparing the
@@ -470,9 +495,25 @@ def _chargen_choice_ctda(type_byte: int, data: bytes, func_idx: int,
                        0, 0, 0xFFFFFFFF)
 
 
+def is_speak_as_record(rec: dict) -> bool:
+    """True when this INFO belongs to a speak-as topic (see the module note).
+
+    Reads the INFO's own ParentDIAL, so the answer is a property of the record
+    rather than of any NPC it happens to name.
+    """
+    if not _SPEAK_AS_TOPICS:
+        return False
+    raw = rec.get('ParentDIAL') or rec.get('DIAL') or ''
+    try:
+        return (int(raw, 16) & 0x00FFFFFF) in _SPEAK_AS_TOPICS
+    except (TypeError, ValueError):
+        return False
+
+
 def convert_ctda(raw: bytes, offset: 'int | None' = None,
                  run_on_target_ref: 'int | None' = None,
-                 drop_run_on_target: bool = False) -> 'bytes | None':
+                 drop_run_on_target: bool = False,
+                 in_speak_as_topic: bool = False) -> 'bytes | None':
     """Convert one 24-byte TES4 CTDA to a 32-byte TES5 CTDA.
 
     Returns None if the function must be dropped (no faithful TES5 equivalent),
@@ -489,6 +530,24 @@ def convert_ctda(raw: bytes, offset: 'int | None' = None,
     targets are mixed/unknown, drop_run_on_target discards the condition
     (Oblivion's call sites already pick speaker+topic, so auto-pass is closer
     to intent than never-pass).
+
+    `in_speak_as_topic` marks an INFO whose topic is reached ONLY through a
+    TES4 `Say <topic> <flag> <speak-as NPC> <flag>` —
+    `ArenaMatchPlayerRef.Say Announcer 1 ArenaMouth 1`.  Oblivion resolves the
+    speaker's identity to that NPC even though an XMarker emits the sound, so
+    the INFO's SUBJECT-run `GetIsID <thatNPC>` passes.  Skyrim's Say has no
+    such argument, the subject is the emitting marker, and the condition can
+    never pass: no INFO is selected and the line is silent while the caller's
+    timers run on.  That is the same never-pass shape drop_run_on_target
+    already handles on the target side, so it gets the same treatment — the
+    call site has already chosen both speaker and topic.
+
+    🛑 Keyed on the TOPIC, never on the NPC.  An NPC is not "a voice":
+    SEThadon is a real, placed actor who speaks his own dialogue AND lends his
+    identity to a marker-spoken shout, and keying on him stripped the authored
+    `GetIsID(SEThadon)` from lines he delivers himself (53 INFOs name both a
+    voice identity and a real speaker).  A dedicated topic is the authored
+    fact; see talking_activators.py.
     """
     if offset is None:
         offset = get_formid_index_offset()
@@ -523,6 +582,16 @@ def convert_ctda(raw: bytes, offset: 'int | None' = None,
 
     if func_idx in _CHARGEN_CHOICE:
         return _chargen_choice_ctda(type_byte, data, func_idx, param1)
+
+    # Inside a SPEAK-AS topic the speaker is the emitting reference (an
+    # XMarker, a shrine, a door), never the NPC the author named -- Skyrim's
+    # Say has no speak-as argument.  So a subject-run actor-identity gate can
+    # never pass and the line is SILENT, while the caller's timers run on.
+    # Fails OPEN, exactly as the target-side identity drop below does: the
+    # script call site already chose both speaker and topic.
+    if in_speak_as_topic and not (type_byte & CTDA_RUN_ON_TARGET) and (
+            func_idx in _NON_ACTOR_SPEAKER_DROP):
+        return None
 
     if func_idx in _FUNC_DROP:
         return None
@@ -670,6 +739,7 @@ def convert_ctda_list_with_strings(rec: dict, script_vars: dict = None,
     if offset is None:
         offset = get_formid_index_offset()
     script_vars = script_vars or {}
+    speak_as = is_speak_as_record(rec)
     out = []
     i = 0
     while True:
@@ -696,7 +766,8 @@ def convert_ctda_list_with_strings(rec: dict, script_vars: dict = None,
         try:
             ctda = convert_ctda(raw, offset,
                                 run_on_target_ref=run_on_target_ref,
-                                drop_run_on_target=drop_run_on_target)
+                                drop_run_on_target=drop_run_on_target,
+                                in_speak_as_topic=speak_as)
         except (ValueError, struct.error):
             continue
         if ctda is not None:

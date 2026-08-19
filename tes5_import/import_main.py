@@ -971,6 +971,46 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                                         ctx.master_export if ctx else None)
     from .record_types.actors import set_npc_voice_map
     set_npc_voice_map(npc_to_vtyp)
+
+    # TES4 `Say <topic> <flag> <speak-as NPC> <flag>` names the identity the
+    # line belongs to, separately from the reference that emits it.  Skyrim's
+    # Say has no such argument, so inside those topics the speaker is the
+    # emitting marker and every actor-shaped gate on the line (GetIsID, the
+    # injected GetIsVoiceType, an inherited GetIsPlayableRace) is
+    # unsatisfiable: no INFO is selected and the line plays SILENT while the
+    # caller's timers run on -- the Arena announcer said nothing yet the gates
+    # still opened.  Registered by TOPIC, never by NPC: a real actor can lend
+    # his identity to a marker-spoken line without his own dialogue being
+    # affected.  See talking_activators.py.
+    from .talking_activators import scan_speak_as_topics
+    from .dialog_conditions import set_speak_as_topics
+    _speak_as = scan_speak_as_topics(by_type)
+    set_speak_as_topics(_speak_as)
+    print(f"  {len(_speak_as)} speak-as topics "
+          f"(non-actor speaker: actor-identity gates fail open)")
+
+    # ...and give each of those call sites a speaker that HAS a voice type.
+    # Dropping the gates above lets the INFO be selected; it does not give the
+    # engine a voice folder to read audio from, because voice lookup is keyed
+    # on the SPEAKER's voice type and an XMarker STAT has none.  That is why
+    # the announcer showed subtitles with no sound, and why they never timed
+    # out (no audio => no duration).  Mint the vanilla answer: a TACT carrying
+    # the speak-as NPC's VTYP, placed at the emitter's own position.
+    # Must run BEFORE the CELL/WRLD builders, which read by_type['REFR'].
+    from .speaker_activators import build_speaker_activators, reset as _spk_reset
+    _spk_reset()
+    _n_spk = build_speaker_activators(by_type, writer, npc_to_vtyp,
+                                      num_new_masters)
+    # Register each speaker under the SAME property name script_convert emits
+    # for that call site, so `TES4Voice_<emitter>_<voice>.Say(topic)` binds.
+    # These refs are synthesized, so they are absent from the TES4 export and
+    # resolve_property_formid() cannot find them -- the well-known registry is
+    # exactly the channel for that (see get_well_known_properties).
+    from .speaker_activators import export_speaker_map, speaker_property_name
+    for (_em, _vo), _fid in export_speaker_map().items():
+        _WELL_KNOWN_PROPERTIES[speaker_property_name(_em, _vo)] = _fid
+    print(f"  Speaker activators: {_n_spk} TACT+REFR pairs "
+          f"(voiced stand-ins for Say speak-as markers)")
     _step_done('npc voice map')
 
     # AddTopic unlock plan: gated topics get GetGlobalValue conditions and one

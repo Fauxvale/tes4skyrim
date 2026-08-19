@@ -742,7 +742,7 @@ class PluginWriter:
             # precede the FSTS that lists it. Creature footstep audio rides
             # this chain — see tes5_import/creature_footsteps.py.
             'IPCT', 'IPDS', 'FSTP', 'FSTS',
-            'STAT', 'ACTI', 'CONT', 'DOOR',
+            'STAT', 'ACTI', 'TACT', 'CONT', 'DOOR',
             'FLOR', 'FURN', 'GRAS', 'TREE', 'LIGH', 'MISC', 'KEYM', 'ARMO',
             'ARMA', 'BOOK', 'AMMO', 'ENCH', 'SPEL', 'ALCH', 'INGR', 'SCRL',
             'SLGM', 'VTYP', 'OTFT', 'NPC_', 'LVLN', 'LVLI', 'LVSP',

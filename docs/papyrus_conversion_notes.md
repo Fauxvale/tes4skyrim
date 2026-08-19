@@ -1479,3 +1479,78 @@ like an actor-only call and is not one.
 then flag every `Actor Property <name>` whose named ref has a non-NPC_/CREA
 base) — worth re-running after touching any handler that passes
 `actor_func=True`.
+
+## `StopQuest` converts to `Stop()` — a "run bit" global does NOT work (2026-08-19)
+
+**The real difference** is that Skyrim's `Quest.Start()` on a stopped quest
+RESETS it: every `Auto` property back to its default, stage back to 0.
+Oblivion's `StopQuest` clears a run bit and touches nothing, so the authored
+idiom "seed the variables, then StartQuest" is safe there and destructive here.
+
+**That is handled by `_hoist_quest_start_above_writes`** — move `Start()` ABOVE
+the writes it would clobber. Nothing else is needed, and nothing else works.
+
+🛑 **A converter-owned run bit was built and REVERTED (2026-08-19).** The idea:
+keep the TES4 run bit in a GLOB `TES4Stopped_<Quest>`, never engine-stop the
+quest, and gate dialogue/`GetQuestRunning` on the global — so variables and
+stages survive a stop/start cycle exactly as in Oblivion. It preserved the
+variables correctly (`CombatantsKilled`/`FirstWin` measured surviving), and it
+still broke the Arena, because **a quest that never stops keeps its CURRENT
+STAGE**:
+
+* `Arena` has exactly ONE stage, 10 (`AllowRepeatedStages`), whose script
+  zeroes the whole match state and then stops the quest.
+* Oblivion restages it every match: stopped quest -> `SetStage 10` runs the
+  reset again.
+* Left engine-running, `Arena` sat at stage 10 permanently. `SetStage(10)` on
+  the stage it is already at does nothing, so the reset never re-ran,
+  `ReadyMatch` stayed 1, and Owyn's next-match line (gated `ReadyMatch == 0`)
+  could never fire — he behaved as though the match had not happened, and the
+  gate stayed down. Measured live: `GetStage Arena >> 10`, `ReadyMatch = 1`.
+
+Reverted in full: no `TES4Stopped_*` globals, no INFO stop-gates, no
+`GetQuestRunning` expansion, no `IsQuestStopped` poll gate, no
+`TES4PersistentActors` FLST / `ResetInterior` polyfill (that rode on the same
+design). `StopQuest`/`StartQuest`/`GetQuestRunning` are plain
+`Stop()`/`Start()`/`IsRunning()`.
+
+**Kept from that work** (both independently verified): the `Start()` hoist now
+also matches a renamed call shape, and `set X.fQuestDelayTime to N` emits
+`RegisterForSingleUpdate`, never `RegisterForUpdate` — the latter is a
+REPEATING registration and `RegisterForUpdate(0)` shipped in 45 scripts as an
+every-frame storm, ended only by the engine stop that the reverted design
+removed. Measured on the shipped build: 0 repeating registrations.
+
+### Renaming a converted call can silently disable a post-pass (2026-08-19)
+
+**Symptom:** after the StopQuest run-bit change, ALL arena dialogue stopped —
+no announcer line, no subtitle, and the gate never opened. Regression, not a
+new bug.
+
+**Cause:** `_hoist_quest_start_above_writes` exists because Skyrim's
+`Quest.Start()` resets every `Auto` property, so the authored TES4 idiom
+"seed the variables, then StartQuest" must become "Start, then seed". Its
+`_QUEST_START_RE` matched only the literal `Q.Start()` shape. Converting
+`StartQuest` to `TES4Polyfill.StartQuest(Q, TES4Stopped_Q)` renamed the call
+out from under that regex, the hoist stopped firing, and every seeded write
+was clobbered again — **91 writes across 43 scripts** (every arena match INFO,
+the arena betting, FGC01), reproducing the exact softlock the hoist was
+written to fix. The polyfill still calls `Q.Start()` internally, so the
+hazard was unchanged; only the pattern that detected it moved.
+
+**Rule:** when a converted call site changes SHAPE, grep for every post-pass
+regex that matches the old shape. A post-pass that silently stops matching
+fails open — no error, no warning, just the original bug back.
+
+**Second, independent clobber (same symptom class):** `pipeline.py`'s
+`_state_writes_before_setstage` hoists literal state writes ABOVE the first
+`SetStage` (so an inline stage fragment's `EvaluatePackage` sees committed
+state). That runs AFTER the converter's post-processing, and it can lift a
+write above `SetStage` while leaving the `Start()` below it — stranding the
+seed again (`ArenaICGrandChampion.CrazyIdea`, 2 sites). Fixed by re-running
+the quest-start hoist on that pass's result; both passes are order-preserving
+elsewhere, so applying it twice is idempotent.
+
+**Guard:** the invariant is "no write to `Q.<prop>` may precede a `Start()` /
+`TES4Polyfill.StartQuest` on the same `Q` within one straight-line run".
+Measured on the shipped build: 91 → 0.

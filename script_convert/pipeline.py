@@ -949,7 +949,17 @@ def _state_writes_before_setstage(lines: list) -> list:
     if not hoist:
         return lines
     rest = [ln for ln in tail if not _is_state_write(ln)]
-    return lines[:first] + hoist + [lines[first]] + rest
+    out = lines[:first] + hoist + [lines[first]] + rest
+    # Moving a write ABOVE the SetStage can strand it below a `Start()` on the
+    # same quest, which is the one reordering that silently destroys it:
+    # Skyrim's Start() resets every Auto property, so the seeded value is gone
+    # (ArenaICGrandChampion's `CrazyIdea`, 2 sites).  The converter already
+    # hoists Start() above such writes, but it ran BEFORE this pass, so re-run
+    # it on the reordered result.  Both passes are order-preserving elsewhere,
+    # so applying it twice is idempotent.
+    from .converter import ScriptConverter
+    return ScriptConverter._hoist_quest_start_above_writes(
+        ScriptConverter.__new__(ScriptConverter), out)
 
 
 def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
