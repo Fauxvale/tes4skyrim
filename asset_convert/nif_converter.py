@@ -4517,32 +4517,6 @@ def _strip_gnd_skin(data):
 from .skin_replacement import (collect_skin_info, strip_body_skin_geometry, splice_body_geometry, apply_armor_offset)
 
 
-def _get_armor_piece_type(src_path: str) -> str:
-    """Classify an armor NIF path into a piece-type key for ARMOR_PIECE_OFFSETS.
-
-    Detection is based solely on the NIF filename stem (case-insensitive).  This
-    covers the standard Oblivion naming convention (cuirass_0.nif, boots_0.nif,
-    pants.nif, etc.) as well as common clothing names (shirt, robe, pants, shoe).
-    Returns one of: 'cuirass', 'greaves', 'boots', 'gauntlets', 'helmet', 'shield',
-    or 'default' (treated identically to 'cuirass' by ARMOR_PIECE_OFFSETS).
-    """
-    stem = Path(src_path).stem.lower()
-    if any(k in stem for k in ('boot', 'shoe', 'sandal', 'slipper', 'clog')):
-        return 'boots'
-    if any(k in stem for k in ('gauntlet', 'glove', 'bracer', 'vambrace', 'handwrap')):
-        return 'gauntlets'
-    if any(k in stem for k in ('helm', 'hood', 'hat', 'coif', 'circlet', 'crown',
-                                 'mask', 'cap', 'cowl')):
-        return 'helmet'
-    if any(k in stem for k in ('greave', 'pant', 'trouser', 'lowerbody', 'skirt',
-                                 'kilt', 'loincloth', 'shorts')):
-        return 'greaves'
-    if any(k in stem for k in ('shield', 'buckler', 'targe')):
-        return 'shield'
-    # Cuirass / shirt / robe / default upper-body
-    return 'cuirass'
-
-
 def _remap_bone_names(data) -> int:
     """Rename Oblivion Bip01 skeleton bones to Skyrim NPC skeleton names.
 
@@ -4603,6 +4577,44 @@ def _get_prn_bone(root_node):
     return None
 
 
+def _bake_root_transform_into_verts(root_node):
+    """Bake ONLY the root node's own transform into the geometry verts.
+
+    The sibling _bake_node_transforms_into_verts flattens the geometry node's
+    transform too, which is right for creature parts (their bind is identity
+    and nothing else carries the offset) but wrong for worn armor: skin_retarget
+    places a PRN piece by ADDING the Skyrim bone position to the geometry node's
+    existing translation, so that translation has to survive to that point.
+    Baking the root alone keeps a non-identity root (rare, but real) from being
+    dropped while leaving the per-geometry offset intact.
+    """
+    root_m = root_node.get_transform()
+    if root_m.is_identity():
+        return
+    rot = root_m.get_matrix_33()
+    for block in list(root_node.tree()):
+        if not isinstance(block, (NifFormat.NiTriShape, NifFormat.NiTriStrips)):
+            continue
+        gd = block.data
+        if gd is None:
+            continue
+        for v in gd.vertices:
+            nv = v * root_m
+            v.x, v.y, v.z = nv.x, nv.y, nv.z
+        if getattr(gd, 'has_normals', 0):
+            for n in gd.normals:
+                nn = n * rot
+                n.x, n.y, n.z = nn.x, nn.y, nn.z
+        try:
+            gd.update_center_radius()
+        except Exception:
+            pass
+    root_node.rotation.set_identity()
+    root_node.translation.x = root_node.translation.y = 0.0
+    root_node.translation.z = 0.0
+    root_node.scale = 1.0
+
+
 def _bake_node_transforms_into_verts(root_node):
     """Bake each geometry's node-to-root transform PLUS the root's own
     transform into the vertex/normal data, then zero those transforms.
@@ -4642,7 +4654,21 @@ def _bake_node_transforms_into_verts(root_node):
     root_node.scale = 1.0
 
 
-def _add_prn_skin(data, root_node, keep_bone_names=False, plain=False):
+# Skyrim body part -> the Oblivion bone that piece rigidly attaches to.  Used
+# only when a worn NIF carries NO 'Prn' and NO skin at all: those meshes fell
+# straight out of _add_prn_skin, shipping with no skin instance, so they never
+# left Oblivion object space (Morroblivion's cryohelm.nif rendered at z -5..27
+# instead of ~115..133, i.e. on the floor).  Keyed off the wearing record's
+# BMDT biped flags -- the plugin's own statement of what the item is.
+_BODY_PART_FALLBACK_PRN_BONE = {
+    131: 'Bip01 Head',
+    33:  'Bip01 R Hand',
+    37:  'Bip01 R Foot',
+}
+
+
+def _add_prn_skin(data, root_node, keep_bone_names=False, plain=False,
+                  fallback_bone=None):
     """Add Skyrim-compatible BSDismemberSkinInstance to non-skinned rigid armor.
 
     Oblivion attaches some armor pieces (e.g. helmets) rigidly to a bone via a
@@ -4670,7 +4696,7 @@ def _add_prn_skin(data, root_node, keep_bone_names=False, plain=False):
     if not isinstance(root_node, NifFormat.NiNode):
         return 0
 
-    prn_val = _get_prn_bone(root_node)
+    prn_val = _get_prn_bone(root_node) or fallback_bone
     if prn_val is None:
         return 0
     prn_bone = prn_val if keep_bone_names else \
@@ -4831,7 +4857,7 @@ def _upgrade_skin_instances(data):
 
 
 def _convert_nif(data, fix_textures=True, src_path='', weight=0,
-                 creature=False, worn=False):
+                 creature=False, worn=False, biped_flags=0):
     """Convert a PyFFI NifFormat.Data in-place to Skyrim format.
 
     worn=True marks the NIF as body-worn gear on the plugin's own authority (an
@@ -4901,7 +4927,26 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
     _in_armor_dir = worn or \
         'armor' in src_path.lower().replace('\\', '/') or \
         'clothes' in src_path.lower().replace('\\', '/')   # clothing
-    _is_shield = 'shield' in nif_basename
+    # Bit 13 of the record's BMDT flags is Shield -- authored, and it catches
+    # what the filename misses ('towersheild.nif' is misspelled, so the old
+    # name check dragged it through the worn-armor path).  The name is only
+    # consulted for meshes no ARMO/CLOT record names.
+    _is_shield = (bool(biped_flags & (1 << 13)) if biped_flags
+                  else 'shield' in nif_basename)
+    # Biped slot the wearing record assigns this mesh (131 head, 32 body, ...),
+    # or None when no record names it.  Authored data -- always preferred over
+    # the filename stem and the geometry name, both of which are guesses.
+    from .wearable_plan import (body_part_for_flags as _bp_for_flags,
+                                body_parts_for_flags as _bps_for_flags)
+    _authored_bp = _bp_for_flags(biped_flags) if biped_flags else None
+    # Every slot the record claims.  More than one means the mesh holds several
+    # shapes and the per-shape slot is resolved from its skin weights.
+    _authored_allowed = _bps_for_flags(biped_flags) if biped_flags else None
+    # True when the record names exactly one slot, so it answers outright.
+    _single_slot = _authored_allowed is not None and len(_authored_allowed) == 1
+    # Slot used for whole-file decisions (offset table, body-fill partition).
+    # Filled in after retarget for multi-slot meshes, which need the skin.
+    _slot_for_offset = _authored_bp if _single_slot else None
 
     # Bow bend rig: capture string vertex masks from the Oblivion draw morph
     # BEFORE _walk_node strips the NiGeomMorpherController (see bow_rig.py).
@@ -4975,9 +5020,22 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         if not has_skin and not _is_shield:
             # Non-skinned armor pieces (e.g. Oblivion helmets attached via 'Prn'
             # NiStringExtraData) need a BSDismemberSkinInstance added.
+            #
+            # Bake the ROOT's transform into the verts first, exactly as the
+            # creature path above does: _add_prn_skin writes an IDENTITY bind,
+            # which is only correct once the verts are in bone-local space.
+            # The geometry node's own transform is deliberately NOT baked --
+            # skin_retarget composes it with the Skyrim bone position (a PRN
+            # part is placed by its node, not by its bind matrix).
+            #
+            # A few worn meshes carry neither 'Prn' nor a skin; fall back to
+            # the bone their piece type implies so they still attach instead
+            # of shipping unskinned at Oblivion origin.
+            _fb_bone = _BODY_PART_FALLBACK_PRN_BONE.get(_authored_bp)
             for root in data.roots:
                 if root is not None:
-                    _add_prn_skin(data, root)
+                    _bake_root_transform_into_verts(root)
+                    _add_prn_skin(data, root, fallback_bone=_fb_bone)
             has_skin = _has_skin(data)
 
         if has_skin:
@@ -5000,7 +5058,6 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
     # This applies to body armor, helmets, gauntlets, boots, greaves, clothing —
     # but NOT shields.  Shields use BSFadeNode root + Prn='SHIELD' in Skyrim,
     # just like weapons.  Only _gnd (ground model) variants also get BSFadeNode.
-    _is_shield = 'shield' in nif_basename
     # Creature body parts keep NiNode root + plain NiSkinInstance, exactly
     # like worn armor keeps NiNode (both are skeleton-attached at runtime).
     _is_creature_body = creature and has_skin
@@ -5672,17 +5729,32 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                 if skin is not None:
                     geom_name = bytes(block.name).rstrip(b'\x00').decode(
                         'latin-1', errors='replace')
-                    _regen_skin_partition(block, skin, geom_name)
+                    _regen_skin_partition(block, skin, geom_name,
+                                          authored_body_part=_authored_bp,
+                                          authored_allowed=_authored_allowed)
 
     if not creature and not _is_gnd and _in_armor_dir and has_skin:
         from .skin_retarget import retarget_skin_to_skyrim as _retarget
 
-        # Pre-retarget: classify the piece type early so we can apply fixups.
-        _piece_type = _get_armor_piece_type(src_path)
+        # Which offset/scale table entry fits this piece.  ONE offset applies to
+        # the whole NIF, so a record claiming a SINGLE slot answers it outright.
+        # A multi-slot record (Knight of Order: helmet + torso + legs + feet in
+        # one mesh, flags 0x003D) has no single stated answer, and taking its
+        # head-ward slot lifted the entire suit by the helmet's dz=+7 -- its
+        # Foot shape floated from z -1.3 to +5.9.  Resolve those by where the
+        # mesh's skinned vertex MASS actually sits, which is the rig the artist
+        # authored.  Per-SHAPE slotting is handled separately in retarget.
+        from .skin_retarget import dominant_body_part as _dominant_bp
+        _BP_TO_PIECE = {131: 'helmet', 32: 'cuirass', 44: 'greaves',
+                        33: 'gauntlets', 37: 'boots'}
+        if not _single_slot:
+            _slot_for_offset = _dominant_bp(data, allowed=_authored_allowed)
+        _piece_type = _BP_TO_PIECE.get(_slot_for_offset, 'default')
 
         _prn_block_ids: set = set()
         _retarget(data, src_path=src_path, prn_out=_prn_block_ids,
-                  weight=weight)
+                  weight=weight, authored_body_part=_authored_bp,
+                  authored_allowed=_authored_allowed)
 
         # NOW rename bones to Skyrim names — AFTER skin transforms are correct.
         stats['bones_remapped'] += _remap_bone_names(data)
@@ -5723,9 +5795,10 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         # post-morphing the finished mesh (identical topology contract)
         # Fill partitions get the piece's primary biped slot — the ARMA only
         # renders partitions for slots it claims (a slot-44 pants ARMA culls
-        # a partition-32 fill, leaving invisible skin holes).
-        _fill_bp = {'greaves': 44, 'boots': 37, 'gauntlets': 33}.get(
-            _get_armor_piece_type(src_path), 32)
+        # a partition-32 fill, leaving invisible skin holes).  Same rule as the
+        # offset above: a single-slot record states it, a multi-slot one is
+        # resolved from where the skinned vertex mass sits.
+        _fill_bp = (_authored_bp if _single_slot else _slot_for_offset) or 32
         splice_body_geometry(data, _body_nibs_to_splice, fill_body_part=_fill_bp)
 
     # Bow bend rig: graft the vanilla 7-bone rig + BGED onto converted bows
@@ -6052,13 +6125,18 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # armor rules (dismember skin, NiNode root, skeleton retarget) apply to gear
     # filed outside meshes\armor and meshes\clothes.
     _worn = False
+    _biped_flags = 0
     if wearable_plan is not None and src_meshes_dir is not None and not creature:
         from . import wearable_plan as _wp
         _worn = _wp.is_worn(wearable_plan, src_path, src_meshes_dir)
+        # What the plugin says this mesh IS (head/body/hands/feet/shield), so
+        # the converter never has to guess the slot from the filename.
+        _biped_flags = _wp.biped_flags_for(wearable_plan, src_path,
+                                           src_meshes_dir)
 
     stats = _convert_nif(data, fix_textures=fix_textures,
                          src_path=str(src_path), creature=creature,
-                         worn=_worn)
+                         worn=_worn, biped_flags=_biped_flags)
 
     # Graft the converted Oblivion flame NIF under FlameNode* markers (candle
     # flame / torch fire) — full conversion of Oblivion's own flame visuals,

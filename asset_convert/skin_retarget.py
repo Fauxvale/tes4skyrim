@@ -41,6 +41,12 @@ from .skyrim_overrides import (
     ARMOR_DEFAULT_BODY_PART,
     ARMOR_GEOMETRY_BODY_PARTS,
     OBLIVION_TO_SKYRIM_BONE_MAP,
+    SBP_33_HANDS,
+    SBP_37_FEET,
+    SBP_38_CALVES,
+    SBP_44_LOWERBODY,
+    SBP_32_BODY,
+    SBP_131_HAIR,
 )
 
 # ---------------------------------------------------------------------------
@@ -411,7 +417,13 @@ def _build_parent_map(root):
 
 
 def _get_body_parts_for_geometry(geom_name: str, num_partitions: int) -> list[int]:
-    """Return body_part IDs for BSDismemberSkinInstance, one per partition."""
+    """Return body_part IDs for BSDismemberSkinInstance, one per partition.
+
+    Last resort only: the slot normally comes from the wearing record's BMDT
+    biped flags (wearable_plan.body_part_for_flags), which is authored data.
+    This name match is a guess and is reached only for geometry inside a mesh
+    that no ARMO/CLOT record references.
+    """
     lower = geom_name.lower()
     for keyword, single_bp, multi_bps in ARMOR_GEOMETRY_BODY_PARTS:
         if keyword in lower:
@@ -422,6 +434,161 @@ def _get_body_parts_for_geometry(geom_name: str, num_partitions: int) -> list[in
                 return result[:num_partitions]
             return [single_bp] * num_partitions
     return [ARMOR_DEFAULT_BODY_PART] * num_partitions
+
+
+# Which body region a skeleton bone belongs to.  Matched against the bones a
+# shape is actually WEIGHTED to -- rigging the artist authored, not a name we
+# parse.  Ordered most-distal first so 'Bip01 L Toe0' resolves as foot rather
+# than leg.  Head deliberately excludes Neck: a cuirass collar routinely
+# weights the neck without being headgear.
+_BONE_REGION_RULES = [
+    (('finger', 'hand'), SBP_33_HANDS),
+    (('toe', 'foot'), SBP_37_FEET),
+    (('calf',), SBP_38_CALVES),
+    (('thigh', 'pelvis'), SBP_44_LOWERBODY),
+    (('head',), SBP_131_HAIR),
+    (('spine', 'clavicle', 'neck', 'upperarm', 'forearm'), SBP_32_BODY),
+]
+
+
+def _body_part_from_skin_bones(skin, allowed=None):
+    """Body part implied by the bones a shape is skinned to, or None.
+
+    Used for a mesh whose record claims SEVERAL biped slots at once (Oblivion's
+    Knight of Order armour is one NIF holding helmet, torso, legs and feet, with
+    flags 0x003D).  The record cannot say which shape is which, but the skin
+    weights can: the Helmet shape binds to Bip01 Head alone, LowerBody to
+    thigh/calf/pelvis, Foot to foot/toe.
+
+    *allowed* restricts the answer to the slots the record actually claims, so
+    a torso shape that happens to weight the neck cannot become headgear.
+    Returns None when the weights are ambiguous or say nothing useful.
+    """
+    if skin is None:
+        return None
+    names = []
+    for bone in (skin.bones or []):
+        if bone is None:
+            continue
+        nm = bone.name
+        names.append((nm.decode('latin-1', errors='replace')
+                      if isinstance(nm, bytes) else str(nm)).lower())
+    if not names:
+        return None
+    # Weight each region by how many VERTICES it actually holds, not by whether
+    # the bone appears.  A torso shape lists the head bone (collar verts weight
+    # to the neck/head chain) but almost none of its mass is there, so a plain
+    # presence vote makes every multi-region shape ambiguous -- which sent the
+    # Knight of Order torso, legs and arms to the hair slot.
+    sd = getattr(skin, 'data', None)
+    mass = {}
+    for i, nm in enumerate(names):
+        region = None
+        for keys, bp in _BONE_REGION_RULES:
+            if any(k in nm for k in keys):
+                region = bp
+                break
+        if region is None:
+            continue
+        n_v = 0
+        if sd is not None and i < getattr(sd, 'num_bones', 0):
+            n_v = getattr(sd.bone_list[i], 'num_vertices', 0) or 0
+        mass[region] = mass.get(region, 0) + n_v
+    if allowed is not None:
+        allowed = set(allowed)
+        mass = {k: v for k, v in mass.items() if k in allowed}
+    mass = {k: v for k, v in mass.items() if v > 0}
+    if not mass:
+        return None
+    top = max(mass.values())
+    winners = [k for k, v in mass.items() if v == top]
+    return winners[0] if len(winners) == 1 else None
+
+
+def dominant_body_part(data, allowed=None):
+    """The body part holding most of a NIF's skinned vertex mass, or None.
+
+    For a mesh whose record claims SEVERAL slots at once, ONE offset still has
+    to be chosen for the whole file.  Oblivion's Knight of Order armour is
+    helmet + torso + legs + feet in a single NIF: its head-ward slot (131) is
+    the wrong choice, because the mesh is overwhelmingly a body piece and the
+    helmet's dz=+7 lifted the entire suit off the ground.
+
+    Weighing each shape's skinned vertices by region answers it from the rig
+    the artist authored rather than from the file's name.
+    """
+    mass = {}
+    for root in data.roots:
+        if root is None:
+            continue
+        for block in root.tree():
+            if not isinstance(block, (NifFormat.NiTriShape,
+                                      NifFormat.NiTriStrips)):
+                continue
+            skin = getattr(block, 'skin_instance', None)
+            if skin is None:
+                continue
+            bp = _body_part_from_skin_bones(skin, allowed=allowed)
+            if bp is None:
+                continue
+            gd = block.data
+            n = getattr(gd, 'num_vertices', 0) if gd is not None else 0
+            mass[bp] = mass.get(bp, 0) + (n or 0)
+    if not mass:
+        return None
+    top = max(mass.values())
+    winners = [k for k, v in mass.items() if v == top]
+    return winners[0] if len(winners) == 1 else None
+
+
+def _bake_block_transform(block):
+    """Fold a geometry block's own rotation/translation/scale into its verts.
+
+    Used for rigid PRN pieces, whose shapes all share one attachment frame:
+    the per-shape offset has to live in the vertices so the node can carry the
+    bone position instead.  No-op when the transform is already identity.
+    """
+    M = block.get_transform()          # local, relative to the block's parent
+    if M.is_identity():
+        return
+    gd = block.data
+    if gd is None:
+        return
+    rot = M.get_matrix_33()
+    for v in gd.vertices:
+        nv = v * M
+        v.x, v.y, v.z = nv.x, nv.y, nv.z
+    if getattr(gd, 'has_normals', 0):
+        for n in gd.normals:
+            nn = n * rot
+            n.x, n.y, n.z = nn.x, nn.y, nn.z
+    block.rotation.set_identity()
+    block.scale = 1.0
+    try:
+        gd.update_center_radius()
+    except Exception:
+        pass
+
+
+def _get_body_parts_for_bone(bone_name: str, num_partitions: int):
+    """Body part IDs implied by the bone a rigid PRN piece is skinned to.
+
+    Mirrors the classification in nif_converter._add_prn_skin, which picks the
+    slot from the bone and then had it overwritten here.  Returns None when the
+    bone says nothing useful, so the caller falls back to the geometry name.
+    """
+    lower = (bone_name or '').lower()
+    if 'head' in lower or 'neck' in lower:
+        bp = SBP_131_HAIR       # helmets/hoods ride the hair slot in Skyrim
+    elif 'hand' in lower or 'finger' in lower:
+        bp = SBP_33_HANDS
+    elif 'foot' in lower or 'toe' in lower:
+        bp = SBP_37_FEET
+    elif 'calf' in lower or 'thigh' in lower:
+        bp = SBP_38_CALVES
+    else:
+        return None
+    return [bp] * num_partitions
 
 
 def _resolve_sk_target(name: str, sk_skel: dict) -> tuple:
@@ -485,8 +652,17 @@ def _manual_update_bind_position(block, skin, skel_root):
 # Skin partition regeneration
 # ---------------------------------------------------------------------------
 
-def _regen_skin_partition(block, skin, geom_name: str):
-    """Regenerate NiSkinPartition in Skyrim triangle format."""
+def _regen_skin_partition(block, skin, geom_name: str, bone_name: str | None = None,
+                          authored_body_part: int | None = None,
+                          authored_allowed=None):
+    """Regenerate NiSkinPartition in Skyrim triangle format.
+
+    bone_name : the skin's single bone, for rigid PRN-attached pieces.  Their
+    geometry is named for the ARTWORK ('ArmunAn', 'Plane02'), which matches no
+    keyword in ARMOR_GEOMETRY_BODY_PARTS, so the name lookup silently fell back
+    to SBP_32_BODY -- tagging helmets as torso armour.  The bone the piece is
+    rigid-skinned to states the slot unambiguously, so it wins when present.
+    """
     skin.skin_partition = None
     try:
         block.update_skin_partition(
@@ -502,7 +678,36 @@ def _regen_skin_partition(block, skin, geom_name: str):
     if isinstance(skin, NifFormat.BSDismemberSkinInstance):
         new_n = (skin.skin_partition.num_skin_partition_blocks
                  if skin.skin_partition is not None else 0)
-        body_parts = _get_body_parts_for_geometry(geom_name, max(new_n, 1))
+        n_part = max(new_n, 1)
+        # Slot precedence, all authored data first:
+        #  1. the record claims exactly ONE body slot -> that is the answer for
+        #     every shape, with nothing left to disambiguate.
+        #  2. the record claims SEVERAL (Oblivion's Knight of Order armour is
+        #     one NIF holding helmet + torso + legs + feet, flags 0x003D) ->
+        #     the record cannot say which shape is which, but the SKIN WEIGHTS
+        #     can: its Helmet shape binds to Bip01 Head alone, LowerBody to
+        #     thigh/calf/pelvis.  Restricted to the slots the record claims.
+        #  3. a rigid PRN piece hangs off one bone, which states the slot.
+        #  4. nothing authored is available (no record names this mesh) ->
+        #     fall back to the geometry-name guess.
+        body_parts = None
+        if authored_body_part is not None:
+            if authored_allowed and len(authored_allowed) > 1:
+                bp = _body_part_from_skin_bones(skin, allowed=authored_allowed)
+                if bp is not None:
+                    body_parts = [bp] * n_part
+            else:
+                body_parts = [authored_body_part] * n_part
+        # The record still outranks the PRN bone: a ring hangs off a FINGER
+        # bone, which the bone rules read as hands (33), but vanilla Skyrim
+        # partitions rings as 36 and amulets as 40.  Only consult the bone when
+        # nothing was authored.
+        if body_parts is None and authored_body_part is not None:
+            body_parts = [authored_body_part] * n_part
+        if body_parts is None and bone_name:
+            body_parts = _get_body_parts_for_bone(bone_name, n_part)
+        if body_parts is None:
+            body_parts = _get_body_parts_for_geometry(geom_name, n_part)
         skin.num_partitions = new_n
         skin.partitions.update_size()
         for pi in range(new_n):
@@ -1165,7 +1370,9 @@ def _deform_vertices_animation_fk(skinned_geoms, skel_root, bone_deltas):
 # ---------------------------------------------------------------------------
 
 def retarget_skin_to_skyrim(data, src_path: str = '', prn_out: set | None = None,
-                            allow_wrap: bool = True, weight: int = 0) -> int:
+                            allow_wrap: bool = True, weight: int = 0,
+                            authored_body_part: int | None = None,
+                            authored_allowed=None) -> int:
     """Retarget skinned armor from Oblivion skeleton to Skyrim skeleton.
 
     Called BEFORE _remap_bone_names() — bones still have Oblivion names.
@@ -1356,17 +1563,42 @@ def retarget_skin_to_skyrim(data, src_path: str = '', prn_out: set | None = None
             if prn_bone_name:
                 sk_name, W_sk = _resolve_sk_target(prn_bone_name, sk_skel)
                 if sk_name is not None:
+                    # A PRN piece hangs off ONE bone: in Oblivion the whole
+                    # piece is parented to it, and each shape's node transform
+                    # is an offset WITHIN the piece, not a second attachment
+                    # point.  So the bone position belongs on every shape
+                    # equally, and the shape's own offset has to survive it.
+                    #
+                    # Overwriting the node outright dropped that offset --
+                    # Armun-An Bonemold (node y=+2.8567) landed 3.33 units
+                    # behind the skull once the PRN sy=1.165 scale amplified
+                    # it.  ADDING the bone position instead is only right for a
+                    # single-shape piece: with two shapes it offsets them
+                    # against each other, which split the Imperial Legion helm
+                    # (Helmet:0 at origin, 'default' at x=-1.6) into a centred
+                    # half and a shifted half.
+                    #
+                    # Bake the shape's own transform into its verts, then give
+                    # every shape the same bone frame.  Rigid skinning ignores
+                    # node transforms at render time anyway; the identity bind
+                    # written by _add_prn_skin needs the verts to carry it.
+                    _bake_block_transform(block)
                     bone_pos = W_sk[3, :3]
                     block.translation.x = float(bone_pos[0])
                     block.translation.y = float(bone_pos[1])
                     block.translation.z = float(bone_pos[2])
             _manual_update_bind_position(block, skin, skel_root)
-            _regen_skin_partition(block, skin, geom_name)
+            _regen_skin_partition(block, skin, geom_name,
+                                  bone_name=prn_bone_name,
+                                  authored_body_part=authored_body_part,
+                                  authored_allowed=authored_allowed)
             count += 1
             continue
 
         _manual_update_bind_position(block, skin, skel_root)
-        _regen_skin_partition(block, skin, geom_name)
+        _regen_skin_partition(block, skin, geom_name,
+                              authored_body_part=authored_body_part,
+                              authored_allowed=authored_allowed)
         count += 1
 
     return count

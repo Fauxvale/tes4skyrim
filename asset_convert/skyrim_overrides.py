@@ -116,8 +116,13 @@ SBP_131_HAIR     = 131  # Hair / headwear (helmets, hoods, circlets)
 # multi_block_bps is used when the geometry has exactly 2 partition blocks;
 # it should list the most anatomically accurate part for each block.
 ARMOR_GEOMETRY_BODY_PARTS: list[tuple[str, int, list[int] | None]] = [
+    # Matched in order, first hit wins -- headwear MUST precede the 'arm'
+    # entry below, which otherwise swallows any name containing those three
+    # letters ('ArmunAn' helm -> torso).  'helm' (not 'helmet') is the right
+    # stem: vanilla-style geometry is named helm1/helm_visor, never 'helmet'.
     ('head',      SBP_131_HAIR,    None),   # headwear (helmets, hoods)
-    ('helmet',    SBP_131_HAIR,    None),   # helmets → hair slot
+    ('helm',      SBP_131_HAIR,    None),   # helm1, helmet, helm_visor → hair slot
+    ('visor',     SBP_131_HAIR,    None),   # visor sub-piece of a helm
     ('hood',      SBP_131_HAIR,    None),
     ('upperbody', SBP_32_BODY,     None),
     ('torso',     SBP_32_BODY,     None),
@@ -228,7 +233,9 @@ ARMOR_GND_INV_MARKER_ZOOM  = 1.0
 # body skin) in Skyrim skeleton space.
 # Positive Z = up, positive Y = forward (into screen from front view), positive X = right.
 # Applied order: per-axis scale → pull → rotate → translate, then bind matrices recomputed.
-# Piece type is detected from the NIF filename in nif_converter._get_armor_piece_type().
+# Piece type comes from the wearing record's BMDT biped flags; a mesh whose
+# record claims several slots is resolved by where its skinned vertex mass
+# sits (skin_retarget.dominant_body_part).  Never from the filename.
 # ---------------------------------------------------------------------------
 
 

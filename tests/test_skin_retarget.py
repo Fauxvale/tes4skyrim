@@ -1060,3 +1060,101 @@ class TestMeshContinuity:
         assert not holes, (
             f"Boots has {len(holes)} seam hole(s):\n" + "\n".join(holes[:10])
         )
+
+
+# ---------------------------------------------------------------------------
+# PRN-attached rigid armor: authored node offset + biped slot
+# ---------------------------------------------------------------------------
+# Regression for the Morroblivion Armun-An Bonemold Helm, which sat ~3.3 units
+# behind the skull.  Two independent defects, both fixed:
+#   1. retarget OVERWROTE the geometry node's translation with the Skyrim bone
+#      position, discarding the offset the mesh was authored with (Armun-An's
+#      geometry node carries y=+2.8567).  A PRN piece is rigid-skinned with an
+#      IDENTITY bind, so that node transform is the ONLY thing positioning it.
+#   2. the partition body_part came from the geometry NAME ('ArmunAn'), which
+#      matched the 'arm' keyword and tagged a helmet as torso armour (slot 32).
+def test_get_body_parts_for_bone_head_is_hair_slot():
+    """A piece rigid-skinned to the head bone claims the hair slot, not torso."""
+    from asset_convert.skin_retarget import _get_body_parts_for_bone
+    assert _get_body_parts_for_bone('Bip01 Head', 1) == [131]
+    assert _get_body_parts_for_bone('NPC Head [Head]', 2) == [131, 131]
+    # A bone that implies nothing defers to the geometry-name lookup.
+    assert _get_body_parts_for_bone('Bip01 Spine2', 1) is None
+
+
+def test_headwear_geometry_keywords_beat_arm():
+    """'ArmunAn'/'helm1' must not fall through to the torso slot.
+
+    ARMOR_GEOMETRY_BODY_PARTS is matched in order and 'arm' is a substring of
+    'ArmunAn', so the headwear entries have to come first.  This lookup is the
+    last resort, reached only for meshes no ARMO/CLOT record names — anything
+    a record wears is slotted from its BMDT flags instead.
+    """
+    from asset_convert.skin_retarget import _get_body_parts_for_geometry
+    assert _get_body_parts_for_geometry('helm1', 1) == [131]
+    assert _get_body_parts_for_geometry('visor', 1) == [131]
+    assert _get_body_parts_for_geometry('greave', 1) == [44]
+    # Artwork names match nothing and get the torso default.
+    assert _get_body_parts_for_geometry('Plane02', 1) == [32]
+
+
+def test_biped_bit_meanings_match_xedit():
+    """BMDT bit -> slot, pinned to xEdit's wbBipedFlags (wbDefinitionsTES4.pas).
+
+    Bits 6/7 are Right/Left RING and bit 8 is AMULET -- tail is bit 15, not 8.
+    Getting 8 wrong put the Amulet of Kings on the torso slot.  Ring 36 and
+    amulet 40 are measured from vanilla goldring_1.nif / amulet.nif.
+    """
+    from asset_convert.wearable_plan import body_part_for_flags
+    assert body_part_for_flags(1 << 6) == 36    # Right Ring
+    assert body_part_for_flags(1 << 7) == 36    # Left Ring
+    assert body_part_for_flags(1 << 8) == 40    # Amulet
+    assert body_part_for_flags(1 << 15) is None  # Tail is not a body slot
+    assert body_part_for_flags(1 << 13) is None  # Shield is not a body slot
+
+
+def test_authored_biped_flags_decide_the_slot():
+    """The wearing record's BMDT flags outrank every filename/geometry guess.
+
+    Slot used to come from the NIF filename stem and the geometry name, both
+    heuristics: 'towersheild.nif' (misspelled) escaped the shield check, and
+    'ArmunAn' matched the 'arm' keyword and tagged a helmet as torso armour.
+    """
+    from asset_convert.wearable_plan import body_part_for_flags
+    assert body_part_for_flags(0x0002) == 131   # bit 1 Head  -> hair slot
+    assert body_part_for_flags(0x0004) == 32    # bit 2 UpperBody
+    assert body_part_for_flags(0x0010) == 33    # bit 4 Hand
+    assert body_part_for_flags(0x0020) == 37    # bit 5 Foot
+    # Shield (bit 13) is not a body slot at all -- it must not become one.
+    assert body_part_for_flags(0x2000) is None
+    # No flags -> nothing authored, caller falls back to inspecting the mesh.
+    assert body_part_for_flags(0) is None
+
+
+def test_bake_block_transform_folds_offset_into_verts():
+    """A PRN piece's shapes share ONE bone frame; per-shape offsets go to verts.
+
+    Regression for the Imperial Legion helm, whose two shapes ('Helmet:0' at
+    the origin, 'default' at x=-1.6) rendered as a centred half plus a shifted
+    half once the bone position was ADDED to each shape's own translation.
+    """
+    from asset_convert.skin_retarget import _bake_block_transform
+    shape = NifFormat.NiTriShape()
+    shape.translation.x, shape.translation.y, shape.translation.z = -1.6, 0.0, 0.0
+    data_blk = NifFormat.NiTriShapeData()
+    data_blk.num_vertices = 1
+    data_blk.has_vertices = True
+    data_blk.vertices.update_size()
+    data_blk.vertices[0].x = 2.0
+    data_blk.vertices[0].y = 3.0
+    data_blk.vertices[0].z = 4.0
+    shape.data = data_blk
+
+    _bake_block_transform(shape)
+
+    # The -1.6 now lives in the vertex, and the node no longer carries a scale
+    # or rotation of its own -- it is free to hold the bone position verbatim.
+    assert data_blk.vertices[0].x == pytest.approx(0.4)
+    assert data_blk.vertices[0].y == pytest.approx(3.0)
+    assert data_blk.vertices[0].z == pytest.approx(4.0)
+    assert shape.scale == pytest.approx(1.0)

@@ -37,6 +37,47 @@ W0 = 2          # <name>_0.nif
 W1 = 4          # <name>_1.nif
 WORN = 8        # named as an ARMA worn (biped) model by some ARMO/CLOT record
 
+# TES4 BMDT biped bit -> the Skyrim body part the geometry belongs in.  This is
+# the plugin's OWN statement of what the item is, so it replaces guessing the
+# slot from the filename ('helm' in the stem) or from the geometry name.
+# Bit 0 Head, 1 Hair, 2 UpperBody, 3 LowerBody, 4 Hand, 5 Foot.
+_SBP_131_HAIR = 131
+_SBP_32_BODY = 32
+_SBP_44_LOWERBODY = 44
+_SBP_33_HANDS = 33
+_SBP_37_FEET = 37
+_SBP_36_RING = 36
+_SBP_40_NECK = 40
+_BIPED_BIT_BODY_PART = [
+    (0, _SBP_131_HAIR),        # Head  -> helmets ride Skyrim's hair slot
+    (1, _SBP_131_HAIR),        # Hair
+    (2, _SBP_32_BODY),
+    (3, _SBP_44_LOWERBODY),
+    (4, _SBP_33_HANDS),
+    (5, _SBP_37_FEET),
+    # Jewellery.  Bit meanings per xEdit wbBipedFlags (wbDefinitionsTES4.pas):
+    # 6 Right Ring, 7 Left Ring, 8 Amulet -- NOT 7=amulet/8=tail (tail is 15).
+    # Slots measured from vanilla Skyrim: goldring_1.nif partitions as 36,
+    # amulet.nif as 40.  Listed last so a ring that also claims a body slot is
+    # still slotted by the body one.
+    (6, _SBP_36_RING),         # Right Ring
+    (7, _SBP_36_RING),         # Left Ring
+    (8, _SBP_40_NECK),         # Amulet
+]
+
+
+def body_part_for_flags(biped_flags: int):
+    """Skyrim body part implied by a record's BMDT biped flags, or None.
+
+    Head/Hair win when set: a helmet that also claims UpperBody is still
+    headgear.  None means the flags say nothing useful and the caller should
+    fall back to inspecting the mesh.
+    """
+    for bit, bp in _BIPED_BIT_BODY_PART:
+        if biped_flags & (1 << bit):
+            return bp
+    return None
+
 
 def _norm(path: str) -> str:
     """Normalise an export model path to a lowercase mesh-relative key.
@@ -65,6 +106,70 @@ def _iter_records(txt: Path):
             rec[k] = v
         if rec:
             yield rec
+
+
+def build_biped_flags(export_dir) -> dict:
+    """Map mesh-relative NIF path -> the BMDT biped flags of the record wearing it.
+
+    The authored answer to 'what slot is this?', which the converter previously
+    guessed from the filename stem.  A mesh worn by several records ORs their
+    flags together; in practice they agree.
+    """
+    export_dir = Path(export_dir)
+    flags: dict = {}
+    for name in ('ARMO.txt', 'CLOT.txt'):
+        for rec in _iter_records(export_dir / name):
+            try:
+                bf = int(rec.get('BMDT.BipedFlags', '0') or 0)
+            except ValueError:
+                continue
+            if not bf:
+                continue
+            for key in ('Male.BipedModel.MODL', 'Female.BipedModel.MODL'):
+                mp = rec.get(key, '').strip()
+                if mp:
+                    k = _norm(mp)
+                    flags[k] = flags.get(k, 0) | bf
+    return flags
+
+
+# Key under which build_plan stashes the biped-flag map inside the plan dict.
+# _norm() lowercases and strips leading '/', so it can never emit this string —
+# the sub-map cannot collide with a real mesh entry.
+BIPED_FLAGS_KEY = '*biped_flags*'
+
+
+def biped_flags_for(plan: dict, src_path, meshes_root) -> int:
+    """BMDT biped flags for a source NIF, or 0 when no record wears it.
+
+    Accepts the plan dict returned by build_plan (the flag map rides along
+    under BIPED_FLAGS_KEY) or a bare flag map.
+    """
+    if not plan:
+        return 0
+    flags = plan.get(BIPED_FLAGS_KEY)
+    if not isinstance(flags, dict):
+        flags = plan
+    try:
+        rel = os.path.relpath(str(src_path), str(meshes_root))
+    except (ValueError, TypeError):
+        return 0
+    val = flags.get(_norm(rel), 0)
+    return val if isinstance(val, int) else 0
+
+
+def body_parts_for_flags(biped_flags: int) -> list:
+    """EVERY Skyrim body part a record's BMDT flags claim.
+
+    body_part_for_flags returns the single most head-ward one; this returns the
+    whole set, which is what a mesh holding several shapes needs to be resolved
+    against (see skin_retarget._body_part_from_skin_bones).
+    """
+    out = []
+    for bit, bp in _BIPED_BIT_BODY_PART:
+        if biped_flags & (1 << bit) and bp not in out:
+            out.append(bp)
+    return out
 
 
 def build_plan(export_dir) -> dict:
@@ -109,6 +214,9 @@ def build_plan(export_dir) -> dict:
             want(male_world or male_biped or female_world or female_biped, BASE)
             want(female_world, BASE)
 
+    # Carry the authored slot data alongside, so callers that need to know what
+    # a mesh IS (not just which variants to write) do not re-parse the export.
+    plan[BIPED_FLAGS_KEY] = build_biped_flags(export_dir)
     return plan
 
 
