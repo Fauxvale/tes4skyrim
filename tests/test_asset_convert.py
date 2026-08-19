@@ -2612,6 +2612,114 @@ class TestControllerComputeScaledTime:
 
 
 # ---------------------------------------------------------------------------
+# Ambient (self-playing) sequences: AutoPlay/AutoLoop pair + accum-root pose
+# ---------------------------------------------------------------------------
+
+_ARENA_SPECTATOR = 'architecture/arena/arenaspectatorm01.nif'
+_LOAD_DOOR_ACCUM = 'architecture/bravil/bravilloaddoorlowerint01.nif'
+
+
+def _read_nif(path):
+    import time
+    if not hasattr(time, '_original_clock'):
+        time.clock = time.perf_counter
+    from pyffi.formats.nif import NifFormat as NF
+    d = NF.Data()
+    with open(str(path), 'rb') as f:
+        d.read(f)
+    return NF, d
+
+
+class TestAmbientSequences:
+    """The arena crowd: read out of the live engine 2026-08-18 (see
+    docs/nif_conversion_notes.md, 'Ambient (self-playing) meshes')."""
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_idle_becomes_autoloop_loop_plus_autoplay_clamp(self, tmp_path):
+        src = EXPORT_MESHES / _ARENA_SPECTATOR
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'meshes' / 'tes4' / 'arena' / 'arenaspectatorm01.nif'
+        dst.parent.mkdir(parents=True)
+        convert_nif(str(src), str(dst))
+        NF, d = _read_nif(dst)
+        seqs = {bytes(b.name).decode('latin-1'): b for b in d.blocks
+                if isinstance(b, NF.NiControllerSequence)}
+        assert set(seqs) == {'AutoLoop', 'AutoPlay'}, list(seqs)
+        # CycleType: 0 LOOP, 2 CLAMP.  The authored Idle is LOOP and stays so;
+        # the AutoPlay intro must END for the graph to hand off to AutoLoop.
+        assert int(seqs['AutoLoop'].cycle_type) == 0
+        assert int(seqs['AutoPlay'].cycle_type) == 2
+        assert seqs['AutoPlay'].num_controlled_blocks == seqs['AutoLoop'].num_controlled_blocks
+        bged = [b for b in d.blocks if type(b).__name__ == 'BSBehaviorGraphExtraData']
+        assert bged and b'Autoplay.hkx' in bytes(bged[0].behaviour_graph_file)
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_transferred_accum_root_pose_stays_identity(self, tmp_path):
+        """Bip01's identity pose is REAL: 'Bip01 NonAccum' carries the 82.5 deg
+        / 64-unit transform, so sentinelling Bip01's rotation doubled it."""
+        src = EXPORT_MESHES / _ARENA_SPECTATOR
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+        NF, d = _read_nif(dst)
+        for seq in (b for b in d.blocks if isinstance(b, NF.NiControllerSequence)):
+            cb = next(c for c in seq.controlled_blocks if bytes(c.node_name) == b'Bip01')
+            it = cb.interpolator
+            assert it.data is None
+            assert (it.translation.x, it.translation.y, it.translation.z) == (0.0, 0.0, 0.0)
+            assert (round(it.rotation.w, 3), it.rotation.x, it.rotation.y, it.rotation.z) == (1.0, 0.0, 0.0, 0.0)
+            assert it.scale == 1.0
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_transferred_door_accum_root_pose_stays_identity(self, tmp_path):
+        """Load door whose accum root sits at (0,-42.7,12)/90 deg with NonAccum
+        carrying that transform: the identity must be applied, not sentinelled."""
+        src = EXPORT_MESHES / _LOAD_DOOR_ACCUM
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+        NF, d = _read_nif(dst)
+        for seq in (b for b in d.blocks if isinstance(b, NF.NiControllerSequence)):
+            cb = next(c for c in seq.controlled_blocks if bytes(c.node_name) == b'DoorLowerINT01')
+            it = cb.interpolator
+            assert round(it.rotation.w, 3) == 1.0 and it.scale == 1.0,                 'accum-root rotation sentinelled -> door rotation doubles'
+
+
+_PALACE_FONT = 'architecture/palace/interior/palacefont01.nif'
+
+
+class TestSharedPropertyFanOut:
+    """Oblivion shares one NiTexturingProperty between shapes; a sequence entry
+    names one shape but scrolls all of them.  Every wearing shape must get its
+    own entry + controller (the Font of Madness's upper tier, 2026-08-18)."""
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_every_water_shape_is_driven(self, tmp_path):
+        src = EXPORT_MESHES / _PALACE_FONT
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+        NF, d = _read_nif(dst)
+        water = ['Water', 'Water02', 'Water03', 'Water04', 'WaterFoam01',
+                 'PalaceWaterL1', 'PalaceWaterR1', 'PalaceWaterL2',
+                 'PalaceWaterR02', 'PalaceWaterFoam01']
+        for seq in (b for b in d.blocks if isinstance(b, NF.NiControllerSequence)):
+            named = {bytes(cb.node_name).decode('latin-1') for cb in seq.controlled_blocks}
+            assert set(water) <= named, (seq.name, sorted(set(water) - named))
+        # ...and each shape's own shader carries its own (targeted) controller.
+        for b in d.blocks:
+            if isinstance(b, NF.NiTriShape) and bytes(b.name).decode('latin-1') in water:
+                shader = next(p for p in b.bs_properties if p is not None
+                              and 'ShaderProperty' in type(p).__name__)
+                c = shader.controller
+                assert c is not None and c.target is shader, bytes(b.name)
+
+
+# ---------------------------------------------------------------------------
 # Shader-property controller targets (NULL target = CTD on cell load)
 # ---------------------------------------------------------------------------
 

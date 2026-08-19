@@ -36,6 +36,17 @@ def convert_STAT(rec: dict) -> bytes:
     (every swinging inn sign, e.g. SignBraidwoodInn01, MSTT DATA=0) or ACTI
     (TrapBoneAlarmHavok01).  The FormID is unchanged, so placed REFRs keep
     resolving.
+
+    Do NOT extend this to "the mesh has an animation graph".  That was tried on
+    2026-08-18 and reverted: promoting every BGED-bearing STAT moved 107
+    Oblivion bases / 4,568 placed refs and crashed the game on save load with a
+    null TESObjectREFR in the ExtraPromotedRef / QueuedPromoteQuestTask path
+    (SKChamberSecretDoor, NightMotherBaseRef).
+
+    The premise was wrong anyway: 94 vanilla STATs DO carry a BGED, including
+    self-animating scenery (WRJovaskrBanner02 -> IdleRandomized.hkx,
+    PowShrine01, SFarmhouseMill).  A STAT can host an animation graph, so the
+    record type is not what stops an animation from playing.
     """
     flags = get_int(rec, 'RecordFlags')
     # Resolve OBND from converted mesh bounds (or type default as fallback).

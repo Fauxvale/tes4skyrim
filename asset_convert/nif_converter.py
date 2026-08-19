@@ -1808,6 +1808,203 @@ def _iter_controllers(mgr):
                 yield c
 
 
+_NO_VALUE = -3.4028234663852886e+38   # Gamebryo's "channel has no value"
+
+
+def _accum_root_mode(seq, root, resolve_name):
+    """How the sequence's accum-root controlled block must be converted.
+
+    Oblivion's exporter writes the accum root's entry as the ROOT-MOTION
+    placeholder -- an IDENTITY pose (census of all 464 Oblivion non-creature
+    NIFs with sequences: 853 accum-root entries, 815 data-less identity poses,
+    38 with never-varying keys, 0 that move) -- and moves the node's real
+    transform onto the "<accum> NonAccum" child (as a pose on doors, as key 0
+    on keyed nodes: sesacellumgate01's NonAccum keys start at MetalGate's
+    authored (-7,-16.2,37.9); bravilloaddoorlowerint01's NonAccum pose is
+    (0,-42.7,12) with rotation keys starting at the root's 90 deg).  Both
+    engines apply the identity, and NonAccum restores the world pose.  Playing
+    the identity is therefore CORRECT for those ('transferred') and the entry
+    must be left exactly as authored -- sentinelling its rotation, as the
+    generic data-less rule below does, doubles the door's authored rotation.
+
+    The arena spectators are exactly this: Bip01 (the actor rig's 82.5 deg Z
+    rotation, 64 units up) has the identity pose and "Bip01 NonAccum" key 0 is
+    (-0.34,-1.64,64.07) at 82.6 deg.  Sentinelling Bip01's rotation left the
+    authored 82.5 deg in place while NonAccum re-applied its own -- the crowd
+    faced 165 deg off whenever the sequence played ("rotated 90 degrees").
+    Patched in the live engine (2026-08-18): with Bip01's pose left as the
+    valid identity, Bip01 read back as identity, NonAccum as
+    (-0.34,-1.64,~64)/82.5 deg, and the crowd sat at its authored pose.
+
+    Every one of the 195 non-identity accum roots in Oblivion.esm is
+    'transferred'.  'orphan' (nothing carries the transform, so applying the
+    identity would collapse the node) is defensive, for plugins whose exporter
+    did not follow the convention: every channel is sentinelled so the node
+    keeps its authored transform.
+
+    Returns 'transferred', 'orphan', or None (no accum root, or one whose
+    authored transform is identity, where the pose is a no-op either way).
+    """
+    accum = getattr(seq, 'target_name', b'') or b''
+    if isinstance(accum, str):
+        accum = accum.encode('latin-1')
+    accum = bytes(accum)
+    if not accum:
+        return None
+    anode = None
+    for b in root.tree():
+        nm = getattr(b, 'name', None)
+        if nm is not None and bytes(nm) == accum and hasattr(b, 'translation'):
+            anode = b
+            break
+    if anode is None:
+        return None
+    t = anode.translation
+    m = anode.rotation
+    root_t = (t.x, t.y, t.z)
+    rot_identity = (abs(m.m_11 - 1) < 1e-3 and abs(m.m_22 - 1) < 1e-3
+                    and abs(m.m_33 - 1) < 1e-3)
+    root_moved = max(abs(v) for v in root_t) >= 0.05
+    if not root_moved and rot_identity:
+        return None
+    # The NonAccum child's ANIMATED transform in this sequence.
+    na_name = accum + b' NonAccum'
+    na_t = None
+    na_rot_animated = False
+    for cb in seq.controlled_blocks:
+        nm = resolve_name(cb, seq, 'node_name')
+        nm = nm.encode('latin-1') if isinstance(nm, str) else bytes(nm or b'')
+        if nm != na_name:
+            continue
+        it = cb.interpolator
+        if it is None or not hasattr(it, 'rotation'):
+            continue
+        d = getattr(it, 'data', None)
+        if d is not None and d.translations.num_keys:
+            k = d.translations.keys[0].value
+            na_t = (k.x, k.y, k.z)
+        elif it.translation.x > _NO_VALUE:
+            na_t = (it.translation.x, it.translation.y, it.translation.z)
+        if d is not None and (getattr(d, 'num_rotation_keys', 0) or
+                              any(g.num_keys for g in d.xyz_rotations)):
+            na_rot_animated = True
+        elif it.rotation.w > _NO_VALUE:
+            na_rot_animated = True
+        break
+    if root_moved:
+        if (na_t is not None and
+                max(abs(a - b) for a, b in zip(na_t, root_t)) < 1.0):
+            return 'transferred'
+        return 'orphan'
+    # Root at the origin but rotated: transferred iff NonAccum animates a
+    # rotation at all (the identity pose then only zeroes what NonAccum
+    # re-applies).
+    return 'transferred' if na_rot_animated else 'orphan'
+
+
+def _property_ctrl_index(root):
+    """id(property controller) -> [geometry names wearing that property].
+
+    Oblivion shares one NiTexturingProperty / NiMaterialProperty block between
+    several shapes, and a sequence entry names only ONE of them: palacefont01's
+    'Water' entry drives NiTexturingProperty #71, which Water03, PalaceWaterL2
+    and PalaceWaterR02 also wear, so in TES4 one entry scrolls all four (the
+    fountain's upper tier).  Skyrim gives every converted shape its own
+    BS*ShaderProperty, so the retargeted entry must be fanned out to one
+    entry (and one controller) per sharing shape or the siblings stay frozen
+    -- the upper tier of the Font of Madness after the first conversion.
+    Built once per manager (one tree walk), looked up per entry.
+    """
+    index = {}
+    for blk in root.tree():
+        if not hasattr(blk, 'properties') or not hasattr(blk, 'data'):
+            continue           # geometry only (NiGeometry / NiParticleSystem)
+        nm = bytes(getattr(blk, 'name', b'') or b'')
+        if not nm:
+            continue
+        for prop in blk.properties or ():
+            if prop is None:
+                continue
+            c = getattr(prop, 'controller', None)
+            while c is not None:
+                lst = index.setdefault(id(c), [])
+                if nm not in lst:
+                    lst.append(nm)
+                c = getattr(c, 'next_controller', None)
+    return index
+
+
+def _shapes_sharing_property_ctrl(index, src_ctrl, own_name):
+    """Names of the OTHER geometries whose Oblivion property carries *src_ctrl*."""
+    return [nm for nm in index.get(id(src_ctrl), ()) if nm != own_name]
+
+
+def _fan_out_shared_entries(seq, extras):
+    """Append one controlled block per (source entry, sibling name) pair.
+
+    The controller and interpolator are cloned per sibling (each shape's own
+    shader gets its own controller, as vanilla does); the key DATA is shared.
+    """
+    if not extras:
+        return 0
+    have = set()
+    for cb in seq.controlled_blocks:
+        have.add((bytes(cb.node_name or b''), cb.controller.__class__.__name__,
+                  getattr(cb.controller, 'type_of_controlled_variable', None),
+                  getattr(cb.controller, 'type_of_controlled_color', None)))
+    added = 0
+    for src_cb, sib in extras:
+        sc = src_cb.controller
+        sig = (sib, sc.__class__.__name__,
+               getattr(sc, 'type_of_controlled_variable', None),
+               getattr(sc, 'type_of_controlled_color', None))
+        if sig in have:
+            continue
+        have.add(sig)
+        names = list(src_cb._get_names())
+        seq.num_controlled_blocks += 1
+        seq.controlled_blocks.update_size()
+        cb = seq.controlled_blocks[seq.num_controlled_blocks - 1]
+        for m in names:
+            setattr(cb, m, getattr(src_cb, m))
+        cb.node_name = sib
+        for off in ('node_name_offset', 'property_type_offset',
+                    'controller_type_offset', 'variable_1_offset',
+                    'variable_2_offset'):
+            if hasattr(cb, off):
+                try:
+                    setattr(cb, off, -1)
+                except Exception:
+                    pass
+        # Clone the controller (same class, same public fields + the private
+        # re-stamp markers _match_seq_shader_types reads).
+        c2 = sc.__class__()
+        for m in sc._get_names():
+            try:
+                setattr(c2, m, getattr(sc, m))
+            except Exception:
+                pass
+        for priv in ('_tt_operation', '_alpha_ctrl', '_is_color_ctrl'):
+            if hasattr(sc, priv):
+                setattr(c2, priv, getattr(sc, priv))
+        c2.next_controller = None
+        c2.target = None
+        # Clone the interpolator (key data shared).
+        it = src_cb.interpolator
+        if it is not None:
+            i2 = it.__class__()
+            for m in it._get_names():
+                try:
+                    setattr(i2, m, getattr(it, m))
+                except Exception:
+                    pass
+            c2.interpolator = i2
+            cb.interpolator = i2
+        cb.controller = c2
+        added += 1
+    return added
+
+
 def _process_controller_manager(node, palette):
     """Strip unsupported NiControllerManager sequences.
 
@@ -1841,8 +2038,15 @@ def _process_controller_manager(node, palette):
         return _palette_lookup(_palette_bytes(getattr(seq, 'string_palette', None)),
                                getattr(blk, attr + '_offset', None))
 
+    prop_index = None      # id(property ctrl) -> shapes; built on first use
     for seq in mgr.controller_sequences:
+        accum_mode = _accum_root_mode(seq, node, _resolve_name)
+        accum_name = getattr(seq, 'target_name', b'') or b''
+        if isinstance(accum_name, str):
+            accum_name = accum_name.encode('latin-1')
+        accum_name = bytes(accum_name)
         key = 0
+        shared_extras = []     # (retargeted entry, sibling shape name)
         while key < seq.num_controlled_blocks:
             blk = seq.controlled_blocks[key]
             node_name = _resolve_name(blk, seq, 'node_name')
@@ -1898,15 +2102,40 @@ def _process_controller_manager(node, palette):
             #
             # The root-named entry is still dropped above: 0 vanilla sequences
             # target their own root node.
+            #
+            # The sequence's ACCUM ROOT is the exception, both ways -- see
+            # _accum_root_mode.  'transferred' (NonAccum carries the node's
+            # transform): the exporter's identity pose is what both engines
+            # play, so leave the entry exactly as authored -- sentinelling its
+            # rotation would double the door's authored rotation (the arena
+            # crowd's "rotated 90 degrees").  'orphan' (nothing carries the
+            # transform): sentinel EVERY channel so the node keeps its
+            # authored transform; a keyless NiTransformData is dropped first
+            # so the sentinel applies.
             if isinstance(blk.interpolator, NifFormat.NiTransformInterpolator):
                 interp = blk.interpolator
-                if interp.data is None:
-                    _NO_VALUE = -3.4028234663852886e+38
-                    interp.rotation.w = _NO_VALUE
-                    interp.rotation.x = _NO_VALUE
-                    interp.rotation.y = _NO_VALUE
-                    interp.rotation.z = _NO_VALUE
-                    interp.scale = _NO_VALUE
+                _nn = node_name.encode('latin-1') if isinstance(node_name, str) else bytes(node_name or b'')
+                is_accum_root = bool(_nn) and _nn == accum_name
+                if is_accum_root and accum_mode == 'transferred':
+                    pass
+                else:
+                    if is_accum_root and interp.data is not None:
+                        _d = interp.data
+                        if (getattr(_d, 'num_rotation_keys', 0) == 0 and
+                                _d.translations.num_keys == 0 and
+                                _d.scales.num_keys == 0 and
+                                all(g.num_keys == 0 for g in _d.xyz_rotations)):
+                            interp.data = None
+                    if interp.data is None:
+                        interp.rotation.w = _NO_VALUE
+                        interp.rotation.x = _NO_VALUE
+                        interp.rotation.y = _NO_VALUE
+                        interp.rotation.z = _NO_VALUE
+                        interp.scale = _NO_VALUE
+                        if is_accum_root and accum_mode == 'orphan':
+                            interp.translation.x = _NO_VALUE
+                            interp.translation.y = _NO_VALUE
+                            interp.translation.z = _NO_VALUE
 
             # Morph controllers do not exist in Skyrim (the SSE exe has no
             # NiGeomMorpherController RTTI class at all; vanilla ships 0) --
@@ -1967,6 +2196,10 @@ def _process_controller_manager(node, palette):
                     new._is_color_ctrl = True     # for _match_seq_shader_types
                     blk.controller = new
                     blk.controller_type = b'BSLightingShaderPropertyColorController'
+                    if prop_index is None:
+                        prop_index = _property_ctrl_index(node)
+                    for sib in _shapes_sharing_property_ctrl(prop_index, src_ctrl, node_name):
+                        shared_extras.append((blk, sib))
                     key += 1
                     continue
                 seq.controlled_blocks.pop(key)
@@ -2035,6 +2268,12 @@ def _process_controller_manager(node, palette):
                     new._tt_operation = op       # remembered for that pass
                     blk.controller = new
                     blk.controller_type = b'BSLightingShaderPropertyFloatController'
+                    # One entry per shape that WORE the shared source property
+                    # (see _shapes_sharing_property_ctrl).
+                    if prop_index is None:
+                        prop_index = _property_ctrl_index(node)
+                    for sib in _shapes_sharing_property_ctrl(prop_index, src_ctrl, node_name):
+                        shared_extras.append((blk, sib))
                     key += 1
                     continue
                 # TT_ROTATE has no Skyrim equivalent -- drop the entry.
@@ -2066,6 +2305,10 @@ def _process_controller_manager(node, palette):
                     new._alpha_ctrl = True       # for _match_seq_shader_types
                     blk.controller = new
                     blk.controller_type = b'BSLightingShaderPropertyFloatController'
+                    if prop_index is None:
+                        prop_index = _property_ctrl_index(node)
+                    for sib in _shapes_sharing_property_ctrl(prop_index, src_ctrl, node_name):
+                        shared_extras.append((blk, sib))
                     key += 1
                     continue
                 seq.controlled_blocks.pop(key)
@@ -2087,6 +2330,8 @@ def _process_controller_manager(node, palette):
                 continue
 
             key += 1
+
+        _fan_out_shared_entries(seq, shared_extras)
 
 
 def _apply_rest_visibility(root, stats=None):
@@ -2116,7 +2361,8 @@ def _apply_rest_visibility(root, stats=None):
         # node's visibility -- baking the t=0 value in would hide geometry the
         # animation is about to show.
         seq_name = bytes(getattr(block, 'name', b'') or b'')
-        if seq_name == _AUTOPLAY_SEQUENCE.encode('latin-1'):
+        if seq_name in (_AUTOPLAY_SEQUENCE.encode('latin-1'),
+                        _AUTOLOOP_SEQUENCE.encode('latin-1')):
             continue
         raw = _palette_bytes(getattr(block, 'string_palette', None))
         for cb in block.controlled_blocks:
@@ -2231,15 +2477,74 @@ def _attach_seq_shader_controllers(root, stats=None):
     return attached
 
 
+def _clone_sequence_as(root, seq, new_name, cycle_type):
+    """Add a second NiControllerSequence named *new_name* beside *seq*.
+
+    Vanilla's shared ambient graph (GenericBehaviors/Autoplay.hkx) needs BOTH
+    'AutoPlay' (its start state) and 'AutoLoop' (the state it hands off to).
+    Oblivion authors only one ambient sequence, so the second is cloned here.
+
+    The clone REUSES the original's controlled-block interpolators rather than
+    deep-copying the key data: a NiControllerSequence only references its
+    interpolators, two sequences may reference the same ones (verified in the
+    live engine: both sequences bind the same interpolator pointers and play),
+    and the keys are by far the largest part of the block.
+
+    Returns the new sequence, or None when the manager cannot be reached (a
+    sequence with no manager is unreachable by the graph, so there is nothing
+    to register).
+    """
+    mgr = getattr(seq, 'manager', None)
+    if mgr is None:
+        return None
+    clone = NifFormat.NiControllerSequence()
+    clone.name = new_name.encode('latin-1')
+    clone.cycle_type = cycle_type
+    clone.frequency = seq.frequency
+    clone.start_time = seq.start_time
+    clone.stop_time = seq.stop_time
+    clone.manager = mgr
+    clone.text_keys = seq.text_keys
+    clone.string_palette = seq.string_palette
+    if hasattr(seq, 'target_name'):
+        clone.target_name = seq.target_name      # accum root name
+    clone.num_controlled_blocks = seq.num_controlled_blocks
+    clone.array_grow_by = getattr(seq, 'array_grow_by', 0)
+    clone.controlled_blocks.update_size()
+    # Copy every declared member: ControllerLink's field set differs across NIF
+    # versions (20.0.0.4 has variable_1/variable_2 where later ones have
+    # controller_id/interpolator_id), so naming them explicitly breaks on the
+    # next version.  _get_names() is pyffi's own declaration order.
+    names = list(seq.controlled_blocks[0]._get_names()) if seq.num_controlled_blocks else []
+    for dst, src in zip(clone.controlled_blocks, seq.controlled_blocks):
+        for member in names:
+            setattr(dst, member, getattr(src, member))
+    mgr.num_controller_sequences += 1
+    mgr.controller_sequences.update_size()
+    mgr.controller_sequences[mgr.num_controller_sequences - 1] = clone
+    return clone
+
+
 def _autoplay_ambient_sequences(root, stats=None):
-    """Rename Oblivion's self-playing "Idle" sequence to Skyrim's "AutoPlay".
+    """Turn Oblivion's self-playing "Idle" sequence into vanilla's AutoPlay pair.
 
     Oblivion starts a sequence called Idle on load; Skyrim starts nothing by
-    itself unless the sequence is named AutoPlay, so ambient animation arrived
-    frozen on its first frame (palacefont01's fountain water, the SE01 waiting
-    room light ripples).  Also force CYCLE_LOOP: Oblivion authors these as
-    CLAMP (cycle_type 0), which would play through once and stop, whereas every
-    vanilla AutoPlay is a loop.
+    itself.  Vanilla's self-playing meshes (63 in Skyrim.esm's BSAs) all point
+    their BGED at GenericBehaviors/Autoplay.hkx, whose state machine STARTS on
+    a state playing sequence 'AutoPlay' (a CLAMP intro; 53/54 vanilla) and, on
+    that sequence's End event, hands off to a state playing 'AutoLoop' (the
+    real motion, cycle type LOOP; 39/53 vanilla).  Looping is the SEQUENCE's
+    own cycle type -- BGSGamebryoSequenceGenerator has no looping field
+    (bLooping is SERIALIZE_IGNORED) and the AutoLoop state has no
+    self-transition.
+
+    So: the authored Idle becomes AutoLoop and KEEPS its authored cycle type
+    (all 116 Oblivion 'Idle' sequences are CYCLE_LOOP = 0), and a CLAMP clone
+    named AutoPlay is added for the start state.  Read out of the running
+    engine (2026-08-18, arena spectator, `tools/game_bridge.py`): with AutoLoop
+    written as CLAMP the graph reached AutoLoopState and froze on the last
+    frame; flipping the loaded sequence's cycleType to LOOP in memory and
+    `sae AutoReset` made it loop indefinitely.
 
     Script-driven names (Forward, SpecialIdle, ...) are left alone -- those are
     started through the behaviour graph BY NAME and renaming them would break
@@ -2253,8 +2558,8 @@ def _autoplay_ambient_sequences(root, stats=None):
         name = raw.decode('latin-1') if isinstance(raw, bytes) else str(raw)
         if name.lower() not in _AMBIENT_SEQUENCES:
             continue
-        block.name = _AUTOPLAY_SEQUENCE.encode('latin-1')
-        block.cycle_type = _CYCLE_LOOP
+        block.name = _AUTOLOOP_SEQUENCE.encode('latin-1')
+        _clone_sequence_as(root, block, _AUTOPLAY_SEQUENCE, _CYCLE_CLAMP)
         renamed += 1
     if renamed and stats is not None:
         stats['autoplay_sequences'] = stats.get('autoplay_sequences', 0) + renamed
@@ -3564,6 +3869,25 @@ def _walk_node(parent, node, fix_textures, stats):
 
 
 
+def _has_autoplay_sequence(root):
+    """True if the tree carries an ambient (AutoPlay/AutoLoop) sequence.
+
+    Those meshes get the animated-object BSX (0x8B, later masked to 0x0B when
+    the BGED is attached) like a converted animated door.  Verified running in
+    game with 0x0B (arena spectators, 2026-08-18); vanilla ships 0x01 for the
+    same graph on collisionless meshes (29/63), so either would do -- this is
+    the one that has been seen working.
+    """
+    for b in root.tree():
+        if not isinstance(b, NifFormat.NiControllerSequence):
+            continue
+        raw = getattr(b, 'name', b'') or b''
+        nm = raw.decode('latin-1') if isinstance(raw, bytes) else str(raw)
+        if nm in (_AUTOPLAY_SEQUENCE, _AUTOLOOP_SEQUENCE):
+            return True
+    return False
+
+
 def _tree_is_animated(root):
     """True if anything in the tree needs per-frame controller updates:
     a NiParticleSystem, or any block with a NiTimeController attached.
@@ -3632,6 +3956,11 @@ def _add_bsx_flags(root, has_constraints=False):
         if not tree_animated:
             return
         bsx_value = 0x01  # Animated only — vanilla collisionless particle meshes
+        # ...except an ambient AutoPlay/AutoLoop mesh (crowd/fountain), which
+        # takes the animated-object value like a converted door -- see
+        # _has_autoplay_sequence.
+        if _has_autoplay_sequence(root):
+            bsx_value = BSX_FLAGS_ANIMATED
     else:
         root_is_animated = (
             root.controller is not None and
@@ -4024,23 +4353,22 @@ _SCRIPT_DRIVEN_SEQUENCES = frozenset((
 # Skyrim has NO such convention: a NiControllerSequence sits idle until
 # something starts it (a script's PlayGamebryoAnimation, an engine-native name
 # like Open/Close, or the behaviour graph).  So converted ambient animation --
-# palacefont01's fountain water, se01waitingroomwalls' light ripples -- simply
-# never ran, and the surface rendered as a frozen first frame.
+# palacefont01's fountain water, se01waitingroomwalls' light ripples, the arena
+# crowds -- simply never ran, and the surface rendered as a frozen first frame.
 #
-# Vanilla's self-playing convention is the sequence name "AutoPlay": 66 meshes
-# use it, all ambient FX with no script behind them (atronach skins, dragon
-# priest mist, steam centurion vents).  It is ALWAYS a loop -- every AutoPlay
-# sampled is cycle_type 2 (CYCLE_LOOP) -- and 36/36 sit alongside a BGED.
-# Corroborating: across 345 graph-less vanilla sequence meshes the only names
-# are the engine-native Open/Close plus script-fired SpecialIdle_AreaEffect,
-# and 114/116 of those are cycle_type 2 as well.  Nothing named "Idle"
-# auto-plays anything.
+# Vanilla's self-playing convention is the AutoPlay/AutoLoop sequence pair
+# driven by GenericBehaviors\Autoplay.hkx (see _autoplay_ambient_sequences).
 _AUTOPLAY_SEQUENCE = 'AutoPlay'
-_CYCLE_LOOP = 2
+_AUTOLOOP_SEQUENCE = 'AutoLoop'
+# NiControllerSequence cycle types (nif.xml CycleType): 0 = LOOP, 1 = REVERSE,
+# 2 = CLAMP.  Reading 2 as "loop" is what left every converted ambient mesh
+# playing exactly one cycle and freezing.
+_CYCLE_CLAMP = 2
 
 # Oblivion sequence names that mean "ambient, plays by itself" and therefore
-# become AutoPlay.  Script-driven names are excluded -- those are reached
-# through the behaviour graph by their own name and must keep it.
+# become the AutoPlay/AutoLoop pair.  Script-driven names are excluded --
+# those are reached through the behaviour graph by their own name and must
+# keep it.
 _AMBIENT_SEQUENCES = frozenset(('idle',))
 
 
@@ -4078,10 +4406,11 @@ def collect_sequence_names(data):
                 # state would make PlayAnimation() succeed on a dead sequence.
                 if not name or name in seen or not seq.num_controlled_blocks:
                     continue
-                # AutoPlay is not script-driven, but it still needs the graph:
-                # it is the animation graph manager that starts it, and 36/36
-                # vanilla AutoPlay meshes carry a BSBehaviorGraphExtraData.
-                if (name != _AUTOPLAY_SEQUENCE and
+                # AutoPlay/AutoLoop are not script-driven, but they still
+                # need the graph: it is the behaviour graph that starts them
+                # (63/63 vanilla AutoPlay meshes carry a BGED, and the arena
+                # crowd's graph was read running out of the live engine).
+                if (name not in (_AUTOPLAY_SEQUENCE, _AUTOLOOP_SEQUENCE) and
                         name.lower() not in _SCRIPT_DRIVEN_SEQUENCES):
                     continue
                 seen.add(name)
@@ -5166,9 +5495,10 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         # collection.
         _emulate_morphs(root, stats)
 
-        # Oblivion's auto-started "Idle" sequence -> Skyrim's "AutoPlay" (loop),
-        # or the animation never starts.  Runs before collect_sequence_names so
-        # the behaviour graph is built from the final names.
+        # Oblivion's auto-started "Idle" sequence -> vanilla's AutoPlay (CLAMP
+        # intro) + AutoLoop (the authored loop) pair, or the animation never
+        # starts.  Runs before collect_sequence_names so the behaviour graph is
+        # built from the final names.
         _autoplay_ambient_sequences(root, stats)
 
         # Nodes a sequence keeps invisible at t=0 must ship hidden: Skyrim only

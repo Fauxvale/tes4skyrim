@@ -83,5 +83,8 @@ def get_mesh_physics_flags(path_key: str) -> int:
     Bit 0: the converted NIF is a constrained dynamic havok island (swinging
     chains/signs).  Skyrim never simulates those on a STAT reference — the
     base record must be written as MSTT (see items.convert_STAT).
+
+    Bit 1: a held keyframed body — the mesh needs SetMotionType(Dynamic) before
+    it can move (read by script_convert.cross_ref for breakaway releases).
     """
     return _MESH_PHYSICS.get(path_key, 0)
