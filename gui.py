@@ -79,6 +79,25 @@ PACKING_STEPS = ("pack", "pack_zip")
 # behaviour instead of silently dropping the packing steps from a run.
 PACK_DEFAULT_CONFIG_KEY = "packStepsDefaultOn"
 
+# Collision winding repair (Settings > Fix collision winding). A tri-state,
+# persisted under this key: "auto" keeps the measured per-plugin default (on for
+# the plugins in WINDING_FIX_DEFAULT_PLUGINS, off for everything else), while
+# "on"/"off" pin it for every plugin. Anything unrecognised -- including a
+# config written before this setting existed -- reads as "auto", so the defaults
+# are unchanged for anyone who never touches it.
+WINDING_CONFIG_KEY = "collisionWindingFix"
+WINDING_AUTO, WINDING_ON, WINDING_OFF = "auto", "on", "off"
+WINDING_MODES = (WINDING_AUTO, WINDING_ON, WINDING_OFF)
+
+
+def winding_enabled_for(mode: str, plugin: str) -> bool:
+    """Whether the winding repair runs, given the setting and the plugin."""
+    if mode == WINDING_ON:
+        return True
+    if mode == WINDING_OFF:
+        return False
+    return _winding_default(plugin)
+
 
 def default_on_steps(pack_default: bool = True) -> set:
     """Step keys that start ticked, given the Pack-by-default setting.
@@ -646,6 +665,13 @@ def gui_main():
     # Same "only an explicit false disables it" rule as the cache option above.
     pack_default = cfg.get(PACK_DEFAULT_CONFIG_KEY) is not False
 
+    # Collision winding repair mode. Anything that is not one of the three
+    # recognised values -- including the key being absent -- means "auto", the
+    # per-plugin default this setting replaced a checkbox for.
+    winding_mode_default = str(cfg.get(WINDING_CONFIG_KEY, "")).strip().lower()
+    if winding_mode_default not in WINDING_MODES:
+        winding_mode_default = WINDING_AUTO
+
     # ── Root window ───────────────────────────────────────────────────────────
     # tkinterdnd2 supplies drag-and-drop by replacing the Tk root class. It is
     # OPTIONAL: without it the window still opens and Mods > Import... still
@@ -804,21 +830,16 @@ def gui_main():
     # Skyrim patch-plugin state: list of (name, BooleanVar), all-on by default
     patch_plugin_vars = []
 
-    # Collision winding repair: defaults per plugin (on for the plugins measured
-    # to need it — see collision_options).  It tracks the plugin selector until
-    # the user ticks the box themselves, after which their choice is respected
-    # for the rest of the session rather than being silently overwritten.
-    winding_var = tk.BooleanVar(value=_winding_default(file_var.get()))
-    winding_user_set = {"v": False}
+    # Collision winding repair — Settings ▸ Fix collision winding. "Auto" (the
+    # default) follows the measured per-plugin defaults: on for the plugins in
+    # WINDING_FIX_DEFAULT_PLUGINS, off for everything else. The other two modes
+    # pin it for every plugin. Persisted, so a user who has decided either way
+    # does not have to re-set it every launch.
+    winding_mode_var = tk.StringVar(value=winding_mode_default)
 
-    def _sync_winding_default(*_):
-        if not winding_user_set["v"]:
-            winding_var.set(_winding_default(file_var.get()))
-
-    def _on_winding_toggled():
-        winding_user_set["v"] = True
-
-    file_var.trace_add("write", _sync_winding_default)
+    def _winding_on() -> bool:
+        """Whether the repair runs for the plugin currently selected."""
+        return winding_enabled_for(winding_mode_var.get(), file_var.get())
 
     def _get_workers() -> int:
         """Current worker-count value, clamped to [1, cpu_max]."""
@@ -906,6 +927,29 @@ def gui_main():
     settings_menu.add_checkbutton(
         label="Pack BSAs / Mod Zip by default", variable=pack_default_var,
         onvalue=True, offvalue=False, command=_on_pack_default_change)
+
+    # Settings ▸ Fix collision winding ▸ Automatic / Always on / Always off.
+    # Repairs collision faces whose winding was reversed at the source -- the
+    # "I fall straight through the floor" symptom. Only a handful of plugins
+    # re-export their collision in the way that causes it, so "Automatic" turns
+    # it on for exactly those (measured; see collision_options) and leaves it
+    # off elsewhere. A radio group rather than a checkbox because "follow the
+    # per-plugin default" is a third answer, not the absence of one.
+    def _on_winding_mode_change():
+        updated = load_config()
+        updated[WINDING_CONFIG_KEY] = winding_mode_var.get()
+        save_config(updated)
+
+    winding_menu = tk.Menu(settings_menu, **_menu_opts)
+    _auto_plugins = ", ".join(sorted(WINDING_FIX_DEFAULT_PLUGINS))
+    for _mode, _label in (
+            (WINDING_AUTO, f"Automatic  (on for {_auto_plugins})"),
+            (WINDING_ON,   "Always on"),
+            (WINDING_OFF,  "Always off")):
+        winding_menu.add_radiobutton(
+            label=_label, value=_mode, variable=winding_mode_var,
+            command=_on_winding_mode_change)
+    settings_menu.add_cascade(label="Fix collision winding", menu=winding_menu)
 
     # ── Converted ▸ (plugins already in output/) ──────────────────────────────
     # Picking one selects it AND ticks the steps its last conversion still owes,
@@ -3029,28 +3073,6 @@ def gui_main():
     mesh_toggle_lbl.pack(side=tk.LEFT, padx=(20, 0))
     mesh_toggle_lbl.bind("<Button-1>", lambda _: _open_mesh_subdir_panel())
 
-    # Collision winding repair toggle, sitting with the other Meshes sub-options.
-    _winding_row = ttk.Frame(sidebar, style="Panel.TFrame")
-    _winding_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_mesh_toggle_row)
-    _winding_chk = ttk.Checkbutton(_winding_row, text="Fix collision winding",
-                                   variable=winding_var,
-                                   command=_on_winding_toggled,
-                                   style="TCheckbutton")
-    _winding_chk.pack(side=tk.LEFT, padx=(20, 0))
-    _winding_hint = ttk.Label(_winding_row, text="repair inverted floors",
-                              style="PanelSub.TLabel")
-    _winding_hint.pack(side=tk.LEFT, padx=(6, 0))
-
-    _WINDING_TIP = (
-        "Fixes floors and walls you fall straight through.\n\n"
-        "Most mods don't need this. Turn it on only if you fall through "
-        "solid ground in game.\n\n"
-        "Switches on automatically for "
-        + ", ".join(sorted(WINDING_FIX_DEFAULT_PLUGINS)) + ", which need it."
-    )
-    _attach_tooltip(_winding_chk, _WINDING_TIP)
-    _attach_tooltip(_winding_hint, _WINDING_TIP)
-
     # ── Action buttons ────────────────────────────────────────────────────────
     # 12px above, matching a separator's gap: the step rows are packed tight
     # (pady=1 each), so without it the Run button crowds the last checkbox and
@@ -3832,8 +3854,8 @@ def gui_main():
 
     # ── Run logic ─────────────────────────────────────────────────────────────
     def _winding_flag() -> str:
-        """The explicit collision-winding flag matching the checkbox."""
-        return ("--collision-winding-fix" if winding_var.get()
+        """The explicit collision-winding flag matching the setting."""
+        return ("--collision-winding-fix" if _winding_on()
                 else "--no-collision-winding-fix")
 
     def _build_cmd(step_key: str, fname: str, out_dir: str,
@@ -3849,8 +3871,8 @@ def gui_main():
         if step_key == "meshes":
             if selected_subdirs:
                 cmd += ["--mesh-subdirs"] + selected_subdirs
-            # Always explicit: the checkbox is the user's answer, whether it
-            # came from the per-plugin default or from them ticking the box.
+            # Always explicit: the setting is the user's answer, whether it
+            # resolved from Automatic or from them pinning it on or off.
             cmd.append(_winding_flag())
         return cmd
 
@@ -4225,7 +4247,7 @@ def gui_main():
         if selected_subdirs:
             _log(f"Mesh subdirs: {', '.join(selected_subdirs)}")
         if "meshes" in steps:
-            _log(f"Collision winding fix: {'on' if winding_var.get() else 'off'}")
+            _log(f"Collision winding fix: {'on' if _winding_on() else 'off'}")
         _log("")
 
         q = queue.Queue()
