@@ -269,6 +269,10 @@ def main() -> int:
         # the overlays are — an unrelated plugin's meshes are not in this world.
         asset_dirs = [out_root / n for n in [owner] + contributors
                       if (out_root / n).is_dir()]
+        # Where each contributor's mesh conversion left its detail-overlay
+        # diffuse manifest (build bookkeeping, so export/ not output/).
+        overlay_dirs = [export_root / n for n in [owner] + contributors
+                        if (export_root / n).is_dir()]
 
         cloud_rel = merge_cloud_bank(out_root, lod_dir, edid, owner,
                                      contributors)
@@ -295,6 +299,7 @@ def main() -> int:
             # Derived _far.nif meshes stay with the plugin that ships the full
             # model; only tiles and LODSettings land in the LOD mod.
             far_nif_dirs=asset_dirs,
+            overlay_manifest_dirs=overlay_dirs,
         )
 
         print(f"  Generating terrain LOD...")

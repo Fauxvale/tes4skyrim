@@ -104,6 +104,17 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
         if mesh_subdirs:
             _used = set(_used) | texture_prune.read_manifest(mesh_manifest_dir)
         texture_prune.write_manifest(mesh_manifest_dir, _used)
+
+        # Which of those the source authored as detail overlays (alpha = blend
+        # weight).  Object LOD reads diffuse alpha as opacity, so the LOD stage
+        # ships opaque copies of exactly these; see
+        # texture_prune.OVERLAY_MANIFEST_NAME.
+        _overlays = stats['mesh_conversion'].pop('overlay_diffuses', set())
+        if mesh_subdirs:
+            _overlays = set(_overlays) | texture_prune.read_manifest(
+                mesh_manifest_dir, texture_prune.OVERLAY_MANIFEST_NAME)
+        texture_prune.write_manifest(mesh_manifest_dir, _overlays,
+                                     texture_prune.OVERLAY_MANIFEST_NAME)
     else:
         print(f"  No meshes found at {mesh_src}")
         stats['mesh_conversion'] = {'converted': 0, 'skipped': 0, 'errors': 0}

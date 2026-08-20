@@ -1518,7 +1518,7 @@ def generate_lod(esm_path: Path, output_dir: Path,
                  master_dirs=None, master_texture_dirs=None,
                  master_mesh_dirs=None,
                  overlay_paths=None, only_cells=None,
-                 far_nif_dirs=None) -> bool:
+                 far_nif_dirs=None, overlay_manifest_dirs=None) -> bool:
     """
     Full LOD generation pipeline:
       1. Write LODSettings/<worldspace>.lod
@@ -1580,6 +1580,12 @@ def generate_lod(esm_path: Path, output_dir: Path,
                            root) and dropped afterwards, exactly as master
                            meshes already are. None means write them under
                            `output_dir` — the single-plugin behaviour.
+        overlay_manifest_dirs: Per-plugin EXPORT dirs holding the
+                           APPLY_HILIGHT2 diffuse manifests mesh conversion
+                           wrote. Their alpha is a blend weight, and the LOD
+                           object shader would read it as transparency, so
+                           opaque copies are shipped in the LOD texture tree
+                           (see `_force_opaque_lod_diffuses`).
 
     Returns True on success.
     """
@@ -1829,10 +1835,16 @@ def generate_lod(esm_path: Path, output_dir: Path,
     # Fill in any LOD texture the .bto files reference but that does not exist:
     # atlas normal maps (synthesized) and any diffuse that lives only in a
     # master's output because this plugin baked the master's models into its LOD.
-    _fill_missing_lod_textures(
-        objects_dir, _textures_root(output_dir),
-        master_tex_roots=[_textures_root(Path(d))
-                          for d in (master_texture_dirs or master_dirs or [])])
+    _lod_tex_root = _textures_root(output_dir)
+    _src_tex_roots = [_textures_root(Path(d))
+                      for d in (master_texture_dirs or master_dirs or [])]
+    _fill_missing_lod_textures(objects_dir, _lod_tex_root,
+                               master_tex_roots=_src_tex_roots)
+
+    # Detail-overlay diffuses (APPLY_HILIGHT2): their alpha is a blend weight,
+    # but the LOD object shader reads it as opacity, so ship opaque copies.
+    _force_opaque_lod_diffuses(objects_dir, _lod_tex_root, _src_tex_roots,
+                               overlay_manifest_dirs)
 
     # The master meshes staged for LODGen have served their purpose: the
     # geometry is baked into the .bto and the master ships the mesh itself.
@@ -1988,6 +2000,101 @@ def _fill_missing_lod_textures(bto_dir: Path, tex_root: Path,
         print(f"  WARNING: {len(unresolved)} LOD textures missing: "
               + ", ".join(unresolved[:5])
               + ("..." if len(unresolved) > 5 else ""))
+
+
+def _force_opaque_lod_diffuses(bto_dir: Path, lod_tex_root: Path,
+                               source_tex_roots, export_dirs) -> None:
+    """Ship opaque copies of detail-overlay diffuses for object LOD.
+
+    Oblivion's APPLY_HILIGHT2 apply mode makes a diffuse's alpha channel a
+    per-texel BLEND WEIGHT for laying detail over a surface, not a transparency
+    mask.  Skyrim has no such mode.  `nif_converter` already drops the
+    NiAlphaProperty when one is present (that is why `seisland` renders solid
+    up close), but most overlay shapes never had one -- `RockGreatForest645`
+    ships apply_mode 4 with no alpha property at all -- so nothing about the
+    converted mesh records that its texture's alpha is not opacity.
+
+    That stays harmless until LODGen bakes the mesh: it stamps every shape it
+    emits with `slsf_2_lod_objects`, and the LOD object shader DOES sample
+    diffuse alpha as opacity.  The rock then renders see-through at distance
+    while looking correct up close, with no alpha property anywhere to explain
+    it.
+
+    LODGen cannot be told otherwise -- it writes the shader itself -- and the
+    texture cannot be flattened in place, because the full-size mesh still
+    needs that alpha for its detail overlay.  So the alpha is flattened in a
+    COPY written into the LOD texture tree at the same relative path the tiles
+    already reference: Data holds exactly one file per path and this tree
+    shadows the plugins', so tiles resolve to the opaque copy while full meshes
+    keep the original.
+
+    Which textures those are is AUTHORED, not guessed: mesh conversion records
+    every diffuse whose NiTexturingProperty said APPLY_HILIGHT2, and this reads
+    that manifest back.  A genuine cutout mask (tree billboards, cobwebs,
+    hanging moss) ships APPLY_MODULATE instead, is absent from the manifest,
+    and keeps its alpha exactly as authored.
+    """
+    from . import texture_prune
+
+    dirs = [Path(d) for d in (export_dirs or [])]
+    have = [d for d in dirs
+            if (d / texture_prune.OVERLAY_MANIFEST_NAME).is_file()]
+    if not have:
+        # Written by mesh conversion, so an older output tree has none. Say so:
+        # silence here looks identical to "nothing needed fixing", and the
+        # symptom (see-through distant rock) is easy to blame on the bake.
+        print("  NOTE: no detail-overlay manifest found"
+              f"{' in ' + str(dirs[0].parent) if dirs else ''}"
+              " — re-run the meshes stage for overlay diffuses to be made "
+              "opaque in LOD")
+        return
+
+    overlays = set()
+    for d in have:
+        overlays |= texture_prune.read_manifest(
+            d, texture_prune.OVERLAY_MANIFEST_NAME)
+    if not overlays:
+        return
+
+    # Manifest keys are 'tes4/foo/bar.dds'; .bto refs are 'tes4\foo\bar.dds'.
+    wanted = {k.replace('/', '\\') for k in overlays}
+    refs = _bto_texture_refs(bto_dir) & wanted
+    if not refs:
+        return
+
+    from PIL import Image
+    import numpy as _np
+
+    fixed = 0
+    for rel in sorted(refs):
+        dest = _win_join(lod_tex_root, rel)
+        if dest.exists():
+            continue          # already LOD-local (an atlas, or a previous run)
+        src = None
+        for root in source_tex_roots:
+            if root is None:
+                continue
+            p = _win_join(root, rel)
+            if p.exists():
+                src = p
+                break
+        if src is None:
+            continue
+        try:
+            with Image.open(src) as img:
+                if 'A' not in img.getbands():
+                    continue          # no alpha channel to flatten
+                arr = _np.asarray(img.convert('RGBA')).copy()
+            arr[..., 3] = 255
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(arr, 'RGBA').save(dest, format='DDS')
+            fixed += 1
+        except Exception:
+            continue
+
+    if fixed:
+        print(f"  Made {fixed} detail-overlay LOD diffuse(s) opaque "
+              f"(APPLY_HILIGHT2 alpha is a blend weight, not transparency)")
 
 
 def _write_flat_normal_for(atlas_diffuse: Path, dest: Path):

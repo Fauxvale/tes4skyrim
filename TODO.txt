@@ -94,3 +94,5 @@ Minor Issues:
 	17 - Pandora compatibility
 
 	19 - Leaving a force-greet conversation can soft-lock
+
+	20 - Tree LOD as real Skyrim billboards (.btt instance tables) instead of baked + cards

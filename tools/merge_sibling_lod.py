@@ -190,6 +190,9 @@ def main() -> int:
             master_texture_dirs=asset_dirs,
             overlay_paths=overlays,
             only_cells=hot,
+            overlay_manifest_dirs=[export_root / n
+                                   for n in [g['master']] + plugins
+                                   if (export_root / n).is_dir()],
         )
 
         print(f"   Baking merged terrain LOD -> {merged_dir}")

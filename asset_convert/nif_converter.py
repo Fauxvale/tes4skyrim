@@ -1717,6 +1717,25 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         ts.bs_properties[0] = eff_shader
     else:
         ts.bs_properties[0] = shader
+
+    # Record the diffuse as a DETAIL OVERLAY when the source authored it that
+    # way.  This is not about the NiAlphaProperty (most overlay shapes ship
+    # none, e.g. RockGreatForest645): it is about the TEXTURE, whose alpha is a
+    # blend weight rather than a mask.  Harmless in the full mesh -- nothing
+    # samples that channel as transparency -- but object LOD does, because
+    # LODGen stamps every baked shape slsf_2_lod_objects and the LOD shader
+    # reads diffuse alpha as opacity.  The LOD stage flattens the alpha on a
+    # LOD-local copy of exactly these textures; see
+    # `lod_gen._force_opaque_lod_diffuses`.
+    #
+    # Keyed off the CONVERTED path (tex_set.textures[0], i.e. post-'tes4\'
+    # rewrite), because that is what the shipped mesh -- and therefore the
+    # baked .bto tile -- actually references.
+    if tex_apply_mode == _APPLY_HILIGHT2 and stats is not None:
+        _overlay_key = _norm_tex_ref(tex_set.textures[0])
+        if _overlay_key:
+            stats.setdefault('overlay_diffuses', set()).add(_overlay_key)
+
     if alpha_prop is not None:
         # Oblivion's APPLY_HILIGHT2 (4) is a DETAIL-OVERLAY apply mode: the
         # diffuse's alpha channel is a per-texel BLEND WEIGHT for laying the
@@ -6072,6 +6091,7 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
         'root_rotation_baked': False,
         'version_upgraded': False,
         'textures': set(),         # texture paths this mesh references
+        'overlay_diffuses': set(), # of those, the APPLY_HILIGHT2 overlays
     }
 
     if not _PYFFI:
@@ -6221,6 +6241,10 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # a reference to without re-reading the whole output tree afterwards.
     _harvest_textures(data, result['textures'])
 
+    # Diffuses the source authored as APPLY_HILIGHT2 detail overlays, for the
+    # LOD stage (see the note beside _APPLY_HILIGHT2 in _process_geometry).
+    result['overlay_diffuses'] = stats.get('overlay_diffuses', set())
+
     # Write to a buffer first — some NIFs have version-incompatible blocks
     # (e.g. NiGeomMorpherController morph arrays) that fail at Skyrim version.
     buf = _io.BytesIO()
@@ -6356,6 +6380,10 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
         # Union of the textures every written mesh references — the pipeline
         # prunes the texture tree against this.
         'textures_used': set(),
+        # Of those, the ones the source authored as APPLY_HILIGHT2 detail
+        # overlays: their alpha is a blend weight, not transparency, and object
+        # LOD must not read it as opacity.
+        'overlay_diffuses': set(),
     }
 
     # Collect (rel_path, reason) for every skipped file
@@ -6378,6 +6406,7 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
     def _update(nif_str, r):
         stats['warn_counts'].update(r.get('warn_counts', {}))
         stats['textures_used'].update(r.get('textures', ()))
+        stats['overlay_diffuses'].update(r.get('overlay_diffuses', ()))
         if r.get('error'):
             stats['errors'] += 1
             rel = str(Path(nif_str).relative_to(mesh_path))
