@@ -501,8 +501,11 @@ def phase_assets(file_name: str, config: dict, output_dir: str = None,
     else:
         origin = "requested"
     os.environ[WINDING_FIX_ENV_VAR] = "1" if winding_fix else "0"
-    print(f"[{file_name}] Collision winding repair: "
-          f"{'ON' if winding_fix else 'OFF'} ({origin})")
+    # The authored-normal repair always runs; only the inferred steps are
+    # switchable, so say which one this line is about.
+    print(f"[{file_name}] Inferred collision winding steps: "
+          f"{'ON' if winding_fix else 'OFF'} ({origin}); "
+          f"authored-normal repair: always on")
 
     print(f"[{file_name}] Converting meshes (NIFs + textures)...")
     stats = convert_meshes(
@@ -1255,18 +1258,25 @@ def main():
                         help="Skyrim plugin filenames to generate a slot-44 "
                              "patch for (e.g. Skyrim.esm Dawnguard.esm). "
                              "Default: Skyrim.esm only.")
-    # Collision winding repair (asset_convert/collision.py). Tri-state: the flag
-    # forces it on, --no- forces it off, and unspecified (None) defers to the
-    # per-plugin default in collision_options, resolved separately for each file.
+    # The INFERRED collision winding steps (asset_convert/collision.py steps
+    # 1-3). The authored-normal repair (step 0) is always on and this flag does
+    # not touch it. Tri-state: the flag forces the inferred steps on, --no-
+    # forces them off, and unspecified (None) defers to the per-plugin default
+    # in collision_options, resolved separately for each file.
     winding = parser.add_mutually_exclusive_group()
     winding.add_argument("--collision-winding-fix", dest="collision_winding_fix",
                          action="store_true", default=None,
-                         help="Rewind reversed collision triangles (fall-through-"
-                              "floor repair). Default: on only for "
+                         help="Also INFER collision winding from adjacency, "
+                              "enclosed volume and the render mesh, on top of "
+                              "the always-on authored-normal repair. Guesses, "
+                              "so it can invert correct geometry -- only for "
+                              "plugins whose exporter destroyed the normals. "
+                              "Default: on only for "
                               + ", ".join(sorted(WINDING_FIX_DEFAULT_PLUGINS)))
     winding.add_argument("--no-collision-winding-fix", dest="collision_winding_fix",
                          action="store_false", default=None,
-                         help="Disable the collision winding repair.")
+                         help="Disable the inferred winding steps (the "
+                              "authored-normal repair still runs).")
 
     args = parser.parse_args()
 

@@ -3783,3 +3783,109 @@ class TestGraphMeshesShipNoEmptyTextKeys:
         assert b'start' in keys and b'end' in keys
         sound = [k for k in keys if k.startswith(b'sound:')]
         assert sound, 'the sound: key is the plant audio -- it must survive'
+
+
+class TestCollisionWindingRepair:
+    """Step 0 (the authored normal) must run WITHOUT the toggle, and the
+    inferred steps must stay behind it.
+
+    The split exists because the two halves have different risk: step 0 reads
+    a fact the NIF states about itself, while steps 1-3 infer one.  Inference
+    inverted a whole vanilla tower once already (leyawiincastle02: 274 of 284
+    triangles, 806 walkable cells), so it may only run where the authored
+    normals were destroyed.
+    """
+
+    def _repair(self, tris, normals, enabled, visual=None, groups=None):
+        import os as _os
+        from asset_convert import collision as C
+        prev = _os.environ.get("TESCONV_COLLISION_WINDING_FIX")
+        _os.environ["TESCONV_COLLISION_WINDING_FIX"] = "1" if enabled else "0"
+        try:
+            return C._repair_inverted_floors(tris, visual, groups, normals)
+        finally:
+            if prev is None:
+                _os.environ.pop("TESCONV_COLLISION_WINDING_FIX", None)
+            else:
+                _os.environ["TESCONV_COLLISION_WINDING_FIX"] = prev
+
+    # One up-facing quad, wound counter-clockwise (normal = +Z).
+    _UP = [((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+           ((1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0))]
+
+    def _reversed(self):
+        return [(a, c, b) for a, b, c in self._UP]
+
+    def test_reversed_winding_is_repaired_with_the_toggle_OFF(self):
+        """The whole point: vanilla Oblivion gets fixed without opting in."""
+        tris = self._reversed()
+        normals = [(0.0, 0.0, 1.0)] * len(tris)   # authored: faces UP
+        out, n = self._repair(tris, normals, enabled=False)
+        assert n == len(tris), 'authored-normal repair must run ungated'
+        from asset_convert import collision as C
+        assert all(C._face_normal(t)[2] > 0 for t in out)
+
+    def test_correct_winding_is_left_alone(self):
+        """Zero false positives on a mesh that already agrees with itself."""
+        normals = [(0.0, 0.0, 1.0)] * len(self._UP)
+        out, n = self._repair(list(self._UP), normals, enabled=False)
+        assert n == 0
+        assert out == self._UP
+
+    def test_self_consistent_corruption_is_NOT_touched_ungated(self):
+        """Morroblivion's case: normals rewritten to match the bad winding.
+
+        Both sources agree while both are wrong, so step 0 has nothing to
+        detect and must not guess -- that is what the toggle is for.
+        """
+        tris = self._reversed()
+        normals = [(0.0, 0.0, -1.0)] * len(tris)  # authored to match, i.e. DOWN
+        _out, n = self._repair(tris, normals, enabled=False)
+        assert n == 0
+
+    def test_missing_normals_are_never_guessed_at(self):
+        tris = self._reversed()
+        _out, n = self._repair(tris, [None] * len(tris), enabled=False)
+        assert n == 0
+        _out, n = self._repair(tris, None, enabled=False)
+        assert n == 0
+
+    def test_smoothed_vertex_normals_are_rejected(self):
+        """A per-vertex average that did not survive the length test is None.
+
+        Averaging three normals across a smoothed edge yields a short vector
+        pointing at none of them (mageguilddesk01: |n| = 0.31); trusting it
+        rewound 9 correct faces.
+        """
+        from asset_convert import collision as C
+        assert C._AUTHORED_NORMAL_MIN_LEN > 0.9
+
+    def test_normals_track_shape_tri_soup_ordering(self):
+        """_shape_tri_normals must align 1:1 with _shape_tri_soup or normals
+        bind to the wrong triangles."""
+        from asset_convert import collision as C
+        from pyffi.formats.nif import NifFormat
+        src = EXPORT_MESHES / 'rocks' / 'seisland' / 'seisland.nif'
+        if not src.exists():
+            pytest.skip('seisland.nif not exported')
+        data = NifFormat.Data()
+        with open(src, 'rb') as fh:
+            data.read(fh)
+        checked = 0
+        for root in data.roots:
+            for node in root.tree():
+                shape = getattr(node, 'shape', None)
+                if shape is None:
+                    continue
+                inner = (shape.shape
+                         if isinstance(shape, NifFormat.bhkMoppBvTreeShape)
+                         else shape)
+                soup = C._shape_tri_soup(inner)
+                if soup is None:
+                    continue
+                normals = C._shape_tri_normals(inner)
+                if normals is None:
+                    continue
+                assert len(normals) == len(soup[0])
+                checked += 1
+        assert checked, 'expected a mesh collision shape in seisland.nif'

@@ -131,13 +131,17 @@ class TestCollisionWindingSetting:
             assert not gui.winding_enabled_for(gui.WINDING_OFF, plugin)
 
     def test_unknown_or_absent_config_value_reads_as_auto(self):
-        """A config written before this setting existed keeps the old defaults."""
+        """A config written before this setting existed keeps the defaults."""
         for stored in ("", "maybe", None, "AUTO"):
             mode = str(stored or "").strip().lower()
             if mode not in gui.WINDING_MODES:
                 mode = gui.WINDING_AUTO
-            assert gui.winding_enabled_for(mode, "Nehrim.esm") is True
+            assert gui.winding_enabled_for(mode, "Morrowind_ob.esm") is True
             assert gui.winding_enabled_for(mode, "Oblivion.esm") is False
+            # Nehrim's exporter left the authored normals intact, so the
+            # ungated step 0 repairs it on its own and it must NOT pull in
+            # the inferred steps (see collision_options).
+            assert gui.winding_enabled_for(mode, "Nehrim.esm") is False
 
     def test_auto_agrees_with_collision_options(self):
         """The GUI must not carry its own copy of the plugin list."""

@@ -79,10 +79,11 @@ PACKING_STEPS = ("pack", "pack_zip")
 # behaviour instead of silently dropping the packing steps from a run.
 PACK_DEFAULT_CONFIG_KEY = "packStepsDefaultOn"
 
-# Collision winding repair (Settings > Fix collision winding). A tri-state,
-# persisted under this key: "auto" keeps the measured per-plugin default (on for
-# the plugins in WINDING_FIX_DEFAULT_PLUGINS, off for everything else), while
-# "on"/"off" pin it for every plugin. Anything unrecognised -- including a
+# The INFERRED collision winding steps (Settings > Infer collision winding).
+# The authored-normal repair always runs and is not covered by this key. A
+# tri-state, persisted here: "auto" keeps the measured per-plugin default (on
+# for the plugins in WINDING_FIX_DEFAULT_PLUGINS, off for everything else),
+# while "on"/"off" pin it for every plugin. Anything unrecognised -- including a
 # config written before this setting existed -- reads as "auto", so the defaults
 # are unchanged for anyone who never touches it.
 WINDING_CONFIG_KEY = "collisionWindingFix"
@@ -830,15 +831,16 @@ def gui_main():
     # Skyrim patch-plugin state: list of (name, BooleanVar), all-on by default
     patch_plugin_vars = []
 
-    # Collision winding repair — Settings ▸ Fix collision winding. "Auto" (the
+    # Inferred winding steps — Settings ▸ Infer collision winding. "Auto" (the
     # default) follows the measured per-plugin defaults: on for the plugins in
     # WINDING_FIX_DEFAULT_PLUGINS, off for everything else. The other two modes
     # pin it for every plugin. Persisted, so a user who has decided either way
-    # does not have to re-set it every launch.
+    # does not have to re-set it every launch. The authored-normal repair runs
+    # regardless of this setting.
     winding_mode_var = tk.StringVar(value=winding_mode_default)
 
     def _winding_on() -> bool:
-        """Whether the repair runs for the plugin currently selected."""
+        """Whether the INFERRED steps run for the plugin currently selected."""
         return winding_enabled_for(winding_mode_var.get(), file_var.get())
 
     def _get_workers() -> int:
@@ -928,13 +930,16 @@ def gui_main():
         label="Pack BSAs / Mod Zip by default", variable=pack_default_var,
         onvalue=True, offvalue=False, command=_on_pack_default_change)
 
-    # Settings ▸ Fix collision winding ▸ Automatic / Always on / Always off.
-    # Repairs collision faces whose winding was reversed at the source -- the
-    # "I fall straight through the floor" symptom. Only a handful of plugins
-    # re-export their collision in the way that causes it, so "Automatic" turns
-    # it on for exactly those (measured; see collision_options) and leaves it
-    # off elsewhere. A radio group rather than a checkbox because "follow the
-    # per-plugin default" is a third answer, not the absence of one.
+    # Settings ▸ Infer collision winding ▸ Automatic / Always on / Always off.
+    # This controls ONLY the inferred steps. The authored-normal repair (which
+    # reads the winding each triangle records for itself) always runs and has
+    # no switch -- it is what fixes "I fall straight through the floor" on
+    # vanilla Oblivion and on Nehrim. The inferred steps GUESS from adjacency,
+    # enclosed volume and the render mesh, so they can invert geometry that was
+    # already correct, and are only worth it where the exporter destroyed the
+    # normals. "Automatic" turns them on for exactly those plugins (measured;
+    # see collision_options). A radio group rather than a checkbox because
+    # "follow the per-plugin default" is a third answer, not the absence of one.
     def _on_winding_mode_change():
         updated = load_config()
         updated[WINDING_CONFIG_KEY] = winding_mode_var.get()
@@ -949,7 +954,7 @@ def gui_main():
         winding_menu.add_radiobutton(
             label=_label, value=_mode, variable=winding_mode_var,
             command=_on_winding_mode_change)
-    settings_menu.add_cascade(label="Fix collision winding", menu=winding_menu)
+    settings_menu.add_cascade(label="Infer collision winding", menu=winding_menu)
 
     # ── Converted ▸ (plugins already in output/) ──────────────────────────────
     # Picking one selects it AND ticks the steps its last conversion still owes,

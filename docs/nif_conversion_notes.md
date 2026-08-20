@@ -970,10 +970,12 @@ The single most important havok-conversion fact, and the root cause of both "con
 - Consequence of passing them through: every constraint frame and collision shape is rotated out from under the solver → constraint assemblies act welded solid; ordinary clutter collision sits askew from the visual mesh.
 - Fix in `_convert_collision`: non-T bodies get translation=(0,0,0,0) AND rotation=(0,0,0,1). bhkRigidBodyT keeps its (scaled) transform. NOTE: field-level dumps looked "fine" for months because everyone (and the docs) believed the non-T fields were dead — when a converted mesh matches vanilla on every OTHER field, byte-diff the remaining "ignored" ones.
 
-## Inverted collision winding in Nehrim source meshes — "I fall through the floor" (SOLVED 2026-07-20)
+## Inverted collision winding — "I fall through the floor" (SOLVED 2026-07-20; **rewritten 2026-08-20, see round 3 below**)
 Falling through floors in Nehrim (worst in caves) that are solid in Oblivion. **Source-data corruption, not a conversion bug** — the converter faithfully reproduced broken input.
 - **Symptom shape matters**: you fall through *half* a floor, not all of it. Collision is present, MOPP is clean, layer/material/orientation all correct.
 - **Cause**: Nehrim re-exported collision as `bhkPackedNiTriStripsShape` (Oblivion ships `bhkNiTriStripsShape`). Flattening strips → triangle lists dropped the parity flip on odd-indexed triangles, so one half of every floor quad has reversed winding. **Havok mesh collision is single-sided** → a down-facing triangle is walked straight through from above.
+
+> **⚠ Read [round 3](#rewritten-2026-08-20-round-3--the-winding-is-authored-stop-inferring-it) before changing anything here.** Two claims in the sections below are now superseded: the repair is **no longer Nehrim-specific** (vanilla Oblivion has the same damage — `seisland.nif` ships 1480 inverted triangles, `meshes/rocks` measures 14.5%), and **"vanilla Oblivion is the control test for any detector" is FALSE**. The winding is recorded per-triangle in the NIF itself, so the primary repair no longer infers anything; the inferred steps described below still exist but are now gated to Morroblivion alone.
   - `priorychapelinterior.nif` floor: Oblivion `(37,35,34)`+`(35,36,34)` both UP; Nehrim `(37,35,34)` UP + `(35,34,36)` **DOWN** (last two indices swapped). Floor area 719k → 359k, exactly half.
   - `rfrmfloor.nif` (fort/cave tileset, used in hundreds of cells): Oblivion `(0,1,2)`+`(1,3,2)` UP; Nehrim `(0,1,2)` UP + `(1,2,3)` DOWN.
 - **Scale**: 1065/4485 Nehrim meshes vs 10/4199 vanilla Oblivion (~100×). Vanilla-Oblivion cleanliness is the control test for any detector here — if a scanner flags lots of Oblivion meshes, the scanner is wrong.
@@ -1019,6 +1021,105 @@ The first rewrite (coplanar contradiction + co-located visual face) scored 35.8%
 
 ## `bhkPackedNiTriStripsShape` sub-shapes MOVED between formats — load CTD (SOLVED 2026-07-28)
 Three crashes in converted Morrowind_ob traced to one mesh, named directly in the crash log's stack strings (`inputFilePath: "data\MESHES\tes4\morro\i\inucaveuplant00.nif"`). Exception was `vmovntdq [rcx+0x40], ymm3` in VCRUNTIME140 (a `memcpy`) writing off the end of a heap page, with `bhkPackedNiTriStripsShape` + `bhkRigidBody` + `BSResource::LooseFileStream` on the stack — i.e. **a crash while reading the NIF, before anything renders**.
+### Rewritten 2026-08-20 (round 3) — the winding is AUTHORED; stop inferring it
+
+Round 2 solved Nehrim but was gated per-plugin and off for vanilla, on the
+premise that "vanilla Oblivion is authored correctly". **That premise is
+false**, and the gate hid a signal that was in the file the whole time.
+
+- **Vanilla Oblivion falls through its own floors.** `rocks/seisland/seisland.nif`
+  (the Shivering Isles island, `STAT 00078C2C`, placed at scale 1.0 in two
+  worldspaces) ships **1480 of 3590** collision triangles wound against their
+  own recorded normal. Downward-raycast over its top surface: **538 walkable /
+  432 fall-through**. Across `meshes/rocks`, **14.5%** of decidable floor faces
+  are inverted in vanilla. The converter reproduced this faithfully — it was
+  never a conversion bug, and the per-plugin gate meant it was never repaired.
+
+- **THE AUTHORED INDICATOR: every collision triangle records the direction it is
+  meant to face, independently of the winding that produces that facing.**
+
+  | format | field |
+  |---|---|
+  | `hkPackedNiTriStripsData` | `triangles[i].normal` — one per triangle |
+  | `NiTriStripsData` | `normals[]` — per **vertex**, averaged per face |
+
+  A strip flatten reverses the winding and carries the stored normal through
+  **unchanged**, so `dot(face_normal(tri), stored_normal) < 0` is the file
+  stating which of its own triangles are damaged. No adjacency walk, no oracle
+  mesh, no thresholds, and inert wherever the two already agree. On seIsland it
+  identifies 1480 triangles — matching the 1487 the round-2 heuristic flips —
+  and rewinding to it alone gives **970 walkable / 0 fall-through**.
+
+  Cross-checked against the render-skin oracle (`collision_winding_truth.py`,
+  which is independent of both winding and normals):
+
+  | tree | authored normal agrees with render truth |
+  |---|---|
+  | Oblivion architecture | **98.6%** |
+  | Nehrim architecture | **97.9%** |
+  | Morroblivion `morro/i` | **60.0%** |
+
+- **This is now STEP 0 and it is UNGATED.** `_shape_tri_normals()` extracts the
+  normals index-aligned with `_shape_tri_soup` (**same degenerate-triangle
+  filtering — edit the two together or normals bind to the wrong faces**), and
+  `_repair_inverted_floors` applies them before consulting the toggle at all.
+
+- **Steps 1-3 are INFERENCE and stay gated, because inference costs false
+  positives.** Step 1 seeds each welded component from an arbitrary triangle and
+  propagates that choice, so a component seeded inward inverts wholesale:
+  `architecture/castle/leyawiin/leyawiincastle02.nif` is ONE `NiTriStripsData`
+  block of 1849 triangles that welds into **40 disconnected components**; step 1
+  flipped **274 of 284** triangles in one of them (96% — the tell that the seed
+  was in the 4%) and cost **806 walkable raycast cells on a vanilla mesh**.
+  Step 2 nearly caught it (visual vote 11:1 against, well past `_VIS_MARGIN`)
+  but abstained: the component is not closed, and coverage was **137/284**,
+  five short of the quorum. Measured over Oblivion architecture, step 1 alone
+  takes 43 inverted faces to **103**.
+
+- **Nehrim no longer needs the gate.** Its exporter left the normals intact, so
+  step 0 alone does the job and the inference risk is not worth taking:
+
+  | tree | raw | step 0 only (SHIPPED) |
+  |---|---|---|
+  | Nehrim dungeons | 46.07% inverted | **0.09%** |
+  | Nehrim architecture | 24.17% | **0.70%** |
+
+- **Morroblivion still needs it, and is the ONLY default member.** Its exporter
+  rewrote each normal to match the winding it emitted, so both agree while both
+  are wrong and step 0 has nothing to detect. `morro/i/inuhlaaluuroomuside.nif`:
+  all 10 triangles score `dot = +1.0` over a floor (`z = -123`, under a ceiling
+  at `z = +97`) you fall straight through. Across `morro/i` the authored normals
+  change **0 of 5496** inverted faces; steps 1-3 take it to **20**.
+
+- **⚠ MEASURING AN ENCLOSED MESH: a downward raycast sees the CEILING.** This
+  cost two wrong conclusions in one session — that `inuhlaaluuroomuside` was
+  unrepaired (it is repaired; its floor is simply under a roof) and that the
+  round-2 docstring was stale (it is accurate). For a room, score the **lowest**
+  surface, or use the render-skin oracle. Never read a top-down "fall-through"
+  count on interior geometry.
+
+- **Result, scored on the SHIPPED output against the source render skin:**
+
+  | tree | raw | shipped |
+  |---|---|---|
+  | Oblivion rocks | 17.8% | **0.10%** |
+  | Oblivion architecture | 0.81% | **0.43%** |
+  | Oblivion dungeons | 0.10% | **0.10%** (inert) |
+  | Nehrim dungeons | 46.07% | **0.09%** |
+  | Nehrim architecture | 24.17% | **0.70%** |
+
+  `leyawiincastle02` ships **847 walkable / 0 fall-through**, identical to its
+  source — zero false positives.
+
+- **Caveat on the numbers above.** The render-skin oracle shares its signal with
+  step 2's `_component_visual_vote` (same coincidence rule, same constants), so
+  scores for variants *containing step 2* are partly self-graded and read high.
+  The step-0 figures do not depend on it — they come from reading normals
+  directly out of the files. The oracle also has a documented thin-slab trap
+  (chairs, benches, stairs), which is why Oblivion clutter/furniture measure
+  ~9-12% "inverted" raw while `lowerclasschair01` and `lowerclassbench01` in
+  fact have **0** triangles disagreeing with their normals.
+
 - **Root cause — the sub-shape list changed owner between the two NIF versions** (`references/nif 0.10.0.0.xml`):
   - `bhkPackedNiTriStripsShape.Num Sub Shapes` — `until="20.0.0.5"` (Oblivion)
   - `hkPackedNiTriStripsData.Num Sub Shapes` — `since="20.2.0.7"` (Skyrim)
