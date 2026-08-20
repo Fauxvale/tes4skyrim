@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import struct
 import zlib
 from collections import defaultdict
@@ -60,6 +61,107 @@ LOD_DIR_NAME = "AutoConvertLOD"
 # The previous merged-tile folder. Kept only so an existing install can be
 # recognised and cleaned up; nothing writes here any more.
 MERGED_DIR_NAME = "ZZZ Merged Sibling LOD"
+
+
+def _lod_mod_deliverables(lod_dir: Path) -> list:
+    """Mesh subtrees the LOD mod legitimately OWNS, as absolute dirs.
+
+    Everything else under `meshes/` is scratch. Kept as one list so a new
+    generator that writes into the LOD mod has exactly one place to register
+    itself, instead of the sweep silently eating its output.
+    """
+    from .worldmap_clouds import _OUT_DIR as _CLOUD_DIR
+
+    return [
+        # The baked tiles -- the whole point of the mod.
+        lod_dir / 'meshes' / 'terrain',
+        # World-map cloud banks: ONE file per worldspace at a fixed shared
+        # path, written here by merge_cloud_bank from the UNION of every
+        # sibling's land. The per-plugin copies are the rival versions; this
+        # is the authoritative one, so it must survive the sweep.
+        lod_dir / 'meshes' / _CLOUD_DIR.replace(chr(92), '/'),
+    ]
+
+
+def drop_staged_meshes(lod_dir: Path) -> int:
+    """Delete the meshes a previous bake staged into the LOD mod.
+
+    Staged models are scratch: LODGen resolves geometry under a single
+    PathData root, so `lod_gen._import_master_mesh` copies each model in for
+    the duration of the bake and `_drop_staged_master_meshes` removes it
+    afterwards. Nothing DERIVES an ordinary mesh here -- `far_nif_dirs` routes
+    every generated _far.nif to the plugin tree that ships its full model,
+    which is also where lod_far_gen writes the `.nif.generated` marker that
+    proves authorship. Staging copies the .nif alone and never its marker, so
+    a staged mesh in this tree has no provenance to lose. Measured before this
+    first ran: 4,120 .nif here, 0 markers.
+
+    What the mod genuinely owns is listed by `_lod_mod_deliverables` and is
+    never touched -- the tiles, and the world-map cloud banks that
+    `merge_cloud_bank` writes here precisely BECAUSE the per-plugin copies
+    conflict. Sweeping by "everything that is not terrain/" deleted those
+    banks, which was survivable only because create_lod happens to rewrite
+    them later in the same run; a sweep-only invocation would have left every
+    worldspace's MODL pointing at a missing mesh.
+
+    Scratch is removed as whole SUBTREES where a top-level directory holds no
+    deliverable (one rmtree, not thousands of unlinks), and file-by-file only
+    inside a directory that also holds one. Returns the number of files
+    removed.
+
+    The sweep is needed because the in-process set cannot survive a run.
+    `_import_master_mesh` early-returns for a mesh that is already present and
+    so never registers it, which means anything a killed or pre-one-bake run
+    left behind is invisible to the post-bake cleanup and pins itself forever
+    -- shadowing, since the LOD mod installs last to win the tile overwrite,
+    every plugin's current copy of that mesh.
+    """
+    meshes = lod_dir / 'meshes'
+    if not meshes.is_dir():
+        return 0
+
+    keep = [Path(os.path.normcase(str(d))) for d in _lod_mod_deliverables(lod_dir)]
+
+    def _protected(d: Path) -> bool:
+        """True if `d` is, or contains, a deliverable."""
+        nd = Path(os.path.normcase(str(d)))
+        return any(k == nd or nd in k.parents or k in nd.parents for k in keep)
+
+    def _is_deliverable_dir(d: Path) -> bool:
+        """True only for a deliverable root or something inside one."""
+        nd = Path(os.path.normcase(str(d)))
+        return any(k == nd or k in nd.parents for k in keep)
+
+    def _count(d: Path) -> int:
+        return sum(len(f) for _r, _dirs, f in os.walk(d))
+
+    n = 0
+    for child in sorted(meshes.iterdir()):
+        if not child.is_dir():
+            continue
+        if not _protected(child):
+            n += _count(child)
+            shutil.rmtree(child, ignore_errors=True)
+            continue
+        # Mixed: this subtree holds a deliverable somewhere beneath it, so
+        # recurse and drop only the branches that hold none.
+        stack = [child]
+        while stack:
+            cur = stack.pop()
+            for sub in sorted(cur.iterdir()):
+                if sub.is_dir():
+                    if _protected(sub):
+                        stack.append(sub)
+                    else:
+                        n += _count(sub)
+                        shutil.rmtree(sub, ignore_errors=True)
+                elif not _is_deliverable_dir(cur):
+                    # A loose file inside a directory that merely CONTAINS a
+                    # deliverable is still scratch; only files sitting in the
+                    # deliverable directory itself are kept.
+                    sub.unlink()
+                    n += 1
+    return n
 
 
 def changed_cells_in_worldspace(plugin_esm: Path, master_esm: Path,

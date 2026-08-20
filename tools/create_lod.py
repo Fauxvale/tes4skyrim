@@ -72,6 +72,7 @@ def main() -> int:
                                            lod_worldspaces, owner_map,
                                            merge_cloud_bank, _master_chain,
                                            touched_worldspace_fids,
+                                           drop_staged_meshes,
                                            LOD_DIR_NAME)
     from asset_convert.terrain_lod import _find_worldspace_fid
     from asset_convert.lod_gen import _formid_remap_table
@@ -86,6 +87,15 @@ def main() -> int:
     print("=" * 54)
     print(f"  Output dir: {out_root}")
     print(f"  LOD mod:    {lod_dir}")
+
+    # The LOD mod ships tiles; any mesh here is scratch a previous bake staged
+    # for LODGen and failed to remove. Sweeping up front rather than trusting
+    # the post-bake cleanup keeps a killed run from pinning meshes forever --
+    # and since this mod installs LAST to win the tile overwrite, a stale mesh
+    # here silently overrides every plugin's current copy.
+    swept = drop_staged_meshes(lod_dir)
+    if swept:
+        print(f"  Swept {swept} stale staged mesh file(s) from the LOD mod")
 
     available = converted_plugins(out_root)
     if args.plugins:

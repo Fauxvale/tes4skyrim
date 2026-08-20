@@ -889,6 +889,32 @@ def _obnd_max_dim(stat: dict) -> float:
 _STAGED_MASTER_MESHES = set()
 
 
+def _register_if_staged_scratch(rel: str, output_meshes_dir: Path,
+                                master_meshes) -> None:
+    """Mark an already-present mesh as scratch if a previous run staged it.
+
+    Only a mesh that (a) has no `.nif.generated` marker, so nothing in this
+    tree derived it, and (b) exists identically in a master tree, so staging is
+    where it could have come from, is treated as scratch. Both conditions are
+    required: the marker test alone would sweep a hand-placed mesh, and the
+    master test alone would sweep a legitimately derived one.
+    """
+    r = rel.lower().replace('/', '\\').lstrip('\\')
+    if r.startswith('meshes\\'):
+        r = r[len('meshes\\'):]
+    dst = _win_join(output_meshes_dir, r)
+    if not dst.exists() or str(dst) in _STAGED_MASTER_MESHES:
+        return
+    # Derived here -> has a marker -> not scratch, leave it alone.
+    if dst.with_suffix('.nif.generated').exists():
+        return
+    for mdir in (master_meshes or []):
+        src = _win_join(Path(mdir), r)
+        if src.exists() and src.stat().st_size == dst.stat().st_size:
+            _STAGED_MASTER_MESHES.add(str(dst))
+            return
+
+
 def _import_master_mesh(rel: str, output_meshes_dir: Path,
                         master_meshes) -> bool:
     """Stage a master's mesh into this plugin's tree, if needed.
@@ -911,6 +937,17 @@ def _import_master_mesh(rel: str, output_meshes_dir: Path,
     if not rel:
         return False
     if _mesh_exists(rel, output_meshes_dir):
+        # Already here -- but "already here" includes scratch a previous run
+        # staged and failed to remove (a kill between the copy and
+        # _drop_staged_master_meshes, or any run predating one-bake). Returning
+        # without registering it left that copy pinned forever: every later run
+        # took this same branch, so the post-bake cleanup never saw it.
+        #
+        # A file this tree GENERATED carries a `.nif.generated` marker from
+        # lod_far_gen; staging copies the .nif alone and never the marker. So an
+        # unmarked mesh in a bake tree that derives nothing is staged scratch,
+        # and re-registering it lets this run finish the previous one's cleanup.
+        _register_if_staged_scratch(rel, output_meshes_dir, master_meshes)
         return True
     r = rel.lower().replace('/', '\\').lstrip('\\')
     if r.startswith('meshes\\'):
