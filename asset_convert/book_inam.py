@@ -788,6 +788,43 @@ def _convert_one(model_rel):
         return (model_rel, 'fail', '%s: %s' % (type(exc).__name__, exc))
 
 
+def _split_master_owned(models, export_subdir, extract_roots):
+    """Drop the models whose source assets belong to a MASTER, not to us.
+
+    A plugin's BOOK.txt lists every book it PLACES, including its masters'.
+    Baking from a master's assets is what lets those books have inventory art
+    at all (`_find_source_mesh` searches the masters for exactly that reason),
+    but the generated pair is named after the model's leaf filename, so two
+    plugins placing the same master book both write
+    `clutter/books/inv/<base>.nif|.dds`. The bytes differ -- the atlas is baked
+    from whichever extract root won -- so the copies genuinely conflict and the
+    install order decides which one the game loads.
+
+    Ownership follows the SOURCE mesh: a model this plugin extracted itself is
+    its own to bake, and one that resolves only in a master's export is the
+    master's. The master's own run generates it at the identical path, so
+    deferring loses nothing -- the STAT that `equipment.py` synthesizes points
+    at the same `inv_basename`, and Data holds one file per path.
+
+    A plugin that OVERRIDES a master's book mesh still ships its own copy in
+    its export, so it keeps the bake and legitimately wins the path.
+    """
+    own, deferred = [], 0
+    master_roots = [r for r in _as_roots(extract_roots)
+                    if os.path.normpath(r) != os.path.normpath(export_subdir)]
+    if not master_roots:
+        return list(models), 0
+    for model in models:
+        rel = model.replace('/', chr(92)).strip(chr(92))
+        if _find_source_mesh([export_subdir], rel) is not None:
+            own.append(model)                 # we ship the source: ours to bake
+        elif _find_source_mesh(master_roots, rel) is not None:
+            deferred += 1                     # master ships it: master bakes it
+        else:
+            own.append(model)                 # missing everywhere: report as before
+    return own, deferred
+
+
 def generate_book_inams(source_file, extract_dir='export', output_dir='output',
                         templates_dir=None, skyrim_data=None, workers=None,
                         master_names=None):
@@ -813,6 +850,10 @@ def generate_book_inams(source_file, extract_dir='export', output_dir='output',
     models = distinct_book_models(export_subdir)
     if not models:
         return {'ok': 0, 'skip': 0, 'fail': 0}
+    models, deferred = _split_master_owned(models, export_subdir, extract_roots)
+    if deferred:
+        print('  [book_inam] %d model(s) left to the master that ships them'
+              % deferred)
 
     # Distinct models sharing a leaf filename each get their own unique asset
     # name (see inv_basename_map) — nothing is dropped, and the old hard

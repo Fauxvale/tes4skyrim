@@ -381,8 +381,15 @@ def build_wrld_cloud_modl(rec: dict, edid: str = None):
     # bank is -- so the sheet has to be moved onto the terrain or the far
     # side of the origin runs out from under the clouds.
     center = compute_center(min_x, min_y, max_x, max_y)
+    # NAME only, no file. The bank is ONE mesh at a fixed path shared by every
+    # plugin in the worldspace, so a per-plugin copy is a rival version of it:
+    # each was sized to its own bounds and the install order picked a winner.
+    # sibling_lod.merge_cloud_bank writes the single authoritative copy, sized
+    # to the UNION of every sibling's land, into the LOD mod that installs
+    # last. MODL is the same string either way, and every validity check still
+    # runs -- a worldspace whose bank cannot be built still returns None here.
     return generate_cloud_bank(edid, width, height, _CLOUD_BANK_ROOT,
-                               center=center, land_rect=rect)
+                               center=center, land_rect=rect, write=False)
 
 
 def convert_CELL(rec: dict) -> bytes:

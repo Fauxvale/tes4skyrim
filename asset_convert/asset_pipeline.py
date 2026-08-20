@@ -69,6 +69,8 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
     }
 
     plugin_dir = output_dir / source_name
+    # Build bookkeeping, not a shipped asset -- see texture_prune.MANIFEST_NAME.
+    mesh_manifest_dir = extract_dir / source_name
 
     # -----------------------------------------------------------------------
     # NIF Mesh Conversion
@@ -100,8 +102,8 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
         # nothing outside those folders uses a texture, and it deletes the rest.
         _used = stats['mesh_conversion'].pop('textures_used', set())
         if mesh_subdirs:
-            _used = set(_used) | texture_prune.read_manifest(plugin_dir)
-        texture_prune.write_manifest(plugin_dir, _used)
+            _used = set(_used) | texture_prune.read_manifest(mesh_manifest_dir)
+        texture_prune.write_manifest(mesh_manifest_dir, _used)
     else:
         print(f"  No meshes found at {mesh_src}")
         stats['mesh_conversion'] = {'converted': 0, 'skipped': 0, 'errors': 0}

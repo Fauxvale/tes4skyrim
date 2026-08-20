@@ -282,7 +282,8 @@ def _rescale_and_flatten(data, scales, keep: float, center=(0.0, 0.0)):
 
 def generate_cloud_bank(editor_id: str, width: float, height: float,
                         out_root: str, flatten: float = 0.0,
-                        center=(0.0, 0.0), land_rect=None) -> str:
+                        center=(0.0, 0.0), land_rect=None,
+                        write: bool = True) -> str:
     """Write a scaled, centred cloud bank for one worldspace; return its MODL path.
 
     land_rect: (min_x, min_y, max_x, max_y) of the worldspace's REAL LAND, in
@@ -294,6 +295,16 @@ def generate_cloud_bank(editor_id: str, width: float, height: float,
     rectangle to offer.
     out_root: the plugin's output folder (the one that holds `meshes\\`).
     center: world-unit (x, y) the deck is centred on.
+
+    write: False computes and validates the bank but writes no file,
+    returning the MODL path it WOULD have written. The mesh is ONE file at
+    a fixed path shared by every plugin in a worldspace, so the per-plugin
+    copies were rival versions of it -- each sized to its own bounds, the
+    install order picking a winner. `sibling_lod.merge_cloud_bank` writes
+    the single authoritative copy, sized to the UNION of every sibling's
+    land, into the LOD mod that installs last. MODL is the same string
+    either way, and every validity check above still runs, so a worldspace
+    whose bank cannot be built returns None here exactly as before.
 
     Returns None when the vanilla source mesh is unavailable, so the caller
     simply omits MODL and the engine falls back to its own default -- exactly
@@ -326,6 +337,8 @@ def generate_cloud_bank(editor_id: str, width: float, height: float,
         return None
 
     rel = cloud_model_path(editor_id)
+    if not write:
+        return rel
     # MODL omits the `meshes\` prefix; the file on disk needs it.
     dest = os.path.join(out_root, 'meshes', *rel.split('\\'))
     os.makedirs(os.path.dirname(dest), exist_ok=True)

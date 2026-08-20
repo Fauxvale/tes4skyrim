@@ -50,21 +50,28 @@ _LATE_ASSET_SUFFIXES = ('.nif', '.bto', '.btr')
 
 # Where mesh conversion leaves the texture set it harvested, for the prune
 # phase to pick up later.
+#
+# It lives in the plugin's EXPORT dir, not its output dir. This is build
+# bookkeeping the game never reads, and output/<plugin>/ is a Data root: every
+# plugin wrote the same filename there, so all of them collided on install.
+# export/<plugin>/ is where the other per-plugin build state already lives
+# (collision_cache.bin, mesh_bounds_cache.json, voice_durations.json) and is
+# never installed.
 MANIFEST_NAME = 'textures_used.txt'
 
 
-def write_manifest(plugin_dir, refs) -> Path:
+def write_manifest(export_dir, refs) -> Path:
     """Record the textures the converted meshes reference."""
-    plugin_dir = Path(plugin_dir)
-    plugin_dir.mkdir(parents=True, exist_ok=True)
-    out = plugin_dir / MANIFEST_NAME
+    export_dir = Path(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    out = export_dir / MANIFEST_NAME
     out.write_text('\n'.join(sorted(refs)), encoding='utf-8')
     return out
 
 
-def read_manifest(plugin_dir) -> set:
+def read_manifest(export_dir) -> set:
     """Read back the mesh-conversion texture set (empty if it was never run)."""
-    f = Path(plugin_dir) / MANIFEST_NAME
+    f = Path(export_dir) / MANIFEST_NAME
     if not f.is_file():
         return set()
     return {ln.strip() for ln in
@@ -199,10 +206,10 @@ def build_refs(plugin_dir, export_dir, mesh_texture_refs=None) -> set:
     plugin_dir = Path(plugin_dir)
 
     if mesh_texture_refs is None:
-        mesh_texture_refs = read_manifest(plugin_dir)
+        mesh_texture_refs = read_manifest(export_dir)
     if not mesh_texture_refs:
         raise RuntimeError(
-            f'no mesh texture manifest in {plugin_dir} — run mesh conversion '
+            f'no mesh texture manifest in {export_dir} — run mesh conversion '
             f'first; pruning without it would delete textures that are in use')
 
     refs = {_norm(r) for r in mesh_texture_refs}
