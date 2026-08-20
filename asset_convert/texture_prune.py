@@ -136,6 +136,44 @@ def refs_from_records(export_dir) -> set:
     return refs
 
 
+def refs_from_tree_billboards(export_dir) -> set:
+    """Billboard renders, which no texture path in the plugin ever names.
+
+    A TREE record points at a SpeedTree model (MODL names a `.spt`) and
+    the distant-LOD card for it is Oblivion's shipped render of that same tree,
+    found by NAME: `<billboard dir>/<model stem>.dds`. Nothing writes that path
+    down -- not the record, not a NIF -- so neither `refs_from_records` (which
+    matches `.dds` literals) nor the mesh manifest (billboards belong to no
+    mesh) can see it, and the prune dropped 43 of Oblivion.esm's 245 billboards
+    from the archive. The loose output/ copy survives, so this only ever showed
+    up as missing distant trees in a PACKED build.
+
+    The stem comes from the record's own MODL, and the folder from the
+    generator that consumes these files (`lod_far_gen._BILLBOARD_TEX_DIR`), so
+    the pair stays in step with whatever actually reads them.
+    """
+    from .lod_far_gen import _BILLBOARD_TEX_DIR
+
+    tree_txt = Path(export_dir) / 'TREE.txt'
+    if not tree_txt.is_file():
+        return set()
+
+    bb_dir = _BILLBOARD_TEX_DIR.replace('\\', '/').strip('/').lower()
+    refs = set()
+    for ln in tree_txt.read_text(encoding='utf-8', errors='replace').splitlines():
+        ln = ln.strip()
+        if not ln.lower().startswith('model.modl='):
+            continue
+        # The export escapes its separators, so a raw Path() would read a
+        # leading separator as a UNC root and hand back an empty stem.
+        raw = ln.split('=', 1)[1].strip().lower().replace('\\', '/')
+        stem = raw.rsplit('/', 1)[-1]
+        stem = stem.rsplit('.', 1)[0]
+        if stem:
+            refs.add(f'{bb_dir}/{stem}.dds')
+    return refs
+
+
 def _texture_refs_in(raw: bytes) -> list:
     """Every texture path in one binary asset.
 
@@ -215,6 +253,7 @@ def build_refs(plugin_dir, export_dir, mesh_texture_refs=None) -> set:
     refs = {_norm(r) for r in mesh_texture_refs}
     refs.discard('')
     refs |= refs_from_records(export_dir)
+    refs |= refs_from_tree_billboards(export_dir)
 
     # Meshes generated after mesh conversion (speedtrees, _far, LOD/terrain
     # tiles, the grass copies) — no converter harvested these, so read them.
