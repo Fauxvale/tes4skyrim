@@ -862,7 +862,15 @@ def _root_is_ninode_slow(full: Path) -> bool:
 # Objects smaller than this (max OBND dimension, game units) are only baked
 # into the near LOD-4 tiles.  A level-8 tile starts ~2 cells out; small
 # clutter is invisible there but its baked geometry still costs disk/VRAM.
-_LOD8_MIN_SIZE = 400.0
+#
+# 400 sat just below the median reference size, so it kept 74% of Tamriel's
+# 327,096 references at level 8 — and the gate feeds level 16 as well, so the
+# two coarse rings together carried 57% of the bake's bytes.  Censused across
+# the real bake input, reference sizes run p25=386, p50=548, p75=1011: 600 is
+# the knee of that curve (400->600 drops 118k references, 600->900 only 35k
+# more) and still keeps everything hut-sized and larger.  At level-8 distance
+# (8,000+ units) a 600-unit object is well under a pixel of silhouette.
+_LOD8_MIN_SIZE = 600.0
 
 
 def _obnd_max_dim(stat: dict) -> float:
@@ -1028,8 +1036,13 @@ def _lod_meshes_for(stat: dict, output_meshes_dir: Path, master_meshes=None):
     """
     Return (lod4, lod8, lod16) mesh paths for a stat record.
 
-    - Trees use their billboard-card _far.nif at every level — the cards are
-      8 verts each, so distant forests stay visible for almost no cost.
+    - Trees use their billboard-card _far.nif, and are subject to the SAME
+      size gate as everything else: a card is only 8 verts, but it is baked
+      once per PLACEMENT, and Tamriel places 124,872 of them. Listing every
+      tree at every level put 73,672 tree cards into level-16 tiles — 72% of
+      everything reaching that level, and why a level-16 tile spans 256 cells
+      yet reached 371 MB. 26% of tree placements are shrubs under the gate
+      (ShrubBoxwood is 130 units and was being drawn ~8 km out).
     - Other LOD objects (0x8000) get lod4; lod8 only if they're big enough
       to matter at level-8 distances (_LOD8_MIN_SIZE).
     - World-map objects (0x10000000) additionally get lod16 so LODGenx64
@@ -1055,19 +1068,30 @@ def _lod_meshes_for(stat: dict, output_meshes_dir: Path, master_meshes=None):
         return '', '', ''
 
     from .lod_far_gen import is_tree_model, _tier_path, _TIER8, _TIER16
-    if is_tree_model(stat):
-        return far, far, far
+    is_tree = is_tree_model(stat)
 
     flags = stat.get('flags', 0)
+    big_enough = _obnd_max_dim(stat) >= _LOD8_MIN_SIZE
     lod8_mesh = lod16_mesh = ''
-    if _obnd_max_dim(stat) >= _LOD8_MIN_SIZE:
-        far8 = str(_tier_path(Path(far), _TIER8['suffix']))
-        lod8_mesh = (far8 if _import_master_mesh(far8, output_meshes_dir,
-                                                 master_meshes) else far)
-    if flags & 0x10000000:
-        far16 = str(_tier_path(Path(far), _TIER16['suffix']))
-        lod16_mesh = (far16 if _import_master_mesh(far16, output_meshes_dir,
-                                                   master_meshes) else far)
+    if big_enough:
+        # A billboard card has no coarser tier to fall back to: it is already
+        # two crossed quads, so the same card serves every level it reaches.
+        if is_tree:
+            lod8_mesh = far
+        else:
+            far8 = str(_tier_path(Path(far), _TIER8['suffix']))
+            lod8_mesh = (far8 if _import_master_mesh(far8, output_meshes_dir,
+                                                     master_meshes) else far)
+    # Trees carry no world-map flag, so gate their far ring on size alone —
+    # otherwise every tree drops out at level 16 and distant forests vanish
+    # from the world map.
+    if (flags & 0x10000000) or (is_tree and big_enough):
+        if is_tree:
+            lod16_mesh = far
+        else:
+            far16 = str(_tier_path(Path(far), _TIER16['suffix']))
+            lod16_mesh = (far16 if _import_master_mesh(far16, output_meshes_dir,
+                                                       master_meshes) else far)
     return far, lod8_mesh, lod16_mesh
 
 

@@ -61,6 +61,8 @@ Later Issues:
 
 	14 - Add optional skyrim creature remapping
 
+	15 - Refine armor conversion: rings don't properly attach
+
 Minor Issues:
 
 	2 - Improve landscape layer blending
