@@ -2842,6 +2842,24 @@ def gui_main():
                 lbl.pack(anchor="w", padx=4, pady=4)
                 return
 
+            # A MISSING EXPORT has to be visible even when other plugins
+            # filled the list. Shipped LOD is the authority now, so "this
+            # plugin offers nothing" is the ordinary case for most of the load
+            # order and cannot itself be the trigger -- but a deleted export
+            # produces the same silence, and previously the warning only
+            # appeared when NOTHING was offered, so one healthy plugin hid it.
+            lost = [_ws_why[n] for n in names
+                    if n in _ws_why and 'run the Export stage' in _ws_why[n]]
+            if lost:
+                warn = tk.Label(
+                    winner,
+                    text="\n\n".join(lost[:4]) +
+                         (f"\n\n(+{len(lost) - 4} more)" if len(lost) > 4
+                          else ""),
+                    bg=CLR["panel"], fg=CLR["yellow"],
+                    justify=tk.LEFT, wraplength=210, font=("Segoe UI", 9))
+                warn.pack(anchor="w", padx=4, pady=(4, 6))
+
             for wname in live:
                 var = tk.BooleanVar(value=ws_state.get(wname, True))
                 ws_vars.append((wname, var))

@@ -184,9 +184,13 @@ class TestModAddedWorldspacesAreOffered:
         monkeypatch.setattr(terrain_lod, 'detect_terrain_worldspaces',
                             lambda _e: [(1879, 0x3C, 'ANQWorld')])
 
+        # Terrain alone is NOT a reason to bake LOD. An ESP that extends a
+        # master's landmass ships LOD for the MASTER's worldspace, and a city
+        # world renders on its parent's grid -- so "has terrain, shipped
+        # nothing" means covered elsewhere, not missed.
         ws, why = terrain_lod.lod_capable_worldspaces(d, out)
-        assert [e for e, _f in ws] == ['ANQWorld']
-        assert why is None
+        assert ws == []
+        assert why and 'ships no distant LOD' in why
 
     def test_shipped_ranks_before_generated_and_dedupes(self, monkeypatch,
                                                         tmp_path):
@@ -204,17 +208,19 @@ class TestModAddedWorldspacesAreOffered:
             terrain_lod, 'detect_terrain_worldspaces',
             lambda _e: [(9, 0x3C, 'TES4Tamriel'), (5, 0x99, 'Toddland')])
 
+        # Only the shipped list survives; Toddland has terrain but the game
+        # never baked LOD for it, which is the authored answer we trust.
         ws, _why = terrain_lod.lod_capable_worldspaces(d, out)
-        assert [e for e, _f in ws] == ['TES4Tamriel', 'Toddland']
+        assert [e for e, _f in ws] == ['TES4Tamriel']
 
     def test_a_plugin_with_no_worldspaces_is_explained(self, monkeypatch,
                                                        tmp_path):
         """A quest-only ESP defines none, so there is nothing to offer.
 
-        Note this is about defining no WORLDSPACE at all. A worldspace that
-        exists but is empty IS offered: it simply bakes no tiles, and gating
-        on content meant counting LAND records, which cost a walk of 1.17
-        million records purely to rank a list.
+        With shipped LOD as the authority, "offers nothing" is the normal
+        answer for most plugins, so the reason string carries the whole
+        diagnostic burden -- it must tell a deleted export apart from a plugin
+        that legitimately ships no LOD of its own.
         """
         from asset_convert import terrain_lod
 
@@ -231,7 +237,10 @@ class TestModAddedWorldspacesAreOffered:
 
         ws, why = terrain_lod.lod_capable_worldspaces(d, out)
         assert ws == []
-        assert 'no worldspace' in why
+        assert why and 'no landscape-LOD folders' in why
+        # The warning must name the recovery, because a DELETED export looks
+        # exactly like a plugin that never had LOD.
+        assert '--extract-only' in why
 
     def test_owner_falls_back_to_terrain_when_nobody_shipped(self, shipped,
                                                              tmp_path):
@@ -261,7 +270,7 @@ class TestModAddedWorldspacesAreOffered:
         from asset_convert.terrain_lod import lod_capable_worldspaces
         ws, why = lod_capable_worldspaces(tmp_path / 'Ghost.esp')
         assert ws == []
-        assert 'not exported' in why and '--export-only' in why
+        assert 'no export folder' in why and '--export-only' in why
 
     def test_reason_map_only_covers_empty_plugins(self, monkeypatch, tmp_path):
         """A plugin that resolved worldspaces contributes no reason."""
