@@ -1023,9 +1023,12 @@ _TEX_TRANSFORM_VARS = {
 }
 
 
-# NiTexturingProperty.apply_mode = APPLY_HILIGHT2: Oblivion's detail/overlay
-# pass, where the diffuse alpha is a blend WEIGHT rather than transparency.
-# Skyrim has no equivalent -- see the alpha handling in _process_geometry.
+# NiTexturingProperty.apply_mode = APPLY_HILIGHT2: Oblivion's PARALLAX switch.
+# The diffuse's alpha channel holds a HEIGHT FIELD, not transparency and not a
+# blend weight -- see asset_convert/parallax.py for both engines' mechanism.
+# Skyrim reads the same channel as plain opacity, so the alpha property must be
+# dropped either way (see the alpha handling in _process_geometry); with
+# --parallax the height is additionally carried across into a slot-3 map.
 _APPLY_HILIGHT2 = 4
 
 # NiMaterialColorController.target_color: which material channel the curve
@@ -1320,6 +1323,133 @@ def _plan_flipbook_atlas(frame_rels, stats):
     jobs = stats.setdefault('_flipbook_atlases', {})
     jobs[atlas_rel.lower()] = {'atlas_rel': atlas_rel, 'files': files}
     return atlas_rel, n_pad, n_real
+
+
+# Alpha classification is a full scan of a texture's top mip, and 2359 flagged
+# shapes share only 130 diffuse textures — without this the same DDS would be
+# decoded eighteen times over.  Keyed on the resolved absolute path, so it
+# holds per worker process and stays deterministic.
+_PARALLAX_ALPHA_CACHE = {}
+
+
+def _plan_parallax(diffuse_rel, stats):
+    """Decide whether this shape's diffuse can carry a Skyrim height map.
+
+    Two independent questions, both of which must answer yes — see
+    asset_convert/parallax.py.  The mesh flag (checked by the caller) is the
+    AUTHORED intent; this is the measurement of whether there is anything to
+    carry.  Returns the height map's texture path, or None.
+
+    Registers a build job in stats; convert_nif executes it, because only it
+    knows the output tree.
+    """
+    from . import parallax
+    src = _resolve_source_texture(diffuse_rel, stats.get('_src_path', ''))
+    if src is None:
+        stats['parallax_texture_unresolved'] = \
+            stats.get('parallax_texture_unresolved', 0) + 1
+        return None
+    key = src.lower()
+    info = _PARALLAX_ALPHA_CACHE.get(key)
+    if info is None:
+        try:
+            with open(src, 'rb') as f:
+                raw = f.read()
+        except OSError:
+            raw = b''
+        info = parallax.classify_alpha(raw)
+        _PARALLAX_ALPHA_CACHE[key] = info
+    if not info.usable:
+        # Named per category, not a single "skipped" counter: two thirds of the
+        # flagged textures have nothing to carry, and the build log has to say
+        # WHY or the next person re-measures all 130 of them.
+        stats[f'parallax_skipped_{info.kind}'] = \
+            stats.get(f'parallax_skipped_{info.kind}', 0) + 1
+        return None
+
+    rel = parallax.height_path(diffuse_rel)
+    jobs = stats.setdefault('_parallax_maps', {})
+    jobs[rel.lower()] = {'height_rel': rel, 'src': src}
+    return rel
+
+
+# Oblivion's distant-LOD tier meshes.  `_far` is the convention; `_far8` and
+# `_far16` are the coarser tiers `lod_far_gen` derives beside it.
+_LOD_TIER_SUFFIXES = ('_far', '_far8', '_far16')
+
+
+def _is_lod_tier_mesh(src_path) -> bool:
+    """True for a `_far` / `_far8` / `_far16` distant-LOD tier mesh."""
+    stem = os.path.splitext(os.path.basename(str(src_path or '')))[0].lower()
+    return stem.endswith(_LOD_TIER_SUFFIXES)
+
+
+def _apply_parallax(ts, shader, tex_set, tex_apply_mode, stats):
+    """Rebuild a flagged shape as a Skyrim parallax shape.
+
+    Never runs by default: verified in game, a correctly built parallax shape
+    SWIMS under vanilla SSE (and the SSE Parallax Shader Fix did not help), so
+    the output needs Community Shaders or ENB.  The converter cannot detect
+    that, hence the opt-in.
+    """
+    if (stats is None or not stats.get('_parallax')
+            or tex_apply_mode != _APPLY_HILIGHT2):
+        return
+    # 🔴 Never on a distant-LOD tier mesh, for three independent reasons.
+    #
+    # It is invisible: a `_far.nif` is only ever drawn at LOD distance, where a
+    # per-pixel height offset resolves to nothing.
+    #
+    # It does not survive: the LOD stage regenerates these from the full model
+    # with `force_regen_generated=True`, and that path knows nothing about
+    # parallax — it drops the vertex colours the heightmap shader needs while
+    # leaving shader type 3 in place. `parallax_check.py verify` found exactly
+    # that: 60 malformed shapes, every one of them in a `_far`/`_far8`/`_far16`
+    # mesh, all reported as "no vertex colours (renders unlit-black)".
+    #
+    # And it made the output ORDER-DEPENDENT, which is the real defect: run
+    # meshes then LOD and the tier meshes come out clean, run LOD then meshes
+    # and they keep a half-built parallax shape. The shape count moved 1495 ->
+    # 1555 purely on that ordering.
+    if _is_lod_tier_mesh(stats.get('_src_path', '')):
+        stats['parallax_skipped_lod_tier'] = \
+            stats.get('parallax_skipped_lod_tier', 0) + 1
+        return
+    data = getattr(ts, 'data', None)
+    if data is None:
+        return                      # no geometry to render the height on
+    diffuse_rel = tex_set.textures[0]
+    if not diffuse_rel:
+        return
+    if isinstance(diffuse_rel, bytes):
+        diffuse_rel = diffuse_rel.decode('utf-8', errors='replace')
+    height_rel = _plan_parallax(diffuse_rel, stats)
+    if height_rel is None:
+        return
+
+    from . import parallax
+    tex_set.textures[parallax.HEIGHT_SLOT] = height_rel.encode('utf-8')
+    shader.skyrim_shader_type = parallax.SHADER_TYPE_HEIGHTMAP
+    shader.shader_flags_1.slsf_1_parallax = 1
+    # Mutually exclusive with the height path — the shader has one auxiliary
+    # slot and type 3 claims it.  Neither is set anywhere in this converter
+    # today; clearing them keeps that true if that ever changes.
+    shader.shader_flags_1.slsf_1_environment_mapping = 0
+    shader.shader_flags_2.slsf_2_glow_map = 0
+
+    # Skyrim's heightmap shader needs vertex colours present; without them the
+    # shape renders unlit-black.  All-white is neutral and is what the in-game
+    # test shipped.  Measured on Nehrim: 848 of the 1551 converted shapes have
+    # none of their own.
+    if not getattr(data, 'has_vertex_colors', False):
+        data.has_vertex_colors = True
+        data.vertex_colors.update_size()
+        for c in data.vertex_colors:
+            c.r = c.g = c.b = c.a = 1.0
+        stats['parallax_vertex_colors_added'] = \
+            stats.get('parallax_vertex_colors_added', 0) + 1
+    shader.shader_flags_2.slsf_2_vertex_colors = 1
+    stats['parallax_shapes'] = stats.get('parallax_shapes', 0) + 1
 
 
 def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
@@ -1753,6 +1883,11 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
 
         ts.bs_properties[0] = eff_shader
     else:
+        # Oblivion's parallax, carried across when the opt-in is on.  Only on
+        # this branch: the FX/flip-book path above threw `shader` away for a
+        # BSEffectShaderProperty, which has neither a height slot nor a shader
+        # type to set.
+        _apply_parallax(ts, shader, tex_set, tex_apply_mode, stats)
         ts.bs_properties[0] = shader
 
     # Record the diffuse as a DETAIL OVERLAY when the source authored it that
@@ -1774,24 +1909,25 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
             stats.setdefault('overlay_diffuses', set()).add(_overlay_key)
 
     if alpha_prop is not None:
-        # Oblivion's APPLY_HILIGHT2 (4) is a DETAIL-OVERLAY apply mode: the
-        # diffuse's alpha channel is a per-texel BLEND WEIGHT for laying the
-        # texture over the surface, NOT a transparency mask.  Skyrim has no
-        # such mode -- it reads the same channel as plain transparency, so the
-        # SI mania/dementia rocks render see-through, and where the weight is
+        # Oblivion's APPLY_HILIGHT2 (4) is its PARALLAX switch: the diffuse's
+        # alpha channel is a HEIGHT FIELD, not a transparency mask.  Skyrim
+        # reads the same channel as plain transparency, so the SI
+        # mania/dementia rocks render see-through, and where the surface is
         # low they disappear completely (seisland's body texture mrock01.dds
         # averages alpha 133 = the whole island ~50% transparent).
         #
         # These are provably not cutout masks: 97-99% of texels are PARTIALLY
         # opaque with almost no fully-transparent region (mrock01 97.9% >= 1
-        # but only 22% >= 254; DMRockSideRoot01 99.0% >= 1 and 0% >= 254), so
-        # there is no shape being cut out and nothing to preserve.  Vanilla
-        # agrees: across 600 landscape/clutter meshes, 1088/1313 shapes ship
-        # NO NiAlphaProperty at all and the commonest value on the rest is
-        # 0x12EC (test, blend OFF) -- vanilla rock simply does not alpha-blend.
-        # So drop the property and let the rock render solid.
+        # but only 22% >= 254; DMRockSideRoot01 99.0% >= 1 and 0% >= 254) --
+        # mid-tone-dominant, which is exactly a height map's profile and not a
+        # cutout's.  Vanilla agrees on the remedy: across 600 landscape/clutter
+        # meshes, 1088/1313 shapes ship NO NiAlphaProperty at all and the
+        # commonest value on the rest is 0x12EC (test, blend OFF) -- vanilla
+        # rock simply does not alpha-blend.  So drop the property and let the
+        # rock render solid.  This is right whether or not --parallax is on;
+        # with it, the height also survives as a real slot-3 map.
         #
-        # Only the overlay case is touched.  Genuine transparency (gems,
+        # Only the parallax case is touched.  Genuine transparency (gems,
         # bottles, curtains, potion liquids) ships MODULATE/HILIGHT and keeps
         # its alpha exactly as authored.
         if tex_apply_mode == _APPLY_HILIGHT2 and (int(alpha_prop.flags) & 0x0001):
@@ -1799,6 +1935,19 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
                 stats.get('hilight2_alpha_dropped', 0) + 1
         else:
             ts.bs_properties[1] = alpha_prop
+            # This shape READS the diffuse's alpha -- as blend weight or as a
+            # test threshold, either way as opacity.  That is evidence the
+            # channel is not a height field here, whatever the texture-level
+            # classifier decided, so the diffuse must keep its alpha and may
+            # not be stripped to BC1 later.  Measured on the author's Nehrim
+            # parallax mod: 1 shape of 39,201, but the converter runs on
+            # plugins nobody has measured.
+            _dif = tex_set.textures[0] if tex_set.textures else None
+            if _dif and stats is not None:
+                if isinstance(_dif, bytes):
+                    _dif = _dif.decode('utf-8', errors='replace')
+                stats.setdefault('_alpha_opacity_diffuse', set()).add(
+                    _dif.replace('/', '\\').lower())
 
     # Re-emit the harvested UV animation onto whichever shader we settled on.
     _attach_tex_transform_ctrls(ts.bs_properties[0], tex_transforms)
@@ -5090,13 +5239,17 @@ def _upgrade_skin_instances(data):
 
 
 def _convert_nif(data, fix_textures=True, src_path='', weight=0,
-                 creature=False, worn=False, biped_flags=0):
+                 creature=False, worn=False, parallax=False, biped_flags=0):
     """Convert a PyFFI NifFormat.Data in-place to Skyrim format.
 
     worn=True marks the NIF as body-worn gear on the plugin's own authority (an
     ARMO/CLOT record names it as a biped model — see wearable_plan.is_worn).
     It only ever widens the armor path: the folder-name guess below still
     applies on its own for meshes no record references.
+
+    parallax=True carries Oblivion's APPLY_HILIGHT2 height field across as a
+    Skyrim slot-3 height map (asset_convert/parallax.py).  Off by default: the
+    result needs Community Shaders or ENB and renders wrong without one.
 
     creature=True selects the creature-asset rules (skeleton.nif and skinned
     body parts from meshes/creatures/): skinned bodies keep a plain NiNode
@@ -5116,7 +5269,8 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         'tangents_injected': 0,
         'bones_remapped': 0,
         'textures_fixed': 0,
-        '_src_path': str(src_path),   # for flip-book frame resolution
+        '_src_path': str(src_path),   # for flip-book/height-map source lookup
+        '_parallax': bool(parallax),  # opt-in; see _apply_parallax
         # Sky geometry (stars/clouds/atmosphere) needs BSSkyShaderProperty
         # rather than the lighting shader — see sky_object_type_for.
         '_sky_type': sky_object_type_for(src_path),
@@ -6284,7 +6438,8 @@ def merge_creature_body(part_paths, dst_path, skeleton_path=None):
 
 
 def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
-                src_meshes_dir=None, creature=False, wearable_plan=None):
+                src_meshes_dir=None, creature=False, wearable_plan=None,
+                parallax=False, textures_only=False):
     """Convert a single Oblivion NIF to Skyrim format.
 
     Already-Skyrim versions are copied to dst_path unchanged.
@@ -6297,6 +6452,12 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     wearable_plan: mapping from asset_convert.wearable_plan.build_plan, naming
     the _0/_1/plain variants each armor/clothing mesh is referenced as.  None
     disables weight-variant output entirely.
+
+    parallax: carry Oblivion's parallax across (opt-in — see _apply_parallax).
+
+    textures_only: read and analyse every mesh, write NONE of them.  The
+    height maps still get built, because the decision to build one needs the
+    mesh's own APPLY_HILIGHT2 flag — see the mode's rationale in batch_convert.
     """
     result = {
         'converted': False,
@@ -6375,7 +6536,8 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
 
     stats = _convert_nif(data, fix_textures=fix_textures,
                          src_path=str(src_path), creature=creature,
-                         worn=_worn, biped_flags=_biped_flags)
+                         worn=_worn, parallax=parallax,
+                         biped_flags=_biped_flags)
 
     # Graft the converted Oblivion flame NIF under FlameNode* markers (candle
     # flame / torch fire) — full conversion of Oblivion's own flame visuals,
@@ -6405,6 +6567,23 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
                         pass  # shader falls back to sampling a missing atlas;
                               # frames were pre-validated so this is unexpected
 
+    # Write the BC4 height maps planned by _apply_parallax.  Same reason as the
+    # atlas above: only convert_nif knows the output tree.  Each map is written
+    # once — the file test skips the other meshes sharing that diffuse, and
+    # 2359 flagged shapes share just 163 textures, so nearly all of them skip.
+    _height_jobs = stats.pop('_parallax_maps', {})
+    if _height_jobs:
+        from . import parallax as _parallax
+        _dstn = str(dst_path).replace('/', os.sep).replace('\\', os.sep)
+        _k = os.sep + 'meshes' + os.sep
+        _i = _dstn.lower().rfind(_k)
+        if _i >= 0:
+            _out_root = _dstn[:_i] + os.sep
+            for _job in _height_jobs.values():
+                _out = _out_root + _job['height_rel'].replace('\\', os.sep)
+                if not os.path.isfile(_out):
+                    _parallax.build_height_map(_job['src'], _out)
+
     # Animated objects (activators/doors/levers): Skyrim will not drive an
     # in-NIF NiControllerSequence from ObjectReference.PlayAnimation() — that
     # call needs an animation graph manager, which only exists when the root
@@ -6415,7 +6594,7 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # would give PlayAnimation a dead state) are already gone, and before the
     # write so the BGED ships in the file.  See asset_convert/hkx_animobject.py.
     _seq_names = collect_sequence_names(data)
-    if _seq_names:
+    if _seq_names and not textures_only:
         # A graph-bound mesh must ship NO empty text keys: the generator
         # strchr()s every key value on activation and an empty NiString loads
         # as a NULL pointer (see _strip_empty_text_keys — the Spiddal Stick /
@@ -6462,7 +6641,16 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
 
     # Diffuses the source authored as APPLY_HILIGHT2 detail overlays, for the
     # LOD stage (see the note beside _APPLY_HILIGHT2 in _process_geometry).
+    # Harvested BEFORE the textures_only return: that mode still analyses every
+    # shape, so the LOD manifest it feeds must be complete either way.
     result['overlay_diffuses'] = stats.get('overlay_diffuses', set())
+
+    if textures_only:
+        # Everything above still ran: the shape was read, its APPLY_HILIGHT2
+        # flag consulted, its diffuse measured, and the BC4 height map written.
+        # Only the mesh itself is not emitted — PGPatcher does that side, in
+        # the player's real load order where it can see every plugin.
+        return _finish_result(result, stats)
 
     # Write to a buffer first — some NIFs have version-incompatible blocks
     # (e.g. NiGeomMorpherController morph arrays) that fail at Skyrim version.
@@ -6532,6 +6720,15 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
             with open(_root + '_1' + _ext, 'wb') as f:
                 f.write(w1_bytes if w1_bytes is not None else buf.getvalue())
 
+    return _finish_result(result, stats)
+
+
+def _finish_result(result, stats):
+    """Roll `stats` up into the worker's result dict.
+
+    Its own function because --textures-only returns before the mesh is ever
+    written, and both exits owe batch_convert the same accounting.
+    """
     result['converted'] = True
     result['strips_fixed'] = stats['strips_fixed'] > 0
     result['properties_converted'] = stats['properties_converted'] > 0
@@ -6540,17 +6737,40 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     result['version_upgraded'] = True
     result['bones_remapped'] = stats['bones_remapped'] > 0
     result['textures_fixed'] = stats['properties_converted'] > 0  # proxy: every property conversion rewrites textures
+    # Parallax accounting.  Carried up per CATEGORY, because "skipped" on its
+    # own sends the next person back to all 163 flagged textures with no lead —
+    # over half of them legitimately have no height data to carry.
+    _px = {k: v for k, v in stats.items() if k.startswith('parallax_')}
+    if _px:
+        result['parallax'] = _px
+    # Carried separately from the counters above: this one is a SET of texture
+    # paths, and `parallax` is merged with Counter.update().
+    _au = stats.get('_alpha_opacity_diffuse')
+    if _au:
+        result['alpha_opacity_diffuse'] = _au
     return result
 
 
 def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
-                  remap_skeleton=None, subdir_filter=None, wearable_plan=None):
+                  remap_skeleton=None, subdir_filter=None, wearable_plan=None,
+                  parallax=False, textures_only=False):
     """Convert all NIF files in mesh_dir to Skyrim format, writing to output_dir.
 
     Skip reason codes:
       VER  — unsupported NIF version (too old / unrecognised)
       RD   — read failure (corrupt, truncated, unknown block types)
       WR   — write failure (version-incompatible blocks, e.g. NiGeomMorpherController)
+
+    textures_only: analyse every mesh, emit none of them.  For the parallax
+    path there is a better mesh patcher than us — **PGPatcher** (ParallaxGen)
+    runs over the player's finished load order, so it sees every plugin at
+    once and can also upgrade a shape to ENB's complex-material system, which
+    Community Shaders reads too.  Our job then reduces to the one thing it
+    cannot do: recover the height field out of Oblivion's diffuse alpha.
+
+    The meshes still have to be READ.  Whether a diffuse carries a height map
+    is only knowable from the shape's own APPLY_HILIGHT2 flag — the authored
+    intent — so the analysis is the same and only the emit is dropped.
 
     Args:
         subdir_filter: If provided, an iterable of root subfolder names (e.g.
@@ -6561,6 +6781,9 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
                        naming which _0/_1/plain variants of each armor and
                        clothing mesh the plugin references.  None writes no
                        weight variants at all.
+        parallax:      Carry Oblivion's parallax across as Skyrim height maps.
+                       OFF by default — the result needs Community Shaders or
+                       ENB and renders wrong under vanilla SSE.
 
     Returns a stats dict compatible with asset_pipeline.py expectations.
     """
@@ -6599,6 +6822,11 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
         # Union of the textures every written mesh references — the pipeline
         # prunes the texture tree against this.
         'textures_used': set(),
+        # Per-category parallax accounting, empty unless parallax=True.
+        'parallax': _collections.Counter(),
+        # Diffuse textures some shape reads as opacity — see the alpha branch
+        # in _process_geometry.  Their alpha is never stripped to BC1.
+        'alpha_opacity_diffuse': set(),
         # Of those, the ones the source authored as APPLY_HILIGHT2 detail
         # overlays: their alpha is a blend weight, not transparency, and object
         # LOD must not read it as opacity.
@@ -6618,13 +6846,17 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
 
     work_args = [
         (str(nif_file), str(out_base / nif_file.relative_to(mesh_path)),
-         fix_textures, remap_skeleton, str(mesh_path), wearable_plan)
+         fix_textures, remap_skeleton, str(mesh_path), wearable_plan,
+         parallax, textures_only)
         for nif_file in nif_files
     ]
 
     def _update(nif_str, r):
         stats['warn_counts'].update(r.get('warn_counts', {}))
         stats['textures_used'].update(r.get('textures', ()))
+        stats['parallax'].update(r.get('parallax') or {})
+        stats['alpha_opacity_diffuse'].update(
+            r.get('alpha_opacity_diffuse') or ())
         stats['overlay_diffuses'].update(r.get('overlay_diffuses', ()))
         if r.get('error'):
             stats['errors'] += 1
@@ -6706,6 +6938,20 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
             remaining = len(stats['warn_counts']) - len(top_cats)
             print(f'  ... ({total_suppressed - shown} more in {remaining} other categories)')
 
+    if parallax:
+        px = stats['parallax']
+        built = px.get('parallax_shapes', 0)
+        print(f'\nParallax: {built} shapes converted to the heightmap shader'
+              f' (+{px.get("parallax_vertex_colors_added", 0)} given white '
+              f'vertex colours)')
+        skipped = sorted((k, v) for k, v in px.items()
+                         if k.startswith('parallax_skipped_')
+                         or k == 'parallax_texture_unresolved')
+        for cat, cnt in skipped:
+            # Flagged by the author but nothing to carry.  Not a failure:
+            # Oblivion renders no parallax there either.
+            print(f'  left flat, {cat[len("parallax_"):]}: {cnt} shapes')
+
     # plain ASCII: cp1252 consoles/pipes choke on the arrow character
     print(f'\nDetailed stats: Strips->Shape={stats["strips"]}, '
           f'Properties={stats["properties"]}, '
@@ -6716,14 +6962,15 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
 
 def _batch_worker(args):
     (nif_str, out_path, fix_textures, remap_skeleton, src_meshes_dir,
-     wearable_plan) = args
+     wearable_plan, parallax, textures_only) = args
     global _worker_warn_log
     _worker_warn_log = []
     try:
         r = convert_nif(nif_str, out_path,
                         fix_textures=fix_textures, remap_skeleton=remap_skeleton,
                         src_meshes_dir=src_meshes_dir,
-                        wearable_plan=wearable_plan)
+                        wearable_plan=wearable_plan, parallax=parallax,
+                        textures_only=textures_only)
         r['warn_counts'] = _categorize_pyffi_warnings(_worker_warn_log)
         return ('ok', nif_str, r)
     except Exception as e:

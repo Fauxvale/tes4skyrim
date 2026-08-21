@@ -497,7 +497,8 @@ def phase_extract(file_name: str, tes4_data: str, config: dict,
 # ===========================================================================
 
 def phase_assets(file_name: str, config: dict, output_dir: str = None,
-                 mesh_subdirs=None, winding_fix=None):
+                 mesh_subdirs=None, winding_fix=None, parallax=False,
+                 textures_only=False):
     """Convert extracted NIF assets and copy textures to output (meshes only).
 
     `winding_fix` tri-states the collision winding repair: True/False force it,
@@ -528,6 +529,8 @@ def phase_assets(file_name: str, config: dict, output_dir: str = None,
         extract_dir=extract_dir,
         output_dir=out_dir,
         mesh_subdirs=mesh_subdirs,
+        parallax=parallax,
+        textures_only=textures_only,
     )
     total = sum(v for v in stats.values() if isinstance(v, int))
     print(f"[{file_name}] Meshes complete ({total} items processed)")
@@ -535,6 +538,11 @@ def phase_assets(file_name: str, config: dict, output_dir: str = None,
     # Book inventory-art: bake each distinct BOOK model's textures onto the
     # vanilla Skyrim reading rigs (see asset_convert/book_inam.py); the import
     # phase points each BOOK's INAM at meshes\tes4\clutter\books\inv\<base>.nif
+    if textures_only:
+        print(f"[{file_name}] Textures only: no meshes, no book art "
+              f"(PGPatcher patches the meshes in the load order)")
+        return True
+
     from asset_convert.book_inam import generate_book_inams
 
     _, tes5_data = get_paths(config)
@@ -1313,6 +1321,24 @@ def main():
                          action="store_false", default=None,
                          help="Disable the inferred winding steps (the "
                               "authored-normal repair still runs).")
+    # Parallax (asset_convert/parallax.py). Deliberately opt-in and NOT a
+    # per-plugin default: a correct parallax shape renders wrong under vanilla
+    # SSE, and the converter cannot tell what the player will run it under.
+    parser.add_argument("--parallax", action="store_true",
+                        help="Carry Oblivion's parallax across as Skyrim "
+                             "height maps. REQUIRES Community Shaders or ENB "
+                             "in the player's setup -- under vanilla SSE the "
+                             "affected surfaces render wrong. Off by default.")
+    # Meant to pair with --parallax: PGPatcher (ParallaxGen) patches meshes
+    # across the player's whole load order and can also upgrade them to ENB's
+    # complex-material system, which we cannot see from here. Then the only
+    # thing left for us is recovering the height field out of Oblivion's
+    # diffuse alpha -- so analyse every mesh, ship none of them.
+    parser.add_argument("--textures-only", action="store_true",
+                        help="Mesh stage: read and analyse every NIF but write "
+                             "none. Ships textures only (with their _p height "
+                             "maps), for use with PGPatcher. Pair with "
+                             "--parallax.")
 
     args = parser.parse_args()
 
@@ -1472,7 +1498,9 @@ def main():
         for fn in order:
             ok = phase_assets(fn, config, output_dir=output_dir,
                               mesh_subdirs=getattr(args, 'mesh_subdirs', None),
-                              winding_fix=args.collision_winding_fix)
+                              winding_fix=args.collision_winding_fix,
+                              parallax=args.parallax,
+                              textures_only=args.textures_only)
             # A filtered mesh run converts only some subfolders, so it must not
             # certify the Meshes step as fully rebuilt at this version.
             if not getattr(args, 'mesh_subdirs', None):

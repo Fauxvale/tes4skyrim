@@ -783,6 +783,571 @@ Every one was invisible to structural inspection **and to NifSkope, which render
 - **0 vanilla Skyrim meshes contain any NiAmbientLight/NiDirectionalLight/NiPointLight/NiSpotLight block** (nif_block_scan). They are 3ds Max export leftovers in a handful of Oblivion assets (11 meshes: statuegodszenithar01, sanguine statue/shrine, priory doors/cabinets, vine01/02, countess clothes _gnd). SSE fails to load a static carrying one — statuegodszenithar01.nif (NiAmbientLight child of the root) rendered as the missing-model red triangle (TODO §26).
 - Skyrim lighting comes from placed LIGH references, never from mesh-embedded light nodes, so there is nothing to convert them into. `_walk_node`'s NiDynamicEffect branch now strips ALL dynamic-effect subtypes (it previously kept Ambient/Point/Spot believing them valid; NiNode `effects` arrays were already cleared, but a light in the `children` array survived).
 
+## Oblivion parallax → Skyrim height maps (`asset_convert/parallax.py`, opt-in, 2026-08-15)
+
+`NiTexturingProperty.apply_mode == APPLY_HILIGHT2 (4)` is **Oblivion's parallax
+switch**, and the height field lives in the **diffuse's ALPHA channel**. It was
+long read here as a "detail-overlay blend weight"; the *action* that reading
+produced (drop the NiAlphaProperty) is right either way, but the reason was
+wrong and the height was being thrown away. Parallax and glow map are mutually
+exclusive in Oblivion.
+
+Skyrim's side: shader type **3** (Heightmap), `SLSF1_Parallax` in Shader Flags
+1, the height map in **texture slot 3** as `<name>_p.dds`, height read from the
+RED channel, **vertex colours required** (all-white is fine), incompatible with
+glow map and env map, compatible with specular and shadow. Type 3 adds **no
+conditional fields** to the record (`references/nif 0.10.0.0.xml`: only types
+1/5/6/7/11/14/16 do), so setting it changes the enum and nothing else.
+
+### 🔴 This must never be the default
+Measured in game on a hand-built parallax shape (`temp/parallax_testbuild.py`,
+one shape of `skingradbridgemain01.nif`, the other six as an in-frame control):
+
+| Environment | Result |
+|---|---|
+| Vanilla SSE | the shape **swims** — visibly broken, not merely flat |
+| + SSE Parallax Shader Fix | **identical**, no improvement |
+| + Community Shaders | works, effect is good |
+
+So the switch is `--parallax` (CLI), a GUI checkbox, and off everywhere else.
+The converter cannot detect the player's shader setup, which is the only thing
+that decides whether the output is correct. ENB also handles it (user's
+report, not measured here). Do **not** rely on the SSE Parallax Shader Fix: it
+did not carry the one test we ran.
+
+### Two conditions, both required
+1. **The mesh flag** answers "did the author want parallax here" — authored
+   intent, never guessed at.
+2. **The texture** answers "is there any height data to carry" — measured over
+   Nehrim's full 12,437-mesh set with `tools/parallax_check.py census`:
+   **2359 flagged shapes** in 1267 meshes, on **130 distinct diffuse
+   textures**, of which only **44** actually hold a height field.
+
+| verdict | textures | shapes |
+|---|---|---|
+| **height** (converted) | **38** | **1495** |
+| no alpha at all (DXT1) | 67 | 508 |
+| flat/empty alpha | 14 | 279 |
+| **too coarsely quantised** | **6** | **56** |
+| soft-edged mask (bimodal) | 1 | 11 |
+| transparency cutout (binary) | 1 | 1 |
+| names a file that does not exist | 3 | 9 |
+
+### 🔴 Count the LEVELS, not just the distribution (found in game, 2026-08-15)
+The first version of the classifier tested range, mid-tone share and edge
+share — and accepted six **DXT3** textures that pass all three. DXT3 stores
+4-bit explicit alpha: **at most 16 distinct values, whatever the artist
+painted.** Measured over the 44 it first accepted, the two clusters do not
+overlap at all:
+
+```
+DXT3   7-16 levels     (RockBeach04: 7 levels over a range of 102)
+DXT5 147-256 levels
+```
+
+A parallax shader OFFSETS by the height, so seven levels across a range of 102
+is a ~15-unit step per level — the surface renders as **visible spikes and
+terracing**, which is exactly how Oblivion's beach rocks looked in game.
+`_MIN_LEVELS = 64` rejects them as `quantised`. The threshold sits in the empty
+gap between the clusters, so it is not fitted to the data, and the check counts
+LEVELS rather than testing the FourCC — a DXT5 alpha that happens to be an
+eight-step staircase is just as unusable.
+
+The flag on those meshes is genuine (`rockbeachshell045.nif` carries HILIGHT2
+in Nehrim's own BSA and has no loose override at all). What was wrong was
+assuming a flag plus a plausible-looking histogram implies usable data.
+
+**Per shape the yield is 63%, not 29%** — the textures that carry height are
+the ones used everywhere (cave and fort-ruin walls, the Lazeon interior set).
+Flag alone would write an empty height map and switch the shader for the other
+864 — producing exactly the swimming surface above. Skipping those is the
+**faithful** conversion: with no alpha channel to read, Oblivion renders no
+parallax there either. Nothing is invented; the categories are counted and
+printed per build. (Whoever wants more should use the TES4N2HGenerator, which
+reconstructs height from the normal map properly.)
+
+🔴 **Count textures by LOWERCASED path, not by spelling.** Oblivion meshes
+spell the same file several ways — Nehrim's Lazeon walls appear as both
+`Lazeon\` and `lazeon\`. Keying on the verbatim string turns these 130
+textures into 163 and the 44 height maps into 74, and an earlier measurement
+(`temp/parallax_yield.py`, `sorted(set(diffuses))`) reported exactly those
+inflated figures. `census` prints both counts side by side so the two can be
+reconciled instead of re-investigated. The remaining 74-vs-75 difference is
+the one soft-edged mask: the author's own `dds_is_parallax` lacks the
+`edge_ratio >= 0.70` guard that `_is_clear_parallax` beside it applies, and we
+apply it.
+
+All three unresolvable textures are defects in the source, not path bugs here:
+`lazeon\static\wanda2.dds` exists nowhere in the BSAs;
+`lowres\architecture\leyawiin\SkingradTrim05.dds` names the Leyawiin folder for
+a texture that lives in `architecture\skingrad\`; and one mesh
+(`leyawiinhouselower02_far.nif`) drops the separator entirely and writes
+`textureslowres\…`. That last one is **one reference in one mesh out of
+12,437** — a single-record typo, deliberately not special-cased.
+
+Distribution is worth knowing: **63% of flagged shapes are vanilla Oblivion**
+(dungeons 808, rocks 340, architecture 338), not mod content — so the gain
+starts at the base conversion. Architecture is where the DXT1 no-data cases
+cluster; a 6,000-mesh sample that happened to exclude it put DXT1 at 12%
+instead of 37%.
+
+### 🔴 Amplitude: cap at 150, and NEVER touch a map that is already good
+The raw Oblivion/Nehrim alpha renders far too deep in Skyrim. Both engines
+read the channel identically (white out, black in, mid-grey neutral) — what
+differs is the depth the shader gives it: Community Shaders computes
+`maxHeight = 0.1 * scale` from an engine parameter no texture can influence,
+and Oblivion's figure is unmeasurable from here (compiled shader packages).
+
+The rule must not damage a mod that ships GOOD maps. A hand-made height map
+works in both engines — the user's own set is authored for Oblivion, rebuilt
+from the normal maps and hand-tuned, and renders correctly in Skyrim too.
+Calibrated on **56 pairs of the same texture**, hand-tuned vs Nehrim's
+original (`temp/parallax_pairs.csv`):
+
+| | min | p25 | median | p75 | max |
+|---|---|---|---|---|---|
+| hand-tuned (good) | 130 | 144 | **146** | 147 | **148** |
+| Nehrim (raw) | 95 | 159 | **203** | 254 | **255** |
+
+```
+cap 148 -> 100% of the hand-tuned set untouched, 83% of Nehrim's corrected
+cap 150 -> same, with margin        <- DEFAULT_MAX_RANGE
+```
+
+A field already inside the cap is returned **bit for bit unchanged**; only the
+over-deep ones are compressed, and around their own MEDIAN so the body of the
+distribution stays where the author put it. On Nehrim's 38 shipped maps: 33
+compressed, 5 untouched.
+
+### 🔴 The thing that actually mattered: how FLAT the face is (rebuilt 2026-08-16)
+A hand-made height map is a flat face with narrow grooves; Nehrim's raw alpha
+undulates everywhere. Stated so no outlier can distort it — the share of the
+surface within ±20 levels of its own median:
+
+| | hand-tuned | Nehrim |
+|---|---|---|
+| **share within ±20 of the median** | **63.2** | **36.6** |
+
+That is a SHAPE difference. **Shifting cannot touch it** (linear, moves the
+median with the body), which is why matching amplitude (150 vs 143) changed
+nothing about the impression. Only a tone curve does.
+
+#### The measure this replaced was outlier-confounded — do not go back to it
+The first version used the share of texels in the bottom third of `min..max`.
+That threshold comes from the EXTREMES, so a couple of bright texels stretch
+the range and drag the whole surface into the "deep" band.
+`leyawiinmetalstrip03.dds` — a flat plate with **two rivets** — scored
+**94.2% deep** while 93.7% of it lies within ±20 of the median (p95 83, p99
+jumps to 132). Recomputed on a robust p05..p95 range the separation collapses:
+
+| | hand-tuned | Nehrim |
+|---|---|---|
+| deep third, full range | 12.1 | 39.1 |
+| deep third, robust range | 25.8 | 37.9 |
+| **share within ±20 of the median** | **63.2** | **36.6** |
+
+The middle row is the finding: once the range is made robust, the deep-third
+figure stops separating the two populations at all. `temp/dark_reference_maps.csv`
+was generated with the broken figure and lists flat textures with bright specks.
+
+#### The curve: `x**g` cannot do this job, and the reason is worth keeping
+`x**g` compresses one END of the range, so the share inside a band around the
+median **is not even monotone in g** — measured over all 38 maps, 21 DIP before
+they rise as g falls, so a bisection has nothing to bisect on. Inside the range
+its own posterisation floor allowed (g ≥ 0.63 at amplitude 255) the median
+share only moved 53% → 56%. The 63% target is out of reach for that family.
+
+The replacement works on the DISTANCE from the median:
+
+```
+y = med + sign(d) * D * (|d| / D) ** p          d = v - med
+```
+
+`D` per side, so `lo`→`lo` and `hi`→`hi` exactly and the amplitude is
+untouched. `p > 1` presses the body together and steepens the tails. Two
+properties `x**g` lacked:
+
+- **Monotone in p by construction** — raising `p` moves every texel weakly
+  closer to the median, so the share inside any band can only grow. That is
+  what makes the bisection valid.
+- **It cannot punch holes.** Steepest slope is `p`, at the ENDS, where `x**g`
+  had *unbounded* slope at 0 — the thing that turned `cave04` into grey
+  plateaus with black holes. The linear step then scales even that down by `f`.
+
+The fit is O(1) per bisection step: the curve is monotone and fixes the median,
+so the texels landing inside the band are those between the band edges'
+pre-images, read straight out of a cumulative histogram (`_flat_share_at`).
+
+**Ceiling on `p` is the authored floor, not a round number.** Counting the
+distinct levels actually occupied inside each reference map's own ±20 band,
+over all 3631: `min 21, p05 25, median 41, max 41`. A ±20 band spans 41 levels,
+so the median hand-tuned map uses every one and none drops below 21 — hence
+`_MIN_BODY_LEVELS = 21`. A texture that simply IS restless goes as far as that
+allows and no further; a partial correction beats a destroyed map.
+
+#### Calibration — check BOTH reference folders, again
+The target is the median of the whole corpus, not of the 56 pairs:
+
+| | p05 | median | p95 |
+|---|---|---|---|
+| both folders (3631) | 34.7 | **63.3** | 84.8 |
+| folder A (1738) | 49.9 | 69.6 | 85.7 |
+| folder B (1893) | 29.3 | 51.3 | 83.1 |
+
+🔴 The same author normalises to 69.6% in one set and 51.3% in the other — the
+**same split that made the amplitude cap dangerous** (medians 145 and 153).
+The pooled median 63.3 is the natural target and sits between them;
+calibrating on either folder alone lands 6–12 points off. The spread is wide on
+purpose: half the corpus sits below 63%, so this says "as flat as a typical
+hand-made map", not "flatter than every one". It is a CURVE TARGET only — as a
+detector the same figure fails badly (see `DEFAULT_MAX_RANGE`).
+
+#### The target saturates, which is what makes it safe to turn
+`TARGET_FLAT_SHARE = 0.68`, not the pooled 63.3, on the author's in-game
+verdict: *"the maps are OK, they could go a touch flatter"*. 0.68 stays inside
+the hand-tuned population, in the direction of folder A's own 69.6.
+
+Swept through the shipped module over the 38 maps, the median flat share is:
+
+```
+target   63%    66%    68%    70%    75%    80%
+median  63.4   65.4   65.4   65.4   65.4   65.4
+```
+
+It stops at 65.4 and does not move again. **`_MIN_BODY_LEVELS`, not the target,
+is what ends the curve** — beyond that point the fit would have to press the
+face flat, and the guard refuses. So this dial cannot be over-turned, which is
+the property that makes tuning it by eye safe.
+
+Three safety properties hold by construction, not by observation:
+
+- **bit-identical maps are decided by the amplitude detector alone** — 6 of 38
+  stay bit-identical across the entire target sweep; the curve never runs on a
+  map the detector let through (`f < 1.0` gates it);
+- **posterisation is bounded** — steepest slope is `p·f` with `p ≤ 4` and
+  `f ≤ 1`, so at most ~4 levels. Measured largest output gap is 10 and it sits
+  in a map that was only *shifted*, i.e. it is authored, not introduced;
+- **the body keeps ≥ 21 levels**, the reference population's own floor.
+
+At 0.68: flat share median **40.4% → 65.4%**, poorest corrected body 34 levels.
+
+#### ✅ Validated against a third-party pack nobody calibrated on
+The detector was tuned on two folders by ONE author, which is a real weakness —
+so it was then run against QTP3 (Qarl's Texture Pack 3), a well-known Oblivion
+replacer with no connection to this project. `dungeons\caves`, via
+`tools/parallax_check.py pack`:
+
+| | |
+|---|---|
+| 38 DDS | 19 diffuse, 19 `_n` normal maps (never read) |
+| of the 19 diffuse | **9** hold a usable height field, 8 have no alpha channel at all, 2 are cutout masks |
+| of the 9 | **5 bit-identical**, 4 corrected |
+
+The split is clean and lands where it should:
+
+```
+untouched   amplitude  82 .. 137      cave08, cave03, cave06, cave04, cave01
+corrected   amplitude 207 .. 255      cave07, cave11, cave10, cave12
+```
+
+**Nothing sits between 137 and 207.** All four corrections fired on amplitude;
+the median floor did not fire once (no QTP3 median is below 45). Largest output
+gap 2 — no posterisation. On two of the four the tone curve contributed exactly
++0.0, i.e. the amplitude cap alone had already brought them inside the target.
+
+The author's own verdict on that split: the five left alone are the ones that
+"would already look good", the four changed are the ones that are "extreme to
+very extreme". That is an independent confirmation of the threshold, on content
+it was not fitted to.
+
+Worth stating plainly: those four ARE authored work being changed — `cave07`
+loses a third of its depth. The justification is the same premise the whole
+correction rests on (Community Shaders renders the same field deeper than
+Oblivion does), and `--max-range 0` turns it off for anyone who disagrees.
+
+### 🔴 `durchgangD`: a SECOND defect, and the band measure does not cover it
+`lazeon\static\durchgangD` — a practically black wall, median 17, amplitude 158
+— reads as **89.2% flat** on the band measure, and correctly so: it *is* flat,
+just parked entirely at the bottom of the channel. Restlessness and
+off-centredness are two different defects and the curve only fixes the first.
+
+The mechanism is why it matters: a parallax shader offsets along the view
+vector by `(height − neutral)`, so a surface sitting near 0 renders not as depth
+but as a **constant view-dependent UV shift** — the texture slides across the
+wall as the camera moves. Same swimming artefact an empty height map produces.
+
+**Centring was rejected once and came back only on new evidence.** The old
+refutation stands for what it tested: a *tolerance around mid-grey*, measured on
+56 pairs, where the medians overlap so badly that sparing 96% of the good maps
+also spares 53% of Nehrim's. `MIN_MEDIAN` is a different rule — a **one-sided
+floor** — and the evidence is the full 3631-map corpus:
+
+| median level | min | p05 | median | p95 |
+|---|---|---|---|---|
+| hand-tuned | **52** | 94 | 125 | 175 |
+| Nehrim | 17 | 31 | 105 | 169 |
+
+```
+floor < 45   touches 0 of 3631 hand-tuned (0.00%), catches 4 Nehrim maps
+floor < 60   touches 3 of 3631 (0.08%)
+```
+
+Nothing the author shipped is darker than 52. The four it catches are
+`durchgangD` (17), `durchgangA` (31), `decked` (32) and `bodend` (36) — exactly
+the set sitting just under the amplitude threshold at 153–159 that used to ship
+untouched. 45 sits in the middle of the empty gap between 36 and 52, the same
+way `DEFAULT_MAX_RANGE` sits in the gap between 156 and 169.
+
+A map caught by this rule ALONE gets the re-centring shift and nothing else —
+no compression, no tone curve. A pure translation cannot damage relief: every
+level, gradient and gap survives. Verified on `durchgangD`: median 17 → 113,
+amplitude 158 → 158, levels 149 → 149, gap 5 → 5, and the render goes from a
+black slab to a legible stone wall with the mortar joints as the deep parts.
+The amplitude detector remains the only thing that may compress a field.
+
+Consequence worth knowing: the amplitude target had been dialled down to 80 by
+eye, but that was compensating for the wrong SHAPE. With the curve in place it
+went back up to 140 — next to the hand-tuned set's own 143.
+
+**Detection and correction depth are two separate numbers** — `max_range`
+decides WHICH maps are touched and is pinned at 150 by the hand-tuned set
+(130..148); `target_range` decides HOW FAR a condemned map is taken and is
+free to go lower. That split exists because the eye and the measurements
+disagree: corrected to amplitude 150, Nehrim's `wandb` still read as too
+strong in game while the hand-tuned version at **143** read as right. Three
+explanations were measured and all three failed —
+
+* amplitude: 150 vs 143, five percent apart;
+* steepness: ours is **0.70x** theirs in UV space (mean |dh| per texel x width
+  — resolution cancels, so 1024² and 2048² are comparable), i.e. ours is the
+  FLATTER one;
+* a material depth parameter: shader type 3 has none (only type 7,
+  ParallaxOcc, carries `Scale`), Community Shaders' Extended Materials exposes
+  on/off switches and nothing numeric, and `HeightScale *= PBRParams1.y`
+  belongs to the TruePBR path, not to vanilla parallax shading.
+
+So what drives the perceived strength is still unexplained, and the depth of a
+corrected map is a dial set by eye. Keeping it separate from the detector
+means turning that dial can never cost a mod anything it authored well —
+pinned by `test_lowering_the_target_never_reaches_a_good_map`.
+
+**The refuted theory, so it is not retried:** re-centring on mid-grey. It is
+the obvious idea — Nehrim's `wandb` sits at median 63 with 92% below mid-grey
+while the hand-tuned version sits at 126 — but the same 56 pairs kill it. The
+hand-tuned medians scatter 86..132 and overlap Nehrim's, so any tolerance that
+spares the good maps also spares half the bad ones (tolerance 40: 96% of the
+good set kept, only 53% of Nehrim's corrected). Amplitude separates cleanly;
+centring does not.
+
+Tuning does NOT need a mesh rebuild — the meshes never change, only the
+`_p.dds`. Use `python tools/parallax_check.py regen [--max-range N]
+[--strength F] [--only SUBSTRING]`, which rewrites the maps in seconds and
+reports per texture whether the cap bit or the map was left alone.
+
+### Output conditioning: halve → blur → curve → BC4 (added 2026-08-19)
+
+**Skyrim's parallax sampling is coarser than Oblivion's.** Verified in game by
+the author: an unsmoothed Oblivion height field reads as "comic" under Skyrim's
+stepping. So *every* map is smoothed, not just the ones a detector flags.
+
+The chain in `build_height_map` is, in order:
+
+1. **`mitchell_halve`** — half linear size, Mitchell-Netravali (B = C = 1/3),
+   resampled for an exact 2× reduction so the tap offsets are constant and the
+   seven weights are a literal (`-5/288, 1/36, 77/288, 4/9, …`, summing to 1).
+   **Lanczos was ruled out deliberately** — too sharp for a field that is
+   already slightly soft, which is the whole point of the blur that follows.
+2. **`gaussian_blur`** — radius `BLUR_RADIUS_PER_1000 = 5.0` texels per 1000
+   texels of *output* width, i.e. resolution relative; σ = radius/3. A fixed
+   pixel radius would hit a 512 map about eight times harder than a 4096 one
+   and this content ships both. Below ~100 px output width the radius falls
+   under 0.5 and the blur is skipped — small maps are left alone by design.
+3. **`normalise_height`** — the tone curve, **last**.
+4. **`encode_bc4_dds`**.
+
+#### 🔴 The order is why nothing needed recalibrating
+
+`normalise_height` is not a fixed curve, it is a **fit onto a measured property
+of its input** (share of area within ±`FLAT_BAND` of the median, target
+`TARGET_FLAT_SHARE`). Run it LAST, on the texels that actually ship, and it
+still lands on the calibrated target whatever the halving and the blur did to
+the field. Putting the blur *after* the curve would silently give back part of
+the in-game-approved depth.
+
+Halving is also a straight **speed win** on the slowest step: `encode_bc4_dds`
+is pure Python, one 4×4 block at a time, inside the mesh workers — a quarter of
+the pixels is a quarter of the blocks. Both new passes are numpy and accumulate
+tap by tap rather than gathering, because a 4096-square map would otherwise
+materialise a 234 MB intermediate in each of nine workers.
+
+Measured on `anvilcastledoor01.dds` (4096×8192, 42 MB), `temp/bench_chain.py`:
+
+| step | s |
+|---|---|
+| `decode_alpha_plane` | 8.45 |
+| `mitchell_halve` | 1.78 |
+| `gaussian_blur` (r = 10.2) | 0.47 |
+| `normalise_height` | 0.38 |
+| `encode_bc4_dds` at half | 4.60 |
+| **new chain** | **15.68** |
+| `encode_bc4_dds` at full — what the old chain paid | 18.00 |
+| **old chain** | **26.45** |
+
+So the conditioning is **41% cheaper per texture**, not more expensive: the
+encoder saves 13.4 s and the two new passes cost 2.25 s. `decode_alpha_plane`
+is now the single biggest cost and is still pure Python — the next place to
+look if this ever needs to be faster.
+
+### Diffuse → BC1: a block strip, not a recompression (added 2026-08-19)
+
+Once the height is out in a `_p` map the diffuse has no use for its alpha, and
+DXT1 is half the size. **This is not a re-encode.** Every height-carrying
+diffuse is DXT5 — `classify_alpha` rejects DXT1 and uncompressed outright, and
+`_MIN_LEVELS` rejects every DXT3 source — and a DXT5 block is 8 bytes of alpha
+followed by 8 bytes of colour **in exactly BC1's colour-block layout**. So the
+colour half is copied verbatim, keeping the endpoints the original encoder
+chose.
+
+**Dithering and perceptual error metrics therefore have nothing to act on**:
+nothing is being quantised. Decoding to RGB to re-compress with dithering would
+*lose* quality, not gain it.
+
+The one real difference is DXT1's 3-colour mode. Two exact repairs, neither
+changing a texel's colour (`_bc1_repair_modes`):
+
+| source block | repair |
+|---|---|
+| `c0 > c1` | copy verbatim — already a legal 4-colour DXT1 block |
+| `c0 < c1` | swap the endpoints, XOR the index word with `0x55555555` (0↔1, 2↔3) — the swapped palette names the same four colours |
+| `c0 == c1` | zero the indices. Every palette entry already equals `c0`, and DXT1 index 3 would be **transparent black** |
+
+Verified on real Nehrim textures: first 64 blocks decode identically, file
+exactly halved (170 KB → 85 KB).
+
+#### The gate: a shape that BLENDS with the alpha vetoes the strip
+
+`strip_diffuse_alpha` runs after the texture copy (same reason as the
+landscape-normal fix) and keys on the presence of `<name>_p.dds` beside
+`<name>.dds` — the mesh stage already decided that texture carried height, so
+no plumbing is needed and a non-parallax build is a no-op by construction.
+
+But a texture-level classification is not the whole answer. If some *other*
+shape reads that diffuse's alpha as opacity, that is evidence the channel is
+not a height field there, whatever the classifier said. `_process_geometry`
+records those diffuses in `alpha_opacity_diffuse` (a set, carried separately
+from the `parallax` Counter) and the strip skips them.
+
+Measured on the author's NTATU/Qarl parallax mod: 39,201 shapes, 134 textures
+classified `height`, of which **1** — `architecture\chorrol\interior\
+forgeembers01.dds` — is read as opacity by a non-parallax shape. One in forty
+thousand, but the converter runs on plugins nobody has measured, so the gate is
+generic rather than a bet on that number.
+
+### The global depth scale (added 2026-08-19)
+
+Oblivion's authored depth reads far too bumpy under Skyrim whatever the map was
+calibrated for, so **every** map is compressed toward the neutral plane:
+
+    v' = 128 + (v - 128) * DEPTH_SCALE          # 0.6, confirmed in game
+
+**128 is not a guess.** Community Shaders pivots the height on 0.5 twice over —
+`AdjustDisplacementNormalized` returns `(displacement - 0.5) * scale + 0.5 +
+offset`, and the POM ray starts at `minHeight = maxHeight * 0.5`. Above 128 a
+surface pushes OUT, below it pushes IN, so compressing toward 128 reduces
+displacement in both directions and a groove never flips into a bump.
+
+#### 🔴 GLOBAL, not per-map — the trap that was nearly built
+
+The first cut normalised every map to a fixed target amplitude. That is wrong:
+it makes a plaster wall exactly as deep as a cave wall and throws away the
+relief the author actually authored — the same trap `normalise_height` already
+warns about under `strength`. One factor for every texture keeps every
+relationship between two surfaces intact and only bounds the excursion.
+
+Prior art confirms the shape of the fix. The author's own `TES4N2HGenerator`
+ends its pipeline with Output Levels (Output Black 26 / Output White 165, clamp
+26..179) — the same global band operation — and the shipped NTATU/Qarl pack
+measures 30..179, so `clamp_max` is visible in the data. Those values are
+calibrated for Oblivion's much gentler offset mapping, which is why Skyrim needs
+a further factor on top rather than a different band.
+
+Not taken from that tool: its Contrast (150) and Balance. Shape correction is
+already done by `TARGET_FLAT_SHARE`, calibrated in game; two S-curves stacked
+would fight each other.
+
+#### Why this one has no detector
+
+Everything above the halve/blur/depth block is a CORRECTION — it decides a map
+is defective and leaves everything else bit-identical, which is what protects a
+mod author's own calibration. These three are a SYSTEM ADAPTATION and run
+unconditionally, from any source, because the target engine samples differently:
+
+| step | when |
+|---|---|
+| amplitude cap (163) | outliers only |
+| median floor (45) | sunk maps only |
+| tone curve | only if the cap fired |
+| **halve, blur, `scale_depth`** | **always, every map, every source** |
+
+`build_height_map` is the single funnel — the mesh converter and
+`parallax_check.py regen` are its only two callers, and it is the only thing
+that calls `encode_bc4_dds`. There is no second route by which a `_p.dds` can
+come into being.
+
+### `--textures-only`: hand the mesh side to PGPatcher (added 2026-08-19)
+
+`convert.py -f <plugin> --meshes-only --parallax --textures-only` reads and
+analyses every NIF and writes **none** of them; only the textures ship, height
+maps included.
+
+The reason is that there is a better mesh patcher than us for this job.
+**PGPatcher** (ParallaxGen) runs over the player's finished load order, so it
+sees every plugin at once, and it can also upgrade a shape to ENB's
+complex-material system — which Community Shaders reads too. Neither is
+knowable from inside a single-plugin conversion. What PGPatcher cannot do is
+recover a height field out of Oblivion's diffuse alpha, and that is exactly
+what we keep.
+
+The meshes still have to be READ: whether a diffuse carries height is only
+knowable from the shape's own `APPLY_HILIGHT2` flag, the authored intent. So
+the analysis is unchanged and only the emit is dropped — `convert_nif` returns
+right after `_harvest_textures`, through the same `_finish_result` the normal
+path uses, so `batch_convert`'s accounting does not silently read zero.
+Animation-object projects, grass models and book inventory art are skipped too,
+being mesh products.
+
+### Implementation notes
+- `classify_alpha` returns a **category** (`height` / `binary` / `bimodal` /
+  `empty` / `no_alpha` / `unreadable`), not a bool, so the build log can say
+  WHY a shape was skipped. Thresholds come from the user's own
+  TES4AutoParallaxer, tuned on this content.
+- DXT5 alpha must be decoded through the **interpolated palette**. Sampling
+  only the two endpoints misreads every smooth height field as binary — a
+  gentle block's endpoints sit far apart with all six mid-tones between them.
+- **Empty alpha reads WHITE (mean 255), not black.** Every flat channel
+  measured on Nehrim was 255. Code that assumes an unused channel is 0 gets
+  these exactly backwards.
+- Output format is **BC4**: one channel, BC1's file size, no banding on grey
+  gradients. Written without texconv — a BC4 block is byte-for-byte a DXT5
+  ALPHA block, so `encode_bc4_dds` reuses the decoder's own understanding of
+  the format. The palette index is **computed, not searched** (quantise
+  `hi - v` onto sevenths); the 8-way search cost 4x as much and this runs
+  inside the mesh workers. Cost per 512x512 texture: 0.23 s end to end.
+  Beyond-Skyrim's BC1 recommendation is for the vanilla path we do not serve.
+- Normal maps in both games are **DirectX convention** (green/Y inverted).
+  Anything reconstructing height FROM a normal map must flip before taking
+  gradients — omitting it produced garbage on the first test build. (Not used
+  by the converter, which reads the authored alpha; relevant to the tooling.)
+- The prune keeps the maps by itself: the shape names `_p.dds` in slot 3, so
+  `_harvest_textures` puts it in the mesh manifest. `_p` is also in
+  `texture_prune._MAP_SUFFIXES` and `_companions` derives it from any kept
+  diffuse — two independent reasons, no extra handling.
+- Alpha-blended flagged shapes need no separate exclusion: the HILIGHT2 branch
+  already drops a blend-enabled NiAlphaProperty (below), so by the time the
+  shape ships it is not blended. A surviving alpha there is test-only
+  (`0x12EC`), and alpha-tested cutout + parallax is legal in Skyrim.
+- Audit either side with `python tools/parallax_check.py census|verify`.
+
 ## NIF worn armor conversion
 - Worn armor (has_skin AND not _gnd AND in armor/clothes dir) must use **NiNode** root, NOT BSFadeNode
 - BSFadeNode is for world objects only — worn armor is attached to the character skeleton
@@ -795,11 +1360,11 @@ Every one was invisible to structural inspection **and to NifSkope, which render
 - **Clothing vs armor ARMA body coverage**: Clothing ARMA should NOT add ForeArms(34) extra coverage — shirt sleeves (SBP_32_BODY) should remain visible when gloves are equipped. Armor cuirasses DO add ForeArms(34) because the separate ARMA system allows gauntlets to properly overlay.
 - **Shoes vs boots calves slot**: Shoes (clogs, sandals) should NOT claim Calves(38) in ARMA. Only boots get calves. Detection: `'boot' in model_path`. Clothing foot items without 'boot' are shoes.
 - **Oblivion alpha-BLENDS surfaces it also alpha-TESTS; Skyrim must not (fixed 2026-07-27, `_skyrim_alpha_property`)**: Oblivion ships cutout geometry as `NiAlphaProperty` flags **0x12ED** (blend bit 0 SET + test bit 9 set). Skyrim reads the blend bit as "draw in the transparent pass", so an opaque diffuse authored that way renders wrong — this is why the **Shivering Isles Dark Seducer body armor was invisible when worn while its ground model was fine** (SI armor is one all-in-one ARMO covering slots 32/33/37/44; its `armor.dds` is DXT3 but **99.5% fully opaque**, so it should be a plain cutout). Vanilla uses **0x12EC** — the identical value with blending CLEAR — on **188/193** surveyed shapes that enable alpha testing (`references/Skyrim Meshes` armor + landscape + architecture + clutter). So whenever the test bit is on, the blend bit is dropped. This is a GENERAL TES4→TES5 rule, not an SI quirk; `grass_profile.py` had already learned the same thing for grass (`0x12ED`→blend clear) and this generalises it to every converted mesh.
-- **Blend-on/test-OFF is real transparency EXCEPT under `APPLY_HILIGHT2` (fixed 2026-07-27)**: see-through SI mania/dementia rocks ship `0x00ED` (blend on, test off) — but so do gems, bottles, curtains, posters and potion liquids, which must keep blending, and a flawed emerald has *byte-identical* alpha flags to a rock overlay. The discriminator is **`NiTexturingProperty.apply_mode`**: the rocks use **APPLY_HILIGHT2 (4)**, Oblivion's detail/decal overlay pass laid over solid geometry, whose diffuse is a soft partial-alpha mask rather than a shape (SI `DMRockSideRoot01.dds`: 0% opaque / 99% partial). Skyrim has no equivalent mode, so it blends the mask across the whole surface → you see through the rock. Census over ~1,000 source meshes (rocks, clutter, architecture, dungeons, plants): **all 5** blend-on HILIGHT2 shapes are the SI rock overlays; **none** of the other 142 blend-on shapes use HILIGHT2 (they are MODULATE=2 or HILIGHT=3). Everything else is left exactly as authored. Do NOT try to classify these by texture alpha percentages — potion liquids measure 100% partial alpha and would be wrongly turned opaque.
-  - **The remedy is the DECAL shader flags, NOT an alpha-tested cutout (corrected 2026-07-27, same day)**: the first version of this fix turned HILIGHT2+blend+no-test into a threshold-128 cutout, which replaced see-through rock with **completely invisible sections** — these overlay masks are soft gradients with NO fully-opaque texels at all, so a cutout deletes a quarter to a half of the surface outright (`DMRockSideRoot01` peaks at alpha **221** with 29% of texels below 128; `DMRockSideMudBase01` peaks at 238, 26% below; `mrock01worn` 47% below). Skyrim's real equivalent of Oblivion's overlay pass is `slsf_1_decal` + `slsf_1_dynamic_decal` on the BSLightingShaderProperty, with blending KEPT. Vanilla census (400 random meshes, all block types): blend-on/test-off is a perfectly legal Skyrim mode (370 shapes), and **142/206 blend-on shapes carrying the decal pair all ship alpha flags exactly `0x10ED`** — Oblivion's own `0x00ED` plus the no-sort bit `0x1000`. So HILIGHT2 + blend + no-test → keep the blend, OR in no-sort, set both decal flags (`_skyrim_alpha_property` returns `(prop, is_decal)`; the caller applies the shader bits). Verified on rockdementiaoverhang02/03 + seisland: every converted overlay shape now writes `0x10ED` with decal=True.
+- **Blend-on/test-OFF is real transparency EXCEPT under `APPLY_HILIGHT2` (fixed 2026-07-27)**: see-through SI mania/dementia rocks ship `0x00ED` (blend on, test off) — but so do gems, bottles, curtains, posters and potion liquids, which must keep blending, and a flawed emerald has *byte-identical* alpha flags to a rock overlay. The discriminator is **`NiTexturingProperty.apply_mode`**: the rocks use **APPLY_HILIGHT2 (4)**, which is Oblivion's **parallax** switch — that alpha is a HEIGHT FIELD, not transparency and not a blend weight (see the parallax section; the mid-tone-dominant profile the census measured is exactly a height map's) (SI `DMRockSideRoot01.dds`: 0% opaque / 99% partial). Skyrim has no equivalent mode, so it blends the mask across the whole surface → you see through the rock. Census over ~1,000 source meshes (rocks, clutter, architecture, dungeons, plants): **all 5** blend-on HILIGHT2 shapes are the SI rock overlays; **none** of the other 142 blend-on shapes use HILIGHT2 (they are MODULATE=2 or HILIGHT=3). Everything else is left exactly as authored. Do NOT try to classify these by texture alpha percentages — potion liquids measure 100% partial alpha and would be wrongly turned opaque.
+  - **The remedy is to DROP the NiAlphaProperty (`hilight2_alpha_dropped`), not to reinterpret it.** Two earlier attempts are recorded because neither is in the code and both are worth not repeating: the first version of this fix turned HILIGHT2+blend+no-test into a threshold-128 cutout, which replaced see-through rock with **completely invisible sections** — these overlay masks are soft gradients with NO fully-opaque texels at all, so a cutout deletes a quarter to a half of the surface outright (`DMRockSideRoot01` peaks at alpha **221** with 29% of texels below 128; `DMRockSideMudBase01` peaks at 238, 26% below; `mrock01worn` 47% below). The second attempt was `slsf_1_decal` + `slsf_1_dynamic_decal` with blending KEPT. 🛑 **Neither shipped** — grep for `slsf_1_decal` or `0x10ED` in `nif_converter.py` and you will find nothing; `_process_geometry` drops a blend-enabled NiAlphaProperty under HILIGHT2 outright and the rock renders solid. Vanilla census (400 random meshes, all block types): blend-on/test-off is a perfectly legal Skyrim mode (370 shapes), and **142/206 blend-on shapes carrying the decal pair all ship alpha flags exactly `0x10ED`** — Oblivion's own `0x00ED` plus the no-sort bit `0x1000`. Vanilla agrees with the drop: across 600 landscape/clutter meshes, 1088/1313 shapes ship no NiAlphaProperty at all and the commonest value on the rest is `0x12EC` (test, blend OFF). Vanilla rock does not alpha-blend.
   - **The same overlay breaks OBJECT LOD even with NO alpha property at all (fixed 2026-08-20)**: the two fixes above both hang off `alpha_prop is not None`, so a HILIGHT2 shape that ships no `NiAlphaProperty` was untouched — correct up close (nothing samples the channel) but see-through at LOD range. `RockGreatForest645` is the reference case: `apply_mode=4`, no alpha property, and its diffuses `GreatForestRock03/01.dds` measure alpha mean 101.6/157.2 with only 0.5%/0.0% of texels fully opaque — a blend WEIGHT, not a mask. Cause: LODGen stamps `slsf_2_lod_objects` on every shape it bakes (`num2 = 5U` in `LODApp.cs`), and the LOD object shader reads diffuse alpha as opacity. Confirmed in the artifacts — `TES4Tamriel.4.4.-12.bto` has 13 shapes and **zero** `NiAlphaProperty` blocks, and 154 shapes across 75 sampled VANILLA `.bto` tiles carry zero between them: vanilla object LOD is opaque, always.
     - LODGen cannot be told otherwise — it writes the shader itself, and it only harvests `NiAlphaProperty` in its `fo4`/`merge5` modes (`ShapeDesc.cs:369`), never the `tes5`/`sse` mode we run, so `isAlpha` stays false and the emit path writes `SetBSProperty(1, -1)`.
-    - The texture cannot be flattened in place either: the full-size mesh still needs that alpha as its detail overlay. So mesh conversion records every HILIGHT2 diffuse to `export/<plugin>/overlay_diffuses.txt` (`texture_prune.OVERLAY_MANIFEST_NAME`) and `lod_gen._force_opaque_lod_diffuses` writes an alpha-flattened COPY into the LOD mod's texture tree at the same relative path the tiles reference. Data holds one file per path and that tree shadows the plugins', so tiles get the opaque copy and full meshes keep theirs.
+    - The texture cannot be flattened in place either — **unless `--parallax` carried the height out to a `_p.dds` first**, which is the one case where the full mesh no longer needs that channel (the height then lives in slot 3, where Skyrim's shader actually reads it). Without `--parallax`, or for a texture the height classifier rejects (92 of Nehrim's 130 flagged diffuses hold no usable height), the full-size mesh still needs the alpha. So mesh conversion records every HILIGHT2 diffuse to `export/<plugin>/overlay_diffuses.txt` (`texture_prune.OVERLAY_MANIFEST_NAME`) and `lod_gen._force_opaque_lod_diffuses` writes an alpha-flattened COPY into the LOD mod's texture tree at the same relative path the tiles reference. Data holds one file per path and that tree shadows the plugins', so tiles get the opaque copy and full meshes keep theirs.
     - **The discriminator is the AUTHORED `apply_mode`, never the pixels.** A genuine cutout mask ships MODULATE (2), is absent from the manifest, and is left alone. Measuring alpha instead flattens tree billboards and cobwebs into solid rectangles — DXT5 leaves a billboard with ~0% of texels at exactly 255 even though it is unambiguously a mask. (Same trap the bullet above warns about for potion liquids.) Measured: 94 overlay diffuses across the 4 Tamriel contributors; `cobweb01.nif` (MODULATE) correctly reports none.
 - **Body skin splice section_bboxes coordinate space**: OB body skin sections are in OB skeleton space; SK body NIF verts are in SK skeleton space. These are DIFFERENT frames. The OB arm area (z≈98–105) is at SK z≈72–92 after retarget. **Always use POST-RETARGET section_bboxes** from `collect_skin_info()` — these are in SK world space and correctly localise both arm openings and neck. Pre-retarget bboxes (source OB verts) only work for neck/collar (small-x geometry that happens to be at the same world z in both skeletons) but MISS the arms (which are displaced ~20 Z units by skeleton frame differences). SK male body max arm reach (|x|>20) sits at z=75–97 world, exactly within the post-retarget 'Arms' bbox z=72–92. Use `bbox_pad=1.0` to stay under 25% of total body verts spliced.
 

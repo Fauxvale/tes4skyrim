@@ -846,6 +846,12 @@ def gui_main():
     # regardless of this setting.
     winding_mode_var = tk.StringVar(value=winding_mode_default)
 
+    # Parallax carry-over.  Always starts OFF and never tracks the plugin: the
+    # question it answers is about the PLAYER's Skyrim setup (Community Shaders
+    # or ENB present), which nothing here can detect.
+    parallax_var = tk.BooleanVar(value=False)
+    tex_only_var = tk.BooleanVar(value=False)
+
     def _winding_on() -> bool:
         """Whether the INFERRED steps run for the plugin currently selected."""
         return winding_enabled_for(winding_mode_var.get(), file_var.get())
@@ -3111,6 +3117,66 @@ def gui_main():
     mesh_toggle_lbl.pack(side=tk.LEFT, padx=(20, 0))
     mesh_toggle_lbl.bind("<Button-1>", lambda _: _open_mesh_subdir_panel())
 
+    # Parallax carry-over, the other Meshes sub-option.  No per-plugin default
+    # and no auto-on: whether the output renders correctly depends on the
+    # PLAYER's setup, not on the plugin, so only they can answer it.
+    _parallax_row = ttk.Frame(sidebar, style="Panel.TFrame")
+    _parallax_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_mesh_toggle_row)
+    _parallax_chk = ttk.Checkbutton(_parallax_row, text="Convert parallax",
+                                    variable=parallax_var,
+                                    style="TCheckbutton")
+    _parallax_chk.pack(side=tk.LEFT, padx=(20, 0))
+    _parallax_hint = ttk.Label(_parallax_row, text="needs Community Shaders",
+                               style="PanelSub.TLabel")
+    _parallax_hint.pack(side=tk.LEFT, padx=(6, 0))
+
+    _PARALLAX_TIP = (
+        "Carries Oblivion's own parallax (depth on dungeon walls, rock and "
+        "architecture) across to Skyrim.\n\n"
+        "ONLY turn this on if you play with Community Shaders or an ENB.\n\n"
+        "Without one, the affected surfaces do not just look flat -- the "
+        "texture visibly swims across them as you move. Tested: the SSE "
+        "Parallax Shader Fix does not repair it."
+    )
+    _attach_tooltip(_parallax_chk, _PARALLAX_TIP)
+    _attach_tooltip(_parallax_hint, _PARALLAX_TIP)
+
+    # Textures only, a sub-option OF parallax: it exists so PGPatcher can
+    # do the mesh side across the player's whole load order, and without
+    # parallax on it would just be a texture copy with the meshes missing.
+    # Enabled/disabled follows the parallax box for exactly that reason.
+    _texonly_row = ttk.Frame(sidebar, style="Panel.TFrame")
+    _texonly_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_parallax_row)
+    _texonly_chk = ttk.Checkbutton(_texonly_row, text="Textures only",
+                                   variable=tex_only_var,
+                                   style="TCheckbutton")
+    _texonly_chk.pack(side=tk.LEFT, padx=(40, 0))
+    _texonly_hint = ttk.Label(_texonly_row, text="for PGPatcher",
+                              style="PanelSub.TLabel")
+    _texonly_hint.pack(side=tk.LEFT, padx=(6, 0))
+
+    _TEXONLY_TIP = (
+        "Ships the textures and their height maps, but NO meshes.\n\n"
+        "For PGPatcher (ParallaxGen), which patches meshes across your "
+        "whole load order and can also upgrade them to complex material "
+        "-- neither of which a single-plugin conversion can see.\n\n"
+        "The meshes are still read: Oblivion's parallax flag lives in the "
+        "mesh, and it is the only evidence that a texture carries a "
+        "height map at all."
+    )
+    _attach_tooltip(_texonly_chk, _TEXONLY_TIP)
+    _attach_tooltip(_texonly_hint, _TEXONLY_TIP)
+
+    def _sync_texonly(*_a):
+        on = parallax_var.get()
+        _texonly_chk.state(['!disabled'] if on else ['disabled'])
+        if not on:
+            tex_only_var.set(False)
+
+    parallax_var.trace_add('write', _sync_texonly)
+    _sync_texonly()
+
+
     # ── Action buttons ────────────────────────────────────────────────────────
     # 12px above, matching a separator's gap: the step rows are packed tight
     # (pady=1 each), so without it the Run button crowds the last checkbox and
@@ -3933,6 +3999,10 @@ def gui_main():
             # Always explicit: the setting is the user's answer, whether it
             # resolved from Automatic or from them pinning it on or off.
             cmd.append(_winding_flag())
+            if parallax_var.get():
+                cmd.append("--parallax")
+                if tex_only_var.get():
+                    cmd.append("--textures-only")
         return cmd
 
     # ── Global actions ────────────────────────────────────────────────────────
@@ -4307,6 +4377,11 @@ def gui_main():
             _log(f"Mesh subdirs: {', '.join(selected_subdirs)}")
         if "meshes" in steps:
             _log(f"Collision winding fix: {'on' if _winding_on() else 'off'}")
+            _log(f"Parallax: {'on' if parallax_var.get() else 'off'}"
+                 + (" (Community Shaders or ENB required in game)"
+                    if parallax_var.get() else ""))
+            if tex_only_var.get():
+                _log("Textures only: no meshes written (for PGPatcher)")
         _log("")
 
         q = queue.Queue()

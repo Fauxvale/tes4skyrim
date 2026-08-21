@@ -1322,6 +1322,44 @@ def _read_skyrim_nif(src_path: Path):
     return nif_data
 
 
+def _strip_parallax(nif_data) -> int:
+    """Clear the heightmap shader from a mesh about to be written as LOD.
+
+    🔴 A distant-LOD mesh must never carry parallax, and this is the only place
+    that can guarantee it. `_decimate_and_write` reduces the FULL model in
+    place and copies its shader properties verbatim — so a parallax source
+    hands its shader type 3, its `SLSF1_Parallax` flag and its slot-3 height
+    map straight to the LOD tier, while the decimation rebuilds the geometry
+    and drops the vertex colours that shader requires. The result renders
+    unlit-black.
+
+    Found by `parallax_check.py verify`: 60 malformed shapes, every one in a
+    `_far`/`_far8`/`_far16` mesh, all reported "no vertex colours". Skipping
+    parallax when CONVERTING a source `_far.nif` fixes only half of it; a tier
+    DERIVED from a parallax full model needs this.
+
+    It is also pointless work even when it renders: a per-pixel height offset
+    at LOD distance resolves to nothing, and LODGen bakes these into `.bto`.
+    """
+    cleared = 0
+    for block in nif_data.blocks:
+        if not isinstance(block, NifFormat.BSLightingShaderProperty):
+            continue
+        touched = False
+        if int(block.skyrim_shader_type) == 3:      # SHADER_TYPE_HEIGHTMAP
+            block.skyrim_shader_type = 0            # back to Default
+            touched = True
+        if int(block.shader_flags_1.slsf_1_parallax):
+            block.shader_flags_1.slsf_1_parallax = 0
+            touched = True
+        ts = block.texture_set
+        if ts is not None and len(ts.textures) > 3 and bytes(ts.textures[3]):
+            ts.textures[3] = b''
+            touched = True
+        cleared += bool(touched)
+    return cleared
+
+
 def _decimate_and_write(nif_data, src_stem: str, dst_path: Path,
                         decimate_ratio: float, cap: int,
                         max_dev_frac: float) -> bool:
@@ -1331,8 +1369,14 @@ def _decimate_and_write(nif_data, src_stem: str, dst_path: Path,
     return _write_decimated(nif_data, src_stem, dst_path)
 
 
+
 def _write_decimated(nif_data, src_stem: str, dst_path: Path) -> bool:
     """Write an already-decimated NIF to dst_path (+ its .generated marker)."""
+    # Whatever this was derived from, it ships as LOD — never with parallax.
+    # Here rather than in _decimate_and_write so BOTH callers are covered: the
+    # coarser `_far8`/`_far16` tiers are written straight through this.
+    _strip_parallax(nif_data)
+
     # Rename root to <stem>_far
     for root in nif_data.roots:
         if root is not None:
