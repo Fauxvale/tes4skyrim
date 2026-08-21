@@ -26,6 +26,26 @@ Each stage has a `--<step>-only` flag. The steps are: `export`, `import`,
 `modify-body-meshes`, `pack`, `pack-zip`. Read `convert.py`'s module docstring
 for the authoritative list — it changes more often than this doc.
 
+### Asset-only mods are pseudo-plugins — they still take `-f`
+
+A mod with no ESP/ESM (texture/mesh replacer, resource pack) is a legitimate
+`-f` target. `--import-mod` registers it under its **mod name**, and its asset
+stages run exactly like any other plugin's — the same `export/<name>/` and
+`output/<name>/` layout:
+
+```bash
+python convert.py --import-mod <archive|folder>   # register it
+python convert.py --list-mods                     # names + what each ships
+python convert.py -f "Tamriel Landscape Pack" --speedtrees-only
+```
+
+Only the record stages (`export`/`import`/`scripts`/`creatures`) are skipped —
+there is no binary to read, so they no-op rather than fail
+(`convert.py::_is_asset_only`).
+After `--import-mod`, the tool prints the exact command with the applicable
+flags already filled in. **Never conclude that an asset has "no plugin to
+build" because no ESP references it** — check `--list-mods` first.
+
 ### Unreferenced textures are dropped at PACK time, never deleted
 
 Oblivion's BSAs carry textures for content the conversion never emits, so the

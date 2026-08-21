@@ -258,6 +258,12 @@ real data, or a failing-then-passing test.
   `--prune-textures-only`, `--pack-zip-only`. Report what you built and any
   failures verbatim; if a stage genuinely cannot be run, say which and why rather
   than staying silent.
+
+  **An asset-only mod (no ESP/ESM) is still a `-f` target.** `--import-mod`
+  registers a pseudo-plugin for it, so its asset stages run exactly like any
+  other plugin's: `python convert.py -f "Tamriel Landscape Pack"
+  --speedtrees-only`. Only the record stages (export/import/scripts/creatures)
+  are skipped. `python convert.py --list-mods` shows them.
 - **NEVER START A BUILD UNTIL YOU ARE SURE THE FIX IS CORRECT.** Finish every
   edit, run the targeted tests, and re-read your own diff FIRST.
 - **A FULL `--meshes-only` REBUILD IS LONG AND EXPENSIVE (~20,000 meshes, many

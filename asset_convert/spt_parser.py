@@ -97,10 +97,17 @@ class BezierSpline:
         return self.lo + y * (self.hi - self.lo)
 
     def eval_var(self, x, rng: np.random.Generator):
-        """eval() plus the stored per-instance random variance."""
+        """eval() plus the stored per-instance random variance.
+
+        Variance is a spread MAGNITUDE, so its sign carries no meaning -- the
+        same convention the flare code uses (abs() on *_var).  A handful of
+        authored trees store it negative (reddeliciousappletree level 3 stores
+        -0.007), which would otherwise make the range low > high.
+        """
         v = self.eval(x)
-        if self.variance:
-            v = v + rng.uniform(-self.variance, self.variance, np.shape(v) or None)
+        var = abs(self.variance)
+        if var:
+            v = v + rng.uniform(-var, var, np.shape(v) or None)
         return v
 
 
@@ -201,6 +208,35 @@ class Collision:
 
 
 @dataclass
+class TexLayer:
+    """One texture layer's coordinate mapping (SPT 50002..50003).
+
+    Newer SpeedTree CAD versions write a 50000 block holding, for every
+    level, seven of these -- one per texture layer (diffuse, normal, detail,
+    specular, ...).  The block covers trunk + branch levels + leaves + roots,
+    so the group count is always (num_levels + 1) * 7.  Layer 0 is diffuse and
+    carries the same authored values as the older per-level 6013-6016 /
+    15002 / 15003 sections; the remaining layers exist so a normal or detail
+    map can be tiled independently of the diffuse map.
+    """
+    u_tile: float = 1.0                 # 50004
+    v_tile: float = 1.0                 # 50005
+    u_abs: int = 0                      # 50006
+    v_abs: int = 0                      # 50007
+    twist: float = 0.0                  # 50008
+    random_v_offset: int = 0            # 50009
+    v_offset: float = 0.0               # 50010
+    clamp_u: int = 0                    # 50011
+    clamp_v: int = 0                    # 50012
+    left: float = 0.0                   # 50013
+    right: float = 1.0                  # 50014
+    bottom: float = 0.0                 # 50015
+    top: float = 1.0                    # 50016
+    u_offset: float = 0.0               # 50017
+    sync_to_diffuse: int = 1            # 50018
+
+
+@dataclass
 class SptTree:
     path: str = ''
     version: str = ''
@@ -245,6 +281,10 @@ class SptTree:
     branch_material: tuple = ()         # 8003 (13 floats)
     leaf_material: tuple = ()           # 8005
     leaf_meshes: list = field(default_factory=list)      # (name, verts, tris)
+    # 50000 block: flat list of TexLayer, 7 per level, ordered
+    # trunk..branches..leaves then roots.  Empty on trees authored by
+    # older CAD versions, which omit the block entirely.
+    tex_layers: list = field(default_factory=list)       # TexLayer
 
 
 # ---------------------------------------------------------------------------
@@ -257,8 +297,9 @@ _MARKERS = {
     12000, 12001, 13000, 13001, 14001, 15000, 15001, 16000, 16001,
     18000, 18001, 19000, 19001, 20000, 20001, 25000, 25001,
     26000, 26001, 27000, 27001, 28000, 28001, 29000, 29001, 30000, 30001,
-    40000, 40001, 40006, 40007, 40008, 50000, 50001, 50003,
+    40000, 40001, 40006, 40007, 40008, 50000, 50001,
     60000, 60001, 60002, 60003, 60004, 60005, 60009,
+    70000, 70001,
     71000, 71005, 71011, 71014, 71015, 72000, 72004, 73000, 73001, 73003,
     74000, 74001, 75000, 75001,
 }
@@ -334,6 +375,15 @@ _LEAF_FIELDS = {4000: ('blossom', 'b'), 4001: ('color', 'fff'),
 _FROND_FIELDS = {14002: ('texture', 's'), 14003: ('unknown3', 'f'),
                  14004: ('size_factor', 'f'), 14005: ('min_angle', 'f'),
                  14006: ('max_angle', 'f')}
+# 50004..50018, one texture layer (SPT FORMAT / spttools sptparser.c).
+_TEXLAYER_FIELDS = {50004: ('u_tile', 'f'), 50005: ('v_tile', 'f'),
+                    50006: ('u_abs', 'b'), 50007: ('v_abs', 'b'),
+                    50008: ('twist', 'f'), 50009: ('random_v_offset', 'b'),
+                    50010: ('v_offset', 'f'), 50011: ('clamp_u', 'b'),
+                    50012: ('clamp_v', 'b'), 50013: ('left', 'f'),
+                    50014: ('right', 'f'), 50015: ('bottom', 'f'),
+                    50016: ('top', 'f'), 50017: ('u_offset', 'f'),
+                    50018: ('sync_to_diffuse', 'b')}
 _LEAFMESH_FIELDS = {72001: ('use_mesh', 'b'), 72003: ('mesh_index', 'i'),
                     72005: ('hang', 'f'), 72006: ('rotate', 'f')}
 
@@ -397,6 +447,7 @@ def parse_spt(path) -> SptTree:
     in_roots = False
     cur_leaf: LeafMap | None = None
     cur_frond: FrondMap | None = None
+    cur_texlayer: TexLayer | None = None      # open 50002..50003 group
     leafmesh_idx = -1                         # 72000 per-map group counter
     pending_capsule_angles = 0                # 73000 capsule angle group counter
     # leaf mesh (71000) scratch
@@ -472,13 +523,26 @@ def parse_spt(path) -> SptTree:
                 setattr(tgt, name, read_pattern(p))
 
             # --- 15002/15003 texture twist per level (sequential) ---
+            # Inside the roots block (40000..40001) the pair appears once, bare
+            # (no 15000 opener) and in the reversed order 15003,15002 -- it
+            # belongs to the roots level, so it must not advance the per-level
+            # sequence counter (same rule as the 16002 flare and 26002
+            # roughness groups).  Without this guard twist_idx runs one past
+            # the last level and _level_by_seq returns None.
             elif sid == 15002:
-                twist_idx += 1
-                tgt = _level_by_seq(tree, twist_idx)
-                tgt.random_v_offset = rb()
+                if in_roots:
+                    tgt = tree.roots_level
+                else:
+                    twist_idx += 1
+                    tgt = _level_by_seq(tree, twist_idx)
+                val = rb()
+                if tgt is not None:
+                    tgt.random_v_offset = val
             elif sid == 15003:
-                tgt = _level_by_seq(tree, twist_idx)
-                tgt.twist = rf()
+                tgt = tree.roots_level if in_roots else _level_by_seq(tree, twist_idx)
+                val = rf()
+                if tgt is not None:
+                    tgt.twist = val
 
             # --- 16002..16012 flares per level (sequential groups) ---
             elif sid in _FLARE_FIELDS:
@@ -628,6 +692,21 @@ def parse_spt(path) -> SptTree:
                     dst.append(tuple(rf() for _ in range(8)))
             elif sid == 20002:
                 tree.composite_map = rs()
+
+            # --- 50002..50003 per-layer texture coordinates ---
+            # 50000 opens the block; each 50002 group is one texture layer.
+            # Fields are optional and order is not fixed, so each is applied to
+            # whichever group is currently open.
+            elif sid == 50002:
+                cur_texlayer = TexLayer()
+                tree.tex_layers.append(cur_texlayer)
+            elif sid == 50003:
+                cur_texlayer = None
+            elif sid in _TEXLAYER_FIELDS:
+                name, p = _TEXLAYER_FIELDS[sid]
+                val = read_pattern(p)
+                if cur_texlayer is not None:
+                    setattr(cur_texlayer, name, val)
 
             # --- generic consumed sections ---
             elif sid in _PATTERNS:
