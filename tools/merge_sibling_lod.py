@@ -35,6 +35,7 @@ _MAX_LISTED = 12
 
 from subprocess_flags import configure_multiprocessing
 from process_job import create_pool_job
+from output_layout import assets_for  # noqa: E402
 
 configure_multiprocessing()
 create_pool_job()
@@ -65,7 +66,8 @@ def main() -> int:
     from asset_convert.lod_gen import (generate_lod,
                                        _textures_root as _lod_textures_root)
     from asset_convert.terrain_lod import generate_terrain_lod
-    from asset_convert.sibling_lod import (find_sibling_groups,
+    from asset_convert.sibling_lod import (_out_root, _record_dir,
+                                       find_sibling_groups,
                                            contested_cells,
                                            converted_plugins,
                                            merge_cloud_bank,
@@ -129,7 +131,7 @@ def main() -> int:
         # siblings share a worldspace, before the tile check below can skip.
         if not args.dry_run:
             cloud_rel = merge_cloud_bank(out_root, merged_dir, edid,
-                                         g['master'], plugins)
+                                         g['master'], plugins, export_root)
             if cloud_rel:
                 print(f"   Merged world-map cloud bank -> {cloud_rel} "
                       f"(union of {len(plugins) + 1} plugin bounds)")
@@ -172,9 +174,10 @@ def main() -> int:
         # Assets from the master AND every sibling: a merged tile draws objects
         # from all of them, so a model converted into only one sibling's output
         # still has to be findable here.
-        asset_dirs = [out_root / n for n in [g['master']] + plugins
-                      if (out_root / n).is_dir()]
-        overlays = [out_root / n / n for n in plugins]
+        asset_dirs = [_out_root(out_root, n, export_root)
+                      for n in [g['master']] + plugins
+                      if _out_root(out_root, n, export_root).is_dir()]
+        overlays = [_out_root(out_root, n, export_root) / n for n in plugins]
 
         print(f"   Baking merged object LOD -> {merged_dir}")
         ok = generate_lod(
@@ -190,9 +193,9 @@ def main() -> int:
             master_texture_dirs=asset_dirs,
             overlay_paths=overlays,
             only_cells=hot,
-            overlay_manifest_dirs=[export_root / n
+            overlay_manifest_dirs=[assets_for(_record_dir(export_root, n))
                                    for n in [g['master']] + plugins
-                                   if (export_root / n).is_dir()],
+                                   if _record_dir(export_root, n).is_dir()],
         )
 
         print(f"   Baking merged terrain LOD -> {merged_dir}")
@@ -212,7 +215,8 @@ def main() -> int:
         # reports what shipped and not what was intended.
         print()
         print(f"   Overwrites in '{edid}':")
-        rep = overwrite_report(out_root, edid, plugins, MERGED_DIR_NAME)
+        rep = overwrite_report(out_root, edid, plugins, MERGED_DIR_NAME,
+                               export_root)
         for name in plugins:
             r = rep[name]
             n_over = len(r['overwritten'])

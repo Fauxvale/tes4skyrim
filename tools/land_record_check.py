@@ -218,8 +218,11 @@ def main():
                     help='Max problem cells to list (default 25)')
     args = ap.parse_args()
 
+    # Through the resolver: an imported mod's plugins convert into their
+    # MOD's folder, so `<out>/<plugin>/<plugin>` names nothing for them.
+    from output_layout import paths as _paths
     root = args.output_dir
-    path = os.path.join(root, args.plugin, args.plugin)
+    path = str(_paths(args.plugin, out_root=root).esm)
     if not os.path.isfile(path):
         print('ERROR: no converted plugin at %s' % path)
         return 1
@@ -243,7 +246,7 @@ def main():
     # the default IS the whole list, so it starts at slot 0.
     base_slot = _master_count(path) - len(args.masters)
     for pos, m in enumerate(args.masters):
-        mp = os.path.join(root, m, m)
+        mp = str(_paths(m, out_root=root).esm)
         if os.path.isfile(mp):
             _c, _l, mltex = load(mp)
             own = _master_count(mp)

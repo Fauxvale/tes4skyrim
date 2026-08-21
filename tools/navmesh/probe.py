@@ -22,6 +22,10 @@ from tes5_import.text_reader import (  # noqa: E402
     parse_export_directory, group_records_by_type, get_float, get_int, get_str,
 )
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
+from output_layout import assets_for  # noqa: E402
+
 _TYPES = {'CELL', 'REFR', 'PGRD', 'LAND', 'STAT', 'CONT', 'FURN', 'ACTI',
           'TREE', 'DOOR', 'WRLD'}
 _BLOCKING_BASES = ('STAT', 'CONT', 'FURN', 'ACTI', 'TREE', 'DOOR')
@@ -129,7 +133,7 @@ def load_by_type(export_dir, reindex=False):
 def load_cell(export_dir, cell_arg, load_collision=True):
     """Return a dict with cell/refrs/pgrd/land/nodes/edges/base_model."""
     if load_collision:
-        ce.load_collision(os.path.join(export_dir, 'collision_cache.bin'),
+        ce.load_collision(str(assets_for(export_dir) / 'collision_cache.bin'),
                           quiet=True)
 
     by_type = load_by_type(export_dir)
@@ -216,7 +220,8 @@ def load_cell(export_dir, cell_arg, load_collision=True):
 
     # Doors as build_navmesh wants them: (x, y, z, rot_z, is_teleport).
     from tes5_import.pgrd_to_navm import _collect_doors, load_door_centroids
-    load_door_centroids(os.path.join(export_dir, 'door_centers_cache.json'),
+    load_door_centroids(
+        str(assets_for(export_dir) / 'door_centers_cache.json'),
                         quiet=True)
     doors = [(x, y, z, r, tp, w)
              for (x, y, z, r, _f, tp, w) in _collect_doors(refrs, door_fids)]

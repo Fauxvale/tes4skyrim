@@ -28,6 +28,8 @@ override's source id directly.
 
 import json
 import os
+import sys
+from output_layout import paths  # noqa: E402
 
 MANIFEST_VERSION = 1
 
@@ -69,6 +71,23 @@ def _master_names(export_dir: str) -> list:
     return names
 
 
+def _master_export_dir(export_root, name: str) -> str:
+    """Where master `name`'s exported records live under `export_root`.
+
+    Masters used to resolve as siblings of the export root. An imported mod's
+    plugins are nested inside their mod's shared folder, so the plain join
+    misses them entirely.
+    """
+    try:
+        from output_layout import record_dir
+        got = record_dir(export_root, name)
+        if os.path.isdir(got):
+            return str(got)
+    except ImportError:
+        pass
+    return os.path.join(export_root, name)
+
+
 def _index_map(export_root: str, name: str, slot: int, slot_of: dict,
                new_master_count: int) -> tuple:
     """(source-space map, output-space map) for one master's manifest.
@@ -89,7 +108,10 @@ def _index_map(export_root: str, name: str, slot: int, slot_of: dict,
     """
     if not export_root:
         return None
-    own = _master_names(os.path.join(export_root, name))
+    # Not a plain join: an imported mod's plugins live inside their mod's
+    # shared folder, so a master that IS exported reads as missing here and the
+    # id remap silently falls back to the verbatim merge.
+    own = _master_names(_master_export_dir(export_root, name))
     src = {len(own): slot}
     for k, sub in enumerate(own):
         target = slot_of.get(sub.lower())
@@ -201,7 +223,7 @@ def load_master_manifests(masters: list, tes4_master_count: int,
     manifest = MasterManifest()
     missing = []
     for slot, name in enumerate(names):
-        plugin_out = os.path.join(output_root, name, name)
+        plugin_out = str(paths(name, out_root=output_root).esm)
         path = manifest_path(plugin_out)
         if not os.path.isfile(path):
             missing.append((name, path))

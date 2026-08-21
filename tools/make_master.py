@@ -41,6 +41,9 @@ import argparse
 import os
 import struct
 import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+from output_layout import paths  # noqa: E402
 
 FLAG_ESM = 0x00000001
 FLAG_ESL = 0x00000200
@@ -87,13 +90,16 @@ def set_flag(path, enable):
 
 
 def resolve(name, output_dir):
-    """Map a plugin name to its built path under <output_dir>/<name>/<name>."""
+    """Map a plugin name to its built path in the output tree."""
     if os.path.isfile(name):
         return name
-    candidate = os.path.join(output_dir, name, name)
+    candidate = str(paths(name, out_root=output_dir).esm)
     if os.path.isfile(candidate):
         return candidate
-    candidate = os.path.join(output_dir, name)
+    # Last resort: a plugin written as a bare FILE at the output root (a
+    # plugin with no asset phase used to land there). Not a folder lookup, so
+    # the plugin-name-onto-a-root rule does not apply.
+    candidate = os.path.join(output_dir, name)   # noqa: plugin-path (bare-file fallback)
     if os.path.isfile(candidate):
         return candidate
     raise FileNotFoundError(f'cannot find plugin {name!r} under {output_dir}/')

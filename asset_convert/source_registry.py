@@ -42,6 +42,7 @@ Entry shape (see `docs/mod_archive_ingest_plan.md`):
       }
     }
 """
+import copy
 import json
 import os
 from pathlib import Path
@@ -60,26 +61,68 @@ def registry_path(export_dir) -> Path:
     return Path(export_dir) / REGISTRY_NAME
 
 
+# Parsed-registry cache, keyed by (path, mtime_ns, size). Resolving one
+# plugin's folder costs up to three loads (asset_root -> get, group_members ->
+# get + load), and every phase resolves at least once, so re-reading and
+# re-parsing the JSON each time is pure waste. Keyed on the file's own stat so
+# an external edit -- or this process's own save() -- is picked up on the very
+# next call.
+_CACHE = {}
+
+
 def load(export_dir) -> dict:
     """The whole registry. Never raises: a corrupt file reads as empty.
 
     A broken registry must not take down a Data-directory conversion that does
     not need it, so this degrades to "no imported mods" rather than failing.
+
+    The result is a fresh copy each call: callers mutate what they get back
+    (`put` edits `data['sources']` in place), and handing out the cached dict
+    would let one caller's edit leak into every later reader.
     """
+    return copy.deepcopy(_load_raw(export_dir))
+
+
+def _load_raw(export_dir) -> dict:
+    """The cached, SHARED registry dict. Internal: callers must not mutate it."""
     path = registry_path(export_dir)
-    if not path.is_file():
-        return {'version': REGISTRY_VERSION, 'sources': {}}
     try:
-        with open(path, encoding='utf-8') as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
+        st = path.stat()
+        key = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
         return {'version': REGISTRY_VERSION, 'sources': {}}
-    if not isinstance(data, dict):
-        return {'version': REGISTRY_VERSION, 'sources': {}}
+
+    hit = _CACHE.get(key)
+    if hit is None:
+        try:
+            with open(path, encoding='utf-8') as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {'version': REGISTRY_VERSION, 'sources': {}}
+        if not isinstance(data, dict):
+            return {'version': REGISTRY_VERSION, 'sources': {}}
+        sources = data.get('sources')
+        if not isinstance(sources, dict):
+            data['sources'] = {}
+        # One entry is enough: every call in a run uses the same export dir,
+        # and a stale key can never be read (the stat is part of the key).
+        _CACHE.clear()
+        _CACHE[key] = data
+        hit = data
+    return hit
+
+
+def _sources(export_dir) -> dict:
+    """The `sources` mapping, READ-ONLY -- never mutate what this returns.
+
+    `load()` deep-copies so callers like `put()` can edit their result safely,
+    but the read paths (`get`, `group_members`, `groups`) only ever look. They
+    resolve up to three times per folder lookup, and copying the whole registry
+    three times per lookup was ~68% of the cost.
+    """
+    data = _load_raw(export_dir)
     sources = data.get('sources')
-    if not isinstance(sources, dict):
-        data['sources'] = {}
-    return data
+    return sources if isinstance(sources, dict) else {}
 
 
 def save(export_dir, data) -> None:
@@ -90,6 +133,13 @@ def save(export_dir, data) -> None:
     with open(tmp, 'w', encoding='utf-8') as fh:
         json.dump(data, fh, indent=2, sort_keys=True)
     os.replace(tmp, path)
+    # Drop the parse cache explicitly. The (mtime, size) key alone is NOT
+    # enough: this filesystem stamps mtime at ~0.5 ms resolution (measured --
+    # 60 rapid writes produced 12 distinct values), so two put() calls in a
+    # loop can land in one tick and leave a same-size registry looking
+    # unchanged. Every write goes through here, so this is the one place that
+    # has to remember.
+    _CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +320,7 @@ def get(export_dir, plugin: str):
     """The registry entry for `plugin`, or None if it is not an imported mod."""
     if not plugin:
         return None
-    sources = load(export_dir).get('sources', {})
+    sources = _sources(export_dir)
     want = _key(plugin)
     for name, entry in sources.items():
         if _key(name) == want and isinstance(entry, dict):
@@ -320,7 +370,7 @@ def groups(export_dir) -> list:
     share a group_id so the GUI can offer "the mod you just imported" as a
     single source scope.
     """
-    sources = load(export_dir).get('sources', {})
+    sources = _sources(export_dir)
     by_group = {}
     for name, entry in sources.items():
         if not isinstance(entry, dict):
@@ -342,9 +392,132 @@ def groups(export_dir) -> list:
     return [(gid, label, plugs) for gid, label, plugs, _ in out]
 
 
+# ---------------------------------------------------------------------------
+#  Asset folder resolution — the GROUP tree
+#
+#  A mod archive holding several plugins ships ONE set of meshes/textures/
+#  sound/trees that all of its plugins draw on. Giving each plugin its own
+#  `export/<plugin>/` meant extracting that payload once per plugin (or
+#  hard-linking it, which is the same bytes wearing a disguise) and left the
+#  pipeline unable to tell "these three read the same assets" from "these
+#  three are unrelated".
+#
+#  So assets live in ONE folder per MOD, named for the mod:
+#
+#      export/Tamriel Resource Pack Full 2.0/      <- assets, shared
+#          meshes/ textures/ sound/ trees/
+#          _source/  TamRes.esm, TamRes.esp, ... , <retained>.7z
+#          TamRes.esm/            <- this plugin's record dump
+#          TamRes.esp/
+#
+#  The PLUGINS stay separate — three plugins in, three plugins out. Only the
+#  asset payload is shared; record dumps and converted output remain per
+#  plugin, nested inside the group folder.
+#
+#  A plugin that is not an imported mod (Oblivion.esm and friends) resolves to
+#  `export/<plugin>/` exactly as before, so the game-Data path is untouched.
+# ---------------------------------------------------------------------------
+
+def _sanitize_folder(name: str) -> str:
+    """A mod label reduced to something safe to use as a folder name.
+
+    Labels come from archive filenames, so they can carry characters Windows
+    forbids in a path. Collapsing them here keeps the folder name derivable
+    from the label alone -- no second field to keep in sync.
+    """
+    cleaned = ''.join('_' if c in r'<>:"/\|?*' else c for c in (name or ''))
+    cleaned = ' '.join(cleaned.split()).strip(' .')
+    return cleaned
+
+
+def asset_root_name(export_dir, plugin: str) -> str:
+    """The folder name holding `plugin`'s ASSETS.
+
+    The mod's group folder for an imported mod, else the plugin's own name.
+    Returned as a bare name rather than a path so both `export/` and `output/`
+    can build their own root from it -- the two must agree, and they only do
+    that reliably if the name is computed once.
+    """
+    entry = get(export_dir, plugin)
+    if not entry:
+        return plugin
+    label = _sanitize_folder(entry.get('group_label') or '')
+    return label or plugin
+
+
+def asset_root(export_dir, plugin: str) -> Path:
+    """`export/<group-or-plugin>/` — where `plugin`'s shared assets live."""
+    return Path(export_dir) / asset_root_name(export_dir, plugin)
+
+
+def record_dir(export_dir, plugin: str) -> Path:
+    """Where `plugin`'s own record dump (STAT.txt, _HEADER.txt...) lives.
+
+    Nested inside the group folder for an imported mod so that three plugins
+    sharing one asset tree still keep three distinct record sets.
+
+    The test is "does this mod SHIP more than one plugin", NOT "is the folder
+    named after this plugin". An archive called `MyMod.esp.zip` that holds two
+    plugins yields the label `MyMod.esp`, and keying on the name put that one
+    plugin's records loose in the group root -- mixed in with meshes/ and
+    _source/ -- while its sibling nested correctly.
+
+    🛑 It reads the ARCHIVE's plugin list (`group_plugins`), never how many
+    members are currently REGISTERED. This answer has to be stable for the
+    life of the folder: keying it on the live registry meant importing a
+    second plugin from the same archive silently MOVED the first one's record
+    directory, stranding an .txt dump that was already exported and leaving
+    every later stage to report "No export directory" and skip.
+    """
+    root = asset_root(export_dir, plugin)
+    return root / plugin if _ships_multiple_plugins(export_dir, plugin) else root
+
+
+def _ships_multiple_plugins(export_dir, plugin: str) -> bool:
+    """True when `plugin`'s source archive holds more than one plugin.
+
+    Authored data, fixed when the archive was inspected -- unlike the set of
+    registered members, which grows as the user imports more of them.
+    """
+    entry = get(export_dir, plugin)
+    if not entry:
+        return False
+    shipped = entry.get('group_plugins')
+    if isinstance(shipped, list) and shipped:
+        return len({str(n).lower() for n in shipped}) > 1
+    # Pre-`group_plugins` entry: fall back to the live membership, which is
+    # what this used to do and is right for every entry written since.
+    return len(group_members(export_dir, plugin)) > 1
+
+
+def group_members(export_dir, plugin: str) -> list:
+    """Every plugin sharing `plugin`'s asset tree, itself included.
+
+    Derived from the live registry rather than the stored `group_plugins`
+    field: a partial import writes a narrowed list into the entries it
+    creates, so the field disagrees with reality exactly when it matters.
+    """
+    entry = get(export_dir, plugin)
+    if not entry:
+        return [plugin]
+    gid = entry.get('group_id')
+    if not gid:
+        return [entry.get('plugin') or plugin]
+    sources = _sources(export_dir)
+    out = [name for name, row in sources.items()
+           if isinstance(row, dict) and row.get('group_id') == gid
+           and row.get('plugin')]
+    return sorted(out, key=str.lower) or [plugin]
+
+
 def source_dir(export_dir, plugin: str) -> Path:
-    """`export/<plugin>/_source/` — where the binary and archive are kept."""
-    return Path(export_dir) / plugin / SOURCE_SUBDIR
+    """`export/<group-or-plugin>/_source/` — binaries and retained archive.
+
+    One `_source/` per MOD, not per plugin: every plugin in an archive comes
+    out of the same download, so retaining that archive once per plugin stored
+    the same ~1 GB several times over.
+    """
+    return asset_root(export_dir, plugin) / SOURCE_SUBDIR
 
 
 def plugin_binary(export_dir, plugin: str):

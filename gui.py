@@ -364,18 +364,25 @@ def scan_converted(output_path: str) -> list:
         folder = os.path.join(output_path, name)
         if not os.path.isdir(folder):
             continue
-        manifest = os.path.join(folder, f"{name}.manifest.json")
-        if not os.path.isfile(manifest):
-            continue
-        source = name
+        # A folder named for its plugin holds ONE manifest; a mod GROUP folder
+        # is named for the mod and holds one per plugin it converted, so glob
+        # rather than probing for `<folder>.manifest.json`.
         try:
-            with open(manifest, encoding="utf-8") as fh:
-                got = json.load(fh).get("source")
-            if isinstance(got, str) and got.strip():
-                source = got.strip()
-        except (OSError, ValueError):
-            pass          # a truncated manifest still proves the folder is ours
-        found.add(source)
+            manifests = sorted(f for f in os.listdir(folder)
+                               if f.endswith(".manifest.json"))
+        except OSError:
+            continue
+        for manifest_name in manifests:
+            manifest = os.path.join(folder, manifest_name)
+            source = manifest_name[:-len(".manifest.json")]
+            try:
+                with open(manifest, encoding="utf-8") as fh:
+                    got = json.load(fh).get("source")
+                if isinstance(got, str) and got.strip():
+                    source = got.strip()
+            except (OSError, ValueError):
+                pass      # a truncated manifest still proves the folder is ours
+            found.add(source)
     return sorted(found, key=str.lower)
 
 
@@ -989,12 +996,15 @@ def gui_main():
                   "Source, then pick it again.")
             return
 
+        # Picking from Converted > is an explicit request to re-plan that
+        # plugin, even when it is the one already selected (where _commit
+        # deliberately leaves the user's edits alone) and even if its plan was
+        # already auto-applied once this session. Clear the guard BEFORE
+        # committing so the refresh _commit starts already re-applies it.
+        _plan_applied.discard(name)
+        _set_default()
         _commit(name)
         file_combo.selection_clear()
-        # Re-selecting a plugin is an explicit request to re-plan it, even if
-        # its plan was already auto-applied once this session.
-        _plan_applied.discard(name)
-        _refresh_upgrade_notice()
 
     def _rebuild_converted_menu():
         converted_menu.delete(0, tk.END)
@@ -1695,6 +1705,7 @@ def gui_main():
         """
         try:
             from asset_convert import mod_ingest, source_registry
+            from output_layout import asset_root
             name = file_var.get()
             entry = source_registry.get(EXPORT_DIR, name)
         except Exception:
@@ -1707,9 +1718,14 @@ def gui_main():
         # Imported before capabilities were recorded: measure the tree now
         # rather than falling back to "allow everything", which would offer
         # steps the mod has no content for.
+        #
+        # Measure the SHARED asset tree. Every plugin from one archive draws on
+        # the same meshes/textures, so capabilities are a property of the MOD;
+        # measuring `export/<plugin>/` looked at a folder that no longer exists
+        # and reported a resource pack as having no meshes at all.
         try:
             return mod_ingest.capabilities_for(
-                EXPORT_DIR / (entry.get("plugin") or name),
+                asset_root(EXPORT_DIR, entry.get("plugin") or name),
                 has_plugin=bool(entry.get("plugin")))
         except Exception:
             return None
@@ -1892,9 +1908,26 @@ def gui_main():
 
     def _commit(name: str):
         searching[0] = False
+        previous = last_valid[0]
         last_valid[0] = name
         file_var.set(name)
         file_combo["values"] = list(all_plugins)
+        # Switching plugin starts that plugin's selection over. The ticks are
+        # per-plugin state -- what THIS plugin still owes -- so carrying the
+        # last one's boxes across meant edits made for plugin A silently
+        # governed the run for plugin B.
+        #
+        # Reset to the defaults first so the window is never showing another
+        # plugin's selection, then let the upgrade plan narrow it to what is
+        # actually outstanding when the (threaded) lookup returns. Re-selecting
+        # the plugin already shown is not a switch and must not discard the
+        # user's edits.
+        # Case-insensitive: the combo and a typed name differ in case for
+        # the same file often enough that a raw compare would read as a
+        # switch and wipe the selection.
+        if (name or '').strip().lower() != (previous or '').strip().lower():
+            _plan_applied.discard(name)
+            _set_default()
         # Each plugin carries its own conversion history, so the upgrade notice
         # is per-plugin and has to follow the selection.
         _refresh_upgrade_notice()
@@ -3639,11 +3672,32 @@ def gui_main():
         card.place(relx=0.5, rely=0.5, anchor="center")
         card.grab_set()
 
+    def _plugin_esm(out_root, plugin: str):
+        """The converted plugin file, wherever its mod's folder is."""
+        try:
+            from output_layout import plugin_esm
+            return plugin_esm(out_root, plugin, EXPORT_DIR)
+        except ImportError:
+            return Path(out_root) / plugin / plugin   # noqa: plugin-path (no-registry fallback)
+
+    def _master_export_present(master: str) -> bool:
+        """True when `master`'s exported records exist under EXPORT_DIR."""
+        try:
+            from output_layout import record_dir
+            return record_dir(EXPORT_DIR, master).is_dir()
+        except ImportError:
+            return (EXPORT_DIR / master).is_dir()   # noqa: plugin-path (no-registry fallback)
+
     def _missing_masters_for(manifest):
-        """Masters of the archive's plugins that have no export/<master>/ yet.
+        """Masters of the archive's plugins with no export records yet.
 
         Read straight out of the archive, so the warning appears BEFORE the
         import rather than after a failed conversion.
+
+        Resolved through `record_dir`, never by joining the name onto export/:
+        an imported mod's plugins live inside their mod's shared folder, so a
+        master that IS converted reads as missing under the plain join and the
+        dialog tells the user to convert something they already have.
         """
         try:
             import tempfile
@@ -3668,7 +3722,7 @@ def gui_main():
                             manifest.path, member,
                             os.path.join(tmp, os.path.basename(rel)))
                     for master in get_masters_from_binary(str(target)):
-                        if not (EXPORT_DIR / master).is_dir():
+                        if not _master_export_present(master):
                             missing.add(master)
                 except Exception:
                     continue
@@ -4103,7 +4157,7 @@ def gui_main():
                 sig = []
                 for n in names:
                     try:
-                        st = (out_root / n / n).stat()
+                        st = _plugin_esm(out_root, n).stat()
                         sig.append(f"{n}:{st.st_size}:{st.st_mtime_ns}")
                     except OSError:
                         sig.append(f"{n}:-")

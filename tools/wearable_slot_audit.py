@@ -16,6 +16,7 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from asset_convert import wearable_plan as wp  # noqa: E402
+from output_layout import paths
 
 BP_NAME = {32: 'body', 33: 'hands', 36: 'ring', 37: 'feet', 38: 'calves',
            40: 'amulet', 44: 'lowerbody', 131: 'head'}
@@ -26,7 +27,7 @@ def records_by_mesh(export_dir):
     from pathlib import Path
     out = defaultdict(list)
     for name in ('ARMO.txt', 'CLOT.txt'):
-        path = Path(export_dir) / name
+        path = Path(export_dir) / name   # noqa: plugin-path (record file)
         if not path.is_file():
             continue
         for chunk in path.read_text(encoding='utf-8',

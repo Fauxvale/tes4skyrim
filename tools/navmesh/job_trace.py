@@ -39,6 +39,9 @@ import os
 import sys
 import time
 import traceback
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
+from output_layout import assets_for  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -107,9 +110,9 @@ def main():
                                                             args.offset)
     print(f'  {len(jobs)} navmesh jobs', flush=True)
 
-    collision_cache = os.path.join(export_dir, 'collision_cache.bin')
+    collision_cache = str(assets_for(export_dir) / 'collision_cache.bin')
     geom_cache = im._navmesh_geom_cache(collision_cache)
-    dcc = os.path.join(export_dir, 'door_centers_cache.json')
+    dcc = str(assets_for(export_dir) / 'door_centers_cache.json')
 
     from tes5_import import navm_worker
     from tes5_import.pgrd_to_navm import convert_PGRD

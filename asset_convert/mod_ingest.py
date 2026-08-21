@@ -324,22 +324,6 @@ def _write_manifest(plugin_dir, data):
         json.dump(data, fh, indent=2, sort_keys=True)
 
 
-def _link_or_copy(src, dst):
-    """Hard-link `src` to `dst`, falling back to a copy across volumes.
-
-    One archive can hold several plugins sharing one asset payload (both TWMP
-    archives do). Linking means a 400 MB mod costs 400 MB, not 400 MB per
-    plugin.
-    """
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists():
-        dst.unlink()
-    try:
-        os.link(src, dst)
-    except (OSError, NotImplementedError):
-        shutil.copy2(src, dst)
-
-
 def _place_payload(staged_root, plugin_dir, counts, log):
     """Route every staged file into `plugin_dir` by asset category.
 
@@ -530,9 +514,22 @@ def ingest(path, export_dir, plugin_members=None, keep_archive=True,
     # Idempotence: if every registered name already carries a manifest with
     # this exact key, there is nothing to do.
     if not force:
-        stale = [n for n in names
-                 if (_read_manifest(export_dir / n) or {}).get('key') != key]
-        if not stale:
+        group_dir = export_dir / (source_registry._sanitize_folder(man.label)
+                                  or names[0])
+        got = (_read_manifest(group_dir) or {})
+        # Re-import when the archive changed OR when this run would add a
+        # plugin the group folder does not already hold: a --plugin-member
+        # import of one plugin must not mark the whole mod as done.
+        #
+        # Only PLUGINS are looked for. An asset-only mod registers under its
+        # own label, which is not a file and never lands in _source/ (only the
+        # retained archive does), so requiring it here could never be satisfied
+        # and every run re-extracted the whole archive.
+        have = {q.name.lower()
+                for q in (group_dir / source_registry.SOURCE_SUBDIR).glob('*')
+                } if group_dir.is_dir() else set()
+        missing = [n for n in names if chosen and n.lower() not in have]
+        if got.get('key') == key and not missing:
             log(f"  {path.name}: already imported (unchanged), skipping.")
             return {n: {'cached': True} for n in names}
 
@@ -548,7 +545,10 @@ def ingest(path, export_dir, plugin_members=None, keep_archive=True,
 
     results = {}
     primary = names[0]
-    primary_dir = export_dir / primary
+    # ONE asset tree per mod, named for the mod. Every plugin in the archive
+    # reads from it, so there is nothing to copy or hard-link per plugin.
+    group_name = source_registry._sanitize_folder(man.label) or primary
+    primary_dir = export_dir / group_name
 
     with tempfile.TemporaryDirectory(prefix='tesconv_ingest_') as staging:
         staged = Path(staging) / 'payload'
@@ -563,38 +563,35 @@ def ingest(path, export_dir, plugin_members=None, keep_archive=True,
             if not bsa_path.is_file():
                 continue
             log(f"  Extracting {Path(rel).name}...")
+            # Into the GROUP folder, the same tree the loose payload lands
+            # in -- otherwise loose files could not overwrite BSA content.
             bsa_extract.extract_bsa(bsa_path, str(export_dir), force=True,
-                                    source_name=primary)
+                                    source_name=group_name)
             bsa_path.unlink(missing_ok=True)
 
         # 2) Loose payload overlays whatever the BSAs wrote.
         placed = _place_payload(staged, primary_dir, counts, log)
         log(f"  Placed {placed} loose files")
 
-        # 3) The plugin binaries: each goes to its OWN export/<plugin>/_source/.
+        # 3) The plugin binaries: all into the ONE shared _source/.
+        dest_dir = primary_dir / source_registry.SOURCE_SUBDIR
+        dest_dir.mkdir(parents=True, exist_ok=True)
         for rel in chosen:
             name = Path(rel).name
             staged_plugin = staged / rel
             if not staged_plugin.is_file():
                 raise IngestError(f'plugin missing after extraction: {rel}')
-            dest_dir = source_registry.source_dir(export_dir, name)
-            dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / name
             if dest.exists():
                 dest.unlink()
             shutil.move(str(staged_plugin), str(dest))
-
-        # Secondary plugins share the primary's asset tree by hard link, so a
-        # 400 MB mod costs 400 MB once rather than once per plugin.
-        for rel in chosen[1:]:
-            _share_payload(primary_dir, export_dir / Path(rel).name, log)
 
     # 4) Retain the archive so re-import survives the download being deleted.
     retained = ''
     if keep_archive and not man.is_folder:
         # Created here, not just in the plugin loop: an asset-only mod has no
         # plugin to write into _source/, but still retains its archive there.
-        src_dir = source_registry.source_dir(export_dir, primary)
+        src_dir = primary_dir / source_registry.SOURCE_SUBDIR
         src_dir.mkdir(parents=True, exist_ok=True)
         dest = src_dir / path.name
         if not dest.is_file() or dest.stat().st_size != path.stat().st_size:
@@ -620,17 +617,26 @@ def ingest(path, export_dir, plugin_members=None, keep_archive=True,
             'plugin_member': rel,
             'payload_root': man.payload_root,
             'plugin_path': (os.path.relpath(
-                source_registry.source_dir(export_dir, name) / name,
+                primary_dir / source_registry.SOURCE_SUBDIR / name,
                 export_dir.parent).replace('\\', '/') if chosen else ''),
             'group_id': group_id,
             'group_label': man.label,
-            'group_plugins': list(names) if chosen else [],
-            'counts': counts if name == primary else {},
+            # EVERY plugin the archive holds -- not just the ones this run
+            # imported. Recording the narrowed selection made a --plugin-member
+            # import disagree with the entries a full import had written.
+            'group_plugins': ([Path(q).name for q in man.plugins]
+                              if chosen else []),
+            'group_dir': group_name,
+            # The counts describe the SHARED asset tree, so every member
+            # carries them. Keying on `name == primary` meant a
+            # --plugin-member import stamped them on whichever single plugin
+            # it happened to import and left the siblings reading zero.
+            'counts': counts,
             'capabilities': caps,
             'ingested_utc': stamp,
         }
         source_registry.put(export_dir, name, entry)
-        _write_manifest(export_dir / name, {'key': key, 'group_id': group_id})
+        _write_manifest(primary_dir, {'key': key, 'group_id': group_id})
         results[name] = {'cached': False, 'counts': counts,
                          'capabilities': caps}
 
@@ -710,24 +716,6 @@ def available_steps(capabilities) -> set:
     return out
 
 
-def _share_payload(primary_dir, other_dir, log):
-    """Hard-link the primary plugin's asset tree into a sibling plugin's dir."""
-    other_dir.mkdir(parents=True, exist_ok=True)
-    linked = 0
-    for cat in bsa_extract.ASSET_CATEGORIES + ('misc',):
-        src = Path(primary_dir) / cat
-        if not src.is_dir():
-            continue
-        for dirpath, _d, files in os.walk(src):
-            for fn in files:
-                full = Path(dirpath) / fn
-                rel = full.relative_to(primary_dir).as_posix()
-                _link_or_copy(full, archive.safe_join(other_dir, rel))
-                linked += 1
-    if linked:
-        log(f"  Shared {linked} files with {Path(other_dir).name}")
-
-
 def reingest(plugin, export_dir, log=print, force=False):
     """Re-run the import for an already-registered plugin.
 
@@ -767,16 +755,38 @@ def reingest(plugin, export_dir, log=print, force=False):
 
 
 def remove(plugin, export_dir, log=print):
-    """Delete an imported plugin's export tree and registry entry."""
+    """Delete an imported plugin's export tree and registry entry.
+
+    The asset tree is SHARED by every plugin from the same archive, so it is
+    deleted only when this is the last one still registered. Removing one
+    plugin of three must not take the other two's meshes with it.
+    """
     export_dir = Path(export_dir)
     entry = source_registry.get(export_dir, plugin)
     if not entry:
         return False
     name = entry.get('plugin') or plugin
-    target = export_dir / name
-    if target.is_dir():
-        shutil.rmtree(target, ignore_errors=True)
-        log(f"  Removed {target}")
+    group_dir = source_registry.asset_root(export_dir, name)
+    siblings = [n for n in source_registry.group_members(export_dir, name)
+                if n.lower() != name.lower()]
+
+    # This plugin's own records go regardless.
+    rec = source_registry.record_dir(export_dir, name)
+    if rec.is_dir() and rec != group_dir:
+        shutil.rmtree(rec, ignore_errors=True)
+        log(f"  Removed {rec}")
+
+    if siblings:
+        # Its binary, but not the payload the others still read.
+        binary = group_dir / source_registry.SOURCE_SUBDIR / name
+        if binary.is_file():
+            binary.unlink()
+        log(f"  Kept shared assets in {group_dir} "
+            f"({len(siblings)} plugin(s) still use them)")
+    elif group_dir.is_dir():
+        shutil.rmtree(group_dir, ignore_errors=True)
+        log(f"  Removed {group_dir}")
+
     source_registry.remove(export_dir, name)
     return True
 

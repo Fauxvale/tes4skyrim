@@ -345,11 +345,72 @@ TESConversion/
   external/               # third-party binaries (see README license table)
   tests/ tools/ docs/ references/ temp/
   export/                 # cached exports (gitignored)
+    <plugin>/             #   a Data-directory plugin: records + its assets
+    <Mod Label>/          #   an IMPORTED mod: one folder for the whole archive
   output/                 # WORKING area (gitignored)
-    <plugin>/             #   one folder per converted plugin
+    <plugin>/             #   one folder per converted plugin...
+    <Mod Label>/          #   ...or one per imported mod (mirrors export/)
     AutoConvertLOD/       #   the baked LOD mod (tools/create_lod.py)
     Finished Mods/        #   everything the user INSTALLS -- see below
 ```
+
+### Imported mods share ONE folder per MOD
+
+A mod archive holding several plugins ships ONE set of meshes/textures/sound/
+trees that all of them draw on. Giving each plugin its own `export/<plugin>/`
+meant extracting that payload once per plugin (or hard-linking it, which is the
+same bytes wearing a disguise), and left the pipeline unable to tell "these
+three read the same assets" from "these three are unrelated".
+
+So an imported mod gets one folder, named for the mod, in BOTH roots:
+
+```
+export/Tamriel Resource Pack Full 2.0/
+  _source/              every plugin binary + the retained archive
+  meshes/ textures/ sound/ trees/ misc/        <- SHARED payload
+  collision_cache.bin, mesh_bounds_cache.json,
+  door_centers_cache.json, door_panel_axis_cache.json   <- SHARED, asset-keyed
+  TamRes.esm/           <- THIS plugin's .txt dump + per-plugin caches
+  TamRes.esp/              (navmesh_geom_cache, creature_projects.json,
+  TamRes_LandscapeResource.esm/   voice_durations.json, animdata_base)
+
+output/Tamriel Resource Pack Full 2.0/
+  TamRes.esm  TamRes.esp  TamRes_LandscapeResource.esm   + their manifests
+  meshes/ Textures/ scripts/ sound/ seq/
+```
+
+**Three plugins in, three plugins out** — only the asset payload is shared.
+Records, manifests and the converted ESM/ESP stay per plugin.
+
+Which caches are shared is a measured fact, not a guess:
+`collision_extract.scan_mesh_data` keys its entries on the mesh's relative path
+with no plugin identity, and the door/navmesh caches are located via
+`os.path.dirname(collision_cache)`, so they follow it. Everything else derives
+from a plugin's records and stays in that plugin's subfolder.
+
+Never join a plugin name onto a root by hand. Three resolvers own this, and
+export/ and output/ only agree because they all go through them:
+
+| Need | Call |
+|---|---|
+| the shared assets | `source_registry.asset_root(export_dir, plugin)` |
+| this plugin's records | `source_registry.record_dir(export_dir, plugin)` |
+| this plugin's output | `output_layout.plugin_out_root(out_root, plugin, export_dir)` |
+
+A plugin that is not an imported mod resolves to `<root>/<plugin>` from all
+three, so the game-Data path is byte-for-byte unchanged.
+
+Two consequences worth knowing:
+
+* **The output scanners cannot use `<folder>/<folder>`.** A group folder is
+  named for the mod, so `sibling_lod.converted_plugins` and `gui.scan_converted`
+  find plugins by their `<plugin>.manifest.json` instead. Getting this wrong
+  drops a plugin out of load-order resolution silently.
+* **Removing one plugin must not delete the shared tree.** `mod_ingest.remove`
+  deletes the payload only when the plugin being removed is the last one
+  registered in its group.
+
+`tools/migrate_group_layout.py` moves mods imported under the old layout.
 
 ### `output/Finished Mods/`
 

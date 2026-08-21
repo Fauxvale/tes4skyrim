@@ -51,6 +51,35 @@ if not hasattr(time, 'clock'):
     time.clock = time.perf_counter  # pyffi uses the removed time.clock
 from pyffi.formats.nif import NifFormat
 
+
+# Shared-folder resolution -- see output_layout. An imported mod's plugins keep
+# records in `export/<Mod>/<plugin>/` but share `export/<Mod>/` for assets.
+
+def _record_dir(extract_dir, plugin):
+    try:
+        from output_layout import record_dir
+        return record_dir(extract_dir, plugin)
+    except ImportError:
+        return Path(extract_dir) / plugin
+
+
+def _asset_root(extract_dir, plugin):
+    try:
+        from output_layout import asset_root
+        return asset_root(extract_dir, plugin)
+    except ImportError:
+        return Path(extract_dir) / plugin
+
+
+def _out_root(output_dir, plugin, extract_dir=None):
+    try:
+        from output_layout import plugin_out_root
+        return plugin_out_root(output_dir, plugin,
+                               str(extract_dir) if extract_dir else None)
+    except ImportError:
+        return Path(output_dir) / plugin
+
+
 CANVAS = 512  # baked atlas size (matches vanilla LargeBookSkyrim.dds density)
 
 BOOK_TEMPLATE = 'meshes\\clutter\\books\\book02\\character assets\\bookskyrim01.nif'
@@ -788,7 +817,7 @@ def _convert_one(model_rel):
         return (model_rel, 'fail', '%s: %s' % (type(exc).__name__, exc))
 
 
-def _split_master_owned(models, export_subdir, extract_roots):
+def _split_master_owned(models, asset_subdir, extract_roots):
     """Drop the models whose source assets belong to a MASTER, not to us.
 
     A plugin's BOOK.txt lists every book it PLACES, including its masters'.
@@ -802,7 +831,8 @@ def _split_master_owned(models, export_subdir, extract_roots):
 
     Ownership follows the SOURCE mesh: a model this plugin extracted itself is
     its own to bake, and one that resolves only in a master's export is the
-    master's. The master's own run generates it at the identical path, so
+    master's.  `asset_subdir` is therefore this plugin's ASSET root, never its
+    record dir -- the record dir has no meshes/ and every model would defer. The master's own run generates it at the identical path, so
     deferring loses nothing -- the STAT that `equipment.py` synthesizes points
     at the same `inv_basename`, and Data holds one file per path.
 
@@ -810,13 +840,17 @@ def _split_master_owned(models, export_subdir, extract_roots):
     its export, so it keeps the bake and legitimately wins the path.
     """
     own, deferred = [], 0
+    # `asset_subdir` is this plugin's own ASSET root -- the tree that actually
+    # holds meshes/. It must be the same root `extract_roots[0]` names, or the
+    # plugin's own assets get filtered in as a "master" root below and it
+    # defers its own books to nobody.
     master_roots = [r for r in _as_roots(extract_roots)
-                    if os.path.normpath(r) != os.path.normpath(export_subdir)]
+                    if os.path.normpath(r) != os.path.normpath(asset_subdir)]
     if not master_roots:
         return list(models), 0
     for model in models:
         rel = model.replace('/', chr(92)).strip(chr(92))
-        if _find_source_mesh([export_subdir], rel) is not None:
+        if _find_source_mesh([asset_subdir], rel) is not None:
             own.append(model)                 # we ship the source: ours to bake
         elif _find_source_mesh(master_roots, rel) is not None:
             deferred += 1                     # master ships it: master bakes it
@@ -838,19 +872,28 @@ def generate_book_inams(source_file, extract_dir='export', output_dir='output',
     Returns {'ok': n, 'skip': n, 'fail': n}.
     """
     source_name = Path(source_file).name
-    export_subdir = os.path.join(extract_dir, source_name)
-    out_root = os.path.join(output_dir, source_name)
-    # This plugin's export first, then its masters' — nearest wins, so a
+    # Records are per plugin; the meshes/textures they name live in the mod's
+    # SHARED asset tree, which for an imported mod is the group folder.
+    export_subdir = str(_record_dir(extract_dir, source_name))
+    asset_subdir = str(_asset_root(extract_dir, source_name))
+    out_root = str(_out_root(output_dir, source_name, extract_dir))
+    # This plugin's assets first, then its masters' — nearest wins, so a
     # plugin that overrides a master's asset still uses its own copy.
-    extract_roots = [export_subdir]
+    extract_roots = [asset_subdir]
     for m in (master_names or []):
-        d = os.path.join(extract_dir, m)
-        if os.path.isdir(d) and os.path.normpath(d) != os.path.normpath(export_subdir):
+        d = str(_asset_root(extract_dir, m))
+        if os.path.isdir(d) and os.path.normpath(d) != os.path.normpath(asset_subdir):
             extract_roots.append(d)
     models = distinct_book_models(export_subdir)
     if not models:
         return {'ok': 0, 'skip': 0, 'fail': 0}
-    models, deferred = _split_master_owned(models, export_subdir, extract_roots)
+    # The plugin's own ASSET root, not its record dir: ownership is decided by
+    # which tree ships the source MESH, and the record dir holds no meshes at
+    # all. Passing it meant the own-mesh probe always missed, the plugin's own
+    # asset root was classed as a MASTER root (it no longer equals the record
+    # dir), and every book a grouped mod ships was deferred to a master that
+    # never bakes it -- so those books shipped with no inventory art.
+    models, deferred = _split_master_owned(models, asset_subdir, extract_roots)
     if deferred:
         print('  [book_inam] %d model(s) left to the master that ships them'
               % deferred)

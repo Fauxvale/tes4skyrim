@@ -1467,6 +1467,17 @@ Two pieces, both native, both re-enabled in the pipeline (`generate_lod` + `gene
 
 ## SpeedTree (.spt) conversion
 
+> 🛑 **GROUND TRUTH IS `Oblivion.exe`, NOT the billboards.** The game statically
+> links SpeedTreeRT 4.x with symbols intact — the RNG, the child-placement
+> rules, the spline evaluator and the level struct are all decompiled in
+> **[speedtree_engine_decomp.md](speedtree_engine_decomp.md)**. Read that
+> before changing `spt_generator.py`. The "compare against the billboards"
+> advice below is SUPERSEDED for anything structural: the generator was already
+> fitted to those images, so an A/B can never reveal a 3D error.
+> Known-wrong today: golden-angle azimuth (engine uses `uniform(-180,180)`),
+> the `MAX_STEMS_PER_LEVEL` caps (engine uses a smooth per-level density
+> falloff), and the crown-shell culls.
+
 **Real procedural, rewritten 2026-07-05 — replaces the asset-matching hack**: `asset_convert/spt_parser.py` + `spt_generator.py` + `spt_converter.py` decode the Oblivion SpeedTreeCAD-4.x `.spt` binary and bake procedural tree geometry directly into a Skyrim NIF that matches the Oblivion tree's silhouette. `python -m asset_convert.spt_converter <trees_src> <nif_dst> [--export-dir <dir>]`. The old `assets/speedtrees/` asset-matching + `_spt_to_skyblivion` is GONE (those were custom Skyblivion creations, not real conversions).
 
 - **`.spt` format** is documented in `references/spttools-master/FORMAT` (GPL sptparser reference). It's a flat stream of `<int32 section_id><payload>` chunks. `spt_parser.py::parse_spt` consumes EVERY section (strict — unknown id raises) into an `SptTree`: levels (trunk=0, branch levels, leaves=last; count in section 1014), shape curves as ASCII "BezierSpline" strings (section 6000-6017), leaf maps (4003 texture / 4005 size / 4004 origin), composite-map UV quads (section 10002), collision primitives (12002/3/4), floor, flares, roughness. Parses 113/113 Oblivion.esm SPTs byte-exact, and 547/547 across every exported plugin (see the newer-CAD note below).

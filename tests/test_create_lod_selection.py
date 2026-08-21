@@ -277,8 +277,10 @@ class TestModAddedWorldspacesAreOffered:
         from asset_convert import terrain_lod
         from asset_convert.sibling_lod import worldspaces_by_plugin_diagnosed
 
-        def _fake(export_dir, out_root=None):
-            if Path(export_dir).name == 'Good.esm':
+        def _fake(export_dir, out_root=None, plugin=None):
+            # Identify by the PLUGIN argument, not the folder name: a
+            # single-plugin imported mod's records live in the mod's folder.
+            if (plugin or Path(export_dir).name) == 'Good.esm':
                 return [('W1', 1)], None
             return [], 'Bad.esp: nope.'
 
@@ -293,7 +295,7 @@ class TestModAddedWorldspacesAreOffered:
         from asset_convert import terrain_lod
         from asset_convert.sibling_lod import worldspaces_by_plugin_diagnosed
 
-        def _boom(export_dir, out_root=None):
+        def _boom(export_dir, out_root=None, plugin=None):
             raise OSError('disk gone')
 
         monkeypatch.setattr(terrain_lod, 'lod_capable_worldspaces', _boom)

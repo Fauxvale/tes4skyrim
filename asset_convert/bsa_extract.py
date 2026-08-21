@@ -371,7 +371,9 @@ def extract_bsa(bsa_path, extract_dir, force=False, source_name=None):
     """
     bsa_path = Path(bsa_path)
     extract_dir = Path(extract_dir)
-    base_dir = extract_dir / source_name if source_name else extract_dir
+    # `source_name` is an already-resolved FOLDER name from the caller,
+    # not a raw plugin name.
+    base_dir = extract_dir / source_name if source_name else extract_dir   # noqa: plugin-path (resolved folder)
     manifest = _load_manifest(base_dir)
 
     bsa_key  = bsa_path.name
@@ -468,8 +470,18 @@ def extract_assets_for_file(source_file, data_path, extract_dir, force=False):
     totals = {'bsas_found': len(bsa_files), 'bsas_extracted': 0,
               'bsas_cached': 0, 'total_extracted': 0, 'total_errors': 0}
 
+    # Where this plugin's assets live. For a game-Data plugin that is a folder
+    # named after it; an imported mod's plugins share their MOD's folder. Ask
+    # the resolver rather than assuming (see output_layout).
+    try:
+        from output_layout import asset_root
+        asset_dir_name = asset_root(extract_dir, source_file).name
+    except ImportError:
+        asset_dir_name = source_file
+
     for bsa_file in bsa_files:
-        stats = extract_bsa(bsa_file, extract_dir, force=force, source_name=source_file)
+        stats = extract_bsa(bsa_file, extract_dir, force=force,
+                            source_name=asset_dir_name)
         if stats.get('skipped_cached'):
             totals['bsas_cached'] += 1
         else:

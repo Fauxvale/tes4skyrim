@@ -45,10 +45,14 @@ def _load_master_export(export_dir: str) -> dict:
                 _, _, val = line.partition('=')
                 if val.strip():
                     names.append(val.strip())
-    root = os.path.dirname(os.path.normpath(export_dir))
+    # Masters resolve through the registry: an imported mod's plugins live
+    # inside their mod's folder, so the parent of a record dir is not the
+    # export root and a plain join finds nothing.
+    from tes5_import.overrides import _export_root, _master_export_dir
+    root = _export_root(export_dir)
     out = {}
     for name in names:
-        mdir = os.path.join(root, name)
+        mdir = _master_export_dir(root, name)
         if not os.path.isdir(mdir):
             print(f'  WARNING: master export not found ({mdir}); '
                   f'its items cannot be classified')

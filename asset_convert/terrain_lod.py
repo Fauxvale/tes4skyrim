@@ -33,6 +33,7 @@ from worker_budget import worker_count  # noqa: E402
 
 # Apply all PyFFI patches (time.clock fix, nif.xml condition fixes) before import
 from . import pyffi_monkey_patch as _patch  # noqa: F401
+from output_layout import assets_for  # noqa: E402
 
 try:
     from pyffi.formats.nif import NifFormat
@@ -278,6 +279,32 @@ def _scan_wrld_block(raw, include_children: bool):
     return ranked
 
 
+def _master_record_dir(export_dir, master: str):
+    """Where `master`'s records live, given any plugin's record folder.
+
+    Masters used to resolve as `export_dir.parent / master`. That holds only
+    while every plugin owns a top-level folder; an imported mod's plugins are
+    nested inside their mod's folder, making `.parent` the mod rather than the
+    export root.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+    d = _Path(export_dir).parent
+    root = d
+    for cand in (d, d.parent):
+        if cand and (cand / 'sources.json').is_file():
+            root = cand
+            break
+    try:
+        from output_layout import record_dir as _rd
+        got = _rd(root, master)
+        if _os.path.isdir(got):
+            return got
+    except ImportError:
+        pass
+    return root / master
+
+
 def _master_names(export_dir: Path):
     """The TES4 master file names listed in an export's _HEADER.txt."""
     header = Path(export_dir) / '_HEADER.txt'
@@ -430,7 +457,8 @@ def _scan_cell_coords(esm_path: Path, coords: dict):
             p += 24 + size
 
 
-def lod_capable_worldspaces(export_dir: Path, out_root: Path = None):
+def lod_capable_worldspaces(export_dir: Path, out_root: Path = None,
+                            plugin: str = None):
     """Every worldspace a plugin should get distant LOD for.
 
     The authority is the SOURCE GAME's own shipped LOD assets. Whoever built
@@ -463,7 +491,10 @@ def lod_capable_worldspaces(export_dir: Path, out_root: Path = None):
     cause is a deleted or never-run export.
     """
     export_dir = Path(export_dir)
-    name = export_dir.name
+    # The messages below tell the user to re-run `convert.py -f <name>`, so it
+    # must be the PLUGIN. A single-plugin imported mod keeps its records in the
+    # mod's folder, whose name is the mod label and not a valid -f argument.
+    name = plugin or export_dir.name
 
     if not export_dir.is_dir():
         return [], (f"{name}: no export folder — run the Export stage "
@@ -480,8 +511,9 @@ def lod_capable_worldspaces(export_dir: Path, out_root: Path = None):
     # No shipped LOD. Distinguish "this plugin genuinely has none" from "the
     # assets that would have told us were deleted", because the two look
     # identical from here and only one of them is the user's problem.
-    lod_dirs = [export_dir / 'meshes' / 'landscape' / 'lod',
-                export_dir / 'textures' / 'landscapelod' / 'generated']
+    _assets = assets_for(export_dir)
+    lod_dirs = [_assets / 'meshes' / 'landscape' / 'lod',
+                _assets / 'textures' / 'landscapelod' / 'generated']
     if not any(d.is_dir() for d in lod_dirs):
         return [], (f"{name}: the export has no landscape-LOD folders. If you "
                     f"deleted them, re-run the Extract stage "
@@ -553,8 +585,11 @@ def shipped_lod_worldspaces(export_dir: Path):
                 edid_by_fid.setdefault(cur_fid, line[9:].strip())
 
     _scan_wrld(export_dir)
+    # A master's records are NOT reliably a sibling directory: an imported
+    # mod's plugins live inside their mod's shared folder, so `.parent` is that
+    # folder rather than export/. Resolve through the registry.
     for master in _master_names(export_dir):
-        _scan_wrld(export_dir.parent / master)
+        _scan_wrld(_master_record_dir(export_dir, master))
 
     # The importer renames Oblivion's 'Tamriel' worldspace to 'TES4Tamriel'
     # (tes5_import/record_types/world.py) so it doesn't override Skyrim's

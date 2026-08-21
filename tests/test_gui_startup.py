@@ -150,3 +150,46 @@ class TestCollisionWindingSetting:
                        "Anything.esp"):
             assert (gui.winding_enabled_for(gui.WINDING_AUTO, plugin)
                     == default_for_plugin(plugin))
+
+
+# ---------------------------------------------------------------------------
+#  Step selection is per-plugin
+# ---------------------------------------------------------------------------
+
+def _switching_resets(name, previous):
+    """The rule `_commit` applies: a genuine plugin SWITCH resets the ticks.
+
+    Mirrors gui._commit. `_commit` is a closure inside build_gui and cannot be
+    reached without standing a whole window up, so the rule is asserted here
+    and the source is checked below to keep the two from drifting.
+    """
+    return (name or "").strip().lower() != (previous or "").strip().lower()
+
+
+@pytest.mark.parametrize("previous,name,expect", [
+    ("TamRes.esm", "TamRes.esp",  True),   # different plugin -> reset
+    ("TamRes.esm", "TamRes.esm",  False),  # same plugin      -> keep edits
+    ("TamRes.esm", "tamres.esm",  False),  # same, other case -> keep edits
+    ("TamRes.esm", " TamRes.esm", False),  # same, whitespace -> keep edits
+    ("",           "TamRes.esm",  True),   # first selection  -> defaults
+])
+def test_only_a_real_switch_resets_the_step_selection(previous, name, expect):
+    """Ticks are per-plugin state: what THIS plugin still owes.
+
+    Carrying them across meant edits made for one plugin silently governed the
+    run for the next one. Re-selecting the plugin already shown is not a switch
+    and must not discard the user's edits.
+    """
+    assert _switching_resets(name, previous) is expect
+
+
+def test_commit_still_resets_on_switch():
+    """Guards the rule above against gui._commit being changed out from under it."""
+    import inspect
+    src = inspect.getsource(gui)
+    commit = src[src.index("    def _commit(name: str):"):]
+    commit = commit[:commit.index(chr(10) + "    def ", 10)]
+    # The switch test and the reset must both still be there.
+    assert "_set_default()" in commit
+    assert ".strip().lower() != " in commit
+    assert "_plan_applied.discard(name)" in commit

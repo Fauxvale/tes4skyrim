@@ -54,7 +54,7 @@ def collect_cell_bases(export_dir, cell_fids):
     """Return {cell_fid: {base_fid: count}} from all placed-object files."""
     out = {fid: defaultdict(int) for fid in cell_fids}
     for fname in PLACED_FILES:
-        for rec in iter_records(os.path.join(export_dir, fname)):
+        for rec in iter_records(os.path.join(export_dir, fname)):   # noqa: plugin-path (record .txt)
             parent = rec.get("ParentCELL", [None])[0]
             if parent and parent.upper() in out:
                 base = rec.get("NAME", [None])[0]
@@ -69,7 +69,7 @@ def build_base_index(export_dir, wanted_fids):
     for fname in sorted(os.listdir(export_dir)):
         if not fname.endswith(".txt") or fname in PLACED_FILES or fname == "CELL.txt":
             continue
-        path = os.path.join(export_dir, fname)
+        path = os.path.join(export_dir, fname)   # noqa: plugin-path (record .txt)
         for rec in iter_records(path):
             fid = rec.get("FormID", [None])[0]
             if not fid or fid.upper() not in wanted_fids:

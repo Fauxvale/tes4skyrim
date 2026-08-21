@@ -367,6 +367,14 @@ Correctness first, then quality, then geometry probes. See
   - This replaced a CI commit that stamped `VERSION` and tagged itself. That commit could never reach protected master (GH013), so it lived only on the tag — master's `VERSION` was permanently stale, and the scheme was **push-only and could not work for a PR merge at all**. Removing it is what makes tagging identical on both routes.
   - `.conversion_state.json` (gitignored) records, per plugin, the version that last ran each step **and the TES4 data directory it was converted from** — Nehrim and Morrowind_ob each live in their own install, so the GUI's *Converted* menu restores the right one instead of assuming whichever is configured.
   - `check_for_update()` is a **network call** — the GUI runs it on a worker thread and marshals the result back with `root.after`. It reads tags anonymously (no `gh` required) and ignores `navmesh-cache-*`, which are a different series.
+- **Group-layout migration**: `python tools/migrate_group_layout.py [--apply]
+  [--clean-output] [--mod LABEL]` — moves imported mods from the old
+  one-folder-per-plugin layout onto the shared group folder
+  (`export/<Mod Label>/` with `_source/`, the shared asset tree, and one
+  subfolder per plugin for its records). Dry run by default; `--apply` performs
+  the move and `--clean-output` also drops the stale `output/<plugin>/` trees.
+  Counts hard-linked files once, so the reclaim figure is real bytes. Idempotent
+  — an already-migrated mod is reported and skipped.
 
 ## verify_plugin.py
 

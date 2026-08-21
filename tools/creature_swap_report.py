@@ -18,6 +18,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tes5_import import vanilla_creature_swap as V
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+from output_layout import paths  # noqa: E402
 
 BS = chr(92)
 
@@ -36,7 +39,8 @@ def read_crea(path):
 
 
 def report(plugin, export_root, allow_near, show_list):
-    path = os.path.join(export_root, plugin, 'CREA.txt')
+    path = str(paths(plugin, export_root=export_root).records
+                / 'CREA.txt')
     if not os.path.exists(path):
         return False
     swapped = collections.Counter()

@@ -446,7 +446,14 @@ def record_step_run(step_key: str, plugin: str | None,
     version = current_version() if version is None else version
     state = _load_state()
     steps = state.setdefault("steps", {})
-    key = GLOBAL_PLUGIN_KEY if step_key in GLOBAL_STEPS else _plugin_key(plugin)
+    if step_key in GLOBAL_STEPS:
+        key = GLOBAL_PLUGIN_KEY
+    else:
+        # A shared-asset step converts the whole mod's payload at once, so it
+        # is recorded against the MOD, falling back to the plugin when this is
+        # not an imported mod -- which is every game-Data plugin.
+        key = _group_key(plugin) if step_key in GROUP_STEPS else None
+        key = key or _plugin_key(plugin)
     entry = steps.setdefault(key, {})
     entry[step_key] = version
     # Never record a source directory against the shared key: it belongs to no
@@ -473,14 +480,37 @@ def _plugin_key(plugin: str | None) -> str:
     return (plugin or "").strip().lower() or "*"
 
 
+def _merge_newer(merged: dict, entry, keys) -> None:
+    """Fold `entry`'s records for `keys` into `merged`, newest version winning.
+
+    The same three-line "is this stamp newer than the one I have" dance was
+    written out once per tier (mod, sibling, global); one copy is enough.
+    """
+    if not isinstance(entry, dict):
+        return
+    for key in keys:
+        at = entry.get(key)
+        if not isinstance(at, str):
+            continue
+        have = merged.get(key)
+        if have is None or (version_key(at) or (0, 0)) > (
+                version_key(have) or (0, 0)):
+            merged[key] = at
+
+
 def steps_run_at(plugin: str | None) -> dict[str, str]:
     """{step_key: version} for every step recorded for *plugin*.
 
-    Steps in `GLOBAL_STEPS` are merged in from the shared key: they produce one
-    artifact covering the whole load order, so running one while converting
-    Oblivion counts for Nehrim too.  Without this merge every plugin but the one
-    it happened to run alongside sees a step that "never ran" and re-selects it
-    on every check.
+    Three tiers of ownership are merged in, newest stamp winning:
+
+    * the plugin's own key -- steps that convert THAT plugin's records;
+    * its MOD's key (`GROUP_STEPS`) -- an imported mod's plugins share one
+      asset tree, so converting it once counts for every plugin that reads it;
+    * the shared key (`GLOBAL_STEPS`) -- one artifact for the whole load order,
+      so running it while converting Oblivion counts for Nehrim too.
+
+    Without the last two merges every plugin but the one a step happened to run
+    alongside sees a step that "never ran" and re-selects it on every check.
 
     A per-plugin entry left by an older build still counts -- the newer of the
     two wins, so history recorded under the old scheme is not thrown away and
@@ -492,16 +522,22 @@ def steps_run_at(plugin: str | None) -> dict[str, str]:
     if isinstance(got, dict):
         merged.update({k: v for k, v in got.items() if isinstance(v, str)})
 
-    shared = steps.get(GLOBAL_PLUGIN_KEY)
-    if isinstance(shared, dict) and _plugin_key(plugin) != GLOBAL_PLUGIN_KEY:
-        for key in GLOBAL_STEPS:
-            at = shared.get(key)
-            if not isinstance(at, str):
-                continue
-            have = merged.get(key)
-            if have is None or (version_key(at) or (0, 0)) > (
-                    version_key(have) or (0, 0)):
-                merged[key] = at
+    # Shared-asset steps recorded against this plugin's MOD count for it: one
+    # conversion of the group payload covers every plugin that reads it, so
+    # running Meshes for one plugin of a resource pack must not leave its
+    # siblings looking like they still owe the step.
+    gkey = _group_key(plugin)
+    if gkey:
+        _merge_newer(merged, steps.get(gkey), GROUP_STEPS)
+        # History written before shared-asset steps were group-scoped sits
+        # under a SIBLING's own key. Read it across the group so an existing
+        # conversion is not reported as still owed. Read-only, like the
+        # GLOBAL_STEPS lift: the next successful run records it properly.
+        for sib in _group_siblings(plugin):
+            _merge_newer(merged, steps.get(_plugin_key(sib)), GROUP_STEPS)
+
+    if _plugin_key(plugin) != GLOBAL_PLUGIN_KEY:
+        _merge_newer(merged, steps.get(GLOBAL_PLUGIN_KEY), GLOBAL_STEPS)
     return merged
 
 
@@ -648,8 +684,9 @@ STEP_KEYS: list[tuple[str, str]] = [
     # rearranging the buttons moves these too.
     ("create_lod",         "Create LOD"),
     ("pack_lod",           "Pack LOD"),
-    ("modify_body_meshes", "Patch Skyrim"),
+    ("make_master",        "Convert to Master"),
     ("package_start_mod",  "Package Start Mod"),
+    ("modify_body_meshes", "Patch Skyrim"),
 ]
 
 _LABEL_TO_KEY = {label: key for key, label in STEP_KEYS}
@@ -677,12 +714,82 @@ _LABEL_OF     = {key: label for key, label in STEP_KEYS}
 #
 # "Pack LOD" inherits it: it zips that one shared folder into one shared
 # archive, so it is no more per-plugin than the bake it packages.
+#
+# "Convert to Master" is global for the same reason: the ESM flag has to be
+# applied to a whole dependency CHAIN at once (an ESM may not master a plain
+# ESP), so it belongs to no single plugin. It was absent from this set while
+# being listed in gui.GLOBAL_ACTIONS, which two tests already asserted against.
 GLOBAL_STEPS: frozenset[str] = frozenset({"modify_body_meshes", "create_lod",
-                                          "package_start_mod", "pack_lod"})
+                                          "package_start_mod", "pack_lod",
+                                          "make_master"})
 
 # The state-file key those steps are recorded under.  `_plugin_key(None)`
 # already collapses to "*", which is exactly "belongs to no plugin".
 GLOBAL_PLUGIN_KEY = "*"
+
+
+# Steps that consume the SHARED asset tree of an imported mod. Plugins from one
+# archive read the same meshes/textures/sound/trees and write into one output
+# folder, so running "Meshes" for any one of them converts the payload for all
+# of them -- it is the same work over the same files, and re-running it for a
+# sibling would redo identical work and produce identical bytes.
+#
+# Recorded once per MOD (key "mod:<group_id>") rather than per plugin, exactly
+# as GLOBAL_STEPS is recorded once for the whole load order. Without this, a
+# three-plugin resource pack showed Meshes as still owed for two of its plugins
+# after it had already been converted.
+#
+# The record-driven steps are deliberately absent: export, import_, scripts and
+# creatures each read THAT plugin's own .txt dump and produce that plugin's own
+# ESM, so they remain per-plugin.
+#
+# "Sounds" is absent too, and it is the interesting case. Its non-voice half
+# (sound/fx/) really is shared, but VOICE is per plugin end to end: the source
+# tree is partitioned as `sound/voice/<plugin>/`, the output goes to
+# `Sound/Voice/<plugin>/`, FormIDs are shifted by THAT plugin's load-order
+# index, and the filename prefixes come from that plugin's own
+# `<esm>.voicemap.txt` / `.liptext.txt`. Marking it group-wide would tell the
+# user a sibling's voice lines were converted when they were never touched.
+GROUP_STEPS: frozenset[str] = frozenset({"extract", "meshes", "speedtrees"})
+
+
+def _group_siblings(plugin: str | None) -> list:
+    """Other plugins sharing `plugin`'s imported-mod asset tree."""
+    if not plugin:
+        return []
+    try:
+        from asset_convert import source_registry
+    except ImportError:
+        return []
+    try:
+        members = source_registry.group_members(SCRIPT_DIR / 'export', plugin)
+    except Exception:
+        return []
+    return [n for n in members if _plugin_key(n) != _plugin_key(plugin)]
+
+
+def _group_key(plugin: str | None) -> str | None:
+    """`mod:<group_id>` when `plugin` belongs to an imported mod, else None.
+
+    The registry lives in asset_convert, which version.py must not hard-depend
+    on -- it is imported by tools that never load the pipeline. An unavailable
+    registry simply means "no group", and the step falls back to per-plugin
+    recording, which is the pre-existing behaviour.
+    """
+    if not plugin:
+        return None
+    try:
+        from asset_convert import source_registry
+    except ImportError:
+        return None
+    try:
+        entry = source_registry.get(SCRIPT_DIR / 'export', plugin)
+    except Exception:
+        return None
+    if not entry:
+        return None
+    gid = entry.get("group_id")
+    return f"mod:{gid}" if gid else None
 
 
 def label_to_key(label: str) -> str | None:
@@ -754,7 +861,17 @@ def upgrade_plan(plugin: str | None) -> dict:
     all_keys  = [key for key, _ in STEP_KEYS]
     ran       = steps_run_at(plugin)
 
-    if installed is None:
+    # "Never converted" is about THIS plugin, so it is decided only by steps
+    # that belong to it. A shared step (the mod's asset tree, or a load-order
+    # wide artifact) can be recorded before this plugin has been converted at
+    # all -- converting a sibling of the same resource pack is enough -- and
+    # counting those made a plugin with no export and no ESM claim it had been
+    # run. That is the exact inversion the "Not converted" state exists to
+    # prevent.
+    own = {k: v for k, v in ran.items()
+           if k not in GROUP_STEPS and k not in GLOBAL_STEPS}
+
+    if not own:
         # Nothing recorded: a first run, so everything is owed, but this is a
         # fresh install rather than an upgrade -- the GUI says so differently.
         return {"current": current, "installed": None, "upgraded": False,

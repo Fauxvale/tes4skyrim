@@ -63,8 +63,9 @@ STEP_ORDER = [
     # "10. Pack Mod Zip" follows the per-plugin steps.
     "Create LOD",
     "Pack LOD",
-    "Patch Skyrim",
+    "Convert to Master",
     "Package Start Mod",
+    "Patch Skyrim",
 ]
 
 # Steps that only repackage what earlier steps produced.  Added automatically

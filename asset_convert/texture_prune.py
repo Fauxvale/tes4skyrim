@@ -29,6 +29,7 @@ Anything under textures/ that no reference names is left out of the archive.
 import os
 import re
 from pathlib import Path
+from output_layout import assets_for  # noqa: E402
 
 # Bytes that may appear in a texture path embedded in a binary asset.  This is
 # the character class the old `_TEX_BYTES_RE` used; `_texture_refs_in` walks it
@@ -72,14 +73,14 @@ def write_manifest(export_dir, refs, name: str = MANIFEST_NAME) -> Path:
     """Record a set of texture keys for a later phase to read back."""
     export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
-    out = export_dir / name
+    out = export_dir / name   # noqa: plugin-path (record/manifest filename)
     out.write_text('\n'.join(sorted(refs)), encoding='utf-8')
     return out
 
 
 def read_manifest(export_dir, name: str = MANIFEST_NAME) -> set:
     """Read back a manifest written by write_manifest (empty if never run)."""
-    f = Path(export_dir) / name
+    f = Path(export_dir) / name   # noqa: plugin-path (record/manifest filename)
     if not f.is_file():
         return set()
     return {ln.strip() for ln in
@@ -251,11 +252,18 @@ def build_refs(plugin_dir, export_dir, mesh_texture_refs=None) -> set:
     """Every texture the shipped plugin can ask for, as textures-root keys."""
     plugin_dir = Path(plugin_dir)
 
+    # `export_dir` is a plugin's RECORD directory. The manifests live beside
+    # the SHARED meshes they describe, which for an imported mod is one level
+    # up; the record globs below stay on the record dir. Two roots, one
+    # argument -- keep them straight or the manifest reads as empty and the
+    # whole pack aborts.
+    asset_root = assets_for(export_dir)
+
     if mesh_texture_refs is None:
-        mesh_texture_refs = read_manifest(export_dir)
+        mesh_texture_refs = read_manifest(asset_root)
     if not mesh_texture_refs:
         raise RuntimeError(
-            f'no mesh texture manifest in {export_dir} — run mesh conversion '
+            f'no mesh texture manifest in {asset_root} — run mesh conversion '
             f'first; pruning without it would delete textures that are in use')
 
     refs = {_norm(r) for r in mesh_texture_refs}

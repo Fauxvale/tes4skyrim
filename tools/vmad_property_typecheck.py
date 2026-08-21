@@ -44,6 +44,9 @@ import struct
 import sys
 import zlib
 from collections import Counter, defaultdict
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+from output_layout import paths  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'tools'))
@@ -254,7 +257,7 @@ def _report_cross_master(plugin, src, limit, verbose):
     plugin at all.
     """
     out_dir = os.path.join(ROOT, 'output')
-    esm = os.path.join(out_dir, plugin, plugin)
+    esm = str(paths(plugin, out_root=out_dir).esm)
     masters = _masters(esm)
 
     # Declared Papyrus type per (script, property), for the compatibility test.
@@ -273,7 +276,7 @@ def _report_cross_master(plugin, src, limit, verbose):
     def index_for(name):
         """Record index of a master, read from ITS OWN converted output."""
         if name not in cache:
-            path = os.path.join(out_dir, name, name)
+            path = str(paths(name, out_root=out_dir).esm)
             cache[name] = _record_index(path) if os.path.exists(path) else None
         return cache[name]
 

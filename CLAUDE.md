@@ -416,6 +416,7 @@ relevant doc when working in that area.
 | Doc | Covers |
 |---|---|
 | [nif_conversion_notes.md](docs/nif_conversion_notes.md) | NIF deep-dive: bhk collision/MOPP/CMS, particles, FlameNode grafting, worn armor/shields/furniture markers, skin retargeting, clutter physics, terrain LOD, SpeedTree |
+| [speedtree_engine_decomp.md](docs/speedtree_engine_decomp.md) | SpeedTreeRT decompiled from Oblivion.exe: RNG, child placement/count, spline eval, level struct, parse-stage map. |
 | [world_land_navmesh_notes.md](docs/world_land_navmesh_notes.md) | PGRD→NAVM/NAVI algorithm, LAND record structure, landscape TXST, world-map cloud banks (WRLD MODL) |
 | [navmesh_corridor_redesign.md](docs/navmesh_corridor_redesign.md) | The corridor-ribbon navmesh model |
 | [ck_navmesh_generation.md](docs/ck_navmesh_generation.md) | How the CK generates navmesh (Recast), defaults, the voxel-vs-world units trap |

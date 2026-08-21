@@ -118,7 +118,7 @@ def build_biped_flags(export_dir) -> dict:
     export_dir = Path(export_dir)
     flags: dict = {}
     for name in ('ARMO.txt', 'CLOT.txt'):
-        for rec in _iter_records(export_dir / name):
+        for rec in _iter_records(export_dir / name):   # noqa: plugin-path (record/manifest filename)
             try:
                 bf = int(rec.get('BMDT.BipedFlags', '0') or 0)
             except ValueError:
@@ -187,7 +187,7 @@ def build_plan(export_dir) -> dict:
             plan[key] = plan.get(key, 0) | flags
 
     for name in ('ARMO.txt', 'CLOT.txt'):
-        for rec in _iter_records(export_dir / name):
+        for rec in _iter_records(export_dir / name):   # noqa: plugin-path (record/manifest filename)
             male_biped = rec.get('Male.BipedModel.MODL', '').strip()
             female_biped = rec.get('Female.BipedModel.MODL', '').strip()
             male_world = rec.get('Male.WorldModel.MODL', '').strip()

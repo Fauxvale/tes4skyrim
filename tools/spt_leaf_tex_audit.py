@@ -23,6 +23,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from asset_convert.spt_converter import (                    # noqa: E402
     _match_tex_stem, _tex_index, load_tree_manifest)
 from asset_convert.spt_parser import parse_spt, SptParseError  # noqa: E402
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+from output_layout import paths  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
+from output_layout import assets_for  # noqa: E402
 
 
 def _master_names(export_dir: Path):
@@ -40,9 +47,9 @@ def _master_names(export_dir: Path):
 
 def build_tex_index(export_dir: Path, export_root: Path) -> dict:
     """Texture index for this plugin, then its masters' (same as the converter)."""
-    idx = _tex_index(export_dir / 'textures' / 'trees')
+    idx = _tex_index(assets_for(export_dir) / 'textures' / 'trees')
     for m in _master_names(export_dir):
-        mtex = export_root / m / 'textures' / 'trees'
+        mtex = paths(m, export_root=export_root).assets / 'textures' / 'trees'
         if mtex.is_dir():
             for stem, sub in _tex_index(mtex).items():
                 idx.setdefault(stem, sub)
@@ -50,7 +57,7 @@ def build_tex_index(export_dir: Path, export_root: Path) -> dict:
 
 
 def audit(export_dir: Path, export_root: Path, show_ok=False):
-    trees = export_dir / 'trees'
+    trees = assets_for(export_dir) / 'trees'
     if not trees.is_dir():
         return 0, 0, []
     idx = build_tex_index(export_dir, export_root)

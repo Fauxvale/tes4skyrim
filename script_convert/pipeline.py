@@ -15,6 +15,7 @@ from script_convert.constants import (_PAPYRUS_RESERVED, _RECORD_TYPE_PAPYRUS, _
                                      PAPYRUS_MAX_SCRIPT_NAME)
 from script_convert.cross_ref import CrossRefGraph, master_names
 from script_convert.converter import ScriptConverter
+from output_layout import assets_for  # noqa: E402
 
 
 # ===========================================================================
@@ -155,7 +156,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
     # CrossRefGraph.needs_havok_release.
     from tes5_import.mesh_bounds import load_mesh_bounds
     from asset_convert.collision_extract import bounds_cache_is_current
-    _bounds_cache = os.path.join(export_dir, 'mesh_bounds_cache.json')
+    _bounds_cache = str(assets_for(export_dir) / 'mesh_bounds_cache.json')
     # A cache from before the HELD bit existed loads fine and answers 0 for
     # every mesh, so the release silently vanishes from every converted script.
     # This step cannot rebuild it (--scripts-only runs with no mesh scan), so
@@ -195,7 +196,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
             for name in os.listdir(static_dir):
                 if not name.endswith('.psc'):
                     continue
-                stale_psc = os.path.join(output_dir, name)
+                stale_psc = os.path.join(output_dir, name)   # noqa: plugin-path (.psc filename)
                 stale_pex = os.path.join(os.path.dirname(output_dir),
                                          name[:-4] + '.pex')
                 for stale in (stale_psc, stale_pex):
@@ -208,7 +209,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
             for name in os.listdir(static_dir):
                 if name.endswith('.psc'):
                     shutil.copy2(os.path.join(static_dir, name),
-                                 os.path.join(output_dir, name))
+                                 os.path.join(output_dir, name))   # noqa: plugin-path (.psc filename)
 
     # Phase 1: Build cross-reference graph
     print('  Building cross-reference graph...')
@@ -462,7 +463,7 @@ def _fix_udf_call_arg_types(output_dir: str) -> None:
     for name in os.listdir(output_dir):
         if not name.endswith('.psc'):
             continue
-        path = os.path.join(output_dir, name)
+        path = os.path.join(output_dir, name)   # noqa: plugin-path (.psc filename)
         try:
             with open(path, encoding='utf-8') as fh:
                 text = fh.read()
@@ -567,7 +568,7 @@ def _comment_undeclared_identifiers(output_dir: str) -> None:
     for name in sorted(os.listdir(output_dir)):
         if not name.endswith('.psc'):
             continue
-        path = os.path.join(output_dir, name)
+        path = os.path.join(output_dir, name)   # noqa: plugin-path (.psc filename)
         try:
             with open(path, encoding='utf-8') as fh:
                 lines = fh.read().splitlines()

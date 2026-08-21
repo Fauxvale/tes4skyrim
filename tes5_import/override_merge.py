@@ -16,6 +16,7 @@ authors never touched. Authorship now comes from diffing the two TES4 exports
 import os
 import struct
 import zlib
+from output_layout import paths  # noqa: E402
 
 _HEADER_SIZE = 24
 
@@ -596,8 +597,9 @@ def resolve_master_outputs(masters: list, tes4_master_count: int,
         return []
     out = []
     for name in masters[len(masters) - tes4_master_count:]:
-        # convert.py writes output/<plugin>/<plugin>
-        path = os.path.join(output_root, name, name)
+        # convert.py writes the ESM into the plugin's output folder, which
+        # for an imported mod is its MOD's folder, not one named for it.
+        path = str(paths(name, out_root=output_root).esm)
         out.append((name, path if os.path.isfile(path) else None))
     return out
 
@@ -613,7 +615,7 @@ def load_master_index(masters: list, tes4_master_count: int,
     if not resolved:
         return None
 
-    missing = [(n, os.path.join(output_root, n, n))
+    missing = [(n, str(paths(n, out_root=output_root).esm))
                for n, p in resolved if p is None]
     if missing:
         lines = [

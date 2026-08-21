@@ -47,6 +47,8 @@ from .common import (
 )
 
 
+from output_layout import assets_for  # noqa: E402
+
 def _resolve_mgef(code: str, actor_value: int = -1, script_fid: str = '',
                   effect_type: str = '') -> int:
     """Map one TES4 effect instance to the MGEF FormID it should reference.
@@ -233,7 +235,8 @@ def _book_source_mesh_missing(writer, model: str) -> bool:
     hit = cache.get(key)
     if hit is None:
         parts = model.replace('/', '\\').split('\\')
-        hit = not os.path.isfile(os.path.join(export_dir, 'meshes', *parts))
+        hit = not os.path.isfile(
+        os.path.join(str(assets_for(export_dir)), 'meshes', *parts))
         cache[key] = hit
     return hit
 

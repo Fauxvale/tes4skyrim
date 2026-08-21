@@ -879,3 +879,69 @@ def test_parser_agrees_with_what_release_notes_actually_writes(monkeypatch):
     notes = rn.build_notes("0.581", "0.58", "HEAD")
     assert v._CHECKLIST_HEADING in notes, "heading drifted from release_notes"
     assert v.steps_from_tag_message(notes) == steps
+
+
+# ---------------------------------------------------------------------------
+#  Shared-asset steps are recorded once per MOD
+# ---------------------------------------------------------------------------
+
+def _imported_group(tmp_path, monkeypatch, plugs, label='My Pack'):
+    """Point version.py at a temp root holding an imported multi-plugin mod."""
+    import json
+    monkeypatch.setattr(v, "SCRIPT_DIR", tmp_path)
+    monkeypatch.setattr(v, "STATE_FILE", tmp_path / ".conversion_state.json")
+    exp = tmp_path / "export"
+    exp.mkdir(parents=True, exist_ok=True)
+    reg = {"version": 1, "sources": {
+        n: {"kind": "archive", "plugin": n, "group_id": "g1",
+            "group_label": label, "group_plugins": list(plugs)} for n in plugs}}
+    (exp / "sources.json").write_text(json.dumps(reg), encoding="utf-8")
+    return exp
+
+
+def test_shared_asset_step_counts_for_every_plugin_in_the_mod(tmp_path,
+                                                              monkeypatch):
+    """Meshes converts the mod's ONE payload, so it is done for all of them.
+
+    Recorded per plugin, a three-plugin resource pack showed Meshes as still
+    owed for two of its members right after it had been converted.
+    """
+    _imported_group(tmp_path, monkeypatch, ("A.esm", "B.esp", "C.esm"))
+    v.record_step_run("meshes", "A.esm", version="0.600")
+
+    for name in ("A.esm", "B.esp", "C.esm"):
+        assert v.steps_run_at(name).get("meshes") == "0.600", name
+
+
+def test_record_driven_steps_stay_per_plugin(tmp_path, monkeypatch):
+    """Export/import/scripts read one plugin's own records, and Sounds writes
+    per-plugin voice folders -- none of them carry across the group."""
+    _imported_group(tmp_path, monkeypatch, ("A.esm", "B.esp"))
+    for step in ("export", "import_", "scripts", "sounds"):
+        v.record_step_run(step, "A.esm", version="0.600")
+
+    for step in ("export", "import_", "scripts", "sounds"):
+        assert v.steps_run_at("A.esm").get(step) == "0.600"
+        assert v.steps_run_at("B.esp").get(step) is None, step
+
+
+def test_history_recorded_before_group_scoping_still_counts(tmp_path,
+                                                            monkeypatch):
+    """A sibling's own pre-existing record is read across the group, so an
+    already-converted mod is not reported as owing the step again."""
+    _imported_group(tmp_path, monkeypatch, ("A.esm", "B.esp"))
+    # Simulate the old scheme: stamped directly on one plugin's key.
+    state = v._load_state()
+    state.setdefault("steps", {})[v._plugin_key("A.esm")] = {"meshes": "0.590"}
+    v._save_state(state)
+
+    assert v.steps_run_at("B.esp").get("meshes") == "0.590"
+
+
+def test_a_data_directory_plugin_is_unaffected(tmp_path, monkeypatch):
+    """No registry entry means no group: recording stays exactly as it was."""
+    _imported_group(tmp_path, monkeypatch, ("A.esm",))
+    v.record_step_run("meshes", "Oblivion.esm", version="0.600")
+
+    assert v.steps_run_at("Oblivion.esm").get("meshes") == "0.600"
+    assert v.steps_run_at("A.esm").get("meshes") is None
