@@ -200,6 +200,8 @@ real data, or a failing-then-passing test.
   scoped down, say so instead of waiting on it. **Does NOT apply to real
   pipeline runs** (`convert.py --import-only` etc.), which take as long as they
   take — see [BUILD EVERY FILE](#build-every-file).
+  **Write each result as you compute it; on timeout use what it wrote. Never
+  re-run the same sweep at a smaller scope.**
 - **NEVER stop mid-task for a status update** — see [no stopping](#no-stopping).
 
 ### Working with the user

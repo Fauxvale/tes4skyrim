@@ -1083,13 +1083,49 @@ _ALPHA_DST_ONE = 0
 _SOFT_FALLOFF_DEPTH = 100.0
 
 
-def _apply_fx_soft_effect(eff_shader, alpha_prop):
+# Vanilla's own FLAME shapes -- the ones mounted against geometry, which is
+# exactly our torch/sconce case -- ship soft_effect OFF and a boosted emissive:
+#   torchsconce01  pFireballCore04  soft=0 mult=1.50
+#   slighthousefire Fireball/Flames soft=0 mult=1.50
+#   campfire01burning Glow:2/Glow:3 soft=0 mult=2.50/1.60
+# Only the free-standing smoke/glow planes take the fade (smoke02, Glow02,
+# Hot_Center: soft=1 mult=1.00).  A soft fade on a flame pinned to its sconce
+# attenuates it against the very surface it is mounted on -- the flame reads
+# dim and see-through -- and 1.0 then removes the over-brighten fire needs.
+_FIRE_TEX_HINTS = (b'fire', b'flame', b'torch')
+_FIRE_EMISSIVE_MULTIPLE = 1.5
+
+
+def _is_fire_fx(texture_path):
+    """Is this FX surface a FLAME (vs smoke/mist/dust/glow)?
+
+    Read off the AUTHORED diffuse path, which is how Oblivion names these
+    (fire/FireTorchLargeS01.dds, fire/FireFlameParticle.dds).  Smoke shares
+    the fire/ folder, so an explicit smoke/mist/dust/steam match wins.
+    """
+    t = bytes(texture_path or b'').lower()
+    if not t:
+        return False
+    for neg in (b'smoke', b'mist', b'fog', b'dust', b'steam', b'cloud'):
+        if neg in t:
+            return False
+    return any(h in t for h in _FIRE_TEX_HINTS)
+
+
+def _apply_fx_soft_effect(eff_shader, alpha_prop, texture_path=None):
     """Enable the soft-particle depth fade on a blended FX shader.
 
     Keyed on the source's own NiAlphaProperty: blending on -> fade, off/absent
     -> leave hard (matching the vanilla split above).  A quad that does not
     blend has no soft edge to preserve in the first place.
+
+    FLAMES are excluded and instead get vanilla's fire emissive boost -- see
+    the census beside _FIRE_TEX_HINTS.
     """
+    if _is_fire_fx(texture_path):
+        eff_shader.shader_flags_1.slsf_1_soft_effect = 0
+        eff_shader.emissive_multiple = _FIRE_EMISSIVE_MULTIPLE
+        return False
     if alpha_prop is None:
         return False
     if not (int(alpha_prop.flags) & _ALPHA_BLEND_ENABLED):
@@ -1679,7 +1715,8 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         # alpha, which is what the engine multiplies the sampled texel by.
         eff_shader.emissive_color.a = material_alpha
         # Kill the rectangular hard edge where the quad intersects walls/floor.
-        if _apply_fx_soft_effect(eff_shader, alpha_prop) and stats is not None:
+        if _apply_fx_soft_effect(eff_shader, alpha_prop,
+                                 effective_path) and stats is not None:
             stats['fx_soft_effect'] = stats.get('fx_soft_effect', 0) + 1
 
         if atlas is not None:
@@ -3256,20 +3293,114 @@ def _resolve_geometry_suffix(root, name):
 # the PyFFI NiPSysData 66-vs-70-byte misalignment plus uv_scale=(0,0), both
 # long fixed; the interim BSValueNode/AddonNode substitution is now removed.)
 
+# Which flame burns at a FlameNode<N> socket.
+#
+# THIS IS AUTHORED DATA, read from the plugin -- not inferred.  Oblivion ships
+# one STAT record per socket under WorldObjects/Static, EditorID "FlameNode<N>",
+# whose MODL is the flame NIF the engine attaches there:
+#
+#   FlameNode0  0x0000001E  Fire/FireCandleFlame.NIF
+#   FlameNode1  0x0000001F  Fire/FireTorchSmall.nif
+#   FlameNode2  0x00000020  Fire/FireTorchLarge.nif
+#   FlameNode3  0x00000021  Fire/FireTorchLargeSmoke.nif
+#   FlameNode4  0x00000022  Fire/FireOpenSmall.nif
+#   FlameNode5  0x00000023  Fire/FireOpenSmallSmoke.nif
+#   FlameNode6  0x00000024  Fire/FireOpenMedium.nif
+#   FlameNode7  0x00000025  Fire/FireOpenMediumSmoke.nif
+#   FlameNode8  0x00000026  Fire/FireOpenLarge.nif
+#   FlameNode9  0x00000027  Fire/FireOpenLargeSmoke.nif
+#
+# Those FormIDs are the very keys Oblivion.exe hardcodes: the socket-name table
+# at 0xB06818 ("FlameNode1", "FlameNode2", ... "FlameNode0", "FlameNode10" ...
+# "FlameNode20") is walked in lockstep with a parallel table at 0xB067C0 holding
+# 0x1E..0x32, which are looked up in the form map at 0xB0613C.  So the engine
+# resolves a socket to a STAT and draws that STAT's model -- the plugin owns the
+# mapping, and a mod may repoint it.  FlameNode10-20 exist for custom use and
+# ship no STAT in vanilla.
+#
+# Reading it beats any heuristic: keying on the host FILENAME ("torch" in the
+# name) put the 1.3x2.6-unit candle flame on every lamp in the game --
+# castlelight02 is FlameNode2, i.e. FireTorchLarge (32x64).
+_FLAME_STAT_RE = re.compile(
+    r'EditorID=(FlameNode(\d+))\s.*?Model\.MODL=([^\r\n]+)', re.S)
+# The engine matches socket names EXACTLY against its own table, which holds
+# only unpadded "FlameNode<N>".  A ZERO-PADDED marker therefore matches nothing
+# and no flame is attached -- verified against Oblivion.exe, which contains
+# "FlameNode7" and "FlameNode1" but neither "FlameNode07" nor "FlameNode01".
+# Two vanilla meshes are authored that way and burn nothing in game:
+# clutter/metalsmith/forgeopen01.nif (FlameNode07) and
+# clutter/lecternworkstation1.nif (FlameNode01).  Matching them loosely put a
+# 468-unit FireOpenMediumSmoke on the forge that Oblivion never shows.
+# `[1-9]\d*|0` accepts "0" and "12" but rejects "07".
+_FLAME_SOCKET_RE = re.compile(r'^FlameNode(0|[1-9][0-9]*)(?![0-9])')
+_FLAME_SOCKET_MAP = {}   # export_root_lower -> {index: 'firecandleflame.nif'}
+
+
+def _flame_socket_map(src_path):
+    """{socket index: flame nif basename} from the plugin's FlameNode STATs."""
+    norm = str(src_path).replace('/', os.sep).replace(chr(92), os.sep)
+    key = os.sep + 'meshes' + os.sep
+    i = norm.lower().rfind(key)
+    if i < 0:
+        return {}
+    export_root = norm[:i]
+    ck = export_root.lower()
+    cached = _FLAME_SOCKET_MAP.get(ck)
+    if cached is not None:
+        return cached
+    table = {}
+    stat_txt = os.path.join(export_root, 'STAT.txt')
+    try:
+        with open(stat_txt, 'r', encoding='latin1') as fh:
+            blob = fh.read()
+    except OSError:
+        blob = ''
+    if blob:
+        for rec in blob.split('---RECORD_BEGIN---'):
+            if 'FlameNode' not in rec:
+                continue
+            m = _FLAME_STAT_RE.search(rec)
+            if not m:
+                continue
+            model = m.group(3).strip().replace(chr(92)*2, os.sep)
+            model = model.replace('/', os.sep).replace(chr(92), os.sep)
+            table[int(m.group(2))] = os.path.basename(model).lower()
+    _FLAME_SOCKET_MAP[ck] = table
+    return table
+
+
+def _flame_socket_index(node_name):
+    """The N in a FlameNode<N> marker name, or None.
+
+    Oblivion suffixes duplicates ("FlameNode0@#3", "FlameNode0	"), so match a
+    leading run of digits rather than parsing the whole name.
+    """
+    if isinstance(node_name, bytes):
+        node_name = node_name.decode('latin1', 'replace')
+    m = _FLAME_SOCKET_RE.match(node_name)
+    return int(m.group(1)) if m else None
+
+
+def _flame_nif_for_socket(src_path, index):
+    """Which Oblivion flame NIF burns at a FlameNode<index> socket.
+
+    None when nothing does -- an unmatched socket burns NOTHING in Oblivion,
+    it does not fall back to some default flame.  There is no guessing left in
+    this path: no STAT for the index (FlameNode10-20 ship none) and no flame.
+    """
+    if index is None:
+        return None
+    return _flame_socket_map(src_path).get(index)
+
+
 _FLAME_CACHE = {}   # (meshes_root_lower, flame_name) -> nif bytes | None
 _FLAME_ATLAS_JOBS = {}  # same key -> flip-book atlas jobs from the conversion
-
-
-def _flame_nif_for_host(src_path):
-    """Which Oblivion flame NIF burns at this host's FlameNode markers."""
-    name = os.path.basename(str(src_path)).lower()
-    return 'firetorchsmall.nif' if 'torch' in name else 'firecandleflame.nif'
 
 
 def _load_converted_flame(src_path, flame_name):
     """Convert meshes/fire/<flame_name> once per worker; return serialized
     Skyrim NIF bytes (deep-copies are made by re-reading), or None."""
-    norm = str(src_path).replace('/', os.sep).replace('\\', os.sep)
+    norm = str(src_path).replace('/', os.sep).replace(chr(92), os.sep)
     key = os.sep + 'meshes' + os.sep
     i = norm.lower().rfind(key)
     if i < 0:
@@ -3302,15 +3433,21 @@ def _convert_flame_nodes(root_node, src_path, stats=None):
     """Graft the converted Oblivion flame NIF under every empty FlameNode*
     marker.  Modifies root_node's tree in-place; returns the graft count.
 
-    Marker transform: TRANSLATION and SCALE are kept (Oblivion authored
-    FlameNodes with ~2x scale that the attached flame NIF expects); ROTATION
-    is reset to identity — the converted flame's own billboard wrappers carry
-    the Skyrim −90°X axis correction, and a rotated parent would tip them.
+    Marker transform: TRANSLATION, SCALE **and ROTATION** are all kept
+    (Oblivion authored FlameNodes with ~2x scale that the attached flame NIF
+    expects).  The rotation is the authored hook-up between two DIFFERENT model
+    frames and must not be discarded: the flame NIFs are authored +Y-up, and a
+    host authored +Z-up carries exactly the −90°X correction on its marker —
+    uppersilverplatecandles01's FlameNode0 is [1,0,0][0,0,1][0,-1,0], i.e.
+    _BB_AXIS_FIX itself, mapping the flame's +Y onto the plate's +Z.  (That
+    host is a flat plate, extent X=23 Y=23 Z=2, and all 121 of its REFRs use
+    RotX=0 — nothing else would stand the flame up.)  Zeroing it laid the
+    candle flames on their side.  Hosts that are themselves +Y-up author an
+    identity marker and are unaffected.
     """
-    flame_name = _flame_nif_for_host(src_path)
-    flame_bytes = _load_converted_flame(src_path, flame_name)
-    if flame_bytes is None:
-        return 0
+    # Resolved PER MARKER: one mesh can mix socket families (lecternworkstation1
+    # carries both a FlameNode0 candle and a FlameNode1 torch).
+    used_flames = set()
     count = 0
 
     def _visit(node):
@@ -3327,6 +3464,14 @@ def _convert_flame_nodes(root_node, src_path, stats=None):
             if (nm.startswith('FlameNode')
                     and isinstance(child, NifFormat.NiNode)
                     and child.num_children == 0):
+                flame_name = _flame_nif_for_socket(src_path,
+                                                   _flame_socket_index(nm))
+                if flame_name is None:
+                    continue   # no STAT for this socket: burns nothing
+                flame_bytes = _load_converted_flame(src_path, flame_name)
+                if flame_bytes is None:
+                    continue
+                used_flames.add(flame_name)
                 # Deep-copy the converted flame by re-reading its bytes.
                 fdata = NifFormat.Data()
                 buf = _io.BytesIO(flame_bytes)
@@ -3335,7 +3480,9 @@ def _convert_flame_nodes(root_node, src_path, stats=None):
                 fdata.read(buf)
                 froot = fdata.roots[0]
                 kids = [c for c in froot.children if c is not None]
-                child.rotation.set_identity()
+                # Keep the marker's authored rotation — see the docstring:
+                # it is the host-frame -> flame-frame hook-up, and on a +Z-up
+                # host it IS the axis correction the flame needs.
                 child.num_children = len(kids)
                 child.children.update_size()
                 for j, k in enumerate(kids):
@@ -3366,14 +3513,15 @@ def _convert_flame_nodes(root_node, src_path, stats=None):
         # Propagate the flame's flip-book atlas jobs so convert_nif builds
         # them into this host's output tree too (idempotent, exists-checked).
         if stats is not None:
-            norm = str(src_path).replace('/', os.sep).replace('\\', os.sep)
+            norm = str(src_path).replace('/', os.sep).replace(chr(92), os.sep)
             key = os.sep + 'meshes' + os.sep
             i = norm.lower().rfind(key)
             if i >= 0:
-                cache_key = (norm[:i + len(key)].lower(), flame_name)
-                jobs = _FLAME_ATLAS_JOBS.get(cache_key, {})
-                if jobs:
-                    stats.setdefault('_flipbook_atlases', {}).update(jobs)
+                for _fname in used_flames:
+                    cache_key = (norm[:i + len(key)].lower(), _fname)
+                    jobs = _FLAME_ATLAS_JOBS.get(cache_key, {})
+                    if jobs:
+                        stats.setdefault('_flipbook_atlases', {}).update(jobs)
 
     return count
 
@@ -3676,7 +3824,8 @@ def _convert_particle_system(node, fix_textures):
     # a smoke plume drifting into a wall otherwise cuts off along a hard line,
     # and every billboard shows its own quad edge.  alpha_prop is always set by
     # this point (defaulted to additive above), so blended systems all qualify.
-    _apply_fx_soft_effect(shader, alpha_prop)
+    _apply_fx_soft_effect(shader, alpha_prop,
+                          getattr(shader, 'source_texture', b''))
 
 
 # Skyrim billboard axis correction (see the root-billboard handling for the
@@ -3701,18 +3850,47 @@ def _compose_axis_fix(rot):
 
 
 def _wrap_in_billboard(child, bb_mode):
-    """Wrap a geometry block in a fresh NiBillboardNode carrying the Skyrim
-    axis correction (vanilla campfire pattern: BSFadeNode → NiBillboardNode
-    → NiTriShape)."""
+    """Wrap a geometry block in a fresh NiBillboardNode so the quad faces the
+    camera (vanilla campfire pattern: BSFadeNode → NiBillboardNode →
+    NiTriShape).
+
+    The wrapper deliberately carries NO axis correction -- see the comment in
+    the body -- and is tagged `_axis_fixed` so the later _skyrimize_billboard
+    pass leaves it alone instead of treating it as an Oblivion-authored
+    billboard and composing one in.
+    """
     bb = NifFormat.NiBillboardNode()
     bb.name = (child.name or b'') + b'-Billboard'
     bb.flags = NIF_FLAGS
     bb.billboard_mode = bb_mode
-    _compose_axis_fix(bb.rotation)
+    # NO axis fix here.  These meshes are authored +Y-up and their PLACED
+    # REFERENCES carry the stand-up rotation: censused across Oblivion.esm,
+    # 494 REFRs of the Fire\*.nif lights use RotX = +-90 deg (10/10 for
+    # FireTorchLargeSmoke, 188+51 of 395 for FireOpenSmall, ...).  The whole
+    # model -- quads AND emitter markers -- shares that one +Y-up frame, and
+    # the REFR rotates all of it together.  Pre-rotating the quad to +Z-up
+    # here made it the ONLY part in a different frame, so the REFR's -90 then
+    # laid it flat: the "third flame component on its side", with the smoke
+    # and flame beside it looking correct.  Leave the quad in the model frame.
+    bb._axis_fixed = True
     bb.num_children = 1
     bb.children.update_size()
     bb.children[0] = child
     return bb
+
+
+def _is_emitter_marker(node):
+    """Is this node referenced as a particle emitter/gravity marker?
+
+    Such a node's rotation is the emission DIRECTION a NiPSysEmitter reads, so
+    it survives demotion even though a billboard's rotation is otherwise
+    discarded for drawing (NifSkope BillboardNode::viewTrans).
+    """
+    for blk in node.tree():
+        for attr in ('emitter_object', 'gravity_object'):
+            if getattr(blk, attr, None) is node:
+                return True
+    return False
 
 
 def _skyrimize_billboard(bb):
@@ -3725,11 +3903,18 @@ def _skyrimize_billboard(bb):
       correction into its rotation (Oblivion billboards are authored identity
       over flat-XY quads; Skyrim's up/facing axes differ).
     """
+    # A wrapper this converter built (the root-billboard demotion runs before
+    # the child walk reaches these).  It is already in the frame we want, so
+    # the pure-geometry branch below must not compose an axis fix into it --
+    # that is what laid the flame quad on its side.
+    if getattr(bb, '_axis_fixed', False):
+        return bb
     bb_mode = int(getattr(bb, 'billboard_mode', 1)) or 1
     has_psys = any(isinstance(b, NifFormat.NiParticleSystem)
                    for b in bb.tree())
     if not has_psys:
         _compose_axis_fix(bb.rotation)
+        bb._axis_fixed = True
         return bb
     plain = NifFormat.NiNode()
     plain.name = bb.name
@@ -3737,9 +3922,38 @@ def _skyrimize_billboard(bb):
     plain.translation.x = bb.translation.x
     plain.translation.y = bb.translation.y
     plain.translation.z = bb.translation.z
-    plain.rotation.m_11 = bb.rotation.m_11; plain.rotation.m_12 = bb.rotation.m_12; plain.rotation.m_13 = bb.rotation.m_13
-    plain.rotation.m_21 = bb.rotation.m_21; plain.rotation.m_22 = bb.rotation.m_22; plain.rotation.m_23 = bb.rotation.m_23
-    plain.rotation.m_31 = bb.rotation.m_31; plain.rotation.m_32 = bb.rotation.m_32; plain.rotation.m_33 = bb.rotation.m_33
+    # NOT the billboard's rotation.  A NiBillboardNode DISCARDS its own
+    # rotation at runtime and substitutes identity in view space -- NifSkope's
+    # BillboardNode::viewTrans (glnode.cpp): `t = parent->viewTrans() * local;
+    # t.rotation = Matrix();`.  So the authored rotation on a billboard node
+    # was never used for orientation.  Copying it onto the plain replacement
+    # RESURRECTS a dead value: firetorchsmall's "Sparks-Emitter" and
+    # firecandleflame's "FlameParticles-Emitter" are billboards carrying
+    # +Z=(0,-1,0), and reviving that aims the emitter sideways -- the
+    # horizontal jet beside the upright flame.  Identity is what the engine
+    # actually applied, so identity is what the demoted node inherits.
+    #
+    # EXCEPT when the node is an EMITTER MARKER.  Rotation-is-discarded applies
+    # to how a billboard DRAWS its subtree; a NiPSysEmitter reads its
+    # `emitter_object` node's orientation as the emission DIRECTION, and that
+    # is live data.  firecandleflame authors quad and emitter in one +Y-up
+    # frame -- quad identity with extent [1.3, 2.6, 0.0] (tall in Y), emitter
+    # [1,0,0][0,0,-1][0,1,0] whose local +Z maps to model +Y.  Zeroing the
+    # emitter makes it +Z-up while the quad stays +Y-up, so the flame splits
+    # into an upright quad and a sideways particle jet -- visible once the
+    # FlameNode marker rotates the pair into a +Z-up host.
+    if _is_emitter_marker(bb):
+        plain.rotation.m_11 = bb.rotation.m_11
+        plain.rotation.m_12 = bb.rotation.m_12
+        plain.rotation.m_13 = bb.rotation.m_13
+        plain.rotation.m_21 = bb.rotation.m_21
+        plain.rotation.m_22 = bb.rotation.m_22
+        plain.rotation.m_23 = bb.rotation.m_23
+        plain.rotation.m_31 = bb.rotation.m_31
+        plain.rotation.m_32 = bb.rotation.m_32
+        plain.rotation.m_33 = bb.rotation.m_33
+    else:
+        plain.rotation.set_identity()
     plain.scale = bb.scale
     plain.num_extra_data_list = bb.num_extra_data_list
     plain.extra_data_list.update_size()
@@ -5129,7 +5343,12 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                 plain.name = root.name
                 plain.flags = NIF_FLAGS
                 plain.translation = root.translation
-                plain.rotation = root.rotation
+                # Identity, not the billboard's rotation -- see the note in
+                # _skyrimize_billboard: a NiBillboardNode discards its own
+                # rotation at runtime (NifSkope BillboardNode::viewTrans), so
+                # copying it onto the plain replacement revives a value the
+                # engine never used and skews the whole subtree.
+                plain.rotation.set_identity()
                 plain.scale = root.scale
                 plain.num_children = root.num_children
                 plain.children.update_size()
