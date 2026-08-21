@@ -105,3 +105,91 @@ def test_a_broken_tkdnd_runtime_also_falls_back(display, monkeypatch):
         assert gui.DND_AVAILABLE is False
     finally:
         root.destroy()
+
+
+class TestCollisionWindingSetting:
+    """Settings ▸ Fix collision winding must preserve the per-plugin defaults.
+
+    The repair moved from a Meshes checkbox to a persisted tri-state setting.
+    "Automatic" is the default and has to resolve exactly as the checkbox did:
+    ON for the plugins measured to need it (collision_options), OFF elsewhere.
+    A regression here is invisible in the GUI -- the wrong flag simply reaches
+    convert.py -- and shows up only as floors you fall through, or as a plugin
+    silently getting a repair its collision never needed.
+    """
+
+    def test_auto_matches_the_measured_per_plugin_defaults(self):
+        for plugin in gui.WINDING_FIX_DEFAULT_PLUGINS:
+            assert gui.winding_enabled_for(gui.WINDING_AUTO, plugin + ".esm")
+            assert gui.winding_enabled_for(gui.WINDING_AUTO, plugin + ".esp")
+        for plugin in ("Oblivion.esm", "SomeMod.esp", ""):
+            assert not gui.winding_enabled_for(gui.WINDING_AUTO, plugin)
+
+    def test_explicit_modes_override_every_plugin(self):
+        for plugin in ("Nehrim.esm", "Morrowind_ob.esm", "Oblivion.esm", ""):
+            assert gui.winding_enabled_for(gui.WINDING_ON, plugin)
+            assert not gui.winding_enabled_for(gui.WINDING_OFF, plugin)
+
+    def test_unknown_or_absent_config_value_reads_as_auto(self):
+        """A config written before this setting existed keeps the defaults."""
+        for stored in ("", "maybe", None, "AUTO"):
+            mode = str(stored or "").strip().lower()
+            if mode not in gui.WINDING_MODES:
+                mode = gui.WINDING_AUTO
+            assert gui.winding_enabled_for(mode, "Morrowind_ob.esm") is True
+            assert gui.winding_enabled_for(mode, "Oblivion.esm") is False
+            # Nehrim's exporter left the authored normals intact, so the
+            # ungated step 0 repairs it on its own and it must NOT pull in
+            # the inferred steps (see collision_options).
+            assert gui.winding_enabled_for(mode, "Nehrim.esm") is False
+
+    def test_auto_agrees_with_collision_options(self):
+        """The GUI must not carry its own copy of the plugin list."""
+        from collision_options import default_for_plugin
+        for plugin in ("Nehrim.esm", "Morrowind_ob.esp", "Oblivion.esm",
+                       "Anything.esp"):
+            assert (gui.winding_enabled_for(gui.WINDING_AUTO, plugin)
+                    == default_for_plugin(plugin))
+
+
+# ---------------------------------------------------------------------------
+#  Step selection is per-plugin
+# ---------------------------------------------------------------------------
+
+def _switching_resets(name, previous):
+    """The rule `_commit` applies: a genuine plugin SWITCH resets the ticks.
+
+    Mirrors gui._commit. `_commit` is a closure inside build_gui and cannot be
+    reached without standing a whole window up, so the rule is asserted here
+    and the source is checked below to keep the two from drifting.
+    """
+    return (name or "").strip().lower() != (previous or "").strip().lower()
+
+
+@pytest.mark.parametrize("previous,name,expect", [
+    ("TamRes.esm", "TamRes.esp",  True),   # different plugin -> reset
+    ("TamRes.esm", "TamRes.esm",  False),  # same plugin      -> keep edits
+    ("TamRes.esm", "tamres.esm",  False),  # same, other case -> keep edits
+    ("TamRes.esm", " TamRes.esm", False),  # same, whitespace -> keep edits
+    ("",           "TamRes.esm",  True),   # first selection  -> defaults
+])
+def test_only_a_real_switch_resets_the_step_selection(previous, name, expect):
+    """Ticks are per-plugin state: what THIS plugin still owes.
+
+    Carrying them across meant edits made for one plugin silently governed the
+    run for the next one. Re-selecting the plugin already shown is not a switch
+    and must not discard the user's edits.
+    """
+    assert _switching_resets(name, previous) is expect
+
+
+def test_commit_still_resets_on_switch():
+    """Guards the rule above against gui._commit being changed out from under it."""
+    import inspect
+    src = inspect.getsource(gui)
+    commit = src[src.index("    def _commit(name: str):"):]
+    commit = commit[:commit.index(chr(10) + "    def ", 10)]
+    # The switch test and the reset must both still be there.
+    assert "_set_default()" in commit
+    assert ".strip().lower() != " in commit
+    assert "_plan_applied.discard(name)" in commit

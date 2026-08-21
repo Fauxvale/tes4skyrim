@@ -381,9 +381,17 @@ class ScriptConverter:
         """
         tm = self._SAY_TOPIC_RE.search(say_expr or '')
         topic = tm.group(1).lower() if tm else ''
+        if not topic:
+            ms = self._SPEAK_AS_CALL_RE.match(say_expr or '')
+            if ms:
+                topic = ms.group('topic').strip().lower()
         return float((self.say_durations or {}).get(topic) or SAY_LINE_SECONDS)
 
     _SAY_CALL_RE = re.compile(r'^\s*(?P<recv>.+?)\.Say\((?P<topic>[^()]*)\)\s*$')
+    # The speak-as shape emitted by the Say handler (see _say_speak_as).
+    _SPEAK_AS_CALL_RE = re.compile(
+        r'^\s*TES4Polyfill\.SpeakAs\((?P<speaker>[^,()]+),'
+        r'(?P<inhead>[^,()]+),(?P<topic>[^,()]+)\)\s*$')
 
     # Events that run on the engine's own dispatch path, where a blocking
     # Say would stall the engine rather than just this script's tick.  A
@@ -491,13 +499,28 @@ class ScriptConverter:
         keeps one waiter per speaker.
         """
         m = self._SAY_CALL_RE.match(say_call or '')
-        if not m:
+        ms = self._SPEAK_AS_CALL_RE.match(say_call or '')
+        if not m and not ms:
             # Unrecognised shape: keep the line audible and the timer > 0.
             return (f'{target} = {SAY_LINE_SECONDS:g}{delay}\n'
                     f'  {say_call}')
+        fallback = self._say_fallback_seconds(say_call)
+        if ms:
+            # A speak-as site (see _say_speak_as): the measuring variant waits
+            # for the INFO's Begin fragment the same way SayLine does and
+            # returns the same measured length.
+            pre = SAY_START_WAIT + 0.25
+            fn = 'SpeakAsLine' if self._say_may_block() else 'SpeakAsLineNoWait'
+            call = (f'TES4Polyfill.{fn}({ms.group("speaker").strip()}, '
+                    f'{fallback:g}, {ms.group("inhead").strip()}, '
+                    f'{ms.group("topic").strip()})')
+            if self._var_types.get(target.lower().split('.')[-1]) == 'Int':
+                return (f'{target} = {int(pre + 0.999)}  ; TES4 Say: closed until the line is under way\n'
+                        f'  {target} = Math.Ceiling({call}){delay}')
+            return (f'{target} = {pre:g}  ; TES4 Say: closed until the line is under way\n'
+                    f'  {target} = {call}{delay}')
         speaker = m.group('recv').strip()
         topic = m.group('topic').strip()
-        fallback = self._say_fallback_seconds(say_call)
         # The pre-charge closes this poll's own `T <= 0` guard for as long as
         # SayLine can still be BLOCKED, so a second tick cannot re-enter.
         #
@@ -2267,7 +2290,7 @@ class ScriptConverter:
         _dedup_window = 3
         _stop_re = re.compile(
             r'^\s*(If|ElseIf|Else|EndIf|While|EndWhile|Return|'
-            r'Event|EndEvent|Function|EndFunction)|; TES4 Say: closed',
+            r'Event|EndEvent|Function|EndFunction)\b|; TES4 Say: closed',
             re.IGNORECASE)
         _skip = set()
         for idx, line in enumerate(_flat):
@@ -2710,7 +2733,78 @@ class ScriptConverter:
                 lines[idx] = _cast_recv_re.sub(_cast_receiver, lines[idx])
 
         lines = self._shadow_controls_writes(lines)
+        lines = self._hoist_quest_start_above_writes(lines)
         return lines
+
+    # `<Quest>.Start()` and a write to a property of that same quest's script.
+    # 🛑 If the emitted shape of a `StartQuest` conversion ever changes, this
+    # regex must change with it: a post-pass that silently stops matching
+    # FAILS OPEN -- no error, just the original bug back (measured: renaming
+    # this call once re-clobbered 91 seed writes across 43 scripts).  See
+    # docs/papyrus_conversion_notes.md.
+    _QUEST_START_RE = re.compile(r'^(\s*)(\w+)\.Start\(\)\s*(;.*)?$')
+    _QUEST_PROP_WRITE_RE = re.compile(r'^(\s*)(\w+)\.(\w+)\s*=(?!=)')
+    # Lines that make reordering unsafe: anything that branches, returns, or
+    # otherwise means the two statements may not be in one straight run.
+    _HOIST_STOP_RE = re.compile(
+        r'^\s*(If|ElseIf|Else|EndIf|While|EndWhile|Return|'
+        r'Event|EndEvent|Function|EndFunction|State|EndState)\b',
+        re.IGNORECASE)
+
+    def _hoist_quest_start_above_writes(self, lines: list) -> list:
+        """Move `Q.Start()` ABOVE property writes to Q that precede it.
+
+        **A TES4->TES5 semantic difference, not a style fix.**  In Oblivion,
+        `set Q.Var to 1` writes a quest variable that persists whether or not
+        the quest is running, and a later `StartQuest Q` does not disturb it --
+        so the authored idiom "seed the variables, then start the quest" is
+        safe and extremely common.  In Skyrim, `Quest.Start()` on a STOPPED
+        quest initialises its scripts, resetting every `Auto` property to its
+        default.  Converted literally, every seeded value is silently wiped by
+        the `Start()` that follows it.
+
+        That is what softlocked the Imperial City Arena: the match INFO sets
+        `Arena.ReadyMatch = 1` and then calls `Arena.Start()` four lines later
+        (`Arena` is `Stop()`ped after every match by its own stage 10), so
+        ReadyMatch was always back to 0 by the time the announcer polled it.
+        The announcer's first gate is `ReadyMatch == 1`, so it never spoke,
+        `GateDownFight` was never set, the gates never opened.  Measured
+        2026-08-18: **131 clobbered writes across 65 scripts** -- the arena
+        matches, the arena betting (ArenaSpectator), FGC01, MS16B and more.
+
+        The reordering is only applied within one straight-line run: a branch,
+        loop or return between the write and the `Start()` means the two may
+        not both execute, so the sequence is left exactly as authored.
+        """
+        out = list(lines)
+        n = len(out)
+        idx = 0
+        while idx < n:
+            m = self._QUEST_START_RE.match(out[idx])
+            if not m:
+                idx += 1
+                continue
+            indent, quest = m.group(1), m.group(2)
+            # Walk BACK to the first write to this same quest, stopping at
+            # anything that breaks the straight-line run.
+            first = None
+            j = idx - 1
+            while j >= 0:
+                if self._HOIST_STOP_RE.match(out[j]):
+                    break
+                w = self._QUEST_PROP_WRITE_RE.match(out[j])
+                if w and w.group(2) == quest:
+                    first = j     # a write to a DIFFERENT quest is no barrier
+                j -= 1
+            if first is None:
+                idx += 1
+                continue
+            # Hoist the Start() to just above the earliest clobbered write, so
+            # the seeded values are written into the freshly started quest.
+            start_line = out.pop(idx)
+            out.insert(first, start_line)
+            idx += 1
+        return out
 
     _CONTROLS_WRITE_RE = re.compile(
         r'^(\s*)Game\.(Disable|Enable)PlayerControls\(\)\s*(;.*)?$')
@@ -2768,6 +2862,73 @@ class ScriptConverter:
         ActorBase), not here.
         """
         return dict(self._property_refs)
+
+    # Where the speak-as identity sits in a TES4 Say/SayTo argument list:
+    #   Say   <topic> <force-subtitles> <speak-as> [<in-players-head>]
+    #   SayTo <target> <topic> <flag> <speak-as> <flag>
+    _SAY_SPEAKAS_MIN_TOKENS = {'say': 3, 'saycustom': 3, 'sayto': 4}
+
+    def _say_speak_as(self, ref_name, pparts: list, fname_low: str) -> tuple:
+        """(speaker property, in-head) for a speak-as call site.
+
+        TES4's third `Say` argument is the identity the line belongs to; the
+        receiver only emits the sound.  Skyrim has no equivalent parameter and
+        keys voice lookup on the SPEAKER, so the emitting marker (a STAT, with
+        no voice type) resolves to no voice folder and the line is silent.
+        The importer places a TACT carrying that NPC's voice type at the
+        emitter's authored position and registers it under the speaker name --
+        see tes5_import/speaker_activators.py, which derives the SAME name
+        from the same authored pair, so the two agree with no side-channel.
+
+        The fourth authored argument is TES4's "speak in the player's head",
+        which Skyrim exposes natively as `Say`'s third parameter
+        (abSpeakInPlayersHead) -- passed straight through by
+        TES4Polyfill.SpeakAs.  🛑 Never emulate it by moving the speaker.
+
+        Returns ('', False) when this is not a speak-as site.
+        """
+        none = ('', False)
+        if not ref_name:
+            return none
+        need = self._SAY_SPEAKAS_MIN_TOKENS.get(fname_low)
+        if need is None:
+            return none
+        tokens = []
+        for part in pparts:
+            tokens.extend(str(part).split())
+        if len(tokens) < need:
+            return none
+        # The identity is the first non-numeric token after the topic; the
+        # in-head flag is the numeric token after it.
+        rest = tokens[2:] if fname_low == 'sayto' else tokens[1:]
+        topic = tokens[1] if fname_low == 'sayto' else tokens[0]
+        voice = ''
+        in_head = False
+        for i, t in enumerate(rest):
+            if t and not t.lstrip('-').replace('.', '').isdigit():
+                voice = t
+                nxt = rest[i + 1] if i + 1 < len(rest) else ''
+                in_head = bool(nxt) and nxt.lstrip('-').isdigit() and int(nxt) != 0
+                break
+        if not voice or not re.fullmatch(r'\w+', voice):
+            return none
+        topic = topic.strip().strip('"')
+        if not re.fullmatch(r'\w+', topic):
+            return none
+        # Only an actor BASE is a speak-as identity; anything else in that slot
+        # is a flag or a stray token.  And only a real DIAL is a topic.
+        if self.xref:
+            fid = self.xref.edid_to_formid.get(voice.lower(), '')
+            if not fid or self.xref.record_type.get(fid, '') not in ('NPC_',
+                                                                     'CREA'):
+                return none
+            tfid = self.xref.edid_to_formid.get(topic.lower(), '')
+            if not tfid or self.xref.record_type.get(tfid, '') != 'DIAL':
+                return none
+        speaker = _safe_property_name(
+            f'TES4Voice_{ref_name.lower()}_{voice.lower()}')
+        self._property_refs[speaker] = 'ObjectReference'
+        return speaker, in_head
 
     def _mark_topic_property(self, name: str) -> None:
         """Type `name` as a Topic, but only if it really names a DIAL.
@@ -3576,10 +3737,14 @@ class ScriptConverter:
                 return f'{target} = {dflt}  {value}'
             value = self._fix_ref_zero(target, value)
             # Say() returns None in Papyrus but TES4 returned audio duration
-            if '.Say(' in value or value.startswith('Say('):
+            if ('.Say(' in value or value.startswith('Say(')
+                    or '.SpeakAs(' in value):
                 # Extract the Say() call using balanced-paren matching
                 # TES4: "set timer to (ref.Say topic args) + delay" → "(ref.Say(topic)) + 0.2"
+                # (`.SpeakAs(` is the speak-as shape -- see _say_speak_as.)
                 say_idx = value.find('.Say(')
+                if say_idx < 0:
+                    say_idx = value.find('.SpeakAs(')
                 if say_idx < 0:
                     say_idx = value.find('Say(')
                 if say_idx >= 0:
@@ -3644,10 +3809,31 @@ class ScriptConverter:
                 val_clean = value.split(';TODO')[0].rstrip() if ';TODO' in value else value
                 todo_part = '  ;TODO' + value.split(';TODO', 1)[1] if ';TODO' in value else ''
                 return f'{target}.SetValue({val_clean}){todo_part}'
-            # fQuestDelayTime cross-script access → RegisterForUpdate
+            # fQuestDelayTime cross-script access -> kick the OWNING quest
+            # script's poll (a SINGLE update: its OnUpdate re-arms itself).
+            # 🛑 NEVER RegisterForUpdate here.  `set X.fQuestDelayTime to 0`
+            # used to emit `X.RegisterForUpdate(0)` -- a REPEATING zero-
+            # interval registration, i.e. OnUpdate every frame until something
+            # unregisters it (the CK wiki: "can cause the game to freeze as
+            # the scripting system becomes overwhelmed").  It shipped in 45
+            # scripts.  A single update is what the TES4 semantics call for
+            # anyway: the converted OnUpdate re-arms itself, and per the TES4
+            # CS a delay of 0 means "revert to the DEFAULT 5s cadence", not
+            # "run continuously".
             if target.endswith('.fQuestDelayTime'):
                 quest_ref = target.rsplit('.', 1)[0]
-                return f'{quest_ref}.RegisterForUpdate({value})'
+                v = value.strip()
+                try:
+                    fval = float(v)
+                except ValueError:
+                    fval = None
+                if fval is not None and fval <= 0:
+                    return (f'{quest_ref}.RegisterForSingleUpdate(5.0)'
+                            f'  ;fQuestDelayTime = 0 (TES4 default cadence)')
+                if fval is not None:
+                    return (f'{quest_ref}.RegisterForSingleUpdate({fval:g})'
+                            f'  ;fQuestDelayTime')
+                return f'{quest_ref}.RegisterForSingleUpdate({v})  ;fQuestDelayTime'
             # Float→Int coercion: if target is Int and value is from a Float-returning function, cast
             value = self._coerce_float_to_int(target, value)
             # ObjectReference→Actor coercion: if target is Actor and value is ObjectReference param, cast
@@ -5792,7 +5978,13 @@ class ScriptConverter:
                 papyrus = f'GetPosition{axis}'
             else:
                 papyrus = f'GetAngle{axis}'
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            # GetPositionX/GetAngleX and friends are declared on
+            # ObjectReference, so the subject must not be promoted to Actor --
+            # TES4 reads and writes the position/angle of plain scenery
+            # (SEXedPuzStatue1-5 are STATs the Xeddefen puzzle rotates).  An
+            # `Actor Property` on a STAT never binds, so the read came back
+            # None and the puzzle could not track its own statues.
+            ref = self._resolve_objref_ref(ref_name, extends)
             return f'{ref}.{papyrus}()' if ref_name else f'{papyrus}()'
 
         # SetPos/SetAngle: axis param -> SetPosition(x,y,z) / SetAngle(x,y,z)
@@ -5800,7 +5992,7 @@ class ScriptConverter:
             parts = args_str.split(None, 1) if args_str else ['X', '0']
             axis = parts[0].upper() if parts else 'X'
             value = self._convert_expression(parts[1], extends) if len(parts) > 1 else '0'
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            ref = self._resolve_objref_ref(ref_name, extends)
             if fname_low == 'setpos':
                 axes = {'X': (value, f'{ref}.GetPositionY()', f'{ref}.GetPositionZ()'),
                         'Y': (f'{ref}.GetPositionX()', value, f'{ref}.GetPositionZ()'),
@@ -5875,6 +6067,20 @@ class ScriptConverter:
                         'getquestrunning': 'IsRunning',
                         'completequest': 'CompleteQuest',
                         'isquestcompleted': 'IsCompleted'}[fname_low]
+            # 🛑 StopQuest CONVERTS TO Stop().  A converter-owned "run bit"
+            # global that leaves the quest engine-running was tried and
+            # REVERTED (2026-08-19): Oblivion restages a stopped quest, and a
+            # quest that never stops keeps its CURRENT STAGE, so `SetStage N`
+            # on the stage it is already at does nothing and that stage's
+            # reset script never runs again.  Arena has exactly ONE stage (10,
+            # AllowRepeatedStages) whose script zeroes the match state; with
+            # the quest left running it sat at stage 10 forever, ReadyMatch
+            # was never re-zeroed, and Owyn's next-match line (gated on
+            # ReadyMatch == 0) could never fire -- he behaved as though the
+            # match had not happened.  Skyrim's Start() resetting properties
+            # is a real difference, but it is handled where it belongs: by
+            # hoisting Start() above the seed writes
+            # (_hoist_quest_start_above_writes), not by refusing to stop.
             return f'{quest_ref}.{papyrus}()'
 
         # Message/MessageBox.  Vanilla TES4 uses the same printf convention as
@@ -6331,10 +6537,15 @@ class ScriptConverter:
             if shader_name:
                 safe = _safe_property_name(shader_name)
                 self._property_refs[safe] = 'EffectShader'
-                ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+                # EffectShader.Play/Stop take an **ObjectReference**, so the
+                # subject must not be promoted to Actor: TES4 casts these
+                # shaders on markers and statues (SEXedPuzStatue1-5, the SE05
+                # spell markers), and an `Actor Property` on a STAT/ACTI refuses
+                # to bind -- the property is None and the shader never plays.
+                ref = self._resolve_objref_ref(ref_name, extends)
                 dur = self._convert_expression(duration, extends)
                 return f'{safe}.Play({ref}, {dur})'
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            ref = self._resolve_objref_ref(ref_name, extends)
             return f'Self.Play({ref})'
         if fname_low in ('sms', 'stopmagicshadervisuals'):
             parts = args_str.strip().split() if args_str else []
@@ -6342,9 +6553,9 @@ class ScriptConverter:
             if shader_name:
                 safe = _safe_property_name(shader_name)
                 self._property_refs[safe] = 'EffectShader'
-                ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+                ref = self._resolve_objref_ref(ref_name, extends)
                 return f'{safe}.Stop({ref})'
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            ref = self._resolve_objref_ref(ref_name, extends)
             return f'Self.Stop({ref})'
         if fname_low == 'triggerhitshader':
             return 'Game.TriggerScreenBlood(3)'
@@ -7052,7 +7263,45 @@ class ScriptConverter:
                 topic = self._convert_expression(pparts[0], extends) if pparts else 'None'
                 if pparts:
                     self._mark_topic_property(pparts[0].strip())
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            # Say is declared on ObjectReference, NOT Actor
+            # (`ObjectReference.Say(Topic, Actor akActorToSpeakAs = None,
+            # bool abSpeakInPlayersHead = false)`).  A census of Oblivion.esm's
+            # receivers found 144 calls on 21 NON-actor references -- Daedric
+            # shrines (ACTI), Clavicus' dog statue (MISC), the XMarker (STAT)
+            # speakers the Arena announcer talks through.  Promoting the
+            # receiver to Actor made those declare `Actor Property`, which the
+            # VM refuses to bind, so the property read None and the first call
+            # on it aborted the function.
+            ref = self._resolve_objref_ref(ref_name, extends)
+
+            # TES4 `Say <topic> <flag> <speak-as NPC> <flag>` names WHO is
+            # speaking, separately from the reference that emits the sound.
+            # Skyrim's Say has no such argument, and voice-file lookup is keyed
+            # on the SPEAKER's voice type -- an XMarker STAT has none, so the
+            # engine finds no folder, plays no audio, and (having no audio to
+            # time against) leaves the subtitle onscreen forever.
+            #
+            # The importer mints the vanilla answer for each call site: a TACT
+            # carrying the speak-as NPC's voice type, placed at the emitter's
+            # own position, bound under this exact property name.  Speaking on
+            # THAT reference gives the line a real voice type and a real
+            # folder.  See tes5_import/speaker_activators.py.
+            speaker, in_head = self._say_speak_as(ref_name, pparts, fname_low)
+            if speaker:
+                # Speak the line on the voiced TACT stand-in (see
+                # _say_speak_as).  The topic rides along for the polyfill and
+                # for the fallback length lookup in _emit_say_line -- unless a
+                # script LOCAL
+                # shadows the topic's name (DABoethiaCageOpenScript01 has
+                # `Short Salutation` next to `say Salutation`; TES4 resolved
+                # the argument as the topic, Papyrus would pass the Int).
+                topic_name = (pparts[1] if fname_low == 'sayto' and len(pparts) >= 2
+                              else (pparts[0] if pparts else '')).strip().split()[0] if pparts else ''
+                topic_arg = topic
+                if topic_name and self._var_types.get(topic_name.lower()):
+                    topic_arg = 'None'
+                return (f'TES4Polyfill.SpeakAs({speaker}, '
+                        f'{"True" if in_head else "False"}, {topic_arg})')
             return f'{ref}.Say({topic})'
 
         # Functions whose Papyrus equivalent takes fewer args - drop the extra
@@ -7626,7 +7875,13 @@ class ScriptConverter:
                     self._property_refs[parts[0].strip()] = 'Spell'
                 elif _cur != 'Spell':
                     spell = f'({spell} as Spell)'
-            source = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            # Spell.Cast(ObjectReference akSource, ObjectReference akTarget)
+            # -- the caster is an ObjectReference.  TES4 fires spells from
+            # invisible marker refs (SEHaskillSummonMarker, MG05ShockMark1,
+            # SE05SpellMarker1-3, SEOrderPriestCastingMarker ...), all STATs;
+            # promoting the source to Actor left an unbindable `Actor Property`
+            # and the spell was never cast.
+            source = self._resolve_objref_ref(ref_name, extends)
             if len(parts) > 1:
                 target = self._convert_expression(parts[1], extends)
                 return f'{spell}.Cast({source}, {target})'
@@ -7921,7 +8176,13 @@ class ScriptConverter:
             if parts and re.fullmatch(r'\w+', parts[0]) and target == parts[0]:
                 self._property_refs.setdefault(parts[0], 'ObjectReference')
             offsets = ', '.join(parts[1:4]) if len(parts) > 1 else ''
-            ref = self._resolve_self_ref(ref_name, extends, actor_func=True)
+            # MoveTo is declared on ObjectReference (`MoveTo(ObjectReference
+            # akTarget, ...)`), and TES4 moves scenery with it as readily as
+            # actors -- SEHaskillSummonMarker is a STAT the summon spell
+            # relocates.  Promoting the subject to Actor left an `Actor
+            # Property` the VM refuses to bind on a STAT, so the marker stayed
+            # None and never moved.
+            ref = self._resolve_objref_ref(ref_name, extends)
             if offsets:
                 return f'{ref}.MoveTo({target}, {offsets})'
             return f'{ref}.MoveTo({target})'

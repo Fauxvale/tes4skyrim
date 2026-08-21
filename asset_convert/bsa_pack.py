@@ -272,6 +272,25 @@ def _run_bsarch(
     return True
 
 
+_DEFAULT_EXPORT = Path(__file__).resolve().parent.parent / 'export'
+
+
+def _out_root(output_dir, plugin: str, export_root=None):
+    """The plugin's output folder (its MOD's folder for an imported mod).
+
+    `export_root` is the export ROOT (the folder holding sources.json), NOT a
+    plugin's record directory. Handing it a record dir is how this resolved
+    `output/<plugin>/` for a grouped plugin and aborted the pack with
+    "output directory not found" -- the very failure it was added to fix.
+    """
+    try:
+        from output_layout import plugin_out_root
+        return plugin_out_root(output_dir, plugin,
+                               str(export_root) if export_root else None)
+    except ImportError:
+        return Path(output_dir) / plugin
+
+
 def pack_bsas(
     source_file: str,
     output_dir: str = 'output',
@@ -279,6 +298,7 @@ def pack_bsas(
     compress_textures: bool = False,
     size_limit: int = BSA_SIZE_LIMIT,
     export_dir: str = None,
+    export_root: str = None,
 ) -> dict:
     """Pack converted assets into Skyrim SE BSA archives.
 
@@ -305,9 +325,17 @@ def pack_bsas(
         compress_textures:  Compress the textures BSA (-z flag). Default False.
         size_limit:         Max payload bytes per archive (default ~2 GiB minus
                             BSA metadata overhead).
-        export_dir:         Export text dir for this plugin (e.g.
-                            'export/Oblivion.esm').  Enables the texture
-                            keep-set; omit to pack every texture on disk.
+        export_dir:         This plugin's RECORD dir (e.g.
+                            'export/Oblivion.esm', or
+                            'export/<Mod>/<plugin>' for an imported mod).
+                            Enables the texture keep-set; omit to pack every
+                            texture on disk.
+        export_root:        The export ROOT ('export/'), used only to resolve
+                            which output folder this plugin converts into.
+                            Distinct from `export_dir` on purpose: they are
+                            the same folder for a game-Data plugin and two
+                            different ones for an imported mod, and passing
+                            the record dir here is what made the pack abort.
 
     Returns:
         dict with keys: packed (list of BSA paths), skipped (list),
@@ -327,7 +355,15 @@ def pack_bsas(
     print(f"  BSArch: {bsarch}")
 
     source_name = Path(source_file).name
-    plugin_dir  = Path(output_dir).resolve() / source_name
+    # An imported mod's plugins all convert into their MOD's folder, so this
+    # must be resolved rather than assumed -- the plain join names a folder
+    # that does not exist and packing aborts with "output directory not found".
+    # Resolved from the export ROOT: `export_dir` is a RECORD dir and holds no
+    # sources.json, so the registry reads as empty and the resolver falls back
+    # to the pre-group path. Fall back to the repo's own export/ so a caller
+    # that passes neither still resolves an imported mod correctly.
+    plugin_dir = _out_root(Path(output_dir).resolve(), source_name,
+                           export_root or _DEFAULT_EXPORT)
     if not plugin_dir.is_dir():
         msg = f"Plugin output directory not found: {plugin_dir}"
         print(f"  ERROR: {msg}")
@@ -492,11 +528,16 @@ if __name__ == '__main__':
                         help='Export text dir (e.g. export/Oblivion.esm). '
                              'Enables the texture keep-set; without it every '
                              'texture on disk is packed.')
+    parser.add_argument('--export-root', default=None, metavar='DIR',
+                        help='The export ROOT (default: the repo export/). '
+                             'Resolves which output folder the plugin '
+                             'converts into for an imported mod.')
     a = parser.parse_args()
     r = pack_bsas(a.source_file, output_dir=a.output_dir,
                   bsarch_path=a.bsarch,
                   compress_textures=a.compress_textures,
                   size_limit=a.size_limit,
-                  export_dir=a.export_dir)
+                  export_dir=a.export_dir,
+                  export_root=a.export_root)
     print(f"\nPacked: {len(r['packed'])}  Skipped: {len(r['skipped'])}  "
           f"Loaders: {len(r['loaders'])}  Errors: {len(r['errors'])}")

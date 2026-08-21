@@ -41,6 +41,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from subprocess_flags import POPEN_FLAGS, windows_cmd, to_wine_path  # noqa: E402
 from worker_budget import worker_count  # noqa: E402
 
+
+# Shared-folder resolution lives in output_layout -- see asset_pipeline. An
+# imported mod's plugins share one `sound/` payload but keep their own
+# voicemap/liptext files. Without an explicit `extract_dir` the export root is
+# assumed, which is where the registry lives for every caller that omits it.
+from output_layout import asset_root as _asset_root, plugin_out_root
+
+_DEFAULT_EXPORT = Path(__file__).resolve().parent.parent / 'export'
+
+
+def _out_root(output_dir, source_name, extract_dir=None):
+    return plugin_out_root(output_dir, source_name,
+                           str(extract_dir or _DEFAULT_EXPORT))
+
+
 # Use most CPUs – wmav2 is fast so many parallel ffmpeg processes help.
 _WORKER_COUNT = worker_count()
 
@@ -398,19 +413,19 @@ def convert_sounds(
     print('Sound Conversion')
     print('=' * 60)
 
-    snd_src = extract_dir / source_name / 'sound'
+    snd_src = _asset_root(extract_dir, source_name) / 'sound'
     if not snd_src.exists():
         print(f'  No sound directory found at {snd_src}')
         return {'converted': 0, 'copied': 0, 'failed': 0, 'total': 0}
 
-    snd_dst = output_dir / source_name / 'sound' / 'tes4'
+    snd_dst = _out_root(output_dir, source_name, extract_dir) / 'sound' / 'tes4'
     ffmpeg    = find_ffmpeg(ffmpeg_path)
 
     # ── Voice files: reorganise into TES5 layout ────────────────────────────
     print('\n  [Voice files]')
     voice_stats = organize_voice_files(
-        source_dir=extract_dir / source_name,
-        dest_dir=output_dir / source_name,
+        source_dir=_asset_root(extract_dir, source_name),
+        dest_dir=_out_root(output_dir, source_name, extract_dir),
         plugin_name=source_name,
         copy=True,
         convert_audio=(ffmpeg is not None),
@@ -604,7 +619,8 @@ def load_voice_map(map_path) -> dict:
 def find_voice_map(output_dir, source_name) -> 'dict | None':
     """Locate and load the voicemap written next to the converted ESM
     (output/<plugin>/<plugin>.voicemap.txt), if present."""
-    map_path = Path(output_dir) / source_name / (source_name + '.voicemap.txt')
+    map_path = (_out_root(output_dir, source_name)
+                / (source_name + '.voicemap.txt'))
     if map_path.exists():
         return load_voice_map(map_path)
     return None
@@ -641,7 +657,8 @@ def load_lip_text(map_path) -> dict:
 def find_lip_text(output_dir, source_name) -> 'dict | None':
     """Locate and load the lip transcript map written next to the converted
     ESM (output/<plugin>/<plugin>.liptext.txt), if present."""
-    map_path = Path(output_dir) / source_name / (source_name + '.liptext.txt')
+    map_path = (_out_root(output_dir, source_name)
+                / (source_name + '.liptext.txt'))
     if map_path.exists():
         return load_lip_text(map_path)
     return None

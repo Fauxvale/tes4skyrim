@@ -87,8 +87,13 @@ class Pack:
         body = re.split(r'^XNAM=', body, maxsplit=1, flags=re.M)[0]
         out = []
         for m in re.finditer(
-                r'^ANAM=(\w+)(?:\n(CNAM|PLDT|PTDA)[^\n]*)?', body, re.M):
-            out.append((m.group(1), m.group(2) or ''))
+                r'^ANAM=(\w+)(?:\n(CNAM|PLDT|PTDA|PDTO)([^\n]*)'
+                r'(?:\n\2\.hex=([0-9A-Fa-f]+))?)?', body, re.M):
+            sub = m.group(2) or ''
+            # The VALUE: CNAM=<v> is inline; PLDT/PTDA/PDTO carry .size on
+            # the ANAM's next line and .hex on the one after.
+            val = m.group(4) or (m.group(3) or '').lstrip('=').strip()
+            out.append((m.group(1), sub, val))
         return out
 
     def index_list(self):
@@ -105,6 +110,19 @@ def load(path: Path):
     return [Pack(r) for r in _records(path)]
 
 
+def _decode_value(sub: str, val: str) -> str:
+    """Human-readable slot value: PLDT/PTDA -> (type, formid, radius/count)."""
+    if not val:
+        return ''
+    if sub in ('PLDT', 'PTDA') and len(val) == 24:
+        t, f, n = struct.unpack('<iIi', bytes.fromhex(val))
+        return f'type={t} {f:08X} {n}'
+    if sub == 'PDTO' and len(val) == 16:
+        t, f = struct.unpack('<II', bytes.fromhex(val))
+        return f'type={t} {f:08X}'
+    return val
+
+
 def show(p: Pack):
     kind = 'TEMPLATE ROOT' if p.is_root else 'instance'
     print(f'{"=" * 72}\n{p.fid}  {p.edid}   [{kind}, PKDT.Type={p.type}]')
@@ -118,8 +136,9 @@ def show(p: Pack):
         print(f'  procedures : {" -> ".join(p.procedures)}')
     if p.values:
         print('  data inputs (positional — an instance MUST match this order):')
-        for i, (atype, sub) in enumerate(p.values):
-            print(f'     [{i:2d}] ANAM={atype:<16} {sub}')
+        for i, (atype, sub, val) in enumerate(p.values):
+            print(f'     [{i:2d}] ANAM={atype:<16} {sub:<4} '
+                  f'{_decode_value(sub, val)}')
     idx = p.index_list()
     if idx:
         print(f'  UNAM index list (copy verbatim): {idx}')
@@ -144,7 +163,7 @@ def emit_python(packs, names):
         print(f'        version={p.version},')
         print(f'        index_list={p.index_list()!r},')
         print(f'        inputs=[  # positional')
-        for i, (atype, sub) in enumerate(p.values):
+        for atype, _sub, _val in p.values:
             print(f'            {atype!r},')
         print(f'        ],')
         print('    ),')

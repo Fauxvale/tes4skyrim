@@ -30,26 +30,6 @@ _TES4_SND_LOOP              = 0x0010
 _TES4_SND_MENU_SOUND        = 0x0020
 _TES4_SND_2D                = 0x0040
 
-# Root of the extracted TES4 assets for the plugin being imported, set by
-# set_sound_source_dir() at import start. Used only to enumerate the .wav files
-# inside a directory-valued SOUN.FNAM.
-_SOUND_SOURCE_DIR = None
-
-
-def set_sound_source_dir(export_dir: str) -> None:
-    """Point the SOUN converter at this plugin's extracted assets.
-
-    Only needed to expand directory-valued FNAMs; a missing/None dir simply
-    means such sounds fall back to the single literal path.
-    """
-    global _SOUND_SOURCE_DIR
-    _SOUND_SOURCE_DIR = export_dir
-
-
-def get_sound_source_dir() -> str:
-    return _SOUND_SOURCE_DIR
-
-
 # TES4 SOUN FormID (low 24 bits) → the SNDR FormID convert_SOUN gave its
 # companion. Filled DURING Phase 3, and read afterwards to patch the records
 # that reference it (see items.patch_door_sounds).
@@ -162,15 +142,20 @@ _SOUND_SOURCE_DIR = None
 _AUDIO_EXTS = ('.wav', '.xwm', '.mp3')
 
 
-def set_sound_source_dir(export_dir: str) -> None:
+def set_sound_source_dir(asset_root: str) -> None:
     """Point the SOUN converter at this plugin's extracted assets.
+
+    🛑 The ASSET root (the folder holding `sound/`), not the record dir. For an
+    imported mod those are two different folders, and the record dir has no
+    `sound/` -- every directory-valued FNAM then fell back to its bare literal.
+    Callers hold a record dir, so wrap it: `assets_for(export_dir)`.
 
     Only needed to expand directory-valued FNAMs; a missing/None dir simply
     means such sounds fall back to the single literal path (see
     _sound_anam_paths).
     """
     global _SOUND_SOURCE_DIR
-    _SOUND_SOURCE_DIR = export_dir
+    _SOUND_SOURCE_DIR = asset_root
 
 
 # TES4 SOUN FormID (low 24 bits) → the SNDR FormID convert_SOUN gave its

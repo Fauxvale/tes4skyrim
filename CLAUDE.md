@@ -86,6 +86,8 @@ caching, skipped record types, the export text format, and the directory layout.
   output — `tools/` scripts take arguments and produce general output, so they are
   reusable next time.
 - **Always record new learnings** in this file or, more likely, the relevant `docs/` file.
+- **Findings go in `docs/`, NOT just memory.** Memory is per-machine; a doc is
+  the only copy another computer sees.
 - **KEEP THIS FILE EXTREMELY TERSE.** Every rule is the shortest sentence that
   states it. No rationale, history, worked examples, or "rewritten on <date>"
   notes — those go in `docs/`, linked. Editing a rule means it gets SHORTER.
@@ -93,6 +95,11 @@ caching, skipped record types, the export text format, and the directory layout.
   Grep the source before claiming a mechanism exists, and fix the doc.
 - Test scripts must print as they go, so a 120s timeout still yields output.
 - **LISTEN CAREFULLY to EXACTLY what the user's prompt says**. Seek to understand any implementation ideas instead of using your pre-conceived notions
+- **A MECHANISM THE USER NAMES IS THE LEAD. BUILD IT TO COMPLETION.**
+  Never abandon it for a cheaper substitute, and never because it is
+  "invasive" / "touches too much" / "needs new records" — **COST IS NEVER A
+  REASON, ONLY CORRECTNESS IS.** If it truly cannot work, PROVE it with a
+  measurement and say so; never silently swap in something smaller.
 - If you need to continue iterating on an idea with only marginal improvments in some areas and regressions in another, your idea is likely incorrect and you need to find another one
 - **Look for the AUTHORED indicator** If you need to resort to heuristics, your approach is most likely incorrect. Remember, everything in the original plugin works for a reason
 - **Pay close attention to performance** This needs to run quickly on a modest PC. If your new code makes a step run significantly slower than it did before you **MUST optimize**. Python first optimizations, and then native C++ if necessary.
@@ -193,6 +200,8 @@ real data, or a failing-then-passing test.
   scoped down, say so instead of waiting on it. **Does NOT apply to real
   pipeline runs** (`convert.py --import-only` etc.), which take as long as they
   take — see [BUILD EVERY FILE](#build-every-file).
+  **Write each result as you compute it; on timeout use what it wrote. Never
+  re-run the same sweep at a smaller scope.**
 - **NEVER stop mid-task for a status update** — see [no stopping](#no-stopping).
 
 ### Working with the user
@@ -249,6 +258,12 @@ real data, or a failing-then-passing test.
   `--prune-textures-only`, `--pack-zip-only`. Report what you built and any
   failures verbatim; if a stage genuinely cannot be run, say which and why rather
   than staying silent.
+
+  **An asset-only mod (no ESP/ESM) is still a `-f` target.** `--import-mod`
+  registers a pseudo-plugin for it, so its asset stages run exactly like any
+  other plugin's: `python convert.py -f "Tamriel Landscape Pack"
+  --speedtrees-only`. Only the record stages (export/import/scripts/creatures)
+  are skipped. `python convert.py --list-mods` shows them.
 - **NEVER START A BUILD UNTIL YOU ARE SURE THE FIX IS CORRECT.** Finish every
   edit, run the targeted tests, and re-read your own diff FIRST.
 - **A FULL `--meshes-only` REBUILD IS LONG AND EXPENSIVE (~20,000 meshes, many
@@ -376,18 +391,21 @@ relevant doc when working in that area.
 | [package_conversion_plan.md](docs/package_conversion_plan.md) | PACK template model + vanilla census (implemented — the design behind `pack_converter.py`) |
 | [package_conversion_audit.md](docs/package_conversion_audit.md) | Full PACK audit (2026-08-17): 5 measured gaps (PTDT type-1 unhandled, master-blind PackagePlan, 48 ungated packages) + what is verified correct |
 | [dialogue_conversion_notes.md](docs/dialogue_conversion_notes.md) | DIAL/INFO/QUST/DLBR/DLVW implementation, voice type routing, AddTopic unlocks, GetIsID injection |
-| [dialogue_engine_contracts.md](docs/dialogue_engine_contracts.md) | Verified engine rules for dialogue routing |
+| [dialogue_engine_contracts.md](docs/dialogue_engine_contracts.md) | Verified engine rules for dialogue routing; **speak-as lines = `Say(topic, None, inHead)` on a voiced TACT stand-in** |
 | [dialogue_transfer_gaps.md](docs/dialogue_transfer_gaps.md) | Measured gaps: what Oblivion dialogue does NOT survive conversion, with counts from both emulators |
 | [ambient_dialogue_channel_plan.md](docs/ambient_dialogue_channel_plan.md) | Oblivion's 3 delivery channels vs Skyrim's 2; constant quipping, NPC-to-NPC topics in the player menu; **the NPC-to-NPC conversation scheduler Skyrim lacks** and the driver quest that replays quest-advancing chains |
 | [QUEST_AUDIT.md](docs/QUEST_AUDIT.md) | Quest completability audit via the walkthrough emulator (2026-07-17, all 390 QUSTs) |
 | [creature_conversion.md](docs/creature_conversion.md) | CREA→actor: behavior graphs, HKX skeleton/animation/ragdoll, creature records |
 | [creature_race_equivalence.md](docs/creature_race_equivalence.md) | Oblivion creature ↔ vanilla Skyrim race map (exact/near tiers) for a possible "use the vanilla creature" option; which creatures have NO equivalent |
+| [vanilla_creature_swap_plan.md](docs/vanilla_creature_swap_plan.md) | PLAN (unimplemented): override-ESP + GUI to swap exact-match creatures to vanilla; race identity = (folder, NIFZ body set), NOT folder |
+| [vanilla_item_swap_plan.md](docs/vanilla_item_swap_plan.md) | PLAN (unimplemented): item/ingredient/clutter **and WEATHER** swap; model-swap vs full-reference modes, OBND size+orientation gate, PIL preview renderer |
+| [item_swap_table.md](docs/item_swap_table.md) | Per-item MISC/INGR swap recommendations with measured size ratios and verdicts (OK/SCALE/ROT/REJECT) |
 | [horse_rideability_plan.md](docs/horse_rideability_plan.md) | Rideable horses: RACE Mount Data, horse/rider graph pair, rider-animation sourcing |
 
 ### Scripts
 | Doc | Covers |
 |---|---|
-| [papyrus_conversion_notes.md](docs/papyrus_conversion_notes.md) | TES4→Papyrus mapping, paired on/off soft-lock trap, **Say() timers = `TES4Polyfill.SayLine` (engine-reported line length; fragments never write timers)**, syntax traps, OBSE constructs |
+| [papyrus_conversion_notes.md](docs/papyrus_conversion_notes.md) | TES4→Papyrus mapping, paired on/off soft-lock trap, **Say() timers = `TES4Polyfill.SayLine` (engine-reported line length; fragments never write timers)**, **StopQuest = `Stop()` (a run-bit global was tried and REVERTED)**, syntax traps, OBSE constructs |
 | [Script_Conversion_Plan.md](docs/Script_Conversion_Plan.md) | Script conversion scope, counts, block/variable distributions |
 | [quest_script_conversion_audit.md](docs/quest_script_conversion_audit.md) | Which quest scripts have been read against their originals (don't re-audit), defects found, and verified-correct behaviours not to "fix" |
 | [skse_conversion_audit.md](docs/skse_conversion_audit.md) | SKSE/OBSE function coverage audit |
@@ -398,6 +416,7 @@ relevant doc when working in that area.
 | Doc | Covers |
 |---|---|
 | [nif_conversion_notes.md](docs/nif_conversion_notes.md) | NIF deep-dive: bhk collision/MOPP/CMS, particles, FlameNode grafting, worn armor/shields/furniture markers, skin retargeting, clutter physics, terrain LOD, SpeedTree |
+| [speedtree_engine_decomp.md](docs/speedtree_engine_decomp.md) | SpeedTreeRT decompiled from Oblivion.exe: RNG, child placement/count, spline eval, level struct, parse-stage map. |
 | [world_land_navmesh_notes.md](docs/world_land_navmesh_notes.md) | PGRD→NAVM/NAVI algorithm, LAND record structure, landscape TXST, world-map cloud banks (WRLD MODL) |
 | [navmesh_corridor_redesign.md](docs/navmesh_corridor_redesign.md) | The corridor-ribbon navmesh model |
 | [ck_navmesh_generation.md](docs/ck_navmesh_generation.md) | How the CK generates navmesh (Recast), defaults, the voxel-vs-world units trap |

@@ -807,10 +807,17 @@ def _load_projects(export_dir: str) -> dict:
                 _, _, val = line.partition('=')
                 names.append(val.strip())
 
-    root = os.path.dirname(os.path.normpath(export_dir))
+    # Resolved through the registry, never `dirname(export_dir)` + a join: an
+    # imported mod's plugins live INSIDE their mod's folder, so the parent is
+    # the mod and the join looked for the master under it. Nothing was ever
+    # found, no master projects were inherited, and every CREA reusing a
+    # master's creature folder shipped as a BASE SKYRIM creature.
+    from .overrides import _export_root, _master_export_dir
+    root = _export_root(export_dir)
     merged, inherited = {}, 0
     for name in names:
-        mpath = os.path.join(root, name, 'creature_projects.json')
+        mpath = os.path.join(_master_export_dir(root, name),
+                             'creature_projects.json')
         if not os.path.exists(mpath):
             continue
         with open(mpath, encoding='utf-8') as f:

@@ -71,6 +71,16 @@ QUEST_PARAM_FUNCS = frozenset({
 REF_TARGET_TYPES = frozenset({0, 1, 2, 7, 8, 9, 11})
 
 
+# Every TES4 record type that carries SCRI (the 21 records in xEdit
+# wbDefinitionsTES4 that include wbSCRI).  A GetScriptVariable condition may
+# name a REFR of any of them.
+SCRIPTABLE_BASE_SIGS = (
+    'ACTI', 'ALCH', 'APPA', 'ARMO', 'BOOK', 'CLOT', 'CONT', 'CREA', 'DOOR',
+    'FLOR', 'FURN', 'INGR', 'KEYM', 'LIGH', 'LVLC', 'MISC', 'NPC_', 'QUST',
+    'SGST', 'SLGM', 'WEAP',
+)
+
+
 def build_script_var_map(by_type: dict, master_export: dict = None) -> dict:
     """ref_fid -> {var_index: var_name} for every scripted actor/object.
 
@@ -123,9 +133,13 @@ def build_script_var_map(by_type: dict, master_export: dict = None) -> dict:
         if table:
             script_vars[sfid] = table
 
-    # 2. base record fid -> its script's variable table
+    # 2. base record fid -> its script's variable table.  EVERY base type
+    #    TES4 lets a script attach to: a Find gated on a scripted WEAP (the
+    #    goblin leaders' totem staffs, CreatureGoblinLeaderFindHead*) or a
+    #    scripted MISC (11 INFO conditions) resolved to nothing under the
+    #    shorter list and lost its variable NAME.
     base_vars = {}
-    for sig in ('NPC_', 'CREA', 'ACTI', 'CONT', 'DOOR', 'QUST'):
+    for sig in SCRIPTABLE_BASE_SIGS:
         for rec in _recs(sig):
             scri = get_formid(rec, 'SCRI') & 0x00FFFFFF
             if scri in script_vars:
@@ -236,6 +250,171 @@ def build_scriptvar_owner_map(by_type: dict, fid_to_edid: dict) -> dict:
     return owner
 
 
+GET_IS_ID_FUNCS = frozenset({72, 73})   # GetIsID, GetIsCreature
+
+
+def _speaker_from_conditions(rec: dict) -> int:
+    """The actor a dialogue INFO is restricted to, via its GetIsID condition.
+
+    Returns 0 when the INFO is not actor-specific (a shared topic), in which
+    case a bare `AddScriptPackage` has no single target to resolve.
+    """
+    i = 0
+    while True:
+        raw = rec.get(f'Condition[{i}].Raw')
+        if raw is None:
+            return 0
+        i += 1
+        if not raw:
+            continue
+        try:
+            blob = bytes.fromhex(raw)
+            if len(blob) < 20:
+                continue
+            func = struct.unpack('<I', blob[8:12])[0]
+            param1 = struct.unpack('<I', blob[12:16])[0]
+        except (ValueError, struct.error):
+            continue
+        if func in GET_IS_ID_FUNCS and param1:
+            # A CTDA param is a RAW TES4 id; the caller remaps it like every
+            # other id it produces.
+            return param1
+
+
+#   ref.AddScriptPackage PkgEdid   /   AddScriptPackage PkgEdid   (implicit)
+# Quoted and comma forms both occur: `AddScriptPackage "Pkg"`, `ref.foo, Pkg`.
+#
+# The export escapes the script's newlines and tabs as the LITERAL two-character
+# sequences \r \n \t (a backslash followed by the letter), so the text arrives
+# as one physical line.  Both matter here:
+#   * `\t` before a ref name would otherwise be captured INTO it, turning
+#     `CelebroRef` into `tCelebroRef` and resolving nothing.
+#   * a `;` comment runs to the next `\r\n`, not to a real newline, so comment
+#     stripping has to work on the escaped form or every commented-out call is
+#     read as live code.  Nehrim's StartCelleTrigZonePlayerStoryvar01SCRIPT has
+#     `;\tCelebroRef.AddScriptPackage, ...` — disabled by its author, and
+#     attaching it would resurrect content the mod deliberately cut.
+_ADD_SCRIPT_PACKAGE_RE = re.compile(
+    r'(?:([A-Za-z]\w*)\s*\.\s*)?AddScriptPackage[\s,]+"?(\w+)"?', re.I)
+
+_SCRIPT_ESCAPES = (('\\r\\n', '\n'), ('\\n', '\n'), ('\\r', '\n'),
+                   ('\\t', ' '))
+
+
+def _script_lines(text: str):
+    """Yield the script's LIVE source lines, comments and escapes resolved."""
+    if not text:
+        return
+    for old, new in _SCRIPT_ESCAPES:
+        text = text.replace(old, new)
+    for line in text.split('\n'):
+        yield line.split(';', 1)[0]
+
+
+def build_script_assigned_packages(by_type: dict, fid_to_edid: dict,
+                                   master_export: dict = None) -> dict:
+    """pack_fid -> set(actor ref_fid) for packages forced on by script.
+
+    TES4's `AddScriptPackage` puts a package on an actor that does NOT list it
+    in its AI package array — the package exists only to be forced on later.
+    Skyrim has no equivalent call (`SetOverridePackage` is a Fallout 4 API and
+    is absent from SkyrimSE.exe 1.6; only `EvaluatePackage` and
+    `KeepOffsetFromActor` exist), so the forced package must instead be
+    attached to the actor's quest alias as an ALPC.  Then the converted
+    `EvaluatePackage()` can actually select it, because it is finally ON the
+    stack the engine arbitrates.
+
+    Without this the package is invisible to arbitration and silently never
+    runs: 35 of Nehrim's 43 script-assigned packages and 75 of Oblivion's 97
+    appear on no actor at all.  MQ00CalebroPackage04 is the visible case —
+    Nehrim's Celebro stops following the player because the package that should
+    take over was never anywhere the engine could find it.
+
+    Both call forms are recovered.  `ref.AddScriptPackage Pkg` names the actor
+    explicitly; a bare `AddScriptPackage Pkg` targets the script's own owner,
+    which for an INFO result script is the SPEAKER — resolved by the caller
+    via `speaker_refs`, since only the dialogue converter knows who that is.
+    """
+    # `fid_to_edid` is keyed on RAW export FormIDs, but every id this plan
+    # produces has to be in the same space as `get_formid()` — which applies
+    # the load-order index offset — or PackagePlan's base_to_ref/alias lookups
+    # miss and the ALPC is never written.
+    edid_to_fid = {v.lower(): k for k, v in fid_to_edid.items() if v}
+    offset = get_formid_index_offset()
+    out = {}
+
+    def _scan(text: str, implicit_ref: int = 0):
+        if not text or 'addscriptpackage' not in text.lower():
+            return
+        for line in _script_lines(text):
+            for m in _ADD_SCRIPT_PACKAGE_RE.finditer(line):
+                pfid = edid_to_fid.get(m.group(2).lower())
+                if not pfid:
+                    continue
+                ref = (edid_to_fid.get(m.group(1).lower()) if m.group(1)
+                       else implicit_ref)
+                if ref:
+                    out.setdefault(remap_formid(pfid, offset), set()).add(
+                        remap_formid(ref, offset))
+
+    def _recs(sig):
+        if master_export:
+            for r in master_export.values():
+                if r.get('Signature') == sig:
+                    yield r
+        yield from by_type.get(sig, [])
+
+    # A bare `AddScriptPackage` (no `ref.` prefix) acts on the script's OWN
+    # actor, and that is the majority form — 66 of Nehrim's 111 SCPT calls and
+    # 31 of Oblivion's 214.  Resolve it by inverting SCRI: script fid -> the
+    # actors carrying it -> their placed refs.  An object script attached to
+    # several actors forces the package on each, which is what TES4 does.
+    # Kept in RAW id space, like every other id _scan sees; _scan remaps on the
+    # way out.
+    def _raw(rec, field):
+        try:
+            return int(rec.get(field, '0') or '0', 16)
+        except ValueError:
+            return 0
+
+    script_actors = {}
+    for sig in ('NPC_', 'CREA'):
+        for rec in _recs(sig):
+            sfid = _raw(rec, 'SCRI')
+            if sfid:
+                script_actors.setdefault(sfid, []).append(_raw(rec, 'FormID'))
+
+    for rec in _recs('SCPT'):
+        text = get_str(rec, 'ScriptText') or get_str(rec, 'SCTX')
+        if not text:
+            continue
+        owners = script_actors.get(_raw(rec, 'FormID'), [])
+        if owners:
+            for owner in owners:
+                _scan(text, owner)
+        else:
+            _scan(text)
+    # An INFO's bare `AddScriptPackage` acts on the SPEAKER, and the speaker is
+    # named by the INFO's own GetIsID/GetIsCreature condition (function 72/73,
+    # param1 = the actor).  That is authored data: it is exactly how Oblivion
+    # restricts a response to one NPC.  MQ00CalebroPackage04 is reached this
+    # way — Nehrim's INFO 0x11D3 is gated `GetIsID Celebro02` and forces the
+    # package that should keep Celebro moving after he speaks.
+    for rec in _recs('INFO'):
+        text = get_str(rec, 'ResultScript')
+        if not text:
+            continue
+        _scan(text, _speaker_from_conditions(rec))
+    for rec in _recs('QUST'):
+        s = 0
+        while f'Stage[{s}].Index' in rec:
+            lc = get_int(rec, f'Stage[{s}].LogCount')
+            for j in range(max(lc, 1)):
+                _scan(get_str(rec, f'Stage[{s}].Log[{j}].ResultScript'))
+            s += 1
+    return out
+
+
 class PackagePlan:
     """The quest/alias wiring for every converted package.
 
@@ -256,7 +435,8 @@ class PackagePlan:
     # -- build ----------------------------------------------------------
 
     def build(self, by_type: dict, quest_fids: set,
-              scriptvar_owner: dict = None, master_export: dict = None) -> None:
+              scriptvar_owner: dict = None, master_export: dict = None,
+              script_assigned: dict = None) -> None:
         """Wire packages to quests and aliases.
 
         `master_export` is the MASTERS' export records and is REQUIRED for a
@@ -366,6 +546,37 @@ class PackagePlan:
                 self.needed_aliases.setdefault(q, set()).add(aref)
                 self.alias_actor[aref] = afid
 
+        # 2b. Packages forced on by `AddScriptPackage`, which are NOT in any
+        # actor's AI array — that is the whole point of the call.  Skyrim has
+        # no equivalent function, so the only way the engine can ever run one
+        # is to hang it off the actor's quest alias like any other quest
+        # package; the converted `EvaluatePackage()` then has something to
+        # select.  See build_script_assigned_packages.
+        #
+        # ref_to_base inverts base_to_ref so a call naming the ACHR still
+        # records which base actor fills the alias (alias_actor), exactly as
+        # the AI-array path above does.
+        # Ids here are already in get_formid() space (build_script_assigned_
+        # packages remaps them), which is the space base_to_ref uses.
+        ref_to_base = {r: b for b, r in base_to_ref.items()}
+        for pfid, refs in (script_assigned or {}).items():
+            q = self.owner_quest.get(pfid)
+            if q is None:
+                continue
+            for ref in refs:
+                # The call may name the placed ACHR (the usual form) or the
+                # base actor; normalise to the ref, which is what an alias
+                # fills.  Anything else (a levelled spawn with no placement)
+                # cannot take an alias and is skipped.
+                aref = ref if ref in ref_to_base else base_to_ref.get(ref)
+                if aref is None:
+                    continue
+                pkgs = self.quest_packages.setdefault(q, {}).setdefault(aref, [])
+                if pfid not in pkgs:
+                    pkgs.append(pfid)
+                self.needed_aliases.setdefault(q, set()).add(aref)
+                self.alias_actor.setdefault(aref, ref_to_base.get(aref, ref))
+
         # 3. Refs the quest packages point AT (escort/follow targets, e.g. the
         #    player; and PLDT "near reference" destinations).
         for pfid, qfid in self.owner_quest.items():
@@ -403,6 +614,26 @@ class PackagePlan:
             added.append((ref, next_id))
             next_id += 1
         return added
+
+    def expand_packages(self, chains: dict) -> None:
+        """Replace each source package with its chain (chain fids first, then
+        the source) wherever an alias lists it, and give the chain fids the
+        source's owner quest.  `chains`: source pack fid -> [chain fid, ...].
+        See pack_converter.hunt_chain_targets."""
+        for src, links in chains.items():
+            q = self.owner_quest.get(src)
+            if q is not None:
+                for c in links:
+                    self.owner_quest[c] = q
+        for per_actor in self.quest_packages.values():
+            for aref, pkgs in per_actor.items():
+                if not any(p in chains for p in pkgs):
+                    continue
+                out = []
+                for p in pkgs:
+                    out.extend(chains.get(p, ()))
+                    out.append(p)
+                per_actor[aref] = out
 
     def alias_of(self, qfid: int, ref_fid: int):
         return self.alias_index.get((qfid, ref_fid))

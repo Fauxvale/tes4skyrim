@@ -40,8 +40,16 @@ false positives; a tree with a real defect rate is a candidate.  Measured:
 
     Oblivion architecture/imperialcity : 1 of 5156  (0.02%)
 
-so the "vanilla Oblivion is authored correctly" claim in collision_options.py
-is now measured rather than assumed.
+but that figure is for ONE tree and does not generalise: meshes/rocks measures
+14.5% of decidable floor faces inverted in vanilla (seisland.nif, the Shivering
+Isles island, is 1480 of 3590 triangles).  The "vanilla Oblivion is authored
+correctly" claim is WITHDRAWN -- see docs/nif_conversion_notes.md "round 3".
+
+NOTE ON USING THIS AS A SCORER.  This tool shares its coincidence rule and its
+constants with asset_convert.collision._component_visual_vote (step 2 of the
+repair), so scoring a repair variant that CONTAINS step 2 is partly self-
+grading and reads high.  It is a fair referee for the authored-normal step,
+which uses an entirely independent signal.
 
 Usage:
     python tools/collision_winding_truth.py <nif_or_dir> [--max N]

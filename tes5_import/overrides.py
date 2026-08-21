@@ -77,6 +77,41 @@ def _export_master_names(export_dir: str) -> list:
     return names
 
 
+def _export_root(export_dir: str) -> str:
+    """The `export/` root, given any plugin's record folder.
+
+    A game-Data plugin sits directly under it (`export/Oblivion.esm/`), but an
+    imported mod's plugins are nested inside their mod's shared folder
+    (`export/<Mod>/<plugin>/`), so the parent of a record dir is not reliably
+    the root. The registry file marks the real one.
+    """
+    d = os.path.dirname(os.path.normpath(export_dir))
+    # At most two levels: <root>/<mod>/<plugin> is the deepest shape there is.
+    for cand in (d, os.path.dirname(d)):
+        if cand and os.path.isfile(os.path.join(cand, 'sources.json')):
+            return cand
+    return d
+
+
+def _master_export_dir(root: str, name: str) -> str:
+    """Where master `name`'s records live under `root`.
+
+    Masters resolve as sibling directories, EXCEPT that an imported mod's
+    plugins live inside their mod's folder. Consulting the registry is what
+    lets a plugin master a resource pack's ESM after that pack moved into a
+    group folder; without it the master silently reads as missing and every
+    override is diffed against nothing.
+    """
+    try:
+        from output_layout import record_dir
+        got = record_dir(root, name)
+        if os.path.isdir(got):
+            return str(got)
+    except ImportError:
+        pass
+    return os.path.join(root, name)
+
+
 def load_master_export(export_dir: str) -> dict:
     """The masters' export records, keyed by the TES4 FormID THIS PLUGIN uses.
 
@@ -111,10 +146,14 @@ def load_master_export(export_dir: str) -> dict:
         return {}
     slot_of = {n.lower(): i for i, n in enumerate(names)}
 
-    root = os.path.dirname(os.path.normpath(export_dir))
+    # `export_dir` is THIS plugin's record folder, which for an imported mod is
+    # nested one level deeper (`export/<Mod>/<plugin>/`). Walk up to the real
+    # export root rather than assuming the parent is it, or every master lookup
+    # below would be rooted inside the mod's own group folder.
+    root = _export_root(export_dir)
     out = {}
     for slot, name in enumerate(names):
-        mdir = os.path.join(root, name)
+        mdir = _master_export_dir(root, name)
         if not os.path.isdir(mdir):
             print(f"  WARNING: master export not found ({mdir}); "
                   f"overrides cannot be diffed against it")
@@ -275,9 +314,18 @@ class OverrideContext:
             masters, num_tes4_masters, output_root)
         # export_root lets the loader re-key each manifest out of its master's
         # own TES4 id space into the one THIS plugin names it by.
+        # `_export_root`, never the plain parent: `export_dir` is THIS
+        # plugin's RECORD folder, and an imported mod nests that one level
+        # inside the mod's shared folder. Rooting the manifest loader at the
+        # parent pointed every master lookup inside the mod, `_master_names`
+        # answered nothing for all of them, and `_index_map` built a map that
+        # silently dropped 5,160 of TWMP_HighRock's manifest entries -- 229 of
+        # them carrying companions, which have no arithmetic fallback and so
+        # get DUPLICATED. That is exactly what MissingManifestError exists to
+        # prevent, arrived at by a wrong root instead of a missing file.
         self.master_manifest = load_master_manifests(
             masters, num_tes4_masters, output_root,
-            export_root=os.path.dirname(os.path.normpath(export_dir)))
+            export_root=_export_root(export_dir))
         self.master_export = load_master_export(export_dir)
         self.stats = Counter()
         self.unmapped_keys = Counter()

@@ -975,7 +975,27 @@ EndFunction
 ; OnBegin fragment hook: the engine has selected this INFO and started it.
 Function LineBegan(ObjectReference akSpeakerRef, Float afLength) Global
   Actor a = akSpeakerRef as Actor
-  If a == None || (a as Form).GetFormID() == 0x14
+  If a == None
+    ; A talking activator (a speak-as speaker, see SpeakAs): no actor values of
+    ; its own, so the length lands on the PLAYER for SpeakAsLine to read,
+    ; and the game-wide "a line is playing until" record is stamped as for
+    ; any speaker.  The player's own Variable09 is otherwise unused (the
+    ; player is never a tracked speaker: see the 0x14 tests below).
+    If akSpeakerRef != None
+      Actor gp0 = Game.GetPlayer()
+      Float len0 = afLength
+      If len0 <= 0.0
+        len0 = 0.01
+      EndIf
+      gp0.SetActorValue("Variable09", len0)
+      Float until0 = Utility.GetCurrentRealTime() + len0
+      If until0 > gp0.GetActorValue("Variable07")
+        gp0.SetActorValue("Variable07", until0)
+      EndIf
+    EndIf
+    Return
+  EndIf
+  If (a as Form).GetFormID() == 0x14
     Return
   EndIf
   Float len = afLength
@@ -1034,7 +1054,16 @@ EndFunction
 ; line owns the flag and it is left alone.
 Function LineEnded(ObjectReference akSpeakerRef, Float afLength = -1.0) Global
   Actor a = akSpeakerRef as Actor
-  If a == None || (a as Form).GetFormID() == 0x14
+  If a == None
+    ; Talking activator (speak-as): release the game-wide record and the length.
+    If akSpeakerRef != None
+      Actor gp0 = Game.GetPlayer()
+      gp0.SetActorValue("Variable09", 0.0)
+      gp0.SetActorValue("Variable07", 0.0)
+    EndIf
+    Return
+  EndIf
+  If (a as Form).GetFormID() == 0x14
     Return
   EndIf
   _SayTrace("END", afLength)
@@ -1187,4 +1216,87 @@ Float Function _GameDays(Float afSeconds) Global
     scale = ts.GetValue()
   EndIf
   Return afSeconds * scale / 86400.0
+EndFunction
+
+; ============================================================= speak-as ==
+;
+; TES4 `Say <topic> <force-subtitles> <speak-as NPC> [<in-head>]` -- a line
+; spoken THROUGH a marker, shrine or door AS some NPC.  Skyrim's Say has no
+; speak-as argument and keys voice lookup on the SPEAKER, and a bare XMarker
+; STAT has no voice type at all, so the engine finds no voice folder and
+; plays nothing.
+;
+; The importer gives each such call site a talking activator (TACT) carrying
+; that NPC's voice type, placed at the emitter's authored position
+; (tes5_import/speaker_activators.py).  Speaking on THAT reference is what
+; gives the line a real voice folder.
+;
+; abInHead is TES4's fourth argument and Skyrim's own third one, native on
+; Say: the voice comes from inside the player's head, at full volume,
+; wherever the player stands -- as in Oblivion, where the Arena announcer,
+; the Daedric princes and Mankar Camoran were heard regardless of the
+; marker's position.
+
+Function SpeakAs(ObjectReference akSpeaker, Bool abInHead = False, Topic akTopic = None) Global
+  ; TES4 `marker.Say <topic> 1 <speak-as NPC> <in-head>` -- a line spoken
+  ; THROUGH a marker/shrine/door AS some NPC.  The importer gives each such
+  ; call site a talking activator carrying that NPC's voice type
+  ; (tes5_import/speaker_activators.py); speaking on THAT reference is what
+  ; gives the line a real voice folder, which a bare XMarker STAT has not.
+  ;
+  ; 🛑 THIS IS A PLAIN Say().  Two cleverer deliveries were tried and both
+  ; KILLED THE AUDIO outright (worse than the defect they targeted):
+  ;   * a one-action SCEN per call site;
+  ;   * Activate() on the talking activator (vanilla's own idiom -- but
+  ;     vanilla activates a TACT the PLAYER walked up to, which is not what a
+  ;     polled announcer line is).
+  ; Say() on the voiced stand-in is the only form measured to produce audio.
+  ;
+  ; abInHead is TES4's fourth argument and Skyrim's own third one, native on
+  ; Say: the voice comes from inside the player's head, at full volume,
+  ; wherever they stand.  🛑 NEVER emulate it by MoveTo'ing the speaker onto
+  ; the player -- that teleports the marker out of its authored position
+  ; permanently and costs the line its audio.
+  If akSpeaker == None || akTopic == None
+    Return
+  EndIf
+  akSpeaker.Say(akTopic, None, abInHead)
+EndFunction
+
+; The measuring form: `set T to marker.Say topic 1 voice 1` -- returns the
+; selected line's real length, exactly as SayLine does for an actor.  The
+; INFO's Begin fragment reports it through LineBegan, which for a non-actor
+; speaker stashes it on the PLAYER (Variable09; the game-wide "a line is
+; playing until" record in Variable07 is stamped as for any speaker).
+Float Function SpeakAsLine(ObjectReference akSpeaker, Float afFallbackLength, Bool abInHead = False, Topic akTopic = None) Global
+  ; The measuring form: TES4 `set T to marker.Say topic 1 voice 1` returned
+  ; the selected line's length and the caller counted it down.  Delivery is
+  ; the plain Say above (the only form measured to produce audio); the length
+  ; comes from the INFO's Begin fragment, which stashes it on the PLAYER for a
+  ; non-actor speaker (see LineBegan).
+  If akSpeaker == None || akTopic == None
+    Return afFallbackLength
+  EndIf
+  Actor gp = Game.GetPlayer()
+  gp.SetActorValue("Variable09", 0.0)
+  SpeakAs(akSpeaker, abInHead, akTopic)
+  Float t = 0.0
+  While t < SAY_START_WAIT() && gp.GetActorValue("Variable09") == 0.0
+    Utility.Wait(0.05)
+    t += 0.05
+  EndWhile
+  Float len = gp.GetActorValue("Variable09")
+  If len <= 0.0
+    Return afFallbackLength      ; no length reported: fall back, never 0
+  EndIf
+  If len < 0.02
+    Return afFallbackLength      ; began, but the line has no measured voice file
+  EndIf
+  Return len
+EndFunction
+
+; The non-blocking form, for the engine's dispatch path (see SayLineNoWait).
+Float Function SpeakAsLineNoWait(ObjectReference akSpeaker, Float afFallbackLength, Bool abInHead = False, Topic akTopic = None) Global
+  SpeakAs(akSpeaker, abInHead, akTopic)
+  Return afFallbackLength
 EndFunction

@@ -1425,3 +1425,132 @@ unmapped pinned the player at level 1 forever.
 > Check `Data/Scripts.zip`, not `Data/Scripts/Source/`, when asking whether a
 > Papyrus native exists: the latter is where mods install their own headers, and
 > in this install its `Game.psc` is 454 lines against vanilla's 266.
+
+## Actor promotion must follow the DECLARING type, not the "feels like an actor" test (2026-08-18)
+
+**Symptom:** the Imperial City Arena softlocked. The player arranged a match with
+Owyn, walked up the ramp, and the announcer never spoke — so `Arena.GateDownFight`
+was never set, the gates never opened, and nothing could advance.
+
+**Cause:** the dedicated `Say` handler resolved its receiver with
+`_resolve_self_ref(..., actor_func=True)`, which PROMOTES the receiver's property
+to `Actor`. But `Say` is declared on **ObjectReference**:
+
+```
+ObjectReference.Say(Topic akTopicToSay, Actor akActorToSpeakAs = None,
+                    bool abSpeakInPlayersHead = false)
+```
+
+Oblivion exercises that breadth. A census of Oblivion.esm's `Say`/`SayTo`
+receivers found **144 calls on 21 non-actor references**: every Daedric shrine
+(ACTI), Clavicus' dog statue (MISC), and — the arena case — four **XMarker
+(STAT)** refs the announcer talks through: `ArenaMatchPlayerRef`,
+`ArenaGalleryMarkerRef`, `ICArenaPlayerMarkerRef`, `ICMonsterFightPlayerRef`.
+The announcer is not an NPC standing somewhere; it is an invisible marker
+positioned in the arena that the topic is played from.
+
+Declared `Actor Property`, those refuse to bind ("cannot be bound because
+`<fid>` is not the right type"), the property comes back **None**, and the first
+call on it aborts the whole function. In `ArenaAnnouncerScript` that first call
+is `ArenaMatchPlayerRef.GetDistance(Player)` on the very first gate, so the
+entire `OnUpdate` body was dead every tick.
+
+This is the same failure the `Unlock` handler already documents. Four handlers
+had it:
+
+| Handler | Real declaration | Non-actor subjects in Oblivion.esm |
+|---|---|---|
+| `say` / `sayto` / `saycustom` | `ObjectReference.Say` | arena XMarkers, Daedric shrines, dog statue |
+| `cast` | `Spell.Cast(ObjectReference akSource, …)` | `SEHaskillSummonMarker`, `MG05ShockMark1`, `SE05SpellMarker1-3` |
+| `pms` / `sms` | `EffectShader.Play/Stop(ObjectReference)` | `SEXedPuzStatue1-5` |
+| `getpos`/`getangle`/`setpos`/`setangle`, `moveto` | all on `ObjectReference` | the Xeddefen puzzle statues, summon markers |
+
+All now use `_resolve_objref_ref`. Whole-plugin `Actor Property`-bound-to-a-
+non-actor count went **54 → 3**, and the 3 survivors are `LVLC` refs called with
+`evp`, which spawn actors — correct as-is.
+
+**The rule:** promote to `Actor` only when the Papyrus method is declared on
+`Actor` and nowhere up the chain. `ObjectReference` is the base type, so anything
+declared there must resolve with `_resolve_objref_ref` — no matter how strongly
+the TES4 call reads like something only an actor would do. `Say` reads exactly
+like an actor-only call and is not one.
+
+**Audit for the whole class** (map REFR/ACHR/ACRE EditorID → base record type,
+then flag every `Actor Property <name>` whose named ref has a non-NPC_/CREA
+base) — worth re-running after touching any handler that passes
+`actor_func=True`.
+
+## `StopQuest` converts to `Stop()` — a "run bit" global does NOT work (2026-08-19)
+
+**The real difference** is that Skyrim's `Quest.Start()` on a stopped quest
+RESETS it: every `Auto` property back to its default, stage back to 0.
+Oblivion's `StopQuest` clears a run bit and touches nothing, so the authored
+idiom "seed the variables, then StartQuest" is safe there and destructive here.
+
+**That is handled by `_hoist_quest_start_above_writes`** — move `Start()` ABOVE
+the writes it would clobber. Nothing else is needed, and nothing else works.
+
+🛑 **A converter-owned run bit was built and REVERTED (2026-08-19).** The idea:
+keep the TES4 run bit in a GLOB `TES4Stopped_<Quest>`, never engine-stop the
+quest, and gate dialogue/`GetQuestRunning` on the global — so variables and
+stages survive a stop/start cycle exactly as in Oblivion. It preserved the
+variables correctly (`CombatantsKilled`/`FirstWin` measured surviving), and it
+still broke the Arena, because **a quest that never stops keeps its CURRENT
+STAGE**:
+
+* `Arena` has exactly ONE stage, 10 (`AllowRepeatedStages`), whose script
+  zeroes the whole match state and then stops the quest.
+* Oblivion restages it every match: stopped quest -> `SetStage 10` runs the
+  reset again.
+* Left engine-running, `Arena` sat at stage 10 permanently. `SetStage(10)` on
+  the stage it is already at does nothing, so the reset never re-ran,
+  `ReadyMatch` stayed 1, and Owyn's next-match line (gated `ReadyMatch == 0`)
+  could never fire — he behaved as though the match had not happened, and the
+  gate stayed down. Measured live: `GetStage Arena >> 10`, `ReadyMatch = 1`.
+
+Reverted in full: no `TES4Stopped_*` globals, no INFO stop-gates, no
+`GetQuestRunning` expansion, no `IsQuestStopped` poll gate, no
+`TES4PersistentActors` FLST / `ResetInterior` polyfill (that rode on the same
+design). `StopQuest`/`StartQuest`/`GetQuestRunning` are plain
+`Stop()`/`Start()`/`IsRunning()`.
+
+**Kept from that work** (both independently verified): the `Start()` hoist now
+also matches a renamed call shape, and `set X.fQuestDelayTime to N` emits
+`RegisterForSingleUpdate`, never `RegisterForUpdate` — the latter is a
+REPEATING registration and `RegisterForUpdate(0)` shipped in 45 scripts as an
+every-frame storm, ended only by the engine stop that the reverted design
+removed. Measured on the shipped build: 0 repeating registrations.
+
+### Renaming a converted call can silently disable a post-pass (2026-08-19)
+
+**Symptom:** after the StopQuest run-bit change, ALL arena dialogue stopped —
+no announcer line, no subtitle, and the gate never opened. Regression, not a
+new bug.
+
+**Cause:** `_hoist_quest_start_above_writes` exists because Skyrim's
+`Quest.Start()` resets every `Auto` property, so the authored TES4 idiom
+"seed the variables, then StartQuest" must become "Start, then seed". Its
+`_QUEST_START_RE` matched only the literal `Q.Start()` shape. Converting
+`StartQuest` to `TES4Polyfill.StartQuest(Q, TES4Stopped_Q)` renamed the call
+out from under that regex, the hoist stopped firing, and every seeded write
+was clobbered again — **91 writes across 43 scripts** (every arena match INFO,
+the arena betting, FGC01), reproducing the exact softlock the hoist was
+written to fix. The polyfill still calls `Q.Start()` internally, so the
+hazard was unchanged; only the pattern that detected it moved.
+
+**Rule:** when a converted call site changes SHAPE, grep for every post-pass
+regex that matches the old shape. A post-pass that silently stops matching
+fails open — no error, no warning, just the original bug back.
+
+**Second, independent clobber (same symptom class):** `pipeline.py`'s
+`_state_writes_before_setstage` hoists literal state writes ABOVE the first
+`SetStage` (so an inline stage fragment's `EvaluatePackage` sees committed
+state). That runs AFTER the converter's post-processing, and it can lift a
+write above `SetStage` while leaving the `Start()` below it — stranding the
+seed again (`ArenaICGrandChampion.CrazyIdea`, 2 sites). Fixed by re-running
+the quest-start hoist on that pass's result; both passes are order-preserving
+elsewhere, so applying it twice is idempotent.
+
+**Guard:** the invariant is "no write to `Q.<prop>` may precede a `Start()` /
+`TES4Polyfill.StartQuest` on the same `Q` within one straight-line run".
+Measured on the shipped build: 91 → 0.

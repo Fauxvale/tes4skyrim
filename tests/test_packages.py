@@ -203,15 +203,29 @@ def test_getscriptvariable_becomes_getvmscriptvariable_with_cis2():
     assert struct.unpack_from('<f', ctda, 4)[0] == 1.0
 
 
-def test_unresolvable_script_variable_is_dropped_not_emitted():
-    """A condition we cannot name would invoke a dead function and be
-    permanently false — silently disabling the package it gates. Drop it."""
+def test_unresolvable_script_variable_reads_zero_like_tes4():
+    """A GetScriptVariable we cannot name must still be emitted, against a
+    sentinel that no script declares.
+
+    TES4 returns 0 for a variable that does not exist (scriptless base,
+    missing index, deleted ref), and Skyrim's GetVMScriptVariable returns 0
+    for a name no attached script has — so the sentinel reproduces the
+    authored outcome. Dropping the condition failed OPEN: SE08's five
+    Xedilian victims (base SE08XeddefenNPC01 has no SCRI) force-greeted and
+    fled unconditionally."""
+    from tes5_import.dialog_conditions import _UNRESOLVED_VAR_SENTINEL
     rec = {
         'ConditionCount': '1',
         'Condition[0].Raw':
             '000000000000803f3500000072bc00000100000000000000',
     }
-    assert convert_ctda_list_with_strings(rec, {}) == []
+    out = convert_ctda_list_with_strings(rec, {})
+    assert len(out) == 1
+    ctda, cis2 = out[0]
+    assert cis2 == _UNRESOLVED_VAR_SENTINEL
+    assert struct.unpack_from('<H', ctda, 8)[0] == 630   # GetVMScriptVariable
+    assert struct.unpack_from('<I', ctda, 12)[0] & 0xFFFFFF == 0xBC72
+    assert struct.unpack_from('<f', ctda, 4)[0] == 1.0    # authored compare
 
 
 # --- Quest ownership / aliasing ------------------------------------------
@@ -247,6 +261,24 @@ def test_script_var_map_walks_refr_to_base_to_script():
     }
     vars_by_ref = build_script_var_map(by_type)
     assert vars_by_ref[0x0000BC72] == {1: 'packageVAR'}
+
+
+def test_script_var_map_covers_every_scriptable_base():
+    """A scripted WEAP/MISC ref resolves too: the goblin leaders' totem staffs
+    (CreatureGoblinLeaderFindHead*, 21 PACK conditions) and 11 INFO gates on
+    scripted MISC refs lost their variable name under an NPC_/CREA/ACTI/CONT/
+    DOOR/QUST-only list."""
+    by_type = {
+        'SCPT': [{'FormID': '00000100', 'VariableCount': '1',
+                  'Variable[0].Index': '2', 'Variable[0].Name': 'totemHeld'}],
+        'WEAP': [{'FormID': '00000200', 'SCRI': '00000100'}],
+        'MISC': [{'FormID': '00000201', 'SCRI': '00000100'}],
+        'REFR': [{'FormID': '00000300', 'NAME': '00000200'},
+                 {'FormID': '00000301', 'NAME': '00000201'}],
+    }
+    vars_by_ref = build_script_var_map(by_type)
+    assert vars_by_ref[0x300] == {2: 'totemHeld'}
+    assert vars_by_ref[0x301] == {2: 'totemHeld'}
 
 
 def test_alias_location_uses_reference_alias_type_8():
@@ -329,6 +361,84 @@ def test_shared_base_keeps_script_and_adds_ref(monkeypatch):
     assert os_._OBJECT_VMAD.get(0x0000A29D) == b'VMAD\x04\x00base'
 
 
+def test_addscriptpackage_reaches_the_actors_quest_alias():
+    """A package forced on by `AddScriptPackage` must land on the actor's alias.
+
+    TES4's `AddScriptPackage` puts a package on an actor that does NOT list it
+    in its AI array — that is the point of the call. Skyrim has no equivalent
+    (`SetOverridePackage` is a Fallout 4 API; it is absent from SkyrimSE.exe
+    1.6, which exports only `EvaluatePackage` and `KeepOffsetFromActor`), and
+    the converter maps the call to a bare `EvaluatePackage()`. That only
+    re-runs arbitration over packages the actor ALREADY has, so unless the
+    forced package is attached to the actor's quest alias as an ALPC the engine
+    can never select it and the package silently never runs.
+
+    Nehrim's MQ00 is the visible case: Celebro stops following the player
+    because MQ00CalebroPackage04 — added by INFO 0x11D3, which is gated
+    `GetIsID Celebro02` — was on no actor at all.
+    """
+    from tes5_import.pack_aliases import (PackagePlan,
+                                          build_script_assigned_packages)
+
+    # INFO gated on GetIsID (func 72) -> Celebro02 (0x11C7), forcing Package04.
+    getisid = struct.pack('<BBBBfIIIiI', 0, 0, 0, 0, 1.0,
+                          72, 0x000011C7, 0, 0, 0xFFFFFFFF)
+    getstage = struct.pack('<BBBBfIIIiI', 0x60, 0, 0, 0, 20.0,
+                           58, 0x00000811, 0, 0, 0xFFFFFFFF)
+    by_type = {
+        'PACK': [{'FormID': '000011DD', 'EditorID': 'MQ00CalebroPackage04',
+                  'Condition[0].Raw': getstage.hex()}],
+        'QUST': [{'FormID': '00000811', 'EditorID': 'MQ00'}],
+        'NPC_': [{'FormID': '000011C7', 'EditorID': 'Celebro02'}],
+        'ACHR': [{'FormID': '000011CA', 'EditorID': 'Celebro2Ref',
+                  'NAME': '000011C7'}],
+        'INFO': [{'FormID': '000011D3', 'Condition[0].Raw': getisid.hex(),
+                  'ResultScript':
+                      'SetStage MQ00 20\r\nAddScriptPackage '
+                      'MQ00CalebroPackage04'}],
+    }
+    fid_to_edid = {0x000011DD: 'MQ00CalebroPackage04',
+                   0x000011C7: 'Celebro02', 0x000011CA: 'Celebro2Ref'}
+
+    assigned = build_script_assigned_packages(by_type, fid_to_edid)
+    assert assigned.get(0x000011DD) == {0x000011C7}, \
+        'the INFO speaker (GetIsID) is who the bare call acts on'
+
+    plan = PackagePlan()
+    plan.build(by_type, {0x00000811}, {}, None, assigned)
+    # The package hangs off the SPEAKER'S PLACED REF, which is what an alias
+    # fills — not the base actor.
+    assert plan.quest_packages[0x00000811][0x000011CA] == [0x000011DD]
+    assert 0x000011CA in plan.needed_aliases[0x00000811]
+
+
+def test_commented_out_addscriptpackage_is_not_resurrected():
+    """A disabled call must stay disabled.
+
+    The export escapes script newlines/tabs as the LITERAL sequences \r\n and
+    \t, so a `;` comment runs to the escaped newline rather than a real one.
+    Scanning the raw text treats every commented-out call as live — Nehrim's
+    StartCelleTrigZonePlayerStoryvar01SCRIPT carries
+    `;\tCelebroRef.AddScriptPackage, ...`, and attaching it would resurrect
+    content the author deliberately cut. The escaped `\t` also has to be
+    resolved or the ref name is captured as `tCelebroRef` and resolves to
+    nothing.
+    """
+    from tes5_import.pack_aliases import build_script_assigned_packages
+
+    by_type = {'SCPT': [{
+        'FormID': '00001111', 'EditorID': 'S',
+        'SCTX': 'scn S\r\n;\tCelebroRef.AddScriptPackage, Pkg\r\n'
+                '\tCelebroRef.AddScriptPackage, LivePkg\r\n',
+    }]}
+    fid_to_edid = {0x00000D91: 'CelebroRef', 0x00000E9D: 'Pkg',
+                   0x00000E9E: 'LivePkg'}
+    assigned = build_script_assigned_packages(by_type, fid_to_edid)
+    assert 0x00000E9D not in assigned, 'commented-out call was resurrected'
+    assert assigned.get(0x00000E9E) == {0x00000D91}, \
+        'the live call on the next line must still resolve (tab-stripped)'
+
+
 def test_cross_cell_follow_stays_follow_not_escort():
     """A TES4 Follow whose PLDT is in ANOTHER cell must stay Follow.
 
@@ -368,3 +478,101 @@ def test_cross_cell_follow_stays_follow_not_escort():
 
     # An unknown cell must NOT silently downgrade a package that was fine.
     assert _choose(rec, PackContext(), 0x00000E9D).t is ESCORT
+
+
+def test_hunt_at_actor_base_becomes_a_follow_chain_nearest_first():
+    """A Find at an actor BASE with several placements is a CHAIN of Follow
+    packages (one per placed target, nearest the hunter first), each gated on
+    the target being in the hunter's cell, enabled and alive, followed by the
+    source package as the tail.
+
+    Measured live 2026-08-18 on FGC06: with a wander-only in-cell Sandbox all
+    three fighters were RUNNING their hunt package (getiscurrentpackage) and
+    stayed within ~300 units of spawn; a PLDT type-4 'Object ID' location
+    patched into the live package left them standing.  Skyrim seeks a
+    REFERENCE (Follow) — so the chain does the seeking, and the engine walks
+    it as each target dies.
+    """
+    from tes5_import.pack_converter import (hunt_chain_targets, PackContext,
+                                            _seek_record, convert_PACK_records,
+                                            T4_FIND, CTDA_GET_DEAD,
+                                            CTDA_GET_DISABLED,
+                                            CTDA_GET_IN_SAME_CELL)
+    from tes5_import.pack_templates import FOLLOW, SANDBOX
+    from tes5_import.text_reader import set_formid_index_offset
+    set_formid_index_offset(1)
+    try:
+        rec = {'Signature': 'PACK', 'FormID': '000292CD',
+               'EditorID': 'FGC06RiennaGoblinHunt', 'RecordFlags': '0',
+               'PKDT.Type': str(T4_FIND), 'PKDT.Flags': '4096',
+               'PTDT.Type': '1', 'PTDT.Target': '0002888E',
+               'PTDT.Count': '10', 'ConditionCount': '1',
+               # GetStage(FGC06Courier) >= 30
+               'Condition[0].Raw': '600000000000f0413a0000008e7f0200'
+                                   '0000000000000000'}
+        far, near, mid = 0x01048F45, 0x010288A4, 0x01048F41
+        ctx = PackContext(
+            base_sig={0x02888E: 'CREA'},
+            base_placements={0x02888E: ((far, 0x028869), (near, 0x028869),
+                                        (mid, 0x028869))},
+            interior_cells={0x028869},
+            pack_runner_refs={0x0292CD: {0x0288AA}},
+            actor_pos={0x0288AA: (1295.0, 7.0, 2.0),
+                       0x048F45: (3378.0, 1143.0, -345.0),
+                       0x0288A4: (2560.0, 224.0, -352.0),
+                       0x048F41: (2552.0, 400.0, -341.0)},
+            pack_runner_cells={0x0292CD: {0x028869}})
+        assert hunt_chain_targets(rec, ctx, 0x010292CD) == [near, mid, far], \
+            'nearest to the hunter first'
+
+        ctx.hunt_chains = {0x010292CD: [(0x01F00001, near), (0x01F00002, mid),
+                                        (0x01F00003, far)]}
+        recs = convert_PACK_records(rec, ctx)
+        assert len(recs) == 4, 'three seek links + the source tail'
+        # Every link is a Follow of its target under the source's gates plus
+        # the three target gates.
+        for k, (b, ref) in enumerate(zip(recs[:3], (near, mid, far)), 1):
+            subs = _subrecords(b)
+            assert struct.unpack('<I', b[12:16])[0] == 0x01F00000 + k
+            assert _first(subs, 'EDID').rstrip(b'\0') == \
+                f'FGC06RiennaGoblinHuntSeek{k:02d}'.encode()
+            pkcu = struct.unpack('<III', _first(subs, 'PKCU'))
+            assert pkcu[1] == FOLLOW.formid
+            ctdas = [d for s, d in subs if s == 'CTDA']
+            funcs = [struct.unpack_from('<H', d, 8)[0] for d in ctdas]
+            assert funcs[0] == 58, 'the source GetStage gate is kept'
+            assert funcs[1:] == [CTDA_GET_IN_SAME_CELL, CTDA_GET_DISABLED,
+                                 CTDA_GET_DEAD]
+            # GetInSameCell(target) runs on the hunter; the other two run ON
+            # the target reference (RunOn 2 + reference).
+            assert struct.unpack_from('<I', ctdas[1], 12)[0] == ref
+            for d in ctdas[2:]:
+                run_on, reference = struct.unpack_from('<II', d, 20)
+                assert (run_on, reference) == (2, ref)
+                assert struct.unpack_from('<f', d, 4)[0] == 0.0
+            ptda = struct.unpack('<iIi', _first(subs, 'PTDA'))
+            assert ptda == (0, ref, 0), 'Follow THIS placed goblin'
+        tail = _subrecords(recs[3])
+        assert struct.unpack('<III', _first(tail, 'PKCU'))[1] == SANDBOX.formid
+    finally:
+        set_formid_index_offset(0)
+
+
+def test_hunt_chain_runs_ahead_of_its_source_on_alias_and_pkid_lists():
+    from tes5_import.packages import (npc_packages, set_package_chains,
+                                      set_quest_packages)
+    plan = PackagePlan()
+    plan.owner_quest[0x0100AAAA] = 0x01000900
+    plan.quest_packages[0x01000900] = {0x01000BB1: [0x0100AAAA, 0x0100AAAB]}
+    plan.expand_packages({0x0100AAAA: [0x0100C001, 0x0100C002]})
+    assert plan.quest_packages[0x01000900][0x01000BB1] == \
+        [0x0100C001, 0x0100C002, 0x0100AAAA, 0x0100AAAB]
+    assert plan.owner_quest[0x0100C001] == 0x01000900
+
+    set_quest_packages(())
+    set_package_chains({0x0100DDDD: [0x0100E001]})
+    try:
+        assert npc_packages([0x0100DDDD, 0x0100DDDE]) == \
+            [0x0100E001, 0x0100DDDD, 0x0100DDDE]
+    finally:
+        set_package_chains({})

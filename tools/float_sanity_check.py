@@ -29,6 +29,9 @@ import struct
 import sys
 import zlib
 from collections import Counter
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+from output_layout import paths  # noqa: E402
 
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _HEADER = 24
@@ -132,7 +135,7 @@ def main():
 
     total = 0
     for name in args.plugin:
-        path = os.path.join(args.output_dir, name, name)
+        path = str(paths(name, out_root=args.output_dir).esm)
         if not os.path.isfile(path):
             print(f"--- {name}: NOT BUILT ({path})")
             continue

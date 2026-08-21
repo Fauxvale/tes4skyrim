@@ -352,7 +352,7 @@ def bounds_from_data(data):
 # mwallplankbreakaway01's planks hung in mid-air.  Oblivion's cache happened to
 # be rebuilt an hour after that commit, so the same meshes worked there — which
 # is why this looked like a Nehrim-only mesh bug rather than a stale cache.
-BOUNDS_SCHEMA_VERSION = 2
+BOUNDS_SCHEMA_VERSION = 3
 _BOUNDS_SCHEMA_KEY = '__schema__'
 
 

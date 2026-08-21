@@ -112,6 +112,12 @@ _BLEND_DURATION = 0.0   # objects snap between sequences; no cross-fade
 # Vanilla's name for a self-playing ambient sequence.  The state machine starts
 # on it instead of the do-nothing Rest state (see _behavior_xml).
 _AUTOPLAY_SEQUENCE = 'AutoPlay'
+_AUTOLOOP_SEQUENCE = 'AutoLoop'   # where the real ambient motion lives
+
+# Vanilla's shared self-playing graph -- the BGED value stored by all 63
+# vanilla AutoPlay meshes.  Backslashed and relative to meshes\ (the engine
+# prepends "Meshes\%s" itself).
+_VANILLA_AUTOPLAY_BGED = 'GenericBehaviors\\Autoplay.hkx'
 
 # Vanilla's fixed dummy bone name for single-bone animated objects
 # (clutter\beehive\characterassets\SingleBoneSkeleton.hkx uses exactly this).
@@ -430,13 +436,19 @@ def _behavior_xml(graph_name: str, sequences: list) -> str:
         '\t<hkparam name="payload">null</hkparam>\n</hkobject>'))
     sm.param('startStateChooser', 'null')
     # Start on the Rest state, never on a motion sequence (see above) -- UNLESS
-    # the mesh carries an AutoPlay sequence.  AutoPlay is vanilla's name for
-    # ambient animation that plays by itself with no script behind it (66
-    # meshes: atronach skins, dragon-priest mist, steam vents), so for those the
-    # graph MUST start on it or the effect sits frozen on its first frame --
-    # which is precisely the Rest-state behaviour the doors need.
-    _autoplay_id = next((i for i, s in enumerate(sequences)
-                         if s == _AUTOPLAY_SEQUENCE), None)
+    # the mesh carries an ambient sequence.  AutoPlay/AutoLoop is vanilla's
+    # name for animation that plays by itself with no script behind it, so
+    # for those the graph MUST start on it or the effect sits frozen on its
+    # first frame -- which is precisely the Rest-state behaviour the doors
+    # need.  A mesh mixing ambient and script-driven sequences reaches this
+    # generated graph (the shared vanilla one has no states for the scripted
+    # names); AutoLoop is the authored loop and AutoPlay only its CLAMP intro
+    # (nif_converter._autoplay_ambient_sequences), so start on AutoLoop when
+    # both exist -- this graph has no End -> AutoLoop hand-off.
+    _autoplay_id = next(
+        (i for i, s in enumerate(sequences) if s == _AUTOLOOP_SEQUENCE),
+        next((i for i, s in enumerate(sequences) if s == _AUTOPLAY_SEQUENCE),
+             None))
     sm.param('startStateId',
              rest_id if _autoplay_id is None else _autoplay_id)
     sm.param('returnToPreviousStateEventId', -1)
@@ -447,6 +459,11 @@ def _behavior_xml(graph_name: str, sequences: list) -> str:
     sm.param('wrapAroundStateId', 'false')
     sm.param('maxSimultaneousTransitions', 32)
     sm.param('startStateMode', 'START_STATE_MODE_DEFAULT')
+    # Vanilla's shared AutoPlay graph (GenericBehaviors\Autoplay.hkx) decodes
+    # to selfTransitionMode=0, so this stays NO_TRANSITION.  Looping is the
+    # SEQUENCE's own cycle type, not the state machine's: an ambient sequence
+    # loops because it is CYCLE_LOOP, and FORCE_TRANSITION_TO_START_STATE
+    # (tried 2026-08-18) did not make a CLAMP sequence loop.
     sm.param('selfTransitionMode', 'SELF_TRANSITION_MODE_NO_TRANSITION')
     sm.params.append(('states', ' '.join(s.ref for s in states),
                       f'array:{len(states)}'))
@@ -504,6 +521,31 @@ def generate_animobject_project(out_root: str, model_rel: str,
     """
     if not sequences:
         return ''
+
+    # Ambient meshes use VANILLA'S OWN shared AutoPlay graph instead of a
+    # generated per-mesh project.
+    #
+    # All 63 self-playing vanilla meshes (atronach skins, dragon-priest mist,
+    # steam vents, the camera-attach weather effects) store
+    # 'GenericBehaviors\\Autoplay.hkx' in their BGED; none ships a project of
+    # its own.  Its four files are present in vanilla SSE, so pointing at it
+    # ships nothing extra.
+    #
+    # Vanilla proves this graph drives SKINNED bone animation off a
+    # single-bone rig, which is what an arena spectator needs:
+    # effects\\trailerfx\\tfxdsflight.nif is non-actor, skinned over 17
+    # bones, animates 13 NiTransformControllers, and runs on this graph.
+    #
+    # Read out of the live engine on a converted arena spectator
+    # (2026-08-18): the graph binds, AutoplayState plays 'AutoPlay' to its
+    # end, hands off to AutoLoopState, and 'AutoLoop' runs from there.
+    #
+    # Scoped to meshes whose sequences are ONLY ambient.  Anything a script
+    # drives by name (Forward/Backward/SpecialIdle) keeps its generated
+    # project: the shared graph has no state for those events, so
+    # PlayAnimation() would have nothing to transition to.
+    if all(seq in (_AUTOPLAY_SEQUENCE, _AUTOLOOP_SEQUENCE) for seq in sequences):
+        return _VANILLA_AUTOPLAY_BGED
 
     rel_dir = os.path.dirname(model_rel).replace('\\', '/')
     stem = os.path.splitext(os.path.basename(model_rel))[0]

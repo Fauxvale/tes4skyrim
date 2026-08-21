@@ -129,9 +129,16 @@ def _all_export_codes():
     codes = set()
     if not os.path.isdir(root):
         return codes
+    # Every RECORD dir under export/, not every top-level folder: an imported
+    # mod's group folder holds its plugins' records one level down.
     for name in os.listdir(root):
-        codes |= {_get(r, 'EditorID')
-                  for r in _load(os.path.join(root, name), 'MGEF')}
+        d = os.path.join(root, name)   # noqa: plugin-path (listdir entry, not a plugin name)
+        if not os.path.isdir(d):
+            continue
+        subs = [os.path.join(d, q) for q in os.listdir(d)
+                if os.path.isfile(os.path.join(d, q, 'MGEF.txt'))]
+        for rec_dir in ([d] + subs):
+            codes |= {_get(r, 'EditorID') for r in _load(rec_dir, 'MGEF')}
     codes.discard('')
     return codes
 

@@ -179,8 +179,9 @@ def test_lip_files_excluded_like_bsa(tmp_path, capsys):
     arc = _zip(tmp_path / 'mod.zip', entries)
     export = tmp_path / 'export'
     mod_ingest.ingest(arc, export, log=lambda *a: None)
-    assert not list((export / 'MyMod.esp').rglob('*.lip'))
-    assert (export / 'MyMod.esp' / 'sound' / 'fx' / 'noise.wav').is_file()
+    assert not list(source_registry.asset_root(export, 'MyMod.esp').rglob('*.lip'))
+    assert (source_registry.asset_root(export, 'MyMod.esp')
+            / 'sound' / 'fx' / 'noise.wav').is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +193,7 @@ def test_ingest_produces_bsa_shaped_tree(tmp_path):
     export = tmp_path / 'export'
     mod_ingest.ingest(arc, export, log=lambda *a: None)
 
-    root = export / 'MyMod.esp'
+    root = source_registry.asset_root(export, 'MyMod.esp')
     assert (root / 'meshes' / 'clutter' / 'thing.nif').read_bytes() == b'NIF-DATA'
     assert (root / 'textures' / 'clutter' / 'thing.dds').read_bytes() == b'DDS-DATA'
     assert (root / 'sound' / 'fx' / 'noise.wav').is_file()
@@ -230,7 +231,8 @@ def test_ingest_is_idempotent(tmp_path):
     arc = _zip(tmp_path / 'mod.zip', _mod_entries())
     export = tmp_path / 'export'
     mod_ingest.ingest(arc, export, log=lambda *a: None)
-    nif = export / 'MyMod.esp' / 'meshes' / 'clutter' / 'thing.nif'
+    nif = (source_registry.asset_root(export, 'MyMod.esp')
+           / 'meshes' / 'clutter' / 'thing.nif')
     stamp = nif.stat().st_mtime_ns
 
     res = mod_ingest.ingest(arc, export, log=lambda *a: None)
@@ -246,13 +248,33 @@ def test_multiple_plugins_share_one_payload(tmp_path):
     res = mod_ingest.ingest(arc, export, log=lambda *a: None)
 
     assert set(res) == {'MyMod.esp', 'MapMarkers.esp'}
+
+    # ONE asset tree, shared -- not a copy or a hard-link farm per plugin.
+    roots = {source_registry.asset_root(export, n)
+             for n in ('MyMod.esp', 'MapMarkers.esp')}
+    assert len(roots) == 1
+    root = roots.pop()
+    assert (root / 'meshes' / 'clutter' / 'thing.nif').is_file()
+
+    # The payload exists exactly once on disk.
+    assert len(list(export.rglob('meshes/clutter/thing.nif'))) == 1
+
+    # Both binaries live in that one tree's _source/, and each plugin keeps
+    # its own identity.
     for name in ('MyMod.esp', 'MapMarkers.esp'):
-        assert (export / name / 'meshes' / 'clutter' / 'thing.nif').is_file()
-        assert (export / name / '_source' / name).is_file()
+        assert (root / '_source' / name).is_file()
+        assert source_registry.record_dir(export, name) == root / name
+
     # Both share one group so the GUI can offer them as one source.
     gids = {source_registry.get(export, n)['group_id']
             for n in ('MyMod.esp', 'MapMarkers.esp')}
     assert len(gids) == 1
+
+    # group_plugins records the whole archive, so a later partial import
+    # cannot silently disagree with a full one.
+    for name in ('MyMod.esp', 'MapMarkers.esp'):
+        assert set(source_registry.get(export, name)['group_plugins']) == {
+            'MyMod.esp', 'MapMarkers.esp'}
 
 
 @pytest.mark.parametrize('spelling', [
@@ -295,7 +317,7 @@ def test_loose_files_win_over_bsa(tmp_path):
     export = tmp_path / 'export'
     mod_ingest.ingest(arc, export, log=lambda *a: None)
 
-    root = export / 'MyMod.esp'
+    root = source_registry.asset_root(export, 'MyMod.esp')
     assert (root / 'meshes' / 'clutter' / 'thing.nif').read_bytes() == b'FROM-LOOSE'
     # ...and BSA-only content still survives.
     assert (root / 'meshes' / 'only' / 'in' / 'bsa.nif').read_bytes() == b'BSA-ONLY'
@@ -310,7 +332,7 @@ def test_nested_archive_is_ingested(tmp_path):
     export = tmp_path / 'export'
     mod_ingest.ingest(arc, export, log=lambda *a: None)
 
-    root = export / 'MyMod.esp'
+    root = source_registry.asset_root(export, 'MyMod.esp')
     assert (root / 'meshes' / 'nested' / 'deep.nif').read_bytes() == b'NESTED'
     assert (root / 'meshes' / 'clutter' / 'thing.nif').is_file()
     assert not list(root.rglob('inner.zip'))
@@ -324,7 +346,8 @@ def test_outer_archive_wins_over_nested(tmp_path):
     arc = _zip(tmp_path / 'outer.zip', entries)
     export = tmp_path / 'export'
     mod_ingest.ingest(arc, export, log=lambda *a: None)
-    thing = export / 'MyMod.esp' / 'meshes' / 'clutter' / 'thing.nif'
+    thing = (source_registry.asset_root(export, 'MyMod.esp')
+             / 'meshes' / 'clutter' / 'thing.nif')
     assert thing.read_bytes() == b'NIF-DATA'
 
 
@@ -337,7 +360,7 @@ def test_folder_import(tmp_path):
     export = tmp_path / 'export'
     mod_ingest.ingest(src, export, log=lambda *a: None)
 
-    root = export / 'MyMod.esp'
+    root = source_registry.asset_root(export, 'MyMod.esp')
     assert (root / 'meshes' / 'clutter' / 'thing.nif').is_file()
     assert source_registry.get(export, 'MyMod.esp')['kind'] == 'folder'
 
@@ -353,7 +376,8 @@ def test_reingest_uses_retained_archive(tmp_path):
     res = mod_ingest.reingest('MyMod.esp', export, log=lambda *a: None,
                               force=True)
     assert res['MyMod.esp']['cached'] is False
-    assert (export / 'MyMod.esp' / 'meshes' / 'clutter' / 'thing.nif').is_file()
+    assert (source_registry.asset_root(export, 'MyMod.esp')
+            / 'meshes' / 'clutter' / 'thing.nif').is_file()
 
 
 def test_secondary_plugin_can_reingest(tmp_path):
@@ -388,8 +412,9 @@ def test_remove_deletes_tree_and_entry(tmp_path):
     arc = _zip(tmp_path / 'mod.zip', _mod_entries())
     export = tmp_path / 'export'
     mod_ingest.ingest(arc, export, log=lambda *a: None)
+    root = source_registry.asset_root(export, 'MyMod.esp')
     assert mod_ingest.remove('MyMod.esp', export, log=lambda *a: None)
-    assert not (export / 'MyMod.esp').exists()
+    assert not root.exists()
     assert source_registry.get(export, 'MyMod.esp') is None
 
 
@@ -715,3 +740,229 @@ def _make_bsa(path, files):
 
     path.write_bytes(bytes(out))
     return path
+
+
+# ---------------------------------------------------------------------------
+#  Group folders and the output-side scanners
+# ---------------------------------------------------------------------------
+
+def test_converted_plugins_finds_plugins_inside_a_group_folder(tmp_path):
+    """A mod folder is named for the MOD, so `<folder>/<folder>` misses it.
+
+    Both scanners key off `<plugin>.manifest.json` instead. Getting this wrong
+    drops the plugin out of load-order resolution silently.
+    """
+    from asset_convert.sibling_lod import converted_plugins
+
+    out = tmp_path / 'output'
+    # A single-plugin conversion: folder named for the plugin.
+    solo = out / 'Oblivion.esm'
+    solo.mkdir(parents=True)
+    (solo / 'Oblivion.esm').write_bytes(b'x')
+
+    # A mod group: folder named for the mod, three plugins inside.
+    grp = out / 'Tamriel Resource Pack Full 2.0'
+    grp.mkdir(parents=True)
+    for n in ('TamRes.esm', 'TamRes.esp', 'TamRes_LandscapeResource.esm'):
+        (grp / n).write_bytes(b'x')
+        (grp / f'{n}.manifest.json').write_text('{}', encoding='utf-8')
+
+    # A manifest with no plugin beside it is NOT a converted plugin.
+    (grp / 'Ghost.esp.manifest.json').write_text('{}', encoding='utf-8')
+
+    assert converted_plugins(out) == [
+        'Oblivion.esm', 'TamRes.esm', 'TamRes.esp',
+        'TamRes_LandscapeResource.esm']
+
+
+def test_gui_scan_converted_finds_group_members(tmp_path):
+    import json as _json
+    import gui
+
+    out = tmp_path / 'output'
+    grp = out / 'Some Mod 1.0'
+    grp.mkdir(parents=True)
+    for n in ('A.esp', 'B.esp'):
+        (grp / n).write_bytes(b'x')
+        (grp / f'{n}.manifest.json').write_text(
+            _json.dumps({'source': n}), encoding='utf-8')
+
+    assert gui.scan_converted(str(out)) == ['A.esp', 'B.esp']
+
+
+def test_removing_one_plugin_keeps_the_shared_assets(tmp_path):
+    """Deleting one of three plugins must not delete the other two's meshes."""
+    entries = _mod_entries('TWMP/Data/')
+    entries['TWMP/Data/MapMarkers.esp'] = _tes4_plugin_bytes()
+    arc = _zip(tmp_path / 'twmp.zip', entries)
+    export = tmp_path / 'export'
+    mod_ingest.ingest(arc, export, log=lambda *a: None)
+    root = source_registry.asset_root(export, 'MyMod.esp')
+
+    assert mod_ingest.remove('MapMarkers.esp', export, log=lambda *a: None)
+    assert (root / 'meshes' / 'clutter' / 'thing.nif').is_file()
+    assert (root / '_source' / 'MyMod.esp').is_file()
+    assert not (root / '_source' / 'MapMarkers.esp').exists()
+    assert source_registry.get(export, 'MyMod.esp') is not None
+
+    # The last one out takes the tree with it.
+    assert mod_ingest.remove('MyMod.esp', export, log=lambda *a: None)
+    assert not root.exists()
+
+
+# ---------------------------------------------------------------------------
+#  The migration tool agrees with the resolver
+# ---------------------------------------------------------------------------
+
+def _legacy_layout(tmp_path, label, plugs):
+    """An export/ tree in the OLD one-folder-per-plugin shape."""
+    import json as _json
+    exp = tmp_path / 'export'
+    for n in plugs:
+        (exp / n / 'meshes').mkdir(parents=True)
+        (exp / n / '_source').mkdir(parents=True)
+        (exp / n / 'meshes' / 'm.nif').write_bytes(b'M')
+        (exp / n / '_source' / n).write_bytes(b'P')
+        (exp / n / 'STAT.txt').write_text('recs ' + n, encoding='utf-8')
+    reg = {'version': 1, 'sources': {
+        n: {'kind': 'archive', 'plugin': n, 'group_id': 'g',
+            'group_label': label, 'group_plugins': list(plugs)} for n in plugs}}
+    (exp / 'sources.json').write_text(_json.dumps(reg), encoding='utf-8')
+    return exp
+
+
+@pytest.mark.parametrize('label,plugs', [
+    ('My Pack', ('A.esm', 'B.esp')),   # ordinary multi-plugin mod
+    ('A.esm',   ('A.esm', 'B.esp')),   # label == a member's name (A.esm.zip)
+    ('Solo',    ('A.esm',)),           # one plugin, label differs
+    ('A.esm',   ('A.esm',)),           # one plugin, label == its name
+])
+def test_migration_puts_records_where_the_resolver_looks(tmp_path, label, plugs):
+    """The migration and `record_dir` must agree on the nesting rule.
+
+    They disagreed twice: the tool nested unconditionally while `record_dir`
+    nests only for multi-plugin mods, and a self-named group folder left one
+    member's records loose in the root. Either way the records end up
+    somewhere the pipeline never looks and the export silently reads as
+    missing -- no error, just an empty export.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
+    from migrate_group_layout import migrate
+
+    exp = _legacy_layout(tmp_path, label, plugs)
+    migrate(exp, apply=True, log=lambda *a: None)
+
+    for n in plugs:
+        rec = source_registry.record_dir(exp, n)
+        assert (rec / 'STAT.txt').is_file(), f'{n}: records not at {rec}'
+        assert (rec / 'STAT.txt').read_text(encoding='utf-8') == 'recs ' + n
+
+    # One shared payload, and running it again changes nothing.
+    assert len(list(exp.rglob('meshes/m.nif'))) == 1
+    migrate(exp, apply=True, log=lambda *a: None)
+    for n in plugs:
+        assert (source_registry.record_dir(exp, n) / 'STAT.txt').is_file()
+
+
+def test_shared_counts_land_on_every_group_member(tmp_path):
+    """`counts` describes the shared tree, so a partial import must not leave
+    siblings reading zero -- that made --list-mods show one plugin's files."""
+    entries = _mod_entries('TWMP/Data/')
+    entries['TWMP/Data/MapMarkers.esp'] = _tes4_plugin_bytes()
+    arc = _zip(tmp_path / 'twmp.zip', entries)
+    export = tmp_path / 'export'
+    mod_ingest.ingest(arc, export, log=lambda *a: None)
+
+    totals = {n: sum((source_registry.get(export, n) or {}).get('counts', {})
+                     .values())
+              for n in ('MyMod.esp', 'MapMarkers.esp')}
+    assert totals['MyMod.esp'] > 0
+    assert totals['MyMod.esp'] == totals['MapMarkers.esp']
+
+
+def test_capabilities_are_shared_across_group_members(tmp_path):
+    """Every plugin from one archive draws on the SAME meshes/textures, so the
+    GUI must offer the same steps for all of them.
+
+    Two separate defects made a resource pack look empty: siblings imported
+    before the field existed stored `capabilities: None`, and the GUI's
+    fallback measured `export/<plugin>/` -- a path that stops existing once the
+    mod shares one group folder -- so it reported no meshes at all.
+    """
+    entries = _mod_entries('TWMP/Data/')
+    entries['TWMP/Data/MapMarkers.esp'] = _tes4_plugin_bytes()
+    arc = _zip(tmp_path / 'twmp.zip', entries)
+    export = tmp_path / 'export'
+    mod_ingest.ingest(arc, export, log=lambda *a: None)
+
+    caps = {n: (source_registry.get(export, n) or {}).get('capabilities')
+            for n in ('MyMod.esp', 'MapMarkers.esp')}
+    assert caps['MyMod.esp'] == caps['MapMarkers.esp']
+    assert caps['MyMod.esp']['meshes'] is True
+    assert caps['MyMod.esp']['textures'] is True
+
+    steps = {n: mod_ingest.available_steps(c) for n, c in caps.items()}
+    assert steps['MyMod.esp'] == steps['MapMarkers.esp']
+    assert 'meshes' in steps['MyMod.esp']
+
+    # The measured-on-demand path (an entry with no stored capabilities) must
+    # look at the shared tree, not the vanished per-plugin folder.
+    measured = mod_ingest.capabilities_for(
+        source_registry.asset_root(export, 'MapMarkers.esp'), has_plugin=True)
+    assert measured['meshes'] is True
+    assert measured['textures'] is True
+
+
+def test_a_master_inside_a_group_folder_still_resolves(tmp_path):
+    """A plugin can master an imported mod's ESM.
+
+    Masters used to resolve as sibling directories under export/. Once an
+    imported mod's plugins moved into their mod's shared folder, every such
+    master read as MISSING -- the importer warned "master export not found" and
+    diffed the overrides against nothing, which is this project's classic
+    silent-failure mode.
+    """
+    import os
+    from tes5_import.overrides import _export_root, _master_export_dir
+
+    # A two-plugin mod, so its members nest inside the group folder.
+    entries = _mod_entries('TWMP/Data/')
+    entries['TWMP/Data/MapMarkers.esp'] = _tes4_plugin_bytes()
+    arc = _zip(tmp_path / 'twmp.zip', entries)
+    export = tmp_path / 'export'
+    mod_ingest.ingest(arc, export, log=lambda *a: None)
+
+    # Give the master a record dump, as an export would.
+    rec = source_registry.record_dir(export, 'MyMod.esp')
+    rec.mkdir(parents=True, exist_ok=True)
+    (rec / '_HEADER.txt').write_text('', encoding='utf-8')
+
+    # From a top-level plugin's record dir AND from a nested one, the master
+    # must be found.
+    for start in (export / 'Oblivion.esm',
+                  source_registry.record_dir(export, 'MapMarkers.esp')):
+        root = _export_root(str(start))
+        assert os.path.isfile(os.path.join(root, 'sources.json')), start
+        found = _master_export_dir(root, 'MyMod.esp')
+        assert os.path.isdir(found), f'{start}: master not found at {found}'
+
+
+def test_missing_master_check_sees_group_folder_masters(tmp_path, monkeypatch):
+    """convert._missing_master_exports must not report a converted master."""
+    import convert
+
+    entries = _mod_entries('TWMP/Data/')
+    entries['TWMP/Data/MapMarkers.esp'] = _tes4_plugin_bytes()
+    arc = _zip(tmp_path / 'twmp.zip', entries)
+    export = tmp_path / 'export'
+    mod_ingest.ingest(arc, export, log=lambda *a: None)
+
+    rec = source_registry.record_dir(export, 'MyMod.esp')
+    rec.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(convert, 'get_masters_from_binary',
+                        lambda _p: ['MyMod.esp'])
+    missing = convert._missing_master_exports(
+        ['MapMarkers.esp'], str(export), '')
+    assert missing == {}, f'falsely reported missing: {missing}'

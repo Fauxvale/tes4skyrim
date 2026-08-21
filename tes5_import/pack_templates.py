@@ -148,14 +148,41 @@ SLEEP = Template(
 )
 
 # --- Sit (00019715) — 129 instances --------------------------------------
-# procedures: Find -> Travel -> Wander -> Wait
+# procedures: Simultaneous(Find chair -> list, Travel -> Wander at location)
+#             then Simultaneous(Sit found chair, Wait).
+# "Go to this area and sit on any piece of furniture matching the criteria".
+# Slot 1 takes every PTDA form vanilla uses for a criteria: a specific ref
+# (WindhelmJarlSitInThrone), an object TYPE (DA14StartSamSit, type 2), or an
+# object ID = a FURN base (MG06Stage99MirabelleGetIntoFurniture, type 1) —
+# which is exactly how a TES4 Find aimed at a furniture BASE spells itself.
+# Wait time 0 is what all three vanilla instances above write: sit until the
+# package is conditioned out.
 SIT = Template(
     formid=0x00019715, edid='Sit', xnam=14, version=5,
     index_list=(0, 1, 2, 3, 4, 6, 8),
     inputs=(T_LOCATION, T_TARGETSEL, T_OBJECTLIST, T_FLOAT, T_BOOL, T_BOOL,
             T_BOOL),
-    defaults={2: 0, 3: 300.0, 4: 0, 5: 0, 6: 0},
+    defaults={2: 0, 3: 0.0, 4: 0, 5: 0, 6: 0},
     slots={'location': 0, 'chair_target': 1, 'wait_time': 3},
+)
+
+# --- Acquire (00019713) — 5 instances ------------------------------------
+# procedures: Travel -> Find -> Wander -> Acquire.
+# "Search this area for an item matching the criteria, walk to it, pick it
+# up."  This is TES4's Find aimed at an ITEM base (a weapon, an ingredient, a
+# potion): Oblivion's Find picks the found item up, which is why the beggars'
+# food Finds and Bruscus Dannus's dropped-weapon Finds exist.  Slot 1 takes a
+# type-1 object-ID criteria in vanilla (MQ101RalofGetDoorKey -> a KEYM base),
+# so the TES4 PTDT copies across as-is.
+# Slot 0 is the SEARCH area (vanilla: an in-cell location, a "near self"
+# radius, or an alias).  Defaults are MS09Stage25JonAcquireNote's: acquire 1,
+# no stealing/pickpocketing/killing, no horse, randomise the find list.
+ACQUIRE = Template(
+    formid=0x00019713, edid='Acquire', xnam=22, version=10,
+    index_list=(0, 1, 4, 2, 6, 8, 11, 13, 15, 17, 19, 21),
+    inputs=(T_LOCATION, T_TARGETSEL, T_INT, T_OBJECTLIST) + (T_BOOL,) * 8,
+    defaults={2: 1, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0, 10: 0, 11: 1},
+    slots={'location': 0, 'target': 1, 'count': 2, 'allow_stealing': 6},
 )
 
 # --- Follow (00019B2C) — 124 instances -----------------------------------
@@ -311,5 +338,5 @@ PATROL = Template(
 
 ALL_TEMPLATES = (
     TRAVEL, SANDBOX, EAT, SLEEP, SIT, FOLLOW, ESCORT, HOLD_POSITION,
-    SIT_TARGET, USE_IDLE_MARKER, FLEE_TO, USE_MAGIC, PATROL,
+    SIT_TARGET, USE_IDLE_MARKER, FLEE_TO, USE_MAGIC, PATROL, ACQUIRE,
 )

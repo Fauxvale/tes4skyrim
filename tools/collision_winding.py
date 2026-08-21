@@ -7,9 +7,15 @@ the strip parity flip on odd-indexed triangles — so one half of a floor quad
 faces the wrong way and you fall through half the floor.
 
 The default scan looks for that signature: an up-facing and a down-facing
-near-horizontal triangle sharing an edge.  Vanilla Oblivion is essentially
-clean (~10 of 4199 dungeon+architecture meshes), so a run against an Oblivion
-tree is the control test for this detector.
+near-horizontal triangle sharing an edge.
+
+DO NOT USE VANILLA OBLIVION AS A CONTROL TEST -- it is NOT clean, and the
+earlier claim here that it was (~10 of 4199 dungeon+architecture meshes) is
+withdrawn.  rocks/seisland/seisland.nif alone scores 553 bad edge-pairs, and
+14.5% of decidable floor faces in meshes/rocks are genuinely inverted.  A
+detector that lights up on an Oblivion tree may well be right.  The authored
+per-triangle normal is the ground truth to check against instead; see
+docs/nif_conversion_notes.md "round 3".
 
 IMPORTANT — the default scan has a blind spot.  It only fires on a MIXED pair,
 so a surface that is UNIFORMLY reversed reports zero: Morrowind_ob's

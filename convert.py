@@ -62,6 +62,16 @@ if sys.stderr and hasattr(sys.stderr, "buffer"):
 
 SCRIPT_DIR = Path(__file__).parent.resolve()  # TESConversion root
 
+
+# Shared-folder resolution. Plugins imported together from one mod archive
+# share ONE asset tree, so a plugin name maps to a folder through these
+# resolvers and never by joining a name onto a root by hand -- that is the only
+# reason export/ and output/ agree. `output_layout` imports nothing but
+# pathlib, so this is safe at module scope despite convert.py being the entry
+# point every package imports from.
+from output_layout import record_dir, plugin_out_root
+
+
 # Papyrus batch compilation (see phase_compile).  An error line from
 # papyrus.exe looks like:  <path>\Foo.psc:12:3: Checker error: <message>
 # The compiler aborts the whole batch on the first bad file, so each failing
@@ -194,11 +204,13 @@ def _mod_commands(args, export_dir: str, tes4_data: str) -> int:
             return 0
         print(f"Imported mods ({len(groups)}):")
         for _gid, label, plugs in groups:
-            print(f"  {label}")
+            # One shared asset tree per mod, so the file count belongs on the
+            # mod's line -- printing it per plugin implied three payloads.
+            _first = source_registry.get(export_dir, plugs[0]) if plugs else {}
+            _total = sum((_first or {}).get("counts", {}).values())
+            print(f"  {label}" + (f"  ({_total} files)" if _total else ""))
             for name in plugs:
                 entry = source_registry.get(export_dir, name) or {}
-                counts = entry.get("counts") or {}
-                total = sum(counts.values())
                 if not entry.get("plugin"):
                     # Asset-only mod: no plugin is the normal state, not a
                     # missing file.
@@ -210,9 +222,7 @@ def _mod_commands(args, export_dir: str, tes4_data: str) -> int:
                     continue
                 binary = source_registry.plugin_binary(export_dir, name)
                 mark = "" if binary else "   [binary MISSING]"
-                print(f"    - {name}"
-                      + (f"  ({total} files)" if total else "")
-                      + mark)
+                print(f"    - {name}" + mark)
         return 0
 
     if args.remove_mod:
@@ -313,9 +323,14 @@ def _is_asset_only(file_name: str, export_dir: str) -> bool:
 def _missing_master_exports(results, export_dir: str, tes4_data: str) -> dict:
     """{master_name: {plugins needing it}} for masters lacking an export dir.
 
-    A plugin's masters resolve as SIBLING directories under export/ (see
+    A plugin's masters resolve through `record_dir` (see
     tes5_import/overrides.py:load_master_export), so a missing one is the
     project's classic silent-failure mode.
+
+    Resolved through the registry rather than by joining the name onto
+    `export/`: an imported mod's plugins live inside their mod's shared folder,
+    so a plugin mastering a resource pack's ESM reported every one of its
+    masters as missing while they sat converted one level down.
     """
     from asset_convert import source_registry
 
@@ -325,7 +340,7 @@ def _missing_master_exports(results, export_dir: str, tes4_data: str) -> dict:
         if not binary:
             continue
         for master in get_masters_from_binary(str(binary)):
-            if os.path.isdir(os.path.join(export_dir, master)):
+            if os.path.isdir(record_dir(export_dir, master)):
                 continue
             missing.setdefault(master, set()).add(name)
     return missing
@@ -401,7 +416,7 @@ def phase_export(file_name: str, tes4_data: str, export_dir: str,
     from tes4_export.tes4_reader import read_file
     from tes4_export.export import export_file, export_header
 
-    out_dir = os.path.join(export_dir, file_name)
+    out_dir = str(record_dir(export_dir, file_name))
 
     # Find the source file -- the Oblivion Data directory, or an imported mod's
     # retained binary under export/<plugin>/_source/.
@@ -502,8 +517,11 @@ def phase_assets(file_name: str, config: dict, output_dir: str = None,
     else:
         origin = "requested"
     os.environ[WINDING_FIX_ENV_VAR] = "1" if winding_fix else "0"
-    print(f"[{file_name}] Collision winding repair: "
-          f"{'ON' if winding_fix else 'OFF'} ({origin})")
+    # The authored-normal repair always runs; only the inferred steps are
+    # switchable, so say which one this line is about.
+    print(f"[{file_name}] Inferred collision winding steps: "
+          f"{'ON' if winding_fix else 'OFF'} ({origin}); "
+          f"authored-normal repair: always on")
 
     print(f"[{file_name}] Converting meshes (NIFs + textures)...")
     stats = convert_meshes(
@@ -537,7 +555,7 @@ def phase_assets(file_name: str, config: dict, output_dir: str = None,
         extract_dir=extract_dir,
         output_dir=out_dir,
         skyrim_data=tes5_data or None,
-        master_names=_tes4_masters(Path(extract_dir) / file_name),
+        master_names=_tes4_masters(record_dir(extract_dir, file_name)),
     )
     print(f"[{file_name}] Book INAM complete: ok={bstats['ok']} "
           f"skip={bstats['skip']} fail={bstats['fail']}")
@@ -580,20 +598,24 @@ def phase_creatures(file_name: str, tes5_data: str, config: dict,
     """
     from asset_convert.creature_pipeline import convert_creatures
 
-    export_subdir = str(SCRIPT_DIR / "export" / file_name)
+    export_root = str(SCRIPT_DIR / "export")
+    export_subdir = str(record_dir(export_root, file_name))
     if not os.path.isdir(export_subdir):
         print(f"[{file_name}] No export directory, skipping creatures")
         return False
     out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
-    out_meshes = str(out_root / file_name / "meshes")
+    out_meshes = str(plugin_out_root(out_root, file_name, export_root)
+                     / "meshes")
 
     # The animation singlefiles are ONE shared file in Data. A child plugin
     # registers its creatures in its MASTER's copy rather than shipping a
     # rival copy of its own (see _shared_singlefile_dir).
     from asset_convert.terrain_lod import _master_names
-    master_dirs = [out_root / m
+    # A master's OUTPUT folder is its mod's folder for an imported mod, so
+    # resolve it the same way the export side does.
+    master_dirs = [plugin_out_root(out_root, m, export_root)
                    for m in _master_names(Path(export_subdir))
-                   if (out_root / m).is_dir()]
+                   if plugin_out_root(out_root, m, export_root).is_dir()]
 
     print(f"[{file_name}] Converting creatures (behavior projects + meshes)...")
     res = convert_creatures(export_subdir, out_meshes,
@@ -613,7 +635,7 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
     from tes5_import.import_main import import_plugin
     from tes5_import.override_merge import MissingMasterOutputError
 
-    export_subdir = os.path.join(export_dir, file_name)
+    export_subdir = str(record_dir(export_dir, file_name))
     if not os.path.isdir(export_subdir):
         print(f"[{file_name}] No export directory, skipping import")
         return False
@@ -644,7 +666,10 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
     # relying on the folder already existing left plugins with no asset phase
     # (e.g. Translation.esp) written as a bare file in output/, with their
     # voicemap/liptext companions loose in the output root.
-    plugin_dir = os.path.join(out_root, file_name)
+    # An imported mod's plugins all land in their mod's folder, so this must
+    # agree with where the asset phases write -- otherwise the ESM and its
+    # meshes end up in two different mods.
+    plugin_dir = str(plugin_out_root(out_root, file_name, export_dir))
     os.makedirs(plugin_dir, exist_ok=True)
     output_path = os.path.join(plugin_dir, file_name)
 
@@ -704,13 +729,15 @@ def phase_scripts(file_name: str, config: dict, output_dir: str = None):
     """Convert TES4 scripts to Papyrus .psc source files."""
     from script_convert.pipeline import convert_all_scripts
 
-    export_subdir = str(SCRIPT_DIR / "export" / file_name)
+    export_root = str(SCRIPT_DIR / "export")
+    export_subdir = str(record_dir(export_root, file_name))
     if not os.path.isdir(export_subdir):
         print(f"[{file_name}] No export directory, skipping scripts")
         return False
 
     out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
-    script_dir = out_root / file_name / "scripts" / "source"
+    script_dir = (plugin_out_root(out_root, file_name, export_root)
+                  / "scripts" / "source")
 
     print(f"[{file_name}] Converting scripts to Papyrus...")
     stats = convert_all_scripts(export_subdir, str(script_dir))
@@ -727,8 +754,9 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
-    script_src = out_root / file_name / "scripts" / "source"
-    script_out = out_root / file_name / "scripts"
+    _pout = plugin_out_root(out_root, file_name, str(SCRIPT_DIR / "export"))
+    script_src = _pout / "scripts" / "source"
+    script_out = _pout / "scripts"
 
     # Nothing to compile is SUCCESS, not failure.  A plugin can legitimately
     # convert zero scripts -- the merged-BSA DLC plugins export zero records
@@ -765,8 +793,9 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
     # only: the master's own run compiles and ships the .pex.
     from script_convert.cross_ref import master_names
     master_src_dirs = []
-    for m in master_names(SCRIPT_DIR / "export" / file_name):
-        d = out_root / m / "scripts" / "source"
+    _exp = str(SCRIPT_DIR / "export")
+    for m in master_names(record_dir(_exp, file_name)):
+        d = plugin_out_root(out_root, m, _exp) / "scripts" / "source"
         if d.is_dir():
             master_src_dirs.append(d)
         else:
@@ -1141,14 +1170,19 @@ def phase_pack(file_name: str, config: dict, output_dir: str = None):
 
     out_dir = output_dir or str(SCRIPT_DIR / "output")
     bsarch  = config.get("bsarchPath") or None
-    export_dir = SCRIPT_DIR / "export" / file_name
+    export_root = str(SCRIPT_DIR / "export")
+    export_dir = record_dir(export_root, file_name)
 
     print(f"[{file_name}] Packing BSAs...")
     results = pack_bsas(
         source_file=file_name,
         output_dir=out_dir,
         bsarch_path=bsarch,
+        # Two different roots, and they must not be confused: the RECORD dir
+        # drives the texture keep-set, the export ROOT resolves which output
+        # folder this plugin converted into.
         export_dir=str(export_dir) if export_dir.is_dir() else None,
+        export_root=export_root,
     )
     packed  = len(results['packed'])
     skipped = len(results['skipped'])
@@ -1171,12 +1205,17 @@ def phase_pack_zip(file_name: str, config: dict, output_dir: str = None):
     from output_layout import finished_dir
 
     out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
-    src_root = out_root / file_name
+    src_root = plugin_out_root(out_root, file_name,
+                               str(SCRIPT_DIR / "export"))
     if not src_root.is_dir():
         print(f"[{file_name}] Source not found: {src_root}, skipping zip pack")
         return False
 
-    zip_path = finished_dir(out_root) / f"{file_name}.zip"
+    # ONE mod in, ONE mod out: the folder holds every plugin of an imported
+    # mod, so the zip is named for the MOD. Naming it after whichever plugin
+    # happened to be the -f argument produced three identical archives under
+    # three different names for a three-plugin pack.
+    zip_path = finished_dir(out_root) / f"{src_root.name}.zip"
 
     packed = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1263,18 +1302,25 @@ def main():
                         help="Skyrim plugin filenames to generate a slot-44 "
                              "patch for (e.g. Skyrim.esm Dawnguard.esm). "
                              "Default: Skyrim.esm only.")
-    # Collision winding repair (asset_convert/collision.py). Tri-state: the flag
-    # forces it on, --no- forces it off, and unspecified (None) defers to the
-    # per-plugin default in collision_options, resolved separately for each file.
+    # The INFERRED collision winding steps (asset_convert/collision.py steps
+    # 1-3). The authored-normal repair (step 0) is always on and this flag does
+    # not touch it. Tri-state: the flag forces the inferred steps on, --no-
+    # forces them off, and unspecified (None) defers to the per-plugin default
+    # in collision_options, resolved separately for each file.
     winding = parser.add_mutually_exclusive_group()
     winding.add_argument("--collision-winding-fix", dest="collision_winding_fix",
                          action="store_true", default=None,
-                         help="Rewind reversed collision triangles (fall-through-"
-                              "floor repair). Default: on only for "
+                         help="Also INFER collision winding from adjacency, "
+                              "enclosed volume and the render mesh, on top of "
+                              "the always-on authored-normal repair. Guesses, "
+                              "so it can invert correct geometry -- only for "
+                              "plugins whose exporter destroyed the normals. "
+                              "Default: on only for "
                               + ", ".join(sorted(WINDING_FIX_DEFAULT_PLUGINS)))
     winding.add_argument("--no-collision-winding-fix", dest="collision_winding_fix",
                          action="store_false", default=None,
-                         help="Disable the collision winding repair.")
+                         help="Disable the inferred winding steps (the "
+                              "authored-normal repair still runs).")
     # Parallax (asset_convert/parallax.py). Deliberately opt-in and NOT a
     # per-plugin default: a correct parallax shape renders wrong under vanilla
     # SSE, and the converter cannot tell what the player will run it under.

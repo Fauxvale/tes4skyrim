@@ -3666,3 +3666,118 @@ class TestInfoFragmentSkipping:
             assert info_needs_fragment(plain) is False
         finally:
             ScriptConverter.say_topics = saved
+
+
+class TestObjectReferenceMethodsDoNotPromoteToActor:
+    """A method declared on ObjectReference must never retype its receiver.
+
+    The Imperial City Arena softlocked because `Say` promoted its receiver to
+    `Actor`.  Its four announcer speakers (ArenaMatchPlayerRef,
+    ArenaGalleryMarkerRef, ICArenaPlayerMarkerRef, ICMonsterFightPlayerRef) are
+    XMarker **STAT** refs, so `Actor Property` refused to bind, the property was
+    None, and the first call on it aborted the whole announcer function.
+    See docs/papyrus_conversion_notes.md.
+    """
+
+    def test_say_does_not_promote_receiver(self, converter):
+        result = converter._convert_line(
+            'ArenaMatchPlayerRef.Say Announcer 1 ArenaMouth 1', 'Quest')
+        assert 'ArenaMatchPlayerRef.Say(' in result
+        assert converter._property_refs.get('ArenaMatchPlayerRef') != 'Actor'
+
+    def test_say_keeps_existing_objectreference_type(self, converter):
+        converter._property_refs['ArenaGalleryMarkerRef'] = 'ObjectReference'
+        converter._convert_line('ArenaGalleryMarkerRef.Say Announcer', 'Quest')
+        assert converter._property_refs['ArenaGalleryMarkerRef'] == 'ObjectReference'
+
+    def test_cast_source_does_not_promote(self, converter):
+        result = converter._convert_line(
+            'SEHaskillSummonMarker.Cast SummonSpell Player', 'Quest')
+        assert '.Cast(SEHaskillSummonMarker' in result
+        assert converter._property_refs.get('SEHaskillSummonMarker') != 'Actor'
+
+    def test_pms_subject_does_not_promote(self, converter):
+        result = converter._convert_line(
+            'SEXedPuzStatue1.pms effectSoulTrap', 'Quest')
+        assert '.Play(SEXedPuzStatue1' in result
+        assert converter._property_refs.get('SEXedPuzStatue1') != 'Actor'
+
+    def test_getangle_does_not_promote(self, converter):
+        result = converter._convert_line(
+            'set x to SEXedPuzStatue2.GetAngle Z', 'Quest')
+        assert 'SEXedPuzStatue2.GetAngleZ()' in result
+        assert converter._property_refs.get('SEXedPuzStatue2') != 'Actor'
+
+    def test_moveto_does_not_promote_subject(self, converter):
+        result = converter._convert_line(
+            'SEHaskillSummonMarker.MoveTo SEHaskillSummonReturnMarker', 'Quest')
+        assert 'SEHaskillSummonMarker.MoveTo(' in result
+        assert converter._property_refs.get('SEHaskillSummonMarker') != 'Actor'
+
+    def test_actor_only_call_still_promotes(self, converter):
+        """The guard must not disarm genuine Actor-only promotion."""
+        converter._convert_line('SomeGuardRef.EVP', 'Quest')
+        assert converter._property_refs.get('SomeGuardRef') == 'Actor'
+
+
+class TestQuestStartDoesNotClobberSeededWrites:
+    """`Quest.Start()` must not wipe property writes the author seeded first.
+
+    TES4 quest variables persist across StartQuest, so "seed then start" is a
+    common authored idiom.  TES5 `Quest.Start()` on a stopped quest re-inits
+    its scripts and resets every Auto property, silently erasing the seed.
+    This softlocked the Imperial City Arena: `Arena.ReadyMatch = 1` then
+    `Arena.Start()` left ReadyMatch at 0, so the announcer never fired.
+    See docs/papyrus_conversion_notes.md.
+    """
+
+    def _hoist(self, converter, body):
+        return converter._hoist_quest_start_above_writes(body)
+
+    def test_start_hoisted_above_its_own_writes(self, converter):
+        out = self._hoist(converter, [
+            '  Arena.ReadyMatch = 1',
+            '  Arena.ChorrolMatch = 1',
+            '  Arena.Start()',
+        ])
+        assert out.index('  Arena.Start()') == 0
+        assert out[1:] == ['  Arena.ReadyMatch = 1', '  Arena.ChorrolMatch = 1']
+
+    def test_writes_after_start_are_left_alone(self, converter):
+        body = ['  Arena.Start()', '  Arena.ReadyMatch = 1']
+        assert self._hoist(converter, body) == body
+
+    def test_other_quests_writes_are_not_a_barrier(self, converter):
+        out = self._hoist(converter, [
+            '  Arena.ReadyMatch = 1',
+            '  Other.Something = 2',
+            '  Arena.Start()',
+        ])
+        assert out[0] == '  Arena.Start()'
+
+    def test_unrelated_statement_before_write_is_preserved(self, converter):
+        out = self._hoist(converter, [
+            '  Game.GetPlayer().RemoveItem(Gold001, 25)',
+            '  Spec.BetAmount = 1',
+            '  Spec.Start()',
+        ])
+        assert out[0] == '  Game.GetPlayer().RemoveItem(Gold001, 25)'
+        assert out[1] == '  Spec.Start()'
+        assert out[2] == '  Spec.BetAmount = 1'
+
+    def test_branch_between_blocks_the_hoist(self, converter):
+        body = [
+            '  Arena.ReadyMatch = 1',
+            '  If (x == 1)',
+            '  Arena.Start()',
+            '  EndIf',
+        ]
+        assert self._hoist(converter, body) == body
+
+    def test_start_with_no_preceding_write_is_untouched(self, converter):
+        body = ['  DoThing()', '  Arena.Start()']
+        assert self._hoist(converter, body) == body
+
+    def test_comparison_is_not_mistaken_for_a_write(self, converter):
+        body = ['  If Arena.ReadyMatch == 1', '  Arena.Start()']
+        assert self._hoist(converter, body) == body

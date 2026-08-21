@@ -1243,6 +1243,392 @@ class TestFlameNodeConversion:
     """
 
     @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    @pytest.mark.parametrize('rel', [
+        'fire/firetorchlargesmoke.nif',
+        'fire/firetorchlarge.nif',
+        'fire/fireopenlarge.nif',
+        'fire/fireopenlargesmoke.nif',
+        'fire/fireopenmedium.nif',
+        'fire/fireopensmall.nif',
+        'fire/firearcanemedium01.nif',
+        'fire/firetorchsmall.nif',
+    ])
+    def test_flame_keeps_the_authored_model_frame(self, rel, tmp_path):
+        """Quads and emitters must stay in ONE frame -- the source's.
+
+        These meshes are authored +Y-up and their PLACED REFERENCES carry the
+        stand-up rotation: across Oblivion.esm, 494 REFRs of the Fire\*.nif
+        lights use RotX = +-90 deg (10/10 for FireTorchLargeSmoke).  The REFR
+        rotates the whole model at once, so the conversion must not re-frame
+        any PART of it.
+
+        Pre-rotating just the flip-book quad to +Z-up made it the only piece in
+        a different frame; the REFR's -90 then laid it flat, which is the
+        "third flame component on its side" next to a correct-looking flame and
+        smoke.  This asserts quad and emitters still share the source's axis.
+        """
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat
+
+        src = EXPORT_MESHES / rel
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'meshes' / 'out.nif'
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        assert convert_nif(str(src), str(dst)).get('converted')
+
+        def _tall_quad_axis(path, reader):
+            data = reader(path)
+
+            def _mul(A, B):
+                return tuple(tuple(sum(A[i][k] * B[k][j] for k in range(3))
+                                   for j in range(3)) for i in range(3))
+            best = None
+
+            def _walk(n, M, T):
+                nonlocal best
+                if n is None:
+                    return
+                r = n.rotation
+                R = _mul(((r.m_11, r.m_12, r.m_13),
+                          (r.m_21, r.m_22, r.m_23),
+                          (r.m_31, r.m_32, r.m_33)), M)
+                t = n.translation
+                Tn = (T[0] + t.x * M[0][0] + t.y * M[1][0] + t.z * M[2][0],
+                      T[1] + t.x * M[0][1] + t.y * M[1][1] + t.z * M[2][1],
+                      T[2] + t.x * M[0][2] + t.y * M[1][2] + t.z * M[2][2])
+                nm = bytes(getattr(n, 'name', b'') or b'')
+                if (isinstance(n, NifFormat.NiTriBasedGeom) and n.data
+                        and len(n.data.vertices) and b'EditorMarker' not in nm):
+                    ys = [Tn[1] + v.x * R[0][1] + v.y * R[1][1] + v.z * R[2][1]
+                          for v in n.data.vertices]
+                    zs = [Tn[2] + v.x * R[0][2] + v.y * R[1][2] + v.z * R[2][2]
+                          for v in n.data.vertices]
+                    spread = (max(ys) - min(ys), max(zs) - min(zs))
+                    if best is None or max(spread) > best[0]:
+                        best = (max(spread), 'Y' if spread[0] > spread[1] else 'Z')
+                for c in getattr(n, 'children', []) or []:
+                    _walk(c, R, Tn)
+
+            ident = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+            for r0 in data.roots:
+                _walk(r0, ident, (0.0, 0.0, 0.0))
+            return best
+
+        def _read(path):
+            d = NifFormat.Data()
+            with open(str(path), 'rb') as f:
+                d.inspect(f)
+                f.seek(0)
+                d.read(f)
+            return d
+
+        src_axis = _tall_quad_axis(src, _read)
+        out_axis = _tall_quad_axis(dst, _read)
+        assert src_axis and out_axis, f'{rel}: fixture expects a tall quad'
+        assert out_axis[1] == src_axis[1], (
+            f'{rel}: the tall flame quad grows along {out_axis[1]} but the '
+            f'source authored it along {src_axis[1]} -- the quad was re-framed '
+            f'away from the rest of the model, and the REFR rotation '
+            f'(RotX=-90 on these lights) will lay it on its side')
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    @pytest.mark.parametrize('rel', [
+        'fire/firetorchlargesmoke.nif',
+        'fire/firecandleflame.nif',
+        'fire/fireopenlarge.nif',
+        'fire/firetorchsmall.nif',
+    ])
+    def test_flames_are_bright_and_not_soft_faded(self, rel, tmp_path):
+        """Flames: soft_effect OFF and emissive_multiple 1.5.  Smoke: 1.0.
+
+        Vanilla census of the mounted-fire meshes, which is our torch/sconce
+        case: torchsconce01 pFireballCore04, slighthousefire Fireball and
+        Flames, campfire01burning Glow:2/Glow:3 are ALL soft=0 with a boosted
+        multiple (1.5-2.5).  Only the free-standing smoke and glow planes take
+        the fade (smoke02, Glow02, Hot_Center: soft=1, mult=1.0).
+
+        A soft-particle fade on a flame pinned to its sconce attenuates it
+        against the surface it is mounted on, so the flame reads dim and
+        see-through; mult=1.0 then drops the over-brighten fire needs.
+        """
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat
+
+        src = EXPORT_MESHES / rel
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'meshes' / 'out.nif'
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        assert convert_nif(str(src), str(dst)).get('converted')
+
+        data = NifFormat.Data()
+        with open(str(dst), 'rb') as f:
+            data.inspect(f)
+            f.seek(0)
+            data.read(f)
+
+        fires = smokes = 0
+        for blk in data.blocks:
+            if not isinstance(blk, (NifFormat.NiParticleSystem,
+                                    NifFormat.NiTriBasedGeom)):
+                continue
+            name = bytes(getattr(blk, 'name', b'') or b'').decode('latin1')
+            for pr in (getattr(blk, 'bs_properties', None) or []):
+                if pr is None or type(pr).__name__ != 'BSEffectShaderProperty':
+                    continue
+                tex = bytes(getattr(pr, 'source_texture', b'') or b'').lower()
+                soft = pr.shader_flags_1.slsf_1_soft_effect
+                mult = pr.emissive_multiple
+                if b'smoke' in tex or b'mist' in tex:
+                    smokes += 1
+                    assert mult == pytest.approx(1.0), (
+                        f'{rel}: smoke {name} mult={mult}, expected the '
+                        f'neutral 1.0 (the fire boost must not leak onto it)')
+                elif b'fire' in tex or b'flame' in tex or b'torch' in tex:
+                    fires += 1
+                    assert soft == 0, (
+                        f'{rel}: flame {name} has soft_effect=1 -- it will '
+                        f'fade against the surface it is mounted on and read '
+                        f'dim/transparent')
+                    assert mult == pytest.approx(1.5), (
+                        f'{rel}: flame {name} mult={mult}, expected 1.5 to '
+                        f'match vanilla mounted fires')
+        assert fires, f'{rel}: fixture expects flame FX shapes'
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    @pytest.mark.parametrize('rel', [
+        'fire/firecandleflame.nif',
+        'lights/uppersilverplatecandles01.nif',
+        'clutter/wallsconcesingle01.nif',
+        'fire/firetorchlargesmoke.nif',
+    ])
+    def test_emitter_and_quad_agree_on_up(self, rel, tmp_path):
+        """The particle jet and the flame quad must point the same way.
+
+        A demoted billboard normally inherits IDENTITY -- a NiBillboardNode
+        discards its own rotation at runtime (NifSkope
+        BillboardNode::viewTrans).  But an EMITTER MARKER's rotation is not
+        decoration: NiPSysEmitter reads its `emitter_object` node's orientation
+        as the emission DIRECTION.
+
+        firecandleflame authors quad and emitter in one +Y-up frame -- the quad
+        identity with local extent [1.3, 2.6, 0.0] (tall in Y), the emitter
+        [1,0,0][0,0,-1][0,1,0] whose local +Z maps to model +Y.  Zeroing the
+        emitter made it +Z-up while the quad stayed +Y-up: an upright flame
+        with a second, sideways particle jet -- most visible once a FlameNode
+        marker rotates the pair into a +Z-up host like the candle plate.
+        """
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat
+
+        src = EXPORT_MESHES / rel
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'meshes' / 'out.nif'
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        assert convert_nif(str(src), str(dst)).get('converted')
+
+        data = NifFormat.Data()
+        with open(str(dst), 'rb') as f:
+            data.inspect(f)
+            f.seek(0)
+            data.read(f)
+
+        def _mul(A, B):
+            return tuple(tuple(sum(A[i][k] * B[k][j] for k in range(3))
+                               for j in range(3)) for i in range(3))
+
+        placed = {}
+        quads = []
+
+        def _walk(n, M, T):
+            if n is None:
+                return
+            r = n.rotation
+            R = _mul(((r.m_11, r.m_12, r.m_13),
+                      (r.m_21, r.m_22, r.m_23),
+                      (r.m_31, r.m_32, r.m_33)), M)
+            t = n.translation
+            Tn = (T[0] + t.x * M[0][0] + t.y * M[1][0] + t.z * M[2][0],
+                  T[1] + t.x * M[0][1] + t.y * M[1][1] + t.z * M[2][1],
+                  T[2] + t.x * M[0][2] + t.y * M[1][2] + t.z * M[2][2])
+            placed[id(n)] = R
+            nm = bytes(getattr(n, 'name', b'') or b'')
+            if (isinstance(n, NifFormat.NiTriBasedGeom) and n.data
+                    and len(n.data.vertices) and b'Fire' in nm):
+                ys = [Tn[1] + v.x * R[0][1] + v.y * R[1][1] + v.z * R[2][1]
+                      for v in n.data.vertices]
+                zs = [Tn[2] + v.x * R[0][2] + v.y * R[1][2] + v.z * R[2][2]
+                      for v in n.data.vertices]
+                quads.append((nm.decode('latin1'),
+                              'Y' if (max(ys) - min(ys)) > (max(zs) - min(zs))
+                              else 'Z'))
+            for c in getattr(n, 'children', []) or []:
+                _walk(c, R, Tn)
+
+        ident = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        for r0 in data.roots:
+            _walk(r0, ident, (0.0, 0.0, 0.0))
+
+        assert quads, f'{rel}: fixture expects a flame quad'
+        quad_axis = quads[0][1]
+
+        checked = 0
+        for blk in data.blocks:
+            if not isinstance(blk, NifFormat.NiPSysEmitter):
+                continue
+            o = getattr(blk, 'emitter_object', None)
+            if o is None or id(o) not in placed:
+                continue
+            name = bytes(getattr(o, 'name', b'') or b'').decode('latin1')
+            if 'Smoke' in name:
+                continue  # smoke may legitimately drift off-axis
+            z = placed[id(o)][2]
+            emit_axis = 'Y' if abs(z[1]) > abs(z[2]) else 'Z'
+            assert emit_axis == quad_axis, (
+                f'{rel}: emitter {name} fires along {emit_axis} '
+                f'(+Z=({z[0]:.2f},{z[1]:.2f},{z[2]:.2f})) but the flame quad '
+                f'is tall in {quad_axis} -- the flame ships as an upright quad '
+                f'plus a sideways particle jet')
+            checked += 1
+        assert checked, f'{rel}: fixture expects a flame emitter'
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    @pytest.mark.parametrize('rel,marker', [
+        ('clutter/metalsmith/forgeopen01.nif', 'FlameNode07'),
+        ('clutter/lecternworkstation1.nif', 'FlameNode01'),
+    ])
+    def test_zero_padded_socket_burns_nothing(self, rel, marker, tmp_path):
+        """A ZERO-PADDED socket name matches nothing and attaches no flame.
+
+        The engine compares socket names EXACTLY against its own table, which
+        holds only unpadded "FlameNode<N>": Oblivion.exe contains "FlameNode7"
+        and "FlameNode1" but neither "FlameNode07" nor "FlameNode01", and the
+        plugin's STATs are likewise EditorID FlameNode0..FlameNode9.  These two
+        vanilla meshes are authored with padded markers and show NO flame in
+        the original game.
+
+        Matching them loosely put a 468-unit FireOpenMediumSmoke on the forge
+        and a spurious torch on the lectern.  An unmatched socket must burn
+        nothing -- never fall back to a default flame.
+        """
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat
+        from asset_convert.nif_converter import _flame_socket_index
+
+        src = EXPORT_MESHES / rel
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+
+        assert _flame_socket_index(marker) is None, (
+            f'{marker} must not resolve to a socket: the engine has no such '
+            f'name in its table')
+
+        # The fixture really is authored with that padded marker.
+        raw = src.read_bytes()
+        assert marker.encode() in raw, f'{rel}: expected a {marker} marker'
+
+        dst = tmp_path / 'meshes' / 'out.nif'
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        assert convert_nif(str(src), str(dst)).get('converted')
+
+        out = NifFormat.Data()
+        with open(str(dst), 'rb') as f:
+            out.inspect(f)
+            f.seek(0)
+            out.read(f)
+
+        # Nothing may be grafted AT that padded marker.  (Other, correctly
+        # named sockets in the same mesh still get their flame -- the lectern
+        # keeps its three FlameNode0 candles.)
+        for blk in out.blocks:
+            name = bytes(getattr(blk, 'name', b'') or b'').decode('latin1')
+            if name.startswith(marker):
+                kids = [c for c in (getattr(blk, 'children', None) or [])
+                        if c is not None]
+                assert not kids, (
+                    f'{rel}: {marker} got a flame grafted ({len(kids)} child '
+                    f'node(s)); vanilla shows no flame here')
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    @pytest.mark.parametrize('rel,socket,flame', [
+        ('clutter/candlefat01.nif', 0, b'firecandleflame'),
+        ('lights/torchtall01.nif', 1, b'firetorchsmall'),
+        ('architecture/castle/castlelight02.nif', 2, b'firetorchlarge'),
+        ('architecture/anvil/anvilstreetlamp01.nif', 2, b'firetorchlarge'),
+    ])
+    def test_flame_comes_from_the_flamenode_stat(self, rel, socket, flame,
+                                                 tmp_path):
+        """The socket index picks the flame, per the plugin's own STAT records.
+
+        Oblivion ships one STAT per socket (WorldObjects/Static, EditorID
+        "FlameNode<N>") whose MODL is the flame to attach -- FlameNode0
+        0x0000001E Fire/FireCandleFlame.NIF, FlameNode1 0x1F FireTorchSmall,
+        FlameNode2 0x20 FireTorchLarge, ... FlameNode9 0x27 FireOpenLargeSmoke.
+        Those FormIDs are the keys Oblivion.exe hardcodes beside its socket-name
+        table (0xB06818 names, 0xB067C0 form keys 0x1E..0x32), so the mapping
+        lives in the plugin and a mod may repoint it -- we read it, never guess.
+
+        Selecting on the host FILENAME instead ("torch" in the name) put the
+        1.3x2.6-unit candle flame on every lamp in the game: castlelight02 is a
+        105-unit fixture on socket 2, i.e. FireTorchLarge at 32x64.
+        """
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat
+        from asset_convert.nif_converter import (_flame_socket_map,
+                                                 _flame_socket_index)
+
+        src = EXPORT_MESHES / rel
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+
+        # The host really does use the socket this case claims.
+        data = NifFormat.Data()
+        with open(str(src), 'rb') as f:
+            data.inspect(f)
+            f.seek(0)
+            data.read(f)
+        sockets = {_flame_socket_index(bytes(b.name or b''))
+                   for b in data.blocks
+                   if bytes(getattr(b, 'name', b'') or b'').startswith(
+                       b'FlameNode')}
+        assert socket in sockets, (
+            f'{rel}: expected a FlameNode{socket} marker, found {sockets}')
+
+        # And the authored table maps it to the flame we expect.
+        table = _flame_socket_map(str(src))
+        assert table, 'no FlameNode STAT records parsed from the export'
+        assert flame in table[socket].encode(), (
+            f'FlameNode{socket} -> {table[socket]}, expected {flame!r}')
+
+        dst = tmp_path / 'meshes' / 'out.nif'
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        assert convert_nif(str(src), str(dst)).get('converted')
+
+        out = NifFormat.Data()
+        with open(str(dst), 'rb') as f:
+            out.inspect(f)
+            f.seek(0)
+            out.read(f)
+        texs = b'|'.join(
+            bytes(b.source_texture or b'').lower() for b in out.blocks
+            if type(b).__name__ == 'BSEffectShaderProperty')
+        assert flame in texs, (
+            f'{rel}: FlameNode{socket} should graft {flame!r}; shader textures '
+            f'are {texs!r}')
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
     @pytest.mark.parametrize('rel,flame_tex', [
         ('lights/candlefat02fake.nif', b'firecandleflame'),
         ('lights/middlecandlestickfloor01fake.nif', b'firecandleflame'),
@@ -2612,6 +2998,114 @@ class TestControllerComputeScaledTime:
 
 
 # ---------------------------------------------------------------------------
+# Ambient (self-playing) sequences: AutoPlay/AutoLoop pair + accum-root pose
+# ---------------------------------------------------------------------------
+
+_ARENA_SPECTATOR = 'architecture/arena/arenaspectatorm01.nif'
+_LOAD_DOOR_ACCUM = 'architecture/bravil/bravilloaddoorlowerint01.nif'
+
+
+def _read_nif(path):
+    import time
+    if not hasattr(time, '_original_clock'):
+        time.clock = time.perf_counter
+    from pyffi.formats.nif import NifFormat as NF
+    d = NF.Data()
+    with open(str(path), 'rb') as f:
+        d.read(f)
+    return NF, d
+
+
+class TestAmbientSequences:
+    """The arena crowd: read out of the live engine 2026-08-18 (see
+    docs/nif_conversion_notes.md, 'Ambient (self-playing) meshes')."""
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_idle_becomes_autoloop_loop_plus_autoplay_clamp(self, tmp_path):
+        src = EXPORT_MESHES / _ARENA_SPECTATOR
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'meshes' / 'tes4' / 'arena' / 'arenaspectatorm01.nif'
+        dst.parent.mkdir(parents=True)
+        convert_nif(str(src), str(dst))
+        NF, d = _read_nif(dst)
+        seqs = {bytes(b.name).decode('latin-1'): b for b in d.blocks
+                if isinstance(b, NF.NiControllerSequence)}
+        assert set(seqs) == {'AutoLoop', 'AutoPlay'}, list(seqs)
+        # CycleType: 0 LOOP, 2 CLAMP.  The authored Idle is LOOP and stays so;
+        # the AutoPlay intro must END for the graph to hand off to AutoLoop.
+        assert int(seqs['AutoLoop'].cycle_type) == 0
+        assert int(seqs['AutoPlay'].cycle_type) == 2
+        assert seqs['AutoPlay'].num_controlled_blocks == seqs['AutoLoop'].num_controlled_blocks
+        bged = [b for b in d.blocks if type(b).__name__ == 'BSBehaviorGraphExtraData']
+        assert bged and b'Autoplay.hkx' in bytes(bged[0].behaviour_graph_file)
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_transferred_accum_root_pose_stays_identity(self, tmp_path):
+        """Bip01's identity pose is REAL: 'Bip01 NonAccum' carries the 82.5 deg
+        / 64-unit transform, so sentinelling Bip01's rotation doubled it."""
+        src = EXPORT_MESHES / _ARENA_SPECTATOR
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+        NF, d = _read_nif(dst)
+        for seq in (b for b in d.blocks if isinstance(b, NF.NiControllerSequence)):
+            cb = next(c for c in seq.controlled_blocks if bytes(c.node_name) == b'Bip01')
+            it = cb.interpolator
+            assert it.data is None
+            assert (it.translation.x, it.translation.y, it.translation.z) == (0.0, 0.0, 0.0)
+            assert (round(it.rotation.w, 3), it.rotation.x, it.rotation.y, it.rotation.z) == (1.0, 0.0, 0.0, 0.0)
+            assert it.scale == 1.0
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_transferred_door_accum_root_pose_stays_identity(self, tmp_path):
+        """Load door whose accum root sits at (0,-42.7,12)/90 deg with NonAccum
+        carrying that transform: the identity must be applied, not sentinelled."""
+        src = EXPORT_MESHES / _LOAD_DOOR_ACCUM
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+        NF, d = _read_nif(dst)
+        for seq in (b for b in d.blocks if isinstance(b, NF.NiControllerSequence)):
+            cb = next(c for c in seq.controlled_blocks if bytes(c.node_name) == b'DoorLowerINT01')
+            it = cb.interpolator
+            assert round(it.rotation.w, 3) == 1.0 and it.scale == 1.0,                 'accum-root rotation sentinelled -> door rotation doubles'
+
+
+_PALACE_FONT = 'architecture/palace/interior/palacefont01.nif'
+
+
+class TestSharedPropertyFanOut:
+    """Oblivion shares one NiTexturingProperty between shapes; a sequence entry
+    names one shape but scrolls all of them.  Every wearing shape must get its
+    own entry + controller (the Font of Madness's upper tier, 2026-08-18)."""
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_every_water_shape_is_driven(self, tmp_path):
+        src = EXPORT_MESHES / _PALACE_FONT
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+        NF, d = _read_nif(dst)
+        water = ['Water', 'Water02', 'Water03', 'Water04', 'WaterFoam01',
+                 'PalaceWaterL1', 'PalaceWaterR1', 'PalaceWaterL2',
+                 'PalaceWaterR02', 'PalaceWaterFoam01']
+        for seq in (b for b in d.blocks if isinstance(b, NF.NiControllerSequence)):
+            named = {bytes(cb.node_name).decode('latin-1') for cb in seq.controlled_blocks}
+            assert set(water) <= named, (seq.name, sorted(set(water) - named))
+        # ...and each shape's own shader carries its own (targeted) controller.
+        for b in d.blocks:
+            if isinstance(b, NF.NiTriShape) and bytes(b.name).decode('latin-1') in water:
+                shader = next(p for p in b.bs_properties if p is not None
+                              and 'ShaderProperty' in type(p).__name__)
+                c = shader.controller
+                assert c is not None and c.target is shader, bytes(b.name)
+
+
+# ---------------------------------------------------------------------------
 # Shader-property controller targets (NULL target = CTD on cell load)
 # ---------------------------------------------------------------------------
 
@@ -3675,3 +4169,109 @@ class TestGraphMeshesShipNoEmptyTextKeys:
         assert b'start' in keys and b'end' in keys
         sound = [k for k in keys if k.startswith(b'sound:')]
         assert sound, 'the sound: key is the plant audio -- it must survive'
+
+
+class TestCollisionWindingRepair:
+    """Step 0 (the authored normal) must run WITHOUT the toggle, and the
+    inferred steps must stay behind it.
+
+    The split exists because the two halves have different risk: step 0 reads
+    a fact the NIF states about itself, while steps 1-3 infer one.  Inference
+    inverted a whole vanilla tower once already (leyawiincastle02: 274 of 284
+    triangles, 806 walkable cells), so it may only run where the authored
+    normals were destroyed.
+    """
+
+    def _repair(self, tris, normals, enabled, visual=None, groups=None):
+        import os as _os
+        from asset_convert import collision as C
+        prev = _os.environ.get("TESCONV_COLLISION_WINDING_FIX")
+        _os.environ["TESCONV_COLLISION_WINDING_FIX"] = "1" if enabled else "0"
+        try:
+            return C._repair_inverted_floors(tris, visual, groups, normals)
+        finally:
+            if prev is None:
+                _os.environ.pop("TESCONV_COLLISION_WINDING_FIX", None)
+            else:
+                _os.environ["TESCONV_COLLISION_WINDING_FIX"] = prev
+
+    # One up-facing quad, wound counter-clockwise (normal = +Z).
+    _UP = [((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+           ((1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0))]
+
+    def _reversed(self):
+        return [(a, c, b) for a, b, c in self._UP]
+
+    def test_reversed_winding_is_repaired_with_the_toggle_OFF(self):
+        """The whole point: vanilla Oblivion gets fixed without opting in."""
+        tris = self._reversed()
+        normals = [(0.0, 0.0, 1.0)] * len(tris)   # authored: faces UP
+        out, n = self._repair(tris, normals, enabled=False)
+        assert n == len(tris), 'authored-normal repair must run ungated'
+        from asset_convert import collision as C
+        assert all(C._face_normal(t)[2] > 0 for t in out)
+
+    def test_correct_winding_is_left_alone(self):
+        """Zero false positives on a mesh that already agrees with itself."""
+        normals = [(0.0, 0.0, 1.0)] * len(self._UP)
+        out, n = self._repair(list(self._UP), normals, enabled=False)
+        assert n == 0
+        assert out == self._UP
+
+    def test_self_consistent_corruption_is_NOT_touched_ungated(self):
+        """Morroblivion's case: normals rewritten to match the bad winding.
+
+        Both sources agree while both are wrong, so step 0 has nothing to
+        detect and must not guess -- that is what the toggle is for.
+        """
+        tris = self._reversed()
+        normals = [(0.0, 0.0, -1.0)] * len(tris)  # authored to match, i.e. DOWN
+        _out, n = self._repair(tris, normals, enabled=False)
+        assert n == 0
+
+    def test_missing_normals_are_never_guessed_at(self):
+        tris = self._reversed()
+        _out, n = self._repair(tris, [None] * len(tris), enabled=False)
+        assert n == 0
+        _out, n = self._repair(tris, None, enabled=False)
+        assert n == 0
+
+    def test_smoothed_vertex_normals_are_rejected(self):
+        """A per-vertex average that did not survive the length test is None.
+
+        Averaging three normals across a smoothed edge yields a short vector
+        pointing at none of them (mageguilddesk01: |n| = 0.31); trusting it
+        rewound 9 correct faces.
+        """
+        from asset_convert import collision as C
+        assert C._AUTHORED_NORMAL_MIN_LEN > 0.9
+
+    def test_normals_track_shape_tri_soup_ordering(self):
+        """_shape_tri_normals must align 1:1 with _shape_tri_soup or normals
+        bind to the wrong triangles."""
+        from asset_convert import collision as C
+        from pyffi.formats.nif import NifFormat
+        src = EXPORT_MESHES / 'rocks' / 'seisland' / 'seisland.nif'
+        if not src.exists():
+            pytest.skip('seisland.nif not exported')
+        data = NifFormat.Data()
+        with open(src, 'rb') as fh:
+            data.read(fh)
+        checked = 0
+        for root in data.roots:
+            for node in root.tree():
+                shape = getattr(node, 'shape', None)
+                if shape is None:
+                    continue
+                inner = (shape.shape
+                         if isinstance(shape, NifFormat.bhkMoppBvTreeShape)
+                         else shape)
+                soup = C._shape_tri_soup(inner)
+                if soup is None:
+                    continue
+                normals = C._shape_tri_normals(inner)
+                if normals is None:
+                    continue
+                assert len(normals) == len(soup[0])
+                checked += 1
+        assert checked, 'expected a mesh collision shape in seisland.nif'

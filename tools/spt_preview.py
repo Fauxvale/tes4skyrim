@@ -120,15 +120,24 @@ def render_tree(spt_path: Path, tex_root: Path, views=(0.0,), size=800,
     bark_rgb = _mean_color(bark_img)
 
     def _leaf_tex(g):
-        if g['texture'] == '__composite__':
-            for cand in (icon, tree.composite_map,
-                         tree.leaf_maps[0].texture if tree.leaf_maps else ''):
-                if cand:
-                    t = _load_texture(Path(str(cand).replace('\\', '/')).name, tex_root)
-                    if t is not None:
-                        return t
-            return None
-        return _load_texture(Path(g['texture'].replace('\\', '/')).name, tex_root)
+        # The SPT names the artist's .tga, which is often NOT what shipped
+        # (alorange1 asks for TreeGreyPoplarLeavesSU, the pack ships
+        # alorange2frut; reddeliciousappletree asks for
+        # RedDeliciousAppleLeaves_1/_2, the pack ships reddeliciousapples).
+        # spt_converter falls back to the ICON-resolved composite whenever the
+        # per-map stem does not ship -- mirror that here, or the preview shows
+        # untextured leaves for a tree that converts correctly.
+        cands = []
+        if g['texture'] != '__composite__':
+            cands.append(g['texture'])
+        cands += [icon, tree.composite_map,
+                  tree.leaf_maps[0].texture if tree.leaf_maps else '']
+        for cand in cands:
+            if cand:
+                t = _load_texture(Path(str(cand).replace('\\', '/')).name, tex_root)
+                if t is not None:
+                    return t
+        return None
 
     pts = [geo.bark_verts] + [g['verts'] for g in geo.leaf_groups]
     allpts = np.concatenate(pts)

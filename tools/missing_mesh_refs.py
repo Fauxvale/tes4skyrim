@@ -128,8 +128,11 @@ def main():
     ap.add_argument('--max', type=int, default=25)
     args = ap.parse_args()
 
+    # Through the resolver: an imported mod's plugins convert into their
+    # MOD's folder, so `<out>/<plugin>/<plugin>` names nothing for them.
+    from output_layout import paths as _paths
     root = args.output_dir
-    path = os.path.join(root, args.plugin, args.plugin)
+    path = str(_paths(args.plugin, out_root=root).esm)
     if not os.path.isfile(path):
         print('ERROR: no converted plugin at %s' % path)
         return 1
@@ -140,11 +143,13 @@ def main():
     # and is skipped (its assets ship in the game's own BSAs).
     owners = {}
     for slot, name in enumerate(masters):
-        mp = os.path.join(root, name, name)
+        mp = str(_paths(name, out_root=root).esm)
         if os.path.isfile(mp):
-            owners[slot] = (_records(mp), os.path.join(root, name, 'meshes'))
-    owners[len(masters)] = (_records(path),
-                            os.path.join(root, args.plugin, 'meshes'))
+            owners[slot] = (_records(mp),
+                            str(_paths(name, out_root=root).out / 'meshes'))
+    owners[len(masters)] = (
+        _records(path),
+        str(_paths(args.plugin, out_root=root).out / 'meshes'))
 
     cellpos, refs = _placements(path)
     missing = Counter()

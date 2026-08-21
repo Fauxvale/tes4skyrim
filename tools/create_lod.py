@@ -42,6 +42,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from subprocess_flags import configure_multiprocessing
 from process_job import create_pool_job
+from output_layout import assets_for  # noqa: E402
 
 configure_multiprocessing()
 create_pool_job()
@@ -68,10 +69,12 @@ def main() -> int:
     from asset_convert.lod_gen import (generate_lod,
                                        _textures_root as _lod_textures_root)
     from asset_convert.terrain_lod import generate_terrain_lod
-    from asset_convert.sibling_lod import (converted_plugins, create_lod_order,
+    from asset_convert.sibling_lod import (_out_root, _record_dir,
+                                           converted_plugins, create_lod_order,
                                            lod_worldspaces, owner_map,
                                            merge_cloud_bank, _master_chain,
                                            touched_worldspace_fids,
+                                           drop_staged_meshes,
                                            LOD_DIR_NAME)
     from asset_convert.terrain_lod import _find_worldspace_fid
     from asset_convert.lod_gen import _formid_remap_table
@@ -86,6 +89,15 @@ def main() -> int:
     print("=" * 54)
     print(f"  Output dir: {out_root}")
     print(f"  LOD mod:    {lod_dir}")
+
+    # The LOD mod ships tiles; any mesh here is scratch a previous bake staged
+    # for LODGen and failed to remove. Sweeping up front rather than trusting
+    # the post-bake cleanup keeps a killed run from pinning meshes forever --
+    # and since this mod installs LAST to win the tile overwrite, a stale mesh
+    # here silently overrides every plugin's current copy.
+    swept = drop_staged_meshes(lod_dir)
+    if swept:
+        print(f"  Swept {swept} stale staged mesh file(s) from the LOD mod")
 
     available = converted_plugins(out_root)
     if args.plugins:
@@ -152,7 +164,7 @@ def main() -> int:
     # in BOTH generators. Scanned once per plugin here, then reused below.
     touched = {}
     for name in plugins:
-        esm = out_root / name / name
+        esm = _out_root(out_root, name, export_root) / name
         if esm.is_file():
             try:
                 touched[name] = touched_worldspace_fids(esm)
@@ -172,7 +184,7 @@ def main() -> int:
             print(f"  '{edid}': no selected plugin supplies terrain for it; "
                   f"skipping")
             continue
-        owner_esm = out_root / owner / owner
+        owner_esm = _out_root(out_root, owner, export_root) / owner
         if not owner_esm.is_file():
             print(f"  '{edid}': {owner} has no converted ESM; skipping")
             continue
@@ -208,8 +220,9 @@ def main() -> int:
                       f"here, not overlaid ({', '.join(skipped)})")
             contributors = scoped
 
-        overlays = [out_root / n / n for n in contributors
-                    if (out_root / n / n).is_file()]
+        overlays = [_out_root(out_root, n, export_root) / n
+                    for n in contributors
+                    if (_out_root(out_root, n, export_root) / n).is_file()]
         jobs.append((edid, owner, owner_esm, overlays, contributors))
 
     if not jobs:
@@ -257,11 +270,19 @@ def main() -> int:
         # output still has to be findable. Scoped to this worldspace's
         # contributors rather than every selected plugin, for the same reason
         # the overlays are — an unrelated plugin's meshes are not in this world.
-        asset_dirs = [out_root / n for n in [owner] + contributors
-                      if (out_root / n).is_dir()]
+        asset_dirs = [_out_root(out_root, n, export_root)
+                      for n in [owner] + contributors
+                      if _out_root(out_root, n, export_root).is_dir()]
+        # Where each contributor's mesh conversion left its detail-overlay
+        # diffuse manifest (build bookkeeping, so export/ not output/).
+        # The overlay manifest sits beside the SHARED meshes it describes,
+        # which for an imported mod is one level above the record dir.
+        overlay_dirs = [assets_for(_record_dir(export_root, n))
+                        for n in [owner] + contributors
+                        if _record_dir(export_root, n).is_dir()]
 
         cloud_rel = merge_cloud_bank(out_root, lod_dir, edid, owner,
-                                     contributors)
+                                     contributors, export_root)
         if cloud_rel:
             print(f"  World-map cloud bank -> {cloud_rel}")
 
@@ -285,6 +306,7 @@ def main() -> int:
             # Derived _far.nif meshes stay with the plugin that ships the full
             # model; only tiles and LODSettings land in the LOD mod.
             far_nif_dirs=asset_dirs,
+            overlay_manifest_dirs=overlay_dirs,
         )
 
         print(f"  Generating terrain LOD...")

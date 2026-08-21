@@ -29,6 +29,7 @@ Anything under textures/ that no reference names is left out of the archive.
 import os
 import re
 from pathlib import Path
+from output_layout import assets_for  # noqa: E402
 
 # Bytes that may appear in a texture path embedded in a binary asset.  This is
 # the character class the old `_TEX_BYTES_RE` used; `_texture_refs_in` walks it
@@ -50,21 +51,36 @@ _LATE_ASSET_SUFFIXES = ('.nif', '.bto', '.btr')
 
 # Where mesh conversion leaves the texture set it harvested, for the prune
 # phase to pick up later.
+#
+# It lives in the plugin's EXPORT dir, not its output dir. This is build
+# bookkeeping the game never reads, and output/<plugin>/ is a Data root: every
+# plugin wrote the same filename there, so all of them collided on install.
+# export/<plugin>/ is where the other per-plugin build state already lives
+# (collision_cache.bin, mesh_bounds_cache.json, voice_durations.json) and is
+# never installed.
 MANIFEST_NAME = 'textures_used.txt'
 
+# Of the textures above, the ones the SOURCE authored as APPLY_HILIGHT2 detail
+# overlays, where the diffuse alpha is a per-texel blend weight rather than a
+# transparency mask.  Object LOD reads that channel as opacity, so the LOD
+# stage needs to know which textures they are; it cannot tell from the
+# converted mesh, because the apply mode is a TES4 concept with no Skyrim
+# equivalent and most of these shapes carry no NiAlphaProperty to give it away.
+OVERLAY_MANIFEST_NAME = 'overlay_diffuses.txt'
 
-def write_manifest(plugin_dir, refs) -> Path:
-    """Record the textures the converted meshes reference."""
-    plugin_dir = Path(plugin_dir)
-    plugin_dir.mkdir(parents=True, exist_ok=True)
-    out = plugin_dir / MANIFEST_NAME
+
+def write_manifest(export_dir, refs, name: str = MANIFEST_NAME) -> Path:
+    """Record a set of texture keys for a later phase to read back."""
+    export_dir = Path(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    out = export_dir / name   # noqa: plugin-path (record/manifest filename)
     out.write_text('\n'.join(sorted(refs)), encoding='utf-8')
     return out
 
 
-def read_manifest(plugin_dir) -> set:
-    """Read back the mesh-conversion texture set (empty if it was never run)."""
-    f = Path(plugin_dir) / MANIFEST_NAME
+def read_manifest(export_dir, name: str = MANIFEST_NAME) -> set:
+    """Read back a manifest written by write_manifest (empty if never run)."""
+    f = Path(export_dir) / name   # noqa: plugin-path (record/manifest filename)
     if not f.is_file():
         return set()
     return {ln.strip() for ln in
@@ -126,6 +142,44 @@ def refs_from_records(export_dir) -> set:
                 # records name the path as Oblivion wrote it; the importer
                 # prefixes it with tes4\ on the way into the plugin.
                 refs.add('tes4/' + variant)
+    return refs
+
+
+def refs_from_tree_billboards(export_dir) -> set:
+    """Billboard renders, which no texture path in the plugin ever names.
+
+    A TREE record points at a SpeedTree model (MODL names a `.spt`) and
+    the distant-LOD card for it is Oblivion's shipped render of that same tree,
+    found by NAME: `<billboard dir>/<model stem>.dds`. Nothing writes that path
+    down -- not the record, not a NIF -- so neither `refs_from_records` (which
+    matches `.dds` literals) nor the mesh manifest (billboards belong to no
+    mesh) can see it, and the prune dropped 43 of Oblivion.esm's 245 billboards
+    from the archive. The loose output/ copy survives, so this only ever showed
+    up as missing distant trees in a PACKED build.
+
+    The stem comes from the record's own MODL, and the folder from the
+    generator that consumes these files (`lod_far_gen._BILLBOARD_TEX_DIR`), so
+    the pair stays in step with whatever actually reads them.
+    """
+    from .lod_far_gen import _BILLBOARD_TEX_DIR
+
+    tree_txt = Path(export_dir) / 'TREE.txt'
+    if not tree_txt.is_file():
+        return set()
+
+    bb_dir = _BILLBOARD_TEX_DIR.replace('\\', '/').strip('/').lower()
+    refs = set()
+    for ln in tree_txt.read_text(encoding='utf-8', errors='replace').splitlines():
+        ln = ln.strip()
+        if not ln.lower().startswith('model.modl='):
+            continue
+        # The export escapes its separators, so a raw Path() would read a
+        # leading separator as a UNC root and hand back an empty stem.
+        raw = ln.split('=', 1)[1].strip().lower().replace('\\', '/')
+        stem = raw.rsplit('/', 1)[-1]
+        stem = stem.rsplit('.', 1)[0]
+        if stem:
+            refs.add(f'{bb_dir}/{stem}.dds')
     return refs
 
 
@@ -198,16 +252,24 @@ def build_refs(plugin_dir, export_dir, mesh_texture_refs=None) -> set:
     """Every texture the shipped plugin can ask for, as textures-root keys."""
     plugin_dir = Path(plugin_dir)
 
+    # `export_dir` is a plugin's RECORD directory. The manifests live beside
+    # the SHARED meshes they describe, which for an imported mod is one level
+    # up; the record globs below stay on the record dir. Two roots, one
+    # argument -- keep them straight or the manifest reads as empty and the
+    # whole pack aborts.
+    asset_root = assets_for(export_dir)
+
     if mesh_texture_refs is None:
-        mesh_texture_refs = read_manifest(plugin_dir)
+        mesh_texture_refs = read_manifest(asset_root)
     if not mesh_texture_refs:
         raise RuntimeError(
-            f'no mesh texture manifest in {plugin_dir} — run mesh conversion '
+            f'no mesh texture manifest in {asset_root} — run mesh conversion '
             f'first; pruning without it would delete textures that are in use')
 
     refs = {_norm(r) for r in mesh_texture_refs}
     refs.discard('')
     refs |= refs_from_records(export_dir)
+    refs |= refs_from_tree_billboards(export_dir)
 
     # Meshes generated after mesh conversion (speedtrees, _far, LOD/terrain
     # tiles, the grass copies) — no converter harvested these, so read them.

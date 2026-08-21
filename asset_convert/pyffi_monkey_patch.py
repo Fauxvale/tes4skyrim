@@ -158,6 +158,8 @@ def _apply_nifformat_patches(NifFormat):
 _V10_0_1_2 = 0x0A000102
 _V10_1_0_0 = 0x0A010000
 _V10_1_0_104 = 0x0A010068
+_V10_2_0_0 = 0x0A020000
+_V20_1_0_2 = 0x14010002
 
 
 def _make_attr(NifFormat, xml_attrs, ver1=None, ver2=None, template=None):
@@ -186,6 +188,8 @@ def _refresh_attribute_caches(NifFormat, changed_classes):
 
 
 def _install_early_oblivion_layouts(NifFormat):
+    from pyffi.object_models.xml.expression import Expression
+
     # --- Patch 5a: bhkWorldObject extra int (until 10.0.1.2) --------------
     wo = NifFormat.bhkWorldObject
     if not any(a.name == 'unknown_int_early' for a in wo._attrs):
@@ -318,6 +322,57 @@ def _install_early_oblivion_layouts(NifFormat):
     # reads 0x05000000-style garbage and the whole file fails [RD].
     gm = NifFormat.NiGeomMorpherController
     gm._attrs[:] = [a for a in gm._attrs if a.name != 'unknown_2']
+
+    # ...and its Unknown Ints array starts at 10.2.0.0, not 20.0.0.4.  The
+    # reference gates the pair
+    #   since="10.2.0.0" until="20.0.0.5" vercond="#BSVER# #GT# 9"
+    # while pyffi floors both at 20.0.0.4, so on a 10.2.0.0 / bsver 11 file it
+    # skips them and the block ends 24 bytes short -- the stream then reads
+    # NiMorphData from the middle of the controller.  Measured on
+    # mudcrab\mud crbeye l00.nif: the controller ends at 0x2A3, NiMorphData
+    # truly begins at 0x2BB, and 0x2A3 holds num_unknown_ints=5 followed by
+    # five zero ints = 4 + 5*4 = 24 bytes, landing exactly on 0x2BB.
+    # pyffi's 'user_version >= 10' vercond is also the wrong field; BSVER is
+    # user_version_2.
+    _gm_unknown_vercond = Expression('user_version_2 > 9')
+    for _attr in gm._attrs:
+        if _attr.name in ('num_unknown_ints', 'unknown_ints'):
+            _attr.ver1 = _V10_2_0_0
+            _attr.vercond = _gm_unknown_vercond
+
+    # --- Patch 6e: Morph "Legacy Weight" is gated on BSVER, not version ---
+    # pyffi models the reference nif.xml's Morph."Legacy Weight" float as an
+    # 'unknown_int' gated ver1=10.1.0.106 ver2=10.2.0.0 -- a pure version
+    # range.  The reference gates it
+    #   since="10.1.0.104" until="20.1.0.2" vercond="#BSVER# #LT# 10"
+    # so on a 10.2.0.0 file the field's presence depends on the BS version,
+    # which pyffi never consults.  Both of pyffi's entries are also literally
+    # named 'unknown_int', and _get_filtered_attribute_list skips duplicate
+    # names, so the second can never be read at all.
+    #
+    # Census of every creature NIF containing a NiMorphData (Oblivion.esm):
+    #   ver 10.1.0.106 bsver 5   -> present  (goblinhead, 7 files)
+    #   ver 10.2.0.0   bsver 9   -> present  (doghead, 2 files)
+    #   ver 10.2.0.0   bsver 11  -> ABSENT   (minotaur eyelidslord, mudcrab
+    #                                         eyes -- the 3 files that failed)
+    # Byte-walking mud crbeye l00.nif settles it: NiMorphData at 0x2BB reads
+    # num_morphs=5 num_vertices=90 relative_targets=1, and only the no-field
+    # layout parses all five morph names (Base, Mud Crbeye L01..L04); with the
+    # field the second morph's name length is garbage and the file fails [RD].
+    # Note ver2 is INCLUSIVE in pyffi (`version > attr.ver2` skips), so the
+    # old range covered 10.2.0.0 exactly.
+    #
+    # Restoring the reference gating verbatim -- widen the version range and
+    # add the BSVER vercond -- keeps the bsver 5/9 files reading as they do
+    # today while dropping the phantom 4 bytes per morph on bsver >= 10.
+    _legacy_weight_vercond = Expression('user_version_2 < 10')
+    for _attr in NifFormat.Morph._attrs:
+        if _attr.name != 'unknown_int':
+            continue
+        _attr.ver1 = _V10_1_0_104
+        _attr.ver2 = _V20_1_0_2
+        _attr.userver = None
+        _attr.vercond = _legacy_weight_vercond
 
     # --- Patch 7: register bhkConvexSweepShape ----------------------------
     if not hasattr(NifFormat, 'bhkConvexSweepShape'):

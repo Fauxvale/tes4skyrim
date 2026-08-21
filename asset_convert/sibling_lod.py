@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import struct
 import zlib
 from collections import defaultdict
@@ -40,6 +41,27 @@ from pathlib import Path
 from .terrain_lod import (shipped_lod_worldspaces, _master_names,
                           _find_worldspace_fid, _scan_cell_coords)
 from .lod_gen import _kept_tile_cells_by_level
+
+
+# Shared-folder resolution -- see output_layout. An imported mod's plugins keep
+# their records in `export/<Mod>/<plugin>/` and write into `output/<Mod>/`, so a
+# name must never be joined onto a root by hand.
+
+def _record_dir(export_root, plugin: str) -> Path:
+    try:
+        from output_layout import record_dir
+        return record_dir(export_root, plugin)
+    except ImportError:
+        return Path(export_root) / plugin
+
+
+def _out_root(out_root, plugin: str, export_root=None) -> Path:
+    try:
+        from output_layout import plugin_out_root
+        return plugin_out_root(out_root, plugin,
+                               str(export_root) if export_root else None)
+    except ImportError:
+        return Path(out_root) / plugin
 
 
 # The standalone mod ALL generated LOD ships in.
@@ -60,6 +82,107 @@ LOD_DIR_NAME = "AutoConvertLOD"
 # The previous merged-tile folder. Kept only so an existing install can be
 # recognised and cleaned up; nothing writes here any more.
 MERGED_DIR_NAME = "ZZZ Merged Sibling LOD"
+
+
+def _lod_mod_deliverables(lod_dir: Path) -> list:
+    """Mesh subtrees the LOD mod legitimately OWNS, as absolute dirs.
+
+    Everything else under `meshes/` is scratch. Kept as one list so a new
+    generator that writes into the LOD mod has exactly one place to register
+    itself, instead of the sweep silently eating its output.
+    """
+    from .worldmap_clouds import _OUT_DIR as _CLOUD_DIR
+
+    return [
+        # The baked tiles -- the whole point of the mod.
+        lod_dir / 'meshes' / 'terrain',
+        # World-map cloud banks: ONE file per worldspace at a fixed shared
+        # path, written here by merge_cloud_bank from the UNION of every
+        # sibling's land. The per-plugin copies are the rival versions; this
+        # is the authoritative one, so it must survive the sweep.
+        lod_dir / 'meshes' / _CLOUD_DIR.replace(chr(92), '/'),
+    ]
+
+
+def drop_staged_meshes(lod_dir: Path) -> int:
+    """Delete the meshes a previous bake staged into the LOD mod.
+
+    Staged models are scratch: LODGen resolves geometry under a single
+    PathData root, so `lod_gen._import_master_mesh` copies each model in for
+    the duration of the bake and `_drop_staged_master_meshes` removes it
+    afterwards. Nothing DERIVES an ordinary mesh here -- `far_nif_dirs` routes
+    every generated _far.nif to the plugin tree that ships its full model,
+    which is also where lod_far_gen writes the `.nif.generated` marker that
+    proves authorship. Staging copies the .nif alone and never its marker, so
+    a staged mesh in this tree has no provenance to lose. Measured before this
+    first ran: 4,120 .nif here, 0 markers.
+
+    What the mod genuinely owns is listed by `_lod_mod_deliverables` and is
+    never touched -- the tiles, and the world-map cloud banks that
+    `merge_cloud_bank` writes here precisely BECAUSE the per-plugin copies
+    conflict. Sweeping by "everything that is not terrain/" deleted those
+    banks, which was survivable only because create_lod happens to rewrite
+    them later in the same run; a sweep-only invocation would have left every
+    worldspace's MODL pointing at a missing mesh.
+
+    Scratch is removed as whole SUBTREES where a top-level directory holds no
+    deliverable (one rmtree, not thousands of unlinks), and file-by-file only
+    inside a directory that also holds one. Returns the number of files
+    removed.
+
+    The sweep is needed because the in-process set cannot survive a run.
+    `_import_master_mesh` early-returns for a mesh that is already present and
+    so never registers it, which means anything a killed or pre-one-bake run
+    left behind is invisible to the post-bake cleanup and pins itself forever
+    -- shadowing, since the LOD mod installs last to win the tile overwrite,
+    every plugin's current copy of that mesh.
+    """
+    meshes = lod_dir / 'meshes'
+    if not meshes.is_dir():
+        return 0
+
+    keep = [Path(os.path.normcase(str(d))) for d in _lod_mod_deliverables(lod_dir)]
+
+    def _protected(d: Path) -> bool:
+        """True if `d` is, or contains, a deliverable."""
+        nd = Path(os.path.normcase(str(d)))
+        return any(k == nd or nd in k.parents or k in nd.parents for k in keep)
+
+    def _is_deliverable_dir(d: Path) -> bool:
+        """True only for a deliverable root or something inside one."""
+        nd = Path(os.path.normcase(str(d)))
+        return any(k == nd or k in nd.parents for k in keep)
+
+    def _count(d: Path) -> int:
+        return sum(len(f) for _r, _dirs, f in os.walk(d))
+
+    n = 0
+    for child in sorted(meshes.iterdir()):
+        if not child.is_dir():
+            continue
+        if not _protected(child):
+            n += _count(child)
+            shutil.rmtree(child, ignore_errors=True)
+            continue
+        # Mixed: this subtree holds a deliverable somewhere beneath it, so
+        # recurse and drop only the branches that hold none.
+        stack = [child]
+        while stack:
+            cur = stack.pop()
+            for sub in sorted(cur.iterdir()):
+                if sub.is_dir():
+                    if _protected(sub):
+                        stack.append(sub)
+                    else:
+                        n += _count(sub)
+                        shutil.rmtree(sub, ignore_errors=True)
+                elif not _is_deliverable_dir(cur):
+                    # A loose file inside a directory that merely CONTAINS a
+                    # deliverable is still scratch; only files sitting in the
+                    # deliverable directory itself are kept.
+                    sub.unlink()
+                    n += 1
+    return n
 
 
 def changed_cells_in_worldspace(plugin_esm: Path, master_esm: Path,
@@ -215,7 +338,7 @@ def _master_chain(name: str, export_root: Path, known: list[str]) -> set[str]:
     stack = [name]
     while stack:
         cur = stack.pop()
-        for m in _master_names(export_root / cur):
+        for m in _master_names(_record_dir(export_root, cur)):
             if m in seen or m not in known:
                 continue
             seen.add(m)
@@ -226,9 +349,14 @@ def _master_chain(name: str, export_root: Path, known: list[str]) -> set[str]:
 def converted_plugins(out_root: Path) -> list[str]:
     """Every plugin with a converted ESM in `out_root`, in name order.
 
-    A folder qualifies only when it holds the plugin file it is named after —
-    output/ also collects the shared `Slot44 Patch.esp`, this step's own merged
-    folder, and whatever else the pipeline drops at the root.
+    Two folder shapes both count. A plugin converted on its own lives in a
+    folder named after it (`output/Oblivion.esm/Oblivion.esm`). Plugins
+    imported together from one mod archive share a folder named after the MOD,
+    and are found by their `<name>.manifest.json`.
+
+    Either way the plugin file itself must be present — output/ also collects
+    the shared `Slot44 Patch.esp`, this step's own merged folder, and whatever
+    else the pipeline drops at the root.
     """
     if not out_root.is_dir():
         return []
@@ -238,7 +366,17 @@ def converted_plugins(out_root: Path) -> list[str]:
             continue
         if (p / p.name).is_file():
             names.append(p.name)
-    return names
+            continue
+        # A GROUP folder is named for the mod, not for any one plugin, so the
+        # `<folder>/<folder>` test above cannot see the plugins inside it.
+        # Every converted plugin writes `<name>.manifest.json` beside itself,
+        # which is what distinguishes a real plugin from a stray .esp copied
+        # into the tree.
+        for man in sorted(p.glob('*.manifest.json')):
+            plugin = man.name[:-len('.manifest.json')]
+            if (p / plugin).is_file():
+                names.append(plugin)
+    return sorted(set(names), key=str.lower)
 
 
 def plugins_txt_order() -> list[str]:
@@ -291,7 +429,7 @@ def _master_rank(names: list[str], export_root: Path) -> dict[str, int]:
         if name in seen:
             return 0
         val = 1 + max([d(m, seen | {name})
-                       for m in _master_names(export_root / name)
+                       for m in _master_names(_record_dir(export_root, name))
                        if m in names], default=-1)
         depth[name] = val
         return val
@@ -369,7 +507,8 @@ def worldspaces_by_plugin_diagnosed(names: list[str], export_root: Path,
     reasons: dict[str, str] = {}
     for name in names:
         try:
-            found, why = lod_capable_worldspaces(export_root / name, out_root)
+            found, why = lod_capable_worldspaces(
+                _record_dir(export_root, name), out_root, plugin=name)
         except Exception as exc:
             found, why = [], f"{name}: scan failed ({exc})."
         out[name] = [edid for edid, _fid in found]
@@ -461,14 +600,14 @@ def owner_map(edids, order: list[str], export_root: Path,
     wanted = set(edids)
     out: dict = {}
     for name in order:                      # pass 1: shipped LOD wins
-        for e in _shipped_edids(export_root / name) & wanted:
+        for e in _shipped_edids(_record_dir(export_root, name)) & wanted:
             out.setdefault(e, name)
     if out_root is not None:
         for name in order:                  # pass 2: defined in the ESM
             rest = wanted - out.keys()
             if not rest:
                 break
-            esm = Path(out_root) / name / name
+            esm = _out_root(out_root, name, export_root) / name
             if esm.is_file():
                 for e in _defined_edids(esm) & rest:
                     out.setdefault(e, name)
@@ -488,7 +627,7 @@ def dependents_of(names: list[str], export_root: Path) -> dict[str, set[str]]:
     Translation even though nothing names the two together.
     """
     direct: dict[str, list[str]] = {
-        n: [m for m in _master_names(export_root / n) if m in names]
+        n: [m for m in _master_names(_record_dir(export_root, n)) if m in names]
         for n in names}
 
     out: dict[str, set[str]] = {n: set() for n in names}
@@ -564,7 +703,7 @@ def _load_order(names: list[str], export_root: Path,
             return depth[name]
         if name in seen:
             return 0
-        masters = _master_names(export_root / name)
+        masters = _master_names(_record_dir(export_root, name))
         val = 1 + max([d(m, seen | {name}) for m in masters if m in names],
                       default=-1)
         depth[name] = val
@@ -603,12 +742,13 @@ def find_sibling_groups(out_root: Path, export_root: Path,
     # on who the master is.
     owner: dict[str, str] = {}
     for name in order:
-        for edid, _fid in (shipped_lod_worldspaces(export_root / name) or []):
+        rec = _record_dir(export_root, name)
+        for edid, _fid in (shipped_lod_worldspaces(rec) or []):
             owner.setdefault(edid, name)
 
     groups: dict[str, dict] = {}
     for edid, master in owner.items():
-        master_esm = out_root / master / master
+        master_esm = _out_root(out_root, master, export_root) / master
         if not master_esm.is_file():
             continue
         # The master's CELL FormID -> (x, y) map, scanned ONCE and reused for
@@ -621,7 +761,7 @@ def find_sibling_groups(out_root: Path, export_root: Path,
         for name in order:
             if name == master:
                 continue
-            esm = out_root / name / name
+            esm = _out_root(out_root, name, export_root) / name
             if not esm.is_file():
                 continue
 
@@ -880,7 +1020,8 @@ def _wrld_bounds(esm: Path, edid: str):
 
 
 def merge_cloud_bank(out_root: Path, merged_dir: Path, edid: str,
-                     master: str, plugins: list[str]) -> str:
+                     master: str, plugins: list[str],
+                     export_root: Path = None) -> str:
     """One world-map cloud bank covering the UNION of every sibling's bounds.
 
     Same overwrite problem the LOD tiles have, one level up.  The bank is a
@@ -910,7 +1051,7 @@ def merge_cloud_bank(out_root: Path, merged_dir: Path, edid: str,
     # plugin contributes no cells of its own.
     boxes = []
     for name in [master] + list(plugins):
-        esm = out_root / name / name
+        esm = _out_root(out_root, name, export_root) / name
         if not esm.is_file():
             continue
         box = None
@@ -965,7 +1106,8 @@ def _lod_files(plugin_dir: Path, worldspace: str) -> set[str]:
 
 
 def overwrite_report(out_root: Path, worldspace: str, plugins: list[str],
-                     merged_dir_name: str = None) -> dict:
+                     merged_dir_name: str = None,
+                     export_root: Path = None) -> dict:
     """Which of each plugin's LOD files the merged folder supersedes.
 
     Returns {plugin: {'overwritten': [...], 'kept': N}} — the files this merge
@@ -981,7 +1123,7 @@ def overwrite_report(out_root: Path, worldspace: str, plugins: list[str],
                         worldspace)
     report: dict[str, dict] = {}
     for name in plugins:
-        own = _lod_files(out_root / name, worldspace)
+        own = _lod_files(_out_root(out_root, name, export_root), worldspace)
         hit = sorted(own & merged)
         report[name] = {'overwritten': hit, 'kept': len(own) - len(hit)}
     return report

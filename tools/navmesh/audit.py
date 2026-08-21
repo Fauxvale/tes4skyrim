@@ -36,6 +36,10 @@ from tes5_import.text_reader import (  # noqa: E402
     parse_export_directory, group_records_by_type, get_float, get_int, get_str,
 )
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
+from output_layout import assets_for  # noqa: E402
+
 _TYPES = {'CELL', 'REFR', 'PGRD', 'LAND', 'STAT', 'CONT', 'FURN', 'ACTI',
           'TREE', 'DOOR', 'WRLD'}
 _BASES = ('STAT', 'CONT', 'FURN', 'ACTI', 'TREE', 'DOOR')
@@ -236,7 +240,8 @@ _W = {}
 
 def _init_worker(export_dir, base_model):
     """Load the collision cache ONCE per worker, not once per cell."""
-    ce.load_collision(os.path.join(export_dir, 'collision_cache.bin'), quiet=True)
+    ce.load_collision(str(assets_for(export_dir) / 'collision_cache.bin'),
+                      quiet=True)
     _W['base_model'] = base_model
 
 

@@ -32,6 +32,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 
 from worker_budget import worker_count  # noqa: E402
+from output_layout import assets_for  # noqa: E402
 
 _WORKERS = worker_count()
 
@@ -467,7 +468,7 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
     """
     from asset_convert.animation_data import write_singlefiles
 
-    meshes_root = os.path.join(export_dir, 'meshes')
+    meshes_root = str(assets_for(export_dir) / 'meshes')
     if not os.path.isdir(meshes_root):
         log(f'  No meshes folder at {meshes_root}')
         return {'projects': {}, 'errors': {}}

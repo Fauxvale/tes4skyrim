@@ -79,6 +79,26 @@ PACKING_STEPS = ("pack", "pack_zip")
 # behaviour instead of silently dropping the packing steps from a run.
 PACK_DEFAULT_CONFIG_KEY = "packStepsDefaultOn"
 
+# The INFERRED collision winding steps (Settings > Infer collision winding).
+# The authored-normal repair always runs and is not covered by this key. A
+# tri-state, persisted here: "auto" keeps the measured per-plugin default (on
+# for the plugins in WINDING_FIX_DEFAULT_PLUGINS, off for everything else),
+# while "on"/"off" pin it for every plugin. Anything unrecognised -- including a
+# config written before this setting existed -- reads as "auto", so the defaults
+# are unchanged for anyone who never touches it.
+WINDING_CONFIG_KEY = "collisionWindingFix"
+WINDING_AUTO, WINDING_ON, WINDING_OFF = "auto", "on", "off"
+WINDING_MODES = (WINDING_AUTO, WINDING_ON, WINDING_OFF)
+
+
+def winding_enabled_for(mode: str, plugin: str) -> bool:
+    """Whether the winding repair runs, given the setting and the plugin."""
+    if mode == WINDING_ON:
+        return True
+    if mode == WINDING_OFF:
+        return False
+    return _winding_default(plugin)
+
 
 def default_on_steps(pack_default: bool = True) -> set:
     """Step keys that start ticked, given the Pack-by-default setting.
@@ -344,18 +364,25 @@ def scan_converted(output_path: str) -> list:
         folder = os.path.join(output_path, name)
         if not os.path.isdir(folder):
             continue
-        manifest = os.path.join(folder, f"{name}.manifest.json")
-        if not os.path.isfile(manifest):
-            continue
-        source = name
+        # A folder named for its plugin holds ONE manifest; a mod GROUP folder
+        # is named for the mod and holds one per plugin it converted, so glob
+        # rather than probing for `<folder>.manifest.json`.
         try:
-            with open(manifest, encoding="utf-8") as fh:
-                got = json.load(fh).get("source")
-            if isinstance(got, str) and got.strip():
-                source = got.strip()
-        except (OSError, ValueError):
-            pass          # a truncated manifest still proves the folder is ours
-        found.add(source)
+            manifests = sorted(f for f in os.listdir(folder)
+                               if f.endswith(".manifest.json"))
+        except OSError:
+            continue
+        for manifest_name in manifests:
+            manifest = os.path.join(folder, manifest_name)
+            source = manifest_name[:-len(".manifest.json")]
+            try:
+                with open(manifest, encoding="utf-8") as fh:
+                    got = json.load(fh).get("source")
+                if isinstance(got, str) and got.strip():
+                    source = got.strip()
+            except (OSError, ValueError):
+                pass      # a truncated manifest still proves the folder is ours
+            found.add(source)
     return sorted(found, key=str.lower)
 
 
@@ -646,6 +673,13 @@ def gui_main():
     # Same "only an explicit false disables it" rule as the cache option above.
     pack_default = cfg.get(PACK_DEFAULT_CONFIG_KEY) is not False
 
+    # Collision winding repair mode. Anything that is not one of the three
+    # recognised values -- including the key being absent -- means "auto", the
+    # per-plugin default this setting replaced a checkbox for.
+    winding_mode_default = str(cfg.get(WINDING_CONFIG_KEY, "")).strip().lower()
+    if winding_mode_default not in WINDING_MODES:
+        winding_mode_default = WINDING_AUTO
+
     # ── Root window ───────────────────────────────────────────────────────────
     # tkinterdnd2 supplies drag-and-drop by replacing the Tk root class. It is
     # OPTIONAL: without it the window still opens and Mods > Import... still
@@ -804,12 +838,13 @@ def gui_main():
     # Skyrim patch-plugin state: list of (name, BooleanVar), all-on by default
     patch_plugin_vars = []
 
-    # Collision winding repair: defaults per plugin (on for the plugins measured
-    # to need it — see collision_options).  It tracks the plugin selector until
-    # the user ticks the box themselves, after which their choice is respected
-    # for the rest of the session rather than being silently overwritten.
-    winding_var = tk.BooleanVar(value=_winding_default(file_var.get()))
-    winding_user_set = {"v": False}
+    # Inferred winding steps — Settings ▸ Infer collision winding. "Auto" (the
+    # default) follows the measured per-plugin defaults: on for the plugins in
+    # WINDING_FIX_DEFAULT_PLUGINS, off for everything else. The other two modes
+    # pin it for every plugin. Persisted, so a user who has decided either way
+    # does not have to re-set it every launch. The authored-normal repair runs
+    # regardless of this setting.
+    winding_mode_var = tk.StringVar(value=winding_mode_default)
 
     # Parallax carry-over.  Always starts OFF and never tracks the plugin: the
     # question it answers is about the PLAYER's Skyrim setup (Community Shaders
@@ -817,14 +852,9 @@ def gui_main():
     parallax_var = tk.BooleanVar(value=False)
     tex_only_var = tk.BooleanVar(value=False)
 
-    def _sync_winding_default(*_):
-        if not winding_user_set["v"]:
-            winding_var.set(_winding_default(file_var.get()))
-
-    def _on_winding_toggled():
-        winding_user_set["v"] = True
-
-    file_var.trace_add("write", _sync_winding_default)
+    def _winding_on() -> bool:
+        """Whether the INFERRED steps run for the plugin currently selected."""
+        return winding_enabled_for(winding_mode_var.get(), file_var.get())
 
     def _get_workers() -> int:
         """Current worker-count value, clamped to [1, cpu_max]."""
@@ -913,6 +943,32 @@ def gui_main():
         label="Pack BSAs / Mod Zip by default", variable=pack_default_var,
         onvalue=True, offvalue=False, command=_on_pack_default_change)
 
+    # Settings ▸ Infer collision winding ▸ Automatic / Always on / Always off.
+    # This controls ONLY the inferred steps. The authored-normal repair (which
+    # reads the winding each triangle records for itself) always runs and has
+    # no switch -- it is what fixes "I fall straight through the floor" on
+    # vanilla Oblivion and on Nehrim. The inferred steps GUESS from adjacency,
+    # enclosed volume and the render mesh, so they can invert geometry that was
+    # already correct, and are only worth it where the exporter destroyed the
+    # normals. "Automatic" turns them on for exactly those plugins (measured;
+    # see collision_options). A radio group rather than a checkbox because
+    # "follow the per-plugin default" is a third answer, not the absence of one.
+    def _on_winding_mode_change():
+        updated = load_config()
+        updated[WINDING_CONFIG_KEY] = winding_mode_var.get()
+        save_config(updated)
+
+    winding_menu = tk.Menu(settings_menu, **_menu_opts)
+    _auto_plugins = ", ".join(sorted(WINDING_FIX_DEFAULT_PLUGINS))
+    for _mode, _label in (
+            (WINDING_AUTO, f"Automatic  (on for {_auto_plugins})"),
+            (WINDING_ON,   "Always on"),
+            (WINDING_OFF,  "Always off")):
+        winding_menu.add_radiobutton(
+            label=_label, value=_mode, variable=winding_mode_var,
+            command=_on_winding_mode_change)
+    settings_menu.add_cascade(label="Infer collision winding", menu=winding_menu)
+
     # ── Converted ▸ (plugins already in output/) ──────────────────────────────
     # Picking one selects it AND ticks the steps its last conversion still owes,
     # so "re-run what this plugin needs" is two clicks from a cold start.
@@ -946,12 +1002,15 @@ def gui_main():
                   "Source, then pick it again.")
             return
 
+        # Picking from Converted > is an explicit request to re-plan that
+        # plugin, even when it is the one already selected (where _commit
+        # deliberately leaves the user's edits alone) and even if its plan was
+        # already auto-applied once this session. Clear the guard BEFORE
+        # committing so the refresh _commit starts already re-applies it.
+        _plan_applied.discard(name)
+        _set_default()
         _commit(name)
         file_combo.selection_clear()
-        # Re-selecting a plugin is an explicit request to re-plan it, even if
-        # its plan was already auto-applied once this session.
-        _plan_applied.discard(name)
-        _refresh_upgrade_notice()
 
     def _rebuild_converted_menu():
         converted_menu.delete(0, tk.END)
@@ -1652,6 +1711,7 @@ def gui_main():
         """
         try:
             from asset_convert import mod_ingest, source_registry
+            from output_layout import asset_root
             name = file_var.get()
             entry = source_registry.get(EXPORT_DIR, name)
         except Exception:
@@ -1664,9 +1724,14 @@ def gui_main():
         # Imported before capabilities were recorded: measure the tree now
         # rather than falling back to "allow everything", which would offer
         # steps the mod has no content for.
+        #
+        # Measure the SHARED asset tree. Every plugin from one archive draws on
+        # the same meshes/textures, so capabilities are a property of the MOD;
+        # measuring `export/<plugin>/` looked at a folder that no longer exists
+        # and reported a resource pack as having no meshes at all.
         try:
             return mod_ingest.capabilities_for(
-                EXPORT_DIR / (entry.get("plugin") or name),
+                asset_root(EXPORT_DIR, entry.get("plugin") or name),
                 has_plugin=bool(entry.get("plugin")))
         except Exception:
             return None
@@ -1849,9 +1914,26 @@ def gui_main():
 
     def _commit(name: str):
         searching[0] = False
+        previous = last_valid[0]
         last_valid[0] = name
         file_var.set(name)
         file_combo["values"] = list(all_plugins)
+        # Switching plugin starts that plugin's selection over. The ticks are
+        # per-plugin state -- what THIS plugin still owes -- so carrying the
+        # last one's boxes across meant edits made for plugin A silently
+        # governed the run for plugin B.
+        #
+        # Reset to the defaults first so the window is never showing another
+        # plugin's selection, then let the upgrade plan narrow it to what is
+        # actually outstanding when the (threaded) lookup returns. Re-selecting
+        # the plugin already shown is not a switch and must not discard the
+        # user's edits.
+        # Case-insensitive: the combo and a typed name differ in case for
+        # the same file often enough that a raw compare would read as a
+        # switch and wipe the selection.
+        if (name or '').strip().lower() != (previous or '').strip().lower():
+            _plan_applied.discard(name)
+            _set_default()
         # Each plugin carries its own conversion history, so the upgrade notice
         # is per-plugin and has to follow the selection.
         _refresh_upgrade_notice()
@@ -2848,6 +2930,24 @@ def gui_main():
                 lbl.pack(anchor="w", padx=4, pady=4)
                 return
 
+            # A MISSING EXPORT has to be visible even when other plugins
+            # filled the list. Shipped LOD is the authority now, so "this
+            # plugin offers nothing" is the ordinary case for most of the load
+            # order and cannot itself be the trigger -- but a deleted export
+            # produces the same silence, and previously the warning only
+            # appeared when NOTHING was offered, so one healthy plugin hid it.
+            lost = [_ws_why[n] for n in names
+                    if n in _ws_why and 'run the Export stage' in _ws_why[n]]
+            if lost:
+                warn = tk.Label(
+                    winner,
+                    text="\n\n".join(lost[:4]) +
+                         (f"\n\n(+{len(lost) - 4} more)" if len(lost) > 4
+                          else ""),
+                    bg=CLR["panel"], fg=CLR["yellow"],
+                    justify=tk.LEFT, wraplength=210, font=("Segoe UI", 9))
+                warn.pack(anchor="w", padx=4, pady=(4, 6))
+
             for wname in live:
                 var = tk.BooleanVar(value=ws_state.get(wname, True))
                 ws_vars.append((wname, var))
@@ -3017,33 +3117,11 @@ def gui_main():
     mesh_toggle_lbl.pack(side=tk.LEFT, padx=(20, 0))
     mesh_toggle_lbl.bind("<Button-1>", lambda _: _open_mesh_subdir_panel())
 
-    # Collision winding repair toggle, sitting with the other Meshes sub-options.
-    _winding_row = ttk.Frame(sidebar, style="Panel.TFrame")
-    _winding_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_mesh_toggle_row)
-    _winding_chk = ttk.Checkbutton(_winding_row, text="Fix collision winding",
-                                   variable=winding_var,
-                                   command=_on_winding_toggled,
-                                   style="TCheckbutton")
-    _winding_chk.pack(side=tk.LEFT, padx=(20, 0))
-    _winding_hint = ttk.Label(_winding_row, text="repair inverted floors",
-                              style="PanelSub.TLabel")
-    _winding_hint.pack(side=tk.LEFT, padx=(6, 0))
-
-    _WINDING_TIP = (
-        "Fixes floors and walls you fall straight through.\n\n"
-        "Most mods don't need this. Turn it on only if you fall through "
-        "solid ground in game.\n\n"
-        "Switches on automatically for "
-        + ", ".join(sorted(WINDING_FIX_DEFAULT_PLUGINS)) + ", which need it."
-    )
-    _attach_tooltip(_winding_chk, _WINDING_TIP)
-    _attach_tooltip(_winding_hint, _WINDING_TIP)
-
     # Parallax carry-over, the other Meshes sub-option.  No per-plugin default
     # and no auto-on: whether the output renders correctly depends on the
     # PLAYER's setup, not on the plugin, so only they can answer it.
     _parallax_row = ttk.Frame(sidebar, style="Panel.TFrame")
-    _parallax_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_winding_row)
+    _parallax_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_mesh_toggle_row)
     _parallax_chk = ttk.Checkbutton(_parallax_row, text="Convert parallax",
                                     variable=parallax_var,
                                     style="TCheckbutton")
@@ -3097,6 +3175,7 @@ def gui_main():
 
     parallax_var.trace_add('write', _sync_texonly)
     _sync_texonly()
+
 
     # ── Action buttons ────────────────────────────────────────────────────────
     # 12px above, matching a separator's gap: the step rows are packed tight
@@ -3659,11 +3738,32 @@ def gui_main():
         card.place(relx=0.5, rely=0.5, anchor="center")
         card.grab_set()
 
+    def _plugin_esm(out_root, plugin: str):
+        """The converted plugin file, wherever its mod's folder is."""
+        try:
+            from output_layout import plugin_esm
+            return plugin_esm(out_root, plugin, EXPORT_DIR)
+        except ImportError:
+            return Path(out_root) / plugin / plugin   # noqa: plugin-path (no-registry fallback)
+
+    def _master_export_present(master: str) -> bool:
+        """True when `master`'s exported records exist under EXPORT_DIR."""
+        try:
+            from output_layout import record_dir
+            return record_dir(EXPORT_DIR, master).is_dir()
+        except ImportError:
+            return (EXPORT_DIR / master).is_dir()   # noqa: plugin-path (no-registry fallback)
+
     def _missing_masters_for(manifest):
-        """Masters of the archive's plugins that have no export/<master>/ yet.
+        """Masters of the archive's plugins with no export records yet.
 
         Read straight out of the archive, so the warning appears BEFORE the
         import rather than after a failed conversion.
+
+        Resolved through `record_dir`, never by joining the name onto export/:
+        an imported mod's plugins live inside their mod's shared folder, so a
+        master that IS converted reads as missing under the plain join and the
+        dialog tells the user to convert something they already have.
         """
         try:
             import tempfile
@@ -3688,7 +3788,7 @@ def gui_main():
                             manifest.path, member,
                             os.path.join(tmp, os.path.basename(rel)))
                     for master in get_masters_from_binary(str(target)):
-                        if not (EXPORT_DIR / master).is_dir():
+                        if not _master_export_present(master):
                             missing.add(master)
                 except Exception:
                     continue
@@ -3879,8 +3979,8 @@ def gui_main():
 
     # ── Run logic ─────────────────────────────────────────────────────────────
     def _winding_flag() -> str:
-        """The explicit collision-winding flag matching the checkbox."""
-        return ("--collision-winding-fix" if winding_var.get()
+        """The explicit collision-winding flag matching the setting."""
+        return ("--collision-winding-fix" if _winding_on()
                 else "--no-collision-winding-fix")
 
     def _build_cmd(step_key: str, fname: str, out_dir: str,
@@ -3896,8 +3996,8 @@ def gui_main():
         if step_key == "meshes":
             if selected_subdirs:
                 cmd += ["--mesh-subdirs"] + selected_subdirs
-            # Always explicit: the checkbox is the user's answer, whether it
-            # came from the per-plugin default or from them ticking the box.
+            # Always explicit: the setting is the user's answer, whether it
+            # resolved from Automatic or from them pinning it on or off.
             cmd.append(_winding_flag())
             if parallax_var.get():
                 cmd.append("--parallax")
@@ -4127,7 +4227,7 @@ def gui_main():
                 sig = []
                 for n in names:
                     try:
-                        st = (out_root / n / n).stat()
+                        st = _plugin_esm(out_root, n).stat()
                         sig.append(f"{n}:{st.st_size}:{st.st_mtime_ns}")
                     except OSError:
                         sig.append(f"{n}:-")
@@ -4276,7 +4376,7 @@ def gui_main():
         if selected_subdirs:
             _log(f"Mesh subdirs: {', '.join(selected_subdirs)}")
         if "meshes" in steps:
-            _log(f"Collision winding fix: {'on' if winding_var.get() else 'off'}")
+            _log(f"Collision winding fix: {'on' if _winding_on() else 'off'}")
             _log(f"Parallax: {'on' if parallax_var.get() else 'off'}"
                  + (" (Community Shaders or ENB required in game)"
                     if parallax_var.get() else ""))

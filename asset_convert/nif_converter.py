@@ -1086,13 +1086,49 @@ _ALPHA_DST_ONE = 0
 _SOFT_FALLOFF_DEPTH = 100.0
 
 
-def _apply_fx_soft_effect(eff_shader, alpha_prop):
+# Vanilla's own FLAME shapes -- the ones mounted against geometry, which is
+# exactly our torch/sconce case -- ship soft_effect OFF and a boosted emissive:
+#   torchsconce01  pFireballCore04  soft=0 mult=1.50
+#   slighthousefire Fireball/Flames soft=0 mult=1.50
+#   campfire01burning Glow:2/Glow:3 soft=0 mult=2.50/1.60
+# Only the free-standing smoke/glow planes take the fade (smoke02, Glow02,
+# Hot_Center: soft=1 mult=1.00).  A soft fade on a flame pinned to its sconce
+# attenuates it against the very surface it is mounted on -- the flame reads
+# dim and see-through -- and 1.0 then removes the over-brighten fire needs.
+_FIRE_TEX_HINTS = (b'fire', b'flame', b'torch')
+_FIRE_EMISSIVE_MULTIPLE = 1.5
+
+
+def _is_fire_fx(texture_path):
+    """Is this FX surface a FLAME (vs smoke/mist/dust/glow)?
+
+    Read off the AUTHORED diffuse path, which is how Oblivion names these
+    (fire/FireTorchLargeS01.dds, fire/FireFlameParticle.dds).  Smoke shares
+    the fire/ folder, so an explicit smoke/mist/dust/steam match wins.
+    """
+    t = bytes(texture_path or b'').lower()
+    if not t:
+        return False
+    for neg in (b'smoke', b'mist', b'fog', b'dust', b'steam', b'cloud'):
+        if neg in t:
+            return False
+    return any(h in t for h in _FIRE_TEX_HINTS)
+
+
+def _apply_fx_soft_effect(eff_shader, alpha_prop, texture_path=None):
     """Enable the soft-particle depth fade on a blended FX shader.
 
     Keyed on the source's own NiAlphaProperty: blending on -> fade, off/absent
     -> leave hard (matching the vanilla split above).  A quad that does not
     blend has no soft edge to preserve in the first place.
+
+    FLAMES are excluded and instead get vanilla's fire emissive boost -- see
+    the census beside _FIRE_TEX_HINTS.
     """
+    if _is_fire_fx(texture_path):
+        eff_shader.shader_flags_1.slsf_1_soft_effect = 0
+        eff_shader.emissive_multiple = _FIRE_EMISSIVE_MULTIPLE
+        return False
     if alpha_prop is None:
         return False
     if not (int(alpha_prop.flags) & _ALPHA_BLEND_ENABLED):
@@ -1809,7 +1845,8 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         # alpha, which is what the engine multiplies the sampled texel by.
         eff_shader.emissive_color.a = material_alpha
         # Kill the rectangular hard edge where the quad intersects walls/floor.
-        if _apply_fx_soft_effect(eff_shader, alpha_prop) and stats is not None:
+        if _apply_fx_soft_effect(eff_shader, alpha_prop,
+                                 effective_path) and stats is not None:
             stats['fx_soft_effect'] = stats.get('fx_soft_effect', 0) + 1
 
         if atlas is not None:
@@ -1852,6 +1889,25 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         # type to set.
         _apply_parallax(ts, shader, tex_set, tex_apply_mode, stats)
         ts.bs_properties[0] = shader
+
+    # Record the diffuse as a DETAIL OVERLAY when the source authored it that
+    # way.  This is not about the NiAlphaProperty (most overlay shapes ship
+    # none, e.g. RockGreatForest645): it is about the TEXTURE, whose alpha is a
+    # blend weight rather than a mask.  Harmless in the full mesh -- nothing
+    # samples that channel as transparency -- but object LOD does, because
+    # LODGen stamps every baked shape slsf_2_lod_objects and the LOD shader
+    # reads diffuse alpha as opacity.  The LOD stage flattens the alpha on a
+    # LOD-local copy of exactly these textures; see
+    # `lod_gen._force_opaque_lod_diffuses`.
+    #
+    # Keyed off the CONVERTED path (tex_set.textures[0], i.e. post-'tes4\'
+    # rewrite), because that is what the shipped mesh -- and therefore the
+    # baked .bto tile -- actually references.
+    if tex_apply_mode == _APPLY_HILIGHT2 and stats is not None:
+        _overlay_key = _norm_tex_ref(tex_set.textures[0])
+        if _overlay_key:
+            stats.setdefault('overlay_diffuses', set()).add(_overlay_key)
+
     if alpha_prop is not None:
         # Oblivion's APPLY_HILIGHT2 (4) is its PARALLAX switch: the diffuse's
         # alpha channel is a HEIGHT FIELD, not a transparency mask.  Skyrim
@@ -1957,6 +2013,203 @@ def _iter_controllers(mgr):
                 yield c
 
 
+_NO_VALUE = -3.4028234663852886e+38   # Gamebryo's "channel has no value"
+
+
+def _accum_root_mode(seq, root, resolve_name):
+    """How the sequence's accum-root controlled block must be converted.
+
+    Oblivion's exporter writes the accum root's entry as the ROOT-MOTION
+    placeholder -- an IDENTITY pose (census of all 464 Oblivion non-creature
+    NIFs with sequences: 853 accum-root entries, 815 data-less identity poses,
+    38 with never-varying keys, 0 that move) -- and moves the node's real
+    transform onto the "<accum> NonAccum" child (as a pose on doors, as key 0
+    on keyed nodes: sesacellumgate01's NonAccum keys start at MetalGate's
+    authored (-7,-16.2,37.9); bravilloaddoorlowerint01's NonAccum pose is
+    (0,-42.7,12) with rotation keys starting at the root's 90 deg).  Both
+    engines apply the identity, and NonAccum restores the world pose.  Playing
+    the identity is therefore CORRECT for those ('transferred') and the entry
+    must be left exactly as authored -- sentinelling its rotation, as the
+    generic data-less rule below does, doubles the door's authored rotation.
+
+    The arena spectators are exactly this: Bip01 (the actor rig's 82.5 deg Z
+    rotation, 64 units up) has the identity pose and "Bip01 NonAccum" key 0 is
+    (-0.34,-1.64,64.07) at 82.6 deg.  Sentinelling Bip01's rotation left the
+    authored 82.5 deg in place while NonAccum re-applied its own -- the crowd
+    faced 165 deg off whenever the sequence played ("rotated 90 degrees").
+    Patched in the live engine (2026-08-18): with Bip01's pose left as the
+    valid identity, Bip01 read back as identity, NonAccum as
+    (-0.34,-1.64,~64)/82.5 deg, and the crowd sat at its authored pose.
+
+    Every one of the 195 non-identity accum roots in Oblivion.esm is
+    'transferred'.  'orphan' (nothing carries the transform, so applying the
+    identity would collapse the node) is defensive, for plugins whose exporter
+    did not follow the convention: every channel is sentinelled so the node
+    keeps its authored transform.
+
+    Returns 'transferred', 'orphan', or None (no accum root, or one whose
+    authored transform is identity, where the pose is a no-op either way).
+    """
+    accum = getattr(seq, 'target_name', b'') or b''
+    if isinstance(accum, str):
+        accum = accum.encode('latin-1')
+    accum = bytes(accum)
+    if not accum:
+        return None
+    anode = None
+    for b in root.tree():
+        nm = getattr(b, 'name', None)
+        if nm is not None and bytes(nm) == accum and hasattr(b, 'translation'):
+            anode = b
+            break
+    if anode is None:
+        return None
+    t = anode.translation
+    m = anode.rotation
+    root_t = (t.x, t.y, t.z)
+    rot_identity = (abs(m.m_11 - 1) < 1e-3 and abs(m.m_22 - 1) < 1e-3
+                    and abs(m.m_33 - 1) < 1e-3)
+    root_moved = max(abs(v) for v in root_t) >= 0.05
+    if not root_moved and rot_identity:
+        return None
+    # The NonAccum child's ANIMATED transform in this sequence.
+    na_name = accum + b' NonAccum'
+    na_t = None
+    na_rot_animated = False
+    for cb in seq.controlled_blocks:
+        nm = resolve_name(cb, seq, 'node_name')
+        nm = nm.encode('latin-1') if isinstance(nm, str) else bytes(nm or b'')
+        if nm != na_name:
+            continue
+        it = cb.interpolator
+        if it is None or not hasattr(it, 'rotation'):
+            continue
+        d = getattr(it, 'data', None)
+        if d is not None and d.translations.num_keys:
+            k = d.translations.keys[0].value
+            na_t = (k.x, k.y, k.z)
+        elif it.translation.x > _NO_VALUE:
+            na_t = (it.translation.x, it.translation.y, it.translation.z)
+        if d is not None and (getattr(d, 'num_rotation_keys', 0) or
+                              any(g.num_keys for g in d.xyz_rotations)):
+            na_rot_animated = True
+        elif it.rotation.w > _NO_VALUE:
+            na_rot_animated = True
+        break
+    if root_moved:
+        if (na_t is not None and
+                max(abs(a - b) for a, b in zip(na_t, root_t)) < 1.0):
+            return 'transferred'
+        return 'orphan'
+    # Root at the origin but rotated: transferred iff NonAccum animates a
+    # rotation at all (the identity pose then only zeroes what NonAccum
+    # re-applies).
+    return 'transferred' if na_rot_animated else 'orphan'
+
+
+def _property_ctrl_index(root):
+    """id(property controller) -> [geometry names wearing that property].
+
+    Oblivion shares one NiTexturingProperty / NiMaterialProperty block between
+    several shapes, and a sequence entry names only ONE of them: palacefont01's
+    'Water' entry drives NiTexturingProperty #71, which Water03, PalaceWaterL2
+    and PalaceWaterR02 also wear, so in TES4 one entry scrolls all four (the
+    fountain's upper tier).  Skyrim gives every converted shape its own
+    BS*ShaderProperty, so the retargeted entry must be fanned out to one
+    entry (and one controller) per sharing shape or the siblings stay frozen
+    -- the upper tier of the Font of Madness after the first conversion.
+    Built once per manager (one tree walk), looked up per entry.
+    """
+    index = {}
+    for blk in root.tree():
+        if not hasattr(blk, 'properties') or not hasattr(blk, 'data'):
+            continue           # geometry only (NiGeometry / NiParticleSystem)
+        nm = bytes(getattr(blk, 'name', b'') or b'')
+        if not nm:
+            continue
+        for prop in blk.properties or ():
+            if prop is None:
+                continue
+            c = getattr(prop, 'controller', None)
+            while c is not None:
+                lst = index.setdefault(id(c), [])
+                if nm not in lst:
+                    lst.append(nm)
+                c = getattr(c, 'next_controller', None)
+    return index
+
+
+def _shapes_sharing_property_ctrl(index, src_ctrl, own_name):
+    """Names of the OTHER geometries whose Oblivion property carries *src_ctrl*."""
+    return [nm for nm in index.get(id(src_ctrl), ()) if nm != own_name]
+
+
+def _fan_out_shared_entries(seq, extras):
+    """Append one controlled block per (source entry, sibling name) pair.
+
+    The controller and interpolator are cloned per sibling (each shape's own
+    shader gets its own controller, as vanilla does); the key DATA is shared.
+    """
+    if not extras:
+        return 0
+    have = set()
+    for cb in seq.controlled_blocks:
+        have.add((bytes(cb.node_name or b''), cb.controller.__class__.__name__,
+                  getattr(cb.controller, 'type_of_controlled_variable', None),
+                  getattr(cb.controller, 'type_of_controlled_color', None)))
+    added = 0
+    for src_cb, sib in extras:
+        sc = src_cb.controller
+        sig = (sib, sc.__class__.__name__,
+               getattr(sc, 'type_of_controlled_variable', None),
+               getattr(sc, 'type_of_controlled_color', None))
+        if sig in have:
+            continue
+        have.add(sig)
+        names = list(src_cb._get_names())
+        seq.num_controlled_blocks += 1
+        seq.controlled_blocks.update_size()
+        cb = seq.controlled_blocks[seq.num_controlled_blocks - 1]
+        for m in names:
+            setattr(cb, m, getattr(src_cb, m))
+        cb.node_name = sib
+        for off in ('node_name_offset', 'property_type_offset',
+                    'controller_type_offset', 'variable_1_offset',
+                    'variable_2_offset'):
+            if hasattr(cb, off):
+                try:
+                    setattr(cb, off, -1)
+                except Exception:
+                    pass
+        # Clone the controller (same class, same public fields + the private
+        # re-stamp markers _match_seq_shader_types reads).
+        c2 = sc.__class__()
+        for m in sc._get_names():
+            try:
+                setattr(c2, m, getattr(sc, m))
+            except Exception:
+                pass
+        for priv in ('_tt_operation', '_alpha_ctrl', '_is_color_ctrl'):
+            if hasattr(sc, priv):
+                setattr(c2, priv, getattr(sc, priv))
+        c2.next_controller = None
+        c2.target = None
+        # Clone the interpolator (key data shared).
+        it = src_cb.interpolator
+        if it is not None:
+            i2 = it.__class__()
+            for m in it._get_names():
+                try:
+                    setattr(i2, m, getattr(it, m))
+                except Exception:
+                    pass
+            c2.interpolator = i2
+            cb.interpolator = i2
+        cb.controller = c2
+        added += 1
+    return added
+
+
 def _process_controller_manager(node, palette):
     """Strip unsupported NiControllerManager sequences.
 
@@ -1990,8 +2243,15 @@ def _process_controller_manager(node, palette):
         return _palette_lookup(_palette_bytes(getattr(seq, 'string_palette', None)),
                                getattr(blk, attr + '_offset', None))
 
+    prop_index = None      # id(property ctrl) -> shapes; built on first use
     for seq in mgr.controller_sequences:
+        accum_mode = _accum_root_mode(seq, node, _resolve_name)
+        accum_name = getattr(seq, 'target_name', b'') or b''
+        if isinstance(accum_name, str):
+            accum_name = accum_name.encode('latin-1')
+        accum_name = bytes(accum_name)
         key = 0
+        shared_extras = []     # (retargeted entry, sibling shape name)
         while key < seq.num_controlled_blocks:
             blk = seq.controlled_blocks[key]
             node_name = _resolve_name(blk, seq, 'node_name')
@@ -2047,15 +2307,40 @@ def _process_controller_manager(node, palette):
             #
             # The root-named entry is still dropped above: 0 vanilla sequences
             # target their own root node.
+            #
+            # The sequence's ACCUM ROOT is the exception, both ways -- see
+            # _accum_root_mode.  'transferred' (NonAccum carries the node's
+            # transform): the exporter's identity pose is what both engines
+            # play, so leave the entry exactly as authored -- sentinelling its
+            # rotation would double the door's authored rotation (the arena
+            # crowd's "rotated 90 degrees").  'orphan' (nothing carries the
+            # transform): sentinel EVERY channel so the node keeps its
+            # authored transform; a keyless NiTransformData is dropped first
+            # so the sentinel applies.
             if isinstance(blk.interpolator, NifFormat.NiTransformInterpolator):
                 interp = blk.interpolator
-                if interp.data is None:
-                    _NO_VALUE = -3.4028234663852886e+38
-                    interp.rotation.w = _NO_VALUE
-                    interp.rotation.x = _NO_VALUE
-                    interp.rotation.y = _NO_VALUE
-                    interp.rotation.z = _NO_VALUE
-                    interp.scale = _NO_VALUE
+                _nn = node_name.encode('latin-1') if isinstance(node_name, str) else bytes(node_name or b'')
+                is_accum_root = bool(_nn) and _nn == accum_name
+                if is_accum_root and accum_mode == 'transferred':
+                    pass
+                else:
+                    if is_accum_root and interp.data is not None:
+                        _d = interp.data
+                        if (getattr(_d, 'num_rotation_keys', 0) == 0 and
+                                _d.translations.num_keys == 0 and
+                                _d.scales.num_keys == 0 and
+                                all(g.num_keys == 0 for g in _d.xyz_rotations)):
+                            interp.data = None
+                    if interp.data is None:
+                        interp.rotation.w = _NO_VALUE
+                        interp.rotation.x = _NO_VALUE
+                        interp.rotation.y = _NO_VALUE
+                        interp.rotation.z = _NO_VALUE
+                        interp.scale = _NO_VALUE
+                        if is_accum_root and accum_mode == 'orphan':
+                            interp.translation.x = _NO_VALUE
+                            interp.translation.y = _NO_VALUE
+                            interp.translation.z = _NO_VALUE
 
             # Morph controllers do not exist in Skyrim (the SSE exe has no
             # NiGeomMorpherController RTTI class at all; vanilla ships 0) --
@@ -2116,6 +2401,10 @@ def _process_controller_manager(node, palette):
                     new._is_color_ctrl = True     # for _match_seq_shader_types
                     blk.controller = new
                     blk.controller_type = b'BSLightingShaderPropertyColorController'
+                    if prop_index is None:
+                        prop_index = _property_ctrl_index(node)
+                    for sib in _shapes_sharing_property_ctrl(prop_index, src_ctrl, node_name):
+                        shared_extras.append((blk, sib))
                     key += 1
                     continue
                 seq.controlled_blocks.pop(key)
@@ -2184,6 +2473,12 @@ def _process_controller_manager(node, palette):
                     new._tt_operation = op       # remembered for that pass
                     blk.controller = new
                     blk.controller_type = b'BSLightingShaderPropertyFloatController'
+                    # One entry per shape that WORE the shared source property
+                    # (see _shapes_sharing_property_ctrl).
+                    if prop_index is None:
+                        prop_index = _property_ctrl_index(node)
+                    for sib in _shapes_sharing_property_ctrl(prop_index, src_ctrl, node_name):
+                        shared_extras.append((blk, sib))
                     key += 1
                     continue
                 # TT_ROTATE has no Skyrim equivalent -- drop the entry.
@@ -2215,6 +2510,10 @@ def _process_controller_manager(node, palette):
                     new._alpha_ctrl = True       # for _match_seq_shader_types
                     blk.controller = new
                     blk.controller_type = b'BSLightingShaderPropertyFloatController'
+                    if prop_index is None:
+                        prop_index = _property_ctrl_index(node)
+                    for sib in _shapes_sharing_property_ctrl(prop_index, src_ctrl, node_name):
+                        shared_extras.append((blk, sib))
                     key += 1
                     continue
                 seq.controlled_blocks.pop(key)
@@ -2236,6 +2535,8 @@ def _process_controller_manager(node, palette):
                 continue
 
             key += 1
+
+        _fan_out_shared_entries(seq, shared_extras)
 
 
 def _apply_rest_visibility(root, stats=None):
@@ -2265,7 +2566,8 @@ def _apply_rest_visibility(root, stats=None):
         # node's visibility -- baking the t=0 value in would hide geometry the
         # animation is about to show.
         seq_name = bytes(getattr(block, 'name', b'') or b'')
-        if seq_name == _AUTOPLAY_SEQUENCE.encode('latin-1'):
+        if seq_name in (_AUTOPLAY_SEQUENCE.encode('latin-1'),
+                        _AUTOLOOP_SEQUENCE.encode('latin-1')):
             continue
         raw = _palette_bytes(getattr(block, 'string_palette', None))
         for cb in block.controlled_blocks:
@@ -2380,15 +2682,74 @@ def _attach_seq_shader_controllers(root, stats=None):
     return attached
 
 
+def _clone_sequence_as(root, seq, new_name, cycle_type):
+    """Add a second NiControllerSequence named *new_name* beside *seq*.
+
+    Vanilla's shared ambient graph (GenericBehaviors/Autoplay.hkx) needs BOTH
+    'AutoPlay' (its start state) and 'AutoLoop' (the state it hands off to).
+    Oblivion authors only one ambient sequence, so the second is cloned here.
+
+    The clone REUSES the original's controlled-block interpolators rather than
+    deep-copying the key data: a NiControllerSequence only references its
+    interpolators, two sequences may reference the same ones (verified in the
+    live engine: both sequences bind the same interpolator pointers and play),
+    and the keys are by far the largest part of the block.
+
+    Returns the new sequence, or None when the manager cannot be reached (a
+    sequence with no manager is unreachable by the graph, so there is nothing
+    to register).
+    """
+    mgr = getattr(seq, 'manager', None)
+    if mgr is None:
+        return None
+    clone = NifFormat.NiControllerSequence()
+    clone.name = new_name.encode('latin-1')
+    clone.cycle_type = cycle_type
+    clone.frequency = seq.frequency
+    clone.start_time = seq.start_time
+    clone.stop_time = seq.stop_time
+    clone.manager = mgr
+    clone.text_keys = seq.text_keys
+    clone.string_palette = seq.string_palette
+    if hasattr(seq, 'target_name'):
+        clone.target_name = seq.target_name      # accum root name
+    clone.num_controlled_blocks = seq.num_controlled_blocks
+    clone.array_grow_by = getattr(seq, 'array_grow_by', 0)
+    clone.controlled_blocks.update_size()
+    # Copy every declared member: ControllerLink's field set differs across NIF
+    # versions (20.0.0.4 has variable_1/variable_2 where later ones have
+    # controller_id/interpolator_id), so naming them explicitly breaks on the
+    # next version.  _get_names() is pyffi's own declaration order.
+    names = list(seq.controlled_blocks[0]._get_names()) if seq.num_controlled_blocks else []
+    for dst, src in zip(clone.controlled_blocks, seq.controlled_blocks):
+        for member in names:
+            setattr(dst, member, getattr(src, member))
+    mgr.num_controller_sequences += 1
+    mgr.controller_sequences.update_size()
+    mgr.controller_sequences[mgr.num_controller_sequences - 1] = clone
+    return clone
+
+
 def _autoplay_ambient_sequences(root, stats=None):
-    """Rename Oblivion's self-playing "Idle" sequence to Skyrim's "AutoPlay".
+    """Turn Oblivion's self-playing "Idle" sequence into vanilla's AutoPlay pair.
 
     Oblivion starts a sequence called Idle on load; Skyrim starts nothing by
-    itself unless the sequence is named AutoPlay, so ambient animation arrived
-    frozen on its first frame (palacefont01's fountain water, the SE01 waiting
-    room light ripples).  Also force CYCLE_LOOP: Oblivion authors these as
-    CLAMP (cycle_type 0), which would play through once and stop, whereas every
-    vanilla AutoPlay is a loop.
+    itself.  Vanilla's self-playing meshes (63 in Skyrim.esm's BSAs) all point
+    their BGED at GenericBehaviors/Autoplay.hkx, whose state machine STARTS on
+    a state playing sequence 'AutoPlay' (a CLAMP intro; 53/54 vanilla) and, on
+    that sequence's End event, hands off to a state playing 'AutoLoop' (the
+    real motion, cycle type LOOP; 39/53 vanilla).  Looping is the SEQUENCE's
+    own cycle type -- BGSGamebryoSequenceGenerator has no looping field
+    (bLooping is SERIALIZE_IGNORED) and the AutoLoop state has no
+    self-transition.
+
+    So: the authored Idle becomes AutoLoop and KEEPS its authored cycle type
+    (all 116 Oblivion 'Idle' sequences are CYCLE_LOOP = 0), and a CLAMP clone
+    named AutoPlay is added for the start state.  Read out of the running
+    engine (2026-08-18, arena spectator, `tools/game_bridge.py`): with AutoLoop
+    written as CLAMP the graph reached AutoLoopState and froze on the last
+    frame; flipping the loaded sequence's cycleType to LOOP in memory and
+    `sae AutoReset` made it loop indefinitely.
 
     Script-driven names (Forward, SpecialIdle, ...) are left alone -- those are
     started through the behaviour graph BY NAME and renaming them would break
@@ -2402,8 +2763,8 @@ def _autoplay_ambient_sequences(root, stats=None):
         name = raw.decode('latin-1') if isinstance(raw, bytes) else str(raw)
         if name.lower() not in _AMBIENT_SEQUENCES:
             continue
-        block.name = _AUTOPLAY_SEQUENCE.encode('latin-1')
-        block.cycle_type = _CYCLE_LOOP
+        block.name = _AUTOLOOP_SEQUENCE.encode('latin-1')
+        _clone_sequence_as(root, block, _AUTOPLAY_SEQUENCE, _CYCLE_CLAMP)
         renamed += 1
     if renamed and stats is not None:
         stats['autoplay_sequences'] = stats.get('autoplay_sequences', 0) + renamed
@@ -3081,20 +3442,114 @@ def _resolve_geometry_suffix(root, name):
 # the PyFFI NiPSysData 66-vs-70-byte misalignment plus uv_scale=(0,0), both
 # long fixed; the interim BSValueNode/AddonNode substitution is now removed.)
 
+# Which flame burns at a FlameNode<N> socket.
+#
+# THIS IS AUTHORED DATA, read from the plugin -- not inferred.  Oblivion ships
+# one STAT record per socket under WorldObjects/Static, EditorID "FlameNode<N>",
+# whose MODL is the flame NIF the engine attaches there:
+#
+#   FlameNode0  0x0000001E  Fire/FireCandleFlame.NIF
+#   FlameNode1  0x0000001F  Fire/FireTorchSmall.nif
+#   FlameNode2  0x00000020  Fire/FireTorchLarge.nif
+#   FlameNode3  0x00000021  Fire/FireTorchLargeSmoke.nif
+#   FlameNode4  0x00000022  Fire/FireOpenSmall.nif
+#   FlameNode5  0x00000023  Fire/FireOpenSmallSmoke.nif
+#   FlameNode6  0x00000024  Fire/FireOpenMedium.nif
+#   FlameNode7  0x00000025  Fire/FireOpenMediumSmoke.nif
+#   FlameNode8  0x00000026  Fire/FireOpenLarge.nif
+#   FlameNode9  0x00000027  Fire/FireOpenLargeSmoke.nif
+#
+# Those FormIDs are the very keys Oblivion.exe hardcodes: the socket-name table
+# at 0xB06818 ("FlameNode1", "FlameNode2", ... "FlameNode0", "FlameNode10" ...
+# "FlameNode20") is walked in lockstep with a parallel table at 0xB067C0 holding
+# 0x1E..0x32, which are looked up in the form map at 0xB0613C.  So the engine
+# resolves a socket to a STAT and draws that STAT's model -- the plugin owns the
+# mapping, and a mod may repoint it.  FlameNode10-20 exist for custom use and
+# ship no STAT in vanilla.
+#
+# Reading it beats any heuristic: keying on the host FILENAME ("torch" in the
+# name) put the 1.3x2.6-unit candle flame on every lamp in the game --
+# castlelight02 is FlameNode2, i.e. FireTorchLarge (32x64).
+_FLAME_STAT_RE = re.compile(
+    r'EditorID=(FlameNode(\d+))\s.*?Model\.MODL=([^\r\n]+)', re.S)
+# The engine matches socket names EXACTLY against its own table, which holds
+# only unpadded "FlameNode<N>".  A ZERO-PADDED marker therefore matches nothing
+# and no flame is attached -- verified against Oblivion.exe, which contains
+# "FlameNode7" and "FlameNode1" but neither "FlameNode07" nor "FlameNode01".
+# Two vanilla meshes are authored that way and burn nothing in game:
+# clutter/metalsmith/forgeopen01.nif (FlameNode07) and
+# clutter/lecternworkstation1.nif (FlameNode01).  Matching them loosely put a
+# 468-unit FireOpenMediumSmoke on the forge that Oblivion never shows.
+# `[1-9]\d*|0` accepts "0" and "12" but rejects "07".
+_FLAME_SOCKET_RE = re.compile(r'^FlameNode(0|[1-9][0-9]*)(?![0-9])')
+_FLAME_SOCKET_MAP = {}   # export_root_lower -> {index: 'firecandleflame.nif'}
+
+
+def _flame_socket_map(src_path):
+    """{socket index: flame nif basename} from the plugin's FlameNode STATs."""
+    norm = str(src_path).replace('/', os.sep).replace(chr(92), os.sep)
+    key = os.sep + 'meshes' + os.sep
+    i = norm.lower().rfind(key)
+    if i < 0:
+        return {}
+    export_root = norm[:i]
+    ck = export_root.lower()
+    cached = _FLAME_SOCKET_MAP.get(ck)
+    if cached is not None:
+        return cached
+    table = {}
+    stat_txt = os.path.join(export_root, 'STAT.txt')
+    try:
+        with open(stat_txt, 'r', encoding='latin1') as fh:
+            blob = fh.read()
+    except OSError:
+        blob = ''
+    if blob:
+        for rec in blob.split('---RECORD_BEGIN---'):
+            if 'FlameNode' not in rec:
+                continue
+            m = _FLAME_STAT_RE.search(rec)
+            if not m:
+                continue
+            model = m.group(3).strip().replace(chr(92)*2, os.sep)
+            model = model.replace('/', os.sep).replace(chr(92), os.sep)
+            table[int(m.group(2))] = os.path.basename(model).lower()
+    _FLAME_SOCKET_MAP[ck] = table
+    return table
+
+
+def _flame_socket_index(node_name):
+    """The N in a FlameNode<N> marker name, or None.
+
+    Oblivion suffixes duplicates ("FlameNode0@#3", "FlameNode0	"), so match a
+    leading run of digits rather than parsing the whole name.
+    """
+    if isinstance(node_name, bytes):
+        node_name = node_name.decode('latin1', 'replace')
+    m = _FLAME_SOCKET_RE.match(node_name)
+    return int(m.group(1)) if m else None
+
+
+def _flame_nif_for_socket(src_path, index):
+    """Which Oblivion flame NIF burns at a FlameNode<index> socket.
+
+    None when nothing does -- an unmatched socket burns NOTHING in Oblivion,
+    it does not fall back to some default flame.  There is no guessing left in
+    this path: no STAT for the index (FlameNode10-20 ship none) and no flame.
+    """
+    if index is None:
+        return None
+    return _flame_socket_map(src_path).get(index)
+
+
 _FLAME_CACHE = {}   # (meshes_root_lower, flame_name) -> nif bytes | None
 _FLAME_ATLAS_JOBS = {}  # same key -> flip-book atlas jobs from the conversion
-
-
-def _flame_nif_for_host(src_path):
-    """Which Oblivion flame NIF burns at this host's FlameNode markers."""
-    name = os.path.basename(str(src_path)).lower()
-    return 'firetorchsmall.nif' if 'torch' in name else 'firecandleflame.nif'
 
 
 def _load_converted_flame(src_path, flame_name):
     """Convert meshes/fire/<flame_name> once per worker; return serialized
     Skyrim NIF bytes (deep-copies are made by re-reading), or None."""
-    norm = str(src_path).replace('/', os.sep).replace('\\', os.sep)
+    norm = str(src_path).replace('/', os.sep).replace(chr(92), os.sep)
     key = os.sep + 'meshes' + os.sep
     i = norm.lower().rfind(key)
     if i < 0:
@@ -3127,15 +3582,21 @@ def _convert_flame_nodes(root_node, src_path, stats=None):
     """Graft the converted Oblivion flame NIF under every empty FlameNode*
     marker.  Modifies root_node's tree in-place; returns the graft count.
 
-    Marker transform: TRANSLATION and SCALE are kept (Oblivion authored
-    FlameNodes with ~2x scale that the attached flame NIF expects); ROTATION
-    is reset to identity — the converted flame's own billboard wrappers carry
-    the Skyrim −90°X axis correction, and a rotated parent would tip them.
+    Marker transform: TRANSLATION, SCALE **and ROTATION** are all kept
+    (Oblivion authored FlameNodes with ~2x scale that the attached flame NIF
+    expects).  The rotation is the authored hook-up between two DIFFERENT model
+    frames and must not be discarded: the flame NIFs are authored +Y-up, and a
+    host authored +Z-up carries exactly the −90°X correction on its marker —
+    uppersilverplatecandles01's FlameNode0 is [1,0,0][0,0,1][0,-1,0], i.e.
+    _BB_AXIS_FIX itself, mapping the flame's +Y onto the plate's +Z.  (That
+    host is a flat plate, extent X=23 Y=23 Z=2, and all 121 of its REFRs use
+    RotX=0 — nothing else would stand the flame up.)  Zeroing it laid the
+    candle flames on their side.  Hosts that are themselves +Y-up author an
+    identity marker and are unaffected.
     """
-    flame_name = _flame_nif_for_host(src_path)
-    flame_bytes = _load_converted_flame(src_path, flame_name)
-    if flame_bytes is None:
-        return 0
+    # Resolved PER MARKER: one mesh can mix socket families (lecternworkstation1
+    # carries both a FlameNode0 candle and a FlameNode1 torch).
+    used_flames = set()
     count = 0
 
     def _visit(node):
@@ -3152,6 +3613,14 @@ def _convert_flame_nodes(root_node, src_path, stats=None):
             if (nm.startswith('FlameNode')
                     and isinstance(child, NifFormat.NiNode)
                     and child.num_children == 0):
+                flame_name = _flame_nif_for_socket(src_path,
+                                                   _flame_socket_index(nm))
+                if flame_name is None:
+                    continue   # no STAT for this socket: burns nothing
+                flame_bytes = _load_converted_flame(src_path, flame_name)
+                if flame_bytes is None:
+                    continue
+                used_flames.add(flame_name)
                 # Deep-copy the converted flame by re-reading its bytes.
                 fdata = NifFormat.Data()
                 buf = _io.BytesIO(flame_bytes)
@@ -3160,7 +3629,9 @@ def _convert_flame_nodes(root_node, src_path, stats=None):
                 fdata.read(buf)
                 froot = fdata.roots[0]
                 kids = [c for c in froot.children if c is not None]
-                child.rotation.set_identity()
+                # Keep the marker's authored rotation — see the docstring:
+                # it is the host-frame -> flame-frame hook-up, and on a +Z-up
+                # host it IS the axis correction the flame needs.
                 child.num_children = len(kids)
                 child.children.update_size()
                 for j, k in enumerate(kids):
@@ -3191,14 +3662,15 @@ def _convert_flame_nodes(root_node, src_path, stats=None):
         # Propagate the flame's flip-book atlas jobs so convert_nif builds
         # them into this host's output tree too (idempotent, exists-checked).
         if stats is not None:
-            norm = str(src_path).replace('/', os.sep).replace('\\', os.sep)
+            norm = str(src_path).replace('/', os.sep).replace(chr(92), os.sep)
             key = os.sep + 'meshes' + os.sep
             i = norm.lower().rfind(key)
             if i >= 0:
-                cache_key = (norm[:i + len(key)].lower(), flame_name)
-                jobs = _FLAME_ATLAS_JOBS.get(cache_key, {})
-                if jobs:
-                    stats.setdefault('_flipbook_atlases', {}).update(jobs)
+                for _fname in used_flames:
+                    cache_key = (norm[:i + len(key)].lower(), _fname)
+                    jobs = _FLAME_ATLAS_JOBS.get(cache_key, {})
+                    if jobs:
+                        stats.setdefault('_flipbook_atlases', {}).update(jobs)
 
     return count
 
@@ -3501,7 +3973,8 @@ def _convert_particle_system(node, fix_textures):
     # a smoke plume drifting into a wall otherwise cuts off along a hard line,
     # and every billboard shows its own quad edge.  alpha_prop is always set by
     # this point (defaulted to additive above), so blended systems all qualify.
-    _apply_fx_soft_effect(shader, alpha_prop)
+    _apply_fx_soft_effect(shader, alpha_prop,
+                          getattr(shader, 'source_texture', b''))
 
 
 # Skyrim billboard axis correction (see the root-billboard handling for the
@@ -3526,18 +3999,47 @@ def _compose_axis_fix(rot):
 
 
 def _wrap_in_billboard(child, bb_mode):
-    """Wrap a geometry block in a fresh NiBillboardNode carrying the Skyrim
-    axis correction (vanilla campfire pattern: BSFadeNode → NiBillboardNode
-    → NiTriShape)."""
+    """Wrap a geometry block in a fresh NiBillboardNode so the quad faces the
+    camera (vanilla campfire pattern: BSFadeNode → NiBillboardNode →
+    NiTriShape).
+
+    The wrapper deliberately carries NO axis correction -- see the comment in
+    the body -- and is tagged `_axis_fixed` so the later _skyrimize_billboard
+    pass leaves it alone instead of treating it as an Oblivion-authored
+    billboard and composing one in.
+    """
     bb = NifFormat.NiBillboardNode()
     bb.name = (child.name or b'') + b'-Billboard'
     bb.flags = NIF_FLAGS
     bb.billboard_mode = bb_mode
-    _compose_axis_fix(bb.rotation)
+    # NO axis fix here.  These meshes are authored +Y-up and their PLACED
+    # REFERENCES carry the stand-up rotation: censused across Oblivion.esm,
+    # 494 REFRs of the Fire\*.nif lights use RotX = +-90 deg (10/10 for
+    # FireTorchLargeSmoke, 188+51 of 395 for FireOpenSmall, ...).  The whole
+    # model -- quads AND emitter markers -- shares that one +Y-up frame, and
+    # the REFR rotates all of it together.  Pre-rotating the quad to +Z-up
+    # here made it the ONLY part in a different frame, so the REFR's -90 then
+    # laid it flat: the "third flame component on its side", with the smoke
+    # and flame beside it looking correct.  Leave the quad in the model frame.
+    bb._axis_fixed = True
     bb.num_children = 1
     bb.children.update_size()
     bb.children[0] = child
     return bb
+
+
+def _is_emitter_marker(node):
+    """Is this node referenced as a particle emitter/gravity marker?
+
+    Such a node's rotation is the emission DIRECTION a NiPSysEmitter reads, so
+    it survives demotion even though a billboard's rotation is otherwise
+    discarded for drawing (NifSkope BillboardNode::viewTrans).
+    """
+    for blk in node.tree():
+        for attr in ('emitter_object', 'gravity_object'):
+            if getattr(blk, attr, None) is node:
+                return True
+    return False
 
 
 def _skyrimize_billboard(bb):
@@ -3550,11 +4052,18 @@ def _skyrimize_billboard(bb):
       correction into its rotation (Oblivion billboards are authored identity
       over flat-XY quads; Skyrim's up/facing axes differ).
     """
+    # A wrapper this converter built (the root-billboard demotion runs before
+    # the child walk reaches these).  It is already in the frame we want, so
+    # the pure-geometry branch below must not compose an axis fix into it --
+    # that is what laid the flame quad on its side.
+    if getattr(bb, '_axis_fixed', False):
+        return bb
     bb_mode = int(getattr(bb, 'billboard_mode', 1)) or 1
     has_psys = any(isinstance(b, NifFormat.NiParticleSystem)
                    for b in bb.tree())
     if not has_psys:
         _compose_axis_fix(bb.rotation)
+        bb._axis_fixed = True
         return bb
     plain = NifFormat.NiNode()
     plain.name = bb.name
@@ -3562,9 +4071,38 @@ def _skyrimize_billboard(bb):
     plain.translation.x = bb.translation.x
     plain.translation.y = bb.translation.y
     plain.translation.z = bb.translation.z
-    plain.rotation.m_11 = bb.rotation.m_11; plain.rotation.m_12 = bb.rotation.m_12; plain.rotation.m_13 = bb.rotation.m_13
-    plain.rotation.m_21 = bb.rotation.m_21; plain.rotation.m_22 = bb.rotation.m_22; plain.rotation.m_23 = bb.rotation.m_23
-    plain.rotation.m_31 = bb.rotation.m_31; plain.rotation.m_32 = bb.rotation.m_32; plain.rotation.m_33 = bb.rotation.m_33
+    # NOT the billboard's rotation.  A NiBillboardNode DISCARDS its own
+    # rotation at runtime and substitutes identity in view space -- NifSkope's
+    # BillboardNode::viewTrans (glnode.cpp): `t = parent->viewTrans() * local;
+    # t.rotation = Matrix();`.  So the authored rotation on a billboard node
+    # was never used for orientation.  Copying it onto the plain replacement
+    # RESURRECTS a dead value: firetorchsmall's "Sparks-Emitter" and
+    # firecandleflame's "FlameParticles-Emitter" are billboards carrying
+    # +Z=(0,-1,0), and reviving that aims the emitter sideways -- the
+    # horizontal jet beside the upright flame.  Identity is what the engine
+    # actually applied, so identity is what the demoted node inherits.
+    #
+    # EXCEPT when the node is an EMITTER MARKER.  Rotation-is-discarded applies
+    # to how a billboard DRAWS its subtree; a NiPSysEmitter reads its
+    # `emitter_object` node's orientation as the emission DIRECTION, and that
+    # is live data.  firecandleflame authors quad and emitter in one +Y-up
+    # frame -- quad identity with extent [1.3, 2.6, 0.0] (tall in Y), emitter
+    # [1,0,0][0,0,-1][0,1,0] whose local +Z maps to model +Y.  Zeroing the
+    # emitter makes it +Z-up while the quad stays +Y-up, so the flame splits
+    # into an upright quad and a sideways particle jet -- visible once the
+    # FlameNode marker rotates the pair into a +Z-up host.
+    if _is_emitter_marker(bb):
+        plain.rotation.m_11 = bb.rotation.m_11
+        plain.rotation.m_12 = bb.rotation.m_12
+        plain.rotation.m_13 = bb.rotation.m_13
+        plain.rotation.m_21 = bb.rotation.m_21
+        plain.rotation.m_22 = bb.rotation.m_22
+        plain.rotation.m_23 = bb.rotation.m_23
+        plain.rotation.m_31 = bb.rotation.m_31
+        plain.rotation.m_32 = bb.rotation.m_32
+        plain.rotation.m_33 = bb.rotation.m_33
+    else:
+        plain.rotation.set_identity()
     plain.scale = bb.scale
     plain.num_extra_data_list = bb.num_extra_data_list
     plain.extra_data_list.update_size()
@@ -3713,6 +4251,25 @@ def _walk_node(parent, node, fix_textures, stats):
 
 
 
+def _has_autoplay_sequence(root):
+    """True if the tree carries an ambient (AutoPlay/AutoLoop) sequence.
+
+    Those meshes get the animated-object BSX (0x8B, later masked to 0x0B when
+    the BGED is attached) like a converted animated door.  Verified running in
+    game with 0x0B (arena spectators, 2026-08-18); vanilla ships 0x01 for the
+    same graph on collisionless meshes (29/63), so either would do -- this is
+    the one that has been seen working.
+    """
+    for b in root.tree():
+        if not isinstance(b, NifFormat.NiControllerSequence):
+            continue
+        raw = getattr(b, 'name', b'') or b''
+        nm = raw.decode('latin-1') if isinstance(raw, bytes) else str(raw)
+        if nm in (_AUTOPLAY_SEQUENCE, _AUTOLOOP_SEQUENCE):
+            return True
+    return False
+
+
 def _tree_is_animated(root):
     """True if anything in the tree needs per-frame controller updates:
     a NiParticleSystem, or any block with a NiTimeController attached.
@@ -3781,6 +4338,11 @@ def _add_bsx_flags(root, has_constraints=False):
         if not tree_animated:
             return
         bsx_value = 0x01  # Animated only — vanilla collisionless particle meshes
+        # ...except an ambient AutoPlay/AutoLoop mesh (crowd/fountain), which
+        # takes the animated-object value like a converted door -- see
+        # _has_autoplay_sequence.
+        if _has_autoplay_sequence(root):
+            bsx_value = BSX_FLAGS_ANIMATED
     else:
         root_is_animated = (
             root.controller is not None and
@@ -4173,23 +4735,22 @@ _SCRIPT_DRIVEN_SEQUENCES = frozenset((
 # Skyrim has NO such convention: a NiControllerSequence sits idle until
 # something starts it (a script's PlayGamebryoAnimation, an engine-native name
 # like Open/Close, or the behaviour graph).  So converted ambient animation --
-# palacefont01's fountain water, se01waitingroomwalls' light ripples -- simply
-# never ran, and the surface rendered as a frozen first frame.
+# palacefont01's fountain water, se01waitingroomwalls' light ripples, the arena
+# crowds -- simply never ran, and the surface rendered as a frozen first frame.
 #
-# Vanilla's self-playing convention is the sequence name "AutoPlay": 66 meshes
-# use it, all ambient FX with no script behind them (atronach skins, dragon
-# priest mist, steam centurion vents).  It is ALWAYS a loop -- every AutoPlay
-# sampled is cycle_type 2 (CYCLE_LOOP) -- and 36/36 sit alongside a BGED.
-# Corroborating: across 345 graph-less vanilla sequence meshes the only names
-# are the engine-native Open/Close plus script-fired SpecialIdle_AreaEffect,
-# and 114/116 of those are cycle_type 2 as well.  Nothing named "Idle"
-# auto-plays anything.
+# Vanilla's self-playing convention is the AutoPlay/AutoLoop sequence pair
+# driven by GenericBehaviors\Autoplay.hkx (see _autoplay_ambient_sequences).
 _AUTOPLAY_SEQUENCE = 'AutoPlay'
-_CYCLE_LOOP = 2
+_AUTOLOOP_SEQUENCE = 'AutoLoop'
+# NiControllerSequence cycle types (nif.xml CycleType): 0 = LOOP, 1 = REVERSE,
+# 2 = CLAMP.  Reading 2 as "loop" is what left every converted ambient mesh
+# playing exactly one cycle and freezing.
+_CYCLE_CLAMP = 2
 
 # Oblivion sequence names that mean "ambient, plays by itself" and therefore
-# become AutoPlay.  Script-driven names are excluded -- those are reached
-# through the behaviour graph by their own name and must keep it.
+# become the AutoPlay/AutoLoop pair.  Script-driven names are excluded --
+# those are reached through the behaviour graph by their own name and must
+# keep it.
 _AMBIENT_SEQUENCES = frozenset(('idle',))
 
 
@@ -4227,10 +4788,11 @@ def collect_sequence_names(data):
                 # state would make PlayAnimation() succeed on a dead sequence.
                 if not name or name in seen or not seq.num_controlled_blocks:
                     continue
-                # AutoPlay is not script-driven, but it still needs the graph:
-                # it is the animation graph manager that starts it, and 36/36
-                # vanilla AutoPlay meshes carry a BSBehaviorGraphExtraData.
-                if (name != _AUTOPLAY_SEQUENCE and
+                # AutoPlay/AutoLoop are not script-driven, but they still
+                # need the graph: it is the behaviour graph that starts them
+                # (63/63 vanilla AutoPlay meshes carry a BGED, and the arena
+                # crowd's graph was read running out of the live engine).
+                if (name not in (_AUTOPLAY_SEQUENCE, _AUTOLOOP_SEQUENCE) and
                         name.lower() not in _SCRIPT_DRIVEN_SEQUENCES):
                     continue
                 seen.add(name)
@@ -4337,32 +4899,6 @@ def _strip_gnd_skin(data):
 from .skin_replacement import (collect_skin_info, strip_body_skin_geometry, splice_body_geometry, apply_armor_offset)
 
 
-def _get_armor_piece_type(src_path: str) -> str:
-    """Classify an armor NIF path into a piece-type key for ARMOR_PIECE_OFFSETS.
-
-    Detection is based solely on the NIF filename stem (case-insensitive).  This
-    covers the standard Oblivion naming convention (cuirass_0.nif, boots_0.nif,
-    pants.nif, etc.) as well as common clothing names (shirt, robe, pants, shoe).
-    Returns one of: 'cuirass', 'greaves', 'boots', 'gauntlets', 'helmet', 'shield',
-    or 'default' (treated identically to 'cuirass' by ARMOR_PIECE_OFFSETS).
-    """
-    stem = Path(src_path).stem.lower()
-    if any(k in stem for k in ('boot', 'shoe', 'sandal', 'slipper', 'clog')):
-        return 'boots'
-    if any(k in stem for k in ('gauntlet', 'glove', 'bracer', 'vambrace', 'handwrap')):
-        return 'gauntlets'
-    if any(k in stem for k in ('helm', 'hood', 'hat', 'coif', 'circlet', 'crown',
-                                 'mask', 'cap', 'cowl')):
-        return 'helmet'
-    if any(k in stem for k in ('greave', 'pant', 'trouser', 'lowerbody', 'skirt',
-                                 'kilt', 'loincloth', 'shorts')):
-        return 'greaves'
-    if any(k in stem for k in ('shield', 'buckler', 'targe')):
-        return 'shield'
-    # Cuirass / shirt / robe / default upper-body
-    return 'cuirass'
-
-
 def _remap_bone_names(data) -> int:
     """Rename Oblivion Bip01 skeleton bones to Skyrim NPC skeleton names.
 
@@ -4423,6 +4959,44 @@ def _get_prn_bone(root_node):
     return None
 
 
+def _bake_root_transform_into_verts(root_node):
+    """Bake ONLY the root node's own transform into the geometry verts.
+
+    The sibling _bake_node_transforms_into_verts flattens the geometry node's
+    transform too, which is right for creature parts (their bind is identity
+    and nothing else carries the offset) but wrong for worn armor: skin_retarget
+    places a PRN piece by ADDING the Skyrim bone position to the geometry node's
+    existing translation, so that translation has to survive to that point.
+    Baking the root alone keeps a non-identity root (rare, but real) from being
+    dropped while leaving the per-geometry offset intact.
+    """
+    root_m = root_node.get_transform()
+    if root_m.is_identity():
+        return
+    rot = root_m.get_matrix_33()
+    for block in list(root_node.tree()):
+        if not isinstance(block, (NifFormat.NiTriShape, NifFormat.NiTriStrips)):
+            continue
+        gd = block.data
+        if gd is None:
+            continue
+        for v in gd.vertices:
+            nv = v * root_m
+            v.x, v.y, v.z = nv.x, nv.y, nv.z
+        if getattr(gd, 'has_normals', 0):
+            for n in gd.normals:
+                nn = n * rot
+                n.x, n.y, n.z = nn.x, nn.y, nn.z
+        try:
+            gd.update_center_radius()
+        except Exception:
+            pass
+    root_node.rotation.set_identity()
+    root_node.translation.x = root_node.translation.y = 0.0
+    root_node.translation.z = 0.0
+    root_node.scale = 1.0
+
+
 def _bake_node_transforms_into_verts(root_node):
     """Bake each geometry's node-to-root transform PLUS the root's own
     transform into the vertex/normal data, then zero those transforms.
@@ -4462,7 +5036,21 @@ def _bake_node_transforms_into_verts(root_node):
     root_node.scale = 1.0
 
 
-def _add_prn_skin(data, root_node, keep_bone_names=False, plain=False):
+# Skyrim body part -> the Oblivion bone that piece rigidly attaches to.  Used
+# only when a worn NIF carries NO 'Prn' and NO skin at all: those meshes fell
+# straight out of _add_prn_skin, shipping with no skin instance, so they never
+# left Oblivion object space (Morroblivion's cryohelm.nif rendered at z -5..27
+# instead of ~115..133, i.e. on the floor).  Keyed off the wearing record's
+# BMDT biped flags -- the plugin's own statement of what the item is.
+_BODY_PART_FALLBACK_PRN_BONE = {
+    131: 'Bip01 Head',
+    33:  'Bip01 R Hand',
+    37:  'Bip01 R Foot',
+}
+
+
+def _add_prn_skin(data, root_node, keep_bone_names=False, plain=False,
+                  fallback_bone=None):
     """Add Skyrim-compatible BSDismemberSkinInstance to non-skinned rigid armor.
 
     Oblivion attaches some armor pieces (e.g. helmets) rigidly to a bone via a
@@ -4490,7 +5078,7 @@ def _add_prn_skin(data, root_node, keep_bone_names=False, plain=False):
     if not isinstance(root_node, NifFormat.NiNode):
         return 0
 
-    prn_val = _get_prn_bone(root_node)
+    prn_val = _get_prn_bone(root_node) or fallback_bone
     if prn_val is None:
         return 0
     prn_bone = prn_val if keep_bone_names else \
@@ -4651,7 +5239,7 @@ def _upgrade_skin_instances(data):
 
 
 def _convert_nif(data, fix_textures=True, src_path='', weight=0,
-                 creature=False, worn=False, parallax=False):
+                 creature=False, worn=False, parallax=False, biped_flags=0):
     """Convert a PyFFI NifFormat.Data in-place to Skyrim format.
 
     worn=True marks the NIF as body-worn gear on the plugin's own authority (an
@@ -4726,7 +5314,26 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
     _in_armor_dir = worn or \
         'armor' in src_path.lower().replace('\\', '/') or \
         'clothes' in src_path.lower().replace('\\', '/')   # clothing
-    _is_shield = 'shield' in nif_basename
+    # Bit 13 of the record's BMDT flags is Shield -- authored, and it catches
+    # what the filename misses ('towersheild.nif' is misspelled, so the old
+    # name check dragged it through the worn-armor path).  The name is only
+    # consulted for meshes no ARMO/CLOT record names.
+    _is_shield = (bool(biped_flags & (1 << 13)) if biped_flags
+                  else 'shield' in nif_basename)
+    # Biped slot the wearing record assigns this mesh (131 head, 32 body, ...),
+    # or None when no record names it.  Authored data -- always preferred over
+    # the filename stem and the geometry name, both of which are guesses.
+    from .wearable_plan import (body_part_for_flags as _bp_for_flags,
+                                body_parts_for_flags as _bps_for_flags)
+    _authored_bp = _bp_for_flags(biped_flags) if biped_flags else None
+    # Every slot the record claims.  More than one means the mesh holds several
+    # shapes and the per-shape slot is resolved from its skin weights.
+    _authored_allowed = _bps_for_flags(biped_flags) if biped_flags else None
+    # True when the record names exactly one slot, so it answers outright.
+    _single_slot = _authored_allowed is not None and len(_authored_allowed) == 1
+    # Slot used for whole-file decisions (offset table, body-fill partition).
+    # Filled in after retarget for multi-slot meshes, which need the skin.
+    _slot_for_offset = _authored_bp if _single_slot else None
 
     # Bow bend rig: capture string vertex masks from the Oblivion draw morph
     # BEFORE _walk_node strips the NiGeomMorpherController (see bow_rig.py).
@@ -4800,9 +5407,22 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         if not has_skin and not _is_shield:
             # Non-skinned armor pieces (e.g. Oblivion helmets attached via 'Prn'
             # NiStringExtraData) need a BSDismemberSkinInstance added.
+            #
+            # Bake the ROOT's transform into the verts first, exactly as the
+            # creature path above does: _add_prn_skin writes an IDENTITY bind,
+            # which is only correct once the verts are in bone-local space.
+            # The geometry node's own transform is deliberately NOT baked --
+            # skin_retarget composes it with the Skyrim bone position (a PRN
+            # part is placed by its node, not by its bind matrix).
+            #
+            # A few worn meshes carry neither 'Prn' nor a skin; fall back to
+            # the bone their piece type implies so they still attach instead
+            # of shipping unskinned at Oblivion origin.
+            _fb_bone = _BODY_PART_FALLBACK_PRN_BONE.get(_authored_bp)
             for root in data.roots:
                 if root is not None:
-                    _add_prn_skin(data, root)
+                    _bake_root_transform_into_verts(root)
+                    _add_prn_skin(data, root, fallback_bone=_fb_bone)
             has_skin = _has_skin(data)
 
         if has_skin:
@@ -4825,7 +5445,6 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
     # This applies to body armor, helmets, gauntlets, boots, greaves, clothing —
     # but NOT shields.  Shields use BSFadeNode root + Prn='SHIELD' in Skyrim,
     # just like weapons.  Only _gnd (ground model) variants also get BSFadeNode.
-    _is_shield = 'shield' in nif_basename
     # Creature body parts keep NiNode root + plain NiSkinInstance, exactly
     # like worn armor keeps NiNode (both are skeleton-attached at runtime).
     _is_creature_body = creature and has_skin
@@ -4878,7 +5497,12 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                 plain.name = root.name
                 plain.flags = NIF_FLAGS
                 plain.translation = root.translation
-                plain.rotation = root.rotation
+                # Identity, not the billboard's rotation -- see the note in
+                # _skyrimize_billboard: a NiBillboardNode discards its own
+                # rotation at runtime (NifSkope BillboardNode::viewTrans), so
+                # copying it onto the plain replacement revives a value the
+                # engine never used and skews the whole subtree.
+                plain.rotation.set_identity()
                 plain.scale = root.scale
                 plain.num_children = root.num_children
                 plain.children.update_size()
@@ -5320,9 +5944,10 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         # collection.
         _emulate_morphs(root, stats)
 
-        # Oblivion's auto-started "Idle" sequence -> Skyrim's "AutoPlay" (loop),
-        # or the animation never starts.  Runs before collect_sequence_names so
-        # the behaviour graph is built from the final names.
+        # Oblivion's auto-started "Idle" sequence -> vanilla's AutoPlay (CLAMP
+        # intro) + AutoLoop (the authored loop) pair, or the animation never
+        # starts.  Runs before collect_sequence_names so the behaviour graph is
+        # built from the final names.
         _autoplay_ambient_sequences(root, stats)
 
         # Nodes a sequence keeps invisible at t=0 must ship hidden: Skyrim only
@@ -5496,17 +6121,32 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                 if skin is not None:
                     geom_name = bytes(block.name).rstrip(b'\x00').decode(
                         'latin-1', errors='replace')
-                    _regen_skin_partition(block, skin, geom_name)
+                    _regen_skin_partition(block, skin, geom_name,
+                                          authored_body_part=_authored_bp,
+                                          authored_allowed=_authored_allowed)
 
     if not creature and not _is_gnd and _in_armor_dir and has_skin:
         from .skin_retarget import retarget_skin_to_skyrim as _retarget
 
-        # Pre-retarget: classify the piece type early so we can apply fixups.
-        _piece_type = _get_armor_piece_type(src_path)
+        # Which offset/scale table entry fits this piece.  ONE offset applies to
+        # the whole NIF, so a record claiming a SINGLE slot answers it outright.
+        # A multi-slot record (Knight of Order: helmet + torso + legs + feet in
+        # one mesh, flags 0x003D) has no single stated answer, and taking its
+        # head-ward slot lifted the entire suit by the helmet's dz=+7 -- its
+        # Foot shape floated from z -1.3 to +5.9.  Resolve those by where the
+        # mesh's skinned vertex MASS actually sits, which is the rig the artist
+        # authored.  Per-SHAPE slotting is handled separately in retarget.
+        from .skin_retarget import dominant_body_part as _dominant_bp
+        _BP_TO_PIECE = {131: 'helmet', 32: 'cuirass', 44: 'greaves',
+                        33: 'gauntlets', 37: 'boots'}
+        if not _single_slot:
+            _slot_for_offset = _dominant_bp(data, allowed=_authored_allowed)
+        _piece_type = _BP_TO_PIECE.get(_slot_for_offset, 'default')
 
         _prn_block_ids: set = set()
         _retarget(data, src_path=src_path, prn_out=_prn_block_ids,
-                  weight=weight)
+                  weight=weight, authored_body_part=_authored_bp,
+                  authored_allowed=_authored_allowed)
 
         # NOW rename bones to Skyrim names — AFTER skin transforms are correct.
         stats['bones_remapped'] += _remap_bone_names(data)
@@ -5547,9 +6187,10 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         # post-morphing the finished mesh (identical topology contract)
         # Fill partitions get the piece's primary biped slot — the ARMA only
         # renders partitions for slots it claims (a slot-44 pants ARMA culls
-        # a partition-32 fill, leaving invisible skin holes).
-        _fill_bp = {'greaves': 44, 'boots': 37, 'gauntlets': 33}.get(
-            _get_armor_piece_type(src_path), 32)
+        # a partition-32 fill, leaving invisible skin holes).  Same rule as the
+        # offset above: a single-slot record states it, a multi-slot one is
+        # resolved from where the skinned vertex mass sits.
+        _fill_bp = (_authored_bp if _single_slot else _slot_for_offset) or 32
         splice_body_geometry(data, _body_nibs_to_splice, fill_body_part=_fill_bp)
 
     # Bow bend rig: graft the vanilla 7-bone rig + BGED onto converted bows
@@ -5830,6 +6471,7 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
         'root_rotation_baked': False,
         'version_upgraded': False,
         'textures': set(),         # texture paths this mesh references
+        'overlay_diffuses': set(), # of those, the APPLY_HILIGHT2 overlays
     }
 
     if not _PYFFI:
@@ -5883,13 +6525,19 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # armor rules (dismember skin, NiNode root, skeleton retarget) apply to gear
     # filed outside meshes\armor and meshes\clothes.
     _worn = False
+    _biped_flags = 0
     if wearable_plan is not None and src_meshes_dir is not None and not creature:
         from . import wearable_plan as _wp
         _worn = _wp.is_worn(wearable_plan, src_path, src_meshes_dir)
+        # What the plugin says this mesh IS (head/body/hands/feet/shield), so
+        # the converter never has to guess the slot from the filename.
+        _biped_flags = _wp.biped_flags_for(wearable_plan, src_path,
+                                           src_meshes_dir)
 
     stats = _convert_nif(data, fix_textures=fix_textures,
                          src_path=str(src_path), creature=creature,
-                         worn=_worn, parallax=parallax)
+                         worn=_worn, parallax=parallax,
+                         biped_flags=_biped_flags)
 
     # Graft the converted Oblivion flame NIF under FlameNode* markers (candle
     # flame / torch fire) — full conversion of Oblivion's own flame visuals,
@@ -5990,6 +6638,12 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # the finished blocks, so the pipeline can drop every texture nothing ships
     # a reference to without re-reading the whole output tree afterwards.
     _harvest_textures(data, result['textures'])
+
+    # Diffuses the source authored as APPLY_HILIGHT2 detail overlays, for the
+    # LOD stage (see the note beside _APPLY_HILIGHT2 in _process_geometry).
+    # Harvested BEFORE the textures_only return: that mode still analyses every
+    # shape, so the LOD manifest it feeds must be complete either way.
+    result['overlay_diffuses'] = stats.get('overlay_diffuses', set())
 
     if textures_only:
         # Everything above still ran: the shape was read, its APPLY_HILIGHT2
@@ -6173,6 +6827,10 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
         # Diffuse textures some shape reads as opacity — see the alpha branch
         # in _process_geometry.  Their alpha is never stripped to BC1.
         'alpha_opacity_diffuse': set(),
+        # Of those, the ones the source authored as APPLY_HILIGHT2 detail
+        # overlays: their alpha is a blend weight, not transparency, and object
+        # LOD must not read it as opacity.
+        'overlay_diffuses': set(),
     }
 
     # Collect (rel_path, reason) for every skipped file
@@ -6199,6 +6857,7 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
         stats['parallax'].update(r.get('parallax') or {})
         stats['alpha_opacity_diffuse'].update(
             r.get('alpha_opacity_diffuse') or ())
+        stats['overlay_diffuses'].update(r.get('overlay_diffuses', ()))
         if r.get('error'):
             stats['errors'] += 1
             rel = str(Path(nif_str).relative_to(mesh_path))

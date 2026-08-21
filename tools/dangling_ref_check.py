@@ -26,6 +26,9 @@ import struct
 import sys
 import zlib
 from collections import Counter
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+from output_layout import paths  # noqa: E402
 
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SCRIPT_DIR)
@@ -147,7 +150,7 @@ def iter_refs(data):
 
 
 def audit(name, output_dir, max_list):
-    path = os.path.join(output_dir, name, name)
+    path = str(paths(name, out_root=output_dir).esm)
     if not os.path.isfile(path):
         print(f"--- {name}: NOT BUILT ({path})")
         return 0
@@ -159,7 +162,7 @@ def audit(name, output_dir, max_list):
     # slot -> ids that slot's file defines, restated in THIS plugin's space.
     by_slot = {}
     for slot, m in enumerate(masters):
-        mp = os.path.join(output_dir, m, m)
+        mp = str(paths(m, out_root=output_dir).esm)
         if not os.path.isfile(mp):
             by_slot[slot] = None            # unreadable: never judged
             continue

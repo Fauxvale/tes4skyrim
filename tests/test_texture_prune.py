@@ -108,7 +108,7 @@ class TestRecordTexturePrefixes:
         # A non-empty manifest is required: build_refs refuses to build a
         # keep-set without one, so a missing mesh pass cannot strip the
         # textures that are in use out of the archive.
-        tp.write_manifest(plugin_dir, {'tes4/clutter/unrelated.dds'})
+        tp.write_manifest(export, {'tes4/clutter/unrelated.dds'})
 
         refs = tp.build_refs(plugin_dir, export)
         assert 'tes4/landscape/terrainmud02.dds' in refs

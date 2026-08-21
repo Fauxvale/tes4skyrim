@@ -31,6 +31,7 @@ import os
 import re
 import struct
 from collections import defaultdict
+from output_layout import assets_for  # noqa: E402
 
 # MPEG-1 Layer III bitrate table (kbps), index 0/15 invalid.
 _BITRATES_V1_L3 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224,
@@ -115,7 +116,7 @@ def scan_voice_durations(export_dir: str, use_cache: bool = True,
     fallback for a `Say()` whose response cannot be known statically.
     """
     cache_path = os.path.join(export_dir, CACHE_NAME)
-    voice_root = os.path.join(export_dir, 'sound', 'voice')
+    voice_root = str(assets_for(export_dir) / 'sound' / 'voice')
     if not os.path.isdir(voice_root):
         return {}
     if use_cache and os.path.isfile(cache_path):

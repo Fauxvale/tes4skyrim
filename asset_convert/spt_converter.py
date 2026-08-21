@@ -56,6 +56,7 @@ except ImportError:
 from .spt_parser import parse_spt, SptTree
 from .spt_generator import build_tree, TreeGeometry
 from .collision import _set_havok_material
+from output_layout import assets_for  # noqa: E402
 
 NIF_FLAGS = 14
 BSX_FLAGS = 130            # 0x82: complex + havok (vanilla flora value)
@@ -519,7 +520,7 @@ def convert_spt_directory(src_dir: Path, dst_dir: Path,
         print(f'  [SPT] No .spt files found in {src_dir}')
         return {'ok': 0, 'fail': 0, 'skip': 0}
 
-    tex_idx = _tex_index(export_dir / 'textures' / 'trees')
+    tex_idx = _tex_index(assets_for(export_dir) / 'textures' / 'trees')
     # A borrowed .spt's leaf texture lives in the master's tree textures too.
     for mdir in (master_tree_dirs or []):
         mtex = Path(mdir).parent / 'textures' / 'trees'

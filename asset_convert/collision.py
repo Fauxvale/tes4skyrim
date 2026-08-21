@@ -417,7 +417,8 @@ def _component_visual_vote(comp, idx, verts, flip, vdata):
     return agree, oppose, covered
 
 
-def _repair_inverted_floors(tris, visual_tris=None, groups=None):
+def _repair_inverted_floors(tris, visual_tris=None, groups=None,
+                            authored_normals=None):
     """Rewind collision triangles whose winding was reversed at the source.
 
     Havok mesh collision is single-sided: a face only blocks from the side its
@@ -425,6 +426,28 @@ def _repair_inverted_floors(tris, visual_tris=None, groups=None):
     the classic "I fall through the floor" symptom.  Both Nehrim and
     Morrowind_ob re-export collision as bhkPackedNiTriStripsShape triangle
     lists, and that flatten drops the strip's alternating parity.
+
+    STEP 0 — the AUTHORED normal (always on, no toggle).
+        Every collision triangle stores the direction it is meant to face,
+        independently of the winding that produces that facing.  A flatten
+        reverses the winding but carries the stored normal through unchanged,
+        so a triangle whose winding contradicts its own normal is damaged BY
+        ITS OWN RECORD -- read off the file, not inferred.  This needs no
+        adjacency, no oracle mesh and no thresholds, it is inert wherever the
+        two already agree, and it is therefore safe on every plugin.
+
+        It is also the only step that repairs VANILLA Oblivion, which is not
+        clean: seIsland.nif ships 1480 of 3590 collision triangles contradicting
+        their own normals, and the rocks tree measures 14.5% of decidable floor
+        faces inverted.  You fall through the Shivering Isles island in vanilla
+        because of it.
+
+        Its limit is corruption that is SELF-CONSISTENT: where an exporter
+        rewrote the normals to match the winding it emitted, both sources agree
+        while both are wrong and nothing is left to detect.  That is the
+        Morroblivion case (inuhlaaluuroomuside's 10 triangles all score dot
+        +1.0 over an inverted floor), and it is what the gated steps below are
+        for.
 
     Measured against the Oblivion originals of the same meshes (Nehrim
     re-exports assets Oblivion also ships, so the vanilla file is exact ground
@@ -469,15 +492,42 @@ def _repair_inverted_floors(tris, visual_tris=None, groups=None):
     scored 35.8% recall on the same corpus and left priorychapelinterior,
     skbridgesmall and rockgreatforest645lichen unwalkable.
 
-    Gated by the collision winding-fix toggle (see collision_options): the
-    damage this repairs is specific to plugins that re-export collision as
-    flattened triangle lists, so the repair is opt-in per plugin rather than
-    always-on.  Vanilla-authored collision skips it entirely.
+    STEPS 1-3 ARE GATED (see collision_options); STEP 0 IS NOT.  Step 0 reads
+    a fact the file states about itself, so it is always correct to apply.
+    Steps 1-3 INFER the answer from adjacency, enclosed volume and the render
+    mesh, and inference costs false positives: step 1 seeds each welded
+    component from an arbitrary triangle and propagates that choice, so a
+    component whose seed happens to be inward inverts wholesale
+    (leyawiincastle02: 274 of 284 triangles flipped, 806 walkable raycast
+    cells lost on a vanilla mesh).  They are worth that risk only where the
+    authored normals have been destroyed and nothing else can recover the
+    orientation.
 
     Returns (repaired_tris, n_flipped).
     """
-    if not tris or not winding_fix_enabled():
+    if not tris:
         return tris, 0
+
+    # ---- Step 0: the authored normal.  Ungated -- see the docstring.
+    authored_flip = set()
+    if authored_normals and len(authored_normals) == len(tris):
+        for i, (t, an) in enumerate(zip(tris, authored_normals)):
+            if an is None:
+                continue
+            alen = math.sqrt(an[0]**2 + an[1]**2 + an[2]**2)
+            if alen < 1e-6:
+                continue
+            n = _face_normal(t)
+            if (n[0]*an[0] + n[1]*an[1] + n[2]*an[2]) / alen \
+                    < _AUTHORED_NORMAL_DOT:
+                authored_flip.add(i)
+
+    if not winding_fix_enabled():
+        if not authored_flip:
+            return tris, 0
+        out = [(t[0], t[2], t[1]) if i in authored_flip else t
+               for i, t in enumerate(tris)]
+        return out, len(authored_flip)
 
     # Weld to shared vertex indices so adjacency is discoverable.  The packed
     # list stores each triangle's corners independently, so without welding no
@@ -763,6 +813,95 @@ def _shape_tri_soup(shape):
     return None
 
 
+# A face normal and its triangle's winding must point the same way; the dot
+# product of the two is +1 when they agree and -1 when the winding is
+# reversed.  -0.3 is deliberately slack: it only has to separate "same
+# hemisphere" from "opposite hemisphere", and a normal that is merely
+# imprecise (a coarse export, a quantised value) still lands nowhere near it.
+_AUTHORED_NORMAL_DOT = -0.3
+
+# Minimum length of an averaged per-vertex normal for it to describe THIS
+# triangle.  bhkNiTriStripsShape stores normals per VERTEX, and a vertex on a
+# smoothed edge carries the average of every face meeting there -- averaging
+# three of those yields a short vector pointing at none of them
+# (mageguilddesk01's desk edge: |n| = 0.31, and trusting it rewound 9 correct
+# faces).  Near unit length is the proof that all three vertices agreed, i.e.
+# the face is flat-shaded and its normal really is the face normal.
+_AUTHORED_NORMAL_MIN_LEN = 0.95
+
+
+def _shape_tri_normals(shape):
+    """Authored per-triangle normals for `shape`, parallel to _shape_tri_soup.
+
+    A collision triangle records the direction it is supposed to face
+    INDEPENDENTLY of the winding that actually produces that facing:
+
+        hkPackedNiTriStripsData.triangles[i].normal   -- one per triangle
+        NiTriStripsData.normals[]                     -- one per vertex
+
+    When an exporter flattens triangle strips and drops the alternating
+    parity, the winding is reversed but this stored normal is carried through
+    untouched -- so the two disagree, and the disagreement is the AUTHORED
+    record of exactly which triangles were damaged.  No adjacency walk, no
+    thresholds, no oracle mesh: the file says which faces are wrong.
+
+    Entries are None where nothing can be trusted (no normals block, a
+    zero-length normal, or a per-vertex average that did not survive the
+    length test), and the caller leaves those triangles alone.  The order and
+    the degenerate-triangle filtering MUST match _shape_tri_soup exactly or
+    normals bind to the wrong faces; the two are edited together.
+
+    Returns None when the shape carries no usable normals at all.
+    """
+    if isinstance(shape, NifFormat.bhkNiTriStripsShape):
+        out = []
+        any_real = False
+        for sd in shape.strips_data:
+            if sd is None:
+                continue
+            tri_iter = list(_triangulate_strips(sd))
+            if not getattr(sd, 'has_normals', False) or not sd.normals:
+                out.extend([None] * len(tri_iter))
+                continue
+            norms = [(n.x, n.y, n.z) for n in sd.normals]
+            for a, b, c in tri_iter:
+                try:
+                    na, nb, nc = norms[a], norms[b], norms[c]
+                except IndexError:
+                    out.append(None)
+                    continue
+                avg = ((na[0] + nb[0] + nc[0]) / 3.0,
+                       (na[1] + nb[1] + nc[1]) / 3.0,
+                       (na[2] + nb[2] + nc[2]) / 3.0)
+                if (math.sqrt(avg[0]**2 + avg[1]**2 + avg[2]**2)
+                        < _AUTHORED_NORMAL_MIN_LEN):
+                    out.append(None)      # smoothed edge -- not this face
+                    continue
+                out.append(avg)
+                any_real = True
+        return out if any_real else None
+
+    if isinstance(shape, NifFormat.bhkPackedNiTriStripsShape):
+        data = getattr(shape, 'data', None)
+        if data is None or data.num_triangles == 0:
+            return None
+        out = []
+        any_real = False
+        for t in data.triangles:
+            a, b, c = t.triangle.v_1, t.triangle.v_2, t.triangle.v_3
+            if a == b or b == c or a == c:
+                continue              # dropped by _shape_tri_soup too
+            n = (t.normal.x, t.normal.y, t.normal.z)
+            if n[0] == 0.0 and n[1] == 0.0 and n[2] == 0.0:
+                out.append(None)
+                continue
+            out.append(n)
+            any_real = True
+        return out if any_real else None
+
+    return None
+
+
 def _visual_tri_soup(root, max_tris=20000):
     """Render-mesh triangles under `root`, in Havok units to match collision.
 
@@ -950,6 +1089,12 @@ def _rebuild_mesh_collision(rb, target_node):
     # Independent geometry groups, kept in step with the filtering below so
     # _repair_inverted_floors never welds two separate pieces together.
     groups = shape_tri_groups(inner)
+    # The winding each triangle was AUTHORED to have (step 0 of the repair).
+    # Filtered alongside `tris` below so the two stay index-aligned; a
+    # mismatched length makes _repair_inverted_floors ignore them entirely.
+    authored_normals = _shape_tri_normals(inner)
+    if authored_normals is not None and len(authored_normals) != len(tris):
+        authored_normals = None
     keep = [all(math.isfinite(c) for v in t for c in v) for t in tris]
     if groups and sum(groups) == len(tris) and not all(keep):
         adj, base = [], 0
@@ -957,6 +1102,8 @@ def _rebuild_mesh_collision(rb, target_node):
             adj.append(sum(1 for i in range(base, base + g) if keep[i]))
             base += g
         groups = adj
+    if authored_normals is not None and not all(keep):
+        authored_normals = [n for n, k in zip(authored_normals, keep) if k]
     tris = [t for t, k in zip(tris, keep) if k]
     if not tris:
         return False
@@ -970,9 +1117,25 @@ def _rebuild_mesh_collision(rb, target_node):
         _DEGENERATE_HULLS_DROPPED[0] += 1
         return 'drop'
 
+    # The authored normals live in the SHAPE's frame; _bake_body_transform
+    # rotates the triangles into the node's.  Rotate the normals by the same
+    # matrix first or every comparison is made across two different frames --
+    # a 180-degree body would then read every face as reversed.  (The rotation
+    # comes from a quaternion, so it never mirrors and never itself changes
+    # which way a triangle winds.)
+    if authored_normals and isinstance(rb, NifFormat.bhkRigidBodyT):
+        q = rb.rotation
+        R = _m3_from_quat_xyzw(q.x, q.y, q.z, q.w)
+        authored_normals = [
+            None if n is None else
+            (R[0][0]*n[0] + R[0][1]*n[1] + R[0][2]*n[2],
+             R[1][0]*n[0] + R[1][1]*n[1] + R[1][2]*n[2],
+             R[2][0]*n[0] + R[2][1]*n[1] + R[2][2]*n[2])
+            for n in authored_normals
+        ]
     tris = _bake_body_transform_into_tris(rb, tris)
     tris, n_flipped = _repair_inverted_floors(
-        tris, _visual_tri_soup(target_node), groups)
+        tris, _visual_tri_soup(target_node), groups, authored_normals)
     if n_flipped:
         _INVERTED_FLOOR_FLIPS[0] += n_flipped
     mopp = build_cms_collision(tris, sk_material, NifFormat)

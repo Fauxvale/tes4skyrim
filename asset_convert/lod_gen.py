@@ -862,7 +862,15 @@ def _root_is_ninode_slow(full: Path) -> bool:
 # Objects smaller than this (max OBND dimension, game units) are only baked
 # into the near LOD-4 tiles.  A level-8 tile starts ~2 cells out; small
 # clutter is invisible there but its baked geometry still costs disk/VRAM.
-_LOD8_MIN_SIZE = 400.0
+#
+# 400 sat just below the median reference size, so it kept 74% of Tamriel's
+# 327,096 references at level 8 — and the gate feeds level 16 as well, so the
+# two coarse rings together carried 57% of the bake's bytes.  Censused across
+# the real bake input, reference sizes run p25=386, p50=548, p75=1011: 600 is
+# the knee of that curve (400->600 drops 118k references, 600->900 only 35k
+# more) and still keeps everything hut-sized and larger.  At level-8 distance
+# (8,000+ units) a 600-unit object is well under a pixel of silhouette.
+_LOD8_MIN_SIZE = 600.0
 
 
 def _obnd_max_dim(stat: dict) -> float:
@@ -889,6 +897,32 @@ def _obnd_max_dim(stat: dict) -> float:
 _STAGED_MASTER_MESHES = set()
 
 
+def _register_if_staged_scratch(rel: str, output_meshes_dir: Path,
+                                master_meshes) -> None:
+    """Mark an already-present mesh as scratch if a previous run staged it.
+
+    Only a mesh that (a) has no `.nif.generated` marker, so nothing in this
+    tree derived it, and (b) exists identically in a master tree, so staging is
+    where it could have come from, is treated as scratch. Both conditions are
+    required: the marker test alone would sweep a hand-placed mesh, and the
+    master test alone would sweep a legitimately derived one.
+    """
+    r = rel.lower().replace('/', '\\').lstrip('\\')
+    if r.startswith('meshes\\'):
+        r = r[len('meshes\\'):]
+    dst = _win_join(output_meshes_dir, r)
+    if not dst.exists() or str(dst) in _STAGED_MASTER_MESHES:
+        return
+    # Derived here -> has a marker -> not scratch, leave it alone.
+    if dst.with_suffix('.nif.generated').exists():
+        return
+    for mdir in (master_meshes or []):
+        src = _win_join(Path(mdir), r)
+        if src.exists() and src.stat().st_size == dst.stat().st_size:
+            _STAGED_MASTER_MESHES.add(str(dst))
+            return
+
+
 def _import_master_mesh(rel: str, output_meshes_dir: Path,
                         master_meshes) -> bool:
     """Stage a master's mesh into this plugin's tree, if needed.
@@ -911,6 +945,17 @@ def _import_master_mesh(rel: str, output_meshes_dir: Path,
     if not rel:
         return False
     if _mesh_exists(rel, output_meshes_dir):
+        # Already here -- but "already here" includes scratch a previous run
+        # staged and failed to remove (a kill between the copy and
+        # _drop_staged_master_meshes, or any run predating one-bake). Returning
+        # without registering it left that copy pinned forever: every later run
+        # took this same branch, so the post-bake cleanup never saw it.
+        #
+        # A file this tree GENERATED carries a `.nif.generated` marker from
+        # lod_far_gen; staging copies the .nif alone and never the marker. So an
+        # unmarked mesh in a bake tree that derives nothing is staged scratch,
+        # and re-registering it lets this run finish the previous one's cleanup.
+        _register_if_staged_scratch(rel, output_meshes_dir, master_meshes)
         return True
     r = rel.lower().replace('/', '\\').lstrip('\\')
     if r.startswith('meshes\\'):
@@ -991,8 +1036,13 @@ def _lod_meshes_for(stat: dict, output_meshes_dir: Path, master_meshes=None):
     """
     Return (lod4, lod8, lod16) mesh paths for a stat record.
 
-    - Trees use their billboard-card _far.nif at every level — the cards are
-      8 verts each, so distant forests stay visible for almost no cost.
+    - Trees use their billboard-card _far.nif, and are subject to the SAME
+      size gate as everything else: a card is only 8 verts, but it is baked
+      once per PLACEMENT, and Tamriel places 124,872 of them. Listing every
+      tree at every level put 73,672 tree cards into level-16 tiles — 72% of
+      everything reaching that level, and why a level-16 tile spans 256 cells
+      yet reached 371 MB. 26% of tree placements are shrubs under the gate
+      (ShrubBoxwood is 130 units and was being drawn ~8 km out).
     - Other LOD objects (0x8000) get lod4; lod8 only if they're big enough
       to matter at level-8 distances (_LOD8_MIN_SIZE).
     - World-map objects (0x10000000) additionally get lod16 so LODGenx64
@@ -1018,19 +1068,30 @@ def _lod_meshes_for(stat: dict, output_meshes_dir: Path, master_meshes=None):
         return '', '', ''
 
     from .lod_far_gen import is_tree_model, _tier_path, _TIER8, _TIER16
-    if is_tree_model(stat):
-        return far, far, far
+    is_tree = is_tree_model(stat)
 
     flags = stat.get('flags', 0)
+    big_enough = _obnd_max_dim(stat) >= _LOD8_MIN_SIZE
     lod8_mesh = lod16_mesh = ''
-    if _obnd_max_dim(stat) >= _LOD8_MIN_SIZE:
-        far8 = str(_tier_path(Path(far), _TIER8['suffix']))
-        lod8_mesh = (far8 if _import_master_mesh(far8, output_meshes_dir,
-                                                 master_meshes) else far)
-    if flags & 0x10000000:
-        far16 = str(_tier_path(Path(far), _TIER16['suffix']))
-        lod16_mesh = (far16 if _import_master_mesh(far16, output_meshes_dir,
-                                                   master_meshes) else far)
+    if big_enough:
+        # A billboard card has no coarser tier to fall back to: it is already
+        # two crossed quads, so the same card serves every level it reaches.
+        if is_tree:
+            lod8_mesh = far
+        else:
+            far8 = str(_tier_path(Path(far), _TIER8['suffix']))
+            lod8_mesh = (far8 if _import_master_mesh(far8, output_meshes_dir,
+                                                     master_meshes) else far)
+    # Trees carry no world-map flag, so gate their far ring on size alone —
+    # otherwise every tree drops out at level 16 and distant forests vanish
+    # from the world map.
+    if (flags & 0x10000000) or (is_tree and big_enough):
+        if is_tree:
+            lod16_mesh = far
+        else:
+            far16 = str(_tier_path(Path(far), _TIER16['suffix']))
+            lod16_mesh = (far16 if _import_master_mesh(far16, output_meshes_dir,
+                                                       master_meshes) else far)
     return far, lod8_mesh, lod16_mesh
 
 
@@ -1457,7 +1518,7 @@ def generate_lod(esm_path: Path, output_dir: Path,
                  master_dirs=None, master_texture_dirs=None,
                  master_mesh_dirs=None,
                  overlay_paths=None, only_cells=None,
-                 far_nif_dirs=None) -> bool:
+                 far_nif_dirs=None, overlay_manifest_dirs=None) -> bool:
     """
     Full LOD generation pipeline:
       1. Write LODSettings/<worldspace>.lod
@@ -1519,6 +1580,12 @@ def generate_lod(esm_path: Path, output_dir: Path,
                            root) and dropped afterwards, exactly as master
                            meshes already are. None means write them under
                            `output_dir` — the single-plugin behaviour.
+        overlay_manifest_dirs: Per-plugin EXPORT dirs holding the
+                           APPLY_HILIGHT2 diffuse manifests mesh conversion
+                           wrote. Their alpha is a blend weight, and the LOD
+                           object shader would read it as transparency, so
+                           opaque copies are shipped in the LOD texture tree
+                           (see `_force_opaque_lod_diffuses`).
 
     Returns True on success.
     """
@@ -1768,10 +1835,16 @@ def generate_lod(esm_path: Path, output_dir: Path,
     # Fill in any LOD texture the .bto files reference but that does not exist:
     # atlas normal maps (synthesized) and any diffuse that lives only in a
     # master's output because this plugin baked the master's models into its LOD.
-    _fill_missing_lod_textures(
-        objects_dir, _textures_root(output_dir),
-        master_tex_roots=[_textures_root(Path(d))
-                          for d in (master_texture_dirs or master_dirs or [])])
+    _lod_tex_root = _textures_root(output_dir)
+    _src_tex_roots = [_textures_root(Path(d))
+                      for d in (master_texture_dirs or master_dirs or [])]
+    _fill_missing_lod_textures(objects_dir, _lod_tex_root,
+                               master_tex_roots=_src_tex_roots)
+
+    # Detail-overlay diffuses (APPLY_HILIGHT2): their alpha is a blend weight,
+    # but the LOD object shader reads it as opacity, so ship opaque copies.
+    _force_opaque_lod_diffuses(objects_dir, _lod_tex_root, _src_tex_roots,
+                               overlay_manifest_dirs)
 
     # The master meshes staged for LODGen have served their purpose: the
     # geometry is baked into the .bto and the master ships the mesh itself.
@@ -1927,6 +2000,101 @@ def _fill_missing_lod_textures(bto_dir: Path, tex_root: Path,
         print(f"  WARNING: {len(unresolved)} LOD textures missing: "
               + ", ".join(unresolved[:5])
               + ("..." if len(unresolved) > 5 else ""))
+
+
+def _force_opaque_lod_diffuses(bto_dir: Path, lod_tex_root: Path,
+                               source_tex_roots, export_dirs) -> None:
+    """Ship opaque copies of detail-overlay diffuses for object LOD.
+
+    Oblivion's APPLY_HILIGHT2 apply mode makes a diffuse's alpha channel a
+    per-texel BLEND WEIGHT for laying detail over a surface, not a transparency
+    mask.  Skyrim has no such mode.  `nif_converter` already drops the
+    NiAlphaProperty when one is present (that is why `seisland` renders solid
+    up close), but most overlay shapes never had one -- `RockGreatForest645`
+    ships apply_mode 4 with no alpha property at all -- so nothing about the
+    converted mesh records that its texture's alpha is not opacity.
+
+    That stays harmless until LODGen bakes the mesh: it stamps every shape it
+    emits with `slsf_2_lod_objects`, and the LOD object shader DOES sample
+    diffuse alpha as opacity.  The rock then renders see-through at distance
+    while looking correct up close, with no alpha property anywhere to explain
+    it.
+
+    LODGen cannot be told otherwise -- it writes the shader itself -- and the
+    texture cannot be flattened in place, because the full-size mesh still
+    needs that alpha for its detail overlay.  So the alpha is flattened in a
+    COPY written into the LOD texture tree at the same relative path the tiles
+    already reference: Data holds exactly one file per path and this tree
+    shadows the plugins', so tiles resolve to the opaque copy while full meshes
+    keep the original.
+
+    Which textures those are is AUTHORED, not guessed: mesh conversion records
+    every diffuse whose NiTexturingProperty said APPLY_HILIGHT2, and this reads
+    that manifest back.  A genuine cutout mask (tree billboards, cobwebs,
+    hanging moss) ships APPLY_MODULATE instead, is absent from the manifest,
+    and keeps its alpha exactly as authored.
+    """
+    from . import texture_prune
+
+    dirs = [Path(d) for d in (export_dirs or [])]
+    have = [d for d in dirs
+            if (d / texture_prune.OVERLAY_MANIFEST_NAME).is_file()]
+    if not have:
+        # Written by mesh conversion, so an older output tree has none. Say so:
+        # silence here looks identical to "nothing needed fixing", and the
+        # symptom (see-through distant rock) is easy to blame on the bake.
+        print("  NOTE: no detail-overlay manifest found"
+              f"{' in ' + str(dirs[0].parent) if dirs else ''}"
+              " — re-run the meshes stage for overlay diffuses to be made "
+              "opaque in LOD")
+        return
+
+    overlays = set()
+    for d in have:
+        overlays |= texture_prune.read_manifest(
+            d, texture_prune.OVERLAY_MANIFEST_NAME)
+    if not overlays:
+        return
+
+    # Manifest keys are 'tes4/foo/bar.dds'; .bto refs are 'tes4\foo\bar.dds'.
+    wanted = {k.replace('/', '\\') for k in overlays}
+    refs = _bto_texture_refs(bto_dir) & wanted
+    if not refs:
+        return
+
+    from PIL import Image
+    import numpy as _np
+
+    fixed = 0
+    for rel in sorted(refs):
+        dest = _win_join(lod_tex_root, rel)
+        if dest.exists():
+            continue          # already LOD-local (an atlas, or a previous run)
+        src = None
+        for root in source_tex_roots:
+            if root is None:
+                continue
+            p = _win_join(root, rel)
+            if p.exists():
+                src = p
+                break
+        if src is None:
+            continue
+        try:
+            with Image.open(src) as img:
+                if 'A' not in img.getbands():
+                    continue          # no alpha channel to flatten
+                arr = _np.asarray(img.convert('RGBA')).copy()
+            arr[..., 3] = 255
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(arr, 'RGBA').save(dest, format='DDS')
+            fixed += 1
+        except Exception:
+            continue
+
+    if fixed:
+        print(f"  Made {fixed} detail-overlay LOD diffuse(s) opaque "
+              f"(APPLY_HILIGHT2 alpha is a blend weight, not transparency)")
 
 
 def _write_flat_normal_for(atlas_diffuse: Path, dest: Path):

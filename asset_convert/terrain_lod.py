@@ -33,6 +33,7 @@ from worker_budget import worker_count  # noqa: E402
 
 # Apply all PyFFI patches (time.clock fix, nif.xml condition fixes) before import
 from . import pyffi_monkey_patch as _patch  # noqa: F401
+from output_layout import assets_for  # noqa: E402
 
 try:
     from pyffi.formats.nif import NifFormat
@@ -278,6 +279,32 @@ def _scan_wrld_block(raw, include_children: bool):
     return ranked
 
 
+def _master_record_dir(export_dir, master: str):
+    """Where `master`'s records live, given any plugin's record folder.
+
+    Masters used to resolve as `export_dir.parent / master`. That holds only
+    while every plugin owns a top-level folder; an imported mod's plugins are
+    nested inside their mod's folder, making `.parent` the mod rather than the
+    export root.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+    d = _Path(export_dir).parent
+    root = d
+    for cand in (d, d.parent):
+        if cand and (cand / 'sources.json').is_file():
+            root = cand
+            break
+    try:
+        from output_layout import record_dir as _rd
+        got = _rd(root, master)
+        if _os.path.isdir(got):
+            return got
+    except ImportError:
+        pass
+    return root / master
+
+
 def _master_names(export_dir: Path):
     """The TES4 master file names listed in an export's _HEADER.txt."""
     header = Path(export_dir) / '_HEADER.txt'
@@ -430,68 +457,71 @@ def _scan_cell_coords(esm_path: Path, coords: dict):
             p += 24 + size
 
 
-def lod_capable_worldspaces(export_dir: Path, out_root: Path = None):
+def lod_capable_worldspaces(export_dir: Path, out_root: Path = None,
+                            plugin: str = None):
     """Every worldspace a plugin should get distant LOD for.
 
-    Shipped LOD assets are NOT the authority, and treating them as one was the
-    original defect: only Bethesda baked LOD offline. A third-party landmass
-    mod ships none — there is nothing to extract, and never will be — so a
-    shipped-asset scan reported zero worldspaces for exactly the plugins that
-    most need LOD generated (ElsweyrAnequina.esp, Tamriel.esp and
-    TWMP_Valenwood_Elsweyr.esp all scanned as "ships no LOD" and silently
-    contributed nothing, in the dialog AND in the bake).
+    The authority is the SOURCE GAME's own shipped LOD assets. Whoever built
+    the plugin decided which worldspaces are seen from a distance and baked
+    LOD for exactly those; that judgement is authored data, and it is better
+    than anything we can infer. Measured over the whole load order: of the 20
+    worldspaces with shipped LOD, every single one also contains LOD-flagged
+    references, so the list has no false positives at all.
 
-    The authority is the CONVERTED ESM's WRLD records. Which worldspaces
-    deserve LOD is already decided by `detect_terrain_worldspaces`, which
-    excludes CHILD worldspaces (a WNAM parent means it renders on the parent's
-    LOD grid). That is the discriminator; do not add a second one. A worldspace
-    with nothing in it simply bakes no tiles, so gating on content buys
-    nothing — and gating on the WRLD "Small World" flag is actively wrong, as
-    mod authors set it inconsistently and it drops real landmasses (Nehrim's
-    Arktwend, ElsweyrAnequina's ANQVerkarthHillsWorld).
+    Inferring it instead was tried and is worse in both directions. Deriving
+    the set from the converted ESM's WRLD records offers every worldspace that
+    merely HAS terrain, which pulls in Bethesda's debug worlds (TestGatekeeper,
+    TestShambles, CubeWorldspace ...) -- they bake no object tiles, and
+    `generate_lod` returning False for them dragged an otherwise clean
+    84-worldspace run down to "create_lod: FAILED for all plugins". Filtering
+    THAT list back down needs a full reference scan of every ESM, which is
+    seconds of work to reconstruct a fact the export already states for free.
+
+    A plugin shipping no LOD assets is not a plugin whose worldspaces were
+    missed. City worldspaces are folded into their parent's LOD grid (a WNAM
+    parent, which `detect_terrain_worldspaces` already excludes), and an ESP
+    that extends a master's landmass ships LOD for the MASTER's worldspace:
+    ElsweyrPelletine.esp supplies TES4Tamriel tiles, not tiles of its own.
+
+    `out_root` is accepted for call compatibility and used only to tell a
+    missing conversion apart from a missing export in the reason text.
 
     Returns (worldspaces, reason); `reason` is None unless nothing qualified.
+    A reason is a WARNING for the caller to surface, not an error: the usual
+    cause is a deleted or never-run export.
     """
     export_dir = Path(export_dir)
-    name = export_dir.name
+    # The messages below tell the user to re-run `convert.py -f <name>`, so it
+    # must be the PLUGIN. A single-plugin imported mod keeps its records in the
+    # mod's folder, whose name is the mod label and not a valid -f argument.
+    name = plugin or export_dir.name
 
-    shipped = []
-    if export_dir.is_dir():
-        try:
-            shipped = shipped_lod_worldspaces(export_dir) or []
-        except Exception:
-            shipped = []
-
-    # Worldspaces defined in the converted output. This is what makes
-    # mod-added landmasses visible to the dialog and to the bake.
-    generated = []
-    if out_root is not None:
-        esm = Path(out_root) / name / name
-        if esm.is_file():
-            try:
-                generated = [(edid, fid)
-                             for _sz, fid, edid in detect_terrain_worldspaces(esm)]
-            except Exception:
-                generated = []
-
-    # Shipped first (Bethesda's own ranking by tile count), then anything with
-    # terrain the source never baked. De-duplicated on EDID, since a plugin can
-    # both ship LOD for a worldspace and add terrain to it.
-    out, seen = [], set()
-    for edid, fid in list(shipped) + generated:
-        if edid not in seen:
-            seen.add(edid)
-            out.append((edid, fid))
-
-    if out:
-        return out, None
     if not export_dir.is_dir():
-        return [], (f"{name}: not exported yet — run the Export stage "
+        return [], (f"{name}: no export folder — run the Export stage "
                     f"(convert.py -f {name} --export-only).")
-    if out_root is not None and not (Path(out_root) / name / name).is_file():
-        return [], (f"{name}: not converted yet — run the Import stage "
-                    f"(convert.py -f {name} --import-only).")
-    return [], f"{name}: defines no worldspace, so there is no LOD to bake."
+
+    try:
+        shipped = shipped_lod_worldspaces(export_dir) or []
+    except Exception as exc:
+        return [], f"{name}: could not read the export's LOD assets ({exc})."
+
+    if shipped:
+        return shipped, None
+
+    # No shipped LOD. Distinguish "this plugin genuinely has none" from "the
+    # assets that would have told us were deleted", because the two look
+    # identical from here and only one of them is the user's problem.
+    _assets = assets_for(export_dir)
+    lod_dirs = [_assets / 'meshes' / 'landscape' / 'lod',
+                _assets / 'textures' / 'landscapelod' / 'generated']
+    if not any(d.is_dir() for d in lod_dirs):
+        return [], (f"{name}: the export has no landscape-LOD folders. If you "
+                    f"deleted them, re-run the Extract stage "
+                    f"(convert.py -f {name} --extract-only); otherwise this "
+                    f"plugin simply ships no distant LOD of its own.")
+    return [], (f"{name}: ships no distant LOD of its own — its worldspaces "
+                f"are covered by whichever plugin does (a city world renders "
+                f"on its parent's LOD grid).")
 
 
 def shipped_lod_worldspaces(export_dir: Path):
@@ -555,8 +585,11 @@ def shipped_lod_worldspaces(export_dir: Path):
                 edid_by_fid.setdefault(cur_fid, line[9:].strip())
 
     _scan_wrld(export_dir)
+    # A master's records are NOT reliably a sibling directory: an imported
+    # mod's plugins live inside their mod's shared folder, so `.parent` is that
+    # folder rather than export/. Resolve through the registry.
     for master in _master_names(export_dir):
-        _scan_wrld(export_dir.parent / master)
+        _scan_wrld(_master_record_dir(export_dir, master))
 
     # The importer renames Oblivion's 'Tamriel' worldspace to 'TES4Tamriel'
     # (tes5_import/record_types/world.py) so it doesn't override Skyrim's
