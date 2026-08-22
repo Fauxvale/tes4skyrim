@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import struct
 import sys
@@ -50,6 +51,7 @@ from .record_types.world import (
     convert_LTEX,
     convert_REFR,
     convert_WRLD,
+    restamp_wrld_mnam,
     set_cell_locations,
     set_teleport_grid,
     set_cloud_bank_output,
@@ -1963,6 +1965,23 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     _phase_done('phase 4b LAND conversion')
 
     world_sigs = ('CELL', 'WRLD', 'REFR', 'ACHR', 'ACRE', 'LAND', 'PGRD')
+
+    # Land extents must be registered BEFORE the override pass: a plugin that
+    # adds land to a MASTER's worldspace never converts a WRLD of its own, so
+    # the override rebuilders and the anchor paths are the only consumers that
+    # ever see them.  _build_world_groups re-registers for the own-hierarchy
+    # case.  See docs/world_land_navmesh_notes.md.
+    ext_by_wrld = defaultdict(list)
+    for cell in by_type.get('CELL', []):
+        wrld_fid = get_formid(cell, 'ParentWRLD')
+        if wrld_fid:
+            ext_by_wrld[wrld_fid].append(cell)
+    extents = _land_extents_by_wrld(ext_by_wrld) if ext_by_wrld else {}
+    if output_root:
+        extents = _merge_world_extents(output_root, extents)
+    if extents:
+        set_world_land_extents(extents)
+
     if ctx:
         # A CELL's child GRUP REPLACES the master's — it is not merged (see
         # overrides.build_nested_overrides). LAND and PGRD ride along: LAND
@@ -3137,6 +3156,52 @@ def _land_extents_by_wrld(ext_cells_by_wrld: dict) -> dict:
     return extents
 
 
+WORLD_EXTENT_CACHE = 'world_extents.json'
+
+
+
+
+def _merge_world_extents(output_root: str, measured: dict) -> dict:
+    """Union `measured` into the shared per-output-tree extent cache.
+
+    A worldspace is SHARED, so its rectangle is not a fact any one plugin
+    owns: ten converted plugins override Tamriel 0100003C but only Tamriel.esp
+    adds the outer land, and the LAST to load wins.  Unioning across the whole
+    output tree makes every plugin emit the same widest rectangle, so load
+    order stops mattering.  Keyed by output-space FormID, which is stable
+    across plugins that share a master.
+
+    Best-effort: a cache that cannot be read or written just means each plugin
+    falls back to its own measurement, i.e. the previous behaviour.
+    """
+    path = os.path.join(output_root, WORLD_EXTENT_CACHE)
+    stored = {}
+    try:
+        with open(path, encoding='utf-8') as fh:
+            stored = {int(k): tuple(v) for k, v in json.load(fh).items()}
+    except (OSError, ValueError, TypeError):
+        stored = {}
+
+    merged = dict(stored)
+    for fid, rect in measured.items():
+        old = merged.get(fid)
+        if old is None:
+            merged[fid] = tuple(rect)
+        else:
+            merged[fid] = (min(old[0], rect[0]), min(old[1], rect[1]),
+                           max(old[2], rect[2]), max(old[3], rect[3]))
+
+    if merged != stored:
+        try:
+            os.makedirs(output_root, exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as fh:
+                json.dump({str(k): list(v) for k, v in sorted(merged.items())},
+                          fh, indent=1)
+        except OSError:
+            pass
+    return merged
+
+
 def _build_world_groups(by_type: dict, writer: PluginWriter,
                         navm_metas: list = None, base_model_by_fid: dict = None,
                         door_fids: set = None, navm_cache: dict = None,
@@ -3216,7 +3281,11 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
                 continue
             rec = master_index.record(out_fid) if master_index else b''
             if rec and rec[:4] == b'WRLD':
-                anchor_wrld[out_fid] = rec
+                # These are the MASTER's bytes, so they carry the master's
+                # narrow map rectangle -- and the LAST plugin to override a
+                # WRLD wins, so one verbatim anchor undoes every other
+                # plugin's widened MNAM.
+                anchor_wrld[out_fid] = restamp_wrld_mnam(rec, out_fid)
             else:
                 n = sum(1 for c in cells
                         if get_formid(c, 'ParentWRLD') == out_fid)

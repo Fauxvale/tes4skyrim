@@ -634,6 +634,14 @@ def emit_nested_overrides(records: list, writer: PluginWriter,
         if rec:
             anchored[0] += 1
             anchored_fids.add(fid)
+            if rec[:4] == b'WRLD':
+                # The master's WRLD carries the MASTER's map rectangle. This
+                # plugin is adding land to that worldspace, and the LAST
+                # plugin to override a WRLD wins -- so emitting the narrow
+                # rectangle here re-clamps the world map for every other
+                # plugin too. Re-stamp from the shared extent registry.
+                from .record_types.world import restamp_wrld_mnam
+                rec = restamp_wrld_mnam(rec, fid)
         return rec
 
     def build(prefix: tuple, depth: int) -> bytes:

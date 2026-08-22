@@ -194,6 +194,76 @@ CLR = {
 }
 
 
+# Loaded HICONs are kept alive for the process lifetime; freeing them would
+# blank the taskbar button.
+_ICON_HANDLES = []
+
+
+def _set_app_user_model_id() -> None:
+    """Give the process its own taskbar identity so it shows OUR icon.
+
+    Windows groups taskbar buttons by AppUserModelID, and a bare script
+    inherits the one python.exe/pythonw.exe registered for itself -- so the
+    taskbar shows the Python logo no matter what `iconbitmap` does to the
+    window. Claiming a distinct ID detaches us from that group, after which
+    the taskbar falls back to the window's own icon.
+
+    This has to run BEFORE the first window exists: the shell reads the ID
+    when the button is created, and changing it afterwards does nothing.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "TESConversion.AutoConvert.GUI")
+    except Exception:
+        pass  # non-Windows shell, or an older build without the API
+
+
+def _set_window_icon(root, icon_path) -> None:
+    """Load the .ico at both icon sizes Windows asks for.
+
+    Tk's `iconbitmap` only ever supplies the SMALL icon (title bar / Alt-Tab).
+    The taskbar button and the large Alt-Tab overlay ask for ICON_BIG, which Tk
+    never sets, so the shell substitutes a generic one. LoadImage picks the
+    best-matching frame out of our multi-resolution .ico for each request.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        root.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
+
+        IMAGE_ICON, LR_LOADFROMFILE, LR_DEFAULTSIZE = 1, 0x0010, 0x0040
+        WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+        metrics = {
+            ICON_BIG: (ctypes.windll.user32.GetSystemMetrics(11),   # SM_CXICON
+                       ctypes.windll.user32.GetSystemMetrics(12)),
+            ICON_SMALL: (ctypes.windll.user32.GetSystemMetrics(49),  # SM_CXSMICON
+                         ctypes.windll.user32.GetSystemMetrics(50)),
+        }
+
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+
+        for which, (cx, cy) in metrics.items():
+            flags = LR_LOADFROMFILE | (LR_DEFAULTSIZE if not cx else 0)
+            handle = user32.LoadImageW(None, str(icon_path), IMAGE_ICON,
+                                       cx, cy, flags)
+            if handle:
+                # Keep a reference: destroying the icon would blank the button.
+                _ICON_HANDLES.append(handle)
+                user32.SendMessageW(hwnd, WM_SETICON, which, handle)
+    except Exception:
+        pass  # any failure just leaves Tk's own icon in place
+
+
 def _style_titlebar(root) -> None:
     """Recolor the native Windows title bar to match the app's dark/purple theme."""
     if sys.platform != "win32":
@@ -299,6 +369,7 @@ def _make_root():
     never appeared. Anyone with the package installed (the author) never saw it.
     """
     global DND_AVAILABLE
+    _set_app_user_model_id()
     import tkinter
     try:
         from tkinterdnd2 import TkinterDnD
@@ -697,6 +768,7 @@ def gui_main():
     root.option_add("*Foreground", CLR["text"])
     icon_path = SCRIPT_DIR / "docs" / "favicon.ico"
     root.iconbitmap(default=str(icon_path))
+    _set_window_icon(root, icon_path)
     _style_titlebar(root)
 
     style = ttk.Style(root)

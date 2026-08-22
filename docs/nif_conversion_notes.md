@@ -1704,8 +1704,8 @@ Three crashes in converted Morrowind_ob traced to one mesh, named directly in th
 - **Degenerate collision hulls crash the MOPP bridge**: the bridge access-violates (`rc 3221225477`) inside "computing two-sided welding" on very small hulls — Havok divides by near-zero edge lengths. Verified by scale sweep on `inucaveuplant00`: ×1 crashes, ×10/×100/×1000 all succeed. The duplicated reversed triangle in that mesh is *not* the trigger (A/B tested — crashes with and without it). **This is not Morroblivion-specific**: vanilla Oblivion `paintbrush01/02/03` (0.034 hu) hit it too.
   - **Fix is a scaled rebuild, not a drop** (`cms_builder.build_cms_collision`): MOPP encodes geometry as `(v - origin) * scale`, so building the bytecode over vertices scaled by `k` and storing `origin/k` with `scale*k` is an **exact** restatement for the original geometry — no approximation, and the CMS chunk data stays at native scale. Retries k=10/100/1000. Verified on paintbrush01: MOPP origin reproduces the source AABB minimum on all 3 axes, decoded CMS AABB matches the source, `walk_mopp` returns 0 errors and its terminal key set equals the CMS key set.
   - **Dropping is now only for sub-viable hulls**: `_MIN_HULL_EXTENT = 0.01` hu (≈0.07 game units, sub-millimetre) — far below the smallest vanilla Skyrim hull (**0.179 hu**, censused from vanilla clutter CMS). Morroblivion's `inucaveuplant00` is 0.0098 hu against a 73.5-game-unit visual mesh (~1000× too small), so its collision is meaningless and the collision object is removed (`collision_object = None`). Counter: `degenerate_hull_drop_count()`. Do **not** raise this to catch things like the paintbrush — that clutter must stay grabbable, and the scaled retry already gives it real MOPP.
-- **Vanilla control**: **0 of 17,216** vanilla Skyrim meshes contain `bhkPackedNiTriStripsShape` at all — Skyrim always ships MOPP+CMS. So that shape is only ever our no-MOPP fallback, and it must at minimum be structurally valid.
-- **Scale of the bug**: 3 meshes in Morrowind_ob, 4 in Oblivion.esm; 0 in Nehrim/SI. After the fix the paintbrushes and `crescentblade` get real MOPP+CMS (collision preserved), the two `inucaveuplant` hulls are dropped, and the only remaining packed shape is `gnarlspawner.nif`'s **`bhkSPCollisionObject` trigger phantom** — a deliberately-preserved type (see the constrained-objects section) that goes through `_convert_shape`, not the rebuilder. It now ships `data.num_sub_shapes = 1`, so it is structurally safe even though it keeps the fallback shape.
+- **Vanilla control**: **0 of 17,216** vanilla Skyrim meshes contain `bhkPackedNiTriStripsShape` at all — Skyrim always ships MOPP+CMS. That was read here as "our fallback must at least be structurally valid"; **2026-08-22 corrected it to "never emit it"** — a structurally-valid shape of a type the engine does not support still corrupts the heap on load.
+- **Scale of the bug**: 3 meshes in Morrowind_ob, 4 in Oblivion.esm; 0 in Nehrim/SI. After the fix the paintbrushes and `crescentblade` get real MOPP+CMS (collision preserved), the two `inucaveuplant` hulls are dropped, and the only remaining packed shape is `gnarlspawner.nif`'s **`bhkSPCollisionObject` trigger phantom** — a deliberately-preserved type (see the constrained-objects section) that goes through `_convert_shape`, not the rebuilder. It now ships `data.num_sub_shapes = 1`, so it is structurally safe even though it keeps the fallback shape. **SUPERSEDED 2026-08-22:** keeping the fallback shape at all was wrong -- Skyrim never loads that type, and it caused the 2 GB-memcpy heap corruption documented below. `gnarlspawner`'s phantom now carries MOPP+CMS (the `bhkSPCollisionObject` / `bhkSimpleShapePhantom` types are still preserved; only the shape inside changed, geometry exact at 120->120 and 124->124 triangles), and the packed shape is no longer emitted anywhere.
 - **Verify**: `python tools/nif_block_scan.py output/<plugin>/meshes --has bhkPackedNiTriStripsShape`; any hit must have `data.num_sub_shapes >= 1` covering all vertices. Note the scanner reads the header block-type *table*, so it flags a file whose table still lists the type — confirm with a block walk before concluding a real shape is present.
 
 ## Constrained objects: chains, swinging traps, gates, trigger phantoms (2026-07-15)
@@ -2093,3 +2093,209 @@ Two pieces, both native, both re-enabled in the pipeline (`generate_lod` + `gene
 - **`asset_convert/sse_nif.read_nif(path_or_bytes)`** converts any SSE graph to LE in-memory: BSTriShape → NiTriShape+NiTriShapeData (verts/normals/uvs/colors/tangents; skinned shapes pull geometry from the partition's shared vertex buffer), skin partitions rebuilt faithfully (preserving the vanilla body's semantic 32/34/38 dismember split — do NOT regenerate from scratch), `user_version_2` set to 83 so writes are LE. Validated field-identical against the LE reference body.
 - **SSE partition gotchas**: BOTH triangle arrays in an SSE NiSkinPartition ("Triangles" and "Triangles Copy") hold GLOBAL shape-vertex indices — LE wants partition-LOCAL indices into the vertex map, so remap via inverted vertex_map. Vertex-data bone indices are partition-local. Vanilla SSE `NiSkinData` still carries LE-style per-bone weights (`has_vertex_weights=1`), so binds/weights come straight from it; `_ensure_skin_weights` rebuilds them from partition data only if absent.
 - **Consumers**: `skin_replacement.load_body_geom` (modified body in `output/` → BSA body), `book_inam.load_templates` (BSA book/note rigs; emit re-writes them as LE), `modify_body_meshes` (BSA body → split → LE output), `body_wrap._load_sk_surface`, `extract_skeleton_bones`. A missing body source now prints a loud `[skin_replacement] WARNING` instead of silently skipping the splice, and `generate_book_inams` validates templates in the parent before spawning workers (a worker-initializer crash surfaces only as an opaque BrokenProcessPool, with stderr hidden under pythonw).
+
+
+## Two vanilla divergences investigated and DELIBERATELY NOT FIXED (2026-08-22)
+
+Both were found while chasing the ElsweyrAnequina load crash, both were briefly
+believed to be its cause, and both turned out not to be: that crash was an
+unsupported collision shape (next section), confirmed fixed in-game.
+
+Fixes for both were written, measured, tested — and then **reverted and not
+shipped**, because neither has a demonstrated in-game benefit and both carry
+real downside. Recorded here so the measurements are not re-derived, and so a
+future session does not "fix" them again without new evidence.
+
+**Do not re-fix either one on the strength of the census alone.** Ship only if
+an actual in-game symptom is traced to it.
+
+### 1. Object LOD carries `slsf_2_double_sided`; vanilla never does
+
+Oblivion marks foliage and other cutout geometry two-sided with a
+`NiStencilProperty` (`draw_mode` 3 = DRAW_BOTH). `nif_converter` carries that
+across as `slsf_2_double_sided` — correct for the full-size mesh — and LODGen
+then copies the flag into the shader it writes for each baked tile.
+
+Measured:
+
+| population | tiles | shader props | `double_sided` |
+|---|---|---|---|
+| vanilla `meshes/terrain` (mixed) | 120 | 141 | **0** |
+| vanilla `terrain/tamriel/objects` | 40 | 74 | **0** |
+| our output | 2,582 | — | **21,899** |
+
+Vanilla object LOD is uniformly `f2=0x00000005` on Tamriel tree LOD. So the
+flag is a genuine divergence.
+
+**Why it was not shipped:** no in-game symptom was ever traced to it, and no
+back-face rendering cost was measured. The fix had to be a byte patch (parsing
+~15,700 tiles with pyffi costs ~2.3s each, i.e. ten hours), and an in-place
+byte patch on shipped artifacts is a standing corruption risk if a future
+LODGen output shifts the anchored layout — a bad trade for an unmeasured gain.
+
+For the record the patch did validate cleanly: anchoring on the 32-byte window
+(controller/extra-data refs `-1,0,-1` before the flag pair; UV offset/scale
+`0,0,1,1` after) matched the true `BSLightingShaderProperty` count **exactly on
+453 of 453 tiles**, was idempotent over repeated passes, and ran the full
+output in 31s.
+
+### 2. One `NiAlphaProperty` shared between shapes; vanilla never shares
+
+Measured: **10 of 400** Oblivion source meshes share one block between shapes,
+up to **14 shapes on the single block** in `benirusdoor01.nif`, and the sharing
+survives conversion (5 of 300 converted architecture meshes). Vanilla Skyrim:
+**300 meshes, 250 carrying an alpha property, 0 sharing one.**
+
+The particle path in `nif_converter` already clones for exactly this reason;
+the geometry path does not.
+
+**Why it was not shipped:** the mechanism originally claimed for it — that
+these properties are refcounted per render pass, so a block reached through N
+shapes is released N times — was **never measured**. It was a theory invented
+while this looked like the crash cause. With that removed, what remains is
+"vanilla does not do this", with no observed misbehaviour to fix.
+
+## `bhkPackedNiTriStripsShape` reaching the output — the 2 GB memcpy / heap-wide `0x100000001` (SOLVED 2026-08-22, confirmed in-game)
+
+**Symptom.** Reproducible crash-or-freeze near `tes4tamriel 0 -30` in
+ElsweyrAnequina.  The access violation moved around between runs -- the shadow
+renderer, `BSXAudio2GameSound`, a `ScrapHeap` path, `bhkListShape` during a mesh
+load, and finally inside tbbmalloc's own
+`rml::internal::MemoryPool::getTLS` -- but the faulting value was **always
+`0x0000000100000001`**.  Sometimes CrashLoggerSSE itself deadlocked in its
+handler (`MSVCP140!_Mtx_lock` -> `RtlpAcquireSRWLockExclusiveContended` ->
+`NtWaitForAlertByThreadId`), so the game "hung" with no crash log written at
+all.
+
+**Same family as the Seyda Neen UV-set CTD** (see the `_clamp_uv_sets` entry
+above): both are a short destination buffer, both fault inside a `memcpy`
+on a non-temporal store, and in both the crash log blames whatever the
+corrupted memory reached next rather than the mesh that caused it.
+
+**Do not chase the subsystem in the log.**  Four different crash logs blamed
+four different subsystems and all four were victims, not causes.
+
+**Diagnosis (from a live dump).**  Attach cdb, `sxe av`, `.dump /ma` at the
+fault (`tools/hang_capture.py` does exactly this).  In the captured dump:
+
+* the faulting thread was inside `VCRUNTIME140!memcpy` with **`r8 =
+  0x7EF225F0` -- a 2.03 GB copy length** (a second crash log showed
+  `0x7F436BE0`, the same thing);
+* the memcpy SOURCE was a **2.25 GB** committed block whose tbbmalloc header
+  read `totalSize=0x90010000`, `objectSize=0x90000000`, owner pointer into
+  `EngineFixes.dll`, and whose contents were **entirely
+  `01 00 00 00 01 00 00 00 ...`**;
+* the same allocator list held a **36 GB** block; total commit was **49.2 GB**
+  against a normal ~8 GB;
+* the loader stack carried the asset path as a plain string --
+  `data\MESHES\tes4\anequina\architecture\huts\domehut01.nif`.
+
+So the `(1,1)` fill is not something corrupting memory: it is uninitialised
+content being **copied around by the gigabyte**, landing in whatever allocates
+next.  That is why one bad mesh looks like four unrelated crashes.
+
+Finding the path on the stack is the step that matters -- search the loader
+thread's stack for `"nif"` (`s -a <stack range> "nif"`) and read the string
+back.
+
+**Cause.** `_convert_shape` had:
+
+```python
+if isinstance(shape, NifFormat.bhkNiTriStripsShape):
+    packed = _ni_strips_to_packed(shape)
+    return packed if packed is not None else shape      # <-- returns too early
+```
+
+A `bhkNiTriStripsShape` nested inside a `bhkListShape` was converted to a
+`bhkPackedNiTriStripsShape` and returned **directly**, never reaching the
+`bhkPackedNiTriStripsShape` branch a few lines below that rebuilds it as
+MOPP + `bhkCompressedMeshShape`.
+
+Skyrim does not support that shape.  Census: **0 of 17,216 vanilla Skyrim
+meshes** contain `bhkPackedNiTriStripsShape` or `hkPackedNiTriStripsData`.  The
+engine mis-sizes its sub-part allocation and then memcpys the payload with a
+garbage 32-bit length -- the loader's grow step is
+`imul edx, r15d` / `imul esi, r15d`, both 32-bit, feeding the allocator and the
+memcpy.
+
+**Scope.** Exactly **10 meshes** in the whole output still shipped the type:
+1 in ElsweyrAnequina (`domehut01.nif` -- the only one of 1,837 in that plugin,
+and the one the dump named), 1 in Oblivion.esm
+(`dungeons\root\interior\misc\gnarlspawner.nif`), 8 in Tamriel Resource
+Pack Full 2.0.
+
+**Fix.** Route the converted shape back through `_convert_shape` so the
+existing MOPP/CMS rebuild runs.  The rebuild succeeds for these meshes -- it was
+simply never attempted.  Verified on `domehut01.nif`: before, `bhkListShape` ->
+`bhkPackedNiTriStripsShape` + `hkPackedNiTriStripsData`; after, `bhkListShape`
+-> `bhkMoppBvTreeShape` -> `bhkCompressedMeshShape` with one chunk of 1,935
+verts / 3,711 indices = **1,237 triangles, exactly the source count**, and a
+10,587-byte MOPP tree.
+
+**Note on a red herring:** pyffi prints the Skyrim stone material
+(`3741512247` = `SKY_HAV_MAT_STONE`) as `<INVALID>` because its enum table is
+incomplete.  That value is correct output, not a corruption sentinel.
+
+**Also note:** `bhkPackedNiTriStripsShape.Num Sub Shapes` is `until="20.0.0.5"`
+and `hkPackedNiTriStripsData.Num Sub Shapes` is `since="20.2.0.7"` (nif.xml
+3195/3968), so at our output version the shape-side count is not serialised and
+a `0` there is cosmetic.  It is not the bug -- the unsupported *shape type* is.
+
+### Three defects, not one (2026-08-22)
+
+The unsupported shape reached the output by three separate routes.  All three
+are fixed; the first is the one confirmed in-game.
+
+1. **Nested strips never rebuilt.**  `_convert_shape`'s
+   `bhkNiTriStripsShape` branch converted to a packed shape and returned it
+   directly, skipping the `bhkPackedNiTriStripsShape` branch below that
+   rebuilds as MOPP+CMS.  Fixed by recursing:
+   `return _convert_shape(packed, root_node)`.
+   (`anequina/architecture/huts/domehut01.nif` — confirmed fixed in-game.)
+
+2. **Collision on non-NiNode geometry never converted at all.**
+   `convert_all_collisions` opened with
+   `if node is None or not isinstance(node, NifFormat.NiNode): return`, so a
+   `bhkCollisionObject` hanging off a **NiTriShape** was skipped *and* its
+   subtree was never walked.  Oblivion does exactly that:
+   `obmkmeadhallmaindoor.nif` puts a `bhkPackedNiTriStripsShape` on the
+   NiTriShape `'Scene Root:5'`.  Those objects passed through completely
+   unconverted — Oblivion-format shape, Oblivion-format filter values and all.
+   Fixed by converting whatever any node owns and always continuing the walk.
+
+3. **Unsafe fallbacks when MOPP failed.**  Two sites shipped a packed shape
+   when `build_cms_collision` returned None (`_rebuild_mesh_collision`, and the
+   `bhkPackedNiTriStripsShape` branch of `_convert_shape`, which also had a
+   "repair the sub-shape count and return `shape`" path).  An unsupported shape
+   is never safer than no collision, so both now drop instead.
+   `_packed_from_tris` had no callers left and was deleted.
+
+   In practice MOPP only fails on geometry that is not a surface:
+   `romanhanginglamp01.nif`'s collision is 8 vertices with X=Y=0 — a bare line
+   segment on the Z axis, zero area, quantising to two distinct points.
+
+### Measured blast radius (2026-08-22)
+
+762 Oblivion.esm **source** meshes contain a packed shape, but the converter
+already handled 761 of them: scanning all **44,856 converted meshes** across
+every plugin found only **5** carrying `bhkPackedNiTriStripsShape` /
+`hkPackedNiTriStripsData` after the first fix —
+
+| plugin | leaked / scanned |
+|---|---|
+| Oblivion.esm | 1 / 11,575 (`dungeons/root/interior/misc/gnarlspawner.nif`) |
+| Tamriel Resource Pack Full 2.0 | 4 / 6,129 (3 oblivimonk architecture + romanhanginglamp01) |
+| ElsweyrAnequina.esp | 0 / 1,837 (was `domehut01.nif`) |
+| Nehrim.esm | 0 / 14,609 |
+| Morrowind_ob.esm | 0 / 8,444 |
+| everything else | 0 |
+
+So the crash needed a rare combination, which is why it reproduced at one spot
+rather than everywhere.  Re-run the census with:
+
+```bash
+python tools/nif_block_scan.py output/<plugin>/meshes \
+    --any bhkPackedNiTriStripsShape hkPackedNiTriStripsData
+```
+
+Guarded by `tests/test_collision_packed_strips.py`.

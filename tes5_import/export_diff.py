@@ -122,8 +122,15 @@ def diff_records(master_rec: dict, plugin_rec: dict) -> dict:
     m_scalars, m_lists = _split_indexed(master_rec)
     p_scalars, p_lists = _split_indexed(plugin_rec)
 
+    # SORTED, not set order: `changed` becomes `pending` in override_builder,
+    # whose insert loop puts every newly-inserted subrecord at the SAME index,
+    # so dict order decides the emitted subrecord order. Python randomizes
+    # string hashing per process, so a bare set made two builds of the same
+    # input disagree -- CATShipCabinDoorExteriorREF came out `DATA EDID XTEL`
+    # in one run and `DATA XTEL EDID` in the next. The output ESM must stay
+    # byte-reproducible (docs/performance_notes.md).
     changed = {}
-    for key in set(m_scalars) | set(p_scalars):
+    for key in sorted(set(m_scalars) | set(p_scalars)):
         if key in _IGNORED_KEYS or _is_count_key(key):
             continue
         m_val, p_val = m_scalars.get(key), p_scalars.get(key)
@@ -133,7 +140,7 @@ def diff_records(master_rec: dict, plugin_rec: dict) -> dict:
         if m_val != p_val:
             changed[key] = p_val
 
-    for name in set(m_lists) | set(p_lists):
+    for name in sorted(set(m_lists) | set(p_lists)):
         m_entries = _list_as_multiset(name, m_lists.get(name, {}))
         p_entries = _list_as_multiset(name, p_lists.get(name, {}))
         if m_entries != p_entries:
