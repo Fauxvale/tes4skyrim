@@ -1024,7 +1024,9 @@ def _rebuild_mesh_collision(rb, target_node):
 
     Returns True when handled, False → caller uses the primitive-shape
     conversion path, or 'drop' → caller removes the collision object
-    entirely (degenerate sub-viable hull).
+    entirely.  'drop' covers a sub-viable hull (see _MIN_HULL_EXTENT) and a
+    MOPP build that failed outright: the old fallback shipped a
+    bhkPackedNiTriStripsShape in that case, which Skyrim cannot load at all.
     """
     shape = rb.shape
     inner = shape.shape if isinstance(shape, NifFormat.bhkMoppBvTreeShape) else shape
