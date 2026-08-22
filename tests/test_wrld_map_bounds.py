@@ -108,3 +108,31 @@ def test_restamp_leaves_compressed_records_alone():
         assert restamp_wrld_mnam(compressed, TAMRIEL) == compressed
     finally:
         set_world_land_extents({})
+
+
+def test_registering_extents_unions_rather_than_replaces():
+    """Two calls per import; the second must never shrink the first.
+
+    import_plugin registers over EVERY exterior cell before the override pass,
+    then _build_world_groups registers again over just the own-hierarchy
+    cells. A replacing register let that narrower second call clamp the map
+    back down.
+    """
+    set_world_land_extents(MEASURED)
+    try:
+        # A later, narrower measurement of the same worldspace.
+        set_world_land_extents(
+            {TAMRIEL: (-64 * 4096.0, -69 * 4096.0, 70 * 4096.0, 60 * 4096.0)})
+        assert _cells(build_wrld_mnam(AUTHORED)) == (-192, 159, 191, -129)
+    finally:
+        set_world_land_extents({})
+
+
+def test_registering_extents_still_widens():
+    set_world_land_extents(
+        {TAMRIEL: (-64 * 4096.0, -69 * 4096.0, 70 * 4096.0, 60 * 4096.0)})
+    try:
+        set_world_land_extents(MEASURED)
+        assert _cells(build_wrld_mnam(AUTHORED)) == (-192, 159, 191, -129)
+    finally:
+        set_world_land_extents({})

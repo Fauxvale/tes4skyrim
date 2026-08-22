@@ -1051,6 +1051,12 @@ persisted in `output/world_extents.json`
 Every plugin emits the same widest rectangle and load order stops mattering.
 A narrow measurement can only ever widen the stored box, never shrink it.
 
+`set_world_land_extents` UNIONS for the same reason: it is called twice per
+import -- once over every exterior cell before the override pass, and again
+from `_build_world_groups` over just the own-hierarchy cells -- so replacing
+would let the narrower second call shrink a rectangle the first measured
+correctly.
+
 ## World-map cloud banks (WRLD MODL) — sized to the LAND
 
 Skyrim's world map draws a bank of cloud sheets over the terrain. The mesh is

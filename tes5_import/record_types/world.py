@@ -124,17 +124,33 @@ def set_cloud_bank_output(out_root):
 
 
 def set_world_land_extents(extents: dict):
-    """Register WRLD FormID -> real land rectangle, for the cloud banks.
+    """Register WRLD FormID -> real land rectangle.
 
-    The bank must be sized and centred on the terrain the player actually
-    sees.  MNAM is the map-camera framing an author typed in, and on a
-    converted plugin it can simply be wrong: NehrimWorldspace's MNAM sits
-    26,624 units south of its land's centre and clips 16,384 units of real
-    land off the north edge, which makes a deck built from it both offset and
-    undersized.  The exterior cell grid is the authored ground truth.
+    Feeds the world-map cloud bank and MNAM's map-camera rectangle.  Both must
+    cover the terrain the player actually sees, and an authored MNAM can
+    simply be wrong about it: NehrimWorldspace's sits 26,624 units south of
+    its land's centre and clips 16,384 units off the north edge.  The exterior
+    cell grid is the authored ground truth.
+
+    UNIONS into whatever is already registered rather than replacing it.  This
+    runs twice per import -- once before the override pass over every cell,
+    and again from _build_world_groups over just the own-hierarchy cells -- so
+    replacing would let the second, NARROWER call shrink a rectangle the first
+    one measured correctly.  A rectangle may only ever grow.
+
+    Pass an empty dict to reset (tests).
     """
-    _WORLD_LAND_EXTENT.clear()
-    _WORLD_LAND_EXTENT.update(extents or {})
+    if not extents:
+        _WORLD_LAND_EXTENT.clear()
+        return
+    for fid, rect in extents.items():
+        old = _WORLD_LAND_EXTENT.get(fid)
+        if old is None:
+            _WORLD_LAND_EXTENT[fid] = tuple(rect)
+        else:
+            _WORLD_LAND_EXTENT[fid] = (
+                min(old[0], rect[0]), min(old[1], rect[1]),
+                max(old[2], rect[2]), max(old[3], rect[3]))
 
 
 def _extent_cell_rect(extent):

@@ -94,6 +94,44 @@ Profile it in isolation without paying for a full import: set
 `TESCONV_DUMP_NAVM_CACHE=<path>` on an import run to pickle the precomputed
 navmesh cache, then profile `build_edge_links` against it.
 
+### 0b. The ESM was NON-DETERMINISTIC too (fixed 2026-08-21)
+
+Same root cause as the NIF case below, in a different file: an override built
+twice from unchanged inputs emitted its subrecords in a different ORDER.
+Measured on `Morrowind_ob - Chargen and Transport Mod.esp`, REFR
+`CATShipCabinDoorExteriorREF` (70 bytes differing, record size identical):
+
+```
+run A:  NAME XLOC XSCL XNDP DATA EDID XTEL XLCN
+run B:  NAME XLOC XSCL XNDP DATA XTEL EDID XLCN
+```
+
+Cause, in `export_diff.diff_records`:
+
+```python
+for key in set(m_scalars) | set(p_scalars):   # <- per-process order
+```
+
+`set` over **str**, randomised per process (PEP 456). That dict becomes
+`pending` in `override_builder.build_override_record`, whose insert loop puts
+every newly-inserted subrecord at the SAME index — so dict order decided which
+of EDID/XTEL landed first. Verified directly: under `PYTHONHASHSEED` 1 / 999 /
+12345 / 777 the pre-fix `diff_records` returned four different key orders; the
+fixed version returns one.
+
+Two changes, both needed:
+* `diff_records` iterates `sorted(...)` — the actual cause.
+* The insert loop splices the pending subrecords in as a BLOCK
+  (`out[pos:pos] = insertable`) instead of one at a time, which had silently
+  REVERSED them relative to `pending`.
+
+Guarded by `tests/test_export_diff_determinism.py` (both tests fail against
+the pre-fix code). The end-to-end check is two `--import-only` runs under
+opposed `PYTHONHASHSEED` values: they must be byte-identical.
+
+🛑 **Any `set` of strings/bytes whose ITERATION ORDER reaches the output is
+this bug.** Membership tests are fine; iteration is not.
+
 ### 0. NIF output was NON-DETERMINISTIC (fixed — read this first)
 
 Converting the same source NIF twice produced **different bytes**, with no code

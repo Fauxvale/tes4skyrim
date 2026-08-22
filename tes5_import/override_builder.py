@@ -592,8 +592,10 @@ def generic_substitutions(plugin_rec: dict, master_rec: dict):
     m_subs = _converted_subrecords(master_rec)
     if m_subs is None:
         return None
+    # sorted: this dict's order can reach the emitted subrecord order, and
+    # set order over strings varies per process (see diff_records).
     out = {sig: p_subs.get(sig, [])
-           for sig in set(p_subs) | set(m_subs)
+           for sig in sorted(set(p_subs) | set(m_subs))
            if p_subs.get(sig) != m_subs.get(sig)}
     # A REFR that places a LEVELLED CREATURE becomes an ACHR aimed at a SHELL
     # NPC_ the MASTER's run minted (see leveled_actors) — an index a plugin run
@@ -1139,14 +1141,16 @@ def apply_changes(master_record: bytes, changes: dict,
     # forever at the main menu. overrides.load_master_export fixes the
     # mis-pairing at its source; this refuses to write the damage regardless.
     base_sig = master_record[:4]
-    for sub_sig, payload in pending.items():
-        if sub_sig in replaced:
-            continue
-        if sub_sig not in _INSERTABLE_SUBRECORDS.get(base_sig, frozenset()):
-            continue
+    insertable = [(sig, payload) for sig, payload in pending.items()
+                  if sig not in replaced
+                  and sig in _INSERTABLE_SUBRECORDS.get(base_sig, frozenset())]
+    if insertable:
+        # Inserted as a BLOCK. Inserting one at a time at a fixed index
+        # reverses them relative to `pending`, which made the emitted order an
+        # artifact of dict order rather than a decision.
         pos = 1 if out and out[0][0] == b'EDID' else 0
-        out.insert(pos, (sub_sig, payload))
-        replaced.add(sub_sig)
+        out[pos:pos] = insertable
+        replaced.update(sig for sig, _ in insertable)
 
     # Subrecord rebuilds: regenerate from the plugin's record with the
     # converter's own builder; replace in place, insert at the spec's anchor,
