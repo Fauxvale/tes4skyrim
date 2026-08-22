@@ -986,60 +986,6 @@ def _bake_body_transform_into_tris(rb, tris):
     return tris
 
 
-def _packed_from_tris(tris, sk_material):
-    """Fallback: bare bhkPackedNiTriStripsShape (no MOPP) from a hu soup.
-
-    Only used when the Havok bridge is unavailable or rejects the mesh.
-    Packed data vertices are stored at 10× havok units (1/7 game scale).
-    """
-    vert_index = {}
-    verts = []
-    idx_tris = []
-    for tri in tris:
-        idx = []
-        for v in tri:
-            key = (round(v[0], 6), round(v[1], 6), round(v[2], 6))
-            i = vert_index.get(key)
-            if i is None:
-                i = len(verts)
-                vert_index[key] = i
-                verts.append(key)
-            idx.append(i)
-        if idx[0] == idx[1] or idx[1] == idx[2] or idx[0] == idx[2]:
-            continue
-        idx_tris.append(idx)
-    if not idx_tris:
-        return None
-
-    packed_verts = [(x * 10.0, y * 10.0, z * 10.0) for x, y, z in verts]
-    hkdata = NifFormat.hkPackedNiTriStripsData()
-    hkdata.num_vertices = len(packed_verts)
-    hkdata.vertices.update_size()
-    for i, (x, y, z) in enumerate(packed_verts):
-        hkdata.vertices[i].x = x
-        hkdata.vertices[i].y = y
-        hkdata.vertices[i].z = z
-    hkdata.num_triangles = len(idx_tris)
-    hkdata.triangles.update_size()
-    for i, (a, b, c) in enumerate(idx_tris):
-        hkdata.triangles[i].triangle.v_1 = a
-        hkdata.triangles[i].triangle.v_2 = b
-        hkdata.triangles[i].triangle.v_3 = c
-        hkdata.triangles[i].welding_info = 0
-        nx, ny, nz = _find_normal(packed_verts, a, b, c)
-        hkdata.triangles[i].normal.x = nx
-        hkdata.triangles[i].normal.y = ny
-        hkdata.triangles[i].normal.z = nz
-
-    packed = NifFormat.bhkPackedNiTriStripsShape()
-    packed.data = hkdata
-    _set_packed_sub_shape(packed, len(packed_verts), sk_material)
-    packed.scale.x = 1.0
-    packed.scale.y = 1.0
-    packed.scale.z = 1.0
-    packed.unknown_float_1 = 0.1
-    packed.unknown_float_3 = 0.1
-    return packed
 
 
 # Smallest AABB extent (havok units) a mesh collision hull may have.
@@ -1143,11 +1089,21 @@ def _rebuild_mesh_collision(rb, target_node):
         mopp.shape.target = target_node
         rb.shape = mopp
         return True
-    packed = _packed_from_tris(tris, sk_material)
-    if packed is not None:
-        rb.shape = packed
-        return True
-    return False
+    # MOPP failed.  Shipping _packed_from_tris here was a LOAD CRASH: Skyrim
+    # does not support bhkPackedNiTriStripsShape (0 of 17,216 vanilla meshes
+    # carry it or hkPackedNiTriStripsData), so the engine mis-sizes its
+    # sub-part allocation and memcpys the payload with a garbage 32-bit
+    # length -- measured live at 2.03 GB out of a 2.25 GB tbbmalloc block,
+    # with 49.2 GB committed and the resulting 0x0000000100000001 fill
+    # crashing whatever allocated next.  An unsupported shape is never a
+    # safer outcome than no collision, so the collision is dropped instead.
+    #
+    # In practice MOPP only fails on geometry that is not a surface at all:
+    # romanhanginglamp01.nif's collision is 8 vertices with X=Y=0 -- a bare
+    # line segment on the Z axis, zero area, which quantises to two distinct
+    # points and yields no chunk.  Dropping it costs nothing real.
+    _DEGENERATE_HULLS_DROPPED[0] += 1
+    return 'drop'
 
 
 def demote_t_body_on_mesh_collision(data):
@@ -1480,9 +1436,28 @@ def _convert_shape(shape, root_node):
         return shape
 
     if isinstance(shape, NifFormat.bhkNiTriStripsShape):
-        # Nested strips (inside a list shape) → bare packed triangle shape.
+        # Nested strips (inside a list shape) → triangle soup, then rebuilt as
+        # MOPP+CMS by the bhkPackedNiTriStripsShape branch below.
+        #
+        # Returning the packed shape DIRECTLY here was a load crash: Skyrim
+        # never ships bhkPackedNiTriStripsShape/hkPackedNiTriStripsData -- 0 of
+        # 17,216 vanilla meshes contain either -- so the engine mis-sizes its
+        # sub-part allocation from a shape it does not really support and then
+        # memcpys the payload with a garbage 32-bit length.  Measured live:
+        # a 2.03 GB memcpy out of a 2.25 GB tbbmalloc block, a 36 GB block in
+        # the same allocator list, 49.2 GB committed, and the resulting
+        # 0x0000000100000001 fill surfacing as an access violation in whatever
+        # allocated next (renderer, audio, tbbmalloc's own getTLS).
+        # Reproduced from the mesh the crash dump named:
+        # anequina/architecture/huts/domehut01.nif, which was
+        # the ONLY mesh of 1,837 in its plugin still carrying the shape.
+        #
+        # The rebuild succeeds for these meshes -- it was simply never
+        # attempted, because this branch returned before reaching it.
         packed = _ni_strips_to_packed(shape)
-        return packed if packed is not None else shape
+        if packed is None:
+            return shape
+        return _convert_shape(packed, root_node)
 
     if isinstance(shape, NifFormat.bhkMoppBvTreeShape):
         # Never keep the outer bhkMoppBvTreeShape with stale Oblivion MOPP
@@ -1513,20 +1488,20 @@ def _convert_shape(shape, root_node):
                 if mopp is not None:
                     mopp.shape.target = root_node
                     return mopp
-                rebuilt = _packed_from_tris(tris, sk_material)
-                if rebuilt is not None:
-                    return rebuilt
-        # Could not rebuild — repair the sub-shape count in place.
-        data = getattr(shape, 'data', None)
-        if (data is not None and getattr(data, 'num_sub_shapes', 0) == 0
-                and getattr(data, 'num_vertices', 0) > 0):
-            material = 3741512247
-            if shape.num_sub_shapes > 0:
-                material = _get_havok_material(shape.sub_shapes[0].material)
-                if 0 <= material <= 31:
-                    material = _OB_TO_SK_MATERIAL.get(material, 3741512247)
-            _set_packed_sub_shape(shape, data.num_vertices, material)
-        return shape
+        # Could not rebuild.  Both of the old fallbacks here -- returning
+        # _packed_from_tris, or repairing the sub-shape count and returning
+        # `shape` -- kept a bhkPackedNiTriStripsShape in the output, and
+        # Skyrim does not support that shape at all (0 of 17,216 vanilla
+        # meshes carry it or hkPackedNiTriStripsData).  The engine then
+        # mis-sizes its sub-part allocation and memcpys the payload with a
+        # garbage 32-bit length: measured live at 2.03 GB out of a 2.25 GB
+        # tbbmalloc block, 49.2 GB committed, and the resulting
+        # 0x0000000100000001 fill crashing whatever allocated next.
+        #
+        # No collision is strictly better than a shape that crashes on load,
+        # so the child is dropped.
+        _DEGENERATE_HULLS_DROPPED[0] += 1
+        return None
 
     # Unknown shape — return as-is
     return shape
@@ -2318,11 +2293,18 @@ def convert_all_collisions(node, actual_root=None, keep_blend=False):
     bhkCompressedMeshShape.target always points to the root, not an inner wrapper.
     keep_blend: creature skeleton mode — see _convert_collision.
     """
-    if node is None or not isinstance(node, NifFormat.NiNode):
+    if node is None:
         return
+    # Collision is NOT limited to NiNode: Oblivion hangs bhkCollisionObject off
+    # GEOMETRY too (obmkmeadhallmaindoor.nif puts a bhkPackedNiTriStripsShape
+    # on the NiTriShape 'Scene Root:5').  Bailing on anything that was not an
+    # NiNode left those objects entirely unconverted, so an Oblivion-only
+    # packed shape reached Skyrim's loader -- the 2 GB memcpy / heap-corruption
+    # crash.  Convert whatever this node owns, then keep walking.
     if actual_root is None:
         actual_root = node
-    _convert_collision(node, actual_root, keep_blend=keep_blend)
+    if getattr(node, 'collision_object', None) is not None:
+        _convert_collision(node, actual_root, keep_blend=keep_blend)
     if hasattr(node, 'children'):
         for child in node.children:
             convert_all_collisions(child, actual_root, keep_blend=keep_blend)
