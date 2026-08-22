@@ -297,7 +297,7 @@ def _build_fltv(rec):
 def _build_land_hex(key):
     """A LAND vertex-data subrecord: the export's raw hex, copied through.
 
-    VNML (normals), VHGT (heights) and VCLR (colours) have IDENTICAL layout in
+    VNML (normals), VHGT (heights) and VCLR (colors) have IDENTICAL layout in
     TES4 and TES5, so convert_LAND copies the hex blob straight across. That
     makes the authored value directly substitutable — no re-derivation, so no
     drift. Terrain edits are the whole point of a castle mod regrading the

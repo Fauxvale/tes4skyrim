@@ -174,7 +174,7 @@ def test_version_warning_is_not_a_hard_dependency(monkeypatch):
 
 
 def test_version_warning_banner_is_delimited_for_the_gui():
-    """The GUI colours the banner by header + two rules; both must be present."""
+    """The GUI colors the banner by header + two rules; both must be present."""
     banner = preflight.format_python_warning('body text here')
     lines = [x for x in banner.split('\n') if x.strip()]
     assert lines[0].lower().startswith('warning: python version')

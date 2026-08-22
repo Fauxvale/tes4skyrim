@@ -729,7 +729,7 @@ def _clamp_uv_sets(ts_data):
     On disk the u16 "BS Data Flags" packs the UV-set COUNT in its low 6 bits
     (PyFFI exposes that half as num_uv_sets and bit 12 as extra_vectors_flags).
     That count is the only thing telling the engine how many TexCoord arrays
-    follow the vertex colours, so a mesh that stores 2 sets while
+    follow the vertex colors, so a mesh that stores 2 sets while
     BSLightingShaderProperty binds 1 leaves the engine's vertex buffer a whole
     array short: the copy runs past the end of the allocation and faults on a
     non-temporal store (vmovntdq) at the next page boundary.
@@ -1059,7 +1059,7 @@ _LIGHTING_EMISSIVE_ONLY = 0
 _ALPHA_BLEND_ENABLED = 0x0001
 
 # NiAlphaProperty.flags bits 5-8 = destination blend factor.  0 = GL_ONE, i.e.
-# ADDITIVE blending (the surface adds its colour to whatever is behind it).
+# ADDITIVE blending (the surface adds its color to whatever is behind it).
 # Oblivion's FX quads are authored this way; ordinary lit geometry never is.
 _ALPHA_DST_SHIFT = 5
 _ALPHA_DST_ONE = 0
@@ -1141,7 +1141,7 @@ def _apply_fx_soft_effect(eff_shader, alpha_prop, texture_path=None):
 # Skyrim's lighting shader dereferences the diffuse without a null check, so
 # "no texture" is not representable -- see the else branch in _process_geometry.
 # white.dds is vanilla Skyrim's own neutral texture (shipped in the SSE BSAs),
-# so the material colour we carry across shows through unmodified.
+# so the material color we carry across shows through unmodified.
 _DEFAULT_DIFFUSE_TEXTURE = b'Textures\\white.dds'
 
 
@@ -1402,10 +1402,10 @@ def _apply_parallax(ts, shader, tex_set, tex_apply_mode, stats):
     #
     # It does not survive: the LOD stage regenerates these from the full model
     # with `force_regen_generated=True`, and that path knows nothing about
-    # parallax — it drops the vertex colours the heightmap shader needs while
+    # parallax — it drops the vertex colors the heightmap shader needs while
     # leaving shader type 3 in place. `parallax_check.py verify` found exactly
     # that: 60 malformed shapes, every one of them in a `_far`/`_far8`/`_far16`
-    # mesh, all reported as "no vertex colours (renders unlit-black)".
+    # mesh, all reported as "no vertex colors (renders unlit-black)".
     #
     # And it made the output ORDER-DEPENDENT, which is the real defect: run
     # meshes then LOD and the tier meshes come out clean, run LOD then meshes
@@ -1437,7 +1437,7 @@ def _apply_parallax(ts, shader, tex_set, tex_apply_mode, stats):
     shader.shader_flags_1.slsf_1_environment_mapping = 0
     shader.shader_flags_2.slsf_2_glow_map = 0
 
-    # Skyrim's heightmap shader needs vertex colours present; without them the
+    # Skyrim's heightmap shader needs vertex colors present; without them the
     # shape renders unlit-black.  All-white is neutral and is what the in-game
     # test shipped.  Measured on Nehrim: 848 of the 1551 converted shapes have
     # none of their own.
@@ -1584,7 +1584,7 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
             emissive_g = ec.g
             emissive_b = ec.b
             material_alpha = prop.alpha
-            # A NiMaterialColorController on the material ANIMATES a colour
+            # A NiMaterialColorController on the material ANIMATES a color
             # channel (target_color 3 = emissive).  The static values above are
             # then only the curve's starting point -- frequently (0,0,0) -- so
             # they must not be read as "this surface does not glow".
@@ -1618,7 +1618,7 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         tex_set.textures[1] = (base + '_n.dds').encode('utf-8')
     else:
         # No NiTexturingProperty at all: Oblivion renders these shapes with the
-        # flat NiMaterialProperty colour, so the source legitimately names no
+        # flat NiMaterialProperty color, so the source legitimately names no
         # texture.  Skyrim has no such mode -- BSLightingShader::SetupMaterial
         # binds the diffuse UNCONDITIONALLY (SkyrimSE.exe 1.6.659 +0x1412138 ->
         # +0x1415790 "mov rax,[rdx+0x48]" with rdx = material->diffuse), so a
@@ -1627,7 +1627,7 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         # shapes sampled across Skyrim's own meshes ship an empty slot 0.
         #
         # white.dds is Skyrim's own neutral texture, so multiplying it by the
-        # material colour we already carry across reproduces Oblivion's flat
+        # material color we already carry across reproduces Oblivion's flat
         # shading exactly.  Slot 1 stays empty on purpose -- the normal map is
         # null-checked (+0x1412144 "test rax,rax / je") and vanilla ships
         # normal-less shapes, so a fabricated _n path would only dangle.
@@ -1647,7 +1647,7 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         ssf1.slsf_1_z_buffer_test = 1
         ssf2 = sky_shader.shader_flags_2
         ssf2.slsf_2_z_buffer_write = 1
-        # Oblivion tints its star/cloud layers with vertex colours; vanilla
+        # Oblivion tints its star/cloud layers with vertex colors; vanilla
         # sky/stars.nif sets the same flag, and SSE renders geometry black when
         # the flag disagrees with the mesh data.
         if getattr(ts.data, 'has_vertex_colors', False):
@@ -1697,9 +1697,9 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         shader.emissive_color.r = emissive_r
         shader.emissive_color.g = emissive_g
         shader.emissive_color.b = emissive_b
-        # Skyrim MULTIPLIES the emissive colour by this, so a zero here leaves
-        # the surface black no matter what the colour animation does.  Vanilla
-        # shapes carrying an emissive colour controller set own_emit in 133/133
+        # Skyrim MULTIPLIES the emissive color by this, so a zero here leaves
+        # the surface black no matter what the color animation does.  Vanilla
+        # shapes carrying an emissive color controller set own_emit in 133/133
         # cases and never pair it with a 0 multiple; 1.0 is the baseline.
         shader.emissive_multiple = 1.0
     else:
@@ -1757,13 +1757,13 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     # mode defaults to "lit" and genuine FX geometry took the lighting shader.
     # dungeons/misc/fx/fxmistgroundeffect01 -- the Ayleid-ruin ground mist --
     # is exactly that: five additively-blended AtmosphereCloud01 planes, no
-    # vertex-colour property, so every one became a LIT, normal-mapped surface
+    # vertex-color property, so every one became a LIT, normal-mapped surface
     # with no soft fade.  That is the visible rectangle the user reported.
     # Across Oblivion's own FX directories 76 of 179 blended shapes declare no
     # lighting_mode at all, so the gap is the common case, not an edge case.
     #
     # ADDITIVE blending is the second authored indicator.  A surface whose
-    # NiAlphaProperty sets dst=ONE ADDS its colour to the framebuffer; it can
+    # NiAlphaProperty sets dst=ONE ADDS its color to the framebuffer; it can
     # never be ordinary lit geometry, because lighting it would double-count the
     # light it is already contributing.  Vanilla Skyrim agrees without exception:
     # of 64 additively-blended shapes sampled across meshes/effects and
@@ -1822,7 +1822,7 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         # what vanilla uses on 852/1164 blended FX shapes -- it is the neutral
         # value, and anything above it is a deliberate over-brighten.
         eff_shader.emissive_multiple = 1.0
-        # Carry Oblivion's AUTHORED emissive colour instead of forcing white.
+        # Carry Oblivion's AUTHORED emissive color instead of forcing white.
         # NiMaterialProperty.emissive_color is how Oblivion dims an FX surface:
         # dungeons/misc/fx/fxmist01 ships (0.47, 0.47, 0.47), i.e. the mist is
         # authored at just under HALF brightness.  Overwriting that with white
@@ -2373,7 +2373,7 @@ def _process_controller_manager(node, palette):
                 seq.num_controlled_blocks -= 1
                 continue
 
-            # NiMaterialColorController animates a material colour channel;
+            # NiMaterialColorController animates a material color channel;
             # target_color 3 is EMISSIVE.  Skyrim's equivalent is
             # BS*ShaderPropertyColorController (present in vanilla sequences),
             # so CONVERT it -- deleting it froze the animation at its first key,
@@ -3928,7 +3928,7 @@ def _convert_particle_system(node, fix_textures):
     shader.shader_flags_1.slsf_1_z_buffer_test = 1
     sf2 = shader.shader_flags_2
     sf2.slsf_2_z_buffer_write = 0       # particles don't write to depth buffer
-    sf2.slsf_2_vertex_colors = 1        # particles modulate colour per-vertex
+    sf2.slsf_2_vertex_colors = 1        # particles modulate color per-vertex
     shader.source_texture = effective_path
     # u32 packs clamp mode (low byte, 3 = WRAP_S|WRAP_T) with lighting
     # influence (byte 1, 0xFF) — every vanilla fire effect shader uses 0xFF03.
@@ -3940,7 +3940,7 @@ def _convert_particle_system(node, fix_textures):
     # translucent.  Vanilla's overwhelming default is 1.0 (852/1164 blended FX
     # shapes); the brighter values are authored per-effect, not applied blanket.
     # Oblivion states the intended brightness in NiMaterialProperty.emissive_color
-    # (harvested below), so the multiple stays neutral and the authored colour
+    # (harvested below), so the multiple stays neutral and the authored color
     # does the dimming.
     shader.emissive_multiple = 1.0
     if psys_emissive is not None:
@@ -4421,7 +4421,7 @@ def _sanitize_geometry_data(data):
 
         # A shape that declares vertices and then ships NONE of them.
         # `LeyawiinLowerDoor01` in leyawiinhouselower01.nif is the measured
-        # case: num_vertices=16, has_vertices=False, yet normals, colours, UVs
+        # case: num_vertices=16, has_vertices=False, yet normals, colors, UVs
         # and 6 triangles all still index 16 of them. Oblivion tolerates it
         # (there is nothing to draw, so it draws nothing); anything that walks
         # the faces and reaches for a vertex does not.
@@ -6943,7 +6943,7 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
         built = px.get('parallax_shapes', 0)
         print(f'\nParallax: {built} shapes converted to the heightmap shader'
               f' (+{px.get("parallax_vertex_colors_added", 0)} given white '
-              f'vertex colours)')
+              f'vertex colors)')
         skipped = sorted((k, v) for k, v in px.items()
                          if k.startswith('parallax_skipped_')
                          or k == 'parallax_texture_unresolved')

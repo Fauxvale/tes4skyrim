@@ -7,7 +7,7 @@ metal in this project reads its numbers from here, so the app icon and the GUI
 banner stay one visual set instead of drifting apart.
 
 Consumers:
-    tools/make_app_icon.py  - recolours the lexicon cube's stone
+    tools/make_app_icon.py  - recolors the lexicon cube's stone
     tools/make_banner.py    - the banner title's SVG gradient
 """
 

@@ -7,7 +7,7 @@ Defaults: docs/lexicon.webp -> docs/favicon.ico (plus a full-size
 docs/lexicon_dwemer.png preview beside the source, for eyeballing the tint).
 
 The source is a near-black stone cube covered in saturated red glowing runes.
-Two independent recolours, split by how saturated-and-red a pixel is:
+Two independent recolors, split by how saturated-and-red a pixel is:
 
   * rune pixels  -> hue rotated to a cold blue (216 deg)
   * stone pixels -> mapped to the Dwemer brass ramp measured from the vanilla

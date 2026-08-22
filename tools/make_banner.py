@@ -91,7 +91,7 @@ def build_svg():
   </defs>
 
   <!-- No background rect: the banner is transparent so it sits on whatever
-       panel colour the GUI theme is using, instead of punching a dark hole. -->
+       panel color the GUI theme is using, instead of punching a dark hole. -->
 
   <!-- Title: Oblivion font traced to outlines, Dwemer brass ramp -->
   <g filter="url(#engrave)">

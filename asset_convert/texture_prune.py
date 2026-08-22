@@ -285,7 +285,7 @@ def build_refs(plugin_dir, export_dir, mesh_texture_refs=None) -> set:
 def _shared_maps_on_disk(plugin_dir, refs: set) -> set:
     """Map siblings a VARIANT diffuse borrows from its base name.
 
-    Oblivion's convention lets a colour/state variant reuse the base texture's
+    Oblivion's convention lets a color/state variant reuse the base texture's
     maps: `brumawoodpost_grey.dds` is shipped without its own normal map and the
     engine loads `brumawoodpost_n.dds` from the same folder. Nothing writes that
     down — not the NIF, not the record — and `_companions` only derives from the

@@ -9,7 +9,7 @@
 
   verify  — read the CONVERTED meshes: is every parallax shape built the way
             Skyrim wants it (shader type 3, SLSF1_Parallax, height in slot 3,
-            vertex colours present) and does the height map it names exist as
+            vertex colors present) and does the height map it names exist as
             a real BC4 DDS.
 
   pack    — point it at ANY texture folder, including a third-party pack, and
@@ -55,7 +55,7 @@ _DXGI_BC4_UNORM = 80
 # ---------------------------------------------------------------------------
 
 def scan_source(path):
-    """(shape name, diffuse path, has vertex colours) for each flagged shape."""
+    """(shape name, diffuse path, has vertex colors) for each flagged shape."""
     from asset_convert import pyffi_monkey_patch      # noqa: F401
     from pyffi.formats.nif import NifFormat
     out = []
@@ -114,7 +114,7 @@ def census(plugin, subdir, mx, workers, show_all):
 
     print(f'\nflagged shapes: {len(hits)} in '
           f'{len({h[0] for h in hits})} meshes')
-    print(f'  with vertex colours already: {sum(1 for h in hits if h[2])}'
+    print(f'  with vertex colors already: {sum(1 for h in hits if h[2])}'
           f' (the rest are given white ones on conversion)')
 
     # One classification per distinct texture, not per shape.  Keyed on the
@@ -233,9 +233,9 @@ def scan_output(path):
         if int(shader.shader_flags_2.slsf_2_glow_map):
             problems.append('glow map set (excludes parallax)')
         if b.data is None or not b.data.has_vertex_colors:
-            problems.append('no vertex colours (renders unlit-black)')
+            problems.append('no vertex colors (renders unlit-black)')
         elif not int(shader.shader_flags_2.slsf_2_vertex_colors):
-            problems.append('vertex colours present but the shader flag is off')
+            problems.append('vertex colors present but the shader flag is off')
         out.append((str(path), name, '; '.join(problems), slot0, slot3))
     return out
 

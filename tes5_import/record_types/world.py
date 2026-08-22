@@ -1349,7 +1349,7 @@ def convert_WATR(rec: dict) -> bytes:
 # ---------------------------------------------------------------------------
 # Effect shader texture substitution
 # ---------------------------------------------------------------------------
-# Oblivion's renderer synthesises a membrane from the DATA colour fields alone,
+# Oblivion's renderer synthesises a membrane from the DATA color fields alone,
 # so a texture-less EFSH is ordinary there: 42 of Oblivion.esm's 102 records
 # name neither a fill (ICON) nor a particle (ICO2) texture.  Skyrim's samples a
 # fill texture and modulates it through a gradient palette (NAM8/NAM9) — a
@@ -1361,7 +1361,7 @@ def convert_WATR(rec: dict) -> bytes:
 # vanilla shader built for the same job.  The TES4 EditorID is the authored
 # indicator — `effectEnchant<School>` and `effect<Element>Shield` say exactly
 # which vanilla family the record belongs to — so the match keys off the name,
-# never off a colour heuristic.  The source's own colours still drive the DATA
+# never off a color heuristic.  The source's own colors still drive the DATA
 # fields; only the texture paths come from vanilla.
 #
 # (fill ICON, particle ICO2, membrane palette NAM8, particle palette NAM9)
@@ -1463,7 +1463,7 @@ def convert_EFSH(rec: dict) -> bytes:
     """EFSH — Effect Shader.
 
     TES5 DATA is 400 bytes and prefix-compatible with TES4's 224: every field
-    up to and including the three colour keys sits at an identical offset in
+    up to and including the three color keys sits at an identical offset in
     both games, so the source block is copied field-for-field and only the
     TES5-only tail (holes, addon models, particle rotation, animated frames,
     the widened U32 flags, texture scales) is filled with vanilla defaults.
@@ -1584,35 +1584,47 @@ def convert_EFSH(rec: dict) -> bytes:
 
     # --- TES5-only tail (offset 224+): no TES4 source, vanilla defaults. ---
     # Particle rotation (224-240) and Addon Models (244) stay 0/absent.
-    struct.pack_into('<f', data, 264, 1.0)   # Holes - End Val
-    # Edge width in alpha units + its colour mirror the edge block above, which
+    #
+    # OFFSETS ARE FROM THE xEdit TES5 EFSH STRUCT, verified field-by-field
+    # against 152 real Skyrim.esm records.  Every field from 260 up used to sit
+    # 4 bytes too high, which put float 1.0 (0x3F800000) into 'Ambient Sound'
+    # at 308; the CK read its low 3 bytes as an object id and reported
+    # "Could not find shader effect sound (01800000)" on all 102 records.
+    # Holes - End Val: 0.0 on 143 of 152 vanilla records.
+    struct.pack_into('<f', data, 260, 0.0)   # Holes - End Val
+    # Edge width in alpha units + its color mirror the edge block above, which
     # is what vanilla shaders carrying an edge effect do.
-    struct.pack_into('<f', data, 268, get_float(rec, 'DATA.EdgeEffectWidth', 1.0))
-    data[272] = get_int(rec, 'DATA.EdgeColorR') & 0xFF
-    data[273] = get_int(rec, 'DATA.EdgeColorG') & 0xFF
-    data[274] = get_int(rec, 'DATA.EdgeColorB') & 0xFF
-    struct.pack_into('<I', data, 280, 1)     # Texture Count U
-    struct.pack_into('<I', data, 284, 1)     # Texture Count V
-    struct.pack_into('<f', data, 288, 1.0)   # Addon Models - Fade In Time
-    struct.pack_into('<f', data, 292, 1.0)   # Addon Models - Fade Out Time
-    struct.pack_into('<f', data, 296, 1.0)   # Addon Models - Scale Start
-    struct.pack_into('<f', data, 300, 1.0)   # Addon Models - Scale End
-    struct.pack_into('<f', data, 304, 1.0)   # Addon Models - Scale In Time
-    struct.pack_into('<f', data, 308, 1.0)   # Addon Models - Scale Out Time
-    # Fill colour keys 2 and 3: TES4 has one fill colour, so all three keys
-    # carry it and the membrane holds a steady colour instead of fading to
+    struct.pack_into('<f', data, 264, get_float(rec, 'DATA.EdgeEffectWidth', 1.0))
+    data[268] = get_int(rec, 'DATA.EdgeColorR') & 0xFF
+    data[269] = get_int(rec, 'DATA.EdgeColorG') & 0xFF
+    data[270] = get_int(rec, 'DATA.EdgeColorB') & 0xFF
+    # 272 Explosion Wind Speed stays 0.
+    struct.pack_into('<I', data, 276, 1)     # Texture Count U
+    struct.pack_into('<I', data, 280, 1)     # Texture Count V
+    struct.pack_into('<f', data, 284, 1.0)   # Addon Models - Fade In Time
+    struct.pack_into('<f', data, 288, 1.0)   # Addon Models - Fade Out Time
+    struct.pack_into('<f', data, 292, 1.0)   # Addon Models - Scale Start
+    struct.pack_into('<f', data, 296, 1.0)   # Addon Models - Scale End
+    struct.pack_into('<f', data, 300, 1.0)   # Addon Models - Scale In Time
+    struct.pack_into('<f', data, 304, 1.0)   # Addon Models - Scale Out Time
+    # 308 Ambient Sound (SNDR FormID): TES4 EFSH has no sound field, and 95 of
+    # 152 vanilla records leave it null.  Must stay 0 — anything else is read
+    # as an object id.
+    # Fill color keys 2 and 3: TES4 has one fill color, so all three keys
+    # carry it and the membrane holds a steady color instead of fading to
     # black across the key ramp.
+    put_rgb(312, 'DATA.FillColor')
     put_rgb(316, 'DATA.FillColor')
-    put_rgb(320, 'DATA.FillColor')
-    struct.pack_into('<f', data, 324, 1.0)   # Colour key 1 scale
-    struct.pack_into('<f', data, 328, 1.0)   # Colour key 2 scale
-    struct.pack_into('<f', data, 332, 1.0)   # Colour key 3 scale
-    struct.pack_into('<f', data, 336, 0.0)   # Colour key 1 time
-    struct.pack_into('<f', data, 340, 0.5)   # Colour key 2 time
-    struct.pack_into('<f', data, 344, 1.0)   # Colour key 3 time
-    struct.pack_into('<f', data, 348, 1.0)   # Colour Scale
-    # Frame count 1 keeps a non-animated particle on its single frame.
-    struct.pack_into('<I', data, 372, 1)     # Frame Count
+    struct.pack_into('<f', data, 320, 1.0)   # Color key 1 scale
+    struct.pack_into('<f', data, 324, 1.0)   # Color key 2 scale
+    struct.pack_into('<f', data, 328, 1.0)   # Color key 3 scale
+    struct.pack_into('<f', data, 332, 0.0)   # Color key 1 time
+    struct.pack_into('<f', data, 336, 0.5)   # Color key 2 time
+    struct.pack_into('<f', data, 340, 1.0)   # Color key 3 time
+    struct.pack_into('<f', data, 344, 1.0)   # Color Scale
+    # Frame Count 0 = not a frame-animated texture, which is what 108 of 152
+    # vanilla records carry; a TES4 shader has no frame data to convert.
+    struct.pack_into('<I', data, 376, 0)     # Frame Count
     # The U32 flags field is what TES5 actually reads; the U8 at offset 0 is
     # marked unused in the TES5 definition.  TES4 bits 0/3/4/5 keep their
     # meaning, so the low byte carries over directly.

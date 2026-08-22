@@ -2676,7 +2676,7 @@ class TestFXBrightnessAndSoftEffect:
 
     @pytest.mark.skipif(not Path(GROUND_MIST).exists(),
                         reason='Oblivion ground-mist mesh not available')
-    def test_additive_fx_without_vertex_colour_prop_is_not_lit(self, tmp_path):
+    def test_additive_fx_without_vertex_color_prop_is_not_lit(self, tmp_path):
         """The Ayleid ground mist declares no NiVertexColorProperty.
 
         lighting_mode therefore defaults to "lit" and every plane used to be
@@ -3155,7 +3155,7 @@ class TestShaderControllerTarget:
                     and b.string_palette is not None]
         assert palettes, 'sample has no string palette — test is stale'
         pal = bytes(palettes[0].palette.palette)
-        # The colour controller targets "CandleSkinny01:0", which — unlike the
+        # The color controller targets "CandleSkinny01:0", which — unlike the
         # bare "CandleSkinny01" NiNode carrying the transform tracks — is not a
         # node in this mesh at all, so no shader can ever be found for it.
         assert b'CandleSkinny01:0' in pal, \
@@ -3202,7 +3202,7 @@ class TestShaderControllerTarget:
                                      (round(k.value.x, 4), round(k.value.y, 4),
                                       round(k.value.z, 4)))
                                     for k in it.data.data.keys]
-        assert src_keys, 'source has no colour curve — test is stale'
+        assert src_keys, 'source has no color curve — test is stale'
         got_keys = []
         for c in ctrls:
             it = c.interpolator
@@ -3212,7 +3212,7 @@ class TestShaderControllerTarget:
                               round(k.value.z, 4)))
                             for k in it.data.data.keys]
         assert got_keys == src_keys, \
-            f'colour curve changed: {src_keys} -> {got_keys}'
+            f'color curve changed: {src_keys} -> {got_keys}'
 
         # The entry must name a block that exists, or the engine cannot bind it.
         names = {bytes(getattr(b, 'name', b'') or b'') for b in dst_data.blocks}

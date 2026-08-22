@@ -35,25 +35,25 @@ prefix: `01......` is Oblivion.esm, `00......` is Skyrim.esm.
 
 **45,437 warning lines.** 46,050 FormID mentions are `01` (ours), 1,320 are `00`.
 
-| # | Bucket | Count | Tag | Effort |
-|---|---|---|---|---|
-| 1 | Book has invalid character | 543 | FORMS | trivial |
-| 2 | MGEF invalid primary Actor Value → HEALTH | 14 | MAGIC | trivial |
-| 3 | MGEF counter-effect invalid FormID | 25 | FORMS | trivial |
-| 4 | Shader effect sound `01800000` not found | 102 | MASTERFILE | easy |
-| 5 | Biped Object slot 44 invalid for DefaultRace | 596 | MASTERFILE | easy |
-| 6 | One-way faction Friend/Ally relations | 105 | DEFAULT | easy |
-| 7 | Duplicate EditorIDs → `…DUPLICATE001` | 270 | EDITOR | easy–moderate |
-| 8 | "cannot be scripted, but has scripts attached" | 136 | SCRIPTS | moderate |
-| 9 | Script property points at invalid object | 40 | SCRIPTS | moderate |
-| 10 | Potentially invalid X/Y on reference | 62 | MASTERFILE | moderate |
-| 11 | Ref should be persistent but is not | 18 | MASTERFILE | moderate |
-| 12 | CTDA param init failures | 44 | MASTERFILE | moderate |
-| 13 | Navmesh should be refinalized (bounds missing) | 19 | PATHFINDING | moderate–hard |
-| 14 | Special Ref not in Special Ref data (map markers) | 1,002 | MASTERFILE | hard |
-| 15 | Exterior cell no longer tagged to this location | 989 | MASTERFILE | hard |
-| 16 | Ref uses location but not in unloaded-ref data | 15,333 | MASTERFILE | hard |
-| 17 | Cell not in worldspace exterior cell data | 26,124 | MASTERFILE | hard |
+| # | Bucket | Count | Tag | Effort | Status |
+|---|---|---|---|---|---|
+| 1 | Book has invalid character | 543 | FORMS | trivial | **WONTFIX** — font, not data |
+| 2 | MGEF invalid primary Actor Value → HEALTH | 14 | MAGIC | trivial | **WONTFIX** — vanilla-legal |
+| 3 | MGEF counter-effect invalid FormID | 25 | FORMS | trivial | **FIXED** 2026-08-22 |
+| 4 | Shader effect sound `01800000` not found | 102 | MASTERFILE | easy | **FIXED** 2026-08-22 |
+| 5 | Biped Object slot 44 invalid for DefaultRace | 596 | MASTERFILE | easy | open |
+| 6 | One-way faction Friend/Ally relations | 105 | DEFAULT | easy | open |
+| 7 | Duplicate EditorIDs → `…DUPLICATE001` | 270 | EDITOR | easy–moderate | open |
+| 8 | "cannot be scripted, but has scripts attached" | 136 | SCRIPTS | moderate | open |
+| 9 | Script property points at invalid object | 40 | SCRIPTS | moderate | open |
+| 10 | Potentially invalid X/Y on reference | 62 | MASTERFILE | moderate | open |
+| 11 | Ref should be persistent but is not | 18 | MASTERFILE | moderate | open |
+| 12 | CTDA param init failures | 44 | MASTERFILE | moderate | open |
+| 13 | Navmesh should be refinalized (bounds missing) | 19 | PATHFINDING | moderate–hard | open |
+| 14 | Special Ref not in Special Ref data (map markers) | 1,002 | MASTERFILE | hard | open |
+| 15 | Exterior cell no longer tagged to this location | 989 | MASTERFILE | hard | open |
+| 16 | Ref uses location but not in unloaded-ref data | 15,333 | MASTERFILE | hard | open |
+| 17 | Cell not in worldspace exterior cell data | 26,124 | MASTERFILE | hard | open |
 
 Buckets **14–17 are one root cause** and account for 43,448 lines (**96%**).
 
@@ -72,47 +72,120 @@ Only **4 distinct books**, and the count is per bad byte, not per book:
 | `Broadsheet01Assassination` | 1 |
 | `FGD06ViranusJournal` | 1 |
 
-Non-ASCII bytes surviving into the book text. The two `test*` books are
-Bethesda font-test assets — candidates for the skip list. The other two are real
-content needing an encoding pass on BOOK description text.
+**WONTFIX — the encoding is already correct; the FONT is the limitation.**
+
+Every offending character is ordinary accented Latin (`é É à è ù ü ï ñ œ`, 49
+distinct) and all of them round-trip through cp1252 exactly as authored.
+`pack_string_subrecord` already writes cp1252, matching xEdit's
+`wbMBCSEncoding(1252)`.
+
+The CK rejects them because the English Skyrim font has no glyph. Census:
+**zero** of Skyrim.esm's text subrecords (DESC/FULL/CNAM/SHRT/RNAM/...) contain
+any character above ASCII 126, so the glyphs were never authored on the Skyrim
+side either.
+
+Every available "fix" alters authored text — folding `naïve`->`naive` and
+`protégé`->`protege` drops characters the author wrote. Not worth it for the
+real content, which is **2 lines total**:
+
+- `FGD06ViranusJournal` — "na**ï**ve" x1
+- `Broadsheet01Assassination` — "prot**é**g**é**" x2
+
+The remaining 541 lines are `testFonts` (483) and `testqabook` (58), Bethesda
+font-test sheets that exist precisely to display accented glyphs. If the noise
+ever needs silencing, skip those two records rather than rewriting text.
 
 ## 2. MGEF invalid primary Actor Value → HEALTH (14) — trivial
 
 `[MAGIC] Effect Setting 'X' has an invalid primary Actor Value! HEALTH used.`
 
-All 14 are the attribute/skill/confidence families that Skyrim has no AV for:
-Turn Undead, Rally, Frenzy, Charm, Calm, Demoralize, and the
-Fortify/Drain/Damage/Absorb × Attribute/Skill matrix.
+**WONTFIX — vanilla-legal. The CK warns about its own records.**
 
-The CK silently substitutes HEALTH, which is almost certainly wrong for every
-one of them. Either pick a correct Skyrim AV per effect or confirm the fallback
-is acceptable and suppress. Cross-check
-[magic_conversion_plan.md](magic_conversion_plan.md).
+Census of Skyrim.esm's 950 MGEFs: **304 write Actor Value = -1**, including all
+13 Turn Undead records (archetype 35) and the vanilla Rally record (archetype
+41) — the very archetypes warned about here.
+
+Our 14 are the AV-less **fallback** records that stand in when an effect's
+actor value cannot be mapped; the per-AV variants (`_av_variants`, one MGEF per
+(code, actor value) pair the plugin uses) carry the real work. All 14 have their
+archetype set correctly and differ from vanilla only in writing -1 for the AV,
+which is exactly what vanilla does 304 times.
+
+Verified in the built ESM: Rally arch=38, Frenzy 8, Charm 6, Calm 6, Demoralize
+7, Absorb Skill/Attribute 4, Damage/Restore Attribute 0, Drain/Fortify 34, Turn
+Undead 24 — all AV = -1.
 
 ## 3. MGEF counter-effect invalid FormID (25) — trivial
 
 `[FORMS] Invalid form ID for effect setting found while loading counter effects for XXXX.`
 
-25 Oblivion effect codes: ABAT ABFA ABHE ABSK ABSP BRDN CHRM COCR COHU
-CalmDUPLICATE DEMO DGAT DGFA DGHE DGSP DIAR DIWE DRAT DRFA DRHE DRSK DRSP
-FRNZ POSN RALY.
+**FIXED 2026-08-22** — `_sort_mgef_by_counter_effects` in
+[writer.py](../tes5_import/writer.py).
 
-These are the **dropped effect families** — we keep the counter-effect list but
-the targets no longer exist. Fix: filter counter-effect (ESCE) entries against
-the set of MGEFs actually written. Note `CalmDUPLICATE` — that entry is
-collateral from bucket 7, not a source-data problem.
+The original diagnosis ("targets no longer exist") was **wrong**. Every ESCE
+target resolves to an MGEF that is present in the output, no ESCE dangles, and
+the DATA counter-effect count matches the ESCE subrecord count on every record.
+
+The real cause is **group ORDER**. The reported ids decode as real records —
+`16783472` = `0x01001870` = DSPL, `16783458` = `0x01001862` = CUPO — and the CK
+resolves ESCE *while reading the MGEF group*, looking the target up in what it
+has loaded so far. A record naming a counter effect that appears later in the
+group fails.
+
+Measured on the pre-fix ESM: 41 ESCE references, **25 pointing forward and all
+25 warned; 16 pointing backward and all 16 silent** — the forward set equals the
+warning set exactly.
+
+Vanilla Skyrim.esm ships **zero** ESCE subrecords across its 950 MGEFs, so there
+is no vanilla ordering to copy; the engine's counter-effect load path is simply
+order-dependent and untested by Bethesda's own data.
+
+Fix: a stable topological sort of the MGEF group at serialization time, so every
+target precedes its referrer. Records keep source order except where a dependency
+forces one earlier, which preserves byte-reproducibility; a cycle (Oblivion has
+none) degrades to source order rather than raising. Verified after rebuild: 340
+records, 41 ESCE refs, **0 forward, 0 dangling**.
 
 ## 4. Shader effect sound `01800000` not found (102) — easy
 
 `[MASTERFILE] Could not find shader effect sound (01800000) on object 'X'.`
 
-All 102 point at the **same FormID**, `01800000`, which is not a record we
-write — a synthesized/garbage id landing in the EFSH sound field. Affects 102
-EFSH objects (`SE13FlyingKnightEffect`, `SE10PRChimeEffect`,
-`SE10BrellachChimeEffect`, …).
+**FIXED 2026-08-22** — `convert_EFSH` in
+[world.py](../tes5_import/record_types/world.py).
 
-Single-source bug: find whatever produces `0x800000` and either resolve it or
-write a null.
+Not a stray FormID at all: **the EFSH DATA tail was written 4 bytes off**.
+
+Every field from offset 260 up sat one slot too high against the xEdit TES5
+EFSH struct. That put the float `1.0` written for "Addon Models - Scale Out
+Time" into **`Ambient Sound` at offset 308**. Float 1.0 is `0x3F800000`; the CK
+reads it as an object id, takes the low three bytes `0x800000`, applies our
+plugin index `01`, and reports `01800000` — the exact id in all 102 warnings.
+
+Offsets verified field-by-field against the xEdit definition **and** 152 real
+Skyrim.esm EFSH records:
+
+| Offset | Field | Was written at |
+|---|---|---|
+| 260 | Holes - End Val | 264 |
+| 264 | Edge Width (alpha units) | 268 |
+| 268 | Edge Color | 272 |
+| 272 | Explosion Wind Speed | *(skipped)* |
+| 276/280 | Texture Count U/V | 280/284 |
+| 284-304 | Addon Models Fade/Scale block | 288-308 |
+| **308** | **Ambient Sound (SNDR FormID)** | *(never written — got Scale Out Time)* |
+| 312/316 | Fill Color Key 2/3 | 316/320 |
+| 320-340 | Color key scales and times | 324-344 |
+| 344 | Color Scale | 348 |
+| 376 | Frame Count | 372 |
+
+Two values were also wrong on the merits and corrected against the vanilla
+census: `Holes - End Val` is 0.0 on 143 of 152 vanilla records (we wrote 1.0),
+and `Frame Count` is 0 on 108 of 152 (we wrote 1 — a TES4 shader has no frame
+data to convert). `Ambient Sound` stays 0: TES4 EFSH has no sound field and 95
+of 152 vanilla records leave it null.
+
+Verified after rebuild: 102 EFSH records, **all 11 checked fields correct on
+102/102**, Ambient Sound zero on every one.
 
 ## 5. Biped Object slot 44 invalid for DefaultRace (596) — easy
 

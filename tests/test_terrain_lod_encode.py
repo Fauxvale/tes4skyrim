@@ -129,7 +129,7 @@ class TestDXT1Encoder:
 
     def test_flat_block_endpoints(self):
         """A uniform block hits the c0 == c1 branch; both endpoints must still
-        encode a valid opaque (4-colour) block."""
+        encode a valid opaque (4-color) block."""
         for value in (0, 1, 128, 255):
             img = np.full((4, 4, 3), value, dtype=np.uint8)
             assert _encode_dxt1_quality(img) == _dxt1_reference(img)

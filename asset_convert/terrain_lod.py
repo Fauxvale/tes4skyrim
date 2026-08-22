@@ -388,7 +388,7 @@ def count_land_records(esm_path: Path, worldspace_edid: str) -> int:
     `phase_lod` needs this ONLY as a number, to decide whether this plugin or a
     master owns a worldspace's terrain.  It used to call `_parse_land_records`
     and take `len()` of the result, which fully DECODES every record — VHGT
-    heights, VCLR colours and the whole BTXT/ATXT/VTXT layer tree — and then
+    heights, VCLR colors and the whole BTXT/ATXT/VTXT layer tree — and then
     throws all of it away.  Measured on Tamriel that is 2.8 s discarded per
     worldspace, and `_records_esm` runs it once for this plugin plus once per
     master, for every one of the 18 worldspaces.
@@ -1187,7 +1187,7 @@ def _encode_dxt1_quality(img: np.ndarray) -> bytes:
     c0 = _rgb_to_565_vec(cmax)
     c1 = _rgb_to_565_vec(cmin)
 
-    # Ensure c0 > c1 for opaque DXT1 (4-colour mode).
+    # Ensure c0 > c1 for opaque DXT1 (4-color mode).
     swap = c0 < c1
     c0, c1 = np.where(swap, c1, c0), np.where(swap, c0, c1)
     eq = c0 == c1
@@ -1661,7 +1661,7 @@ def _build_terrain_nif(heights: np.ndarray, tile_x: int, tile_y: int,
     # UV set — the tile texture maps across the whole tile.  Vanilla ground
     # truth (tamriel.4.0.32.btr): u = x/4096, v = 1 - y/4096 (v=0 at the NORTH
     # edge, matching the DDS row 0 = north).  All-zero UVs made every triangle
-    # sample a single texel, so each tile rendered as one flat colour — the
+    # sample a single texel, so each tile rendered as one flat color — the
     # in-game map became a hard-edged per-tile checkerboard.
     shapedata.uv_sets.update_size()
     for row in range(tv):
@@ -1788,7 +1788,7 @@ def _composite_tile_diffuse(lands, tile_x, tile_y, level, ltex_map, tex_root,
 
     tile_heights is the FILLED tile height grid from _assemble_tile (row 0 =
     south), used to bake the underwater murk.  Cells with no LAND record get
-    the engine default texture + murk instead of a flat fill colour.
+    the engine default texture + murk instead of a flat fill color.
 
     Returns (atlas RGB ndarray, side_px) with image row 0 = north (+Y), so it
     matches the DDS orientation vanilla terrain LOD uses.

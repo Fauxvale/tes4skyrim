@@ -10,7 +10,7 @@ break:
      44 of Nehrim's 130 flagged textures carry one; writing an empty height
      map for the rest produces exactly that swimming surface.
   3. When both conditions hold, the shape comes out as Skyrim builds one:
-     shader type 3, SLSF1_Parallax, height in slot 3, vertex colours present.
+     shader type 3, SLSF1_Parallax, height in slot 3, vertex colors present.
 """
 
 import struct
@@ -591,10 +591,10 @@ class TestParallaxIsOptIn:
     def test_a_distant_lod_tier_mesh_is_never_converted(self, nif, tmp_path,
                                                         name):
         """Found by `parallax_check.py verify`: 60 malformed shapes, every one
-        of them in a `_far`/`_far8`/`_far16` mesh, all "no vertex colours".
+        of them in a `_far`/`_far8`/`_far16` mesh, all "no vertex colors".
 
         The LOD stage regenerates those from the full model and knows nothing
-        about parallax, so it drops the vertex colours the heightmap shader
+        about parallax, so it drops the vertex colors the heightmap shader
         needs while leaving shader type 3 behind. It also made the result
         depend on whether meshes or LOD ran last. A height offset at LOD
         distance is invisible anyway.
@@ -639,7 +639,7 @@ class TestLodMeshesNeverCarryParallax:
         """`_decimate_and_write` reduces the FULL model in place and copies its
         shader verbatim, so a parallax source hands shader type 3, the parallax
         flag and the slot-3 height map straight to the LOD tier — while the
-        decimation rebuilds the geometry and drops the vertex colours that
+        decimation rebuilds the geometry and drops the vertex colors that
         shader needs. That is what rendered unlit-black."""
         from asset_convert.lod_far_gen import _strip_parallax
 
@@ -712,7 +712,7 @@ class TestParallaxNeedsRealHeightData:
 
 class TestParallaxShapeConstruction:
     """What the in-game test confirmed renders correctly under Community
-    Shaders: type 3, SLSF1_Parallax, height in slot 3, vertex colours."""
+    Shaders: type 3, SLSF1_Parallax, height in slot 3, vertex colors."""
 
     def test_shader_is_rebuilt_for_the_heightmap_path(self, nif, tmp_path):
         src = _tree(tmp_path, HEIGHT_DDS)
@@ -733,7 +733,7 @@ class TestParallaxShapeConstruction:
         assert int(shader.shader_flags_1.slsf_1_environment_mapping) == 0
         assert int(shader.shader_flags_2.slsf_2_glow_map) == 0
 
-    def test_missing_vertex_colours_are_added_as_white(self, nif, tmp_path):
+    def test_missing_vertex_colors_are_added_as_white(self, nif, tmp_path):
         """Skyrim's heightmap shader needs them present; 848 of the 1551
         converted shapes have none of their own and would render unlit-black
         without."""
@@ -747,10 +747,10 @@ class TestParallaxShapeConstruction:
         assert int(ts.bs_properties[0].shader_flags_2.slsf_2_vertex_colors) == 1
         assert stats['parallax_vertex_colors_added'] == 1
 
-    def test_existing_vertex_colours_are_kept(self, nif, tmp_path):
+    def test_existing_vertex_colors_are_kept(self, nif, tmp_path):
         src = _tree(tmp_path, HEIGHT_DDS)
         ts, stats = _convert(_shape(nif, parallax.APPLY_HILIGHT2), src, True)
-        assert ts.data.vertex_colors[0].r == 0.5, 'authored colours overwritten'
+        assert ts.data.vertex_colors[0].r == 0.5, 'authored colors overwritten'
         assert 'parallax_vertex_colors_added' not in stats
 
     def test_build_job_points_at_the_source_texture(self, nif, tmp_path):
@@ -771,29 +771,29 @@ class TestParallaxShapeConstruction:
 # lands on TARGET_FLAT_SHARE after the halving and the blur.
 # ---------------------------------------------------------------------------
 
-def _bc1_palette(c0, c1, four_colour):
+def _bc1_palette(c0, c1, four_color):
     """The four RGB triples a BC1 block names, in index order."""
     def rgb(c):
         return (((c >> 11) & 0x1F) * 255 // 31,
                 ((c >> 5) & 0x3F) * 255 // 63,
                 (c & 0x1F) * 255 // 31)
     a, b = rgb(c0), rgb(c1)
-    if four_colour:
+    if four_color:
         return [a, b,
                 tuple((2 * a[i] + b[i]) // 3 for i in range(3)),
                 tuple((a[i] + 2 * b[i]) // 3 for i in range(3))]
     return [a, b, tuple((a[i] + b[i]) // 2 for i in range(3)), None]
 
 
-def _decode_colour_block(blk, always_four_colour):
-    """The 16 texels of one 8-byte BC1 / DXT5-colour block."""
+def _decode_color_block(blk, always_four_color):
+    """The 16 texels of one 8-byte BC1 / DXT5-color block."""
     c0, c1, idx = struct.unpack('<HHI', blk)
-    pal = _bc1_palette(c0, c1, always_four_colour or c0 > c1)
+    pal = _bc1_palette(c0, c1, always_four_color or c0 > c1)
     return [pal[(idx >> (2 * i)) & 3] for i in range(16)]
 
 
-def _dxt5_with_colour_blocks(w, h, colour_blocks):
-    """DXT5 whose colour halves are given verbatim; alpha is a real gradient."""
+def _dxt5_with_color_blocks(w, h, color_blocks):
+    """DXT5 whose color halves are given verbatim; alpha is a real gradient."""
     abits = 0
     for i in range(16):
         abits |= (i % 8) << (i * 3)
@@ -801,7 +801,7 @@ def _dxt5_with_colour_blocks(w, h, colour_blocks):
     n = ((w + 3) // 4) * ((h + 3) // 4)
     out = bytearray(_dds_header(w, h, b'DXT5'))
     for i in range(n):
-        out += alpha + colour_blocks[i % len(colour_blocks)]
+        out += alpha + color_blocks[i % len(color_blocks)]
     return bytes(out)
 
 
@@ -913,36 +913,36 @@ class TestDiffuseAlphaStrip:
     # c0 > c1 already, so DXT1 reads the block exactly as DXT5 did
     FOUR_COLOUR = struct.pack('<HHI', 0xF800, 0x001F, 0x1B1B1B1B)
 
-    def test_four_colour_blocks_survive_texel_for_texel(self):
-        dds = _dxt5_with_colour_blocks(4, 4, [self.FOUR_COLOUR])
+    def test_four_color_blocks_survive_texel_for_texel(self):
+        dds = _dxt5_with_color_blocks(4, 4, [self.FOUR_COLOUR])
         out = parallax.strip_alpha_to_bc1(dds)
         assert out[84:88] == b'DXT1'
-        assert (_decode_colour_block(out[128:136], False)
-                == _decode_colour_block(self.FOUR_COLOUR, True))
+        assert (_decode_color_block(out[128:136], False)
+                == _decode_color_block(self.FOUR_COLOUR, True))
 
     def test_a_swapped_block_decodes_to_the_same_texels(self):
-        # c0 < c1 would mean 3-colour + TRANSPARENT in DXT1; the repair swaps
+        # c0 < c1 would mean 3-color + TRANSPARENT in DXT1; the repair swaps
         # the endpoints and flips every index, and must be exact
         blk = struct.pack('<HHI', 0x001F, 0xF800, 0x0000E41B)
-        dds = _dxt5_with_colour_blocks(4, 4, [blk])
+        dds = _dxt5_with_color_blocks(4, 4, [blk])
         out = parallax.strip_alpha_to_bc1(dds)
         c0, c1, _ = struct.unpack('<HHI', out[128:136])
-        assert c0 > c1, 'left in DXT1 3-colour mode'
-        assert (_decode_colour_block(out[128:136], False)
-                == _decode_colour_block(blk, True))
+        assert c0 > c1, 'left in DXT1 3-color mode'
+        assert (_decode_color_block(out[128:136], False)
+                == _decode_color_block(blk, True))
 
     def test_a_solid_block_never_becomes_transparent(self):
-        # c0 == c1: every palette entry is that colour, but DXT1 index 3 would
+        # c0 == c1: every palette entry is that color, but DXT1 index 3 would
         # be transparent black, so the indices must be zeroed
         blk = struct.pack('<HHI', 0x07E0, 0x07E0, 0xFFFFFFFF)
-        dds = _dxt5_with_colour_blocks(4, 4, [blk])
+        dds = _dxt5_with_color_blocks(4, 4, [blk])
         out = parallax.strip_alpha_to_bc1(dds)
         assert struct.unpack_from('<I', out, 132)[0] == 0
-        assert (_decode_colour_block(out[128:136], False)
-                == _decode_colour_block(blk, True))
+        assert (_decode_color_block(out[128:136], False)
+                == _decode_color_block(blk, True))
 
     def test_the_payload_halves(self):
-        dds = _dxt5_with_colour_blocks(16, 16, [self.FOUR_COLOUR])
+        dds = _dxt5_with_color_blocks(16, 16, [self.FOUR_COLOUR])
         out = parallax.strip_alpha_to_bc1(dds)
         assert len(out) - 128 == (len(dds) - 128) // 2
 
@@ -960,7 +960,7 @@ class TestDiffuseAlphaStrip:
         assert parallax.strip_alpha_to_bc1(dds) is None
 
     def test_only_diffuses_with_a_height_map_are_stripped(self, tmp_path):
-        dxt5 = _dxt5_with_colour_blocks(4, 4, [self.FOUR_COLOUR])
+        dxt5 = _dxt5_with_color_blocks(4, 4, [self.FOUR_COLOUR])
         (tmp_path / 'carried.dds').write_bytes(dxt5)
         (tmp_path / 'carried_p.dds').write_bytes(b'placeholder')
         (tmp_path / 'plain.dds').write_bytes(dxt5)
@@ -976,7 +976,7 @@ class TestDiffuseAlphaStrip:
 
     def test_running_it_twice_changes_nothing(self, tmp_path):
         (tmp_path / 'x.dds').write_bytes(
-            _dxt5_with_colour_blocks(4, 4, [self.FOUR_COLOUR]))
+            _dxt5_with_color_blocks(4, 4, [self.FOUR_COLOUR]))
         (tmp_path / 'x_p.dds').write_bytes(b'p')
         parallax.strip_diffuse_alpha(str(tmp_path))
         once = (tmp_path / 'x.dds').read_bytes()

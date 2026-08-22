@@ -537,24 +537,24 @@ def _mip_chain(w, h, count):
     return dims
 
 
-def _bc1_repair_modes(colour):
-    """Make DXT3/DXT5 colour blocks legal as DXT1.  `colour` is (n, 8) uint8.
+def _bc1_repair_modes(color):
+    """Make DXT3/DXT5 color blocks legal as DXT1.  `color` is (n, 8) uint8.
 
-    DXT1 reads a block with ``c0 <= c1`` as three colours plus TRANSPARENT
-    black; DXT3/DXT5 colour blocks are always four opaque colours.  Both
-    repairs below are exact -- no texel changes colour:
+    DXT1 reads a block with ``c0 <= c1`` as three colors plus TRANSPARENT
+    black; DXT3/DXT5 color blocks are always four opaque colors.  Both
+    repairs below are exact -- no texel changes color:
 
       c0 <  c1  swap the endpoints and flip the low bit of every 2-bit index
                 (0<->1, 2<->3).  The swapped palette names the same four
-                colours in a different order, so the flip restores each texel.
+                colors in a different order, so the flip restores each texel.
       c0 == c1  every palette entry already equals c0, whatever the indices
                 say, so zeroing them reproduces the block and steps around the
                 transparent slot.
     """
-    n = colour.shape[0]
-    u16 = colour.view('<u2').reshape(n, 4)
+    n = color.shape[0]
+    u16 = color.view('<u2').reshape(n, 4)
     c0, c1 = u16[:, 0], u16[:, 1]
-    idx = np.ascontiguousarray(colour[:, 4:8]).view('<u4').reshape(n)
+    idx = np.ascontiguousarray(color[:, 4:8]).view('<u4').reshape(n)
 
     less = c0 < c1
     equal = c0 == c1
@@ -574,8 +574,8 @@ def strip_alpha_to_bc1(data: bytes):
     """Re-container a DXT3/DXT5 diffuse as DXT1, dropping the alpha channel.
 
     This is NOT a recompression.  A DXT3/DXT5 block is 8 bytes of alpha
-    followed by 8 bytes of colour in exactly BC1's colour-block layout, so the
-    colour half is copied verbatim and the endpoints keep the values the
+    followed by 8 bytes of color in exactly BC1's color-block layout, so the
+    color half is copied verbatim and the endpoints keep the values the
     original encoder chose.  Dithering and perceptual error metrics have
     nothing to act on: nothing is being quantised, and decoding to RGB just to
     re-quantise would LOSE quality rather than gain it.

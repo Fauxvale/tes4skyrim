@@ -1,7 +1,7 @@
 """A shape that declares vertices and ships none must not reach the output.
 
 `LeyawiinLowerDoor01` in `leyawiinhouselower01.nif` is the measured case:
-`num_vertices = 16` with `has_vertices = False`, while normals, colours, UVs
+`num_vertices = 16` with `has_vertices = False`, while normals, colors, UVs
 and 6 triangles all still index 16 vertices that are not in the file.
 
 Oblivion tolerates it — there is nothing to draw, so it draws nothing. LODGen

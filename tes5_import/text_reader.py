@@ -431,7 +431,7 @@ def get_str(record: dict, key: str, default: str = '') -> str:
 def get_hex_bytes(record: dict, key: str, default: bytes = b'') -> bytes:
     """Get a raw byte blob exported as an uppercase hex string.
 
-    Used by records the export dumps verbatim (WTHR NAM0 colour tables).
+    Used by records the export dumps verbatim (WTHR NAM0 color tables).
     Returns `default` if the key is absent or is not valid hex.
     """
     val = record.get(key)

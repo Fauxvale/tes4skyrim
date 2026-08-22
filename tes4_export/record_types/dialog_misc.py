@@ -440,7 +440,7 @@ def export_EFSH(rec: Record) -> list:
 
     TES4 DATA is 224 bytes and prefix-compatible with TES5's 400-byte one:
     flags, membrane blend state, the fill and edge blocks, the two full-alpha
-    ratios, membrane dest blend, the whole particle block and the three colour
+    ratios, membrane dest blend, the whole particle block and the three color
     keys all sit at identical offsets in both games (verified against the
     xEdit TES4/TES5 definitions and a real Oblivion.esm).  Everything past
     offset 224 is TES5-only (holes, addon models, rotation, animated frames).
@@ -525,7 +525,7 @@ def export_EFSH(rec: Record) -> list:
     f("PartScaleKey2", 176)
     f("PartScaleKey1Time", 180)
     f("PartScaleKey2Time", 184)
-    # Colour keys
+    # Color keys
     rgb("ColorKey1", 188)
     rgb("ColorKey2", 192)
     rgb("ColorKey3", 196)
@@ -642,7 +642,7 @@ def export_WTHR(rec: Record) -> list:
             if i * 4 + 4 <= len(d):
                 lines.append(f"HNAM.{name}={struct.unpack_from('<f', d, i*4)[0]}")
     # DATA (15 bytes) — full dump. Offsets 6-14 (precipitation/thunder fades,
-    # lightning frequency, weather classification, lightning colour) exist in
+    # lightning frequency, weather classification, lightning color) exist in
     # TES5's DATA too and were previously dropped on the floor.
     data = get_subrecord(rec, "DATA")
     if data and len(data.data) >= 15:

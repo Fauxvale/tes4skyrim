@@ -103,7 +103,7 @@ def python_version_warning() -> 'str | None':
 
 
 def format_python_warning(text: str) -> str:
-    """Render the version warning as a banner the GUI log can colour."""
+    """Render the version warning as a banner the GUI log can color."""
     bar = '-' * 70
     return '\n'.join(['', f'WARNING: Python version', bar, text, bar, ''])
 
@@ -461,7 +461,7 @@ def format_report(phase: str, missing: list, skipped: list) -> str:
     """Render the abort banner printed at the bottom of the console."""
     label = PHASE_LABELS.get(phase, phase)
     bar = '=' * 70
-    # The header comes FIRST, before any rule: the GUI log colours the banner by
+    # The header comes FIRST, before any rule: the GUI log colors the banner by
     # spotting that line and staying red until the closing rule, so a leading
     # rule would be styled as an ordinary section heading and break the block.
     lines = [

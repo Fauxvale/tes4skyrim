@@ -13,7 +13,7 @@ amount of structural validation catches:
 
 2. **UV-set count.**  The u16 "BS Data Flags" packs the UV-set count in its low
    6 bits, and that count is the ONLY thing telling the engine how many
-   TexCoord arrays follow the vertex colours.  A mesh storing 2 sets while
+   TexCoord arrays follow the vertex colors.  A mesh storing 2 sets while
    BSLightingShaderProperty binds 1 leaves the vertex buffer an array short, so
    the copy runs past the allocation and faults on a non-temporal store
    (vmovntdq) at the next page boundary.  Vanilla census: 2,233 shapes carry 0

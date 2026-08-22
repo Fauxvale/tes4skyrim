@@ -506,7 +506,7 @@ def geometry_from_dump(dump: Path) -> TreeGeometry:
     """Build a bark-only TreeGeometry from an engine dump.
 
     Coordinates are scaled into generator world units so the result drops into
-    `build_tree_nif` unchanged.  Vertex colours use the bark default (opaque,
+    `build_tree_nif` unchanged.  Vertex colors use the bark default (opaque,
     alpha = wind weight 0): the engine's own wind weights live in a buffer we
     do not currently read, and inventing a ramp here would be a guess.
     """

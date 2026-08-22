@@ -1330,11 +1330,11 @@ def _strip_parallax(nif_data) -> int:
     place and copies its shader properties verbatim — so a parallax source
     hands its shader type 3, its `SLSF1_Parallax` flag and its slot-3 height
     map straight to the LOD tier, while the decimation rebuilds the geometry
-    and drops the vertex colours that shader requires. The result renders
+    and drops the vertex colors that shader requires. The result renders
     unlit-black.
 
     Found by `parallax_check.py verify`: 60 malformed shapes, every one in a
-    `_far`/`_far8`/`_far16` mesh, all reported "no vertex colours". Skipping
+    `_far`/`_far8`/`_far16` mesh, all reported "no vertex colors". Skipping
     parallax when CONVERTING a source `_far.nif` fixes only half of it; a tier
     DERIVED from a parallax full model needs this.
 

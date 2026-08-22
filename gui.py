@@ -162,7 +162,7 @@ GLOBAL_ACTIONS = [
      "Patch Skyrim", 2),
 ]
 
-# ── Colours ───────────────────────────────────────────────────────────────────
+# ── Colors ───────────────────────────────────────────────────────────────────
 CLR = {
     "bg":           "#1e1e2e",
     "panel":        "#2a2a3d",
@@ -944,8 +944,8 @@ def gui_main():
 
     # ── Top menu bar (dark, custom-drawn) ─────────────────────────────────────
     # Windows renders a native (white) bar for root.configure(menu=...) and
-    # ignores tk colours on it, so the bar is built from dark Menubuttons whose
-    # dropdown popups (which DO honour colour options) are tk.Menu instances.
+    # ignores tk colors on it, so the bar is built from dark Menubuttons whose
+    # dropdown popups (which DO honour color options) are tk.Menu instances.
     _menu_opts = dict(
         tearoff=0,
         bg=CLR["panel"], fg=CLR["text"],
@@ -1340,7 +1340,7 @@ def gui_main():
         """Modal message card in the app's palette.  Returns the button clicked.
 
         tkinter's `messagebox` renders NATIVE OS dialogs, which ignore every
-        colour here and flash white in a dark UI.  This is the same card the
+        color here and flash white in a dark UI.  This is the same card the
         mesh-subfolder panel uses, so dialogs match the rest of the window.
 
         `links` is [(label, url)] rendered as clickable rows under the message.
@@ -2859,7 +2859,7 @@ def gui_main():
                 n = _name_at(i)
                 plb.delete(i)
                 plb.insert(i, _row(n))
-                # Greyed rows are drawn in the subtext colour so "unavailable"
+                # Greyed rows are drawn in the subtext color so "unavailable"
                 # is visible at a glance and not just inferred from the tick.
                 plb.itemconfigure(
                     i, foreground=(CLR["subtext"] if n in disabled
@@ -3415,7 +3415,7 @@ def gui_main():
 
     # preflight emits two multi-line banners, each `HEADER / rule / body / rule`
     # (header FIRST, so no leading rule steals the "head" style).  Both must
-    # keep one colour throughout: their bodies are install/build instructions
+    # keep one color throughout: their bodies are install/build instructions
     # that would otherwise classify as plain text and lose the visual grouping.
     # State is (tag, rules_seen); the banner closes on its second rule.
     #   MISSING DEPENDENCY … / "=" rules  -> err   (run aborted)
@@ -3572,7 +3572,7 @@ def gui_main():
         # Failure verdicts come FIRST, before the generic "complete"/"error"
         # rules below.  "Pipeline completed with errors." used to fall past the
         # err rule (guarded on "errors" not in l, so plural error counts like
-        # "0 errors" stay uncoloured) and land on the "complete" rule -- the
+        # "0 errors" stay uncolored) and land on the "complete" rule -- the
         # single most important line in the run was painted GREEN.  A line that
         # states the run failed is red no matter what other words it carries.
         # A tally ("154/154 succeeded, 0 failed", "3 errors") is judged by its
@@ -3584,7 +3584,7 @@ def gui_main():
         # A failure the stage RECOVERED from ("download failed; generating
         # normally") is orange, not red -- it is checked first so the hard-fail
         # rule below cannot claim it.  Red is reserved for what actually broke
-        # the run; colouring recoverable notices red trains the user to ignore
+        # the run; coloring recoverable notices red trains the user to ignore
         # red altogether.
         if _is_recovered_line(l):
             return "warn"
@@ -3604,7 +3604,7 @@ def gui_main():
             return "warn"
         # Compare LOWER-cased: the runners' own verdict line is "  DONE", which
         # never matched the lower-case-only literals here and so printed
-        # uncoloured while its FAILED counterpart is red.
+        # uncolored while its FAILED counterpart is red.
         if l.strip() in ("done", "ok") or "complete" in l or "success" in l:
             return "ok"
         # `cmd` is the command echo ONLY.  This used to also return "cmd" for

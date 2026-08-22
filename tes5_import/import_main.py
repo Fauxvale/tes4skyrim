@@ -1679,8 +1679,8 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     from .record_types.dialog_misc import convert_WTHR, set_nam0_normalization
     wthr_records = by_type.get('WTHR', [])
     if wthr_records:
-        # Self-calibrating colour normalization: Oblivion authors weather
-        # colours far hotter than Skyrim (Sun slot 193 vs 43 median day
+        # Self-calibrating color normalization: Oblivion authors weather
+        # colors far hotter than Skyrim (Sun slot 193 vs 43 median day
         # luminance) and ambient darker; scale each slot so this plugin's
         # median lands on the vanilla median. Must run before any weather
         # converts.

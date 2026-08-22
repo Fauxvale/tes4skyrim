@@ -291,6 +291,77 @@ def _merge_grid_groups(body: bytes) -> bytes:
     return bytes(out)
 
 
+def _sort_mgef_by_counter_effects(records: list) -> list:
+    """Order MGEFs so every ESCE counter-effect target precedes its referrer.
+
+    The CK resolves ESCE while READING the MGEF group and looks the target up
+    in what it has loaded so far, so a record naming a counter effect that
+    appears later in the group fails with "[FORMS] Invalid form ID (N) for
+    effect setting found while loading counter effects for X".
+
+    Measured on Oblivion.esm: 25 of 41 ESCE references pointed forward and
+    every one warned; all 16 backward references were silent — the split is
+    exactly the warning list.  Vanilla Skyrim.esm ships ZERO ESCE subrecords
+    across its 950 MGEFs, so there is no vanilla ordering to copy and the
+    engine's counter-effect load path is simply order-dependent.
+
+    A stable topological sort: records keep their original relative order
+    except where a dependency forces one earlier, so the output stays
+    byte-reproducible (a cycle, which Oblivion does not have, degrades to
+    source order rather than raising).
+    """
+    parsed = []          # (formid, [esce targets], record_bytes)
+    for rec in records:
+        if len(rec) < 24 or rec[:4] != b'MGEF':
+            parsed.append((None, (), rec))
+            continue
+        fid = struct.unpack_from('<I', rec, 12)[0]
+        dsize = struct.unpack_from('<I', rec, 4)[0]
+        body = rec[24:24 + dsize]
+        targets = []
+        sp = 0
+        while sp + 6 <= len(body):
+            sig = body[sp:sp + 4]
+            ssz = struct.unpack_from('<H', body, sp + 4)[0]
+            if sig == b'ESCE' and ssz >= 4:
+                targets.append(struct.unpack_from('<I', body, sp + 6)[0])
+            sp += 6 + ssz
+        parsed.append((fid, tuple(targets), rec))
+
+    index = {fid: i for i, (fid, _, _) in enumerate(parsed) if fid is not None}
+    if not any(t for _, t, _ in parsed):
+        return records
+
+    out = []
+    state = [0] * len(parsed)        # 0 = unvisited, 1 = on stack, 2 = emitted
+
+    def emit(i):
+        # Iterative DFS: the group is ~340 records but a deep chain would
+        # otherwise risk the recursion limit.
+        stack = [(i, False)]
+        while stack:
+            node, expanded = stack.pop()
+            if expanded:
+                if state[node] != 2:
+                    state[node] = 2
+                    out.append(parsed[node][2])
+                continue
+            if state[node] != 0:
+                continue            # emitted, or already on the stack (cycle)
+            state[node] = 1
+            stack.append((node, True))
+            # Reversed so dependencies are emitted in their source order.
+            for target in reversed(parsed[node][1]):
+                dep = index.get(target)
+                if dep is not None and state[dep] == 0:
+                    stack.append((dep, False))
+
+    for i in range(len(parsed)):
+        if state[i] == 0:
+            emit(i)
+    return out
+
+
 def _merge_owned_groups(blob: bytes) -> bytes:
     """Fold repeated owned-groups with the same label into the first one.
 
@@ -666,7 +737,10 @@ class PluginWriter:
         for sig in self._group_order():
             if sig not in self._top_groups:
                 continue
-            contents = _merge_owned_groups(b''.join(self._top_groups[sig]))
+            records = self._top_groups[sig]
+            if sig == 'MGEF':
+                records = _sort_mgef_by_counter_effects(records)
+            contents = _merge_owned_groups(b''.join(records))
             if contents:
                 staged[sig] = [contents]
 

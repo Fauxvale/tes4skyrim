@@ -164,7 +164,7 @@ BY_EDITORID = [
     ('ziege',  Swap(0x000131FA, 0x0006F278, EXACT, 'GoatRace')),  # goat
     ('pferd',  Swap(0x000131FD, 0x00060715, EXACT, 'HorseRace')), # horse
 
-    # `bear` folder — Skyrim has colour-matched bears. BearBlackRace's skin is
+    # `bear` folder — Skyrim has color-matched bears. BearBlackRace's skin is
     # SkinBearCave (the black bear IS the cave bear in Skyrim), not SkinBearBlack.
     ('blackbear',   Swap(0x000131E8, 0x000187FE, EXACT, 'BearBlackRace')),
     ('bearblack',   Swap(0x000131E8, 0x000187FE, EXACT, 'BearBlackRace')),

@@ -1,10 +1,10 @@
 """Terrain LOD diffuse texture compositing for TES4->TES5 worldspaces.
 
 The old terrain LOD wrote the per-tile diffuse .dds straight from the LAND
-VCLR vertex colours upscaled to 1024 — a blurry colour grid, not the actual
+VCLR vertex colors upscaled to 1024 — a blurry color grid, not the actual
 ground.  Vanilla Skyrim terrain LOD diffuse is a *render* of the real landscape
 textures, alpha-blended exactly as the near landscape shader blends them, then
-modulated by the vertex-colour shading and baked to a single texture per tile.
+modulated by the vertex-color shading and baked to a single texture per tile.
 
 This module reproduces that:
 
@@ -22,7 +22,7 @@ We render each cell to an RGB image by:
     ground textures were authored to tile the same way),
   * starting from the base layer, then compositing each alpha layer using its
     bilinearly-upsampled opacity grid,
-  * multiplying by the vertex-colour luminance (VCLR) for baked terrain shading.
+  * multiplying by the vertex-color luminance (VCLR) for baked terrain shading.
 
 The result is downsampled per LOD level into the tile diffuse atlas.
 """
@@ -50,7 +50,7 @@ CELL_PX = 64
 DEFAULT_LAND_TEXTURE = 'tes4\\landscape\\default.dds'
 
 # Baked underwater murk.  Vanilla terrain LOD diffuse bakes submerged terrain
-# toward a flat murky colour (the LOD water sheet drawn above it is nearly
+# toward a flat murky color (the LOD water sheet drawn above it is nearly
 # opaque-looking only up close).  Blend by depth below the cell water height.
 MURK_COLOR = np.array([54.0, 66.0, 62.0], dtype=np.float32)
 MURK_FULL_DEPTH = 512.0    # game units below water at which murk saturates
@@ -378,7 +378,7 @@ def composite_cell(layers: dict, colors: np.ndarray, ltex_map: dict,
         out = np.clip(out * mult, 0, 255)
 
     # Bake the underwater murk: blend submerged pixels toward a flat murky
-    # colour by depth, like vanilla LOD diffuse (the LOD water sheet alone is
+    # color by depth, like vanilla LOD diffuse (the LOD water sheet alone is
     # too translucent to hide raw seafloor texture at distance).
     if water_height is not None and heights is not None:
         from PIL import Image

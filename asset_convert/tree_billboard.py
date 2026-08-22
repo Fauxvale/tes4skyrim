@@ -66,7 +66,7 @@ def _as_text(v) -> str:
 
     These come back as `bytes`, and `str(b'...')` yields the literal
     "b'textures\\\\...'" — a path that can never resolve.  That silently sent
-    every shape to the flat-colour fallback and rendered plain green cards.
+    every shape to the flat-color fallback and rendered plain green cards.
     """
     if v is None:
         return ''
@@ -191,7 +191,7 @@ def render_billboard(nif_path: Path, tex_roots, size=256, supersample=2):
         if tex is not None:
             ta = np.asarray(tex, dtype=np.float64) / 255.0
         else:
-            # No flat-colour stand-in: a billboard drawn from a placeholder is
+            # No flat-color stand-in: a billboard drawn from a placeholder is
             # a green blob, and doing that silently is how the first version of
             # this tool produced 162 useless cards.  Skip the shape and report.
             missing.append(diff or '(no texture set)')

@@ -3379,7 +3379,7 @@ class TestWeatherConversion:
     """
 
     def _nam0(self):
-        """TES4 NAM0: 10 types x 4 times x RGBA, one recognisable colour each."""
+        """TES4 NAM0: 10 types x 4 times x RGBA, one recognisable color each."""
         raw = bytearray(160)
         for t in range(10):
             for time in range(4):
@@ -3421,7 +3421,7 @@ class TestWeatherConversion:
         dalc = _find_all_subrecords(rec, b'DALC')
         assert len(dalc) == 4 and all(len(d) == 32 for d in dalc)
 
-    def test_nam0_colours_are_remapped_not_stubbed(self):
+    def test_nam0_colors_are_remapped_not_stubbed(self):
         """The first version wrote flat 128-grey over the whole table."""
         nam0 = _find_subrecord(self._convert(self._rec()), b'NAM0')
 
@@ -3448,7 +3448,7 @@ class TestWeatherConversion:
         """Slots 13-16 come from the per-classification, per-time census of
         the REAL Skyrim.esm (the references dump truncates NAM0 hex).
 
-        Two prior calibrations were wrong: copying the TES4 Sun/Stars colours
+        Two prior calibrations were wrong: copying the TES4 Sun/Stars colors
         into the glare slots produced a blinding sky, and the 'vanilla mode is
         black' correction hid the MOONS — slot 13 Sky Statics tints the moon
         discs and is never black in vanilla outdoor weathers (SkyrimClear
@@ -3491,7 +3491,7 @@ class TestWeatherConversion:
         assert (d[8], d[9]) == (7, 8)            # thunder fades
         assert d[10] == 188                      # thunder frequency
         assert d[11] == 4                        # classification (Rainy)
-        assert (d[12], d[13], d[14]) == (11, 12, 13)   # lightning colour
+        assert (d[12], d[13], d[14]) == (11, 12, 13)   # lightning color
 
     def test_thunder_frequency_keeps_inverted_scale(self):
         """Both games use 255=never .. 15=constant, so it is a passthrough.
@@ -3607,7 +3607,7 @@ class TestWeatherConversion:
         assert len(_find_subrecord(self._convert(rec), b'NAM0')) == 272
 
     def test_luminance_normalization_lands_plugin_median_on_vanilla(self):
-        """Oblivion authors weather colours far hotter than Skyrim — the Sun
+        """Oblivion authors weather colors far hotter than Skyrim — the Sun
         slot's midday median is 193 luminance vs vanilla 43 (a 255 disc
         BLOOMS enormously; Skyrim's sun brightness is HDR, not this slot) —
         while Ambient is authored at HALF vanilla (92 vs 172), giving blown
@@ -3616,7 +3616,7 @@ class TestWeatherConversion:
         scaled onto the vanilla median, hue preserved, capped at p90."""
         from tes5_import.record_types.dialog_misc import (
             set_nam0_normalization, _NAM0_K)
-        # A synthetic plugin whose Sun (slot 5) day colour is flat (200,200,200)
+        # A synthetic plugin whose Sun (slot 5) day color is flat (200,200,200)
         # (lum 200) and whose Ambient (slot 3) day is (60,60,60) (lum 60).
         raw = bytearray(160)
         for time in range(4):
@@ -4953,7 +4953,7 @@ class TestLandOverrides:
             "the override kept the master's heights — the castle would sit on "
             "the master's terrain")
 
-    def test_normals_and_colours_are_mapped(self):
+    def test_normals_and_colors_are_mapped(self):
         master = self._land(VNML='00' * 3267, VCLR='11' * 3267)
         plugin = self._land(VNML='7f' * 3267, VCLR='22' * 3267)
 
