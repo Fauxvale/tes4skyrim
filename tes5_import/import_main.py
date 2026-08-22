@@ -1911,11 +1911,40 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # can be gated to cells that actually need it (see split_disconnected_
     # interiors docstring: only a same-cell door pair whose two ends land in
     # different components is the CharacterGen-class bug).
+    #
+    # The MASTERS' doors are indexed too, exactly as _build_teleport_grid does
+    # for the same records: an override plugin re-places a master's cell while
+    # the teleport pair inside it stays master-owned, so a by_type-only scan
+    # sees no pair, skips the split, and the CharacterGen bug comes back for
+    # precisely the plugins that inherit their interiors. Measured on
+    # Morrowind_ob - Chargen and Transport Mod.esp: 8,087 master REFRs carry
+    # XTEL that this dict could not see.
+    #
+    # **Key a master's record on its master_export KEY, not rec['FormID'].**
+    # The key is already in THIS plugin's index space; the record's own field
+    # is in the master's (see the fid_to_edid note above). get_formid applies
+    # our blanket offset, which is only valid for the former.
     door_xtel_target = {}
-    for rec in by_type.get('REFR', []):
+    _xtel_sources = [ctx.master_export.items()] if (
+        ctx and getattr(ctx, 'master_export', None)) else []
+    # The plugin's own records go LAST so an override wins the FormID.
+    _xtel_sources.append((r.get('FormID', ''), r) for r in by_type.get('REFR', []))
+    # `XTEL.Door` first: it is absent on all but ~0.5% of a master's records,
+    # so it rejects the 1.6M-record scan far cheaper than the signature does
+    # (measured on the Chargen mod's masters: 0.28s vs 0.73s, same 8,087 rows).
+    for fid_str, rec in (p for src in _xtel_sources for p in src):
+        if 'XTEL.Door' not in rec:
+            continue
+        if not fid_str or rec.get('Signature', 'REFR') != 'REFR':
+            continue
         tgt = get_formid(rec, 'XTEL.Door')
         if tgt:
-            door_xtel_target[get_formid(rec, 'FormID')] = tgt
+            # Remap the KEY through the same path a record's own id takes.
+            # get_formid(..., 'FormID') is `remap_formid(raw, is_own_id=True)`
+            # plus the malformed-value guard, so feed it the key verbatim.
+            src_fid = get_formid({'FormID': fid_str}, 'FormID')
+            if src_fid:
+                door_xtel_target[src_fid] = tgt
     n_split = split_disconnected_interiors(navm_cache, writer, door_xtel_target)
     print(f"    Interior split: {time.time() - _t_sp:.1f}s")
     if n_split:

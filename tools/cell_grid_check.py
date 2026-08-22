@@ -222,15 +222,18 @@ def main():
         for (wrld, gx, gy), fids in grids.items():
             by_world[wrld].append((gx, gy, fids))
         print('\nworldspace grid extents:')
-        for wrld, cells in sorted(by_world.items(), key=lambda kv: -len(kv[1])):
-            xs = [c[0] for c in cells]
-            ys = [c[1] for c in cells]
-            oob = [c for c in cells
+        # NOT `cells`: that name holds the cell table `check_teleport_cells`
+        # reads, and rebinding it here would silently empty the teleport
+        # report for anyone combining --extents with --teleport-cells.
+        for wrld, wcells in sorted(by_world.items(), key=lambda kv: -len(kv[1])):
+            xs = [c[0] for c in wcells]
+            ys = [c[1] for c in wcells]
+            oob = [c for c in wcells
                    if abs(c[0]) > CK_MAX_CELL_COORD
                    or abs(c[1]) > CK_MAX_CELL_COORD]
             n_oob += len(oob)
             mark = f'  <-- {len(oob)} OUTSIDE CK RANGE' if oob else ''
-            print(f'  {worlds.get(wrld, "?"):34s} {len(cells):6d} cells  '
+            print(f'  {worlds.get(wrld, "?"):34s} {len(wcells):6d} cells  '
                   f'x[{min(xs)},{max(xs)}] y[{min(ys)},{max(ys)}]{mark}')
             for gx, gy, fids in sorted(oob)[:20]:
                 print(f'      ({gx},{gy}) '
