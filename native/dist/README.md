@@ -1,11 +1,17 @@
-# Prebuilt navmesh extension
+# Prebuilt native artifacts
 
-One compiled module, **committed on purpose** — the navmesh build requires it
-and most machines running the conversion have no C++ compiler:
+**Committed on purpose** — the conversion needs them and most machines running
+it have no C++ compiler:
 
-| Module | Source | Used by |
-|---|---|---|
-| `_navgrow_native.<abi>.pyd` | `../src/grow.cpp` | `navmesh.corridor_grow` (Phase-2 width march) and `navmesh.corridor_union` (per-vertex surface levels) |
+| Artifact | Kind | Source | Used by |
+|---|---|---|---|
+| `_navgrow_native.<abi>.pyd` | Python extension (64-bit) | `../src/navgrow/grow.cpp` | `navmesh.corridor_grow` (Phase-2 width march) and `navmesh.corridor_union` (per-vertex surface levels) |
+| `spt_engine_dump.exe` | standalone program (**32-bit**) | `../src/spt_engine/` | `asset_convert.spt_engine_geom` — the SpeedTree engine-branch path (`--engine-branches`) |
+
+Build everything with:
+
+    python native/build.py --programs      # .pyd + the standalone programs
+    python native/build.py --only-programs # just the .exe
 
 (`_navmesh_native` / `decimate.cpp` served the old `spanmesh` generator and was
 deleted with it — see
@@ -17,9 +23,28 @@ dense interior cell (Wendir02, 938 edges) spent ~150s in the width march alone
 lookup. Both are batched so the Python/C boundary is crossed once per CELL
 rather than once per probe, which took that cell to ~2.6s.
 
-Only the `.pyd` belongs here. The `.lib` / `.exp` MSVC emits are link-time
-artifacts for callers that link against the DLL — nothing does — so they are
-written to `../build/` and gitignored.
+Only runtime artifacts belong here. The `.lib` / `.exp` MSVC emits are
+link-time artifacts for callers that link against the DLL — nothing does — so
+they are written to `../build/` and gitignored, along with every `.obj`.
+
+## `spt_engine_dump.exe` is 32-bit, and must be
+
+It maps the user's own `Oblivion.exe` and calls the SpeedTreeRT 4.x code
+statically linked into it. That image is i386 with its relocations **stripped**,
+so it can only load at its fixed base `0x400000` — which only a 32-bit host can
+address. The harness is therefore built `/BASE:0x20000000 /FIXED
+/DYNAMICBASE:NO` to keep itself out of that range.
+
+**No Bethesda code is redistributed.** The harness contains none of
+Oblivion.exe; it maps the copy the user already owns, at runtime, as data (the
+game is never launched). Verified by scanning 4,000 random 32-byte windows of
+Oblivion.exe against the built binary: the only 3 hits are generic MSVC CRT
+character tables (ASCII, case-conversion, a codepage ramp), and the only
+"Oblivion"/"SpeedTree" strings present are the harness's own usage text.
+
+Unlike the `.pyd`, this one is **optional at runtime**: if it or a configured
+Oblivion install is missing, `spt_engine_geom` raises `EngineUnavailable` and
+the caller falls back to the pure-Python generator, which needs no executable.
 
 ## The ABI tag matters
 
@@ -35,9 +60,9 @@ That needs "Build Tools for Visual Studio" with the C++ workload (a full Visual
 Studio install is not required); the build script locates MSVC through
 `vswhere`.
 
-## Why it is not optional
+## Why the `.pyd` is not optional
 
-The extensions are imported unconditionally. A silent fallback to a Python
+The navmesh extension is imported unconditionally. A silent fallback to a Python
 implementation would make navmesh output depend on whether a build artifact
 happened to be present, and the pipeline's output must be byte-reproducible.
 

@@ -246,9 +246,15 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
 
     return stats
 
-def convert_speedtrees(source_file, extract_dir='export', output_dir='output'):
+def convert_speedtrees(source_file, extract_dir='export', output_dir='output',
+                       use_engine=True):
     """Convert SpeedTree `.spt` files into NIFs and place them under
     `output_dir/<source_name>/meshes/tes4/speedtrees`.
+
+    `use_engine` (ON by default) takes branches from Oblivion's own SpeedTree
+    code via the committed native harness; the Python generator is the
+    per-tree FALLBACK when no Oblivion.exe is configured, the harness is
+    missing, or a dump fails.  See asset_convert/spt_engine_geom.py.
     """
     extract_dir = Path(extract_dir)
     output_dir = Path(output_dir)
@@ -277,7 +283,7 @@ def convert_speedtrees(source_file, extract_dir='export', output_dir='output'):
         spt_stats['spt_conversion'] = spt_converter.convert_spt_directory(
             spt_src, spt_dst,
             export_dir=_record_dir(extract_dir, source_name),
-            master_tree_dirs=master_tree_dirs)
+            master_tree_dirs=master_tree_dirs, use_engine=use_engine)
     else:
         print(f"  No trees/ directory found at {spt_src}")
 

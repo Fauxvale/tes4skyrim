@@ -30,7 +30,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # module name -> source file.  Each builds to its own .pyd; they share no code,
 # so a failure in one does not block the other.
 MODULES = {
-    '_navgrow_native': os.path.join(ROOT, 'native', 'src', 'grow.cpp'),
+    '_navgrow_native': os.path.join(ROOT, 'native', 'src', 'navgrow',
+                                    'grow.cpp'),
+}
+
+# Standalone EXECUTABLES, not importable modules.  They need their own build
+# rules (no Python/numpy headers, no ABI suffix, and spt_engine must be 32-bit
+# -- see native/src/spt_engine/build.bat for why), so they are driven by their
+# own script rather than forced through the extension-module path above.
+PROGRAMS = {
+    'spt_engine_dump': os.path.join(ROOT, 'native', 'src', 'spt_engine',
+                                    'build.bat'),
 }
 
 # The built .pyd is COMMITTED (see native/dist/README.md) so the pipeline runs
@@ -155,11 +165,46 @@ def build_one(name, src, toolchain, py_inc, np_inc, py_lib, ext_suffix, force):
     return 0
 
 
+def build_programs():
+    """Build the standalone executables in PROGRAMS.
+
+    These are NOT Python extension modules: each ships its own build script
+    because its requirements differ from the .pyd path (spt_engine_dump is
+    32-bit, links no Python, and pins its image base).  Windows-only for now;
+    the scripts are .bat.
+    """
+    if sys.platform != 'win32':
+        print('skipping standalone programs: their build scripts are Windows '
+              'batch files (the built .exe still runs under Wine)')
+        return 0
+    rc = 0
+    for name, script in PROGRAMS.items():
+        if not os.path.exists(script):
+            print(f'ERROR: missing build script for {name}: {script}',
+                  file=sys.stderr)
+            rc = 1
+            continue
+        print('building', name)
+        r = subprocess.run([script], cwd=os.path.dirname(script), shell=True)
+        if r.returncode != 0:
+            print('BUILD FAILED:', name, file=sys.stderr)
+            rc = r.returncode
+    return rc
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--force', action='store_true')
     ap.add_argument('--module', help='build only this module')
+    ap.add_argument('--programs', action='store_true',
+                    help='also build the standalone executables '
+                         '(see PROGRAMS)')
+    ap.add_argument('--only-programs', action='store_true',
+                    help='build ONLY the standalone executables')
     a = ap.parse_args()
+
+    if a.only_programs:
+        return build_programs()
 
     import numpy
     ext_suffix = sysconfig.get_config_var('EXT_SUFFIX') or '.pyd'
@@ -193,6 +238,8 @@ def main():
                        ext_suffix, a.force)
         if rc != 0:
             return rc
+    if a.programs:
+        return build_programs()
     return 0
 
 

@@ -572,11 +572,22 @@ def phase_speedtrees(file_name: str, config: dict, output_dir: str = None):
     extract_dir = str(SCRIPT_DIR / "export")
     out_dir     = output_dir or str(SCRIPT_DIR / "output")
 
+    # Branches come from Oblivion's own SpeedTree code by DEFAULT.  It needs a
+    # configured Oblivion.exe plus the committed native/dist harness; when
+    # either is missing, or a dump fails, conversion falls back PER TREE to the
+    # pure-Python generator, which needs no executable.  Set
+    # "speedtreeEngineBranches": false (or pass --no-engine-branches) to force
+    # the Python generator everywhere.
+    use_engine = bool(config.get("speedtreeEngineBranches", True))
+    if not use_engine:
+        print(f"[{file_name}]   engine branches DISABLED -- using the Python "
+              f"generator for every tree")
     print(f"[{file_name}] Converting SpeedTrees (SPTs)...")
     stats = convert_speedtrees(
         source_file=file_name,
         extract_dir=extract_dir,
         output_dir=out_dir,
+        use_engine=use_engine,
     )
     s = stats.get('spt_conversion', {})
     print(f"[{file_name}] SpeedTrees complete: ok={s.get('ok',0)} fail={s.get('fail',0)} skip={s.get('skip',0)}")
@@ -1252,6 +1263,12 @@ def main():
                         help="Path to conversion_config.json")
     parser.add_argument("--output-dir", metavar="PATH",
                         help="Output directory (default: output/ in project root)")
+    parser.add_argument("--no-engine-branches", action="store_true",
+                        help="Force the pure-Python SpeedTree generator. "
+                             "Engine branches (from the game's own code) are "
+                             "the DEFAULT and already fall back to Python per "
+                             "tree when no Oblivion.exe is configured or the "
+                             "native harness is missing.")
     parser.add_argument("--export-only",         action="store_true",
                         help="Parse TES4 binary -> key/value text cache")
     parser.add_argument("--import-only",         action="store_true",
@@ -1343,6 +1360,9 @@ def main():
     args = parser.parse_args()
 
     config       = load_config(args.config)
+    # CLI flag overrides the config key; without it the config value stands.
+    if args.no_engine_branches:
+        config["speedtreeEngineBranches"] = False
     tes4_data, tes5_data = get_paths(config)
     output_dir   = args.output_dir or config.get("outputDir") or str(SCRIPT_DIR / "output")
     export_dir   = str(SCRIPT_DIR / "export")

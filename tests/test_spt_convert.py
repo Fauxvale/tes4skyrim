@@ -298,3 +298,228 @@ def _read_manifest():
             k, v = line.split('=', 1)
             cur[k] = v
     return out
+
+
+# ---------------------------------------------------------------------------
+# Engine-branch alternate path (asset_convert/spt_engine_geom.py)
+#
+# The engine path is OPT-IN and needs a configured Oblivion.exe plus the built
+# native/dist harness.  What must hold unconditionally is the CONTRACT:
+# when the engine is unavailable, conversion falls back to the untouched
+# Python generator and produces byte-identical output to the default path.
+# ---------------------------------------------------------------------------
+
+class TestEngineBranchPath:
+
+    def _fixture(self):
+        from asset_convert.spt_converter import (_tex_index, load_tree_manifest)
+        from output_layout import assets_for
+        export_dir = Path('export/Oblivion.esm')
+        tex = _tex_index(assets_for(export_dir) / 'textures' / 'trees')
+        man = load_tree_manifest(export_dir)
+        recs = man.get('treeginkgo')
+        if not recs:
+            pytest.skip('treeginkgo TREE record not in the export')
+        eid, icon, seed = recs[0]
+        return Path(_EXPORT / 'treeginkgo.spt'), tex, eid, icon, seed
+
+    @pytest.mark.skipif(not (_HAVE_EXPORT and _HAVE_PYFFI),
+                        reason='needs the Oblivion export and pyffi')
+    def test_fallback_is_byte_identical_to_default(self, tmp_path):
+        """An unavailable engine must fall back to the generator EXACTLY.
+
+        Regression: build_tree_engine originally checked availability only on a
+        dump-cache MISS, so a stale cached .bin made an unavailable engine look
+        available and the fallback never fired.
+        """
+        from asset_convert import spt_engine_geom as eg
+        from asset_convert.spt_converter import convert_one
+        src, tex, eid, icon, seed = self._fixture()
+
+        default = tmp_path / 'default.nif'
+        convert_one(src, default, icon=icon, seed=seed, tex_idx=tex,
+                    name=eid.lower(), use_engine=False)
+
+        real = eg.HARNESS
+        try:
+            eg.HARNESS = tmp_path / 'missing_harness.exe'
+            fb = tmp_path / 'fallback.nif'
+            convert_one(src, fb, icon=icon, seed=seed, tex_idx=tex,
+                        name=eid.lower(), use_engine=True)
+        finally:
+            eg.HARNESS = real
+        assert fb.read_bytes() == default.read_bytes()
+
+    @pytest.mark.skipif(not (_HAVE_EXPORT and _HAVE_PYFFI),
+                        reason='needs the Oblivion export and pyffi')
+    def test_missing_exe_falls_back(self, tmp_path):
+        """No configured Oblivion.exe must fall back, not raise."""
+        from asset_convert import spt_engine_geom as eg
+        from asset_convert.spt_converter import convert_one
+        src, tex, eid, icon, seed = self._fixture()
+
+        orig = eg.find_oblivion_exe
+        try:
+            eg.find_oblivion_exe = lambda *a, **k: ''
+            out = tmp_path / 'noexe.nif'
+            convert_one(src, out, icon=icon, seed=seed, tex_idx=tex,
+                        name=eid.lower(), use_engine=True)
+        finally:
+            eg.find_oblivion_exe = orig
+        assert out.is_file() and out.stat().st_size > 0
+
+    def test_engine_path_is_on_by_default(self):
+        """Engine branches are the DEFAULT; Python is the FALLBACK.
+
+        The engine path is what ships -- it is only skipped per tree when no
+        Oblivion.exe is configured, the native harness is missing, or a dump
+        fails.  Defaulting it off made the good path opt-in and left everyone
+        on the reimplementation.
+        """
+        import inspect
+        from asset_convert.spt_converter import convert_one, convert_spt_directory
+        from asset_convert.asset_pipeline import convert_speedtrees
+        assert (inspect.signature(convert_one)
+                .parameters['use_engine'].default is True)
+        assert (inspect.signature(convert_spt_directory)
+                .parameters['use_engine'].default is True)
+        assert (inspect.signature(convert_speedtrees)
+                .parameters['use_engine'].default is True)
+
+    @pytest.mark.skipif(not _HAVE_EXPORT, reason='needs the Oblivion export')
+    def test_strip_expansion_drops_degenerates(self):
+        """Strip stitching repeats an index; those joins are not triangles."""
+        from asset_convert.spt_engine_geom import strips_to_triangles
+        strip = np.array([0, 1, 2, 2, 2, 3, 4, 5], np.int64)
+        tris = strips_to_triangles([strip])
+        assert len(tris) == 3                     # 6 windows, 3 degenerate
+        for a, b, c in tris:
+            assert a != b and b != c and a != c
+
+    @pytest.mark.skipif(not _HAVE_EXPORT, reason='needs the Oblivion export')
+    def test_strip_expansion_alternates_winding(self):
+        """A triangle strip flips winding on every other triangle."""
+        from asset_convert.spt_engine_geom import strips_to_triangles
+        tris = strips_to_triangles([np.array([0, 1, 2, 3], np.int64)])
+        assert tris.tolist() == [[0, 1, 2], [1, 3, 2]]
+
+    @pytest.mark.skipif(not _HAVE_EXPORT, reason='needs the Oblivion export')
+    def test_orphan_repair_winding_faces_outward(self):
+        """Repair triangles must wind the same way the engine's own do.
+
+        The engine's LOD-0 strip list leaves whole vertex blocks unreferenced
+        (on treecottonwoodsu, 560 of 2,044 -- including the flared trunk base),
+        so those blocks are stitched back into tubes here.  The engine's strips
+        carry their winding; ours is derived, and the first version derived it
+        BACKWARDS, giving inward-facing normals and an inside-out trunk.
+
+        Ground truth is the engine's own per-vertex normals: a correctly wound
+        face normal points the same way they do.
+        """
+        from asset_convert.spt_engine_geom import (read_dump, run_dump,
+                                                   _orphan_ring_triangles,
+                                                   engine_available)
+        if not engine_available():
+            pytest.skip('engine path unavailable')
+        src = _EXPORT / 'treecottonwoodsu.spt'
+        if not src.is_file():
+            pytest.skip('treecottonwoodsu.spt not in the export')
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            dump = run_dump(src, Path(td) / 'cw.bin', seed=301409)
+            co, no, uv, strips = read_dump(dump)
+        orphan = _orphan_ring_triangles(co, strips)
+        if not len(orphan):
+            pytest.skip('no orphan blocks for this tree')
+
+        a, b, c = co[orphan[:, 0]], co[orphan[:, 1]], co[orphan[:, 2]]
+        face = np.cross(b - a, c - a)
+        vn = (no[orphan[:, 0]] + no[orphan[:, 1]] + no[orphan[:, 2]]) / 3.0
+        dot = np.einsum('ij,ij->i', face, vn)
+        ok = np.isfinite(dot)
+        agree = (dot[ok] > 0).mean()
+        assert agree > 0.95, (
+            f'repair triangles wound inward: only {agree:.1%} agree with the '
+            f'engine vertex normals (reversed would be {1 - agree:.1%})')
+
+    @pytest.mark.skipif(not _HAVE_EXPORT, reason='needs the Oblivion export')
+    def test_orphan_repair_emits_no_oversized_triangles(self):
+        """Ring-size inference is heuristic; the size guard must bound it.
+
+        Mis-inferring a block's ring size stitches vertices from opposite
+        sides of a tube, producing triangles that span a large fraction of the
+        tree (measured up to 46% on treedogwoodsu across three successive
+        inference attempts).  Whatever the inference does, nothing long may
+        survive.
+        """
+        from asset_convert.spt_engine_geom import (read_dump, run_dump,
+                                                   _orphan_ring_triangles,
+                                                   engine_available)
+        if not engine_available():
+            pytest.skip('engine path unavailable')
+        # Pick a tree the repair actually touches.  Only 14 of 202 dumps get
+        # any repair triangles now that it is gated on coverage, and dogwood
+        # (the original subject) is no longer one of them -- a test aimed at a
+        # tree with zero repair triangles asserts nothing.
+        src = _EXPORT / 'treecottonwoodsu.spt'
+        if not src.is_file():
+            pytest.skip('treecottonwoodsu.spt not in the export')
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            dump = run_dump(src, Path(td) / 'cw.bin', seed=301409)
+            co, no, uv, strips = read_dump(dump)
+        orphan = _orphan_ring_triangles(co, strips)
+        if not len(orphan):
+            pytest.skip('no orphan blocks for this tree')
+        a, b, c = co[orphan[:, 0]], co[orphan[:, 1]], co[orphan[:, 2]]
+        edge = np.maximum(np.maximum(np.linalg.norm(b - a, axis=1),
+                                     np.linalg.norm(c - b, axis=1)),
+                          np.linalg.norm(a - c, axis=1))
+        fin = np.isfinite(co).all(1)
+        span = float(np.linalg.norm(co[fin].max(0) - co[fin].min(0)))
+        assert edge.max() <= 0.10 * span + 1e-6, (
+            f'repair emitted a {edge.max():.1f}-unit edge on a {span:.1f}-unit '
+            f'tree ({edge.max() / span:.1%} of the diagonal)')
+
+    @pytest.mark.skipif(not _HAVE_EXPORT, reason='needs the Oblivion export')
+    def test_bare_tree_gets_no_leaves(self):
+        """A tree the engine gives no leaves must ship none.
+
+        dtree01 is a bare dead tree: its leaf level stores child_freq = 0, so
+        the engine generates zero leaves.  The dump therefore records an
+        EXPLICIT zero, and the reader must distinguish that from "this dump
+        has no leaf chunk at all".
+
+        Regression: it did not, and fell back to the Python foliage -- pasting
+        264 leaf cards, placed against PYTHON branches, onto engine bark they
+        never matched.  They floated up to 36% of the tree diagonal off the
+        model, wearing a mania leaf atlas on a dementia tree.
+        """
+        from asset_convert.spt_engine_geom import (read_leaf_centres, run_dump,
+                                                   build_tree_engine,
+                                                   engine_available)
+        if not engine_available():
+            pytest.skip('engine path unavailable')
+        src = _EXPORT / 'dtree01.spt'
+        if not src.is_file():
+            pytest.skip('dtree01.spt not in the export')
+        tree = parse_spt(src)
+        assert float(tree.levels[-2].child_freq or 0.0) <= 0.0, \
+            'dtree01 is supposed to gate its leaves off'
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            dump = run_dump(src, Path(td) / 'dtree01.bin', seed=581987)
+            centres = read_leaf_centres(dump)
+            # an explicit zero is an empty ARRAY, never None
+            assert centres is not None, \
+                'a zero leaf count must be recorded, not omitted'
+            assert len(centres) == 0
+
+            geo = build_tree_engine(tree, src, seed=581987,
+                                    cache_dir=Path(td))
+        assert geo.leaf_groups == [], \
+            f'bare tree grew {geo.n_leaves} leaves from the Python fallback'
+        assert geo.n_leaves == 0
+        assert geo.bark_tris is not None and len(geo.bark_tris) > 0, \
+            'the bark must still be there'

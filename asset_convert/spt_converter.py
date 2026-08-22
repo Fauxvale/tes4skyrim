@@ -429,10 +429,28 @@ def _resolve_leaf_tex(tree: SptTree, icon: str, tex_idx: dict) -> str:
 
 def convert_one(spt_path: Path, out_path: Path, icon: str = '',
                 seed: int | None = None, tex_idx: dict | None = None,
-                name: str | None = None) -> bool:
-    """Convert one .spt (one TREE-record variant) to a NIF file."""
+                name: str | None = None, use_engine: bool = True) -> bool:
+    """Convert one .spt (one TREE-record variant) to a NIF file.
+
+    `use_engine` (ON by default) takes branch geometry from Oblivion's own
+    SpeedTree code via `asset_convert/spt_engine_geom.py`.  It needs a
+    configured Oblivion.exe and the committed native harness; when either is
+    missing -- or the dump fails for this tree -- `spt_generator.build_tree`
+    runs instead, unchanged, which needs no executable.  Pass False to force
+    that fallback everywhere.
+    """
     tree = parse_spt(spt_path)
-    geo = build_tree(tree, seed=seed)
+    geo = None
+    if use_engine:
+        try:
+            from .spt_engine_geom import build_tree_engine
+            geo = build_tree_engine(tree, spt_path, seed=seed)
+        except Exception as e:      # noqa: BLE001 - fall back, never abort
+            print(f'  [spt] engine path unavailable for {spt_path.name}: {e}'
+                  f' -- using the generator', flush=True)
+            geo = None
+    if geo is None:
+        geo = build_tree(tree, seed=seed)
 
     bark_stem = Path(tree.bark_texture.replace('\\', '/')).stem.lower()
     tex_idx = tex_idx or {}
@@ -451,13 +469,14 @@ def convert_one(spt_path: Path, out_path: Path, icon: str = '',
 def _convert_job(args):
     """Module-level worker for ProcessPoolExecutor (must be picklable).
 
-    args = (spt_path_str, out_path_str, icon, seed, tex_idx, out_name).
+    args = (spt_path_str, out_path_str, icon, seed, tex_idx, out_name,
+            use_engine).
     Returns (out_name, ok, error_message_or_None).
     """
-    spt_path, out_path, icon, seed, tex_idx, out_name = args
+    spt_path, out_path, icon, seed, tex_idx, out_name, use_engine = args
     try:
         convert_one(Path(spt_path), Path(out_path), icon=icon, seed=seed,
-                    tex_idx=tex_idx, name=out_name)
+                    tex_idx=tex_idx, name=out_name, use_engine=use_engine)
         return (out_name, True, None)
     except Exception as e:  # noqa: BLE001 — report, don't abort the batch
         return (out_name, False, f'{Path(spt_path).name}: {e}')
@@ -466,7 +485,8 @@ def _convert_job(args):
 def convert_spt_directory(src_dir: Path, dst_dir: Path,
                           export_dir: Path | None = None,
                           workers: int | None = None,
-                          master_tree_dirs=None) -> dict:
+                          master_tree_dirs=None,
+                          use_engine: bool = True) -> dict:
     """Convert all .spt files under src_dir into NIFs in dst_dir.
 
     One NIF per TREE record (named <editorid>.nif, seeded and textured from
@@ -483,6 +503,8 @@ def convert_spt_directory(src_dir: Path, dst_dir: Path,
         workers:    process count (default: cpu_count - 1)
         master_tree_dirs: this plugin's masters' `trees/` dirs, searched for
             .spt files its own TREE records name but its export does not ship.
+        use_engine: engine-generated branches (default True; see convert_one).
+            Falls back to the Python generator per-tree when unavailable.
     """
     src_dir = Path(src_dir)
     dst_dir = Path(dst_dir)
@@ -537,11 +559,11 @@ def convert_spt_directory(src_dir: Path, dst_dir: Path,
                 if edid:
                     out_name = edid.lower()
                     jobs.append((str(p), str(dst_dir / (out_name + '.nif')),
-                                 icon, seed, tex_idx, out_name))
+                                 icon, seed, tex_idx, out_name, use_engine))
         else:
             out_name = p.stem.lower()
             jobs.append((str(p), str(dst_dir / (out_name + '.nif')),
-                         '', None, tex_idx, out_name))
+                         '', None, tex_idx, out_name, use_engine))
     n_records = sum(1 for j in jobs if j[3] is not None)
     workers = max(1, min(workers, len(jobs)))
     print(f'  [SPT] {len(spt_files)} SPT files, {len(jobs)} tree variants '
@@ -582,6 +604,12 @@ if __name__ == '__main__':
                         help='Export dir with TREE.txt/textures (default: parent of src_dir)')
     parser.add_argument('--workers', type=int, default=None,
                         help=f'Parallel worker processes (default: {_WORKER_COUNT})')
+    parser.add_argument('--no-engine-branches', action='store_true',
+                        help='Force the pure-Python generator. Engine branches '
+                             '(from the game\'s own SpeedTree code) are the '
+                             'DEFAULT and already fall back to Python per tree '
+                             'when no Oblivion.exe is configured or the '
+                             'native/dist harness is missing.')
     args = parser.parse_args()
 
     if not _PYFFI:
@@ -591,5 +619,5 @@ if __name__ == '__main__':
     counts = convert_spt_directory(
         Path(args.src_dir), Path(args.dst_dir),
         export_dir=Path(args.export_dir) if args.export_dir else None,
-        workers=args.workers)
+        workers=args.workers, use_engine=not args.no_engine_branches)
     raise SystemExit(0 if counts['fail'] == 0 else 1)
