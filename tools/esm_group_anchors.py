@@ -12,9 +12,21 @@ nothing, so every record inside it is unreachable by the engine — as invisible
 as if it had never been written. This is a silent failure: the file loads, the
 records are present in xEdit, and nothing appears in-game.
 
+It also checks TOP-LEVEL GROUP ORDER, a second silent failure of the same
+shape. A REFR resolves its NAME (base object) while the CELL group is being
+parsed, so a base-object type written AFTER CELL/WRLD is not in the form map
+yet and every reference to it is dropped. Measured on Oblivion.esm
+(ckpe.log 2026-08-22): the MSTT group landed after CELL and CK deleted
+**1,852 references** with "Missing/Invalid base object (01xxxxxx)" followed by
+"Ref will be deleted", even though all 18 distinct base records were present
+in the file. Nothing else catches this — the plugin is structurally valid,
+xEdit shows the bases, and only the load order of the groups is wrong.
+
 Usage:
     python tools/esm_group_anchors.py output/<Plugin>/<Plugin>
     python tools/esm_group_anchors.py <plugin> --verbose
+    python tools/esm_group_anchors.py <plugin> --order-only
+    python tools/esm_group_anchors.py <plugin> --reference <Skyrim.esm>
 """
 
 import argparse
@@ -23,6 +35,51 @@ import sys
 
 _HEADER_SIZE = 24
 _OWNED = {1: 'world children', 6: 'cell children', 7: 'topic children'}
+
+# Top-level signatures vanilla writes BEFORE its CELL group. Measured from the
+# real Skyrim.esm and Dawnguard.esm, which agree on every entry here; pass
+# --reference to re-derive it from a plugin instead of trusting this copy.
+_VANILLA_BEFORE_CELL = [
+    'GMST', 'KYWD', 'LCRT', 'AACT', 'TXST', 'GLOB', 'CLAS', 'FACT', 'HDPT',
+    'HAIR', 'EYES', 'RACE', 'SOUN', 'ASPC', 'MGEF', 'SCPT', 'LTEX', 'ENCH',
+    'SPEL', 'SCRL', 'ACTI', 'TACT', 'ARMO', 'BOOK', 'CONT', 'DOOR', 'INGR',
+    'LIGH', 'MISC', 'APPA', 'STAT', 'SCOL', 'MSTT', 'PWAT', 'GRAS', 'TREE',
+    'CLDC', 'FLOR', 'FURN', 'WEAP', 'AMMO', 'NPC_', 'LVLN', 'KEYM', 'ALCH',
+    'IDLM', 'COBJ', 'PROJ', 'HAZD', 'SLGM', 'LVLI', 'WTHR', 'CLMT', 'SPGD',
+    'RFCT', 'REGN', 'NAVI',
+]
+
+
+def top_level_order(path):
+    """[signature] of every top-level GRUP, in file order."""
+    with open(path, 'rb') as fh:
+        hdr_size = struct.unpack_from('<I', fh.read(24), 4)[0]
+        fh.seek(24 + hdr_size)
+        order = []
+        while True:
+            g = fh.read(24)
+            if len(g) < 24 or g[:4] != b'GRUP':
+                break
+            gsize, label = struct.unpack_from('<I4s', g, 4)
+            order.append(label.decode('latin1'))
+            fh.seek(gsize - 24, 1)
+    return order
+
+
+def check_order(path, reference=None):
+    """[(sig, our_index, cell_index)] for groups written too late."""
+    order = top_level_order(path)
+    if 'CELL' not in order:
+        return order, []
+    cell = order.index('CELL')
+    if reference:
+        ref = top_level_order(reference)
+        before = set(ref[:ref.index('CELL')]) if 'CELL' in ref else set()
+    else:
+        before = set(_VANILLA_BEFORE_CELL)
+    late = [(sig, i, cell) for i, sig in enumerate(order)
+            if i > cell and sig in before]
+    return order, late
 
 
 def scan(path):
@@ -63,10 +120,29 @@ def main():
     ap.add_argument('plugin')
     ap.add_argument('--verbose', action='store_true',
                     help='list every orphaned group, not just a summary')
+    ap.add_argument('--order-only', action='store_true',
+                    help='only run the top-level group-order check (seconds, '
+                         'vs a full walk of a 600 MB file)')
+    ap.add_argument('--reference',
+                    help='derive the canonical order from this plugin '
+                         '(e.g. a real Skyrim.esm) instead of the built-in list')
     args = ap.parse_args()
 
-    anchored, orphans = scan(args.plugin)
+    order, late = check_order(args.plugin, args.reference)
     print(f"{args.plugin}")
+    print(f"  top-level groups: {len(order)}")
+    if late:
+        print(f"  GROUPS WRITTEN AFTER CELL that vanilla puts before it: "
+              f"{len(late)}")
+        for sig, i, cell in late:
+            print(f"    {sig} at #{i}, CELL at #{cell} — every reference to a "
+                  f"{sig} base object will be dropped at load")
+    else:
+        print("  group order OK: no base-object type written after CELL")
+    if args.order_only:
+        return 1 if late else 0
+
+    anchored, orphans = scan(args.plugin)
     print(f"  owned groups correctly anchored: {len(anchored)}")
     print(f"  ORPHANED (unreachable in-engine): {len(orphans)}")
     if orphans:
@@ -82,7 +158,7 @@ def main():
             if not args.verbose and len(fids) > len(shown):
                 print(f"      ... and {len(fids) - len(shown)} more "
                       f"(use --verbose)")
-    return 1 if orphans else 0
+    return 1 if (orphans or late) else 0
 
 
 if __name__ == '__main__':

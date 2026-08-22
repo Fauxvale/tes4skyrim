@@ -53,6 +53,7 @@ from .record_types.world import (
     convert_WRLD,
     restamp_wrld_mnam,
     set_cell_locations,
+    set_teleport_grid,
     set_cloud_bank_output,
     set_world_land_extents,
     set_door_navmesh_links,
@@ -1846,6 +1847,9 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     if not ctx or _owns_new_world:
         set_cell_locations(*build_marker_locations(by_type, writer))
 
+    set_teleport_grid(*_build_teleport_grid(
+        by_type, ctx.master_export if ctx else None))
+
     # --- Phase 4: CELL/WRLD hierarchy (+ PGRD→NAVM navmeshes) ---
     # Base-object model index for navmesh static-footprint carving. Only
     # blocking base types contribute; keyed by raw low-24 FormID so lookups
@@ -1903,7 +1907,45 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # collection below (it moves doors onto the component meshes).
     from .navm_split import split_disconnected_interiors
     _t_sp = time.time()
-    n_split = split_disconnected_interiors(navm_cache, writer)
+    # door REFR FormID -> its XTEL teleport-target door FormID, so the split
+    # can be gated to cells that actually need it (see split_disconnected_
+    # interiors docstring: only a same-cell door pair whose two ends land in
+    # different components is the CharacterGen-class bug).
+    #
+    # The MASTERS' doors are indexed too, exactly as _build_teleport_grid does
+    # for the same records: an override plugin re-places a master's cell while
+    # the teleport pair inside it stays master-owned, so a by_type-only scan
+    # sees no pair, skips the split, and the CharacterGen bug comes back for
+    # precisely the plugins that inherit their interiors. Measured on
+    # Morrowind_ob - Chargen and Transport Mod.esp: 8,087 master REFRs carry
+    # XTEL that this dict could not see.
+    #
+    # **Key a master's record on its master_export KEY, not rec['FormID'].**
+    # The key is already in THIS plugin's index space; the record's own field
+    # is in the master's (see the fid_to_edid note above). get_formid applies
+    # our blanket offset, which is only valid for the former.
+    door_xtel_target = {}
+    _xtel_sources = [ctx.master_export.items()] if (
+        ctx and getattr(ctx, 'master_export', None)) else []
+    # The plugin's own records go LAST so an override wins the FormID.
+    _xtel_sources.append((r.get('FormID', ''), r) for r in by_type.get('REFR', []))
+    # `XTEL.Door` first: it is absent on all but ~0.5% of a master's records,
+    # so it rejects the 1.6M-record scan far cheaper than the signature does
+    # (measured on the Chargen mod's masters: 0.28s vs 0.73s, same 8,087 rows).
+    for fid_str, rec in (p for src in _xtel_sources for p in src):
+        if 'XTEL.Door' not in rec:
+            continue
+        if not fid_str or rec.get('Signature', 'REFR') != 'REFR':
+            continue
+        tgt = get_formid(rec, 'XTEL.Door')
+        if tgt:
+            # Remap the KEY through the same path a record's own id takes.
+            # get_formid(..., 'FormID') is `remap_formid(raw, is_own_id=True)`
+            # plus the malformed-value guard, so feed it the key verbatim.
+            src_fid = get_formid({'FormID': fid_str}, 'FormID')
+            if src_fid:
+                door_xtel_target[src_fid] = tgt
+    n_split = split_disconnected_interiors(navm_cache, writer, door_xtel_target)
     print(f"    Interior split: {time.time() - _t_sp:.1f}s")
     if n_split:
         print(f"  Navmesh split: {n_split} interior meshes split into "
@@ -2354,6 +2396,48 @@ def _build_base_model_index(by_type: dict, master_export: dict = None) -> dict:
     return index
 
 
+def _build_teleport_grid(by_type: dict, master_export: dict = None):
+    """(occupied exterior grid squares, teleport-door placements).
+
+    Feeds `record_types.world.set_teleport_grid`, which uses it to reject an
+    XTEL destination that names a grid square holding no cell — a null the CK
+    dereferences without checking.
+
+    The MASTERS' cells and doors are indexed too: a dependent plugin's door
+    routinely teleports into a master-owned worldspace, and a door missing from
+    these maps is simply left alone, so master blindness here would silently
+    turn the check off for exactly the plugins that need it most.
+    """
+    def _sources(sig):
+        out = []
+        if master_export:
+            out.append(r for r in master_export.values()
+                       if r.get('Signature') == sig)
+        out.append(by_type.get(sig, []))
+        return (r for src in out for r in src)
+
+    grid_cells = set()
+    for cell in _sources('CELL'):
+        wrld = get_formid(cell, 'ParentWRLD')
+        if not wrld:
+            continue                       # interior: no grid square
+        if get_int(cell, 'RecordFlags') & 0x400:
+            continue                       # worldspace dummy/persistent cell
+        # Mirror the group builder: a cell whose TES4 record omits XCLC is
+        # bucketed at (0,0), so it really does occupy that square.
+        grid_cells.add((wrld, get_int(cell, 'XCLC.X'), get_int(cell, 'XCLC.Y')))
+
+    placement = {}
+    for ref in _sources('REFR'):
+        if not ref.get('XTEL.Door'):
+            continue                       # only teleport doors can be targets
+        placement[get_formid(ref, 'FormID')] = (
+            get_formid(ref, 'ParentWRLD'),
+            get_float(ref, 'PosX'), get_float(ref, 'PosY'),
+            get_float(ref, 'PosZ'))
+    return grid_cells, placement
+
+
 def _build_door_fid_set(by_type: dict, master_export: dict = None) -> dict:
     """Map raw low-24 DOOR base FormID -> normalised model key.
 
@@ -2714,6 +2798,8 @@ def _precompute_land(by_type: dict, export_dir: str) -> dict:
         str(assets_for(export_dir) / 'mesh_bounds_cache.json'),
         get_injected_formids(),
         dict(world_mod._DOOR_NAVMESH_LINK),
+        set(world_mod._WORLD_GRID_CELLS),
+        dict(world_mod._DOOR_PLACEMENT),
     )
 
     chunks = [[('LAND', rec) for rec in lands[i:i + _LAND_CHUNK]]
@@ -3266,16 +3352,38 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
         cell_fid = get_formid(rec, 'ParentCELL')
         achr_by_cell[cell_fid].append(rec)
 
+    # NOT force-persisted: an exterior static whose bounds cross a cell edge
+    # does NOT have to be persistent.  The CK warning "Ref ... should be
+    # persistent but is not" was read as a rule and applied to 74,467 refs;
+    # the vanilla census refutes it outright -- Skyrim.esm ships 67,751
+    # cell-edge-straddling STAT/TREE refs and only 842 of them (1.2%) are
+    # persistent, LOWER than the 2.3% among refs that straddle nothing.
+    # Forcing the flag made the objects vanish in game while the CK kept
+    # showing them: ICMarketBlock03House01 (forced persistent) was invisible
+    # where its neighbour ICMarketBlock03House02 (untouched) rendered, same
+    # cell, same mesh family.  See docs/ck_vs_game_missing_objects.md.
+
     # Re-home misplaced exterior refs.  Oblivion.esm ships a handful of
-    # temporary refs attached to a grid cell that does not match their
-    # coordinates (the TES4 CS tolerated it; 11 in Tamriel).  The Skyrim CK
-    # does not: on load it warns "Reference attached to wrong cell for its
-    # location" for each and relocates them — and hangs there.  Attach each
-    # such ref to the cell its position actually falls in.  Persistent refs
-    # and refs in persistent (dummy) cells keep their cells: the engine loads
-    # those by worldspace, not by grid.
-    grid_cell = {}   # (wrld, gx, gy) -> cell FormID, non-persistent cells only
-    cell_grid = {}   # cell FormID -> (wrld, gx, gy)
+    # refs attached to a grid cell that does not match their coordinates (the
+    # TES4 CS tolerated it; 11 in Tamriel).  The Skyrim CK does not: on load
+    # it warns "Reference attached to wrong cell for its location" for each
+    # and relocates them — and hangs there.  Attach each such ref to the cell
+    # its position actually falls in.  Refs in a worldspace's persistent
+    # (dummy) cell keep their cell: the engine loads those by worldspace, not
+    # by grid, and such cells are excluded below (never in `cell_grid`).
+    #
+    # A ref being individually flagged Persistent is NOT a reason to skip
+    # this — it still lives in a perfectly normal grid-tiled cell (just in
+    # that cell's "Persistent" child group instead of "Temporary"), and CK
+    # checks its cell placement exactly the same way.  This used to be
+    # gated on `not persistent`, which happened to be harmless while almost
+    # nothing was persistent; once the cross-cell-boundary fix above started
+    # persisting refs that sit right on a cell edge — the same population
+    # most likely to be off-by-one-cell in the first place — the gate started
+    # hiding exactly the refs it needed to fix, and CK hung on them instead.
+    grid_cell = {}       # (wrld, gx, gy) -> output-space cell FormID
+    grid_cell_raw = {}   # (wrld, gx, gy) -> cell's raw (TES4-space) FormID string
+    cell_grid = {}       # output-space cell FormID -> (wrld, gx, gy)
     for cell in cells:
         if get_int(cell, 'RecordFlags') & 0x400:
             continue
@@ -3285,6 +3393,7 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
                get_int(cell, 'XCLC.X'), get_int(cell, 'XCLC.Y'))
         fid = get_formid(cell, 'FormID')
         grid_cell.setdefault(key, fid)
+        grid_cell_raw.setdefault(key, cell.get('FormID'))
         cell_grid[fid] = key
     rehomed = 0
     for by_cell in (refr_by_cell, achr_by_cell):
@@ -3295,14 +3404,21 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
             wrld_fid, cx, cy = grid
             kept = []
             for rec in by_cell[cell_fid]:
-                if (not (get_int(rec, 'RecordFlags') & 0x400)
-                        and get_str(rec, 'PosX')):
+                if get_str(rec, 'PosX'):
                     # Same floor semantics as world._ref_grid.
                     gx = int(get_float(rec, 'PosX') // 4096.0)
                     gy = int(get_float(rec, 'PosY') // 4096.0)
                     if (gx, gy) != (cx, cy):
                         target = grid_cell.get((wrld_fid, gx, gy))
                         if target and target != cell_fid:
+                            # Keep ParentCELL in sync (raw TES4-space string —
+                            # get_formid remaps on every read, so storing the
+                            # already-remapped int here would double-remap).
+                            # Downstream code (XLCN's _reference_location)
+                            # reads ParentCELL directly; leaving it stale
+                            # produced "Ref is not in its persistence
+                            # location" for every persisted, re-homed ref.
+                            rec['ParentCELL'] = grid_cell_raw[(wrld_fid, gx, gy)]
                             by_cell[target].append(rec)
                             rehomed += 1
                             continue

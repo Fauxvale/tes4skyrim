@@ -100,21 +100,39 @@ NAVMESH_FUNCS = {
 }
 
 HOOK_MARKER = '# >>> navmesh-cache-gate >>>'
+HOOK_PRELUDE_MARKER = '# >>> navmesh-cache-stdin >>>'
+HOOK_PRELUDE_END = '# <<< navmesh-cache-stdin <<<'
 # git feeds the refs being pushed on STDIN, one
 # "<local ref> <local sha> <remote ref> <remote sha>" line each.  The gate has
 # to prompt and publish interactively, so python gets </dev/null -- which means
-# python can never read that list itself.  Read it HERE, where stdin is still
-# intact, and forward each remote ref as a --ref argument.  (Passing them on
-# stdin and redirecting were mutually exclusive; this hook previously did both
-# and so gated EVERY push, on every branch, instead of only master.)
+# python can never read that list itself.  So the ref list is captured into a
+# variable and forwarded as --ref arguments.  (Passing them on stdin and
+# redirecting were mutually exclusive; this hook previously did both and so
+# gated EVERY push, on every branch, instead of only master.)
+#
+# The capture MUST happen before any other hook step, because stdin is a PIPE
+# and therefore read-once: `git lfs pre-push` -- which --install appends after,
+# and which ships here by default -- drains it to EOF.  A capture placed after
+# it read nothing, forwarded no --ref, and pushed_refs() then returned None,
+# which gates by design ("unreadable must gate rather than skip").  That made
+# the gate fire on EVERY branch push whenever navmesh sources changed, exactly
+# the bug the ref forwarding was added to fix.  The prelude is installed as a
+# separate marked block at the TOP of the hook, and replays the captured lines
+# into the rest of the hook so git-lfs still receives them.
+HOOK_PRELUDE = '''%s
+# Added by tools/navmesh_cache_hook.py --install
+# stdin is a read-once pipe and later steps (git-lfs) drain it, so capture the
+# pushed-ref list HERE, before anything else, and replay it downstream.
+navmesh_stdin=$(cat)
+navmesh_refs=$(echo "$navmesh_stdin" | awk '$3 != "" {printf " --ref %%s", $3}')
+%s
+''' % (HOOK_PRELUDE_MARKER, HOOK_PRELUDE_END)
 HOOK_SNIPPET = '''%s
 # Added by tools/navmesh_cache_hook.py --install
 # Blocks a push to master that changes navmesh generation unless the shared
 # geometry cache has been rebuilt, then publishes it as a release asset.
-navmesh_refs=''
-while read -r _local_ref _local_sha _remote_ref _remote_sha; do
-    [ -n "$_remote_ref" ] && navmesh_refs="$navmesh_refs --ref $_remote_ref"
-done
+# $navmesh_refs was captured by the stdin prelude at the top of this hook,
+# before git-lfs (or any other step) could drain the read-once pipe.
 # shellcheck disable=SC2086
 python tools/navmesh_cache_hook.py --pre-push $navmesh_refs "$@" </dev/null || exit 1
 # <<< navmesh-cache-gate <<<
@@ -403,6 +421,33 @@ def _existing_block(text: str) -> str:
     return text[start:end]
 
 
+def _insert_prelude(text: str) -> str:
+    """Put the stdin capture at the TOP of the hook, just after the shebang.
+
+    Everything below it then reads the ref list from $navmesh_stdin rather than
+    the pipe, so an existing git-lfs step no longer steals it.
+    """
+    block_new = HOOK_PRELUDE.strip('\n')
+    if HOOK_PRELUDE_MARKER in text:
+        start = text.index(HOOK_PRELUDE_MARKER)
+        end = text.index(HOOK_PRELUDE_END, start) + len(HOOK_PRELUDE_END)
+        block = text[start:end]
+        if block == block_new:
+            return text
+        return text.replace(block, block_new, 1)
+
+    lines = text.split('\n')
+    at = 1 if lines and lines[0].startswith('#!') else 0
+    lines.insert(at, '\n' + block_new + '\n')
+    text = '\n'.join(lines)
+    # Any pre-existing step that expects git's ref list on stdin (git-lfs does)
+    # must now be fed the captured copy, since the pipe is already at EOF.
+    text = re.sub(r'^(\s*)(git lfs pre-push .*)$',
+                  r'\1echo "$navmesh_stdin" | \2',
+                  text, count=1, flags=re.M)
+    return text
+
+
 def install_hook() -> int:
     hooks = os.path.join(nc.repo_root(), '.git', 'hooks')
     path = os.path.join(hooks, 'pre-push')
@@ -415,12 +460,17 @@ def install_hook() -> int:
             # installed": that left a hook whose snippet predates a fix (the
             # ref-forwarding one especially) silently in place forever.
             block = _existing_block(existing)
-            if block == HOOK_SNIPPET.strip('\n'):
+            updated = existing
+            if block != HOOK_SNIPPET.strip('\n'):
+                updated = updated.replace(block, HOOK_SNIPPET.strip('\n'), 1)
+            # The gate block alone is not enough: without the stdin prelude the
+            # ref list is already at EOF by the time it runs.
+            updated = _insert_prelude(updated)
+            if updated == existing:
                 print('Already installed and up to date in %s' % path)
                 return 0
-            existing = existing.replace(block, HOOK_SNIPPET.strip('\n'), 1)
             with open(path, 'w', encoding='utf-8', newline='\n') as fh:
-                fh.write(existing)
+                fh.write(updated)
             print('Updated the navmesh cache gate in %s' % path)
             return 0
 
@@ -430,8 +480,10 @@ def install_hook() -> int:
         existing += '\n'
 
     # Append: an existing hook (git-lfs ships one here) must keep working.
+    # _insert_prelude puts the stdin capture ABOVE that hook and rewires it to
+    # the captured copy, so the gate below still sees the pushed refs.
     with open(path, 'w', encoding='utf-8', newline='\n') as fh:
-        fh.write(existing + '\n' + HOOK_SNIPPET)
+        fh.write(_insert_prelude(existing) + '\n' + HOOK_SNIPPET)
     try:
         os.chmod(path, 0o755)
     except OSError:

@@ -54,6 +54,8 @@ except ImportError:
     sys.exit('pefile required: pip install pefile')
 try:
     from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+    from capstone.x86 import X86_OP_MEM as _X86_OP_MEM
+    from capstone.x86 import X86_REG_RIP as _X86_REG_RIP
 except ImportError:
     sys.exit('capstone required: pip install capstone')
 
@@ -173,6 +175,58 @@ class Binary:
             if self.rva_to_off(rva) is None:
                 break
             out.append((i, rva))
+        return out
+
+    # -- .pdata function bounds -------------------------------------------
+
+    def runtime_functions(self):
+        """Sorted [(begin_rva, end_rva, unwind_rva)] from the .pdata table.
+
+        x64 PE images carry a complete function table for SEH unwinding, so
+        function START and END are recorded facts, not guesses -- that is what
+        makes "disassemble the whole function containing this address" exact
+        even with no PDBs.
+        """
+        if getattr(self, '_pdata', None) is not None:
+            return self._pdata
+        d = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]      # EXCEPTION table
+        rva, size = d.VirtualAddress, d.Size
+        raw = self.read(rva, size)
+        out = []
+        for i in range(0, len(raw) - 11, 12):
+            b, e, u = struct.unpack_from('<III', raw, i)
+            if b == 0 and e == 0:
+                continue
+            out.append((b, e, u))
+        out.sort()
+        self._pdata = out
+        return out
+
+    def func_bounds(self, rva: int):
+        """(begin, end) of the function containing `rva`, or None."""
+        import bisect
+        tbl = self.runtime_functions()
+        i = bisect.bisect_right([t[0] for t in tbl], rva) - 1
+        if i < 0:
+            return None
+        b, e, _ = tbl[i]
+        return (b, e) if b <= rva < e else None
+
+    # -- strings -----------------------------------------------------------
+
+    def strings_at(self, rva: int, count: int = 20, maxlen: int = 400):
+        """[(rva, text)] for `count` consecutive NUL-terminated strings."""
+        out = []
+        cur = rva
+        for _ in range(count):
+            blk = self.read(cur, maxlen)
+            if not blk:
+                break
+            end = blk.find(b'\0')
+            if end < 0:
+                break
+            out.append((cur, blk[:end].decode('latin1')))
+            cur += end + 1
         return out
 
     # -- disassembly -------------------------------------------------------
@@ -311,12 +365,47 @@ class LiveBinary(Binary):
         return off if 0 <= off < len(self.data) else None
 
 
+_PRINTABLE = set(range(0x20, 0x7f)) | {9}
+
+
+def _string_at(binary: Binary, rva: int, maxlen: int = 200):
+    """The C string at `rva` if it looks like readable text, else None.
+
+    `lea reg, [rip+disp]` is how every literal reaches a call site, so
+    resolving those operands turns the engine's own error messages into an
+    inline map of what each branch is checking -- which is the whole reason
+    this annotation exists.
+    """
+    blk = binary.read(rva, maxlen)
+    if not blk:
+        return None
+    end = blk.find(b'\0')
+    if end < 4:
+        return None
+    s = blk[:end]
+    if not all(c in _PRINTABLE for c in s):
+        return None
+    return s.decode('latin1')
+
+
 def _fmt(binary: Binary, insns, show_targets=False):
     lines = []
     targets = []
     for ins in insns:
         rva = ins.address - binary.base
-        lines.append(f'  {rva:#010x}  {ins.mnemonic:<7} {ins.op_str}')
+        note = ''
+        if 'rip +' in ins.op_str or 'rip -' in ins.op_str:
+            try:
+                for op in ins.operands:
+                    if op.type == _X86_OP_MEM and op.mem.base == _X86_REG_RIP:
+                        tgt = ins.address + ins.size + op.mem.disp - binary.base
+                        text = _string_at(binary, tgt)
+                        note = (f'   ; {tgt:#x} {text!r}' if text
+                                else f'   ; {tgt:#x}')
+                        break
+            except Exception:
+                pass
+        lines.append(f'  {rva:#010x}  {ins.mnemonic:<7} {ins.op_str}{note}')
         if show_targets and ins.mnemonic in ('call', 'jmp') and \
                 ins.op_str.startswith('0x'):
             try:
@@ -334,6 +423,12 @@ def main():
     ap.add_argument('--vtable', help='show vtable(s) for this class name')
     ap.add_argument('--slot', type=int, help='with --vtable: disassemble this slot')
     ap.add_argument('--disasm', help='disassemble at this RVA (hex ok)')
+    ap.add_argument('--func',
+                    help='disassemble the WHOLE function containing this RVA '
+                         '(bounds come from the .pdata unwind table, so they '
+                         'are exact without PDBs)')
+    ap.add_argument('--strings',
+                    help='dump consecutive NUL-terminated strings at this RVA')
     ap.add_argument('--count', type=int, default=60)
     ap.add_argument('--live', action='store_true',
                     help='analyse the RUNNING process instead of the file on '
@@ -379,6 +474,33 @@ def main():
                 print('\n'.join(lines))
                 if tg:
                     print('  targets: ' + ', '.join(hex(t) for t in sorted(set(tg))))
+
+    if args.strings:
+        rva = int(args.strings, 16)
+        if rva > b.base:
+            rva -= b.base
+        print(f'\nstrings @ {rva:#x}:')
+        for srva, text in b.strings_at(rva, args.count):
+            print(f'  {srva:#010x}  {text!r}')
+
+    if args.func:
+        rva = int(args.func, 16)
+        if rva > b.base:
+            rva -= b.base
+        bounds = b.func_bounds(rva)
+        if not bounds:
+            print(f'\nno .pdata entry covers {rva:#x}')
+        else:
+            start, end = bounds
+            n = (end - start)
+            print(f'\nfunction {start:#x}..{end:#x} ({n} bytes) contains '
+                  f'{rva:#x}:')
+            insns = [i for i in b.disasm(start, n)
+                     if i.address - b.base < end]
+            lines, tg = _fmt(b, insns, args.show_targets)
+            print('\n'.join(lines))
+            if tg:
+                print('  targets: ' + ', '.join(hex(t) for t in sorted(set(tg))))
 
     if args.disasm:
         rva = int(args.disasm, 16) if args.disasm.startswith('0x') \

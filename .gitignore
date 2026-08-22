@@ -10,6 +10,13 @@ temp/
 
 *_log.txt
 *.log
+
+# Patch/merge backup files. `patch` and most merge tools drop these next to
+# the source; six of them were committed once already.
+*.orig
+*.rej
+*.bak
+
 .papyrus
 tools/*.txt
 external/lodgen/*.txt
