@@ -10,6 +10,13 @@ temp/
 
 *_log.txt
 *.log
+
+# Patch/merge backup files. `apply_patches.py --apply` and `patch` both
+# drop these next to the source; six of them were committed once already.
+*.orig
+*.rej
+*.bak
+
 .papyrus
 tools/*.txt
 external/lodgen/*.txt

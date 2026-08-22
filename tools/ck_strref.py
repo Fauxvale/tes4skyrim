@@ -19,7 +19,12 @@ def o2r(off):
         if ra <= off < ra + rs:
             return va + (off - ra)
     return None
-tva, _, tra, trs, _ = [s for s in secs if s[4] == '.text' and s[3] > 0x1000000][0]
+# The largest `.text` section, whatever its size -- this also has to work on
+# the small CKPE DLLs, not just the 48 MB CreationKit.exe.
+_texts = [s for s in secs if s[4] == '.text' and s[3] > 0]
+if not _texts:
+    sys.exit(f'{a.exe}: no .text section')
+tva, _, tra, trs, _ = max(_texts, key=lambda s: s[3])
 code = d[tra:tra + trs]
 
 rx = re.compile(a.pattern)
