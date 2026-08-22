@@ -241,7 +241,16 @@ def _resolve_declared_properties(declared, well_known_props: dict = None) -> dic
     for name in (declared or ()):
         low = name.lower()
         if low in ('player', 'playerref'):
-            out[name] = _PLAYER_FORMID
+            # An ActorBase-typed `Player` is the NPC_ (0x7), not the reference
+            # (0x14): the VM refuses a reference into an ActorBase property and
+            # the whole script's init aborts.  TES4 scripts reach the base by
+            # raw FormID — `GetIsID 7` in Knights' ND10 time-stop effect.
+            # `declared` is normally {name: type}, but callers may pass a
+            # bare sequence of names; without a type, assume the reference.
+            _dtype = (declared.get(name)
+                      if isinstance(declared, dict) else None)
+            out[name] = (_PLAYER_BASE_FID if _dtype == 'ActorBase'
+                         else _PLAYER_FORMID)
         elif low in ENGINE_GLOBAL_FORMIDS:
             out[name] = ENGINE_GLOBAL_FORMIDS[low]
         elif well_known_props and name in well_known_props:
@@ -802,6 +811,8 @@ def convert_QUST(rec: dict, fid_to_edid: dict = None,
                 # The engine's PlayerRef always wins — a SCRO-derived case
                 # variant naming the converted TES4 player NPC_ would bind a
                 # BASE record the VM refuses, and the property reads None.
+                # (`fid` is already the base 0x7 when the property is declared
+                # ActorBase — see _resolve_declared_properties.)
                 for k in [k for k in prop_vals
                           if k.lower() == name.lower() and k != name]:
                     del prop_vals[k]
@@ -1341,7 +1352,8 @@ def _build_info_script_properties(result_script: str, xref,
     for prop_edid, ptype in conv._property_refs.items():
         low = prop_edid.lower()
         if low in ('player', 'playerref'):
-            props[prop_edid] = _PLAYER_FORMID
+            props[prop_edid] = (_PLAYER_BASE_FID if ptype == 'ActorBase'
+                                else _PLAYER_FORMID)
             continue
         # Engine globals keep their vanilla FormID — see
         # object_scripts.ENGINE_GLOBAL_FORMIDS.

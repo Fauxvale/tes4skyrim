@@ -964,6 +964,158 @@ class TestScroRefTyping:
 
 
 # ===========================================================================
+# Stale source names recovered from the SCRO table
+# ===========================================================================
+
+class TestScroAliasRecovery:
+    """Oblivion runs the COMPILED script, so the SCRO table outranks the text.
+
+    Knights.esp's quest-stage result scripts still read
+    `player.additem NDArmorCuirass 1` and `player.additem NDLL0WeaponSword 1`,
+    names no record in the plugin carries, while the SCROs those same stages
+    ship bind NDArmorHeavyCuirass1 and NDLL0WeaponSwordLvl100.  Unrecovered the
+    names reach the compiler undefined, which fails the CHECKER and emits no
+    .pex for the WHOLE script — every other stage of the quest dies with it.
+    """
+
+    def _xref(self):
+        x = CrossRefGraph()
+        for fid, edid, rtype in (
+                ('01002D3F', 'ND02', 'QUST'),
+                ('01002D3E', 'ND03', 'QUST'),
+                ('01000ECE', 'NDArmorHeavyCuirass1', 'ARMO'),
+                ('01000FCA', 'NDLL0WeaponSwordLvl100', 'LVLI'),
+        ):
+            x.formid_to_edid[fid] = edid
+            x.edid_to_formid[edid.lower()] = fid
+            x.record_type[fid] = rtype
+        return x
+
+    def test_rename_with_an_inserted_word_is_recovered(self):
+        """NDArmorCuirass -> NDArmorHeavyCuirass1 is NOT a prefix relation."""
+        from script_convert.pipeline import resolve_scro_aliases
+        body = ('; quickstart\nsetstage ND02 0\nsetstage ND02 10\n'
+                'setstage ND02 60\nplayer.additem NDArmorCuirass 1\n'
+                'setstage ND03 10')
+        aliases = resolve_scro_aliases(
+            body, ['00000014', '01002D3F', '01000ECE', '01002D3E'], self._xref())
+        assert aliases == {'ndarmorcuirass': 'NDArmorHeavyCuirass1'}
+
+    def test_alias_binds_the_property_with_the_records_own_type(self):
+        from script_convert.pipeline import resolve_scro_aliases
+        x = self._xref()
+        conv = ScriptConverter(x)
+        body = 'player.additem NDArmorCuirass 1\nsetstage ND03 10'
+        conv.set_scro_aliases(resolve_scro_aliases(
+            body, ['00000014', '01000ECE', '01002D3E'], x))
+        out = '\n'.join(conv.convert_fragment(body, 'Quest'))
+        assert 'NDArmorHeavyCuirass1' in out
+        assert 'NDArmorCuirass,' not in out
+        assert conv.get_property_refs()['NDArmorHeavyCuirass1'] == 'Armor'
+
+    def test_a_live_editorid_is_never_redirected(self):
+        """Every name resolves, so there is nothing to recover."""
+        from script_convert.pipeline import resolve_scro_aliases
+        body = 'setstage ND02 10\nsetstage ND03 10'
+        assert resolve_scro_aliases(
+            body, ['01002D3F', '01002D3E'], self._xref()) == {}
+
+    def test_ambiguity_is_left_alone(self):
+        """Two unspelled SCROs cannot be told apart — bind neither."""
+        from script_convert.pipeline import resolve_scro_aliases
+        body = 'player.additem NDArmorCuirass 1\nplayer.additem NDMystery 1'
+        assert resolve_scro_aliases(
+            body, ['00000014', '01000ECE', '01000FCA'], self._xref()) == {}
+
+    def test_an_unnameable_scro_abandons_recovery(self):
+        """A master-owned SCRO this export cannot name could be the target."""
+        from script_convert.pipeline import resolve_scro_aliases
+        body = 'player.additem NDArmorCuirass 1'
+        assert resolve_scro_aliases(
+            body, ['00000014', '0001BEEF'], self._xref()) == {}
+
+    def test_a_quoted_editorid_counts_as_spelled(self):
+        """Oblivion's parser accepts quotes around any EditorID, and the vanilla
+        scripts use them.  Stripping the whole literal made TG03Elven's
+        `PlaceAtMe "TG03LlathasasBust"` look like a SCRO the body never spells,
+        and that stage's `IsXBox` — an OBSE command with no FUNCTION_MAP entry —
+        then looked like the rename it paired with, binding a variable to a
+        statue."""
+        from script_convert.pipeline import resolve_scro_aliases
+        x = CrossRefGraph()
+        for fid, edid, rtype in (
+                ('00008032', 'TG03LlathasasBust', 'STAT'),
+                ('00034EA2', 'TG03Elven', 'QUST'),
+        ):
+            x.formid_to_edid[fid] = edid
+            x.edid_to_formid[edid.lower()] = fid
+            x.record_type[fid] = rtype
+        body = ('BustMarker.PlaceAtMe "TG03LlathasasBust" 1,0,0\n'
+                'If IsXBox == 1\n  AddAchievement 25\nEndIf\n'
+                'StopQuest TG03Elven')
+        assert resolve_scro_aliases(
+            body, ['00008032', '00034EA2'], x) == {}
+
+
+# ===========================================================================
+# Zero-argument commands read bare
+# ===========================================================================
+
+class TestBareZeroArgCommands:
+
+    def test_getcurrentweatherpercent_reaches_the_real_handler(self):
+        """Takes no arguments, so it is ALWAYS read bare.  Unrouted it survived
+        as an undefined identifier; the stubbed spelling returned a constant 0,
+        which made every `< 0.1` transition test permanently true."""
+        conv = ScriptConverter(CrossRefGraph())
+        out = '\n'.join(conv.convert_fragment(
+            'if getCurrentWeatherPercent < .1\n  return\nendif', 'Quest'))
+        assert 'Weather.GetCurrentWeatherTransition()' in out
+        assert 'getCurrentWeatherPercent' not in out
+
+    def test_getweatherpercent_is_no_longer_stubbed_to_zero(self):
+        conv = ScriptConverter(CrossRefGraph())
+        out = '\n'.join(conv.convert_fragment(
+            'if getWeatherPercent < .1\n  return\nendif', 'Quest'))
+        assert 'Weather.GetCurrentWeatherTransition()' in out
+
+    def test_isplayerslastriddenhorse_alias_is_neutralised(self):
+        """The other authored spelling of GetPlayerHasLastRiddenHorse (0x1153).
+        Skyrim tracks no last-ridden horse, so it neutralises to 0 — but it must
+        be ROUTED, or the name survives undefined and kills the script."""
+        conv = ScriptConverter(CrossRefGraph())
+        out = '\n'.join(conv.convert_fragment(
+            'if HorseRef.IsPlayersLastRiddenHorse == 0\n  return\nendif',
+            'Quest'))
+        assert 'IsPlayersLastRiddenHorse ==' not in out
+        assert ';NE:' in out
+
+
+# ===========================================================================
+# Raw FormIDs in form-argument positions
+# ===========================================================================
+
+class TestRawFormIdOperands:
+
+    def test_getisid_resolves_a_short_raw_formid(self):
+        """`GetIsID 7` names the Player NPC_ at 0x00000007.  A number in a FORM
+        slot is never a literal, so the 6-digit floor the bare-identifier path
+        uses must not apply — left a literal, the comparison became
+        `Form == Int` and the checker rejected the whole script."""
+        x = CrossRefGraph()
+        x.formid_to_edid['00000007'] = 'Player'
+        x.edid_to_formid['player'] = '00000007'
+        x.record_type['00000007'] = 'NPC_'
+        conv = ScriptConverter(x)
+        out = '\n'.join(conv.convert_fragment(
+            'if ( GetIsID 7 == 0 )\n  return\nendif', 'ActiveMagicEffect'))
+        assert 'GetBaseObject() == Player' in out
+        assert '== 7' not in out
+        # No `d7` artifact from naming a property after the digit.
+        assert 'd7' not in conv.get_property_refs()
+
+
+# ===========================================================================
 # Type mapping tests
 # ===========================================================================
 

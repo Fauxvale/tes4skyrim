@@ -12,7 +12,7 @@ from worker_budget import worker_count
 from script_convert.constants import (_PAPYRUS_RESERVED, _RECORD_TYPE_PAPYRUS, _GLOBAL_CANONICAL,
                                      _sanitize_name, _safe_property_name, _canonical_global,
                                      _record_type_to_papyrus, papyrus_script_name,
-                                     PAPYRUS_MAX_SCRIPT_NAME)
+                                     PAPYRUS_MAX_SCRIPT_NAME, FUNCTION_MAP)
 from script_convert.cross_ref import CrossRefGraph, master_names
 from script_convert.converter import ScriptConverter
 from output_layout import assets_for  # noqa: E402
@@ -630,6 +630,10 @@ def _scpt_batch(records: list, output_dir: str, xref: CrossRefGraph, stats: dict
             conv = ScriptConverter(xref)
             # Pre-populate external references from SCRO entries
             _preload_scro_refs(conv, rec, xref)
+            # Recover names the source text spells staler than the SCRO table
+            # the engine runs off (see resolve_scro_aliases).
+            conv.set_scro_aliases(resolve_scro_aliases(
+                sctx, _scro_list(rec), xref))
             name = _sanitize_name(edid or f'Script_{formid}')
             papyrus = conv.convert_standalone(name, sctx, extends, edid)
 
@@ -1033,6 +1037,8 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             if has_script:
                 conv = ScriptConverter(xref)
                 _preload_scro_refs(conv, rec, xref)
+                conv.set_scro_aliases(resolve_scro_aliases(
+                    result_script, _scro_list(rec), xref))
                 body_lines = conv.convert_fragment(result_script, 'TopicInfo')
                 prop_refs = dict(conv._property_refs)
 
@@ -1330,6 +1336,13 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
             for stage_idx, log_idx, log_text, script_src, complete_flag, stage_arr_idx, log_arr_idx in fragments:
                 # Load per-stage SCROs for this fragment
                 _preload_stage_scro_refs(conv, rec, xref, stage_arr_idx, log_arr_idx)
+                # Recover any name this stage's TEXT spells staler than the
+                # SCRO table the engine actually runs off (see
+                # resolve_scro_aliases).
+                conv.set_scro_aliases(resolve_scro_aliases(
+                    script_src or '',
+                    _scro_list(rec, f'Stage[{stage_arr_idx}].Log[{log_arr_idx}].'),
+                    xref))
                 func_name = f'Fragment_Stage_{stage_idx:04d}_Item_{log_idx}'
                 out_lines.append(f'Function {func_name}()')
                 if stage_idx in objective_emitted:
@@ -1486,6 +1499,128 @@ def _preload_stage_scro_refs(conv: 'ScriptConverter', rec: dict, xref: CrossRefG
             break
         k += 1
         _add_scro_ref(conv, fid, xref)
+
+
+# Control-flow and type keywords, which are never a form reference.  Only used
+# to walk a script body looking for form names — see resolve_scro_aliases.
+_SCRO_WALK_SKIP_KEYWORDS = frozenset({
+    'begin', 'end', 'if', 'elseif', 'else', 'endif', 'while', 'loop',
+    'endwhile', 'return', 'set', 'to', 'short', 'long', 'float', 'ref',
+    'int', 'string_var', 'array_var', 'scn', 'scriptname', 'let', 'eval',
+    'foreach', 'break', 'continue',
+})
+
+
+def _scro_body_tokens(body: str) -> list:
+    """Return the candidate form-reference names in a TES4 script body.
+
+    A dotted `NDLathonREF.disable` contributes only its RECEIVER, which is the
+    part that names a form.  Comments are stripped, quotes around a name are
+    dropped but the name kept, numeric literals never match, and command names
+    are skipped (a command is not a form).  The result is a superset: locals and
+    unknown OBSE commands survive, which resolve_scro_aliases handles by
+    construction.
+    """
+    lines = []
+    for raw in body.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        lines.append(raw.split(';', 1)[0])
+    # Oblivion's parser accepts QUOTES around any EditorID and the vanilla
+    # scripts use them (`PlaceAtMe "TG03LlathasasBust" 1,0,0`).  A quoted name is
+    # a form reference like any other, so drop the quotes rather than the name:
+    # stripping the whole literal made TG03LlathasasBust look like a SCRO the
+    # body never spells, and that stage's `IsXBox` — an OBSE command with no
+    # FUNCTION_MAP entry — then looked like the rename it paired with.
+    text = re.sub(r'"([^"]*)"', r' \1 ', '\n'.join(lines))
+    out = []
+    for m in re.finditer(r'[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?',
+                         text):
+        head = m.group(0).split('.', 1)[0]
+        low = head.lower()
+        if low in _SCRO_WALK_SKIP_KEYWORDS or low in FUNCTION_MAP:
+            continue
+        out.append(head)
+    return out
+
+
+def resolve_scro_aliases(body: str, scros: list, xref: CrossRefGraph) -> dict:
+    """Map a name in `body` that resolves to NO record onto its SCRO EditorID.
+
+    Oblivion runs the COMPILED script, not the source text the CK shows, and the
+    two can disagree.  Knights.esp's quest-stage result scripts still read
+    `player.additem NDArmorCuirass 1` and `player.additem NDLL0WeaponSword 1` —
+    names no record in the plugin carries — while the SCRO tables those same
+    stages ship bind 01000ECE (NDArmorHeavyCuirass1, "Cuirass of the Crusader")
+    and 01000FCA (NDLL0WeaponSwordLvl100).  The records were renamed after the
+    scripts were last compiled; the engine kept handing out the right items
+    because it reads the SCRO FormID, so the stale spellings never showed
+    in-game.
+
+    Converting the TEXT, those names resolve to nothing, declare no property and
+    reach the compiler undefined — which fails the CHECKER, so no .pex is emitted
+    for the whole script and every OTHER stage of the quest dies with it.  These
+    are the fragments that hand out the Crusader relics.
+
+    The recovery is a SET DIFFERENCE, not a positional walk: the compiler's
+    emission order does not follow source order (`player.additem X` emits the
+    receiver first), but the CONTENTS of the table are exact.  A SCRO whose
+    EditorID the body never spells is a form the script references under some
+    other name, and a body name that resolves to no record is a reference with no
+    form — when there is exactly ONE of each, they are the same reference and the
+    binding is certain.
+
+    Anything less certain is left alone.  Measured over Knights.esp's 146 stage
+    result scripts: 119 have neither an unspelled SCRO nor an unresolvable name,
+    5 have exactly one of each (the five renames above), and the remaining 22
+    have unresolvable names but NO unspelled SCRO — master-owned records and
+    local variables, correctly untouched.
+    """
+    if not scros:
+        return {}
+    tokens = _scro_body_tokens(body)
+    if not tokens:
+        return {}
+    spelled = {t.lower() for t in tokens}
+
+    # SCROs the body never names.  The player is skipped: it is referenced by a
+    # KEYWORD, not an EditorID, so it is never "unspelled" in the relevant sense.
+    unspelled = []
+    for fid in scros:
+        if fid in _PLAYER_FORMIDS:
+            continue
+        edid = xref.formid_to_edid.get(fid)
+        if not edid:
+            # A form this export cannot name (master-owned). It could be the
+            # target of any unresolvable name here, so nothing is certain.
+            return {}
+        if edid.lower() not in spelled:
+            unspelled.append(edid)
+    if len(unspelled) != 1:
+        return {}
+
+    unresolved = []
+    for tok in dict.fromkeys(tokens):
+        low = tok.lower()
+        if low in ('player', 'playerref'):
+            continue
+        if xref.edid_to_formid.get(low):
+            continue
+        unresolved.append(tok)
+    if len(unresolved) != 1:
+        return {}
+    return {unresolved[0].lower(): unspelled[0]}
+
+
+def _scro_list(rec: dict, prefix: str = '') -> list:
+    """Return a record's SCRO FormIDs in table order (optionally a stage log's)."""
+    out = []
+    i = 0
+    while True:
+        fid = rec.get(f'{prefix}SCRO[{i}]')
+        if fid is None:
+            break
+        out.append(fid)
+        i += 1
+    return out
 
 
 def _add_scro_ref(conv: 'ScriptConverter', fid: str, xref: CrossRefGraph):

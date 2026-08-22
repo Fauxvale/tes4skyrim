@@ -1554,3 +1554,111 @@ elsewhere, so applying it twice is idempotent.
 **Guard:** the invariant is "no write to `Q.<prop>` may precede a `Start()` /
 `TES4Polyfill.StartQuest` on the same `Q` within one straight-line run".
 Measured on the shipped build: 91 → 0.
+
+## The SCRO table outranks the script TEXT (2026-08-22)
+
+**Oblivion runs the COMPILED script, not the source the CK shows you, and the
+two can disagree.** When a record is renamed after its scripts were last
+compiled, the source keeps the old name while the compiled form-reference table
+(the `SCRO` array) keeps the FormID. The engine reads the FormID, so the stale
+spelling is completely invisible in-game.
+
+Converting the TEXT, such a name resolves to nothing. Two failure modes, both
+measured:
+
+| Symptom | Where | Cost |
+|---|---|---|
+| Undefined identifier | Knights.esp `TES4_QF_ND00/03/07/09` | CHECKER error → **no `.pex` for the whole script**, so every OTHER stage of the quest dies too |
+| Property declared but bound to nothing | Oblivion.esm `TES4_QF_SE02` | compiles fine; the first use ABORTS the fragment (see `project_unbound_vmad_property_aborts`) |
+
+Knights.esp's stage result scripts still read `player.additem NDArmorCuirass 1`
+and `player.additem NDLL0WeaponSword 1` while their SCROs bind
+`NDArmorHeavyCuirass1` ("Cuirass of the Crusader") and
+`NDLL0WeaponSwordLvl100` — these fragments are what hand out the Crusader
+relics. Oblivion's SE02 stage 15 reads `startQuest SE02FIN`, a name no record
+carries, while the SCRO binds the real quest `SE02Conv`; the Shivering Isles
+post-quest dialogue quest was silently never started.
+
+### Recovery is a SET DIFFERENCE, not a positional walk
+
+`pipeline.resolve_scro_aliases()`. The compiler's emission order does **not**
+follow source order — `player.additem X` emits the receiver first, so the ND03
+stage reads `ND02 / ND02 / ND02 / player / NDArmorCuirass / ND03` against SCROs
+`[Player, ND02, NDArmorHeavyCuirass1, ND03]`. A positional walk mis-binds. The
+CONTENTS of the table, however, are exact:
+
+- a SCRO whose EditorID the body never spells = a form referenced under some
+  other name;
+- a body name that resolves to no record = a reference with no form.
+
+**Exactly one of each ⇒ they are the same reference.** Anything less certain
+binds nothing.
+
+A prefix rule does not work either: two of the five Knights renames only append
+(`NDLL0WeaponSword` → `…Lvl100`) but `NDArmorCuirass` → `NDArmorHeavyCuirass1`
+inserts a word in the middle.
+
+### Tokenising the body — the two traps
+
+- **Command names must be dropped** (`low in FUNCTION_MAP`): a command is not a
+  form. Otherwise `setstage` looks like an unresolvable name.
+- **Quoted EditorIDs must be KEPT, quotes stripped.** Oblivion's parser accepts
+  quotes around any EditorID and vanilla uses them. Stripping the whole literal
+  made TG03Elven's `PlaceAtMe "TG03LlathasasBust"` look unspelled, and that
+  stage's `IsXBox` — an OBSE command with no `FUNCTION_MAP` entry — looked like
+  the rename it paired with. It would have bound a variable to a statue.
+
+### Measured selectivity
+
+| Plugin | fragments scanned | aliases fired |
+|---|---|---|
+| Oblivion.esm | 9,892 (2,393 SCPT + 1,870 QUST stages + 5,629 INFO) | **1** (SE02FIN → SE02Conv, a true rename) |
+| Knights.esp | 495 (194 SCPT + 146 QUST stages + 155 INFO) | **5**, across the four failing quests (ND00 twice, ND03, ND07, ND09) |
+
+Oblivion's other 22 stage scripts with unresolvable names have **no** unspelled
+SCRO — master-owned records and local variables, correctly left alone. Full
+Oblivion `--scripts-only` rebuild after the change: 16,518/16,518 compile, and
+exactly ONE of the 16,518 `.psc` files differs from the pre-change baseline.
+
+### Handlers that name a property directly need their own hook
+
+`_convert_ref` and the bare-identifier path in `_convert_expression` both
+consult the alias map, but `startquest`/`stopquest`/`getquestrunning` build the
+property name themselves via `_safe_property_name` and bypass both — that is
+why SE02 still emitted `SE02FIN.Start()` after the first fix. Any new handler
+that skips `_convert_ref` must call `_scro_alias_for()` itself.
+
+## Zero-argument commands must be ROUTED or they survive undefined
+
+A command taking no arguments is ALWAYS read bare, so it never reaches
+`_emit_function` through the call path — it must be in `_BARE_NO_EQUIV_COMMANDS`
+(with a `FUNCTION_MAP` entry) or the name reaches the compiler as an undefined
+identifier and fails the CHECKER. Added 2026-08-22:
+
+- `getcurrentweatherpercent` — the spelled-out form of `getweatherpercent`, used
+  by Knights' `ND08WraithSCRIPT`. Both now reach the real handler and return
+  `Weather.GetCurrentWeatherTransition()` (0..1). `getweatherpercent` was
+  previously caught by a stub list that returned a constant `0`, which made
+  every `< 0.1` "still transitioning" test permanently true.
+- `isplayerslastriddenhorse` — the other authored spelling of
+  `GetPlayerHasLastRiddenHorse` (both are engine function `0x1153`, confirmed via
+  `tools/uesp_lookup.py`). No Skyrim equivalent; neutralised to `0` with an
+  `;NE:` marker.
+
+## A raw FormID in a FORM-ARGUMENT slot is never a numeric literal
+
+`_convert_expression`'s bare-identifier path only reinterprets a **6-8 digit**
+token as a FormID, because anywhere else a short run of digits is an ordinary
+number. In an argument slot the engine reads as a FORM there is no such
+ambiguity, and the LOW ids are the ones scripts write by hand: Knights'
+`ND10TimeStopSpellScript` tests `GetIsID 7`, i.e. the Player NPC_ at
+`0x00000007`.
+
+Left a literal it produced `Form == Int` (checker error, no `.pex`) plus a
+phantom `Form Property d7` — `_safe_property_name` prefixing the digit.
+`_form_operand_edid()` resolves any 1-8 digit token in such a slot.
+
+**An `ActorBase`-typed `Player` property must bind to `0x7`, not `0x14`.** Both
+binders (`dialog_converter`, `object_scripts`) hardcoded the reference id; the VM
+refuses a reference into an `ActorBase` property and the script's whole init
+aborts. Skyrim's Player ActorBase is `0x00000007`, the same id as TES4's.

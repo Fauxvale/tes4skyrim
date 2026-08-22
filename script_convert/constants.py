@@ -711,6 +711,10 @@ FUNCTION_MAP = {
 
     # --- Weather ---
     'getweatherpercent': (None,                False, None),  # Special handler
+    # Same reading, spelled out in full.  Takes no arguments, so it is ALWAYS
+    # read bare — without a FUNCTION_MAP entry the bare-identifier path had
+    # nothing to route and the name survived into the output undefined.
+    'getcurrentweatherpercent': (None,         False, None),  # Special handler
     'forceweather': (None,                  False,  None),  # Special handler
     'releaseweatheroverride': (None,                  False,  None),  # Special handler
 
@@ -805,6 +809,9 @@ FUNCTION_MAP = {
     'addflames':         (None,                True,  None),
     'removeflames':      (None,                True,  None),
     'getplayerhaslastriddenhorse': (None,      True,  None),
+    # The same engine function (0x1153) under its other authored spelling —
+    # Knights.esp writes `<horse>.IsPlayersLastRiddenHorse == 0`.
+    'isplayerslastriddenhorse': (None,          True,  None),
     'attachashpile':     (None,                True,  None),  # no-op
     'setsize':           ('SetScale',          True,  None),
     'getsize':           ('GetScale',          True,  None),
@@ -1050,6 +1057,7 @@ _BARE_BOOL_FUNCTIONS = {
     'getforcesneak', 'getknockedstate',
     # OBSE IsCasting and vanilla HasFlames are read bare/as `ref.X == 1`
     'iscasting', 'hasflames', 'getplayerhaslastriddenhorse',
+    'isplayerslastriddenhorse',
     'getignorefriendlyhits',
 }
 
@@ -1117,6 +1125,7 @@ _BARE_NO_EQUIV_COMMANDS = {
     'emcisbattleoverridden', 'emcismusiconhold', 'emcgetplaylist',
     'iscasting', 'hasflames', 'flameson', 'flamesoff', 'addflames',
     'removeflames', 'getplayerhaslastriddenhorse', 'getignorefriendlyhits',
+    'isplayerslastriddenhorse',
     # Read bare, mid-expression, with no same-named Papyrus form: without
     # routing they survive as undefined identifiers and fail the whole script.
     'flee', 'getattacked', 'skipanim', 'getpackagetarget',
@@ -1139,6 +1148,10 @@ _BARE_NO_EQUIV_COMMANDS = {
     # (see _emit_function).
     'seteventhandler', 'removeeventhandler',
     'runscriptline', 'runbatchscript',
+    # Zero-argument weather-transition read, so it is always bare.  Routed here
+    # so _emit_function's Weather.GetCurrentWeatherTransition() handler is
+    # reachable instead of the name surviving as an undefined identifier.
+    'getweatherpercent', 'getcurrentweatherpercent',
 } | _OBSE_NO_EQUIV_COMMANDS
 
 # TES4 `ref.` commands that take NO arguments.  Oblivion let the receiver be
@@ -1163,6 +1176,7 @@ _ZERO_ARG_REF_FUNCTIONS = {
     'gettalkedtopc', 'getweaponanimtype', 'hasflames', 'isactor',
     'iscasting', 'isessential', 'isguard', 'isidleplaying',
     'isindangerouswater', 'issneaking', 'isswimming', 'istalking',
+    'isplayerslastriddenhorse', 'getplayerhaslastriddenhorse',
     'isweaponout', 'markfordelete', 'pickidle', 'removeflames', 'resetai',
     'resetfalldamagetimer', 'stopcombat', 'stopcombatalarmonactor',
     'stoplook',

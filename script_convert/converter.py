@@ -322,6 +322,12 @@ class ScriptConverter:
     def __init__(self, xref: CrossRefGraph):
         self.xref = xref
         self._property_refs: dict[str, str] = {}
+        # Names in the script TEXT that resolve to no record, mapped to the
+        # canonical EditorID the original compiler bound them to.  Populated
+        # from the record's SCRO array — the compiled form-reference table that
+        # is the authored ground truth when the source spelling has gone stale.
+        # See _register_scro_alias_candidates.
+        self._scro_aliases: dict[str, str] = {}
         # GetInCell prefix families needing a generated helper: name -> cells.
         self._cell_families: dict[str, list] = {}
         self._has_gamemode = False
@@ -707,8 +713,10 @@ class ScriptConverter:
                            editor_id: str = '') -> str:
         """Convert a standalone SCPT record to a full .psc file."""
         saved_refs = dict(self._property_refs)
+        saved_aliases = dict(self._scro_aliases)
         self._reset()
         self._property_refs = saved_refs
+        self._scro_aliases = saved_aliases
         self._current_script_edid = editor_id or name
 
         # Pre-scan: if script uses Actor-only functions on self (no ref prefix),
@@ -2224,9 +2232,13 @@ class ScriptConverter:
         # fragment body already called (undefined function TES4_IsIn...).
         saved_refs = dict(self._property_refs)
         saved_families = dict(self._cell_families)
+        saved_aliases = dict(self._scro_aliases)
         self._reset()
         self._cell_families = saved_families
         self._property_refs = saved_refs
+        # The caller installed this fragment's SCRO alias map just before the
+        # call; _reset clears it for the NEXT fragment, not this one.
+        self._scro_aliases = saved_aliases
         # A fragment body runs on the ENGINE'S DISPATCH PATH: a quest stage
         # cannot advance, and an INFO cannot finish, while the fragment is
         # still executing.  A blocking SayLine there stalls the transition
@@ -3015,6 +3027,9 @@ class ScriptConverter:
 
     def _reset(self):
         self._property_refs = {}
+        # Scoped to ONE fragment: each caller installs the map built from that
+        # fragment's own SCRO table before converting it.
+        self._scro_aliases = {}
         self._cell_families = {}
         self._has_gamemode = False
         self._has_menumode = False
@@ -5038,7 +5053,7 @@ class ScriptConverter:
                             'getbookread', 'gettalkedtopc',
                             'getcrimeknown', 'getstartingpos',
                             'getisplayerbirthsign',
-                            'hasbeenpickedup', 'getweatherpercent',
+                            'hasbeenpickedup',
                             'getgameloaded', 'hasvariable', 'getownership',
                             'isonguard', 'isindangerouswater',
                             'getarmorrating', 'isspelltarget', 'isswimming',
@@ -5105,6 +5120,13 @@ class ScriptConverter:
             fid = self.xref.edid_to_formid.get(bare_low, '')
             if not fid:
                 fid = _digit_stripped_formid(self.xref, bare_low)
+            if not fid:
+                # Stale source spelling — recover it from this record's SCRO
+                # table (see register_scro_alias_pool).
+                _alias = self._scro_alias_for(expr)
+                if _alias:
+                    expr, bare_low = _alias, _alias.lower()
+                    fid = self.xref.edid_to_formid.get(bare_low, '')
             if fid:
                 rtype = self.xref.record_type.get(fid, '')
                 ptype = self._papyrus_type_for(fid, rtype)
@@ -5281,6 +5303,13 @@ class ScriptConverter:
         fid = self.xref.edid_to_formid.get(low, '')
         if not fid:
             fid = _digit_stripped_formid(self.xref, low)
+        if not fid:
+            # Stale source spelling: recover the record the ORIGINAL compiler
+            # bound, from this record's SCRO table (see register_scro_alias_pool).
+            alias = self._scro_alias_for(name)
+            if alias:
+                name, low = alias, alias.lower()
+                fid = self.xref.edid_to_formid.get(low, '')
         if fid:
             # Use canonical EditorID (original case) as key to match _add_scro_ref
             canon_edid = self.xref.formid_to_edid.get(fid, name)
@@ -5759,6 +5788,65 @@ class ScriptConverter:
                 return 'GetReference()'
         return self._convert_ref(ref_name, extends, as_receiver=True)
 
+    def set_scro_aliases(self, aliases: dict) -> None:
+        """Install the stale-name -> canonical-EditorID map for this fragment.
+
+        Oblivion runs the COMPILED script, not the source text the CK shows, and
+        the two can disagree.  Knights.esp's quest-stage result scripts still say
+        `player.additem NDArmorCuirass 1` and `player.additem NDLL0WeaponSword 1`
+        — names no record in the plugin carries — while the SCRO table those same
+        stages ship binds 01000ECE (NDArmorHeavyCuirass1, "Cuirass of the
+        Crusader") and 01000FCA (NDLL0WeaponSwordLvl100).  The records were
+        renamed after the scripts were last compiled; the engine kept handing out
+        the right items because it reads the SCRO FormID, so the stale spellings
+        are invisible in-game.
+
+        Converting the TEXT, those names resolve to nothing, declare no property
+        and reach the compiler undefined — which fails the CHECKER, so no .pex is
+        emitted for the whole script and every OTHER stage of the quest dies with
+        it (these fragments are what hand out the Crusader relics).
+
+        The map is built positionally by `resolve_scro_aliases`; see there.
+        """
+        self._scro_aliases = {k.lower(): v for k, v in aliases.items()}
+
+    def _scro_alias_for(self, name: str) -> str:
+        """Return the canonical EditorID a stale script-text `name` refers to."""
+        low = name.strip().lower()
+        if not low or not self.xref:
+            return ''
+        alias = self._scro_aliases.get(low, '')
+        if not alias:
+            return ''
+        # Never redirect a name that resolves on its own.
+        if (self.xref.edid_to_formid.get(low)
+                or _digit_stripped_formid(self.xref, low)):
+            return ''
+        return alias
+
+    def _form_operand_edid(self, raw: str) -> str:
+        """Resolve a FORM-ARGUMENT operand written as a raw FormID.
+
+        The bare-identifier path in _convert_expression only reinterprets a
+        6-8 digit token as a FormID, because anywhere else in a script a short
+        run of digits is an ordinary numeric literal.  In an argument slot that
+        the engine reads as a FORM (GetIsID's base record) there is no such
+        ambiguity: a number there is ALWAYS a FormID, and the low ids are the
+        ones scripts actually write by hand — Knights.esp's ND10 time-stop
+        effect tests `GetIsID 7`, i.e. the Player NPC_ at 0x00000007.
+
+        Left unresolved the number survived as a literal and the comparison
+        became `Form == Int`, which the checker rejects outright, so no .pex was
+        emitted for the script at all.  Returns the canonical EditorID, or ''
+        when the token is not a resolvable id.
+        """
+        raw = raw.strip().strip('"\'')
+        if not raw or not re.fullmatch(r'[0-9A-Fa-f]{1,8}', raw):
+            return ''
+        if not self.xref:
+            return ''
+        return self.xref.formid_to_edid.get(raw.upper().zfill(8), '')
+
     def _bind_base_form_property(self, name: str) -> None:
         """Type `name` as the Papyrus type of the BASE record it names.
 
@@ -6053,7 +6141,16 @@ class ScriptConverter:
 
         # StartQuest/StopQuest/GetQuestRunning/CompleteQuest/IsQuestCompleted: arg is quest
         if fname_low in ('startquest', 'stopquest', 'getquestrunning', 'completequest', 'isquestcompleted'):
-            quest_ref = _safe_property_name(args_str.strip() if args_str else 'quest')
+            _qname = args_str.strip() if args_str else 'quest'
+            # This handler names the property directly instead of going through
+            # _convert_ref, so it needs its own stale-name recovery: Oblivion's
+            # SE02 stage 15 reads `startQuest SE02FIN`, a name no record
+            # carries, while the stage's SCRO binds the real quest SE02Conv.
+            # Unrecovered it declared a property that binds to NOTHING, and the
+            # first use of an unbound property ABORTS the fragment — so the
+            # Shivering Isles post-quest dialogue quest was never started.
+            _qname = self._scro_alias_for(_qname) or _qname
+            quest_ref = _safe_property_name(_qname)
             existing = self._property_refs.get(quest_ref, self._property_refs.get(quest_ref.lower(), ''))
             if not existing:
                 # No type known yet — use Quest (base type sufficient for
@@ -6345,9 +6442,10 @@ class ScriptConverter:
 
         # Vanilla TES4 GetPlayerHasLastRiddenHorse — no Skyrim equivalent (the
         # engine tracks no "last ridden" horse), and SKSE adds none.
-        if fname_low == 'getplayerhaslastriddenhorse':
+        if fname_low in ('getplayerhaslastriddenhorse',
+                         'isplayerslastriddenhorse'):
             self._line_comments.append(
-                ';NE: GetPlayerHasLastRiddenHorse has no Skyrim equivalent')
+                f';NE: {func_name} has no Skyrim equivalent')
             return '0'
 
         # TES4 `PositionCell x, y, z, angle, Cell` teleports a reference to raw
@@ -7898,9 +7996,12 @@ class ScriptConverter:
         # still works for actors, since Actor extends ObjectReference) and returns
         # a Form, which compares against every base type.
         if fname_low == 'getisid':
-            arg = self._convert_expression(args_str.strip(), extends) if args_str else 'None'
-            if args_str:
-                self._bind_base_form_property(args_str.strip())
+            operand = args_str.strip() if args_str else ''
+            # A raw FormID operand (`GetIsID 7`) is a FORM here, never a number.
+            operand = self._form_operand_edid(operand) or operand
+            arg = self._convert_expression(operand, extends) if operand else 'None'
+            if operand:
+                self._bind_base_form_property(operand)
             ref = self._resolve_objref_ref(ref_name, extends)
             return f'{ref}.GetBaseObject() == {arg}'
 

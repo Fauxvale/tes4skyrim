@@ -36,6 +36,10 @@ from .skyrim_overrides import TES4_ITEM_FORMID_TO_SKYRIM
 _VALUE_TYPES = {'Int', 'Float', 'Bool'}
 
 _PLAYER_FORMID = 0x14
+# NPC_ Player.  An ActorBase-typed `Player` property must bind to the BASE, not
+# the reference — the VM refuses a reference into an ActorBase property and the
+# script's whole init aborts.  Same id in TES4 and TES5.
+_PLAYER_BASE_FID = 0x07
 
 # Record types that carry a SCRI in TES4 and become plain object scripts
 # in Skyrim.  NPC_/CREA are included: TES4 attaches actor scripts to the BASE
@@ -625,7 +629,8 @@ def _resolve_props(sctx: str, edid: str, extends: str, xref,
         safe = _safe_property_name(pname)
         low = pname.lower()
         if low in ('player', 'playerref'):
-            obj_props[safe] = _PLAYER_FORMID
+            obj_props[safe] = (_PLAYER_BASE_FID if ptype == 'ActorBase'
+                               else _PLAYER_FORMID)
             continue
         if low in ENGINE_GLOBAL_FORMIDS:
             obj_props[safe] = ENGINE_GLOBAL_FORMIDS[low]
