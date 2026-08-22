@@ -1006,6 +1006,51 @@ outright: **4.2 s** for the whole export.
   - ARMO=(-15,-10,0,15,10,30), NPC_/CREA=(-12,-12,0,12,12,60), LIGH=(-6,-6,0,6,6,20)
   - Other types get (-5,-5,0,5,5,5) as fallback
 
+## The world-map camera clamp — MNAM's cell rectangle (verified by disassembly)
+
+How far the world map can SCROLL is set by WRLD `MNAM`'s NW/SE **cell**
+rectangle — not by `NAM0`/`NAM9`, and not by any LOD, terrain, `.btr`/`.bto`,
+or map-image input. Recovered from `SkyrimSE.exe` (GOG/AE):
+
+`MapCameraStates::World::Update` at RVA **`0x9213e0`** (vtable
+`.?AVWorld@MapCameraStates@@` @ `0x17b0fc0`, slot 3) branches at `0x9216ac` on
+`MapCamera+0x68`, a border-polygon list, into two **mutually exclusive** clamps:
+
+* **MNAM border polygon (wins whenever present).** Built in the state-enter
+  handler at RVA `0x9219f0`. It calls `0x2c7d80`, which walks the parent chain
+  (`WRLD+0x158` = WNAM) while `WRLD+0xa2` bit 2 (**PNAM "Use Map Data"**) is
+  set and returns `owner+0x188`, the MNAM blob. **If all four MNAM cell int16s
+  are zero it jumps to `0x921cb2` and leaves the polygon NULL**; otherwise
+  `0x921b20`/`0x921b94`/`0x921c08`/`0x921c7c` build four vertices from
+  `NW.X(+8) NW.Y(+0xa) SE.X(+0xc) SE.Y(+0xe)`, each `shl 12` (cells → world
+  units). Clamping is a point-in-polygon push-back at `0x921f10`.
+* **NAM0/NAM9 box — FALLBACK ONLY,** reached at `0x921717` solely when the
+  polygon is NULL (`je 0x921717`). Clamps X into `[WRLD+0x1c0, +0x1c8]` and Y
+  into `[+0x1c4, +0x1cc]`, filled by `TESWorldSpace::Load` (`0x2c5620`) via
+  `minss` on NAM0 (`0x2c57a2`) and `maxss` on NAM9 (`0x2c591b`). MNAM lands in
+  separate storage at `+0x188` and is never read by the box clamp.
+
+`MNAM+0x10/+0x14/+0x18` are Min Height / Max Height / Initial Pitch, matching
+xEdit's `wbWorldMapData` "Camera Data" — which validates the offset mapping.
+`UsableDimX/Y` participates in nothing here; all 3 Skyrim.esm WRLDs that carry
+MNAM write `(0, 0)`, Tamriel included, so we write 0 too.
+
+### A worldspace's rectangle is SHARED, so it is unioned across plugins
+
+🛑 **The last plugin to override a WRLD wins, so one plugin that never touched
+the terrain can clamp the map back down.** Ten converted plugins override
+Tamriel `0100003C`; only `Tamriel.esp` adds the outer land (99,946 cells, grid
+X -192..191, Y -129..159). The other nine measure nothing there, fell back to
+Oblivion's authored 119x106-cell rectangle, and three of them are plain ESPs
+that therefore load after every ESM — so the widened map reverted to Cyrodiil.
+`ElsweyrAnequina.esp` additionally reverted NAM0/NAM9 to cells -64..70.
+
+So the extent is **unioned across every plugin built into an output tree** and
+persisted in `output/world_extents.json`
+(`tes5_import.import_main._merge_world_extents`), keyed by output-space FormID.
+Every plugin emits the same widest rectangle and load order stops mattering.
+A narrow measurement can only ever widen the stored box, never shrink it.
+
 ## World-map cloud banks (WRLD MODL) — sized to the LAND
 
 Skyrim's world map draws a bank of cloud sheets over the terrain. The mesh is

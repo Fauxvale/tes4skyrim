@@ -137,6 +137,38 @@ def set_world_land_extents(extents: dict):
     _WORLD_LAND_EXTENT.update(extents or {})
 
 
+def _extent_cell_rect(extent):
+    """(NW.X, NW.Y, SE.X, SE.Y) cell indices for a land rectangle, or None.
+
+    `extent` is (min_x, min_y, max_x, max_y) in world units, where the max
+    edge is the FAR side of the last cell -- hence the -1.  NW is
+    (min X, max Y) and SE is (max X, min Y).  Returns None when the grid
+    cannot be expressed in MNAM's int16 fields, so callers fall back rather
+    than wrap.
+    """
+    min_x, min_y, max_x, max_y = extent
+    nwx = int(math.floor(min_x / 4096.0))
+    sey = int(math.floor(min_y / 4096.0))
+    sex = int(math.ceil(max_x / 4096.0)) - 1
+    nwy = int(math.ceil(max_y / 4096.0)) - 1
+    if not all(-32768 <= v <= 32767 for v in (nwx, nwy, sex, sey)):
+        return None
+    return nwx, nwy, sex, sey
+
+
+def get_world_land_extent(fid: int):
+    """The registered land rectangle for a worldspace, or None.
+
+    Accepts either FormID space: the registry is keyed in OUTPUT space while
+    export records carry the raw TES4 source id, and the two coincide only for
+    a plugin that OWNS the worldspace.  A pure override (ElsweyrAnequina ->
+    Tamriel, 0000003C vs 0100003C) missed an output-space-only lookup and fell
+    back to the authored rectangle.
+    """
+    return (_WORLD_LAND_EXTENT.get(fid)
+            or _WORLD_LAND_EXTENT.get(remap_formid(fid, is_own_id=True)))
+
+
 def set_door_navmesh_links(door_links: dict):
     """Register door REFR -> (NAVM, triangle) for XNDP emission.
 
@@ -317,18 +349,69 @@ def build_wrld_mnam(rec: dict):
     UsableDimX(i) + UsableDimY(i) + NWCellX(h) + NWCellY(h) + SECellX(h) +
     SECellY(h) + CameraMinHeight(f) + CameraMaxHeight(f) + InitialPitch(f).
     Shared by convert_WRLD and the override path.
+
+    The NW/SE cell pair is what the world map clamps SCROLLING to: the engine
+    builds a border polygon from it and clamps the camera into that polygon
+    (SkyrimSE RVA 0x9213e0; NAM0/NAM9 is only the fallback used when all four
+    cell values are zero).  See docs/world_land_navmesh_notes.md.
+
+    So the measured cell grid wins over the authored value, exactly as it does
+    for the cloud bank in build_wrld_cloud_modl -- an authored MNAM routinely
+    does not cover land a plugin adds (Tamriel.esp adds 99,946 cells over grid
+    X -192..191, Y -129..159 while copying Oblivion's 119x106-cell rectangle
+    verbatim).  The authored value is the fallback for a worldspace whose
+    cells we did not measure.
+
+    UsableDimX/Y is written 0, as all 3 Skyrim.esm WRLDs carrying MNAM do.
     """
-    if not get_str(rec, 'MNAM.UsableDimX'):
-        return None
-    dx = get_int(rec, 'MNAM.UsableDimX')
-    dy = get_int(rec, 'MNAM.UsableDimY')
-    nwx = get_int(rec, 'MNAM.NWCellX')
-    nwy = get_int(rec, 'MNAM.NWCellY')
-    sex = get_int(rec, 'MNAM.SECellX')
-    sey = get_int(rec, 'MNAM.SECellY')
+    have_authored = bool(get_str(rec, 'MNAM.UsableDimX'))
+
+    extent = get_world_land_extent(get_formid(rec, 'FormID'))
+    cells = _extent_cell_rect(extent) if extent else None
+    if cells is None:
+        if not have_authored:
+            return None
+        cells = (get_int(rec, 'MNAM.NWCellX'), get_int(rec, 'MNAM.NWCellY'),
+                 get_int(rec, 'MNAM.SECellX'), get_int(rec, 'MNAM.SECellY'))
+    nwx, nwy, sex, sey = cells
+
     # Camera defaults from Skyrim's Tamriel worldspace
-    return struct.pack('<iihhhhfff', dx, dy, nwx, nwy, sex, sey,
+    return struct.pack('<iihhhhfff', 0, 0, nwx, nwy, sex, sey,
                        50000.0, 80000.0, 50.0)
+
+
+def restamp_wrld_mnam(rec: bytes, out_fid: int) -> bytes:
+    """Rewrite a converted WRLD's MNAM cell rectangle from the extent registry.
+
+    Used on the ANCHOR path, where a plugin that adds land to a master's
+    worldspace emits the MASTER's converted bytes verbatim to parent its new
+    cells. Those bytes hold the master's narrow rectangle, which silently
+    re-clamps the world map (see docs/world_land_navmesh_notes.md).
+
+    Only the 8 cell bytes inside an existing 28-byte MNAM are replaced, in
+    place, so the record's size and every other subrecord are untouched. A
+    record with no MNAM, or a compressed one, is returned unchanged.
+    """
+    extent = get_world_land_extent(out_fid)
+    if not extent or len(rec) < 24:
+        return rec
+    # Record flag 0x00040000 = compressed body; leave those alone.
+    if struct.unpack('<I', rec[8:12])[0] & 0x00040000:
+        return rec
+    size = struct.unpack('<I', rec[4:8])[0]
+    body = bytearray(rec[24:24 + size])
+    o = 0
+    while o + 6 <= len(body):
+        sub = bytes(body[o:o + 4])
+        ln = struct.unpack('<H', body[o + 4:o + 6])[0]
+        o += 6
+        if sub == b'MNAM' and ln == 28:
+            cells = _extent_cell_rect(extent)
+            if cells is not None:
+                body[o + 8:o + 16] = struct.pack('<hhhh', *cells)
+            return bytes(rec[:24]) + bytes(body)
+        o += ln
+    return rec
 
 
 def build_wrld_cloud_modl(rec: dict, edid: str = None):

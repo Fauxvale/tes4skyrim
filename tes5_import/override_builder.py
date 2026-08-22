@@ -435,8 +435,12 @@ _reg('ACHR', 'XOWN.Owner', _RB_REFR_XOWN)
 _reg('ACRE', 'XOWN.Owner', _RB_REFR_XOWN)
 _reg('WRLD', ('MNAM.UsableDimX', 'MNAM.UsableDimY', 'MNAM.NWCellX',
               'MNAM.NWCellY', 'MNAM.SECellX', 'MNAM.SECellY'), _RB_MNAM)
-_reg('WRLD', ('NAM0.MinX', 'NAM0.MinY'), _RB_NAM0, _RB_WRLD_MODL)
-_reg('WRLD', ('NAM9.MaxX', 'NAM9.MaxY'), _RB_NAM9, _RB_WRLD_MODL)
+# MNAM (the map camera's pan rectangle) rides along with the bounds change: a
+# plugin that adds land routinely leaves its authored MNAM untouched, so
+# keying the rebuild on an MNAM field having CHANGED would never fire on the
+# case that needs it. Widening NAM0/NAM9 is the signal that land was added.
+_reg('WRLD', ('NAM0.MinX', 'NAM0.MinY'), _RB_NAM0, _RB_WRLD_MODL, _RB_MNAM)
+_reg('WRLD', ('NAM9.MaxX', 'NAM9.MaxY'), _RB_NAM9, _RB_WRLD_MODL, _RB_MNAM)
 _reg('GLOB', 'FLTV.Value', _RB_FLTV)
 _reg('LAND', 'VNML', _RB_LAND_VNML)
 _reg('LAND', 'VHGT', _RB_LAND_VHGT)
