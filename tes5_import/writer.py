@@ -412,7 +412,16 @@ def _walk_cells_for_refs(blob: bytes, start: int, end: int,
 
 
 def _cell_placement(blob: bytes, rec_off: int, dsize: int):
-    """(is_interior, cell_formid, grid_x, grid_y) for a serialized CELL."""
+    """(is_interior, cell_formid, grid_x, grid_y) for a serialized CELL.
+
+    A worldspace's PERSISTENT DUMMY CELL reports grid (None, None) whatever its
+    XCLC says.  It is identified by its record flag (0x400 Persistent) and not
+    by a missing XCLC, because only 49 of the 69 dummies actually omit XCLC —
+    the other 20, Tamriel's among them, carry a plausible-looking (0, 0) that is
+    NOT where the refs inside it stand.  Trusting that value files thousands of
+    refs at the origin and draws "currently has the ref under a different cell
+    key" for every one.
+    """
     fid = struct.unpack_from('<I', blob, rec_off + 12)[0]
     flags = struct.unpack_from('<I', blob, rec_off + 8)[0]
     if flags & 0x00040000:
@@ -425,6 +434,8 @@ def _cell_placement(blob: bytes, rec_off: int, dsize: int):
             interior = bool(blob[at] & 0x01)
         elif sig == b'XCLC' and ssz >= 8:
             gx, gy = struct.unpack_from('<ii', blob, at)
+    if (flags & _PERSISTENT_FLAG) and not interior:
+        gx = gy = None
     return (interior, fid, gx, gy)
 
 
@@ -444,14 +455,34 @@ def _record_ref_location(blob: bytes, rec_off: int, dsize: int,
             xlrt = struct.unpack_from('<I', blob, at)[0]
     if not xlcn and not xlrt:
         return
-    # An interior ref is addressed by its CELL; an exterior one by its
-    # worldspace plus the grid square it stands in.
+    # The World/Cell column and the grid columns move together — vanilla is
+    # absolute about it across all 5,596 LCPR entries in Skyrim.esm:
+    #
+    #   INTERIOR  -> World/Cell = the CELL, grid = the 0x7FFF sentinel  (3,828)
+    #   EXTERIOR  -> World/Cell = the WRLD, grid = the real coordinates (1,768)
+    #
+    # There is no third form.  In particular a ref may NOT be filed under a
+    # worldspace's PERSISTENT DUMMY CELL (record flag 0x400, DATA not-interior,
+    # XCLC absent or a meaningless 0,0) — every worldspace keeps its persistent
+    # refs in one such cell, and vanilla names that cell in ZERO of its LCPR
+    # entries.  Doing so draws two CK complaints per ref: "currently has the ref
+    # under a different cell key" when the grid disagrees, and "is a not a valid
+    # cell" when the dummy has no XCLC at all.
+    #
+    # So an exterior ref is always addressed by worldspace + ITS OWN position,
+    # taken from the cell it sits in when that cell has real coordinates and
+    # from the reference's own DATA position when it does not.
     if cell is not None and cell[0]:
         where, gx, gy = cell[1], _LCTN_NO_GRID, _LCTN_NO_GRID
-    elif cell is not None and cell[2] is not None and world_fid:
-        where, gx, gy = world_fid, cell[2], cell[3]
-    elif cell is not None:
-        where, gx, gy = cell[1], _LCTN_NO_GRID, _LCTN_NO_GRID
+    elif world_fid:
+        if cell is not None and cell[2] is not None:
+            gx, gy = cell[2], cell[3]
+        else:
+            pos = _ref_position(blob, rec_off, dsize)
+            if pos is None:
+                return
+            gx, gy = pos
+        where = world_fid
     else:
         return
     if xlcn and (flags & _PERSISTENT_FLAG):
@@ -460,6 +491,31 @@ def _record_ref_location(blob: bytes, rec_off: int, dsize: int,
     if xlrt and xlcn:
         lcpr, lcsr = out.setdefault(xlcn, ([], []))
         lcsr.append((xlrt, fid, where, gy, gx))
+
+
+def _ref_position(blob: bytes, rec_off: int, dsize: int):
+    """(grid x, grid y) of a placed reference, from its DATA position.
+
+    Needed for refs kept in a worldspace's persistent dummy cell, which carries
+    no usable XCLC of its own.  DATA is 24 bytes: X, Y, Z, RotX, RotY, RotZ as
+    floats; one exterior cell is 4096 units square, matching
+    record_types.world._ref_grid.
+    """
+    for sig, at, ssz in _iter_subrecords(blob, rec_off + 24,
+                                         rec_off + 24 + dsize):
+        if sig == b'DATA' and ssz >= 8:
+            x, y = struct.unpack_from('<ff', blob, at)
+            try:
+                gx = int(x // _CELL_SIZE)
+                gy = int(y // _CELL_SIZE)
+            except (ValueError, OverflowError):
+                return None      # NaN/inf position
+            # The grid columns are int16; anything outside that is not a real
+            # cell coordinate and would pack as garbage.
+            if -32768 <= gx <= 32767 and -32768 <= gy <= 32767:
+                return (gx, gy)
+            return None
+    return None
 
 
 def _rewrite_lctn_group(blob: bytes, refs: dict) -> bytes:

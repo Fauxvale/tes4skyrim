@@ -270,6 +270,38 @@ def build_marker_locations(by_type: dict, writer) -> tuple:
     cell_to_location = {}
     count = 0
 
+    # Resolve which marker OWNS each exterior cell square before writing any
+    # LCTN, because LCEC ownership must be EXCLUSIVE.  A cell carries a single
+    # XLCN, so if two locations both list it the CK reports the losers with
+    # "Exterior cell (x, y) in world 'W' is no longer tagged to this location".
+    # Vanilla never overlaps: all 948 LCEC cells in Skyrim.esm are claimed by
+    # exactly one location.  Ours overlapped on 873 squares (762 claimed twice,
+    # 106 three times, 5 four times) because every marker takes a 3x3 block and
+    # neighbouring markers collide — the count matched the warning exactly.
+    #
+    # The marker standing IN a square always beats one that merely spills into
+    # it, so its own cell is claimed first and the surrounding ring only fills
+    # squares still unowned.  Ties are broken by marker FormID so the output
+    # stays byte-reproducible.
+    cell_owner = {}
+    marker_cells = {}
+    ordered = [r for r in sorted(markers, key=lambda r: get_formid(r, 'FormID'))
+               if get_formid(r, 'FormID')]
+    for pass_ring in (False, True):
+        for rec in ordered:
+            world_fid = get_formid(rec, 'ParentWRLD')
+            if not world_fid:
+                continue
+            marker_fid = get_formid(rec, 'FormID')
+            gx = _grid(get_float(rec, 'PosX'))
+            gy = _grid(get_float(rec, 'PosY'))
+            squares = (_marker_cells(gx, gy) if pass_ring else [(gy, gx)])
+            for cgy, cgx in squares:
+                key = (world_fid, cgx, cgy)
+                if key not in cell_owner:
+                    cell_owner[key] = marker_fid
+                    marker_cells.setdefault(marker_fid, []).append((cgy, cgx))
+
     for rec in sorted(markers, key=lambda r: get_formid(r, 'FormID')):
         marker_fid = get_formid(rec, 'FormID')
         if not marker_fid:
@@ -290,10 +322,11 @@ def build_marker_locations(by_type: dict, writer) -> tuple:
         world_fid = get_formid(rec, 'ParentWRLD')
         cells = []
         if world_fid:
-            gx = _grid(get_float(rec, 'PosX'))
-            gy = _grid(get_float(rec, 'PosY'))
-            cells = _marker_cells(gx, gy)
-            subs += _pack_lcec(world_fid, cells)
+            # Only the squares this marker actually won (see cell_owner above);
+            # sorted so the subrecord is byte-reproducible.
+            cells = sorted(marker_cells.get(marker_fid, ()))
+            if cells:
+                subs += _pack_lcec(world_fid, cells)
 
         if name:
             subs += pack_string_subrecord('FULL', name)
@@ -313,7 +346,9 @@ def build_marker_locations(by_type: dict, writer) -> tuple:
         writer.add_record('LCTN', pack_record('LCTN', lctn_fid, 0, subs))
         count += 1
 
-        # The marker names the cells it sits in, beating the worldspace default.
+        # The marker names the cells it OWNS.  This is the same exclusive set
+        # written to LCEC above, which is what keeps a cell's XLCN and its
+        # location's LCEC pointing at each other.
         for gy, gx in cells:
             grid_to_location[(world_fid, gx, gy)] = lctn_fid
 
