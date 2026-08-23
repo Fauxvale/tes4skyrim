@@ -10,6 +10,20 @@ Handles:
 
 Usage:
     python -m tes5_import export/Oblivion.esm -o output/Oblivion.esm
+
+🛑 ADDING A NEW FUNCTION? DO NOT PUT IT DIRECTLY BELOW A NAVMESH FUNCTION.
+Six functions in this file are gated by `tools/navmesh_cache_hook.py`
+(`NAVMESH_FUNCS`): `_navmesh_geom_cache`, `_navm_model_key`,
+`_build_base_model_index`, `_build_door_fid_set`, `_gather_navm_jobs`,
+`_precompute_navmeshes`.  The hook attributes a change using git's `-U0` hunk
+header, which names the ENCLOSING function -- and for a pure insertion at a
+function boundary that is the function ABOVE.  So a brand-new function placed
+immediately after any of those six is reported as a change to IT, the pre-push
+gate fires, and its success path republishes the whole shared navmesh cache
+(~206 MB re-uploaded, and the open-ended cache release renamed).  Editing the
+TAIL of one of those functions does the same thing.  Put new helpers next to
+unrelated code instead -- and if a push does start a cache publish you did not
+intend, see `tools/navmesh_cache_hook.py --check`.
 """
 
 import argparse
@@ -43,6 +57,7 @@ from .skyrim_overrides import (
     set_voice_type,
 )
 from .navi_builder import NAVI_SINGLETON_FID, build_navi_record
+from .lava_placement import LavaPlanner, build_lava_stat
 from .locations import build_marker_locations
 from .record_types.world import (
     convert_ACHR,
@@ -2225,6 +2240,13 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     t3 = time.time()
     print(f"\nConverted {converted} records ({errors} errors) in {t3-t2:.2f}s")
 
+    # Lava surface mesh.  Generated here rather than in the asset stage so
+    # that --import-only alone produces a working result: the REFRs written
+    # above name it, and a placed reference whose model is missing renders as
+    # nothing at all.
+    if getattr(writer, '_lava_stat_emitted', False):
+        _write_lava_mesh(plugin_out_dir, by_type)
+
     # Write output
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     writer.write(output_path)
@@ -2976,6 +2998,9 @@ def _build_cell_groups(by_type: dict, writer: PluginWriter,
         base_model_by_fid = {}
     if navm_cache is None:
         navm_cache = {}
+    # Lava surfaces: Skyrim's water shader cannot render lava, so realm water
+    # gets an emissive plane laid over it (see tes5_import/lava_placement.py).
+    lava = LavaPlanner(by_type, writer)
     cells = by_type.get('CELL', [])
     refrs = by_type.get('REFR', [])
     achrs = by_type.get('ACHR', []) + by_type.get('ACRE', [])
@@ -3075,6 +3100,10 @@ def _build_cell_groups(by_type: dict, writer: PluginWriter,
                         if not is_persistent(achr_rec):
                             temporary.append(convert_ACHR(achr_rec))
                             converted += 1
+                    lava_refr = lava.refr_for(cell_rec)
+                    if lava_refr:
+                        temporary.append(lava_refr)
+                        converted += 1
                     # PGRD → NAVM (interior cells have no LAND; Z from node heights)
                     # Precomputed in parallel by _precompute_navmeshes.
                     for pgrd_rec in pgrd_by_cell.get(cell_fid, []):
@@ -3104,10 +3133,15 @@ def _build_cell_groups(by_type: dict, writer: PluginWriter,
         if block_parts:
             all_cell_parts.append(pack_group(2, struct.pack('<i', block_num), b''.join(block_parts)))
 
+    if lava.placed:
+        lava.emit_stat()
+
     if all_cell_parts:
         writer.add_raw_group('CELL', b''.join(all_cell_parts))
 
     print(f"    Interior cells: {len(interior_cells)}, children: {converted}")
+    if lava.placed:
+        print(f"    Lava surfaces placed (interior): {lava.placed}")
 
 
 def _grid_sort_key(label: bytes):
@@ -3153,6 +3187,53 @@ def _ensure_cell_grid(cell: dict) -> None:
         return
     cell['XCLC.X'] = '0'
     cell['XCLC.Y'] = '0'
+
+
+def _write_lava_mesh(plugin_out_dir: str, by_type: dict) -> None:
+    """Generate the emissive lava plane the placed lava REFRs point at.
+
+
+    The texture comes from the AUTHORED WATR: Oblivion's lava records name
+    their surface image in TNAM (OblivionLavaTest01 names
+    ``Water\\OblivionLava06.dds``), and the asset stage deploys it under
+    ``textures\\tes4\\``.  Records that name no texture fall back to the one a
+    sibling lava record does name, so a stub record cannot leave the plane
+    untextured.
+    """
+    from .lava_placement import (LAVA_MESH_REL, collect_lava_water_fids,
+                                 scroll_for)
+    from .record_types.common import _prefix_path
+
+    lava_fids = collect_lava_water_fids(by_type)
+    if not lava_fids:
+        return
+
+    texture = ''
+    for rec in by_type.get('WATR', []):
+        if get_formid(rec, 'FormID') not in lava_fids:
+            continue
+        tex = get_str(rec, 'TNAM.Texture', '').strip()
+        if tex:
+            texture = _prefix_path(tex)
+            break
+    if not texture:
+        print('    Lava surface: no authored texture on any lava WATR '
+              '- surface not generated')
+        return
+
+    scroll_x, scroll_y = scroll_for(by_type, lava_fids)
+
+    try:
+        from asset_convert.lava_surface import write_lava_nif
+    except Exception as exc:
+        print(f'    Lava surface: generator unavailable ({exc})')
+        return
+
+    dst = os.path.join(plugin_out_dir, 'meshes', *LAVA_MESH_REL.split('\\'))
+    if write_lava_nif(dst, 'textures\\' + texture,
+                      scroll_x=scroll_x, scroll_y=scroll_y):
+        print(f'    Lava surface mesh: {dst} (texture {texture}, '
+              f'scroll {scroll_x:g}/{scroll_y:g})')
 
 
 def _land_extents_by_wrld(ext_cells_by_wrld: dict) -> dict:
@@ -3244,6 +3325,8 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
         door_fids = set()
     if navm_cache is None:
         navm_cache = {}
+    # Lava surfaces over Oblivion realm water — see tes5_import/lava_placement.py.
+    lava = LavaPlanner(by_type, writer)
     worlds = by_type.get('WRLD', [])
     cells = by_type.get('CELL', [])
     refrs = by_type.get('REFR', [])
@@ -3608,6 +3691,10 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
                                 if not (get_int(achr, 'RecordFlags') & 0x400):
                                     temporary.append(convert_ACHR(achr))
                                     converted += 1
+                            lava_refr = lava.refr_for(cell_rec)
+                            if lava_refr:
+                                temporary.append(lava_refr)
+                                converted += 1
                             # PGRD → NAVM for exterior cells (LAND gives Z, CELL gives water)
                             # Precomputed in parallel by _precompute_navmeshes.
                             for pgrd_rec in pgrd_by_cell.get(cell_fid, []):
@@ -3657,7 +3744,12 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
     if all_wrld_parts:
         writer.add_raw_group('WRLD', b''.join(all_wrld_parts))
 
+    if lava.placed:
+        lava.emit_stat()
+
     print(f"    Worldspaces: {len(_wrld_jobs)}, children: {converted}")
+    if lava.placed:
+        print(f"    Lava surfaces placed (exterior): {lava.placed}")
 
 
 def main():

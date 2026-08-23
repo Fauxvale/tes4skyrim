@@ -418,6 +418,18 @@ def export_CLMT(rec: Record) -> list:
 
 
 def export_WATR(rec: Record) -> list:
+    """Water Type.
+
+    DATA is a 102-byte struct, but it is authored at five different lengths in
+    Oblivion.esm alone (2, 42, 62, 86 and 102 bytes -- CamoranLava ships just
+    the 2-byte tail), so every field is emitted only when the source is long
+    enough to hold it.  Field order and offsets follow the xEdit TES4
+    definition and were verified against a real Oblivion.esm.
+
+    Note TES4 carries a Scroll X/Y Speed pair at offsets 28-35 that TES5 has
+    no field for; that is why the colors sit at 44/48/52 here but at 40/44/48
+    in the TES5 DNAM.  The import side does the shift, not this dump.
+    """
     lines = []
     emit_string(lines, "EditorID", get_subrecord(rec, "EDID"))
     emit_string(lines, "TNAM.Texture", get_subrecord(rec, "TNAM"))
@@ -427,11 +439,42 @@ def export_WATR(rec: Record) -> list:
     emit_formid(lines, "SNAM.Sound", get_subrecord(rec, "SNAM"))
     data = get_subrecord(rec, "DATA")
     if data and len(data.data) >= 2:
-        # DATA is a large struct (~186 bytes), dump key fields
-        lines.append(f"DATA.Size={len(data.data)}")
-        if len(data.data) >= 8:
-            lines.append(f"DATA.WindVelocity={struct.unpack_from('<f', data.data, 0)[0]}")
-            lines.append(f"DATA.WindDirection={struct.unpack_from('<f', data.data, 4)[0]}")
+        d = data.data
+        n = len(d)
+        lines.append(f"DATA.Size={n}")
+
+        def f(name, off):
+            if off + 4 <= n:
+                lines.append(f"DATA.{name}={struct.unpack_from('<f', d, off)[0]}")
+
+        def rgb(name, off):
+            if off + 3 <= n:
+                lines.append(f"DATA.{name}R={d[off]}")
+                lines.append(f"DATA.{name}G={d[off + 1]}")
+                lines.append(f"DATA.{name}B={d[off + 2]}")
+
+        f("WindVelocity", 0)
+        f("WindDirection", 4)
+        f("WaveAmplitude", 8)
+        f("WaveFrequency", 12)
+        f("SunPower", 16)
+        f("ReflectivityAmount", 20)
+        f("FresnelAmount", 24)
+        f("ScrollXSpeed", 28)
+        f("ScrollYSpeed", 32)
+        f("FogNear", 36)
+        f("FogFar", 40)
+        rgb("ShallowColor", 44)
+        rgb("DeepColor", 48)
+        rgb("ReflectionColor", 52)
+        if n >= 57:
+            lines.append(f"DATA.TextureBlend={d[56]}")
+        # 60-99 are the rain / displacement simulator blocks: TES5 keeps the
+        # displacement struct but reorders it and marks rain unused, and no
+        # vanilla Skyrim record varies them meaningfully, so they are not
+        # carried across.
+        if n >= 102:
+            lines.append(f"DATA.Damage={struct.unpack_from('<H', d, 100)[0]}")
     return lines
 
 

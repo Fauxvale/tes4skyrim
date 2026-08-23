@@ -2299,3 +2299,73 @@ python tools/nif_block_scan.py output/<plugin>/meshes \
 ```
 
 Guarded by `tests/test_collision_packed_strips.py`.
+
+## Lava surfaces — Oblivion realm water rendered as actual lava (2026-08-23)
+
+**Skyrim's water shader physically cannot render lava.** The complete
+`BSWaterShaderPixelConstants` table, read out of SkyrimSE.exe at `0x1455789`,
+is: `ShallowColor DeepColor ReflectionColor FresnelRI CameraData ProjData
+VarAmounts SunDir SunColor NumLights LightPos LightColor WaterParams
+DepthControl SSRParams`. **No diffuse texture slot and no emissive term** — the
+three colors only tint a reflection/refraction result. All 93 `NNAM` entries
+across vanilla Skyrim's 34 WATR records name the same `DefaultWater.dds`, which
+is the normal/noise map, not a color map. Oblivion's lava colors are DARK
+(`shallow=(79,12,2)`) precisely because they tinted a bright emissive texture
+Skyrim has no way to sample, so a faithful WATR port renders as dark water.
+Chasing better WATR values is a dead end.
+
+**Bethesda's own answer is geometry.** Dawnguard's Aetherium Forge
+(`DLC1Bthalft01`) layers two things: `LavaSettings` (WATR, reached by the
+cell's `XCWT`) for the PHYSICS — swim, damage, fog, plus an `INAM` image space
+for being submerged — and `DweSpecialForgeLava01/02/03.nif` for the LOOK, an
+ordinary mesh with a `BSEffectShaderProperty`:
+`source_texture=WavyTurbulence01.dds`, `greyscale_texture=GradHotCoals.dds`,
+`emissive 1,1,1 × 2.0`, and a `BSEffectShaderPropertyFloatController` on
+U Offset. `Skyrim.esm`'s own `LavaWater` record is **dead data** — zero cell,
+worldspace, or REFR references; the only "lava" strings in Skyrim.esm are
+Olava the Feeble.
+
+**Our implementation**: `asset_convert/lava_surface.py` generates the plane,
+`tes5_import/lava_placement.py` places it. Oblivion's `oblivionlava06.dds` is
+already full colour (DXT1 blocks decode to `(230,97,49)`, `(222,64,32)`; mean
+channel spread 151/255), so it goes straight into `source_texture` and the
+greyscale-to-palette path is NOT used — setting `slsf_1_greyscale_to_palette_color`
+without binding a gradient samples a missing texture.
+
+**Lava is identified from AUTHORED data only**: a WATR is lava when
+`MNAM.MaterialID == "lava"` (Oblivion.esm: exactly `OblivionLavaTest01` and
+`OblivionCitadelLavaPlane`; Nehrim: `LavaLow`, `LavaDurchsichtig`). A cell gets
+a plane when its `XCWT.Water` is such a record, or — failing that — when it
+inherits one via its worldspace's `NAM2.Water`, which is how the engine itself
+resolves a cell's water. **Never infer from the worldspace being an "Oblivion
+realm"**: that flag says nothing about whether the water is lava. Oblivion.esm
+yields 7,765 planes (7,719 exterior on the 4096-unit cell grid, 46 interior at
+their authored `XCLW` heights).
+
+### Three bugs that each cost an in-game test cycle — check these FIRST
+
+All three produce a mesh that is perfectly valid on disk, loads without crash
+or warning, and is silently wrong in game:
+
+1. **No `BSXFlags` on the root → the scroll never runs.** Skyrim only ticks a
+   mesh's time controllers when the root sets BSXFlags **bit 0 (Animated)**.
+   The controller sits in the file and the texture is frozen. Vanilla lava
+   ships `BSX=1` (collisionless + animated). Identical to the fire-invisibility
+   root cause above — the same trap, twice.
+2. **Reversed winding → invisible from above.** With `a=(x,y)`, `b=(x+1,y)`,
+   `c=(x,y+1)`, winding `(a,c,b)` yields a **−Z** normal and the plane
+   backface-culls exactly where the player stands. Correct is `(a,b,c)` /
+   `(b,d,c)`. Compute the cross product; do not trust the comment.
+3. **Controller `target` unset → animation never binds.** Vanilla sets
+   `.target` on every shader float controller, as does `nif_converter.py` at
+   all six of its own sites.
+
+Also match `texture_clamp_mode = 0xFF03` (both vanilla and our own working
+converted meshes; a bare `3` differs) and controller `flags = 0x48`
+(Active | Compute Scaled Time — without the scaled-time bit the curve does not
+advance). `NiFloatInterpolator.float_value` may be `0.0`: our shipped,
+in-game-confirmed scrolling meshes (streetlamps, flame atronach) use `0.0` and
+animate fine, so it is **not** the blocker it first appears to be.
+
+Guarded by `tests/test_lava_surface.py` (5 tests, each asserting one of the
+silent-failure properties).

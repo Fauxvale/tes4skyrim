@@ -363,6 +363,11 @@ python tools/navmesh_cache_hook.py --run                      # publish manually
   keyed by asset path. Only our own `navmesh_geom_cache` pickles go in.
 - **Never put mtime, absolute paths, or worker counts in a cache key** — they
   are machine-local, so every downloader misses.
+- **NEVER add a function directly below — or edit the tail of — one of the six
+  gated functions in `import_main.py`** (`NAVMESH_FUNCS` in
+  `navmesh_cache_hook.py`). Git's `-U0` hunk header names the function ABOVE an
+  insertion, so unrelated code reads as a navmesh change and the next push
+  republishes the whole cache. Check with `navmesh_cache_hook.py --check`.
 
 Why, and the invalidation/tag contracts:
 [world_land_navmesh_notes.md](docs/world_land_navmesh_notes.md#the-shared-navmesh-cache--design-rationale).

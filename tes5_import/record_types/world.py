@@ -615,6 +615,15 @@ def convert_CELL(rec: dict) -> bytes:
     if lctn_fid:
         subs += pack_formid_subrecord('XLCN', lctn_fid)
 
+    # XCWT — the cell's own water type, overriding the worldspace's NAM2.  This
+    # is how Oblivion authors the lava in its realm interiors (46 of the 162
+    # cells that set XCWT name a lava record); dropping it left every one of
+    # them on the worldspace default.  Emitted after XLCN and before ownership
+    # to match the xEdit CELL subrecord order.
+    xcwt = get_formid(rec, 'XCWT.Water')
+    if xcwt:
+        subs += pack_formid_subrecord('XCWT', xcwt)
+
     return pack_record('CELL', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
 
@@ -675,13 +684,21 @@ def convert_WRLD(rec: dict) -> bytes:
     cnam = get_formid(rec, 'CNAM.Climate') or remap_formid(_TES4_DEFAULT_CLIMATE)
     subs += pack_formid_subrecord('CNAM', cnam)
 
-    # Water: TES4 WATR records are in skipTypes (we use Skyrim's water), so
-    # point NAM2 (water type) and NAM3 (LOD water type) at Skyrim.esm's
-    # DefaultWater (0x18, master index 0).  Vanilla Tamriel uses the same
-    # record for both.  Without NAM3 the engine's terrain-LOD water codepath
-    # derefs a null WATR pointer and CTDs as soon as a .btr contains a WATER
+    # Water: NAM2 (water type) and NAM3 (LOD water type).  WATR is converted
+    # (convert_WATR), so the authored TES4 pointer is honoured when there is
+    # one — 14 of Oblivion.esm's 84 worldspaces point NAM2 at lava, and
+    # hardcoding 0x18 here is what made every Oblivion realm render as
+    # ordinary blue water regardless of what its WATR said.  Worldspaces with
+    # no authored water fall back to Skyrim.esm's DefaultWater (0x18, master
+    # index 0), as vanilla Tamriel does.
+    #
+    # NAM3 stays on DefaultWater in all cases: it is the water drawn on
+    # distant terrain LOD, which vanilla always renders as ordinary water, and
+    # without a valid NAM3 the engine's terrain-LOD water codepath derefs a
+    # null WATR pointer and CTDs as soon as a .btr contains a WATER
     # BSMultiBoundNode.  NAM4 = LOD water height; Oblivion's sea level is 0.
-    subs += pack_formid_subrecord('NAM2', 0x00000018)
+    nam2 = get_formid(rec, 'NAM2.Water') or 0x00000018
+    subs += pack_formid_subrecord('NAM2', nam2)
     subs += pack_formid_subrecord('NAM3', 0x00000018)
     subs += pack_float_subrecord('NAM4', 0.0)
 
@@ -1300,46 +1317,64 @@ def convert_LSCR(rec: dict) -> bytes:
 def convert_WATR(rec: dict) -> bytes:
     """WATR — Water Type conversion.
 
-    TES5 order: EDID FULL NNAM ANAM FNAM MNAM SNAM XNAM DATA DNAM GNAM NAM0 NAM1
-    DATA is a 2-byte Damage value; DNAM is the 228-byte water-visuals struct
-    (wind/fog/color/reflectivity), heavily restructured from TES4's own DATA.
+    TES5 order: EDID FULL NNAM*3 ANAM FNAM MNAM TNAM SNAM XNAM INAM DATA DNAM
+    GNAM NAM0 NAM1.  DATA is a 2-byte Damage-per-second value; DNAM is the
+    228-byte water-visuals struct (fog/color/specular/noise/depth), restructured
+    from TES4's own 102-byte DATA and NOT offset-compatible with it.
     """
     subs = b''
     edid = get_str(rec, 'EditorID')
     if edid:
         subs += pack_string_subrecord('EDID', edid)
 
-    # NNAM — Noise map texture (TES5 uses separate field)
-    texture = get_str(rec, 'TNAM.Texture')
-    if texture:
-        subs += pack_string_subrecord('NNAM', _prefix_path(texture))
+    # NNAM — noise map textures.  TES5 takes three (one per noise layer) and
+    # every vanilla record points all three at the same file; TES4 authors a
+    # single surface texture.  Oblivion's is a diffuse surface map, not a
+    # normal/noise map, so feeding it to Skyrim's noise sampler produces
+    # garbage displacement — all 34 vanilla records use DefaultWater.dds and
+    # so do we, letting the DNAM colors carry the look instead.
+    for _ in range(3):
+        subs += pack_string_subrecord('NNAM', r'Data\Textures\Water\DefaultWater.dds')
 
     # ANAM — Opacity
     opacity = get_int(rec, 'ANAM.Opacity', 128)
-    subs += pack_uint8_subrecord('ANAM', opacity)
+    subs += pack_uint8_subrecord('ANAM', max(0, min(255, opacity)))
 
-    # FNAM — Flags
-    flags = get_int(rec, 'FNAM.Flags')
+    # FNAM — Flags.  Bit 0 (Causes Damage) means the same thing in both games.
+    # TES4 bit 1 is "Reflective", which TES5 reassigned (bit 3 Enable Flowmap,
+    # bit 4 Blend Normals in SSE), so only bit 0 is carried through — passing
+    # the raw byte would set flowmap/normal-blend bits at random.
+    flags = get_int(rec, 'FNAM.Flags') & 0x01
     subs += pack_uint8_subrecord('FNAM', flags)
 
-    # MNAM — Material ID (string)
-    mat_id = get_str(rec, 'MNAM.MaterialID')
-    if mat_id:
-        subs += pack_string_subrecord('MNAM', mat_id)
+    # MNAM — TES5 marks this "Material ID (Unused)" and every vanilla record
+    # that writes it writes a zero byte array, not the TES4 material string.
+    # TNAM took over as the material reference and is a MATT FormID; Skyrim
+    # ships no lava MATT and only 5 of 34 vanilla records set TNAM at all, so
+    # neither is emitted.
 
     # SNAM — Sound (open water sound)
     sound_fid = get_formid(rec, 'SNAM.Sound')
     if sound_fid:
         subs += pack_formid_subrecord('SNAM', sound_fid)
 
-    # DATA — Water Damage (2 bytes in TES5, a UInt16). TES4 exposes no damage
-    # value for WATR, so this is 0 for every converted water type (matches
-    # the large majority of vanilla Skyrim.esm's own WATR, where only a
-    # handful of DLC lava/acid types carry a nonzero value).
-    subs += pack_subrecord('DATA', struct.pack('<H', 0))
+    # DATA — Damage Per Second (UInt16).  TES4 carries the damage value at the
+    # tail of its own DATA struct and gates it behind FNAM bit 0 ("Causes
+    # Damage"); OblivionLavaTest01 authors 50/sec that way.  Honour the gate:
+    # a record with a damage value but no flag is not meant to hurt.
+    damage = get_int(rec, 'DATA.Damage', 0) if (flags & 0x01) else 0
+    subs += pack_subrecord('DATA', struct.pack('<H', max(0, min(0xFFFF, damage))))
 
-    # DNAM — Water Data (228 bytes in TES5). Preserve wind velocity/direction
-    # from TES4, fill the rest with reasonable defaults.
+    # DNAM — Water Data (228 bytes).  TES4's DATA is prefix-compatible with
+    # this struct as far as the color block, but NOT at the same offsets: TES4
+    # carries a Scroll X/Y Speed pair at 28-35 that TES5 dropped, so every
+    # field from Fog Near onward sits 4 bytes earlier here (colors at 40/44/48,
+    # not TES4's 44/48/52).  Writing TES4's offsets straight through is what
+    # used to land the colors in the rain-simulator region, leaving the real
+    # color bytes zeroed and every converted water rendering as undefined
+    # near-black.  Offsets below are derived from the xEdit TES5 definition and
+    # verified field-by-field against Skyrim.esm's DefaultWater, LavaWater and
+    # DefaultVolcanicWater.
     #
     # Real vanilla order is EDID NNAM* ANAM FNAM [MNAM] [SNAM] DATA DNAM
     # [GNAM NAM0 NAM1] — this used to be written with the 228-byte struct
@@ -1347,38 +1382,75 @@ def convert_WATR(rec: dict) -> bytes:
     # SSEEdit's background loader flags on every single WATR record
     # ("unexpected (or out of order) subrecord DATA"/"DNAM").
     dnam = bytearray(228)
-    wind_vel = get_float(rec, 'DATA.WindVelocity', 0.3)
-    wind_dir = get_float(rec, 'DATA.WindDirection', 0.0)
-    # Byte 0-3: Unknown float
-    struct.pack_into('<f', dnam, 0, 0.1)     # Unknown
-    struct.pack_into('<f', dnam, 4, 0.1)     # Unknown
-    struct.pack_into('<f', dnam, 8, 0.1)     # Unknown
-    struct.pack_into('<f', dnam, 12, wind_vel)
-    struct.pack_into('<f', dnam, 16, wind_dir)
-    # Sun specular power
-    struct.pack_into('<f', dnam, 20, 100.0)
-    # Reflectivity amount
-    struct.pack_into('<f', dnam, 24, 0.5)
-    # Fresnel amount
-    struct.pack_into('<f', dnam, 28, 0.025)
-    # Scroll speeds (UV for layers)
-    struct.pack_into('<f', dnam, 36, 0.3)
-    struct.pack_into('<f', dnam, 40, 0.3)
-    # Fog amount
-    struct.pack_into('<f', dnam, 64, 0.01)
-    # Fog near plane distance
-    struct.pack_into('<f', dnam, 68, 1000.0)
-    # Fog far plane distance
-    struct.pack_into('<f', dnam, 72, 100000.0)
-    # Shallow color (RGBA at offset 76): blue-ish
-    dnam[76] = 64; dnam[77] = 96; dnam[78] = 128; dnam[79] = 200
-    # Deep color (RGBA at offset 80): darker blue
-    dnam[80] = 32; dnam[81] = 48; dnam[82] = 96; dnam[83] = 255
-    # Reflection color (RGBA at offset 84): light
-    dnam[84] = 200; dnam[85] = 200; dnam[86] = 200; dnam[87] = 128
-    # Depth
-    struct.pack_into('<f', dnam, 100, 150.0)
+
+    def _f(off, value):
+        struct.pack_into('<f', dnam, off, value)
+
+    # 0-15: wind/wave. Marked "unused" by TES5 but every vanilla record still
+    # writes the same four constants, so mirror them rather than TES4's values.
+    _f(0, 0.1)
+    _f(4, 90.0)
+    _f(8, 0.5)
+    _f(12, 1.0)
+
+    # 16-27: the surface response TES4 does author.  Sun Power is a 0-50ish
+    # scale in TES4 and a ~1000 scale in TES5 (vanilla: 1021 default water,
+    # 1000 lava), so it is renormalised rather than copied raw; the rest are
+    # 0-1 ratios that mean the same thing in both games.
+    sun_power = get_float(rec, 'DATA.SunPower', 15.0)
+    _f(16, max(0.0, min(4000.0, sun_power * (1021.0 / 15.0))))
+    _f(20, get_float(rec, 'DATA.ReflectivityAmount', 1.0))
+    _f(24, get_float(rec, 'DATA.FresnelAmount', 0.05))
+    _f(28, 0.0)
+
+    # 32-39: above-water fog distance, straight across from TES4.
+    _f(32, get_float(rec, 'DATA.FogNear', 0.0))
+    _f(36, get_float(rec, 'DATA.FogFar', 110.0))
+
+    # 40-52: the color block — the whole visual identity of the water, and the
+    # reason Oblivion's realms came through as ordinary blue.  Alpha is 0 in
+    # every vanilla Skyrim record, so only RGB is carried.
+    for off, key, fallback in ((40, 'ShallowColor', (37, 52, 37)),
+                               (44, 'DeepColor', (5, 16, 5)),
+                               (48, 'ReflectionColor', (103, 122, 117))):
+        for i, chan in enumerate(('R', 'G', 'B')):
+            dnam[off + i] = max(0, min(255, get_int(
+                rec, f'DATA.{key}{chan}', fallback[i])))
+    dnam[52] = max(0, min(255, get_int(rec, 'DATA.TextureBlend', 50)))
+
+    # 56-227: noise, fog-under, specular and depth properties.  TES4 has no
+    # source for any of these — they describe a shader it does not have — so
+    # they take Skyrim's own DefaultWater values, which is what an unedited
+    # record in the CK would carry.  Leaving them zeroed instead produces
+    # water with no noise scale and no depth response.
+    for off, value in (
+            (100, 270.0),                                    # noise falloff
+            (104, 210.0), (108, 225.0), (112, 0.019),        # noise wind dir
+            (116, 0.013), (120, 0.096), (124, 6200.0),       # noise wind speed
+            (128, 0.2),
+            (132, 0.93), (136, 900.0),                       # fog above
+            (140, 0.9), (144, -500.0), (148, 1600.0),        # fog under
+            (152, 9.0),                                      # refraction mag
+            (156, 500.0), (160, 0.0), (164, 10000.0), (168, 10.0),
+            (172, 1920.0), (176, 6703.0), (180, 488.0),      # noise UV scale
+            (184, 0.6957), (188, 0.6304), (192, 0.4746),     # noise amp scale
+            (196, 0.34),                                     # reflection mag
+            (200, 1.7), (204, 3.2),                          # sun sparkle/spec
+            (208, 0.9), (212, 0.5), (216, 0.1), (220, 0.2),  # depth properties
+            (224, 2200.0)):                                  # sun sparkle power
+        _f(off, value)
     subs += pack_subrecord('DNAM', bytes(dnam))
+
+    # GNAM — Related Waters (daytime/nighttime/underwater).  Required by the
+    # xEdit definition and present on all 34 vanilla records, always zeroed.
+    subs += pack_subrecord('GNAM', b'\x00' * 12)
+
+    # NAM0/NAM1 — linear and angular velocity, required and zero on vanilla
+    # still water.  TES4's Scroll X/Y Speed is the closest analogue to NAM0's
+    # linear velocity, but the units differ by orders of magnitude (TES4
+    # authors 0.0011 where vanilla NAM0 carries 0.22), so it is not carried.
+    subs += pack_subrecord('NAM0', b'\x00' * 12)
+    subs += pack_subrecord('NAM1', b'\x00' * 12)
 
     return pack_record('WATR', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
