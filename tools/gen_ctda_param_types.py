@@ -35,6 +35,20 @@ _VALUE_TYPE_EXCEPTIONS = {
     'ptEquipType',   # engine parameter type 0x37, a plain equip-slot enum
 }
 
+# Param types xEdit's function table uses but never declares in
+# TConditionParameterType. The positional rule cannot classify these — they are
+# in no position at all — and defaulting them to "value" silently leaves a
+# FormID unremapped, which is a dangling reference in the output rather than a
+# loud failure. Anything named here is treated as a FormID; anything NOT named
+# here and NOT in the enum aborts the run (see build()).
+_FORMID_TYPES_NOT_IN_ENUM = {
+    # GetInWorldspace(ptWorldSpace). Unremapped, its worldspace argument kept
+    # the master index: 33 conditions across INFO and PACK referenced
+    # 0x00011F7C (nothing) instead of our 0x01011F7C SETheFringeOrdered, and
+    # the CK reported "Unable to find Function Info TESForm" for every one.
+    'ptWorldSpace',
+}
+
 _ENUM_RE = re.compile(
     r'TConditionParameterType\s*=\s*\((.*?)\)\s*;', re.S)
 _ENUM_ENTRY_RE = re.compile(r'\{\s*\d+\s*\}\s*(pt\w+)')
@@ -73,7 +87,8 @@ def formid_types(enum_names):
         first = enum_names.index(_FIRST_FORMID_TYPE)
     except ValueError:
         sys.exit(f'{_FIRST_FORMID_TYPE} not present in enum')
-    return set(enum_names[first:]) - _VALUE_TYPE_EXCEPTIONS
+    return ((set(enum_names[first:]) | _FORMID_TYPES_NOT_IN_ENUM)
+            - _VALUE_TYPE_EXCEPTIONS)
 
 
 def build(pas_path):
@@ -81,6 +96,18 @@ def build(pas_path):
     enum_names = parse_enum(text)
     funcs = parse_functions(text)
     fid_types = formid_types(enum_names)
+
+    # A param type the enum never declares cannot be classified by position,
+    # and guessing "value" hides an unremapped FormID in the output. Fail here
+    # instead: whoever adds the type decides which side it belongs on.
+    known = set(enum_names) | _FORMID_TYPES_NOT_IN_ENUM
+    unknown = {t for _n, params in funcs.values() for t in params.values()
+               if t not in known}
+    if unknown:
+        sys.exit('param type(s) used by wbConditionFunctions but absent from '
+                 'TConditionParameterType: ' + ', '.join(sorted(unknown)) +
+                 '\nAdd each to _FORMID_TYPES_NOT_IN_ENUM (FormID) or '
+                 '_VALUE_TYPE_EXCEPTIONS (plain value).')
     return enum_names, funcs, fid_types
 
 

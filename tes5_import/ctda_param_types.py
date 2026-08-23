@@ -68,6 +68,7 @@ CTDA_FORMID_PARAMS = {
     264: frozenset({1}),  # HasSpell(ptEffectItem)
     278: frozenset({1}),  # IsOwner(ptOwner)
     280: frozenset({1, 2}),  # IsCellOwner(ptCell, ptOwner)
+    310: frozenset({1}),  # GetInWorldspace(ptWorldSpace)
     359: frozenset({1}),  # GetInCurrentLoc(ptLocation)
     362: frozenset({1}),  # HasLinkedRef(ptKeyword)
     366: frozenset({1}),  # GetStolenItemValueNoCrime(ptFaction)

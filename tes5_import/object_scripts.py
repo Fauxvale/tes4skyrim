@@ -30,7 +30,9 @@ from script_convert.pipeline import build_vmad_object_script
 from .text_reader import (parse_export_file, get_formid_index_offset,
                           remap_formid, unescape_value)
 from .constants import ENGINE_GLOBAL_FORMIDS
-from .skyrim_overrides import TES4_ITEM_FORMID_TO_SKYRIM
+from .skyrim_overrides import (DEFAULT_RACE, RACE_MAP,
+                               TES4_ITEM_FORMID_TO_SKYRIM,
+                               TES4_RACE_FID_TO_EDID)
 
 # Papyrus property types that are literal-valued (not bound to a FormID).
 _VALUE_TYPES = {'Int', 'Float', 'Bool'}
@@ -677,5 +679,30 @@ def _resolve_props(sctx: str, edid: str, extends: str, xref,
         # reward otherwise hands out inert Oblivion gold that cannot be spent.
         # get_formid() applies this for export-driven references; a script
         # PROPERTY resolves through xref instead, so it needs it here too.
-        obj_props[safe] = TES4_ITEM_FORMID_TO_SKYRIM.get(raw) or _remap(raw, offset)
+        #
+        # The PLAYABLE RACES are the same case: they are not converted at all,
+        # every actor is retargeted onto Skyrim's own RACE (see
+        # _resolve_npc_race), so remapping a race reference by load order points
+        # at a record that does not exist.  The CK reports one "Property <Race>
+        # on script X is pointing at an invalid object" per bound property — 22
+        # of them on DAHermaeusStaff/DABoethiaPortal alone, whose scripts branch
+        # on the player's race and so silently do nothing.
+        obj_props[safe] = (TES4_ITEM_FORMID_TO_SKYRIM.get(raw)
+                           or _skyrim_race_formid(raw)
+                           or _remap(raw, offset))
     return obj_props
+
+
+def _skyrim_race_formid(raw: int) -> int:
+    """Skyrim RACE a TES4 race reference binds to, or 0 if it is not a race.
+
+    Mirrors record_types.actors._resolve_npc_race: mask the load-order byte,
+    resolve the TES4 FormID to its EditorID, then map that onto Skyrim's race.
+    Unlike that path there is NO DEFAULT_RACE fallback — an unrecognised id is
+    left for the normal remap, so only ids we positively know to be races are
+    redirected.
+    """
+    race_edid = TES4_RACE_FID_TO_EDID.get(raw & 0x00FFFFFF)
+    if not race_edid:
+        return 0
+    return RACE_MAP.get(race_edid, DEFAULT_RACE)

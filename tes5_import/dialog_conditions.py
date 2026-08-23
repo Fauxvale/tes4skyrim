@@ -18,8 +18,10 @@ conditions reference for the methodology.
 
 import struct
 
+from .constants import ENGINE_GLOBAL_FORMIDS
 from .ctda_param_types import CTDA_FORMID_PARAMS
-from .text_reader import get_formid_index_offset, remap_formid
+from .text_reader import (_ENGINE_FIXED_FORMIDS, get_formid_index_offset,
+                          remap_formid)
 
 # --- CTDA type-byte bits (identical in TES4 and TES5) --------------------------
 CTDA_OR = 0x01            # OR with the next condition
@@ -308,6 +310,16 @@ def _map_race_param(fid: int) -> 'int | None':
     return RACE_MAP.get(edid, DEFAULT_RACE)
 
 
+# FormIDs a CONDITION PARAMETER may keep at index 0. Both games define these
+# at the same ids and the ENGINE owns the live copy, so a condition must read
+# Skyrim's form rather than our converted duplicate:
+#   0x07/0x14  the player base and PlayerRef
+#   0x35-0x3A  GameYear, GameMonth, GameDay, GameHour, GameDaysPassed, TimeScale
+# Everything else below 0x100 is a real Oblivion record and MUST remap.
+_CONDITION_PASSTHROUGH_FIDS = frozenset(_ENGINE_FIXED_FORMIDS) | frozenset(
+    ENGINE_GLOBAL_FORMIDS.values())
+
+
 def _remap_formid(fid: int, offset: int) -> int:
     """Remap a TES4 FormID to the output plugin's load order.
 
@@ -327,8 +339,23 @@ def _remap_formid(fid: int, offset: int) -> int:
     Everything else delegates to text_reader.remap_formid so conditions shift
     identically to record fields — including overrides, which keep their
     master's index.
+    The pass-through set is ENUMERATED, not "everything below 0x100":
+    Oblivion.esm defines 127 records of its own down there — Tamriel WRLD 0x3C,
+    gold 0xF, DASkeletonKey 0xB, 57 DIALs from 0xAA, 21 SKILs, 27 marker STATs
+    — and passing those through hands the condition a vanilla Skyrim form of an
+    unrelated type, or nothing at all. Measured: the two MQ08 Skeleton Key
+    INFOs asked GetItemCount(0x0000000B) instead of 0x0100000B and the CK
+    reported "Unable to find Function Info TESForm".
+
+    The set is the player forms PLUS the six engine GLOBALS (GameYear 0x35 ..
+    TimeScale 0x3A). Those six exist at IDENTICAL ids in both games —
+    Skyrim.esm carries GameHour at 0x38 exactly as Oblivion.esm does — and the
+    engine updates its own copies, so a condition must read Skyrim's clock and
+    not our inert converted duplicate. Narrowing the set to the player forms
+    alone and letting these remap cost 119 warnings on GetGlobalValue against
+    0x01000038/0x01000037, worse than the 2 it fixed.
     """
-    if (fid >> 24) == 0 and (fid & 0x00FFFFFF) < 0x100:
+    if (fid >> 24) == 0 and (fid & 0x00FFFFFF) in _CONDITION_PASSTHROUGH_FIDS:
         return fid
     return remap_formid(fid, offset)
 

@@ -45,10 +45,10 @@ prefix: `01......` is Oblivion.esm, `00......` is Skyrim.esm.
 | 6 | One-way faction Friend/Ally relations | 105 | DEFAULT | easy | open |
 | 7 | Duplicate EditorIDs → `…DUPLICATE001` | 270 | EDITOR | — | **DEFERRED** — cosmetic; QUST/DIAL feed voice paths |
 | 8 | "cannot be scripted, but has scripts attached" | 136 | SCRIPTS | moderate | open |
-| 9 | Script property points at invalid object | 40 | SCRIPTS | moderate | open |
-| 10 | Potentially invalid X/Y on reference | 62 | MASTERFILE | moderate | open |
+| 9 | Script property points at invalid object | 40 | SCRIPTS | moderate | **FIXED** 2026-08-23 |
+| 10 | Potentially invalid X/Y on reference | 62 | MASTERFILE | — | **WONTFIX** — authored data |
 | 11 | Ref should be persistent but is not | 18 | MASTERFILE | moderate | open |
-| 12 | CTDA param init failures | 44 | MASTERFILE | moderate | open |
+| 12 | CTDA param init failures | 44 | MASTERFILE | moderate | **35 FIXED** 2026-08-23; 11 by design |
 | 13 | Navmesh should be refinalized (bounds missing) | 19 | PATHFINDING | moderate–hard | open |
 | 14 | Special Ref not in Special Ref data (map markers) | 513 uniq | MASTERFILE | hard | LCSR done; LCEC fix pending verify |
 | 15 | Exterior cell no longer tagged to this location | 989 | MASTERFILE | hard | LCEC fix pending verify |
@@ -308,40 +308,70 @@ This is a real behavioural loss, not cosmetic — the Oblivion scripts on those
 actors do not run. Fix requires moving the script off the shell (onto the
 placed ACHR, or onto a quest alias that fills the spawned actor).
 
-## 9. Script property points at invalid object (40) — moderate
+## 9. Script property points at invalid object (40) — FIXED 2026-08-23
 
 `[SCRIPTS] <name> on script <script> on <form> is pointing at an invalid object.`
 
-Dominated by two scripts × 10 races each — a **race name bound where an object
-is expected**:
-
-- `TES4_DAHermaeusStaff` on `DAHermaeusThing` — Argonian, Breton, DarkElf,
-  HighElf, IMPERIAL, Khajiit, Nord, Orc, Redguard, WoodElf
-- `TES4_DABoethiaPortal` on `DABoethiaPortalFinal` — same 10
-
-Plus 16 on `TES4_SE08AllyMainScript` (`GoldenSaint`/`DarkSeducer` properties on
-`SE08GoldenSaint01-04Ref` / `SE08DarkSeducer01-04Ref`), one `Orc` on
-`TES4_DAMalacathStatueScript`, one `Argonian` on
+Dominated by two scripts x 10 races each (`TES4_DAHermaeusStaff` on
+`DAHermaeusThing`, `TES4_DABoethiaPortal` on `DABoethiaPortalFinal`), plus 16 on
+`TES4_SE08AllyMainScript`, one on `TES4_DAMalacathStatueScript`, one on
 `TES4_MS40DaggerSpellEffect`, one `BurdTopic` on `TES4_QF_MQ07`.
 
-The pattern is a property typed as ObjectReference but filled with a RACE (or
-DIAL) form. One additional line:
-`SE32ArrowSteelRef … is pointing at an object that can be picked up and has an
-enable state parent` — separate, minor.
+An earlier draft of this audit guessed "a property typed as ObjectReference but
+filled with a RACE form". **That was wrong** — the generated `.psc` declares
+`Race Property Argonian Auto`, correctly typed. The VMAD binding was the
+problem.
 
-Cross-check `tools/property_type_audit.py` and
-`project_objref_methods_never_promote_to_actor`.
+**PLAYABLE RACES ARE NOT CONVERTED.** Every actor is retargeted onto Skyrim's
+own RACE record (`_resolve_npc_race` -> `RACE_MAP`), so no `TES4Argonian` RACE
+is ever written. But the script-property binder remapped race references by load
+order like any other form, producing `0x01023FE9` and friends — ids that exist
+in no file. The CK reports one warning per bound property, and the scripts, which
+branch on the player's race, silently do nothing.
 
-## 10. Potentially invalid X/Y on reference (62) — moderate
+[object_scripts.py](../tes5_import/object_scripts.py) already had exactly this
+pattern for engine-hardcoded bases (`TES4_ITEM_FORMID_TO_SKYRIM`, so a scripted
+`AddItem Gold001` hands out real Skyrim gold). Races are the same case and were
+simply missing; `_skyrim_race_formid` now routes them through
+`TES4_RACE_FID_TO_EDID` -> `RACE_MAP`, mirroring `_resolve_npc_race`. There is
+deliberately NO `DEFAULT_RACE` fallback — an unrecognised id falls through to
+the normal remap, so only ids positively known to be races are redirected.
 
-`[MASTERFILE] Potentially Invalid X|Y value on reference: REFR Form to TYPE form in Cell …`
+Verified in the built ESM: Argonian -> `0x00013740`, Nord -> `0x00013746`,
+Orc -> `0x00013747`, while the `DAHermaeusMora` QUST property still resolves to
+our own `0x010146AF`.
 
-23 X + 39 Y. By base type: STAT 32, LIGH 12, NPC_ 5, MISC 5, ALCH 4, INGR 2,
-DOOR 1, SOUN 1.
+**Note on reading VMAD by hand:** xEdit's `wbScriptObjFormatDecider` selects
+"Object v1" `(FormID, Alias, unused)` when `objFormat == 1` and "Object v2"
+`(unused, Alias, FormID)` otherwise. Getting that backwards makes every property
+look like a null FormID with the real id sitting in the alias field.
 
-Coordinates the CK considers out of sane range. Related to the
-`project_refr_angle_normalize_hang` family — the same class of oversized float
-that hung reference init, here caught as a warning instead.
+Remaining, not fixed: one
+`SE32ArrowSteelRef ... is pointing at an object that can be picked up and has an
+enable state parent` — separate and minor.
+
+## 10. Potentially invalid X/Y on reference (62) — WONTFIX, authored data
+
+`[MASTERFILE] Potentially Invalid X|Y value (N) on reference: REFR ... in Cell ...`
+
+23 X + 39 Y across **55 distinct refs**. By base type: STAT 32, LIGH 12, NPC_ 5,
+MISC 5, ALCH 4, INGR 2, DOOR 1, SOUN 1. Concentrated in a few interiors —
+`UnderpallCave03` 30, `TestMattInterior` 13, `HornCave` 4.
+
+**All 55 are authored exactly as Bethesda shipped them.** The export carries
+`PosX=-71640.6640625` verbatim; the conversion changes nothing. Coordinates run
+from 30,016 to 526,134 units (a cell is 4,096).
+
+The CK is not wrong that this is unusual — vanilla Skyrim has **0 of 404,901**
+interior-group refs beyond 30,000 units, its maximum being 23,593. Oblivion
+simply authored interiors on a looser leash.
+
+**Do not "fix" these by clamping or relocating.** The obvious reading — stray
+junk far outside the room — is wrong. In `UnderpallCave03` the 30 flagged refs
+sit at Y -30,060 to -30,888 while the cell's other 150 refs span Y -29,866 to
+-24,336: they are **contiguous with the level geometry**, a few hundred units
+past an editor threshold. Moving them would break the cave to silence a warning
+that has no in-game effect.
 
 ## 11. Ref should be persistent but is not (18) — moderate
 
@@ -357,24 +387,76 @@ that hung reference init, here caught as a warning instead.
 acting.** Force-persisting on the strength of this warning is exactly the fix
 that was tried and refuted there — it made objects vanish in game.
 
-## 12. CTDA param init failures (44) — moderate
+## 12. CTDA param init failures (44) — 35 FIXED 2026-08-23, 11 by design
 
-Four related shapes:
+Four shapes, three different causes.
 
-| Shape | Count |
-|---|---|
-| `Unable to find Function Info TESForm … in TESConditionItem Parameter Init` | 33 |
-| `Unable to find variable ::TES4NoSuchVariable_var on any VM scripts` | 11 |
-| `Non-Persistent Function Info Reference … Initialization may fail in game` | 9 |
-| `Package Location Reference on owner object … is not persistent` | 2 |
+### 33 `Unable to find Function Info TESForm` — FIXED
 
-Mostly SE Fringe / Xeddefen dialogue INFOs and `SE08XedVictim0N_Flee` PACKs.
-`TES4NoSuchVariable_var` is our own sentinel leaking into shipped conditions —
-the condition is dead wherever it appears (e.g. `SKLxLightArmor4` on
-`DaedraShrineTopic`, `SE08XeddefenNPC0NRef` on the flee packages).
+The named FormIDs (`0x00011F7C`, `0x0005CF61`, `0x0004FE12`, `0x0004FE13`,
+`0x00032AFE`) are all **Oblivion WRLD records that kept the master index**:
+`0x00011F7C` is `SETheFringeOrdered`, written by us as `0x01011F7C`. With index
+0 they either name nothing or collide with an unrelated vanilla REFR — which is
+also what produced the 9 "Non-Persistent Function Info Reference" lines, since
+`0x00032AFE` happens to be a non-persistent vanilla ref.
 
-Background: [dialogue_conversion_notes.md](dialogue_conversion_notes.md) on the
-`Conditional` flag requirement, and `project_ctda_func_79_is_solved`.
+**40 of the 47 complained-about parameters belong to condition function 310,
+`GetInWorldspace(ptWorldSpace)`.** Its parameter was never remapped because
+`ptWorldSpace` is **used by xEdit's function table but never declared in its
+`TConditionParameterType` enum** — the only such type. Our generator classifies
+by position in that enum, so an undeclared type fell through to "plain value"
+and the id was left alone.
+
+Fixed in [gen_ctda_param_types.py](../tools/gen_ctda_param_types.py):
+`_FORMID_TYPES_NOT_IN_ENUM` names `ptWorldSpace` explicitly, and the generator
+now **aborts** when any function uses a type the enum does not declare, rather
+than silently guessing. Regenerating changed exactly one line of
+`ctda_param_types.py` (`310: frozenset({1})`).
+
+Verified in the built ESM: 43 func-310 conditions, **43 remapped, 0 left at
+index 0**.
+
+### 2 `GetItemCount(0x0000000B)` — FIXED
+
+`_remap_formid` in [dialog_conditions.py](../tes5_import/dialog_conditions.py)
+passed through **everything** with index 0 and object id `< 0x100`. That is far
+too wide: Oblivion.esm defines **127 records** below 0x100 — Tamriel WRLD
+`0x3C`, gold `0xF`, `DASkeletonKey` `0xB`, 57 DIALs from `0xAA`, 21 SKILs, 27
+marker STATs. Two MQ08 Skeleton Key INFOs therefore asked for `0x0000000B`,
+which is not a Skyrim form.
+
+The pass-through set is now **enumerated**: the player forms PLUS the six
+engine globals.
+
+⚠️ **Narrowing it to the player forms alone is WRONG and was tried** — it cost
+119 new warnings against the 2 it fixed. `GameYear 0x35` … `TimeScale 0x3A`
+exist at **identical ids in both games** (Skyrim.esm carries `GameHour` at
+`0x38` exactly as Oblivion.esm does), the engine owns the live copy, and
+`convert_GLOB` deliberately writes NO record for them — so a remapped
+`0x01000038` points at nothing. Two existing tables already documented this:
+`ENGINE_GLOBAL_FORMIDS` in `constants.py` and `_ENGINE_GLOBALS` in
+`record_types/actors.py`. Check what actually lives below `0x100` before
+touching this predicate.
+
+Note `text_reader._ENGINE_FIXED_FORMIDS` is `{0x14, 0x7}` and that is correct
+*there* — a record FIELD naming a global resolves by name through
+`ENGINE_GLOBAL_FORMIDS`, so only the CTDA numeric path needs the wider set.
+
+Verified in the built ESM: both Skeleton Key conditions read `0x0100000B`, 255
+conditions reference Skyrim's `0x00000036/37/38`, none reference ours, and no
+GLOB record is written at an engine-global id.
+
+### 11 `Unable to find variable ::TES4NoSuchVariable_var` — BY DESIGN, do not "fix"
+
+A deliberate sentinel. When a TES4 `GetScriptVariable` names a variable that
+does not exist (no script on the base, no variable at that index, deleted ref),
+the converter emits a CIS2 name **no script declares**, so the read yields 0 —
+exactly what Oblivion returns in those cases, preserving the authored comparison
+and Or-flag.
+
+The alternative was tried and **failed open**: dropping the condition made SE08's
+five Xedilian victims force-greet and flee unconditionally, and 14 jailor
+packages run with the player free. See `_convert_script_var_ctda`.
 
 ## 13. Navmesh should be refinalized (19) — moderate to hard
 

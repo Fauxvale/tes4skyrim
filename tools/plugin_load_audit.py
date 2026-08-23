@@ -26,7 +26,13 @@ Checks, per plugin:
   9. at most ONE LAND per cell. Two landscapes in one cell is unresolvable
      while the engine builds its form table, so the game hangs on the main
      menu with no crash and no log — and xEdit still calls the file clean.
- 10. exterior block/sub-block groups ascend by UNSIGNED (X, Y), X major, with
+ 10. records that OVERRIDE a vanilla Skyrim.esm form. Our converted content is
+     brand-new, so a form whose own FormID carries master index 00 silently
+     replaces a Bethesda record and breaks vanilla Skyrim for the player. The
+     one legal case is the Navmesh Info Map singleton 0x00012FB4, which the
+     engine resolves by that fixed id and which Dawnguard/HearthFires/
+     Dragonborn each override the same way.
+ 11. exterior block/sub-block groups ascend by UNSIGNED (X, Y), X major, with
      no duplicate label. The engine walks this list to build a worldspace's
      cell grid while PARSING the file, so a run where X descends and
      re-ascends never terminates: main-menu hang, no crash, no log, and xEdit
@@ -62,9 +68,28 @@ FORBIDDEN = {
     b'CELL': {b'VNML', b'VHGT', b'VCLR', b'ACBS', b'AIDT', b'VTCK'},
 }
 ILLEGAL_TOP = {'REFR', 'ACHR', 'LAND', 'NAVM', 'PGRE', 'PHZD', 'PMIS', 'PARW'}
+# Vanilla Skyrim.esm forms our plugins are ALLOWED to override. The Navmesh
+# Info Map is a singleton the engine looks up by this fixed FormID, so every
+# file that ships navmesh must override it -- verified: all three vanilla DLC
+# ESMs do exactly this. Anything else with master index 00 is an accident.
+LEGAL_VANILLA_OVERRIDES = {(b'NAVI', 0x00012FB4)}
 # GRUP types labelled with the FormID of the record that owns them. At most one
 # of each may exist per owner per file.
 OWNED_GROUP_TYPES = (1, 6, 7)
+
+
+def plugin_masters(d):
+    """Master filenames from the TES4 header, in load-order index order."""
+    size = struct.unpack_from('<I', d, 4)[0]
+    out = []
+    j = 24
+    while j + 6 <= 24 + size:
+        ssig = d[j:j + 4]
+        z = struct.unpack_from('<H', d, j + 4)[0]
+        if ssig == b'MAST':
+            out.append(d[j + 6:j + 6 + z].rstrip(b'\0').decode('cp1252'))
+        j += 6 + z
+    return out
 
 
 def audit(path, label):
@@ -79,6 +104,11 @@ def audit(path, label):
     cell_lands = {}          # cell formid -> the LAND inside it (max one)
     # (enclosing group id) -> [block labels in file order], for the grid sort
     grid_siblings = {}
+    # Index of Skyrim.esm in this plugin's master list. A record whose own
+    # FormID carries this index byte is an override of a Bethesda record.
+    masters = plugin_masters(d)
+    vanilla_idx = next((k for k, m in enumerate(masters)
+                        if m.lower() == 'skyrim.esm'), None)
 
     def note(kind, detail):
         problems[kind] += 1
@@ -165,6 +195,10 @@ def audit(path, label):
             if key in seen:
                 note('duplicate-formid', f'{sig.decode()} {fid:08X}')
             seen[key] = True
+            if (vanilla_idx is not None and fid >> 24 == vanilla_idx
+                    and key not in LEGAL_VANILLA_OVERRIDES):
+                note('overrides-vanilla-skyrim',
+                     f'{sig.decode()} {fid:08X}')
 
             names = [s for s, _v in subs(body)]
             bad = FORBIDDEN.get(sig, set()) & set(names)
