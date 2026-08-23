@@ -291,6 +291,252 @@ def _merge_grid_groups(body: bytes) -> bytes:
     return bytes(out)
 
 
+_CELL_SIZE = 4096.0
+
+
+def _iter_subrecords(blob: bytes, start: int, end: int):
+    """Yield (signature, payload offset, payload length) honouring XXXX.
+
+    A subrecord's 2-byte length cannot express more than 65535, so a larger
+    payload is preceded by an XXXX subrecord carrying the real U32 length and
+    the following header's own length field reads 0.  Vanilla Skyrim.esm does
+    exactly this for CWTestHold's 113,836-byte OFST, and Oblivion's
+    TES4Tamriel needs it for a 135x130 grid (70,200 bytes) — a walker that
+    trusts the 2-byte field reads that grid as empty.
+    """
+    sp = start
+    pending = None
+    while sp + 6 <= end:
+        sig = blob[sp:sp + 4]
+        ssz = struct.unpack_from('<H', blob, sp + 4)[0]
+        if sig == b'XXXX':
+            if ssz >= 4:
+                pending = struct.unpack_from('<I', blob, sp + 6)[0]
+            sp += 6 + ssz
+            continue
+        real = pending if pending is not None else ssz
+        pending = None
+        yield (sig, sp + 6, real)
+        sp += 6 + real
+
+
+# Grid placeholder an LCPR/LCSR entry carries when its World/Cell field names an
+# INTERIOR cell rather than a worldspace.  Vanilla is completely consistent:
+# across Skyrim.esm's 16,093 entries, every CELL-targeted one uses this and
+# every WRLD-targeted one carries the real cell coordinates (0 exceptions).
+_LCTN_NO_GRID = 0x7FFF
+
+# REFR/ACHR record flag 0x400 — Persistent Reference.  Only persistent refs
+# carry XLCN, and every one of them must appear in its Location's LCPR.
+_PERSISTENT_FLAG = 0x00000400
+
+
+def _fill_location_refs(group_blobs: list) -> list:
+    """Populate every LCTN's LCPR / LCSR reference arrays.
+
+    Skyrim expects a Location to list the references that belong to it:
+
+      LCPR (12B/entry)  Ref, World/Cell, Grid Y, Grid X
+                        every PERSISTENT ref whose XLCN names this location
+      LCSR (16B/entry)  Loc Ref Type, Ref, World/Cell, Grid Y, Grid X
+                        every ref carrying XLRT (map markers), keyed by type
+
+    Without them the CK reports, once per reference, "Ref 'X' uses location but
+    is not in the unloaded ref data" (15,333 lines) and "Special Ref 'X' with
+    type 'MapMarkerRefType' is not in the Special Ref data" (1,002) — together
+    the second-largest warning bucket.
+
+    Vanilla writes the LC* ("master") arrays; the AC*/RC* variants are
+    save-game deltas that a plugin has no business emitting.  Verified against
+    Skyrim.esm: LCSR on 572 of 638 LCTN records, LCPR on 289, LCUN on 121.
+    """
+    refs = _collect_location_refs(group_blobs)
+    if not refs:
+        return group_blobs
+    out = []
+    for blob in group_blobs:
+        if len(blob) >= 12 and blob[:4] == b'GRUP' and blob[8:12] == b'LCTN':
+            out.append(_rewrite_lctn_group(blob, refs))
+        else:
+            out.append(blob)
+    return out
+
+
+def _collect_location_refs(group_blobs: list) -> dict:
+    """{location formid: ([LCPR entries], [LCSR entries])} from CELL/WRLD bytes.
+
+    Walks the serialized cell hierarchies, reading each placed reference's
+    XLCN (its Location) and XLRT (its special-reference type), and resolves the
+    World/Cell + grid columns from the CELL the reference sits in.
+    """
+    out = {}
+    for blob in group_blobs:
+        if len(blob) < 12 or blob[:4] != b'GRUP':
+            continue
+        if blob[8:12] not in (b'CELL', b'WRLD'):
+            continue
+        _walk_cells_for_refs(blob, 24, len(blob), None, out)
+    return out
+
+
+def _walk_cells_for_refs(blob: bytes, start: int, end: int,
+                         world_fid, out: dict) -> None:
+    """Descend a CELL/WRLD group, recording each ref against its Location."""
+    stack = [(start, end, world_fid, None)]
+    while stack:
+        s, e, wfid, cell = stack.pop()
+        p = s
+        while p + 24 <= e:
+            sig = blob[p:p + 4]
+            size = struct.unpack_from('<I', blob, p + 4)[0]
+            if sig == b'GRUP':
+                if size < 24:
+                    break
+                gtype = struct.unpack_from('<i', blob, p + 12)[0]
+                label = struct.unpack_from('<I', blob, p + 8)[0]
+                # type 1 = world children (label is the WRLD formid);
+                # types 6/8/9 = cell children, which inherit the cell above.
+                nw = label if gtype == 1 else wfid
+                nc = cell if gtype in (6, 8, 9) else None
+                stack.append((p + 24, p + size, nw, nc))
+                p += size
+                continue
+            if sig == b'WRLD':
+                wfid = struct.unpack_from('<I', blob, p + 12)[0]
+            elif sig == b'CELL':
+                cell = _cell_placement(blob, p, size)
+            elif sig in (b'REFR', b'ACHR', b'PGRE', b'PHZD', b'PMIS',
+                         b'PARW', b'PBAR', b'PBEA', b'PCON', b'PFLA'):
+                _record_ref_location(blob, p, size, wfid, cell, out)
+            p += 24 + size
+
+
+def _cell_placement(blob: bytes, rec_off: int, dsize: int):
+    """(is_interior, cell_formid, grid_x, grid_y) for a serialized CELL."""
+    fid = struct.unpack_from('<I', blob, rec_off + 12)[0]
+    flags = struct.unpack_from('<I', blob, rec_off + 8)[0]
+    if flags & 0x00040000:
+        return None
+    interior = False
+    gx = gy = None
+    for sig, at, ssz in _iter_subrecords(blob, rec_off + 24,
+                                         rec_off + 24 + dsize):
+        if sig == b'DATA' and ssz >= 1:
+            interior = bool(blob[at] & 0x01)
+        elif sig == b'XCLC' and ssz >= 8:
+            gx, gy = struct.unpack_from('<ii', blob, at)
+    return (interior, fid, gx, gy)
+
+
+def _record_ref_location(blob: bytes, rec_off: int, dsize: int,
+                         world_fid, cell, out: dict) -> None:
+    """Add one placed reference to its Location's LCPR / LCSR lists."""
+    flags = struct.unpack_from('<I', blob, rec_off + 8)[0]
+    if flags & 0x00040000:
+        return
+    fid = struct.unpack_from('<I', blob, rec_off + 12)[0]
+    xlcn = xlrt = 0
+    for sig, at, ssz in _iter_subrecords(blob, rec_off + 24,
+                                         rec_off + 24 + dsize):
+        if sig == b'XLCN' and ssz >= 4:
+            xlcn = struct.unpack_from('<I', blob, at)[0]
+        elif sig == b'XLRT' and ssz >= 4:
+            xlrt = struct.unpack_from('<I', blob, at)[0]
+    if not xlcn and not xlrt:
+        return
+    # An interior ref is addressed by its CELL; an exterior one by its
+    # worldspace plus the grid square it stands in.
+    if cell is not None and cell[0]:
+        where, gx, gy = cell[1], _LCTN_NO_GRID, _LCTN_NO_GRID
+    elif cell is not None and cell[2] is not None and world_fid:
+        where, gx, gy = world_fid, cell[2], cell[3]
+    elif cell is not None:
+        where, gx, gy = cell[1], _LCTN_NO_GRID, _LCTN_NO_GRID
+    else:
+        return
+    if xlcn and (flags & _PERSISTENT_FLAG):
+        lcpr, lcsr = out.setdefault(xlcn, ([], []))
+        lcpr.append((fid, where, gy, gx))
+    if xlrt and xlcn:
+        lcpr, lcsr = out.setdefault(xlcn, ([], []))
+        lcsr.append((xlrt, fid, where, gy, gx))
+
+
+def _rewrite_lctn_group(blob: bytes, refs: dict) -> bytes:
+    """Re-emit an LCTN top-level group with LCPR / LCSR arrays filled in."""
+    out = bytearray(blob[:24])
+    p = 24
+    end = len(blob)
+    while p + 24 <= end:
+        sig = blob[p:p + 4]
+        size = struct.unpack_from('<I', blob, p + 4)[0]
+        if sig != b'LCTN':
+            out += blob[p:p + 24 + size]
+            p += 24 + size
+            continue
+        fid = struct.unpack_from('<I', blob, p + 12)[0]
+        flags = struct.unpack_from('<I', blob, p + 8)[0]
+        entry = refs.get(fid)
+        if not entry or (flags & 0x00040000):
+            out += blob[p:p + 24 + size]
+            p += 24 + size
+            continue
+        lcpr, lcsr = entry
+        body = blob[p + 24:p + 24 + size]
+        out += _lctn_record_with_arrays(blob, p, body, lcpr, lcsr)
+        p += 24 + size
+    # A GRUP's size field covers its own 24-byte header (see pack_group), so it
+    # is the whole blob length — not the contents length.
+    struct.pack_into('<I', out, 4, len(out))
+    return bytes(out)
+
+
+def _lctn_record_with_arrays(blob: bytes, rec_off: int, body: bytes,
+                             lcpr: list, lcsr: list) -> bytes:
+    """Rebuild one LCTN record, inserting LCPR/LCSR in xEdit field order.
+
+    Field order per the TES5 LCTN definition: EDID, then the ACPR/LCPR/RCPR
+    reference arrays, then ACUN/LCUN/RCUN, ACSR/LCSR/RCSR, and the rest.  Any
+    existing LCPR/LCSR is dropped first so the pass is idempotent.
+    """
+    subs = []
+    for sig, at, ssz in _iter_subrecords(body, 0, len(body)):
+        if sig not in (b'LCPR', b'LCSR'):
+            subs.append((sig, body[at:at + ssz]))
+
+    rebuilt = b''
+    emitted = False
+
+    def _arrays() -> bytes:
+        out = b''
+        if lcpr:
+            # Sorted for byte-reproducibility; xEdit marks these arrays sorted
+            # on the reference FormID.
+            payload = b''.join(
+                struct.pack('<IIhh', r, w, gy, gx)
+                for r, w, gy, gx in sorted(set(lcpr)))
+            out += pack_subrecord('LCPR', payload)
+        if lcsr:
+            payload = b''.join(
+                struct.pack('<IIIhh', t, r, w, gy, gx)
+                for t, r, w, gy, gx in sorted(set(lcsr)))
+            out += pack_subrecord('LCSR', payload)
+        return out
+
+    for sig, data in subs:
+        if not emitted and sig != b'EDID':
+            rebuilt += _arrays()
+            emitted = True
+        rebuilt += pack_subrecord(sig.decode('ascii', 'replace'), data)
+    if not emitted:
+        rebuilt += _arrays()
+
+    fid = struct.unpack_from('<I', blob, rec_off + 12)[0]
+    flags = struct.unpack_from('<I', blob, rec_off + 8)[0]
+    version = struct.unpack_from('<H', blob, rec_off + 20)[0]
+    return pack_record('LCTN', fid, flags, rebuilt, form_version=version)
+
+
 def _sort_mgef_by_counter_effects(records: list) -> list:
     """Order MGEFs so every ESCE counter-effect target precedes its referrer.
 
@@ -753,18 +999,24 @@ class PluginWriter:
         total_count = sum(_count_records_and_groups(b) for b in group_blobs)
         overridden = self._collect_overridden_temporary(group_blobs)
 
+        header = pack_tes4_header(
+            self.masters,
+            num_records=total_count,
+            next_object_id=self._high_water_id(),
+            author=self.author,
+            description=self.description,
+            is_esm=self.is_esm,
+            overridden_forms=overridden,
+        )
+
+        # LCTN's reference arrays are derived from the CELL/WRLD bytes, so they
+        # are built here rather than in locations.py (which runs before any ref
+        # is serialized, and in the parent process only).  This RESIZES LCTN
+        # records, so anything depending on final byte offsets must run after it.
+        group_blobs = _fill_location_refs(group_blobs)
+
         try:
             with open(tmp_path, 'wb') as f:
-                # TES4 header
-                header = pack_tes4_header(
-                    self.masters,
-                    num_records=total_count,
-                    next_object_id=self._high_water_id(),
-                    author=self.author,
-                    description=self.description,
-                    is_esm=self.is_esm,
-                    overridden_forms=overridden,
-                )
                 f.write(header)
 
                 for blob in group_blobs:
