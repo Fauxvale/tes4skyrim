@@ -230,6 +230,16 @@ class TestConverters:
             pos += 6 + size
         return None
 
+    def _iter_subrecords(self, rec_bytes: bytes):
+        """Yield (signature, data) for every subrecord, in written order."""
+        data = rec_bytes[RECORD_HEADER_SIZE:]
+        pos = 0
+        while pos + 6 <= len(data):
+            sig = data[pos:pos + 4].decode('ascii', 'replace')
+            size = struct.unpack_from('<H', data, pos + 4)[0]
+            yield sig, data[pos + 6:pos + 6 + size]
+            pos += 6 + size
+
     def test_stat(self):
         rec = {'Signature': 'STAT', 'FormID': '00012345', 'RecordFlags': '0',
                'EditorID': 'TestRock', 'Model.MODL': 'Rocks\\Rock01.nif'}
@@ -518,6 +528,125 @@ class TestConverters:
         result = convert_CREA(rec)
         sig = result[:4].decode('ascii')
         assert sig == 'NPC_'
+
+    def test_crea_spells_are_emitted(self):
+        """CREA spells must reach SPLO — convert_CREA emitted NONE, so all
+        600 spell-carrying Oblivion creatures shipped unable to cast."""
+        rec = {'Signature': 'CREA', 'FormID': '0003E9CB', 'RecordFlags': '0',
+               'EditorID': 'CreatureScampStunted', 'FULL': 'Stunted Scamp',
+               'ACBS.Flags': '0', 'ACBS.Level': '3', 'ACBS.CalcMin': '1',
+               'ACBS.CalcMax': '10', 'ACBS.BarterGold': '0',
+               'FactionCount': '0', 'ItemCount': '0', 'AIPackageCount': '0',
+               'AIDT.Aggression': '0', 'AIDT.Confidence': '30',
+               'AIDT.Services': '0',
+               'SpellCount': '2',
+               'Spell[0]': '0002B543', 'Spell[1]': '0005D4A2',
+               'DATA.CombatSkill': '30', 'DATA.MagicSkill': '25',
+               'DATA.StealthSkill': '20', 'DATA.Health': '20',
+               'DATA.Strength': '30', 'DATA.Intelligence': '10'}
+        result = convert_CREA(rec)
+        spct = self._get_subrecord_data(result, 'SPCT')
+        assert struct.unpack('<I', spct)[0] == 2
+        # both spells present, in authored order; an LVSP target is legal
+        # (xEdit types SPLO as [SPEL, SHOU, LVSP])
+        splos = [struct.unpack('<I', d)[0]
+                 for s, d in self._iter_subrecords(result) if s == 'SPLO']
+        assert len(splos) == 2
+        assert [f & 0x00FFFFFF for f in splos] == [0x02B543, 0x05D4A2]
+
+    def test_offensive_spells_are_classified(self):
+        """Delivery classification drives the two cast paths: an aimed spell
+        is offensive (cast through SPLO + the graph's FireForget chain), a
+        passive Ability is neither (the scamp's AbDaedricResistWeak is a
+        self-buff), and only a pure TOUCH spell becomes the melee ATKD
+        'Attack Spell' (the flame atronach idiom)."""
+        from tes5_import import creature_races as cr
+        cr.load_creature_item_index({
+            'SPEL': [
+                {'Signature': 'SPEL', 'FormID': '0002B543',
+                 'SPIT.Type': '4', 'EffectCount': '1',
+                 'Effect[0].Type': 'Self'},
+                {'Signature': 'SPEL', 'FormID': '000A97DF',
+                 'SPIT.Type': '0', 'EffectCount': '1',
+                 'Effect[0].Type': 'Target'},
+                {'Signature': 'SPEL', 'FormID': '000A97E0',
+                 'SPIT.Type': '0', 'EffectCount': '1',
+                 'Effect[0].Type': 'Touch'},
+            ],
+            'LVSP': [
+                {'Signature': 'LVSP', 'FormID': '0005D4A2',
+                 'EntryCount': '1', 'Entry[0].FormID': '000A97DF'},
+            ],
+        })
+        try:
+            scamp = {'Signature': 'CREA', 'SpellCount': '2',
+                     'Spell[0]': '0002B543', 'Spell[1]': '0005D4A2'}
+            # the ability is passive; the LEVELED spell resolves offensive
+            assert cr.creature_has_offensive_spell([scamp])
+            assert not cr._spell_is_offensive(0x02B543)
+            assert cr._spell_is_offensive(0x05D4A2)
+            # an aimed spell must NOT ride the melee attacks...
+            assert cr.creature_touch_attack_spell([scamp]) == 0
+            # ...but a pure touch spell must
+            toucher = {'Signature': 'CREA', 'SpellCount': '1',
+                       'Spell[0]': '000A97E0'}
+            assert cr.creature_touch_attack_spell(
+                [toucher]) & 0x00FFFFFF == 0x0A97E0
+        finally:
+            cr.load_creature_item_index({})
+
+    def test_atkd_carries_the_attack_spell(self):
+        """ATKD field 3 is 'Attack Spell' (xEdit: [SPEL, SHOU, NULL]) — the
+        vanilla melee-caster idiom (109 vanilla attack entries; the flame
+        atronach's four attacks each name a fire spell)."""
+        from tes5_import.creature_races import _atkd
+        data = _atkd(spell=0x0105D4A2)
+        assert len(data) == 44
+        dmg, chance, spell, flags = struct.unpack_from('<ffII', data, 0)
+        assert spell == 0x0105D4A2
+        assert abs(chance - 1.0) < 1e-6
+        # a plain melee attack must still write a NULL spell
+        assert struct.unpack_from('<ffII', _atkd(), 0)[2] == 0
+
+    def test_crea_spells_follow_rnam(self):
+        """Order is RNAM -> SPCT -> SPLO[] -> COCT/CNTO (verified against the
+        xEdit TES5 NPC_ definition and real Skyrim.esm records)."""
+        rec = {'Signature': 'CREA', 'FormID': '0003E9CC', 'RecordFlags': '0',
+               'EditorID': 'TestCaster',
+               'ACBS.Flags': '0', 'ACBS.Level': '3', 'ACBS.CalcMin': '1',
+               'ACBS.CalcMax': '10', 'ACBS.BarterGold': '0',
+               'FactionCount': '0', 'ItemCount': '0', 'AIPackageCount': '0',
+               'AIDT.Aggression': '0', 'AIDT.Confidence': '30',
+               'AIDT.Services': '0', 'SpellCount': '1',
+               'Spell[0]': '0002B543',
+               'DATA.CombatSkill': '15', 'DATA.MagicSkill': '10',
+               'DATA.StealthSkill': '20', 'DATA.Health': '20',
+               'DATA.Strength': '30', 'DATA.Intelligence': '10'}
+        order = [s for s, _d in self._iter_subrecords(convert_CREA(rec))]
+        assert order.index('RNAM') < order.index('SPCT') < order.index('SPLO')
+        for after in ('AIDT', 'PKID'):
+            if after in order:
+                assert order.index('SPLO') < order.index(after)
+
+    def test_crea_null_spell_ids_are_dropped(self):
+        """A null FormID must never reach SPLO, and SPCT must match what was
+        actually written."""
+        rec = {'Signature': 'CREA', 'FormID': '0003E9CD', 'RecordFlags': '0',
+               'EditorID': 'TestNullSpell',
+               'ACBS.Flags': '0', 'ACBS.Level': '3', 'ACBS.CalcMin': '1',
+               'ACBS.CalcMax': '10', 'ACBS.BarterGold': '0',
+               'FactionCount': '0', 'ItemCount': '0', 'AIPackageCount': '0',
+               'AIDT.Aggression': '0', 'AIDT.Confidence': '30',
+               'AIDT.Services': '0', 'SpellCount': '2',
+               'Spell[0]': '00000000', 'Spell[1]': '0002B543',
+               'DATA.CombatSkill': '15', 'DATA.MagicSkill': '10',
+               'DATA.StealthSkill': '20', 'DATA.Health': '20',
+               'DATA.Strength': '30', 'DATA.Intelligence': '10'}
+        result = convert_CREA(rec)
+        assert struct.unpack('<I', self._get_subrecord_data(result,
+                                                            'SPCT'))[0] == 1
+        assert len([1 for s, _d in self._iter_subrecords(result)
+                    if s == 'SPLO']) == 1
 
     def test_crea_base_scale_to_nam6(self):
         """TES4 CREA BNAM 'Base Scale' -> TES5 NPC_ NAM6 'Height'.

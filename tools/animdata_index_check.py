@@ -20,11 +20,12 @@ reports:
 
 Usage:
   python tools/animdata_index_check.py [--plugin Oblivion.esm]
-      [--project tes4dogproject.txt] [--verbose]
+      [--project tes4oblivion_dogproject.txt] [--verbose]
 
 Exits non-zero if any generated project has an out-of-range index.
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -88,15 +89,30 @@ def main():
     blocks = parse_singlefile(single)
     failures = 0
     checked = 0
-    for folder in sorted(os.listdir(actors)):
-        proj_txt = f'tes4{folder}project.txt'.lower()
+    # layout: actors/tes4/<plugin namespace>/<folder>/project_manifest.json
+    # (hkx_behavior.project_layout) — the manifest names the project files
+    manifests = []
+    for ns in sorted(os.listdir(actors)):
+        ns_dir = os.path.join(actors, ns)
+        if not os.path.isdir(ns_dir):
+            continue
+        for folder in sorted(os.listdir(ns_dir)):
+            mp = os.path.join(ns_dir, folder, 'project_manifest.json')
+            if os.path.isfile(mp):
+                with open(mp, encoding='utf-8') as f:
+                    manifests.append((os.path.join(ns_dir, folder),
+                                      json.load(f)))
+    for proj_dir, m in manifests:
+        proj_txt = m['project_txt'].lower()
         if args.project and proj_txt != args.project.lower():
             continue
         if proj_txt not in blocks:
             continue
-        char = os.path.join(actors, folder, 'characters',
-                            f'tes4{folder}character.hkx')
-        if not os.path.isfile(char):
+        char_rel = next((p for p in m.get('project_files', [])
+                         if p.lower().startswith('characters')), None)
+        char = os.path.join(proj_dir, *char_rel.split('\\')) if char_rel \
+            else ''
+        if not char or not os.path.isfile(char):
             print(f'{proj_txt}: character hkx missing, skipped')
             continue
         anims = character_anims(char)

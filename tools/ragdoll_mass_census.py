@@ -26,7 +26,7 @@ Usage:
 
   # ours, whole plugin
   python tools/ragdoll_mass_census.py --glob \
-      "output/Oblivion.esm/meshes/actors/tes4/*/character assets/skeleton.hkx"
+      "output/Oblivion.esm/meshes/actors/tes4/*/*/character assets/skeleton.hkx"
 
   # side-by-side summary only
   python tools/ragdoll_mass_census.py --summary <files...>

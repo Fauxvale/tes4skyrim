@@ -235,57 +235,204 @@ class TestAnimHkx:
         assert 'FootFront' in texts and 'FootBack' in texts
 
 
-class TestSharedSinglefileBlockSelection:
-    """A clip block must describe the character hkx that actually DEPLOYS.
+class TestPerPluginProjectNamespace:
+    """Two plugins' same-named creature folders must never share a path.
 
-    Every plugin writes its creatures to the same loose
-    `meshes\\actors\\tes4\\<folder>\\` path, so exactly one
-    `tes4<folder>character.hkx` survives in Data — but the animationdata block
-    describing it is picked separately, by whichever plugin merged the shared
-    singlefile last.  When the two disagree, the block's indices are read
-    against a shorter file list and every clip past its end silently never
-    binds.  That is how Morrowind_ob's 27-clip / 21-file clannfear landed on
-    top of Oblivion's 17-file hkx and left Equip_H2H, the run gaits and
-    FullyRagdollPose (the death-pose source) permanently unbound.
+    Oblivion's scamp and Morrowind_ob's Morrowind scamp both came from a
+    folder called `scamp`; under one shared `actors\\tes4\\scamp` path only
+    one survived in Data, and a Stunted Scamp in Oblivion ran Morrowind_ob's
+    graph — no Spell_FireForget_LH, none of Oblivion's attackStart_TES4_*
+    events (read back from the engine's live event map, 2026-08-23). The
+    owning plugin is now part of the directory, every project file stem and
+    the project name the animation caches are keyed on.
     """
 
-    @staticmethod
-    def _manifest(n_files):
-        return {'project_txt': 'tes4xproject.txt',
-                'clips': [{'anim': 'Animations\\a%d.hkx' % i}
-                          for i in range(n_files)]}
+    def test_layout_is_namespaced_everywhere(self):
+        from asset_convert.hkx_behavior import project_layout
+        a = project_layout('scamp', 'oblivion')
+        b = project_layout('scamp', 'morrowind_ob')
+        for key in ('project_hkx', 'project_txt', 'behavior_hkx', 'anim_dir',
+                    'skeleton_nif', 'body_dir', 'fs_dir'):
+            assert a[key] != b[key], key
+        assert a['project_hkx'] == \
+            'Actors\\TES4\\oblivion\\scamp\\tes4oblivion_scampproject.hkx'
+        assert a['behavior_hkx'] == ('Actors\\TES4\\oblivion\\scamp\\'
+                                     'Behaviors\\tes4oblivion_scampbehavior.hkx')
+        assert a['project_txt'] == 'tes4oblivion_scampproject.txt'
+        assert a['fs_dir'] == os.path.join('actors', 'tes4', 'oblivion',
+                                           'scamp')
 
-    def _fake_char(self, tmp_path, plugin, folder, n_files):
-        d = tmp_path / plugin / 'meshes' / 'actors' / 'tes4' / folder
-        (d / 'characters').mkdir(parents=True, exist_ok=True)
-        blob = b'\x00'.join(b'Animations\\a%d.hkx' % i
-                            for i in range(n_files))
-        (d / 'characters' / ('tes4%scharacter.hkx' % folder)).write_bytes(blob)
-        return str(tmp_path / plugin / 'meshes')
+    def test_namespace_is_the_plugin_stem(self):
+        from asset_convert.creature_pipeline import plugin_namespace
+        assert plugin_namespace('Oblivion.esm') == 'oblivion'
+        assert plugin_namespace('Morrowind_ob.esm') == 'morrowind_ob'
+        assert plugin_namespace('DLCShiveringIsles.esp') == 'dlcshiveringisles'
+        assert plugin_namespace(
+            'Morrowind_ob - Chargen and Transport Mod.esp') == \
+            'morrowind_ob_chargen_and_transport_mod'
 
-    def test_oversized_block_loses_to_fitting_one(self, tmp_path):
-        from asset_convert.creature_pipeline import _block_outranks
-        big = self._fake_char(tmp_path, 'Child.esm', 'clannfear', 21)
-        small = self._fake_char(tmp_path, 'Master.esm', 'clannfear', 17)
-        # Master's hkx is the one deployed; the child's 21-file block does not
-        # fit it, the master's 17-file block does -> the master's block wins.
-        assert _block_outranks(small, big, 'clannfear',
-                               self._manifest(21), self._manifest(17),
-                               small, log=lambda *a: None) is True
+    def test_sibling_union_keeps_both_plugins_projects(self, tmp_path):
+        """The shared singlefile registers every plugin's block; same folder
+        name in two plugins = two distinct projects, no winner picked."""
+        import json
+        from asset_convert.creature_pipeline import _manifests_under
+        for plug, ns in (('Oblivion.esm', 'oblivion'),
+                         ('Morrowind_ob.esm', 'morrowind_ob')):
+            d = tmp_path / plug / 'meshes' / 'actors' / 'tes4' / ns / 'scamp'
+            d.mkdir(parents=True)
+            (d / 'project_manifest.json').write_text(json.dumps(
+                {'name': 'scamp', 'namespace': ns,
+                 'project_txt': f'tes4{ns}_scampproject.txt'}))
+        a = _manifests_under(str(tmp_path / 'Oblivion.esm' / 'meshes'))
+        b = _manifests_under(str(tmp_path / 'Morrowind_ob.esm' / 'meshes'))
+        assert set(a) == {'tes4oblivion_scampproject.txt'}
+        assert set(b) == {'tes4morrowind_ob_scampproject.txt'}
+        assert not (set(a) & set(b))
 
-    def test_fitting_incumbent_is_kept(self, tmp_path):
-        from asset_convert.creature_pipeline import _block_outranks
-        big = self._fake_char(tmp_path, 'Child.esm', 'clannfear', 21)
-        small = self._fake_char(tmp_path, 'Master.esm', 'clannfear', 17)
-        # Incumbent already fits the deployed hkx — never swap it out.
-        assert _block_outranks(big, small, 'clannfear',
-                               self._manifest(17), self._manifest(21),
-                               small, log=lambda *a: None) is False
-
-    def test_every_clip_index_is_in_range(self, tmp_path):
-        """The end-to-end invariant: no clip may index past the file list."""
+    def test_every_clip_index_is_in_range(self):
+        """No clip may index past the character file list."""
         from asset_convert.animation_data import _anim_file_index
-        m = self._manifest(17)
+        m = {'project_txt': 'tes4xproject.txt',
+             'clips': [{'anim': 'Animations\\a%d.hkx' % i}
+                       for i in range(17)]}
         idx = _anim_file_index(m)
         n_files = len(dict.fromkeys(c['anim'] for c in m['clips']))
         assert all(0 <= i < n_files for i in idx.values())
+
+
+# ---------------------------------------------------------------------------
+# Spellcasting lane (the magic handshake the engine waits on)
+# ---------------------------------------------------------------------------
+
+SCAMP_DIR = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                         'creatures', 'scamp')
+needs_scamp = pytest.mark.skipif(
+    not os.path.exists(os.path.join(SCAMP_DIR, 'castself.kf')),
+    reason='Oblivion scamp export assets missing')
+
+
+@needs_scamp
+class TestCastLane:
+    """Cast clips must become the vanilla FireForget chain wired to the
+    ENGINE's magic handshake (decompiled from atronachflamebehavior.hkx):
+    the graph raises BeginCast* TO the engine, the engine replies with
+    Spell_FireForget_LH/RH (the state-entry events), Magic_Pre_Out chains
+    In->Loop, Spell_Release moves to the Out, and the Out clip's
+    MLh_SpellFire_Event trigger is what actually fires the spell."""
+
+    def _clips(self):
+        from asset_convert.hkx_behavior import classify_clips
+        return classify_clips(SCAMP_DIR)
+
+    def test_cast_clips_are_claimed_not_dropped(self):
+        clips = self._clips()
+        assert set(clips['cast']) == {'Self', 'Target'}
+        # nothing named cast* may survive in the dead bucket
+        assert not [p for p in clips['extra']
+                    if os.path.basename(p).lower().startswith('cast')]
+
+    def test_cast_states_are_three_phase(self):
+        """A Skyrim cast is In -> Loop -> Out (vanilla Mag_FF_RH_In/_Loop/
+        _Out), ONE chain per graph — vanilla creature casters route
+        everything through the left hand (the atronach's RH states are dead
+        code and even its RH Out fires MLh_SpellFire_Event)."""
+        from asset_convert.hkx_behavior import cast_phase_defs
+        names = [s for s, _kf, _p, _st in cast_phase_defs(self._clips())]
+        assert names == ['Mag_FF_In', 'Mag_FF_Loop', 'Mag_FF_Out']
+
+    def test_cast_plays_the_aimed_clip_first(self):
+        """The engine's entry event carries no delivery, so the chain plays
+        the most cast-like gesture available: casttarget over castself."""
+        from asset_convert.hkx_behavior import cast_clip
+        assert os.path.basename(cast_clip(self._clips())).lower() \
+            == 'casttarget.kf'
+
+    def test_only_the_loop_repeats(self):
+        from asset_convert.hkx_behavior import state_defs
+        loops = {n: l for n, _k, l, _e, _x in state_defs(self._clips())
+                 if n.startswith('Mag_FF_')}
+        assert loops == {'Mag_FF_In': False, 'Mag_FF_Loop': True,
+                         'Mag_FF_Out': False}
+
+    def test_each_phase_gets_its_own_animation(self):
+        """The phases are CUT from one source clip, so they cannot share
+        one animation file."""
+        from asset_convert.hkx_behavior import cast_anim_stems
+        stems = cast_anim_stems(self._clips())
+        assert stems == {'Mag_FF_In': 'casttarget_In',
+                         'Mag_FF_Loop': 'casttarget_Loop',
+                         'Mag_FF_Out': 'casttarget_Out'}
+
+    def test_split_is_anchored_on_the_authored_hit_key(self):
+        """The release moment is the clip's authored 'Hit' key; the Out
+        opens CAST_PRE_RELEASE before it (vanilla's Out carries ~0.23s of
+        wind-up before its SpellFire trigger) and the returned offset points
+        the trigger back at the authored moment exactly."""
+        from asset_convert.hkx_anim import (decode_clip, split_cast_clip,
+                                            CAST_LOOP_SECONDS,
+                                            CAST_PRE_RELEASE)
+        clip, _m = decode_clip(self._clips()['cast']['Target'], 30.0)
+        hit = [t for t, v in clip.text_keys if v.strip().lower() == 'hit'][0]
+        i, l, o, rel = split_cast_clip(clip)
+        cut = max(0.0, hit - CAST_PRE_RELEASE)
+        assert abs(i.duration - cut) < 0.05
+        assert abs(l.duration - CAST_LOOP_SECONDS) < 1e-6
+        assert abs(o.duration - (clip.duration - cut)) < 0.05
+        assert abs((cut + rel) - hit) < 1e-6
+        # the slices must carry real animation, not empty tracks
+        assert len(i.tracks) == len(clip.tracks) == len(o.tracks)
+        assert len(i.times) > 1 and len(o.times) > 1
+
+    def test_graph_declares_the_engine_magic_interface(self):
+        """Without these variables the engine cannot ask for a cast, and
+        without the entry/release vocabulary it can never drive one."""
+        from asset_convert.hkx_behavior import build_behavior_xml
+        xml = build_behavior_xml('TES4ScampBehavior', self._clips())
+        for var in ('bWantCastRight', 'bWantCastLeft', 'bMRh_Ready',
+                    'bMLh_Ready', 'IsCasting'):
+            assert var in xml, var
+        for evt in ('MRh_SpellFire_Event', 'MLh_SpellFire_Event',
+                    'BeginCastRight', 'BeginCastLeft',
+                    'Spell_FireForget_LH', 'Spell_FireForget_RH',
+                    'Magic_Pre_Out', 'Spell_Release', 'Spell_Stop'):
+            assert evt in xml, evt
+        # the vanilla gating conditions, verbatim — and ONLY those: an
+        # expression can read variables, never events, so no invented
+        # event-conditioned expressions may exist
+        assert ('BeginCastRight if (bWantCastRight && bMRh_Ready '
+                '&& !IsCasting)') in xml
+        assert ('BeginCastLeft if (bWantCastLeft && bMLh_Ready '
+                '&& !IsCasting)') in xml
+        assert 'if (BeginCast' not in xml
+
+    def test_ready_and_want_variables_init_to_zero(self):
+        """Vanilla inits bM*h_Ready/bWantCast*/IsCasting to 0 — readiness is
+        the ENGINE's to grant. (A working caster, the atronach, ships all
+        five at 0 in its wordVariableValues.)"""
+        import re
+        from asset_convert.hkx_behavior import build_behavior_xml
+        xml = build_behavior_xml('TES4ScampBehavior', self._clips())
+        names = re.search(r'name="variableNames"[^>]*>(.*?)</hkparam>',
+                          xml, re.S).group(1)
+        order = re.findall(r'<hkcstring>(.*?)</hkcstring>', names)
+        vals = xml[xml.index('wordVariableValues'):
+                   xml.index('quadVariableValues')]
+        words = re.findall(r'name="value">(-?\d+)</hkparam>', vals)
+        for var in ('bWantCastRight', 'bWantCastLeft', 'bMRh_Ready',
+                    'bMLh_Ready', 'IsCasting'):
+            assert int(words[order.index(var)]) == 0, var
+
+    def test_release_fires_from_the_out_phase(self):
+        """The Out clip's trigger array must carry the SpellFire release —
+        it is what actually fires the spell — plus Spell_Stop at clip end;
+        vanilla's Mag_FF_RH_Out block is exactly that pair."""
+        import re
+        from asset_convert.hkx_behavior import build_behavior_xml
+        xml = build_behavior_xml('TES4ScampBehavior', self._clips())
+        names = re.search(r'name="eventNames"[^>]*>(.*?)</hkparam>',
+                          xml, re.S).group(1)
+        order = re.findall(r'<hkcstring>(.*?)</hkcstring>', names)
+        fire_id = order.index('MLh_SpellFire_Event')
+        stop_id = order.index('Spell_Stop')
+        assert f'<hkparam name="id">{fire_id}</hkparam>' in xml
+        assert f'<hkparam name="id">{stop_id}</hkparam>' in xml

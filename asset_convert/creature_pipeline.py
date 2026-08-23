@@ -43,10 +43,27 @@ _WORKERS = worker_count()
 _EXCLUDE = {'boxtest', 'endgame'}
 
 
+def plugin_namespace(plugin: str) -> str:
+    """The creature-path namespace for a plugin: its file stem, lowercase,
+    [a-z0-9_] only ('Morrowind_ob.esm' -> 'morrowind_ob'). One per plugin,
+    so two plugins' same-named creature folders never share a path — see
+    hkx_behavior.project_layout."""
+    stem = os.path.splitext(os.path.basename(str(plugin).rstrip('\\/')))[0]
+    return re.sub(r'[^a-z0-9_]+', '_', stem.lower()).strip('_') or 'plugin'
+
+
+def _namespace_for(out_meshes_dir: str) -> str:
+    """output/<plugin>/meshes -> that plugin's namespace."""
+    return plugin_namespace(os.path.basename(
+        os.path.dirname(os.path.normpath(out_meshes_dir))))
+
+
 def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
                       part_sets: list = None, fps: float = 30.0,
                       sound_slots: dict = None,
-                      sound_chances: dict = None) -> dict:
+                      sound_chances: dict = None,
+                      attr_speed: int = 0,
+                      namespace: str = '') -> dict:
     """Full conversion of one creature folder. Returns its manifest
     (with added 'skeleton_nif'/'bodies' keys) or raises.
 
@@ -61,8 +78,10 @@ def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
 
     manifest = generate_creature_project(creature_dir, name, out_meshes_dir,
                                          fps=fps, sound_slots=sound_slots,
-                                         sound_chances=sound_chances)
-    proj_dir = os.path.join(out_meshes_dir, 'actors', 'tes4', name.lower())
+                                         sound_chances=sound_chances,
+                                         attr_speed=attr_speed,
+                                         namespace=namespace)
+    proj_dir = os.path.join(out_meshes_dir, manifest['dir'])
 
     # SSE only loads 64-bit havok files: a 32-bit project makes the engine
     # silently fail the behavior-graph load → invisible actor (collision
@@ -147,8 +166,6 @@ def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
             shutil.move(p, os.path.join(proj_dir, fn_l))
     shutil.rmtree(parts_dir, ignore_errors=True)
 
-    manifest['skeleton_nif'] = \
-        f'actors\\tes4\\{name.lower()}\\character assets\\skeleton.nif'
     manifest['bodies'] = bodies
     manifest['body_map'] = body_map
     manifest['nif_failures'] = nif_failures
@@ -304,6 +321,35 @@ def _sound_slots_by_folder(export_dir: str) -> dict:
             for folder, slots in _sound_data_by_folder(export_dir).items()}
 
 
+def _speed_attr_by_folder(export_dir: str) -> dict:
+    """folder(lower) -> MAX TES4 DATA.Speed attribute across its CREA records.
+
+    Feeds the speed bake (hkx_behavior.generate_creature_project attr_speed):
+    Oblivion moved creatures at the Speed-attribute GMST formula, not at the
+    clip's root motion. MAX because the combat variants are the fast ones —
+    dead/prop variants (Speed ~9-12) never move — and one behavior project
+    serves the whole folder.
+    """
+    from tes5_import.text_reader import parse_export_file
+
+    crea_path = os.path.join(export_dir, 'CREA.txt')
+    if not os.path.exists(crea_path):
+        return {}
+    out = {}
+    for rec in parse_export_file(crea_path):
+        model = (rec.get('Model.MODL') or '').replace('/', '\\')
+        parts = [p for p in model.lower().split('\\') if p]
+        folder = parts[-2] if len(parts) >= 2 else ''
+        if not folder:
+            continue
+        try:
+            spd = int(rec.get('DATA.Speed', 0) or 0)
+        except (TypeError, ValueError):
+            spd = 0
+        out[folder] = max(out.get(folder, 0), spd)
+    return out
+
+
 def _part_sets_by_folder(export_dir: str) -> dict:
     """folder(lower) -> list of distinct NIFZ part sets (each a tuple of
     lowercase .nif filenames), read from the CREA export.
@@ -383,70 +429,48 @@ def _shared_singlefile_dir(out_meshes_dir: str, master_dirs) -> str:
     return None
 
 
-def _character_anim_count(meshes_dir: str, folder: str) -> int:
-    """Number of animationNames in a plugin's character hkx for `folder`.
+def _remove_unnamespaced_projects(meshes_dir: str, log=print) -> None:
+    """Delete project trees from the pre-namespace layout
+    (actors/tes4/<folder>/project_manifest.json directly under tes4).
 
-    The clip-block index space (animation_data._anim_file_index) is exactly
-    this list, so it is the only thing that decides whether a block is legal
-    against a given plugin's assets.  Counts the `Animations\\*.hkx` strings
-    the same way tools/animdata_index_check.py does.  -1 when absent.
+    They are generated output, and leaving them beside the namespaced tree
+    would re-create the very collision the namespace removes the moment the
+    whole meshes folder is deployed.
     """
-    char = os.path.join(meshes_dir, 'actors', 'tes4', folder, 'characters',
-                        f'tes4{folder}character.hkx')
-    if not os.path.isfile(char):
-        return -1
-    try:
-        with open(char, 'rb') as f:
-            raw = f.read()
-    except OSError:
-        return -1
-    return len({m.group(0).lower()
-                for m in re.finditer(rb'[ -~]{4,}\.hkx', raw)
-                if m.group(0).lower().startswith(b'animations')})
+    root = os.path.join(meshes_dir, 'actors', 'tes4')
+    if not os.path.isdir(root):
+        return
+    for d in sorted(os.listdir(root)):
+        p = os.path.join(root, d)
+        if os.path.isfile(os.path.join(p, 'project_manifest.json')):
+            shutil.rmtree(p, ignore_errors=True)
+            log(f'  [cleanup] removed pre-namespace project tree '
+                f'actors\\tes4\\{d}')
 
 
-def _manifest_fits(manifest: dict, meshes_dir: str, folder: str) -> bool:
-    """Is this block's index space legal against `meshes_dir`'s character hkx?
+def _manifests_under(meshes_dir: str) -> dict:
+    """{project_txt: manifest} for every generated project in a plugin's
+    meshes tree: actors/tes4/<namespace>/<folder>/project_manifest.json.
 
-    A block indexes the DEDUPED animation list of the character hkx that
-    actually lands in Data (animation_data._anim_file_index), so it is legal
-    exactly when it needs no more files than that hkx lists.  Unknown hkx
-    (never built) counts as a fit — nothing better is available.
+    Keyed on the project file name, which carries the plugin namespace, so
+    two plugins' manifests can never collide (hkx_behavior.project_layout).
     """
-    n = _character_anim_count(meshes_dir, folder)
-    if n < 0:
-        return True
-    need = len(dict.fromkeys(c['anim'] for c in manifest.get('clips', ())))
-    return need <= n
-
-
-def _block_outranks(cand_meshes: str, cur_meshes: str, folder: str,
-                    cur_manifest: dict, cand_manifest: dict,
-                    deployed_meshes: str, log=print) -> bool:
-    """Should the candidate plugin's block replace the one already chosen?
-
-    Judged against `deployed_meshes` — the tree whose loose
-    `actors\\tes4\\<folder>\\characters\\...hkx` is the one the game ends up
-    reading.  Every plugin writes that same path, so the block and the hkx are
-    chosen independently and can disagree; a block needing more files than the
-    surviving hkx lists leaves those clips permanently unbound (Morrowind_ob's
-    27-clip/21-file clannfear over Oblivion's 17-file hkx put Equip_H2H, the
-    run gaits and FullyRagdollPose out of range).  Replace only to trade a
-    block that does NOT fit for one that does; ties and unknowns keep the
-    incumbent, so a single-plugin run is byte-identical to before.
-    """
-    if not cur_meshes:
-        return True
-    if _manifest_fits(cur_manifest, deployed_meshes, folder):
-        return False
-    if not _manifest_fits(cand_manifest, deployed_meshes, folder):
-        return False
-    need = len(dict.fromkeys(c['anim'] for c in cur_manifest.get('clips', ())))
-    log(f'  [animdata] {folder}: incumbent block needs {need} animation files '
-        f'but the deployed character hkx lists '
-        f'{_character_anim_count(deployed_meshes, folder)}; using the copy '
-        f'from {os.path.basename(os.path.dirname(cand_meshes))} instead')
-    return True
+    out = {}
+    root = os.path.join(meshes_dir, 'actors', 'tes4')
+    if not os.path.isdir(root):
+        return out
+    for ns in sorted(os.listdir(root)):
+        ns_dir = os.path.join(root, ns)
+        if not os.path.isdir(ns_dir):
+            continue
+        for d in sorted(os.listdir(ns_dir)):
+            mp = os.path.join(ns_dir, d, 'project_manifest.json')
+            if not os.path.exists(mp):
+                continue
+            with open(mp, encoding='utf-8') as f:
+                m = json.load(f)
+            out[m['project_txt'].lower()] = m
+    return out
 
 
 def convert_creatures(export_dir: str, out_meshes_dir: str,
@@ -533,9 +557,12 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
                    for f, s in sound_data.items()}
     sound_chances = {f: {t: c for t, (_e, c) in s.items()}
                      for f, s in sound_data.items()}
+    speed_attrs = _speed_attr_by_folder(export_dir)
+    namespace = _namespace_for(out_meshes_dir)
+    _remove_unnamespaced_projects(out_meshes_dir, log)
 
     log(f'  Converting {len(dirs)} creatures '
-        f'({workers or _WORKERS} workers)...')
+        f'({workers or _WORKERS} workers, namespace {namespace})...')
     # ProcessPoolExecutor: the per-creature work is CPU-bound pure Python
     # (pyffi NIF conversion, KF decode, spline compression) — threads
     # serialize on the GIL and give no speedup at all.
@@ -544,7 +571,9 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
         futs = {pool.submit(_convert_creature, cdir, name, out_meshes_dir,
                             part_sets.get(name.lower()), 30.0,
                             sound_slots.get(name.lower()),
-                            sound_chances.get(name.lower())):
+                            sound_chances.get(name.lower()),
+                            speed_attrs.get(name.lower(), 0),
+                            namespace):
                 name for cdir, name in dirs}
         for fut in as_completed(futs):
             name = futs[fut]
@@ -564,52 +593,26 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
     # A subset run (--names) must not drop the other creatures' registrations,
     # so pick up every previously generated project_manifest.json too.
     all_manifests = dict(projects)
-    actors_root = os.path.join(out_meshes_dir, 'actors', 'tes4')
-    if os.path.isdir(actors_root):
-        for d in sorted(os.listdir(actors_root)):
-            if d in all_manifests:
-                continue
-            mp = os.path.join(actors_root, d, 'project_manifest.json')
-            if os.path.exists(mp):
-                with open(mp, encoding='utf-8') as f:
-                    all_manifests[d] = json.load(f)
+    for m in _manifests_under(out_meshes_dir).values():
+        if m.get('namespace') == namespace:
+            all_manifests.setdefault(m['name'], m)
 
     # UNION across EVERY built plugin (masters and siblings): the game's Data
     # folder holds exactly ONE animationdatasinglefile.txt, so the single
     # deployed copy must register every plugin's creatures — deploying
     # Morrowind_ob's file over Oblivion's de-registered all of Oblivion's
     # projects and its creatures froze in their idles (confirmed in game
-    # 2026-08-07). This plugin's own version of a same-named folder wins; the
-    # deployed loose meshes collide on the same paths anyway.
+    # 2026-08-07). A child writes through to its master's copy
+    # (_shared_singlefile_dir), but whichever plugin is built LAST rewrites
+    # that one shared file from the vanilla base and must put every sibling's
+    # projects back, so every plugin's project_manifest.json is read here.
     #
-    # A child no longer ships a rival copy (it writes through to its master's,
-    # see _shared_singlefile_dir), so the race is gone — but the union is still
-    # required: whichever plugin is built LAST rewrites that one shared file
-    # from the vanilla base, and must put every sibling's projects back. This
-    # scan reads project_manifest.json under each plugin's actors/tes4, which
-    # every plugin still ships for the creatures it owns, so it is unaffected
-    # by where the singlefiles land.
-    #
-    # WHICH plugin's block wins is NOT a free choice, and "this plugin's own
-    # wins" is wrong whenever the run writes through to a master.  A clip
-    # block's second line indexes the character hkx's animationNames list
-    # (see animation_data._anim_file_index), and every plugin deploys its
-    # creature folder LOOSE to the same path — so exactly one
-    # `actors\tes4\<folder>\characters\tes4<folder>character.hkx` survives in
-    # Data, while the block that describes it comes from whichever plugin
-    # merged the shared singlefile last.  When those two disagree the indices
-    # are read against a different (usually shorter) file list and every clip
-    # past its end silently never binds.  Morrowind_ob's clannfear ships 21
-    # animations / 27 clips, Oblivion's ships 17 / 23: building Morrowind_ob
-    # last left Oblivion's 17-animation hkx deployed under a block indexing up
-    # to 20, so Equip_H2H, the run gaits and FullyRagdollPose — the death-pose
-    # source — all fell out of range (same failure mode as the 2026-08-08
-    # dead-ragdoll bug, arriving through plugin collision instead of a bad
-    # emitter).  So pair each block with the hkx that actually lands on that
-    # path: the manifest whose OWN character hkx matches wins, regardless of
-    # which plugin is being built.
-    union = dict(all_manifests)
-    owner = {d: out_meshes_dir for d in all_manifests}
+    # Projects are keyed on their project file name, which carries the owning
+    # plugin's namespace (hkx_behavior.project_layout), so two plugins can
+    # never contribute rival blocks for one name and no winner has to be
+    # picked: each block describes exactly the character hkx its own plugin
+    # ships at its own path.
+    union = {m['project_txt'].lower(): m for m in all_manifests.values()}
     plugins_root = os.path.dirname(os.path.dirname(out_meshes_dir))
     try:
         siblings = sorted(os.listdir(plugins_root))
@@ -617,25 +620,10 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
         siblings = []
     for plug in siblings:
         sib_meshes = os.path.join(plugins_root, plug, 'meshes')
-        sib_actors = os.path.join(sib_meshes, 'actors', 'tes4')
-        if os.path.normpath(sib_actors) == os.path.normpath(actors_root) \
-                or not os.path.isdir(sib_actors):
+        if os.path.normpath(sib_meshes) == os.path.normpath(out_meshes_dir):
             continue
-        for d in sorted(os.listdir(sib_actors)):
-            mp = os.path.join(sib_actors, d, 'project_manifest.json')
-            if not os.path.exists(mp):
-                continue
-            with open(mp, encoding='utf-8') as f:
-                cand = json.load(f)
-            # The hkx that reaches Data for this folder is the one THIS run
-            # deploys when it owns the folder; otherwise the candidate's.
-            deployed = (out_meshes_dir if d in all_manifests else sib_meshes)
-            if d in union and not _block_outranks(
-                    sib_meshes, owner.get(d), d, union[d], cand,
-                    deployed, log):
-                continue
-            union[d] = cand
-            owner[d] = sib_meshes
+        for key, cand in _manifests_under(sib_meshes).items():
+            union.setdefault(key, cand)
 
     if union:
         cache_dir = os.path.join(export_dir, 'animdata_base')
@@ -663,9 +651,12 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
     # stale file kill the summary for every other creature.
     summary = {name: {
         'project_hkx': m['project_hkx'],
-        'skeleton_nif': m.get(
-            'skeleton_nif',
-            f'actors\\tes4\\{name.lower()}\\character assets\\skeleton.nif'),
+        # root behavior path: the engine matches creature IDLE roots to an
+        # actor by this (creature_idles DNAM)
+        'behavior_hkx': m['behavior_hkx'],
+        # directory the merged body NIFs sit in (ARMA MOD2)
+        'body_dir': m['body_dir'],
+        'skeleton_nif': m['skeleton_nif'],
         'bodies': m.get('bodies', []),
         'body_map': m.get('body_map', {}),
         'attacks': m.get('attacks', []),
@@ -677,6 +668,9 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
         # clip root-motion speeds (u/s) → per-creature MOVT SPED columns
         'speeds': m.get('speeds', {}),
         'has_ragdoll': m.get('has_ragdoll', False),
+        # cast/block graph lanes -> their IDLE action routing (creature_idles)
+        'has_cast': m.get('has_cast', False),
+        'has_block': m.get('has_block', False),
         'clips': [c['name'] for c in m.get('clips', [])],
         'bones': m.get('bones', []),
         # ragdoll part bone names -> per-creature BPTD (creature_races)

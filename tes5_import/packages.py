@@ -27,6 +27,8 @@ PKID_NPC_SANDBOX = 0x000BFB6B       # PACK DefaultSandboxCurrentLocation1024
 DPLT_NPC_LIST = 0x00021E81          # FLST DefaultMasterPackageList
 CSTY_DEFAULT = 0x0000003D           # CSTY DefaultCombatstyle
 CSTY_ANIMAL = 0x00057BE8            # CSTY csWolf (vanilla wolf/dog ZNAM)
+CLAS_CREATURE_PREDATOR = 0x000131E6  # CLAS EncClassAnimalPredator (wolf...)
+CLAS_CREATURE_CASTER = 0x00039D30    # CLAS EncClassBanditWizard (atronach)
 
 # fid_low24 -> TES4 PKDT.Type, built once per import run (Phase 0g)
 _PACK_TYPES = {}

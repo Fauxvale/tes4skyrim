@@ -69,29 +69,31 @@ _ARMA_DNAM = bytes.fromhex('000000000000001100000000')
 _DOG_WALK, _DOG_RUN = 74.54, 500.14
 _ROT_WALK, _ROT_RUN = 3.14159265, 4.71238898
 _MOVT_INAM = bytes.fromhex('FFFF7F7FFFFF7F7FFFFF7F7F')
-# Oblivion creature ground speed comes from the Speed ATTRIBUTE, not the
-# animation: walk = fMoveCreatureWalkMin + (Max-Min) x Speed/100, run =
-# walk x fMoveRunMult (GMST values verified from the Oblivion.esm export:
-# 5.0 / 300.0 / 3.0).  Clip-natural MOVT speeds made fast predators crawl
-# ("mountain lion runs in slow motion", 2026-07-16): a Speed-50 lion ran
-# 457 u/s in Oblivion vs its gallop clip's natural 200 u/s.  Commanded
-# speed = max(natural, formula) capped at the parametric blend's top
-# anchor (walk x1.4 / run x2.0 rate-scaled children), so creatures only
-# speed UP toward Oblivion values and the animation rate always tracks.
-_CREA_WALK_MIN, _CREA_WALK_MAX, _RUN_MULT = 5.0, 300.0, 3.0
 
 
-def _movt_sped(speeds: dict, attr_speed: int = 0) -> bytes:
-    walk_nat = speeds.get('walk') or _DOG_WALK
-    run_nat = speeds.get('run') or walk_nat
-    back = speeds.get('back') or walk_nat * 0.8
-    walk, run = walk_nat, run_nat
-    if attr_speed:
-        f_walk = (_CREA_WALK_MIN
-                  + (_CREA_WALK_MAX - _CREA_WALK_MIN) * attr_speed / 100.0)
-        walk = min(max(walk_nat, f_walk), 1.4 * walk_nat)
-        run = min(max(run_nat, f_walk * _RUN_MULT), 2.0 * run_nat)
+def _movt_sped(speeds: dict) -> bytes:
+    """Commanded speed == the shipped animation's root-motion speed, at
+    playback rate 1.0 — the invariant every vanilla creature holds (chaurus:
+    MOVT run 350.267 == blend top anchor == run clip natural speed; sabrecat
+    563, wolf 555 likewise).  Oblivion's faster attribute-formula ground
+    speed is BAKED into the clips by the creature pipeline
+    (hkx_anim.timescale_clip), so `speeds` here are already final; a runtime
+    MOVT raise above the clips' real speed was tried twice (2026-07-16 and
+    after) and the lion still ran in slow motion in game."""
+    walk = speeds.get('walk') or _DOG_WALK
+    run = speeds.get('run') or walk
+    back = speeds.get('back') or walk * 0.8
     return struct.pack('<11f', 0.0, 0.0, 0.0, 0.0, walk, max(run, walk),
+                       back, back, _ROT_WALK, _ROT_RUN, _ROT_RUN)
+
+
+def _movt_sped_swim(speeds: dict) -> bytes:
+    """SPED for the generated <base>Swim movement type (see
+    hkx_behavior.movement_type_names): the swim clips' own natural speeds."""
+    swim = speeds.get('swim') or _DOG_WALK
+    fast = speeds.get('swimfast') or swim
+    back = speeds.get('swimback') or swim * 0.8
+    return struct.pack('<11f', 0.0, 0.0, 0.0, 0.0, swim, max(fast, swim),
                        back, back, _ROT_WALK, _ROT_RUN, _ROT_RUN)
 _MTNM_CODES = (b'WALK', b'RUN1', b'SNEK', b'BLDO', b'SWIM')
 _EGT_MALE = 'Actors\\Character\\UpperBodyHumanMale.egt'
@@ -278,7 +280,7 @@ def build_creature_body_parts(writer) -> int:
         part_bones = proj.get('ragdoll_bones') or []
         if not part_bones:
             continue
-        skel = f'Actors\\TES4\\{folder}\\Character Assets\\skeleton.nif'
+        skel = proj['skeleton_nif']
         base_path = f'BASE Meshes\\{skel}'
         torso_node = part_bones[0]
         spine = next((b for b in part_bones
@@ -488,6 +490,8 @@ _WEAP_TYPE = {}      # fid_low24 → TES4 WEAP DATA.Type
 _ARMOR_FIDS = set()  # fid_low24 of ARMO records (shield detection)
 _SHIELD_FIDS = set() # fid_low24 of ARMO records occupying the shield slot
 _LVLI_REC = {}       # fid_low24 → LVLI record dict
+_SPEL_REC = {}       # fid_low24 → SPEL record dict
+_LVSP_REC = {}       # fid_low24 → LVSP record dict
 
 # TES4 ARMO BMDT biped slot bits (wbDefinitionsTES4.pas:1326-1341).
 # Shield is bit 13 and Torch bit 14 — NOT bit 9, which is 'Weapon'.
@@ -509,10 +513,12 @@ def load_creature_item_index(by_type: dict, master_export: dict = None) -> None:
     _ARMOR_FIDS.clear()
     _SHIELD_FIDS.clear()
     _LVLI_REC.clear()
+    _SPEL_REC.clear()
+    _LVSP_REC.clear()
 
     def _add(rec):
         sig = rec.get('Signature')
-        if sig not in ('WEAP', 'ARMO', 'LVLI'):
+        if sig not in ('WEAP', 'ARMO', 'LVLI', 'SPEL', 'LVSP'):
             return
         try:
             fid = int(rec.get('FormID', ''), 16) & 0x00FFFFFF
@@ -525,6 +531,10 @@ def load_creature_item_index(by_type: dict, master_export: dict = None) -> None:
             if get_int(rec, 'BMDT.BipedFlags') & (_TES4_BIPED_SHIELD
                                                   | _TES4_BIPED_TORCH):
                 _SHIELD_FIDS.add(fid)
+        elif sig == 'SPEL':
+            _SPEL_REC[fid] = rec
+        elif sig == 'LVSP':
+            _LVSP_REC[fid] = rec
         else:
             _LVLI_REC[fid] = rec
 
@@ -532,7 +542,7 @@ def load_creature_item_index(by_type: dict, master_export: dict = None) -> None:
         for rec in master_export.values():
             _add(rec)
     # This plugin's own records are indexed LAST so an override wins.
-    for sig in ('WEAP', 'ARMO', 'LVLI'):
+    for sig in ('WEAP', 'ARMO', 'LVLI', 'SPEL', 'LVSP'):
         for rec in by_type.get(sig, []):
             _add(rec)
 
@@ -601,7 +611,39 @@ def _creature_equip_flags(recs: list) -> int:
     return _VNAM_BASE | bits
 
 
-def _race_data(rec: dict) -> bytes:
+# TES4 CREA ACBS.Flags locomotion bits -> TES5 RACE DATA.Flags
+# (wbDefinitionsTES4 CREA ACBS: 0x10 Swims, 0x20 Flies, 0x40 Walks;
+# wbRACE_DATAFlags01: 0x40 Swims, 0x80 Flies, 0x100 Walks, 0x800 No Combat
+# In Water). The AI keeps an actor where its race says it can go: vanilla
+# SlaughterfishRace = 0x00100040 (Swims, no Walks), WolfRace 0x00108948
+# (Swims|Walks|NoCombatInWater), HorkerRace 0x00100148 (Swims|Walks, fights
+# in water). The DogRace template carried Swims|Walks|NoCombatInWater for
+# EVERY creature, so slaughterfish walked out of the water and bounced
+# around on land (2026-08-23).
+_TES4_CREA_SWIMS, _TES4_CREA_FLIES, _TES4_CREA_WALKS = 0x10, 0x20, 0x40
+_RACE_SWIMS, _RACE_FLIES, _RACE_WALKS = 0x40, 0x80, 0x100
+_RACE_NO_COMBAT_IN_WATER = 0x800
+
+
+def _race_locomotion_flags(recs: list) -> int:
+    """Swims/Flies/Walks union over the creatures sharing the race (one race
+    per mesh folder), plus NoCombatInWater for pure walkers."""
+    t4 = 0
+    for r in recs:
+        t4 |= get_int(r, 'ACBS.Flags')
+    bits = 0
+    if t4 & _TES4_CREA_SWIMS:
+        bits |= _RACE_SWIMS
+    if t4 & _TES4_CREA_FLIES:
+        bits |= _RACE_FLIES
+    if t4 & _TES4_CREA_WALKS or not bits:
+        bits |= _RACE_WALKS
+    if not (bits & _RACE_SWIMS):
+        bits |= _RACE_NO_COMBAT_IN_WATER
+    return bits
+
+
+def _race_data(rec: dict, race_recs: list = None) -> bytes:
     """The 164-byte RACE DATA: DogRace template with CREA stat patches.
 
     Starting Health is the flat CREATURE_RACE_BASE_HEALTH, NOT this creature's
@@ -610,9 +652,18 @@ def _race_data(rec: dict) -> bytes:
     creature_health_offset).
     """
     data = bytearray(_RACE_DATA_TEMPLATE)
+    flags = struct.unpack_from('<I', data, 32)[0]
+    flags &= ~(_RACE_SWIMS | _RACE_FLIES | _RACE_WALKS
+               | _RACE_NO_COMBAT_IN_WATER)
+    flags |= _race_locomotion_flags(race_recs or [rec])
+    struct.pack_into('<I', data, 32, flags)
     struct.pack_into('<f', data, 36, float(creature_race_health(rec)))
-    struct.pack_into('<f', data, 40,
-                     float(get_int(rec, 'ACBS.SpellPoints', 0)))
+    # Starting Magicka is 0 for the same shared-race reason as health: the
+    # actor's whole TES4 SpellPoints pool ships as ACBS.MagickaOffset (see
+    # actors._crea_acbs) — the founding record's pool here would double it
+    # for the founder and misstate it for everyone else. An actor with zero
+    # magicka can never pay a cast cost, so this pair is a casting gate.
+    struct.pack_into('<f', data, 40, 0.0)
     struct.pack_into('<f', data, 44, float(get_int(rec, 'ACBS.Fatigue', 100)))
     struct.pack_into('<f', data, 96,
                      float(max(1, get_int(rec, 'DATA.AttackDamage', 5))))
@@ -621,16 +672,109 @@ def _race_data(rec: dict) -> bytes:
     return bytes(data)
 
 
-def _atkd(damage_mult: float = 1.0) -> bytes:
-    """44-byte attack data: vanilla dog Attack1 values."""
+# TES4 SPIT.Type: 0 = castable Spell, 1 = Disease, 2 = Power,
+# 3 = Lesser Power, 4 = Ability, 5 = Poison. Only a castable Spell is an
+# ATTACK; Abilities/Diseases are passive racial traits and must never be
+# fired at a target (the scamp's AbDaedricResistWeak is a self-buff).
+_TES4_SPIT_SPELL = 0
+
+# TES4 effect target types (as the export writes them): Self, Touch, Target.
+_TES4_EFFECT_SELF = 'Self'
+_TES4_EFFECT_TOUCH = 'Touch'
+_TES4_EFFECT_TARGET = 'Target'
+
+
+def _spell_effect_ranges(fid: int, depth: int = 0) -> set:
+    """The effect delivery ranges a TES4 spell can produce ('Self'/'Touch'/
+    'Target'), castable spells (SPIT.Type 0) only.
+
+    A leveled spell resolves through its entries — the scamp's fireball
+    arrives as LVSP LL2CreatureScampStunted100 -> SPEL Flare — so a leveled
+    list yields the union of its members' ranges.
+    """
+    if depth > _MAX_LVLI_DEPTH:
+        return set()
+    fid &= 0x00FFFFFF
+    rec = _SPEL_REC.get(fid)
+    if rec is not None:
+        if get_int(rec, 'SPIT.Type') != _TES4_SPIT_SPELL:
+            return set()
+        return {rec.get(f'Effect[{i}].Type')
+                for i in range(get_int(rec, 'EffectCount'))
+                if rec.get(f'Effect[{i}].Type')}
+    out = set()
+    lv = _LVSP_REC.get(fid)
+    if lv is not None:
+        for i in range(get_int(lv, 'EntryCount')):
+            try:
+                entry = int(lv.get(f'Entry[{i}].FormID', ''), 16)
+            except (ValueError, TypeError):
+                continue
+            out |= _spell_effect_ranges(entry, depth + 1)
+    return out
+
+
+def _spell_is_offensive(fid: int) -> bool:
+    """Would this TES4 spell be aimed at an enemy?  Castable spells with at
+    least one non-Self effect; Abilities/Diseases/Powers are passive racial
+    traits (the scamp's AbDaedricResistWeak is a self-buff) and never
+    qualify."""
+    return bool(_spell_effect_ranges(fid) - {_TES4_EFFECT_SELF})
+
+
+def creature_touch_attack_spell(recs: list) -> int:
+    """The spell to hang on the race's MELEE attacks as ATKD 'Attack Spell',
+    or 0.
+
+    This is the vanilla melee-caster idiom: the flame atronach's four
+    ordinary attackStart_* entries each name crAtronachFlameMeleeAttack /
+    ...PowerAttack — a fire spell applied by the swing (109 attack entries
+    across Skyrim.esm carry an Attack Spell). Its TES4 analogue is the
+    TOUCH-delivery offensive spell a creature cast in melee range, so
+    exactly those qualify: castable (SPIT.Type 0), at least one Touch
+    effect, and no Target effect (aimed spells go through the real cast
+    chain — the graph's FireForget states — instead).
+
+    First match in (record, slot) order so the result is deterministic; the
+    race is shared by every CREA with the same mesh + body set.
+    """
+    for rec in recs:
+        for i in range(get_int(rec, 'SpellCount')):
+            fid = get_formid(rec, f'Spell[{i}]')
+            if not fid:
+                continue
+            ranges = _spell_effect_ranges(fid)
+            if _TES4_EFFECT_TOUCH in ranges and \
+                    _TES4_EFFECT_TARGET not in ranges:
+                return fid
+    return 0
+
+
+def creature_has_offensive_spell(recs: list) -> bool:
+    """Does any creature sharing the race know a spell it would aim at an
+    enemy? (Gates nothing by itself — SPLO + the graph's cast chain do the
+    casting — but callers use it for reporting.)"""
+    return any(_spell_is_offensive(get_formid(rec, f'Spell[{i}]') or 0)
+               for rec in recs
+               for i in range(get_int(rec, 'SpellCount')))
+
+
+def _atkd(damage_mult: float = 1.0, spell: int = 0, chance: float = 1.0,
+          flags: int = 0) -> bytes:
+    """44-byte attack data: vanilla dog Attack1 values.
+
+    `spell` is the ATKD 'Attack Spell' (xEdit: FormID -> [SPEL, SHOU, NULL]).
+    When set, performing this attack CASTS that spell — the mechanism every
+    vanilla casting creature uses.
+    """
     return struct.pack('<ffIIfffIfff',
-                       damage_mult, 1.0, 0, 0, 0.0, 35.0, 0.75, 0, 0.0, 0.0,
-                       1.0)
+                       damage_mult, chance, spell, flags, 0.0, 35.0, 0.75, 0,
+                       0.0, 0.0, 1.0)
 
 
 def _build_race(writer, rec, folder: str, bodies: list, proj: dict,
                 race_fid: int, skin_fid: int, edid: str, full: str,
-                vnam_flags: int = None) -> None:
+                vnam_flags: int = None, race_recs: list = None) -> None:
     subs = b''
     subs += pack_string_subrecord('EDID', edid)
     subs += pack_string_subrecord('FULL', full)
@@ -641,7 +785,7 @@ def _build_race(writer, rec, folder: str, bodies: list, proj: dict,
     subs += pack_subrecord('KSIZ', struct.pack('<I', len(keywords)))
     subs += pack_subrecord('KWDA',
                            b''.join(struct.pack('<I', k) for k in keywords))
-    subs += pack_subrecord('DATA', _race_data(rec))
+    subs += pack_subrecord('DATA', _race_data(rec, race_recs))
 
     skeleton = proj['skeleton_nif']
     for marker in ('MNAM', 'FNAM'):
@@ -661,8 +805,14 @@ def _build_race(writer, rec, folder: str, bodies: list, proj: dict,
     subs += pack_subrecord('PNAM', struct.pack('<f', 5.0))
     subs += pack_subrecord('UNAM', struct.pack('<f', 3.0))
 
+    # A TOUCH-delivery offensive spell rides the melee attacks as ATKD
+    # 'Attack Spell' — the vanilla melee-caster idiom (the flame atronach's
+    # four ordinary attack entries each name a fire spell; see
+    # creature_touch_attack_spell). Aimed/self spells are NOT attacks: they
+    # go through SPLO + the behavior graph's FireForget cast chain.
+    touch_spell = creature_touch_attack_spell(race_recs or [rec])
     for event, _clip in proj.get('attacks', []):
-        subs += pack_subrecord('ATKD', _atkd())
+        subs += pack_subrecord('ATKD', _atkd(spell=touch_spell))
         subs += pack_string_subrecord('ATKE', event)
 
     subs += pack_subrecord('NAM1', b'')
@@ -701,8 +851,20 @@ def _build_race(writer, rec, folder: str, bodies: list, proj: dict,
     # SkeletonRace) name RightHand+LeftHand+Voice+Potion, so armed converted
     # creatures get the same four.
     armed = vnam_flags & ~(_VNAM_BASE | _VNAM_HAND_TO_HAND | _VNAM_SPELL)
-    slots = ([_QNAM_UNARMED, _QNAM_LEFT_HAND, _QNAM_VOICE, _QNAM_POTION]
-             if armed else [_QNAM_UNARMED])
+    if armed:
+        slots = [_QNAM_UNARMED, _QNAM_LEFT_HAND, _QNAM_VOICE, _QNAM_POTION]
+    elif vnam_flags & _VNAM_SPELL:
+        # A caster needs a HAND slot to equip the spell into — this is the
+        # gate, not VNAM: every vanilla caster race lists LeftHand (0x13F43)
+        # (AtronachFlameRace LeftHand+Potion, HagravenRace Left+Right+Potion,
+        # SprigganRace/ChaurusRace/WispRace Left+Right) while the non-caster
+        # WolfRace lists RightHand only. Without it the engine never equips
+        # the spell (live scamp 2026-08-23: 100 magicka, in combat,
+        # HasEquippedSpell 0 in both hands), bWantCast* is never raised and
+        # the whole cast handshake is moot.
+        slots = [_QNAM_UNARMED, _QNAM_LEFT_HAND]
+    else:
+        slots = [_QNAM_UNARMED]
     for slot in slots:
         subs += pack_formid_subrecord('QNAM', slot)
     subs += pack_formid_subrecord('UNES', _QNAM_UNARMED)
@@ -710,8 +872,7 @@ def _build_race(writer, rec, folder: str, bodies: list, proj: dict,
     writer.add_record('RACE', pack_record('RACE', race_fid, 0, subs))
 
 
-def _build_movts(writer, folder: str, proj: dict,
-                 attr_speed: int = 0) -> None:
+def _build_movts(writer, folder: str, proj: dict) -> None:
     """Generated MOVT records for one creature project (once per folder).
 
     The engine gives an actor movement types by matching the behavior
@@ -725,11 +886,16 @@ def _build_movts(writer, folder: str, proj: dict,
     manifest so graph and records agree by construction (like ATKE)."""
     names = proj.get('movement_types') or [f'TES4{folder}Default',
                                            f'TES4{folder}Run']
-    sped = _movt_sped(proj.get('speeds') or {}, attr_speed)
+    speeds = proj.get('speeds') or {}
+    sped = _movt_sped(speeds)
+    sped_swim = _movt_sped_swim(speeds)
     for mnam in names:
         subs = pack_string_subrecord('EDID', f'{mnam}_MT')
         subs += pack_string_subrecord('MNAM', mnam)
-        subs += pack_subrecord('SPED', sped)
+        # the generated Swim movement type carries the water speeds; the
+        # graph switches iState onto it while the engine sets isSwimming
+        subs += pack_subrecord('SPED',
+                               sped_swim if mnam.endswith('Swim') else sped)
         subs += pack_subrecord('INAM', _MOVT_INAM)
         writer.add_record('MOVT', pack_record(
             'MOVT', writer.derive_formid('MOVT', (folder, mnam)),
@@ -737,7 +903,7 @@ def _build_movts(writer, folder: str, proj: dict,
 
 
 def _build_skin(writer, folder: str, bodies: list, race_fid: int,
-                skin_fid: int, edid_base: str) -> None:
+                skin_fid: int, edid_base: str, body_dir: str) -> None:
     """Single BODY-slot ARMA (the merged whole-animal NIF) + its skin ARMO.
 
     Vanilla creatures use ONE ARMA on slot BODY (0x4); the creature pipeline
@@ -753,7 +919,7 @@ def _build_skin(writer, folder: str, bodies: list, race_fid: int,
     subs += pack_subrecord('BOD2', struct.pack('<II', 0x4, 2))
     subs += pack_formid_subrecord('RNAM', race_fid)
     subs += pack_subrecord('DNAM', _ARMA_DNAM)
-    subs += pack_string_subrecord('MOD2', f'Actors\\TES4\\{folder}\\{body}')
+    subs += pack_string_subrecord('MOD2', f'{body_dir}\\{body}')
     writer.add_record('ARMA', pack_record('ARMA', arma_fid, 0, subs))
     # Footstep sounds hang off ARMA.SNDD, which is written later (the FSTS it
     # points at is allocated last so it cannot shift other FormIDs) — see
@@ -866,18 +1032,6 @@ def build_creature_races(by_type: dict, writer, export_dir: str,
         # "Creatures\Dog\Skeleton.NIF" → folder "dog"
         return parts[-2] if len(parts) >= 2 else ''
 
-    # per-folder Speed ATTRIBUTE for the MOVT formula (_movt_sped): the MAX
-    # across the folder's records — the combat variants are the fast ones
-    # and dead/quest-prop variants (Speed ~9-12) never move anyway.  One
-    # value per folder because all races sharing a behavior project share
-    # its iState_* movement-type names, hence the same MOVT records.
-    folder_speed = {}
-    for rec in by_type.get('CREA', []):
-        f = _folder_of(rec)
-        if f in _PROJECTS:
-            folder_speed[f] = max(folder_speed.get(f, 0),
-                                  get_int(rec, 'DATA.Speed', 0))
-
     def _bodies_of(rec, proj):
         # The creature pipeline merged each CREA's NIFZ part set into ONE
         # whole-animal NIF and ships the exact set→file mapping as body_map
@@ -925,7 +1079,7 @@ def build_creature_races(by_type: dict, writer, export_dir: str,
             continue
 
         if folder not in movt_folders:
-            _build_movts(writer, folder, proj, folder_speed.get(folder, 0))
+            _build_movts(writer, folder, proj)
             # engine-action → graph-event routing (IDLE records) — without
             # these the engine never sends the graph ANY events and the
             # actor plays idle forever while sliding around
@@ -945,9 +1099,10 @@ def build_creature_races(by_type: dict, writer, export_dir: str,
                 n_armed += 1
             _build_race(writer, rec, folder, bodies, proj,
                         race_fid, skin_fid, f'TES4{edid_base}Race', full,
-                        vnam_flags=vnam)
+                        vnam_flags=vnam,
+                        race_recs=race_recs.get(key, [rec]))
             _build_skin(writer, folder, bodies, race_fid, skin_fid,
-                        edid_base)
+                        edid_base, proj['body_dir'])
             made[key] = race_fid
             n_races += 1
         _CREA_RACE_MAP[fid] = (made[key], folder)

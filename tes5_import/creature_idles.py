@@ -26,7 +26,6 @@ the swim IsSwimming CTDA copied verbatim from Skyrim.esm DogMoveStart/
 DogSwimRoot/DogSwimStart/DogSwimStop etc.).
 """
 
-import os
 
 from .writer import pack_record, pack_subrecord, pack_string_subrecord
 
@@ -53,6 +52,20 @@ _ACTIONS = {
     'ActionRagdollInstant': 0x0009BB4E,
     'ActionIdle': 0x00013002,
     'ActionIdleWarn': 0x00098886,
+    # magic / block action entry points (vanilla creature casters and
+    # blockers route these through per-creature IDLE trees — see
+    # _build_cast_idles/_build_block_idles)
+    'ActionLeftAttack': 0x00013004,
+    'ActionRightAttack': 0x00013005,
+    'ActionLeftRelease': 0x00013451,
+    'ActionLeftReady': 0x00013452,
+    'ActionLeftInterrupt': 0x00013453,
+    'ActionRightRelease': 0x00013454,
+    'ActionRightReady': 0x00013455,
+    'ActionRightInterrupt': 0x00013456,
+    'ActionForceEquip': 0x0002ADF1,
+    'ActionBlockAnticipate': 0x000193CE,
+    'ActionBlockHit': 0x00013AF4,
 }
 
 # (edid suffix, graph event, action, vanilla-dog DATA hex)
@@ -125,10 +138,139 @@ def _idle(writer, edid: str, dnam: str, enam: str, parent: int,
     return fid
 
 
+# CTDA function indices (xEdit wbDefinitionsTES5 condition table) used by
+# the vanilla cast/block IDLE trees. Casting source enum: 0 Left, 1 Right.
+_FN_GET_WANT_BLOCKING = 0
+_FN_HAS_EQUIPPED_SPELL = 570
+_FN_GET_CURRENT_CASTING_TYPE = 571
+_FN_GET_EQUIPPED_ITEM_TYPE = 597
+_CASTING_TYPE_FIRE_FORGET = 1.0
+
+
+def _ctda(func: int, value: float, param1: int = 0) -> bytes:
+    """One 32-byte CTDA: `func(param1) == value`, run on subject."""
+    import struct
+    return struct.pack('<B3xfHHIIIIi', 0, value, func, 0, param1, 0, 0, 0,
+                       -1)
+
+
+def _build_cast_idles(writer, base: str, dnam: str, hand: str) -> None:
+    """The magic action tree — the ENGINE side of creature spellcasting,
+    copied node-for-node from the vanilla flame atronach's IDLE set:
+
+      Action<hand>Attack (AACT) -> <X>AttackRoot -> <X>AttackMagic
+        -> <X>MagicFireForgetRoot -> <X>MagicFireForget
+           (ENAM Spell_FireForget_LH/RH — the graph's cast-chain entry)
+      Action<hand>Release   -> root -> leaf ENAM Spell_Release
+      Action<hand>Ready     -> root -> leaf ENAM Spell_Ready
+      Action<hand>Interrupt -> root -> leaf ENAM Spell_Interrupt
+      ActionForceEquip      -> root -> node -> leaf ENAM Magic_Equip
+
+    Without this tree the AI's cast actions reach NO graph event and the
+    creature never casts, no matter how correct the graph and records are —
+    the same action-routing gate as movement (this module's docstring).
+
+    THE CONDITIONS ARE LOAD-BEARING. The engine walks this same tree for an
+    ordinary MELEE left attack: vanilla gates the magic branch with
+    `HasEquippedSpell(Left) == 1` and the FireForget root with
+    `GetCurrentCastingType(Left) == 1`, so a melee swing falls through and
+    the graph's ATKE attack fires instead. Shipping the branch unconditioned
+    (2026-08-22) routed EVERY melee left attack into the cast chain, where
+    the actor parked waiting for a release that never came — the scamp
+    "chases but can't melee and never casts" report. The concentration
+    branch is omitted: every converted TES4 spell is FireForget.
+
+    hand: 'Left' (vanilla caster convention — atronach/hagraven/spriggan)
+    unless the creature also blocks, which owns the left-hand actions
+    (the vanilla wisp splits exactly this way: block left, cast right).
+    """
+    fire_evt = ('Spell_FireForget_LH' if hand == 'Left'
+                else 'Spell_FireForget_RH')
+    src = 0 if hand == 'Left' else 1            # wbCastingSourceEnum
+    has_spell = _ctda(_FN_HAS_EQUIPPED_SPELL, 1.0, src)
+    is_ff = _ctda(_FN_GET_CURRENT_CASTING_TYPE, _CASTING_TYPE_FIRE_FORGET,
+                  src)
+    aroot = _idle(writer, f'{base}{hand}AttackRoot', dnam, '',
+                  _ACTIONS[f'Action{hand}Attack'], 0,
+                  bytes.fromhex('0000006F0000'))
+    amagic = _idle(writer, f'{base}{hand}AttackMagic', dnam, '', aroot, 0,
+                   bytes.fromhex('000000410000'), ctda=has_spell)
+    ffroot = _idle(writer, f'{base}MagicFireForgetRoot', dnam, '', amagic, 0,
+                   bytes.fromhex('000000460000'), ctda=is_ff)
+    _idle(writer, f'{base}MagicFireForget', dnam, fire_evt, ffroot, 0,
+          bytes.fromhex('000000310000'))
+    for action, suffix, evt, data, cond in (
+            ('Release', 'Release', 'Spell_Release', '000000460000',
+             has_spell),
+            ('Ready', 'Ready', 'Spell_Ready', '000000370000', None),
+            ('Interrupt', 'Interrupt', 'Spell_Interrupt', '000000360000',
+             None)):
+        root = _idle(writer, f'{base}{hand}{suffix}Root', dnam, '',
+                     _ACTIONS[f'Action{hand}{action}'], 0,
+                     bytes.fromhex('000000410000'))
+        _idle(writer, f'{base}{hand}{suffix}', dnam, evt, root, 0,
+              bytes.fromhex(data), ctda=cond)
+    feroot = _idle(writer, f'{base}ForceEquipRoot', dnam, '',
+                   _ACTIONS['ActionForceEquip'], 0,
+                   bytes.fromhex('000000320000'))
+    fe = _idle(writer, f'{base}ForceEquip', dnam, '', feroot, 0,
+               bytes.fromhex('000000330000'))
+    # vanilla AtronachFlameActionEquipMagic: GetEquippedItemType(Left) == 9
+    # (9 = spell in the equipped-item-type enum)
+    _idle(writer, f'{base}EquipMagic', dnam, 'Magic_Equip', fe, 0,
+          bytes.fromhex('000000330000'),
+          ctda=_ctda(_FN_GET_EQUIPPED_ITEM_TYPE, 9.0, src))
+
+
+def _build_block_idles(writer, base: str, dnam: str) -> None:
+    """The block action tree — the ENGINE side of creature blocking, copied
+    from the vanilla frost atronach (the unarmed-blocker layout):
+
+      ActionBlockAnticipate -> root -> leaf ENAM blockStart
+      ActionBlockHit        -> root -> leaf ENAM blockHitStart
+      ActionLeftAttack      -> root -> leaf ENAM blockStart
+      ActionLeftRelease     -> root -> leaf ENAM blockStop
+
+    An unarmed creature raises its guard by 'holding the left attack'
+    (AtronachFrostLeftAttack ENAM=blockStart, ...LeftRelease ENAM=blockStop
+    — verbatim), so the left-hand actions belong to blocking; a creature
+    that also casts uses the right-hand actions for magic (wisp split).
+    """
+    aroot = _idle(writer, f'{base}AnticipateBlockRoot', dnam, '',
+                  _ACTIONS['ActionBlockAnticipate'], 0,
+                  bytes.fromhex('0000003F0000'))
+    _idle(writer, f'{base}AnticipateBlock', dnam, 'blockStart', aroot, 0,
+          bytes.fromhex('000000200000'))
+    hroot = _idle(writer, f'{base}BlockHitRoot', dnam, '',
+                  _ACTIONS['ActionBlockHit'], 0,
+                  bytes.fromhex('000000000000'))
+    _idle(writer, f'{base}BlockHit', dnam, 'blockHitStart', hroot, 0,
+          bytes.fromhex('000000690000'))
+    # Gated exactly as vanilla gates them (AtronachFrostLeftAttack /
+    # ...LeftRelease, WispLeftAttack / ...LeftRelease, byte-identical
+    # conditions): `GetWantBlocking == 0` on the raise, `== 1` on the drop.
+    # Unconditioned, every melee left attack would raise the guard instead.
+    laroot = _idle(writer, f'{base}LeftAttackBlockRoot', dnam, '',
+                   _ACTIONS['ActionLeftAttack'], 0,
+                   bytes.fromhex('0000003A0000'))
+    _idle(writer, f'{base}LeftAttackBlock', dnam, 'blockStart', laroot, 0,
+          bytes.fromhex('000000000000'),
+          ctda=_ctda(_FN_GET_WANT_BLOCKING, 0.0))
+    lrroot = _idle(writer, f'{base}LeftReleaseBlockRoot', dnam, '',
+                   _ACTIONS['ActionLeftRelease'], 0,
+                   bytes.fromhex('0000003A0000'))
+    _idle(writer, f'{base}LeftReleaseBlock', dnam, 'blockStop', lrroot, 0,
+          bytes.fromhex('000000740000'),
+          ctda=_ctda(_FN_GET_WANT_BLOCKING, 1.0))
+
+
 def build_creature_idles(writer, folder: str, proj: dict) -> None:
     """The per-project action-routing IDLE set (once per creature folder)."""
-    proj_dir = os.path.dirname(proj['project_hkx'])
-    dnam = f'{proj_dir}\\Behaviors\\tes4{folder}behavior.hkx'
+    # The engine picks a creature's IDLE root (several unchained roots hang
+    # under each AACT) by matching DNAM against the actor's root behavior
+    # path, which it resolves from the loaded project — so this must be the
+    # path the project really ships (CK: "resolve root behavior name").
+    dnam = proj['behavior_hkx']
     base = f'TES4{folder}'
 
     for suffix, event, action, data_hex in _LEAVES:
@@ -157,6 +299,17 @@ def build_creature_idles(writer, folder: str, proj: dict) -> None:
                   0, _DEATH_ANIM_DATA, ctda=_DEATH_ANIM_CTDAS)
     _idle(writer, f'{base}DeathWaitRagdoll', dnam, 'Ragdoll', droot, danim,
           _DEATH_RAGDOLL_DATA)
+
+    # Spellcasting / blocking action routing (see the helpers above). A
+    # creature with both lanes blocks on the LEFT-hand actions and casts on
+    # the RIGHT (the vanilla wisp split); a single lane takes the left.
+    has_cast = bool(proj.get('has_cast'))
+    has_block = bool(proj.get('has_block'))
+    if has_cast:
+        _build_cast_idles(writer, base, dnam,
+                          'Right' if has_block else 'Left')
+    if has_block:
+        _build_block_idles(writer, base, dnam)
 
     # Aware vocal: the entry point for the graph's AwareVocal state (CSDT
     # Aware slot). ActionIdleWarn fires during an aggro warning — the exact

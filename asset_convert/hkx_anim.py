@@ -296,6 +296,202 @@ def decode_clip(ob_kf_path: str, fps: float = 30.0,
     return clip, motion
 
 
+def slice_clip(clip, t0: float, t1: float, name: str = None,
+               hold: bool = False):
+    """A new DecodedClip covering [t0, t1] of `clip`.
+
+    Sampling is uniform, so the cut is an exact index slice — no resampling
+    and no interpolation error. Text keys are carried across with their times
+    rebased to the slice; keys outside it are dropped.
+
+    hold=True produces a STATIC one-pose clip from the sample at t0 (used for
+    the magic Loop, which must hold the charged pose while the engine decides
+    whether to release). A held clip still needs >= 2 samples so the spline
+    writer has a segment to encode, so the pose is duplicated.
+    """
+    import copy
+    import numpy as np
+    from asset_convert.kf_decode import BoneTrack, DecodedClip
+
+    times = clip.times
+    if times is None or len(times) == 0:
+        raise ValueError('clip has no samples to slice')
+    t0 = max(float(t0), float(times[0]))
+    t1 = min(float(t1), float(times[-1]))
+    if t1 <= t0:
+        # degenerate window — fall back to a hold at t0
+        hold = True
+    i0 = int(np.searchsorted(times, t0, side='left'))
+    i1 = int(np.searchsorted(times, t1, side='right'))
+    i0 = min(max(i0, 0), len(times) - 1)
+    i1 = max(min(i1, len(times)), i0 + 1)
+
+    if hold:
+        new_times = np.array([0.0, float(t1 - t0) or (1.0 / 30.0)],
+                             dtype=times.dtype)
+        sel = slice(i0, i0 + 1)
+    else:
+        new_times = np.array(times[i0:i1], dtype=times.dtype) - times[i0]
+        sel = slice(i0, i1)
+
+    tracks = []
+    for tr in clip.tracks:
+        def _cut(a):
+            if a is None:
+                return None
+            part = a[sel]
+            if hold:
+                part = np.concatenate([part, part], axis=0)
+            return np.array(part)
+        tracks.append(BoneTrack(bone=tr.bone,
+                                translations=_cut(tr.translations),
+                                rotations=_cut(tr.rotations),
+                                scales=_cut(tr.scales)))
+
+    keys = [] if hold else [(float(t) - float(times[i0]), s)
+                            for t, s in (clip.text_keys or [])
+                            if t0 <= t <= t1]
+    return DecodedClip(
+        name=name or f'{clip.name}_slice',
+        duration=float(new_times[-1] - new_times[0]),
+        cycle_type=clip.cycle_type,
+        frequency=clip.frequency,
+        times=new_times,
+        tracks=tracks,
+        text_keys=keys,
+        skipped_blocks=list(clip.skipped_blocks or []))
+
+
+# Vanilla FireForget cast timing, measured from the real SSE atronachflame
+# animations (Mag_FF_RH_In 0.800s / _Loop 1.000s / _Out 1.267s, all 44 tracks
+# — read straight out of the hkaSplineCompressedAnimation headers). The Loop
+# is exactly 1.0s and is a true hold: the engine parks there while it decides
+# whether to commit the cast.
+CAST_LOOP_SECONDS = 1.0
+
+# How much of the release GESTURE precedes the release moment inside the Out
+# clip. Vanilla's Mag_FF_RH_Out fires MLh_SpellFire_Event at 0.233s INTO the
+# clip (animationdata atronachflame.txt: `MLh_SpellFire_Event:0.233334`), so
+# the Out is not "release at frame 0" — it opens with a short wind-up and the
+# spell leaves partway in. The In/Loop hold the CHARGED pose (pre-gesture).
+CAST_PRE_RELEASE = 0.25
+
+
+def split_cast_clip(clip, hit_time: float = None):
+    """One Oblivion cast .kf -> (In, Loop, Out, release_offset).
+
+    Oblivion authors a cast as ONE clip; Skyrim expresses it as three states
+    (charge / hold / release): the engine enters the chain by sending
+    Spell_FireForget_LH/RH, the In charges into the hold, the Loop parks on
+    the charged pose until the engine commits (Spell_Release), and the Out
+    plays the release gesture — its MLh_SpellFire_Event trigger at
+    `release_offset` is what actually fires the spell (the exact analogue of
+    HitFrame for a melee swing; vanilla layout verbatim).
+
+    The release moment is the clip's authored 'Hit' text key — the same key
+    melee clips use for HitFrame, present in all 69 Oblivion cast clips
+    (measured) — so nothing here is a guessed fraction. The cut point sits
+    CAST_PRE_RELEASE before it (vanilla's Out opens with ~0.23s of wind-up),
+    so the Loop holds the charged pose and the Out carries the throw.
+    """
+    dur = float(clip.duration)
+    if hit_time is None:
+        hits = [t for t, v in (clip.text_keys or [])
+                if v.strip().lower() == 'hit']
+        hit_time = hits[0] if hits else dur * 0.4
+    hit_time = min(max(float(hit_time), 0.0), dur)
+    cut = max(0.0, hit_time - CAST_PRE_RELEASE)
+    release_offset = hit_time - cut
+
+    in_clip = slice_clip(clip, 0.0, cut, f'{clip.name}_In')
+    # hold the CHARGED pose — the last frame before the release gesture
+    loop_clip = slice_clip(clip, cut, cut + CAST_LOOP_SECONDS,
+                           f'{clip.name}_Loop', hold=True)
+    loop_clip.duration = CAST_LOOP_SECONDS
+    loop_clip.times = loop_clip.times * 0 + np.array(
+        [0.0, CAST_LOOP_SECONDS], dtype=loop_clip.times.dtype)
+    out_clip = slice_clip(clip, cut, dur, f'{clip.name}_Out')
+    return in_clip, loop_clip, out_clip, release_offset
+
+
+def _resample_track(times, new_times, arr, is_quat: bool):
+    """Linear (translations/scales) or sign-continuous nlerp (quaternions)
+    resampling of one channel onto `new_times`."""
+    if arr is None:
+        return None
+    a = np.asarray(arr, dtype=np.float64)
+    flat = a.ndim == 1
+    if flat:
+        a = a[:, None]
+    if is_quat:
+        # keep neighbouring quaternions in the same hemisphere so the
+        # interpolation never takes the long way round
+        a = a.copy()
+        for i in range(1, len(a)):
+            if np.dot(a[i], a[i - 1]) < 0:
+                a[i] = -a[i]
+    out = np.empty((len(new_times), a.shape[1]), dtype=a.dtype)
+    for c in range(a.shape[1]):
+        out[:, c] = np.interp(new_times, times, a[:, c])
+    if is_quat:
+        n = np.linalg.norm(out, axis=1)
+        n[n == 0] = 1.0
+        out /= n[:, None]
+    if flat:
+        out = out[:, 0]
+    return out.astype(np.asarray(arr).dtype)
+
+
+def timescale_clip(clip, motion, factor: float, fps: float = 30.0):
+    """Play `clip` `factor`x faster, IN PLACE, resampled onto the fps grid.
+
+    Used to bake Oblivion's attribute-driven ground speed into the shipped
+    animation file: TES4 moved a creature at the GMST Speed-attribute formula
+    regardless of its animation's root motion (the clips just slid), so a
+    faithful conversion must raise the clip's REAL speed — commanded MOVT
+    speed and animation root motion then agree by construction, exactly like
+    every vanilla creature (chaurus Forward_Run: anchor 350.267 = MOVT run =
+    clip natural speed at rate 1.0; Arcane University: "set movement-type
+    speeds and blend weights to the speed each animation was made for").
+
+    The compressed timeline is RESAMPLED onto the standard 1/fps frame grid
+    rather than shipped as denser frames: every vanilla Skyrim animation is
+    30 fps, and the first bake (2026-08-22) that merely halved the sample
+    spacing produced a 60 fps file (frameDuration 0.0167 under a 30 fps
+    block layout) — the lion's "limbs going every which way" while running.
+    Frame timing in the shipped file is now identical to a native clip's.
+    """
+    if factor <= 1.0 + 1e-6:
+        return clip, motion
+    src_times = np.asarray(clip.times, dtype=np.float64)
+    src_dur = float(src_times[-1])
+    # snap the new duration onto the frame grid so frameDuration is EXACTLY
+    # 1/fps (the effective factor moves by < one frame)
+    n = max(2, int(round(src_dur / float(factor) * fps)) + 1)
+    new_dur = (n - 1) / fps
+    inv = new_dur / src_dur
+    old_times = src_times * inv
+    new_times = np.linspace(0.0, new_dur, n)
+    from asset_convert.kf_decode import BoneTrack
+    tracks = []
+    for tr in clip.tracks:
+        tracks.append(BoneTrack(
+            bone=tr.bone,
+            translations=_resample_track(old_times, new_times,
+                                         tr.translations, False),
+            rotations=_resample_track(old_times, new_times,
+                                      tr.rotations, True),
+            scales=_resample_track(old_times, new_times, tr.scales, False)))
+    clip.tracks = tracks
+    clip.times = new_times.astype(np.asarray(clip.times).dtype)
+    clip.duration = new_dur
+    clip.text_keys = [(float(t) * inv, s) for t, s in (clip.text_keys or [])]
+    if motion is not None and motion.get('times') is not None:
+        motion = dict(motion)
+        motion['times'] = np.asarray(motion['times']) * inv
+    return clip, motion
+
+
 
 
 def write_clip_hkx(clip: DecodedClip, bones, out_hkx: str,

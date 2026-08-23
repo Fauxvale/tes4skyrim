@@ -3,13 +3,15 @@
 Emits per creature (all via packfile XML → hkxcmd, layouts copied from the
 vanilla deer project dumps):
 
-  actors/tes4/<name>/<name>project.hkx          (hkbProjectData boilerplate)
-  actors/tes4/<name>/characters/<name>character.hkx  (hkbCharacterData: rig +
+  (P = actors/tes4/<plugin namespace>/<name>, S = tes4<namespace>_<name>;
+   project_layout() explains why the owning plugin is part of the path)
+  P/<S>project.hkx                              (hkbProjectData boilerplate)
+  P/characters/<S>character.hkx                 (hkbCharacterData: rig +
                                                  animation list + controller)
-  actors/tes4/<name>/behaviors/<name>behavior.hkx    (GENERATED state machine)
-  actors/tes4/<name>/character assets/skeleton.hkx   (from hkx_skeleton)
-  actors/tes4/<name>/animations/*.hkx                (from hkx_anim)
-  actors/tes4/<name>/motion_data.json                (root motion per clip —
+  P/behaviors/<S>behavior.hkx                   (GENERATED state machine)
+  P/character assets/skeleton.hkx               (from hkx_skeleton)
+  P/animations/*.hkx                            (from hkx_anim)
+  P/motion_data.json                            (root motion per clip —
                                                  consumed by the future
                                                  animationdata emitter)
 
@@ -83,7 +85,44 @@ LOCOMOTION_STATES = {
     'MoveBackward': (['backward'], 'moveBackward', 'moveStop'),
     'TurnLeft': (['turnleft'], 'turnLeft', 'turnStop'),
     'TurnRight': (['turnright'], 'turnRight', 'turnStop'),
-    'Swim': (['swimforward'], 'swimStart', 'swimStop'),
+}
+
+# Swimming. The engine sends swimStart/swimStop when the actor enters/leaves
+# deep water and (vanilla quadrupedbehavior) the graph declares `isSwimming`
+# (engine-written) plus a swim MOVEMENT TYPE switched by an expression —
+# `iState = cond((isSwimming ==1), iState_BearSwimDefault, iState_BearDefault)`
+# verbatim in the shared quadruped graph. Oblivion ships a full swim gait set
+# per swimming creature; vanilla sabrecat proves a single looping SwimForward
+# is enough for a land animal, but water natives (slaughterfish) need the
+# idle/turn/backward states too, so the swim sub-machine mirrors the land
+# Default structure driven by the SAME locomotion events (the engine keeps
+# sending moveStart/turnLeft/... while swimming).
+SWIM_CLIPS = {
+    # role -> kf basenames in priority order
+    'forward': ['swimforward'],
+    'fast': ['swimfastforward'],
+    'idle': ['swimidle'],
+    'backward': ['swimbackward'],
+    'left': ['swimturnleft'],
+    'right': ['swimturnright'],
+}
+
+# Blocking. The engine sends blockStart/blockStop when the combat AI raises/
+# drops a guard and blockHitStart/blockHitStop when a blocked blow lands;
+# the graph reports the guard back through IsBlocking (vanilla draugrbehavior:
+# blockStart -> <stance>_Block state, blockHitStart -> <stance>_BlockHit,
+# IsBlocking bound in the block states, iWantBlock declared for the engine).
+# Oblivion ships blockidle (the held guard) and blockhit (the impact flinch)
+# for ~20 creatures; without these states the events fell into the dead
+# 'extra' bucket and those creatures could never block at all.
+BLOCK_CLIPS = {
+    # generic first, then the stance-prefixed variants (census across all
+    # exports: blockhit 39, handtohandblockhit 31, onehandblockhit 26, ...);
+    # creatures block in ONE stance, so the first authored guard wins.
+    'idle': ['blockidle', 'block', 'handtohandblockidle', 'onehandblockidle',
+             'twohandblockidle', 'staffblockidle', 'bowblockidle'],
+    'hit': ['blockhit', 'handtohandblockhit', 'onehandblockhit',
+            'twohandblockhit', 'staffblockhit', 'bowblockhit'],
 }
 IDLE_CANDIDATES = ['idle']
 # single-play interrupt states: clip fires returnToDefault at its end
@@ -126,6 +165,49 @@ EQUIP_STANCES = {
     'Staff': (['staffequip'], ['staffunequip'], (8,)),
 }
 
+# Spellcasting — the ENGINE-side handshake, decompiled from vanilla
+# atronachflamebehavior.hkx (the canonical creature caster; the chaurus —
+# the monolithic single-file caster — declares the same LH vocabulary):
+#
+#   1. The AI decides to cast: the engine writes bWantCastLeft/Right.
+#   2. The graph's BeginCast_EEM raises `BeginCastLeft if (bWantCastLeft &&
+#      bMLh_Ready && !IsCasting)` (verbatim expression). BeginCast* is the
+#      graph's message TO the engine — no transition in the vanilla graph
+#      ever consumes it.
+#   3. The engine replies with the STATE-ENTRY event for the equipped
+#      spell's cast type: `Spell_FireForget_LH` (or Spell_Concentration_LH)
+#      — CombatIdleState's transition into FireForgetState is keyed on
+#      exactly that event, NOT on BeginCast*.
+#   4. The In clip charges; its `Magic_Pre_Out` end trigger chains into the
+#      Loop, which parks on the charged pose until the engine commits.
+#   5. The engine sends `Spell_Release`; the Out clip plays and its
+#      `MLh_SpellFire_Event` trigger (0.233s in, vanilla animationdata) is
+#      what actually FIRES the spell; `Spell_Stop` at its end exits.
+#
+# Both vanilla creature casters route everything through the LEFT hand: the
+# atronach declares Spell_FireForget_RH but no transition ever uses it, and
+# even its RH Out clip fires MLh_SpellFire_Event (animationdata, verbatim);
+# the chaurus declares only bWantCastLeft/bMLh_Ready. So the generated graph
+# builds ONE In/Loop/Out chain and enters it from either hand's entry event.
+#
+# A previous attempt invented per-delivery entry events raised by
+# expressions that tested EVENT names as if they were variables
+# (`... if (BeginCastRight)`) — an expression can only read variables, so
+# the events never fired and no cast ever started. The engine-sent
+# Spell_FireForget_* events above are the real entry path.
+CAST_MODES = {
+    # delivery -> kf basenames in priority order (the _a/_b/_c element
+    # variants are alternates of the same delivery, claimed in order)
+    'Self':   ['castself', 'castself_a', 'castself_b', 'castself_c'],
+    'Target': ['casttarget', 'casttarget_a', 'casttarget_b', 'casttarget_c'],
+    'Touch':  ['casttouch', 'casttouch_a', 'casttouch_b', 'casttouch_c'],
+}
+
+# The one clip the cast chain plays: TES4 authored one clip per delivery but
+# the engine's entry event carries no delivery information, so the chain
+# plays the most cast-like gesture available — the aimed throw first.
+CAST_CLIP_PREFERENCE = ('Target', 'Touch', 'Self')
+
 
 def classify_clips(creature_dir: str) -> dict:
     """Scan an Oblivion creature folder into the v1 graph's clip roles.
@@ -140,7 +222,8 @@ def classify_clips(creature_dir: str) -> dict:
                 creature_dir, fn)
 
     out = {'idle': None, 'locomotion': {}, 'attacks': [], 'single': {},
-           'extra': [], 'run': None, 'equip': {}}
+           'extra': [], 'run': None, 'equip': {}, 'cast': {}, 'swim': {},
+           'block': {}}
     used = set()
     for cand in IDLE_CANDIDATES:
         if cand in kfs:
@@ -182,6 +265,26 @@ def classify_clips(creature_dir: str) -> dict:
         if uneq:
             used.add(os.path.splitext(os.path.basename(uneq))[0].lower())
 
+    # Cast clips, per delivery mode (see CAST_MODES). Claimed BEFORE the
+    # attack sweep so a future 'castattack'-style name cannot be stolen by it.
+    for mode, names in CAST_MODES.items():
+        for n in names:
+            if n in kfs and n not in used:
+                out['cast'][mode] = kfs[n]
+                used.add(n)
+                break
+
+    # Swim gait set (see SWIM_CLIPS) and the block guard/flinch pair (see
+    # BLOCK_CLIPS) — both claimed before the attack sweep for the same
+    # reason ('blockattack' etc. would otherwise steal by substring).
+    for table, key in ((SWIM_CLIPS, 'swim'), (BLOCK_CLIPS, 'block')):
+        for role, names in table.items():
+            for n in names:
+                if n in kfs and n not in used:
+                    out[key][role] = kfs[n]
+                    used.add(n)
+                    break
+
     for name, path in kfs.items():
         if name in used:
             continue
@@ -202,6 +305,37 @@ def build_attack_events(clips: dict) -> list:
     """attackStart event names, shared verbatim with RACE ATKE generation."""
     return [f'attackStart_TES4_{_clip_state_name(p)}'
             for p in clips['attacks']]
+
+
+def cast_clip(clips: dict):
+    """The one .kf the cast chain plays, or None for a non-caster."""
+    for mode in CAST_CLIP_PREFERENCE:
+        kf = clips.get('cast', {}).get(mode)
+        if kf:
+            return kf
+    return None
+
+
+# The three phases of a Skyrim cast, named as vanilla names its clips
+# (Mag_FF_RH_In / _Loop / _Out on atronachflame). Only the Loop repeats.
+CAST_PHASES = ('In', 'Loop', 'Out')
+
+
+def cast_phase_defs(clips: dict) -> list:
+    """(state_name, kf_path, phase, anim_stem) per cast STATE.
+
+    Oblivion authors one clip per delivery; Skyrim needs a charge (In), a
+    hold (Loop) and a release (Out) — see CAST_MODES for the full engine
+    handshake. The three are cut from ONE source .kf around the authored
+    'Hit' key, so each phase gets its OWN animation file (anim_stem).
+    State names follow the vanilla clip naming (Mag_FF_*).
+    """
+    kf = cast_clip(clips)
+    if kf is None:
+        return []
+    stem_base = _clip_state_name(kf)
+    return [(f'Mag_FF_{phase}', kf, phase, f'{stem_base}_{phase}')
+            for phase in CAST_PHASES]
 
 
 def state_defs(clips: dict) -> list:
@@ -246,7 +380,54 @@ def state_defs(clips: dict) -> list:
         if uneq:
             defs.append((f'Unequip_{stance}', uneq, False,
                          f'unequipStart_{stance}', 'weaponSheathe'))
+    # Swim states (see SWIM_CLIPS): the sub-machine mirrors the land
+    # standing/locomotion split, driven by the same engine events.
+    sw = clips.get('swim', {})
+    if sw.get('forward'):
+        defs.append(('SwimIdle', sw.get('idle') or sw['forward'], True,
+                     'swimStart', None))
+        defs.append(('SwimMove', sw['forward'], True, 'moveStart', None))
+        if sw.get('fast'):
+            defs.append(('SwimMoveFast', sw['fast'], True, None, None))
+        if sw.get('backward'):
+            defs.append(('SwimBack', sw['backward'], True, 'moveBackward',
+                         None))
+        for role, st in (('left', 'SwimTurnLeft'), ('right',
+                                                    'SwimTurnRight')):
+            if sw.get(role):
+                defs.append((st, sw[role], True,
+                             'turnLeft' if role == 'left' else 'turnRight',
+                             None))
+    # Block states (see BLOCK_CLIPS): looping guard + single-play flinch.
+    blk = clips.get('block', {})
+    if blk.get('idle'):
+        defs.append(('Block', blk['idle'], True, 'blockStart', None))
+        if blk.get('hit'):
+            defs.append(('BlockHit', blk['hit'], False, 'blockHitStart',
+                         'blockHitStop'))
+    # Cast states: In charges (Magic_Pre_Out chains to the hold), the Loop
+    # holds the charged pose while the engine decides, the Out releases
+    # (its MLh_SpellFire_Event trigger fires the spell; Spell_Stop exits).
+    # Each phase is cut from the same source .kf, so each carries its own
+    # animation file (anim_stem) rather than sharing one.
+    for st, kf, phase, _stem in cast_phase_defs(clips):
+        looping = (phase == 'Loop')
+        enter = {'In': 'Spell_FireForget_LH', 'Loop': 'Magic_Pre_Out',
+                 'Out': 'Spell_Release'}[phase]
+        end_evt = {'In': 'Magic_Pre_Out', 'Loop': None,
+                   'Out': 'Spell_Stop'}[phase]
+        defs.append((st, kf, looping, enter, end_evt))
     return defs
+
+
+def cast_anim_stems(clips: dict) -> dict:
+    """{state_name: animation stem} for cast states.
+
+    The three phases share one source .kf but are CUT from it, so each needs
+    its own animation file. Kept out of state_defs so its tuple arity — and
+    every existing consumer of it — stays unchanged.
+    """
+    return {st: stem for st, _kf, _p, stem in cast_phase_defs(clips)}
 
 
 def speed_blend_plan(clips: dict, speeds: dict) -> list:
@@ -254,43 +435,63 @@ def speed_blend_plan(clips: dict, speeds: dict) -> list:
     [(clip_gen_name, kf_path, playback_rate, anchor u/s)], anchors strictly
     increasing.  None when the walk clip has no usable root-motion speed.
 
-    Vanilla covers the whole commanded-speed range by re-anchoring the SAME
-    clips at scaled playbackSpeeds (ForwardWalkBlend_Dog: walk@0.067→5 u/s,
-    walk@1.0→74.54, walk@1.4→104.4, trot@0.65/1.0/1.5→186.8/287.3/425 —
-    anchor == natural clip speed × rate).  A blend with only rate-1.0
-    anchors plays wrong-rate animation at every other commanded speed and
-    the actor glides/moonwalks (the 2026-07-16 gliding report).
+    Layout is the vanilla MONOLITHIC-creature blend, verbatim from
+    chaurusbehavior's Forward_Blend (a single-file project like ours):
+    a slow-creep child (anchor 5 u/s — the engine's sandbox creep) plus the
+    walk and run clips at their NATURAL anchors, all at playbackSpeed 1.0 —
+    every vanilla top anchor equals the clip's real root-motion speed AND
+    the MOVT commanded speed (chaurus 350.267, wolf 555, sabrecat 563).
+
+    The 2026-07 rate-scaled ladder (walk@1.4, run@0.75/1.5/2.0) that tried
+    to stretch slow Oblivion gaits up to the attribute-formula speed at
+    runtime is gone: it had no vanilla precedent at the top anchor and the
+    lion still ran in slow motion in game. Oblivion's higher ground speed is
+    now BAKED into the shipped clips instead (hkx_anim.timescale_clip in
+    generate_creature_project), so `speeds` here are already the final
+    values and rate 1.0 is correct by construction.
+
+    The slow child keeps its rate-scaled form (chaurus WalkSlow@0.058 → 5):
+    that pair IS how vanilla stops sandbox-creep gliding (2026-07-16 report).
     """
     fwd = clips['locomotion'].get('MoveForward')
     walk = speeds.get('walk')
     if not fwd or not walk:
         return None
-    run_kf, run = clips.get('run'), speeds.get('run')
-    # top children at 2.0× give the blend headroom up to twice the natural
-    # gait speed — the MOVT command side (creature_races._movt_sped) raises
-    # slow clips toward the Oblivion attribute-formula speed and caps at
-    # this top anchor, so the animation rate always tracks ground speed.
-    entries = [('MoveForwardSlow', fwd, 0.067), ('MoveForward', fwd, 1.0)]
-    if run_kf and run and run > walk * 1.05:
-        if 1.4 * walk < 0.75 * run:
-            entries.append(('MoveForwardFast', fwd, 1.4))
-        entries += [('MoveForwardRunSlow', run_kf, 0.75),
-                    ('MoveForwardRun', run_kf, 1.0),
-                    ('MoveForwardRunFast', run_kf, 1.5),
-                    ('MoveForwardRunFaster', run_kf, 2.0)]
-        natural = {id(fwd): walk, id(run_kf): run}
-    else:
-        entries += [('MoveForwardFast', fwd, 1.4),
-                    ('MoveForwardFaster', fwd, 2.0)]
-        natural = {id(fwd): walk}
-    plan, last = [], 0.0
-    for nm, kf, rate in entries:
-        anchor = natural[id(kf)] * rate
-        if anchor <= last * 1.01:
-            continue
-        plan.append((nm, kf, rate, anchor))
-        last = anchor
-    return plan if len(plan) >= 2 else None
+    return [('MoveForwardSlow', fwd, max(0.02, round(5.0 / walk, 3)), 5.0),
+            ('MoveForward', fwd, 1.0, walk)]
+
+
+def run_blend_plan(clips: dict, speeds: dict) -> list:
+    """The RUN-family blend — its own state, never mixed with the walk clip.
+
+    Vanilla sabrecat forwardlocomotion: ForwardRunBlend = RunSlow@0.75 /
+    Run@1.15 (the SAME clip at two rates) in a ForwardRunState separate from
+    the walk/trot family, switched by runStart/walkStart. The first
+    3-child single-blend layout (2026-08-22) put the stalking walk clip
+    (2.9 s cycle) directly beside the gallop (0.75 s) as its only
+    neighbour: every dip of SpeedSampled below the run anchor SYNC-blended a
+    phase-warped walk pose into the gallop — the lion's "briefly breaks into
+    a bad pose while running" report. With the run family in its own state
+    the gallop only ever blends with itself.
+    """
+    run_kf, run, walk = clips.get('run'), speeds.get('run'), speeds.get('walk')
+    if not run_kf or not run or not walk or run <= walk * 1.05:
+        return None
+    return [('MoveForwardRunSlow', run_kf, 0.75, round(run * 0.75, 3)),
+            ('MoveForwardRun', run_kf, 1.0, run)]
+
+
+def gait_thresholds(speeds: dict) -> tuple:
+    """(walkStart below, runStart above) SpeedSampled thresholds for the
+    walk<->run family switch, with hysteresis (vanilla sabrecat: walkStart
+    < 375 / runStart > 410 inside the two families' overlap). Our families
+    need not overlap (lion: walk 32.5 vs run-family bottom 300), so the
+    switch sits midway with a 15% band."""
+    walk, run = speeds['walk'], speeds['run']
+    run_bottom = run * 0.75
+    hi = max(walk * 1.05, min(run_bottom, (walk + run_bottom) / 2.0))
+    lo = max(walk, hi * 0.85)
+    return round(lo, 2), round(hi, 2)
 
 
 def backward_blend_plan(clips: dict, speeds: dict) -> list:
@@ -299,8 +500,33 @@ def backward_blend_plan(clips: dict, speeds: dict) -> list:
     spd = speeds.get('back')
     if not back or not spd:
         return None
-    return [('MoveBackwardSlow', back, 0.067, spd * 0.067),
+    return [('MoveBackwardSlow', back, max(0.02, round(5.0 / spd, 3)), 5.0),
             ('MoveBackward', back, 1.0, spd)]
+
+
+def swim_blend_plan(clips: dict, speeds: dict) -> list:
+    """SwimMove parametric blend: slow-creep child + swim (+ fast) at their
+    natural anchors, rate 1.0 — the vanilla monolithic layout (chaurus)."""
+    sw = clips.get('swim', {})
+    fwd, spd = sw.get('forward'), speeds.get('swim')
+    if not fwd or not spd:
+        return None
+    plan = [('SwimMoveSlow', fwd, max(0.02, 5.0 / spd)),
+            ('SwimMove', fwd, 1.0)]
+    fast_spd = speeds.get('swimfast')
+    if sw.get('fast') and fast_spd and fast_spd > spd * 1.05:
+        plan.append(('SwimMoveFast', sw['fast'], 1.0))
+    natural = {id(fwd): spd}
+    if sw.get('fast'):
+        natural[id(sw['fast'])] = fast_spd
+    out, last = [], 0.0
+    for nm, kf, rate in plan:
+        anchor = natural[id(kf)] * rate
+        if anchor <= last * 1.01:
+            continue
+        out.append((nm, kf, rate, anchor))
+        last = anchor
+    return out if len(out) >= 2 else None
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +752,9 @@ ENGINE_VARIABLES = [
     ('staggerMagnitude', 'REAL', 0), ('staggerDirection', 'REAL', 0),
     ('iState', 'INT32', 0), ('iGetUpType', 'INT32', 0),
     ('iCharacterSelector', 'INT32', 0), ('iCombatStance', 'INT32', 0),
+    # walk(0)/run(1) gait family — the forward locomotion SM's start state
+    # (vanilla quadruped: `iMovementSpeed = cond((Speed < 100), 0, 1)`)
+    ('iMovementSpeed', 'INT32', 0),
     ('IsAttacking', 'BOOL', 0), ('IsAttackReady', 'BOOL', 1),
     ('bEquipOK', 'BOOL', 1),
     # Weapon-class state the ENGINE writes when it equips something, and which
@@ -543,8 +772,27 @@ ENGINE_VARIABLES = [
     ('bDisableHeadTrack', 'BOOL', 0), ('bForceIdleStop', 'BOOL', 0),
 ]
 
+# Magic interface, declared only for casters (vanilla splits the same way:
+# atronach/chaurus declare these, wolf declares none). The engine WRITES
+# bWantCastLeft/Right when the AI decides to cast and bM*h_Ready when the
+# hand is armed, and READS IsCasting. All init to 0 — VERBATIM the vanilla
+# atronach word values (a working caster), so readiness is the ENGINE's to
+# grant, not ours to fake.
+MAGIC_VARIABLES = [
+    ('bWantCastRight', 'BOOL', 0), ('bWantCastLeft', 'BOOL', 0),
+    ('bMRh_Ready', 'BOOL', 0), ('bMLh_Ready', 'BOOL', 0),
+    ('IsCasting', 'BOOL', 0),
+]
 
-def movement_type_names(name: str) -> list:
+# Block interface, declared only when a guard clip exists (draugrbehavior
+# vocabulary: the engine sends blockStart/Stop/HitStart/HitStop, writes
+# iWantBlock, and reads IsBlocking — bound true inside the block states).
+BLOCK_VARIABLES = [
+    ('IsBlocking', 'BOOL', 0), ('iWantBlock', 'INT32', 0),
+]
+
+
+def movement_type_names(name: str, has_swim: bool = False) -> list:
     """The creature's engine movement-type names — the CONTRACT that makes an
     actor movable at all (2026-07-09, the tc-can't-move root cause).
 
@@ -561,9 +809,18 @@ def movement_type_names(name: str) -> list:
     These names are declared as INT32 graph variables here AND emitted as
     MOVT records by tes5_import/creature_races.py (via the manifest), so
     consistency is by construction, like the ATKE attack events.
+
+    has_swim adds the water movement type: the graph's root expression
+    switches iState onto it while the engine-written `isSwimming` is set
+    (vanilla quadruped: `iState = cond((isSwimming ==1),
+    iState_BearSwimDefault, iState_BearDefault)`), which is what gives the
+    actor its swim speeds.
     """
     base = f'TES4{name.lower()}'
-    return [f'{base}Default', f'{base}Run']
+    out = [f'{base}Default', f'{base}Run']
+    if has_swim:
+        out.append(f'{base}Swim')
+    return out
 
 
 def build_behavior_xml(behavior_name: str, clips: dict,
@@ -616,6 +873,7 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     # ---- event vocabulary: standard + per-attack ----
     events = ['moveStart', 'moveStop', 'moveForward', 'moveBackward',
               'turnLeft', 'turnRight', 'turnStop', 'swimStart', 'swimStop',
+              'runStart', 'walkStart',
               'recoilStart', 'recoilStop', 'recoilLargeStart',
               'staggerStart', 'staggerStop',
               'combatStanceStart', 'combatStanceStop',
@@ -625,6 +883,22 @@ def build_behavior_xml(behavior_name: str, clips: dict,
               'AddRagdollToWorld', 'RemoveCharacterControllerFromWorld',
               'SoundPlay', 'preHitFrame', 'HitFrame',
               'FootFront', 'FootBack', 'FootLeft', 'FootRight']
+    cast_defs = cast_phase_defs(clips)
+    if cast_defs:
+        # Magic handshake (vanilla atronachflamebehavior vocabulary; see
+        # CAST_MODES for the full protocol). BeginCast* is the graph's
+        # message TO the engine; Spell_FireForget_* / Spell_Release /
+        # Spell_Stop are the engine's inbound events; the Out clip's
+        # MLh_SpellFire_Event trigger is what actually fires the spell.
+        events += ['BeginCastRight', 'BeginCastLeft',
+                   'MRh_SpellFire_Event', 'MLh_SpellFire_Event',
+                   'Spell_FireForget_LH', 'Spell_FireForget_RH',
+                   'Spell_Concentration_LH', 'Magic_Pre_Out',
+                   'Spell_Ready', 'Spell_Release', 'Spell_Stop',
+                   'Spell_Interrupt', 'InterruptCast', 'Magic_Equip']
+    if clips.get('block', {}).get('idle'):
+        events += ['blockStart', 'blockStop', 'blockHitStart',
+                   'blockHitStop']
     # Vocal idle enter-events (the IDLE records' ENAM strings)
     events += [evt for _s, evt, _a in (vocal_states or [])]
     # Qualified sound events: one table entry per distinct
@@ -666,9 +940,18 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     # variable table is fixed up-front so bindings can reference indices.
     # iState family: vanilla-style movement-type tags (dogbehavior:
     # iState_DogDefault=30/iState_DogRun=31, iState initialized to Default).
-    variables = ([(n, t, iv) for n, t, iv in ENGINE_VARIABLES]
-                 + [(f'iState_{mt}', 'INT32', 30 + i)
-                    for i, mt in enumerate(movement_types)])
+    variables = [(n, t, iv) for n, t, iv in ENGINE_VARIABLES]
+    if cast_defs:
+        variables += MAGIC_VARIABLES
+    if clips.get('block', {}).get('idle'):
+        variables += BLOCK_VARIABLES
+    has_swim_mt = any(mt.endswith('Swim') for mt in movement_types)
+    if has_swim_mt:
+        # engine-written while the actor is in deep water; drives the
+        # iState movement-type switch below (vanilla quadruped verbatim)
+        variables.append(('isSwimming', 'BOOL', 0))
+    variables += [(f'iState_{mt}', 'INT32', 30 + i)
+                  for i, mt in enumerate(movement_types)]
     var_values = [30 if n == 'iState' else iv for n, _t, iv in variables]
     vidx = {n: i for i, (n, _t, _iv) in enumerate(variables)}
 
@@ -751,9 +1034,10 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         st.param('enable', True)
         return st
 
-    def _make_sm(name, states, start_id=0, wildcard_ref='null'):
+    def _make_sm(name, states, start_id=0, wildcard_ref='null',
+                 binding_ref='null'):
         m = pf.add('hkbStateMachine')
-        m.param('variableBindingSet', 'null')
+        m.param('variableBindingSet', binding_ref)
         m.param('userData', 0)
         m.param('name', name)
         m.param_raw('eventToSendWhenStateOrTransitionChanges', (
@@ -817,10 +1101,52 @@ def build_behavior_xml(behavior_name: str, clips: dict,
 
     # ---- LocomotionBehavior: Forward(0) <-> Backward(1) ----
     loco_sm = None
+    gait_eem = None
     if 'MoveForward' in loco:
         fplan = speed_blend_plan(clips, speeds)
-        fwd_gen = (_parametric_blend('ForwardSpeedBlend', fplan) if fplan
-                   else _clip('MoveForward', loco['MoveForward'], True))
+        walk_gen = (_parametric_blend('ForwardWalkBlend', fplan) if fplan
+                    else _clip('MoveForward', loco['MoveForward'], True))
+        rplan = run_blend_plan(clips, speeds)
+        if rplan:
+            # Two gait FAMILIES in two states (vanilla forwardlocomotion
+            # layout): the walk blend and the run blend never mix clips;
+            # runStart/walkStart switch between them on SpeedSampled with
+            # hysteresis, and iMovementSpeed picks the start state.
+            run_gen = _parametric_blend('ForwardRunBlend', rplan)
+            lo, hi = gait_thresholds(speeds)
+            fwd_sm = _make_sm(
+                'ForwardLocomotionBehavior',
+                [_state(0, 'ForwardWalkState', walk_gen.ref,
+                        transitions=[(eid['runStart'], 1, _F_LOCAL)]),
+                 _state(1, 'ForwardRunState', run_gen.ref,
+                        transitions=[(eid['walkStart'], 0, _F_LOCAL)])],
+                binding_ref=_binding_set(
+                    [('startStateId', 'iMovementSpeed')]).ref)
+            fwd_gen = fwd_sm
+            arr = pf.add('hkbExpressionDataArray')
+            # comparison operators must be XML-escaped in the packfile text
+            # (vanilla: `iMovementSpeed = cond((Speed &lt; 100), 0, 1)`)
+            exprs = [('iMovementSpeed = cond((Speed &lt; 100), 0, 1)',
+                      'EVENT_MODE_SEND_ONCE'),
+                     (f'runStart if (SpeedSampled &gt; {hi})',
+                      'EVENT_MODE_SEND_ON_FALSE_TO_TRUE'),
+                     (f'walkStart if (SpeedSampled &lt; {lo})',
+                      'EVENT_MODE_SEND_ON_FALSE_TO_TRUE')]
+            arr.param_raw('expressionsData', '\n'.join(
+                '<hkobject>\n'
+                f'\t<hkparam name="expression">{e}</hkparam>\n'
+                '\t<hkparam name="assignmentVariableIndex">-1</hkparam>\n'
+                '\t<hkparam name="assignmentEventIndex">-1</hkparam>\n'
+                f'\t<hkparam name="eventMode">{mode}</hkparam>\n'
+                '</hkobject>' for e, mode in exprs), numelements=len(exprs))
+            gait_eem = pf.add('hkbEvaluateExpressionModifier')
+            gait_eem.param('variableBindingSet', 'null')
+            gait_eem.param('userData', 2)
+            gait_eem.param('name', 'ForwardLocomotion_EEM')
+            gait_eem.param('enable', True)
+            gait_eem.param('expressions', arr.ref)
+        else:
+            fwd_gen = walk_gen
         has_back = 'MoveBackward' in loco
         fwd_state = _state(
             0, 'ForwardLocomotionState', fwd_gen.ref,
@@ -951,10 +1277,48 @@ def build_behavior_xml(behavior_name: str, clips: dict,
             root_wilds.append((eid['recoilLargeStart'], next_id, _F_WILD))
         next_id += 1
 
-    if 'Swim' in loco:
-        swim_clip = _clip('Swim', loco['Swim'], True)
+    # ---- swimming (engine swimStart/swimStop; see SWIM_CLIPS) ----
+    # A sub-machine mirroring the land standing/locomotion split, driven by
+    # the same engine locomotion events. Vanilla sabrecat ships a single
+    # looping SwimForward; the richer Oblivion gait sets (slaughterfish:
+    # idle/turns/fast) wire in when authored.
+    sw = clips.get('swim', {})
+    if sw.get('forward'):
+        swim_idle_kf = sw.get('idle') or sw['forward']
+        sw_states = []
+        idle_trans = [(eid['moveStart'], 1, _F_LOCAL)]
+        if sw.get('left'):
+            idle_trans.append((eid['turnLeft'], 3, _F_LOCAL))
+        if sw.get('right'):
+            idle_trans.append((eid['turnRight'], 4, _F_LOCAL))
+        sw_states.append(_state(
+            0, 'SwimIdleState',
+            _clip('SwimIdle', swim_idle_kf, True).ref,
+            transitions=idle_trans))
+        splan = swim_blend_plan(clips, speeds)
+        smove_gen = (_parametric_blend('SwimSpeedBlend', splan) if splan
+                     else _clip('SwimMove', sw['forward'], True))
+        move_trans = [(eid['moveStop'], 0, _F_LOCAL)]
+        if sw.get('backward'):
+            move_trans.append((eid['moveBackward'], 2, _F_LOCAL))
+        sw_states.append(_state(1, 'SwimMoveState', smove_gen.ref,
+                                transitions=move_trans))
+        if sw.get('backward'):
+            sw_states.append(_state(
+                2, 'SwimBackState',
+                _clip('SwimBack', sw['backward'], True).ref,
+                transitions=[(eid['moveForward'], 1, _F_LOCAL),
+                             (eid['moveStop'], 0, _F_LOCAL)]))
+        for sid, role, st_name in ((3, 'left', 'SwimTurnLeft'),
+                                   (4, 'right', 'SwimTurnRight')):
+            if sw.get(role):
+                sw_states.append(_state(
+                    sid, f'{st_name}State',
+                    _clip(st_name, sw[role], True).ref,
+                    transitions=[(eid['turnStop'], 0, _F_LOCAL)]))
+        swim_sm = _make_sm('SwimBehavior', sw_states)
         root_states_inner.append(_state(
-            next_id, 'SwimState', swim_clip.ref,
+            next_id, 'SwimState', swim_sm.ref,
             transitions=[(eid['swimStop'], 0, _F_LOCAL)]))
         root_wilds.append((eid['swimStart'], next_id, _F_WILD))
         next_id += 1
@@ -997,6 +1361,172 @@ def build_behavior_xml(behavior_name: str, clips: dict,
             next_id += 1
             equip_dispatch.append((kind, evt, hand_types))
 
+    # ---- spellcasting: the vanilla FireForget chain (see CAST_MODES) ----
+    # One In/Loop/Out sub-machine, entered by the ENGINE-sent
+    # Spell_FireForget_LH/RH events (vanilla keys the transition into
+    # FireForgetState on exactly these — never on BeginCast*, which is the
+    # graph's outbound message). The In clip's Magic_Pre_Out end trigger
+    # chains into the Loop; the engine's Spell_Release moves to the Out,
+    # whose MLh_SpellFire_Event trigger at the authored release moment is
+    # what actually fires the spell; its Spell_Stop end trigger exits.
+    if cast_defs:
+        cast_stems = cast_anim_stems(clips)
+        # Release moment inside the Out slice (hit_times carries it under
+        # the Out state's name — see generate_creature_project; 0.233s is
+        # vanilla's own Mag_FF_RH_Out release offset as the fallback).
+        release_t = (hit_times.get('Mag_FF_Out') or [0.233334])[0]
+        cast_clip_gens = []
+        for st_name, kf, phase, _stem in cast_defs:
+            looping = (phase == 'Loop')
+            items = []
+            if phase == 'In':
+                items.append(_TRIGGER_TMPL.format(
+                    time=0.0, event_id=eid['Magic_Pre_Out'], rel='true'))
+            elif phase == 'Out':
+                # THE RELEASE — both hand events, because vanilla's own data
+                # answers a right-hand cast with the LEFT event (both
+                # atronach Out clips fire MLh_SpellFire_Event) and the extra
+                # event is inert when that hand has no cast in flight.
+                items.append(_TRIGGER_TMPL.format(
+                    time=release_t, event_id=eid['MLh_SpellFire_Event'],
+                    rel='false'))
+                items.append(_TRIGGER_TMPL.format(
+                    time=release_t, event_id=eid['MRh_SpellFire_Event'],
+                    rel='false'))
+                items.append(_TRIGGER_TMPL.format(
+                    time=0.0, event_id=eid['Spell_Stop'], rel='true'))
+            trig = 'null'
+            if items:
+                ta = pf.add('hkbClipTriggerArray')
+                ta.param_raw('triggers', '\n'.join(items),
+                             numelements=len(items))
+                trig = ta.ref
+            cast_clip_gens.append(_clip(st_name, kf, looping, trig,
+                                        anim=cast_stems.get(st_name)))
+        in_clip, loop_clip, out_clip = cast_clip_gens
+        # In -> Loop on the In clip's own end trigger; the engine may
+        # commit early, so Spell_Release must work from the WHOLE chain
+        # (vanilla scopes it as a wildcard of the FF sub-machine).
+        ff_states = [
+            _state(0, 'Mag_FF_InState', in_clip.ref,
+                   transitions=[(eid['Magic_Pre_Out'], 1, _F_LOCAL)]),
+            _state(1, 'Mag_FF_LoopState', loop_clip.ref),
+            _state(2, 'Mag_FF_OutState', out_clip.ref),
+        ]
+        ff_wild = _trans_array([
+            (eid['Spell_Release'], 2, _F_WILD),
+            (eid['Spell_Ready'], 0,
+             'FLAG_IS_LOCAL_WILDCARD|'
+             'FLAG_ALLOW_SELF_TRANSITION_BY_TRANSITION_FROM_ANY_STATE|'
+             'FLAG_DISABLE_CONDITION'),
+        ])
+        ff_sm = _make_sm('Mag_FF_Behavior', ff_states, start_id=0,
+                         wildcard_ref=ff_wild.ref)
+        # IsCasting is held true for the whole chain via one IsActive
+        # modifier over the sub-machine (vanilla BSIsActiveModifier_Spells);
+        # the engine's `!IsCasting` guard blocks a second overlapping cast.
+        cast_iso = pf.add('BSIsActiveModifier')
+        cast_iso.param('variableBindingSet',
+                       _binding_set([('bIsActive0', 'IsCasting')]).ref)
+        cast_iso.param('userData', 1)
+        cast_iso.param('name', 'BSIsActiveModifier_Spells')
+        cast_iso.param('enable', True)
+        for i in range(5):
+            cast_iso.param(f'bIsActive{i}', False)
+            cast_iso.param(f'bInvertActive{i}', False)
+        cast_ml = pf.add('hkbModifierList')
+        cast_ml.param('variableBindingSet', 'null')
+        cast_ml.param('userData', 1)
+        cast_ml.param('name', 'Spells_ModifierList')
+        cast_ml.param('enable', True)
+        cast_ml.param_array('modifiers', [cast_iso.ref])
+        cast_mg = pf.add('hkbModifierGenerator')
+        cast_mg.param('variableBindingSet', 'null')
+        cast_mg.param('userData', 1)
+        cast_mg.param('name', 'FF_MG')
+        cast_mg.param('modifier', cast_ml.ref)
+        cast_mg.param('generator', ff_sm.ref)
+        ff_id = next_id
+        next_id += 1
+        root_states_inner.append(_state(
+            ff_id, 'FireForgetState', cast_mg.ref,
+            transitions=[(eid['Spell_Stop'], 0, _F_LOCAL),
+                         (eid['Spell_Interrupt'], 0, _F_LOCAL),
+                         (eid['InterruptCast'], 0, _F_LOCAL)]))
+        # THE ENTRY PATH: the engine sends the cast-type event after hearing
+        # our BeginCast* (vanilla CombatIdleState keys on these verbatim).
+        # Concentration spells get the same gesture — the engine drives
+        # their release itself, and the stray SpellFire event is inert.
+        for evt in ('Spell_FireForget_LH', 'Spell_FireForget_RH',
+                    'Spell_Concentration_LH'):
+            root_wilds.append((eid[evt], ff_id, _F_WILD))
+        # Magic_Equip = "snap to combat idle" in vanilla; our combat idle
+        # lives inside DefaultState.
+        root_wilds.append((eid['Magic_Equip'], 0, _F_WILD))
+
+    # ---- blocking (engine blockStart/blockStop; see BLOCK_CLIPS) ----
+    # BlockState loops the guard with IsBlocking held true (the engine reads
+    # it — draugrbehavior binds the same variable in its block states);
+    # blockHitStart plays the flinch and returns to the guard.
+    blk = clips.get('block', {})
+    if blk.get('idle'):
+        block_iso = pf.add('BSIsActiveModifier')
+        block_iso.param('variableBindingSet',
+                        _binding_set([('bIsActive0', 'IsBlocking')]).ref)
+        block_iso.param('userData', 1)
+        block_iso.param('name', 'BSIsActiveModifier_IsBlocking')
+        block_iso.param('enable', True)
+        for i in range(5):
+            block_iso.param(f'bIsActive{i}', False)
+            block_iso.param(f'bInvertActive{i}', False)
+        block_ml = pf.add('hkbModifierList')
+        block_ml.param('variableBindingSet', 'null')
+        block_ml.param('userData', 1)
+        block_ml.param('name', 'Block_ModifierList')
+        block_ml.param('enable', True)
+        block_ml.param_array('modifiers', [block_iso.ref])
+
+        def _block_mg(nm, gen_ref):
+            mg = pf.add('hkbModifierGenerator')
+            mg.param('variableBindingSet', 'null')
+            mg.param('userData', 1)
+            mg.param('name', nm)
+            mg.param('modifier', block_ml.ref)
+            mg.param('generator', gen_ref)
+            return mg
+
+        block_id = next_id
+        next_id += 1
+        hit_id = None
+        if blk.get('hit'):
+            hit_id = next_id
+            next_id += 1
+        block_trans = [(eid['blockStop'], 0, _F_LOCAL)]
+        if hit_id is not None:
+            block_trans.append((eid['blockHitStart'], hit_id, _F_LOCAL))
+        root_states_inner.append(_state(
+            block_id, 'BlockState',
+            _block_mg('Block_MG',
+                      _clip('Block', blk['idle'], True).ref).ref,
+            transitions=block_trans))
+        root_wilds.append((eid['blockStart'], block_id, _F_WILD))
+        if hit_id is not None:
+            # the flinch fires its own blockHitStop at clip end, so the
+            # guard resumes even if the engine never sends the stop (no
+            # _clip_triggers here: an authored 'Hit' key on a flinch must
+            # NOT become a damage HitFrame)
+            bh_ta = pf.add('hkbClipTriggerArray')
+            bh_ta.param_raw('triggers', _TRIGGER_TMPL.format(
+                time=0.0, event_id=eid['blockHitStop'], rel='true'),
+                numelements=1)
+            hit_clip = _clip('BlockHit', blk['hit'], False, bh_ta.ref)
+            root_states_inner.append(_state(
+                hit_id, 'BlockHitState',
+                _block_mg('BlockHit_MG', hit_clip.ref).ref,
+                transitions=[(eid['blockHitStop'], block_id, _F_LOCAL),
+                             (eid['blockStop'], 0, _F_LOCAL)]))
+            root_wilds.append((eid['blockHitStart'], hit_id, _F_WILD))
+
     # Vocal idle states (CSDT Idle/Aware slots). Single-play — the sound
     # annotation lives in the state's OWN animation file, so it fires once
     # per entry, and entry is paced by the engine's idle system through the
@@ -1004,11 +1534,23 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     # exactly like vanilla WolfIdleHowl / WolfIdleWarn. Embedding the sound
     # in the looping Idle/CombatStance clips instead made it fire every
     # cycle, in life and in the ragdoll wrapper states after death.
+    #
+    # IdleStop is LOCAL to these idle states, never a root wildcard: vanilla
+    # routes idleStop only out of its idle states (atronach CombatIdleSpecial
+    # -> CombatIdle, MT_Idle specials -> MT_Idle; sabrecat/draugr likewise).
+    # A cast is itself an IDLE-manager action (ActionLeftAttack tree), and
+    # the engine cancels idles with ActionIdleStop, so a root-level
+    # IdleStop -> DefaultState wildcard killed every FireForget/Attack state
+    # the moment the AI wanted to move: the actor snapped back to Default
+    # while the engine stayed in its casting state waiting for a SpellFire /
+    # Spell_Stop that could no longer come (the 2026-08-23 "IsCasting=1,
+    # graph in DefaultState, never casts" readback).
     for st_name, evt, stem in (vocal_states or []):
         clip = _clip(st_name, clips['idle'], False,
                      _clip_triggers(st_name, 'returnToDefault'), anim=stem)
         root_states_inner.append(_state(
-            next_id, f'{st_name}State', clip.ref))
+            next_id, f'{st_name}State', clip.ref,
+            transitions=[(eid['IdleStop'], 0, _F_LOCAL)]))
         root_wilds.append((eid[evt], next_id, _F_WILD))
         next_id += 1
 
@@ -1039,12 +1581,106 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         eem.param('expressions', arr.ref)
         equip_eem = eem
 
-    default_state = _state(0, 'DefaultState', default_sm.ref,
+    # ---- cast gating (vanilla BeginCast_EEM, VERBATIM and nothing else) --
+    # These two expressions are copied character-for-character from
+    # atronachflamebehavior. BeginCast* is the graph's message TO the
+    # engine: the engine hears it and replies with Spell_FireForget_LH (the
+    # state-entry event above). Expressions can only read VARIABLES — the
+    # previous attempt tested event names in conditions, which never fire.
+    cast_eem = None
+    if cast_defs:
+        exprs = [
+            'BeginCastLeft if (bWantCastLeft && bMLh_Ready && !IsCasting)',
+            'BeginCastRight if (bWantCastRight && bMRh_Ready && !IsCasting)',
+        ]
+        arr = pf.add('hkbExpressionDataArray')
+        arr.param_raw('expressionsData', '\n'.join(
+            '<hkobject>\n'
+            f'\t<hkparam name="expression">{e}</hkparam>\n'
+            '\t<hkparam name="assignmentVariableIndex">-1</hkparam>\n'
+            '\t<hkparam name="assignmentEventIndex">-1</hkparam>\n'
+            '\t<hkparam name="eventMode">EVENT_MODE_SEND_ON_FALSE_TO_TRUE'
+            '</hkparam>\n'
+            '</hkobject>' for e in exprs), numelements=len(exprs))
+        eem = pf.add('hkbEvaluateExpressionModifier')
+        eem.param('variableBindingSet', 'null')
+        eem.param('userData', 2)
+        eem.param('name', 'BeginCast_EEM')
+        eem.param('enable', True)
+        eem.param('expressions', arr.ref)
+        cast_eem = eem
+
+    # ---- swim movement-type switch (vanilla quadruped verbatim shape) ----
+    # While the engine-written isSwimming is set, iState points at the swim
+    # MOVT, giving the actor its water speeds; on land it points back at
+    # Default. Without this the engine keeps the land movement type in
+    # water. (`iState = cond((isSwimming ==1), iState_BearSwimDefault,
+    # iState_BearDefault)` is the vanilla original.)
+    swim_eem = None
+    if has_swim_mt:
+        default_mt, swim_mt = None, None
+        for mt in movement_types:
+            if mt.endswith('Swim'):
+                swim_mt = f'iState_{mt}'
+            elif mt.endswith('Default'):
+                default_mt = f'iState_{mt}'
+        arr = pf.add('hkbExpressionDataArray')
+        arr.param_raw('expressionsData', (
+            '<hkobject>\n'
+            f'\t<hkparam name="expression">iState = cond((isSwimming == 1), '
+            f'{swim_mt}, {default_mt})</hkparam>\n'
+            '\t<hkparam name="assignmentVariableIndex">-1</hkparam>\n'
+            '\t<hkparam name="assignmentEventIndex">-1</hkparam>\n'
+            '\t<hkparam name="eventMode">EVENT_MODE_SEND_ONCE</hkparam>\n'
+            '</hkobject>'), numelements=1)
+        eem = pf.add('hkbEvaluateExpressionModifier')
+        eem.param('variableBindingSet', 'null')
+        eem.param('userData', 2)
+        eem.param('name', 'SwimiState_EEM')
+        eem.param('enable', True)
+        eem.param('expressions', arr.ref)
+        swim_eem = eem
+
+    # Cast readiness is the GRAPH's to grant, not the engine's: vanilla's
+    # BSIsActiveModifier_CombatIdle holds bMLh_Ready/bMRh_Ready true while
+    # the combat-idle subtree (idle + combat locomotion) is active, and the
+    # Stagger modifier clears them. The BeginCast_EEM condition
+    # `bWantCastLeft && bMLh_Ready && !IsCasting` can never fire without
+    # this — the AI wants to cast and the actor just stands there (the
+    # 2026-08-23 "scamps get stuck" report). Held over the whole DefaultState
+    # so the creature is ready whenever it is not attacking / casting /
+    # staggering / blocking / swimming — each of those is a sibling state.
+    default_gen_ref = default_sm.ref
+    if cast_defs:
+        ready_iso = pf.add('BSIsActiveModifier')
+        ready_iso.param('variableBindingSet',
+                        _binding_set([('bIsActive0', 'bMLh_Ready'),
+                                      ('bIsActive1', 'bMRh_Ready')]).ref)
+        ready_iso.param('userData', 1)
+        ready_iso.param('name', 'BSIsActiveModifier_CombatIdle')
+        ready_iso.param('enable', True)
+        for i in range(5):
+            ready_iso.param(f'bIsActive{i}', False)
+            ready_iso.param(f'bInvertActive{i}', False)
+        ready_ml = pf.add('hkbModifierList')
+        ready_ml.param('variableBindingSet', 'null')
+        ready_ml.param('userData', 1)
+        ready_ml.param('name', 'CombatIdle_ModifierList')
+        ready_ml.param('enable', True)
+        ready_ml.param_array('modifiers', [ready_iso.ref])
+        ready_mg = pf.add('hkbModifierGenerator')
+        ready_mg.param('variableBindingSet', 'null')
+        ready_mg.param('userData', 1)
+        ready_mg.param('name', 'CombatIdle_MG')
+        ready_mg.param('modifier', ready_ml.ref)
+        ready_mg.param('generator', default_sm.ref)
+        default_gen_ref = ready_mg.ref
+
+    default_state = _state(0, 'DefaultState', default_gen_ref,
                            transitions=default_trans or None)
     root_states_inner.insert(0, default_state)
 
     root_wilds.append((eid['returnToDefault'], 0, _F_GLOBAL))
-    root_wilds.append((eid['IdleStop'], 0, _F_WILD))
     wild = _trans_array(root_wilds)
 
     sm = _make_sm(f'{behavior_name}Root', root_states_inner,
@@ -1201,7 +1837,10 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     mod_list.param_array('modifiers',
                          live_track
                          + [stop_combat.ref, start_combat.ref, sampler.ref]
-                         + ([equip_eem.ref] if equip_eem is not None else []))
+                         + ([equip_eem.ref] if equip_eem is not None else [])
+                         + ([cast_eem.ref] if cast_eem is not None else [])
+                         + ([swim_eem.ref] if swim_eem is not None else [])
+                         + ([gait_eem.ref] if gait_eem is not None else []))
 
     mod_gen = pf.add('hkbModifierGenerator')
     mod_gen.param('variableBindingSet', 'null')
@@ -1631,14 +2270,61 @@ def _apply_sound_slots(clip_meta: list, clips: dict, sound_slots: dict) -> int:
     return added
 
 
+def project_layout(name: str, namespace: str = '') -> dict:
+    """Where a creature's project lives and what its files are called.
+
+    `namespace` is the owning PLUGIN's tag (creature_pipeline.plugin_namespace)
+    and is part of both the directory and every project file stem:
+
+        meshes\\actors\\tes4\\<namespace>\\<folder>\\
+            tes4<namespace>_<folder>project.hkx
+            characters\\tes4<namespace>_<folder>character.hkx
+            behaviors\\tes4<namespace>_<folder>behavior.hkx
+
+    Creature identity used to be the bare leaf folder name in one shared
+    `actors\\tes4\\` tree, so two plugins that each ship a creature folder
+    called `scamp` (Oblivion's scamp and Morrowind_ob's Morrowind scamp —
+    different skeleton, different clips, different attack events) wrote the
+    SAME path, and the Data folder can hold only one. Whichever was
+    deployed last won for every plugin: a Stunted Scamp in Oblivion's
+    worldspace ran Morrowind_ob's graph, whose event table has no
+    Spell_FireForget_LH and none of Oblivion's attackStart_TES4_* names,
+    so it could neither cast nor melee (read back live 2026-08-23 from the
+    engine's project event map). Skyrim's own answer is one project per
+    plugin under its own path; this is that. Record-side identity (RACE /
+    ARMA / IDLE EditorIDs and FormID keys) stays on the leaf name, so the
+    namespace moves files only — no FormID drifts.
+    """
+    lname = name.lower()
+    stem = f'{namespace}_{lname}' if namespace else lname
+    rel = f'TES4\\{namespace}\\{lname}' if namespace else f'TES4\\{lname}'
+    return {
+        'stem': stem,
+        'dir_rel': rel,                             # under meshes\\actors
+        'fs_dir': os.path.join('actors', *rel.lower().split('\\')),
+        'project_hkx': f'Actors\\{rel}\\tes4{stem}project.hkx',
+        'project_txt': f'tes4{stem}project.txt',
+        'character_file': f'Characters\\tes4{stem}character.hkx',
+        'behavior_file': f'Behaviors\\tes4{stem}behavior.hkx',
+        'behavior_hkx': f'Actors\\{rel}\\Behaviors\\tes4{stem}behavior.hkx',
+        'anim_dir': f'meshes\\actors\\{rel.lower()}\\animations',
+        'skeleton_nif': f'actors\\{rel.lower()}\\character assets\\skeleton.nif',
+        'body_dir': f'Actors\\{rel}',
+    }
+
+
 def generate_creature_project(creature_dir: str, name: str, out_root: str,
                               fps: float = 30.0, sound_slots: dict = None,
-                              sound_chances: dict = None) -> dict:
+                              sound_chances: dict = None,
+                              attr_speed: int = 0,
+                              namespace: str = '') -> dict:
     """Full project generation for one creature.
 
     Writes the hkx project tree plus `project_manifest.json` — the manifest
     is the contract consumed by asset_convert/animation_data.py (singlefile
     registration) and tes5_import (RACE ATKE/behavior-graph paths).
+
+    namespace: the owning plugin's tag — see project_layout().
 
     sound_slots: {CSDT type: SOUN EditorID} for this creature's folder. Skyrim
     voices creatures through animation annotations rather than the actor
@@ -1647,16 +2333,29 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     become dedicated single-play vocal states so they cannot fire per loop.
     sound_chances: {CSDT type: authored CSDC chance 0-100}, carried into the
     manifest's vocal_events for the import-side IDLE record conditions.
+
+    attr_speed: the folder's MAX TES4 DATA.Speed attribute. Oblivion moved a
+    creature at the GMST formula speed (walk = fMoveCreatureWalkMin +
+    (Max−Min)×Speed/100, run = walk×fMoveRunMult; 5.0/300.0/3.0 from the
+    export) regardless of the animation's root motion — the clips just slid.
+    Skyrim ties commanded speed to the animation, so the speed-up is BAKED
+    into the walk/run clips here (timescale_clip, capped ×1.4 walk / ×2.0
+    run) and everything downstream — root-motion `speeds`, blend anchors,
+    MOVT SPED — is derived from the baked files and agrees at rate 1.0,
+    exactly like every vanilla creature (chaurus: MOVT run == blend top
+    anchor == clip natural speed).
     """
     from asset_convert.creature_pipeline import foot_enum_map
     from asset_convert.hkx_anim import (decode_clip, event_annotations,
-                                        parse_kf_events, write_clip_hkx)
+                                        parse_kf_events, timescale_clip,
+                                        write_clip_hkx)
     from asset_convert.hkx_ragdoll import ragdoll_info
     from asset_convert.hkx_skeleton import generate_skeleton_hkx
 
     skeleton_nif = os.path.join(creature_dir, 'skeleton.nif')
     lname = name.lower()
-    proj_dir = os.path.join(out_root, 'actors', 'tes4', lname)
+    layout = project_layout(name, namespace)
+    proj_dir = os.path.join(out_root, layout['fs_dir'])
     clips = classify_clips(creature_dir)
 
     bones = generate_skeleton_hkx(
@@ -1674,6 +2373,29 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     attack_kfs = set(clips['attacks'])
     enum_map = foot_enum_map(sound_slots)
 
+    # Speed-bake factors (see the attr_speed docstring): computed per FILE
+    # from its natural root motion, applied once at decode.
+    _bake = {}
+    if attr_speed:
+        f_walk = 5.0 + (300.0 - 5.0) * attr_speed / 100.0
+        for kf_path, formula, cap in (
+                (clips['locomotion'].get('MoveForward'), f_walk, 1.4),
+                (clips.get('run'), f_walk * 3.0, 2.0)):
+            if kf_path:
+                _bake[_clip_state_name(kf_path)] = (formula, cap)
+
+    def _bake_factor(stem, clip, motion):
+        rule = _bake.get(stem)
+        if not rule or motion is None or motion.get('translations') is None:
+            return 1.0
+        formula, cap = rule
+        end = motion['translations'][-1]
+        dur = float(clip.duration) or 1.0
+        natural = float(end[0] ** 2 + end[1] ** 2) ** 0.5 / dur
+        if natural <= 1.0:
+            return 1.0
+        return min(max(formula / natural, 1.0), cap)
+
     # Phase 1 — DECODE every clip and collect its translated events
     # (parse_kf_events: 'Sound: X' → SoundPlay descriptor names, authored
     # 'Enum: Left/...' footfalls → engine foot events, 'Hit' → hit times).
@@ -1684,20 +2406,47 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     # inside the .hkx; animationdata triggers alone stayed silent in game).
     decoded, decode_failed = {}, {}         # stem -> (clip, motion) / error
     clip_meta, motions, failures = [], {}, []
+    cast_stem_map = cast_anim_stems(clips)
+    cast_release_offset = None
     for st_name, kf, looping, _enter, end_evt in convert_list:
-        stem = _clip_state_name(kf)
-        if stem not in decoded and stem not in decode_failed:
+        src_stem = _clip_state_name(kf)
+        # A cast state plays a SLICE of its source clip, not the whole thing
+        # (In/Loop/Out — see hkx_anim.split_cast_clip), so it decodes under
+        # its own per-phase stem.
+        stem = cast_stem_map.get(st_name, src_stem)
+        if src_stem not in decoded and src_stem not in decode_failed:
             try:
-                decoded[stem] = decode_clip(kf, fps)
+                d_clip, d_motion = decode_clip(kf, fps)
+                factor = _bake_factor(src_stem, d_clip, d_motion)
+                if factor > 1.0:
+                    d_clip, d_motion = timescale_clip(d_clip, d_motion,
+                                                      factor)
+                decoded[src_stem] = (d_clip, d_motion)
             except Exception as e:  # keep going; report at the end
-                decode_failed[stem] = f'{type(e).__name__}: {e}'
-        if stem in decode_failed:
-            failures.append((kf, decode_failed[stem]))
+                decode_failed[src_stem] = f'{type(e).__name__}: {e}'
+        if src_stem in decode_failed:
+            failures.append((kf, decode_failed[src_stem]))
             if st_name == 'MoveForwardRun':
                 clips['run'] = None     # blender must not reference it
             continue
-        clip, motion = decoded[stem]
+        clip, motion = decoded[src_stem]
+        if st_name in cast_stem_map and stem not in decoded:
+            from asset_convert.hkx_anim import split_cast_clip
+            in_c, loop_c, out_c, rel_off = split_cast_clip(clip)
+            cast_release_offset = rel_off
+            # no root motion for the slices: a cast is an in-place gesture,
+            # and the full clip's motion curve would outrun the slice anyway
+            for ph, part in zip(CAST_PHASES, (in_c, loop_c, out_c)):
+                ph_stem = cast_stem_map.get(f'Mag_FF_{ph}')
+                if ph_stem:
+                    decoded[ph_stem] = (part, None)
+        if stem in decoded:
+            clip, motion = decoded[stem]
         events = parse_kf_events(clip.text_keys, enum_map)
+        if st_name in cast_stem_map:
+            # a cast is not a melee swing: no weaponSwing/HitFrame damage
+            # window; the release is the Out clip's SpellFire trigger
+            events['hits'] = []
         if kf in attack_kfs and not events['hits']:
             # Keyless attack: the damage contract (weaponSwing/preHitFrame/
             # HitFrame, fired by the graph's clip triggers) still needs a hit
@@ -1736,6 +2485,16 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
                 'rotations': (motion['rotations'].tolist()
                               if motion['rotations'] is not None else None),
             }
+
+    # The cast Out's release trigger, mirrored into animationdata exactly as
+    # vanilla ships it (atronachflame.txt: `MLh_SpellFire_Event:0.233334` +
+    # `Spell_Stop:<end>` on Mag_FF_RH_Out). The graph fires the same pair
+    # from its clip trigger array — both channels must agree.
+    if cast_release_offset is not None:
+        for c in clip_meta:
+            if c['name'] == 'Mag_FF_Out':
+                c['events'] = [(cast_release_offset, 'MLh_SpellFire_Event'),
+                               (cast_release_offset, 'MRh_SpellFire_Event')]
 
     # CREA CSDT sound slots → SoundPlay/footstep events on the right clips,
     # BEFORE compiling, so they land inside the animation hkx too.
@@ -1832,7 +2591,12 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
         ann.update(event_annotations(
             {'sounds': c['sounds'], 'feet': c.get('feet', [])},
             include_hits=False))
+    # A cast source clip is only ever played as its In/Loop/Out slices, so
+    # the uncut original is never referenced — don't ship it.
+    referenced = {c['stem'] for c in clip_meta}
     for stem in sorted(decoded):
+        if stem not in referenced:
+            continue
         clip, _motion = decoded[stem]
         out_hkx = os.path.join(proj_dir, 'animations', stem + '.hkx')
         try:
@@ -1864,7 +2628,9 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
         'walk': _speed_of(clips['locomotion'].get('MoveForward')),
         'run': _speed_of(clips.get('run')),
         'back': _speed_of(clips['locomotion'].get('MoveBackward')),
-        'swim': _speed_of(clips['locomotion'].get('Swim')),
+        'swim': _speed_of(clips.get('swim', {}).get('forward')),
+        'swimfast': _speed_of(clips.get('swim', {}).get('fast')),
+        'swimback': _speed_of(clips.get('swim', {}).get('backward')),
     }
     # a "run" clip that isn't actually faster than the walk (wraith:
     # runforward has LESS root motion than forward) breaks the parametric
@@ -1882,7 +2648,9 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     # dogproject.txt convention).
     base_of = {c['name']: c for c in clip_meta}
     for plan in (speed_blend_plan(clips, speeds) or [],
-                 backward_blend_plan(clips, speeds) or []):
+                 run_blend_plan(clips, speeds) or [],
+                 backward_blend_plan(clips, speeds) or [],
+                 swim_blend_plan(clips, speeds) or []):
         for cnm, kf, rate, _anchor in plan:
             if cnm in base_of:
                 continue
@@ -1902,8 +2670,12 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
             clip_meta.append(entry)
             base_of[cnm] = entry
 
-    behavior_name = f'TES4{name.capitalize()}Behavior'
-    move_types = movement_type_names(lname)
+    # the hkbBehaviorGraph name IS the behavior file's basename (every vanilla
+    # project: AtronachFlameBehavior.hkb <-> atronachflamebehavior.hkx)
+    behavior_name = f'tes4{layout["stem"]}behavior'
+    move_types = movement_type_names(
+        lname, has_swim=bool(clips.get('swim', {}).get('forward')
+                             and speeds.get('swim')))
     # The graph must declare every qualified sound event its clips trigger,
     # exactly as animation_data.project_block_lines writes it — the engine
     # dispatches annotations through this table by name.
@@ -1915,10 +2687,14 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     surviving = {c['name'] for c in clip_meta}
     vocal_states = [v for v in vocal_states if v[0] in surviving]
     vocal_events = [v for v in vocal_events if v['state'] in surviving]
+    graph_hit_times = {c['name']: c['hits'] for c in clip_meta if c['hits']}
+    if cast_release_offset is not None:
+        # the Out state's SpellFire trigger moment (not a damage HitFrame —
+        # cast states keep 'hits' empty; see the decode loop)
+        graph_hit_times['Mag_FF_Out'] = [cast_release_offset]
     _write_and_compile(
         build_behavior_xml(behavior_name, clips,
-                           hit_times={c['name']: c['hits']
-                                      for c in clip_meta if c['hits']},
+                           hit_times=graph_hit_times,
                            movement_types=move_types,
                            speeds=speeds, ragdoll=ragdoll,
                            sound_events=sound_events,
@@ -1929,12 +2705,13 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     anim_files = list(dict.fromkeys(c['anim'] for c in clip_meta))
     _write_and_compile(
         build_character_xml(
-            f'TES4{name.capitalize()}Character', anim_files,
-            f'Behaviors\\{behavior_name.lower()}.hkx', n_bones=len(bones)),
-        os.path.join(proj_dir, 'characters', f'tes4{lname}character.hkx'))
+            f'tes4{layout["stem"]}character', anim_files,
+            layout['behavior_file'], n_bones=len(bones)),
+        os.path.join(proj_dir, 'characters',
+                     os.path.basename(layout['character_file'])))
     _write_and_compile(
-        build_project_xml(f'Characters\\tes4{lname}character.hkx'),
-        os.path.join(proj_dir, f'tes4{lname}project.hkx'))
+        build_project_xml(layout['character_file']),
+        os.path.join(proj_dir, os.path.basename(layout['project_hkx'])))
 
     attack_states = [(evt, f'Attack_{_clip_state_name(kf)}')
                      for kf, evt in zip(clips['attacks'],
@@ -1942,14 +2719,27 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     converted = {c['name'] for c in clip_meta}
     manifest = {
         'name': lname,
-        'project_hkx': f'Actors\\TES4\\{lname}\\tes4{lname}project.hkx',
-        'project_txt': f'tes4{lname}project.txt',
-        'project_files': [f'Behaviors\\{behavior_name.lower()}.hkx',
-                          f'Characters\\tes4{lname}character.hkx',
+        'namespace': namespace,
+        'dir': layout['fs_dir'],
+        'project_hkx': layout['project_hkx'],
+        'project_txt': layout['project_txt'],
+        # the root behavior path the engine's idle manager matches IDLE
+        # DNAMs against (creature_idles)
+        'behavior_hkx': layout['behavior_hkx'],
+        'body_dir': layout['body_dir'],
+        'skeleton_nif': layout['skeleton_nif'],
+        'project_files': [layout['behavior_file'],
+                          layout['character_file'],
                           'Character Assets\\skeleton.HKX'],
-        'anim_dir': f'meshes\\actors\\tes4\\{lname}\\animations',
+        'anim_dir': layout['anim_dir'],
         'clips': clip_meta,
         'attacks': [[e, s] for e, s in attack_states if s in converted],
+        # whether the graph carries the FireForget cast chain (records side:
+        # SPLO spells + the touch-spell melee ATKDs are independent of this)
+        'has_cast': 'Mag_FF_Out' in converted,
+        # whether the graph carries the block states (drives the block IDLE
+        # action routing in tes5_import/creature_idles)
+        'has_block': 'Block' in converted,
         'movement_types': move_types,
         'speeds': speeds,
         'has_ragdoll': bool(ragdoll),

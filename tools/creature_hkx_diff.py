@@ -15,7 +15,7 @@ Usage:
       --vanilla-skel "character assets dog/skeleton.hkx" \
       --vanilla-char "characters dog/dog.hkx" \
       --vanilla-beh  "behaviors/dogbehavior.hkx" \
-      --ours-dir "path/to/actors/tes4/rat" [--keep-xml]
+      --ours-dir "path/to/actors/tes4/oblivion/rat" [--keep-xml]
 
 Ours must be LE 32-bit hkx (regenerate via `python -m asset_convert
 .hkx_behavior <export creature dir> <tmp>` — shipped files are AMD64 and
@@ -105,19 +105,27 @@ def main():
     ap.add_argument('--vanilla-char', required=True)
     ap.add_argument('--vanilla-beh', required=True)
     ap.add_argument('--ours-dir', required=True,
-                    help='converted creature dir (LE hkx): .../actors/tes4/<name>')
+                    help='converted creature dir (LE hkx): '
+                         '.../actors/tes4/<plugin>/<name>')
     ap.add_argument('--keep-xml', action='store_true')
     args = ap.parse_args()
 
-    name = os.path.basename(os.path.normpath(args.ours_dir))
+    # file stems carry the plugin namespace (hkx_behavior.project_layout);
+    # the project's own manifest is the authority on them
+    import json
+    with open(os.path.join(args.ours_dir, 'project_manifest.json'),
+              encoding='utf-8') as f:
+        m = json.load(f)
+    files = {p.split('\\')[0].lower(): p for p in m['project_files']}
     ours = {
         'skeleton': os.path.join(args.ours_dir, 'character assets',
                                  'skeleton.hkx'),
-        'character': os.path.join(args.ours_dir, 'characters',
-                                  f'tes4{name}character.hkx'),
-        'behavior': os.path.join(args.ours_dir, 'behaviors',
-                                 f'tes4{name}behavior.hkx'),
-        'project': os.path.join(args.ours_dir, f'tes4{name}project.hkx'),
+        'character': os.path.join(args.ours_dir,
+                                  *files['characters'].split('\\')),
+        'behavior': os.path.join(args.ours_dir,
+                                 *files['behaviors'].split('\\')),
+        'project': os.path.join(args.ours_dir,
+                                os.path.basename(m['project_hkx'])),
     }
     van = {
         'skeleton': os.path.join(args.vanilla_dir, args.vanilla_skel),

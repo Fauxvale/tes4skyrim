@@ -7,6 +7,8 @@ from ..constants import DEFAULT_RACE, RACE_MAP, TES4_SKILL_TO_TES5, TES5_SKILL_O
 from ..npc_face_mapper import build_face_tail_subs, build_pnam_subs
 from ..outfits import split_inventory
 from ..packages import (
+    CLAS_CREATURE_CASTER,
+    CLAS_CREATURE_PREDATOR,
     CSTY_ANIMAL,
     CSTY_DEFAULT,
     DPLT_CREATURE_LIST,
@@ -536,8 +538,14 @@ def _crea_acbs(rec: dict) -> bytes:
     # the creature's whole TES4 pool. See creature_health_offset.
     from ..creature_races import creature_health_offset
     health_offset = creature_health_offset(rec)
+    # Magicka: the generated race's starting magicka is 0 (shared race), so
+    # the actor's whole TES4 SpellPoints pool rides here. Without it a
+    # spell-knowing creature has 0 magicka, cannot pay any cast cost, and
+    # never casts — vanilla's atronach carries the same split (race base +
+    # ACBS.MagickaOffset 50).
+    magicka_offset = min(get_int(rec, 'ACBS.SpellPoints', 0), 32767)
     return struct.pack('<IhhHHHHhHhH',
-                       tes5_flags, 0, 0, tes5_level,
+                       tes5_flags, magicka_offset, 0, tes5_level,
                        min(calc_min, 65535), min(calc_max, 65535),
                        100, 0, 0, health_offset, 0)
 
@@ -1403,7 +1411,7 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
     """CREA → NPC_ (creatures become NPCs in TES5).
 
     Same subrecord order as NPC_: EDID OBND ACBS SNAM INAM VTCK RNAM
-    COCT/CNTO AIDT PKID FULL DATA DNAM ZNAM DOFT DPLT
+    SPCT SPLO[] COCT/CNTO AIDT PKID FULL DATA DNAM ZNAM DOFT DPLT
     """
     subs = b''
     edid = get_str(rec, 'EditorID')
@@ -1479,6 +1487,32 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
     # RNAM — Race (after VTCK per TES5 NPC_ definition)
     subs += pack_formid_subrecord('RNAM', crea_race_fid)
 
+    # SPCT + SPLO — Spells. Creatures carry their magic through SPLO exactly
+    # like NPCs do (the stunted scamp's fireball, a summoner's summon, an
+    # atronach's touch attack); convert_CREA simply never emitted them, so
+    # ALL 600 of the 914 Oblivion CREA that know a spell shipped with none
+    # and could not cast whatever the behavior graph offered them.
+    #
+    # Order is RNAM -> SPCT -> SPLO[] -> COCT -> CNTO, verified against BOTH
+    # the xEdit TES5 definition (wbDefinitionsTES5.pas: wbSPCT, wbSPLOs
+    # directly after RNAM) and real Skyrim.esm records.
+    #
+    # The target may be a SPEL, a SHOU or an LVSP — xEdit types SPLO as
+    # [SPEL, SHOU, LVSP], so a TES4 leveled spell (LVSP survives conversion
+    # via convert_LVSP) is referenced directly rather than unrolled. The
+    # scamp above is exactly that case: its fireball arrives through
+    # LL2CreatureScampStunted100.
+    crea_spell_count = get_int(rec, 'SpellCount')
+    if crea_spell_count > 0:
+        crea_spells = [get_formid(rec, f'Spell[{i}]')
+                       for i in range(crea_spell_count)]
+        crea_spells = [s for s in crea_spells if s]
+        if crea_spells:
+            subs += pack_subrecord('SPCT',
+                                   struct.pack('<I', len(crea_spells)))
+            for sfid in crea_spells:
+                subs += pack_formid_subrecord('SPLO', sfid)
+
     # Items — carried inventory and outfit are disjoint (see convert_NPC_).
     # Creature inventories are mostly loot leveled-lists, which belong in CNTO;
     # only the armed/armored ones (skeletons, dremora) yield an outfit at all.
@@ -1510,7 +1544,21 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
     # DefaultMasterPackageCreature — give converted creatures the same hookup.
     subs += pack_formid_subrecord('PKID', PKID_CREATURE_MASTER)
 
-    # FULL — Name (after PKID in TES5 NPC_ order)
+    # CNAM — Class. 5118/5118 vanilla NPC_ carry one; a creature never did.
+    # Under ACBS AutoCalc (set above) the engine derives the actor's skills
+    # and attribute growth from the CLASS weights, so a classless actor is a
+    # skill-less one — and the class is where a vanilla caster's magic
+    # profile lives: EncAtronachFlame uses EncClassBanditWizard (Magicka
+    # weight 3, Destruction 3), EncHagraven its own mage class, while the
+    # wolf/sabrecat/skeever/spriggan/wisp share EncClassAnimalPredator
+    # (Magicka weight 0). A creature that knows an offensive spell gets the
+    # atronach's class; everything else the predators'.
+    from ..creature_races import creature_has_offensive_spell
+    subs += pack_formid_subrecord(
+        'CNAM', CLAS_CREATURE_CASTER if creature_has_offensive_spell([rec])
+        else CLAS_CREATURE_PREDATOR)
+
+    # FULL — Name (after CNAM in TES5 NPC_ order)
     if full:
         subs += pack_string_subrecord('FULL', full)
 

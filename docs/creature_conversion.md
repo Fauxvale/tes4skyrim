@@ -750,18 +750,62 @@ Building Morrowind_ob last put its 21-file block on top of Oblivion's
 mehrunesdagon, scamp, slaughterfish); `animdata_index_check` flagged 13
 out-of-range indices across clannfear + flameatronach.
 
-Fixed in `creature_pipeline.convert_creatures`: the sibling-manifest union is
-no longer first-writer-wins. `_block_outranks()` / `_manifest_fits()` compare
-each candidate against the character hkx that will actually be **deployed**
-for that folder, and swap only to trade a block that does NOT fit for one
-that does. Ties and unknowns keep the incumbent, so a single-plugin run is
-unchanged.
+The 2026-08-10 fix picked a "winner" block per folder (`_block_outranks`).
+That was the wrong model and is **gone** — see the next section.
 
-**Also delete stale rival copies.** Before the write-through fix, children
-shipped their own `animationdatasinglefile.txt`; leftovers under
-`output/<child>/meshes/` will overwrite the master's corrected file on
-deployment and silently restore the bug. Only ONE copy — the master's —
-should exist.
+### ★★★ THE ROOT CAUSE OF "SCAMPS NEVER CAST / CAN'T MELEE": plugin path collision (2026-08-23)
+
+Creature identity was the bare leaf folder name in ONE shared
+`meshes\actors\tes4\<folder>\` tree. Oblivion's `scamp` and Morrowind_ob's
+`scamp` (the Morrowind scamp — 75 bones, 2 attack clips
+`handtohandattackrighta/b`, no cast clips, its own `0scampSmoan` sound) are
+**different creatures** that wrote the same path, the same
+`tes4scampproject` name and the same `tes4scampbehavior.hkx`. Data can hold
+one; whichever plugin was deployed last won for *every* plugin.
+
+Proven from the running game, not inferred: with the bridge, hooking
+`hkbStateMachine::handleEvent` showed `sae Spell_FireForget_LH` on a Stunted
+Scamp (Oblivion.esm actor) reached **zero** state machines while
+`equipStart_H2H` reached five — the event died at
+`BShkbAnimationGraph::SendEvent`'s name→id lookup. Dumping that map live
+(`BShkbHkxDB::ProjectDBData` +0xc8, keyed by interned BSFixedString) gave
+52 names: no `Spell_FireForget_LH`, no `Magic_Pre_Out`, none of Oblivion's
+seven `attackStart_TES4_*` events, but `attackStart_TES4_handtohandattackrighta`
+and `SoundPlay.TES4_0scampSmoan_SNDR` — Morrowind_ob's graph, loaded for an
+Oblivion actor. So the engine was sending cast and attack events the loaded
+graph simply did not have: `IsCasting=1` forever, no animation, no melee.
+
+**Fix — one project per plugin, like Skyrim itself** (`hkx_behavior.
+project_layout`, `creature_pipeline.plugin_namespace`):
+
+```
+meshes\actors\tes4\<namespace>\<folder>\tes4<namespace>_<folder>project.hkx
+                                        characters\tes4<namespace>_<folder>character.hkx
+                                        behaviors\tes4<namespace>_<folder>behavior.hkx
+animationdata\tes4<namespace>_<folder>project.txt       (and its setdata dir)
+```
+
+`namespace` = plugin file stem, lowercase `[a-z0-9_]` (`oblivion`,
+`morrowind_ob`, `nehrim`, `dlcshiveringisles`). The manifest now carries
+every path (`project_hkx`, `behavior_hkx`, `body_dir`, `skeleton_nif`) and
+the import side reads them instead of rebuilding `Actors\TES4\<folder>`
+strings — RACE MODL/ANAM, ARMA MOD2, BPTD, and the IDLE DNAM that the engine
+matches creature idle roots by (the CK's "resolve root behavior name" is
+`<project dir> + behaviorPath + behaviorFilenames[0]`, so DNAM must equal the
+shipped behavior path exactly). Record EditorIDs and every FormID key stay
+on the leaf name: **no FormID drift** (`test_formid_determinism` green).
+
+The singlefile union is now keyed on the (unique) project name, so every
+plugin's block registers and no winner is chosen. `convert_creatures` also
+deletes any pre-namespace `actors\tes4\<folder>` tree it finds in its own
+output, so a full-folder deploy cannot reintroduce the collision — but the
+user's Data folder still holds the OLD flat `actors\tes4\<folder>` copies
+from every plugin; those must be removed by hand once, or the game keeps
+loading them for nothing (they are no longer referenced by any record).
+
+The `IdleStop` root wildcard was fixed in the same pass (vanilla routes
+`idleStop` only out of idle states; ours yanked any state — including a cast
+— back to Default). Keep both.
 
 <a id="rigid-part-bind"></a>
 ### "Attached parts have no hitbox / corpse falls through ground" — it was AddRagdollToWorld (2026-08-08)
@@ -1458,11 +1502,9 @@ creature is fully proven.
   verified from the export) — a Speed-50 mountain lion ran 457 u/s in Oblivion while
   its gallop clip's root motion is only 200 u/s (Oblivion never synced anim rate to
   speed; it just slid).  Clip-natural MOVT speeds therefore make fast predators crawl.
-  `_movt_sped(speeds, attr_speed)` now uses commanded = max(natural, formula) capped
-  at the blend's top anchor (walk×1.4 / run×2.0 — speed_blend_plan ships @2.0 top
-  children as headroom), with attr_speed = the MAX DATA.Speed across the folder's
-  CREA records (combat variants; dead/prop variants are Speed ~9-12 and never move).
-  The parametric blend raises animation rate to match, so no skating.
+  The 2026-07-16 runtime fix (MOVT raise + rate-scaled blend children) FAILED in
+  game — the lion still ran in slow motion.  The formula speed is now BAKED into
+  the walk/run animation files at conversion instead; see §8.
 - **PyFFI's NiGeomMorpherController has a phantom `unknown_2` byte at exactly
   10.1.0.106 (2026-07-16, the mountainlion-missing-head regression)**: the reference
   nif.xml has no such field; stacking it with the patch-6b Manager-Controlled byte
@@ -1548,21 +1590,19 @@ creature is fully proven.
   * StandingIdle → StandingIdleBehavior SM {NonCombatIdle(0) ↔ CombatIdle(1)} on
     combatStanceStart/Stop (replaces the old root-level CombatStance state).
   * All SMs use START_STATE_MODE_DEFAULT (vanilla census: every SM on this path).
-- **The speed blend needs rate-scaled anchors across the whole commanded range
-  (2026-07-16, the gliding root cause)**: vanilla ForwardWalkBlend_Dog is a
-  SYNC|PARAMETRIC (flags 17) blend whose children are the SAME clips at scaled
-  playbackSpeeds, each anchored (child weight) at natural_speed × rate: walk@0.067→5
-  u/s, walk@1.0→74.54, walk@1.4→104.4, trot@0.65/1.0/1.5→186.8/287.3/425, blendParameter
-  bound to SpeedSampled.  A two-anchor rate-1.0 blend plays wrong-rate animation at
-  every other commanded speed (AI sandboxing walks well below full walk speed) → feet
-  slide.  `speed_blend_plan()` now emits walk@0.067/1.0(/1.4) + run@0.75/1.0/1.5
-  children with strictly increasing anchors; MoveBackward gets back@0.067/1.0.  Every
-  blend-child hkbClipGenerator NAME must also be registered in the animationdata cache
-  with its playback rate (vanilla dogproject.txt lists WalkForward00 @1.4 etc.; trigger
-  times in the cache are playback-local, i.e. natural/rate).  A "run" clip with less
-  root motion than the walk (wraith) is dropped (anchors must increase, MOVT run falls
-  back to walk).  iState/iState_*Default/iState_*Run now use the vanilla 30/31 tag
-  values.
+- **The speed blend needs a slow-creep child (2026-07-16, the gliding root
+  cause; layout revised 2026-08-22 — see §8)**: the AI sandboxes well below full
+  walk speed, and a blend whose bottom anchor is the walk clip at rate 1.0 plays
+  wrong-rate animation there → feet slide.  Vanilla's fix is a slow child pair
+  (chaurus WalkSlow@0.058 → anchor 5 u/s), which `speed_blend_plan()` keeps.
+  The rest of the blend is now the vanilla monolithic 3-child layout — slow@5 +
+  walk@1.0 + run@1.0 at NATURAL anchors; the 2026-07 rate-scaled ladder
+  (walk@1.4, run@0.75/1.5/2.0) is gone, replaced by the clip-timescale bake (§8).
+  Every blend-child hkbClipGenerator NAME must be registered in the animationdata
+  cache with its playback rate (trigger times in the cache are playback-local,
+  i.e. natural/rate).  A "run" clip with less root motion than the walk (wraith)
+  is dropped (anchors must increase, MOVT run falls back to walk).
+  iState/iState_*Default/iState_*Run use the vanilla 30/31 tag values.
 - Remaining refinements: specialidle/random-idle IDLE wiring (DogIdleRoot/DogIdles
   pattern), foot IK/look-at, getup-after-knockdown (needs getup clips Oblivion lacks —
   knocked-down live actors stay down; death unaffected), canned 90/180° turns
@@ -1642,3 +1682,283 @@ creature is fully proven.
    ARMOs for variants sharing a skeleton (wolf/dog). Skyrim precedent supports either.
 8. Character controller dimensions (hkbCharacterData capsule) — generate from creature
    bounds; verify units against vanilla values.
+
+---
+
+## 7. Spellcasting: the magic handshake (implemented 2026-08-21)
+
+**Symptom:** converted creatures never cast spells, despite 600 of 914 Oblivion
+CREA (65.6%, measured from `export/Oblivion.esm/CREA.txt`) carrying
+`SpellCount>0`.
+
+**Two independent defects had to be fixed — one on each side.**
+
+### 7a. The records: convert_CREA never emitted spells (fixed 2026-08-21)
+
+Initially mis-diagnosed as "the records are fine" — that check looked at the
+NPC_ path and at aggregate SPCT counts in the output ESM (1,182 subrecords,
+all of which turned out to be real NPCs). **`convert_CREA` is a separate
+function and emitted no SPCT/SPLO at all.**
+
+Measured before the fix, by matching source EditorIDs against the built
+plugin: **600 of 600** spell-carrying Oblivion creatures shipped with zero
+spells. Nehrim adds 475 more, Morrowind_ob 250.
+
+Worked example — `CreatureScampStunted` (source `0003E9CB`):
+
+| | Source CREA | Built NPC_ (before) | Built NPC_ (after) |
+|---|---|---|---|
+| SpellCount | 2 | *(no SPCT)* | 2 |
+| Spell[0] | `0002B543` AbDaedricResistWeak (SPEL) | — | SPLO `0102B543` |
+| Spell[1] | `0005D4A2` LL2CreatureScampStunted100 (**LVSP**) | — | SPLO `0105D4A2` |
+
+The second entry is a **leveled spell**, not a SPEL — it resolves
+LVSP → SPEL `000A97DF` "Flare" (FIDG fire damage, magnitude 6). xEdit types
+SPLO as `[SPEL, SHOU, LVSP]` (`wbDefinitionsTES5.pas:2302`), so the leveled
+list is referenced directly and never needs unrolling. `convert_LVSP` already
+converted the record; only the actor's reference to it was missing.
+
+Field order is `RNAM → SPCT → SPLO[] → COCT → CNTO → AIDT`, verified against
+**both** the xEdit TES5 NPC_ definition and real Skyrim.esm records.
+
+After the fix, across all three standalone plugins: **1,325 creatures,
+3,201 SPLO references, 0 dropped.** Guarded by
+`tests/test_import.py::test_crea_spells_are_emitted` (+ order and
+null-FormID cases).
+
+The override path (`override_builder.py`) already handled CREA spells via
+`_RUN_SPELLS` anchored after RNAM — only the base converter was affected.
+
+### 7b. HOW A CREATURE CASTS: the engine handshake, decompiled (corrected 2026-08-22)
+
+Two earlier theories shipped and failed in game — a single fire-and-forget
+state, then an "ATKD Attack Spell is how creatures cast" model whose graph
+entered its cast states from expressions that tested **event names as if they
+were variables** (`Spell_Target_RH_In_Start if (BeginCastRight)`) — an
+hkbExpressionData condition can only read VARIABLES, so those events never
+fired and nothing ever entered the cast states. The real mechanism was read
+out of the decompiled vanilla casters (atronachflame/atronachstorm behavior
+graphs, hagraven/spriggan/wisp IDLE trees, chaurus for the monolithic case):
+
+1. The AI decides to cast → the engine writes `bWantCastLeft`/`Right`.
+2. The graph's `BeginCast_EEM` raises
+   `BeginCastLeft if (bWantCastLeft && bMLh_Ready && !IsCasting)` (verbatim
+   vanilla expression). **BeginCast\* is the graph's message TO the engine**
+   — no transition in any vanilla graph consumes it.
+3. The engine performs the **Left-Attack ACTION** and walks the creature's
+   IDLE tree under AACT `ActionLeftAttack` (0x13004):
+   `<X>ActionLeftAttackRoot → <X>ActionLeftAttackMagic →
+   <X>ActionMagicFireForgetRoot → <X>ActionMagicFireForget`, whose **ENAM
+   `Spell_FireForget_LH` is the state-entry event** — the transition into the
+   cast states is keyed on it, never on BeginCast*. Release/Ready/Interrupt
+   route the same way: `ActionLeftRelease → Spell_Release`,
+   `ActionLeftReady → Spell_Ready`, `ActionLeftInterrupt → Spell_Interrupt`,
+   `ActionForceEquip → Magic_Equip`. **A graph with no such IDLE records
+   never receives ANY of these events** — the same action-routing gate as
+   movement (`creature_idles.py` docstring).
+4. In the graph, the In clip charges; its `Magic_Pre_Out` end trigger chains
+   into the Loop, which parks on the charged pose. The engine commits with
+   `Spell_Release` → Out plays; the Out clip's **`MLh_SpellFire_Event`
+   trigger (0.233s in, vanilla animationdata) is what actually fires the
+   spell**; `Spell_Stop` at its end exits.
+
+Hand convention: vanilla creature casters are LEFT-handed — the atronach's
+`Spell_FireForget_RH` state is dead code (no transition uses it) and even its
+RH Out clip fires `MLh_SpellFire_Event` (animationdata, verbatim); the
+chaurus declares only `bWantCastLeft`/`bMLh_Ready`. The wisp is the
+exception that defines the dual case: it **blocks on the left-hand actions
+and casts on the right**.
+
+Variable inits: `bWantCast*`, `bM*h_Ready`, `IsCasting` all init **0**
+(atronach wordVariableValues, verbatim). **Readiness is the GRAPH's to grant
+at runtime (found 2026-08-23, the "scamps get stuck" report):** vanilla's
+`BSIsActiveModifier_CombatIdle` binds `bIsActive0→bMLh_Ready` over the
+combat-idle subtree (idle + combat locomotion) and `BSIsActiveModifier_Stagger`
+clears it (inverted binding). A graph that never writes `bMLh_Ready` can
+never satisfy `bWantCastLeft && bMLh_Ready && !IsCasting`, so the AI keeps
+wanting to cast and the actor stands there. Ours holds both hands' readiness
+over the whole `DefaultState` (`CombatIdle_MG`) — ready whenever not
+attacking/casting/staggering/blocking/swimming, each a sibling state.
+
+**What ships (2026-08-22):**
+
+- `hkx_behavior.py`: ONE `Mag_FF_In/Loop/Out` chain per caster graph
+  (`Mag_FF_Behavior` sub-machine wrapped in a `BSIsActiveModifier` holding
+  `IsCasting` for the whole cycle), entered by wildcards on
+  `Spell_FireForget_LH`, `Spell_FireForget_RH` and `Spell_Concentration_LH`;
+  internal wildcards `Spell_Release → Out`, `Spell_Ready → In`; the root
+  `FireForgetState` exits on `Spell_Stop`/`Spell_Interrupt`/`InterruptCast`.
+  The `BeginCast_EEM` carries the two vanilla expressions and NOTHING else.
+  The chain plays one clip, preference `casttarget > casttouch > castself`
+  (the engine's entry event carries no delivery information).
+- `hkx_anim.split_cast_clip`: the release moment is the clip's authored
+  'Hit' key (69/69 Oblivion cast clips carry one); the cut sits
+  `CAST_PRE_RELEASE` (0.25s) before it so the Loop holds the charged pose
+  and the Out opens with the throw — vanilla's Out fires SpellFire 0.233s
+  in. The Out's animationdata block is vanilla-shaped:
+  `MLh_SpellFire_Event:<t>` + `MRh_SpellFire_Event:<t>` + `Spell_Stop:<end>`
+  (both hand events because vanilla itself answers a right-hand cast with
+  the LEFT event; the extra event is inert).
+- `creature_idles.py`: `_build_cast_idles` replicates the atronach IDLE tree
+  node-for-node (left hand; right hand when the creature also blocks — the
+  wisp split), **including its CTDA gates** (2026-08-23, the "scamp chases
+  but can't melee and never casts" report): the engine walks the
+  `ActionLeftAttack` tree for ordinary MELEE left attacks too, so vanilla
+  gates the magic branch with `HasEquippedSpell(Left) == 1` (func 570), the
+  FireForget root with `GetCurrentCastingType(Left) == 1` (571), the release
+  leaf with `HasEquippedSpell`, and the force-equip leaf with
+  `GetEquippedItemType(Left) == 9` (597). Shipped unconditioned for one
+  build, every melee left attack was routed into the cast chain and parked
+  there. The block tree carries vanilla's `GetWantBlocking == 0 / == 1`
+  gates on its left-attack/left-release leaves for the same reason. The
+  concentration branch is omitted: every converted TES4 spell is FireForget
+  (`magic._delivery_and_cast` always returns cast type 1).
+- Records (`creature_races.py` / `actors.py`):
+  * SPLO spells (7a) — unchanged, LVSP targets are engine-legal (2,858
+    vanilla SPLO refs point at LVSP records).
+  * **Magicka**: generated races now carry starting magicka 0 and the
+    actor's whole TES4 `ACBS.SpellPoints` pool ships as
+    `ACBS.MagickaOffset` (the race is shared, so a per-race pool was wrong
+    for everyone but the founding record; an actor with 0 magicka can never
+    pay a cast cost). Vanilla's atronach uses the same split
+    (`MagickaOffset=50`).
+  * **ATKD 'Attack Spell' kept, but only where vanilla uses it**: a pure
+    TOUCH-delivery offensive spell (SPIT.Type 0, ≥1 Touch effect, no Target
+    effect) rides the existing melee attack entries — the flame atronach
+    idiom (its four ordinary attacks each name a fire spell; 109 vanilla
+    attack entries carry one). Aimed/self spells go through the cast chain,
+    not the attack table. The invented `attackStart_TES4_cast*` attack
+    entries are gone.
+  * RACE VNAM Spell bit (`1<<9`) — unchanged (set when any creature sharing
+    the race knows a spell).
+  * **RACE QNAM LeftHand equip slot (0x13F43) — THE GATE (found live
+    2026-08-23).** A spell is equipped into a HAND slot; VNAM only permits
+    the class. Every vanilla caster race lists LeftHand (AtronachFlameRace
+    LeftHand+Potion, HagravenRace Left+Right+Potion, SprigganRace/
+    ChaurusRace/WispRace Left+Right); the non-caster WolfRace lists
+    RightHand only — and so did our unarmed creature races. Bridge readback
+    on a live scamp in combat: 100 magicka, weapon out, 77 units from the
+    player, `HasEquippedSpell Left/Right = 0` → the engine never equipped a
+    spell, so `bWantCast*` was never written and no graph/IDLE work could
+    matter. Casters now get `[RightHand, LeftHand]`.
+  * Note for testing: the Oblivion-gate template scamps
+    (`MQ13TemplateGate1/2/3`, FULL "Scamp") carry NO spells in the source
+    CREA records, so they cannot cast in either game; test casting against
+    `CreatureScamp` / `CreatureScampStunted` (`player.placeatme 1203E9CB`
+    with Oblivion.esm at load index 12).
+
+### 7c. Swimming (implemented 2026-08-22)
+
+The engine sends `swimStart`/`swimStop` (already routed by the
+`ActionSwimStateChange` IDLE tree) and writes the graph variable
+`isSwimming`. Vanilla's quadruped graph switches movement type on it —
+`iState = cond((isSwimming ==1), iState_BearSwimDefault, iState_BearDefault)`
+verbatim — which is what gives the actor its water speeds.
+
+What ships:
+
+- `classify_clips` claims the whole authored swim set (`SWIM_CLIPS`:
+  swimforward / swimfastforward / swimidle / swimbackward / swimturnleft /
+  swimturnright — previously only swimforward survived).
+- The `SwimState` wraps a `SwimBehavior` sub-machine mirroring the land
+  standing/locomotion split, driven by the SAME engine locomotion events:
+  SwimIdle ⇄ SwimMove (a `SpeedSampled`-parametric blend of
+  slow/forward/fastforward at natural anchors) ⇄ SwimBack, plus the turn
+  states. Water natives (slaughterfish) finally idle, turn and back up.
+- `movement_type_names` gains `TES4<x>Swim` when swim clips exist; the
+  graph declares `isSwimming` + the vanilla-verbatim iState switch
+  expression; `creature_races._build_movts` emits the matching MOVT with
+  the swim clips' own speeds (`_movt_sped_swim`).
+
+### 7d. Blocking (implemented 2026-08-22)
+
+Vanilla contract (frost atronach = the unarmed-blocker layout, draugr = the
+armed one): the engine sends `blockStart`/`blockStop`/`blockHitStart`/
+`blockHitStop`, writes `iWantBlock`, and reads `IsBlocking` back from the
+graph. An unarmed creature raises its guard by "holding the left attack" —
+`AtronachFrostLeftAttack` ENAM=`blockStart`, `...LeftRelease`
+ENAM=`blockStop`, plus `ActionBlockAnticipate → blockStart` and
+`ActionBlockHit → blockHitStart`, all IDLE-routed.
+
+What ships:
+
+- `classify_clips` claims the guard/flinch pair (`BLOCK_CLIPS`: blockidle/
+  block + blockhit, generic first then the stance-prefixed variants).
+- Graph: looping `BlockState` + single-play `BlockHitState`, both wrapped in
+  a `BSIsActiveModifier` holding `IsBlocking`; `blockHitStart` interrupts
+  the guard, the flinch fires its own `blockHitStop` at clip end so the
+  guard resumes even if the engine never sends the stop; `blockStop` exits.
+  `IsBlocking`/`iWantBlock` declared only for blockers (vanilla splits the
+  same way).
+- `creature_idles._build_block_idles` replicates the frost-atronach IDLE
+  routing. A creature with BOTH lanes (goblin) blocks on the left-hand
+  actions and casts on the right — the wisp split.
+
+### 7e. Still unwired (measured 2026-08-21, unchanged)
+
+Remaining classes of authored-but-unused clips, by cost:
+
+| Class | Files | Creatures | What is lost |
+|---|---|---|---|
+| Stance locomotion (`handtohand*`, `onehand*`, `twohand*`, `staff*`, `bow*`) | ~500 | 47 | An armed creature walks with the generic unarmed `forward.kf`; the authored `onehandforward.kf` etc. is never used. Vanilla drives these from `iRightHandType`, which we already declare and set. |
+| `left` / `right` strafe | 76 | 38 | No strafe states; the locomotion machine has no sideways entry. |
+| `jumpstart` / `jumploop` / `jumpland` | 9 | 3 | No jump states. |
+
+---
+
+## 8. Ground speed: BAKED, not commanded (rewritten 2026-08-22)
+
+**Symptom (twice-reported): "the mountain lion runs in slow motion."**
+
+Oblivion moved a creature at the Speed-attribute GMST formula (walk =
+`fMoveCreatureWalkMin + (Max−Min)×Speed/100`, run = `walk×fMoveRunMult`;
+5.0/300.0/3.0 from the export) regardless of the animation — clips just
+slid. The lion's gallop clip is only 200 u/s natural, so clip-natural MOVT
+speeds made it crawl (first report). The 2026-07-16 fix raised MOVT to
+`max(natural, formula)` capped at rate-scaled blend children (run@0.75/1.5/
+2.0 etc.) — and the lion STILL ran in slow motion in game (second report),
+so the runtime-rate-ladder theory is dead. It also had no vanilla
+precedent: **every vanilla creature's commanded MOVT speed equals its run
+clip's natural speed at playback rate ~1.0** (chaurus `Forward_Run`: blend
+anchor 350.267 = MOVT run = clip natural; sabrecat 563 = run clip 490 ×
+1.15 = MOVT; wolf 555 likewise).
+
+**The fix: bake the formula into the animation file itself.**
+`hkx_anim.timescale_clip` compresses the walk/run clips' timelines at
+conversion (factor = formula/natural, capped ×1.4 walk / ×2.0 run —
+`generate_creature_project` `attr_speed` = the folder's MAX `DATA.Speed`,
+from `creature_pipeline._speed_attr_by_folder`), so the shipped
+`runforward.hkx` REALLY IS a 400 u/s gallop. Everything downstream — root
+motion, `speeds`, blend anchors, MOVT SPED — is derived from the baked file
+and agrees at rate 1.0 by construction; no runtime component can ignore it.
+Mountain lion: walk 23.2→32.5 u/s, run 200→400 u/s (vs 457 formula at the
+×2.0 cap; vanilla sabrecat runs 563).
+
+**Two gait families in two states (2026-08-23).** The first bake layout put
+walk and run in ONE 3-child blend (slow@5 / walk / run) and the lion
+"briefly broke into a bad pose while running": the gallop's only blend
+neighbour was the 2.9 s stalking walk, so every dip of `SpeedSampled` below
+the run anchor SYNC-blended a phase-warped walk pose into it (the old
+7-child ladder never showed this because the top anchor's neighbours were
+the same run clip at other rates). Vanilla's answer (sabrecat
+forwardlocomotion.hkx, verbatim shape): `ForwardWalkState` (walk family:
+slow@5 + walk@1.0) and `ForwardRunState` (run family: RunSlow@0.75 +
+Run@1.0 — the SAME clip) as separate states in `ForwardLocomotionBehavior`,
+`startStateId` bound to `iMovementSpeed = cond((Speed < 100), 0, 1)`, and
+`runStart if (SpeedSampled > hi)` / `walkStart if (SpeedSampled < lo)`
+switching with hysteresis (`gait_thresholds`: midway between the walk anchor
+and the run-family bottom, 15% band; lion 141/166). The gallop now only ever
+blends with itself. Comparison operators in expressions must be XML-escaped
+(`&lt;`/`&gt;`) or hkxcmd refuses the file.
+
+Text keys, foot enums, SoundPlay times and the root-motion curve all scale
+with the bake; cast/swim/block clips are untouched (no formula applies).
+
+**The bake must land on the 30 fps grid (2026-08-23, "limbs going every
+which way").** The first bake merely compressed the sample spacing, shipping
+a 60 fps file (`frameDuration` 0.0167 under a block layout still sized for
+30 fps) — a timing no vanilla animation has, and the lion's limbs exploded
+while running. `timescale_clip` now RESAMPLES the tracks (linear / sign-
+continuous quaternion nlerp) onto exactly 1/30 s frames and snaps the
+duration to the grid (lion run: 46 frames @1.5 s → 24 frames @0.767 s,
+`frameDuration` 0.03333 — identical timing fields to a native clip).
