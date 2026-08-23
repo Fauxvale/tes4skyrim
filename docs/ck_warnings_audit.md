@@ -50,12 +50,14 @@ prefix: `01......` is Oblivion.esm, `00......` is Skyrim.esm.
 | 11 | Ref should be persistent but is not | 18 | MASTERFILE | moderate | open |
 | 12 | CTDA param init failures | 44 | MASTERFILE | moderate | open |
 | 13 | Navmesh should be refinalized (bounds missing) | 19 | PATHFINDING | moderate–hard | open |
-| 14 | Special Ref not in Special Ref data (map markers) | 1,002 | MASTERFILE | hard | open |
-| 15 | Exterior cell no longer tagged to this location | 989 | MASTERFILE | hard | open |
-| 16 | Ref uses location but not in unloaded-ref data | 15,333 | MASTERFILE | hard | open |
-| 17 | Cell not in worldspace exterior cell data | 26,124 | MASTERFILE | hard | open |
+| 14 | Special Ref not in Special Ref data (map markers) | 513 uniq | MASTERFILE | hard | LCSR done; LCEC fix pending verify |
+| 15 | Exterior cell no longer tagged to this location | 989 | MASTERFILE | hard | LCEC fix pending verify |
+| 16 | Ref uses location but not in unloaded-ref data | 15,333 | MASTERFILE | hard | **FIXED** 2026-08-22 (CK-confirmed 0) |
+| 17 | Cell not in worldspace exterior cell data | 26,124 | MASTERFILE | hard | LCEC fix pending verify |
 
-Buckets **14–17 are one root cause** and account for 43,448 lines (**96%**).
+Buckets **14–17** account for 43,448 lines (**96%**). Bucket 16 is CK-confirmed fixed;
+14/15/17 share one cause (the XLCN/LCEC contract) whose fix is built but not yet
+CK-verified.
 
 ---
 
@@ -348,64 +350,135 @@ Missing NVNM bounds data on generated navmeshes. See
 
 ---
 
-## 14–17. The location cluster (43,448 lines, 96%) — hard
+## 14–17. The location cluster (43,448 lines, 96%)
 
-**All four are the same root cause.**
-[locations.py](../tes5_import/locations.py) writes LCTN records carrying only
-`FULL`, `MNAM`, `RNAM`, `PNAM`, `LCEC` — **none** of Skyrim's LCTN ref arrays.
-Separately, there is no `OFST` emitter anywhere in `tes5_import/`.
+**One root cause: XLCN and LCEC are a two-way contract, and we only wrote one
+side.** Bucket 16 needed the LCTN reference arrays as well.
 
-### 17. Cell not in worldspace exterior cell data (26,124)
-
-`[MASTERFILE] Cell (id) in world 'X' (id) is not in exterior cell data.`
-
-The WRLD record has no `OFST` exterior cell-data table, so every exterior CELL
-is unindexed. 59 worldspaces; the top of the distribution:
-
-| Worldspace | Count | Worldspace | Count |
+| # | Warning | Count | Cause |
 |---|---|---|---|
-| TES4Tamriel | 11,777 | OblivionRD004 | 441 |
-| SEWorld | 3,796 | MQ10BrumaOblivionGate | 441 |
-| OblivionRD003 | 1,908 | OblivionRD005 | 420 |
-| MS13CheydinhalOblivionWorld | 1,763 | CamoranParadise | 417 |
-| DAPeryiteRealm | 704 | PalePassWorld | 371 |
-| DABoethiaRealm | 576 | OblivionRD007 | 169 |
-| MQ14OblivionWorld | 495 | MS14World | 169 |
-| OblivionRD002 | 483 | *(45 more)* | ≤100 each |
+| 17 | Cell not in exterior cell data | 26,124 | cell XLCN not matched by the location's LCEC |
+| 16 | Ref uses location, not in unloaded ref data | 15,333 | LCTN had no `LCPR` |
+| 14 | Special Ref not in Special Ref data | 1,002 (513 unique) | LCTN had no `LCSR`, **and** the LCEC contract |
+| 15 | Exterior cell no longer tagged to this location | 989 | same contract as 17, checked from the other side |
 
-### 16. Ref uses location but not in unloaded-ref data (15,333)
+### The contract
 
-`[MASTERFILE] Ref 'X' (id) uses location but is not in the unloaded ref data.`
+The CK runs one validator over every LCTN — its own summary line is
+*"Warnings were encountered validating unloaded ref data for Location '%s'"* —
+and all four warnings come out of it. The rule it enforces:
 
-Refs carry `XLCN` but the target LCTN has no `ACPR`/`RCPR`/`RCUN`/`RCSR`/`RCEC`
-arrays. **9,009 distinct refs.** Worst: `ICDoorInt01` 497, `NirnrootPlant` 271,
-`XMarkerHeading` 230, `XMarker` 177, `ARDoor01` 157, `ICDoor04` 129,
-`RFTrapDarts01` 125, `CTrapSwingMaceShort01` 115, `CDoor01` 104.
+> Anything that claims a location (a cell's `XLCN`, or a placed reference's
+> `XLCN`/`XLRT`) must be claimed back: that cell's grid square has to appear in
+> the location's `LCEC` cell list.
 
-### 14. Special Ref not in Special Ref data (1,002)
+`LCEC` is `World(4) + [GridY(i16), GridX(i16)]...`.
 
-`[MASTERFILE] Special Ref 'X' with type 'MapMarkerRefType' (0010F63C) is not in the Special Ref data.`
+**Vanilla is the opposite of blanket coverage.** Of Skyrim.esm's 16,978
+exterior cells only **982 carry XLCN at all** (948 of them LCEC-listed); the
+other 15,996 are deliberately nameless and show "Wilderness" on a load door.
+Its LCECs are small and hand-picked — 344 locations, 948 coords total, median
+**2** cells per location, max 22.
 
-All 1,002 are `MapMarkerRefType`. We set `XLRT` on the map-marker REFR
-([locations.py:17](../tes5_import/locations.py#L17)) but never add the marker to
-the owning LCTN's special-ref array.
+### What we were doing
 
-### 15. Exterior cell no longer tagged to this location (989)
+`convert_CELL` gave EVERY exterior cell an XLCN, falling back to a
+per-worldspace location when no marker covered the grid square, so that a cell
+would not read as "Wilderness". The naming goal is right and deliberate; the
+placement was not. Those 60 worldspace locations
+(`TES4CyrodiilLocation`, `TES4RealmofSheogorathLocation`, …) have an **empty
+LCEC**, so every cell pointing at one failed the check.
 
-`[MASTERFILE] Exterior cell (id) in world 'X' (id) is no longer tagged to this location.`
+Measured on the pre-fix build: 29,743 exterior cells carried XLCN — **26,124
+aimed at an empty-LCEC worldspace location (every one of them warning)** and
+3,619 at a real marker location whose LCEC did list them (silent). The split is
+exactly the warning count.
 
-TES4Tamriel 888, SEWorld 50, then the city worlds (BrumaWorld 13, CheydinhalWorld
-9, ChorrolWorld 7, AnvilWorld 7, LeyawiinWorld 6, BravilWorld 3, SkingradWorld 2,
-SETheFringe/Ordered 2 each).
+`_reference_location` had the same fallback, which is what left 489 map markers
+still warning after LCPR/LCSR were added: each sat in a cell outside its
+location's LCEC.
 
-### Fix
+### The fix: move the worldspace location onto the WRLD record
 
-One change closes all four: populate the LCTN ref arrays (`ACPR` actor-cell-
-persistent, `RCPR` ref-cell-persistent, `RCUN`/`RCSR`/`RCEC` unique/static/cell
-arrays) and emit WRLD `OFST`. Verify layout against **both** the xEdit LCTN/WRLD
-definitions in `references/xEdit/Core/` and a real Skyrim.esm dump.
+**`XLCN` belongs on the WRLD, not on every cell.** The engine walks up to the
+worldspace when an exterior cell has no Location of its own, so ONE subrecord
+names every cell in the world — and a WRLD-level XLCN is **exempt** from the
+per-cell LCEC validation.
 
----
+Vanilla settles both halves of this:
+
+- **32 of Skyrim.esm's 37 worldspaces** carry XLCN on the WRLD record, while
+  only **982 of its 16,978 exterior cells** carry one individually (948 of
+  those LCEC-listed). 94% of vanilla exteriors have no cell-level XLCN at all.
+- `Blackreach`'s WRLD XLCN points at `BlackreachLocation`, which carries **no
+  LCEC whatsoever**, and it does not warn. That is the direct proof the
+  WRLD-level path skips the check.
+
+So `convert_WRLD` now emits `XLCN` (field order: EDID … FULL, **XLCN**, WNAM)
+from the same `_WORLD_LOCATION` map the cell fallback used, and `convert_CELL`
+/ `_reference_location` drop the worldspace-wide fallback: an exterior only
+claims a location whose LCEC actually lists its square.
+
+Names are preserved — verified in the built ESM: 59 worldspaces carry XLCN
+(TES4Tamriel → "Cyrodiil", SEWorld → "Realm of Sheogorath", SENSBliss →
+"Bliss", …) and 0 exterior cells are left with an uncovered cell-level XLCN.
+
+**A "fix" that deletes the fallback and stops there is wrong** — it silences the
+warnings by making every exterior read "Wilderness". Both halves are required.
+
+### The LCTN reference arrays (bucket 16, and half of 14)
+
+Separately, LCTN needs the arrays listing what belongs to it:
+
+    LCPR  12B/entry   Ref, World/Cell, Grid Y, Grid X
+                      every PERSISTENT ref whose XLCN names this location
+    LCSR  16B/entry   Loc Ref Type, Ref, World/Cell, Grid Y, Grid X
+                      every ref carrying XLRT (map markers), keyed by type
+
+Vanilla writes the `LC*` "master" arrays; `AC*`/`RC*` are save-game deltas and a
+plugin has no business emitting them (Skyrim.esm: `LCSR` on 572 of 638 records,
+`LCPR` on 289, `LCUN` on 121, and **zero** `AC*`/`RC*` anywhere). An earlier
+draft of this audit named the wrong family.
+
+Strides confirmed by GCD over every vanilla payload — **LCSR 16, LCPR 12,
+LCUN 12**. A 12-byte read of LCSR looks plausible on the first entry and
+desyncs after it.
+
+World/Cell + grid follow one rule, with zero exceptions across 16,093 vanilla
+entries:
+
+- **interior cell** → World/Cell = the CELL FormID, grid = `0x7FFF, 0x7FFF`
+- **exterior** → World/Cell = the WRLD FormID, grid = the cell's real (X, Y)
+
+`PluginWriter._fill_location_refs` derives both from the already serialized
+CELL/WRLD bytes rather than from `locations.py`, which runs before any
+reference exists and in the parent process only (cell conversion is
+multiprocess). Entries are sorted for byte-reproducibility and the pass is
+idempotent.
+
+**Result: 15,333 → 0.** Confirmed in the CK.
+
+### Dead end: WRLD OFST (do not rebuild this)
+
+Bucket 17 was first diagnosed as a missing WRLD `OFST` — the row-major U32 grid
+of cell offsets over the NAM0..NAM9 rectangle. That was **wrong**, and the
+implementation was reverted.
+
+The grid was built correctly and verified in the binary (33,570 cells mapped, 0
+wrong, TES4Tamriel's full 14,686 entries) and it changed **nothing**: 26,124
+before, 26,124 after, with the CK demonstrably reading the new file because
+bucket 16 went to zero in the same run. All 26,107 warned cells that fell inside
+a grid had a correct nonzero OFST entry.
+
+The tell was in the CK's string table: the message sits in a block with "Unique
+NPC data", "Special Ref data" and "no longer in location" — all LCTN
+validation, nothing to do with WRLD.
+
+Worth recording for whoever notices we ship no OFST while vanilla ships it on 36
+worldspaces: that is true, and it is still not this warning. If it is ever
+built, two traps are already known — `OFST` entries are offsets **relative to
+the WRLD record**, and the payload needs the **XXXX protocol** above 65,535
+bytes (TES4Tamriel's 135x130 grid is 70,200; vanilla's CWTestHold is 113,836).
 
 ## Fixed in the 2026-07 sweep
 

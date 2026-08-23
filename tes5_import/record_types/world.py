@@ -590,13 +590,28 @@ def convert_CELL(rec: dict) -> bytes:
     # belongs to a location discovers it (revealing its map marker), and it is
     # also where the engine reads the cell's *name* from.  Not one vanilla
     # exterior cell carries a FULL, so an exterior with no XLCN is displayed as
-    # "Wilderness" on a load door.  Interiors are matched by FormID; exteriors
-    # by their grid square, falling back to the worldspace's own location.
+    # "Wilderness" on a load door.
+    #
+    # XLCN AND LCEC ARE A TWO-WAY CONTRACT.  The CK validates every cell that
+    # claims a location against that location's LCEC cell list ("Warnings were
+    # encountered validating unloaded ref data for Location") and reports
+    # "Cell (x, y) in world 'W' is not in exterior cell data" for each one the
+    # location does not claim back.  An exterior may therefore only carry XLCN
+    # when the target's LCEC actually lists its grid square.
+    #
+    # This is why there is no worldspace-wide fallback: a per-worldspace
+    # location has an empty LCEC, so pointing every cell in Tamriel at one
+    # produced 26,124 warnings — the largest bucket in the log.  Vanilla is the
+    # opposite of blanket coverage: of Skyrim.esm's 16,978 exterior cells only
+    # 982 carry XLCN at all (948 of them LCEC-listed), the other 15,996 are
+    # deliberately nameless and show "Wilderness".  Its LCECs are small and
+    # hand-picked — median 2 cells, max 22.
+    #
+    # Interiors are exempt: they are matched by FormID through a door claim and
+    # the LCEC check does not apply to them.
     lctn_fid = _CELL_LOCATION.get(get_formid(rec, 'FormID'))
     if not lctn_fid and x is not None:
-        world_fid = get_formid(rec, 'ParentWRLD')
-        lctn_fid = (_GRID_LOCATION.get((world_fid, x, y))
-                    or _WORLD_LOCATION.get(world_fid))
+        lctn_fid = _GRID_LOCATION.get((get_formid(rec, 'ParentWRLD'), x, y))
     if lctn_fid:
         subs += pack_formid_subrecord('XLCN', lctn_fid)
 
@@ -625,6 +640,22 @@ def convert_WRLD(rec: dict) -> bytes:
     full = WORLD_NAMES.get(get_formid(rec, 'FormID'))
     if full:
         subs += pack_string_subrecord('FULL', full)
+
+    # XLCN — the worldspace's own Location.  THIS is how an exterior cell with
+    # no Location of its own is named: the engine walks up to the worldspace
+    # rather than reading a per-cell XLCN, so one subrecord here names every
+    # cell in the world and "Wilderness" never appears.
+    #
+    # It is also the only way to do it without tripping the CK's location
+    # validator.  A cell's OWN XLCN is checked against the target's LCEC cell
+    # list ("Cell (x, y) in world 'W' is not in exterior cell data" per cell,
+    # 26,124 of them), but a WRLD-level XLCN is exempt — vanilla Blackreach
+    # points at BlackreachLocation, which carries NO LCEC at all, and is
+    # silent.  32 of Skyrim.esm's 37 worldspaces name themselves this way,
+    # while only 982 of its 16,978 exterior cells carry XLCN individually.
+    world_lctn = _WORLD_LOCATION.get(get_formid(rec, 'FormID'))
+    if world_lctn:
+        subs += pack_formid_subrecord('XLCN', world_lctn)
 
     wnam = get_formid(rec, 'WNAM.Parent')
     if wnam:
@@ -718,7 +749,14 @@ def _reference_location(rec: dict) -> int:
     A quest target inside a cell whose CELL has XLCN but whose own ref does NOT
     produces a journal entry with no marker. Resolve the ref's Location the same
     way convert_CELL does: interior by parent-cell FormID, exterior by the grid
-    square the ref stands in, falling back to the worldspace location.
+    square the ref stands in.
+
+    No worldspace-wide fallback, for the same reason convert_CELL has none: a
+    ref claiming a location whose LCEC does not list the ref's cell fails the
+    CK's location validation ("Special Ref 'X' ... is not in the Special Ref
+    data", and the persistent-ref equivalent).  Every one of the 489 markers
+    still warning after the LCPR/LCSR arrays were added sat in a cell outside
+    its location's LCEC, reached through this fallback.
     """
     parent_cell = get_formid(rec, 'ParentCELL')
     lctn_fid = _CELL_LOCATION.get(parent_cell)
@@ -728,8 +766,7 @@ def _reference_location(rec: dict) -> int:
     if world_fid:
         gx = _ref_grid(get_float(rec, 'PosX'))
         gy = _ref_grid(get_float(rec, 'PosY'))
-        return (_GRID_LOCATION.get((world_fid, gx, gy))
-                or _WORLD_LOCATION.get(world_fid) or 0)
+        return _GRID_LOCATION.get((world_fid, gx, gy)) or 0
     return 0
 
 
