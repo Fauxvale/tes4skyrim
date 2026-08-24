@@ -6,11 +6,17 @@ Joins RACE tint-mask definitions with NPC_ tint layers to answer:
     use on that layer?
   - What QNAM (texture lighting) values accompany them?
 
+Also verifies our OWN output: --esm reads a converted TES5 plugin straight
+from disk and reports the same per-race skin tone, so a conversion can be
+checked against the vanilla distribution without a text dump.
+
 Usage:
   python -m tools.census_npc_skin [--dump references/Skyrim.esm] [--race NordRace]
+  python -m tools.census_npc_skin --esm output/Oblivion.esm/Oblivion.esm
 """
 
 import argparse
+import colorsys
 import re
 import struct
 from collections import Counter, defaultdict
@@ -154,10 +160,120 @@ def census(dump_dir: Path, only_race: str = None):
             print(f'  {redid:30} Male={gd["Male"]:3}  Female={gd["Female"]:3}')
 
 
+def _iter_esm_records(path: Path, want: set):
+    """Yield (type, formid, [(subtype, data), ...]) for records in `want`.
+
+    Walks the GRUP/record tree of a TES5 plugin.  Compressed records are
+    inflated; everything else is read in place.
+    """
+    import zlib
+
+    data = path.read_bytes()
+    end = len(data)
+
+    def walk(pos, stop):
+        while pos + 24 <= stop:
+            sig = data[pos:pos + 4].decode('ascii', 'replace')
+            size = struct.unpack_from('<I', data, pos + 4)[0]
+            if sig == 'GRUP':
+                yield from walk(pos + 24, min(pos + size, stop))
+                pos += size
+                continue
+            flags = struct.unpack_from('<I', data, pos + 8)[0]
+            fid = struct.unpack_from('<I', data, pos + 12)[0]
+            body = data[pos + 24:pos + 24 + size]
+            pos += 24 + size
+            if sig not in want:
+                continue
+            if flags & 0x00040000:          # compressed
+                try:
+                    body = zlib.decompress(body[4:])
+                except zlib.error:
+                    continue
+            subs = []
+            i = 0
+            while i + 6 <= len(body):
+                st = body[i:i + 4].decode('ascii', 'replace')
+                ln = struct.unpack_from('<H', body, i + 4)[0]
+                subs.append((st, body[i + 6:i + 6 + ln]))
+                i += 6 + ln
+            yield sig, fid, subs
+
+    yield from walk(0, end)
+
+
+def census_esm(esm_path: Path, only_race: str = None):
+    """Report the skin tone actually written for each race in a TES5 plugin.
+
+    Races are identified by the NPC's RNAM, and the tone by the NPC's tint
+    layers.  Unlike the vanilla census this groups by the SOURCE race name so
+    a conversion can be read at a glance.
+    """
+    races = {}
+    npcs = []
+    for sig, fid, subs in _iter_esm_records(esm_path, {'RACE', 'NPC_'}):
+        if sig == 'RACE':
+            edid = next((d.rstrip(b'\x00').decode('cp1252', 'replace')
+                         for st, d in subs if st == 'EDID'), '')
+            races[fid] = edid
+        else:
+            npcs.append((fid, subs))
+
+    stats = defaultdict(lambda: {'n': 0, 'colors': Counter(), 'tinv': Counter(),
+                                 'qnam': []})
+    for fid, subs in npcs:
+        rnam = next((d for st, d in subs if st == 'RNAM'), None)
+        if not rnam or len(rnam) < 4:
+            continue
+        rfid = struct.unpack('<I', rnam[:4])[0]
+        redid = races.get(rfid) or races.get(rfid & 0x00FFFFFF) or f'{rfid:08X}'
+        if only_race and redid != only_race:
+            continue
+        acbs = next((d for st, d in subs if st == 'ACBS'), None)
+        flags = struct.unpack_from('<I', acbs, 0)[0] if acbs and len(acbs) >= 4 else 0
+        gender = 'Female' if flags & 1 else 'Male'
+        tinc = next((d for st, d in subs if st == 'TINC'), None)
+        if not tinc or len(tinc) < 4:
+            continue
+        s = stats[(redid, gender)]
+        s['n'] += 1
+        s['colors'][tuple(tinc[:3])] += 1
+        tinv = next((d for st, d in subs if st == 'TINV'), None)
+        if tinv and len(tinv) >= 4:
+            s['tinv'][struct.unpack('<I', tinv[:4])[0]] += 1
+        qn = next((d for st, d in subs if st == 'QNAM'), None)
+        if qn and len(qn) >= 12:
+            s['qnam'].append(struct.unpack('<3f', qn[:12]))
+
+    print(f'{"race":16} {"gen":7} {"n":>5}  {"top TINC":18} {"luma":>5} '
+          f'{"hue":>5} {"sat":>5}  TINV  mean QNAM')
+    for (redid, gender), s in sorted(stats.items()):
+        rgb, cnt = s['colors'].most_common(1)[0]
+        luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+        mx, mn = max(rgb), min(rgb)
+        sat = 0.0 if mx == 0 else (mx - mn) / mx
+        hue = colorsys.rgb_to_hsv(*[c / 255.0 for c in rgb])[0] * 360.0
+        tinv = ', '.join(f'{v}x{n}' for v, n in s['tinv'].most_common(2))
+        if s['qnam']:
+            k = len(s['qnam'])
+            mq = tuple(round(sum(q[i] for q in s['qnam']) / k, 3) for i in range(3))
+        else:
+            mq = None
+        uniq = len(s['colors'])
+        print(f'{redid:16} {gender:7} {s["n"]:5}  {str(rgb):18} {luma:5.0f} '
+              f'{hue:5.0f} {sat:5.2f}  {tinv}  {mq}'
+              + ('' if uniq == 1 else f'  ({uniq} distinct)'))
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--dump', default='references/Skyrim.esm',
                     help='Skyrim.esm text dump directory')
+    ap.add_argument('--esm', default=None,
+                    help='converted TES5 plugin to audit instead of a dump')
     ap.add_argument('--race', default=None, help='limit to one race EditorID')
     a = ap.parse_args()
-    census(Path(a.dump), a.race)
+    if a.esm:
+        census_esm(Path(a.esm), a.race)
+    else:
+        census(Path(a.dump), a.race)

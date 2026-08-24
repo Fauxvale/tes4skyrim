@@ -78,6 +78,7 @@ NAM9 / FGGS mapping note:
     [18-49] higher-order detail (diminishing influence; spread across nearest)
 """
 
+import os
 import struct
 
 from .skyrim_overrides import (
@@ -109,95 +110,162 @@ _RACE_HEAD_TXST: dict[str, dict[str, int]] = {
 
 
 # ---------------------------------------------------------------------------
-# Skin tone tint layers (fixes pale-white body skin)
+# Skin tone tint layers
 # ---------------------------------------------------------------------------
 # Skyrim colors an NPC's body skin from the tint layer whose race mask type
-# is "Skin Tone" (RACE TINP=6).  Data below is a census of Skyrim.esm
-# (tools/census_npc_skin.py): per race+gender, the race's skin-tone TINI
-# index and the top TINC colors vanilla NPCs use on it, with (r, g, b,
-# interpolation 0-100, census weight).  Each converted NPC picks one entry
-# deterministically from its FormID so populations show vanilla-like
-# variety instead of a single cloned tone.
+# is "Skin Tone" (RACE TINP=6).  An NPC without one renders pale white no
+# matter its race, so every converted NPC gets one.
 #
-# TES4 has no per-NPC skin color source (FGTS texture PCA is not decodable
-# into a color), so the race+gender census distribution is the best
-# available ground truth.
+# The COLOR comes from Oblivion's own authored data, not from a census of
+# Skyrim: a TES4 RACE record names its skin textures (body/face part ICON
+# paths) and carries its own FGTS vector.  A race either ships its own
+# textures with FGTS all-zero, or shares another race's textures and recolors
+# them with a non-zero FGTS -- which is exactly how High Elf reads gold,
+# Redguard brown and Nord pale while all three point at
+# Characters\Imperial\HeadHuman.dds.  See asset_convert/facegen_egt.py for the
+# reconstruction and docs/npc_skin_tone_conversion.md for the measurements.
+#
+# Per-NPC FGTS is deliberately NOT used: measured across all 2482 Oblivion
+# NPCs it shifts the color by a standard deviation of ~1 unit in 255, so
+# within a race Oblivion NPCs are effectively a single skin tone.
 
 _SKIN_RACE_ALIAS = {
-    # Must follow RACE_MAP's target Skyrim race — tint indices are per-race.
+    # Must follow RACE_MAP's target Skyrim race -- tint indices are per-race.
     'GoldenSaint': 'HighElf',
     'DarkSeducer': 'DarkElf',
     'SEDremora':   'Dremora',
     'Sheogorath':  'Imperial',
 }
 
-# (race, gender) → (skin-tone TINI index, [(r, g, b, tinv, weight), ...])
-_RACE_SKIN_TONES: dict[tuple, tuple] = {
-    ('Imperial', 'Male'):    (1,  [(87, 61, 51, 100, 42), (92, 67, 50, 100, 27),
-                                   (198, 176, 168, 100, 26)]),
-    ('Imperial', 'Female'):  (13, [(221, 221, 221, 100, 22), (145, 119, 111, 100, 18),
-                                   (172, 159, 151, 100, 17)]),
-    ('Nord', 'Male'):        (1,  [(198, 176, 168, 100, 230), (183, 156, 145, 100, 181),
-                                   (130, 109, 91, 100, 19)]),
-    ('Nord', 'Female'):      (24, [(206, 205, 204, 100, 64), (185, 179, 170, 100, 57),
-                                   (172, 159, 151, 100, 13)]),
-    ('Breton', 'Male'):      (2,  [(198, 176, 168, 100, 80), (183, 156, 145, 100, 69),
-                                   (167, 134, 122, 100, 51)]),
-    ('Breton', 'Female'):    (16, [(221, 221, 221, 100, 48), (206, 205, 204, 100, 33),
-                                   (172, 159, 151, 100, 11)]),
-    ('Redguard', 'Male'):    (1,  [(45, 33, 30, 100, 26), (53, 39, 34, 100, 13),
-                                   (79, 69, 64, 100, 10)]),
-    ('Redguard', 'Female'):  (23, [(67, 44, 33, 100, 16), (48, 33, 22, 100, 12),
-                                   (53, 39, 34, 100, 10)]),
-    ('DarkElf', 'Male'):     (1,  [(82, 96, 107, 100, 25), (83, 91, 91, 100, 22),
-                                   (98, 119, 123, 100, 14)]),
-    ('DarkElf', 'Female'):   (24, [(85, 118, 136, 100, 27), (27, 53, 58, 100, 11),
-                                   (47, 88, 100, 100, 8)]),
-    ('HighElf', 'Male'):     (1,  [(153, 141, 85, 100, 31), (124, 101, 48, 100, 21),
-                                   (125, 112, 70, 100, 19)]),
-    ('HighElf', 'Female'):   (24, [(148, 143, 88, 100, 20), (183, 186, 125, 100, 17),
-                                   (153, 160, 109, 100, 8)]),
-    ('WoodElf', 'Male'):     (1,  [(111, 86, 62, 100, 9), (135, 106, 75, 100, 5),
-                                   (121, 91, 64, 100, 5)]),
-    ('WoodElf', 'Female'):   (24, [(132, 126, 104, 100, 7), (116, 109, 86, 100, 7),
-                                   (114, 109, 84, 100, 2)]),
-    ('Orc', 'Male'):         (1,  [(80, 92, 82, 100, 18), (83, 96, 77, 100, 14),
-                                   (41, 47, 36, 100, 14)]),
-    ('Orc', 'Female'):       (13, [(61, 82, 73, 100, 11), (74, 100, 85, 100, 8),
-                                   (99, 129, 113, 100, 4)]),
-    ('Argonian', 'Male'):    (38, [(226, 172, 240, 69, 10), (67, 4, 1, 65, 5),
-                                   (253, 253, 253, 32, 5), (54, 78, 33, 66, 5)]),
-    ('Argonian', 'Female'):  (16, [(253, 253, 253, 32, 3), (74, 137, 69, 42, 3),
-                                   (54, 78, 33, 66, 2)]),
-    ('Khajiit', 'Male'):     (1,  [(0, 0, 0, 50, 11), (213, 145, 4, 31, 5),
-                                   (47, 32, 19, 74, 4)]),
-    ('Khajiit', 'Female'):   (4,  [(0, 0, 0, 50, 3), (47, 32, 19, 74, 3),
-                                   (149, 100, 64, 81, 3)]),
-    ('Dremora', 'Male'):     (1,  [(0, 0, 0, 77, 1)]),
-    ('Dremora', 'Female'):   (24, [(0, 0, 0, 77, 1)]),
+# (race, gender) -> skin-tone TINI index, from the RACE tint-mask definitions
+# in Skyrim.esm (tools/census_npc_skin.py).  The index is a property of the
+# TARGET Skyrim race, so it stays a table; only the color comes from Oblivion.
+_SKIN_TINI: dict[tuple, int] = {
+    ('Imperial', 'Male'): 1,  ('Imperial', 'Female'): 13,
+    ('Nord', 'Male'):     1,  ('Nord', 'Female'):     24,
+    ('Breton', 'Male'):   2,  ('Breton', 'Female'):   16,
+    ('Redguard', 'Male'): 1,  ('Redguard', 'Female'): 23,
+    ('DarkElf', 'Male'):  1,  ('DarkElf', 'Female'):  24,
+    ('HighElf', 'Male'):  1,  ('HighElf', 'Female'):  24,
+    ('WoodElf', 'Male'):  1,  ('WoodElf', 'Female'):  24,
+    ('Orc', 'Male'):      1,  ('Orc', 'Female'):      13,
+    ('Argonian', 'Male'): 38, ('Argonian', 'Female'): 16,
+    ('Khajiit', 'Male'):  1,  ('Khajiit', 'Female'):  4,
+    ('Dremora', 'Male'):  1,  ('Dremora', 'Female'):  24,
 }
+
+# Fallback skin colors, measured from Oblivion's own race textures, used when
+# the export lacks the RACE part/FGTS data (an older export, or a custom race
+# whose textures could not be resolved).  Keyed by TES4 race EditorID.
+_SKIN_FALLBACK_RGB: dict[str, tuple] = {
+    'Imperial':    (186, 120, 80),
+    'Nord':        (234, 162, 145),
+    'Breton':      (224, 164, 120),
+    'HighElf':     (212, 183, 83),
+    'WoodElf':     (198, 139, 107),
+    'Redguard':    (118, 60, 35),
+    'DarkElf':     (89, 88, 83),
+    'Orc':         (103, 111, 45),
+    'Khajiit':     (189, 124, 58),
+    'Argonian':    (101, 56, 33),
+    'Dremora':     (58, 38, 38),
+    'GoldenSaint': (173, 119, 51),
+    'DarkSeducer': (65, 51, 59),
+}
+
+# Interpolation written on the skin-tone layer.  The engine blends the tint
+# toward the base head texture by this fraction, and QNAM must agree with it
+# or the face is lit a different color than the body.  Vanilla writes
+# fractional values on real tint layers; a full-strength 100 paints the raw
+# color flat and reads noticeably darker than the source.
+_SKIN_TINV = 80
+
+# race EditorID -> {gender: (r, g, b)}, filled by load_race_skin_tones().
+_RACE_SKIN_RGB: dict[str, dict] = {}
+
+
+def _first(rec: dict, key: str):
+    """First value for `key` in an export record dict (values may be lists)."""
+    v = rec.get(key)
+    if isinstance(v, list):
+        return v[0] if v else None
+    return v
+
+
+def load_race_skin_tones(by_type: dict, export_dirs=None) -> None:
+    """Index each TES4 race's authored skin color for the skin-tone layer.
+
+    Reconstructs base_texture + FGTS_SCALE * sum(race_FGTS[i] * egt_mode[i])
+    per race and gender.  Safe to call repeatedly; races already indexed are
+    not recomputed.  A race whose assets cannot be resolved is left out, and
+    _SKIN_FALLBACK_RGB supplies its color.
+    """
+    races = by_type.get('RACE') or []
+    if not races:
+        return
+    try:
+        from asset_convert.facegen_egt import (
+            load_egt_mode_means, sample_texture_rgb, reconstruct_skin_rgb,
+            parse_fgts_hex)
+    except ImportError:
+        return
+
+    roots = [d for d in (export_dirs or []) if d]
+
+    def _asset(rel):
+        """Resolve a TES4 asset path against the export trees."""
+        rel = rel.replace('/', os.sep).replace('\\', os.sep).lstrip(os.sep)
+        for root in roots:
+            for sub in ('textures', 'meshes'):
+                cand = os.path.join(root, sub, rel)
+                if os.path.isfile(cand):
+                    return cand
+        return None
+
+    for rec in races:
+        edid = _first(rec, 'EditorID')
+        if not edid or edid in _RACE_SKIN_RGB:
+            continue
+        fgts = parse_fgts_hex(_first(rec, 'FGTS'))
+        modes = None
+        if fgts:
+            head_model = _first(rec, 'FacePart[0].Model')
+            if head_model:
+                egt = _asset(os.path.splitext(head_model)[0] + '.egt')
+                if egt:
+                    modes = load_egt_mode_means(egt)
+        per_gender = {}
+        for gender, key in (('Male', 'MalePart'), ('Female', 'FemalePart')):
+            tex = (_first(rec, key + '[0].Texture')      # upper body
+                   or _first(rec, 'FacePart[0].Texture'))  # head
+            path = _asset(tex) if tex else None
+            base = sample_texture_rgb(path) if path else None
+            if not base:
+                continue
+            rgb = reconstruct_skin_rgb(base, fgts, modes)
+            if rgb:
+                per_gender[gender] = rgb
+        if per_gender:
+            _RACE_SKIN_RGB[edid] = per_gender
 
 
 def _pick_skin_tone(race_edid: str, gender: str, fid: int):
     """Return (tini_index, (r, g, b), tinv) for this NPC's skin-tone layer.
 
-    The pick is a weighted choice over the census table, seeded by the
-    NPC's FormID (Knuth multiplicative scramble) so it is deterministic
-    across runs but varies between consecutive FormIDs.
+    The color is the race's authored Oblivion skin tone.  `fid` is unused and
+    kept so callers need not care whether variation exists: Oblivion NPCs of
+    one race share a skin tone to within ~1/255, so there is nothing to vary.
     """
-    race = _SKIN_RACE_ALIAS.get(race_edid, race_edid)
-    entry = (_RACE_SKIN_TONES.get((race, gender))
-             or _RACE_SKIN_TONES.get(('Imperial', gender))
-             or _RACE_SKIN_TONES[('Imperial', 'Male')])
-    tini, choices = entry
-    total = sum(c[4] for c in choices)
-    t = ((fid * 2654435761) & 0xFFFFFFFF) % total
-    for r, g, b, tinv, weight in choices:
-        if t < weight:
-            return tini, (r, g, b), tinv
-        t -= weight
-    r, g, b, tinv, _ = choices[-1]
-    return tini, (r, g, b), tinv
+    alias = _SKIN_RACE_ALIAS.get(race_edid, race_edid)
+    rgb = (_RACE_SKIN_RGB.get(race_edid, {}).get(gender)
+           or _RACE_SKIN_RGB.get(alias, {}).get(gender)
+           or _SKIN_FALLBACK_RGB.get(race_edid)
+           or _SKIN_FALLBACK_RGB.get(alias)
+           or _SKIN_FALLBACK_RGB['Imperial'])
+    tini = (_SKIN_TINI.get((alias, gender))
+            or _SKIN_TINI.get(('Imperial', gender))
+            or _SKIN_TINI[('Imperial', 'Male')])
+    return tini, tuple(rgb), _SKIN_TINV
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +406,41 @@ def _resolve_eyes_hdpt(rec: dict, race_edid: str, gender: str) -> int:
 # Public API
 # ---------------------------------------------------------------------------
 
-def build_pnam_subs(rec: dict, race_edid: str, gender: str = 'Male') -> bytes:
+def _resolve_hair_part(rec: dict, hair_fid: int, race_edid: str,
+                       gender: str, writer=None) -> int:
+    """The HDPT FormID for this NPC's hair at its authored length + gender.
+
+    convert_HAIR emits one HDPT per (length bucket, gender) — each mesh is
+    fitted to that gender's Skyrim head — so the NPC must name the variant
+    matching its own gender and LNAM.  An NPC wearing a hair authored for the
+    OTHER gender only (Oblivion allowed that) gets the gender that exists.
+    The base variant (base gender, bucket 0) keeps the source FormID, which
+    the generic load-order remap rewrites like any other reference.
+    """
+    from . import hair_variants
+    from .record_types.actors import hair_variant_formid
+
+    bucket = hair_variants.bucket_for_npc(rec)
+    if writer is None:
+        return hair_fid
+    if not hair_variants.is_own_hair(hair_fid):
+        # A master-owned hair: its variants live in the MASTER's converted
+        # plugin under the MASTER's derived ids, which cannot be minted here.
+        # The base FormID is a real reference the load-order remap resolves.
+        return hair_fid
+
+    genders = hair_variants.genders_for(hair_fid)
+    female = (gender == 'Female')
+    if female not in genders:
+        female = genders[0]
+    if bucket > 0 and bucket not in hair_variants.hair_buckets_for(hair_fid):
+        bucket = 0
+    return hair_variant_formid(writer, hair_fid, bucket,
+                               female, base_female=genders[0])
+
+
+def build_pnam_subs(rec: dict, race_edid: str, gender: str = 'Male',
+                    writer=None) -> bytes:
     """Build PNAM[] subrecords for NPC_ head parts.
 
     Writes (in order):
@@ -350,11 +452,15 @@ def build_pnam_subs(rec: dict, race_edid: str, gender: str = 'Male') -> bytes:
     """
     subs = b''
 
-    # Hair head part: map TES4 HAIR FormID → Skyrim HDPT FormID
+    # Hair head part.  The converted HAIR record IS the head part (convert_HAIR
+    # emits an HDPT keeping the source FormID for the base length), so an
+    # NPC resolves to its own plugin's hair rather than a substituted vanilla
+    # Skyrim hairstyle.  Its authored length (NPC_.LNAM) selects which baked
+    # variant — see hair_variants / asset_convert.hair_pipeline.
     hair_fid = get_formid(rec, 'HNAM.Hair')
     if hair_fid:
-        sky_hair = resolve_hair_hdpt(hair_fid, race_edid, gender)
-        subs += pack_formid_subrecord('PNAM', sky_hair)
+        subs += pack_formid_subrecord('PNAM', _resolve_hair_part(
+            rec, hair_fid, race_edid, gender, writer))
 
     # Eyes head part: map TES4 EYES FormID → Skyrim HDPT FormID
     eyes_fid = _resolve_eyes_hdpt(rec, race_edid, gender)
@@ -388,7 +494,7 @@ def build_face_tail_subs(rec: dict, race_edid: str, gender: str) -> bytes:
     if txst_fid:
         subs += pack_formid_subrecord('FTST', txst_fid)
 
-    # Skin tone: census-weighted pick, deterministic per FormID
+    # Skin tone: the race's authored Oblivion color (see _pick_skin_tone)
     fid = get_formid(rec, 'FormID')
     tini, (r, g, b), tinv = _pick_skin_tone(race_edid, gender, fid)
 

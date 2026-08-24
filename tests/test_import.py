@@ -494,25 +494,87 @@ class TestConverters:
         tini = struct.unpack('<H', self._get_subrecord_data(result, 'TINI'))[0]
         assert tini == 1  # Redguard male skin-tone index in Skyrim.esm
         r, g, b, a = struct.unpack('<4B', self._get_subrecord_data(result, 'TINC'))
-        # Must be one of the census colors — all dark Redguard tones, never white
-        assert (r, g, b) in {(45, 33, 30), (53, 39, 34), (79, 69, 64)}
         assert a == 0
-        tinv = struct.unpack('<I', self._get_subrecord_data(result, 'TINV'))[0]
-        assert tinv == 100
+        # The color is Oblivion's authored Redguard skin: a dark warm brown.
+        # Redguards were rendering near-black under the old census pick, and
+        # Imperials came out darker than Redguards should be, so assert the
+        # actual appearance rather than membership of a palette.
+        assert r > g > b, 'Redguard skin must be warm (R > G > B)'
+        luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        assert 45 < luma < 95, f'Redguard luma {luma:.0f} outside brown range'
+
         tias = struct.unpack('<h', self._get_subrecord_data(result, 'TIAS'))[0]
         assert tias == -1
-        # QNAM must agree with the tint (tinv=100 → exactly color/255)
+        # QNAM is the tint blended toward white by TINV, and must agree with
+        # the layer or the face is lit a different color than the body.
+        tinv = struct.unpack('<I', self._get_subrecord_data(result, 'TINV'))[0]
+        assert 0 < tinv <= 100
+        v = tinv / 100.0
         qnam = struct.unpack('<3f', self._get_subrecord_data(result, 'QNAM'))
-        for got, want in zip(qnam, (r / 255.0, g / 255.0, b / 255.0)):
-            assert abs(got - want) < 1e-6
+        for got, c in zip(qnam, (r, g, b)):
+            assert abs(got - (255.0 * (1.0 - v) + c * v) / 255.0) < 1e-6
+
         # Female Nord uses the FEMALE tint list index (24, not male 1)
         rec_f = dict(base, **{'RNAM.Race': '000224FD', 'ACBS.Flags': '1'})
         result_f = convert_NPC_(rec_f)
         tini_f = struct.unpack('<H', self._get_subrecord_data(result_f, 'TINI'))[0]
         assert tini_f == 24
-        # Deterministic: same FormID → same pick
+        # Deterministic: same input → same color
         assert (self._get_subrecord_data(result_f, 'TINC')
                 == self._get_subrecord_data(convert_NPC_(rec_f), 'TINC'))
+
+        # A Nord must be markedly PALER than a Redguard.  This is the defect
+        # the authored-color path fixes: the census pick gave 72% of Imperial
+        # males a luma-66 tone, darker than Redguards ought to be.
+        nord_r, nord_g, nord_b, _ = struct.unpack(
+            '<4B', self._get_subrecord_data(result_f, 'TINC'))
+        nord_luma = 0.2126 * nord_r + 0.7152 * nord_g + 0.0722 * nord_b
+        assert nord_luma > luma + 60, (
+            f'Nord luma {nord_luma:.0f} not clearly paler than '
+            f'Redguard {luma:.0f}')
+
+    def test_race_skin_tones_are_authored_colors(self):
+        """Each race's skin tone must match Oblivion's authored appearance.
+
+        High Elf, Redguard, Nord, Breton and Imperial all share
+        Characters\\Imperial\\HeadHuman.dds and are differentiated ONLY by the
+        RACE record's own FGTS vector, so a converter that ignores race FGTS
+        gives all five the same tan.  These assertions pin the distinctions
+        that FGTS is responsible for.
+        """
+        import colorsys
+        from tes5_import.npc_face_mapper import _pick_skin_tone
+
+        def tone(race, gender='Male'):
+            _, rgb, _ = _pick_skin_tone(race, gender, 0x00000500)
+            h, s, _v = colorsys.rgb_to_hsv(*[c / 255.0 for c in rgb])
+            luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+            return rgb, h * 360.0, s, luma
+
+        # High Elf reads GOLD: yellow-shifted hue, well away from skin-tan.
+        _rgb, hue, sat, _l = tone('HighElf')
+        assert 38 <= hue <= 70, f'High Elf hue {hue:.0f} is not gold'
+        assert sat > 0.45, f'High Elf saturation {sat:.2f} too washed out'
+
+        # Dark Elf reads GREY: near-zero saturation is its defining trait.
+        _rgb, _hue, sat, _l = tone('DarkElf')
+        assert sat < 0.20, f'Dark Elf saturation {sat:.2f} is not grey'
+
+        # Orc reads GREEN: green channel dominates.
+        rgb, _hue, _sat, _l = tone('Orc')
+        assert rgb[1] > rgb[0] and rgb[1] > rgb[2], f'Orc {rgb} is not green'
+
+        # Ordering: Redguard clearly darkest of the human races, Nord palest.
+        lumas = {r: tone(r)[3]
+                 for r in ('Redguard', 'Imperial', 'Breton', 'Nord')}
+        assert lumas['Redguard'] < lumas['Imperial'] < lumas['Nord'], lumas
+        assert lumas['Redguard'] < 95, lumas
+        assert lumas['Nord'] > 150, lumas
+
+        # Imperials must NOT be dark.  The reported bug was pale-skinned
+        # Imperials converting to a near-black tone.
+        assert lumas['Imperial'] > 110, (
+            f"Imperial luma {lumas['Imperial']:.0f} is too dark")
 
     def test_crea_becomes_npc(self):
         rec = {'Signature': 'CREA', 'FormID': '00000600', 'RecordFlags': '0',

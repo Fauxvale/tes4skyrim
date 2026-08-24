@@ -1574,6 +1574,51 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # record_types/actors.py.
     from .record_types.actors import load_faction_player_reactions
     load_faction_player_reactions(by_type)
+
+    # --- Phase 0j: index hair-length variants ---
+    # Skyrim has no per-NPC hair length, so NPC_.LNAM is resolved by baking
+    # the hair .tri's HairMorph into a mesh per distinct length and giving
+    # each its own HDPT (asset_convert.hair_pipeline).  convert_HAIR needs to
+    # know which lengths to emit before it runs in Phase 1, and NPC_ needs it
+    # to point PNAM at the right variant.  Master exports are indexed too:
+    # a dependent plugin's actors wear their MASTER's hair, so a plugin-only
+    # scan would register no lengths and silently give every one of them the
+    # bucket-0 mesh regardless of its authored length.
+    try:
+        from . import hair_variants
+        hair_variants.load(getattr(ctx, 'export_dir', None) or export_dir,
+                           _master_export_dirs(ctx) if ctx else ())
+        print(f"  Hair length variants: "
+              f"{sum(len(v) for v in hair_variants._BUCKETS.values())} baked "
+              f"lengths across {len(hair_variants._BUCKETS)} hair records")
+    except Exception as _hair_exc:      # noqa: BLE001 - never block the import
+        print(f"  WARNING: hair length index unavailable: {_hair_exc}")
+
+    # --- Phase 0k: index authored race skin tones ---
+    # Skyrim colors body skin from a per-NPC "Skin Tone" tint layer, and
+    # Oblivion authors that color in the RACE record: its body/face part
+    # textures plus its own FGTS vector, which recolors a SHARED texture for
+    # the races that do not ship their own (High Elf gold, Redguard brown,
+    # Nord pale all share Characters\Imperial\HeadHuman.dds).  Master exports
+    # are indexed too -- a dependent plugin's actors use their MASTER's races,
+    # so a plugin-only scan would leave every one of them on the fallback.
+    try:
+        from .npc_face_mapper import load_race_skin_tones, _RACE_SKIN_RGB
+        _skin_dirs = [getattr(ctx, 'export_dir', None) or export_dir]
+        if ctx:
+            _skin_dirs.extend(_master_export_dirs(ctx))
+        _skin_by_type = dict(by_type)
+        if ctx and getattr(ctx, 'master_export', None):
+            _m_races = [r for r in ctx.master_export.values()
+                        if r.get('Signature') == 'RACE']
+            if _m_races:
+                _skin_by_type['RACE'] = _m_races + (by_type.get('RACE') or [])
+        load_race_skin_tones(_skin_by_type, _skin_dirs)
+        print(f"  Race skin tones: {len(_RACE_SKIN_RGB)} races resolved "
+              f"from authored textures")
+    except Exception as _skin_exc:      # noqa: BLE001 - never block the import
+        print(f"  WARNING: race skin tone index unavailable: {_skin_exc}")
+
     _phase_done('phase 0 pre-scans')
 
     # --- Phase 1: Simple record types (flat top-level groups) ---

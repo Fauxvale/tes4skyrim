@@ -414,6 +414,7 @@ relevant doc when working in that area.
 | [vanilla_item_swap_plan.md](docs/vanilla_item_swap_plan.md) | PLAN (unimplemented): item/ingredient/clutter **and WEATHER** swap; model-swap vs full-reference modes, OBND size+orientation gate, PIL preview renderer |
 | [item_swap_table.md](docs/item_swap_table.md) | Per-item MISC/INGR swap recommendations with measured size ratios and verdicts (OK/SCALE/ROT/REJECT) |
 | [horse_rideability_plan.md](docs/horse_rideability_plan.md) | Rideable horses: RACE Mount Data, horse/rider graph pair, rider-animation sourcing |
+| [npc_skin_tone_conversion.md](docs/npc_skin_tone_conversion.md) | Skin color = RACE part textures + **race FGTS** via the `.egt` basis; per-NPC FGTS is negligible (sd 1/255); the `.egt` format; why a Skyrim census pick made Imperials dark |
 
 ### Scripts
 | Doc | Covers |

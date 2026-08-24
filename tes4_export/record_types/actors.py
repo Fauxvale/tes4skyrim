@@ -403,7 +403,58 @@ def export_RACE(rec: Record) -> list:
             for i in range(count):
                 lines.append(f"Eyes[{i}]={get_formid_str(struct.unpack_from('<I', enam.data, i*4)[0])}")
 
+    _emit_race_parts(lines, rec)
+
+    # FGGS/FGGA/FGTS - race-level FaceGen vectors.  A race either ships its
+    # own skin textures (FGTS all zero) or shares another race's textures and
+    # recolors them with a non-zero FGTS.  This is the authored source for
+    # the skin tone of every shared-texture race (High Elf gold, Redguard
+    # brown, Nord pale...), so it must survive export.
+    for sig in ("FGGS", "FGGA", "FGTS"):
+        sub = get_subrecord(rec, sig)
+        if sub and sub.data:
+            lines.append(f"{sig}={sub.data.hex()}")
+
     return lines
+
+
+def _emit_race_parts(lines: list, rec: Record):
+    """Emit the RACE face-part and body-part model/texture lists.
+
+    The layout is positional, not keyed: NAM0 opens the face-part block and
+    NAM1 the body-part block, the latter split into MNAM (male) and FNAM
+    (female) sections.  Within a block each part is INDX followed by its
+    MODL/ICON, so the subrecords must be walked in order.
+    """
+    section = None   # 'face' | 'male' | 'female'
+    index = None
+    for sub in rec.subrecords:
+        t = sub.type
+        if t == "NAM0":
+            section, index = "face", None
+            continue
+        if t == "NAM1":
+            section, index = None, None
+            continue
+        if t == "MNAM":
+            section, index = "male", None
+            continue
+        if t == "FNAM":
+            section, index = "female", None
+            continue
+        if section is None:
+            continue
+        if t == "INDX":
+            index = struct.unpack_from("<I", sub.data, 0)[0] if len(sub.data) >= 4 else None
+            continue
+        if index is None:
+            continue
+        if t in ("MODL", "ICON"):
+            val = sub.data.rstrip(b"\x00").decode("cp1252", errors="replace")
+            if val:
+                key = "Model" if t == "MODL" else "Texture"
+                lines.append(f"{section.capitalize()}Part[{index}].{key}"
+                             f"={escape_value(val)}")
 
 
 def export_CLAS(rec: Record) -> list:
