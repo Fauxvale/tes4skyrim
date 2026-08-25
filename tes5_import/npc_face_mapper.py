@@ -88,9 +88,8 @@ from .skyrim_overrides import (
     RACE_DEFAULT_EYES,
     map_eye_formid,
     resolve_eye_by_fid,
-    resolve_hair_hdpt,
 )
-from .text_reader import get_formid, get_int, get_str
+from .text_reader import get_formid, get_str
 from .writer import pack_formid_subrecord, pack_subrecord
 
 # ---------------------------------------------------------------------------

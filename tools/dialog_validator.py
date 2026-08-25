@@ -17,8 +17,6 @@ Usage:
 
 import argparse
 import io
-import mmap
-import os
 import struct
 import sys
 from collections import defaultdict
@@ -29,7 +27,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='repla
 # Import the ESM reader for parsing
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from tools.tes5_esm_reader import (
-    read_tes5_file, TES5Record, Sub, _CTDA_FUNC_NAMES,
+    read_tes5_file, TES5Record, _CTDA_FUNC_NAMES,
 )
 
 
@@ -132,7 +130,6 @@ def validate_dial_structure(dials: list, dlbr_by_fid: dict) -> list:
             issues.append(f'DIAL {fid:08X} ({edid}): DATA size={len(data)} (expected 4)')
             continue
 
-        cat = data[1]
         bnam = _get_sub(rec, 'BNAM')
         if bnam is not None:
             # Verify BNAM references a valid DLBR

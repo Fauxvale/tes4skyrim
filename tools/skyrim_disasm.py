@@ -42,7 +42,6 @@ whenever the game is up.
 """
 
 import argparse
-import mmap
 import os
 import re
 import struct
@@ -263,7 +262,6 @@ class LiveBinary(Binary):
 
     def __init__(self, pid: int = 0, chunk: int = 1 << 20):
         import ctypes
-        from ctypes import wintypes
         self._ct = ctypes
         k32 = ctypes.WinDLL('kernel32', use_last_error=True)
         self._k32 = k32

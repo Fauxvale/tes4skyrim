@@ -8,10 +8,8 @@ all 863 Oblivion.esm Tamriel cells it edits (547 NAVM shipped where 1,351
 pathgrids exist), so the landmass rendered fine and nothing in it could path.
 """
 
-import struct
 from collections import Counter
 
-import pytest
 
 from tes5_import import overrides
 

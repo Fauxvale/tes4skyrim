@@ -26,7 +26,6 @@ without re-reading the (multi-GB) output tree:
 Anything under textures/ that no reference names is left out of the archive.
 """
 
-import os
 import re
 from pathlib import Path
 from output_layout import assets_for  # noqa: E402

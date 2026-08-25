@@ -9,7 +9,6 @@ worse, get stale geometry:
   * the pre-push gate must fire for every file that can change cached geometry.
 """
 import glob
-import hashlib
 import json
 import os
 import pickle

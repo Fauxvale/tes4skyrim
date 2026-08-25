@@ -691,7 +691,6 @@ def run(export_dir, out_meshes_dir, *, verbose: bool = True) -> dict:
     length, converts the result to Skyrim format through the normal NIF
     converter, and writes the paired Skyrim .tri beside it.
     """
-    from .nif_converter import convert_nif
 
     export_dir = str(export_dir)
     # HAIR.txt/NPC_.txt are RECORDS (export_dir), but the NIF/.tri

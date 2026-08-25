@@ -953,11 +953,6 @@ def _variant_name(base_full: str, stat_name: str) -> str:
     return f'{base_full} ({stat_name})'
 
 
-def get_av_variant(code: str, effect_av: int) -> int:
-    """FormID of the per-AV MGEF variant for one effect instance (0 if none)."""
-    return _av_variants.get((code, effect_av), 0)
-
-
 # ---------------------------------------------------------------------------
 # Script-effect (SEFF) variants
 #

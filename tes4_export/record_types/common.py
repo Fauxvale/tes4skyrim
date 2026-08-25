@@ -50,16 +50,6 @@ def emit_u16(lines: list, key: str, sub: Subrecord, offset: int = 0):
         lines.append(f"{key}={struct.unpack_from('<H', sub.data, offset)[0]}")
 
 
-def emit_u32(lines: list, key: str, sub: Subrecord, offset: int = 0):
-    if sub and len(sub.data) >= offset + 4:
-        lines.append(f"{key}={struct.unpack_from('<I', sub.data, offset)[0]}")
-
-
-def emit_s16(lines: list, key: str, sub: Subrecord, offset: int = 0):
-    if sub and len(sub.data) >= offset + 2:
-        lines.append(f"{key}={struct.unpack_from('<h', sub.data, offset)[0]}")
-
-
 def emit_s32(lines: list, key: str, sub: Subrecord, offset: int = 0):
     if sub and len(sub.data) >= offset + 4:
         lines.append(f"{key}={struct.unpack_from('<i', sub.data, offset)[0]}")

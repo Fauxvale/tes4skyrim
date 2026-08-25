@@ -3,7 +3,6 @@
 Everything here builds synthetic archives in a tmp_path, so the whole module
 runs in a couple of seconds and needs no real mod on disk.
 """
-import json
 import os
 import struct
 import sys

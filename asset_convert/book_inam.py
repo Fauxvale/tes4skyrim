@@ -36,7 +36,6 @@ Templates are auto-extracted from the SSE BSAs by default (skyrim_assets).
 """
 
 import argparse
-import io
 import os
 import struct
 import sys

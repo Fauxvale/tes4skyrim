@@ -31,7 +31,7 @@ from typing import Optional
 
 # Add project root for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tools.tes5_esm_reader import read_tes5_file, TES5Record, _get, _all, _zstring
+from tools.tes5_esm_reader import read_tes5_file, TES5Record, _get, _zstring
 
 # ---------------------------------------------------------------------------
 # Engine dialogue tables

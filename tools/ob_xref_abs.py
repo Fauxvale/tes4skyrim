@@ -7,7 +7,6 @@ reader/writer.
 """
 import struct
 import sys
-from collections import defaultdict
 
 EXE = r"D:\Other Games\Nehrim At Fate's Edge\Oblivion.exe"
 

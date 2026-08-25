@@ -32,7 +32,7 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tools.tes5_esm_reader import read_tes5_file, TES5Record, _CTDA_FUNC_NAMES
+from tools.tes5_esm_reader import read_tes5_file, _CTDA_FUNC_NAMES
 
 # ─── helpers ────────────────────────────────────────────────────────────
 _CMP = {0: '==', 1: '!=', 2: '>', 3: '>=', 4: '<', 5: '<='}

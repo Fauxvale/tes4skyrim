@@ -30,7 +30,6 @@ import math
 import numpy as np
 from pathlib import Path
 
-import time
 
 # Apply all PyFFI patches (time.clock fix, nif.xml condition fixes) before import
 from . import pyffi_monkey_patch as _patch  # noqa: F401

@@ -334,9 +334,3 @@ PATROL = Template(
     defaults={1: 0.0, 2: 1, 3: 1, 4: 0, 5: 0},
     slots={'target': 0, 'radius': 1},
 )
-
-
-ALL_TEMPLATES = (
-    TRAVEL, SANDBOX, EAT, SLEEP, SIT, FOLLOW, ESCORT, HOLD_POSITION,
-    SIT_TARGET, USE_IDLE_MARKER, FLEE_TO, USE_MAGIC, PATROL, ACQUIRE,
-)

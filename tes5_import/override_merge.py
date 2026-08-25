@@ -327,7 +327,6 @@ def _shift_record_formids(rec: bytes, index_map: dict) -> bytes:
     """
     if len(rec) < _HEADER_SIZE:
         return rec
-    sig = rec[:4]
     size = struct.unpack_from('<I', rec, 4)[0]
     flags = struct.unpack_from('<I', rec, 8)[0]
     fid = struct.unpack_from('<I', rec, 12)[0]

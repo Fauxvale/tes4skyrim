@@ -479,7 +479,6 @@ def _decode_sse_vertex_block(raw, num_vertices, vdesc):
         out['sse_verts'] = _f32(0, 3)
         if attrs & 0x10:
             bit_x = _f32(12, 1)[:, 0]   # Bitangent X shares the W slot
-        off = 16
     if attrs & 0x2:                     # UV (half2)
         uv_off = ((vdesc >> 8) & 0xF) * 4
         out['sse_uvs'] = _half(uv_off, 2)

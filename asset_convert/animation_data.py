@@ -43,7 +43,6 @@ animationsetdatasinglefile.txt:
 """
 
 import os
-import struct
 import zlib
 
 VANILLA_SINGLEFILES = ('animationdatasinglefile.txt',

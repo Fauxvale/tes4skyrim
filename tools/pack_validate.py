@@ -36,7 +36,6 @@ Usage:
 import argparse
 import mmap
 import struct
-import sys
 import zlib
 from collections import Counter, defaultdict
 

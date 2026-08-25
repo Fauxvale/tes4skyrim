@@ -18,8 +18,6 @@ Output:
 """
 import json
 import os
-import sys
-import time
 
 import asset_convert.pyffi_monkey_patch  # noqa: F401 — must precede NifFormat
 

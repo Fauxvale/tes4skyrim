@@ -14,11 +14,9 @@ still working (and the check for any future ordering regression).
 Exit code is non-zero if any mesh differs between seeds, so it works in CI.
 """
 import argparse
-import hashlib
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -93,7 +91,6 @@ def main():
         results.append(json.loads(r.stdout.strip().splitlines()[-1]))
         print(f"  seed {hs}: {len(results[-1])} converted")
 
-    base = results[0]
     bad = []
     for rel in sample:
         vals = {res.get(rel) for res in results}

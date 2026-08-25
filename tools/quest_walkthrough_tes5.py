@@ -8,16 +8,14 @@ import os
 import struct
 import time
 from collections import defaultdict
-from pathlib import Path
 
 from tools.tes5_esm_reader import read_tes5_file, _get, _all, _zstring
 from tools.quest_walkthrough import (
     Ctda, parse_ctdas, and_groups, parse_vmad, parse_qust_fragments,
     parse_qust_alias_scripts,
-    parse_info_fragments, parse_psc, extract_actions, PscInfo, _OPS,
+    parse_info_fragments, parse_psc, extract_actions, _OPS,
     _BARK_SNAMS, _P1_FORMID_FUNCS,
-    F_GETQUESTRUNNING, F_GETSTAGE, F_GETSTAGEDONE, F_GETISID,
-    F_GETGLOBALVALUE, F_GETISVOICETYPE, F_GETVMQUESTVAR, F_GETVMSCRIPTVAR,
+    F_GETQUESTRUNNING, F_GETSTAGE, F_GETSTAGEDONE, F_GETGLOBALVALUE, F_GETVMQUESTVAR, F_GETVMSCRIPTVAR,
 )
 
 # Record types whose subrecords we actually need (everything else is scanned

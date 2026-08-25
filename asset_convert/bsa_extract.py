@@ -15,20 +15,11 @@ Voice file organization:
 """
 import json
 import os
-import os
-import re
-import shutil
 import struct
-import subprocess
 import zlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from .audio_converter import (
-    find_ffmpeg as _find_ffmpeg,
-    convert_file_to_xwm as _mp3_to_xwm,
     organize_voice_files,
-    _TES4_VOICE_TYPE_MAP,
-    _VOICE_FILENAME_RE,
 )
 from worker_budget import worker_count
 

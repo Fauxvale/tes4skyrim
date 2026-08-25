@@ -494,7 +494,7 @@ def test_hunt_at_actor_base_becomes_a_follow_chain_nearest_first():
     it as each target dies.
     """
     from tes5_import.pack_converter import (hunt_chain_targets, PackContext,
-                                            _seek_record, convert_PACK_records,
+                                            convert_PACK_records,
                                             T4_FIND, CTDA_GET_DEAD,
                                             CTDA_GET_DISABLED,
                                             CTDA_GET_IN_SAME_CELL)

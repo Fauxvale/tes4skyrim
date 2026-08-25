@@ -12,7 +12,6 @@ Usage:
 """
 import argparse
 import re
-import sys
 from collections import Counter
 from pathlib import Path
 

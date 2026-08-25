@@ -16,7 +16,6 @@ Background: docs/ck_vs_game_missing_objects.md and
 docs/ck_reference_init_hang.md.
 """
 
-import os
 import struct
 import subprocess
 import sys

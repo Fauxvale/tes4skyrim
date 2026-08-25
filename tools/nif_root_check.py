@@ -21,7 +21,6 @@ caught that, so run it after ANY edit to `_root_is_ninode`.
 Exit code is non-zero on any disagreement, so it works in CI.
 """
 import argparse
-import os
 import sys
 import time
 from pathlib import Path

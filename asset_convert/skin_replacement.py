@@ -3,7 +3,6 @@
 Fills exposed body gaps in armor meshes by splicing clipped Skyrim body geometry.
 Also generates _1 weight variants for body-weight interpolation."""
 
-import time
 from pathlib import Path
 
 import numpy as np

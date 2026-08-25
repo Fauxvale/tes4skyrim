@@ -216,12 +216,6 @@ def get_creature_arma_folders() -> dict:
     return _CREA_ARMA_FOLDER
 
 
-def get_creature_voice(fid_low24: int) -> int:
-    """Generated creature VTYP FormID for a CREA, or 0 if it has none."""
-    folder = _CREA_FOLDER_MAP.get(fid_low24)
-    return _CREA_VOICE_MAP.get(folder, 0) if folder else 0
-
-
 def build_creature_voice_types(writer) -> int:
     """Phase LAST: one VTYP per creature folder.
 

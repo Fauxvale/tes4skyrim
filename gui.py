@@ -848,11 +848,11 @@ def gui_main():
     style.map("Danger.TButton", background=[("active", "#5a3030")])
 
     # ── Global actions ────────────────────────────────────────────────────────
-    # These two ("Patch Skyrim", "Merge Sibling LOD") are NOT pipeline steps:
-    # they take no plugin, run once for the whole load order, and their result
-    # is shared by every conversion.  Deliberately teal and outlined rather than
-    # gold-and-solid like Run, so the sidebar reads as two different kinds of
-    # thing and neither is mistaken for a per-plugin step.
+    # "Patch Skyrim" is NOT a pipeline step: it takes no plugin, runs once for
+    # the whole load order, and its result is shared by every conversion.
+    # Deliberately teal and outlined rather than gold-and-solid like Run, so the
+    # sidebar reads as two different kinds of thing and it is not mistaken for a
+    # per-plugin step.
     S("Global.TButton", background=CLR["global_btn"], foreground=CLR["blue"],
                         borderwidth=0, relief="flat", padding=(8, 6),
                         font="Segoe\\ UI 9")

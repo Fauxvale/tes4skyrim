@@ -16,7 +16,6 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from asset_convert import wearable_plan as wp  # noqa: E402
-from output_layout import paths
 
 BP_NAME = {32: 'body', 33: 'hands', 36: 'ring', 37: 'feet', 38: 'calves',
            40: 'amulet', 44: 'lowerbody', 131: 'head'}

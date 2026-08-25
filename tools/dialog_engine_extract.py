@@ -30,7 +30,6 @@ Usage:
 
 import argparse
 import json
-import re
 import struct
 import sys
 

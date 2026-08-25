@@ -24,7 +24,6 @@ Usage:
     python -m tools.render_tree_billboard --nif <tree.nif> --out <name.dds>
 """
 
-import os
 import struct
 from pathlib import Path
 

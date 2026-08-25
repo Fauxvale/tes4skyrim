@@ -51,13 +51,11 @@ from .dialog_converter import (
 from .record_types.dialog_misc import convert_SOUN
 from .skyrim_overrides import (
     CUSTOM_VTYP_EDIDS,
-    TES4_RACE_FID_TO_EDID,
-    VOICE_TYPE_MAP,
     VTYP_EDID_BY_FID,
     set_voice_type,
 )
 from .navi_builder import NAVI_SINGLETON_FID, build_navi_record
-from .lava_placement import LavaPlanner, build_lava_stat
+from .lava_placement import LavaPlanner
 from .locations import build_marker_locations
 from .record_types.world import (
     convert_ACHR,
@@ -91,7 +89,6 @@ from .writer import (
     pack_record,
     pack_string_subrecord,
     pack_subrecord,
-    pack_uint32_subrecord,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

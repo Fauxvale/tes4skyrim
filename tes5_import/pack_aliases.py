@@ -33,8 +33,7 @@ import re
 import struct
 
 from .text_reader import (get_formid, get_int, get_str, remap_formid,
-                          get_formid_index_offset,
-                          PLAYER_REF_FID as PLAYER_FID)
+                          get_formid_index_offset)
 
 
 def _master_records(master_export, *sigs):

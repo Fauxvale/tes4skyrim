@@ -83,8 +83,6 @@ _SKY_SPIDER          = 0x000131F8  # FrostbiteSpiderRace
 _SKY_WOLF            = 0x000131EB  # WolfRace
 _SKY_WEREWOLF        = 0x000CDD84  # WerewolfBeastRace (Dawnguard.esm 0x000CDD84)
 _SKY_CHAURUS         = 0x000131F3  # ChaurusRace
-_SKY_MAMMOTH         = 0x000131FC  # (re-use HorkerRace placeholder; mammoth=0x000131FC conflicts)
-#   Corrected:
 _SKY_MAMMOTH         = 0x0001320A  # MammothRace (Skyrim.esm)
 _SKY_RABBIT          = 0x00059339  # RabbitRace (Skyrim.esm)
 _SKY_FOX             = 0x000A0EB2  # FoxRace (Skyrim.esm)
@@ -108,11 +106,6 @@ _BSH_DAEDROTH        = 0x020ADFB0  # CYRDaedraDaedrothRace
 _BSH_TROLL_RIVER     = 0x0208BB68  # CYRTrollRiverRace
 _BSH_WISP            = 0x0207822E  # CYRWillotheWispRace (alt)
 _BSH_SKELETON        = 0x0205BC32  # CYRSkeletonRace (alt)
-
-
-def _make_race(fid, source, alt=None):
-    """Return (formid, source_note, alternate_note) tuple."""
-    return (fid, source, alt)
 
 
 # Keyword patterns matched against EditorID (case-insensitive, substring).
@@ -247,29 +240,6 @@ TES4_RACE_FID_TO_EDID = {
 # Key: (race_editorid, gender) → Skyrim preset NPC FormID
 # These are actual NPC_ records in Skyrim.esm whose face data we reference.
 # ---------------------------------------------------------------------------
-
-NPC_PRESETS = {
-    ('Argonian', 'Female'):   0x000B2E11,  # ArgonianFemalePreset01
-    ('Argonian', 'Male'):     0x00043E57,  # ArgonianMalePreset01
-    ('Breton', 'Female'):     0x00079F65,  # BretonFemalePreset01
-    ('Breton', 'Male'):       0x00079F6A,  # BretonMalePreset01
-    ('DarkElf', 'Female'):    0x00079F5B,  # DarkElfFemalePreset01
-    ('DarkElf', 'Male'):      0x0005EFA7,  # DarkElfMalePreset01
-    ('HighElf', 'Female'):    0x00079BED,  # HighElfFemalePreset01
-    ('HighElf', 'Male'):      0x0005EF9C,  # HighElfMalePreset01
-    ('Imperial', 'Female'):   0x00079F66,  # ImperialFemalePreset01
-    ('Imperial', 'Male'):     0x00026921,  # ImperialMalePreset01
-    ('Khajiit', 'Female'):    0x000EE856,  # KhajiitFemalePreset01
-    ('Khajiit', 'Male'):      0x00043E59,  # KhajiitMalePreset01
-    ('Nord', 'Female'):       0x00079F68,  # NordFemalePreset01
-    ('Nord', 'Male'):         0x0001750C,  # NordMalePreset01
-    ('Orc', 'Female'):        0x00079F4E,  # OrcFemalePreset01
-    ('Orc', 'Male'):          0x00079F69,  # OrcMalePreset01
-    ('Redguard', 'Female'):   0x00079F67,  # RedguardFemalePreset01
-    ('Redguard', 'Male'):     0x0005B4F8,  # RedguardMalePreset01
-    ('WoodElf', 'Female'):    0x00079CD3,  # WoodElfFemalePreset01
-    ('WoodElf', 'Male'):      0x0005EF9A,  # WoodElfMalePreset01
-}
 DEFAULT_PRESET_FEMALE = 0x00079F66  # ImperialFemalePreset01
 DEFAULT_PRESET_MALE = 0x00026921    # ImperialMalePreset01
 

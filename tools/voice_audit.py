@@ -300,7 +300,6 @@ def main():
                                 f'not {n}')
                 else:
                     cls = 'NO_SOURCE_AUDIO'
-                    note = ''
                 stats[cls] += 1
                 misses.append((cls, tf, stem, fid, dial_edid))
 

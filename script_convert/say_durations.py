@@ -29,8 +29,6 @@ Durations are cached to `<export>/voice_durations.json` because a full scan is
 import json
 import os
 import re
-import struct
-from collections import defaultdict
 from output_layout import assets_for  # noqa: E402
 
 # MPEG-1 Layer III bitrate table (kbps), index 0/15 invalid.

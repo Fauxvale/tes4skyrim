@@ -33,7 +33,7 @@ Usage:
     python asset_convert/modify_body_meshes.py [--skyrim-mesh-root <path>]
                                                [--output-dir <path>]
 """
-import argparse, os, sys, time
+import argparse, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import asset_convert.pyffi_monkey_patch  # noqa: F401 — must precede NifFormat

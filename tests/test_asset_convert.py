@@ -2,7 +2,6 @@
 
 import math
 import os
-import re
 import shutil
 import struct
 import tempfile
@@ -1087,7 +1086,6 @@ class TestCollisionRigidBody:
         if not hasattr(time, '_original_clock'):
             time.clock = time.perf_counter
         from pyffi.formats.nif import NifFormat
-        import io
 
         src = EXPORT_MESHES / rel_path
         if not src.exists():
@@ -2683,7 +2681,6 @@ class TestFXBrightnessAndSoftEffect:
         routed to BSLightingShaderProperty -- lit, normal-mapped and with no
         soft fade.  Additive blending is the second authored unlit indicator.
         """
-        from pyffi.formats.nif import NifFormat
         data = self._convert(self.GROUND_MIST, tmp_path)
         eff = self._effect_shaders(data)
         assert eff, 'additively-blended mist planes did not reach the FX shader'
@@ -2811,7 +2808,6 @@ class TestTextureTransformControllerConversion:
         import time
         if not hasattr(time, 'clock'):
             time.clock = time.perf_counter
-        from pyffi.formats.nif import NifFormat
 
         shape, NF = self._build_textured_strip(1, [(0.0, 0.0), (3.3, -2.0)])
         texprop = shape.properties[0]

@@ -35,7 +35,6 @@ Exit code is 1 if any graph names a sequence its mesh does not provide.
 """
 import argparse
 import os
-import re
 import sys
 import time
 import warnings

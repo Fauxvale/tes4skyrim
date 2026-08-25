@@ -11,7 +11,6 @@ Usage:
 """
 
 import argparse
-import io
 import math
 import sys
 from pathlib import Path

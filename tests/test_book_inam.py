@@ -16,7 +16,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from asset_convert.book_inam import (
     CANVAS,
     Calibration,
-    RegionFit,
     Island,
     bake_atlas,
     calibrate,

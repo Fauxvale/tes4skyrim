@@ -28,7 +28,6 @@ override's source id directly.
 
 import json
 import os
-import sys
 from output_layout import paths  # noqa: E402
 
 MANIFEST_VERSION = 1

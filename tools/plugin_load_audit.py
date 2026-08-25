@@ -103,7 +103,6 @@ def audit(path, label):
     local_sigs = {}          # formid -> signature, for the ACHR base check
     cell_lands = {}          # cell formid -> the LAND inside it (max one)
     # (enclosing group id) -> [block labels in file order], for the grid sort
-    grid_siblings = {}
     # Index of Skyrim.esm in this plugin's master list. A record whose own
     # FormID carries this index byte is an override of a Bethesda record.
     masters = plugin_masters(d)

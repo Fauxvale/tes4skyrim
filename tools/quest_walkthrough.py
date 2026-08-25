@@ -35,8 +35,8 @@ if (getattr(sys.stdout, 'encoding', '') or '').lower() not in ('utf-8', 'utf8'):
                                   errors='replace')
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tools.tes5_esm_reader import (read_tes5_file, TES5Record,
-                                   _get, _all, _zstring, _CTDA_FUNC_NAMES)
+from tools.tes5_esm_reader import (TES5Record,
+                                   _zstring)
 from tes5_import.text_reader import parse_export_file
 
 # ── Skyrim CTDA function indices (project table, tools/tes5_esm_reader.py) ──

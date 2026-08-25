@@ -1463,7 +1463,6 @@ class TestSkyrimRecordFormat:
 # Voice file naming tests
 # ---------------------------------------------------------------------------
 
-import re
 from asset_convert.audio_converter import _VOICE_FILENAME_RE, _TES4_VOICE_TYPE_MAP
 
 
@@ -3650,7 +3649,6 @@ class TestSayLineDurations:
 
     def test_mp3_duration_reads_frame_headers(self, tmp_path):
         """A silent MPEG-1 Layer III CBR stream of known length."""
-        import struct
         from script_convert.say_durations import mp3_duration
         # 128kbps, 44100Hz, no padding -> 417-byte frames of 1152 samples
         frame = bytes([0xFF, 0xFB, 0x90, 0x00]) + b'\x00' * 413
@@ -3934,7 +3932,6 @@ class TestWeatherConversion:
         thunderstorms are 188/132/100/24.  Inverting it here would make clear
         skies thunder constantly.
         """
-        from tes5_import.record_types.dialog_misc import convert_WTHR
         clear = self._convert(self._rec(**{'DATA.ThunderFrequency': '255'}))
         assert _find_subrecord(clear, b'DATA')[10] == 255
 

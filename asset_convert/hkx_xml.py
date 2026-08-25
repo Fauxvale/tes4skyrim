@@ -176,11 +176,6 @@ def fmt_vec(*vals) -> str:
     return '(' + ' '.join(f'{v:.6f}' for v in vals) + ')'
 
 
-def fmt_qtransform(t, q_xyzw, s=(1.0, 1.0, 1.0)) -> str:
-    """referencePose entry: (t)(q xyzw)(s)"""
-    return fmt_vec(*t) + fmt_qtransform_rot(q_xyzw) + fmt_vec(*s)
-
-
 def fmt_qtransform_rot(q_xyzw) -> str:
     return fmt_vec(*q_xyzw)
 

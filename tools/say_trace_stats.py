@@ -28,7 +28,6 @@ SAY_TAIL, i.e. the cases where a poll's `T <= 0` guard reopened before the End
 result ran.
 """
 import argparse
-import os
 import re
 import statistics
 import sys

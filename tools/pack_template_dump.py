@@ -98,7 +98,7 @@ class Pack:
 
     def index_list(self):
         """The UNAM index list an instance repeats verbatim (pre-XNAM)."""
-        body = rec_before_xnam = self.raw
+        body = self.raw
         body = body.split('PKCU.hex=', 1)[-1]
         body = re.split(r'^XNAM=', body, maxsplit=1, flags=re.M)[0]
         # In the instance/root Package Data block the bare UNAM lines (no BNAM

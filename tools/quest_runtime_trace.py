@@ -30,15 +30,13 @@ Usage:
 """
 import argparse
 import os
-import re
 import struct
 import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools.tes5_esm_reader import (read_tes5_file, _get, _all,
-                                   _CTDA_FUNC_NAMES, _CTDA_RUNON_NAMES)
+from tools.tes5_esm_reader import (read_tes5_file, _get, _CTDA_RUNON_NAMES)
 
 # TES4 condition function indices that take a QUEST as param1
 TES4_QUEST_FUNCS = {

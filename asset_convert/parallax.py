@@ -1252,16 +1252,6 @@ def scale_depth(texels, factor: float = None, centre: int = NEUTRAL_LEVEL):
     return bytearray(lut[v] for v in texels)
 
 
-def height_report(texels):
-    """(median, amplitude, percent below mid-grey) — the three numbers the
-    good/bad split is made on, so a build log can show its working."""
-    if not texels:
-        return 0, 0, 0.0
-    n = len(texels)
-    below = sum(1 for v in texels if v < 128) * 100.0 / n
-    return _median(texels), max(texels) - min(texels), below
-
-
 def build_height_map(src_dds: str, out_path: str, strength: float = 1.0,
                      max_range: int = DEFAULT_MAX_RANGE,
                      target_range: int = DEFAULT_TARGET_RANGE,

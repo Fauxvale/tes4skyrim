@@ -44,16 +44,6 @@ class Record:
     offset: int = -1
 
 
-@dataclass
-class GroupInfo:
-    """Metadata about a GRUP."""
-    group_type: int
-    label: bytes
-    label_int: int
-    size: int
-    offset: int
-
-
 def parse_subrecords(data: bytes) -> list:
     """Parse subrecords from raw record data."""
     subs = []

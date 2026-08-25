@@ -15,7 +15,6 @@ Options:
 import argparse
 import os
 import re
-import sys
 from collections import defaultdict
 
 PLACED_FILES = ("REFR.txt", "ACHR.txt", "ACRE.txt")

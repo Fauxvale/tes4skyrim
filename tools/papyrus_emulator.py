@@ -53,14 +53,12 @@ import heapq
 import os
 import random
 import re
-import struct
 import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools.papyrus_interp import Interp, truth
-from tools.tes5_esm_reader import read_tes5_file, _get
+from tools.papyrus_interp import Interp
 
 # Papyrus' per-frame budget, read from SkyrimSE.exe (Papyrus:fUpdateBudgetMS).
 # Update latency beyond a timer's nominal delay comes from this.

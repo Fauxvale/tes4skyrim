@@ -18,7 +18,6 @@ degrades and says so itself.
 """
 
 import importlib.util
-import os
 import shutil
 import subprocess
 import sys
@@ -285,11 +284,6 @@ def _papyrus_headers() -> 'Missing | None':
         '(the .zip is unpacked automatically)',
         f'looked under {data or "(no Skyrim SE install found in the registry)"}',
     )
-
-
-def _creation_kit_installed() -> bool:
-    from convert import find_game_path
-    return bool(find_game_path('skyrimse', _load_config()))
 
 
 # ---------------------------------------------------------------------------

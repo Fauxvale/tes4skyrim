@@ -188,7 +188,6 @@ def check_land(body, known_ltex):
                 if op != op or not (-0.001 <= op <= 1.001):
                     problems.append('VTXT opacity %r (layer %s)' % (op, cur))
                     break
-        j = None
     for name in ('DATA', 'VHGT'):
         if counts.get(name, 0) != 1:
             problems.append('%s count %d != 1' % (name, counts.get(name, 0)))

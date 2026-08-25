@@ -274,11 +274,6 @@ def furniture_model_info(nif_path):
     return {'seats': seats, 'origin_shift': shift}
 
 
-def seats_from_nif(nif_path):
-    """Back-compat helper: seat list only (z in re-origined coords)."""
-    return furniture_model_info(nif_path)['seats']
-
-
 def _has_marker_header(path):
     """True if the NIF's header block-type table names BSFurnitureMarker."""
     try:

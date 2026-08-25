@@ -54,7 +54,7 @@ WHAT THE NUMBER MEANS
 ---------------------
 The converted plugin carries 110,634 CTDAs total, INFOGENERAL alone holding
 33,872 across 1,854 INFOs (measured from the built ESM by
-tools/dialog_selection_cost.py).  Vanilla Skyrim's mean is 3.7 per topic.
+the removed dialog_selection_cost.py).  Vanilla Skyrim's mean is 3.7 per topic.
 
   * ~thousands of evaluations per activation  -> the walk IS the stutter, and
     the fix is to cut the per-topic condition volume.

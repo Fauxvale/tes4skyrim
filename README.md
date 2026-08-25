@@ -240,7 +240,6 @@ python convert.py --modify-body-meshes                 # Build ARMA slot-44 patc
 python tools/create_lod.py                             # Bake ALL LOD once (takes no -f)
 python tools/pack_lod.py                               # Zip the baked LOD mod
 python tools/package_start_mod.py                      # Zip the TESGameSelect starter mod
-python tools/merge_sibling_lod.py --dry-run            # Report LOD tiles two converted mods both claim
 python convert.py -f Oblivion.esm --mesh-bounds-only   # Rescan mesh bounds → OBND cache
 ```
 

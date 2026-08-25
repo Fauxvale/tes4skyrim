@@ -23,8 +23,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
-import subprocess
 import sys
 import time
 from pathlib import Path

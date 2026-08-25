@@ -266,7 +266,6 @@ def esp_track(pe, start, targets=None, maxsteps=200000):
     naming slots per-block (rather than relative to entry) silently produces
     wrong identifications.
     """
-    import re as _re
     fn = pe.disasm_fn(start)
     # cache: callee -> bytes popped by its `ret N`
     retpop = {}

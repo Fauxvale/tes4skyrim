@@ -25,7 +25,6 @@ Usage:
 import argparse
 import os
 import struct
-import sys
 from collections import Counter
 
 

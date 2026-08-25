@@ -19,7 +19,6 @@ from .common import (
     pack_record,
     pack_string_subrecord,
     pack_subrecord,
-    pack_uint8_subrecord,
     pack_uint32_subrecord,
 )
 
@@ -29,44 +28,6 @@ _TES4_SND_RANDOM_FREQ_SHIFT = 0x0001
 _TES4_SND_LOOP              = 0x0010
 _TES4_SND_MENU_SOUND        = 0x0020
 _TES4_SND_2D                = 0x0040
-
-# TES4 SOUN FormID (low 24 bits) → the SNDR FormID convert_SOUN gave its
-# companion. Filled DURING Phase 3, and read afterwards to patch the records
-# that reference it (see items.patch_door_sounds).
-#
-# An earlier version reserved these ids in a Phase 0 pre-pass so records could
-# embed them directly. That allocated ~1100 FormIDs before anything else and
-# so SHIFTED every other generated id (OTFT, ARMA, TXST, ...) — which silently
-# invalidated the separately-built 'Slot44 Patch.esp', whose 818 ARMO/233 ARMA
-# overrides are matched to the master BY FORMID. NPCs lost their armor. The
-# allocation ORDER is therefore a compatibility contract with anything built
-# against a previous run: never insert an allocating pass ahead of existing
-# ones.
-_SNDR_FOR_SOUN = {}
-
-
-def reset_sound_descriptors() -> None:
-    """Clear the SOUN→SNDR map at the start of an import run."""
-    _SNDR_FOR_SOUN.clear()
-
-
-def record_sndr_for_soun(soun_fid: int, sndr_fid: int) -> None:
-    """Note the companion SNDR convert_SOUN just built for a SOUN."""
-    _SNDR_FOR_SOUN[soun_fid & 0x00FFFFFF] = sndr_fid
-
-
-def sndr_map() -> dict:
-    """TES4 SOUN id (low 24 bits) → companion SNDR FormID, for slot patching."""
-    return _SNDR_FOR_SOUN
-
-
-def get_sndr_for_soun(soun_fid: int) -> int:
-    """The SNDR FormID for a TES4 SOUN, or 0 if it has no companion.
-
-    Accepts a FormID in either raw or load-order-offset form; the map is keyed
-    on the low 24 bits (same convention as outfits.load_item_index).
-    """
-    return _SNDR_FOR_SOUN.get(soun_fid & 0x00FFFFFF, 0)
 
 
 # Vanilla Skyrim SOPM constants (verified against references/Skyrim.esm SOPM dump)

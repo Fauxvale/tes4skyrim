@@ -42,7 +42,6 @@ CPU sampling here goes through the Windows process API, not the debugger.
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import subprocess
 import sys

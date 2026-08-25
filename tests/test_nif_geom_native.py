@@ -130,7 +130,6 @@ def test_real_nif_read_write_is_byte_identical():
     random.seed(99)
     sample = random.sample(files, min(8, len(files)))
 
-    from pyffi.object_models.xml.array import Array
     for p in sample:
         with open(p, 'rb') as fh:
             d1 = NifFormat.Data()

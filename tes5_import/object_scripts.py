@@ -27,7 +27,7 @@ from script_convert.constants import (_safe_property_name, papyrus_script_name,
                                       wants_placed_reference,
                                       PLAYER_ALIAS_EXTENDS)
 from script_convert.pipeline import build_vmad_object_script
-from .text_reader import (parse_export_file, get_formid_index_offset,
+from .text_reader import (get_formid_index_offset,
                           remap_formid, unescape_value)
 from .constants import ENGINE_GLOBAL_FORMIDS
 from .skyrim_overrides import (DEFAULT_RACE, RACE_MAP,

@@ -54,7 +54,6 @@ Usage:
     python tools/make_sky_unjustified_esp.py --out SkyUJ2.esp
 """
 import argparse
-import json
 import os
 import struct
 import sys
