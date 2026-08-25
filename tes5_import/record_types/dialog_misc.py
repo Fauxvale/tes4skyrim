@@ -519,14 +519,48 @@ _IMGS_SLOT_EYE_ADAPT_BIAS = (0.925, 1.0, 0.925, 1.125)
 # 1.85/1.90/1.85/1.50); TES4 has one value for the whole day.
 _IMGS_SLOT_SUNLIGHT_BIAS = (0.974, 1.0, 0.974, 0.789)
 
-# Sky Scale is the sky's contribution to scene exposure and TES4 has no
-# equivalent field.  It tracks how bright the weather's own sky color is
-# (corr +0.29 over 284 vanilla weather/slot pairs): a dark night sky sits at
-# ~0.025 while any lit sky sits at ~0.19-0.21.  A flat value washes the day
-# sky out to near-white while over-lighting the night.
-_IMGS_SKY_SCALE_DARK = 0.025
-_IMGS_SKY_SCALE_LIT = 0.20
-_IMGS_SKY_LUM_DARK = 40.0     # sky luminance below which the bucket is "dark"
+# SKY SCALE MUST NOT BE DERIVED FROM SKY COLOUR.
+#
+# Sky Scale is a tonemapper term applied to the sky, and in Skyrim's sky pixel
+# shader it lands as an ADDITIVE floor:
+#
+#     psout.Color.xyz = input.Color.xyz * baseColor.xyz + skyScale
+#
+# (Community Shaders `Sky.hlsl`; the constant is PParams.y, set in
+# BSSkyShader.cpp as fInvFrameBufferRange * [sky+0xE4] and forced to 0 for
+# moons/sunglare.)  Oblivion's sky shader has NO additive term at all — its
+# dome pixel shader is literally `mov r0, v0` — so nothing in a TES4 weather
+# should drive this.
+#
+# The previous revision ramped Sky Scale off the weather's own sky luminance.
+# That scales an ADDITIVE floor in proportion to the MULTIPLICATIVE colour,
+# i.e. a feedback loop: brighter sky -> bigger floor -> brighter sky.  It is
+# invisible to any per-field range check, which is why every clamping pass
+# missed it.  Measured on the shipped output, it made our Sky Scale a near
+# deterministic function of sky brightness where vanilla's is only loosely
+# related:
+#
+#     SkyUpper vs SkyScale   vanilla r = +0.407   ours r = +0.885
+#     Horizon  vs SkyScale   vanilla r = +0.374   ours r = +0.819
+#
+# What vanilla actually keys it off, over the 332 weather/time rows that
+# resolve an imagespace: classification x time explains R2 = 0.434, sky
+# luminance only R2 = 0.166.  So this is a LOOKUP on two authored TES4
+# fields (DATA.Classification and the time slot), with no colour dependence —
+# which also makes it generalise to plugins we have never seen.
+#
+# Medians measured over all 177 vanilla WTHR in Skyrim.esm + Update.esm +
+# Dawnguard.esm + Dragonborn.esm (tools/skyscale_authoring.py).
+# Index: [classification bit][time], times = Sunrise, Day, Sunset, Night.
+_IMGS_SKY_SCALE_BY_CLASS = {
+    0x01: (0.080, 0.120, 0.100, 0.020),   # Pleasant
+    0x02: (0.050, 0.100, 0.050, 0.000),   # Cloudy
+    0x04: (0.090, 0.100, 0.100, 0.060),   # Rainy
+    0x08: (0.100, 0.050, 0.050, 0.050),   # Snow
+}
+# Weathers with no classification bit set (10 of Oblivion's 37, including all
+# the Deadlands skies).  Vanilla's own unclassified weathers sit flat at 0.05.
+_IMGS_SKY_SCALE_UNCLASSIFIED = (0.050, 0.050, 0.050, 0.050)
 
 # --- Median-anchored bloom/exposure mapping -------------------------------
 #
@@ -569,13 +603,6 @@ _IMGS_FIELD_RESCALE = {
     'SunlightDimmer': (0.50, 2.00, 0.90, 2.70),
 }
 
-# Vanilla p10..p90 band for Sky Scale per slot.  Oblivion authors BRIGHT
-# night skies, so the luminance ramp alone gave some weathers a daytime
-# SkyScale at night — over-lighting the night sky and washing out the moons
-# and stars.  Vanilla night sits at med 0.035 / p90 0.13, hard-capped here.
-_IMGS_SLOT_SKY_SCALE_CLAMP = ((0.05, 0.20), (0.05, 0.375),
-                              (0.05, 0.25), (0.0, 0.13))
-
 # Bloom Blur Radius is 7.0 in ALL 213 vanilla weather-used imagespaces — it is
 # an engine constant, not authored data.  TES4's BlurRadius belongs to
 # Oblivion's own blur pass (a different quantity that happens to share a name)
@@ -596,13 +623,23 @@ def _rescale(name: str, value: float, default: float) -> float:
     return lo_out + t * (hi_out - lo_out)
 
 
-def _sky_luminance(rec: dict, time: int) -> float:
-    """Rec.709 luminance of the weather's Sky-Upper color at a time of day."""
-    raw = get_hex_bytes(rec, 'NAM0.Data')
-    if not raw or len(raw) < 160:
-        return _IMGS_SKY_LUM_DARK
-    o = (_T4_SKY_UPPER * 4 + time) * 4
-    return 0.299 * raw[o] + 0.587 * raw[o + 1] + 0.114 * raw[o + 2]
+def _imgs_sky_scale(rec: dict, time: int) -> float:
+    """IMGS Sky Scale for a time of day, from the weather's classification.
+
+    Keyed on AUTHORED TES4 data only (DATA.Classification + the time slot), so
+    it never feeds sky colour back into an additive shader term, and it works
+    for plugins whose weathers we have never seen.
+
+    Unclassified weathers keep vanilla's flat unclassified value rather than
+    being promoted to Pleasant the way _wthr_flags does — 10 of Oblivion's 37
+    weathers are unclassified, including the Deadlands skies, and giving them
+    Pleasant's daytime scale lights them like a clear Skyrim afternoon.
+    """
+    cls = get_int(rec, 'DATA.Classification') & _WTHR_CLASSIFICATION_MASK
+    for bit in (0x01, 0x02, 0x04, 0x08):
+        if cls & bit:
+            return _IMGS_SKY_SCALE_BY_CLASS[bit][time]
+    return _IMGS_SKY_SCALE_UNCLASSIFIED[time]
 
 
 def _wthr_imgs(rec: dict, imgs_fid: int, time: int) -> bytes:
@@ -642,16 +679,11 @@ def _wthr_imgs(rec: dict, imgs_fid: int, time: int) -> bytes:
                             get_float(rec, 'HNAM.SunlightDimmer', 1.3), 1.9)
     sunlight *= _IMGS_SLOT_SUNLIGHT_BIAS[time]
 
-    # Sky Scale: ramp from the dark-sky value to the lit-sky value off the
-    # weather's own sky luminance, then clamp to the vanilla p10..p90 band
-    # for this slot — Oblivion's bright night skies otherwise land a daytime
-    # value at night and wash out the moons and stars.
-    lum = _sky_luminance(rec, time)
-    t = min(max((lum - _IMGS_SKY_LUM_DARK) / _IMGS_SKY_LUM_DARK, 0.0), 1.0)
-    sky_scale = (_IMGS_SKY_SCALE_DARK
-                 + t * (_IMGS_SKY_SCALE_LIT - _IMGS_SKY_SCALE_DARK))
-    ss_lo, ss_hi = _IMGS_SLOT_SKY_SCALE_CLAMP[time]
-    sky_scale = min(max(sky_scale, ss_lo), ss_hi)
+    # Sky Scale: a LOOKUP on authored classification + time.  See
+    # _IMGS_SKY_SCALE_BY_CLASS — deriving this from sky luminance (as an
+    # earlier revision did) drives an additive shader term from the
+    # multiplicative colour and is the bloom feedback loop.
+    sky_scale = _imgs_sky_scale(rec, time)
 
     # Defaults are the vanilla weather-used per-slot medians, so a weather
     # with no authored TES4 HDR renders like a normal Skyrim exterior.
@@ -871,30 +903,69 @@ def _nam0_class_defaults(rec: dict) -> dict:
     return _NAM0_SLOT_CLASS_DEFAULTS[0x01]
 
 _TES5_NAM0_SLOTS = 17
+
+# TES5 NAM0 slot indices we address by name (see _NAM0_TES5_FROM_TES4 for the
+# full map).  Named from the decompiled TESWeather::ColorTypes enum.
+_T5_STARS = 6
 _TES5_CLOUD_LAYERS = 32
 
-# --- NAM0 luminance normalization ------------------------------------------
+# --- NAM0 highlight compression (soft knee) --------------------------------
 #
-# Oblivion authors its weather colors MUCH hotter than Skyrim (census of the
-# real Skyrim.esm vs the converted output, 2026-08-09): the Sun color slot is
-# 193 median luminance at midday against vanilla's 43 (the sun's apparent
-# brightness in Skyrim comes from HDR, not this slot — a 255-luminance disc
-# BLOOMS enormously), Sunlight runs 206 vs 152, the day sky 137 vs 84, fog 137
-# vs 96 — while Ambient is authored DARKER (92 vs 172), which is why the scene
-# read as blown highlights over dark shadows no matter what the imagespace
-# said.  Bloom triggers on RENDERED luminance, so no IMGS calibration can fix
-# colors that run 1.5-4x vanilla.
+# THE PALETTE AND THE BLOOM ARE TWO DIFFERENT PROBLEMS.  Getting that wrong
+# is what the previous revision did, and it cost a lot of in-game rounds.
 #
-# The normalization is self-calibrating per plugin: before Phase 2b converts
-# any weather, set_nam0_normalization() computes the PLUGIN's median luminance
-# per TES4 slot and time over all its weathers, and every color is then
-# scaled so the plugin median lands on the vanilla median (hue preserved),
-# hard-capped at the vanilla p90.  Authored bright/dark variation between
-# weathers survives; the overall palette lands where Skyrim's renderer
-# expects.
+# What the old code did: compute the PLUGIN's median luminance per slot and
+# per TIME, scale every colour so that median lands on vanilla's, then cap at
+# vanilla's p90.  It did stop the bloom — but by crushing the whole palette,
+# and it produced two clearly wrong results in game:
 #
+#   * NIGHTS WENT BRIGHT BLUE.  Oblivion authors night at 7-12% of day
+#     luminance.  A PER-TIME factor scaled night up 1.9-3.1x while scaling day
+#     down 0.62-0.70x, so the authored day/night ratio became 22-55% — the
+#     night sky stopped being dark and became a saturated blue.
+#   * THE DAY SKY WENT DULL.  Authored SkyUpper day median 136.5 was pushed to
+#     84.3, because the vanilla median it aimed at is pulled down by storms,
+#     dungeons and Sovngarde rather than describing a clear afternoon.
+#
+# The measurement that settles it: the two populations AGREE at the bottom and
+# only diverge at the top (all sky/light slots x times, TES4 vs the 177
+# vanilla weathers):
+#
+#     percentile     p50    p75    p90    p95    p99
+#     TES4          76.9  154.6  204.6  243.1  255.0
+#     vanilla       83.8  125.8  168.0  193.5  220.3
+#
+# So Oblivion's colours are NOT broadly hot.  Only the top ~20% is, which is
+# exactly the part that crosses the tonemapper's bright-pass threshold
+# (`max(scene - BloomThreshold, 0) * BloomScale`, verified against Oblivion's
+# own HDR005.pso and Skyrim's ISHDR.hlsl).  A uniform scale therefore darkens
+# midtones to fix highlights.
+#
+# What we do instead: leave everything below the knee EXACTLY AS AUTHORED and
+# remap knee..255 into knee..ceiling, scaling all three channels by the same
+# factor so hue is untouched.  Because the curve is a pure function of one
+# colour's luminance, it has no time axis and no plugin-population term — the
+# authored day/night ratio survives bit-for-bit (measured: 0.073 authored ->
+# 0.073 through the knee, against 0.253 through the old code), and a weather
+# converts the same way regardless of what else is in the plugin.
+#
+# THE SUN SLOT IS A GENUINE OUTLIER and gets its own, much harder knee.  Its
+# TES4 day median is 193.4 against vanilla's 42.5 — 4.55x, where no other slot
+# exceeds 1.7x.  In Skyrim the sun's apparent brightness comes from the glare
+# pass and the imagespace, not from this colour, so a near-white disc here is
+# a bloom source with nothing to justify it.
+#
+# Chosen in game from tools/make_sky_unjustified_esp.py (variant UJkneeSun)
+# against UJbase/UJraw/UJknee/UJkneeSoft/UJkneeHard/UJsunonly.
+_NAM0_KNEE = 160.0            # below this, authored colour passes through
+_NAM0_KNEE_CEILING = 200.0    # 255 maps here
+_NAM0_SUN_KNEE = 30.0
+_NAM0_SUN_CEILING = 60.0
+_T5_SUN = 5
+
 # Vanilla targets: (per-time medians, per-time p90 luminance), keyed by TES5
-# NAM0 slot, measured over the 84 Skyrim.esm weathers.
+# NAM0 slot, measured over the 84 Skyrim.esm weathers.  RETAINED ONLY as the
+# reference figures quoted above; nothing reads them any more.
 _NAM0_VANILLA_LUM = {
     0:  ((86.4, 84.3, 85.4, 21.3), (161.8, 155.8, 167.3, 114.8)),   # Sky-Upper
     1:  ((85.2, 95.9, 80.5, 52.3), (137.6, 137.6, 138.4, 117.1)),   # Fog Near
@@ -913,65 +984,47 @@ _NAM0_VANILLA_LUM = {
 _NAM0_EFFECT_LIGHTING = ((150, 163, 158), (198, 193, 193),
                          (159, 129, 116), (84, 148, 166))
 
-# Cloud layer tints (PNAM): vanilla medians are 0 (layers go black at their
-# off times), so med->med scaling is meaningless — the p90 CAP is what stops
-# Oblivion's white cloud banks from bleaching the horizon.
-_PNAM_VANILLA_P90 = (151.0, 186.0, 111.0, 57.0)
-
-# TES5 slot -> the TES4 source slot its normalization factor is computed
-# from.  Mirrors _NAM0_TES5_FROM_TES4 for the slots with vanilla targets.
-_NAM0_NORM_SOURCES = {0: 0, 1: 1, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8, 12: 1}
-
-# k[(tes5_slot, time)] scale factors for the CURRENT plugin, set by
-# set_nam0_normalization() before Phase 2b runs.  Missing key = no scaling
-# (still capped at vanilla p90).
-_NAM0_K = {}
+# Cloud layer tints (PNAM) get the same knee as the sky slots.  The old p90
+# cap here was the same percentile fit as the NAM0 one and had the same flaw:
+# it clamped by TIME, so a layer's authored day/night relationship moved.
+_PNAM_KNEE = _NAM0_KNEE
+_PNAM_KNEE_CEILING = _NAM0_KNEE_CEILING
 
 
 def _lum(r, g, b):
     return 0.299 * r + 0.587 * g + 0.114 * b
 
 
-def set_nam0_normalization(wthr_records: list) -> None:
-    """Compute this plugin's NAM0 luminance scale factors (see block comment).
+def _knee_rgb(r, g, b, knee: float, ceiling: float) -> tuple:
+    """Compress luminance above `knee` into `knee..ceiling`, hue preserved.
 
-    Needs a real population to be meaningful: with fewer than 5 weathers the
-    medians are noise, so scaling is skipped (caps still apply)."""
-    _NAM0_K.clear()
-    lums = {}
-    for rec in wthr_records:
-        raw = get_hex_bytes(rec, 'NAM0.Data')
-        if not raw or len(raw) < 160:
-            continue
-        for t4_slot in range(10):
-            for time in range(4):
-                o = (t4_slot * 4 + time) * 4
-                lums.setdefault((t4_slot, time), []).append(
-                    _lum(raw[o], raw[o + 1], raw[o + 2]))
-    for t5_slot, t4_slot in _NAM0_NORM_SOURCES.items():
-        meds, _p90s = _NAM0_VANILLA_LUM[t5_slot]
-        for time in range(4):
-            xs = sorted(lums.get((t4_slot, time), ()))
-            if len(xs) < 5:
-                continue
-            our_med = xs[len(xs) // 2]
-            if our_med < 5.0:
-                # a population that is essentially black stays black
-                _NAM0_K[(t5_slot, time)] = 0.0 if meds[time] < 5.0 else 1.0
-                continue
-            _NAM0_K[(t5_slot, time)] = meds[time] / our_med
+    Below the knee the colour is returned EXACTLY as authored — no scaling,
+    no rounding drift.  Above it, all three channels are scaled by the same
+    factor, so only brightness changes.
+
+    This is a pure function of one colour: no time-of-day term and no
+    dependence on the rest of the plugin, which is what keeps the authored
+    day/night curve intact.
+    """
+    lum = _lum(r, g, b)
+    if lum <= knee or lum <= 0.0:
+        return (r, g, b)
+    target = knee + (lum - knee) * (ceiling - knee) / (255.0 - knee)
+    s = target / lum
+    return (min(255, round(r * s)), min(255, round(g * s)),
+            min(255, round(b * s)))
 
 
 def _normalize_rgb(t5_slot: int, time: int, r: int, g: int, b: int) -> tuple:
-    """Scale a color by the plugin factor and cap at the vanilla p90."""
-    k = _NAM0_K.get((t5_slot, time), 1.0)
-    r, g, b = r * k, g * k, b * k
-    cap = _NAM0_VANILLA_LUM[t5_slot][1][time]
-    l = _lum(r, g, b)
-    if l > cap and l > 0:
-        s = cap / l
-        r, g, b = r * s, g * s, b * s
-    return (min(255, round(r)), min(255, round(g)), min(255, round(b)))
+    """Apply the highlight knee for a NAM0 slot.
+
+    `time` is unused and kept only so callers read symmetrically with the
+    slot/time addressing everywhere else — the whole point of the knee is
+    that it has no time axis (see the block comment above).
+    """
+    if t5_slot == _T5_SUN:
+        return _knee_rgb(r, g, b, _NAM0_SUN_KNEE, _NAM0_SUN_CEILING)
+    return _knee_rgb(r, g, b, _NAM0_KNEE, _NAM0_KNEE_CEILING)
 
 # DALC face brightness relative to NAM0's Ambient color, in xEdit's field
 # order (X+, X-, Y+, Y-, Z+, Z-).  Medians measured over all 84 vanilla
@@ -1016,6 +1069,24 @@ def _wthr_nam0(rec: dict) -> bytes:
             if t5_slot in _NAM0_VANILLA_LUM:
                 r, g, b = _normalize_rgb(t5_slot, time, r, g, b)
             out[dst:dst + 3] = bytes((r, g, b))
+
+    # Stars (slot 6) is a VISIBILITY SWITCH in vanilla, not a continuous tint.
+    # Censused over the 165 vanilla weathers that carry a full NAM0:
+    #
+    #   Pleasant  91.4% pure white   3.7% black
+    #   Cloudy    17.8% white       60.0% black   (genuinely mixed)
+    #   Rainy      4.3% white       95.7% black
+    #   Snow      22.2% white       77.8% black
+    #
+    # Oblivion has no such convention and authors a continuous value on every
+    # weather, so a converted rainstorm keeps a starfield burning through the
+    # overcast.  Rain and snow are unambiguous, so blank the stars there;
+    # Cloudy is left alone because vanilla itself is split on it.
+    cls = get_int(rec, 'DATA.Classification') & _WTHR_CLASSIFICATION_MASK
+    if cls & (0x04 | 0x08):
+        for time in range(4):
+            dst = (_T5_STARS * 4 + time) * 4
+            out[dst:dst + 3] = b'\x00\x00\x00'
     return bytes(out)
 
 
@@ -1043,12 +1114,152 @@ def _cloud_speed_tes4_to_tes5(speed: int) -> int:
     return min(254, 127 + round(speed / 255.0 * 127.0))
 
 
-def _wthr_cloud_arrays(rec: dict, used_layers) -> bytes:
+def _cloud_speed_signed_tes5(speed: float) -> int:
+    """Encode a SIGNED TES4-scale cloud speed into TES5's RNAM/QNAM byte.
+
+    Same scale as _cloud_speed_tes4_to_tes5, but accepts negatives so a layer
+    can drift backwards.  The engine decodes this as
+    `byte * 0.2/254 - 0.1` (Clouds::Update, SkyrimSE.exe 0x3c54ad-0x3c54de:
+    xmm4=0.1, xmm3=0.1 XOR -0.0 = -0.1, xmm10=1/254), so 0x7F is exactly
+    stationary and the usable range is 0x00..0xFE.
+    """
+    speed = max(-255.0, min(255.0, speed))
+    return max(0, min(254, 127 + round(speed / 255.0 * 127.0)))
+
+
+# Fraction of a layer's authored drift that goes on the X axis.  TES4 authors
+# only a magnitude, so the axis split is ours; this keeps the motion clearly
+# two-dimensional (vanilla drives both axes) without changing the overall
+# rate much.  Sign is negative so X and Y differ, which is what makes the
+# motion read as drift rather than a straight scroll.
+_WTHR_CLOUD_X_DRIFT = -0.35
+
+
+# --- Cloud dome layer plan -------------------------------------------------
+#
+# LAYER INDICES BIND TO SHAPES IN *VANILLA'S* DOME, AND THE SHAPES ARE NOT
+# INTERCHANGEABLE -- each carries its own UV tiling.
+#
+# The engine loads the HARDCODED `Meshes\Sky\Clouds.nif` (string at
+# SkyrimSE.exe 0x169a538).  Our converted `tes4\sky\clouds.nif` is NEVER
+# used: CLMT has no cloud-mesh field at all -- its MODL is the NIGHT SKY
+# (stars) mesh, per wbRecord(CLMT) in wbDefinitionsTES5.pas and
+# TESClimate::nightSky in CommonLibSSE-NG.  An earlier revision assumed we
+# shipped the dome and capped the plan at two layers on that basis; that was
+# wrong, and it put both sheets on the two smallest shapes in the mesh.
+#
+# Measured UV spans of the shipped 29-shape dome:
+#
+#     L11 09_CDTop            U 1.58  V 1.58    ~1:1 projection
+#     L27 14_CDLower          U 2.27  V 2.27    ~1:1 projection
+#     L 8 07_CDDome_Horizon   U 6.00            tiles 6x around the horizon
+#     L 9/10 (_E/_W)          U 2.40            same band, split
+#     L15-26 12_/13_CDHorizon_*  V 0.25         narrow V-sliced STRIPS
+#     L28 15_CDFog            U 21.00           tiles 21x, horizon wash
+#
+# Oblivion authors its two sheets as SINGLE FULL-DOME PROJECTIONS
+# (`CloudDome:0` 3.35x3.35 and `CloudDome:1` 2.97x2.97, both spanning 0..90
+# degrees elevation), so **11 and 27 are the only structural matches**.  Any
+# heavily U-tiled shape turns a full-sky sheet into a repeating horizon band,
+# which is exactly what was observed in game: a variant using 8/9/10 put all
+# the cloud around the horizon instead of over the sky.
+#
+# Vanilla confirms the roles by shipping DEDICATED ART per layer:
+#     L11  SkyrimClouds01 / SkyrimCloudsLower0*   (full-dome sheets)
+#     L27  SkyrimClouds01 / SkyrimCloudsLower03   (full-dome sheets)
+#     L16  SkyrimCloudsHorizon01   50 of 50 times (purpose-made strip)
+#     L28  SkyrimCloudsFill       156 of 157      (purpose-made wash)
+# We have no strip or wash art, so those layers have nothing correct to put
+# on them and stay empty.
+#
+# Confirmed in game against variants placing the sheets on 8/9/10/11 +
+# strips + fog wash, on 3/6/11, on 11/27 swapped, and on 11/27 alone:
+# 11 (upper) + 27 (lower) is correct.  See tools/make_sky_unjustified_esp.py.
+_WTHR_UPPER_LAYER = 11        # 09_CDTop
+_WTHR_LOWER_LAYER = 27        # 14_CDLower
+
+# LNAM IS NOT A LAYER COUNT — it is an ARRAY INDEX CLAMP.
+#
+# Read out of SkyrimSE.exe rather than inferred.  Every read of
+# TESWeather+0x7D0 in .text was enumerated (122 candidate dword hits, three
+# real readers) and they all use the identical idiom:
+#
+#     mov   ecx, [r12 + 0x7d0]        ; LNAM
+#     test  ecx, ecx
+#     jle   .default                  ; LNAM <= 0 -> speed 0x33, alpha 1.0
+#     cmp   ebx, ecx                  ; layerIndex vs LNAM
+#     cmovl eax, ebx                  ; idx = (layer < LNAM) ? layer : 0
+#     movzx edx, byte [rax+r12+0x220] ; cloudLayerSpeedY[idx]   RNAM
+#
+#   Clouds::Update  0x3c5485 (current weather) and 0x3c54ff (last weather)
+#   JNAM alpha getter 0x2c1eb0  ([rcx+rdx*4+0x460])
+#
+# The PNAM colour getter (0x2c1e99) has no clamp at all.  The draw loops are
+# bounded by Clouds::numLayers (the runtime object, +0x510) and a hard 32
+# (`cmp bx, 0x20`), NOT by LNAM.  Layer visibility is owned solely by NAM1,
+# which sets APP_CULLED on the layer geometry (0x3c5c56).
+#
+# So a too-small LNAM does not hide layers — it makes every layer at or above
+# it silently reuse layer 0's speed and layer 0's alpha.  It must therefore
+# cover every layer we actually author an RNAM/QNAM/JNAM entry for.
+_WTHR_LNAM_MIN = 1
+
+# Minimum width of the fog ramp, in world units, when a weather authors a far
+# plane at or inside its near plane.  A zero-width ramp makes fog snap to full
+# density instead of blending; vanilla's tightest real ramp is
+# RiftenOvercastFog at 9000, and its 13 degenerate records are all 0/0
+# no-fog FX weathers rather than authored fog.
+_WTHR_FOG_MIN_RAMP = 9000.0
+
+# Fog curve shape.  1.0/1.0 makes Skyrim's min(Max, pow(t, Power)) identical
+# to Oblivion's fixed-function linear fog — see the FNAM block in convert_WTHR
+# for the derivation.  These are NOT tuning knobs; changing them makes the
+# converted fog stop matching the source engine.
+_WTHR_FOG_POWER = 1.0
+_WTHR_FOG_MAX = 1.0
+
+# ALPHA IS THE SCALAR THAT WAS MISSING (and it is still missing without this).
+#
+# The original converter wrote 1.0 on both layers, so layer 0 was an opaque
+# plane painted over the sky gradient at full strength and layer 1 was
+# completely occluded behind it -- the cloud sheet BECAME the sky, which is
+# what bleached the horizon.  Vanilla composites translucent sheets instead:
+# over every vanilla weather that enables the layer, the per-time medians are
+# 0.50-0.60 on layer 0 and 0.75-1.00 on layer 1.  Those are the values here.
+#
+# (layer, alpha per time-of-day: sunrise, day, sunset, night)
+_WTHR_UPPER_PLAN = (
+    (_WTHR_UPPER_LAYER, (0.60, 0.50, 0.60, 0.50)),
+)
+_WTHR_LOWER_PLAN = (
+    (_WTHR_LOWER_LAYER, (1.00, 1.00, 0.75, 1.00)),
+)
+
+
+def _wthr_cloud_layer_plan(lower_cloud: str, upper_cloud: str) -> list:
+    """Distribute TES4's two cloud textures across the TES5 dome bands.
+
+    Returns [(layer, texture, alpha_per_time), ...] — see the block comment.
+    A weather that authored only one of the two textures still fills the
+    bands that texture is responsible for; the other band stays empty rather
+    than being padded with a texture the weather never authored.
+    """
+    plan = []
+    if upper_cloud:
+        for layer, alphas in _WTHR_UPPER_PLAN:
+            plan.append((layer, upper_cloud, alphas))
+    if lower_cloud:
+        for layer, alphas in _WTHR_LOWER_PLAN:
+            plan.append((layer, lower_cloud, alphas))
+    return plan
+
+
+def _wthr_cloud_arrays(rec: dict, layer_plan) -> bytes:
     """Build TES5's per-cloud-layer RNAM/QNAM/PNAM/JNAM arrays.
 
-    TES4 has no per-layer data — it has exactly two cloud layers and a single
-    speed byte for each.  Layers 0/1 therefore take the TES4 lower/upper cloud
-    speed and color; every other layer gets the vanilla neutral value.
+    `layer_plan` is [(layer, texture, alpha_per_time), ...] from
+    _wthr_cloud_layer_plan(), plus the synthesized fill layer — see the block
+    comment above it for why TES4's two textures are spread over the dome.
 
     Sizes verified against references/Skyrim.esm (83/84 vanilla records):
       RNAM 32B  — cloud speed Y, u8 per layer, 0x7F = neutral (no drift)
@@ -1058,41 +1269,72 @@ def _wthr_cloud_arrays(rec: dict, used_layers) -> bytes:
     """
     speed_lower = get_int(rec, 'DATA.CloudSpeedLower')
     speed_upper = get_int(rec, 'DATA.CloudSpeedUpper')
+    lower_speed = _cloud_speed_tes4_to_tes5(speed_lower)
+    upper_speed = _cloud_speed_tes4_to_tes5(speed_upper)
+
+    lower_cloud = get_str(rec, 'CNAM.LowerCloudLayer')
+    upper_cloud = get_str(rec, 'DNAM.UpperCloudLayer')
 
     rnam = bytearray(b'\x7F' * _TES5_CLOUD_LAYERS)
     qnam = bytearray(b'\x7F' * _TES5_CLOUD_LAYERS)
-    rnam[0] = _cloud_speed_tes4_to_tes5(speed_lower)
-    rnam[1] = _cloud_speed_tes4_to_tes5(speed_upper)
 
-    # Cloud tints come from the TES4 color table's Clouds-Lower/Clouds-Upper
-    # rows so the layers match the sky they are drawn against.
     raw = get_hex_bytes(rec, 'NAM0.Data')
     pnam = bytearray(_TES5_CLOUD_LAYERS * 4 * 4)
-    if raw and len(raw) >= 160:
-        for layer, t4_slot in ((0, _T4_CLOUDS_LOWER), (1, _T4_CLOUDS_UPPER)):
-            for time in range(4):
-                src = (t4_slot * 4 + time) * 4
-                dst = (layer * 4 + time) * 4
-                r, g, b = raw[src], raw[src + 1], raw[src + 2]
-                # Cap at the vanilla textured-layer p90 — Oblivion's near-
-                # white cloud tints are what bleached the horizon (vanilla
-                # medians are 0 here, so only the cap is meaningful).
-                cap = _PNAM_VANILLA_P90[time]
-                l = _lum(r, g, b)
-                if l > cap and l > 0:
-                    s = cap / l
-                    r, g, b = round(r * s), round(g * s), round(b * s)
-                pnam[dst:dst + 3] = bytes((r, g, b))
-
-    # Cloud alpha, per layer per time-of-day.  Only the layers that actually
-    # carry a texture may be opaque: a blanket 1.0 across all 32 layers asks
-    # the engine to draw 30 fully-opaque empty layers on top of the sky.
-    # TES4 has no per-layer alpha curve, so the two real layers are opaque and
-    # the rest are transparent.
     alphas = [0.0] * (_TES5_CLOUD_LAYERS * 4)
-    for layer in used_layers:
+
+    def tint(t4_slot, time):
+        """The TES4 cloud tint, highlight-compressed like the sky slots.
+
+        The cloud sheet is MULTIPLIED by this tint (verified in both engines'
+        pixel shaders), so a near-white tint hands the tonemapper the texture
+        at full strength.  Same knee as NAM0: authored below it, compressed
+        above it, and with no time axis so a layer keeps its authored
+        day/night relationship.
+        """
+        src = (t4_slot * 4 + time) * 4
+        return _knee_rgb(raw[src], raw[src + 1], raw[src + 2],
+                         _PNAM_KNEE, _PNAM_KNEE_CEILING)
+
+    # Wind direction, for the X (QNAM) axis.  TES4 has no per-weather wind
+    # direction, so the drift axis is derived from the same authored speed:
+    # the engine reads BOTH arrays every frame (Clouds::Update 0x3c549b and
+    # 0x3c54a4 in SkyrimSE.exe), and leaving QNAM at the neutral 0x7F means
+    # the clouds never move horizontally at all.  Vanilla authors nonzero X
+    # drift on 557 of 2656 layer entries and NEGATIVE drift on 77 of them, so
+    # a single-axis, single-sign copy is visibly wrong motion.
+    #
+    # Split the authored speed across the two axes so the total drift rate is
+    # preserved: Y keeps the full authored magnitude, X gets a fixed fraction
+    # of it.  Both encode through _cloud_speed_tes4_to_tes5, which is signed
+    # about 0x7F (speed = byte*0.2/254 - 0.1, verified from the machine code).
+    for layer, texture, layer_alphas in layer_plan:
+        if not 0 <= layer < _TES5_CLOUD_LAYERS:
+            continue
+        # Each dome layer drifts with the TES4 speed authored for the sheet it
+        # came from, so the upper and lower bands keep their relative motion.
+        t4_speed = speed_upper if texture == upper_cloud else speed_lower
+        rnam[layer] = upper_speed if texture == upper_cloud else lower_speed
+        qnam[layer] = _cloud_speed_signed_tes5(
+            t4_speed * _WTHR_CLOUD_X_DRIFT)
         for time in range(4):
-            alphas[layer * 4 + time] = 1.0
+            alphas[layer * 4 + time] = layer_alphas[time]
+        if not raw or len(raw) < 160:
+            continue
+        t4_slot = (_T4_CLOUDS_UPPER if texture == upper_cloud
+                   else _T4_CLOUDS_LOWER)
+        for time in range(4):
+            dst = (layer * 4 + time) * 4
+            pnam[dst:dst + 3] = bytes(tint(t4_slot, time))
+
+    # NO SYNTHESIZED FILL LAYER.  A previous revision added one on layer 28
+    # (`Sky\SkyrimCloudsFill.dds`, which 68 of 84 vanilla weathers use as a
+    # dark horizon wash).  That is real vanilla behaviour but it is not
+    # portable: it depends on Skyrim's 29-shape dome having geometry at layer
+    # 28, and the dome WE ship is Oblivion's two-shape CloudDome.  Enabling a
+    # layer the dome cannot draw is what produced the stitched-together sky.
+    # Holding the horizon down has to come from the fog and colour tables,
+    # which apply to the dome we actually have.
+
     jnam = struct.pack('<%df' % (_TES5_CLOUD_LAYERS * 4), *alphas)
 
     return (pack_subrecord('RNAM', bytes(rnam))
@@ -1466,21 +1708,31 @@ def convert_WTHR(rec: dict, writer=None) -> tuple:
             edid = 'TES4' + edid
         subs += pack_string_subrecord('EDID', edid)
 
-    # Cloud layer textures — TES4's two layers become TES5 layers 0 and 1.
+    # Cloud layer textures.  TES4 authors exactly two sheets; Skyrim's dome is
+    # a stack whose vanilla weathers populate a median of EIGHT layers, split
+    # into an upper dome, a mid band and a HORIZON band.  Putting the two TES4
+    # sheets on layers 0/1 alone left the horizon band empty, so the horizon
+    # showed bare sky gradient under an opaque cloud plane seen edge-on.
+    # _wthr_cloud_layer_plan spreads them across the bands the engine expects.
     lower_cloud = get_str(rec, 'CNAM.LowerCloudLayer')
     upper_cloud = get_str(rec, 'DNAM.UpperCloudLayer')
+    layer_plan = _wthr_cloud_layer_plan(lower_cloud, upper_cloud)
     used_layers = []
-    for layer, path in ((0, lower_cloud), (1, upper_cloud)):
-        if not path:
-            continue
+    for layer, path, _alphas in layer_plan:
         sig = _wthr_cloud_sig(layer)
         path_bytes = _prefix_path(path).encode('utf-8') + b'\x00'
         subs += sig + struct.pack('<H', len(path_bytes)) + path_bytes
         used_layers.append(layer)
 
-    # LNAM — Max Cloud Layers.  Vanilla is always 29 (0x1D); xEdit marks the
-    # field required with that default.  0 made the engine allocate no layers.
-    subs += pack_uint32_subrecord('LNAM', 29)
+    # LNAM — see _WTHR_LNAM_MIN.  Disassembly of every reader in SkyrimSE.exe
+    # shows this is an INDEX CLAMP into RNAM/QNAM/JNAM, not an allocation
+    # count: layers >= LNAM keep drawing but silently reuse layer 0's speed
+    # and layer 0's alpha.  So it must span the layers we author, and it must
+    # be > 0 (LNAM <= 0 takes the `jle` default of speed 0x33 / alpha 1.0,
+    # which throws away the authored JNAM entirely).
+    subs += pack_uint32_subrecord(
+        'LNAM', max(_WTHR_LNAM_MIN, (max(used_layers) + 1) if used_layers
+                    else _WTHR_LNAM_MIN))
 
     # MNAM (Precipitation Type -> SPGD) and NNAM (Visual Effect -> RFCT) are
     # .SetRequired in xEdit.
@@ -1500,7 +1752,7 @@ def convert_WTHR(rec: dict, writer=None) -> tuple:
     subs += pack_formid_subrecord('NNAM', 0)
 
     # RNAM/QNAM/PNAM/JNAM — per-cloud-layer speed, color and alpha.
-    subs += _wthr_cloud_arrays(rec, used_layers)
+    subs += _wthr_cloud_arrays(rec, layer_plan)
 
     # NAM0 — weather colors, remapped from TES4's 10 types to TES5's 17.
     subs += pack_subrecord('NAM0', _wthr_nam0(rec))
@@ -1511,15 +1763,58 @@ def convert_WTHR(rec: dict, writer=None) -> tuple:
     # earlier 1.0/1.0 was xEdit's field default, not what vanilla ships:
     # max 1.0 lets fog reach FULL opacity at the horizon, painting it with
     # Oblivion's pale fog color — a big part of the blown-white horizon.
-    fog_day_near = get_float(rec, 'FNAM.FogDayNear', 100.0)
+    #
+    # THE NEAR PLANE MUST NOT BE NEGATIVE.  Both games share the same
+    # `wbWeatherFogDistance` struct (xEdit wbDefinitionsCommon, used by
+    # wbDefinitionsTES4 and TES5 alike), so the field is a straight
+    # passthrough by layout -- but Oblivion AUTHORS negative near planes and
+    # Skyrim never does: 18 of Oblivion.esm's 37 weathers ship one (SETestAsh
+    # -750, SEThunderstorm night -6500, SE09SummoningWeather -2000) against
+    # 0 of the 84 vanilla Skyrim records.
+    #
+    # A negative near plane means the fog ramp starts BEHIND the camera, so
+    # every visible pixel is already past the ramp's start and fog renders at
+    # full density with no gradient.  That is worst along the LONGEST view
+    # rays -- the horizon -- and it is view-dependent, which is why the sky
+    # looks right when facing the ground and the horizon flares when you look
+    # up into it.  Clamp to the vanilla floor of 0.
+    fog_day_near = max(0.0, get_float(rec, 'FNAM.FogDayNear', 100.0))
     fog_day_far = get_float(rec, 'FNAM.FogDayFar', 100000.0)
-    fog_night_near = get_float(rec, 'FNAM.FogNightNear', 100.0)
+    fog_night_near = max(0.0, get_float(rec, 'FNAM.FogNightNear', 100.0))
     fog_night_far = get_float(rec, 'FNAM.FogNightFar', 100000.0)
+    # A near plane at or beyond the far plane is degenerate the same way: the
+    # ramp has no width, so fog snaps to full density instead of blending.
+    if fog_day_far <= fog_day_near:
+        fog_day_far = fog_day_near + _WTHR_FOG_MIN_RAMP
+    if fog_night_far <= fog_night_near:
+        fog_night_far = fog_night_near + _WTHR_FOG_MIN_RAMP
+    # Power and Max: TES4 has NO source for either, and the correct values are
+    # fixed by the two engines' fog EQUATIONS, not by what vanilla happens to
+    # author.
+    #
+    #   Skyrim   (Lighting.hlsl:271, identical in Effect.hlsl/DistantTree.hlsl)
+    #     f = min(Max, exp2(Power * log2(saturate((d-Near)/(Far-Near)))))
+    #       = min(Max, pow(t, Power))
+    #   Oblivion  fixed-function D3DFOG_LINEAR.  Established by disassembling
+    #     all 123 vertex shaders in Data/Shaders/shaderpackage001.sdp and
+    #     finding that NONE writes oFog (RASTOUT#1); the weather's near/far go
+    #     straight into a BSFogProperty (Atmosphere::Update 0x53b318..0x53b34c).
+    #     D3D linear fog is (End-d)/(End-Start), whose complement — the fog
+    #     weight, which is what Skyrim's fogColorParam holds — is
+    #     (d-Start)/(End-Start).
+    #
+    # With Power=1 and Max=1, min(1, pow(t,1)) == t == Oblivion's ramp
+    # exactly, at every distance.  The previous 0.4/0.9 were vanilla medians
+    # and are wrong by up to +0.32 fog mid-ramp and -0.10 at the far plane
+    # (where Max=0.9 leaves a tenth of the scene permanently unfogged).
+    # 15 of 177 vanilla weathers ship Power=1.0 and 29 ship Max=1.0, so these
+    # are ordinary values for the engine — but the reason to write them is the
+    # identity above, not their frequency.
     fnam = struct.pack('<ffffffff',
                         fog_day_near, fog_day_far,
                         fog_night_near, fog_night_far,
-                        0.4, 0.4,      # Day/Night power (vanilla median)
-                        0.9, 0.925)    # Day/Night max (vanilla median)
+                        _WTHR_FOG_POWER, _WTHR_FOG_POWER,
+                        _WTHR_FOG_MAX, _WTHR_FOG_MAX)
     subs += pack_subrecord('FNAM', fnam)
 
     # DATA — Weather Data (19 bytes in TES5).
@@ -1528,20 +1823,26 @@ def convert_WTHR(rec: dict, writer=None) -> tuple:
     # (offsets 1-2) with padding, having moved per-layer speed into RNAM/QNAM,
     # and appends four fields TES4 has no source for.
     #
-    # Two bytes are NOT passthroughs (census of the real Skyrim.esm, 84
-    # weathers, vs the 37/34 authored TES4 records):
-    #  - Trans Delta: TES4 spans 0..255 (median 255); vanilla TES5 is 125
-    #    almost universally (median AND p90).  Linear x125/255 keeps authored
-    #    variation and lands the median exactly on vanilla.
-    #  - Sun Glare: TES4 clear weathers author 255; the vanilla median is 0,
-    #    p90 153, max 191 — a raw 255 overdrives the glare pass and paints
-    #    the sky white toward the sun.  x0.6 maps TES4's max onto vanilla's
-    #    p90.
+    # Trans Delta is a real UNIT conversion, not a fitted one.  xEdit
+    # annotates the TES5 byte `scaled 0..0,25` (wbDefinitionsTES5.pas:10650)
+    # against TES4's plain 0..255, and the authored data shows the ceiling
+    # exactly: over all 177 vanilla WTHR the byte NEVER exceeds 125 (134 of
+    # them sit precisely at 125), whereas 19 of Oblivion's 37 author 255.
+    # 125/255 maps TES4's full range onto the range the engine accepts.
+    #
+    # Sun Glare passes through UNSCALED.  A previous revision multiplied by
+    # 0.6 to land TES4's 255 on the vanilla p90 of 153 — a percentile fit with
+    # no mechanism behind it.  The census does not support a ceiling here the
+    # way it does for Trans Delta: vanilla reaches 204, and both games
+    # document the byte identically (`Sun Glare (0-1)` in the TES5 format
+    # notes; TES4 has the same field with the same width and no scale
+    # annotation).  Since the field means the same fraction in both engines,
+    # scaling it would dim an authored value for no reason.
     data = struct.pack(
         '<B2xBBBBBBBBBBBBBBBB',
         get_int(rec, 'DATA.WindSpeed'),
         round(get_int(rec, 'DATA.TransDelta') * 125 / 255),
-        round(get_int(rec, 'DATA.SunGlare') * 0.6),
+        get_int(rec, 'DATA.SunGlare'),
         get_int(rec, 'DATA.SunDamage'),
         get_int(rec, 'DATA.PrecipBeginFadeIn'),
         get_int(rec, 'DATA.PrecipEndFadeOut'),

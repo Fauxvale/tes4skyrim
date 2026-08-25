@@ -204,6 +204,55 @@ half of `quest_walkthrough.py`).
     dispatches by chained `sub`/`add`, so scanning for `cmp` immediates finds nothing),
     `--xref 0x7925b0` (rel32 call/jmp xrefs), `--const 0xa3f420` (f32/f64/u32 at a VA).
 - **★ Skyrim disassembler**: `python tools/skyrim_disasm.py [--find <class>] [--vtable <class>] [--slot N] [--disasm 0x<rva>] [--count N]` — RTTI class/vtable lookup + disassembly of the unpacked **GOG** `SkyrimSE.exe`. (The flags are `--find`/`--vtable`/`--disasm`; there is no `--rtti` or `--rva`.) `--disasm` takes a **GOG 1.6.659** RVA — feed it addresses from `address_lib.py`, and note that an Address Library ID resolves to the same *function* in both builds but **not** the same `+offset`, so translate the ID and disassemble from the function base rather than adding the crash-log offset.
+- **★ Oblivion RTTI -> vtable** (`python tools/ob_rtti.py [.?AVClass@@ ...]`) — MSVC
+  x86-32 RTTI walk on `Oblivion.exe`: TypeDescriptor -> COL -> vtable, printing the
+  first slots. Defaults to the sky classes. This is how `Atmosphere::Update`
+  (0x53b0e0) and `Clouds::Update` (0x53b730) were found. Per `SkyObject`, slot 3 is
+  `Update(sky, t)`.
+- **★ Oblivion absolute xrefs** (`python tools/ob_xref_abs.py 0xADDR [...]`) — every
+  instruction in `.text` referencing an absolute address. x86-32 encodes absolute
+  operands directly, so this finds all readers AND writers of a global. Used to find
+  the HDR parameter bank at `0xB432xx` and the sky gradient stops at `0xB431A8/B8/C8`.
+- **★ Oblivion shader extraction** (`python tools/sdp_extract.py [pkgsubstr]`) — lists
+  the D3D9 shaders inside `Data/Shaders/shaderpackageNNN.sdp` (offset, ps/vs, size,
+  name). The sky and HDR shaders live here; the exe only stages constants, so the
+  ACTUAL colour/tone-map arithmetic is only readable from this bytecode.
+- **★ D3D9 bytecode disassembler** (`tools/d3d9dis.py`, driver `tools/sky_dump.py
+  0xOFF ...`) — SM 1.x/2.x/3.x disassembly with correct operand counts (SM1 has no
+  length field in the opcode token) and CTAB comment-block skipping, which also
+  recovers constant NAMES. `sky_dump.py` prints `; const cN xM <name>` lines.
+  Register types: 4=oPos(RASTOUT) 5=oD(ATTROUT) 6=oT(TEXCRDOUT) — RASTOUT#1 is oFog,
+  and **no Oblivion vertex shader writes it**, which is how fixed-function linear fog
+  was established.
+- **★ Sky-dome geometry** (`python tools/dome_exact.py`, `python
+  tools/dome_alpha_curve.py`) — ring-by-ring dump of both games' `Atmosphere.nif`.
+  `dome_exact` prints every distinct z as a ring (radius, elevation, mean RGBA);
+  `dome_alpha_curve` resamples both domes onto a common ELEVATION axis, which is
+  what the player actually sees (the dome is drawn centred on the eye).
+  **Classify dome layers by ELEVATION for the atmosphere and by UV SPAN for the
+  clouds** — elevation ranges overlap heavily and say nothing about how a texture
+  is mapped. Established: Oblivion fades 0->1 over 13.81° from -3.65°, Skyrim over
+  2.09° from 0°.
+- **Horizon composite sweep** (`python tools/horizon_all_weathers.py`) — for every
+  converted weather/time, composites `sky*domeAlpha + fog*(1-domeAlpha)` through
+  BOTH domes and reports the Skyrim/Oblivion ratio. Used to show the dome-fade
+  difference is real (corr −0.734 with Horizon-minus-Fog contrast over 148 pairs)
+  but small in magnitude (0.88–1.23), i.e. not the overbright-horizon cause.
+- **★ Weather A/B plugins** — three generations, each answering a different
+  question. All write an ESP of override weathers you force in game; pass
+  `--out` when the previous file is locked by the game or xEdit.
+  - `python tools/make_sky_unjustified_esp.py` — **the current one.** One weather
+    per UNJUSTIFIED value (vanilla medians, percentile caps, invented numbers),
+    each reverting exactly one thing from our real converted record. This is how
+    the highlight knee, the Sun knee, and cloud layers 11/27 were chosen.
+    `--weather` / `--cloud-weather` pick the base records.
+  - `python tools/make_sky_ab_esp.py` — ISO/FIX sweep: every differing subrecord
+    group tested in BOTH directions against vanilla, so a culprit is confirmed
+    twice. Superseded, but the both-directions design is worth reusing.
+  - `python tools/make_sky_template_esp.py` — tests building a weather from a
+    vanilla template plus Tier-1 Oblivion overrides only. Not adopted; kept
+    because it documents which fields carry Oblivion's visual identity.
+
 - **★ Skyrim xrefs**: `python tools/skyrim_xref.py --pattern '<regex>'` — starts from the other end: which code references a given string/address. Pair with `skyrim_disasm.py`.
 - **★ Address Library**: `python tools/address_lib.py --log <crash.log>` — **start every CTD here.** Crash logs come from the user's *Steam* build (1.6.1170); only the *GOG* build (1.6.659) disassembles. `--log` translates every `-> <id>+0x<off>` frame in the log into GOG RVAs in one shot, ready to paste into `skyrim_disasm.py`. Also does single lookups: `--id N [--offset 0x..]`, or `--rva 0x.. --from 1.6.1170` to find the owning function. The versionlib v2 decoder is delta-coded — kinds 6/7 are u16/u32 (**not** u64) and the 0x08 high-nibble flag divides the previous offset by pointer size before the delta and multiplies back after; the loader now hard-fails if the stream doesn't consume the file exactly, since a desync silently yields plausible-looking wrong addresses.
 - **★ NIF load-time CTD audit**: `python tools/nif_block_type_audit.py <mesh dir> [--max N] [--exe <SkyrimSE.exe>]` — four checks for crashes that **PyFFI reads and writes happily** and no structural validation catches. (1) **Unknown block types**: cross-checks every emitted type against the exe's RTTI registry; a type with no RTTI cannot be constructed by `NiStream`, and a link to that slot makes the engine refcount a pointer into read-only `.rdata`. Found `NiUVController` (8 Ghostfence meshes). (2) **UV-set count**: geometry declaring >1 UV set overruns the vertex buffer the engine sized for one → non-temporal `memcpy` past the allocation. Found `furnucomutableu05.nif` (the Seyda Neen Census Office CTD). (3) **NiBoolData key type**: visibility keys must be `CONST_KEY` (5, a step function) — 3449/3449 vanilla Skyrim and 1296/1296 Oblivion source blocks store 5, and `LINEAR` (1) crashes the engine in `NiBoolData::Load` (`ctrigtripwire01`, Vilverin). (4) **Blend-interpolator flags**: `NiBlend*Interpolator` must have Manager Controlled (Flags bit 0) SET — vanilla is 8779/8779 Flags=1/ArraySize=2, and a clear bit makes the engine read 15 bytes from a 7-byte block and AddRef past the end (the second Vilverin CTD). Exits 1 on any of the four and names the meshes. Run after any converter change touching block emission, geometry data, or animation keys.

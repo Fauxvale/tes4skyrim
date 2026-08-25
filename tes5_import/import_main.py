@@ -1736,15 +1736,15 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # the weather points at, so each converted weather mints four IMGS (one
     # per time of day) from its TES4 HNAM block.  Serial, like the other
     # companion-emitting phases, so record order stays deterministic.
-    from .record_types.dialog_misc import convert_WTHR, set_nam0_normalization
+    from .record_types.dialog_misc import convert_WTHR
     wthr_records = by_type.get('WTHR', [])
     if wthr_records:
-        # Self-calibrating color normalization: Oblivion authors weather
-        # colors far hotter than Skyrim (Sun slot 193 vs 43 median day
-        # luminance) and ambient darker; scale each slot so this plugin's
-        # median lands on the vanilla median. Must run before any weather
-        # converts.
-        set_nam0_normalization(wthr_records)
+        # NOTE: weather colours used to be normalised against a per-PLUGIN
+        # median computed here, before any weather converted.  That is gone —
+        # the replacement is a per-colour highlight knee (see the block
+        # comment above _NAM0_KNEE in dialog_misc.py), which needs no
+        # population pass and makes a weather convert identically regardless
+        # of what else is in the plugin.
         print(f"  Converting {len(wthr_records)} WTHR records (with IMGS creation)...")
         for rec in wthr_records:
             try:

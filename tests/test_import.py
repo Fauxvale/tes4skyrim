@@ -3623,7 +3623,13 @@ class TestWeatherConversion:
         assert rgb(0) == (0, 1, 2)        # Sky-Upper
         assert rgb(1) == (10, 11, 12)     # Fog -> Fog Near
         assert rgb(3) == (30, 31, 32)     # Ambient
-        assert rgb(6) == (60, 61, 62)     # Stars
+        # Stars is blanked here because the fixture is Rainy — see
+        # test_stars_are_blanked_under_rain_and_snow.  A Pleasant weather
+        # passes the authored value through.
+        clear = _find_subrecord(
+            self._convert(self._rec(**{'DATA.Classification': '1'})), b'NAM0')
+        o = (6 * 4 + 1) * 4
+        assert tuple(clear[o:o + 3]) == (60, 61, 62)   # Stars
         assert rgb(8) == (80, 81, 82)     # Horizon
         # Cloud LOD Diffuse/Ambient (10/11) stay BLACK: vanilla ships 0 in
         # both (median AND p90, all four times); Oblivion's tints there lit
@@ -3676,7 +3682,7 @@ class TestWeatherConversion:
         assert d[0] == 25                        # wind speed
         assert (d[1], d[2]) == (0, 0)            # TES5 padding (was cloud speed)
         assert d[3] == round(3 * 125 / 255)      # trans delta, rescaled
-        assert d[4] == 153                       # sun glare 255 -> vanilla p90
+        assert d[4] == 255                       # sun glare passes through
         assert d[5] == 200                       # sun damage
         assert (d[6], d[7]) == (5, 6)            # precipitation fades
         assert (d[8], d[9]) == (7, 8)            # thunder fades
@@ -3699,16 +3705,203 @@ class TestWeatherConversion:
         out = self._convert(self._rec(**{'DATA.Classification': '0'}))
         assert _find_subrecord(out, b'DATA')[11] == 0x01
 
-    def test_only_unused_cloud_layers_are_disabled(self):
-        """NAM1=0xFFFFFFFF disabled layers 0/1 too, blanking every sky."""
-        nam1 = struct.unpack('<I', _find_subrecord(self._convert(self._rec()), b'NAM1'))[0]
-        assert nam1 & 0b11 == 0
-        assert nam1 == 0xFFFFFFFC
+    def test_sheets_land_on_the_two_square_uv_dome_shapes(self):
+        """Layer indices bind to shapes in VANILLA's hardcoded Clouds.nif, and
+        those shapes are NOT interchangeable -- each has its own UV tiling.
+
+        Measured UV spans of the shipped 29-shape dome:
+            L11 09_CDTop     U 1.58 V 1.58   ~1:1 projection
+            L27 14_CDLower   U 2.27 V 2.27   ~1:1 projection
+            L 8 07_CDDome_Horizon   U 6.00   tiles 6x around the horizon
+            L15-26 12_/13_CDHorizon_*  V 0.25   narrow V-sliced strips
+            L28 15_CDFog     U 21.00          tiles 21x, horizon wash
+
+        Oblivion authors its two sheets as single FULL-DOME projections
+        (CloudDome:0 3.35x3.35, CloudDome:1 2.97x2.97, both 0..90 deg), so 11
+        and 27 are the only structural matches.  Confirmed in game: a variant
+        using 8/9/10 put all the cloud around the horizon instead of over the
+        sky.
+        """
+        from tes5_import.record_types.dialog_misc import (
+            _wthr_cloud_sig, _WTHR_UPPER_LAYER, _WTHR_LOWER_LAYER)
+        assert (_WTHR_UPPER_LAYER, _WTHR_LOWER_LAYER) == (11, 27)
+        out = self._convert(self._rec())
+        upper = _find_subrecord(out, _wthr_cloud_sig(_WTHR_UPPER_LAYER))
+        lower = _find_subrecord(out, _wthr_cloud_sig(_WTHR_LOWER_LAYER))
+        assert upper.rstrip(b'\x00').lower().endswith(b'upper.dds')
+        assert lower.rstrip(b'\x00').lower().endswith(b'lower.dds')
+
+    def test_only_the_two_authored_layers_are_enabled(self):
+        """Vanilla ships DEDICATED art per layer role -- SkyrimCloudsHorizon01
+        on the strips (50 of 50 times) and SkyrimCloudsFill on the wash (156
+        of 157).  We have neither, so every other layer stays empty rather
+        than being padded with a full-dome sheet that would tile wrongly."""
+        from tes5_import.record_types.dialog_misc import (
+            _WTHR_UPPER_LAYER, _WTHR_LOWER_LAYER)
+        out = self._convert(self._rec())
+        nam1 = struct.unpack('<I', _find_subrecord(out, b'NAM1'))[0]
+        enabled = {L for L in range(32) if not (nam1 >> L) & 1}
+        assert enabled == {_WTHR_UPPER_LAYER, _WTHR_LOWER_LAYER}, enabled
+
+        textured = set()
+        body = out[24:]
+        i = 0
+        while i + 6 <= len(body):
+            sig = body[i:i + 4]
+            sz = struct.unpack('<H', body[i + 4:i + 6])[0]
+            if len(sig) == 4 and sig[1:] == b'0TX':
+                textured.add(sig[0] - 0x30 if sig[0] <= 0x40
+                             else 17 + (sig[0] - 0x41))
+            i += 6 + sz
+        assert textured == enabled, (textured, enabled)
 
     def test_weather_with_no_cloud_textures_disables_all_layers(self):
+        """No authored sheet means no cloud layer at all."""
         rec = self._rec(**{'CNAM.LowerCloudLayer': '', 'DNAM.UpperCloudLayer': ''})
-        out = self._convert(rec)
-        assert struct.unpack('<I', _find_subrecord(out, b'NAM1'))[0] == 0xFFFFFFFF
+        nam1 = struct.unpack('<I', _find_subrecord(self._convert(rec), b'NAM1'))[0]
+        assert nam1 == 0xFFFFFFFF
+
+    def test_lnam_spans_every_authored_layer(self):
+        """LNAM is an INDEX CLAMP into RNAM/QNAM/JNAM, not a layer count.
+
+        Disassembled from SkyrimSE.exe -- all three readers of
+        TESWeather+0x7D0 (Clouds::Update at 0x3c5485 and 0x3c54ff, and the
+        JNAM alpha getter at 0x2c1eb0) do
+            idx = (layer < LNAM) ? layer : 0
+        so a layer at or above LNAM keeps DRAWING but silently reuses layer
+        0's speed and layer 0's alpha.  The draw loops are bounded by
+        Clouds::numLayers and a hard 32, never by LNAM.
+
+        So LNAM must cover every layer we author, and must be > 0 (LNAM <= 0
+        takes the `jle` default of speed 0x33 / alpha 1.0 and throws the
+        authored JNAM away entirely).
+        """
+        out = self._convert(self._rec())
+        lnam = struct.unpack('<I', _find_subrecord(out, b'LNAM'))[0]
+        assert lnam > 0, 'LNAM <= 0 discards authored JNAM alphas'
+
+        textured = []
+        body = out[24:]
+        i = 0
+        while i + 6 <= len(body):
+            sig = body[i:i + 4]
+            sz = struct.unpack('<H', body[i + 4:i + 6])[0]
+            if len(sig) == 4 and sig[1:] == b'0TX':
+                textured.append(sig[0] - 0x30 if sig[0] <= 0x40
+                                else 17 + (sig[0] - 0x41))
+            i += 6 + sz
+        assert textured, 'fixture should author cloud sheets'
+        assert lnam > max(textured), (
+            f'LNAM {lnam} leaves layer {max(textured)} reusing layer 0')
+
+    def test_cloud_drift_is_two_dimensional_and_signed(self):
+        """QNAM/RNAM are SIGNED about 0x7F.
+
+        The engine decodes them as `byte * 0.2/254 - 0.1` (Clouds::Update,
+        0x3c54ad-0x3c54de: xmm4=0.1, xmm3=-0.1, xmm10=1/254), so 0x7F is
+        exactly stationary.  Leaving QNAM at 0x7F means the clouds never drift
+        horizontally at all; vanilla authors nonzero X drift on 557 of 2656
+        layer entries and negative drift on 77 of them.
+        """
+        out = self._convert(self._rec())
+        rnam = _find_subrecord(out, b'RNAM')
+        qnam = _find_subrecord(out, b'QNAM')
+        assert len(rnam) == 32 and len(qnam) == 32
+
+        lnam = struct.unpack('<I', _find_subrecord(out, b'LNAM'))[0]
+        live = range(lnam)
+        assert any(qnam[L] != 0x7F for L in live), 'no horizontal drift at all'
+        # the fixture authors forward Y speeds, so X must differ in sign
+        assert any(qnam[L] < 0x7F for L in live), 'X drift is never negative'
+        assert any(rnam[L] > 0x7F for L in live), 'Y drift lost its direction'
+
+    def test_stars_are_blanked_under_rain_and_snow(self):
+        """Stars is a visibility SWITCH in vanilla, not a continuous tint.
+
+        Censused over the 165 vanilla weathers carrying a full NAM0:
+        Pleasant 91.4% pure white, Rainy 95.7% black, Snow 77.8% black.
+        Oblivion authors a continuous value on every weather, so a converted
+        rainstorm otherwise keeps a starfield burning through the overcast.
+        Cloudy is left alone -- vanilla is genuinely split there (60/18).
+        """
+        def stars(cls):
+            nam0 = _find_subrecord(
+                self._convert(self._rec(**{'DATA.Classification': cls})),
+                b'NAM0')
+            o = (6 * 4 + 3) * 4          # Stars, Night
+            return tuple(nam0[o:o + 3])
+
+        assert stars('4') == (0, 0, 0), 'rain must hide the stars'
+        assert stars('8') == (0, 0, 0), 'snow must hide the stars'
+        assert stars('1') != (0, 0, 0), 'pleasant keeps its stars'
+        assert stars('2') != (0, 0, 0), 'cloudy is left as authored'
+
+    def test_fog_curve_reproduces_oblivions_linear_ramp(self):
+        """Oblivion's fog is fixed-function D3DFOG_LINEAR.
+
+        Established by disassembling all 123 vertex shaders in
+        Data/Shaders/shaderpackage001.sdp: NOT ONE writes oFog (RASTOUT#1),
+        and the weather's near/far go straight into a BSFogProperty
+        (Atmosphere::Update 0x53b318..0x53b34c).
+
+        Skyrim computes min(Max, pow(t, Power)) (Lighting.hlsl:271).  With
+        Power=1 and Max=1 that is exactly t -- Oblivion's ramp.  The previous
+        0.4/0.9 were vanilla MEDIANS and are wrong by up to +0.32 fog
+        mid-ramp and -0.10 at the far plane.
+        """
+        fnam = _find_subrecord(self._convert(self._rec()), b'FNAM')
+        assert len(fnam) == 32
+        (_dn, _df, _nn, _nf,
+         day_power, night_power, day_max, night_max) = struct.unpack('<8f', fnam)
+        assert day_power == 1.0 and night_power == 1.0, 'fog must stay linear'
+        assert day_max == 1.0 and night_max == 1.0, (
+            'Max < 1 leaves the far plane permanently unfogged')
+
+    def test_negative_fog_near_plane_is_clamped(self):
+        """A negative near plane starts the fog ramp BEHIND the camera.
+
+        Every visible pixel is then past the ramp's start, so fog renders at
+        full density with no gradient -- worst along the LONGEST view rays,
+        i.e. the horizon.  That is view-dependent, which is why the sky reads
+        fine facing the ground and the horizon flares when you look up.
+
+        Oblivion AUTHORS these (18 of Oblivion.esm's 37 weathers; SETestAsh
+        -750, SEThunderstorm night -6500) but 0 of the 84 vanilla Skyrim
+        records ship one, so the vanilla floor of 0 is the target.
+        """
+        rec = self._rec(**{'FNAM.FogDayNear': '-750.0',
+                           'FNAM.FogDayFar': '10000.0',
+                           'FNAM.FogNightNear': '-6500.0',
+                           'FNAM.FogNightFar': '12000.0'})
+        f = struct.unpack('<8f', _find_subrecord(self._convert(rec), b'FNAM'))
+        assert f[0] == 0.0, f'day near {f[0]}'
+        assert f[2] == 0.0, f'night near {f[2]}'
+        # the authored far planes must survive untouched
+        assert f[1] == pytest.approx(10000.0)
+        assert f[3] == pytest.approx(12000.0)
+
+    def test_positive_fog_near_plane_passes_through(self):
+        """The clamp must not disturb weathers that authored a sane ramp."""
+        rec = self._rec(**{'FNAM.FogDayNear': '4096.0',
+                           'FNAM.FogDayFar': '170000.0',
+                           'FNAM.FogNightNear': '4096.0',
+                           'FNAM.FogNightFar': '130000.0'})
+        f = struct.unpack('<8f', _find_subrecord(self._convert(rec), b'FNAM'))
+        assert f[0] == pytest.approx(4096.0)
+        assert f[1] == pytest.approx(170000.0)
+        assert f[2] == pytest.approx(4096.0)
+        assert f[3] == pytest.approx(130000.0)
+
+    def test_zero_width_fog_ramp_is_widened(self):
+        """A far plane at or inside the near plane snaps fog to full density."""
+        from tes5_import.record_types.dialog_misc import _WTHR_FOG_MIN_RAMP
+        rec = self._rec(**{'FNAM.FogDayNear': '5000.0',
+                           'FNAM.FogDayFar': '5000.0',
+                           'FNAM.FogNightNear': '5000.0',
+                           'FNAM.FogNightFar': '1000.0'})
+        f = struct.unpack('<8f', _find_subrecord(self._convert(rec), b'FNAM'))
+        assert f[1] == pytest.approx(5000.0 + _WTHR_FOG_MIN_RAMP)
+        assert f[3] == pytest.approx(5000.0 + _WTHR_FOG_MIN_RAMP)
 
     def test_cloud_speed_uses_the_shared_physical_scale(self):
         """Both engines cap cloud drift at 0.1 units.
@@ -3730,23 +3923,52 @@ class TestWeatherConversion:
         assert all(0x7F <= conv(v) <= 0xFE for v in range(256))
 
     def test_cloud_speed_lands_in_rnam_layers(self):
-        from tes5_import.record_types.dialog_misc import convert_WTHR
+        """Each dome layer drifts with the speed authored for the sheet it came from."""
+        from tes5_import.record_types.dialog_misc import (
+            _WTHR_LOWER_PLAN, _WTHR_UPPER_PLAN)
         rnam = _find_subrecord(self._convert(self._rec()), b'RNAM')
-        assert rnam[0] == 0x94 and rnam[1] == 0x88   # TES4 42 / 19
-        assert set(rnam[2:]) == {0x7F}               # untouched layers neutral
+        for layer, _a in _WTHR_UPPER_PLAN:
+            assert rnam[layer] == 0x88, layer   # TES4 CloudSpeedUpper 19
+        for layer, _a in _WTHR_LOWER_PLAN:
+            assert rnam[layer] == 0x94, layer   # TES4 CloudSpeedLower 42
+        planned = {L for L, _a in _WTHR_UPPER_PLAN} | {L for L, _a in _WTHR_LOWER_PLAN}
+        assert set(rnam[L] for L in range(32) if L not in planned) == {0x7F}
 
-    def test_only_textured_layers_are_opaque(self):
-        """A blanket alpha 1.0 draws 30 opaque empty layers over the sky."""
+    def test_cloud_layers_are_translucent_not_opaque_planes(self):
+        """ALPHA IS THE SCALAR THAT WAS MISSING.
+
+        Writing 1.0 on both layers made layer 0 an opaque plane painted over
+        the sky gradient at full strength, with layer 1 completely occluded
+        behind it -- the cloud sheet BECAME the sky, which is what bleached
+        the horizon.  Vanilla composites translucent sheets: the per-time
+        medians over every vanilla weather that enables the layer are
+        0.50-0.60 on layer 0.  This finding is independent of dome geometry
+        and survived the layer-plan revert.
+        """
+        from tes5_import.record_types.dialog_misc import (
+            _WTHR_LOWER_PLAN, _WTHR_UPPER_PLAN, _WTHR_UPPER_LAYER)
         jnam = struct.unpack('<128f', _find_subrecord(self._convert(self._rec()), b'JNAM'))
-        assert jnam[0:4] == (1.0,) * 4      # layer 0 has a texture
-        assert jnam[4:8] == (1.0,) * 4      # layer 1 has a texture
-        assert set(jnam[8:]) == {0.0}       # layers 2..31 do not
+        placed = set()
+        for layer, alphas in _WTHR_UPPER_PLAN + _WTHR_LOWER_PLAN:
+            placed.add(layer)
+            for time in range(4):
+                assert jnam[layer * 4 + time] == pytest.approx(alphas[time])
+        # The upper sheet must NOT be an opaque plane.
+        assert all(jnam[_WTHR_UPPER_LAYER * 4 + t] < 1.0 for t in range(4))
+        # Every layer we do NOT place stays fully transparent.
+        assert set(jnam[L * 4 + t] for L in range(32) if L not in placed
+                   for t in range(4)) == {0.0}
 
     def test_required_subrecords_present(self):
         """LNAM/MNAM/NNAM are .SetRequired in xEdit; LNAM=0 allocated no layers."""
         rec = self._convert(self._rec(**{'DATA.Classification': '1',
                                          'DATA.ThunderFrequency': '255'}))
-        assert struct.unpack('<I', _find_subrecord(rec, b'LNAM'))[0] == 29
+        from tes5_import.record_types.dialog_misc import _WTHR_LOWER_LAYER
+        # LNAM is an index clamp into RNAM/QNAM/JNAM, so it must SPAN the
+        # highest layer we author or that layer silently reuses layer 0's
+        # speed and alpha (SkyrimSE.exe 0x3c5485 / 0x3c54ff / 0x2c1eb0).
+        assert (struct.unpack('<I', _find_subrecord(rec, b'LNAM'))[0]
+                == _WTHR_LOWER_LAYER + 1)
         assert _find_subrecord(rec, b'MNAM') == b'\x00\x00\x00\x00'
         assert _find_subrecord(rec, b'NNAM') == b'\x00\x00\x00\x00'
 
@@ -3797,54 +4019,128 @@ class TestWeatherConversion:
         del rec['NAM0.Data']
         assert len(_find_subrecord(self._convert(rec), b'NAM0')) == 272
 
-    def test_luminance_normalization_lands_plugin_median_on_vanilla(self):
-        """Oblivion authors weather colors far hotter than Skyrim — the Sun
-        slot's midday median is 193 luminance vs vanilla 43 (a 255 disc
-        BLOOMS enormously; Skyrim's sun brightness is HDR, not this slot) —
-        while Ambient is authored at HALF vanilla (92 vs 172), giving blown
-        highlights over black shadows that no imagespace can fix.  The
-        normalization is self-calibrating: the plugin's per-slot median is
-        scaled onto the vanilla median, hue preserved, capped at p90."""
-        from tes5_import.record_types.dialog_misc import (
-            set_nam0_normalization, _NAM0_K)
-        # A synthetic plugin whose Sun (slot 5) day color is flat (200,200,200)
-        # (lum 200) and whose Ambient (slot 3) day is (60,60,60) (lum 60).
+    def _lum(self, c):
+        return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+
+    def _slot(self, nam0, slot, time=1):
+        o = (slot * 4 + time) * 4
+        return tuple(nam0[o:o + 3])
+
+    def test_colours_below_the_knee_pass_through_untouched(self):
+        """Authored colour is the deliverable; only HIGHLIGHTS are compressed.
+
+        The two populations agree at the bottom (TES4 p50 76.9 vs vanilla
+        83.8) and diverge only at the top (p90 204.6 vs 168.0), so a uniform
+        scale darkens midtones to fix highlights.  A previous revision did
+        exactly that and made the day sky dull.  Anything under the knee must
+        come out BIT-IDENTICAL.
+        """
         raw = bytearray(160)
         for time in range(4):
-            o5 = (5 * 4 + time) * 4
-            raw[o5:o5 + 3] = bytes((200, 200, 200))
-            o3 = (3 * 4 + time) * 4
-            raw[o3:o3 + 3] = bytes((60, 60, 60))
-        recs = [self._rec(**{'NAM0.Data': bytes(raw).hex().upper(),
-                             'FormID': f'{0x300 + i:08X}'}) for i in range(6)]
-        try:
-            set_nam0_normalization(recs)
-            out = self._convert(recs[0])
-            nam0 = _find_subrecord(out, b'NAM0')
-            o = (5 * 4 + 1) * 4          # Sun, day
-            sun = nam0[o:o + 3]
-            lum = 0.299 * sun[0] + 0.587 * sun[1] + 0.114 * sun[2]
-            assert abs(lum - 43.0) < 2.0, 'plugin Sun median must land on vanilla 43'
-            o = (3 * 4 + 1) * 4          # Ambient, day: scaled UP 60 -> 172
-            amb = nam0[o:o + 3]
-            lum = 0.299 * amb[0] + 0.587 * amb[1] + 0.114 * amb[2]
-            assert abs(lum - 172.2) < 2.0, 'dark Oblivion ambient must scale up'
-        finally:
-            _NAM0_K.clear()
+            for slot, rgb in ((0, (100, 141, 191)),   # lum 134, under knee
+                              (7, (80, 110, 150)),    # lum 106
+                              (8, (60, 90, 120))):    # lum  85
+                o = (slot * 4 + time) * 4
+                raw[o:o + 3] = bytes(rgb)
+        nam0 = _find_subrecord(
+            self._convert(self._rec(**{'NAM0.Data': bytes(raw).hex().upper()})),
+            b'NAM0')
+        assert self._slot(nam0, 0) == (100, 141, 191)
+        assert self._slot(nam0, 7) == (80, 110, 150)
+        assert self._slot(nam0, 8) == (60, 90, 120)
 
-    def test_without_normalization_colors_still_capped_at_vanilla_p90(self):
-        """Unit conversions (no pre-pass) still cap: a 255-white Sun cannot
-        exceed vanilla's day p90 of 121."""
+    def test_highlights_are_compressed_with_hue_preserved(self):
+        """Above the knee, luminance is remapped into knee..ceiling and all
+        three channels scale together, so only brightness moves."""
+        from tes5_import.record_types.dialog_misc import (_NAM0_KNEE,
+                                                          _NAM0_KNEE_CEILING)
+        raw = bytearray(160)
+        src = (255, 220, 180)            # lum 226, well above the knee
+        for time in range(4):
+            o = (0 * 4 + time) * 4
+            raw[o:o + 3] = bytes(src)
+        nam0 = _find_subrecord(
+            self._convert(self._rec(**{'NAM0.Data': bytes(raw).hex().upper()})),
+            b'NAM0')
+        out = self._slot(nam0, 0)
+        assert _NAM0_KNEE < self._lum(out) <= _NAM0_KNEE_CEILING + 1
+        # hue: channel ratios survive
+        for a, b in ((0, 1), (1, 2)):
+            assert abs(src[a] / src[b] - out[a] / out[b]) < 0.02
+
+    def test_the_knee_has_no_time_axis(self):
+        """The authored day/night curve must survive EXACTLY.
+
+        Oblivion authors night at 7-12% of day.  The old per-time scale
+        pushed that to 22-55%, which is what made nights read as a saturated
+        blue instead of dark.  The same colour must convert the same way at
+        every time of day.
+        """
+        raw = bytearray(160)
+        day, night = (200, 210, 230), (14, 15, 20)
+        for slot in (0, 7, 8, 1):
+            for time, rgb in ((0, day), (1, day), (2, day), (3, night)):
+                o = (slot * 4 + time) * 4
+                raw[o:o + 3] = bytes(rgb)
+        nam0 = _find_subrecord(
+            self._convert(self._rec(**{'NAM0.Data': bytes(raw).hex().upper()})),
+            b'NAM0')
+        authored = self._lum(night) / self._lum(day)
+        for slot in (0, 7, 8):
+            same = {self._slot(nam0, slot, t) for t in (0, 1, 2)}
+            assert len(same) == 1, f'slot {slot} converted differently by time'
+            # NIGHT is under the knee, so it must be bit-identical — this is
+            # the property the old per-time scale destroyed (it multiplied
+            # night by 1.9-3.1x).
+            assert self._slot(nam0, slot, 3) == night, 'night was rescaled'
+            # The ratio does move a little when DAY is above the knee, because
+            # compressing a highlight necessarily raises night's share.  That
+            # is inherent to highlight compression and is small: here the
+            # authored 0.073 becomes 0.085 (+16%), against the +246% the
+            # per-time normalisation produced.
+            ratio = self._lum(self._slot(nam0, slot, 3)) / \
+                self._lum(self._slot(nam0, slot, 1))
+            assert ratio >= authored, 'night must never get DARKER relatively'
+            assert ratio < authored * 1.35, (
+                f'slot {slot} day/night ratio moved too far '
+                f'{authored:.3f} -> {ratio:.3f}')
+
+    def test_the_sun_disc_gets_its_own_hard_knee(self):
+        """Sun is the one genuine outlier: TES4 day median 193.4 vs vanilla
+        42.5 (4.55x, where no other slot exceeds 1.7x).  Skyrim's sun
+        brightness comes from the glare pass and the imagespace, not this
+        colour, so a near-white disc here is a pure bloom source."""
+        from tes5_import.record_types.dialog_misc import _NAM0_SUN_CEILING
         raw = bytearray(160)
         for time in range(4):
             o = (5 * 4 + time) * 4
             raw[o:o + 3] = bytes((255, 255, 255))
-        out = self._convert(self._rec(**{'NAM0.Data': bytes(raw).hex().upper()}))
-        nam0 = _find_subrecord(out, b'NAM0')
-        o = (5 * 4 + 1) * 4
-        sun = nam0[o:o + 3]
-        lum = 0.299 * sun[0] + 0.587 * sun[1] + 0.114 * sun[2]
-        assert lum <= 122.0
+        nam0 = _find_subrecord(
+            self._convert(self._rec(**{'NAM0.Data': bytes(raw).hex().upper()})),
+            b'NAM0')
+        assert self._lum(self._slot(nam0, 5)) <= _NAM0_SUN_CEILING + 1
+
+    def test_conversion_does_not_depend_on_the_rest_of_the_plugin(self):
+        """The old normalisation was a PLUGIN-population statistic, so the
+        same weather converted differently depending on what shipped
+        alongside it.  The knee is a pure function of one colour."""
+        raw = bytearray(160)
+        for time in range(4):
+            o = (0 * 4 + time) * 4
+            raw[o:o + 3] = bytes((100, 141, 191))
+        rec = self._rec(**{'NAM0.Data': bytes(raw).hex().upper()})
+        alone = _find_subrecord(self._convert(rec), b'NAM0')
+
+        # convert it again as if the plugin were full of very bright weathers
+        hot = bytearray(160)
+        for slot in range(10):
+            for time in range(4):
+                o = (slot * 4 + time) * 4
+                hot[o:o + 3] = b'\xff\xff\xff'
+        for _ in range(8):
+            self._convert(self._rec(**{'NAM0.Data': bytes(hot).hex().upper()}))
+        after = _find_subrecord(self._convert(rec), b'NAM0')
+        assert alone == after
 
     def test_ambience_loops_land_in_the_amb_audio_category(self):
         """A 2D looping TES4 sound is an ambience bed; filed under
@@ -4321,16 +4617,57 @@ class TestWeatherImageSpace:
         assert abs(h[4] - 0.625) < 1e-6     # Receive Bloom Threshold
         assert abs(h[5] - 1.0) < 1e-6       # White — NOT 0.88
 
-    def test_sky_scale_tracks_sky_brightness(self):
-        """Sky Scale is the sky's contribution to exposure and TES4 has no
-        equivalent.  Vanilla: ~0.025 for a dark night sky, ~0.20 for a lit
-        one.  A flat value washes the day sky out to near-white."""
+    def test_sky_scale_never_derives_from_sky_colour(self):
+        """Sky Scale lands as an ADDITIVE term in Skyrim's sky pixel shader
+        (`input.Color * baseColor + skyScale`), so deriving it from the
+        weather's own sky luminance scales an additive floor in proportion to
+        the multiplicative colour — a feedback loop that reads as bloom.
+
+        It must depend only on authored classification + time.  Doubling every
+        sky colour must therefore not move it at all.
+        """
+        import copy
+        from tes5_import.record_types.dialog_misc import _wthr_imgs
+
+        base = self._rec()
+        bright = copy.deepcopy(base)
+        raw = bytearray(bytes.fromhex(base['NAM0.Data']))
+        for i in range(0, len(raw), 4):
+            raw[i] = min(255, raw[i] * 2)
+            raw[i + 1] = min(255, raw[i + 1] * 2)
+            raw[i + 2] = min(255, raw[i + 2] * 2)
+        bright['NAM0.Data'] = bytes(raw).hex().upper()
+
+        for time in range(4):
+            a = struct.unpack_from(
+                '<9f', _find_subrecord(_wthr_imgs(base, 1, time), b'HNAM'))[7]
+            b = struct.unpack_from(
+                '<9f', _find_subrecord(_wthr_imgs(bright, 1, time),
+                                       b'HNAM'))[7]
+            assert a == b, f'sky scale moved with sky colour at time {time}'
+
+    def test_sky_scale_comes_from_classification(self):
+        """Vanilla keys Sky Scale off classification x time (R2 = 0.434)
+        rather than sky luminance (R2 = 0.166), measured over the 332
+        weather/time rows in Skyrim.esm + Update + Dawnguard + Dragonborn.
+        Night is near zero for every class."""
+        def scales(cls):
+            _w, imgs = self._convert(
+                self._rec(**{'DATA.Classification': cls}))
+            return [round(self._hnam(b)[7], 3) for b in imgs]
+
+        assert scales('1') == [0.08, 0.12, 0.10, 0.02]   # Pleasant
+        assert scales('2') == [0.05, 0.10, 0.05, 0.00]   # Cloudy
+        assert scales('4') == [0.09, 0.10, 0.10, 0.06]   # Rainy
+        assert scales('8') == [0.10, 0.05, 0.05, 0.05]   # Snow
+
+        # An unclassified weather keeps vanilla's flat unclassified value
+        # instead of being promoted to Pleasant — 10 of Oblivion's 37 are
+        # unclassified, including the Deadlands skies.
+        assert scales('0') == [0.05] * 4
+        # ...which is also what the base fixture (no DATA at all) gets.
         _w, imgs = self._convert(self._rec())
-        day = self._hnam(imgs[self.DAY])[7]
-        night = self._hnam(imgs[self.NIGHT])[7]
-        assert night < 0.06, 'night sky scale must be near zero'
-        assert day > 0.15, 'day sky scale must be the lit value'
-        assert day > night
+        assert [round(self._hnam(b)[7], 3) for b in imgs] == [0.05] * 4
 
     def test_eye_adapt_varies_by_time_of_day(self):
         """Vanilla per-slot medians: speed 37/40/37/45, strength 15/5/15/20."""
