@@ -32,6 +32,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODULES = {
     '_navgrow_native': os.path.join(ROOT, 'native', 'src', 'navgrow',
                                     'grow.cpp'),
+    '_nifgeom_native': os.path.join(ROOT, 'native', 'src', 'nifgeom',
+                                    'geom.cpp'),
 }
 
 # Standalone EXECUTABLES, not importable modules.  They need their own build

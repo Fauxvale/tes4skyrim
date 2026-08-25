@@ -202,10 +202,198 @@ accumulated in float32 `Vector3`s, this accumulates in float64. Measured
 divergence across sample meshes is **1e-16 to 1e-5 per component** — rounding,
 not a different answer. Toggle with `TESCONV_PYFFI_NO_FAST_TANGENTS=1` to A/B.
 
-Still on the table, not done (riskier — it touches conversion correctness):
-`NiTriBasedGeom.get_interchangeable_tri_shape` does a **double deepcopy** of all
-geometry (verts, normals, UVs, colours) purely to change the container type —
-8.4 s cumulative on two meshes.
+**Patch 12**: single-hop `get_interchangeable_tri_shape` / `_tri_strips`.
+PyFFI changes a geometry block's container type with **four** deepcopies routed
+through the common base class:
+
+```python
+shape     = NiTriShape().deepcopy(NiTriBasedGeom().deepcopy(self))
+shapedata = NiTriShapeData().deepcopy(NiTriBasedGeomData().deepcopy(self.data))
+```
+
+The intermediate exists only because `NiTriShapeData` and `NiTriStripsData` are
+**siblings** — `deepcopy` refuses unrelated classes, so a strips→shape copy has
+no legal direct form. But it copies every vertex, normal, uv and colour TWICE,
+and both hops select the *same* attribute list (measured: 19 names for the data
+blocks, 29 for the shape blocks — the base-class attributes). The triangle /
+strip fields are never among them; `set_triangles`/`set_strips` supplies those
+immediately after. So the second copy transfers nothing the first did not.
+
+Two changes, both in `pyffi_monkey_patch.py`:
+
+1. **Copy the base attributes once**, straight from source to target. The
+   attribute list is taken from the **SOURCE**, never the freshly-constructed
+   target — `_get_filtered_attribute_list` is condition-dependent, and
+   `has_normals` / `has_vertex_colors` / the uv flags are all False on a new
+   object, so filtering on the target silently drops every normal and colour.
+2. **Bulk element copy** for flat scalar element types (`Vector3`, `Color4`,
+   `TexCoord`). `update_size()` builds each element through
+   `StructBase.__init__` — a `set()`, an `_items` list and one holder per
+   component — purely so `deepcopy` can overwrite every component one
+   `getattr`/`get_value`/`set_value` at a time. A 10-mesh sample copies 22,494
+   `Vector3` and 11,237 `Color4` elements this way. The fast path builds each
+   element once and assigns the holders' `_value` fields across. Handles the
+   2-D `uv_sets` array; anything else falls back.
+
+Elements are always NEW objects, never shared with the source — `_process_geometry`
+mutates the copy in place (`_set_tangents`, `_clamp_uv_sets`,
+`fix_missing_triangles`) while still reading the original's `extra_data_list`
+and `data.num_vertices`.
+
+**1.21x–1.31x on mesh conversion, byte-identical.** Measured as CPU time
+(`time.process_time`), which is the only stable instrument here — wall-clock on
+this box swings ±20% between identical runs and produced a spurious "0.95x
+regression" on one sample. Verified byte-identical on 60 Oblivion NIFs, 40
+Nehrim NIFs and 30 LOD-inclusive NIFs, plus `tools/nif_determinism.py`.
+`get_interchangeable_tri_shape` went from 2.01 s of 6.47 s (31.1%, the largest
+single item) to below the top-14 cumulative entries; total profiled calls for a
+30-mesh sample dropped 122.4M → 90.6M and `struct_.__init__` 1,176,509 →
+936,657. Toggle with `TESCONV_PYFFI_NO_SINGLE_HOP_COPY=1` to A/B; guarded by
+`tests/test_pyffi_interchangeable_copy.py`, which asserts the result equals
+PyFFI's own two-hop path attribute-for-attribute across five flag combinations.
+
+### 3a. The winding oracle's vertex transform (vectorised 2026-08-24)
+
+`collision._visual_tri_soup` transforms every render vertex under a node into
+Havok units, to serve as the orientation oracle for `_repair_inverted_floors`.
+It did that one vertex at a time:
+
+```python
+for v in data.vertices:
+    w = v * m                      # Vector3 * Matrix44
+```
+
+`Vector3.__mul__` against a `Matrix44` recurses into
+`self * x.get_matrix_33() + x.get_translation()` — three Python calls and
+several `Vector3` allocations **per vertex**. Measured on a 20-mesh sample it
+was **3.42 s of 18.27 s (18.7%) in 24,887 calls**, and `print_callers` showed
+**all** of them came from this one function: the largest single item left after
+Patch 12.
+
+Replaced by `collision._transform_verts`, a bulk numpy affine transform.
+`_visual_tri_soup` went **3.76 s → 0.208 s (18x)** and `Vector3.__mul__`
+disappeared from the profile.
+
+🛑 **It must be BIT-EXACT, and float64 is what makes it so.** The soup feeds a
+nearest-face search with a trust radius, so a 1e-7 drift can flip a DIFFERENT
+triangle and change the collision we ship. Two traps, both hit and both fixed:
+
+- **float32 is wrong.** PyFFI's `Float` holds a plain **Python float**, so
+  `v * m` is evaluated in *double* precision — only the on-disk representation
+  is 32-bit. Computing in float32 left just **0.47% of 52,159 sample vertices**
+  bit-exact (worst 9.5e-07).
+- **`v @ rot` is wrong.** matmul reorders and fuses the accumulation. The
+  transform is written as explicit per-component mul/add in PyFFI's own
+  evaluation order so every intermediate rounds where the scalar loop rounds.
+
+With both: **52,159 of 52,159 vertices bit-exact across 168 shapes, worst diff
+0.** Verified byte-identical on 60 Oblivion + 50 Nehrim + 40 Morrowind_ob NIFs,
+and — the invariant that actually matters — `_INVERTED_FLOOR_FLIPS` is
+unchanged on all three (53 / **693** / 93), including Nehrim where the repair
+does the most work. Toggle with `TESCONV_NO_FAST_VERT_XFORM=1`; guarded by
+`tests/test_collision_vert_transform.py`.
+
+There is **no size crossover**: numpy wins at every vertex count measured,
+including n=4 (16 us vs 135 us, 8x), because the scalar loop pays three Python
+calls and several `Vector3` allocations *per vertex* while the array round trip
+is paid once. `_VECTOR_XFORM_MIN` is therefore 2, not the 24 first guessed.
+
+**1.12x–1.18x on its own; 1.41x for mesh conversion combined with Patch 12**
+(60 NIFs, CPU 21.11 s → 14.95 s).
+
+### 3b. Patch 13 -- native Array.read/write (and why it was NOT 3x)
+
+`Array.read` is **95% of all NIF read time** (2.99 s of 3.17 s over 60 meshes),
+concentrated in three element types: `Vector3` (225,591 elements, 1.259 s),
+`Color4` (81,843, 0.536 s) and `TexCoord` (0.521 s). PyFFI builds one element
+object per item and calls `elem.read()`, which runs a `struct.unpack` per
+**component**.
+
+`native/src/nifgeom/geom.cpp` (`_nifgeom_native`) adds `fill_floats` /
+`pack_floats`: the Python side constructs the elements and hands the extension
+the flat list of value holders, which fills or drains them in one call.
+`asset_convert/nif_geom_native.py` patches `Array.read`/`Array.write` for
+element types that are exactly N unconditional float components; everything
+else falls through to PyFFI untouched.
+
+**Measured: 1.48x on read+write in isolation, 1.20x on full mesh conversion.**
+
+🛑 **The estimate for this work was 2.5-3x. It delivered 1.20x, and the reason
+is worth recording so the next attempt does not repeat it.**
+
+The pitch said "read+write are 46% of per-mesh time and this captures ~90% of
+that." That was wrong about WHAT the cost is. Profiling after the patch:
+
+```
+struct_.__init__     514,239 calls   2.32 s   <- UNCHANGED by Patch 13
+Float.__init__     1,337,405 calls   0.78 s   <- UNCHANGED by Patch 13
+getattr            7,617,961 calls   1.24 s
+get_basic_attribute 2,148,802 calls  0.65 s
+```
+
+The dominant cost was never the `struct.unpack` -- it is **constructing the
+element objects**, and Patch 13 does not remove a single one of them. Measured
+directly: building 225,591 `Vector3` objects costs **0.70 s** all by itself,
+and that is a hard floor for any design in which the converter keeps receiving
+real `Vector3` objects.
+
+Object-model overhead is still **~44% of mesh conversion (6.33 s of 14.3 s)**
+after all three optimisations. Removing it means arrays *replacing* the element
+objects, not feeding them -- which changes the type every consumer sees and
+means rewriting the ~31 modules that touch `NifFormat`. That is the 3x, and it
+is a different, much larger project than a native serialiser. **Do not estimate
+that work again from the read/write share of the profile.**
+
+### 3c. Patch 14 -- numpy-backed geometry arrays (the 2.4x)
+
+`asset_convert/nif_geom_array.py`.  Patch 13 sped up array I/O and left the
+real cost untouched: PyFFI materialises one element OBJECT per item, and
+constructing 225,591 `Vector3` objects alone costs **0.80 s** per 60 meshes.
+This backs `Vector3`/`Color4`/`TexCoord`/`Vector4` arrays with ONE numpy array
+and returns lightweight `__slots__` views, so that construction disappears.
+
+Consumers are unchanged: a census of all **346 geometry-array references across
+37 files** found **309 (91%) work as-is**, and the remaining ones bind an
+element for later use -- which a view supports, because it holds the array and
+a row index rather than a copy.
+
+**2.40x cumulative** for mesh conversion (60 NIFs, CPU 22.16 s -> 9.22 s),
+byte-identical on 60 Oblivion + 50 Nehrim + 40 Morrowind_ob NIFs, and
+`nif_determinism.py` clean.
+
+🛑 **Three bugs it took a byte-diff to find. Do not re-introduce them.**
+
+1. **float64, never float32.**  PyFFI's `Float` holds a Python float (a
+   double); only the on-disk format is 32-bit.  A float32 backing store
+   truncates every intermediate the converter writes back (skin retargeting,
+   tangent generation), and **broke 5 of 60 meshes**.  Same trap as 3a.
+2. **The view MUST subclass the real element class.**  PyFFI's own
+   `update_tangent_space` does `v_2 - v_1`.  A view without `__sub__` raised
+   TypeError inside `SpellAddTangentSpace`, **whose caller swallows exceptions**
+   (`except Exception: pass`) -- so tangent generation silently stopped after 9
+   of 51 shapes in `explodingrootpod.nif` and shipped zeroed tangents with no
+   error printed anywhere.  Subclassing makes the view behaviourally complete by
+   construction instead of by enumerating operators.
+3. **Install the component properties AFTER `type()` returns.**  `StructBase`
+   re-creates a property for every declared attribute when a subclass is built,
+   overwriting a property passed in the namespace dict with PyFFI's own
+   `partial(set_basic_attribute, name='x')` -- which then reaches for the
+   `_x_value_` holder we deliberately never create.
+
+Also: views carry the element class's `_attrs`, because generic copiers detect
+a compound with `hasattr(x, '_attrs')`.  Without it
+`nif_converter._copy_block_fields` assigned the VIEW OBJECT into a clone,
+aliasing it to the source -- and `_emulate_morphs`' `v.x += d.x` then
+accumulated onto the original vertices across morph targets.
+
+Toggle with `TESCONV_NO_GEOM_ARRAY=1`; guarded by
+`tests/test_nif_geom_array.py` (one test per bug above).
+
+🛑 **A measurement warning that cost more time than any of the bugs.** A
+baseline recorded with a patch ACTIVE is worthless: doing that invented a
+phantom "4 of 60 regression" and sent a whole debugging cycle down a wrong
+path.  Record every `--save-baseline` with **every** optimisation toggled OFF,
+and re-record it whenever the default set changes.
 
 **NOT DONE, and do not retry blindly:** caching `_get_filtered_attribute_list`
 (1.98M calls, the obvious next target). Memoising it per

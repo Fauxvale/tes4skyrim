@@ -902,6 +902,95 @@ def _shape_tri_normals(shape):
     return None
 
 
+# Minimum vertex count for the bulk path.  MEASURED, not assumed: there is no
+# crossover -- numpy wins at every size tried, including n=4 (16 us vs 135 us,
+# 8x), because the scalar loop pays three Python calls and several Vector3
+# allocations PER VERTEX while the array round trip is paid once.  Kept at 2
+# only so a degenerate 0/1-vertex shape takes the trivial path.
+_VECTOR_XFORM_MIN = 2
+
+_NUMPY = None
+
+
+def _numpy():
+    """numpy module, or None.  Imported lazily and cached (incl. failure).
+
+    TESCONV_NO_FAST_VERT_XFORM=1 forces the scalar path, for A/B measurement.
+    """
+    global _NUMPY
+    if _NUMPY is None:
+        import os
+        if os.environ.get('TESCONV_NO_FAST_VERT_XFORM'):
+            _NUMPY = False
+            return None
+        try:
+            import numpy
+        except ImportError:
+            _NUMPY = False
+        else:
+            _NUMPY = numpy
+    return _NUMPY or None
+
+
+def _transform_verts(vertices, m, scale):
+    """[(x, y, z), ...] for `vertices` through Matrix44 `m`, times `scale`.
+
+    Reproduces PyFFI's ``v * m`` exactly, in bulk.  That operator is
+    ``v * m.get_matrix_33() + m.get_translation()`` -- a row-vector affine
+    transform -- but PyFFI evaluates it one vertex at a time through
+    ``Vector3.__mul__``, which recurses and allocates several Vector3 objects
+    per vertex.  Measured on a 20-mesh sample it was 3.42 s of 18.27 s
+    (18.7%) in 24,887 calls, ALL of them from _visual_tri_soup: the single
+    largest item left in mesh conversion after Patch 12.
+
+    The result is BIT-EXACT with that loop -- verified 52,159 of 52,159
+    vertices across 168 real shapes, worst diff 0.  That is the contract, not
+    a nicety: this soup is the oracle for _repair_inverted_floors' nearest-face
+    search, which compares against a trust radius, so a 1e-7 drift can flip a
+    DIFFERENT triangle and change the collision we ship.
+
+    Falls back to the scalar loop if numpy is unavailable or the vertex list
+    is too short to be worth the array round trip.
+    """
+    n = len(vertices)
+    if n >= _VECTOR_XFORM_MIN:
+        np = _numpy()
+        if np is not None:
+            flat = np.fromiter(
+                (c for vert in vertices for c in (vert.x, vert.y, vert.z)),
+                dtype=np.float64, count=n * 3)
+            vx = flat[0::3]
+            vy = flat[1::3]
+            vz = flat[2::3]
+            # float64, NOT float32: PyFFI's Float holds a plain Python float,
+            # so ``v * m`` is evaluated in double precision -- only the on-disk
+            # representation is 32-bit.  Computing this in float32 left just
+            # 0.47% of 52,159 sample vertices bit-exact (worst 9.5e-07).
+            #
+            # Row-vector convention, matching Vector3.__mul__(Matrix33):
+            #   x' = v.x*m_11 + v.y*m_21 + v.z*m_31   (+ m_41 from translation)
+            #
+            # Written as explicit per-component mul/add in PyFFI's own
+            # evaluation order rather than a matmul, so every intermediate
+            # rounds exactly where the scalar loop rounds it.
+            out_v = []
+            for (c1, c2, c3, t) in ((m.m_11, m.m_21, m.m_31, m.m_41),
+                                    (m.m_12, m.m_22, m.m_32, m.m_42),
+                                    (m.m_13, m.m_23, m.m_33, m.m_43)):
+                acc = vx * c1
+                acc += vy * c2
+                acc += vz * c3
+                acc += t
+                acc *= scale
+                out_v.append(acc.tolist())
+            return list(zip(*out_v))
+    verts = []
+    for vert in vertices:
+        w = vert * m
+        verts.append((w.x * scale, w.y * scale, w.z * scale))
+    return verts
+
+
 def _visual_tri_soup(root, max_tris=20000):
     """Render-mesh triangles under `root`, in Havok units to match collision.
 
@@ -934,10 +1023,7 @@ def _visual_tri_soup(root, max_tris=20000):
                 continue
             try:
                 m = blk.get_transform(root)
-                verts = []
-                for v in data.vertices:
-                    w = v * m
-                    verts.append((w.x * scale, w.y * scale, w.z * scale))
+                verts = _transform_verts(data.vertices, m, scale)
                 for (a, b, c) in data.get_triangles():
                     if a != b and b != c and a != c:
                         out.append((verts[a], verts[b], verts[c]))

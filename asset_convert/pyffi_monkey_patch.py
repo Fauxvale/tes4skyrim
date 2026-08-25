@@ -1147,6 +1147,217 @@ def _install_vectorised_tangent_space():
 
 
 # ---------------------------------------------------------------------------
+# Patch 12: single-hop get_interchangeable_tri_shape/_strips  (PERFORMANCE)
+# ---------------------------------------------------------------------------
+#
+# PyFFI converts a geometry block to the other container type with FOUR full
+# deepcopies, routed through the common base class:
+#
+#     shape     = NiTriShape().deepcopy(NiTriBasedGeom().deepcopy(self))
+#     shapedata = NiTriShapeData().deepcopy(NiTriBasedGeomData().deepcopy(self.data))
+#
+# The intermediate exists only because NiTriShapeData and NiTriStripsData are
+# SIBLINGS -- deepcopy refuses unrelated classes, so a strips->shape copy has
+# no legal direct form.  But the round trip through the base copies every
+# vertex, normal, uv and vertex colour TWICE, and the base class is exactly
+# what both hops walk: measured, hop1 and hop2 select the SAME attribute list
+# (19 names for the data blocks, 29 for the shape blocks), and the triangle /
+# strip fields are never among them -- set_triangles/set_strips supplies those
+# immediately afterwards.  So the second copy transfers nothing the first did
+# not already produce, and the intermediate object is pure overhead.
+#
+# Measured at 2.01 s cumulative of 6.47 s (31.1%) across a 10-mesh sample --
+# the single largest item in mesh conversion, and 90,364 deepcopy calls.
+#
+# This patch copies the base attributes ONCE, straight from source to target,
+# using deepcopy's own per-attribute semantics (recurse into StructBase,
+# update_size() then recurse into Array, plain setattr otherwise).
+#
+# CRITICAL -- the attribute list is taken from the SOURCE, never the target.
+# _get_filtered_attribute_list is condition-dependent: `has_normals`,
+# `has_vertex_colors` and the uv flags gate whether `normals` / `tangents` /
+# `bitangents` / `vertex_colors` appear at all, and a freshly constructed
+# target has them all False.  Filtering against the target would silently drop
+# every normal and vertex colour.  This mirrors what deepcopy does on hop 1
+# (`isinstance(mid, src.__class__)` is False, so it filters on `mid`... which
+# is why we filter on the BASE view of the source -- see _base_attr_names).
+#
+# Falls back to the original for anything unexpected (unrelated classes, a
+# source missing an attribute the base declares).  Toggle with
+# TESCONV_PYFFI_NO_SINGLE_HOP_COPY=1 to A/B.  Byte-equality is the contract:
+# verify with `python tools/nif_perf.py --baseline ...`.
+def _install_single_hop_interchangeable():
+    from pyffi.formats.nif import NifFormat
+    from pyffi.object_models.xml.struct_ import StructBase
+    from pyffi.object_models.xml.array import Array, _ListWrap
+    from pyffi.object_models.xml.basic import BasicBase
+
+    geom = NifFormat.NiTriBasedGeom
+    if getattr(geom, '_tesconv_single_hop_copy', False):
+        return False
+    if os.environ.get('TESCONV_PYFFI_NO_PERF_PATCH') \
+            or os.environ.get('TESCONV_PYFFI_NO_SINGLE_HOP_COPY'):
+        return False
+
+    orig_shape = geom.get_interchangeable_tri_shape
+    orig_strips = geom.get_interchangeable_tri_strips
+
+    # Element types worth bulk-copying: flat structs whose every attribute is
+    # an unconditional scalar (no nested structs, no arrays, no `cond`).  A
+    # 10-mesh sample copies 22,494 Vector3 and 11,237 Color4 elements -- that
+    # is the whole remaining cost of the surviving copy.
+    _bulk_cache = {}
+
+    def _bulk_fields(element_type):
+        """['_x_value_', ...] if element_type is bulk-copyable, else None."""
+        try:
+            return _bulk_cache[element_type]
+        except KeyError:
+            pass
+        fields = None
+        if isinstance(element_type, type) and issubclass(element_type,
+                                                         StructBase):
+            attrs = element_type._get_attribute_list()
+            names = []
+            seen = set()
+            ok = bool(attrs)
+            for a in attrs:
+                if a.name in seen:
+                    continue          # pyffi lists duplicates; __init__ skips
+                seen.add(a.name)
+                if (a.arr1 is not None or a.arr2 is not None
+                        or a.cond is not None or a.vercond is not None
+                        or not isinstance(a.type_, type)
+                        or not issubclass(a.type_, BasicBase)):
+                    ok = False
+                    break
+                names.append("_%s_value_" % a.name)
+            if ok:
+                fields = tuple(names)
+        _bulk_cache[element_type] = fields
+        return fields
+
+    def _bulk_array_copy(dst_arr, src_arr):
+        """Fill an EMPTY dst_arr with copies of src_arr's elements.
+
+        Replaces update_size() + deepcopy() for flat scalar element types.
+        update_size builds each element through StructBase.__init__ -- a set(),
+        an _items list and one holder object per component, walking the
+        attribute list -- purely so deepcopy can overwrite every component one
+        getattr/get_value/set_value at a time.  Here each element is built once
+        and its holders' `_value` fields are assigned straight across.
+
+        Elements are NEW objects, never shared with the source: the caller
+        mutates the copy in place (_set_tangents, _clamp_uv_sets,
+        fix_missing_triangles) while still reading the original.
+        """
+        fields = _bulk_fields(getattr(dst_arr, '_elementType', None))
+        if fields is None:
+            return False
+        if len(dst_arr):                       # only ever fill a fresh array
+            return False
+        element_type = dst_arr._elementType
+        template = dst_arr._elementTypeTemplate
+        argument = dst_arr._elementTypeArgument
+
+        def fill(dst_list, src_list):
+            append = dst_list.append
+            for src_elem in list.__iter__(src_list):
+                elem = element_type(template=template, argument=argument)
+                for f in fields:
+                    getattr(elem, f)._value = getattr(src_elem, f)._value
+                append(elem)
+
+        try:
+            if dst_arr._count2 is None:
+                fill(dst_arr, src_arr)
+            else:
+                # 2-D (uv_sets): rows are _ListWrap, elements live one level
+                # down.  Row COUNT comes from the source, exactly as
+                # update_size would derive it from the already-copied
+                # num_uv_sets / num_vertices.
+                for src_row in list.__iter__(src_arr):
+                    row = _ListWrap(element_type)
+                    fill(row, src_row)
+                    dst_arr.append(row)
+        except AttributeError:
+            del dst_arr[0:len(dst_arr)]
+            return False
+        return True
+
+    def _transfer(dst, src, base_cls):
+        """Copy base_cls's attributes from src into dst, deepcopy semantics.
+
+        Returns False (having touched nothing) if the source does not carry
+        every attribute the base declares, so the caller can fall back.
+        """
+        # The attribute list must come from the SOURCE instance -- its flags
+        # decide which conditional attributes (normals, vertex colours, uvs)
+        # actually exist.  Restricting to base_cls's names keeps the copy to
+        # exactly what the two-hop path transferred.
+        base_names = frozenset(a.name for a in base_cls._get_attribute_list())
+        attrlist = [a for a in src._get_filtered_attribute_list()
+                    if a.name in base_names]
+        pending = []
+        for attr in attrlist:
+            try:
+                srcvalue = getattr(src, attr.name)
+                dstvalue = getattr(dst, attr.name)
+            except AttributeError:
+                return False
+            pending.append((attr.name, dstvalue, srcvalue))
+        # Only mutate once every attribute resolved, so a fallback is clean.
+        for name, dstvalue, srcvalue in pending:
+            if isinstance(dstvalue, StructBase):
+                dstvalue.deepcopy(srcvalue)
+            elif isinstance(dstvalue, Array):
+                if not _bulk_array_copy(dstvalue, srcvalue):
+                    dstvalue.update_size()
+                    dstvalue.deepcopy(srcvalue)
+            else:
+                setattr(dst, name, srcvalue)
+        return True
+
+    def _make(self, target_cls, target_data_cls, base_cls, base_data_cls,
+              setter, geometry, orig):
+        data = self.data
+        if data is None:
+            return orig(self, geometry)
+        shape = target_cls()
+        if not _transfer(shape, self, base_cls):
+            return orig(self, geometry)
+        shapedata = target_data_cls()
+        if not _transfer(shapedata, data, base_data_cls):
+            return orig(self, geometry)
+        setter(shapedata, geometry)
+        shape.data = shapedata
+        return shape
+
+    def get_interchangeable_tri_shape(self, triangles=None):
+        if triangles is None:
+            if self.data is None:
+                return orig_shape(self, triangles)
+            triangles = self.data.get_triangles()
+        return _make(self, NifFormat.NiTriShape, NifFormat.NiTriShapeData,
+                     NifFormat.NiTriBasedGeom, NifFormat.NiTriBasedGeomData,
+                     lambda d, g: d.set_triangles(g), triangles, orig_shape)
+
+    def get_interchangeable_tri_strips(self, strips=None):
+        if strips is None:
+            if self.data is None:
+                return orig_strips(self, strips)
+            strips = self.data.get_strips()
+        return _make(self, NifFormat.NiTriStrips, NifFormat.NiTriStripsData,
+                     NifFormat.NiTriBasedGeom, NifFormat.NiTriBasedGeomData,
+                     lambda d, g: d.set_strips(g), strips, orig_strips)
+
+    geom.get_interchangeable_tri_shape = get_interchangeable_tri_shape
+    geom.get_interchangeable_tri_strips = get_interchangeable_tri_strips
+    geom._tesconv_single_hop_copy = True
+    return True
+
+
+# ---------------------------------------------------------------------------
 # NOT DONE: caching _get_filtered_attribute_list.  It looks like the obvious
 # next win (5.1M calls in a two-mesh conversion, re-deriving a per-class
 # constant), and it is WRONG.  Memoising it per (class, version, user_version)
@@ -1169,6 +1380,24 @@ def apply_patches():
         _apply_nifformat_patches(NifFormat)
         _install_no_op_struct_logging()
         _install_vectorised_tangent_space()
+        _install_single_hop_interchangeable()
+        # Patch 13: native Array.read/write for flat float element types
+        # (Vector3/Color4/TexCoord).  Array.read is 95% of all NIF read time.
+        # Lives in its own module because it owns a compiled extension; a
+        # missing .pyd just leaves PyFFI's own path in place.
+        try:
+            from . import nif_geom_native
+            nif_geom_native.install()
+        except Exception:
+            pass
+        # Patch 14: numpy-backed Array storage (asset_convert/nif_geom_array.py).
+        # Supersedes Patch 13's fill/pack for the element types it backs; the
+        # native hook above still serves anything it declines.
+        try:
+            from . import nif_geom_array
+            nif_geom_array.install()
+        except Exception:
+            pass
         if not _install_deterministic_string_table():
             # Loud on purpose: without it every mesh build differs from the
             # last one for no reason, and byte-comparisons become meaningless.
