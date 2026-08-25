@@ -69,6 +69,9 @@ def convert_STAT(rec: dict) -> bytes:
 
 
 def convert_ACTI(rec: dict) -> bytes:
+    # SNAM is the activator's looping sound (the Dwemer steam machines).  TES5
+    # wants the descriptor, not the SOUN — the id here is a placeholder that
+    # patch_sound_descriptor_slots resolves in Phase 3 (see _SNDR_SLOTS).
     extra = b''
     snam_fid = get_formid(rec, 'SNAM')
     if snam_fid:
@@ -185,36 +188,83 @@ def _door_model_sounds(rec: dict) -> dict:
     return _DOOR_MODEL_SOUNDS.get(_door_model_key(modl), {})
 
 
-def patch_door_sounds(writer, own_soun_ids=None) -> int:
-    """Rewrite every DOOR SNAM/ANAM/BNAM from its TES4 SOUN id to the SNDR.
+# TES5 sound slots that must hold a sound DESCRIPTOR (SNDR), and never the SOUN
+# a TES4 record names there.  Read straight off xEdit's TES5 definitions, each
+# of which is a `wbFormIDCk(<slot>, ..., [SNDR])`:
+#
+#   ACTI  SNAM 'Sound - Looping'   VNAM 'Sound - Activation'
+#   CONT  SNAM 'Sound - Open'      QNAM 'Sound - Close'
+#   DOOR  SNAM 'Sound - Open'      ANAM 'Sound - Close'   BNAM 'Sound - Loop'
+#   LIGH  SNAM 'Sound'
+#
+# MSTT and TACT also type SNAM as [SNDR], but neither is listed: no MSTT or
+# TACT we write can ever hold a placeholder, so an entry would only ever scan
+# and never patch.  MSTT exists solely as convert_STAT's havok retype, and TES4
+# STAT has no sound field at all (0 SNAM keys across Oblivion's 6,014 and
+# Nehrim's 7,205 STATs); TACT is synthesized only by speaker_activators, which
+# writes VNAM and never SNAM.  Add one back only alongside a converter that
+# actually emits the slot.
+#
+# 🛑 VNAM IS NOT A SOUND SLOT ON EVERY RECORD.  It is [SNDR] on ACTI
+# ('Sound - Activation') but [VTYP] on TACT ('Voice Type') — xEdit
+# wbDefinitionsTES5.pas 3324 vs 3348.  Listing TACT's VNAM here would rewrite
+# every speaker activator's voice type into a sound descriptor and mute the
+# speak-as lines.
+#
+# VERIFIED: the slot must hold an SNDR.  All 594 populated slots of these types
+# in Skyrim.esm are SNDRs and not one is a SOUN (ACTI 52, CONT 272, DOOR 175,
+# LIGH 3, plus MSTT 92), which is why a SOUN id here cannot be right whatever
+# the engine does with it.  Ours is doubly wrong because our SOUNs are not
+# self-describing the way a legacy vanilla SOUN is — convert_SOUN emits
+# `EDID + OBND + SDSC` only, with every byte of audio data on the companion
+# SNDR — so a slot left pointing at one names a record with no audio payload.
+#
+# SUSPECTED, NOT CONFIRMED: that this also CRASHES the audio thread (the engine
+# taking the id at face value into the audio manager's emitter table and
+# BSAudioManagerThread faulting on `mov ecx, [r8+0x48]`).  That story is
+# recorded in docs/record_mapping_reference.md but was never reproduced, and
+# the crash it was written for was later traced elsewhere.  Do not cite it as
+# the reason for this table — the vanilla census above is the reason.
+_SNDR_SLOTS = {
+    'ACTI': (b'SNAM', b'VNAM'),
+    'CONT': (b'SNAM', b'QNAM'),
+    'DOOR': (b'SNAM', b'ANAM', b'BNAM'),
+    'LIGH': (b'SNAM',),
+}
 
-    TES5 DOOR sound slots reference a sound DESCRIPTOR (xEdit:
-    `wbFormIDCk(SNAM, 'Sound - Open', [SNDR])`; confirmed against Skyrim.esm,
-    where WRDragonSideDoor01's SNAM 0005AFC9 is the SNDR
-    DRSWoodImperialDouble01OpenSD).  DOORs are written in Phase 1, long before
-    Phase 3 creates the descriptors, so convert_DOOR stores the SOUN id and
-    this resolves it — the same placeholder-then-patch approach
-    actors.patch_actor_sounds uses for CSDI.
+
+def patch_sound_descriptor_slots(writer, rectype, own_soun_ids=None,
+                                 master_sndr=None) -> int:
+    """Rewrite one record type's sound slots from TES4 SOUN ids to SNDRs.
+
+    These records are written in Phase 1/2, long before Phase 3 mints the
+    descriptors, so the converters store the TES4 SOUN id as a placeholder and
+    this resolves it — the same approach actors.patch_actor_sounds uses for
+    CSDI.  Allocating the descriptor id at conversion time instead would shift
+    every later generated FormID.
 
     *own_soun_ids* is the low-24 id set of the SOUN records THIS plugin
-    converts, and it is what makes the pass safe on an override build: the
-    DOOR group there also holds the master's already-converted records, whose
-    slots hold the MASTER's SNDR ids.  Those are not this run's placeholders,
-    so anything outside the set is left exactly as it is — the alternative
-    (treating an unmappable value as dead) would silently strip the master's
-    door sounds out of every dependent plugin.
+    converts.  Anything outside it is master-owned, and is handed to
+    *master_sndr*, which resolves a master's TES4 SOUN id to the SNDR that
+    master's own conversion produced.  A slot that neither answers is left
+    exactly as it is: on an override build the group also holds the master's
+    already-converted records, whose slots hold real SNDR ids that must not be
+    rewritten or dropped.
+
+    Without the master resolver these slots die silently — the master-blindness
+    failure mode, where only the current plugin's export is indexed.  It is the
+    common case, not an edge case: Morrowind_ob's containers and torches point
+    at Oblivion.esm's sounds, which it never overrides.
 
     A slot that IS one of this run's placeholders but whose SOUN produced no
-    descriptor is dropped, rather than left pointing at a record of the wrong
+    descriptor is DROPPED, rather than left pointing at a record of the wrong
     type.
     """
     from .dialog_misc import sndr_map
     mapping = sndr_map()
-    if not mapping:
-        return 0
     own = own_soun_ids if own_soun_ids is not None else set(mapping)
-    records = writer._top_groups.get('DOOR') or []
-    slots = (b'SNAM', b'ANAM', b'BNAM')
+    slots = _SNDR_SLOTS[rectype]
+    records = writer._top_groups.get(rectype) or []
     patched = 0
     for i, blob in enumerate(records):
         if not any(sig in blob for sig in slots):
@@ -229,10 +279,13 @@ def patch_door_sounds(writer, own_soun_ids=None) -> int:
             pos += 6 + size
             if sig in slots and size == 4:
                 soun = struct.unpack_from('<I', chunk, 6)[0]
-                if (soun & 0x00FFFFFF) not in own:
-                    out += chunk          # not ours to resolve — leave alone
-                    continue
-                sndr = mapping.get(soun & 0x00FFFFFF, 0)
+                if (soun & 0x00FFFFFF) in own:
+                    sndr = mapping.get(soun & 0x00FFFFFF, 0)
+                else:
+                    sndr = master_sndr(soun) if master_sndr else 0
+                    if not sndr:
+                        out += chunk      # not ours to resolve — leave alone
+                        continue
                 if sndr != soun:
                     changed = True
                 if sndr:
@@ -245,6 +298,28 @@ def patch_door_sounds(writer, own_soun_ids=None) -> int:
         records[i] = bytes(out)
         patched += 1
     return patched
+
+
+def patch_door_sounds(writer, own_soun_ids=None, master_sndr=None) -> int:
+    """DOOR SNAM/ANAM/BNAM -> SNDR.
+
+    Confirmed against Skyrim.esm, where WRDragonSideDoor01's SNAM 0005AFC9 is
+    the SNDR DRSWoodImperialDouble01OpenSD.
+    """
+    return patch_sound_descriptor_slots(writer, 'DOOR', own_soun_ids,
+                                        master_sndr)
+
+
+def patch_light_sounds(writer, own_soun_ids=None, master_sndr=None) -> int:
+    """LIGH SNAM -> SNDR.
+
+    A light's SNAM is its looping ambience — the crackle on every torch,
+    sconce and brazier — so this slot is live on hundreds of placed refs in a
+    typical interior, and each one arms the audio-thread fault described on
+    _SNDR_SLOTS.
+    """
+    return patch_sound_descriptor_slots(writer, 'LIGH', own_soun_ids,
+                                        master_sndr)
 
 
 def convert_DOOR(rec: dict) -> bytes:
@@ -624,6 +699,10 @@ def convert_LIGH(rec: dict) -> bytes:
     # FNAM is required in TES5; TES4's default when absent is 1.0.
     fade = get_float(rec, 'FNAM.Fade', 1.0)
     subs += pack_float_subrecord('FNAM', fade)
+    # SNAM is the light's looping ambience (torch crackle, brazier roar).  TES4
+    # names a SOUN there; TES5 wants the sound DESCRIPTOR, so this id is a
+    # placeholder patch_sound_descriptor_slots resolves in Phase 3 — leaving a
+    # SOUN id here crashes the audio thread (see _SNDR_SLOTS).
     snam = get_formid(rec, 'SNAM.Sound')
     if snam:
         subs += pack_formid_subrecord('SNAM', snam)
@@ -680,6 +759,8 @@ def convert_CONT(rec: dict) -> bytes:
     flags = get_int(rec, 'DATA.Flags')
     weight = get_float(rec, 'DATA.Weight')
     extra += pack_subrecord('DATA', struct.pack('<Bf', flags, weight))
+    # Open/close sounds: TES5 wants descriptors, so these TES4 SOUN ids are
+    # placeholders patch_sound_descriptor_slots resolves (see _SNDR_SLOTS).
     snam = get_formid(rec, 'SNAM.OpenSound')
     if snam:
         extra += pack_formid_subrecord('SNAM', snam)

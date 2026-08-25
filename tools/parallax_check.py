@@ -259,7 +259,8 @@ def _check_height_dds(p: Path):
 
 
 def verify(plugin, output_dir, subdir, mx, workers, show_all):
-    root = Path(output_dir) / plugin
+    from output_layout import plugin_out_root
+    root = plugin_out_root(output_dir, plugin, export_dir='export')
     meshes = root / 'meshes' / 'tes4'
     if subdir:
         meshes = meshes / subdir
@@ -391,9 +392,10 @@ def regen(plugin, output_dir, strength, max_range, target_range, only,
     1906 maps single-threaded is hours rather than the "seconds" this was
     originally written for on Nehrim's 38.
     """
-    root = Path(output_dir) / plugin
+    from output_layout import asset_root, plugin_out_root
+    root = plugin_out_root(output_dir, plugin, export_dir='export')
     tex_root = root / 'Textures'
-    src_root = Path('export') / plugin / 'textures'
+    src_root = asset_root('export', plugin) / 'textures'
     maps = sorted(tex_root.rglob('*_p.dds'))
     if only:
         maps = [m for m in maps if only.lower() in str(m).lower()]
