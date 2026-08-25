@@ -569,20 +569,31 @@ every masked child here was a GRADIENT before it was replaced), and whether
   the text says; Skyrim's grows to fit it, and adding a minimum-width term
   would mean recompiling AS2 rather than patching a literal. `box_width` is
   read and reported so the difference is visible, but it is not applied.
-* **The emitted handler runs every frame.** Thirty-two property writes at the
-  movie's 24 fps, only while a message box is open. Cheap, but it is a poll
-  rather than an event, because Scaleform offers no resize notification and
-  the alternative — intercepting `_width` — is not possible for a built-in
-  MovieClip property.
+* **The options are LEFT-ALIGNED, not centered.** Only the widest one looks
+  centered; the rest hang off its left edge. Nothing about the text is at
+  fault — char 8 is `align=2 (CENTER)` with `<p align="center">` in its initial
+  HTML, and the class sets `ButtonText.autoSize = "center"`. It is the button
+  CLIP that is placed left: `MessageBoxButton` is registered on its center
+  (char 8 sits at x[−50, +50] inside it), and the vertical branch of
+  `setupButtons` does `button._x = button._width / 2`, which puts every
+  button's LEFT EDGE at 0 in the container. `PositionElements` then centers
+  the block as a whole with `ButtonContainer._x = -ButtonContainer._width / 2`.
+  The correct value is `maxWidth / 2` per button, which cannot be had inside
+  that loop — `ButtonContainer._width` is only "widest so far" until it ends —
+  so fixing it means a SECOND PASS in `PositionElements`, iterating
+  `MessageButtons` (populated by `MessageButtons.push(button)`). That is new
+  bytecode rather than a length-preserving edit, which is why it is a gap and
+  not a fix.
 * **Conflicts** with any other mod replacing `Interface\messagebox.swf`. It
   replaces exactly one file, so nothing else.
 * Output is ~391 KB, up from 17 KB; the frame art is nearly all of it.
 
 ### Verification status
 
-The frame geometry, the emitted bytecode and the patch surface are all covered
-offline (see [Validating hand-written AVM1](#validating-hand-written-avm1) and
-`tests/test_ui_convert.py`).
+The frame geometry and the patch surface are both covered offline by
+`tests/test_ui_convert.py`. **No ActionScript is emitted** — see
+[Patching AS2 literals safely](#patching-as2-literals-safely) for the only
+kind of code change this makes.
 
 **The message box is confirmed in game.** Frame, brown text, Oblivion focus
 box, vertical buttons, opaque panel, no header shadow, correct motif density.

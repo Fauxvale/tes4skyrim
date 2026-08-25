@@ -161,14 +161,20 @@ GLOBAL_ACTIONS = [
     ("modify_body_meshes", "Patch Skyrim",
      "Build the ARMA slot-44 body patch for your Skyrim load order",
      "Patch Skyrim", 2),
-    # Sits directly under "Pack Start Mod": like it, this converts no plugin.
-    # Oblivion's UI lives in loose menu files and BSAs rather than inside any
-    # ESM, so there is nothing per-plugin to run it against.
+    # row=None -> Tools MENU ONLY, no sidebar button.
+    #
+    # The sidebar is the conversion pipeline: every button there is a stage of
+    # turning a plugin into a mod, and the two packaging actions wrap what those
+    # stages produced. This converts no plugin and reads nothing the pipeline
+    # wrote -- it reskins a vanilla Skyrim movie with Oblivion's own art -- so
+    # it belongs with the other standalone tools rather than in the run order.
+    # It is also a once-ever action: the inputs are GAME FILES, which do not
+    # change, so a permanent button would sit greyed out forever after one use.
     ("convert_ui", "Convert UI",
      "Build the standalone Oblivion UI mod: Skyrim's message boxes reskinned "
      "with Oblivion's own frame art and layout, read from your Oblivion "
      "install. Replaces one file (Interface\\messagebox.swf)",
-     "Convert UI", 2),
+     "Convert UI", None),
 ]
 
 # ── Colors ───────────────────────────────────────────────────────────────────
@@ -3327,9 +3333,14 @@ def gui_main():
     # the same width and a row holding one action fills only its own half —
     # spanning the full width made a lone button read as the most important
     # action here, which none of them is.
+    # A `row` of None means the action lives in the Tools menu only, so it is
+    # skipped here rather than given a button. `_refresh_global_btns` already
+    # tolerates a missing button, so nothing else has to know.
     global_btns: dict[str, ttk.Button] = {}
     _rows: dict[int, list] = {}
     for _act in GLOBAL_ACTIONS:
+        if _act[4] is None:
+            continue
         _rows.setdefault(_act[4], []).append(_act)
 
     for _r in sorted(_rows):
@@ -4499,6 +4510,27 @@ def gui_main():
             _open_make_master_panel(
                 on_apply=lambda: _start_global_action(key))
             return
+        if key == "convert_ui":
+            # Confirm first: this one is reached from a MENU, where there is no
+            # tooltip to explain it and no button state to say it has already
+            # run. It also replaces a vanilla interface file for the whole game
+            # rather than producing something per-plugin, which is worth saying
+            # out loud before it happens.
+            if not _confirm(
+                    "Slopping of Screens",
+                    "This will create a standalone mod which replaces ALL "
+                    "Skyrim message boxes with an Oblivion-styled one, built "
+                    "from your own local game assets.\n\n"
+                    "Nothing Bethesda ships is redistributed: your installed "
+                    "Oblivion menu art and layout are read off this machine "
+                    "and composed over Skyrim's own messagebox.swf.\n\n"
+                    "The result lands in output/Finished Mods as "
+                    "\"Oblivion UI.zip\", ready to install like any other "
+                    "converted mod. It replaces one file, so it conflicts "
+                    "only with other mods that replace Interface"
+                    "\\messagebox.swf.",
+                    yes="Continue", no="Cancel"):
+                return
         _start_global_action(key)
 
     def _start_global_action(key: str):
