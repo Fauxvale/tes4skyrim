@@ -1233,7 +1233,8 @@ creature is fully proven.
   identically whichever plugin ships them. Own projects win on conflict.
   Combined with the nested-folder fix: Morrowind_ob went **54/307 → 307/307** CREA records
   mapped to a real converted creature (240 own + 67 inherited), 64 local projects (was 10),
-  80 generated `TES4*Race` chains. Diagnose with `temp/crea_project_gap.py <plugin> <master>`.
+  80 generated `TES4*Race` chains. Diagnose by diffing CREA model folders against `creature_projects.json`
+  (`crea_project_gap.py` did this; removed 2026-08-25).
 - **animationdata/boundanims/animationsetdata + singlefile merge
   (`asset_convert/animation_data.py`)**: the engine loads projects ONLY via merged
   `meshes/animationdatasinglefile.txt` + `animationsetdatasinglefile.txt`. Singlefile

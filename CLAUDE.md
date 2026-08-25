@@ -72,7 +72,7 @@ caching, skipped record types, the export text format, and the directory layout.
 - Don't preserve backwards compatibility. Delete code that is no longer used.
 - Keep files under ~1000 lines; split by responsibility when one grows.
 - <a id="tools-first"></a>**CHECK `tools/` BEFORE BUILDING ANYTHING BESPOKE.**
-  ~95 tools already exist and one probably answers your question — the full
+  ~147 tools already exist and one probably answers your question — the full
   catalogue is [docs/python_tools_reference.md](docs/python_tools_reference.md).
   The order is:
   1. **Use** the existing tool.
@@ -82,6 +82,12 @@ caching, skipped record types, the export text format, and the directory layout.
   3. Only if nothing is close, write a new one — and **add its entry to
      `python_tools_reference.md` in the same pass**, before you report back. An
      undocumented tool is one the next session will rebuild from scratch.
+- <a id="one-off-goes-in-temp"></a>**A SCRIPT THAT CHASES ONE BUG GOES IN
+  `temp/`, NOT `tools/`.** A tool re-answers its question on NEW input; if
+  nothing new would change its output, it is a one-off. A/B and bisect
+  harnesses, censuses whose answer ships as a constant, and anything naming one
+  plugin/mesh/creature in code are one-offs — finding to `docs/`, script to
+  `temp/`. A good docstring does not make one reusable.
 - Put throwaway files in `temp/`. Don't write one-off scripts with hardcoded
   output — `tools/` scripts take arguments and produce general output, so they are
   reusable next time.

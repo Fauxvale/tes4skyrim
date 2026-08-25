@@ -976,7 +976,8 @@ place the record type is known. **Any record type whose texture field is
 relative to a subfolder has to be listed there**, and it must mirror whatever
 the importer prepends. Guarded by `tests/test_texture_prune.py`.
 
-Diagnose with `python tools/ltex_check.py [plugin]` (LTEX → TXST → file, plus
+Diagnose by walking LAND → LTEX → TNAM → TXST → TX00 → `.dds` (the old
+`ltex_check.py` did this; removed 2026-08-25 as a one-plugin script) —
 dangling LAND layers).
 
 **Why this hid for so long:** the keep-set is applied by `bsa_pack` when the

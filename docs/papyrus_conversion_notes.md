@@ -871,7 +871,8 @@ on the tier the NPC's AIDT was converted to. Values already inside the enum rang
 pass through untouched; non-literals are left alone. `ModActorValue` is
 deliberately NOT scaled — a delta on a 0-100 scale has no enum equivalent, and no
 such call exists in the source. Verify with
-`python tools/check_enum_actor_values.py <scripts/source>`.
+grep the generated sources for `Set/ForceActorValue` on the enum AVs
+(`check_enum_actor_values.py` did this; removed 2026-08-25).
 
 #### Aggression must not collapse 6..105 onto tier 2 (fixed 2026-07-31)
 
