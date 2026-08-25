@@ -3,6 +3,29 @@
 Linked from [CLAUDE.md](../CLAUDE.md). Command reference for the pipeline's
 Python modules and `tools/` debug utilities.
 
+## run_log.py (rotating run logs)
+
+Library, not a CLI. Every run's console output is mirrored to `logs/run-1.log`
+(most recent) through `run-N.log`; `logRunsKept` in `conversion_config.json`
+sets N (default 3, `0` disables). Full contract:
+[pipeline_reference.md](pipeline_reference.md#run-logs).
+
+- `runs_kept(config)` — the configured count, clamped; malformed values fall
+  back to the default rather than silently disabling logging
+- `rotate(logs_dir, keep)` — shift `run-N.log` down one, freeing `run-1.log`.
+  Renames **descending** (ascending would clobber) and prunes past `keep`, so
+  lowering the setting removes the surplus instead of orphaning it
+- `RunLog(path, header)` — header/verbatim-lines/footer, flushed per line so a
+  killed or hung run keeps its output (and has no `# Finished:` footer)
+- `Tee(stream, run_log)` — mirrors `sys.stdout`/`stderr` for the CLI path,
+  buffering partial writes so `print(..., end="")` fragments land as one line
+- `start_cli_run` / `finish_cli_run` — the `convert.py` entry points
+
+**Only a run's OWNER rotates.** The GUI rotates once per run and sets
+`TESCONV_RUN_LOG` (`RUN_LOG_ENV_VAR`) for its children, which then neither
+rotate nor write — a GUI run is several `convert.py` processes, so per-process
+rotation would leave the "last 3 runs" holding the last 3 *steps* of one run.
+
 ## preflight.py (dependency gate)
 
 - **Check every phase**: `python preflight.py` — prints OK / MISSING per phase

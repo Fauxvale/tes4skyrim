@@ -1,9 +1,11 @@
 {
   "// INSTRUCTIONS": "Files to convert are supplied via -f/--files or the GUI. Masters are auto-detected from binary headers. Data paths are auto-detected from registry.",
   "// SKIP_TYPES": "Skip types are managed in tes5_import/constants.py SKIP_TYPES set.",
+  "// logRunsKept": "How many run logs to keep in logs/ (run-1.log is the most recent). 0 disables run logging. Default 3.",
   "tes4DataPath": "",
   "tes5DataPath": "",
   "files": [
     "Oblivion.esm"
-  ]
+  ],
+  "logRunsKept": 3
 }

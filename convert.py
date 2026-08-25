@@ -70,6 +70,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()  # TESConversion root
 # pathlib, so this is safe at module scope despite convert.py being the entry
 # point every package imports from.
 from output_layout import record_dir, plugin_out_root
+import run_log
 
 
 # Papyrus batch compilation (see phase_compile).  An error line from
@@ -1248,7 +1249,7 @@ def phase_pack_zip(file_name: str, config: dict, output_dir: str = None):
 # Main
 # ===========================================================================
 
-def main():
+def _run_pipeline():
     parser = argparse.ArgumentParser(
         description="TES4-to-TES5 Conversion Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1703,6 +1704,75 @@ def main():
     print("-" * 54)
     print("Pipeline completed with errors.")
     return 1
+
+
+def main():
+    """Own the run log for a standalone CLI run, then run the pipeline.
+
+    Only a run's OWNER rotates.  When the GUI launched us it has already
+    opened the log for the whole run (several convert.py invocations, one per
+    step) and set TESCONV_RUN_LOG, so `start_cli_run` returns None here and we
+    neither rotate nor write -- otherwise a 7-step run would rotate 7 times and
+    the retained logs would be the last 3 STEPS of one run.
+    """
+    try:
+        config = load_config(_config_path_from_argv())
+    except Exception:
+        config = {}
+    header = {
+        "Version": _version_string(),
+        "Command": " ".join(["convert.py"] + sys.argv[1:]),
+    }
+    # `--help`/`--list-mods`-style invocations convert nothing; letting them
+    # rotate would push a real run's log out of the retained set for free.
+    log = (None if _is_informational_argv()
+           else run_log.start_cli_run(SCRIPT_DIR / "logs", config, header))
+    code = 1
+    try:
+        code = _run_pipeline()
+        return code
+    except SystemExit as exc:
+        # argparse exits this way for --help and for a bad flag.  Record the
+        # REAL status rather than the "unset" 1, which read as a failed run.
+        code = exc.code if isinstance(exc.code, int) else 0
+        raise
+    finally:
+        run_log.finish_cli_run(log, f"EXIT: {code}")
+
+
+# Flags that print something and exit without converting anything.  A run log
+# exists to explain a CONVERSION; spending a rotation slot on `--help` would
+# evict a real run's log.
+_INFORMATIONAL_FLAGS = {"-h", "--help", "--list-mods"}
+
+
+def _is_informational_argv() -> bool:
+    return any(a in _INFORMATIONAL_FLAGS for a in sys.argv[1:])
+
+
+def _config_path_from_argv() -> str | None:
+    """Read --config out of argv before argparse runs.
+
+    The run log is opened BEFORE _run_pipeline so the header, and any failure
+    inside argument parsing, are captured -- but the config that carries
+    `logRunsKept` is only located by --config. Scanning argv is the cheapest
+    way to honour it without splitting the parser in two.
+    """
+    argv = sys.argv[1:]
+    for i, arg in enumerate(argv):
+        if arg == "--config" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--config="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _version_string() -> str:
+    try:
+        import version as _v
+        return _v.current_version()
+    except Exception:
+        return ""
 
 
 if __name__ == "__main__":
