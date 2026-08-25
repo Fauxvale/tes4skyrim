@@ -160,6 +160,14 @@ GLOBAL_ACTIONS = [
     ("modify_body_meshes", "Patch Skyrim",
      "Build the ARMA slot-44 body patch for your Skyrim load order",
      "Patch Skyrim", 2),
+    # Sits directly under "Pack Start Mod": like it, this converts no plugin.
+    # Oblivion's UI lives in loose menu files and BSAs rather than inside any
+    # ESM, so there is nothing per-plugin to run it against.
+    ("convert_ui", "Convert UI",
+     "Build the standalone Oblivion UI mod: Skyrim's message boxes reskinned "
+     "with Oblivion's own frame art and layout, read from your Oblivion "
+     "install. Replaces one file (Interface\\messagebox.swf)",
+     "Convert UI", 2),
 ]
 
 # ── Colors ───────────────────────────────────────────────────────────────────
@@ -4094,6 +4102,13 @@ def gui_main():
                 cmd += ["--output-dir", out_dir]
             return cmd
 
+        if key == "convert_ui":
+            cmd = [sys.executable, "-u",
+                   str(SCRIPT_DIR / "tools" / "convert_ui.py")]
+            if out_dir:
+                cmd += ["--output-dir", out_dir]
+            return cmd
+
         if key == "make_master":
             cmd = [sys.executable, "-u",
                    str(SCRIPT_DIR / "tools" / "make_master.py")]
@@ -4186,6 +4201,11 @@ def gui_main():
         finished = Path(out_dir) / FINISHED_DIR_NAME
         if key == "package_start_mod":
             return finished / "TESGameSelect.zip"
+        if key == "convert_ui":
+            # The mod name is spelled once, in the tool that produces it.
+            sys.path.insert(0, str(SCRIPT_DIR / "tools"))
+            from convert_ui import MOD_NAME as UI_MOD_NAME
+            return finished / f"{UI_MOD_NAME}.zip"
         if key == "modify_body_meshes":
             return finished / "Slot44 Patch.esp"
         if key == "pack_lod":
@@ -4223,6 +4243,53 @@ def gui_main():
             # already tests the artefact directly, so this only has to describe
             # the inputs that would make an existing zip stale.
             return "\x1f".join(src)
+
+        if key == "convert_ui":
+            # Depends on the GAME FILES it reads, not on anything converted:
+            # the reskin is Oblivion's menu art over Skyrim's own movie, so
+            # keying it to the plugin set would re-light it after every
+            # unrelated conversion while the mod is still correct.
+            #
+            # Identity of the few files actually read, loose first then the
+            # archives holding them -- which is the same resolution order the
+            # tool uses, so installing a UI replacer (DarNified writes loose
+            # menus\*.xml) or patching either game invalidates this and
+            # nothing else does. A handful of stats, because every global
+            # stamp runs before the window first paints.
+            sys.path.insert(0, str(SCRIPT_DIR / "tools"))
+            from convert_ui import MESSAGE_BOX_SWF, find_data_dirs
+            from asset_convert import ui_menus as _ui
+            ob_dir, sk_dir = find_data_dirs()
+            wanted = [(ob_dir, _ui.MESSAGE_MENU_XML),
+                      (ob_dir, _ui.GENERIC_BACKGROUND_XML),
+                      (sk_dir, MESSAGE_BOX_SWF)]
+            for directory, names in (
+                    (_ui.BACKGROUND_TEXTURE_DIR, _ui.BACKGROUND_TEXTURES),
+                    (_ui.FOCUS_TEXTURE_DIR, _ui.FOCUS_TEXTURES)):
+                wanted += [(ob_dir, os.path.join(directory, n))
+                           for n in names]
+            archives = {'Oblivion - Misc.bsa',
+                        'Oblivion - Textures - Compressed.bsa'}
+            parts = []
+            for data_dir, rel in wanted:
+                if not data_dir:
+                    parts.append(f"{rel}:?")
+                    continue
+                loose = Path(data_dir) / Path(*rel.split("\\"))
+                try:
+                    st = loose.stat()
+                    parts.append(f"{rel}:{st.st_size}:{int(st.st_mtime)}")
+                except OSError:
+                    parts.append(f"{rel}:bsa")
+            for data_dir, names in ((ob_dir, archives),
+                                    (sk_dir, {'Skyrim - Interface.bsa'})):
+                for name in sorted(names):
+                    try:
+                        st = (Path(data_dir) / name).stat()
+                        parts.append(f"{name}:{st.st_size}:{int(st.st_mtime)}")
+                    except (OSError, TypeError):
+                        parts.append(f"{name}:?")
+            return "\x1f".join(parts)
 
         if key == "pack_lod":
             # Depends on the BAKED LOD folder, not on the converted plugin set:

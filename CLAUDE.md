@@ -416,6 +416,11 @@ relevant doc when working in that area.
 | [horse_rideability_plan.md](docs/horse_rideability_plan.md) | Rideable horses: RACE Mount Data, horse/rider graph pair, rider-animation sourcing |
 | [npc_skin_tone_conversion.md](docs/npc_skin_tone_conversion.md) | Skin color = RACE part textures + **race FGTS** via the `.egt` basis; per-NPC FGTS is negligible (sd 1/255); the `.egt` format; why a Skyrim census pick made Imperials dark |
 
+### Interface
+| Doc | Covers |
+|---|---|
+| [ui_conversion.md](docs/ui_conversion.md) | Oblivion menus → Skyrim Scaleform, as a SILOED pipeline (no `-f`, global action, own mod — like Create LOD / Pack Start Mod). **Message box implemented** (`tools/convert_ui.py`, GUI *Convert UI*): reskin the vanilla .swf, never rebuild it. Two measured engine rules from 5 in-game rounds: **no 9-slice over a bitmap fill** (0 of 353 vanilla shapes) and **only a shape's FIRST bitmap fill draws** (202 of 207 declare one) — so the 9-slice is composed offline into one bitmap. Also: disassembled `PositionElements` layout maths; **`cropx`/`cropy` is a 1:1 crop not a scaled tile**; the frame's base size is a LAYOUT constraint (border scales, margins do not); translucency and the header shadow live on the PLACEMENT; safe in-place AS2 literal patching. **The HUD stat bars were built and REVERTED** — correct in an offline compositor reading the shipped movie’s own bitmaps/matrices/mask, broken in game; the doc keeps the measurements (the two different reveal mechanisms, the shapes NOT being centered on their origin, the mirrored health fill) so they are not re-derived, and says what was already ruled out. And why every other menu is blocked on missing DATA rather than art |
+
 ### Scripts
 | Doc | Covers |
 |---|---|
