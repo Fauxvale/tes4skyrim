@@ -414,7 +414,12 @@ def _init_dispatch():
         # region data types (objects/grass/sound/map) still belong to TES4
         # systems that have no direct equivalent and are dropped there.
         'EYES',   # Do not convert — NPCs map to Skyrim head parts
-        'HAIR',   # Do not convert — NPCs map to Skyrim head parts
+        # HAIR is CONVERTED to HDPT (convert_HAIR).  Oblivion hair is a real
+        # mesh with a real per-NPC length (NPC_.LNAM blending the .tri's
+        # HairMorph), none of which survives substituting a vanilla Skyrim
+        # hairstyle.  The length is baked per variant by
+        # asset_convert.hair_pipeline, which is why one HAIR record can emit
+        # several HDPTs.
         # NOTE: GMST is skipped WHOLESALE above, but the ambient-dialogue
         # pacing settings are an exception — see AMBIENT_GMST_OVERRIDES below,
         # emitted by import_main regardless of this skip.

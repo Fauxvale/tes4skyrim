@@ -8,8 +8,15 @@ sinks by 0.5-2.5 units, which is exactly the clipping seen in game.
 This module measures that FK error EXACTLY and cancels it:
 
 BUILD (offline, `python -m asset_convert.body_wrap`):
-  1. Load the Oblivion body part meshes (upperbody/lowerbody/hand/foot) in
-     T-pose — the surfaces all Oblivion armor was modelled around.
+  1. Load the Oblivion body part meshes (upperbody/lowerbody/hand/foot AND
+     head+ears) in T-pose — the surfaces all Oblivion armor was modelled
+     around.  The HEAD group (2026-08-23) is what lets helmets, hoods and
+     converted hair be fitted by measurement instead of the hand-tuned
+     ARMOR_PIECE_OFFSETS constants they used to fall back to; its fit is the
+     tightest of any group (surface residual 0.013 vs the body's 0.020) and it
+     corrects a real FK error of mean 4.4 / max 10.4 units.  Its ICP is seeded
+     from the OB<->SK head UV correspondence, without which the fit cannot
+     reach the Skyrim crown at all (see _uv_head_seed).
   2. FK-pose a copy with the very same retarget the armor gets (fkp).
   3. Fit the posed body EXACTLY onto the real Skyrim body surfaces — BOTH
      weight-slider targets (malebody_0 AND malebody_1, hands, feet):
@@ -40,6 +47,7 @@ keeps FK's local mesh quality (no crumpling, no vertex explosions, UV-seam
 twins move identically), while the residual body clipping is cancelled.
 """
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -59,15 +67,30 @@ _REPO = Path(__file__).parent.parent
 _GEN_DIR = Path(__file__).parent / 'generated'
 _OB_BODY_DIR = _REPO / 'export' / 'Oblivion.esm' / 'meshes' / 'characters' / '_male'
 
+# The HEAD group.  Oblivion files the head outside _male\ (it is shared between
+# genders -- there is no femalehead), so these are named relative to the
+# characters\ root and resolved separately from the body parts.
+#
+# Ears are a SEPARATE mesh in Oblivion and are exactly the kind of detail a
+# bounding-box scale gets wrong, so they are fitted alongside the head rather
+# than left to whatever the skull transform happens to do to them.
+_OB_CHAR_DIR = _OB_BODY_DIR.parent
+_OB_HEAD_PARTS = (
+    Path('imperial') / 'headhuman.nif',
+    Path('imperial') / 'earshuman.nif',
+)
+
 # Oblivion body parts per gender, grouped by which Skyrim target surface they
 # fit onto.  src tag makes retarget_skin_to_skyrim pick the right skeleton.
 _OB_BODY_SETS = {
     'male': ({'body':  ['upperbody.nif', 'lowerbody.nif'],
               'hands': ['hand.nif'],
-              'feet':  ['foot.nif']}, 'armor/m/'),
+              'feet':  ['foot.nif'],
+              'head':  list(_OB_HEAD_PARTS)}, 'armor/m/'),
     'female': ({'body':  ['femaleupperbody.nif', 'femalelowerbody.nif'],
                 'hands': ['femalehand.nif'],
-                'feet':  ['femalefoot.nif']}, 'armor/f/'),
+                'feet':  ['femalefoot.nif'],
+                'head':  list(_OB_HEAD_PARTS)}, 'armor/f/'),
 }
 # Skyrim target bodies exist as _0 (thin) / _1 (heavy) weight-slider pairs;
 # a field is fitted against each so armor gets true _0/_1 morph variants.
@@ -76,6 +99,9 @@ _SK_BODY_SETS = {
     'female': {'body': 'femalebody', 'hands': 'femalehands',
                'feet': 'femalefeet'},
 }
+# The Skyrim head target.  Unlike the body/hands/feet there are no _0/_1
+# weight variants -- one head per gender, morphed through chargen instead.
+_SK_HEAD_SETS = {'male': 'malehead.nif', 'female': 'femalehead.nif'}
 
 # ---- build parameters ------------------------------------------------------
 _FIT_PHASES = ((30, 8, 0.5), (20, 2, 0.7))  # (iterations, smooth passes, step)
@@ -109,7 +135,24 @@ SIDE_PENALTY = 0.03
 # clearance from the fitted Skyrim body plus this outward margin (game units).
 # Cancels residual field noise (female chest) at the cost of a slightly
 # looser fit — clipping is far more visible than half a unit of looseness.
-CLEAR_MARGIN = 1.0
+#
+# 2026-08-23: lowered 1.0 -> 0.85.  In game the converted armor read as puffy /
+# scaled-up, and this margin is the only thing inflating it (all 968 armor and
+# clothes NIFs take the wrap path, so ARMOR_PIECE_OFFSETS' legacy 1.05-1.08
+# scales never run for them).  Swept on iron cuirass + greaves, measuring both
+# looseness and how many verts end up under the Skyrim skin:
+#
+#   margin   cuirass inside   greaves inside   greaves size (X,Y)
+#     1.00      7.61%           14.26%           32.99 x 19.63
+#     0.85      7.61%           15.69%           32.69 x 19.37
+#     0.75      7.61%           16.89%           32.49 x 19.25
+#     0.60      7.74%           18.84%           32.19 x 19.12
+#     0.25      7.87%           22.00%           31.93 x 18.64
+#
+# 0.85 is the knee: the cuirass is bit-for-bit unchanged (same 233 verts, same
+# p05 -0.49) while the fit tightens measurably, and greaves give up only 1.4
+# points.  Below 0.75 the greaves degrade fast for very little extra tightness.
+CLEAR_MARGIN = 0.85
 CLEAR_MARGIN_RANGE = 8.0   # margin fades out by this authored clearance
 CLEAR_INNER_FADE = 0.5     # the outward margin dies off by this depth for
                            # verts authored INSIDE the OB body (shirt collars/
@@ -145,13 +188,20 @@ CLEAR_K = 24               # triangles per clearance query.  12 was too few at
 # reliability -> 0), which is where shirt cuffs and collars kept clipping.
 # Hand/foot triangles stay hard-masked to 0 (gauntlets/boots replace them).
 REL_FLOOR = 0.4
-# Skin weight on this bone marks head gear: the field has no head surface,
-# so corrections interpolated from neck/shoulder triangles would drag helmets
-# into the middle of the head.  Head-weighted vertices keep the plain FK
-# result and the legacy ARMOR_PIECE_OFFSETS helmet offset (see nif_converter).
+# Skin weight on this bone marks head gear.  This USED to force such geometry
+# back to the plain FK result plus the hand-tuned ARMOR_PIECE_OFFSETS helmet
+# constants, because the field was built from body/hands/feet only and had no
+# head surface to interpolate from.  The field now includes a fitted head and
+# ears, so the gate is inert whenever `has_head` is set (see deform_geoms_wrap)
+# and survives only as the fallback for fields built before the head group.
 # Head ONLY — the OB body upperbody mesh includes the neck, so Neck/Neck1
 # regions have real field coverage and gating them regresses cuirass collars.
-HEAD_BONES = ('Bip01 Head',)
+# Bone renaming may already have run by the time the wrap deform sees a NIF
+# (converted hair ships skinned to 'NPC Head [Head]'), so head detection must
+# accept BOTH naming conventions -- matching only the Oblivion name silently
+# classified every converted hair mesh as non-head, so it never took the head
+# group's correction at all.
+HEAD_BONES = ('Bip01 Head', 'NPC Head [Head]')
 # Correction-field smoothing at load (body-graph Jacobi passes).  Sweep on
 # iron cuirass/gauntlets/boots (2026-07-10): more passes monotonically lowers
 # armor edge distortion but slowly reintroduces clipping; 12 = best tradeoff
@@ -380,7 +430,10 @@ def _load_ob_group(gender: str):
         v_parts, t_parts, bone_acc = [], [], {}
         offset = 0
         for name in names:
-            path = _OB_BODY_DIR / name
+            # Body parts live in the _male folder; the head parts are named
+            # relative to the characters root (one head serves both genders).
+            path = (_OB_CHAR_DIR / name if group == 'head'
+                    else _OB_BODY_DIR / name)
             if not path.exists():
                 print(f'  [{gender}] missing OB body mesh: {path}')
                 continue
@@ -413,11 +466,15 @@ def _fk_pose_group(gender: str):
     for group, names in sets.items():
         v_parts = []
         for name in names:
-            path = _OB_BODY_DIR / name
+            # Body parts live in the _male folder; the head parts are named
+            # relative to the characters root (one head serves both genders).
+            path = (_OB_CHAR_DIR / name if group == 'head'
+                    else _OB_BODY_DIR / name)
             if not path.exists():
                 continue
             data = _read_nif(path)
-            retarget_skin_to_skyrim(data, src_path=tag + name, allow_wrap=False)
+            retarget_skin_to_skyrim(data, src_path=tag + os.path.basename(str(name)),
+                                    allow_wrap=False)
             for block, skel_root in _iter_skinned_geoms(data):
                 verts, _G = _geom_world(block, skel_root)
                 v_parts.append(verts)
@@ -429,7 +486,14 @@ def _fk_pose_group(gender: str):
 def _load_sk_surface(gender: str, group: str, weight: int):
     """Skyrim target surface for a group+weight: (verts (N,3), tris (M,3))."""
     from .skyrim_assets import get_body_nif_bytes
-    raw = get_body_nif_bytes(f'{_SK_BODY_SETS[gender][group]}_{weight}.nif')
+    if group == 'head':
+        # The head has NO weight-slider variants -- Skyrim ships one
+        # malehead.nif / femalehead.nif and morphs the face through chargen
+        # instead.  The same surface is therefore the target for both weights,
+        # which is correct: a helmet does not change size with body weight.
+        raw = get_body_nif_bytes(_SK_HEAD_SETS[gender])
+    else:
+        raw = get_body_nif_bytes(f'{_SK_BODY_SETS[gender][group]}_{weight}.nif')
     if raw is None:
         return None
     data = _read_nif(raw)
@@ -443,6 +507,36 @@ def _load_sk_surface(gender: str, group: str, weight: int):
     if not v_parts:
         return None
     return np.vstack(v_parts), np.vstack(t_parts)
+
+
+def _uv_head_seed(gender: str, v0):
+    """UV-correspondence positions for the OB head verts, as an ICP seed.
+
+    Both heads share the FaceGen UV layout landmark for landmark (crown OB
+    (0.499,0.053) <-> SK (0.502,0.044); back (0.499,0.506) <-> (0.502,0.464);
+    nose tip (0.400,0.003) <-> (0.437,0.010)), so sampling the Skyrim head at
+    each Oblivion head vertex's UV lands the crown and upper-back skull that
+    nearest-point fitting alone cannot reach.  Returns None (leaving the FK
+    seed in place) if either head or its UVs are unavailable."""
+    try:
+        from .skyrim_assets import get_body_nif_bytes
+        ob_path = _OB_CHAR_DIR / _OB_HEAD_PARTS[0]
+        raw = get_body_nif_bytes(_SK_HEAD_SETS[gender])
+        if not ob_path.exists() or raw is None:
+            return None
+        ob = _head_uv_geometry(ob_path)
+        sk = _head_uv_geometry(raw)
+        if ob is None or sk is None:
+            return None
+        ob_v, _ob_t, ob_u = ob
+        sk_v, sk_t, sk_u = sk
+        if len(ob_v) != len(v0):
+            # the head group may concatenate more than the head mesh
+            return None
+        return _uv_sample(ob_u, sk_u, sk_t, sk_v)
+    except Exception as e:
+        print(f'  [{gender}/head] UV seed unavailable: {e}')
+        return None
 
 
 def _segment_scale(verts, bones, ob_skel, sk_skel):
@@ -530,6 +624,8 @@ def build_field(gender: str, verbose: bool = True) -> bool:
     all_src, all_fkp, all_tris, all_bc, all_part = [], [], [], [], []
     all_dst = {0: [], 1: []}
     offset = 0
+    head_pack = None      # (v0, tris, fitted, (sk_v, sk_t)) for head_fit
+    head_dst_slot = None  # index of the head group in the all_dst lists
 
     for group, gd in groups.items():
         v0 = gd['v0']
@@ -561,6 +657,24 @@ def build_field(gender: str, verbose: bool = True) -> bool:
             sk_tree = cKDTree(sk_cent)
 
             cur = seed.copy()
+            if group == 'head':
+                # Seed the HEAD fit from the UV correspondence instead of the
+                # FK pose.  The Oblivion skull is 19.2 units tall against the
+                # Skyrim skull's 22.5, so from the FK pose ICP has nothing to
+                # project onto the extra height: it converged with the crown
+                # at z 130.8 (real: 131.85) and the upper-back skull up to 5.2
+                # units inside -- exactly where hair and helmets sit, which is
+                # what let the back of the head poke through them.
+                #
+                # The UV seed is used ONLY as a starting point; ICP still runs
+                # and still smooths, so the resulting correction field stays
+                # the smooth slowly-varying translation field armor depends on.
+                # (The raw UV map must NEVER be applied to geometry directly:
+                # it stretches the head's own edges by up to 2045%, and any
+                # field built from it mangles whatever rides it.)
+                uv_seed = _uv_head_seed(gender, v0)
+                if uv_seed is not None:
+                    cur = uv_seed
             for iters, smooth_n, step in _FIT_PHASES:
                 for _ in range(iters):
                     vn = _vertex_normals(cur, tris, wg, n_g)
@@ -583,6 +697,12 @@ def build_field(gender: str, verbose: bool = True) -> bool:
                       f'FK correction mean={corr.mean():.2f} '
                       f'p95={np.percentile(corr, 95):.2f} max={corr.max():.2f}')
             all_dst[wt].append(cur)
+            if group == 'head' and wt == 0:
+                # captured for the head-gear fit (asset_convert.head_fit):
+                # the authored OB head, its fitted counterpart, and the REAL
+                # Skyrim head surface the runtime snap measures against.
+                head_pack = (v0, tris, cur.copy(), (sk_v, sk_t))
+                head_dst_slot = len(all_dst[wt]) - 1
 
         # per-vertex bone centroid (region gate for candidate matching)
         bc = np.zeros_like(v0)
@@ -608,7 +728,25 @@ def build_field(gender: str, verbose: bool = True) -> bool:
         # hand/foot fits (within 3 units of the body surface) is smooth and
         # is exactly where clothing shoe tops and shirt cuffs clip — those
         # verts count as body so enforcement can rescue them.
-        if group == 'body':
+        # The HEAD counts as body for this purpose: unlike hands/feet, no worn
+        # piece REPLACES the head, so a helmet or hairstyle sinking into the
+        # skull is exactly the clipping enforcement exists to stop (this is the
+        # "back of the head pokes through the helmet" case).
+        # THE HEAD IS ITS OWN PART (2), NOT BODY.  Labelling it 0 made every
+        # head triangle a valid correction source for ORDINARY ARMOR: the
+        # head group spans z 107.2-126.0, and in the collar band (z 110-116)
+        # 610 of 662 field verts are head verts carrying a mean delta of
+        # 7.33.  A cuirass collar sits exactly there, so it inherited the
+        # HEAD's correction and was lifted with it -- the iron cuirass
+        # shipped reaching z 121.6, above the head bone at 120.3, and the
+        # mythic dawn robe rode up the same way.  Armor did not do this
+        # before the head group existed, because there were no head verts to
+        # sample.  Head gear and hair are fitted by asset_convert.head_fit in
+        # the head's own frame, so nothing needs the head inside the BODY
+        # wrap's correction domain.
+        if group == 'head':
+            part = np.full(len(v0), 2, dtype=np.int32)
+        elif group == 'body':
             part = np.zeros(len(v0), dtype=np.int32)
         else:
             part = np.ones(len(v0), dtype=np.int32)
@@ -618,6 +756,48 @@ def build_field(gender: str, verbose: bool = True) -> bool:
                 part[d_body < 3.0] = 0
         all_part.append(part)
         offset += len(v0)
+
+    # Head-gear fit data (asset_convert.head_fit): the affine OB->SK head
+    # carrier plus both heads' clearance surfaces.  Hair and Prn helmets are
+    # fitted with these, NOT with the wrap field (their verts are bone-local,
+    # not world, so the field cannot even be queried for them).
+    hf_arrays = {}
+    if head_pack is not None:
+        try:
+            from . import head_fit
+            hv0, htris, _hdst, sk_surface = head_pack
+            hf_arrays = head_fit.build_arrays(
+                hv0, htris, sk_surface, _OB_CHAR_DIR,
+                o_ob=ob_skel['Bip01 Head'][3, :3],
+                o_sk=sk_skel['NPC Head [Head]'][3, :3],
+                gender=gender)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f'  [{gender}] head-fit arrays failed: {e}')
+            hf_arrays = {}
+
+    # THE WRAP'S HEAD SURFACE IS THE FIELD-MAPPED HEAD, NOT THE ICP FIT.
+    # The ICP head fit is a world-frame carrier and oversizes exactly as the
+    # v1 head_fit affine did (measured: the townguardcho skinned helmet
+    # shipped 20.54 units wide against its authored 16.45 — "comically
+    # large" in game).  head_fit's displacement field maps every OB head
+    # vertex EXACTLY onto the earless Skyrim skin, so replacing the head
+    # rows of dst gives skinned head gear (guard helmets, hoods) the
+    # identical mapping rigid PRN gear and hair take.
+    if head_dst_slot is not None and 'hf_dv' in hf_arrays:
+        hv0 = head_pack[0]
+        # hf arrays may be neck-extended; the head group rows come first
+        dv = hf_arrays['hf_dv'].astype(np.float64)[:len(hv0)]
+        carrier = (sk_skel['NPC Head [Head]'][3, :3]
+                   - ob_skel['Bip01 Head'][3, :3])
+        head_dst = hv0 + carrier + dv
+        for wt in (0, 1):
+            all_dst[wt][head_dst_slot] = head_dst
+        if verbose:
+            corr = np.linalg.norm(head_dst - hv0, axis=1)
+            print(f'  [{gender}/head] dst replaced by head-fit field: '
+                  f'correction mean={corr.mean():.2f} max={corr.max():.2f}')
 
     _GEN_DIR.mkdir(parents=True, exist_ok=True)
     out = _GEN_DIR / f'body_wrap_{gender}.npz'
@@ -629,7 +809,9 @@ def build_field(gender: str, verbose: bool = True) -> bool:
         dst1=np.vstack(all_dst[1]).astype(np.float32),
         tris=np.vstack(all_tris).astype(np.int32),
         vert_bc=np.vstack(all_bc).astype(np.float32),
-        part=np.concatenate(all_part))
+        part=np.concatenate(all_part),
+        has_head=np.array([1 if 'head' in groups else 0], dtype=np.int8),
+        **hf_arrays)
     if verbose:
         print(f'  [{gender}] saved {out.name}: {offset} verts, '
               f'{sum(len(t) for t in all_tris)} tris')
@@ -667,6 +849,11 @@ class WrapField:
         tris = z['tris'].astype(np.int64)
         vert_bc = z['vert_bc'].astype(np.float64)
         part = z['part'].astype(np.int64)
+        # Does this field carry a fitted head surface?  Fields built before the
+        # head group existed do not, and head-weighted geometry must keep the
+        # old FK+constants fallback for them rather than take corrections
+        # interpolated from neck and shoulder triangles.
+        self.has_head = bool(z['has_head'][0]) if 'has_head' in z else False
 
         # Smooth the correction field over the body graph: the fit's residual
         # high-frequency noise (tangential bunching, per-triangle projection
@@ -689,6 +876,19 @@ class WrapField:
                      fkp[tris[:, 2]] - fkp[tris[:, 0]])
         area2 = np.linalg.norm(n, axis=1)
         good = area2 > 1e-8
+        # ...AND DROP THE HEAD (part 2) FROM THE WRAP ENTIRELY.  The head
+        # group is in this npz so head_fit can build its scalp displacement
+        # field from the hf_* arrays; it is NOT a correction source for worn
+        # body armor, and nothing worn on the body should ever sample it.
+        # Left in, its triangles are simply the nearest surface for collar
+        # geometry -- in the z 110-116 band 610 of 662 field verts are head
+        # verts carrying a mean delta of 7.33 -- so cuirass and robe collars
+        # inherited the head's correction and rode up with it (iron cuirass
+        # reached z 121.6 against a head bone at 120.3).  Armor never did
+        # this before the head group was added.  Helmets, hoods and hair are
+        # fitted by asset_convert.head_fit in the head's own frame and do not
+        # come through here, so removing these triangles costs nothing.
+        good &= part[tris].max(axis=1) != 2
         self.tris = tris[good]
         self.fkp = fkp
         self.tri_n = n[good] / area2[good][:, None]
@@ -726,6 +926,104 @@ class WrapField:
             self.tri_rel.append(rel * body_tri)
 
 
+# ---------------------------------------------------------------------------
+# Head map: exact UV correspondence between the OB and SK heads
+# ---------------------------------------------------------------------------
+#
+# The wrap field's ICP head fit CANNOT place head gear correctly, and the
+# reason is geometric, not tuning.  The Oblivion skull is 19.2 units tall
+# (z 106.84..126.04); the Skyrim one is 22.5 (z 109.33..131.85).  ICP has no
+# geometry to project onto the extra 3.3 units, so it stretches what it has
+# and leaves the Skyrim crown and upper-back skull up to 5.2 units uncovered
+# (measured: the fitted head tops out at z 130.8 vs the real 131.85, and its
+# back profile over z 120..128 reads 8.8/8.8/7.5/-6.1 against Skyrim's
+# 9.9/10.0/9.2/8.1).  That uncovered upper-back skull is EXACTLY where hair
+# and helmets sit, which is why the back of the head poked through them.
+#
+# Both heads are heads: they share the FaceGen UV layout, landmark for
+# landmark.  Measured on the vanilla pair --
+#     crown    OB (0.499, 0.053) <-> SK (0.502, 0.044)
+#     back     OB (0.499, 0.506) <-> SK (0.502, 0.464)
+#     nose tip OB (0.400, 0.003) <-> SK (0.437, 0.010)
+# -- so sampling the Skyrim head at each Oblivion head vertex's UV gives an
+# EXACT correspondence rather than a nearest-point guess.  It reproduces the
+# real Skyrim head to mean 0.37 / p95 0.89 units INCLUDING the crown
+# (z 131.68 vs the real 131.85), and it accounts for ears, eyes and nose by
+# identity because the UV layout is what pins those features.
+#
+# The correspondence is used ONLY to SEED the head group's ICP fit in
+# build_field.  It must NEVER be applied to geometry directly: the two heads
+# correspond topologically but are wildly non-isometric locally, so the raw
+# map stretches the head's OWN edges by up to 2045% (79.9% of edges over 15%),
+# and a correction field built from it mangles whatever rides it -- measured
+# on converted hair as 34.01% of edges distorted >15%, max 108%.  Seeding ICP
+# instead keeps the field the smooth, slowly-varying translation field armor
+# depends on: 2.51% of edges >15%, max 40%, while the fit's worst
+# back-of-head shortfall drops from 5.2 units to 0.89.
+
+_HEADMAP_CACHE: dict = {}
+
+
+def _head_uv_geometry(source):
+    """(verts_world, tris, uvs) for a head NIF given a path or bytes."""
+    data = _read_nif(source)
+    v_parts, t_parts, u_parts = [], [], []
+    offset = 0
+    for block, skel_root in _iter_skinned_geoms(data):
+        uv = block.data.uv_sets[0] if len(block.data.uv_sets) else None
+        if uv is None:
+            continue
+        verts, _G = _geom_world(block, skel_root)
+        v_parts.append(verts)
+        t_parts.append(_geom_triangles(block) + offset)
+        u_parts.append(np.array([[p.u, p.v] for p in uv], dtype=np.float64))
+        offset += len(verts)
+    if not v_parts:
+        return None
+    return np.vstack(v_parts), np.vstack(t_parts), np.vstack(u_parts)
+
+
+def _uv_sample(q_uv, uv, tris, verts, k=24):
+    """Sample `verts` at uv coordinates `q_uv` over the (uv, tris) uv mesh.
+
+    Barycentric inside a uv triangle where one contains the query, else the
+    triangle whose barycentrics are least negative (nearest in uv space), so
+    the few vertices on a uv island boundary still map continuously."""
+    from scipy.spatial import cKDTree
+    k = min(k, len(tris))
+    _, cand = cKDTree(uv[tris].mean(axis=1)).query(q_uv, k=k)
+    if k == 1:
+        cand = cand[:, None]
+    a = uv[tris[cand, 0]]
+    b = uv[tris[cand, 1]]
+    c = uv[tris[cand, 2]]
+    v0 = b - a
+    v1 = c - a
+    v2 = q_uv[:, None, :] - a
+    d00 = (v0 * v0).sum(axis=2)
+    d01 = (v0 * v1).sum(axis=2)
+    d11 = (v1 * v1).sum(axis=2)
+    d20 = (v2 * v0).sum(axis=2)
+    d21 = (v2 * v1).sum(axis=2)
+    den = d00 * d11 - d01 * d01
+    den = np.where(np.abs(den) < 1e-16, 1.0, den)
+    bv = (d11 * d20 - d01 * d21) / den
+    bw = (d00 * d21 - d01 * d20) / den
+    bu = 1.0 - bv - bw
+    inside = (bu >= -1e-6) & (bv >= -1e-6) & (bw >= -1e-6)
+    pen = np.minimum(np.minimum(bu, bv), bw)
+    best = np.argmax(np.where(inside, 1e6, pen), axis=1)
+    r = np.arange(len(q_uv))
+    bu_, bv_, bw_ = bu[r, best], bv[r, best], bw[r, best]
+    tot = bu_ + bv_ + bw_
+    tot = np.where(np.abs(tot) < 1e-12, 1.0, tot)
+    bu_, bv_, bw_ = bu_ / tot, bv_ / tot, bw_ / tot
+    t = tris[cand[r, best]]
+    return (bu_[:, None] * verts[t[:, 0]]
+            + bv_[:, None] * verts[t[:, 1]]
+            + bw_[:, None] * verts[t[:, 2]])
+
+
 def _field_path(female: bool) -> Path:
     return _GEN_DIR / f'body_wrap_{"female" if female else "male"}.npz'
 
@@ -755,6 +1053,20 @@ def wrap_available(src_path: str) -> bool:
     return get_field(female) is not None
 
 
+def wrap_has_head(src_path: str) -> bool:
+    """True when this NIF's field carries a fitted HEAD surface.
+
+    Head gear (helmets, hoods, converted hair) takes the measured correction
+    only when the field actually has a head in it; a field built before the
+    head group existed must keep the legacy ARMOR_PIECE_OFFSETS fallback or
+    corrections interpolated from neck/shoulder triangles drag it into the
+    middle of the skull.
+    """
+    female = '/f/' in src_path.replace('\\', '/').lower()
+    field = get_field(female)
+    return field is not None and getattr(field, 'has_head', False)
+
+
 # ---------------------------------------------------------------------------
 # Runtime application
 # ---------------------------------------------------------------------------
@@ -766,7 +1078,15 @@ def _field_corrections(field, pts, abc, weight=0):
     barycentric interpolation of vertex deltas at the closest surface point,
     Gaussian-blended by (surface distance, bone-centroid distance) with a
     wrong-side penalty.  Normalised blending extrapolates the regional
-    correction as a constant for far-away points."""
+    correction as a constant for far-away points.
+
+    CHUNKED for memory, exactly like _blended_clearance."""
+    pts = np.asarray(pts, dtype=np.float64)
+    if len(pts) > _WRAP_CHUNK:
+        return np.concatenate([
+            _field_corrections(field, pts[i:i + _WRAP_CHUNK],
+                               abc[i:i + _WRAP_CHUNK], weight)
+            for i in range(0, len(pts), _WRAP_CHUNK)])
     k = min(K_CAND, len(field.tris))
     _, tri = field.tree.query(pts, k=k)
     if k == 1:
@@ -819,11 +1139,41 @@ def _field_corrections(field, pts, abc, weight=0):
     return (w[:, :, None] * delta_cp).sum(axis=1)
 
 
+_WRAP_CHUNK = 4096         # max pts per closest-point solve (memory)
+
+
 def _blended_clearance(field, pts, verts_surf, tri_normals, tree,
                        tri_rel=None, k=12):
     """Smooth signed clearance of pts against a body surface, plus the
     blended outward normal.  Gaussian blend over nearby triangles so the
-    result is a smooth field (safe to use for pushing vertices)."""
+    result is a smooth field (safe to use for pushing vertices).
+
+    CHUNKED: this expands to ~10 (P,K,3) intermediates at CLEAR_K=24, i.e.
+    ~1.15 GB for a 200k-vert armor mesh -- times the mesh-stage worker pool,
+    which exhausted memory and froze the machine (2026-08-25).  Peak is now
+    bounded by _WRAP_CHUNK no matter how large the mesh is.
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    if len(pts) > _WRAP_CHUNK:
+        outs = []
+        for i in range(0, len(pts), _WRAP_CHUNK):
+            outs.append(_blended_clearance(field, pts[i:i + _WRAP_CHUNK],
+                                           verts_surf, tri_normals, tree,
+                                           tri_rel=tri_rel, k=k))
+        # `rel_out` is None when tri_rel is not supplied, and None cannot be
+        # concatenated ("zero-dimensional arrays cannot be concatenated").
+        # That exception propagated out of deform_geoms_wrap, which catches
+        # it and falls back to plain FK -- so every mesh LARGER than
+        # _WRAP_CHUNK silently lost the wrap entirely.  On the mythic dawn
+        # robe (1936-vert Hand shape) FK alone left the hands 84.6 units out
+        # of place and the whole robe offset; smaller meshes such as the
+        # iron cuirass never chunked, which is why only some armor broke
+        # (in-game 2026-08-25).  Members that are None in every chunk stay
+        # None; the rest concatenate.
+        return tuple(
+            None if outs[0][j] is None
+            else np.concatenate([o[j] for o in outs])
+            for j in range(len(outs[0])))
     k = min(k, len(field.tris))
     _, tri = tree.query(pts, k=k)
     if k == 1:
@@ -887,6 +1237,10 @@ def deform_geoms_wrap(skinned_geoms, skel_root, field, female: bool,
         return 0    # wrap needs the FK base; fall back entirely
 
     # capture pre-FK (authored T-pose) world verts for clearance enforcement
+    # PRN-attached rigid pieces are EXCLUDED: their verts are BONE-LOCAL
+    # (near the origin — _add_prn_skin's contract), not skeleton-space, so a
+    # field query for them lands nowhere meaningful.  Rigid head gear is
+    # fitted by asset_convert.head_fit in its own frame instead.
     pre_fk: dict = {}
     for block, is_prn, _pb in skinned_geoms:
         if is_prn or block.data is None or block.data.num_vertices == 0:
@@ -904,17 +1258,18 @@ def deform_geoms_wrap(skinned_geoms, skel_root, field, female: bool,
     _deform_vertices_animation_fk(skinned_geoms, skel_root, bone_deltas)
 
     ob_skel = _load_skeleton(_SKEL_OBLIVION)
-
     # ---- gather every eligible block into one concatenated system --------
     metas = []          # (block, G_id, G, start, nv)
     vw_parts, pre_parts, abc_parts, hf_parts, tri_parts = [], [], [], [], []
+    hwf_parts = []
+    hg_parts = []
     off = 0
     for block, is_prn, _prn_bone in skinned_geoms:
         if is_prn:
             continue
         geom_data = block.data
         skin = block.skin_instance
-        if (geom_data is None or skin.data is None
+        if (geom_data is None or skin is None or skin.data is None
                 or geom_data.num_vertices == 0):
             continue
         v0 = pre_fk.get(id(block))
@@ -939,32 +1294,62 @@ def deform_geoms_wrap(skinned_geoms, skel_root, field, female: bool,
         abc = np.zeros((nv, 3), dtype=np.float64)
         absum = np.zeros(nv)
         head_w = np.zeros(nv)
+        tot_w = np.zeros(nv)
         for bone, (idx, w) in bones_w.items():
+            valid = (idx < nv) & (w > 1e-6)
+            np.add.at(tot_w, idx[valid], w[valid])
+            if bone in HEAD_BONES:
+                np.add.at(head_w, idx[valid], w[valid])
             if bone not in ob_skel:
                 continue
             head = ob_skel[bone][3, :3]
-            valid = (idx < nv) & (w > 1e-6)
             np.add.at(abc, idx[valid], np.outer(w[valid], head))
             np.add.at(absum, idx[valid], w[valid])
-            if bone in HEAD_BONES:
-                np.add.at(head_w, idx[valid], w[valid])
         has = absum > 1e-6
         abc[has] /= absum[has][:, None]
         abc[~has] = vw[~has]
+        hwf = head_w / np.maximum(tot_w, 1e-6)   # head-weight fraction
         # head-gear gating is a PER-GEOMETRY decision: a helmet (majority
         # head-weighted) keeps plain FK everywhere, but a shirt whose collar
         # verts carry partial head weights (authored for neck-turn deform)
         # must NOT lose correction/enforcement exactly at the collar
+        # HEAD GATING IS OFF once the field carries a head surface.
+        #
+        # This used to force head-weighted geometry back to the plain FK result
+        # (hf=1 suppresses both the correction and the clearance enforcement),
+        # because the field was built from body/hands/feet only and corrections
+        # interpolated from neck and shoulder triangles dragged helmets into
+        # the middle of the skull.  That left EVERY head-attached piece --
+        # helmets, hoods, and converted hair -- fitted by the hand-tuned
+        # ARMOR_PIECE_OFFSETS constants instead of a measurement, which is why
+        # helmets let the back of the head poke through and why hair needed a
+        # guessed scale factor.
+        #
+        # The field now includes a fitted head (and ears), so head-weighted
+        # verts have real coverage and take the same exact correction as
+        # everything else.  Keep the fraction computed for the fallback below.
+        # Measure the head fraction against the geometry's TOTAL skin weight.
+        # absum only accumulates bones found in the Oblivion skeleton, so a
+        # mesh already skinned to renamed Skyrim bones has absum == 0 and any
+        # ratio against it is meaningless.
+        w_total = sum(float(w[(idx < nv) & (w > 1e-6)].sum())
+                      for idx, w in bones_w.values())
         hw_total = float(head_w.sum())
-        ab_total = float(absum.sum())
-        geom_is_head = ab_total > 1e-6 and hw_total / ab_total > 0.5
-        hf = np.full(nv, 1.0 if geom_is_head else 0.0)
+        geom_is_head = w_total > 1e-6 and hw_total / w_total > 0.5
+        gate_head = geom_is_head and not getattr(field, 'has_head', False)
+        hf = np.full(nv, 1.0 if gate_head else 0.0)
+        # HEAD GEAR IS A PROPERTY OF THE GEOMETRY, NOT OF A VERTEX.  The
+        # head-fit blend below must see this per vertex, so carry the
+        # per-geometry verdict out with the other parts.
+        hg = np.full(nv, 1.0 if geom_is_head else 0.0)
 
         metas.append((block, G_id, G, off, nv))
         vw_parts.append(vw)
         pre_parts.append(v0)
         abc_parts.append(abc)
         hf_parts.append(hf)
+        hwf_parts.append(hwf)
+        hg_parts.append(hg)
         tri_parts.append(_geom_triangles(block) + off)
         off += nv
 
@@ -987,6 +1372,43 @@ def deform_geoms_wrap(skinned_geoms, skel_root, field, female: bool,
     corr = _field_corrections(field, VW, ABC, weight)
     corr = corr * (1.0 - HF)[:, None]
     new_w = VW + corr
+
+    # HEAD-WEIGHTED GEOMETRY TAKES THE HEAD-FIT FIELD DIRECTLY.  The wrap's
+    # correction field is graph-smoothed (DELTA_SMOOTH_PASSES), which smears
+    # the real jaw/cheek widening across the whole head — a skinned guard
+    # helmet's head band shipped +2.5 units wide ("comically large").  Head-
+    # weighted verts instead map exactly as a rigid PRN helmet would: their
+    # authored position samples head_fit's scalp displacement field, so the
+    # shell keeps its authored standoff everywhere.  Blending by head-weight
+    # fraction hands the shoulder drape (clavicle/spine weights) back to the
+    # wrap, seamlessly at the mixed-weight collar ring.
+    HW = _group_mean(np.concatenate(hwf_parts)[:, None], wg, n_g)[wg][:, 0]
+    # ONLY ACTUAL HEAD GEAR TAKES THE HEAD-FIT FIELD.  head_fit's field is a
+    # SCALP displacement map: it is defined on the head surface and means
+    # nothing below it.  Keying the blend on per-VERTEX head weight fed it
+    # the collar ring of ordinary body armor, which carries head weights so
+    # the neck deforms with the head -- and those verts sit ~3 units off the
+    # OB head surface and well below the scalp, so the sampled delta is an
+    # extrapolation.  Measured on the iron cuirass: 157 collar verts (hwf up
+    # to 1.00) were moved 6.78 mean / 7.98 max, lifting them from z
+    # 105.6-113.0 to 111.9-120.2 -- armor visibly dragged up toward the head
+    # (in-game 2026-08-25).  The mythic dawn robe showed the same thing.
+    # `geom_is_head` is the existing per-GEOMETRY test (>50% of the mesh's
+    # skin weight on the head) that already distinguishes a helmet from a
+    # cuirass; requiring it here means helmets and hoods still fit through
+    # the head field exactly as before, and no body piece is touched by it.
+    HG = _group_mean(np.concatenate(hg_parts)[:, None], wg, n_g)[wg][:, 0]
+    m_head = (HW > 1e-3) & (HG > 0.5)
+    if m_head.any():
+        from . import head_fit
+        hfit = head_fit._get(female)
+        if hfit is not None:
+            delta = head_fit.field_deltas(PRE[m_head] - hfit.o_ob, female)
+            if delta is not None:
+                tgt = PRE[m_head] + (hfit.o_sk - hfit.o_ob) + delta
+                w_h = HW[m_head][:, None]
+                new_w[m_head] = (1.0 - w_h) * new_w[m_head] + w_h * tgt
+                HF = np.maximum(HF, HW)   # field-fitted verts skip the push
 
     # --- minimum-clearance enforcement ------------------------------------
     # authored clearance (T-pose vert vs OB body) must be preserved, plus an

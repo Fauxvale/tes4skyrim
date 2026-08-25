@@ -222,6 +222,7 @@ OUTPUT_USER_VERSION_2 = 83
 
 NIF_FLAGS = 14  # Standard Skyrim NiAVObject flags (SelectiveUpdate bits 1-3)
 
+
 # Controller types vanilla Skyrim puts inside a NiControllerSequence's
 # controlled blocks.  A NiControllerSequence stores its controller type as a
 # STRING and the engine instantiates it BY NAME at load, so any type outside
@@ -1968,7 +1969,6 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         ts.data.unknown_int_2 = 0
 
     return ts
-
 
 
 def _drop_mttc_target(mgr, node_name: bytes) -> int:
@@ -4250,7 +4250,6 @@ def _walk_node(parent, node, fix_textures, stats):
     return node
 
 
-
 def _has_autoplay_sequence(root):
     """True if the tree carries an ambient (AutoPlay/AutoLoop) sequence.
 
@@ -4384,7 +4383,6 @@ def _add_bsx_flags(root, has_constraints=False):
     for i in range(root.num_extra_data_list - 1, insert_at, -1):
         root.extra_data_list[i] = root.extra_data_list[i - 1]
     root.extra_data_list[insert_at] = bsx
-
 
 
 # ---------------------------------------------------------------------------
@@ -4899,6 +4897,88 @@ def _strip_gnd_skin(data):
 from .skin_replacement import (collect_skin_info, strip_body_skin_geometry, splice_body_geometry, apply_armor_offset)
 
 
+# Bone names that mark a Prn piece as HEAD gear (post-rename the bone is
+# 'NPC Head [Head]'; the Oblivion name is accepted defensively).
+_PRN_HEAD_BONES = (b'NPC Head [Head]', b'Bip01 Head')
+
+
+def _fit_prn_head_blocks(data, prn_block_ids, src_path) -> set:
+    """Fit head-attached Prn blocks onto the Skyrim head (head_fit).
+
+    Runs AFTER retarget: Prn verts are face-space (authored coords, the shape
+    transform baked in) and render as ``verts + head bone world``, so the fit
+    maps them into Skyrim head space directly — the same frame the old
+    ARMOR_PIECE_OFFSETS_PRN affine operated in.  All head blocks of the NIF
+    are solved as ONE system so multi-shape helmets keep their seams.
+
+    Returns the ids of the blocks that were fitted (empty when the fit data
+    is unavailable — callers then fall back to the legacy constants).
+    """
+    from . import head_fit
+    female = '/f/' in str(src_path).replace('\\', '/').lower()
+    if not head_fit.fit_available(female):
+        return set()
+
+    # Walk the LIVE tree, never data.blocks: the strips->shape conversion
+    # replaces geometry objects, so data.blocks is stale by this point and
+    # an id() lookup over it silently matches nothing (the fit then never
+    # ran and every helmet fell back to the legacy PRN scale table).
+    blocks = []
+    seen = set()
+    for root in data.roots:
+        if root is None:
+            continue
+        for block in root.tree():
+            if id(block) not in prn_block_ids or id(block) in seen:
+                continue
+            if not isinstance(block, (NifFormat.NiTriShape,
+                                      NifFormat.NiTriStrips)):
+                continue
+            skin = getattr(block, 'skin_instance', None)
+            if skin is None or skin.num_bones < 1 or skin.bones[0] is None:
+                continue
+            name = bytes(skin.bones[0].name or b'')
+            if name not in _PRN_HEAD_BONES:
+                continue
+            gd = block.data
+            if gd is None or gd.num_vertices == 0:
+                continue
+            seen.add(id(block))
+            blocks.append(block)
+    if not blocks:
+        return set()
+
+    import numpy as np
+    shapes = []
+    for block in blocks:
+        gd = block.data
+        verts = np.array([[v.x, v.y, v.z] for v in gd.vertices],
+                         dtype=np.float64)
+        try:
+            tris = np.array([tuple(t) for t in gd.get_triangles()],
+                            dtype=np.int64)
+        except Exception:
+            tris = np.zeros((0, 3), dtype=np.int64)
+        if tris.size == 0:
+            tris = np.zeros((0, 3), dtype=np.int64)
+        shapes.append((verts, tris))
+
+    fitted = head_fit.fit_head_gear(shapes, female)
+    if fitted is None:
+        return set()
+    for block, new_v in zip(blocks, fitted):
+        gd = block.data
+        for i, v in enumerate(gd.vertices):
+            v.x = float(new_v[i, 0])
+            v.y = float(new_v[i, 1])
+            v.z = float(new_v[i, 2])
+        try:
+            gd.update_center_radius()
+        except Exception:
+            pass
+    return {id(b) for b in blocks}
+
+
 def _remap_bone_names(data) -> int:
     """Rename Oblivion Bip01 skeleton bones to Skyrim NPC skeleton names.
 
@@ -5239,7 +5319,8 @@ def _upgrade_skin_instances(data):
 
 
 def _convert_nif(data, fix_textures=True, src_path='', weight=0,
-                 creature=False, worn=False, parallax=False, biped_flags=0):
+                 creature=False, worn=False, parallax=False, biped_flags=0,
+                 hair=False):
     """Convert a PyFFI NifFormat.Data in-place to Skyrim format.
 
     worn=True marks the NIF as body-worn gear on the plugin's own authority (an
@@ -6160,25 +6241,47 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         _body_nibs_to_splice = collect_skin_info(data, src_path=src_path)
         strip_body_skin_geometry(data)
 
-        # Apply per-piece armor vertex offset/scale (from skyrim_overrides) AFTER
-        # body-skin is stripped, so only true armor geometry is shifted.
-        # PRN-attached rigid pieces get their own (near-zero) offsets — the
-        # regular table compensates FK-retarget drift they never had.
-        # When the surface-wrap field is active the fit is already exact, so
-        # the FK-drift compensation offsets must NOT be applied (they would
-        # push armor off the body they were tuned to approximate).
-        # EXCEPTION: helmets/hoods.  The wrap field has no head surface, so
-        # body_wrap leaves head-weighted verts at the plain FK result
-        # (HEAD_BONES gating) — skinned head gear still needs the FK-tuned
-        # helmet offset or it sits inside the middle of the head.
+        # RIGID HEAD GEAR IS FITTED BY MEASUREMENT, NOT BY A SCALE.
+        #
+        # The two skulls differ in SHAPE, not by a factor: in world space the
+        # Oblivion head spans z 106.84..126.04 (19.20 tall) and the Skyrim head
+        # z 109.33..131.85 (22.52) -- the Skyrim skull reaches 5.4 further down
+        # AND 2.1 higher at the crown.  No single scale expresses that, which
+        # is why the old ARMOR_PIECE_OFFSETS_PRN['helmet'] affine could never
+        # stop the back of the head poking through.
+        #
+        # Every Prn block hanging on the HEAD bone (helmets, hoods, hair) is
+        # instead run through asset_convert.head_fit: each vertex keeps its
+        # authored signed distance from the Oblivion skin, measured against
+        # the real Skyrim head — so a helmet authored 2 units off the skull
+        # stays exactly 2 units off, and the skull can no longer poke through
+        # anything that covered it in Oblivion.  Converted hair (`hair=True`)
+        # was fitted upstream in hair_pipeline.bake_hair_variant and must not
+        # be touched again here.
+        #
+        # Everything else keeps the previous rules: skinned geometry is exact
+        # under the wrap (offsets suppressed), non-head Prn pieces (shields)
+        # keep their near-zero PRN offsets, and the FK-tuned constants remain
+        # the fallback whenever the fit/field data is unavailable.
         from .body_wrap import wrap_available as _wrap_available
-        if not _wrap_available(src_path) or _piece_type == 'helmet':
-            _cfg = ARMOR_PIECE_OFFSETS.get(_piece_type, ARMOR_PIECE_OFFSETS['default'])
-            apply_armor_offset(data, _cfg, exclude_block_ids=_prn_block_ids)
-        if _prn_block_ids:
-            _cfg_prn = ARMOR_PIECE_OFFSETS_PRN.get(
-                _piece_type, ARMOR_PIECE_OFFSETS_PRN['default'])
-            apply_armor_offset(data, _cfg_prn, only_block_ids=_prn_block_ids)
+        from .body_wrap import wrap_has_head as _wrap_has_head
+        _prn_head_ids = set()
+        if _prn_block_ids and not hair:
+            _prn_head_ids = _fit_prn_head_blocks(data, _prn_block_ids,
+                                                 src_path)
+        if not hair:
+            # Skinned helmet/hood geometry: exact under the wrap once the
+            # field carries a head surface; FK constants only as fallback.
+            _skinned_head_ok = _wrap_has_head(src_path)
+            if not _wrap_available(src_path) or (
+                    _piece_type == 'helmet' and not _skinned_head_ok):
+                _cfg = ARMOR_PIECE_OFFSETS.get(_piece_type, ARMOR_PIECE_OFFSETS['default'])
+                apply_armor_offset(data, _cfg, exclude_block_ids=_prn_block_ids)
+            _prn_legacy = _prn_block_ids - _prn_head_ids
+            if _prn_legacy:
+                _cfg_prn = ARMOR_PIECE_OFFSETS_PRN.get(
+                    _piece_type, ARMOR_PIECE_OFFSETS_PRN['default'])
+                apply_armor_offset(data, _cfg_prn, only_block_ids=_prn_legacy)
 
     # Splice Skyrim body geometry AFTER retarget + bone rename so that bone
     # NiNodes in the armor NIF already have Skyrim names to match against.
@@ -6439,7 +6542,7 @@ def merge_creature_body(part_paths, dst_path, skeleton_path=None):
 
 def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
                 src_meshes_dir=None, creature=False, wearable_plan=None,
-                parallax=False, textures_only=False):
+                parallax=False, textures_only=False, hair=False):
     """Convert a single Oblivion NIF to Skyrim format.
 
     Already-Skyrim versions are copied to dst_path unchanged.
@@ -6458,6 +6561,13 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     textures_only: read and analyse every mesh, write NONE of them.  The
     height maps still get built, because the decision to build one needs the
     mesh's own APPLY_HILIGHT2 flag — see the mode's rationale in batch_convert.
+
+    hair: this NIF is an Oblivion hair head part (asset_convert.hair_pipeline).
+    Hair lives outside meshes\armor and no ARMO/CLOT record names it, so the
+    wearable plan cannot mark it worn — but it is rigid Prn-attached geometry
+    that needs exactly the same treatment as a helmet: a dismember skin bound
+    to the head bone in slot 131.  Without this the mesh ships unskinned and
+    also picks up a meaningless BSInvMarker (hair is never an inventory item).
     """
     result = {
         'converted': False,
@@ -6524,9 +6634,11 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # Does the plugin itself wear this mesh?  Asked before the conversion so the
     # armor rules (dismember skin, NiNode root, skeleton retarget) apply to gear
     # filed outside meshes\armor and meshes\clothes.
-    _worn = False
-    _biped_flags = 0
-    if wearable_plan is not None and src_meshes_dir is not None and not creature:
+    _worn = bool(hair)
+    # Biped bit 1 (Hair) — the same authored slot a helmet-bearing record
+    # would carry, so the converter resolves body part 131 without guessing.
+    _biped_flags = 0x02 if hair else 0
+    if wearable_plan is not None and src_meshes_dir is not None and not creature             and not hair:
         from . import wearable_plan as _wp
         _worn = _wp.is_worn(wearable_plan, src_path, src_meshes_dir)
         # What the plugin says this mesh IS (head/body/hands/feet/shield), so
@@ -6537,7 +6649,7 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     stats = _convert_nif(data, fix_textures=fix_textures,
                          src_path=str(src_path), creature=creature,
                          worn=_worn, parallax=parallax,
-                         biped_flags=_biped_flags)
+                         biped_flags=_biped_flags, hair=hair)
 
     # Graft the converted Oblivion flame NIF under FlameNode* markers (candle
     # flame / torch fire) — full conversion of Oblivion's own flame visuals,

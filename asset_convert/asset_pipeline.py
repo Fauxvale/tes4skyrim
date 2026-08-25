@@ -19,8 +19,8 @@ import os
 import shutil
 from pathlib import Path
 
-from . import (bsa_extract, grass_profile, landscape_normals, nif_converter,
-               spt_converter, texture_prune, wearable_plan)
+from . import (bsa_extract, grass_profile, hair_pipeline, landscape_normals,
+               nif_converter, spt_converter, texture_prune, wearable_plan)
 
 
 # Shared-folder resolution lives in output_layout (one module, three
@@ -199,6 +199,15 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
     # grass shader profile and a copy under meshes\landscape\grass\, the
     # location every working GRAS record uses (see grass_profile module doc).
     # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Hair — meshes\characters\ is in nif_converter.SKIP_PATHS, and hair could
+    # not be un-skipped into the batch anyway: one Oblivion HAIR record becomes
+    # several Skyrim meshes, because the per-NPC hair length (NPC_.LNAM) has no
+    # Skyrim equivalent and is baked in per variant.  See hair_pipeline.
+    # -----------------------------------------------------------------------
+    if mesh_src.exists() and not textures_only:
+        stats['hair'] = hair_pipeline.run(rec_dir, plugin_dir / 'meshes')
+
     if mesh_src.exists() and not textures_only:
         processed, modified, missing = grass_profile.run(
             rec_dir, plugin_dir / 'meshes')

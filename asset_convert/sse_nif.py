@@ -64,12 +64,45 @@ def sse_to_le(data):
 # per-shape conversion
 # ---------------------------------------------------------------------------
 
+def _partition_triangles(s):
+    """Triangle indices from a shape's skin partition, or an empty array."""
+    skin = getattr(s, 'skin', None)
+    sp = getattr(skin, 'skin_partition', None) if skin is not None else None
+    if sp is None:
+        return np.zeros((0, 3), dtype='<u2')
+    tris = [p['triangles_copy'] for p in sp.sse_partitions
+            if p['triangles_copy'] is not None and len(p['triangles_copy'])]
+    return np.vstack(tris) if tris else np.zeros((0, 3), dtype='<u2')
+
+
 def _geometry_arrays(s):
     """Collect (verts, normals, uvs, colors, tangents, bitangents, tris)
     for a BSTriShape from either its inline buffer or its skin partition."""
     if s.sse_verts is not None:
-        return (s.sse_verts, s.sse_normals, s.sse_uvs, s.sse_colors,
-                s.sse_tangents, s.sse_bitangents, s.sse_triangles)
+        # A skinned shape can carry its vertex buffer inline while keeping
+        # EVERY other per-vertex attribute in the skin partition.  Vanilla
+        # malehead.nif / femalehead.nif are exactly this: BSDynamicTriShape
+        # holds positions inline (chargen morphs them in place) and leaves
+        # uvs, normals, tangents and the index data in the partition.
+        # Returning the inline buffer's Nones for those dropped the head's
+        # UVs and normals entirely -- which silently broke any fit that
+        # relies on them.  Fall back per attribute, not just for triangles.
+        skin = getattr(s, 'skin', None)
+        sp = getattr(skin, 'skin_partition', None) if skin is not None else None
+
+        def _attr(name):
+            a = getattr(s, name, None)
+            if a is not None or sp is None:
+                return a
+            b = getattr(sp, name, None)
+            return b if b is not None and len(b) == len(s.sse_verts) else None
+
+        tris = s.sse_triangles
+        if tris is None:
+            tris = _partition_triangles(s)
+        return (s.sse_verts, _attr('sse_normals'), _attr('sse_uvs'),
+                _attr('sse_colors'), _attr('sse_tangents'),
+                _attr('sse_bitangents'), tris)
     skin = s.skin
     sp = getattr(skin, 'skin_partition', None) if skin is not None else None
     if sp is None or getattr(sp, 'sse_verts', None) is None:

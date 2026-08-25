@@ -52,7 +52,7 @@ see the `oblivion-to-skyrim-dialog` skill.
 | GLOB | GLOB | Identical. |
 | GMST | GMST | Many settings differ but format is same. Some TES4 GMSTs don't exist in TES5. |
 | GRAS | GRAS | Add OBND. Minor changes. |
-| HAIR | HDPT | Hair→Head Part. TES5 HDPT has Type=3 (Hair), flags, extra parts list, TNAM (texture set). |
+| HAIR | HDPT | Hair→Head Part (Type=3). **Converted, not substituted** — `convert_HAIR`. One HAIR becomes SEVERAL HDPTs: Oblivion's per-NPC hair length (`NPC_.LNAM`) blends the mesh toward its `.tri`'s `HairMorph`, and Skyrim has no such field, so each length in use is baked into its own mesh. See [Hair conversion](#hair-conversion). |
 | IDLE | IDLE | Add conditions changes. |
 | INFO | INFO | **Major restructuring**: TES5 INFO uses VMAD fragments, ENAM, different response structure (TRDA vs TRDT), conditions restructured. |
 | INGR | INGR | Add OBND. ENIT restructured. Effects need MGEF resolution. TES5 ingredients have exactly 4 effects. |
@@ -217,6 +217,193 @@ needs to be a sane non-zero seed, not any particular creature's stats.
 
 **Rule:** a template shell's Required subrecords may be neutral, but never
 *zero* for a field the engine caches and reads before template resolution.
+
+## Hair conversion
+
+Oblivion hair is CONVERTED, not substituted with a vanilla Skyrim hairstyle.
+`convert_HAIR` -> HDPT (Type 3), `asset_convert/hair_pipeline.py` for the
+meshes, `asset_convert/facegen_tri.py` for the `.tri` codec,
+`tes5_import/hair_variants.py` for the plan both sides share.
+
+### Why one HAIR becomes several HDPTs
+
+`NPC_.LNAM` ("Hair length", `wbFloat` in xEdit's TES4 definitions) is an
+authored per-NPC float. Oblivion blends the hair mesh toward the `HairMorph`
+target stored in the mesh's sibling `.tri` by exactly that weight. Skyrim has
+no per-NPC hair-length field, so the blend is resolved at conversion time:
+each length actually worn is baked into its own mesh with its own HDPT.
+
+Distribution in Oblivion.esm (654 NPCs at 0.0, 371 at 1.0, long tail at 0.58 /
+0.55 / 0.47 / 0.37 ...) is strongly bimodal, so the endpoint buckets are free —
+bucket 0 IS the base mesh and bucket `LENGTH_BUCKETS` IS the fully applied
+morph. Measured cost for Oblivion.esm (2026-08-25): **721 meshes + 721 `.tri`
+for 57 hair records** — each gender fitted to its own Skyrim head, and each
+GENERIC style additionally baked per race group (bare stem = human, `__ev` =
+elves, `__or` = orc). A race-NAMED style bakes ONE mesh, fitted to its own
+group's head but keeping the bare stem, because its RNAM already restricts
+who wears it. Driven by real NPC usage rather than exhaustive expansion.
+
+### That the morph is length, not a face slider
+
+Verified in both engines, not inferred:
+
+* **Oblivion.exe** holds the literal `HairMorph` once (file `0x6640e8`) with a
+  single xref — a `strcmp` at `0x55c48b` inside a loader copying 12-byte x/y/z
+  triples, adjacent to the RTTI names `BSFaceGenMorphDataHair` /
+  `BSFaceGenMorphDataHead`. Neighbouring diagnostics bucket it as a **"Custom
+  Morph"** (phoneme/modifier/expression have their own messages). There is no
+  second path applying a scale on top, so baking cannot double-apply.
+* **SkyrimSE.exe** holds a morph-name pointer table in `.data` (file
+  `0x1e756c0`) whose categories are Phoneme / Expression / Modifier / **Custom**.
+  `SkinnyMorph` sits alone at index 7, fenced by NULLs from the expression
+  block (8-24), modifier block (26-42) and phoneme block (44-59) — the sole
+  member of `Custom`, structurally the same slot `HairMorph` occupies.
+* **Geometry**, across all 57 vanilla Oblivion hair `.tri` files: 50 extend
+  DOWNWARD under the morph, **0 extend upward**, and the 7 that do not move are
+  exactly the short/spiky styles with no length to add (`argonianspikes`,
+  `highelfmalepeak`, `orcmalestubs`, `woodelfmalepony` ...). Median z-min drop
+  −2.7, extreme −15.9 (`style01`).
+
+`SkinnyMorph` is NOT a length morph — it is a mild build/weight tweak, moving
+9-36% of vertices with mean |delta| 0.017-0.33, versus `HairMorph` at 82-100%
+of vertices and mean 0.38-2.06. The emitted Skyrim `.tri` therefore carries the
+slot with **zero deltas**: the length is already in the geometry.
+
+### The .tri container
+
+Both games use the identical `FRTRI003` FaceGen format (layout documented in
+`facegen_tri.py`, round-tripped against all 57 Oblivion + 113 vanilla Skyrim
+hair files with zero trailing bytes on every one). 4 Oblivion hairs ship no
+`.tri` at all (`blindfold`, `emperor`, `khajiitearrings`, `style07`); those
+convert fine and their HDPT simply omits NAM0/NAM1 rather than naming a file
+that was never written.
+
+**`.egm` does NOT convert.** It is a different system — 50 symmetric + 30
+asymmetric FaceGen PCA morphs, the same basis behind FGGS, and Skyrim ships no
+`.egm` at all with direct sliders instead of a PCA basis (the wall
+`npc_face_mapper` already documents for FGGS→NAM9). `LNAM` does not drive the
+`.egm`, so hair length is unaffected by that gap. What IS lost: converted hair
+will not follow a chargen-morphed player skull. NPC faces are fixed, so NPC
+hair is unaffected.
+
+### Meshes
+
+`meshes\characters\` is in `nif_converter.SKIP_PATHS` and hair could not
+simply be un-skipped, because one record produces several meshes. The stage
+bakes each length, then routes the result through `convert_nif(..., hair=True)`
+— which marks it worn with biped bit 1, so the existing helmet path gives it a
+`BSDismemberSkinInstance` in **slot 131** bound to `NPC Head [Head]`, exactly
+as vanilla Skyrim hair does.
+
+**Head gear is fitted by `asset_convert/head_fit.py` (v3) — a smooth
+scalp-to-scalp displacement field, sampled per vertex.** Built once per
+gender/race: for every OB head vertex, where the matching SK skin point is
+(nearest-point init over the identity carrier — no scale, ever — relaxed by
+smoothing + reprojection along the OB normals; every target ends exactly ON
+the SK skin). Fitting is then a pure per-vertex function: a vertex ON the
+skin lands ON the new skin (hairline edges exactly at the skin line), a
+vertex N units off stays exactly N off (helmets keep authored standoff),
+and everything over one scalp region moves identically (headbands never
+stretch; hanging tails take their region's delta by diffusion). The real
+skull differences it transports: SK jaw/cheek 1-1.6 wider per side, nose and
+crown 2.1 lower, occiput/nape 2-3.5 further back. Ears are flattened out of
+the correspondence (gear ignores them, like vanilla hair); orc hair uses the
+human pair (Skyrim orcs share the human head); khajiit/argonian keep their
+own head pairs. Skinned helmets/hoods blend the SAME field by head weight in
+the wrap deform. **Every in-game head additionally wears its RACE's
+races-tri morph (elf scalps 2.6 off base; the base mesh is worn only by the
+five human races + Dremora, whose scalp morphs are <=0.15). A races.tri on
+the hair HDPT was tried and the engine does NOT apply it to type-3 parts —
+generic hair is instead BAKED per race group (base / `__ev` elves / `__or`
+orc) with four HDPTs per variant gated by the vanilla RNAM race lists, and
+the NPC face mapper routes each NPC to its race group's variant.** Full
+details and the measured gates in
+[nif_conversion_notes.md](nif_conversion_notes.md).
+
+**Hair is emitted PER GENDER** (`stem` / `stem__f`, gendered HDPTs): the
+Skyrim male and female scalps differ by up to **1.23 units** (mean 0.46),
+so one unisex mesh cannot be flush on both — vanilla genders every
+hairstyle. TES4's `NotMale`/`NotFemale` DATA flags decide which genders
+exist; the base gender's bucket-0 HDPT keeps the source FormID, male
+variants key `('HDPT_HAIR', (fid, bucket))`, female ones `('HDPT_HAIR',
+(fid, bucket, 'F'))`, and `npc_face_mapper._resolve_hair_part` routes each
+NPC by its own gender + LNAM bucket (master-owned hair resolves to the base
+FormID — a dependent plugin cannot mint the master's derived ids).
+
+One fix was needed to read the target: `sse_nif._geometry_arrays` returned
+early on inline vertices, but vanilla `malehead.nif` is a `BSDynamicTriShape`
+holding verts inline with UVs/normals/indices in the skin partition — it now
+falls back per attribute.
+
+Two traps found while building this, both worth keeping in mind elsewhere:
+
+* **Hair matched the body-skin stripper.** `is_body_skin_geometry` keys off the
+  `textures\characters\` prefix, which hair shares — so once the mesh became
+  skinned it was deleted wholesale, and the converted NIF shipped with a head
+  bone node and no geometry. Hair is excluded by its `\hair\` subfolder
+  (`_HAIR_TEX_MARKER`). Censused: 0 armor meshes are affected by the exclusion.
+* **The load-order index byte is not identity.** The export dumps HAIR
+  `000C4821` but the record reaching `convert_HAIR` carries `010C4821`. Keying
+  the bucket index on the raw value made every lookup miss **silently** — no
+  error, every NPC just fell back to bucket 0 and the whole feature evaporated.
+  Masked with `& 0x00FFFFFF` at every keying site, including the
+  `derive_formid` key. Guarded by
+  `tests/test_hair_conversion.py::test_lookup_ignores_the_load_order_index_byte`.
+
+### Hair color
+
+Two separate things have to be right, and BOTH were wrong at first — the mesh
+rendered as its raw grey source texture regardless of the NPC's hair color.
+
+**1. The mesh needs the Hair Tint shader (type 6).** `nif.xml` gates the Hair
+Tint Color field on `Shader Type == 6` ("Enables Hair Tint Color"), and the
+engine carries a matching `BSLightingShaderMaterialHairTint` RTTI class, a
+`HairTint` shader technique, and a `HairTint` console command ("3 ints, RGB").
+Converted hair shipped as type 0 (Default), so the tint was never sampled —
+with the wrong material class the color has nowhere to land. Vanilla census
+(214 hair shaders): **type 6 on 196**, type 5 on the 18 beast-race horn meshes,
+which are genuinely untinted. `hair_pipeline.apply_hair_shader` sets type 6
+plus `SLSF1_Hair_Soft_Lighting`, `SLSF1_Own_Emit`, `SLSF2_Assume_Shadowmask`
+**and `SLSF2_Anisotropic_Lighting` with lighting effects 0.3/2.0** — the
+anisotropic flag is what makes the specular read as hair strands; without it
+(and with lighting effects left 0/0) converted hair looked "really shiny and
+not hair-like" in game (2026-08-24; vanilla hairshorthumanm/malehumanoldhair01
+carry it). Vanilla glossiness/specular (10 / 0.9 / white) — a zero glossiness
+reads as flat matte under the tint.
+
+The tint color written into the mesh is a **placeholder** — `nif.xml` says it
+is "Overridden by game settings", and the engine substitutes the wearer's
+HCLF→CLFM color at runtime. We write vanilla's most common value
+(`0.5176, 0.4706, 0.3922` = RGB 132/120/100, 92 of 214 shaders) so a converted
+mesh looks right in NifSkope and the CK preview.
+
+**2. The color itself needs a CLFM that actually holds it.** Skyrim's
+`NPC_.HCLF` is a FormID into CLFM, and vanilla ships only **15** hair-color
+swatches, all dark and desaturated. Oblivion authors a free RGB per NPC:
+**2,482 haired actors using 571 distinct colors** spanning the whole cube.
+Snapping each to the nearest vanilla swatch measured a mean RGB error of
+**26.9**, median 22.1, p90 49.9, **max 274.5** — visibly wrong hair.
+
+So `actors.hair_color_formid` generates one CLFM per DISTINCT authored color
+(EDID + CNAM byte-RGBA + FNAM playable — a tiny record) and HCLF points at it,
+carrying the authored RGB across **exactly**. One record per color rather than
+per actor keeps the count at the 571 distinct values, not 2,482.
+
+Keyed `derive_formid('CLFM_HAIR', (r, g, b))` — authored data, so the same
+color lands on the same id everywhere. **No drift**: the old HCLF targets were
+Skyrim.esm ids (`0x000A04xx`), so nothing of ours moved; only the HCLF *value*
+changed. `map_hair_color` survives as the fallback for the writer-less path,
+now with all 15 swatches (`HairColor12BlackTrue` was missing).
+
+### FormIDs
+
+Variant HDPTs use `derive_formid('HDPT_HAIR', (hair_fid & 0xFFFFFF, bucket))`.
+Both halves are authored TES4 data, satisfying the hashing contract. Bucket 0
+keeps the source FormID, so an NPC with `LNAM` 0 resolves straight through the
+id its `HNAM` already names.
+
+🛑 **Changing `LENGTH_BUCKETS` renumbers every non-zero variant** — that is
+FormID drift and breaks saves.
 
 ## Actor Value / Skill Mapping
 
@@ -562,6 +749,59 @@ must stay in step. CNAM.CrimeGold carries across as the Steal Multiplier.
 ### SOUN Conversion
 - **Create SNDR**: Each SOUN needs a companion SNDR (Sound Descriptor) with the actual sound file path linked via SDSC
 - **Loop flag**: TES4 `SNDD.Flags` bit 4 (`0x10`) = "Is Looping". When set, write `LNAM = 0x00000800` (loop) in the SNDR record. `LNAM` is a 4-byte struct: byte[0]=Unknown, byte[1]=Looping enum (0x00=None, 0x08=Loop, 0x10=Envelope Fast, 0x20=Envelope Slow), byte[2]=Unknown, byte[3]=Rumble. `0x00000800` in little-endian = bytes [0x00, 0x08, 0x00, 0x00] = Loop. Default (`LNAM = 0`) = no loop / plays once. `0xFFFFFFFF` is INVALID and causes no sound to play.
+
+### Sound descriptor slots — a SOUN id here CRASHES the audio thread
+
+Every TES5 slot xEdit types `[SNDR]` must hold the sound DESCRIPTOR, never the
+SOUN a TES4 record names there:
+
+| Record | Slots |
+|---|---|
+| ACTI | SNAM (looping), VNAM (activation) |
+| CONT | SNAM (open), QNAM (close) |
+| DOOR | SNAM (open), ANAM (close), BNAM (loop) |
+| LIGH | SNAM |
+| MSTT / TACT | SNAM (looping) |
+
+This is not a cosmetic wrong-sound bug. Our SOUNs are not self-describing the
+way a legacy vanilla SOUN is — `convert_SOUN` emits `EDID + OBND + SDSC` only,
+with every byte of audio data on the companion SNDR — so the engine takes the
+id at face value, registers it in the audio manager's emitter table, and
+`BSAudioManagerThread` faults dereferencing it as a `BSGameSound`:
+
+```
+EXCEPTION_ACCESS_VIOLATION  SkyrimSE.exe+0CB3CEA   mov ecx, [r8+0x48]
+  r8 = 0x0000000100000001        <- a FormID, not a pointer
+  RBX (BSXAudio2GameSound*)  RSP+110 (BSFadeNode*) "CathedralCryptLight01"
+  RSP+230 (BSAudioManagerThread*)
+```
+
+(1.6.1170 RVA `0xCB3CEA` = Address Library id 67726+0x1DA = GOG 1.6.659
+`0xC28CCA`, inside the audio event handler's case for event type `0x19`; the
+faulting instruction walks the emitter array at `[mgr+0x50]`, count
+`[mgr+0x34]`, 0x18-byte entries of `{?, BSGameSound* at +8, guard at +0x10}`.)
+A single lit torch or opened container arms it.
+
+These records are all written in Phase 1/2, before Phase 3 mints the
+descriptors, so the converters store the TES4 SOUN id as a placeholder and
+`items.patch_sound_descriptor_slots` resolves it afterwards. Allocating the
+descriptor id at conversion time instead would shift every later generated
+FormID.
+
+**The master resolver is required, not optional.** `own_soun_ids` covers only
+the SOUNs THIS plugin converts; a slot pointing at a master-owned SOUN is
+resolved by reading the SDSC out of the master's *converted* SOUN
+(`ctx.master_index.record(fid)`), not re-derived — deriving would mint an id in
+this plugin's index space. The master manifest does NOT answer for these: it
+holds only companion-bearing records and carries no SOUN entries. Measured on
+Morrowind_ob before the fix: 2,377 CONT slots, 97 LIGH, 31 ACTI and 40 DOOR
+slots all pointed at a SOUN, the majority of them Oblivion.esm's
+(`AMBTorchMountedLP` 0x01085837 → master SNDR 0x0158689D). Standalone plugins
+(Oblivion.esm, Nehrim.esm) have zero dangling slots, so this path only matters
+for plugins with masters — the [master-blindness](../CLAUDE.md) failure mode.
+
+WEAP's NAM8/NAM9 are also `[SNDR]` slots but are already correct: they are
+written from `WEAPON_ANIM_NAM8/9`, which name vanilla Skyrim.esm descriptors.
 
 ### CLAS Conversion
 - **Trainer classes**: Skyrim's training menu reads skill/cap from CLAS DATA (Teaches S8 + MaxTrainingLevel U8 at offset 4), but Oblivion trainers store them per-NPC in AIDT (92/114 vanilla trainers disagree with their class). Phase 0c `create_trainer_records` clones each trainer NPC's class with the AIDT values and repoints CNAM; the NPC also joins `TES4JobTrainerFaction`, which gates the generated Training dialogue topic. Vendor barter gold becomes carried Gold001 (no TES5 field). See [dialogue_conversion_notes.md](dialogue_conversion_notes.md) (Barter/Training services).

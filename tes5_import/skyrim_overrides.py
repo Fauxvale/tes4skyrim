@@ -822,6 +822,7 @@ HAIR_COLOR_MAP = [
     ( 39,  38,  35, 0x000A0433, 'HairColor09DarkBrown'),
     ( 20,  20,  24, 0x000A0435, 'HairColor10BlueBlack'),
     ( 26,  28,  28, 0x000A0434, 'HairColor11Black'),
+    ( 16,  18,  18, 0x000F7565, 'HairColor12BlackTrue'),
     ( 90,  95, 105, 0x000A0438, 'HairColor13BrightGrey'),
     ( 70,  75,  85, 0x000A0437, 'HairColor14Grey'),
     ( 43,  49,  51, 0x000A0436, 'HairColor15SteelGrey'),

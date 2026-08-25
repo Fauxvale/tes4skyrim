@@ -17,8 +17,6 @@ Major Issues for V1:
 		fix occasional crack (vilvern near entrance)
 		Fix wrong side of door like the upstairs in anvilfightersguild
 
-	4 - Fix CK Loading (not sure why it doesn't finish)
-
 	5 - Need new skyrim body mesh to actually work to allow leg skin to appear
 	
 	6 - Shops missing full inventory of items
@@ -32,11 +30,7 @@ Major Issues for V1:
 	11 - All-in-one installer that people can just click and expect to work
 
 Later Issues:
-
-	1 - Refine creature conversion further. Speed is still a bit off
 	
-	2 - Refine weathers further. They still feel a bit off. Need exact values to tweak
-
 	3 - Ajust zip step to pack loose files if bsas are out of date or not generated
 
 	4 - Fix walking up stairs
@@ -74,18 +68,8 @@ Minor Issues:
 	6 - Convert Skyrim LE meshes to Skyrim SE format
 
 	7 - Flame atronach animated section not properly converted
-	
-	8 - Refine LOD, Still too big and holes in distant meshes
-
-	9 - Should trim skin in converted clothing that would be occluded by the clothing mesh to avoid clipping
-
-	10 - Clothes don't move which character skin, resulting in clipping
-
-	11 - Can see back of head of skinned helmets
 
 	12 - Minor issues with 44 patch plugin
-
-	13 - Taskbar and app icon
 	
 	15 - Missing location topics (Anvil)
 

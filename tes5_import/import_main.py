@@ -1637,8 +1637,10 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
         simple_types.add(sig)
 
     # Types that need the writer passed in (for companion record generation)
+    # HAIR side-emits one HDPT per extra hair length its NPCs wear (Skyrim has
+    # no per-NPC hair-length field, so NPC_.LNAM is baked per variant).
     _WRITER_TYPES = {'ARMO', 'CLOT', 'WEAP', 'AMMO', 'NPC_', 'CREA', 'BOOK',
-                     'ENCH', 'SPEL', 'SGST'}
+                     'ENCH', 'SPEL', 'SGST', 'HAIR'}
 
     converted = 0
     errors = 0

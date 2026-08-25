@@ -1948,3 +1948,182 @@ def _find_geometry_blocks(data):
             if isinstance(block, (NifFormat.NiTriShape, NifFormat.NiTriStrips)):
                 blocks.append(block)
     return blocks
+
+
+# ===========================================================================
+# Occlusion trim of the spliced fill (_drop_armor_covered_tris)
+# ===========================================================================
+#
+# The splice fills the gap left by the stripped Oblivion body skin with vanilla
+# Skyrim body geometry.  Oblivion bakes the WHOLE upperbody into a cuirass, so
+# much of that fill sits buried inside the armor where it is never visible and
+# only pokes through once animation moves the two meshes differently.  The trim
+# drops fill triangles that are fully covered, and the invariant that matters is
+# asymmetric: cutting too little is a hidden triangle nobody sees, cutting too
+# much is a HOLE in the character.  These tests pin the "too much" side.
+
+def _grid_fill(n=9, spacing=1.0, z=0.0):
+    """A flat n*n triangulated sheet in the z plane, normals +z.
+
+    Stands in for the spliced body fill: `verts` body-local, plus the parallel
+    `normals`/`uvs`/`weights` lists clip_body_geom hands to the trim.
+    """
+    verts, idx = [], {}
+    for j in range(n):
+        for i in range(n):
+            idx[(i, j)] = len(verts)
+            verts.append((i * spacing, j * spacing, z))
+    tris = []
+    for j in range(n - 1):
+        for i in range(n - 1):
+            a, b = idx[(i, j)], idx[(i + 1, j)]
+            c, d = idx[(i + 1, j + 1)], idx[(i, j + 1)]
+            tris.append((a, b, c))
+            tris.append((a, c, d))
+    normals = [(0.0, 0.0, 1.0)] * len(verts)
+    uvs = [(0.0, 0.0)] * len(verts)
+    weights = [[(0, 1.0)] for _ in verts]
+    return (verts, normals, uvs, tris, weights, {0: 'NPC Spine [Spn0]'})
+
+
+def _armor_sheet(pts):
+    """An armor surface -- the (cKDTree, centroids) pair _armor_surface
+    returns -- from explicit triangle-centroid positions."""
+    from scipy.spatial import cKDTree
+    cent = np.asarray(pts, dtype=np.float64)
+    return cKDTree(cent), cent
+
+
+def _plane_centroids(n=9, spacing=1.0, z=0.0, step=0.25):
+    """Dense centroid cloud covering the same footprint as _grid_fill."""
+    xs = np.arange(0.0, (n - 1) * spacing + 1e-9, step)
+    gx, gy = np.meshgrid(xs, xs)
+    return np.column_stack([gx.ravel(), gy.ravel(),
+                            np.full(gx.size, z, dtype=np.float64)])
+
+
+def _pt_key(p):
+    return tuple(round(float(c), 6) for c in p)
+
+
+class TestFillOcclusionTrim:
+    """`_drop_armor_covered_tris` -- drop only fill that is genuinely buried."""
+
+    def test_no_armor_surface_is_a_passthrough(self):
+        """`_armor_surface` returns None without scipy or without geometry;
+        the trim must then be exactly inert, not silently empty the fill."""
+        from asset_convert.skin_replacement import _drop_armor_covered_tris
+        fill = _grid_fill()
+        assert _drop_armor_covered_tris(fill, None, (0.0, 0.0, 0.0)) is fill
+
+    def test_uncovered_fill_is_untouched(self):
+        """Bare skin with no armor over it keeps every triangle -- this is the
+        exposed midriff / open shirt case, where trimming leaves a hole."""
+        from asset_convert.skin_replacement import _drop_armor_covered_tris
+        fill = _grid_fill()
+        far = _armor_sheet(_plane_centroids(z=60.0))
+        out = _drop_armor_covered_tris(fill, far, (0.0, 0.0, 0.0))
+        assert out[3] == fill[3]
+
+    def test_armor_outside_the_cover_band_is_not_cover(self):
+        """Cover is measured along the vertex normal within FILL_COVER_ALONG.
+        Armor NEARER than the band (already-clipped overlap) and armor FURTHER
+        than it (the far side of a loose robe) must both read as uncovered."""
+        from asset_convert.skin_replacement import (FILL_COVER_ALONG,
+                                                    _drop_armor_covered_tris)
+        fill = _grid_fill()
+        lo, hi = FILL_COVER_ALONG
+        for z in (lo - 0.5, hi + 0.5):
+            surf = _armor_sheet(_plane_centroids(z=z))
+            out = _drop_armor_covered_tris(fill, surf, (0.0, 0.0, 0.0))
+            assert out[3] == fill[3], 'armor at %s counted as cover' % z
+
+    def test_fully_covered_fill_is_left_alone(self):
+        """A fill entirely under armor is a legitimate backing layer some
+        armor keeps; dropping all of it would delete the geometry outright."""
+        from asset_convert.skin_replacement import (FILL_COVER_ALONG,
+                                                    _drop_armor_covered_tris)
+        fill = _grid_fill()
+        mid = sum(FILL_COVER_ALONG) / 2.0
+        surf = _armor_sheet(_plane_centroids(z=mid, step=0.2))
+        out = _drop_armor_covered_tris(fill, surf, (0.0, 0.0, 0.0))
+        assert out[3] == fill[3]
+
+    def test_buried_interior_is_dropped_and_the_border_survives(self):
+        """The core behaviour: armor over ONE half of the fill drops buried
+        interior triangles there, while the uncovered half keeps all of its.
+
+        The erosion is what makes it safe -- the kept fill has to run PAST the
+        armor edge and under it, never stop at it, or the seam shows.
+        """
+        from asset_convert.skin_replacement import (FILL_COVER_ALONG,
+                                                    _drop_armor_covered_tris)
+        n = 13
+        fill = _grid_fill(n=n)
+        half = (n - 1) / 2.0
+        mid = sum(FILL_COVER_ALONG) / 2.0
+        cent = _plane_centroids(n=n, z=mid, step=0.2)
+        cent = cent[cent[:, 0] <= half]                 # cover the low-x half
+        out = _drop_armor_covered_tris(fill, _armor_sheet(cent),
+                                       (0.0, 0.0, 0.0))
+        kept, orig, vs = out[3], fill[3], fill[0]
+        assert 0 < len(kept) < len(orig), 'expected a partial trim'
+
+        kept_pts = {_pt_key(out[0][i]) for t in kept for i in t}
+        dropped = [t for t in orig
+                   if not all(_pt_key(vs[i]) in kept_pts for i in t)]
+        assert dropped
+
+        # nothing on the uncovered half may be dropped
+        for tri in orig:
+            if max(vs[i][0] for i in tri) > half + 1.0:
+                assert all(_pt_key(vs[i]) in kept_pts for i in tri), \
+                    'trimmed a triangle on the UNCOVERED side'
+
+        # and the drop must stop short of the armor edge, not at it
+        assert max(max(vs[i][0] for i in t) for t in dropped) < half, \
+            'dropped fill reaches the armor edge -- visible seam'
+
+    def test_trim_result_stays_internally_consistent(self):
+        """Every parallel array is remapped together and the indices stay in
+        range -- a mismatch here writes a corrupt NIF rather than failing."""
+        from asset_convert.skin_replacement import (FILL_COVER_ALONG,
+                                                    _drop_armor_covered_tris)
+        n = 13
+        fill = _grid_fill(n=n)
+        mid = sum(FILL_COVER_ALONG) / 2.0
+        cent = _plane_centroids(n=n, z=mid, step=0.2)
+        cent = cent[cent[:, 0] <= (n - 1) / 2.0]
+        verts, normals, uvs, tris, weights, bi = _drop_armor_covered_tris(
+            fill, _armor_sheet(cent), (0.0, 0.0, 0.0))
+        assert len(normals) == len(verts)
+        assert len(uvs) == len(verts)
+        assert len(weights) == len(verts)
+        assert bi is fill[5]
+        assert tris, 'trim emptied the fill'
+        for tri in tris:
+            assert len(tri) == 3
+            for i in tri:
+                assert 0 <= i < len(verts)
+        used = {i for t in tris for i in t}
+        assert used == set(range(len(verts))), 'orphaned vertices left behind'
+
+    def test_translation_puts_the_fill_in_armor_space(self):
+        """The fill is body-local and the armor is in skeleton space, so the
+        geom translation has to be applied or the occlusion test compares two
+        different frames and cover is judged at the wrong place entirely."""
+        from asset_convert.skin_replacement import (FILL_COVER_ALONG,
+                                                    _drop_armor_covered_tris)
+        n = 13
+        fill = _grid_fill(n=n)
+        mid = sum(FILL_COVER_ALONG) / 2.0
+        offset = (0.0, 0.0, 40.0)
+        cent = _plane_centroids(n=n, z=mid + offset[2], step=0.2)
+        cent = cent[cent[:, 0] <= (n - 1) / 2.0]
+        surf = _armor_sheet(cent)
+        # with the translation applied the armor covers half the fill...
+        moved = _drop_armor_covered_tris(fill, surf, offset)
+        assert len(moved[3]) < len(fill[3])
+        # ...and without it, that same armor is 40 units away and covers none
+        unmoved = _drop_armor_covered_tris(fill, surf, (0.0, 0.0, 0.0))
+        assert unmoved[3] == fill[3]
