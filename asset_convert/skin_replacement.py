@@ -23,6 +23,13 @@ except ImportError:
 # armor; Skyrim renders the body separately so they must be removed.
 _SKIN_TEX_PREFIX = 'textures\\characters\\'
 
+# Hair lives under textures\characters\hair\ but is NOT body skin: it is a head
+# part with its own HDPT, and stripping it deletes the whole mesh (the converted
+# NIF ships with the head bone node and no geometry at all).  The body-skin test
+# keys off the textures\characters\ prefix, which hair shares, so the hair
+# subfolder has to be excluded explicitly.
+_HAIR_TEX_MARKER = '\\hair\\'
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -414,6 +421,122 @@ def clip_body_geom(src_geom, bi_to_name: dict, keep_bones: set,
     kept_weights = [vert_weights[vi] for vi in kept_indices]
 
     return verts, normals, uvs, new_tris, kept_weights, bi_to_name
+
+
+# Occlusion trim of the spliced fill (2026-08-23).  The removed OB skin often
+# includes the whole body section hidden inside the armor (Oblivion bakes the
+# full upperbody into a cuirass), so the proximity clip keeps skyrim skin that
+# is never visible -- measured on the iron cuirass, 71.9% of the fill's verts
+# have armor directly outside them.  That hidden skin exists only to poke
+# through the armor when animation moves the two meshes differently.
+#
+# Coverage is measured along the FILL VERTEX'S OWN NORMAL (armor centroid
+# within FILL_COVER_ALONG outward, lateral offset under FILL_COVER_PERP) --
+# a signed distance against the nearest armor triangle is useless here, the
+# armor's plates and straps flip its sign vertex to vertex.  The covered set
+# is then ERODED by one ring and only triangles fully inside it are dropped,
+# so the kept fill always ends two triangle-rings UNDER the armor edge --
+# never at it (no visible seam, no hole).  Iron cuirass: 49.7% of fill tris
+# dropped, 120/221 verts kept.
+# 2026-08-24 (in-game): the first cut was too aggressive — armor with view
+# gaps (the female iron pauldron over the upper arm, open shirts) reads as
+# "covering" to a ray test, and visible skin was cut away.  Better to cut
+# not enough than too much: only skin buried DEEP under CLOSE armor goes,
+# and the kept region is eroded by two rings, not one.
+FILL_COVER_ALONG = (2.0, 3.5)   # armor this far outward along the vert normal
+FILL_COVER_PERP = 1.0           # ...within this lateral distance of the ray
+_FILL_COVER_EROSIONS = 2        # rings of covered verts spared at the border
+_FILL_COVER_K = 24              # armor triangles examined per fill vert
+
+
+def _armor_surface(armor_root):
+    """KD-tree of the NIF's armor triangle centroids, or None.  Called AFTER
+    strip_body_skin_geometry, so every trishape under the root is armor."""
+    parts = []
+    for block in armor_root.tree():
+        if not isinstance(block, (NifFormat.NiTriShape, NifFormat.NiTriStrips)):
+            continue
+        if block.data is None or block.data.num_vertices == 0:
+            continue
+        try:
+            tris = np.array([tuple(t) for t in block.data.get_triangles()],
+                            dtype=np.int64)
+        except Exception:
+            continue
+        if tris.size == 0:
+            continue
+        v = np.array([[p.x, p.y, p.z] for p in block.data.vertices])
+        parts.append(v[tris].mean(axis=1))
+    if not parts:
+        return None
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        return None
+    cent = np.vstack(parts)
+    return cKDTree(cent), cent
+
+
+def _drop_armor_covered_tris(clip_result, armor_surf, translation):
+    """Drop fill triangles fully hidden under the armor surface.
+
+    clip_result verts are body-local; `translation` is the body geom's
+    translation (the same offset build_clipped_geom bakes in), which puts
+    them in the armor's skeleton space for the occlusion test.
+    """
+    if armor_surf is None:
+        return clip_result
+    verts, normals, uvs, tris, kept_weights, bi_to_name = clip_result
+    if not tris:
+        return clip_result
+    tree, cent = armor_surf
+    v = np.asarray(verts, dtype=np.float64) + np.asarray(translation)
+    t = np.asarray(tris, dtype=np.int64)
+
+    # fill vertex normals from its own triangles (robust: the clip may have
+    # been built from a source without normals)
+    fn = np.cross(v[t[:, 1]] - v[t[:, 0]], v[t[:, 2]] - v[t[:, 0]])
+    n = np.zeros_like(v)
+    for i in range(3):
+        np.add.at(n, t[:, i], fn)
+    n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-9)
+
+    k = min(_FILL_COVER_K, len(cent))
+    _, ti = tree.query(v, k=k)
+    if k == 1:
+        ti = ti[:, None]
+    rel = cent[ti] - v[:, None, :]
+    along = np.einsum('pki,pi->pk', rel, n)
+    perp = np.linalg.norm(rel - along[..., None] * n[:, None, :], axis=2)
+    covered = ((along > FILL_COVER_ALONG[0]) & (along < FILL_COVER_ALONG[1])
+               & (perp < FILL_COVER_PERP)).any(axis=1)
+
+    # erode: covered verts within _FILL_COVER_EROSIONS rings of an exposed
+    # one stay, so the kept fill always ends well under the armor edge
+    eroded = covered.copy()
+    edges = np.vstack([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]])
+    for _ in range(_FILL_COVER_EROSIONS):
+        nbr_unc = np.zeros(len(v), bool)
+        unc_a = ~eroded[edges[:, 0]]
+        unc_b = ~eroded[edges[:, 1]]
+        np.logical_or.at(nbr_unc, edges[:, 1], unc_a)
+        np.logical_or.at(nbr_unc, edges[:, 0], unc_b)
+        eroded = eroded & ~nbr_unc
+
+    drop = eroded[t].all(axis=1)
+    if not drop.any() or drop.all():
+        # nothing hidden -- or everything (a fully-enclosed fill some armor
+        # legitimately keeps as backing); leave the fill alone either way
+        return clip_result
+    keep_tris = t[~drop]
+    used = sorted(set(int(i) for i in keep_tris.ravel()))
+    remap = {old: new for new, old in enumerate(used)}
+    return ([verts[i] for i in used],
+            [normals[i] for i in used] if normals else [],
+            [uvs[i] for i in used] if uvs else [],
+            [(remap[a], remap[b], remap[c]) for a, b, c in keep_tris],
+            [kept_weights[i] for i in used],
+            bi_to_name)
 
 
 def build_clipped_geom(src_geom, clip_result, armor_root, bone_map: dict, geom_name: bytes, sk_skel: dict | None = None):
@@ -839,6 +962,10 @@ def splice_body_geometry(data, skin_info: dict, fill_body_part: int = 32) -> int
     if armor_root is None or not bone_map:
         return 0
 
+    # Armor surface for the occlusion trim — built once per NIF; the original
+    # OB body skin is already stripped, so every trishape present is armor.
+    armor_surf = _armor_surface(armor_root)
+
     # Load Skyrim skeleton data for positioning stub bones.
     _gen_dir = Path(__file__).parent / 'generated'
     sk_skel_m, sk_skel_f = {}, {}
@@ -876,6 +1003,13 @@ def splice_body_geometry(data, skin_info: dict, fill_body_part: int = 32) -> int
                                            proximity_threshold=3.8)
             if clip_result is None:
                 continue
+            # Drop the fill's fully-hidden interior (see FILL_COVER_ALONG):
+            # skin buried under the armor is never visible and only clips
+            # through it once animation moves the two meshes apart.
+            clip_result = _drop_armor_covered_tris(
+                clip_result, armor_surf,
+                (src_geom.translation.x, src_geom.translation.y,
+                 src_geom.translation.z))
             geom_name = geom_name_raw if geom_name_raw else b'BodyFill'
             new_geom = build_clipped_geom(
                 src_geom, clip_result, armor_root, bone_map, geom_name,
@@ -929,7 +1063,8 @@ def is_body_skin_geometry(block) -> bool:
             if prop.has_base_texture and prop.base_texture.source:
                 tex = bytes(prop.base_texture.source.file_name).decode(
                     'latin-1', errors='replace').lower().replace('/', '\\')
-                if tex.startswith(_SKIN_TEX_PREFIX):
+                if tex.startswith(_SKIN_TEX_PREFIX) and \
+                        _HAIR_TEX_MARKER not in tex:
                     return True
     # Post-conversion: BSLightingShaderProperty in bs_properties (tes4\\ prefix added)
     for prop in getattr(block, 'bs_properties', []):
@@ -940,7 +1075,7 @@ def is_body_skin_geometry(block) -> bool:
             if ts is None:
                 continue
             tex = bytes(ts.textures[0]).decode('latin-1', errors='replace').lower().replace('/', '\\')
-            if '\\characters\\' in tex:
+            if '\\characters\\' in tex and _HAIR_TEX_MARKER not in tex:
                 return True
     return False
 

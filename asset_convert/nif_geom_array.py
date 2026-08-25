@@ -51,6 +51,7 @@ contract is byte-equality, verified with ``tools/nif_perf.py --baseline`` and
 ``tools/nif_determinism.py``.  Toggle with ``TESCONV_NO_GEOM_ARRAY=1``.
 """
 
+import operator
 import os
 
 _INSTALLED = False
@@ -289,6 +290,16 @@ def install():
         n = list.__len__(self)
         if arr is None:
             return orig_getitem(self, index)
+        # SLICES MUST STILL WORK.  The accelerated path assumed an integer
+        # index, so any `vertices[:n]` raised "'<' not supported between
+        # instances of 'slice' and 'int'" -- pyffi's own list semantics
+        # allow slicing, and the skin-retarget tests read `data.vertices[:nv]`
+        # exactly that way.  A slice returns the list of element views, which
+        # is what the unaccelerated list would have returned.
+        if isinstance(index, slice):
+            return [view_cls(arr, i)
+                    for i in range(*index.indices(min(n, len(arr))))]
+        index = operator.index(index)
         if index < 0:
             index += n
         if index < 0 or index >= min(n, len(arr)):

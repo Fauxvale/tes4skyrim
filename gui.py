@@ -31,6 +31,7 @@ from worker_budget import worker_count, cpu_total, WORKERS_ENV_VAR
 # because it imports this lazily inside a function.
 from tools.navmesh_cache import NO_DOWNLOAD_ENV_VAR
 import version as version_info
+import run_log
 from preflight import RC_MISSING_DEP as _RC_MISSING_DEP
 from collision_options import (
     WINDING_FIX_DEFAULT_PLUGINS,
@@ -1236,6 +1237,11 @@ def gui_main():
     tools_menu.add_command(
         label="Open Output Folder",
         command=lambda: _open_folder(output_var.get().strip(), "Output folder"))
+    # Rotation is worthless if nobody knows the files are there.  The run also
+    # prints its own log path into the scrollback (see `_run_log_note`).
+    tools_menu.add_command(
+        label="Open Logs Folder",
+        command=lambda: _open_folder(str(SCRIPT_DIR / "logs"), "Logs folder"))
 
     # ── About ─────────────────────────────────────────────────────────────────
     # Top-level rather than under Help: it is currently the only such item, and
@@ -3625,6 +3631,83 @@ def gui_main():
             return "cmd"
         return None
 
+    # -- Run log ---------------------------------------------------------------
+    # The scrollback used to be the ONLY copy of a run's output: closing the
+    # window, or starting the next run (which clears the widget), destroyed the
+    # record of the run the user had just played in game.  `_log` is the single
+    # funnel every line already passes through -- both runners and every child
+    # process -- so mirroring it here also captures the GUI's OWN lines (the
+    # header, the ERROR SUMMARY), which are in no child's stdout.
+    #
+    # One writer only.  A GUI run is usually several convert.py processes, so
+    # the children are told a log already exists (TESCONV_RUN_LOG) and write
+    # nothing; two processes appending to one file would interleave and, on
+    # Windows, corrupt it.
+    _run_log = [None]
+
+    def _run_log_begin(header: dict):
+        """Rotate and open this run's log.  Never fails a run."""
+        _run_log_end()
+        try:
+            cfg = load_config()
+        except Exception:
+            cfg = {}
+        try:
+            keep = run_log.runs_kept(cfg)
+            if keep <= 0:
+                return
+            logs_dir = SCRIPT_DIR / "logs"
+            if not run_log.rotate(logs_dir, keep):
+                return
+            full = {"Version": version_info.current_version()}
+            full.update(header)
+            log = run_log.RunLog(run_log.log_path(logs_dir, 1), full)
+            if log.active:
+                _run_log[0] = log
+        except Exception:
+            _run_log[0] = None
+
+    def _run_log_end(status: str = None):
+        log = _run_log[0]
+        _run_log[0] = None
+        if log is None:
+            return
+        try:
+            log.close(status)
+        except Exception:
+            pass
+
+    def _run_log_env() -> dict:
+        """Tell child processes a run log already exists, so they don't rotate."""
+        log = _run_log[0]
+        return {run_log.RUN_LOG_ENV_VAR: str(log.path)} if log is not None else {}
+
+    def _run_log_note():
+        """Log where this run is being recorded, and how big the last one was."""
+        log = _run_log[0]
+        if log is None:
+            return
+        try:
+            shown = str(log.path.relative_to(SCRIPT_DIR))
+        except ValueError:
+            shown = str(log.path)
+        _log(f"Log: {shown}")
+
+    def _run_log_size_note():
+        """Report the finished log's size, so a runaway file is visible."""
+        log = _run_log[0]
+        if log is None:
+            return
+        try:
+            size = log.path.stat().st_size
+        except OSError:
+            return
+        try:
+            shown = str(log.path.relative_to(SCRIPT_DIR))
+        except ValueError:
+            shown = str(log.path)
+        _log(f"Log saved: {shown} ({run_log.format_size(size)})")
+
     def _log(line: str):
         log_text.configure(state=tk.NORMAL)
         tag = _classify(line)
@@ -3635,6 +3718,12 @@ def gui_main():
             log_text.insert(tk.END, line + "\n")
         log_text.see(tk.END)
         log_text.configure(state=tk.DISABLED)
+        log = _run_log[0]
+        if log is not None:
+            try:
+                log.write_line(line)
+            except Exception:
+                pass
 
     def _log_error_summary():
         """Print the collected errors under the FAILED verdict.
@@ -4421,8 +4510,11 @@ def gui_main():
         label = next(l for k, l, _t, _s, _r in GLOBAL_ACTIONS if k == key)
 
         _clear_log()
+        # Opened BEFORE the header lines so they land in the file too.
+        _run_log_begin({"Command": label, "Output": out_dir})
         _log(label)
         _log(f"Output: {out_dir}")
+        _run_log_note()
         _log("")
 
         q = queue.Queue()
@@ -4440,11 +4532,20 @@ def gui_main():
                 pass
             if running.is_set():
                 root.after(50, _drain)
-            elif _want_summary[0]:
-                _want_summary[0] = False
-                _log_error_summary()
+            elif _want_summary[0] or _run_log[0] is not None:
+                # The queue is empty and the worker is done, so every line --
+                # including the summary below -- has been through _log.
+                # Either condition must enter: with run logging disabled
+                # (logRunsKept: 0) the summary still has to print.
+                if _want_summary[0]:
+                    _want_summary[0] = False
+                    _log_error_summary()
+                _run_log_size_note()
+                _run_log_end(f"EXIT: {'OK' if not _run_errors else 'ERRORS'}")
 
         run_env = {WORKERS_ENV_VAR: str(_get_workers())}
+        # This process owns the run log; a child must not rotate it.
+        run_env.update(_run_log_env())
 
         def _worker():
             _set_running(True)
@@ -4508,6 +4609,15 @@ def gui_main():
                 selected_subdirs = chosen
 
         _clear_log()
+        # Opened BEFORE the header block so the run's settings -- the first
+        # thing anyone reads when diagnosing it later -- are in the file.
+        _run_log_begin({
+            "Command": "Pipeline run",
+            "File":    fname or "(none)",
+            "Steps":   ", ".join(steps),
+            "Output":  out_dir,
+            "Workers": str(_get_workers()),
+        })
         _log(f"File: {fname or '(none)'}")
         _log(f"Steps: {', '.join(steps)}")
         _log(f"Output: {out_dir}")
@@ -4521,6 +4631,7 @@ def gui_main():
                     if parallax_var.get() else ""))
             if tex_only_var.get():
                 _log("Textures only: no meshes written (for PGPatcher)")
+        _run_log_note()
         _log("")
 
         q = queue.Queue()
@@ -4542,11 +4653,16 @@ def gui_main():
             # Continue draining while running
             if running.is_set():
                 root.after(50, _drain_queue)
-            elif _want_summary[0]:
+            elif _want_summary[0] or _run_log[0] is not None:
                 # Final pass: the worker is done and the queue is empty, so
                 # every error line has been through _log and recorded.
-                _want_summary[0] = False
-                _log_error_summary()
+                # Either condition must enter: with run logging disabled
+                # (logRunsKept: 0) the summary still has to print.
+                if _want_summary[0]:
+                    _want_summary[0] = False
+                    _log_error_summary()
+                _run_log_size_note()
+                _run_log_end(f"EXIT: {'OK' if not _run_errors else 'ERRORS'}")
 
         # Propagate the chosen worker count to every child process (and the
         # multiprocessing workers they spawn) via the environment.
@@ -4556,6 +4672,10 @@ def gui_main():
         # the enabled default and inheriting a stale "1" from the parent
         # environment can never silently disable a run the user re-enabled.
         run_env[NO_DOWNLOAD_ENV_VAR] = '' if cache_dl_var.get() else '1'
+        # A GUI run is several convert.py processes; THIS process owns the log
+        # (every line already flows through _log). Children see the variable
+        # and neither rotate nor write, so the file has exactly one writer.
+        run_env.update(_run_log_env())
 
         def _worker():
             _set_running(True)

@@ -4,7 +4,8 @@ TES4 face data available per NPC_:
   HNAM.Hair     — FormID of HAIR record (converted to HDPT, same FormID preserved)
   ENAM.Eyes     — FormID of EYES record (→ mapped Skyrim HDPT by eye color)
   HCLR.R/G/B   — Hair color bytes     (→ CLFM FormID via map_hair_color)
-  LNAM.HairLen  — Hair length float   (no Skyrim equivalent, ignored)
+  LNAM.HairLength — Hair length float (blend weight for the hair .tri's
+                    HairMorph; BAKED per variant — see hair_variants)
   FGGS          — FaceGen Geometry-Symmetric: hex string, 200 bytes = 50 float32 PCA coefficients
   FGGA          — FaceGen Geometry-Asymmetric: hex string, 120 bytes = 30 float32 PCA coefficients
   FGTS          — FaceGen Texture-Symmetric: hex string, 200 bytes = 50 float32 PCA coefficients
@@ -22,8 +23,10 @@ TES5 face subrecords emitted (by the functions in this module):
 
 Hair PNAM note:
   Oblivion HAIR records are converted to Skyrim HDPT records (Type=3/Hair) by
-  convert_HAIR() using the same FormID.  Therefore get_formid(rec,'HNAM.Hair')
-  directly yields the output HDPT FormID — no secondary look-up needed.
+  convert_HAIR().  The BASE length keeps the source FormID, so an NPC whose
+  LNAM is 0 resolves straight through get_formid(rec,'HNAM.Hair').  Any other
+  authored length names a baked variant whose HDPT id is
+  derive_formid('HDPT_HAIR', (hair_fid, bucket)) — see _resolve_hair_part.
 
 FTST note:
   FormIDs listed are from the sequential block 0x000FDFE6–0x000FDFF5 in
@@ -435,8 +438,32 @@ def _resolve_hair_part(rec: dict, hair_fid: int, race_edid: str,
         female = genders[0]
     if bucket > 0 and bucket not in hair_variants.hair_buckets_for(hair_fid):
         bucket = 0
+
+    # RACE-GROUP variant: the in-game head is the base mesh PLUS the race's
+    # races-tri morph, so a GENERIC hair is baked per race group and the NPC
+    # must reference the group matching its (mapped) race — 'E' elves,
+    # 'O' orcs, 'D' dremora, '' the shared human scalp.  Race-NAMED hair has
+    # a single, already-correctly-fitted variant (no tag).
+    from asset_convert.hair_pipeline import _fit_group_lock
+    from asset_convert.head_fit import fit_race_for_hair
+    edid = hair_variants.hair_edid(hair_fid)
+    group = ''
+    if fit_race_for_hair(edid) is None and _fit_group_lock(edid) is None:
+        group = _HAIR_GROUP_BY_TES4_RACE.get(race_edid, '')
     return hair_variant_formid(writer, hair_fid, bucket,
-                               female, base_female=genders[0])
+                               female, base_female=genders[0], group=group)
+
+
+# TES4 race EditorID -> hair race-group tag, following RACE_MAP: GoldenSaint
+# maps to the HighElf race and DarkSeducer to DarkElf, so they wear the elf
+# scalp; Sheogorath is Imperial; everything unlisted (humans, vampires,
+# khajiit, argonian) wears the base scalp.
+_HAIR_GROUP_BY_TES4_RACE = {
+    'HighElf': 'E', 'WoodElf': 'E', 'DarkElf': 'E',
+    'GoldenSaint': 'E', 'DarkSeducer': 'E',
+    'Orc': 'O',
+    'Dremora': 'D', 'SEDremora': 'D',
+}
 
 
 def build_pnam_subs(rec: dict, race_edid: str, gender: str = 'Male',

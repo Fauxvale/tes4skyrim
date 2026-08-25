@@ -1178,6 +1178,11 @@ class PluginWriter:
             'DLBR', 'DLVW',
             # Vanilla tail: …MATO MOVT HAZD SNDR DUAL SNCT SOPM COLL CLFM REVB.
             'MOVT',
+            # CLFM holds the generated hair colors (one per distinct authored
+            # Oblivion HCLR — see record_types/actors.convert_hair_colors).
+            # Nothing resolves it at parse time; pinning the canonical slot
+            # keeps the layout independent of when the group was added.
+            'CLFM',
         ]
         # Append any groups not in the canonical order
         for sig in self._top_groups:

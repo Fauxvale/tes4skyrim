@@ -124,11 +124,14 @@ def test_button_order_matches_game_ids(built):
     _data, _count, recs = built
     subs = recs[('MESG', FID_MESG)]
     texts = [p.rstrip(b'\0').decode() for t, p in subs if t == 'ITXT']
-    assert texts[0].startswith('Skyrim')
-    assert texts[1].startswith('Cyrodiil')
-    assert texts[2].startswith('Nehrim')
-    assert texts[3].startswith('Vvardenfell')
+    # Derive the expectation from BUTTONS rather than freezing a snapshot
+    # of it: the contract is that the record's ITXT order IS the declared
+    # order, not that a given game sits at a given index.
+    assert texts == [text for text, _gate in BUTTONS]
     assert len(texts) == len(BUTTONS) == 4
+    # Index 0 is the one fixed point: it is the unconditional button.
+    assert BUTTONS[0][1] is None
+    assert texts[0].startswith('Skyrim')
 
 
 def test_skyrim_button_is_unconditional_others_are_gated(built):
@@ -153,9 +156,16 @@ def test_skyrim_button_is_unconditional_others_are_gated(built):
             conds.setdefault(idx, []).append(param1)
 
     assert 0 not in conds, 'Skyrim button must stay unconditional'
-    assert conds[1] == [FID_GLOB_OBLIVION]
-    assert conds[2] == [FID_GLOB_NEHRIM]
-    assert conds[3] == [FID_GLOB_MORROBLIVION]
+    # Each remaining button is gated on exactly its own global, in
+    # BUTTONS order -- follow the list instead of restating it.
+    for idx, (_text, gate) in enumerate(BUTTONS):
+        if gate is None:
+            assert idx not in conds
+        else:
+            assert conds[idx] == [gate]
+    # All three converted games are represented, each exactly once.
+    assert sorted(g for gs in conds.values() for g in gs) == sorted(
+        [FID_GLOB_OBLIVION, FID_GLOB_NEHRIM, FID_GLOB_MORROBLIVION])
 
 
 def test_mesg_is_a_message_box(built):
@@ -353,8 +363,24 @@ def test_script_source_declares_matching_game_constants():
     psc = os.path.join(root, 'TESGameSelect', 'scripts', 'source',
                        SCRIPT_NAME + '.psc')
     text = open(psc, encoding='utf-8').read()
-    for name, value in [('GAME_SKYRIM', 0), ('GAME_OBLIVION', 1),
-                        ('GAME_NEHRIM', 2), ('GAME_MORROBLIVION', 3)]:
+
+    # The button's index IS the game id, so the .psc constant for a game
+    # must equal that game's position in BUTTONS. Deriving it here means a
+    # reorder in one file without the other fails loudly instead of
+    # silently launching the wrong game.
+    glob_to_const = {
+        None:                  'GAME_SKYRIM',
+        FID_GLOB_OBLIVION:     'GAME_OBLIVION',
+        FID_GLOB_NEHRIM:       'GAME_NEHRIM',
+        FID_GLOB_MORROBLIVION: 'GAME_MORROBLIVION',
+    }
+    expected = {glob_to_const[gate]: idx
+                for idx, (_text, gate) in enumerate(BUTTONS)}
+    assert len(expected) == len(BUTTONS) == 4
+
+    for name, value in sorted(expected.items(), key=lambda kv: kv[1]):
         assert f'Property {name}' in text
         line = next(ln for ln in text.splitlines() if f'Property {name}' in ln)
-        assert f'= {value}' in line, f'{name} must equal {value}'
+        assert f'= {value}' in line, (
+            f'{name} must equal {value} -- it is button {value} in '
+            f'make_game_select_esp.BUTTONS, and Show() returns that index')
