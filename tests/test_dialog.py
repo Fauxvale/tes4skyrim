@@ -1912,3 +1912,52 @@ class TestSaySpeakAsIdentityGate:
             'SCPT': [{'SCTX': 'SomeRef.Say GREETING'}],
         }
         assert scan_speak_as_topics(by_type) == set()
+
+
+class TestDropNonActorSpeakerCtdas:
+    """_drop_non_actor_speaker_ctdas re-packs a raw condition BLOCK.
+
+    Its `sig` is a 4-byte slice off that buffer, but pack_subrecord takes a
+    str -- so it raised AttributeError ('bytes' has no 'encode') on EVERY
+    speak-as INFO whose owning quest carried conditions, and the caller's
+    blanket `except` swallowed it as "ERROR info under <topic>", silently
+    dropping all four of Morroblivion's mwDASheogorathSpeech lines.
+    """
+
+    @staticmethod
+    def _ctda(func, type_byte=0, run_on=0):
+        return struct.pack('<B3xIHHIIII I', type_byte, 0x3F800000, func, 0,
+                           0, 0, run_on, 0, 0xFFFFFFFF)
+
+    def _block(self):
+        from tes5_import.dialog_conditions import (_NON_ACTOR_SPEAKER_DROP,
+                                                   CTDA_OR)
+        from tes5_import.record_types.common import pack_subrecord
+        drop_func = sorted(_NON_ACTOR_SPEAKER_DROP)[0]
+        keep_func = max(_NON_ACTOR_SPEAKER_DROP) + 1
+        assert keep_func not in _NON_ACTOR_SPEAKER_DROP
+        blob = pack_subrecord('CTDA', self._ctda(drop_func))
+        blob += pack_subrecord('CIS2', b'::foo_var\x00')
+        blob += pack_subrecord('CTDA', self._ctda(keep_func,
+                                                  type_byte=CTDA_OR))
+        return blob, keep_func
+
+    def test_repacks_kept_conditions(self):
+        from tes5_import.dialog_converter import _drop_non_actor_speaker_ctdas
+        from tes5_import.dialog_conditions import CTDA_OR
+        blob, keep_func = self._block()
+        out = _drop_non_actor_speaker_ctdas(blob)
+        # Exactly one CTDA survives: the dropped one took its CIS2 with it.
+        assert out[:4] == b'CTDA'
+        assert len(out) == 6 + 32
+        assert struct.unpack_from('<H', out, 6 + 8)[0] == keep_func
+        # ...and its now-dangling OR flag was cleared.
+        assert not (out[6] & CTDA_OR)
+
+    def test_all_dropped_yields_empty(self):
+        from tes5_import.dialog_converter import _drop_non_actor_speaker_ctdas
+        from tes5_import.dialog_conditions import _NON_ACTOR_SPEAKER_DROP
+        from tes5_import.record_types.common import pack_subrecord
+        blob = pack_subrecord('CTDA',
+                              self._ctda(sorted(_NON_ACTOR_SPEAKER_DROP)[0]))
+        assert _drop_non_actor_speaker_ctdas(blob) == b''
