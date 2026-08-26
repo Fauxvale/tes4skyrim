@@ -371,18 +371,36 @@ class TestBsaPack:
         assert _bin_files([], limit=1000) == []
 
     def test_loader_stem_naming(self):
-        """Overflow loaders are oblivion_loader, oblivion_loader_1, ..."""
+        """Overflow loaders are <stem>_loader, <stem>_loader_1, ..."""
         from asset_convert.bsa_pack import _loader_stem
-        assert _loader_stem(0) == 'oblivion_loader'
-        assert _loader_stem(1) == 'oblivion_loader_1'
-        assert _loader_stem(2) == 'oblivion_loader_2'
+        assert _loader_stem('Oblivion', 0) == 'Oblivion_loader'
+        assert _loader_stem('Oblivion', 1) == 'Oblivion_loader_1'
+        assert _loader_stem('Oblivion', 2) == 'Oblivion_loader_2'
+
+    def test_loader_stem_is_plugin_scoped(self):
+        """Two plugins must never generate the same loader name.
+
+        Loader stems are global to the game's Data folder even though they are
+        generated per output folder, so a fixed stem made every converted mod
+        that overflowed ship identically-named .esl/.bsa files -- installing
+        two of them silently overwrote one mod's overflow archives.
+        """
+        from asset_convert.bsa_pack import _loader_stem
+        stems = ['Oblivion', 'Morrowind_ob', 'Nehrim',
+                 'Morrowind_ob - Chargen and Transport Mod']
+        for i in range(3):
+            names = [_loader_stem(s, i) for s in stems]
+            assert len(set(names)) == len(names), f"collision at index {i}: {names}"
+        # Every name must still carry its own plugin's stem.
+        for s in stems:
+            assert _loader_stem(s, 0).startswith(s)
 
     def test_loader_esl_is_valid_light_master(self):
         """The dummy ESL must be a record-free TES4 header with ESM+ESL flags."""
         import struct
         from asset_convert.bsa_pack import write_loader_esl, ESL_FLAG, ESM_FLAG
         with tempfile.TemporaryDirectory() as tmpdir:
-            p = Path(tmpdir) / 'oblivion_loader.esl'
+            p = Path(tmpdir) / 'Oblivion_loader.esl'
             write_loader_esl(p)
             data = p.read_bytes()
             sig, size, flags, _fid, _v1, form_ver, _v2 = struct.unpack(
