@@ -762,8 +762,15 @@ def gui_main():
     # steps. The progress bar needs no extra height of its own: it is anchored
     # to the bottom beside the status row, so it grows the pair upward rather
     # than demanding headroom that sits empty whenever no run is in flight.
-    root.geometry("1060x1000")
-    root.minsize(860, 740)
+    # 1030, not 1000: the sidebar's content measures 1003px tall including the
+    # window chrome, so the old default clipped its own bottom block by 3px on
+    # every machine before DPI or a taskbar was involved. The sidebar scrolls
+    # now, but the DEFAULT window should still clear it outright.
+    root.geometry("1060x1030")
+    # 740 used to be the height the sidebar needed to avoid clipping its own
+    # bottom blocks. The sidebar scrolls now, so the floor only has to keep the
+    # log pane usable.
+    root.minsize(860, 520)
     root.configure(bg=CLR["bg"])
     root.option_add("*Background", CLR["bg"])
     root.option_add("*Foreground", CLR["text"])
@@ -1420,6 +1427,111 @@ def gui_main():
     sidebar  = ttk.Frame(outer, style="Panel.TFrame")
     sidebar.grid(row=0, column=0, sticky="nsew")
 
+    # ── Sidebar scroller ─────────────────────────────────────────────────────
+    # Every block below is a FIXED height, so the sidebar has one natural
+    # height and a window shorter than it used to clip the bottom blocks
+    # outright -- Global, and on a laptop at 125% DPI even Run. Pack simply
+    # runs off the end of the frame, and because the status row is packed
+    # side=BOTTOM it wins that contest, so what vanished was the middle of the
+    # sidebar rather than its tail.
+    #
+    # So `sidebar` is now a two-part column: a scrollable viewport holding all
+    # the content, and the progress bar + status row pinned underneath it.
+    # Those two stay OUT of the scroller deliberately -- they report what the
+    # app is doing right now, and scrolling "Ready" or a running progress bar
+    # out of sight would be worse than the clipping this fixes.
+    sidebar.rowconfigure(0, weight=1)
+    sidebar.columnconfigure(0, weight=1)
+
+    sb_canvas = tk.Canvas(sidebar, bg=CLR["panel"], highlightthickness=0,
+                          bd=0, takefocus=0)
+    sb_canvas.grid(row=0, column=0, sticky="nsew")
+    sb_vsb = ttk.Scrollbar(sidebar, orient="vertical", command=sb_canvas.yview)
+    sb_canvas.configure(yscrollcommand=sb_vsb.set)
+
+    # Everything that used to be packed straight into `sidebar` goes in here.
+    sb_body = ttk.Frame(sb_canvas, style="Panel.TFrame")
+    _sb_win = sb_canvas.create_window((0, 0), window=sb_body, anchor="nw")
+
+    # The scrollbar is only ever gridded while the content genuinely overflows,
+    # so a tall window looks exactly as it did before this change.
+    _sb_shown = [False]
+    _sb_pending = [False]
+
+    def _sb_sync():
+        """Match the scrollregion to the content and show/hide the scrollbar."""
+        _sb_pending[0] = False
+        try:
+            need = sb_body.winfo_reqheight()
+            have = sb_canvas.winfo_height()
+            sb_canvas.configure(scrollregion=(0, 0, sb_canvas.winfo_width(),
+                                              need))
+            overflow = need > have
+            if overflow != _sb_shown[0]:
+                _sb_shown[0] = overflow
+                if overflow:
+                    sb_vsb.grid(row=0, column=1, sticky="ns")
+                else:
+                    sb_vsb.grid_remove()
+                # Keep the CONTENT column a constant width in both states: the
+                # scrollbar would otherwise steal ~17px from it and reflow the
+                # two-column Global rows the moment it appeared.
+                outer.columnconfigure(
+                    0, minsize=330 + (sb_vsb.winfo_reqwidth() if overflow
+                                      else 0))
+            if not overflow:
+                # A window enlarged back to full height must not be left
+                # scrolled down with a blank strip under the content.
+                sb_canvas.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    def _sb_schedule(_e=None):
+        # <Configure> fires once per child while the sidebar is being built and
+        # again on every step-availability refresh; collapsing the burst into
+        # one idle pass keeps that from turning into a bbox per widget.
+        if not _sb_pending[0]:
+            _sb_pending[0] = True
+            sb_canvas.after_idle(_sb_sync)
+
+    def _sb_canvas_configure(event):
+        # A canvas window has no width of its own, so without this every
+        # fill=X block inside collapses to its requested width.
+        sb_canvas.itemconfigure(_sb_win, width=event.width)
+        _sb_schedule()
+
+    sb_canvas.bind("<Configure>", _sb_canvas_configure)
+    sb_body.bind("<Configure>", _sb_schedule)
+
+    # Wheel handling is bound to the WIDGETS, not bind_all: the dialogs in this
+    # file each call unbind_all("<MouseWheel>") when they close, which would
+    # otherwise take the sidebar's binding with them, and a global binding
+    # would hijack the wheel over the log pane.
+    def _sb_wheel(event):
+        if not _sb_shown[0]:
+            return None
+        sb_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    # Tk delivers <MouseWheel> to the widget under the pointer and then walks
+    # its BINDTAGS -- it does not bubble up to ancestor widgets -- so binding
+    # the canvas alone would leave the wheel dead over every checkbox in the
+    # sidebar. A shared tag on the whole subtree gives each of them the same
+    # handler without a per-widget bind.
+    _SB_WHEEL_TAG = "SidebarWheel"
+    root.bind_class(_SB_WHEEL_TAG, "<MouseWheel>", _sb_wheel)
+
+    def _sb_tag_wheel(widget):
+        """Give `widget` and everything under it the sidebar wheel handler."""
+        tags = widget.bindtags()
+        if _SB_WHEEL_TAG not in tags:
+            widget.bindtags(tags + (_SB_WHEEL_TAG,))
+        for child in widget.winfo_children():
+            _sb_tag_wheel(child)
+
+    # Called once the sidebar is fully built, near the end of gui_main --
+    # sb_body has no children yet at this point.
+
     log_pane = tk.Frame(outer, bg=CLR["log_bg"])
     log_pane.grid(row=0, column=1, sticky="nsew")
 
@@ -1432,11 +1544,11 @@ def gui_main():
     _SEP_GAP = 12
 
     def _sep():
-        ttk.Separator(sidebar, orient=tk.HORIZONTAL).pack(
+        ttk.Separator(sb_body, orient=tk.HORIZONTAL).pack(
             fill=tk.X, padx=14, pady=_SEP_GAP)
 
     def _section(text: str):
-        f = ttk.Frame(sidebar, style="Panel.TFrame")
+        f = ttk.Frame(sb_body, style="Panel.TFrame")
         f.pack(fill=tk.X, padx=14, pady=(6, 2))
         ttk.Label(f, text=text, style="PanelSub.TLabel").pack(anchor="w")
         return f
@@ -1536,7 +1648,7 @@ def gui_main():
         return entry
 
     # ── Title ─────────────────────────────────────────────────────────────────
-    tf = ttk.Frame(sidebar, style="Panel.TFrame")
+    tf = ttk.Frame(sb_body, style="Panel.TFrame")
     tf.pack(fill=tk.X, padx=14, pady=(16, 0))
 
     banner_img = None
@@ -1580,7 +1692,7 @@ def gui_main():
     # anyone with two installs to keep retyping one field, and made whichever
     # path was in the box at conversion time get recorded as that plugin's
     # origin (Oblivion.esm ended up stamped against the Nehrim folder).
-    sf = ttk.Frame(sidebar, style="Panel.TFrame")
+    sf = ttk.Frame(sb_body, style="Panel.TFrame")
     sf.pack(fill=tk.X, padx=14, pady=(0, 8))
     src_head = ttk.Frame(sf, style="Panel.TFrame")
     src_head.pack(fill=tk.X)
@@ -1649,7 +1761,7 @@ def gui_main():
         row=0, column=2, padx=(3, 0))
 
     # ── Plugin selector ───────────────────────────────────────────────────────
-    pf = ttk.Frame(sidebar, style="Panel.TFrame")
+    pf = ttk.Frame(sb_body, style="Panel.TFrame")
     pf.pack(fill=tk.X, padx=14, pady=(0, 8))
     ttk.Label(pf, text="Plugin File", style="PanelSub.TLabel").pack(anchor="w")
     initial_plugins = scan_plugins(tes4_path)
@@ -2076,7 +2188,7 @@ def gui_main():
     last_valid[0] = file_var.get()
 
     # ── Output directory ──────────────────────────────────────────────────────
-    out_frame = ttk.Frame(sidebar, style="Panel.TFrame")
+    out_frame = ttk.Frame(sb_body, style="Panel.TFrame")
     out_frame.pack(fill=tk.X, padx=14, pady=(0, 8))
 
     def _on_output_change(path):
@@ -2096,7 +2208,7 @@ def gui_main():
     tes4_var.trace_add("write", lambda *_: None)  # live binding via on_change
 
     # ── Skyrim SE data directory (for the "Patch Skyrim" step) ───────────────
-    tes5_frame = ttk.Frame(sidebar, style="Panel.TFrame")
+    tes5_frame = ttk.Frame(sb_body, style="Panel.TFrame")
     tes5_frame.pack(fill=tk.X, padx=14, pady=(0, 0))
 
     def _on_tes5_change(path):
@@ -2133,7 +2245,7 @@ def gui_main():
     pf.pack(fill=tk.X, padx=14, pady=(0, 12))
 
     # ── Pipeline steps ────────────────────────────────────────────────────────
-    sh = ttk.Frame(sidebar, style="Panel.TFrame")
+    sh = ttk.Frame(sb_body, style="Panel.TFrame")
     sh.pack(fill=tk.X, padx=14, pady=(0, 4))  # flush to the rule above
     ttk.Label(sh, text="Pipeline Steps", style="PanelSub.TLabel").pack(side=tk.LEFT)
 
@@ -3173,7 +3285,7 @@ def gui_main():
     step_widgets: dict = {}
     for step in STEPS:
         key, label, tip = step[0], step[2], step[3]
-        row = ttk.Frame(sidebar, style="Panel.TFrame")
+        row = ttk.Frame(sb_body, style="Panel.TFrame")
         row.pack(fill=tk.X, padx=14, pady=1)
         cb = ttk.Checkbutton(row, text=label, variable=step_vars[key],
                              command=_update_run_btn)
@@ -3185,7 +3297,7 @@ def gui_main():
             _mesh_step_row = row
 
     # Small link sitting just below the Meshes checkbox row
-    _mesh_toggle_row = ttk.Frame(sidebar, style="Panel.TFrame")
+    _mesh_toggle_row = ttk.Frame(sb_body, style="Panel.TFrame")
     _mesh_toggle_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_mesh_step_row)
     mesh_toggle_lbl = tk.Label(
         _mesh_toggle_row, text="  filter subfolders...",
@@ -3198,7 +3310,7 @@ def gui_main():
     # Parallax carry-over, the other Meshes sub-option.  No per-plugin default
     # and no auto-on: whether the output renders correctly depends on the
     # PLAYER's setup, not on the plugin, so only they can answer it.
-    _parallax_row = ttk.Frame(sidebar, style="Panel.TFrame")
+    _parallax_row = ttk.Frame(sb_body, style="Panel.TFrame")
     _parallax_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_mesh_toggle_row)
     _parallax_chk = ttk.Checkbutton(_parallax_row, text="Convert parallax",
                                     variable=parallax_var,
@@ -3223,7 +3335,7 @@ def gui_main():
     # do the mesh side across the player's whole load order, and without
     # parallax on it would just be a texture copy with the meshes missing.
     # Enabled/disabled follows the parallax box for exactly that reason.
-    _texonly_row = ttk.Frame(sidebar, style="Panel.TFrame")
+    _texonly_row = ttk.Frame(sb_body, style="Panel.TFrame")
     _texonly_row.pack(fill=tk.X, padx=14, pady=(0, 1), after=_parallax_row)
     _texonly_chk = ttk.Checkbutton(_texonly_row, text="Textures only",
                                    variable=tex_only_var,
@@ -3262,7 +3374,7 @@ def gui_main():
     # Bottom pad 0: the rule below owns that gap. A 6px pad here stacked on the
     # separator's own 12px and made the space above that line visibly wider
     # than the matching space below it.
-    bf = ttk.Frame(sidebar, style="Panel.TFrame")
+    bf = ttk.Frame(sb_body, style="Panel.TFrame")
     bf.pack(fill=tk.X, padx=14, pady=(_SEP_GAP, 0))
 
     run_btn = ttk.Button(bf, text="  Run Selected Steps",
@@ -3307,11 +3419,11 @@ def gui_main():
     # This header has no buttons to stretch it, so the same optical gap has to
     # be stated outright — copying the other block's padding alone left it
     # sitting 8px high and the two rules looked unevenly spaced.
-    gh = ttk.Frame(sidebar, style="Panel.TFrame")
+    gh = ttk.Frame(sb_body, style="Panel.TFrame")
     gh.pack(fill=tk.X, padx=14, pady=(0, 4))  # flush to the rule above
     ttk.Label(gh, text="Global", style="PanelSub.TLabel").pack(side=tk.LEFT)
 
-    gf = ttk.Frame(sidebar, style="Panel.TFrame")
+    gf = ttk.Frame(sb_body, style="Panel.TFrame")
     gf.pack(fill=tk.X, padx=14, pady=(0, 6))
 
     # Laid out by the `row` field: position in GLOBAL_ACTIONS decides the
@@ -3361,24 +3473,25 @@ def gui_main():
     # dialog, so a second entry point to the same panel would just duplicate it
     # — and neither packaging action has anything to choose.
 
-    # Progress bar + status, both anchored to the BOTTOM of the sidebar.
+    # Progress bar + status, both pinned to the BOTTOM of the sidebar, OUTSIDE
+    # the scroller: they report what the app is doing right now, so scrolling
+    # them out of view would be worse than the clipping the scroller fixes.
     #
-    # The status row was already side=BOTTOM while the bar was side=TOP, so
-    # every spare pixel in the sidebar pooled between the two — the taller
-    # window needed to fit the bar turned into a 74px void above "Ready".
-    # Anchoring the bar to the bottom as well keeps the pair together and puts
-    # the slack above the whole group, where it reads as ordinary breathing
-    # room instead of a hole. status_row is packed FIRST so that, with
-    # side=BOTTOM stacking upward, it ends up underneath the bar.
-    status_row = ttk.Frame(sidebar, style="Panel.TFrame")
-    status_row.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(0, 10))
-
-    # pady on the BOTTOM side, not the top: the bar sits ABOVE "Ready" now, so
-    # a top pad puts the gap on the wrong side of it and the bar ends up
-    # touching the status text.
+    # They sit in `sidebar`'s own grid (rows 1 and 2) under the scroll viewport
+    # in row 0, which takes all the slack. That reproduces what the old
+    # side=BOTTOM pair did -- keep the two together with the spare space above
+    # them, rather than pooling a void between the bar and "Ready".
+    #
+    # Grid, not pack: `sidebar` is grid-managed now, and the two geometry
+    # managers cannot share a parent.
     prog_bar = ttk.Progressbar(sidebar, mode="indeterminate", length=200)
-    prog_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(0, 6))
-    prog_bar.pack_forget()
+    prog_bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14,
+                  pady=(0, 6))
+    prog_bar.grid_remove()
+
+    status_row = ttk.Frame(sidebar, style="Panel.TFrame")
+    status_row.grid(row=2, column=0, columnspan=2, sticky="ew", padx=14,
+                    pady=(0, 10))
 
     status_var = tk.StringVar(value="Ready")
     ttk.Label(status_row, textvariable=status_var, style="PanelSub.TLabel").pack(
@@ -3770,7 +3883,13 @@ def gui_main():
         def _work():
             try:
                 from asset_convert import mod_ingest
-                result["manifest"] = mod_ingest.inspect(path)
+                man = mod_ingest.inspect(path)
+                result["manifest"] = man
+                # The master scan stages every plugin out of the archive,
+                # so it belongs on this thread too -- running it while the
+                # confirm dialog was built froze the UI for minutes on a
+                # large .7z.
+                result["missing"] = _missing_masters_for(man)
             except Exception as exc:            # IngestError and anything else
                 result["error"] = exc
 
@@ -3783,14 +3902,19 @@ def gui_main():
                 _info("Cannot Import",
                       f"{os.path.basename(path)}\n\n{result['error']}")
                 return
-            _confirm_import(path, result["manifest"])
+            _confirm_import(path, result["manifest"],
+                            result.get("missing") or set())
 
         th = threading.Thread(target=_work, daemon=True)
         th.start()
         root.after(80, lambda: _done(th))
 
-    def _confirm_import(path, manifest):
-        """Show what was found and let the user choose plugins, then ingest."""
+    def _confirm_import(path, manifest, missing=()):
+        """Show what was found and let the user choose plugins, then ingest.
+
+        `missing` is computed on the caller's worker thread -- see
+        `_missing_masters_for`, which is far too slow to run here.
+        """
         card = tk.Frame(outer, bg=CLR["panel"],
                         highlightbackground=CLR["border"], highlightthickness=1)
 
@@ -3851,7 +3975,6 @@ def gui_main():
         # Masters that have no export yet. This is the project's classic silent
         # failure -- a mod whose master was never converted imports "fine" and
         # resolves every master-owned record to nothing.
-        missing = _missing_masters_for(manifest)
         if missing:
             tk.Label(card,
                      text="Missing masters — convert these FIRST:\n  "
@@ -3925,6 +4048,13 @@ def gui_main():
         an imported mod's plugins live inside their mod's shared folder, so a
         master that IS converted reads as missing under the plain join and the
         dialog tells the user to convert something they already have.
+
+        ONE `extract_all` pass, never `extract_one` per plugin. A solid .7z is
+        a single compressed stream, so extracting one member costs a scan of
+        the whole archive: Better Cities (1.7 GB, 99 plugins) measured 3.7 s
+        per member = 364 s serially, against 3.5 s for all 99 in one pass.
+        Slow enough that Windows painted the window "Not Responding" while it
+        ran -- this must also never be called from the UI thread.
         """
         try:
             import tempfile
@@ -3934,20 +4064,31 @@ def gui_main():
         except Exception:
             return set()
 
+        if not manifest.plugins:
+            return set()
+
         missing = set()
         with tempfile.TemporaryDirectory(prefix="tesconv_mast_") as tmp:
-            for rel in manifest.plugins:
+            targets = []
+            if manifest.is_folder:
+                root = manifest.path / manifest.payload_root
+                targets = [root / rel for rel in manifest.plugins]
+            else:
+                members = [(f"{manifest.payload_root}/{rel}"
+                            if manifest.payload_root else rel)
+                           for rel in manifest.plugins]
                 try:
-                    src = (manifest.path / manifest.payload_root / rel
-                           if manifest.is_folder else None)
-                    if src is not None:
-                        target = src
-                    else:
-                        member = (f"{manifest.payload_root}/{rel}"
-                                  if manifest.payload_root else rel)
-                        target = _archive.extract_one(
-                            manifest.path, member,
-                            os.path.join(tmp, os.path.basename(rel)))
+                    _archive.extract_all(manifest.path, tmp, members=members)
+                except Exception:
+                    return set()
+                # extract_all preserves the archive's directory structure, so
+                # the staged file sits under its full member path.
+                targets = [Path(tmp) / m for m in members]
+
+            for target in targets:
+                try:
+                    if not os.path.isfile(target):
+                        continue
                     for master in get_masters_from_binary(str(target)):
                         if not _master_export_present(master):
                             missing.add(master)
@@ -4109,16 +4250,17 @@ def gui_main():
                              text="Cancel")
         file_combo.configure(state="disabled" if state else "normal")
         if state:
-            # Must match the original pack exactly — side=BOTTOM (or the bar
-            # re-appears at the TOP of the sidebar on the first run) and the
-            # pad on the bottom side (or it butts against "Ready").
-            prog_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(0, 6))
+            # grid_remove() remembers the cell and its padding, so a bare
+            # grid() puts the bar back exactly where it was configured. It
+            # must NOT re-state the options: an explicit grid(row=...) here
+            # is how the bar used to reappear at the top of the sidebar.
+            prog_bar.grid()
             prog_bar.start(12)
             status_var.set("Running...")
             _start_timer()
         else:
             prog_bar.stop()
-            prog_bar.pack_forget()
+            prog_bar.grid_remove()
             status_var.set("Ready")
             _stop_timer()
             # The run just rewrote the conversion state, so what is still
@@ -4711,16 +4853,31 @@ def gui_main():
         depth = [0]
         saved_cursor = [None]
 
+        # The scroll viewport now covers `sidebar` almost entirely (measured:
+        # the canvas fills it, and sb_body fills 97% of the canvas), so
+        # restyling the frame alone would tint nothing the user can see. All
+        # three get painted. sb_body is what actually shows: the 25 blocks
+        # packed into it leave ~23% of its background exposed between them,
+        # which is the same gap-tint the old flat sidebar highlight used.
+        # The canvas is a plain tk widget with no ttk style, so it takes the
+        # highlight as a background color instead.
         def _paint(on: bool):
             try:
                 sidebar.configure(style="Drop.TFrame" if on
                                   else "Panel.TFrame")
+                sb_body.configure(style="Drop.TFrame" if on
+                                  else "Panel.TFrame")
+                drop_bg = ttk.Style().lookup("Drop.TFrame", "background")
+                sb_canvas.configure(
+                    bg=(drop_bg or CLR["panel"]) if on else CLR["panel"])
                 if on:
                     if saved_cursor[0] is None:
                         saved_cursor[0] = sidebar.cget("cursor")
                     sidebar.configure(cursor="hand2")
+                    sb_canvas.configure(cursor="hand2")
                 else:
                     sidebar.configure(cursor=saved_cursor[0] or "")
+                    sb_canvas.configure(cursor="")
                     saved_cursor[0] = None
             except tk.TclError:
                 pass
@@ -4763,16 +4920,29 @@ def gui_main():
                     return
             _begin_import(path)
 
-        try:
-            sidebar.drop_target_register(DND_FILES)
-            sidebar.dnd_bind("<<DropEnter>>", _enter)
-            sidebar.dnd_bind("<<DropLeave>>", _leave)
-            sidebar.dnd_bind("<<Drop>>", _drop)
-        except Exception:
+        # Both the frame and the scroll viewport that now covers it: a drop
+        # onto the sidebar lands on whichever of the two is under the pointer,
+        # and registering only the frame would leave the visible area dead.
+        registered = 0
+        for target in (sidebar, sb_canvas, sb_body):
+            try:
+                target.drop_target_register(DND_FILES)
+                target.dnd_bind("<<DropEnter>>", _enter)
+                target.dnd_bind("<<DropLeave>>", _leave)
+                target.dnd_bind("<<Drop>>", _drop)
+                registered += 1
+            except Exception:
+                continue
+        if not registered:
             return
         root.bind("<FocusOut>", _reset, add="+")
 
     _install_dropzone()
+
+    # Now that every sidebar block exists, hand the wheel handler to all of
+    # them. Called here rather than at definition time because sb_body was
+    # still empty then, and again on demand for anything built later.
+    _sb_tag_wheel(sb_canvas)
 
     # Startup: seed the source list from the folders this project already knows
     # about (the configured tes4DataPath plus every folder a past conversion
