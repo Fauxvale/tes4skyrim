@@ -762,10 +762,23 @@ def _rebuild_packages(plugin_rec, master_rec, old_subs):
     """New PKID run for an authored AIPackage[] change.
 
     The converter filters quest packages out of PKID (they reach the actor
-    through a QUST alias). That filter's state isn't rebuilt in a plugin run,
-    so it is DERIVED: whatever the master's export listed but its converted
-    PKID run omitted was filtered, and stays filtered here.
+    through a QUST alias). Two things must be filtered here:
+
+    1. What the MASTER's conversion already filtered, derived by comparing the
+       master's export against its converted PKID run.
+    2. **Packages THIS PLUGIN newly quest-owns.** These cannot be derived from
+       the master -- the master never saw them -- so the live filter set
+       (`packages._QUEST_PACKAGES`, populated in phase 0g before any override
+       is built) is consulted directly.
+
+    Missing (2) is what shipped Knights.esp's `PACK 02002D7C`
+    (`NDAnvilListenProphetGogan8x4`, owned by the plugin's own quest ND00) in
+    the PKID list of `NPC_ 0103AF03` (Gogan). xEdit states the rule outright:
+    "package is owned by quest ND00 and cannot be assigned to an npc record".
+    The engine wedges at the main menu resolving it.
     """
+    from .packages import is_quest_package
+
     def export_fids(rec):
         return [f for f in (get_formid(rec, f'AIPackage[{i}]')
                             for i in range(get_int(rec, 'AIPackageCount')))
@@ -774,8 +787,11 @@ def _rebuild_packages(plugin_rec, master_rec, old_subs):
     old_pkids = [struct.unpack_from('<I', payload)[0]
                  for s, payload in old_subs if s == b'PKID']
     excluded = set(export_fids(master_rec)) - set(old_pkids)
-    new = [f for f in export_fids(plugin_rec) if f not in excluded]
-    new += [f for f in old_pkids if f not in set(export_fids(master_rec))]
+    new = [f for f in export_fids(plugin_rec)
+           if f not in excluded and not is_quest_package(f)]
+    new += [f for f in old_pkids
+            if f not in set(export_fids(master_rec))
+            and not is_quest_package(f)]
     return [(b'PKID', struct.pack('<I', f)) for f in new]
 
 

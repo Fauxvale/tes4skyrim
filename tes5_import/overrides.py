@@ -220,31 +220,48 @@ def _signature_mismatch(tes4_sig: str, base_sig: bytes) -> bool:
 def make_deleted_record(base: bytes) -> bytes:
     """The master's record restated as a DELETED override.
 
-    Shape verified by census against the vanilla record-deleting masters
-    (Update/Dawnguard/HearthFires/Dragonborn, 612 deleted records):
+    Shape re-measured 2026-08-25 against the vanilla record-deleting masters
+    (Update/Dawnguard/HearthFires/Dragonborn, 279 deleted records).  The three
+    shapes are distinct and the type decides which one applies:
 
-      * a deleted REFR/ACHR keeps ONLY its NAME subrecord — 532 of the 612 are
-        exactly `NAME(4) = base object`, dataSize 10. It is not a bare header;
+      * a deleted REFR/ACHR keeps ONLY its NAME subrecord — 193 of the 279 are
+        exactly `NAME(4) = base object`, dataSize 10.  It is not a bare header;
         the engine still wants to know what the reference was.
-      * everything else (NAVM and the handful of deleted STAT/NPC_/SPEL/IDLE)
-        carries an EMPTY body, dataSize 0.
+      * a deleted NAVM carries an EMPTY body, dataSize 0.  All 68 zero-size
+        deleted records in the four masters are NAVM, and every NAVM deletion
+        is zero-size.
+      * EVERY OTHER TYPE KEEPS ITS FULL BODY.  Measured, with the flag set and
+        nothing stripped: NPC_ 0007932F (220 bytes, EDID VMAD OBND ACBS TPLT
+        RNAM AIDT and all six PKIDs), STAT 000BD6A5 (198), SPEL 0010E38C (307),
+        IDLE 000FDC30 (210), IDLE 000F6CBB (192), SMQN 000F2199 (147),
+        EXPL 000F3A8C (163), INFO 000CEFBE (20), STAT 0006CD7C (153).
 
-    In both cases the Deleted flag is set and every other subrecord is
-    dropped. Keeping the master's full body with only the flag added is NOT
-    what vanilla does and leaves the engine loading a record it is being told
-    to remove.
+    An earlier revision emptied every non-REFR body on the strength of a
+    census that did not hold, which shipped `PACK 01069B12` in Knights.esp as
+    a 0-byte deleted record — a shape vanilla never writes for a non-NAVM
+    type.  Matching vanilla is the reason to keep the body; no in-game symptom
+    was ever traced to the old shape.
     """
     if len(base) < _HEADER_SIZE:
         return base
+    sig = base[:4]
     flags = struct.unpack_from('<I', base, 8)[0] | DELETED_FLAG
-    # Preserve NAME for reference records, matching vanilla's shape.
-    body = b''
-    if base[:4] in (b'REFR', b'ACHR', b'ACRE'):
-        for sig, payload in split_subrecords(base):
-            if sig == b'NAME':
-                body = sig + struct.pack('<H', len(payload)) + payload
+    if sig in (b'REFR', b'ACHR', b'ACRE'):
+        # Reference records keep ONLY NAME — the base object they placed.
+        body = b''
+        for sub_sig, payload in split_subrecords(base):
+            if sub_sig == b'NAME':
+                body = sub_sig + struct.pack('<H', len(payload)) + payload
                 break
-    return (base[:4] + struct.pack('<II', len(body), flags)
+    elif sig == b'NAVM':
+        # The one type vanilla empties.
+        body = b''
+    else:
+        # Everything else keeps the master's body verbatim; only the flag
+        # changes.  Compressed records stay compressed (the body is copied
+        # byte-for-byte, so the COMPRESSED flag it already carries stays true).
+        body = base[_HEADER_SIZE:]
+    return (sig + struct.pack('<II', len(body), flags)
             + base[12:_HEADER_SIZE] + body)
 
 
@@ -443,6 +460,21 @@ class OverrideContext:
             base, changes, rec, master_rec)
         for key in unmapped:
             self.unmapped_keys[key] += 1
+
+        # An override whose every authored change was UNMAPPABLE comes back
+        # byte-identical to the master.  diff_records saw a difference, so the
+        # earlier `not changes` drop did not fire, but apply_changes expressed
+        # none of it — shipping the result adds a record that overrides the
+        # master with the master's own bytes.
+        #
+        # Measured on Knights.esp: 43 PACK overrides, every one byte-identical
+        # to Oblivion.esm's, all from 42 unmappable Condition[] changes.
+        #
+        # Drop it: the master already says exactly this.
+        if record_bytes == base:
+            self.stats['unchanged'] += 1
+            return Override('unchanged', out_fid, b'')
+
         self.stats['emitted'] += 1
         return Override('emitted', out_fid, record_bytes)
 

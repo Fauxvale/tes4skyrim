@@ -539,8 +539,14 @@ class PackagePlan:
                 q = self.owner_quest.get(pfid)
                 if q is None or aref is None:
                     continue
-                self.quest_packages.setdefault(q, {}).setdefault(aref, []) \
-                    .append(pfid)
+                _pkgs = self.quest_packages.setdefault(q, {}).setdefault(
+                    aref, [])
+                # Keep the list unique, matching the AddScriptPackage path
+                # below: a second ALPC for the same package adds nothing the
+                # first does not already say.  Knights.esp emitted 8 such
+                # duplicates across 4 aliases before this guard.
+                if pfid not in _pkgs:
+                    _pkgs.append(pfid)
                 # The actor running a quest package needs an alias on that quest.
                 self.needed_aliases.setdefault(q, set()).add(aref)
                 self.alias_actor[aref] = afid
@@ -630,8 +636,14 @@ class PackagePlan:
                     continue
                 out = []
                 for p in pkgs:
-                    out.extend(chains.get(p, ()))
-                    out.append(p)
+                    # Same uniqueness rule as the builder above: a chain link
+                    # shared by two source packages, or a source already
+                    # present, is not listed twice.
+                    for c in chains.get(p, ()):
+                        if c not in out:
+                            out.append(c)
+                    if p not in out:
+                        out.append(p)
                 per_actor[aref] = out
 
     def alias_of(self, qfid: int, ref_fid: int):
