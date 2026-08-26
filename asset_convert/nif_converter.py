@@ -869,6 +869,21 @@ def _prune_orphan_roots(data):
 # exists on this rig wins); 'source' is the node whose LOCAL transform is
 # copied, so the new node lands somewhere sensible for a rig of any size
 # rather than at a hardcoded human offset.
+#
+# Oblivion creatures do NOT sheathe: every one of the 41 armed creature folders
+# ships equip/unequip clips whose text keys are `attach`/`detach` (the AnimObject
+# mechanism) -- the weapon is created in the hand and destroyed, never parked on
+# the body.  38 of those 41 rigs accordingly carry NO Quiver/Shield/BackWeapon
+# node at all.  So the per-type SHEATH nodes below exist only to give the ENGINE
+# a node of the name it looks up; nothing is ever displayed at them, and the
+# creature's own rig is the authority on what it needs.
+#
+# An earlier pass synthesized "proportionate" offsets for them from vanilla
+# Skyrim ratios.  That was wrong on two counts: the placements disagreed with
+# vanilla anyway (axe/mace hang on the RIGHT hip in Skyrim, the guessed offset
+# put them on the left), and no Oblivion creature has anything to place there.
+# The node is created at the anchor's origin, which is what a node nothing
+# renders at should be.
 _CREATURE_EQUIP_NODES = (
     # name,           anchors (first match wins),               source
     ('WeaponSword',  ('Bip01 Pelvis', 'Bip01 Spine'),           'WEAPON'),

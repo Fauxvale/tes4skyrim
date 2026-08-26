@@ -85,6 +85,15 @@ LOCOMOTION_STATES = {
     'MoveBackward': (['backward'], 'moveBackward', 'moveStop'),
     'TurnLeft': (['turnleft'], 'turnLeft', 'turnStop'),
     'TurnRight': (['turnright'], 'turnRight', 'turnStop'),
+    # Strafes: the `Left`/`Right` AnimGroups (distinct from TurnLeft/TurnRight,
+    # which rotate in place).  Census over 53 vanilla creature folders: left 37,
+    # right 37, handtohandleft/right 30 each -- every one of them was landing in
+    # the dead 'extra' bucket and never reaching the output folder.
+    'StrafeLeft': (['left', 'handtohandleft', 'onehandleft', 'twohandleft',
+                    'staffleft', 'bowleft'], 'moveLeft', 'moveStop'),
+    'StrafeRight': (['right', 'handtohandright', 'onehandright',
+                     'twohandright', 'staffright', 'bowright'],
+                    'moveRight', 'moveStop'),
 }
 
 # Swimming. The engine sends swimStart/swimStop when the actor enters/leaves
@@ -155,15 +164,42 @@ SINGLE_PLAY = {
 # 'hand type' is the iRightHandType value the engine sets for that weapon class
 # (from the vanilla behavior expressions: 7 = bow/ranged is called out
 # explicitly in falmerbehavior's bAllowRotation guard, 0 = empty/hand-to-hand).
+# Oblivion spells the same stance clip three ways, and ck-cmd's TES4 analyzer
+# accepts all three verbatim (ConvertNif.cpp:6054 -- "Animations\equip.hkx /
+# Animations\handtohandattackequip.hkx / Animations\handtohandequip.hkx").
+# Census over 53 vanilla creature folders: handtohandequip 64,
+# handtohandattackequip 2, bare equip 14 -- so the 'attack'-infixed spelling is
+# rare but real (the minotaur ships ONLY that one), and a table listing just
+# '<prefix>equip' silently finds no equip clip at all for those creatures.
 EQUIP_STANCES = {
     # state suffix -> (equip kf names, unequip kf names, hand types)
-    'H2H':   (['handtohandequip', 'equip'],
-              ['handtohandunequip', 'unequip'], (0,)),
-    'OneH':  (['onehandequip'], ['onehandunequip'], (1, 2, 3, 4)),
-    'TwoH':  (['twohandequip'], ['twohandunequip'], (5, 6)),
-    'Bow':   (['bowequip'], ['bowunequip'], (7,)),
-    'Staff': (['staffequip'], ['staffunequip'], (8,)),
+    'H2H':   (['handtohandequip', 'handtohandattackequip', 'equip'],
+              ['handtohandunequip', 'handtohandattackunequip', 'unequip'],
+              (0,)),
+    'OneH':  (['onehandequip', 'onehandattackequip'],
+              ['onehandunequip', 'onehandattackunequip'], (1, 2, 3, 4)),
+    'TwoH':  (['twohandequip', 'twohandattackequip'],
+              ['twohandunequip', 'twohandattackunequip'], (5, 6)),
+    'Bow':   (['bowequip', 'bowattackequip'],
+              ['bowunequip', 'bowattackunequip'], (7,)),
+    'Staff': (['staffequip', 'staffattackequip'],
+              ['staffunequip', 'staffattackunequip'], (8,)),
 }
+
+# The COMBAT-READY idle, in weapon-class priority order.  Oblivion stores the
+# `Idle` AnimGroup once per weapon state and the engine picks by what the actor
+# has drawn (CS wiki, Animation Tab: "handtohand*/onehand*/twohand*/staff*/bow*"
+# filename prefixes select the same group by equipment).  ck-cmd builds exactly
+# this as a per-weapon movement set with its own idle slot
+# (ConvertNif.cpp:5772 h2h_move[idle], :5875 twoh_move[idle]).
+#
+# Decoding the minotaur's own KFs proves the point -- idle.kf, handtohandidle.kf
+# and twohandidle.kf ALL declare sequence name 'idle'; they differ only in pose
+# (relaxed vs. guard-up).  We build ONE combat idle, so the most-armed stance
+# available wins; plain idle.kf is the fallback for creatures that ship no
+# stance variant, which is what the graph used unconditionally before.
+COMBAT_IDLE_CANDIDATES = ['twohandidle', 'onehandidle', 'staffidle',
+                          'bowidle', 'handtohandidle']
 
 # Spellcasting — the ENGINE-side handshake, decompiled from vanilla
 # atronachflamebehavior.hkx (the canonical creature caster; the chaurus —
@@ -223,11 +259,19 @@ def classify_clips(creature_dir: str) -> dict:
 
     out = {'idle': None, 'locomotion': {}, 'attacks': [], 'single': {},
            'extra': [], 'run': None, 'equip': {}, 'cast': {}, 'swim': {},
-           'block': {}}
+           'block': {}, 'combat_idle': None, 'run_back': None}
     used = set()
     for cand in IDLE_CANDIDATES:
         if cand in kfs:
             out['idle'] = kfs[cand]
+            used.add(cand)
+            break
+    # The combat-ready idle (guard-up stance).  Claimed BEFORE locomotion so a
+    # stance idle cannot be stolen, and before the attack sweep so an
+    # 'attack'-infixed spelling cannot be mistaken for an attack clip.
+    for cand in COMBAT_IDLE_CANDIDATES:
+        if cand in kfs and cand not in used:
+            out['combat_idle'] = kfs[cand]
             used.add(cand)
             break
     for state, (names, _e, _x) in LOCOMOTION_STATES.items():
@@ -242,6 +286,15 @@ def classify_clips(creature_dir: str) -> dict:
         for n in ('runforward', 'fastforward'):
             if n in kfs and n not in used:
                 out['run'] = kfs[n]
+                used.add(n)
+                break
+    # ...and the matching backpedal run, which otherwise fell into 'extra'
+    # (census: only 2 of 86 creature folders ship fastbackward, but those two
+    # were losing the clip entirely).
+    if 'backward' in used:
+        for n in ('runbackward', 'fastbackward'):
+            if n in kfs and n not in used:
+                out['run_back'] = kfs[n]
                 used.add(n)
                 break
     for state, (names, _e, _x) in SINGLE_PLAY.items():
@@ -293,7 +346,44 @@ def classify_clips(creature_dir: str) -> dict:
         else:
             out['extra'].append(path)
     out['attacks'].sort()
+    # Which weapon stance each attack belongs to (see ATTACK_STANCE_PREFIXES).
+    # Oblivion stores ONE AnimGroup per weapon class and the engine picks by
+    # what is equipped: minotaur handtohandattackleft and twohandattackleft
+    # BOTH declare AnimGroup 'AttackLeft'.  Ungated, the graph fires whichever
+    # attack state the engine's event happens to name, so an armed creature
+    # plays bare-handed swings -- and those clips park the animated `Weapon`
+    # node ~70 units off the hand, dragging the held weapon with it.
+    out['attack_stance'] = {p: attack_stance(p) for p in out['attacks']}
     return out
+
+
+# kf filename prefix -> EQUIP_STANCES key.  Longest first: 'swimhandtohand'
+# must win over 'swim'.
+ATTACK_STANCE_PREFIXES = (
+    ('swimhandtohand', 'H2H'), ('swimonehand', 'OneH'),
+    ('swimtwohand', 'TwoH'), ('swimstaff', 'Staff'), ('swimbow', 'Bow'),
+    ('handtohand', 'H2H'), ('onehand', 'OneH'), ('twohand', 'TwoH'),
+    ('staff', 'Staff'), ('bow', 'Bow'),
+)
+
+
+def attack_stance(kf_path: str):
+    """EQUIP_STANCES key an attack clip belongs to, or None when unprefixed.
+
+    An unprefixed clip (plain `attackpower.kf`) is the creature's only version
+    of that attack and must stay ungated -- gating it would leave the creature
+    unable to attack at all."""
+    base = os.path.splitext(os.path.basename(kf_path))[0].lower()
+    for prefix, stance in ATTACK_STANCE_PREFIXES:
+        if base.startswith(prefix):
+            return stance
+    return None
+
+
+def combat_idle_clip(clips: dict):
+    """The clip CombatIdleState plays: the stance idle if the creature ships
+    one, else the plain idle (see COMBAT_IDLE_CANDIDATES)."""
+    return clips.get('combat_idle') or clips.get('idle')
 
 
 def _clip_state_name(kf_path: str) -> str:
@@ -302,7 +392,15 @@ def _clip_state_name(kf_path: str) -> str:
 
 
 def build_attack_events(clips: dict) -> list:
-    """attackStart event names, shared verbatim with RACE ATKE generation."""
+    """attackStart event names, shared verbatim with RACE ATKE generation.
+
+    These are the names the ENGINE sends (RACE ATKE).  Stance gating does NOT
+    live here: vanilla's draugr names its events attackStart1HM*/H2H* purely
+    descriptively -- the real gate is structural (see the attack dispatch in
+    build_behavior_xml).  An earlier attempt tagged the stance into these
+    names and changed nothing in game, because the engine sends whichever
+    ATKE it chose and the flat graph had a transition for all of them.
+    """
     return [f'attackStart_TES4_{_clip_state_name(p)}'
             for p in clips['attacks']]
 
@@ -360,8 +458,9 @@ def state_defs(clips: dict) -> list:
     for st, (_names, enter, _exit) in LOCOMOTION_STATES.items():
         if st in clips['locomotion']:
             defs.append((st, clips['locomotion'][st], True, enter, None))
-    if clips['idle']:
-        defs.append(('CombatStance', clips['idle'], True,
+    ci = combat_idle_clip(clips)
+    if ci:
+        defs.append(('CombatStance', ci, True,
                      'combatStanceStart', None))
     for st, (_names, enter, _stop) in SINGLE_PLAY.items():
         if st in clips['single']:
@@ -872,6 +971,7 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     speeds = speeds or {}
     # ---- event vocabulary: standard + per-attack ----
     events = ['moveStart', 'moveStop', 'moveForward', 'moveBackward',
+              'moveLeft', 'moveRight',
               'turnLeft', 'turnRight', 'turnStop', 'swimStart', 'swimStop',
               'runStart', 'walkStart',
               'recoilStart', 'recoilStop', 'recoilLargeStart',
@@ -998,9 +1098,9 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         arr.param_raw(
             'transitions',
             '\n'.join(_TRANSITION_TMPL.format(effect=fx_smooth.ref,
-                                              event_id=e, to_state=s,
+                                              event_id=e, to_state=st,
                                               flags=f)
-                      for e, s, f in items),
+                      for e, st, f in items),
             numelements=len(items))
         return arr
 
@@ -1148,10 +1248,20 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         else:
             fwd_gen = walk_gen
         has_back = 'MoveBackward' in loco
+        # Strafes (the Left/Right AnimGroups) sit alongside forward/backward
+        # in the same SM; every gait can be entered from any other, so each
+        # state carries transitions to all the others.
+        strafes = [(st, ev) for st, ev in (('StrafeLeft', 'moveLeft'),
+                                           ('StrafeRight', 'moveRight'))
+                   if st in loco]
+        fwd_trans = []
+        if has_back:
+            fwd_trans.append((eid['moveBackward'], 1, _F_LOCAL))
+        for i, (_st, ev) in enumerate(strafes):
+            fwd_trans.append((eid[ev], 2 + i, _F_LOCAL))
         fwd_state = _state(
             0, 'ForwardLocomotionState', fwd_gen.ref,
-            transitions=([(eid['moveBackward'], 1, _F_LOCAL)]
-                         if has_back else None))
+            transitions=fwd_trans or None)
         loco_states = [fwd_state]
         if has_back:
             bplan = backward_blend_plan(clips, speeds)
@@ -1159,14 +1269,27 @@ def build_behavior_xml(behavior_name: str, clips: dict,
                         if bplan
                         else _clip('MoveBackward', loco['MoveBackward'],
                                    True))
+            back_trans = [(eid['moveForward'], 0, _F_LOCAL)]
+            for i, (_st, ev) in enumerate(strafes):
+                back_trans.append((eid[ev], 2 + i, _F_LOCAL))
             loco_states.append(_state(
                 1, 'BackwardLocomotionState', back_gen.ref,
-                transitions=[(eid['moveForward'], 0, _F_LOCAL)]))
+                transitions=back_trans))
+        for i, (st, _ev) in enumerate(strafes):
+            st_trans = [(eid['moveForward'], 0, _F_LOCAL)]
+            if has_back:
+                st_trans.append((eid['moveBackward'], 1, _F_LOCAL))
+            for j, (_o, oev) in enumerate(strafes):
+                if j != i:
+                    st_trans.append((eid[oev], 2 + j, _F_LOCAL))
+            loco_states.append(_state(
+                2 + i, f'{st}LocomotionState',
+                _clip(st, loco[st], True).ref, transitions=st_trans))
         loco_sm = _make_sm('LocomotionBehavior', loco_states)
 
     # ---- StandingIdleBehavior: NonCombatIdle(0) <-> CombatIdle(1) ----
     idle_clip = _clip('Idle', clips['idle'], True)
-    combat_clip = _clip('CombatStance', clips['idle'], True)
+    combat_clip = _clip('CombatStance', combat_idle_clip(clips), True)
     standing_idle_sm = _make_sm('StandingIdleBehavior', [
         _state(0, 'NonCombatIdleState', idle_clip.ref,
                transitions=[(eid['combatStanceStart'], 1, _F_LOCAL)]),
@@ -1323,6 +1446,36 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         root_wilds.append((eid['swimStart'], next_id, _F_WILD))
         next_id += 1
 
+    # Attacks, gated by weapon stance.
+    #
+    # Oblivion ships one clip per weapon class under the SAME AnimGroup and
+    # the engine picks by what is equipped: minotaur handtohandattackleft and
+    # twohandattackleft BOTH declare AnimGroup 'AttackLeft'.  A flat graph
+    # that transitions straight off the engine's attackStart_* event cannot
+    # honour that, so an armed minotaur could play a bare-handed swing -- and
+    # the H2H clips park the animated `Weapon` node ~70 units off the hand,
+    # dragging the held warhammer out of its grip as they play.
+    #
+    # Vanilla gates this with NESTING, not conditions: draugrbehavior holds a
+    # parent state per stance (H2H_Readied_State / 1HM_Sword_Readied_State /
+    # 2HM_Readied_State / Bow_Readied_State) and each stance's *_Attack_State
+    # children live INSIDE it.  A child state is only reachable while its
+    # parent is the active state, so an H2H attack simply cannot be entered
+    # while the actor is in the 2HM branch.  Which parent is active is chosen
+    # by binding the wrapper machine's startStateId to the engine-written
+    # weapon-class variable.
+    #
+    # NOT usable here, both verified the hard way:
+    #   * hkbExpressionCondition on the transition -- hkxcmd cannot serialize
+    #     the class; it drops the objects and leaves dangling pointers.
+    #   * `EVENT if ((otherEvent) && (iRightHandType == n))` -- an expression
+    #     can only read VARIABLES, never event names, so the guard is always
+    #     false and NOTHING fires.  This file already documents that trap for
+    #     the cast chain (see CAST_MODES); the equip dispatch below inherits
+    #     it and is dead for the same reason.
+    stance_of = clips.get('attack_stance', {})
+    multi_stance = len(clips.get('equip', {})) > 1
+    attack_specs = []       # (stance_or_None, state_name, generator_ref, evt)
     for kf, evt in zip(clips['attacks'], build_attack_events(clips)):
         st_name = f'Attack_{_clip_state_name(kf)}'
         clip = _clip(st_name, kf, False,
@@ -1333,11 +1486,92 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         mg.param('name', f'{st_name}_MG')
         mg.param('modifier', attack_ml.ref)
         mg.param('generator', clip.ref)
-        root_states_inner.append(_state(
-            next_id, f'{st_name}State', mg.ref,
-            exit_events=['attackStop']))
-        default_trans.append((eid[evt], next_id, _F_LOCAL))
-        next_id += 1
+        stance = stance_of.get(kf) if multi_stance else None
+        if stance not in clips.get('equip', {}):
+            stance = None
+        attack_specs.append((stance, st_name, mg.ref, evt))
+
+    if multi_stance and any(sp[0] for sp in attack_specs):
+        # One sub-machine per stance holding that stance's attacks, wrapped in
+        # a selector whose ACTIVE state is bound to iRightHandType.  The
+        # engine writes that variable when it equips; the selector therefore
+        # exposes only the matching stance's attacks.  Hand types are the
+        # Skyrim WEAP DNAM 'Animation Type' enum (wbWeaponAnimTypeEnum:
+        # 0 HandToHandMelee, 1-4 one-handed, 5 TwoHandSword, 6 TwoHandAxe,
+        # 7 Bow, 8 Staff), so binding to it indexes stances directly.
+        by_stance = {}
+        for stance, st_name, gen_ref, evt in attack_specs:
+            by_stance.setdefault(stance, []).append((st_name, gen_ref, evt))
+
+        # hand type -> the stance that owns it, so the selector's stateId IS
+        # the hand type the engine wrote (no remap table at runtime).
+        stance_by_type = {}
+        for stance in clips.get('equip', {}):
+            for t in EQUIP_STANCES[stance][2]:
+                stance_by_type[t] = stance
+
+        # EVERY hand type the engine can write must resolve to a state, or the
+        # actor has no attack at all while holding that weapon class (a
+        # selector whose bound startStateId names no state selects nothing).
+        # The creature only has clips for the stances it shipped, so any
+        # uncovered type falls back to its nearest armed stance, else H2H --
+        # a converted actor can be handed a weapon class Oblivion never
+        # animated for it, and playing the wrong swing beats standing inert.
+        _FALLBACK_ORDER = ('OneH', 'TwoH', 'Staff', 'Bow', 'H2H')
+        have = [st for st in _FALLBACK_ORDER if st in clips.get('equip', {})]
+        for t in range(10):
+            if t not in stance_by_type and have:
+                stance_by_type[t] = have[0]
+
+        sel_states = []
+        for hand_type in sorted(stance_by_type):
+            stance = stance_by_type[hand_type]
+            entries = by_stance.get(stance) or by_stance.get(None) or []
+            if not entries:
+                continue
+            inner = []
+            trans = []
+            for i, (st_name, gen_ref, evt) in enumerate(entries):
+                inner.append(_state(i, f'{st_name}State', gen_ref,
+                                    exit_events=['attackStop'],
+                                    transitions=[(eid['returnToDefault'],
+                                                  0, _F_LOCAL)]))
+                trans.append((eid[evt], i, _F_WILD))
+            # unstanced attacks stay reachable in every stance
+            for st_name, gen_ref, evt in by_stance.get(None, []):
+                if any(x[0] == st_name for x in entries):
+                    continue
+                idx = len(inner)
+                inner.append(_state(idx, f'{st_name}State', gen_ref,
+                                    exit_events=['attackStop'],
+                                    transitions=[(eid['returnToDefault'],
+                                                  0, _F_LOCAL)]))
+                trans.append((eid[evt], idx, _F_WILD))
+            sub = _make_sm(f'Attack_{stance}_SM', inner, start_id=0,
+                           wildcard_ref=_trans_array(trans).ref)
+            sel_states.append(_state(hand_type, f'Attack_{stance}_State',
+                                     sub.ref))
+        if sel_states:
+            sel_bind = _binding_set([('startStateId', 'iRightHandType')])
+            # start in the lowest hand type present (0 = unarmed whenever
+            # the creature has an H2H stance), matching iRightHandType's own
+            # init value so the graph is consistent before the first equip.
+            selector = _make_sm('AttackStanceSelector', sel_states,
+                                start_id=min(stance_by_type),
+                                binding_ref=sel_bind.ref)
+            root_states_inner.append(_state(
+                next_id, 'AttackStanceState', selector.ref,
+                transitions=[(eid['returnToDefault'], 0, _F_LOCAL)]))
+            for _stance, _st_name, _gen, evt in attack_specs:
+                default_trans.append((eid[evt], next_id, _F_LOCAL))
+            next_id += 1
+    else:
+        for stance, st_name, gen_ref, evt in attack_specs:
+            root_states_inner.append(_state(
+                next_id, f'{st_name}State', gen_ref,
+                exit_events=['attackStop']))
+            default_trans.append((eid[evt], next_id, _F_LOCAL))
+            next_id += 1
 
     # Equip / unequip states. The engine sends weaponDraw when it wants the
     # actor armed; the expression modifier below translates that into the
@@ -2370,6 +2604,9 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
     if clips.get('run'):
         convert_list.append(('MoveForwardRun', clips['run'], True, None,
                              None))
+    if clips.get('run_back'):
+        convert_list.append(('MoveBackwardRun', clips['run_back'], True,
+                             None, None))
     attack_kfs = set(clips['attacks'])
     enum_map = foot_enum_map(sound_slots)
 
@@ -2628,6 +2865,11 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
         'walk': _speed_of(clips['locomotion'].get('MoveForward')),
         'run': _speed_of(clips.get('run')),
         'back': _speed_of(clips['locomotion'].get('MoveBackward')),
+        # Strafes: the MOVT left/right columns must carry the strafe clips'
+        # own root-motion speed for the same reason forward/back do --
+        # commanded speed != animation speed makes the actor slide.
+        'left': _speed_of(clips['locomotion'].get('StrafeLeft')),
+        'right': _speed_of(clips['locomotion'].get('StrafeRight')),
         'swim': _speed_of(clips.get('swim', {}).get('forward')),
         'swimfast': _speed_of(clips.get('swim', {}).get('fast')),
         'swimback': _speed_of(clips.get('swim', {}).get('backward')),
