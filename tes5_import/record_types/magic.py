@@ -557,7 +557,7 @@ def _delivery_and_cast(t4_flags: int) -> tuple:
 # --- Projectile resolution ------------------------------------------------
 # An Aimed magic item MUST reach a non-null Projectile through at least one of
 # its effects or the engine null-derefs.  The chain, read out of the GOG 1.6.659
-# exe (crash frames translated by tools/address_lib.py):
+# exe (crash frames translated by tools/disasm/address_lib.py):
 #
 #   MagicItem::GetCostliestEffectItem  (0x10c9f0)
 #       calls GetDelivery (EnchantmentItem vtable +0x2b8 -> `mov eax,[rcx+0xa0]`)
@@ -951,11 +951,6 @@ def _variant_name(base_full: str, stat_name: str) -> str:
         if base_full.endswith(tail):
             return f'{base_full[:-len(tail)]} {stat_name}'
     return f'{base_full} ({stat_name})'
-
-
-def get_av_variant(code: str, effect_av: int) -> int:
-    """FormID of the per-AV MGEF variant for one effect instance (0 if none)."""
-    return _av_variants.get((code, effect_av), 0)
 
 
 # ---------------------------------------------------------------------------

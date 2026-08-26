@@ -16,7 +16,6 @@ Output is a DecodedClip of per-bone tracks sampled at a fixed fps, ready for
 retarget-free HKX writing (the converted skeleton keeps Oblivion bone names).
 """
 
-import math
 import os
 import sys
 from dataclasses import dataclass, field

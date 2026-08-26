@@ -13,13 +13,13 @@ The Steam `SkyrimSE.exe` is Steam-encrypted: its `.text` section has entropy
 at `D:\Other Games\Skyrim Anniversary Edition\SkyrimSE.exe` is **not** packed —
 `.text` entropy is 6.04 and the dialogue routines disassemble cleanly.
 
-`tools/dialog_engine_extract.py` refuses to run against a packed build rather
+`tools/disasm/dialog_engine_extract.py` refuses to run against a packed build rather
 than printing garbage.
 
-    python tools/dialog_engine_extract.py --subtypes
-    python tools/dialog_engine_extract.py --json tes5_import/dialog_engine_tables.json
+    python tools/disasm/dialog_engine_extract.py --subtypes
+    python tools/disasm/dialog_engine_extract.py --json tes5_import/dialog_engine_tables.json
 
-RTTI type names survive in both builds, so `tools/skyrim_disasm.py --find` still
+RTTI type names survive in both builds, so `tools/disasm/skyrim_disasm.py --find` still
 locates classes (`TESTopic`, `TESTopicInfo`, `MenuTopicManager`,
 `BGSDialogueBranch`) either way.
 
@@ -107,7 +107,7 @@ a wrong DATA subtype is harmless. Do not "fix" a converted DIAL by reasoning
 about its DATA bytes, and do not trust DATA when reading vanilla records to
 learn what a subtype number means.
 
-`tools/dialog_emulator.py` now derives both values from SNAM through the engine
+`tools/dialog/dialog_emulator.py` now derives both values from SNAM through the engine
 table, and reports 17 distinct tags across our Oblivion output with zero
 unresolved.
 
@@ -167,8 +167,8 @@ to be started)"*, so it starts a stopped quest. Censused on Skyrim.esm, 0 of
 
 ## Re-deriving any of this
 
-`tools/skyrim_disasm.py` locates classes and disassembles, and
-`tools/dialog_engine_extract.py` pulls the tables. To find which code touches a
+`tools/disasm/skyrim_disasm.py` locates classes and disassembles, and
+`tools/disasm/dialog_engine_extract.py` pulls the tables. To find which code touches a
 table, scan `.text` for RIP-relative `lea` instructions whose target is the
 table's RVA — there are only four such references for the two dialogue tables,
 which is what made `TESTopic::LoadForm` easy to isolate.
@@ -214,3 +214,45 @@ audio and left the subtitle onscreen indefinitely. The engine's countdown /
 reference. **No verified fix exists**; the two attempts above cost the audio
 and were reverted. Audio is the higher-value behaviour, so the stuck subtitle
 stands until a fix is demonstrated in-game rather than reasoned about.
+
+### Speak-as INFOs silently lost their quest-inherited conditions (fixed 2026-08-25)
+
+A speak-as INFO whose owning QUST carries conditions runs its inherited
+condition block through `_drop_non_actor_speaker_ctdas` (dialog_converter),
+which strips subject-run actor-identity CTDAs -- the speaker is a TACT, not an
+actor, so `GetIsID`-family conditions can never pass.
+
+That function walks the PACKED buffer, so its `sig` is a 4-byte `bytes` slice,
+but `pack_subrecord` takes a `str` and calls `sig.encode('ascii')`. Every call
+that kept at least one condition therefore raised
+`AttributeError: 'bytes' object has no attribute 'encode'`.
+
+The failure was invisible because `_convert_topic_infos`' per-INFO handler is a
+blanket `except Exception` that prints `ERROR info under <topic>` and moves on
+-- so the INFO was **dropped from the output entirely**.
+Fix: `pack_subrecord(sig.decode('ascii'), data)`.
+
+**Blast radius, measured 2026-08-25** by instrumenting the call site and running
+both plugins through `--import-only`. An INFO is lost only when the drop leaves
+at least one condition standing; when it strips them ALL, the function returns
+`b''` at its `if not kept` early exit and never reaches the broken line.
+
+* **Morrowind_ob.esm: 35 INFOs across 7 Daedric-prince topics** --
+  mwDAMolagBalSpeech 8, mwDAMalacathSpeech 6, mwDAAzuraSpeech 6,
+  mwDAMehrunesDagonSpeech 5, mwDASheogorathSpeech 4, mwDABoethiahSpeech 4,
+  mwDAMephalaSpeech 2. Every one had `KEPT38` (one surviving condition).
+* **Oblivion.esm: ZERO.** 390 speak-as INFOs reach the call site and 320 carry
+  quest conditions, but all 320 measured `KEPT0` -- Oblivion's speak-as quests
+  condition exclusively on funcs in `_NON_ACTOR_SPEAKER_DROP` (`{72, 254}`), so
+  the block always empties and the bug is a near-miss there. This includes
+  ArenaAnnouncer/Announcer (30), ICAnnouncer (34), DASheogorathSpeech (38) and
+  the 13 other Daedric shrines.
+
+🛑 **Do not estimate this statically from the export.** A first pass replaying
+the drop against the QUST's RAW TES4 conditions predicted 353 lost INFOs in
+Oblivion.esm; the real input is the CONVERTED block, whose TES4->TES5 function
+remap changes which funcs fall in the drop set. Instrument the call site.
+
+**Lesson:** that handler converts any bug in the INFO path into silent data
+loss. When a topic reports `ERROR info under ...`, the INFOs under it are gone,
+not degraded -- get the traceback before theorising.

@@ -36,7 +36,6 @@ mesh's links are appended in sorted order, so the output stays byte-reproducible
 """
 
 import struct
-from collections import defaultdict
 
 import numpy as np
 
@@ -285,7 +284,7 @@ def build_edge_links(navm_cache: dict, verbose: bool = True) -> int:
     Returns the number of links created.
     """
     from .pgrd_to_navm import _pack_navm_record
-    from .writer import pack_subrecord, pack_string_subrecord
+    from .writer import pack_subrecord
 
     # Decode every exterior mesh once, indexed by (worldspace, grid).
     views = {}

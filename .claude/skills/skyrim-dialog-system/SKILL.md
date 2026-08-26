@@ -22,7 +22,7 @@ It is built from two authoritative, grounded sources in this repo:
 1. **xEdit Core record definitions** — `references/xEdit/Core/wbDefinitionsTES5.pas`
    (the binary layout of every record; verbatim field names/sizes/enums).
 2. **Real Skyrim.esm data** — `references/Skyrim.esm` (dumped via
-   `tools/tes5_esm_reader.py`), giving real field values.
+   `tools/esm/tes5_esm_reader.py`), giving real field values.
 
 When the answer needs an exact byte layout or full enum, open the matching
 reference file rather than guessing:
@@ -174,5 +174,5 @@ following (unrelated) condition.
   GetIsID) or a quest not running.
 - **Reading/understanding a CTDA** → `references/conditions.md` for offsets,
   OR-chain rules, and function indices.
-- **Inspecting real data** → `python tools/tes5_esm_reader.py references/Skyrim.esm
+- **Inspecting real data** → `python tools/esm/tes5_esm_reader.py references/Skyrim.esm
   --types DIAL INFO QUST DLBR DLVW VTYP --outdir temp/skyrim_dialog_dump`.

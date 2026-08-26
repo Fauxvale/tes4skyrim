@@ -146,7 +146,6 @@ def main():
     a = ap.parse_args()
 
     if a.all:
-        import re
         path = os.path.join(a.export, 'CELL.txt')
         names = []
         with open(path, encoding='utf-8', errors='replace') as fh:

@@ -19,7 +19,6 @@ from .common import (
     pack_record,
     pack_string_subrecord,
     pack_subrecord,
-    pack_uint8_subrecord,
     pack_uint32_subrecord,
 )
 
@@ -29,44 +28,6 @@ _TES4_SND_RANDOM_FREQ_SHIFT = 0x0001
 _TES4_SND_LOOP              = 0x0010
 _TES4_SND_MENU_SOUND        = 0x0020
 _TES4_SND_2D                = 0x0040
-
-# TES4 SOUN FormID (low 24 bits) → the SNDR FormID convert_SOUN gave its
-# companion. Filled DURING Phase 3, and read afterwards to patch the records
-# that reference it (see items.patch_door_sounds).
-#
-# An earlier version reserved these ids in a Phase 0 pre-pass so records could
-# embed them directly. That allocated ~1100 FormIDs before anything else and
-# so SHIFTED every other generated id (OTFT, ARMA, TXST, ...) — which silently
-# invalidated the separately-built 'Slot44 Patch.esp', whose 818 ARMO/233 ARMA
-# overrides are matched to the master BY FORMID. NPCs lost their armor. The
-# allocation ORDER is therefore a compatibility contract with anything built
-# against a previous run: never insert an allocating pass ahead of existing
-# ones.
-_SNDR_FOR_SOUN = {}
-
-
-def reset_sound_descriptors() -> None:
-    """Clear the SOUN→SNDR map at the start of an import run."""
-    _SNDR_FOR_SOUN.clear()
-
-
-def record_sndr_for_soun(soun_fid: int, sndr_fid: int) -> None:
-    """Note the companion SNDR convert_SOUN just built for a SOUN."""
-    _SNDR_FOR_SOUN[soun_fid & 0x00FFFFFF] = sndr_fid
-
-
-def sndr_map() -> dict:
-    """TES4 SOUN id (low 24 bits) → companion SNDR FormID, for slot patching."""
-    return _SNDR_FOR_SOUN
-
-
-def get_sndr_for_soun(soun_fid: int) -> int:
-    """The SNDR FormID for a TES4 SOUN, or 0 if it has no companion.
-
-    Accepts a FormID in either raw or load-order-offset form; the map is keyed
-    on the low 24 bits (same convention as outfits.load_item_index).
-    """
-    return _SNDR_FOR_SOUN.get(soun_fid & 0x00FFFFFF, 0)
 
 
 # Vanilla Skyrim SOPM constants (verified against references/Skyrim.esm SOPM dump)
@@ -550,7 +511,7 @@ _IMGS_SLOT_SUNLIGHT_BIAS = (0.974, 1.0, 0.974, 0.789)
 # which also makes it generalise to plugins we have never seen.
 #
 # Medians measured over all 177 vanilla WTHR in Skyrim.esm + Update.esm +
-# Dawnguard.esm + Dragonborn.esm (tools/skyscale_authoring.py).
+# Dawnguard.esm + Dragonborn.esm (measured by a one-off script, not in tree).
 # Index: [classification bit][time], times = Sunrise, Day, Sunset, Night.
 _IMGS_SKY_SCALE_BY_CLASS = {
     0x01: (0.080, 0.120, 0.100, 0.020),   # Pleasant
@@ -955,7 +916,8 @@ _TES5_CLOUD_LAYERS = 32
 # pass and the imagespace, not from this colour, so a near-white disc here is
 # a bloom source with nothing to justify it.
 #
-# Chosen in game from tools/make_sky_unjustified_esp.py (variant UJkneeSun)
+# Chosen in game from tools/make_sky_unjustified_esp.py (removed 2026-08-25;
+# variant UJkneeSun)
 # against UJbase/UJraw/UJknee/UJkneeSoft/UJkneeHard/UJsunonly.
 _NAM0_KNEE = 160.0            # below this, authored colour passes through
 _NAM0_KNEE_CEILING = 200.0    # 255 maps here
@@ -1551,13 +1513,14 @@ def patch_weather_sounds(writer, own_soun_ids=None) -> int:
     WTHR is written in Phase 2, before Phase 3 creates the descriptors, so
     convert_WTHR stores the SOUN id and this resolves it — the same
     placeholder-then-patch approach actors.patch_actor_sounds uses for CSDI
-    and items.patch_door_sounds for the DOOR slots.  Allocating during Phase 2
-    instead would shift every later generated FormID.
+    and items.patch_sound_descriptor_slots for the DOOR/LIGH/ACTI/CONT slots.
+    Allocating during Phase 2 instead would shift every later generated
+    FormID.
 
     *own_soun_ids* is the low-24 id set of the SOUN records THIS plugin
     converts; anything outside it (an override build's master-owned records,
     already holding real SNDR ids) is left untouched, exactly as
-    patch_door_sounds does.
+    patch_sound_descriptor_slots does.
 
     A slot whose SOUN produced no descriptor is DROPPED rather than left
     pointing at the wrong record type — 63 of the 84 vanilla weathers ship no
@@ -1872,8 +1835,8 @@ def convert_WTHR(rec: dict, writer=None) -> tuple:
     # weather's TES4 SOUN id: WTHR converts in Phase 2, before Phase 3 mints
     # the SNDR descriptors, so it is a PLACEHOLDER that patch_weather_sounds
     # resolves later (the same approach actors.patch_actor_sounds uses for
-    # CSDI and items.patch_door_sounds for the DOOR slots).  Allocating here
-    # instead would shift every later generated FormID.
+    # CSDI and items.patch_sound_descriptor_slots for the object slots).
+    # Allocating here instead would shift every later generated FormID.
     subs += _wthr_sounds(rec)
 
     # IMSP — Image Spaces (sunrise/day/sunset/night), each pointing at the

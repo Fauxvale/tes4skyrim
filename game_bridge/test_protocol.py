@@ -2,7 +2,7 @@
 """End-to-end protocol test for the game bridge, with no game running.
 
 Stands up a named-pipe server that speaks the same protocol as the plugin, then
-drives it with the REAL client (tools/game_bridge.py). This exercises framing,
+drives it with the REAL client (tools/live/game_bridge.py). This exercises framing,
 request/response pairing, error propagation and the CLI without needing Skyrim.
 
 What it cannot cover: the engine-side handlers. Those need a running game.
@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import win32file  # noqa: E402  (pywin32)
 import win32pipe  # noqa: E402
 
-from tools.game_bridge import Bridge, BridgeError  # noqa: E402
+from tools.live.game_bridge import Bridge, BridgeError  # noqa: E402
 
 PIPE = r"\\.\pipe\tes_game_bridge_test"
 

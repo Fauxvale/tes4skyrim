@@ -3,7 +3,6 @@
 Everything here builds synthetic archives in a tmp_path, so the whole module
 runs in a couple of seconds and needs no real mod on disk.
 """
-import json
 import os
 import struct
 import sys
@@ -847,8 +846,8 @@ def test_migration_puts_records_where_the_resolver_looks(tmp_path, label, plugs)
     missing -- no error, just an empty export.
     """
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
-    from migrate_group_layout import migrate
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from tools.esm.migrate_group_layout import migrate
 
     exp = _legacy_layout(tmp_path, label, plugs)
     migrate(exp, apply=True, log=lambda *a: None)

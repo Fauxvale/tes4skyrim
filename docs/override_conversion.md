@@ -7,7 +7,7 @@ overrides) follows xEdit's "copy as override" model. Modules:
 `overrides.py` (OverrideContext + nested-GRUP emission — the only override
 code import_main touches), `export_diff.py`, `master_manifest.py`,
 `override_builder.py` (field application), `override_merge.py` (master index).
-Audit coverage anytime with `python tools/override_audit.py
+Audit coverage anytime with `python tools/audit/override_audit.py
 export/<Plugin>` — it reports, per record type, what the override path does
 with every record and every authored field with no output mapping.
 
@@ -73,7 +73,7 @@ from comparing two conversion runs.
   owner's converted bytes are pulled from the master VERBATIM and written
   immediately before the group — the same thing xEdit's copy-as-override does.
   Anchoring only the type-6 case (the original code) leaves the WRLD case
-  broken. Gate every override plugin with `tools/esm_group_anchors.py`.
+  broken. Gate every override plugin with `tools/validate/esm_group_anchors.py`.
 - **The plugin's TES4 master NAMES come from the export `_HEADER.txt`, not the
   source binary.** `convert.py` derives its master list from the binary in the
   configured Oblivion data folder, but that file may not be there at all (a
@@ -265,7 +265,7 @@ from comparing two conversion runs.
   resolves to the file itself.
 - <a id="create-lod-order"></a>**`create_lod_order` deliberately differs from
   `_load_order`, and the difference is CONSENT.** LOD is generated for the
-  whole load order in one pass (`tools/create_lod.py`, the GUI's *Create LOD*
+  whole load order in one pass (`tools/release/create_lod.py`, the GUI's *Create LOD*
   button) and that dialog SHOWS the order, lets the user drag it, and does
   nothing until they press Generate. So the rule is the one the user asked
   for: everything `plugins.txt` lists comes FIRST in its own order, and
@@ -441,7 +441,7 @@ from comparing two conversion runs.
   the transposed key was mistaken for vanilla's in the original docstring.
 
   Guarded by `tests/test_exterior_block_order.py` and
-  `tests/test_merge_grid_groups.py`; `tools/plugin_load_audit.py` check #10
+  `tests/test_merge_grid_groups.py`; `tools/validate/plugin_load_audit.py` check #10
   reports both `grid-groups-out-of-order` and `duplicate-grid-group`.
 
   **Ruled out along the way** (all measured clean — don't re-chase): duplicate
@@ -498,7 +498,7 @@ from comparing two conversion runs.
   list of all three plugins that depend on it. An ESM-flagged `.esp` is legal and
   loads as a master.
 
-  Applied with `python tools/make_master.py <chain, lowest first>`, which sets
+  Applied with `python tools/esm/make_master.py <chain, lowest first>`, which sets
   bit `0x00000001` at byte 8 of the TES4 header **in place** — 4 bytes rewritten,
   no record reserialized, so file size is unchanged and **no FormID drift**. It
   reads each `MAST` list and refuses with exit 2, naming the missing files and
@@ -707,3 +707,74 @@ the `_precompute_navmeshes` cache by `(ParentCELL, PGRD)` — the same key
 `_gather_navm_jobs` builds — so this costs no extra generation time.
 
 ROAD remains genuinely unmappable: it converts to nothing at all.
+
+## Deleting a master's record: the three shapes
+
+`overrides.make_deleted_record` restates a master record as a deletion. The
+shape is **type-dependent**, measured 2026-08-25 across Update.esm,
+Dawnguard.esm, HearthFires.esm and Dragonborn.esm (279 deleted records):
+
+| Type | Body | Count |
+|---|---|---|
+| REFR / ACHR / ACRE | **NAME only** (dataSize 10) — the base object it placed | 193 |
+| NAVM | **empty** (dataSize 0) | 68 |
+| everything else | **the master's full body, unchanged** | 18 |
+
+Only the Deleted flag (`0x20`) is added; a compressed record stays compressed.
+
+**Zero-size is a NAVM-only shape.** Every zero-size deleted record in the four
+vanilla masters is a NAVM, and every deleted NAVM is zero-size. Vanilla keeps
+the complete body on every other type — measured: `NPC_ 0007932F` 220 bytes
+(EDID VMAD OBND ACBS TPLT RNAM AIDT and all six PKIDs), `STAT 000BD6A5` 198,
+`SPEL 0010E38C` 307, `IDLE 000FDC30` 210, `IDLE 000F6CBB` 192,
+`SMQN 000F2199` 147, `EXPL 000F3A8C` 163, `INFO 000CEFBE` 20,
+`STAT 0006CD7C` 153.
+
+An earlier revision emptied every non-REFR body on the strength of a census
+that did not hold. That shipped `PACK 01069B12` in Knights.esp as a 0-byte
+deleted record — the only zero-size non-NAVM record in the whole output tree,
+and a shape vanilla never writes. The engine reads a record's own fields while
+unlinking it, so emptying the body throws away exactly what it needs.
+
+## A quest-owned package must never be in an NPC's PKID list
+
+**Symptom.** Infinite load at the MAIN MENU (not on a save). One thread pegged
+at 100%, private memory perfectly flat, no CTD, no crash log, Papyrus log just
+stops. Every structural audit reports the plugin CLEAN.
+
+**xEdit names it outright** — always check there first for a rejected record:
+
+```
+NDAnvilListenProphetGogan8x4 [PACK:02002D7C]
+error: package is owned by quest ND00 and cannot be assigned to an npc record
+```
+
+A quest-owned package reaches its actor through the quest's reference alias
+(ALPC), never through the actor's own PKID run.
+
+**Cause.** `packages.npc_packages` filters quest packages out of PKID on the
+normal conversion path. The OVERRIDE path
+(`override_builder._rebuild_packages`) instead *derived* its exclusion set by
+comparing the master's export against the master's converted PKID run. That
+covers packages the master already quest-owned, but a package **the plugin
+itself newly quest-owns** was never in the master's export, cannot be derived,
+and passed straight through.
+
+Knights.esp shipped `PACK 02002D7C` (owned by its own quest ND00) in the PKID
+list of `NPC_ 0103AF03` (Gogan), an override of an Oblivion.esm NPC.
+
+**Fix.** `packages.is_quest_package()` exposes the live filter set that
+`set_quest_packages` populates in phase 0g, before any override is built; both
+paths consult it. Guarded by `tests/test_quest_package_not_in_pkid.py`.
+Confirmed in-game 2026-08-26.
+
+Gogan's illegal PKID was his only authored change, so with it filtered the
+override became identical to the master and was dropped — he reverts to the
+master's record and the package still reaches him through ND00's alias.
+
+**Diagnostic note.** `tools/live/hang_capture.py` (dump first, analyse second)
+identifies the wedged record: take two dumps minutes apart and compare the loop
+variables. Identical values across both means wedged, not slow — that is what
+pinned `0x02002D7C`. But the record's *identity* is only the start; xEdit's
+error on that record is what names the rule being broken, and is far cheaper
+than reverse-engineering the engine's resolution path.

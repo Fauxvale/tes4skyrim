@@ -167,9 +167,10 @@ instead of AI `Speed`/`Direction`. Reuse every existing mechanism
 graph.
 
 ### Step 5 — Verification
-- `tools/creature_vanilla_ab.py` A/B: our converted horse race/records + vanilla horse
+- Build an A/B ESP repointing the converted horse RACE at vanilla horse
   behavior/animation assets, to isolate record-side correctness from graph correctness
-  (same bisection method used throughout creature_conversion.md).
+  (the per-layer bisection method used throughout creature_conversion.md;
+  `tools/creature_vanilla_ab.py` did this for canines and was removed 2026-08-25).
 - In-game: spawn a converted horse, `player.placeatme`, attempt mount via activate
   prompt; verify camera offset, dismount, and that ordinary (non-ridden) locomotion/
   combat/death — already working via the base creature pipeline — is unaffected.

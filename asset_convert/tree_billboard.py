@@ -2,7 +2,7 @@
 
 Pipeline code: `lod_far_gen._far_nif_worker` calls this whenever a TREE has no
 shipped billboard, so no tree ever reaches the geometry simplifier.  The CLI
-wrapper for ad-hoc/batch runs is `tools/render_tree_billboard.py`.
+wrapper for ad-hoc/batch runs is `tools/lod/render_tree_billboard.py`.
 
 Oblivion ships a pre-rendered front view of each tree as
 `textures\\tes4\\trees\\billboards\\<stem>.dds`, and `lod_far_gen` builds its
@@ -19,12 +19,11 @@ its alpha, over a transparent background.  Output matches what
 the canopy in X and standing on the trunk base in Z.
 
 Usage:
-    python -m tools.render_tree_billboard --all [--dry-run]
-    python -m tools.render_tree_billboard --plugin Oblivion.esm [--size 256]
-    python -m tools.render_tree_billboard --nif <tree.nif> --out <name.dds>
+    python -m tools.lod.render_tree_billboard --all [--dry-run]
+    python -m tools.lod.render_tree_billboard --plugin Oblivion.esm [--size 256]
+    python -m tools.lod.render_tree_billboard --nif <tree.nif> --out <name.dds>
 """
 
-import os
 import struct
 from pathlib import Path
 

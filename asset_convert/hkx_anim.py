@@ -27,7 +27,7 @@ sys.path.insert(0, _REPO)
 from external.pynifly_hkx.anim_fo4 import (Annotation,      # noqa: E402
                                            AnimationData, TrackData)
 from external.pynifly_hkx.anim_skyrim import (               # noqa: E402
-    load_skyrim_animation, write_skyrim_animation)
+    load_skyrim_animation)
 
 from asset_convert.kf_decode import (DecodedClip, decode_kf,  # noqa: E402
                                      split_root_motion)
@@ -309,7 +309,6 @@ def slice_clip(clip, t0: float, t1: float, name: str = None,
     whether to release). A held clip still needs >= 2 samples so the spline
     writer has a segment to encode, so the pose is duplicated.
     """
-    import copy
     import numpy as np
     from asset_convert.kf_decode import BoneTrack, DecodedClip
 

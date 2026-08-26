@@ -15,7 +15,7 @@ White NPCs — Imperials especially — converted to very dark skin.
 `TINC` colors vanilla NPCs use on their skin-tone layer, weighted by count and
 picked per NPC by hashing its FormID.
 
-The census itself was accurate. `python -m tools.census_npc_skin --race
+The census itself was accurate. `python -m tools.generators.gen_npc_skin_table --race
 ImperialRace` genuinely reports 42 of 185 vanilla Imperial males at
 (87, 61, 51). The error was treating that distribution as a target.
 
@@ -154,7 +154,7 @@ part/FGTS fields, or a custom race whose assets cannot be resolved.
 
 ## Verified result (output ESM, all 15 races authored)
 
-`python -m tools.census_npc_skin --esm output/Oblivion.esm/Oblivion.esm`:
+`python -m tools.generators.gen_npc_skin_table --esm output/Oblivion.esm/Oblivion.esm`:
 
 | race | gender | TINC | luma | hue | sat |
 |---|---|---|---|---|---|

@@ -12,8 +12,8 @@ Everything installable is collected here instead: every mod zip
 `Slot44 Patch.esp`, which ships as a loose plugin rather than an archive.
 
 Deliberately its own tiny module: four independent producers write here —
-convert.py's zip and body-patch phases, tools/package_start_mod.py and
-tools/pack_lod.py — and the tools must not import the whole pipeline to learn
+convert.py's zip and body-patch phases, tools/release/package_start_mod.py and
+tools/release/pack_lod.py — and the tools must not import the whole pipeline to learn
 one folder name.
 
 The name has a SPACE in it and is user-facing, so it is spelled exactly once,

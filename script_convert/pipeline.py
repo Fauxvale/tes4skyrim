@@ -4,15 +4,12 @@ import argparse
 import os
 import re
 import struct
-import time
 
 from tes5_import.text_reader import parse_export_file
 from worker_budget import worker_count
 
-from script_convert.constants import (_PAPYRUS_RESERVED, _RECORD_TYPE_PAPYRUS, _GLOBAL_CANONICAL,
-                                     _sanitize_name, _safe_property_name, _canonical_global,
-                                     _record_type_to_papyrus, papyrus_script_name,
-                                     PAPYRUS_MAX_SCRIPT_NAME, FUNCTION_MAP)
+from script_convert.constants import (_sanitize_name, _safe_property_name, _record_type_to_papyrus, papyrus_script_name,
+                                     FUNCTION_MAP)
 from script_convert.cross_ref import CrossRefGraph, master_names
 from script_convert.converter import ScriptConverter
 from output_layout import assets_for  # noqa: E402
@@ -114,7 +111,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
 
     Returns {'initargs': tuple for _script_worker_init, 'scpt_work': [...],
     'info_work': [...], 'qust_work': [...], 'stats': dict}.  Shared by
-    convert_all_scripts (the pipeline stage) and tools/convert_scripts_subset.py
+    convert_all_scripts (the pipeline stage) and tools/script/convert_scripts_subset.py
     (a filtered rebuild of named scripts for iteration), so a subset build is
     the SAME conversion as the full one — same say-timer owners, unlock plan,
     durations and menu plans — never a parallel approximation of it.

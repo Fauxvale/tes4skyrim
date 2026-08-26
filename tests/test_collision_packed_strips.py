@@ -19,7 +19,6 @@ rebuilds it as MOPP + `bhkCompressedMeshShape`.
 Confirmed in-game 2026-08-22 (anequina\\architecture\\huts\\domehut01.nif).
 """
 
-import math
 
 import pytest
 

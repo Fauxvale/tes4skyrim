@@ -4,7 +4,7 @@ Everything pack_converter asks about a package's targets and locations — what
 KIND of thing a ref or a base is, where each base is placed, which cells are
 interiors, where each package's runners stand — comes from these tables.
 They are built here, in one place, so `import_main` (the real import) and
-`tools/pack_audit.py` (the routing census) see the same context and the
+`tools/esm/pack_audit.py` (the routing census) see the same context and the
 audit measures the production routing rather than a stand-in.
 
 Every map is keyed on the RAW LOW-24 FormID, which is identical in a master's

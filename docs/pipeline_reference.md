@@ -266,8 +266,8 @@ topic binding is patched in after Phase 5. Read the phase comments in
 Every converted script compiles against Bethesda's own `.psc` sources, passed
 to the compiler as `-h`. The CK ships them one of three ways, and
 `convert._find_skyrim_source_scripts()` is the single lookup every caller uses
-(the Scripts phase, `preflight._papyrus_headers`, `tools/ck_compile_check.py`,
-`tools/compile_papyrus.py`) so the dependency check can never pass while the
+(the Scripts phase, `preflight._papyrus_headers`, `tools/script/ck_compile_check.py`,
+`tools/script/compile_papyrus.py`) so the dependency check can never pass while the
 phase then fails to find them:
 
 1. `Data/Source/Scripts/` — the modern layout.
@@ -386,7 +386,7 @@ TESConversion/
   output/                 # WORKING area (gitignored)
     <plugin>/             #   one folder per converted plugin...
     <Mod Label>/          #   ...or one per imported mod (mirrors export/)
-    AutoConvertLOD/       #   the baked LOD mod (tools/create_lod.py)
+    AutoConvertLOD/       #   the baked LOD mod (tools/release/create_lod.py)
     Finished Mods/        #   everything the user INSTALLS -- see below
 ```
 
@@ -446,7 +446,7 @@ Two consequences worth knowing:
   deletes the payload only when the plugin being removed is the last one
   registered in its group.
 
-`tools/migrate_group_layout.py` moves mods imported under the old layout.
+`tools/esm/migrate_group_layout.py` moves mods imported under the old layout.
 
 ### `output/Finished Mods/`
 
@@ -461,8 +461,8 @@ Everything installable is collected in `output/Finished Mods/` instead:
 | Artefact | Written by |
 |---|---|
 | `<plugin>.zip` | `convert.py --pack-zip-only` (`phase_pack_zip`) |
-| `AutoConvertLOD.zip` | `tools/pack_lod.py` |
-| `TESGameSelect.zip` | `tools/package_start_mod.py` |
+| `AutoConvertLOD.zip` | `tools/release/pack_lod.py` |
+| `TESGameSelect.zip` | `tools/release/package_start_mod.py` |
 | `Slot44 Patch.esp` | `convert.py --modify-body-meshes` (loose — one plugin with no assets is not worth an archive) |
 
 The folder name lives in `output_layout.py` (`FINISHED_DIR_NAME`), spelled once

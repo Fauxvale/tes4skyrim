@@ -50,13 +50,13 @@ game — xWMAEncode reads the samples only.
 
 ## Rebuilding
 
-`tools/build_ffmpeg.py` reproduces this binary from source. It needs a Linux
+`tools/generators/build_ffmpeg.py` reproduces this binary from source. It needs a Linux
 environment with a MinGW-w64 cross-compiler (on Windows, WSL is fine) and
 takes no privileges — see the script's header for the no-sudo bootstrap it
 uses when the toolchain is not already installed.
 
 ```bash
-python tools/build_ffmpeg.py --output external/ffmpeg/ffmpeg.exe
+python tools/generators/build_ffmpeg.py --output external/ffmpeg/ffmpeg.exe
 ```
 
 The exact `configure` line is embedded in that script (`CONFIGURE_FLAGS`) and
@@ -73,6 +73,6 @@ decoded PCM byte-identical to the shipped build's. Compare outputs, never
 FFmpeg is LGPL v2.1+; `COPYING.LGPLv2.1` sits next to the binary. Because
 this build is **statically linked**, LGPL §6 requires that recipients be able
 to relink it against a modified FFmpeg — satisfied by shipping the complete
-build recipe (`tools/build_ffmpeg.py`, which pins the exact upstream source
+build recipe (`tools/generators/build_ffmpeg.py`, which pins the exact upstream source
 tarball and every configure flag) together with the unmodified upstream
 sources it downloads. **No FFmpeg source is patched.**

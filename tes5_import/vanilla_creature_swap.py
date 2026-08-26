@@ -33,7 +33,7 @@ honest Skyrim equivalent and must be generated — see
 docs/creature_race_equivalence.md for the full reasoning, including why the
 keyword fallbacks in skyrim_overrides.CREA_RACE_PATTERNS are not equivalences.
 
-Inspect coverage with `python tools/creature_swap_report.py -f <plugin>`.
+Inspect coverage with `python tools/creature/creature_swap_report.py -f <plugin>`.
 
 All FormIDs verified against references/Skyrim.esm/RACE.txt and ARMO.txt.
 Several constants in skyrim_overrides.py are WRONG (_SKY_WOLF is ChaurusRace,

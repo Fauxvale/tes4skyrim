@@ -3213,7 +3213,9 @@ def _drop_non_actor_speaker_ctdas(cond_bytes: bytes) -> bytes:
             if data[0] & CTDA_OR:
                 kept[idx] = (sig, bytes([data[0] & ~CTDA_OR]) + data[1:])
             break
-    return b''.join(pack_subrecord(sig, data) for sig, data in kept)
+    # `sig` is a 4-byte slice off the packed buffer; pack_subrecord takes str.
+    return b''.join(pack_subrecord(sig.decode('ascii'), data)
+                    for sig, data in kept)
 
 
 def _build_injected_ctdas(info_rec, is_bark, npc_to_vtyp, topic_vtyps,

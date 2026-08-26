@@ -32,7 +32,7 @@ import mmap
 import struct
 import sys
 import zlib
-from collections import Counter, defaultdict
+from collections import Counter
 
 REC_HDR = 24
 GRP_HDR = 24

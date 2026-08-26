@@ -12,14 +12,14 @@ player's dialogue menu is NPC-to-NPC chatter that was never player-selectable.
 
 All numbers below are measured against the current build
 (`output/Oblivion.esm/Oblivion.esm`, 2026-07-25) with
-`tools/ambient_bark_audit.py`.
+`tools/audit/ambient_bark_audit.py`.
 
 ---
 
 ## The three channels
 
 Oblivion's engine dialogue-type table (recovered by
-`tools/oblivion_engine_extract.py` into `tes4_export/oblivion_engine_tables.json`)
+`tools/disasm/oblivion_engine_extract.py` into `tes4_export/oblivion_engine_tables.json`)
 lists GREETING and HELLO as **separate channels**, indices 0 and 6. NPC-to-NPC
 conversation is a third mechanism — not an engine channel but the DIAL
 **category** `Type=1` (Conversation), driven by Oblivion's actor-pairing AI.
@@ -268,7 +268,7 @@ dangling TCLT in output: 0
 (258 > 242 because the count includes topics whose INFOs were already skipped
 for other reasons.)
 
-**Verify:** `tools/ambient_bark_audit.py --by-source`; regression tests in
+**Verify:** `tools/audit/ambient_bark_audit.py --by-source`; regression tests in
 `tests/test_import.py::TestNpcToNpcConversationDrop` (5 tests, incl. the
 fail-safe and the CharGen keep).
 
@@ -515,7 +515,7 @@ there.
 
 ## Verification
 
-- `python tools/ambient_bark_audit.py output/Oblivion.esm/Oblivion.esm --by-source export/Oblivion.esm`
+- `python tools/audit/ambient_bark_audit.py output/Oblivion.esm/Oblivion.esm --by-source export/Oblivion.esm`
   — per-subtype ambient INFO counts attributed to the originating Oblivion channel.
 - `--compare "<SSE>/Data/Skyrim.esm"` — side-by-side against vanilla density.
 - `--topics HELO` — largest ambient topics, with conditionless counts.

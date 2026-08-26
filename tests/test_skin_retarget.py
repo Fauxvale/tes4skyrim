@@ -19,8 +19,6 @@ Tests are organised bottom-up:
     7. Full converter integration
 """
 
-import json
-import math
 import os
 import sys
 import time
@@ -73,11 +71,8 @@ from asset_convert.skin_retarget import (
     _skin_transform_to_np,
     _m44_to_np,
     _write_skin_transform,
-    _np_to_nif_node,
     _get_block_name,
-    _manual_update_bind_position,
     build_bone_mapping,
-    load_skeleton_from_nif,
     retarget_skin_to_skyrim,
 )
 from asset_convert.skyrim_overrides import OBLIVION_TO_SKYRIM_BONE_MAP

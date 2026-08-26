@@ -3,7 +3,7 @@
 A live control channel into a **running** Skyrim SE, so conversion output can be
 verified in-engine without a relaunch cycle.
 
-    python (tools/game_bridge.py)  <--named pipe-->  TESGameBridge.dll (SKSE plugin)
+    python (tools/live/game_bridge.py)  <--named pipe-->  TESGameBridge.dll (SKSE plugin)
 
 ## Why
 
@@ -27,7 +27,7 @@ game_bridge\build.bat deploy     :: build, then copy into Data\SKSE\Plugins
 Then verify the DLL before launching, and launch through `skse64_loader.exe`:
 
 ```bash
-python tools/skse_version_data.py game_bridge/TESGameBridge.dll
+python tools/misc/skse_version_data.py game_bridge/TESGameBridge.dll
 ```
 
 ### 🛑 `SKSEPlugin_Version` must be STATICALLY initialized
@@ -43,25 +43,25 @@ fields, reporting `disabled, bad version data`. It compiled clean; the only
 evidence was one line in `skse64.log`.
 
 So: plain aggregate initializer, no function calls, no `strncpy`. A
-`static_assert` in `plugin.cpp` guards it, and `tools/skse_version_data.py`
+`static_assert` in `plugin.cpp` guards it, and `tools/misc/skse_version_data.py`
 confirms the shipped bytes (it prints which section the export landed in, which
 is what separates this failure from a merely-wrong value).
 
 ## Use
 
 ```bash
-python tools/game_bridge.py ping           # is the bridge alive?
-python tools/game_bridge.py capabilities   # what resolved on this runtime?
-python tools/game_bridge.py status         # game / session state
-python tools/game_bridge.py console "coc WhiterunDragonsreach"
-python tools/game_bridge.py console "getpos z" --ref 0x0001A2B3
-python tools/game_bridge.py --json status  # machine-readable
+python tools/live/game_bridge.py ping           # is the bridge alive?
+python tools/live/game_bridge.py capabilities   # what resolved on this runtime?
+python tools/live/game_bridge.py status         # game / session state
+python tools/live/game_bridge.py console "coc WhiterunDragonsreach"
+python tools/live/game_bridge.py console "getpos z" --ref 0x0001A2B3
+python tools/live/game_bridge.py --json status  # machine-readable
 ```
 
 As a library:
 
 ```python
-from tools.game_bridge import Bridge
+from tools.live.game_bridge import Bridge
 
 with Bridge() as b:
     b.console("coc BridgeTestCell")
@@ -118,7 +118,7 @@ clients cannot interleave mutations.
 python game_bridge/test_protocol.py    # framing, pairing, error codes; no game needed
 ```
 
-The versionlib parser is verified against `tools/address_lib.py` (the Python
+The versionlib parser is verified against `tools/disasm/address_lib.py` (the Python
 reference): 428,461 entries and all 7 probe addresses match exactly on
 1.6.1170. That check matters because the parser's failure mode is silent — a
 desynced stream still yields plausible numbers, which would then be called as
@@ -142,7 +142,7 @@ Working now:
 ### 🛑 `ConsoleExecute` COMPILES — it does not run
 
 Verified 2026-08-14 by disassembling the **live Steam process** (not the GOG
-copy) with `tools/live_disasm.py`. `ConsoleExecute`'s tail is
+copy) with `tools/live/live_disasm.py`. `ConsoleExecute`'s tail is
 `call <compile finalizer>; mov al,1; ret`: it returns success having only
 produced bytecode. Stopping there gives `returned: 1`, no output, and no effect
 — a false success that cost two debugging sessions.
@@ -215,11 +215,11 @@ inside its thunk; `SkyrimScript::Logger::Log` by
 Higher-level tools built on this:
 
 ```bash
-python tools/quest_debug.py state charactergen      # real quest state
-python tools/quest_debug.py setstage charactergen 27  # drive it + VM output
-python tools/quest_debug.py watch charactergen        # every stage change
-python tools/papyrus_tail.py since --cursor N         # log history
-python tools/game_bridge_verify.py                    # READY / NOT READY
+python tools/live/quest_debug.py state charactergen      # real quest state
+python tools/live/quest_debug.py setstage charactergen 27  # drive it + VM output
+python tools/live/quest_debug.py watch charactergen        # every stage change
+python tools/script/papyrus_tail.py since --cursor N         # log history
+python tools/live/game_bridge_verify.py                    # READY / NOT READY
 ```
 
 **Alt-tabbing pauses the bridge.** Windows throttles a background window, so
@@ -248,7 +248,7 @@ menu — which covers autonomous navigation to a test cell.
 synthesized, so until one such command runs, injected commands compile and
 silently do nothing.
 
-`tools/game_input.py bootstrap` removes that last manual step: it sends real
+`tools/live/game_input.py bootstrap` removes that last manual step: it sends real
 keystrokes to the game window, runs one read-only command, and closes the
 console. Two traps, both of which fail *silently*:
 
@@ -288,4 +288,4 @@ bugs, so the guards are part of the design, not decoration:
 | `plugin/pipe_server.cpp` | named-pipe server |
 | `plugin/json.cpp` | dependency-free JSON |
 | `docs/protocol.md` | full command surface and error codes |
-| `tools/game_bridge.py` | Python client + CLI |
+| `tools/live/game_bridge.py` | Python client + CLI |

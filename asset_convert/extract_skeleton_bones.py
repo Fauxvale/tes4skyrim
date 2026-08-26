@@ -9,7 +9,7 @@ The output is stored as the raw 4x4 matrix values from PyFFI's Matrix44
 (row-vector convention: translation in row 4, R in upper-left 3x3).
 
 Usage:
-    python tools/extract_skeleton_bones.py
+    python -m asset_convert.extract_skeleton_bones
 
 Output:
     asset_convert/generated/skeleton_bones_oblivion.json
@@ -18,8 +18,6 @@ Output:
 """
 import json
 import os
-import sys
-import time
 
 import asset_convert.pyffi_monkey_patch  # noqa: F401 — must precede NifFormat
 

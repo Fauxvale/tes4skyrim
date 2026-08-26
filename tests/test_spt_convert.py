@@ -6,7 +6,6 @@ importer.  Real .spt inputs are used when the Oblivion export is available;
 structural assertions run unconditionally against synthetic parses.
 """
 
-import os
 import struct
 from pathlib import Path
 

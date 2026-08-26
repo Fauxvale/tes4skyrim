@@ -51,13 +51,11 @@ from .dialog_converter import (
 from .record_types.dialog_misc import convert_SOUN
 from .skyrim_overrides import (
     CUSTOM_VTYP_EDIDS,
-    TES4_RACE_FID_TO_EDID,
-    VOICE_TYPE_MAP,
     VTYP_EDID_BY_FID,
     set_voice_type,
 )
 from .navi_builder import NAVI_SINGLETON_FID, build_navi_record
-from .lava_placement import LavaPlanner, build_lava_stat
+from .lava_placement import LavaPlanner
 from .locations import build_marker_locations
 from .record_types.world import (
     convert_ACHR,
@@ -91,7 +89,6 @@ from .writer import (
     pack_record,
     pack_string_subrecord,
     pack_subrecord,
-    pack_uint32_subrecord,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -2220,22 +2217,51 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     n_snd = patch_actor_sounds(writer)
     if n_snd:
         print(f"  Actor sound entries bound/flattened: {n_snd} actors")
-    # DOOR SNAM/ANAM/BNAM hold TES4 SOUN ids because Phase 1 runs before the
-    # descriptors exist — TES5 wants the SNDR there.
-    from .record_types.items import patch_door_sounds
-    n_dsnd = patch_door_sounds(
-        writer,
-        {get_formid(r, 'FormID') & 0x00FFFFFF for r in by_type.get('SOUN', [])})
-    if n_dsnd:
-        print(f"  Door sound descriptors bound: {n_dsnd} doors")
+    # Sound-slot records (ACTI/CONT/DOOR/LIGH) hold TES4 SOUN ids because
+    # Phase 1 runs before the descriptors exist — TES5 wants the SNDR there, and
+    # a SOUN id left in one of these slots CRASHES the audio thread (see
+    # items._SNDR_SLOTS).  Weather is patched separately below: its SNAM is an
+    # 8-byte struct, not a bare FormID.
+    _own_souns = {get_formid(r, 'FormID') & 0x00FFFFFF
+                  for r in by_type.get('SOUN', [])}
+
+    def _master_sound_descriptor(soun_fid: int) -> int:
+        """MASTER-owned TES4 SOUN id -> the SNDR the master's conversion made.
+
+        Read out of the master's converted SOUN (whose SDSC names the
+        companion) rather than re-derived, which would mint an id in THIS
+        plugin's index space.  Required, not optional: Morrowind_ob's containers
+        and torches point at Oblivion.esm sounds it never overrides, so the
+        master manifest carries no entry for them and every one of those ~2,400
+        slots would otherwise be left wrong-typed.
+        """
+        if not ctx or not getattr(ctx, 'master_index', None):
+            return 0
+        blob = ctx.master_index.record(soun_fid)
+        if not blob or blob[:4] != b'SOUN':
+            return 0
+        pos = 24
+        while pos + 6 <= len(blob):
+            sig = blob[pos:pos + 4]
+            size = struct.unpack_from('<H', blob, pos + 4)[0]
+            if sig == b'SDSC' and size == 4:
+                return struct.unpack_from('<I', blob, pos + 6)[0]
+            pos += 6 + size
+        return 0
+
+    from .record_types.items import patch_sound_descriptor_slots
+    for _sig, _label in (('ACTI', 'activators'), ('CONT', 'containers'),
+                         ('DOOR', 'doors'), ('LIGH', 'lights')):
+        _n = patch_sound_descriptor_slots(
+            writer, _sig, _own_souns, _master_sound_descriptor)
+        if _n:
+            print(f"  Sound descriptors bound: {_n} {_label}")
     # WTHR SNAM holds TES4 SOUN ids for the same reason (Phase 2 precedes the
     # descriptors). TES5 weather sounds are SNDR slots; left as SOUN ids the
     # engine dereferences a record that carries no descriptor payload and the
     # sky plays the wrong sound entirely.
     from .record_types.dialog_misc import patch_weather_sounds
-    n_wsnd = patch_weather_sounds(
-        writer,
-        {get_formid(r, 'FormID') & 0x00FFFFFF for r in by_type.get('SOUN', [])})
+    n_wsnd = patch_weather_sounds(writer, _own_souns)
     if n_wsnd:
         print(f"  Weather sound descriptors bound: {n_wsnd} weathers")
     # Creature voice types: allocated LAST so no other generated FormID moves,

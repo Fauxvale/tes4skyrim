@@ -1,4 +1,4 @@
-"""Tests for tools/quest_labtest.py.
+"""Tests for tools/live/quest_labtest.py.
 
 Focused on the VM ring cursor, because its failure mode is SILENCE: a wrong
 cursor produces a recording that looks healthy and contains nothing, and the
@@ -8,9 +8,9 @@ mistake is only visible after a 30-minute playthrough has already been wasted.
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from quest_labtest import _vm_new_lines, _VM_GAP_MARKER  # noqa: E402
+from tools.live.quest_labtest import _vm_new_lines, _VM_GAP_MARKER  # noqa: E402
 
 
 def test_first_poll_returns_everything():

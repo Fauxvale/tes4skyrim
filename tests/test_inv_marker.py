@@ -1,7 +1,7 @@
 """Tests for asset_convert.inv_marker — inventory display orientation.
 
 Convention (derived empirically from vanilla meshes, see
-tools/inv_marker_survey.py): the game composes the stored ushort
+tools/inv_marker_survey.py, removed 2026-08-25): the game composes the stored ushort
 milliradian angles as M = Rx(-rx/1000) @ Ry(-ry/1000) @ Rz(-rz/1000) and
 views the rotated model along +Y with +Z as screen-up.
 """

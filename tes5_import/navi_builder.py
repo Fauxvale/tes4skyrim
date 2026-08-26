@@ -176,7 +176,7 @@ def build_navi_record(form_id: int, navm_metas: list,
         return b''
 
     # Verified against Skyrim.esm NAVI 0x00012FB4: no EDID, NVER first, then one
-    # NVMI per navmesh, then NVPP. (dumped via tools/navmesh_dump.py)
+    # NVMI per navmesh, then NVPP. (dumped via tools/navmesh/dump.py)
     subs = b''
     subs += pack_subrecord('NVER', struct.pack('<I', _NAVI_VERSION))
     for meta in navm_metas:

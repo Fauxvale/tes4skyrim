@@ -25,8 +25,13 @@ across additional archives.  Skyrim only auto-mounts ``<PluginStem>.bsa`` and
 overflow archive is paired with a generated dummy ESL "loader" plugin whose
 stem matches the archive name:
 
-  oblivion_loader.esl     mounts oblivion_loader.bsa / oblivion_loader - Textures.bsa
-  oblivion_loader_1.esl   mounts oblivion_loader_1.bsa / ...
+  <stem>_loader.esl     mounts <stem>_loader.bsa / <stem>_loader - Textures.bsa
+  <stem>_loader_1.esl   mounts <stem>_loader_1.bsa / ...
+
+The plugin stem is part of the loader name because loader stems are global to
+the game's Data folder: a fixed name would make every converted mod that
+overflows ship the same file, and installing two of them would silently
+overwrite one mod's overflow archives with the other's.
 
 Staging strategy: for each BSA a temporary directory is created inside
 ``output/<plugin>/_bsa_staging_<type>/`` containing only hardlinks to the
@@ -34,6 +39,7 @@ relevant files (near-instant on the same drive).  The directory is removed
 after BSArch finishes.  Hardlinks fall back to full copies if the staging
 directory is on a different drive.
 """
+import glob as _glob
 import os
 import shutil
 import subprocess
@@ -205,9 +211,23 @@ _KNOWN_DIRS: frozenset = frozenset(
 ) | frozenset(['meshes'])
 
 
-def _loader_stem(index: int) -> str:
-    """Name of the Nth overflow loader plugin (0-based)."""
-    return 'oblivion_loader' if index == 0 else f'oblivion_loader_{index}'
+def _loader_stem(plugin_stem: str, index: int) -> str:
+    """Name of the Nth overflow loader plugin (0-based) for one plugin.
+
+    Loader stems are GLOBAL to the game's Data folder even though they are
+    generated per output folder, so the plugin stem has to be in the name: a
+    fixed stem makes every converted mod that overflows ship a file with the
+    same name, and installing two of them silently overwrites one mod's
+    overflow archives with the other's.
+
+    A stem containing ' - ' (e.g. 'Morrowind_ob - Chargen and Transport Mod')
+    is safe.  Verified against SkyrimSE.exe at 0x140c64494: the engine locates
+    the plugin's extension, overwrites it in place with '.bsa', and prepends
+    'Data\\'.  It never parses backwards past the extension, so a separator
+    earlier in the name cannot be mistaken for the ' - Textures' suffix.
+    """
+    base = f'{plugin_stem}_loader'
+    return base if index == 0 else f'{base}_{index}'
 
 
 def _run_bsarch(
@@ -308,7 +328,7 @@ def pack_bsas(
 
     Content that would push an archive past the 2 GiB BSA limit spills into
     additional archives, each paired with a generated dummy ESL loader plugin
-    (``oblivion_loader.esl``, ``oblivion_loader_1.esl``, …) so Skyrim mounts it.
+    (``<stem>_loader.esl``, ``<stem>_loader_1.esl``, …) so Skyrim mounts it.
 
     Textures nothing the plugin ships can reference are left OUT of the
     textures archive (see ``texture_prune.build_refs``).  This is a pack-time
@@ -440,9 +460,9 @@ def pack_bsas(
                 # First bin keeps the name the real plugin auto-mounts.
                 bsa_path = plugin_dir / base_name
             else:
-                # Overflow: mounted by oblivion_loader[_N].esl
+                # Overflow: mounted by <stem>_loader[_N].esl
                 loader_idx = bin_idx - 1
-                lstem = _loader_stem(loader_idx)
+                lstem = _loader_stem(stem, loader_idx)
                 loaders_needed = max(loaders_needed, loader_idx + 1)
                 bsa_path = plugin_dir / (
                     f"{lstem} - {bsa_suffix}.bsa" if bsa_suffix else f"{lstem}.bsa"
@@ -471,7 +491,7 @@ def pack_bsas(
 
     # Generate one dummy ESL per overflow slot so the game mounts those BSAs.
     for i in range(loaders_needed):
-        esl_path = plugin_dir / f"{_loader_stem(i)}.esl"
+        esl_path = plugin_dir / f"{_loader_stem(stem, i)}.esl"
         try:
             write_loader_esl(esl_path, description=f"BSA loader for {source_name}")
             print(f"  OK    {esl_path.name}  (BSA loader plugin)")
@@ -483,10 +503,20 @@ def pack_bsas(
 
     # Remove stale overflow archives and loaders left by a previous, larger run.
     # This matters beyond tidiness: a later run that needs the loader slot again
-    # would otherwise re-create oblivion_loader.esl on top of a stale
-    # oblivion_loader.bsa, silently serving assets from the old conversion.
+    # would otherwise re-create <stem>_loader.esl on top of a stale
+    # <stem>_loader.bsa, silently serving assets from the old conversion.
+    # 'oblivion_loader*' is swept too: loaders used to be named that regardless
+    # of the plugin, so an output folder built before the rename still holds
+    # them and nothing else would ever clear them.
+    # glob.escape: a plugin stem is arbitrary text and may hold '[' or '?',
+    # which would make the pattern match nothing and silently strand the very
+    # files this sweep exists to remove.
     written = {Path(p).name.lower() for p in results['packed']}
-    for stale in sorted(plugin_dir.glob('oblivion_loader*')):
+    stale_candidates = sorted(
+        set(plugin_dir.glob(f'{_glob.escape(stem)}_loader*'))
+        | set(plugin_dir.glob('oblivion_loader*'))
+    )
+    for stale in stale_candidates:
         if stale.suffix.lower() not in ('.bsa', '.esl'):
             continue
         if stale.suffix.lower() == '.esl':

@@ -1,6 +1,6 @@
 """Shared navmesh geometry cache: hashing, gating and the publish contract.
 
-The cache is shipped as a GitHub Release asset (tools/navmesh_cache.py), so
+The cache is shipped as a GitHub Release asset (tools/navmesh/navmesh_cache.py), so
 three properties have to hold or downloaders silently lose the benefit -- or
 worse, get stale geometry:
 
@@ -9,7 +9,6 @@ worse, get stale geometry:
   * the pre-push gate must fire for every file that can change cached geometry.
 """
 import glob
-import hashlib
 import json
 import os
 import pickle
@@ -24,8 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import asset_convert.collision_extract as ce  # noqa: E402
 from tes5_import import import_main as im  # noqa: E402
 from tes5_import.pgrd_to_navm import _geom_hash  # noqa: E402
-from tools import navmesh_cache as nc  # noqa: E402
-from tools import navmesh_cache_hook as hook  # noqa: E402
+from tools.navmesh import navmesh_cache as nc  # noqa: E402
+from tools.navmesh import navmesh_cache_hook as hook  # noqa: E402
 
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

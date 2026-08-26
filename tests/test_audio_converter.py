@@ -6,9 +6,7 @@ Tests cover:
   - convert_sounds(): parallel directory batch (with and without ffmpeg)
   - organize_voice_files(): TES4->TES5 layout reorganisation
 """
-import shutil
 import struct
-import tempfile
 import wave
 from pathlib import Path
 

@@ -2,7 +2,7 @@
 
 from script_convert.constants import (
     BLOCK_MAP, TYPE_MAP, ACTOR_VALUE_MAP, KNOWN_GLOBALS,
-    FUNCTION_MAP, _BARE_BOOL_FUNCTIONS, _ACTOR_ONLY_FUNCTIONS,
+    FUNCTION_MAP,
 )
 from script_convert.cross_ref import CrossRefGraph
 from script_convert.converter import ScriptConverter

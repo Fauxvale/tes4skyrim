@@ -2111,7 +2111,6 @@ def _write_flat_normal_for(atlas_diffuse: Path, dest: Path):
 
 def _ensure_flat_normal_dds(path: Path, size: int):
     """Write an uncompressed flat-normal RGBA DDS (128,128,255,255) of side=size."""
-    from PIL import Image
     import numpy as _np
     path.parent.mkdir(parents=True, exist_ok=True)
     arr = _np.zeros((size, size, 4), dtype=_np.uint8)

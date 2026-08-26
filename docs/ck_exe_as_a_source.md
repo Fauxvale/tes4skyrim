@@ -26,7 +26,7 @@ CK also imports no `steam_api*` and contains no Steam DRM strings. **Use the
 Steam CK directly — there is no GOG-copy dance needed** (contrast
 `project_skyrimse_exe_drm_packed`).
 
-Reproduce with `tools/ck_srcpaths.py --pe-check`.
+Reproduce with `tools/disasm/ck_srcpaths.py --pe-check`.
 
 ---
 
@@ -57,7 +57,7 @@ Directly relevant subtrees:
 - `shared\distantterrain\` — 8 files incl. `bgsterrainmeshbuilder.cpp` (LOD).
 - `shared\speedtree\`, `shared\los\`, `shared\regions\`, `shared\facegen\`.
 
-List them with `tools/ck_srcpaths.py --tree`.
+List them with `tools/disasm/ck_srcpaths.py --tree`.
 
 ## 3. Asserts carry FILE AND LINE
 
@@ -97,7 +97,7 @@ Unable to find location ref type %08X. Ref type data will be removed.
 Counts by area: **408** navmesh, **180** LAND/landscape, **146** topic/dialogue.
 
 `Bad portal navmesh ID … needs to be refinalized` resolves to **3 code sites**
-via `tools/ck_strref.py`, and is the same check behind bucket 13 of
+via `tools/disasm/ck_strref.py`, and is the same check behind bucket 13 of
 [ck_warnings_audit.md](ck_warnings_audit.md).
 
 ## 5. RTTI: fewer classes, but the RIGHT extra ones
@@ -116,7 +116,7 @@ BGSRenderWindowNavMeshEditModule     WarningsSink@BGSWarningsHandler
 BGSWarningsDialog                    BGSLOSGenParallelTask
 ```
 
-`--find`/`--vtable` in `tools/skyrim_disasm.py` accept `--exe`, so they work
+`--find`/`--vtable` in `tools/disasm/skyrim_disasm.py` accept `--exe`, so they work
 against the CK unchanged.
 
 ## 6. 433 DIALOG resources = the per-record field lists
@@ -127,7 +127,7 @@ whether a subrecord is authored or derived. Titles include `NavMesh Generation`,
 `Advanced NavMesh Generation`, `Recast Navmesh Generation`, `World LOD`,
 `Landscape Edit Settings`, `Quest Voice Assets`, `Invalid References`.
 
-Dump with `tools/ck_srcpaths.py --dialogs`.
+Dump with `tools/disasm/ck_srcpaths.py --dialogs`.
 
 ---
 
@@ -150,7 +150,7 @@ finding is a lead about *data acceptance*, never proof of *runtime* behaviour.
 
 ## Tooling
 
-- `tools/ck_srcpaths.py` — PE/DRM check, source-tree listing, CK-only string
+- `tools/disasm/ck_srcpaths.py` — PE/DRM check, source-tree listing, CK-only string
   and RTTI diffs, dialog dump.
-- `tools/ck_strref.py --pattern <regex>` — string → referencing code RVAs.
-- `tools/skyrim_disasm.py --exe <CK> --find/--vtable/--disasm` — works on the CK.
+- `tools/disasm/ck_strref.py --pattern <regex>` — string → referencing code RVAs.
+- `tools/disasm/skyrim_disasm.py --exe <CK> --find/--vtable/--disasm` — works on the CK.

@@ -19,10 +19,8 @@ Heights are in Skyrim units (1 unit ≈ 1.4 cm).  Cell size = 4096 units.
 import io
 import math
 import mmap
-import os
 import struct
 import sys
-import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -318,104 +316,6 @@ def _master_names(export_dir: Path):
             if val:
                 names.append(val)
     return names
-
-
-def changed_lod_cells(plugin_esm: Path, master_esm: Path,
-                      worldspace_edid: str) -> set:
-    """Grid cells an override plugin changes the LOD appearance of.
-
-    A cell qualifies when the plugin ships a LAND record for it (terrain
-    regraded — the tearing case) or any REFR (distant objects added, moved,
-    scaled or DELETED). The plugin's own CELL records usually carry no XCLC,
-    so grid coordinates are resolved from the MASTER, which is the only place
-    they exist.
-
-    Returns an empty set when the plugin changes nothing in this worldspace,
-    which the caller reads as "the master's LOD is already correct — skip".
-    """
-    coords = {}
-    _scan_cell_coords(Path(master_esm), coords)
-    _scan_cell_coords(Path(plugin_esm), coords)
-
-    raw = Path(plugin_esm).read_bytes()
-    n = len(raw)
-    # `coords` is keyed by NORMALISED FormID (it merges two files), so this
-    # file's own ids must be normalised before they are looked up in it.
-    from .lod_gen import _formid_remap_table
-    gmap = _formid_remap_table(Path(plugin_esm))
-
-    def g(fid: int) -> int:
-        return gmap[fid >> 24] | (fid & 0x00FFFFFF)
-
-    _t = _find_worldspace_fid(raw, n, worldspace_edid)
-    target = None if _t is None else g(_t)
-    changed = set()
-
-    def scan(start, end, cur_cell, cur_wrld):
-        p = start
-        while p < end and p + 24 <= n:
-            sig = raw[p:p + 4]
-            size = struct.unpack_from('<I', raw, p + 4)[0]
-            if sig == b'GRUP':
-                g_size = struct.unpack_from('<I', raw, p + 4)[0]
-                g_type = struct.unpack_from('<I', raw, p + 12)[0]
-                label = raw[p + 8:p + 12]
-                nxt_cell, nxt_wrld = cur_cell, cur_wrld
-                if g_type == 1:
-                    nxt_wrld = g(struct.unpack_from('<I', label)[0])
-                elif g_type == 6:
-                    nxt_cell = g(struct.unpack_from('<I', label)[0])
-                scan(p + 24, p + g_size, nxt_cell, nxt_wrld)
-                p += g_size
-                continue
-            fid = g(struct.unpack_from('<I', raw, p + 12)[0])
-            if sig == b'CELL':
-                cur_cell = fid
-            elif sig in (b'LAND', b'REFR'):
-                if target is None or cur_wrld == target:
-                    c = coords.get(cur_cell)
-                    if c is not None:
-                        changed.add(c)
-            p += 24 + size
-
-    scan(24 + struct.unpack_from('<I', raw, 4)[0], n, 0, 0)
-    return changed
-
-
-def count_land_records(esm_path: Path, worldspace_edid: str) -> int:
-    """How many LAND records `esm_path` holds for one worldspace.
-
-    `phase_lod` needs this ONLY as a number, to decide whether this plugin or a
-    master owns a worldspace's terrain.  It used to call `_parse_land_records`
-    and take `len()` of the result, which fully DECODES every record — VHGT
-    heights, VCLR colors and the whole BTXT/ATXT/VTXT layer tree — and then
-    throws all of it away.  Measured on Tamriel that is 2.8 s discarded per
-    worldspace, and `_records_esm` runs it once for this plugin plus once per
-    master, for every one of the 18 worldspaces.
-
-    This walks the same group structure but skips the per-record decode, so it
-    costs the file scan and nothing else.
-
-    It must match `len(_parse_land_records(...)[0])` EXACTLY, because the two
-    numbers are compared against each other to pick a record source.  Two
-    subtleties, both found by testing against the real parse:
-
-      * the parse keys `lands` by CELL COORDINATE, so several LAND records for
-        the same cell (an override on top of a master) collapse to one entry —
-        counting raw LAND records reported 704 where the parse saw 516;
-      * when the worldspace EditorID is not present at all, the parse warns and
-        collects EVERY LAND record in the file rather than none.
-
-    Delegating to the real scan is what keeps those rules in one place; only
-    the expensive decode is skipped.
-    """
-    lands = {}
-    cell_water = {}
-    wrld_water = {'default': None}
-    cell_coords = {}
-    _scan_land_file(esm_path, worldspace_edid, lands, cell_water,
-                    wrld_water, cell_coords, count_only=True)
-    return len(lands)
 
 
 def _scan_cell_coords(esm_path: Path, coords: dict):
@@ -1334,16 +1234,6 @@ def _make_flat_bc5_dds(size: int) -> bytes:
         s //= 2
 
     return bytes(hdr) + bytes(pixel_data)
-
-
-def _write_flat_normal_dds(path: Path, size: int = TEX_SIZE):
-    """Write a flat normal map in BC5/ATI2 format matching vanilla Skyrim terrain LOD.
-
-    Vanilla uses BC5/ATI2 (two-channel, stores X and Y; Z derived in shader).
-    Flat normal = (128, 128) in [0,255] for both X and Y channels.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_make_flat_bc5_dds(size))
 
 
 def _make_bc5_dds_header(size: int, mip_count: int) -> bytes:

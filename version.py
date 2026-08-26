@@ -37,14 +37,14 @@ Both are tracked:
 Pasting a new drop over the old install therefore leaves `VERSION` new and
 `.conversion_state.json` old, and the difference between them is exactly the
 set of commits whose changed paths decide which steps must re-run.  That path
--> step mapping is NOT reimplemented here: it is `tools/release_notes.py`,
+-> step mapping is NOT reimplemented here: it is `tools/release/release_notes.py`,
 which the tag workflow already uses to write the same answer into every
 release's notes.  One mapping, two consumers.
 
 The version -> steps table is FETCHED OVER HTTPS from the GitHub RELEASES, and
 there is no file anywhere -- nothing committed, nothing published.  Each
 release's body is its annotated tag's message verbatim, which already contains
-the "Steps to re-run in the GUI" checklist `tools/release_notes.py` wrote at
+the "Steps to re-run in the GUI" checklist `tools/release/release_notes.py` wrote at
 tag time.  The releases ARE the table; `steps_table()` just reads them back.
 
 Deriving it rather than committing it is what lets a PR merge cut a release at
@@ -105,7 +105,7 @@ _RELEASES_API = f"https://api.github.com/repos/{REPO}/releases?per_page=100"
 
 # Anonymous: reading a public repo's tags and assets needs no credentials, and
 # gating this on the GitHub CLI would exclude essentially every end user (the
-# same reasoning tools/navmesh_cache.py records for its download path).
+# same reasoning tools/navmesh/navmesh_cache.py records for its download path).
 _UA = {"User-Agent": "tes4skyrim-update-check",
        "Accept": "application/vnd.github+json"}
 
@@ -331,7 +331,7 @@ def version_key(tag: str) -> tuple[int, int] | None:
 
     Tags through 0.58 are MAJOR.MM (hundredths); 0.581 onward are MAJOR.MMM
     (thousandths).  Both must rank on ONE scale or 0.59 sorts above 0.580 --
-    the same trap `tools/navmesh_cache.py` and the tag workflow each document.
+    the same trap `tools/navmesh/navmesh_cache.py` and the tag workflow each document.
     A 2-digit minor is worth ten of the new units: 0.58 IS 0.580.
 
     The minor field is a FRACTION written without its point, so scale by its

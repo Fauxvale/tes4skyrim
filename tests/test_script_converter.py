@@ -1,10 +1,9 @@
 """
-Tests for tools/oblivion_to_papyrus.py — TES4 script → Papyrus conversion.
+Tests for script_convert/ — TES4 script → Papyrus conversion.
 """
 
 import os
 import struct
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -19,7 +18,6 @@ from script_convert.constants import (
     TYPE_MAP,
     ACTOR_VALUE_MAP,
     TES4_ATTRIBUTES,
-    FUNCTION_MAP,
     PAPYRUS_MAX_SCRIPT_NAME,
     papyrus_script_name,
     _safe_property_name,

@@ -1,6 +1,6 @@
 # Every script name Skyrim ships (from Data/Scripts.zip).
 # A converted property/variable may not reuse any of these.
-# Regenerate with: python tools/gen_papyrus_reserved.py
+# Regenerate with: python tools/generators/gen_papyrus_reserved.py
 AbTGTrapsightScript
 AchievementsScript
 Action

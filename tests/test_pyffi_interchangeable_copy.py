@@ -152,7 +152,7 @@ def test_shape_to_strips_round_trip():
 
 
 def test_env_toggle_documented():
-    """The A/B escape hatch must keep working (used by tools/nif_perf.py)."""
+    """The A/B escape hatch must keep working (used by tools/nif/nif_perf.py)."""
     import inspect
     src = inspect.getsource(pyffi_monkey_patch)
     assert 'TESCONV_PYFFI_NO_SINGLE_HOP_COPY' in src

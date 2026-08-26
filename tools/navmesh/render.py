@@ -25,7 +25,6 @@ looks continuous (the "invisible hole in the stairs" signature).
 """
 
 import argparse
-import math
 import os
 import sys
 
@@ -36,7 +35,7 @@ from PIL import Image, ImageDraw  # noqa: E402
 from tes5_import.navmesh import corridor_clean, params  # noqa: E402
 from tools.navmesh.index import NavIndex, DEFAULT_EXPORT  # noqa: E402
 from tools.navmesh.metrics import (  # noqa: E402
-    boundary_edges, crossed_boundary_edges, open_notches,
+    crossed_boundary_edges, open_notches,
 )
 
 

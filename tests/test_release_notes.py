@@ -1,4 +1,4 @@
-"""Tests for tools/release_notes.py -- the path->GUI-step map used to annotate
+"""Tests for tools/release/release_notes.py -- the path->GUI-step map used to annotate
 each auto-tag (.github/workflows/tag-on-push.yml).
 
 The bug these guard against: the notes told the user to re-run all 12 steps for
@@ -13,9 +13,9 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import release_notes as rn  # noqa: E402
+import tools.release.release_notes as rn  # noqa: E402
 
 
 def steps(path):
@@ -66,7 +66,7 @@ def test_export_also_implies_import():
 @pytest.mark.parametrize("path", [
     "docs/pipeline_reference.md",
     "tests/test_import.py",
-    "tools/release_notes.py",
+    "tools/release/release_notes.py",
     "TODO.txt",
     "CLAUDE.md",
     ".github/workflows/tag-on-push.yml",

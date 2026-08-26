@@ -102,7 +102,7 @@ ALLOWED = {
     ('asset_convert/mod_ingest.py', 'remove'),
 
     # The migration tool's whole job is walking the OLD per-plugin folders.
-    ('tools/migrate_group_layout.py', 'migrate'),
+    ('tools/esm/migrate_group_layout.py', 'migrate'),
 }
 
 
@@ -441,8 +441,8 @@ def test_texture_manifests_live_beside_the_meshes_they_describe(tmp_path):
 def test_migration_treats_texture_manifests_as_shared():
     """The migration must not file them as per-plugin leftovers."""
     import sys
-    sys.path.insert(0, str(Path(ROOT) / 'tools'))
-    import migrate_group_layout as mig
+    sys.path.insert(0, str(Path(ROOT)))
+    import tools.esm.migrate_group_layout as mig
 
     assert 'textures_used.txt' in mig.SHARED_CACHES
     assert 'overlay_diffuses.txt' in mig.SHARED_CACHES

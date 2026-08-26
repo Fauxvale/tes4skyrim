@@ -88,10 +88,10 @@ jobs:
 
           # Commit list + the GUI steps those commits require re-running.
           if [ -n "$latest" ]; then
-            python tools/release_notes.py --from "$latest" --to HEAD \
+            python tools/release/release_notes.py --from "$latest" --to HEAD \
                                           --tag "$next_tag" --output "$RUNNER_TEMP/notes.txt"
           else
-            python tools/release_notes.py --to HEAD \
+            python tools/release/release_notes.py --to HEAD \
                                           --tag "$next_tag" --output "$RUNNER_TEMP/notes.txt"
           fi
           cat "$RUNNER_TEMP/notes.txt"
@@ -160,7 +160,7 @@ jobs:
       - name: Announce the release on Discord
         # Only for CODE releases.  The navmesh cache publishes its own
         # `navmesh-cache-*` releases, but it does so from
-        # tools/navmesh_cache.py on a developer machine (the pre-push hook, or
+        # tools/navmesh/navmesh_cache.py on a developer machine (the pre-push hook, or
         # `navmesh_cache_hook.py --run`) -- never from a workflow.  Nothing in
         # this job runs for a cache publish, so no tag-name filter is needed
         # here: the separation is structural, not a rule that could drift.
@@ -181,7 +181,7 @@ jobs:
             echo "DISCORD_WEBHOOK_URL is not set -- skipping the announcement."
             exit 0
           fi
-          python tools/discord_release_notify.py \
+          python tools/release/discord_release_notify.py \
             --notes "$RUNNER_TEMP/release-body.txt" \
             --tag "$TAG" \
             --repo "$REPO"

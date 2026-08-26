@@ -83,7 +83,13 @@ def _movt_sped(speeds: dict) -> bytes:
     walk = speeds.get('walk') or _DOG_WALK
     run = speeds.get('run') or walk
     back = speeds.get('back') or walk * 0.8
-    return struct.pack('<11f', 0.0, 0.0, 0.0, 0.0, walk, max(run, walk),
+    # Strafe columns: 0 while the creature ships no Left/Right clip (the
+    # vanilla dog case, and what every creature used to get).  Once a strafe
+    # STATE exists in the graph the clip's root motion is real, so commanding
+    # 0 sideways makes the actor glide -- same invariant as forward/back.
+    left = speeds.get('left') or 0.0
+    right = speeds.get('right') or 0.0
+    return struct.pack('<11f', left, left, right, right, walk, max(run, walk),
                        back, back, _ROT_WALK, _ROT_RUN, _ROT_RUN)
 
 
@@ -214,12 +220,6 @@ _CREA_ARMA_FOLDER = {}
 def get_creature_arma_folders() -> dict:
     """{generated body ARMA FormID: creature folder}, for footstep wiring."""
     return _CREA_ARMA_FOLDER
-
-
-def get_creature_voice(fid_low24: int) -> int:
-    """Generated creature VTYP FormID for a CREA, or 0 if it has none."""
-    folder = _CREA_FOLDER_MAP.get(fid_low24)
-    return _CREA_VOICE_MAP.get(folder, 0) if folder else 0
 
 
 def build_creature_voice_types(writer) -> int:

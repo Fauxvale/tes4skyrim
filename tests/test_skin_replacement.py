@@ -18,7 +18,6 @@ Verifies that:
 12. Armor type detection, bone expansion, proximity clipping, weight morphing
 """
 
-import math
 import os
 import sys
 import time
@@ -39,9 +38,6 @@ from asset_convert.skin_replacement import (
     collect_skin_info,
     load_body_geom,
     clip_body_geom,
-    build_clipped_geom,
-    splice_body_geometry,
-    strip_body_skin_geometry,
     is_underwear_only,
     _is_torso_skin,
 )

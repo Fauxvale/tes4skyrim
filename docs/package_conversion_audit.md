@@ -31,7 +31,7 @@ Recorded so a later session does not re-litigate them.
 | Speed byte | Vanilla honours `PKDT` speed only when flag `0x2000` (Preferred Speed) is set — **4,386** vanilla records carry an inert `speed=2` with the flag clear. Writing walk-unflagged is inert, not a defect. |
 | PKDT byte layout | `<IBBBBHH>` confirmed: `[4]`=Type (18 ×5,857 / 19 ×104), `[5]`=interrupt override, `[6]`=speed, `[10:12]`=interrupt flags. |
 | Reused CTDA indices | `_FUNC_DROP` correctly catches the index collisions, incl. **365 = `GetPlayerInSEWorld` (TES4) → `IsChild` (TES5)**, 249 `GetPCFame` → `IsInDialogueWithPlayer`, 224, 227, 258, 259, 264. |
-| Structural contract | `tools/pack_validate.py output/Oblivion.esm/Oblivion.esm` → **clean, 7,209 records**. Every defect below is *semantic*, which is exactly why the structural validator passes. |
+| Structural contract | `tools/esm/pack_validate.py output/Oblivion.esm/Oblivion.esm` → **clean, 7,209 records**. Every defect below is *semantic*, which is exactly why the structural validator passes. |
 
 ---
 
@@ -183,14 +183,14 @@ Sleep      725      Escort        98
 
 **2,878 packages (40%) land on Sandbox**, of which ~1,167 are Find/UseItemAt
 fallbacks that discarded a target (513 Find + 654 UseItemAt per
-`tools/pack_audit.py`). Gap 1 alone accounts for 388 of them.
+`tools/esm/pack_audit.py`). Gap 1 alone accounts for 388 of them.
 
 ## Reproducing
 
 ```bash
-python tools/pack_audit.py --export export/Oblivion.esm      # template routing + data loss
-python tools/pack_validate.py output/Oblivion.esm/Oblivion.esm --summary
-python tools/pack_template_dump.py --list                    # vanilla template roots
+python tools/esm/pack_audit.py --export export/Oblivion.esm      # template routing + data loss
+python tools/esm/pack_validate.py output/Oblivion.esm/Oblivion.esm --summary
+python tools/esm/pack_template_dump.py --list                    # vanilla template roots
 ```
 
 The PTDT/PLDT censuses and the condition-drop measurement were ad-hoc reads of
@@ -202,7 +202,7 @@ rather than in a fresh script.
 
 ## Status after the 2026-08-17 fix pass
 
-Everything below was measured with `python tools/pack_audit.py --detail`
+Everything below was measured with `python tools/esm/pack_audit.py --detail`
 (which now builds the import's own context via `tes5_import.pack_indexes`).
 Oblivion routing before → after, Find/UseItemAt only:
 

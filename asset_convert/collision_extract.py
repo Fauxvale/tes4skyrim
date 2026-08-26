@@ -479,32 +479,6 @@ def _unwrap_shapes(shape, depth=0):
     yield shape
 
 
-def _shape_points(shape):
-    """Vertices of one leaf collision shape, in shape space, or None."""
-    name = type(shape).__name__
-    if name == 'bhkBoxShape':
-        d = shape.dimensions
-        return [(sx * d.x, sy * d.y, sz * d.z)
-                for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
-    if name == 'bhkConvexVerticesShape':
-        return [(v.x, v.y, v.z) for v in shape.vertices] or None
-    if name in ('bhkNiTriStripsShape', 'bhkPackedNiTriStripsShape'):
-        return _tri_shape_points(shape) or None
-    if name == 'bhkCompressedMeshShape':
-        # The converted doors ship CMS (Skyrim's format) -- 85 vanilla door
-        # models arrive here, including every Cheydinhal/Bravil/Leyawiin and
-        # castle-tower door.  Reuse the existing decoder.
-        cms_data = getattr(shape, 'data', None)
-        if cms_data is None:
-            return None
-        try:
-            from .cms import decode_cms
-            return [v for _key, tri in decode_cms(cms_data) for v in tri] or None
-        except Exception:
-            return None
-    return None
-
-
 def _pal_name(sp, off):
     """Resolve a NiStringPalette offset to a node name, or None."""
     if sp is None or off is None or off < 0:
@@ -726,7 +700,7 @@ def _worker_both(args: tuple):
     NOTE: the door axis/centre cache is NOT produced here any more — the scan
     reads CONVERTED meshes, and door geometry must come from the ORIGINAL
     NIF's Close-sequence pose (see door_closed_geometry).  It is built by
-    tools/build_door_axis_cache.py from the export meshes.
+    tools/generators/build_door_axis_cache.py from the export meshes.
     """
     nif_path, rel_key = args
     try:
@@ -901,7 +875,7 @@ def scan_mesh_data(mesh_dir: str, collision_cache: str, bounds_cache: str,
 
     # NOTE: door_panel_axis_cache.json is NOT written here — door geometry
     # must come from the ORIGINAL NIF's Close-sequence pose, and this scan
-    # reads the converted output meshes.  Run tools/build_door_axis_cache.py
+    # reads the converted output meshes.  Run tools/generators/build_door_axis_cache.py
     # (reads export/<plugin>/meshes) to build it.
 
     return len(col_results), len(bnd_results)

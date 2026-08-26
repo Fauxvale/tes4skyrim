@@ -5,8 +5,8 @@
 
 ## How the audit works
 
-A new tool — the **quest walkthrough emulator** ([tools/quest_walkthrough.py](../tools/quest_walkthrough.py) +
-[tools/quest_walkthrough_tes5.py](../tools/quest_walkthrough_tes5.py)) — symbolically "plays" every quest in the
+A new tool — the **quest walkthrough emulator** ([tools/dialog/quest_walkthrough.py](../tools/dialog/quest_walkthrough.py) +
+[tools/dialog/quest_walkthrough_tes5.py](../tools/dialog/quest_walkthrough_tes5.py)) — symbolically "plays" every quest in the
 converted plugin. It collects every stage-advancement edge that survived conversion (dialogue TIF
 fragments, QF stage fragments, attached quest scripts, object-script VMAD attachments), gates each edge
 by real Skyrim rules, and runs a fixpoint from new-game state until nothing more can fire. A quest is
@@ -33,7 +33,7 @@ Unlike the old `dialog_emulator.py`, the reachability rules follow the engine's 
 Run it with:
 
 ```
-python tools/quest_walkthrough.py --export export/Oblivion.esm \
+python tools/dialog/quest_walkthrough.py --export export/Oblivion.esm \
     --esm output/Oblivion.esm/Oblivion.esm --scripts output/Oblivion.esm/scripts \
     --seq output/Oblivion.esm/seq/Oblivion.seq --md temp/quest_audit_raw.md
 ```
@@ -167,4 +167,4 @@ faction ranks, random rolls, ref-walking script logic inside `if` bodies) are as
 can miss a break hidden behind unconverted *conditional logic inside* a fragment body (only lost/unbound
 *calls* are detected there). It does not model packages/scenes as advancement sources (TES4 quests advance
 via dialogue/scripts, so coverage is high), and voice-file presence is out of scope (silent lines still
-advance quests; `tools/voice_audit.py` covers that).
+advance quests; `tools/dialog/voice_audit.py` covers that).

@@ -407,7 +407,7 @@ also what produced the 9 "Non-Persistent Function Info Reference" lines, since
 by position in that enum, so an undeclared type fell through to "plain value"
 and the id was left alone.
 
-Fixed in [gen_ctda_param_types.py](../tools/gen_ctda_param_types.py):
+Fixed in [gen_ctda_param_types.py](../tools/generators/gen_ctda_param_types.py):
 `_FORMID_TYPES_NOT_IN_ENUM` names `ptWorldSpace` explicitly, and the generator
 now **aborts** when any function uses a type the enum does not declare, rather
 than silently guessing. Regenerating changed exactly one line of
@@ -677,7 +677,7 @@ Do not re-diagnose these.
 - **Aimed magic needs projectiles** — an AIMED ENCH/SPEL whose effects have no
   projectile MGEF casts nothing. `magic_effects.py` synthesizes companion MGEFs
   (clone vanilla DATA from `vanilla_mgef_data.py`, regen via
-  `tools/gen_vanilla_mgef_table.py`; patch cast=FF/delivery=aimed/projectile).
+  `tools/generators/gen_vanilla_mgef_table.py`; patch cast=FF/delivery=aimed/projectile).
   MGEF DATA offsets: proj `0x48`, arch `0x40`, AV `0x44`, cast `0x50`,
   delivery `0x54`.
 - **SPEL cast type** — `convert_SPEL` packed CastType=2 (Concentration) for every
@@ -698,4 +698,4 @@ Do not re-diagnose these.
 - **Race VTCK** — vanilla creature races fill *both* voice slots (DogRace:
   CrDogVoice ×2); nulls produce per-race CK warnings.
 
-Re-verify with `python tools/verify_ck_fixes.py <esm>`.
+Re-verify with `python tools/validate/verify_ck_fixes.py <esm>`.

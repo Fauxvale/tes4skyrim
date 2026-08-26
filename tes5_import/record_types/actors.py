@@ -141,6 +141,15 @@ def patch_actor_sounds(writer) -> int:
 
     A CSDI whose SOUN produced no descriptor is dropped along with its CSDT/
     CSDC, rather than left pointing at a record that does not exist.
+
+    An OVERRIDE of a master's actor is different: its bytes come from the
+    master's already-converted record, so the CSDI already holds a real SNDR
+    in the MASTER's id space.  `sndr_map` is keyed on the low 24 bits only, so
+    masking such an id looks it up in the wrong space, finds nothing, and the
+    whole CSDT/CSDI/CSDC group is dropped -- which silently stripped the sound
+    block from all six creature-derived NPC_ overrides in Knights.esp
+    (CreatureWolf's `CSDI 016D9202` is `TES4_NPCWolfInjured_SNDR`).  A CSDI
+    whose index byte names a MASTER is already resolved and is left alone.
     """
     from .dialog_misc import sndr_map
     mapping = sndr_map()
@@ -150,6 +159,9 @@ def patch_actor_sounds(writer) -> int:
     # An already-resolved CSDI must survive a second pass untouched, so treat
     # every descriptor id as mapping to itself.
     resolved = {v for v in mapping.values()}
+    # Index bytes below our own slot belong to a master; anything there was
+    # resolved when that master was converted.
+    own_index = writer.own_index
     patched = 0
     for i, blob in enumerate(records):
         if b'CSDI' not in blob:
@@ -181,8 +193,11 @@ def patch_actor_sounds(writer) -> int:
                 drop_csdc = False
             elif sig == b'CSDI' and cur_type:
                 soun = struct.unpack_from('<I', chunk, 6)[0]
-                sndr = (soun if soun in resolved
-                        else mapping.get(soun & 0x00FFFFFF, 0))
+                if soun and (soun >> 24) < own_index:
+                    sndr = soun          # master-owned, already an SNDR
+                else:
+                    sndr = (soun if soun in resolved
+                            else mapping.get(soun & 0x00FFFFFF, 0))
                 if sndr:
                     cur_pairs += chunk[:6] + struct.pack('<I', sndr)
                     drop_csdc = False

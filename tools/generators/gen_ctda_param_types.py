@@ -1,0 +1,188 @@
+"""Generate the CTDA condition-function parameter-type table from xEdit source.
+
+xEdit's wbDefinitions<GAME>.pas carries the authoritative
+`wbConditionFunctions` array: every condition function index with the type of
+each of its (up to three) parameters. Only the FormID param types may be
+load-order remapped; everything before `ptActor` in xEdit's
+TConditionParameterType enum is a plain integer/enum/float and remapping it
+produces a garbage value the engine dereferences (a `ptActorValue` of 32
+became FormID 0x01000020 and crashed the dialogue menu).
+
+Usage:
+    python tools/generators/gen_ctda_param_types.py \\
+        ../tesconversion/references/xEdit/Core/wbDefinitionsTES5.pas \\
+        -o tes5_import/ctda_param_types.py
+
+    # inspect a single function instead of generating
+    python tools/generators/gen_ctda_param_types.py <pas> --func 277
+"""
+import argparse
+import re
+import sys
+
+# Everything at or after this name in TConditionParameterType is a FormID.
+_FIRST_FORMID_TYPE = 'ptActor'
+
+# ...with these exceptions, which sit after ptActor in xEdit's alphabetical
+# enum but which the engine's own function table types as plain values. The
+# positional rule alone cannot catch them: xEdit orders the enum by name, not
+# by whether a type is a form. Verified against the parameter descriptors in
+# the unpacked SkyrimSE.exe -- see docs/dialogue_engine_contracts.md and
+# `python tools/disasm/dialog_engine_extract.py --functions <name>`. Remapping one of
+# these shifts an enum the engine uses as an array index, which is the same
+# defect class as the GetBaseActorValue crash.
+_VALUE_TYPE_EXCEPTIONS = {
+    'ptEquipType',   # engine parameter type 0x37, a plain equip-slot enum
+}
+
+# Param types xEdit's function table uses but never declares in
+# TConditionParameterType. The positional rule cannot classify these — they are
+# in no position at all — and defaulting them to "value" silently leaves a
+# FormID unremapped, which is a dangling reference in the output rather than a
+# loud failure. Anything named here is treated as a FormID; anything NOT named
+# here and NOT in the enum aborts the run (see build()).
+_FORMID_TYPES_NOT_IN_ENUM = {
+    # GetInWorldspace(ptWorldSpace). Unremapped, its worldspace argument kept
+    # the master index: 33 conditions across INFO and PACK referenced
+    # 0x00011F7C (nothing) instead of our 0x01011F7C SETheFringeOrdered, and
+    # the CK reported "Unable to find Function Info TESForm" for every one.
+    'ptWorldSpace',
+}
+
+_ENUM_RE = re.compile(
+    r'TConditionParameterType\s*=\s*\((.*?)\)\s*;', re.S)
+_ENUM_ENTRY_RE = re.compile(r'\{\s*\d+\s*\}\s*(pt\w+)')
+
+_FUNCS_RE = re.compile(
+    r'wbConditionFunctions\s*:\s*array\[[^\]]*\]\s*of\s*TConditionFunction\s*=\s*\((.*?)\n\s*\)\s*;',
+    re.S)
+_FUNC_RE = re.compile(
+    r"\(\s*Index:\s*(\d+)\s*;\s*Name:\s*'([^']*)'([^)]*)\)")
+_PARAM_RE = re.compile(r'ParamType(\d):\s*(pt\w+)')
+
+
+def parse_enum(text):
+    """Ordered list of TConditionParameterType names."""
+    m = _ENUM_RE.search(text)
+    if not m:
+        sys.exit('could not find TConditionParameterType enum')
+    return _ENUM_ENTRY_RE.findall(m.group(1))
+
+
+def parse_functions(text):
+    """{index: (name, {param_slot: type_name})} for every condition function."""
+    m = _FUNCS_RE.search(text)
+    if not m:
+        sys.exit('could not find wbConditionFunctions array')
+    funcs = {}
+    for idx, name, rest in _FUNC_RE.findall(m.group(1)):
+        params = {int(slot): ptype for slot, ptype in _PARAM_RE.findall(rest)}
+        funcs[int(idx)] = (name, params)
+    return funcs
+
+
+def formid_types(enum_names):
+    """The subset of param types that are FormIDs."""
+    try:
+        first = enum_names.index(_FIRST_FORMID_TYPE)
+    except ValueError:
+        sys.exit(f'{_FIRST_FORMID_TYPE} not present in enum')
+    return ((set(enum_names[first:]) | _FORMID_TYPES_NOT_IN_ENUM)
+            - _VALUE_TYPE_EXCEPTIONS)
+
+
+def build(pas_path):
+    text = open(pas_path, encoding='utf-8', errors='replace').read()
+    enum_names = parse_enum(text)
+    funcs = parse_functions(text)
+    fid_types = formid_types(enum_names)
+
+    # A param type the enum never declares cannot be classified by position,
+    # and guessing "value" hides an unremapped FormID in the output. Fail here
+    # instead: whoever adds the type decides which side it belongs on.
+    known = set(enum_names) | _FORMID_TYPES_NOT_IN_ENUM
+    unknown = {t for _n, params in funcs.values() for t in params.values()
+               if t not in known}
+    if unknown:
+        sys.exit('param type(s) used by wbConditionFunctions but absent from '
+                 'TConditionParameterType: ' + ', '.join(sorted(unknown)) +
+                 '\nAdd each to _FORMID_TYPES_NOT_IN_ENUM (FormID) or '
+                 '_VALUE_TYPE_EXCEPTIONS (plain value).')
+    return enum_names, funcs, fid_types
+
+
+def emit(funcs, fid_types, source):
+    """Render the generated Python module."""
+    lines = [
+        '"""CTDA condition-function parameter types (GENERATED — do not edit).',
+        '',
+        f'Generated by tools/generators/gen_ctda_param_types.py from {source}.',
+        '',
+        'Maps a condition function index to the set of parameter slots (1, 2)',
+        'that hold a FormID. A slot NOT listed here is a plain integer, enum, or',
+        'float and must never be load-order remapped — the engine uses several of',
+        'them as raw array indices (ptActorValue, ptAxis, ptQuestStage, ...), so a',
+        'remapped value is an out-of-bounds read, not merely a dangling reference.',
+        '"""',
+        '',
+        '# {function index: frozenset of 1-based param slots holding a FormID}',
+        'CTDA_FORMID_PARAMS = {',
+    ]
+    for idx in sorted(funcs):
+        name, params = funcs[idx]
+        slots = sorted(s for s, t in params.items() if t in fid_types and s <= 2)
+        if not slots:
+            continue
+        types = ', '.join(params[s] for s in slots)
+        lines.append(
+            f'    {idx}: frozenset({{{", ".join(str(s) for s in slots)}}}),'
+            f'  # {name}({types})')
+    lines.append('}')
+    lines.append('')
+    lines.append('# Every function index xEdit defines, for "is this real" checks.')
+    lines.append('CTDA_KNOWN_FUNCTIONS = frozenset({')
+    known = sorted(funcs)
+    for i in range(0, len(known), 12):
+        lines.append('    ' + ', '.join(str(x) for x in known[i:i + 12]) + ',')
+    lines.append('})')
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('pas', help='path to wbDefinitions<GAME>.pas')
+    ap.add_argument('-o', '--out', help='write the generated module here')
+    ap.add_argument('--func', type=int, action='append',
+                    help='print info for this function index instead of generating')
+    args = ap.parse_args()
+
+    enum_names, funcs, fid_types = build(args.pas)
+
+    if args.func:
+        for idx in args.func:
+            entry = funcs.get(idx)
+            if entry is None:
+                print(f'{idx}: NOT DEFINED')
+                continue
+            name, params = entry
+            desc = ', '.join(
+                f'p{s}={t}{" [FormID]" if t in fid_types else " [value]"}'
+                for s, t in sorted(params.items())) or 'no params'
+            print(f'{idx}: {name}  {desc}')
+        return
+
+    text = emit(funcs, fid_types, args.pas.replace('\\', '/'))
+    if args.out:
+        with open(args.out, 'w', encoding='utf-8', newline='\n') as fh:
+            fh.write(text)
+        n = sum(1 for i in funcs
+                if any(t in fid_types for s, t in funcs[i][1].items() if s <= 2))
+        print(f'wrote {args.out}: {len(funcs)} functions, {n} with FormID params')
+    else:
+        print(text)
+
+
+if __name__ == '__main__':
+    main()

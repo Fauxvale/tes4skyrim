@@ -550,7 +550,7 @@ confirmed in-game.
 - Vanilla census: `references/Skyrim.esm/{NPC_,FACT}.txt`.
 - TES4 source: `export/{Oblivion.esm,Nehrim.esm,Morrowind_ob.esm,…}/`.
 - Converted figures: read from the built binary ESMs in `output/` via
-  `tools/tes5_esm_reader.py`, not simulated from the rules.
+  `tools/esm/tes5_esm_reader.py`, not simulated from the rules.
 - CRVA and XNAM layouts verified against
   `references/xEdit/Core/wbDefinitionsTES5.pas:5176` (`wbStruct(CRVA,…)`) and
   `wbFactionRelations`.

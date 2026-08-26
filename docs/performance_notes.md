@@ -162,7 +162,7 @@ every before/after byte-comparison of a mesh optimisation reported a spurious
 mismatch, so it could not tell a real regression from seed noise. Any mesh
 perf work done before this fix was measured with a broken instrument.
 
-Check it with `python tools/nif_determinism.py` (converts a sample under
+Check it with `python tools/nif/nif_determinism.py` (converts a sample under
 several `PYTHONHASHSEED` values and diffs the hashes; non-zero exit on failure).
 Verified: 65 meshes across 5 seed pairs, 0 differences.
 
@@ -244,7 +244,7 @@ and `data.num_vertices`.
 (`time.process_time`), which is the only stable instrument here — wall-clock on
 this box swings ±20% between identical runs and produced a spurious "0.95x
 regression" on one sample. Verified byte-identical on 60 Oblivion NIFs, 40
-Nehrim NIFs and 30 LOD-inclusive NIFs, plus `tools/nif_determinism.py`.
+Nehrim NIFs and 30 LOD-inclusive NIFs, plus `tools/nif/nif_determinism.py`.
 `get_interchangeable_tri_shape` went from 2.01 s of 6.47 s (31.1%, the largest
 single item) to below the top-14 cumulative entries; total profiled calls for a
 30-mesh sample dropped 122.4M → 90.6M and `struct_.__init__` 1,176,509 →
@@ -568,7 +568,7 @@ properly parallel. Two findings:
 - **Determinism contract**: the output ESM must be byte-reproducible. Process
   results in submission order (`ex.map`, not `as_completed`) and keep record
   EMISSION serial — derived ids no longer depend on call order, but group order
-  still does. Verify with `tools/esm_diff.py A.esm B.esm` (distinguishes real
+  still does. Verify with `tools/esm/esm_diff.py A.esm B.esm` (distinguishes real
   diffs from reorders).
 - **Export format workers re-read from mmap**: `tes4_export` scans record
   offsets only (`read_file(..., parse_subs=False)`) and workers re-read/format
@@ -648,7 +648,7 @@ the old scheme where *any* change moved *everything*.
 
 ### Which record types must be stable — measured, not assumed
 
-Ground truth is a real save's FormID array. `tools/save_formid_scan.py`
+Ground truth is a real save's FormID array. `tools/esm/save_formid_scan.py`
 decompresses an SSE `.ess` (LZ4) and reports it; cross-referenced against the
 built ESM (0 unmatched of 14,368):
 

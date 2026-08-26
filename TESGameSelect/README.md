@@ -140,7 +140,7 @@ what `GetFormFromFile` takes, so the load-order byte is irrelevant.
 ## Rebuilding
 
 ```bash
-python tools/make_game_select_esp.py --outdir TESGameSelect/dist
+python tools/release/make_game_select_esp.py --outdir TESGameSelect/dist
 python -m pytest tests/test_game_select_esp.py -v
 ```
 

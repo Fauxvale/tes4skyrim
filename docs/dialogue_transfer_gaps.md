@@ -1,8 +1,8 @@
 # What Oblivion dialogue does not transfer to Skyrim, and what to do about it
 
 Every number below comes from running the two emulators over real data —
-`tools/oblivion_dialog_emulator.py` against `export/Oblivion.esm` and
-`tools/dialog_emulator.py` against the converted ESM — with the condition tables
+`tools/dialog/oblivion_dialog_emulator.py` against `export/Oblivion.esm` and
+`tools/dialog/dialog_emulator.py` against the converted ESM — with the condition tables
 read out of both game executables (see
 [dialogue_engine_contracts.md](dialogue_engine_contracts.md)). Counts are for
 vanilla Oblivion.esm: 3,817 DIALs, 19,278 INFOs, 2,482 NPCs.
@@ -79,7 +79,7 @@ directly is therefore unusual but well-formed; the function, its parameter type
 
 The tiers now behave, where before conversion they collapsed. Pinarus
 Inventius's greeting pool by relationship rank, from
-`tools/dialog_emulator.py --relationship-rank`:
+`tools/dialog/dialog_emulator.py --relationship-rank`:
 
 | Rank | Greetings |
 |---|---|
@@ -159,16 +159,16 @@ them.
 ## How to check any of this yourself
 
     # what Oblivion gives an NPC
-    python tools/oblivion_dialog_emulator.py export/Oblivion.esm \
+    python tools/dialog/oblivion_dialog_emulator.py export/Oblivion.esm \
         --npc PinarusInventius --stage FGC01Rats:40
 
     # what the conversion gives the same NPC
-    python tools/dialog_emulator.py output/Oblivion.esm/Oblivion.esm \
+    python tools/dialog/dialog_emulator.py output/Oblivion.esm/Oblivion.esm \
         --npc PinarusInventius --stage FGC01Rats:40
 
     # the engines' own condition tables, side by side
-    python tools/oblivion_engine_extract.py --functions GetDisposition
-    python tools/dialog_engine_extract.py --functions FastTravel
+    python tools/disasm/oblivion_engine_extract.py --functions GetDisposition
+    python tools/disasm/dialog_engine_extract.py --functions FastTravel
 
 A topic present on one side and absent on the other is a conversion bug unless
 it falls into one of the five categories above.

@@ -642,7 +642,6 @@ def _leaf_groups_from_centres(tree, centres: np.ndarray, seed: int | None):
 
     # The generator's leaf-size scale: local to build_tree as
     # `K = tree.size * WORLD_SCALE`, not a module constant.
-    K = tree.size * WORLD_SCALE
 
     leaf_maps = [m for m in tree.leaf_maps
                  if m.texture and 'fileloaderror' not in m.texture.lower()]

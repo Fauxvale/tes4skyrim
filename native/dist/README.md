@@ -67,6 +67,6 @@ implementation would make navmesh output depend on whether a build artifact
 happened to be present, and the pipeline's output must be byte-reproducible.
 
 The native kernels are verified against the Python originals they replaced —
-`python tools/navmesh_grow_verify.py` marches both implementations over
+`python tools/navmesh/grow_verify.py` marches both implementations over
 synthetic geometry chosen to exercise every stop rule (wall + bisect, floor
 edge, neighbour cap, hard cap) and reports the worst disagreement.

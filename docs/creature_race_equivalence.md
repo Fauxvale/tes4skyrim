@@ -37,7 +37,7 @@ Sources: `references/Skyrim.esm/RACE.txt` (84 non-vampire/child races) and every
 
 The table is implemented as data in
 [vanilla_creature_swap.py](../tes5_import/vanilla_creature_swap.py); inspect
-coverage with `tools/creature_swap_report.py`. Every Skyrim.esm FormID below was
+coverage with `tools/creature/creature_swap_report.py`. Every Skyrim.esm FormID below was
 verified against the dump.
 
 ---
@@ -70,7 +70,7 @@ Two tiers, because "close enough" is a judgment call:
 | `exact` | Same creature in both games. Safe default. |
 | `near` | Same archetype, visibly different species (mountain lion → sabre cat). Should require an explicit opt-in. |
 
-Measured coverage (`tools/creature_swap_report.py`):
+Measured coverage (`tools/creature/creature_swap_report.py`):
 
 | Plugin | CREA | exact | exact+near |
 |---|---|---|---|
@@ -78,9 +78,9 @@ Measured coverage (`tools/creature_swap_report.py`):
 | Nehrim.esm | 734 | 227 (31%) | 425 (58%) |
 
 ```bash
-python tools/creature_swap_report.py -f Oblivion.esm          # exact only
-python tools/creature_swap_report.py -f Nehrim.esm --near
-python tools/creature_swap_report.py -f Oblivion.esm --list   # per record
+python tools/creature/creature_swap_report.py -f Oblivion.esm          # exact only
+python tools/creature/creature_swap_report.py -f Nehrim.esm --near
+python tools/creature/creature_swap_report.py -f Oblivion.esm --list   # per record
 ```
 
 **Resolution order is EditorID first, then folder** — one Oblivion folder can
@@ -147,7 +147,7 @@ does not describe what is inside it. All are **exact** — the same creature.
 read from the user's installed ESM before use):
 
 **✅ VERIFIED 2026-08-18** — every FormID below was read out of the real plugin
-with `python tools/creature_race_resolve.py`. The low 24 bits are stable; the
+with `python tools/creature/creature_race_resolve.py`. The low 24 bits are stable; the
 load-order byte is assigned at runtime, and **ESL-flagged plugins live in the
 `0xFE___xxx` space** (flagged per row), which changes how the reference is written.
 
@@ -174,7 +174,7 @@ load-order byte is assigned at runtime, and **ESL-flagged plugins live in the
 
 ### Creation Club tier — ✅ VERIFIED 2026-08-18
 
-Read from the real files with `tools/creature_race_resolve.py`. Every id the repo
+Read from the real files with `tools/creature/creature_race_resolve.py`. Every id the repo
 already had in `skyrim_overrides.py` is **confirmed correct**.
 
 ⚠ **Three of these are ESL-flagged**, so at runtime their records live in the
@@ -204,7 +204,7 @@ what the swap wants.
 ### Beyond Skyrim tier — ✅ VERIFIED 2026-08-18
 
 `BSAssets.esm` (30 races) + `BSHeartland.esm` (23 races), read with
-`tools/creature_race_resolve.py`. **Every id the repo already had is confirmed
+`tools/creature/creature_race_resolve.py`. **Every id the repo already had is confirmed
 correct**, and the read turned up considerably more than was recorded.
 
 This is the **single best source** for this project: BS: Cyrodiil is a deliberate
@@ -316,7 +316,7 @@ word, rather than checking the mesh or the lore. Two specific traps:
    identical creatures split into two races.
 
 **Rule: a row is only allowed once the creature has been confirmed from the mesh
-path AND from UESP** (`python tools/uesp_lookup.py --page "Morrowind:<X>"`).
+path AND from UESP** (`python tools/misc/uesp_lookup.py --page "Morrowind:<X>"`).
 Folder-name resemblance is not evidence.
 
 

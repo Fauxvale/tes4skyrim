@@ -339,7 +339,7 @@ links. Verify on the canonical problem cells:
   edge shared by ≤2 triangles (manifold); `_components` count equals the pathgrid
   connected-component count (no splits, no false merges); every door with a
   pathgrid edge through it gets a Door Triangle; byte-reproducible
-  (`tools/esm_diff.py`).
+  (`tools/esm/esm_diff.py`).
 
 Tools: `tools/navmesh/probe.py`, `tools/navmesh/reach.py`, `tools/navmesh/check.py`
 (validate against Skyrim.esm first — it has known findings, don't chase those).

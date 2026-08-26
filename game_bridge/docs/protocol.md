@@ -3,7 +3,7 @@
 A live, bidirectional control channel into a **running** SkyrimSE.exe, so the
 conversion pipeline can be verified in-engine without a relaunch cycle.
 
-    Python (tools/game_bridge.py)  <--named pipe-->  TESGameBridge.dll (SKSE plugin)
+    Python (tools/live/game_bridge.py)  <--named pipe-->  TESGameBridge.dll (SKSE plugin)
 
 ## Why this exists
 
@@ -112,7 +112,7 @@ supposed to reach that path.
 
 ### 🛑 `ConsoleExecute` COMPILES; it does not run
 
-Verified by disassembling the **live Steam process** (`tools/live_disasm.py`),
+Verified by disassembling the **live Steam process** (`tools/live/live_disasm.py`),
 not the GOG build: `ConsoleExecute`'s tail is `call <compile finalizer>;
 mov al,1; ret`. It returns success having only produced bytecode. The console
 then performs a separate execution step. A caller that stops at `ConsoleExecute`
@@ -151,7 +151,7 @@ it is strictly better than tailing the log file for attribution: no cursor
 arithmetic, no racing the game's buffered writes, no guessing which lines are
 yours.
 
-Tailing the file (`tools/papyrus_tail.py`) is still supported and complementary
+Tailing the file (`tools/script/papyrus_tail.py`) is still supported and complementary
 — it sees history and anything emitted while nothing was armed.
 
 ### Papyrus
@@ -170,7 +170,7 @@ Tailing the file (`tools/papyrus_tail.py`) is still supported and complementary
 
 ### Actors / spawning / clean-room testing
 
-Implemented. These back `tools/quest_labtest.py` — see
+Implemented. These back `tools/live/quest_labtest.py` — see
 `docs/ingame_test_methodology.md`.
 
 | cmd | args | returns |

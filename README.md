@@ -237,10 +237,9 @@ python convert.py -f Oblivion.esm --lod-only           # Generate object & terra
 python convert.py -f Oblivion.esm --pack-only          # Pack output assets into Skyrim BSAs
 python convert.py -f Oblivion.esm --pack-zip-only      # Zip plugin + BSAs → output/Finished Mods/
 python convert.py --modify-body-meshes                 # Build ARMA slot-44 patch (takes no -f)
-python tools/create_lod.py                             # Bake ALL LOD once (takes no -f)
-python tools/pack_lod.py                               # Zip the baked LOD mod
-python tools/package_start_mod.py                      # Zip the TESGameSelect starter mod
-python tools/merge_sibling_lod.py --dry-run            # Report LOD tiles two converted mods both claim
+python tools/release/create_lod.py                             # Bake ALL LOD once (takes no -f)
+python tools/release/pack_lod.py                               # Zip the baked LOD mod
+python tools/release/package_start_mod.py                      # Zip the TESGameSelect starter mod
 python convert.py -f Oblivion.esm --mesh-bounds-only   # Rescan mesh bounds → OBND cache
 ```
 
@@ -378,7 +377,7 @@ covered by this project's MIT license.
 > FFmpeg 7.1.2 sources under LGPL v2.1, with no GPL components (`--enable-gpl` and
 > `--enable-version3` are both off). Because it is statically linked, LGPL §6 requires
 > that recipients be able to relink it against a modified FFmpeg — satisfied by
-> `tools/build_ffmpeg.py`, which pins the exact upstream tarball and records every
+> `tools/generators/build_ffmpeg.py`, which pins the exact upstream tarball and records every
 > configure flag used to produce the shipped binary.
 
 > ### ⚠️ Note on Havok

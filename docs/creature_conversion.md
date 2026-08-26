@@ -136,14 +136,14 @@ output.
 | pynifly hkx codec (VENDORED) | `external/pynifly_hkx/` (from PyNifly 27.4.0; format docs remain at `references/PyNifly-27.4.0/docs/hkx_*.md`) | hk_2010 packfile READER (validator) + hkaSplineCompressedAnimation COMPRESSOR (used by hkx_anim.py). Its binary WRITER is bypassed — output crashes real Havok deserializers. Zero Oblivion support — Oblivion side stays on PyFFI. |
 | hkxcmd.exe (VENDORED) | `external/hkxcmd/hkxcmd.exe` | XML↔binary hkx compiler (real Havok serializer — owns all binary layout), verified byte-identical round-trip; EXPORTKF for studying vanilla clips. GOTCHAS: crashes on forward-slash paths; its CONVERTKF compressor is unusably lossy (debug only). |
 | niftools addon | `.../blender_niftools_addon-master/io_scene_niftools/` | Oblivion KF/skeleton semantics: Bip01 X-forward convention, string-palette targeting, B-spline API shape (`get_times()/get_translations()/…`), bhkBlendController layout |
-| Our pipeline | `tools/kf_animation_explorer.py` (KF parse, palette resolve, FK math — **skips B-splines**), `asset_convert/collision.py` (OB→SK bhk + ragdoll constraint conversion), `nif_converter.py` (`_resolve_palette_strings`, version upgrade), `skin_retarget.py` (NOT needed for creatures — see §4 Step 3) | Most machinery exists |
+| Our pipeline | `tools/generators/kf_animation_explorer.py` (KF parse, palette resolve, FK math — **skips B-splines**), `asset_convert/collision.py` (OB→SK bhk + ragdoll constraint conversion), `nif_converter.py` (`_resolve_palette_strings`, version upgrade), `skin_retarget.py` (NOT needed for creatures — see §4 Step 3) | Most machinery exists |
 | LE archives (more) | `D:\SteamLibrary\steamapps\common\Skyrim\Data\` (`Update.bsa` has animation fixes; Meshes/Misc as needed) | Additional reference data |
 
 ### Remaining gaps (action items)
 
 1. CREA export **drops NIFZ and KFFZ** (body-part list + special-anim list) —
    `tes4_export` fix required (§4 Step 0.1).
-2. `tools/tes4_nif_analyzer.py` crashes on `bhkSimpleShapePhantom` (no `.mass`) — minor.
+2. `tools/nif/nif_analyzer.py` crashes on `bhkSimpleShapePhantom` (no `.mass`) — minor.
 3. **ck-cmd** (github.com/aerisarn/ck-cmd) — optional cross-check only; hkxcmd covers the
    XML round-trip we need.
 4. `Update.bsa` not yet extracted (animation fixes overlay some LE base files).
@@ -176,7 +176,7 @@ The whole chain is implemented and wired as pipeline **Phase 4b: Creatures**
   hkaRagdollInstance (vanilla deer anatomy; GAME units — ob-havok ×7;
   identity mappers by folding body translation offsets into shape verts).
   Three hard contracts learned from the mangled-ragdoll saga (2026-07-20,
-  verify with `tools/ragdoll_validate.py`):
+  verify with `tools/creature/ragdoll_validate.py`):
   - namedVariants lists the **anim→ragdoll mapper FIRST**, ragdoll→anim
     second (30/30 vanilla creature census);
   - `unmappedBones` are indices **in skeleton B**: they belong on the
@@ -714,7 +714,7 @@ blocks are keyed by animation index, one per FILE, not one per clip.
 
 Fixed by `_anim_file_index()` (mirrors the character emitter's
 `dict.fromkeys` dedupe exactly). **Audit with
-`python tools/animdata_index_check.py`** after touching `animation_data.py`,
+`python tools/validate/animdata_index_check.py`** after touching `animation_data.py`,
 `clip_meta` composition, or the character animation list; the older
 `animcache_validate.py` checks only the grammar and passed this corruption.
 
@@ -1233,7 +1233,8 @@ creature is fully proven.
   identically whichever plugin ships them. Own projects win on conflict.
   Combined with the nested-folder fix: Morrowind_ob went **54/307 → 307/307** CREA records
   mapped to a real converted creature (240 own + 67 inherited), 64 local projects (was 10),
-  80 generated `TES4*Race` chains. Diagnose with `temp/crea_project_gap.py <plugin> <master>`.
+  80 generated `TES4*Race` chains. Diagnose by diffing CREA model folders against `creature_projects.json`
+  (`crea_project_gap.py` did this; removed 2026-08-25).
 - **animationdata/boundanims/animationsetdata + singlefile merge
   (`asset_convert/animation_data.py`)**: the engine loads projects ONLY via merged
   `meshes/animationdatasinglefile.txt` + `animationsetdatasinglefile.txt`. Singlefile
@@ -1281,7 +1282,7 @@ creature is fully proven.
   NiNode. SSE binds the behavior graph to the actor 3D through that node BY NAME — an
   Oblivion `Bip01` root never binds and the actor spawns invisible (collision capsule
   still works, because the char controller comes up anyway). Isolated with the
-  `tools/creature_vanilla_ab.py` A/B ESP (our records + vanilla canine assets rendered
+  `tools/creature_vanilla_ab.py` (removed 2026-08-25) A/B ESP (our records + vanilla canine assets rendered
   fine → records/cache exonerated, assets implicated). The rename `Bip01` →
   `NPC Root [Root]` is defined ONCE (`hkx_skeleton.BONE_RENAMES`) and applied at every
   emit site: skeleton.hkx bone list (`collect_bones`), animation track binding +
@@ -1390,8 +1391,8 @@ creature is fully proven.
   this hunt: character hkx (property/capsule/axis fields), project hkx, animationdata
   motion curves (nonzero, plausible speeds), setdata attack blocks (V3 grammar walk of
   the whole singlefile), sampler wiring, variable defaults (bAnimationDriven=0).
-  `tools/creature_vanilla_ab.py` now supports `--layers behavior|skeleton,body` +
-  `--edid` lookup for per-layer bisection. Bisection results: vanilla-behavior-only ESP
+  `tools/creature_vanilla_ab.py` (removed 2026-08-25) supported
+  `--layers behavior|skeleton,body` + `--edid` lookup for per-layer bisection. Bisection results: vanilla-behavior-only ESP
   moves, vanilla-NIFs-only ESP doesn't, and console `tc` (take control) can't move the
   actor either → the movement CONTROLLER itself had nothing to drive (see next bullet).
 - **IDLE records are the engine-action → graph-event routing table (2026-07-09, the

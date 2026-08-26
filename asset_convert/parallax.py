@@ -382,7 +382,7 @@ def _encode_bc4_block(vals) -> bytes:
 # 20"; this takes the top of that range, because each retry costs them a full
 # build-and-play cycle and an over-soft height field still reads as depth
 # while an under-blurred one keeps the artifact.  Override per run with
-# `tools/parallax_check.py regen --blur N` rather than editing this.
+# `tools/audit/parallax_check.py regen --blur N` rather than editing this.
 BLUR_RADIUS_PER_1000 = 20.0
 
 # Linear size divisor applied before the blur.  A height field carries no fine
@@ -1226,7 +1226,7 @@ def normalise_height(texels, strength: float = 1.0,
 # zero `_p.dds`, Bethesda having all but dropped parallax for SSE.  0.6 is the
 # value the author confirmed in game (2026-08-19) after 0.5 read a touch flat;
 # on the reference wall it takes the authored amplitude 145 down to about 76.
-# Retune by eye with `tools/parallax_check.py regen --depth F`.
+# Retune by eye with `tools/audit/parallax_check.py regen --depth F`.
 NEUTRAL_LEVEL = 128
 DEPTH_SCALE = 0.6
 
@@ -1250,16 +1250,6 @@ def scale_depth(texels, factor: float = None, centre: int = NEUTRAL_LEVEL):
     lut = bytes(max(0, min(255, int(round(centre + (v - centre) * f))))
                 for v in range(256))
     return bytearray(lut[v] for v in texels)
-
-
-def height_report(texels):
-    """(median, amplitude, percent below mid-grey) — the three numbers the
-    good/bad split is made on, so a build log can show its working."""
-    if not texels:
-        return 0, 0, 0.0
-    n = len(texels)
-    below = sum(1 for v in texels if v < 128) * 100.0 / n
-    return _median(texels), max(texels) - min(texels), below
 
 
 def build_height_map(src_dds: str, out_path: str, strength: float = 1.0,

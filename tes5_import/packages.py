@@ -80,6 +80,19 @@ def set_quest_packages(pack_fids) -> None:
     _QUEST_PACKAGES.update(pack_fids)
 
 
+def is_quest_package(pack_fid: int) -> bool:
+    """True if this package reaches its actor through a QUST alias (ALPC).
+
+    Such a package must NEVER appear in an NPC's PKID list -- xEdit rejects it
+    outright ("package is owned by quest <X> and cannot be assigned to an npc
+    record") and the engine wedges at the main menu resolving it.  Read by
+    both the normal converter (npc_packages) and the OVERRIDE path
+    (override_builder._rebuild_packages), which cannot derive the answer from
+    the master for a package the plugin itself newly quest-owns.
+    """
+    return pack_fid in _QUEST_PACKAGES
+
+
 # source pack fid -> [chain pack fid, ...]: a hunt expanded into a Follow
 # chain (pack_converter.hunt_chain_targets).  The chain runs BEFORE its source
 # in every list that carried the source.

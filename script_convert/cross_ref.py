@@ -7,7 +7,7 @@ from pathlib import Path
 from script_convert.constants import (
     papyrus_script_name, _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS,
     PLAYER_ALIAS_EXTENDS)
-from tes5_import.text_reader import parse_export_file, unescape_value
+from tes5_import.text_reader import parse_export_file
 from worker_budget import worker_count
 
 # ===========================================================================

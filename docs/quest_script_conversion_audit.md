@@ -9,14 +9,14 @@ Corpus: **265** quest scripts in `Oblivion.esm`.
 Audited so far: **196** quest scripts + 4 chargen actor scripts
 (rounds 1-9, 2026-07-31).
 
-How to reproduce the pairing — use `tools/script_pair.py`, which unescapes the
+How to reproduce the pairing — use `tools/script/script_pair.py`, which unescapes the
 SCTX field and prints the original beside the emitted `.psc`:
 
 ```bash
-python tools/script_pair.py MQ02Script            # original + converted
-python tools/script_pair.py MQ02Script --conv-only
-python tools/script_pair.py --list-quest          # every SCHR.Type=1 EditorID
-python tools/script_pair.py --file temp/names.txt # batch a sample
+python tools/script/script_pair.py MQ02Script            # original + converted
+python tools/script/script_pair.py MQ02Script --conv-only
+python tools/script/script_pair.py --list-quest          # every SCHR.Type=1 EditorID
+python tools/script/script_pair.py --file temp/names.txt # batch a sample
 ```
 
 ---
@@ -403,7 +403,7 @@ six `Package` properties beside a VMAD that declares none of them. Every one
 would have been `None` at runtime, i.e. exactly as dead as the `0` it replaced,
 while looking fixed in the source. Anything added to the CLI scan must be
 mirrored into `import_main`'s hand-built graph or the two stages silently
-disagree. Verified with `tools/vmad_probe.py`: `TES4_MG17Script` 25 → **31**
+disagree. Verified with `tools/script/vmad_probe.py`: `TES4_MG17Script` 25 → **31**
 bound properties, all six packages resolving.
 
 ### R9-2. `GetPlayerControlsDisabled` was the literal 0
@@ -934,7 +934,7 @@ The dialogue and quest VMAD builders already inject the same registry as
 **only object scripts were affected** — and why round 2's verification, which
 counted the 4,762 *dialogue* bindings, did not catch it.
 
-Confirmed against the built ESM with `tools/vmad_probe.py` before fixing:
+Confirmed against the built ESM with `tools/script/vmad_probe.py` before fixing:
 
 ```
 TES4_TGStolenGoodsScript   declares TES4GoldFenced   BOUND: []   MISSING: [TES4GoldFenced]
@@ -1022,7 +1022,7 @@ tutorial's prison start, and `TG00FindThievesGuildScript`, whose stage 10 is the
 * **A base form typed `ObjectReference` and passed to `GetItemCount`**
   (`MG02Script`'s `MG02RingofBurden`/`MG02BlackSoulGem`, a CLOT and an SLGM).
   The typing is loose but `ObjectReference` extends `Form`, so it compiles, and
-  both bind to the right FormID — verified with `tools/vmad_probe.py`.
+  both bind to the right FormID — verified with `tools/script/vmad_probe.py`.
 
 ---
 
@@ -1719,7 +1719,7 @@ Per-fix counts measured in `output/`, before → after:
 | Detection sites emitting a live `IsDetectedBy` | 0 | **54** (18 `==3`, 17 `>=2`, 19 `>=3`) |
 | Dead `Sound Property _X_ Auto` declarations | 75 (23 files) | **0** |
 
-Spot-compiled with the stricter CK compiler (`tools/ck_compile_check.py`):
+Spot-compiled with the stricter CK compiler (`tools/script/ck_compile_check.py`):
 `TES4_Dark04ExecutionScript`, `TES4_DarkVicenteScript`,
 `TES4_DarkSanctuaryAssassins`, `TES4_SEZealotScript`,
 `TES4_DarkBrotherhoodScript`, `TES4_Dark12JghastaScript`, `TES4_BaenlinScript`,
@@ -1727,7 +1727,7 @@ Spot-compiled with the stricter CK compiler (`tools/ck_compile_check.py`):
 `TES4_SE42Script`, `TES4_Dark09RetirementScript`, `TES4_MGExpulsion02Script` —
 **13/13 clean.**
 
-Bindings verified in the built ESM with `tools/vmad_probe.py`:
+Bindings verified in the built ESM with `tools/script/vmad_probe.py`:
 
 ```
 TES4_DarkBrotherhoodScript   TES4CyrodiilCrimeFaction 0118E956
@@ -1742,7 +1742,7 @@ Tests: `tests/test_script_converter.py` **192 passed** (10 new — four classes:
 `TestGetDetectionLevelIsDetection`, `TestPlaySoundPropertyIsNotQuoted`);
 `tests/test_import.py` 214 passed, 29 skipped.
 
-Tooling: `tools/uesp_lookup.py` crashed with `UnicodeEncodeError` whenever a
+Tooling: `tools/misc/uesp_lookup.py` crashed with `UnicodeEncodeError` whenever a
 matched wiki line contained a non-cp1252 character (an arrow, an accented
 name), killing the search mid-result. It now forces UTF-8 on stdout/stderr with
 `errors='replace'`.
@@ -1888,7 +1888,7 @@ Round 2 also needed `--import-only` (the new `TES4GoldFenced` GLOB):
 **4,762** VMAD property slots, none null.
 
 Largest generated helpers were spot-compiled with the stricter CK compiler
-(`tools/ck_compile_check.py`), including the 431-cell `IC` family in
+(`tools/script/ck_compile_check.py`), including the 431-cell `IC` family in
 `TES4_MS22SrazirrScript` — clean.
 
 Tests: `tests/test_script_converter.py` 172 passed;
@@ -1905,7 +1905,7 @@ reconciled with the implementation separately.
 ## Not yet audited
 
 109 of 265 quest scripts. Pick the next sample from the `SCHR.Type=1` records
-not listed in the round-1 to round-8 tables above — `tools/script_pair.py
+not listed in the round-1 to round-8 tables above — `tools/script/script_pair.py
 --list-quest` prints the full set to diff against.
 
 Fully covered families:
