@@ -5681,6 +5681,45 @@ class ScriptConverter:
                 self._current_script_edid, pkg_type)
         return []
 
+    # Music cues converted for THIS plugin: {source_rel -> cue EditorID}.
+    # Populated by set_music_cues() from the same music_tracks.json the importer
+    # builds MUSC from, so the two sides cannot drift apart.
+    _music_cues: dict = {}
+
+    @classmethod
+    def set_music_cues(cls, cues: dict):
+        """Register {lowercase source_rel -> MUSC EditorID} for StreamMusic."""
+        cls._music_cues = dict(cues or {})
+
+    def _music_cue_property(self, raw_path: str):
+        """Papyrus property name for a StreamMusic argument, or None.
+
+        `raw_path` is spelled as the TES4 script spells it: a backslash or
+        forward-slash path, or a bare category name.  Normalise to the
+        manifest's `source_rel` form (forward slashes, lowercase, no `data/`
+        prefix, no extension) and look it up; a miss returns None so the caller
+        emits the inert marker rather than binding a property to a record that
+        does not exist.
+        """
+        if not raw_path or not self._music_cues:
+            return None
+        norm = raw_path.replace(chr(92), '/').strip().lower()
+        while '//' in norm:
+            norm = norm.replace('//', '/')
+        norm = norm.lstrip('/')
+        if norm.startswith('data/'):
+            norm = norm[5:]
+        if not norm.startswith('music/'):
+            # A bare category (`StreamMusic dungeon`) names the whole folder.
+            norm = 'music/' + norm
+        stem = norm.rsplit('.', 1)[0]
+
+        for key, edid in self._music_cues.items():
+            if key.rsplit('.', 1)[0] == stem:
+                self._property_refs[edid] = 'MusicType'
+                return edid
+        return None
+
     def _resolve_self_ref(self, ref_name, extends, actor_func=False):
         """Resolve the reference for a function call.
 
@@ -6414,22 +6453,40 @@ class ScriptConverter:
             self._line_comments.append(';NE: StopSound has no Papyrus equivalent')
             return '0'
 
-        # Music playback by FILE PATH: vanilla `StreamMusic "data\music\..."` and
-        # Nehrim's emc* plugin commands.  Skyrim's music system is form-driven
-        # (MusicType.Add()/Remove() on a MUSC record) and neither Papyrus nor
-        # SKSE can start a track from a path, so there is nothing to call — the
-        # MUSC records would have to be authored first.  Emit an inert marker
-        # rather than a call that cannot compile.
-        # `emc*` is Nehrim's bundled music-control plugin (emcPlayTrack,
-        # emcSetMusicType, emcIsBattleOverridden, ...); match the whole family by
-        # prefix rather than chasing each name.  `emcount` is a local variable in
-        # some scripts, not a command, so require a longer name.
-        if fname_low in ('streammusic',) or (
-                fname_low.startswith('emc') and fname_low != 'emcount'
+        # Music playback by FILE PATH.  Skyrim's music system is form-driven
+        # (MusicType.Add()/Remove() on a MUSC record), so a path cannot be
+        # played directly -- but the importer now authors one MUSC per Special
+        # cue, named deterministically from that same path
+        # (music_cue_editor_id), so the call resolves to a real record.
+        #
+        # `StreamMusic "data/music/special/theme_01.mp3"` -> Add() on the cue
+        # MUSC.  Measured: 38 StreamMusic calls in Nehrim.esm, 35 by path and 3
+        # by bare category (`StreamMusic dungeon`); Oblivion.esm has none.
+        # A path with no converted file behind it (8 of Nehrim's references are
+        # dead on disk -- theme_06_part01, the specialevent_05 typo) still gets
+        # the inert marker, because binding a property to a record that was
+        # never written would abort the whole function at runtime.
+        if fname_low == 'streammusic':
+            raw = (args_str.strip() if args_str else '').strip('"\'')
+            cue = self._music_cue_property(raw)
+            if cue:
+                return f'{cue}.Add()'
+            self._line_comments.append(
+                f';NE: {func_name} — no converted music for '
+                f'({args_str.strip()})')
+            return '0'
+
+        # `emc*` is Nehrim's bundled music-control plugin (Elys Music Control:
+        # emcMusicStop, emcSetMusicHold, emcIsBattleOverridden, ...).  These
+        # control the PLAYLIST rather than naming a track, and Papyrus exposes
+        # no equivalent even with MUSC authored, so they stay inert.  `emcount`
+        # is a local variable in some scripts, not a command, so require a
+        # longer name.
+        if (fname_low.startswith('emc') and fname_low != 'emcount'
                 and len(fname_low) > 5):
             self._line_comments.append(
-                f';NE: {func_name} — Skyrim music is MusicType-based, '
-                f'no path playback ({args_str.strip()})')
+                f';NE: {func_name} — no Papyrus equivalent for the Elys '
+                f'music-control API ({args_str.strip()})')
             return '0'
 
         # OBSE IsCasting: "is this actor playing a cast animation".  Skyrim

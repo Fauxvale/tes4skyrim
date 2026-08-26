@@ -102,7 +102,8 @@ see the `oblivion-to-skyrim-dialog` skill.
 | VTYP | Voice Type | NPC_ voice assignment. |
 | CLFM | Color | Hair color (replaces inline HCLR). |
 | LGTM | Lighting Template | Interior CELL lighting. |
-| MUSC | Music Type | CELL music (was U8 enum). |
+| MUSC | Music Type | Built from the TES4 `Music\<Category>\` FOLDERS (no TES4 record exists). CELL `XCMT`/WRLD `SNAM` enum -> `XCMO`/`ZNAM` FormID. See [music_conversion.md](music_conversion.md). |
+| MUST | Music Track | One per converted music file; `ANAM` names the xWMA, `FLTV` the measured duration. |
 | SNDR | Sound Descriptor | Sound data (SOUN is just a marker in TES5). |
 | MATT | Material Type | Landscape material (was HNAM enum). |
 

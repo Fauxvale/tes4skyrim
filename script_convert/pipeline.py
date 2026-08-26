@@ -36,12 +36,57 @@ def _new_stats() -> dict:
     }
 
 
+def _load_music_cues(output_dir) -> dict:
+    """{source_rel -> MUSC EditorID} for this plugin's converted music.
+
+    Reads the same music_tracks.json the importer builds MUSC from, and derives
+    the EditorID through the SHARED helper, so a StreamMusic property can only
+    ever name a record the importer actually wrote.
+    """
+    import json
+    from pathlib import Path as _P
+    from .constants import music_cue_editor_id, music_type_editor_id
+
+    # The manifest sits in the plugin's OUTPUT root; scripts are written to a
+    # subfolder of it, so walk up until it turns up.
+    d = _P(output_dir).resolve()
+    for _ in range(4):
+        cand = d / 'music_tracks.json'
+        if cand.is_file():
+            break
+        d = d.parent
+    else:
+        return {}
+
+    try:
+        data = json.loads(cand.read_text(encoding='utf-8'))
+    except (ValueError, OSError):
+        return {}
+
+    plugin = data.get('plugin') or ''
+    cues = {}
+    for t in data.get('tracks') or []:
+        rel = (t.get('source_rel') or '').lower()
+        if not rel:
+            continue
+        cat = (t.get('category') or '').lower()
+        # Special tracks get a per-cue MUSC (a script names one FILE); every
+        # other category shares its folder's MUSC, which is what a bare
+        # `StreamMusic dungeon` should resolve to.
+        cues[rel] = (music_cue_editor_id(plugin, rel) if cat == 'special'
+                     else music_type_editor_id(plugin, cat))
+        if cat and cat != 'special':
+            cues.setdefault('music/' + cat, music_type_editor_id(plugin, cat))
+    return cues
+
+
 def _script_worker_init(xref, output_dir, info_reveals, service_topics,
                         stage_reveals, say_durations=None,
                         quest_script_vars=None,
                         quest_edid_by_fid=None, topic_unlock_globals=None,
                         message_menus=None, mesh_bounds_cache=None,
-                        chargen_menus=None, say_topics=None):
+                        chargen_menus=None, say_topics=None,
+                        music_cues=None):
     # Windows spawns workers, so module-level caches loaded in the parent do
     # NOT carry over — each worker reloads the mesh-bounds cache or every
     # needs_havok_release() lookup answers 0 and no trap gets its release.
@@ -73,6 +118,11 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
     # spell grants (message_menus.build_chargen_menus; importer authors the
     # MESG records at fixed FormIDs).
     ScriptConverter.chargen_menus = chargen_menus or {}
+    # StreamMusic "<path>" -> the MUSC EditorID the importer authored for that
+    # exact file.  Windows SPAWNS workers, so this has to ride initargs like
+    # say_topics above; a dict built only in the parent leaves every worker with
+    # an empty map and every StreamMusic falls back to the inert marker.
+    ScriptConverter.set_music_cues(music_cues or {})
 
 
 def _script_worker_run(job):
@@ -375,7 +425,8 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
     initargs = (xref, output_dir, info_reveals, service_topics,
                 unlock_plan['stage_reveals'], say_durations,
                 quest_script_vars, quest_edid_by_fid, topic_unlock_globals,
-                message_menus, _bounds_cache, chargen_menus, say_topics)
+                message_menus, _bounds_cache, chargen_menus, say_topics,
+                _load_music_cues(output_dir))
     return {'initargs': initargs, 'scpt_work': scpt_work,
             'info_work': info_work, 'qust_work': qust_work, 'stats': stats}
 
