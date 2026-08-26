@@ -102,7 +102,7 @@ def find_data_dirs(oblivion=None, skyrim=None):
 
 def convert(out_root: Path, oblivion_data=None, skyrim_data=None,
             hide_divider=True, hide_marker=True, opaque=True,
-            mute_shadow=True, preview=False) -> int:
+            mute_shadow=True, scale9=True, preview=False) -> int:
     print('=' * 54)
     print('  CONVERT UI  (message boxes)')
     print('=' * 54)
@@ -166,7 +166,7 @@ def convert(out_root: Path, oblivion_data=None, skyrim_data=None,
         patched, report = ui_menus.patch_message_box(
             movie, textures, layout,
             hide_divider=hide_divider, hide_marker=hide_marker,
-            opaque=opaque, mute_shadow=mute_shadow)
+            opaque=opaque, mute_shadow=mute_shadow, scale9=scale9)
     except ui_menus.UiConvertError as exc:
         print(f'ERROR: {exc}')
         print('The installed messagebox.swf is not the one this reskin was '
@@ -187,7 +187,7 @@ def convert(out_root: Path, oblivion_data=None, skyrim_data=None,
         extra = f', {html} html color(s)' if html else ''
         print(f'    text ({label}){"":<10} {old} -> {new}{extra}')
     for key in ('is_vertical', 'divider', 'marker', 'opacity',
-                'shadow', 'message_field'):
+                'shadow', 'scale9', 'message_field'):
         if key in report:
             print(f'    {key:<24} {report[key]}')
     print(f'    size         {len(movie):,} -> {len(patched):,} bytes')
@@ -260,6 +260,11 @@ def main() -> int:
                          'background at 205/256 alpha)')
     ap.add_argument('--keep-shadow', action='store_true',
                     help="Keep the drop shadow Skyrim hangs on the header text")
+    ap.add_argument('--no-scale9', action='store_true',
+                    help="Do not re-cut Background_mc's scaling grid to the "
+                         "border; the frame then rides the panel's uniform "
+                         'scale, which stretches the carving on tall or wide '
+                         'boxes')
     ap.add_argument('--preview', action='store_true',
                     help='Also write a PNG of the frame next to the mod')
     args = ap.parse_args()
@@ -273,6 +278,7 @@ def main() -> int:
                    hide_marker=not args.keep_marker,
                    opaque=not args.keep_transparency,
                    mute_shadow=not args.keep_shadow,
+                   scale9=not args.no_scale9,
                    preview=args.preview)
 
 

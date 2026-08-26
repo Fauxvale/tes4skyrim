@@ -37,11 +37,18 @@ color.
 🛑 ONE BITMAP, ONE FILL.  Five in-game rounds narrowed the render path to a
 single rule: this engine draws a shape's FIRST bitmap fill across the whole
 shape and ignores the rest, and it did not draw characters this conversion
-ADDS at all.  A 9-slice frame is therefore impossible here -- neither
-`DefineScalingGrid` (0 of 353 vanilla bitmap-filled shapes use one) nor nine
-rects (202 of 207 vanilla shapes declare exactly one fill) nor separate clips.
-The frame is composed offline instead and rides the clip's uniform scale.
-Full evidence, including what that costs: docs/ui_conversion.md.
+ADDS at all.  So the whole frame -- center and border -- is composed offline
+into ONE bitmap on the shape vanilla already sizes, rather than nine rects or
+separate clips.
+
+The border is then 9-SLICED: `Background_mc` already carries a
+`DefineScalingGrid`, and re-cutting that grid to our 44 px border keeps the
+corners fixed while the middle stretches, so the carving holds its density at
+any panel size.  (An earlier rule here claimed the engine will not 9-slice a
+bitmap fill "0 of 353 shapes"; that census compared scaling grids, which name a
+SPRITE, against fills, which live on a SHAPE -- disjoint kinds, so the zero was
+arithmetic, not evidence.  Vanilla 9-slices bitmap art in magic/container/craft
+menus.)  Full evidence, including what that costs: docs/ui_conversion.md.
 
 WHAT IS NOT PORTED (and why)
 ----------------------------
@@ -121,12 +128,20 @@ FOCUS_CONTENT_H = 17
 # The composed frame's base size, as the CENTER's dimensions -- the full shape
 # is this plus a border on each side.
 #
-# 🛑 THE BASE MUST BE BIG ENOUGH THAT THE BORDER NEVER OUTGROWS THE MARGINS.
-# The frame rides Background_mc's uniform scale, so a panel taller than the
-# base draws the border THICKER than its authored 44 px, while the margins
-# that keep text clear of it are fixed pixel values. Measured in game: a
-# ten-choice menu is 762 px tall, which against a 488 px base scaled the border
-# to 69 px against a HEIGHT_MARGIN of 59 -- and the last choice rendered on top
+# Since the scaling grid is re-cut to the border (see patch_message_box), the
+# frame NO LONGER rides Background_mc's uniform scale -- the border draws at a
+# constant 44 px whatever the panel size, so it can no longer outgrow the
+# margins, and the base size is now a quality choice (blur/aspect) rather than
+# the layout constraint it used to be. The note below is the history that set
+# these numbers.
+#
+# 🛑 (HISTORICAL, pre-scale9) THE BASE MUST BE BIG ENOUGH THAT THE BORDER NEVER
+# OUTGROWS THE MARGINS. The frame rode Background_mc's uniform scale, so a panel
+# taller than the base drew the border THICKER than its authored 44 px, while
+# the margins that keep text clear of it are fixed pixel values. Measured in
+# game: a ten-choice menu is 762 px tall, which against a 488 px base scaled the
+# border to 69 px against a HEIGHT_MARGIN of 59 -- and the last choice rendered
+# on top
 # of the border. A four-choice box scaled to 42 px and was fine, which is why
 # it only ever went wrong with many options.
 #
@@ -214,7 +229,23 @@ def _derived_constants(layout: dict) -> dict:
     width_margin = border + layout['text_inset']
     return {
         'WIDTH_MARGIN': width_margin,
-        'HEIGHT_MARGIN': border + layout['text_top'],
+        # border + Oblivion's inset cleared the border for the TEXT. It does
+        # not clear it for the SELECTED option's FOCUS BOX. The indicator is
+        # placed at the button center and only its _width is set, so its native
+        # bottom edge hangs `FOCUS_CONTENT_H/2 + FOCUS_EDGE_BOTTOM` px below the
+        # center -- past the glyphs it frames. Once scale9 made the border a
+        # constant 44 px (no longer scaling thin on small panels), that overhang
+        # started landing on the border for the LAST option.
+        #
+        # 🛑 Worst case: the last button's center sits right at the container's
+        # bottom edge, so the WHOLE overhang hangs below the buttons. Sizing the
+        # margin to clear that -- border + overhang + a gap -- holds at any panel
+        # size and option count, because under scale9 the border is constant, so
+        # this is one number rather than the old panel-dependent invariant. The
+        # gap reuses Oblivion's own text inset. (Overhang derivation matches the
+        # offset compose_focus_box returns.)
+        'HEIGHT_MARGIN': (border + FOCUS_CONTENT_H // 2 + FOCUS_EDGE_BOTTOM
+                          + layout['text_top']),
         # 🛑 NOT Oblivion's authored 30. That value assumes Oblivion's message
         # tile, which is exactly as tall as its text. Skyrim's MessageText
         # reports ~120 px at runtime for a single 22 px line whatever its
@@ -992,6 +1023,7 @@ def patch_message_box(movie_bytes: bytes, textures: dict, layout: dict,
                       text_rgb: tuple = OBLIVION_TEXT_RGB,
                       opaque: bool = True,
                       mute_shadow: bool = True,
+                      scale9: bool = True,
                       message_height: int = MESSAGE_TEXT_HEIGHT) -> tuple:
     """Reskin Skyrim's messagebox.swf with Oblivion's frame. -> (bytes, report)
 
@@ -1039,12 +1071,45 @@ def patch_message_box(movie_bytes: bytes, textures: dict, layout: dict,
           (frame.width, frame.height))])
     next_id += 1
 
+    # 🛑 RE-CUT THE SCALING GRID TO OUR BORDER.
+    #
+    # Background_mc already carries a DefineScalingGrid -- vanilla 9-slices it.
+    # We were leaving it untouched on the belief that this engine will not
+    # 9-slice bitmap art, but the census behind that belief compared scaling
+    # grids (which name a SPRITE) against bitmap fills (which live on a SHAPE).
+    # Those are disjoint character kinds, so an intersection of zero was
+    # guaranteed by construction and proved nothing. Asking the question one
+    # level down -- does any grid's sprite CONTAIN bitmap art? -- finds vanilla
+    # doing it in magicmenu, containermenu and craftingmenu.
+    #
+    # The grid was still there, but its splitter was authored for vanilla's
+    # much smaller panel art. Against our 560x800 shape its fixed rows come to
+    # 354 px top and bottom, more than a whole 379 px panel, so the slice
+    # degenerates and the engine falls back to a plain stretch -- which is
+    # exactly the artifact: the frame scaled ~0.99 wide by ~0.47 tall, leaving
+    # the side borders twice the thickness of the top and bottom and the
+    # carving on them compressed to under half density.
+    #
+    # Re-cut to OUR border, the corners hold their size and only the middle
+    # stretches, which is what the art was drawn for.
+    grid_index = movie.scaling_grid_index(BACKGROUND_SPRITE_ID)
+    if scale9 and grid_index is not None:
+        movie.tags[grid_index] = swf.define_scaling_grid(
+            BACKGROUND_SPRITE_ID, border, border, border, border,
+            width, height)
+        report['scale9'] = (f'grid re-cut to a {border}px border on '
+                            f'{width}x{height}')
+    elif not scale9 and grid_index is not None:
+        report['scale9'] = 'left at vanilla (border rides the uniform scale)'
+
     report['frame'] = {
         'border': border,
         'base': f'{width}x{height}',
         'bitmap': f'{frame.width}x{frame.height} '
                   f'({FRAME_SUPERSAMPLE}x supersampled)',
-        'note': 'single fill on Background_mc; rides its uniform scale',
+        'note': ('single fill on Background_mc, 9-sliced at the border'
+                 if scale9 and grid_index is not None
+                 else 'single fill on Background_mc; rides its uniform scale'),
     }
 
     if hide_divider:

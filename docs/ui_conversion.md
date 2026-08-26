@@ -97,7 +97,7 @@ the class as `Push [reg1, '<NAME>', <int>]`:
 | Constant | Vanilla | Ported |
 |---|---|---|
 | `WIDTH_MARGIN` | 20 | 56 |
-| `HEIGHT_MARGIN` | 30 | 59 |
+| `HEIGHT_MARGIN` | 30 | 81 |
 | `MESSAGE_TO_BUTTON_SPACER` | 10 | 30 |
 | the unnamed `60` | 60 | 112 |
 
@@ -125,7 +125,7 @@ the class as `Push [reg1, '<NAME>', <int>]`:
 
 That is why each ported margin is **border + Oblivion's own inset**: Skyrim
 measures from the panel edge, Oblivion from inside its border.
-`WIDTH_MARGIN = 44 + 12 = 56`, `HEIGHT_MARGIN = 44 + 15 = 59`.
+`WIDTH_MARGIN = 44 + 12 = 56`. `HEIGHT_MARGIN` additionally carries the selected focus box’s downward overhang so the LAST option clears the constant scale9 border: `44 + 15 + (17//2 + 14) = 81` (border + inset + focus overhang).
 
 ### 🛑 `cropx`/`cropy` is a source OFFSET with a 1:1 crop — not a scaled tile
 
@@ -166,17 +166,60 @@ fixture that makes the two readings numerically distinguishable.
 Getting to step 1 took five in-game rounds, and the two rules it obeys are the
 whole story.
 
-### 🛑 Rule 1: no 9-slice over a bitmap fill
+### 🛑 Rule 1 rewritten: 9-slice over a bitmap fill DOES work
 
-Round 1 rebuilt shape 10 as nine bitmap rectangles and moved its existing
-`DefineScalingGrid` to Oblivion's 44 px border. In game the border came out
-magnified into an unrecognisable smear.
+This entry used to say the opposite, and the correction matters more than the
+original claim did.
 
-Across all 53 vanilla `Interface/*.swf`: **353** shapes use a bitmap fill,
-**101** characters carry a `DefineScalingGrid`, and the intersection is
-**zero**. Bethesda uses bitmaps for fixed-size art and *vector* shapes for
-anything that stretches. `test_scaling_grid_is_left_alone` pins the grid as
-untouched.
+**What it used to say:** "Skyrim's Scaleform does not 9-slice a bitmap-filled
+shape — across 53 vanilla Interface movies, 353 shapes use bitmap fills, 101
+characters carry a scaling grid, and the intersection is zero."
+
+**Why that was wrong:** `DefineScalingGrid` names a **sprite**; a bitmap fill
+lives on a **shape**. They are disjoint character kinds, so the intersection of
+those two sets is zero no matter what the engine does. The number was
+arithmetic, not evidence.
+
+**The question asked correctly** — does any grid's sprite CONTAIN bitmap art,
+one level down? — finds vanilla doing it: `magicmenu.swf` (char 25),
+`containermenu.swf` (char 24) and `craftingmenu.swf` (char 25) all 9-slice a
+sprite whose descendants are bitmap-filled. Scale9 over bitmap art is
+supported and shipped.
+
+**What was really happening.** `Background_mc` already carries a grid — vanilla
+9-slices it — and we were carefully leaving it untouched. But its splitter is
+authored for vanilla's panel art:
+
+| | shape 10 box | grid inner rect | fixed border |
+|---|---|---|---|
+| vanilla | 432×155 | x[−187.6, 186.2] y[−46.2, 48.0] | ~29-31 px |
+| ours (before) | 560×800 | *inherited, unchanged* | 44 / 44 / **354** / **352** |
+
+Against our 560×800 shape that same splitter leaves fixed rows about **354 px
+tall top and bottom** — more than an entire 379 px panel. The slice
+degenerates, and the engine falls back to a plain stretch. That fallback is the
+artifact: the frame scaled about 0.99 wide by 0.47 tall, so the side borders
+came out twice the thickness of the top and bottom and the carving on them was
+compressed to under half density.
+
+**The fix is one tag.** Re-cut the grid to our own border, so the corners hold
+their size at any panel size and only the middle stretches:
+
+```
+define_scaling_grid(BACKGROUND_SPRITE_ID, border, border, border, border,
+                    width, height)     # -> 44 px fixed on all four sides
+```
+
+`patch_message_box(scale9=False)` and `--no-scale9` keep the old behavior,
+because this engine has refused things that looked equally safe.
+
+Round 1's "magnified smear" was never evidence for the old rule either. It is
+fully explained by Rule 2 below — nine disjoint rects, of which the engine drew
+only the first, and the first was `top_left`.
+
+**The lesson worth keeping:** a census that returns zero is only evidence if
+the two sets it compares COULD have intersected. Check that before believing
+the number — this one survived five in-game rounds and shaped the whole design.
 
 ### 🛑 Rule 2: one bitmap fill per shape
 
@@ -354,7 +397,13 @@ stretch, so the frame went from 580 KB to 367 KB.
 The center still stretches, which is right — it is a soft parchment wash and
 Oblivion `zoom`s it across the whole box.
 
-### 🛑 The base size is a layout constraint, not just a quality one
+### The base size is a layout constraint, not just a quality one
+
+> With the scaling grid re-cut (Rule 1 above), the border no longer rides the
+> panel's scale, so the base size no longer decides how squashed the carving
+> looks. It still decides how far the border draws INTO the margin, which is
+> what the invariant below is about.
+
 
 The frame rides `Background_mc`'s uniform scale, so a panel **taller than the
 base draws the border thicker than its authored 44 px** — while the margins
@@ -547,7 +596,7 @@ bitmaps, matrices and mask drew all three bars correctly at 100/75/50/25/0%.
 
 So the next attempt should start by asking what the ENGINE does that the file
 format does not describe — the same class of answer as
-[Rule 1](#-rule-1-no-9-slice-over-a-bitmap-fill) and
+[Rule 1](#-rule-1-rewritten-9-slice-over-a-bitmap-fill-does-work) and
 [Rule 2](#-rule-2-one-bitmap-fill-per-shape), both of which were found only by
 looking at what vanilla never does. Candidates not yet ruled out: whether a
 masked shape may be a bitmap fill at all (the mask is a solid-filled shape and

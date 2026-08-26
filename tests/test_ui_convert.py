@@ -389,6 +389,10 @@ def test_derived_constants_add_the_border_to_oblivions_insets():
     """Skyrim measures its margins from the panel EDGE and Oblivion measures
     its insets from inside the border, so each margin is border + inset.
 
+    WIDTH is a plain border + inset. HEIGHT additionally carries the SELECTED
+    focus box's downward overhang, so the last option's box clears the constant
+    scale9 border (see _derived_constants).
+
     The spacer is the exception and is deliberately NOT Oblivion's authored 30:
     Skyrim's MessageText reports ~120 px at runtime for a single 22 px line
     whatever its authored bounds say, so the field already supplies the gap
@@ -396,7 +400,9 @@ def test_derived_constants_add_the_border_to_oblivions_insets():
     """
     constants = ui_menus._derived_constants(
         {'border': 44, 'text_inset': 12, 'text_top': 15, 'button_spacer': 30})
-    assert constants == {'WIDTH_MARGIN': 56, 'HEIGHT_MARGIN': 59,
+    overhang = ui_menus.FOCUS_CONTENT_H // 2 + ui_menus.FOCUS_EDGE_BOTTOM
+    assert constants == {'WIDTH_MARGIN': 56,
+                         'HEIGHT_MARGIN': 44 + 15 + overhang,
                          'MESSAGE_TO_BUTTON_SPACER': 0}
 
 
@@ -570,23 +576,51 @@ def test_patch_changes_only_the_intended_characters(movie_bytes, textures):
     assert report['literals']['reg3:60'] == (60, 112)
 
 
-def test_scaling_grid_is_left_alone(movie_bytes, textures):
-    """🛑 The border must NOT depend on DefineScalingGrid.
+def test_scaling_grid_is_recut_to_our_border(movie_bytes, textures):
+    """🛑 The grid must be RE-CUT, not inherited and not removed.
 
-    Skyrim's Scaleform does not 9-slice a bitmap-filled shape -- across all 53
-    vanilla Interface movies, 353 shapes use bitmap fills, 101 characters carry
-    a scaling grid, and the intersection is zero. Leaning on it anyway put the
-    border through the clip's uniform scale and magnified the carving into a
-    smear (seen in game). The grid is therefore untouched, and the frame
-    positions itself.
+    Background_mc ships with a DefineScalingGrid -- vanilla 9-slices it. The
+    splitter is authored for vanilla's 432x155 panel art, roughly a 30 px
+    border. Our shape is 560x800, so that same splitter leaves fixed rows
+    ~354 px tall top and bottom: more than a whole 379 px panel, which
+    degenerates the slice and drops the engine back to a plain stretch. That
+    is the artifact -- side borders at twice the thickness of top and bottom,
+    with the carving on them compressed to under half density.
+
+    Re-cut to OUR border, the corners hold their size at any panel size.
     """
-    out, _ = ui_menus.patch_message_box(movie_bytes, textures,
-                                        dict(ui_menus.VANILLA_LAYOUT))
+    out, report = ui_menus.patch_message_box(movie_bytes, textures,
+                                             dict(ui_menus.VANILLA_LAYOUT))
+    after = swf.Swf.parse(out)
+    j = after.scaling_grid_index(ui_menus.BACKGROUND_SPRITE_ID)
+    assert j is not None, 'the grid was removed rather than re-cut'
+    inner = _read_rect(after.tags[j].data[2:])
+    box = _read_rect(
+        after.tags[after.index_of_character(
+            ui_menus.BACKGROUND_SHAPE_ID)].data[2:])
+    border = report['frame']['border']
+    # _read_rect gives (x_min, x_max, y_min, y_max) in pixels.
+    for label, got in (('left', inner[0] - box[0]),
+                       ('right', box[1] - inner[1]),
+                       ('top', inner[2] - box[2]),
+                       ('bottom', box[3] - inner[3])):
+        assert abs(got - border) < 0.5, (
+            f'{label} fixed edge is {got:.1f}px, expected the {border}px border')
+    assert 'scale9' in report
+
+
+def test_scale9_can_be_turned_off(movie_bytes, textures):
+    """The engine has refused things that looked this safe before, so the
+    previous behaviour stays reachable without editing code."""
+    out, report = ui_menus.patch_message_box(movie_bytes, textures,
+                                             dict(ui_menus.VANILLA_LAYOUT),
+                                             scale9=False)
     before = swf.Swf.parse(movie_bytes)
     after = swf.Swf.parse(out)
     i = before.scaling_grid_index(ui_menus.BACKGROUND_SPRITE_ID)
     j = after.scaling_grid_index(ui_menus.BACKGROUND_SPRITE_ID)
     assert before.tags[i].data == after.tags[j].data
+    assert 'vanilla' in report['scale9']
 
 
 def test_background_shape_carries_exactly_one_bitmap_fill(movie_bytes,
@@ -612,33 +646,37 @@ def test_background_shape_carries_exactly_one_bitmap_fill(movie_bytes,
                                         -height / 2, height / 2]
 
 
-def test_base_is_large_enough_that_the_border_clears_the_margins(textures):
+def test_margins_clear_the_constant_border_and_the_focus_box(textures):
     """🛑 The invariant that stops a choice rendering on top of the border.
 
-    The frame rides Background_mc's uniform scale, so a panel taller than the
-    base draws the border THICKER than its authored 44 px, while the margins
-    keeping text clear of it are fixed pixels. Measured in game: a ten-choice
-    menu was 762 px tall against a 488 px base -> a 69 px border against a
-    59 px HEIGHT_MARGIN, and "More ..." landed on the border. A four-choice box
-    scaled to 42 px and was fine, which is why it only went wrong with many
-    options.
+    With the scaling grid re-cut to the border, the frame no longer rides
+    Background_mc's uniform scale: the border is a CONSTANT `border` px at any
+    panel size. So the old panel-dependent check (`border*panel/base < margin`)
+    is void, and the invariant is now a plain constant one, the same for every
+    box.
+
+    Two things must clear that constant border:
+      * the message/choice TEXT -- WIDTH_MARGIN and the text part of
+        HEIGHT_MARGIN handle this, exactly as before;
+      * the SELECTED option's FOCUS BOX, which hangs FOCUS_EDGE_BOTTOM px past
+        the glyphs it frames. This is what put the last choice back on the
+        border once the border stopped scaling thin on small panels, and it is
+        why HEIGHT_MARGIN now carries FOCUS_EDGE_BOTTOM on top of the text
+        clearance.
     """
-    border = 44
-    base_w = 2 * border + ui_menus.CENTER_BASE_W
-    base_h = 2 * border + ui_menus.CENTER_BASE_H
+    border = ui_menus.VANILLA_LAYOUT['border']
     constants = ui_menus._derived_constants(ui_menus.VANILLA_LAYOUT)
 
-    # The design envelope the base is sized for.
-    for panel_w, panel_h in ((480, 707), (560, 800),
-                             (ui_menus.MAX_PANEL_W, ui_menus.MAX_PANEL_H)):
-        drawn_h = border * panel_h / base_h
-        drawn_w = border * panel_w / base_w
-        assert drawn_h < constants['HEIGHT_MARGIN'], (
-            f'{panel_w}x{panel_h}: border draws {drawn_h:.0f}px into a '
-            f'{constants["HEIGHT_MARGIN"]}px margin')
-        assert drawn_w < constants['WIDTH_MARGIN'], (
-            f'{panel_w}x{panel_h}: border draws {drawn_w:.0f}px into a '
-            f'{constants["WIDTH_MARGIN"]}px margin')
+    # Room for the border AND the focus box's full downward overhang below the
+    # button center (the worst case: last button center at the container edge).
+    focus_overhang = ui_menus.FOCUS_CONTENT_H // 2 + ui_menus.FOCUS_EDGE_BOTTOM
+    assert constants['HEIGHT_MARGIN'] >= border + focus_overhang, (
+        f"HEIGHT_MARGIN {constants['HEIGHT_MARGIN']} leaves no room for the "
+        f"focus box ({focus_overhang}px overhang) past the {border}px border")
+    # And still room for the text on the width axis.
+    assert constants['WIDTH_MARGIN'] > border, (
+        f"WIDTH_MARGIN {constants['WIDTH_MARGIN']} does not clear the "
+        f"{border}px border")
 
 
 def test_message_field_is_shrunk_to_cut_the_dead_space(movie_bytes, textures):
