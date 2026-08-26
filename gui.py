@@ -356,6 +356,11 @@ EXPORT_DIR = SCRIPT_DIR / "export"
 # is the same feature by a different door -- so nothing here may be fatal.
 DND_AVAILABLE = False
 
+# Above this many plugins the import dialog's picker gets its own scrolling
+# viewport. Better Cities ships 99; packed straight into the card they push
+# the Import/Cancel buttons off the bottom of the screen.
+PICKER_MAX_ROWS = 8
+
 
 def _make_root():
     """The Tk root, drag-and-drop capable when tkinterdnd2 is installed.
@@ -3494,12 +3499,28 @@ def gui_main():
                     pady=(0, 10))
 
     status_var = tk.StringVar(value="Ready")
-    ttk.Label(status_row, textvariable=status_var, style="PanelSub.TLabel").pack(
-        side=tk.LEFT)
-
+    # The timer is packed FIRST so it claims its space at the right; the
+    # status label then fills what is left. Both are inside a row whose width
+    # is the sidebar's, never the text's -- a long message (an archive
+    # basename runs to 45+ chars) used to stretch the entire left pane until
+    # it cleared. `status_row` does not propagate its children's width, so
+    # anything too long is clipped instead.
     timer_var = tk.StringVar(value="")
-    ttk.Label(status_row, textvariable=timer_var, style="PanelSub.TLabel").pack(
-        side=tk.LEFT, padx=(8, 0))
+    _timer_lbl = ttk.Label(status_row, textvariable=timer_var,
+                           style="PanelSub.TLabel")
+    _timer_lbl.pack(side=tk.RIGHT, padx=(8, 0))
+    _status_lbl = ttk.Label(status_row, textvariable=status_var,
+                            style="PanelSub.TLabel", anchor="w")
+    _status_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    # Freeze the row at one line of its own font, THEN stop propagation.
+    # Order matters: pack_propagate(False) on a frame with no height set
+    # collapses it to 1 px (measured), so the height has to be taken from the
+    # laid-out label first.
+    status_row.update_idletasks()
+    status_row.configure(height=max(_status_lbl.winfo_reqheight(),
+                                    _timer_lbl.winfo_reqheight()))
+    status_row.grid_propagate(False)
+    status_row.pack_propagate(False)
 
     # ── Log pane ──────────────────────────────────────────────────────────────
     log_hdr = tk.Frame(log_pane, bg=CLR["panel"], height=34)
@@ -3877,7 +3898,7 @@ def gui_main():
                           "before importing a mod.")
             return
 
-        status_var.set(f"Reading {os.path.basename(path)}...")
+        status_var.set("Reading archive...")
         result = {}
 
         def _work():
@@ -3888,8 +3909,9 @@ def gui_main():
                 # The master scan stages every plugin out of the archive,
                 # so it belongs on this thread too -- running it while the
                 # confirm dialog was built froze the UI for minutes on a
-                # large .7z.
-                result["missing"] = _missing_masters_for(man)
+                # large .7z. Keyed per plugin so the dialog can refilter it
+                # on every checkbox click without touching the archive.
+                result["by_plugin"] = _masters_by_plugin(man)
             except Exception as exc:            # IngestError and anything else
                 result["error"] = exc
 
@@ -3903,18 +3925,21 @@ def gui_main():
                       f"{os.path.basename(path)}\n\n{result['error']}")
                 return
             _confirm_import(path, result["manifest"],
-                            result.get("missing") or set())
+                            result.get("by_plugin") or {})
 
         th = threading.Thread(target=_work, daemon=True)
         th.start()
         root.after(80, lambda: _done(th))
 
-    def _confirm_import(path, manifest, missing=()):
+    def _confirm_import(path, manifest, by_plugin=None):
         """Show what was found and let the user choose plugins, then ingest.
 
-        `missing` is computed on the caller's worker thread -- see
-        `_missing_masters_for`, which is far too slow to run here.
+        `by_plugin` is {plugin_rel: [master, ...]}, computed on the caller's
+        worker thread -- see `_masters_by_plugin`, which is far too slow to
+        run here. Filtering it per selection is pure dict lookups, so the
+        warning can follow the checkboxes live.
         """
+        by_plugin = by_plugin or {}
         card = tk.Frame(outer, bg=CLR["panel"],
                         highlightbackground=CLR["border"], highlightthickness=1)
 
@@ -3949,20 +3974,69 @@ def gui_main():
         # showing an empty "Plugins" heading.
         picks = []
         if manifest.plugins:
-            tk.Label(card, text="Plugins", bg=CLR["panel"], fg=CLR["text"],
+            tk.Label(card,
+                     text="Plugins ({})".format(len(manifest.plugins)),
+                     bg=CLR["panel"], fg=CLR["text"],
                      font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=16,
                                                         pady=(10, 2))
+            # Better Cities ships 99 plugins. Packing 99 checkbuttons straight
+            # into the card makes it taller than the screen with no way to
+            # reach the buttons, so anything past a handful gets its own
+            # scrolling viewport.
+            if len(manifest.plugins) > PICKER_MAX_ROWS:
+                holder = tk.Frame(card, bg=CLR["panel"], height=260)
+                holder.pack(fill=tk.X, padx=16)
+                holder.pack_propagate(False)
+                pcanvas = tk.Canvas(holder, bg=CLR["panel"],
+                                    highlightthickness=0, borderwidth=0)
+                pbar = ttk.Scrollbar(holder, orient=tk.VERTICAL,
+                                     command=pcanvas.yview)
+                pcanvas.configure(yscrollcommand=pbar.set)
+                pbar.pack(side=tk.RIGHT, fill=tk.Y)
+                pcanvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                plist = tk.Frame(pcanvas, bg=CLR["panel"])
+                win = pcanvas.create_window((0, 0), window=plist, anchor="nw")
+
+                def _psync(_e=None):
+                    pcanvas.configure(scrollregion=pcanvas.bbox("all"))
+                    pcanvas.itemconfigure(win, width=pcanvas.winfo_width())
+
+                plist.bind("<Configure>", _psync)
+                pcanvas.bind("<Configure>", _psync)
+                pcanvas.bind(
+                    "<MouseWheel>",
+                    lambda e: pcanvas.yview_scroll(
+                        -1 if e.delta > 0 else 1, "units"))
+
+                def _set_all(value):
+                    for _rel, v in picks:
+                        v.set(value)
+
+                bulk = tk.Frame(card, bg=CLR["panel"])
+                bulk.pack(anchor="w", padx=16, pady=(4, 0))
+                ttk.Button(bulk, text="All",
+                           command=lambda: _set_all(True)).pack(side=tk.LEFT)
+                ttk.Button(bulk, text="None",
+                           command=lambda: _set_all(False)).pack(side=tk.LEFT,
+                                                                 padx=(6, 0))
+            else:
+                plist = card
+
             for rel in manifest.plugins:
                 var = tk.BooleanVar(value=True)
                 picks.append((rel, var))
-                tk.Checkbutton(card, text=os.path.basename(rel), variable=var,
+                # trace_add, not the Checkbutton command: it also fires for
+                # the All/None buttons, which set the vars directly.
+                var.trace_add("write", lambda *_a: _queue_refresh())
+                tk.Checkbutton(plist, text=os.path.basename(rel),
+                               variable=var,
                                bg=CLR["panel"], fg=CLR["text"],
                                selectcolor=CLR["btn"],
                                activebackground=CLR["panel"],
                                activeforeground=CLR["text"],
                                font=("Segoe UI", 9), anchor="w",
                                highlightthickness=0, borderwidth=0).pack(
-                    anchor="w", padx=24)
+                    anchor="w", padx=(24 if plist is card else 4))
         else:
             tk.Label(card,
                      text="No plugin — assets only.\n"
@@ -3975,13 +4049,62 @@ def gui_main():
         # Masters that have no export yet. This is the project's classic silent
         # failure -- a mod whose master was never converted imports "fine" and
         # resolves every master-owned record to nothing.
-        if missing:
-            tk.Label(card,
-                     text="Missing masters — convert these FIRST:\n  "
-                          + "\n  ".join(sorted(missing)),
-                     bg=CLR["panel"], fg=CLR["red"], font=("Segoe UI", 9),
-                     justify=tk.LEFT, anchor="w", wraplength=420).pack(
-                anchor="w", padx=16, pady=(10, 0))
+        # Follows the selection: unticking the plugin that wanted a master
+        # must drop that master from the warning, or the user is told to
+        # convert something nothing they picked needs.
+        miss_var = tk.StringVar(value="")
+        miss_lbl = tk.Label(card, textvariable=miss_var, bg=CLR["panel"],
+                            fg=CLR["red"], font=("Segoe UI", 9),
+                            justify=tk.LEFT, anchor="w", wraplength=420)
+
+        # Plain flag, never winfo_ismapped(): that reads 0 until the geometry
+        # manager next runs, so a hide/show pair inside one callback left the
+        # warning permanently hidden (measured -- re-ticking a plugin after
+        # None did not bring it back).
+        miss_shown = [False]
+
+        def _refresh_missing(*_a):
+            chosen = [rel for rel, var in picks if var.get()]
+            missing = _missing_masters(by_plugin, chosen)
+            if not missing:
+                miss_var.set("")
+                if miss_shown[0]:
+                    miss_lbl.pack_forget()
+                    miss_shown[0] = False
+                return
+            # Better Cities lists dozens. Showing every one makes the card
+            # taller than the screen, so name a few and count the rest.
+            shown = sorted(missing)
+            head = shown[:10]
+            tail = ("\n  …and {} more".format(len(shown) - len(head))
+                    if len(shown) > len(head) else "")
+            miss_var.set("Missing masters — convert these FIRST:\n  "
+                         + "\n  ".join(head) + tail)
+            if not miss_shown[0]:
+                miss_lbl.pack(anchor="w", padx=16, pady=(10, 0),
+                              before=btns_anchor)
+                miss_shown[0] = True
+
+        # All/None writes 99 vars in a loop, and every write fires the trace.
+        # Recomputing on each one measured 708 ms for a single click, so the
+        # work is coalesced into one idle-time pass.
+        pending = [None]
+
+        def _queue_refresh():
+            if pending[0] is not None:
+                return
+
+            def _run():
+                pending[0] = None
+                _refresh_missing()
+
+            pending[0] = card.after_idle(_run)
+
+        # Anchor so the warning always reappears ABOVE the buttons rather
+        # than after them, whatever order it is shown and hidden in.
+        btns_anchor = tk.Frame(card, bg=CLR["panel"], height=0)
+        btns_anchor.pack(anchor="w")
+        _refresh_missing()
 
         keep_var = tk.BooleanVar(value=True)
         if not manifest.is_folder:
@@ -4038,16 +4161,12 @@ def gui_main():
         except ImportError:
             return (EXPORT_DIR / master).is_dir()   # noqa: plugin-path (no-registry fallback)
 
-    def _missing_masters_for(manifest):
-        """Masters of the archive's plugins with no export records yet.
+    def _masters_by_plugin(manifest):
+        """{plugin_rel: [master, ...]} read straight out of the archive.
 
-        Read straight out of the archive, so the warning appears BEFORE the
-        import rather than after a failed conversion.
-
-        Resolved through `record_dir`, never by joining the name onto export/:
-        an imported mod's plugins live inside their mod's shared folder, so a
-        master that IS converted reads as missing under the plain join and the
-        dialog tells the user to convert something they already have.
+        Per-plugin, not a merged set, so the confirm dialog can recompute the
+        missing-master warning instantly as the user ticks plugins on and off
+        -- re-reading the archive on every click is not an option (see below).
 
         ONE `extract_all` pass, never `extract_one` per plugin. A solid .7z is
         a single compressed stream, so extracting one member costs a scan of
@@ -4062,17 +4181,16 @@ def gui_main():
             from asset_convert import archive as _archive
             from convert import get_masters_from_binary
         except Exception:
-            return set()
+            return {}
 
         if not manifest.plugins:
-            return set()
+            return {}
 
-        missing = set()
+        by_plugin = {}
         with tempfile.TemporaryDirectory(prefix="tesconv_mast_") as tmp:
-            targets = []
             if manifest.is_folder:
                 root = manifest.path / manifest.payload_root
-                targets = [root / rel for rel in manifest.plugins]
+                staged = [(rel, root / rel) for rel in manifest.plugins]
             else:
                 members = [(f"{manifest.payload_root}/{rel}"
                             if manifest.payload_root else rel)
@@ -4080,20 +4198,39 @@ def gui_main():
                 try:
                     _archive.extract_all(manifest.path, tmp, members=members)
                 except Exception:
-                    return set()
+                    return {}
                 # extract_all preserves the archive's directory structure, so
-                # the staged file sits under its full member path.
-                targets = [Path(tmp) / m for m in members]
+                # each staged file sits under its full member path.
+                staged = [(rel, Path(tmp) / mem)
+                          for rel, mem in zip(manifest.plugins, members)]
 
-            for target in targets:
+            # A plugin's own siblings in the same archive are about to be
+            # converted alongside it, so they are never "missing".
+            own = {os.path.basename(rel).lower() for rel in manifest.plugins}
+            for rel, target in staged:
                 try:
                     if not os.path.isfile(target):
                         continue
-                    for master in get_masters_from_binary(str(target)):
-                        if not _master_export_present(master):
-                            missing.add(master)
+                    by_plugin[rel] = [
+                        m for m in get_masters_from_binary(str(target))
+                        if m.lower() not in own]
                 except Exception:
                     continue
+        return by_plugin
+
+    def _missing_masters(by_plugin, chosen):
+        """Masters of the SELECTED plugins that have no export records yet.
+
+        Resolved through `record_dir`, never by joining the name onto export/:
+        an imported mod's plugins live inside their mod's shared folder, so a
+        master that IS converted reads as missing under the plain join and the
+        dialog tells the user to convert something they already have.
+        """
+        missing = set()
+        for rel in chosen:
+            for master in by_plugin.get(rel) or ():
+                if not _master_export_present(master):
+                    missing.add(master)
         return missing
 
     def _run_import(path, manifest, chosen, keep_archive):
