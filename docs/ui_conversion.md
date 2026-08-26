@@ -2,7 +2,7 @@
 
 What is implemented, what the two engines actually do, and what cannot be
 ported. Code: `asset_convert/swf.py`, `asset_convert/ui_menus.py`,
-`tools/convert_ui.py`. Tests: `tests/test_ui_convert.py`.
+`tools/misc/convert_ui.py`. Tests: `tests/test_ui_convert.py`.
 
 **Implemented: the message box.** Nothing else. The HUD stat bars were built
 and then REVERTED — see [The HUD stat bars, attempted and
@@ -484,7 +484,7 @@ fails visibly instead of shipping a broken menu.
 
 ### Loose files beat BSAs
 
-`tools/convert_ui.py::read_game_file` reads a loose file before any archive —
+`tools/misc/convert_ui.py::read_game_file` reads a loose file before any archive —
 the games' own order. A user running DarNified UI has edited `menus\*.xml`
 sitting loose in `Data`, and reading the BSA instead would convert vanilla's
 layout while their screen showed something else. Any value that cannot be read

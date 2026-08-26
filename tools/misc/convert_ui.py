@@ -14,11 +14,11 @@ producing one shared artefact.
     output/Finished Mods/Oblivion UI.zip            installable, Data-rooted
 
 Usage:
-  python tools/convert_ui.py
-  python tools/convert_ui.py --output-dir PATH
-  python tools/convert_ui.py --keep-divider --keep-marker
-  python tools/convert_ui.py --oblivion-data PATH --skyrim-data PATH
-  python tools/convert_ui.py --preview            # + a PNG of the frame
+  python tools/misc/convert_ui.py
+  python tools/misc/convert_ui.py --output-dir PATH
+  python tools/misc/convert_ui.py --keep-divider --keep-marker
+  python tools/misc/convert_ui.py --oblivion-data PATH --skyrim-data PATH
+  python tools/misc/convert_ui.py --preview            # + a PNG of the frame
 
 What lands in the archive is ONE file. That is the point: a UI mod that
 replaces a single movie conflicts with exactly the mods that replace that same
@@ -34,7 +34,9 @@ import sys
 import zipfile
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent.parent
+# tools/misc/<this file> -> three levels up is the repo root, the same reach
+# every other relocated tool uses.
+SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from asset_convert import ui_menus                       # noqa: E402

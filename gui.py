@@ -4483,7 +4483,7 @@ def gui_main():
 
         if key == "convert_ui":
             cmd = [sys.executable, "-u",
-                   str(SCRIPT_DIR / "tools" / "convert_ui.py")]
+                   str(SCRIPT_DIR / "tools" / "misc" / "convert_ui.py")]
             if out_dir:
                 cmd += ["--output-dir", out_dir]
             return cmd
@@ -4582,8 +4582,7 @@ def gui_main():
             return finished / "TESGameSelect.zip"
         if key == "convert_ui":
             # The mod name is spelled once, in the tool that produces it.
-            sys.path.insert(0, str(SCRIPT_DIR / "tools"))
-            from convert_ui import MOD_NAME as UI_MOD_NAME
+            from tools.misc.convert_ui import MOD_NAME as UI_MOD_NAME
             return finished / f"{UI_MOD_NAME}.zip"
         if key == "modify_body_meshes":
             return finished / "Slot44 Patch.esp"
@@ -4635,8 +4634,7 @@ def gui_main():
             # menus\*.xml) or patching either game invalidates this and
             # nothing else does. A handful of stats, because every global
             # stamp runs before the window first paints.
-            sys.path.insert(0, str(SCRIPT_DIR / "tools"))
-            from convert_ui import MESSAGE_BOX_SWF, find_data_dirs
+            from tools.misc.convert_ui import MESSAGE_BOX_SWF, find_data_dirs
             from asset_convert import ui_menus as _ui
             ob_dir, sk_dir = find_data_dirs()
             wanted = [(ob_dir, _ui.MESSAGE_MENU_XML),
