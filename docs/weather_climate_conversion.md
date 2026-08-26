@@ -595,7 +595,7 @@ Clouds=3 `BSSM_SKY_CLOUDS`). This does not change how NAM0 is consumed.
 
 `WTHR.HNAM` is 14 floats. TES-Reloaded names them and the CS wiki gives the
 semantics (`cs.uesp.net/wiki/HDR_Settings` — 403s to WebFetch, reachable via
-`tools/uesp_lookup.py`):
+`tools/misc/uesp_lookup.py`):
 
 ```
 0 EyeAdaptSpeed  1 BlurRadius   2 BlurPasses    3 EmissiveMult
@@ -1061,7 +1061,7 @@ binary, with `static_assert`ed sizes). **No census, no vanilla percentile, no
 "vanilla writes X" appears in this section.** Where an earlier note in this doc
 claimed something from a census, this section supersedes it.
 
-Address Library IDs -> 1.6.659 RVAs (via `tools/address_lib.py`):
+Address Library IDs -> 1.6.659 RVAs (via `tools/disasm/address_lib.py`):
 
 | Function | ID | RVA |
 |---|---|---|
@@ -1611,7 +1611,7 @@ same FNAM numbers produce a different horizon because the geometry differs.
 drive `HDR%03i.pso`, a shader family that has no Skyrim counterpart. Until now
 this doc only had the FIELD NAMES for them. The compiled shaders live in
 `Data/Shaders/shaderpackage010.sdp` (and 011-019); disassembled with
-`tools/sdp_extract.py` + `tools/d3d9dis.py` + `tools/sky_dump.py`.
+`tools/disasm/sdp_extract.py` + `tools/disasm/d3d9dis.py`.
 
 ### The pass chain
 
@@ -2056,7 +2056,7 @@ vanilla 42.5 (4.55x, where no other slot exceeds 1.7x), and in Skyrim the
 sun's apparent brightness comes from the glare pass and the imagespace, not
 from this colour — so a near-white disc here is a pure bloom source.
 
-Chosen in game via `tools/make_sky_unjustified_esp.py` (variant `UJkneeSun`)
+Chosen in game via `tools/make_sky_unjustified_esp.py` (removed 2026-08-25; variant `UJkneeSun`)
 against `UJbase` / `UJraw` / `UJknee` / `UJkneeSoft` / `UJkneeHard` /
 `UJsunonly`.
 
@@ -2167,7 +2167,7 @@ L28  SkyrimCloudsFill       156 of 157       purpose-made WASH
 We have no strip or wash art, so those layers have nothing correct to put on
 them and are left empty.
 
-### In-game A/B (tools/make_sky_unjustified_esp.py)
+### In-game A/B (tools/make_sky_unjustified_esp.py, removed 2026-08-25)
 
 | variant | layers | result |
 |---|---|---|

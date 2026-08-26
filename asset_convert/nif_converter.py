@@ -228,7 +228,7 @@ NIF_FLAGS = 14  # Standard Skyrim NiAVObject flags (SelectiveUpdate bits 1-3)
 # STRING and the engine instantiates it BY NAME at load, so any type outside
 # this set rejects the entire NIF (Skyrim's red missing-mesh triangle).
 # Census of ~8,300 vanilla meshes (references/Skyrim Meshes) via
-# tools/nif_block_scan.py --histogram; NiFlipController and NiSourceTexture
+# tools/nif/nif_block_scan.py --histogram; NiFlipController and NiSourceTexture
 # appear ZERO times, which is what killed the four Oblivion gate meshes.
 _VANILLA_SEQ_CONTROLLERS = frozenset({
     'BSEffectShaderPropertyFloatController',
@@ -2746,7 +2746,7 @@ def _autoplay_ambient_sequences(root, stats=None):
     So: the authored Idle becomes AutoLoop and KEEPS its authored cycle type
     (all 116 Oblivion 'Idle' sequences are CYCLE_LOOP = 0), and a CLAMP clone
     named AutoPlay is added for the start state.  Read out of the running
-    engine (2026-08-18, arena spectator, `tools/game_bridge.py`): with AutoLoop
+    engine (2026-08-18, arena spectator, `tools/live/game_bridge.py`): with AutoLoop
     written as CLAMP the graph reached AutoLoopState and froze on the last
     frame; flipping the loaded sequence's cycleType to LOOP in memory and
     `sae AutoReset` made it loop indefinitely.

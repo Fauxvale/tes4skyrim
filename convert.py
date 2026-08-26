@@ -659,7 +659,7 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
     # on any problem the navmesh just regenerates as it always did.
     # Opt out with TESCONV_NO_CACHE_DOWNLOAD=1 (metered connections).
     try:
-        from tools.navmesh_cache import auto_install, NO_DOWNLOAD_ENV_VAR
+        from tools.navmesh.navmesh_cache import auto_install, NO_DOWNLOAD_ENV_VAR
         auto_install(file_name,
                      allow_download=os.environ.get(
                          NO_DOWNLOAD_ENV_VAR, '').strip().lower()
@@ -1116,7 +1116,7 @@ def phase_modify_body_meshes(tes5_data: str = None, plugins: list = None,
     """Add greaves partition to vanilla Skyrim character body NIFs, then
     generate ONE merged companion slot-44 patch covering `plugins`.
 
-    The patch (tools/patch_body_slots.py) is mandatory alongside the split
+    The patch (tools/creature/patch_body_slots.py) is mandatory alongside the split
     body meshes: without slot 44 on the NakedTorso ARMA the new lower-body
     skin partition never renders and naked thighs are invisible.
 
@@ -1129,7 +1129,7 @@ def phase_modify_body_meshes(tes5_data: str = None, plugins: list = None,
     """
     if not tes5_data:
         print("WARNING: Skyrim data path not found - slot-44 patch not "
-              "generated (run tools/patch_body_slots.py manually)")
+              "generated (run tools/creature/patch_body_slots.py manually)")
         return True
 
     plugins = plugins or ["Skyrim.esm"]
@@ -1157,7 +1157,7 @@ def phase_modify_body_meshes(tes5_data: str = None, plugins: list = None,
               "patch not generated")
         return True
 
-    patch_script = SCRIPT_DIR / "tools" / "patch_body_slots.py"
+    patch_script = SCRIPT_DIR / "tools" / "creature" / "patch_body_slots.py"
     ret = subprocess.run(
         [sys.executable, str(patch_script), *plugin_paths, "-o", str(out_path)],
         cwd=str(SCRIPT_DIR), capture_output=True, text=True, **_POPEN_FLAGS)
@@ -1599,7 +1599,7 @@ def _run_pipeline():
         print("=" * 54)
         print("  GENERATE LOD")
         print("=" * 54)
-        # Delegated to tools/create_lod.py, NOT looped per plugin.
+        # Delegated to tools/release/create_lod.py, NOT looped per plugin.
         #
         # LOD tiles are files on a fixed grid keyed only by worldspace and
         # coordinate, so every plugin editing a worldspace writes the same
@@ -1610,7 +1610,7 @@ def _run_pipeline():
         # narrow it to one plugin: there is one shared artefact, and building
         # it from a single plugin would be building it wrong.
         _cmd = [sys.executable, "-u",
-                str(SCRIPT_DIR / "tools" / "create_lod.py")]
+                str(SCRIPT_DIR / "tools" / "release" / "create_lod.py")]
         if output_dir:
             _cmd += ["--output-dir", str(output_dir)]
         ok = subprocess.call(_cmd) == 0

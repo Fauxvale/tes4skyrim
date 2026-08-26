@@ -47,8 +47,8 @@ SAFETY
 ------
 Only element types that are exactly N unconditional same-width components are
 backed this way; every other array keeps PyFFI's own storage untouched.  The
-contract is byte-equality, verified with ``tools/nif_perf.py --baseline`` and
-``tools/nif_determinism.py``.  Toggle with ``TESCONV_NO_GEOM_ARRAY=1``.
+contract is byte-equality, verified with ``tools/nif/nif_perf.py --baseline`` and
+``tools/nif/nif_determinism.py``.  Toggle with ``TESCONV_NO_GEOM_ARRAY=1``.
 """
 
 import operator

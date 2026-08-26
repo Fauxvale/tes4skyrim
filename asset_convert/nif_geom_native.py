@@ -39,7 +39,7 @@ asking PyFFI for the filtered list after each count/flag field is assigned,
 rather than resolving the whole layout up front.
 
 Toggle with ``TESCONV_NO_NATIVE_GEOM=1``.  Byte-equality is the contract:
-verify with ``python tools/nif_perf.py --baseline ...``.
+verify with ``python tools/nif/nif_perf.py --baseline ...``.
 """
 
 import os

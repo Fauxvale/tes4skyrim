@@ -1,5 +1,5 @@
 """
-Tests for tools/oblivion_to_papyrus.py — TES4 script → Papyrus conversion.
+Tests for script_convert/ — TES4 script → Papyrus conversion.
 """
 
 import os

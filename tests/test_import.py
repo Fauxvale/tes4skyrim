@@ -985,7 +985,7 @@ class TestDoorSounds:
     xEdit: wbFormIDCk(SNAM, 'Sound - Open', [SNDR]); Skyrim.esm agrees —
     WRDragonSideDoor01's SNAM 0005AFC9 is the SNDR DRSWoodImperialDouble01OpenSD.
     Doors are written in Phase 1, before the descriptors exist, so the SOUN id
-    is a placeholder that patch_door_sounds resolves.
+    is a placeholder that patch_sound_descriptor_slots resolves.
     """
 
     @staticmethod
@@ -1019,12 +1019,13 @@ class TestDoorSounds:
 
     def test_slots_resolve_to_descriptors(self):
         from tes5_import.record_types import dialog_misc
-        from tes5_import.record_types.items import patch_door_sounds
+        from tes5_import.record_types.items import patch_sound_descriptor_slots
         dialog_misc.reset_sound_descriptors()
         dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
         dialog_misc.record_sndr_for_soun(0x0105C424, 0x01190F01)
         w = self._Writer([self._door('D', SNAM=0x0105C423, ANAM=0x0105C424)])
-        assert patch_door_sounds(w, {0x05C423, 0x05C424}) == 1
+        assert patch_sound_descriptor_slots(
+            w, 'DOOR', {0x05C423, 0x05C424}) == 1
         assert self._slots(w._top_groups['DOOR'][0]) == {
             'SNAM': 0x01190F00, 'ANAM': 0x01190F01}
 
@@ -1032,11 +1033,12 @@ class TestDoorSounds:
         """A SOUN with no FNAM mints no SNDR; a slot pointing at the SOUN
         would be a wrong-typed reference, so it goes."""
         from tes5_import.record_types import dialog_misc
-        from tes5_import.record_types.items import patch_door_sounds
+        from tes5_import.record_types.items import patch_sound_descriptor_slots
         dialog_misc.reset_sound_descriptors()
         dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._door('D', SNAM=0x0105C423, BNAM=0x0105C425)])
-        assert patch_door_sounds(w, {0x05C423, 0x05C425}) == 1
+        assert patch_sound_descriptor_slots(
+            w, 'DOOR', {0x05C423, 0x05C425}) == 1
         assert self._slots(w._top_groups['DOOR'][0]) == {'SNAM': 0x01190F00}
 
     def test_master_override_slots_untouched(self):
@@ -1044,23 +1046,23 @@ class TestDoorSounds:
         whose slots already name the MASTER's SNDRs. Rewriting or dropping
         those would strip door sound out of every dependent plugin."""
         from tes5_import.record_types import dialog_misc
-        from tes5_import.record_types.items import patch_door_sounds
+        from tes5_import.record_types.items import patch_sound_descriptor_slots
         dialog_misc.reset_sound_descriptors()
         dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._door('M', SNAM=0x00190AAA, ANAM=0x00190AAB)])
-        assert patch_door_sounds(w, {0x05C423}) == 0
+        assert patch_sound_descriptor_slots(w, 'DOOR', {0x05C423}) == 0
         assert self._slots(w._top_groups['DOOR'][0]) == {
             'SNAM': 0x00190AAA, 'ANAM': 0x00190AAB}
 
     def test_patch_is_idempotent(self):
         from tes5_import.record_types import dialog_misc
-        from tes5_import.record_types.items import patch_door_sounds
+        from tes5_import.record_types.items import patch_sound_descriptor_slots
         dialog_misc.reset_sound_descriptors()
         dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._door('D', SNAM=0x0105C423)])
-        assert patch_door_sounds(w, {0x05C423}) == 1
+        assert patch_sound_descriptor_slots(w, 'DOOR', {0x05C423}) == 1
         first = w._top_groups['DOOR'][0]
-        assert patch_door_sounds(w, {0x05C423}) == 0
+        assert patch_sound_descriptor_slots(w, 'DOOR', {0x05C423}) == 0
         assert w._top_groups['DOOR'][0] == first
 
     def test_mesh_authored_sound_fills_empty_slots(self):
@@ -1108,8 +1110,8 @@ class TestLightSoundDescriptors:
     non-pointer into the audio manager's emitter table and BSAudioManagerThread
     faults dereferencing it (`mov ecx, [r8+0x48]`), so every lit torch in the
     plugin arms an audio-thread crash. Lights are written in Phase 1, before the
-    descriptors exist, so the SOUN id is a placeholder patch_light_sounds
-    resolves.
+    descriptors exist, so the SOUN id is a placeholder
+    patch_sound_descriptor_slots resolves.
     """
 
     @staticmethod
@@ -1141,11 +1143,11 @@ class TestLightSoundDescriptors:
 
     def test_snam_resolves_to_descriptor(self):
         from tes5_import.record_types import dialog_misc
-        from tes5_import.record_types.items import patch_light_sounds
+        from tes5_import.record_types.items import patch_sound_descriptor_slots
         dialog_misc.reset_sound_descriptors()
         dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._light('L', snam=0x0105C423)])
-        assert patch_light_sounds(w, {0x05C423}) == 1
+        assert patch_sound_descriptor_slots(w, 'LIGH', {0x05C423}) == 1
         assert self._snam(w._top_groups['LIGH'][0]) == 0x01190F00
 
     def test_slot_without_descriptor_is_dropped(self):
@@ -1153,10 +1155,10 @@ class TestLightSoundDescriptors:
         SOUN is exactly the wrong-typed reference that crashes the audio
         thread, so the slot goes instead."""
         from tes5_import.record_types import dialog_misc
-        from tes5_import.record_types.items import patch_light_sounds
+        from tes5_import.record_types.items import patch_sound_descriptor_slots
         dialog_misc.reset_sound_descriptors()
         w = self._Writer([self._light('L', snam=0x0105C425)])
-        assert patch_light_sounds(w, {0x05C425}) == 1
+        assert patch_sound_descriptor_slots(w, 'LIGH', {0x05C425}) == 1
         assert self._snam(w._top_groups['LIGH'][0]) is None
 
     def test_master_owned_soun_resolves_via_master(self):
@@ -1164,40 +1166,42 @@ class TestLightSoundDescriptors:
         SOUN the plugin never overrides. Without the master lookup the largest
         group of lights would lose its ambience — master-export blindness."""
         from tes5_import.record_types import dialog_misc
-        from tes5_import.record_types.items import patch_light_sounds
+        from tes5_import.record_types.items import patch_sound_descriptor_slots
         dialog_misc.reset_sound_descriptors()
         w = self._Writer([self._light('L', snam=0x01085837)])
-        assert patch_light_sounds(
-            w, set(), lambda fid: 0x0158689D if fid == 0x01085837 else 0) == 1
+        assert patch_sound_descriptor_slots(
+            w, 'LIGH', set(),
+            lambda fid: 0x0158689D if fid == 0x01085837 else 0) == 1
         assert self._snam(w._top_groups['LIGH'][0]) == 0x0158689D
 
     def test_master_override_slot_untouched(self):
         """An override build's LIGH group also holds the master's converted
         records, whose SNAM already names the MASTER's SNDR."""
         from tes5_import.record_types import dialog_misc
-        from tes5_import.record_types.items import patch_light_sounds
+        from tes5_import.record_types.items import patch_sound_descriptor_slots
         dialog_misc.reset_sound_descriptors()
         dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._light('M', snam=0x0058689D)])
-        assert patch_light_sounds(w, {0x05C423}, lambda fid: 0) == 0
+        assert patch_sound_descriptor_slots(
+            w, 'LIGH', {0x05C423}, lambda fid: 0) == 0
         assert self._snam(w._top_groups['LIGH'][0]) == 0x0058689D
 
     def test_patch_is_idempotent(self):
         from tes5_import.record_types import dialog_misc
-        from tes5_import.record_types.items import patch_light_sounds
+        from tes5_import.record_types.items import patch_sound_descriptor_slots
         dialog_misc.reset_sound_descriptors()
         dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._light('L', snam=0x0105C423)])
-        assert patch_light_sounds(w, {0x05C423}) == 1
+        assert patch_sound_descriptor_slots(w, 'LIGH', {0x05C423}) == 1
         first = w._top_groups['LIGH'][0]
-        assert patch_light_sounds(w, {0x05C423}) == 0
+        assert patch_sound_descriptor_slots(w, 'LIGH', {0x05C423}) == 0
         assert w._top_groups['LIGH'][0] == first
 
     def test_light_without_sound_untouched(self):
-        from tes5_import.record_types.items import patch_light_sounds
+        from tes5_import.record_types.items import patch_sound_descriptor_slots
         w = self._Writer([self._light('L')])
         first = w._top_groups['LIGH'][0]
-        assert patch_light_sounds(w, {0x05C423}) == 0
+        assert patch_sound_descriptor_slots(w, 'LIGH', {0x05C423}) == 0
         assert w._top_groups['LIGH'][0] == first
 
 
@@ -4980,7 +4984,7 @@ class TestWeatherImageSpace:
 class TestVanillaMgefDataSize:
     """The vanilla MGEF DATA table must hold FULL 152-byte structs.
 
-    tools/gen_vanilla_mgef_table.py used to read the Skyrim.esm dump with
+    tools/generators/gen_vanilla_mgef_table.py used to read the Skyrim.esm dump with
     `line.split('...')[0]`, and the dump truncated hex at 96 bytes — so every
     committed blob was 96 bytes and every synthesized aimed-variant MGEF
     shipped a DATA missing its last 14 fields (HitEffectArt, ImpactData,

@@ -846,8 +846,8 @@ def test_migration_puts_records_where_the_resolver_looks(tmp_path, label, plugs)
     missing -- no error, just an empty export.
     """
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
-    from migrate_group_layout import migrate
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from tools.esm.migrate_group_layout import migrate
 
     exp = _legacy_layout(tmp_path, label, plugs)
     migrate(exp, apply=True, log=lambda *a: None)

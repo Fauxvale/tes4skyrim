@@ -2,7 +2,7 @@
 
 ## ✅ DIAGNOSED (2026-08-22, second session) — it is a CRASH, not a deadlock
 
-`tools/win_stackwalk.py --watch` captured the live process at
+`tools/live/win_stackwalk.py --watch` captured the live process at
 `phase at capture: 'Initializing References...'`. Three facts settled it:
 
 1. **The main thread is in `Sleep`, not a kernel wait.** Its innermost frames
@@ -58,7 +58,7 @@ authored indicator, and where Oblivion would have put the player anyway. The
 index behind it is built master-aware in `_build_teleport_grid`
 (`import_main.py`) and plumbed to the conversion pool in `convert_worker.py`.
 
-**Guard:** `python tools/cell_grid_check.py <esm> --teleport-cells` — 1 hit
+**Guard:** `python tools/validate/cell_grid_check.py <esm> --teleport-cells` — 1 hit
 before the fix, 0 after; exits non-zero so it can gate a build.
 
 🛑 **Not yet confirmed in the CK.** The rebuilt ESM passes both new gates, but
@@ -92,7 +92,7 @@ Two things changed since the section below was written.
    at load.** See "Top-level group order" below. Independent of the hang, and
    fixed.
 2. **Stack scanning has been replaced by real unwinding.**
-   `python tools/win_stackwalk.py --watch` walks every thread through
+   `python tools/live/win_stackwalk.py --watch` walks every thread through
    DbgHelp `StackWalk64` (`.pdata` unwind tables, the same mechanism Windows
    SEH uses), so its frames are facts rather than candidates, and exported
    names resolve without PDBs. `--watch` is unattended: start it, launch CK,
@@ -146,7 +146,7 @@ Fix: `MSTT`, `LTEX` and `PROJ` pinned at their vanilla slots in
 `tes5_import/writer.py`'s `_group_order()`; `WATR`, `FLST`, `MOVT` pinned too
 so the layout no longer depends on the order groups happened to be added in.
 
-Guard: `python tools/esm_group_anchors.py <esm> --order-only` fails the build
+Guard: `python tools/validate/esm_group_anchors.py <esm> --order-only` fails the build
 on any signature vanilla places before `CELL` that we place after it. It
 reproduced all three on the pre-fix output and passes on vanilla.
 
@@ -160,10 +160,10 @@ Edition\CreationKit.exe` 1.7.99.0). The *structure* they describe is right and
 worth keeping, but re-derive the addresses against
 `SkyrimVR\CreationKit.exe` 1.5.73.0 before using any of them — the entry
 points are found the same way, via
-`python tools/ck_strref.py --exe <ck> --pattern 'Initializing References'`.
+`python tools/disasm/ck_strref.py --exe <ck> --pattern 'Initializing References'`.
 
 RVAs are `CreationKit.exe` 1.7.99.0, imagebase `0x140000000`. Dump any of
-these with `python tools/skyrim_disasm.py --exe <CreationKit.exe> --func <rva>`
+these with `python tools/disasm/skyrim_disasm.py --exe <CreationKit.exe> --func <rva>`
 — it prints the whole function from its `.pdata` bounds and annotates every
 `lea reg,[rip+X]` with the string it points at.
 
@@ -207,7 +207,7 @@ cells sit at grid `(-345,-3)`, outside CK's ±100 range — one each in
 `E3Kvatch`, `KvatchPlaza` and `KvatchEntrance`. `XCLC.X=-345` is in the TES4
 export as well, so this is authored Bethesda leftover data carried through
 faithfully, not a conversion defect; CK logs and moves on. Find them again
-with `python tools/cell_grid_check.py <esm> --extents`.
+with `python tools/validate/cell_grid_check.py <esm> --extents`.
 
 ## Status
 
@@ -241,7 +241,7 @@ text), CPU/IO both flatline at ~0 (genuine deadlock, not slow processing).
 
 ## Live-hang diagnostic methodology (SUPERSEDED — history only)
 
-🛑 Do not repeat this. `tools/win_stackwalk.py` does the same job with real
+🛑 Do not repeat this. `tools/live/win_stackwalk.py` does the same job with real
 unwinding instead of stack scanning; see the top of this file. Kept because
 the window-text and CPU/IO sampling tricks below are still how you tell a
 hang from slow work.
@@ -289,14 +289,14 @@ xEdit is a separate tool. Useful for TES4/5 binary format questions only.)
    `target_rva = insn_rva + insn_len + disp` (stays in RVA-space throughout,
    the imagebase cancels out — don't re-subtract it, that was a bug in the
    first draft of this) and match against `imp.address - ImageBase`.
-6. **Find CK's own message strings**: `tools/ck_strref.py --exe <CreationKit.exe>
+6. **Find CK's own message strings**: `tools/disasm/ck_strref.py --exe <CreationKit.exe>
    --pattern <regex>` — indexes every rip-relative `.text` reference to a
    matching `.rdata` string in one pass. This is how the exact source of the
    "should be refinalized" message (and 3 sibling "Bad portal navmesh
    ID/triangle index... needs to be refinalized" messages) was found. The
    printed hex is the **referencing instruction's** RVA, not the string's
    own address.
-7. **Disassemble at an RVA**: `tools/skyrim_disasm.py --exe <path> --disasm
+7. **Disassemble at an RVA**: `tools/disasm/skyrim_disasm.py --exe <path> --disasm
    <rva> --count N` (works against any PE, not just SkyrimSE.exe despite the
    name — pass `--exe` to override). `CreationKit.exe` is **not**
    DRM-packed (unlike the Steam SkyrimSE.exe), disassembles fine statically.
@@ -333,7 +333,7 @@ not a one-off.)
    — the same source `convert_STAT`/`convert_TREE` use for their own
    OBND/LOD-flag decisions) and force the Persistent flag when the ref sits
    within that radius of a cell edge. **74,444 refs forced persistent.**
-   Verified structurally sound (`tools/verify_ck_fixes.py` — XLCN-vs-location
+   Verified structurally sound (`tools/validate/verify_ck_fixes.py` — XLCN-vs-location
    check still passes).
 
 2. **Re-homing didn't cover persistent refs, and didn't fix `ParentCELL`**
@@ -404,7 +404,7 @@ not a one-off.)
   with reused STAT bases, so left it `false` rather than keep it "just in
   case". Total refs in our output alone: **1,029,315** (REFR 1,017,647 +
   ACHR 11,668) — big, but the flag made no measurable difference either way.
-- **Structural corruption in our own output**: `tools/verify_ck_fixes.py`
+- **Structural corruption in our own output**: `tools/validate/verify_ck_fixes.py`
   passes (only known-benign fail: `NAVI` at `0x00012fb4`, a deliberate
   low-FormID singleton per `navi_builder.py`, not a real override). Checked
   and ruled out separately: XESP/XLKR/LCTN-PNAM cycles or dangling targets

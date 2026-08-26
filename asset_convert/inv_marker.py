@@ -8,7 +8,7 @@ are milliradians and the engine composes them as
     M_game = Rx(-rx/1000) @ Ry(-ry/1000) @ Rz(-rz/1000)
 
 (column-vector convention).  This was derived empirically with
-tools/inv_marker_survey.py: across vanilla Skyrim meshes that convention
+tools/inv_marker_survey.py (removed 2026-08-25): across vanilla Skyrim meshes that convention
 turns each mesh's largest-visible-area side toward +Y with mean alignment
 0.97+ (and reproduces vanilla markers exactly on the canonical cases:
 ironshield.nif (4712,0,0), cuirassgnd (1570,0,0), iron weapons Rx=4712).

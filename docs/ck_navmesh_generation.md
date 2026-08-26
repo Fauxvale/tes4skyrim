@@ -23,9 +23,9 @@ plus a fully-named progress log for every generation pass. Static analysis is
 easy; most of what follows was read straight out of strings + the settings
 initializers.
 
-Tools added for this: `tools/ck_settings_dump.py` (recovers compiled-in INI
-defaults) and `tools/ck_strref.py` (indexes rip-relative references from `.text`
-to a set of strings in one pass). `tools/skyrim_disasm.py` takes `--exe` and
+Tools added for this: `tools/disasm/ck_settings_dump.py` (recovers compiled-in INI
+defaults) and `tools/disasm/ck_strref.py` (indexes rip-relative references from `.text`
+to a set of strings in one pass). `tools/disasm/skyrim_disasm.py` takes `--exe` and
 works on the CK unchanged.
 
 ## The headline finding: there are THREE generators

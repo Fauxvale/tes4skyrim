@@ -19,10 +19,10 @@ repeat the root's UNAM index list verbatim, then the root's XNAM value.  Getting
 the order wrong feeds e.g. "max radius" into "min radius" silently.
 
 Every table below was dumped from real Skyrim.esm records with
-tools/pack_template_dump.py — do not hand-edit.  Regenerate with:
+tools/esm/pack_template_dump.py — do not hand-edit.  Regenerate with:
 
-    python -m tools.pack_template_dump --list
-    python -m tools.pack_template_dump Travel Sandbox Eat Sleep ...
+    python -m tools.esm.pack_template_dump --list
+    python -m tools.esm.pack_template_dump Travel Sandbox Eat Sleep ...
 
 `inputs` gives each slot's ANAM type string; `defaults` gives the value a vanilla
 instance supplies when we have no TES4 data for that slot (taken from a real

@@ -4,7 +4,7 @@
 **Question:** Nehrim relies on OBSE. For a *faithful* conversion of its scripts, which OBSE (and Skyrim-removed vanilla-Oblivion) functions are **actually used**, and for each, is a faithful Skyrim conversion possible with **vanilla Papyrus**, only with **SKSE**, or **not at all**?
 
 **Method (grep-based, reading the ORIGINAL source):**
-1. **What is actually used** — extracted every function token invoked in the original Oblivion script source: `SCPT.SCTX` + `INFO.ResultScript` in `export/Nehrim.esm` (2,415 script bodies). Tool: `tools/obse_convertibility_audit.py`.
+1. **What is actually used** — extracted every function token invoked in the original Oblivion script source: `SCPT.SCTX` + `INFO.ResultScript` in `export/Nehrim.esm` (2,415 script bodies). Tool: `tools/audit/obse_convertibility_audit.py`.
 2. **Is it OBSE-added?** — a token counts as OBSE only if it appears in the xOBSE command set (`DEFINE_COMMAND*` / `CommandInfo kCommandInfo_*` across `references/xOBSE-master/`; 1,567 names) or is an OBSE compiler keyword (`Let`/`eval`/`Call`/`Function`/`ForEach`/`SetFunctionValue`/`loop`). Everything else used in the scripts is vanilla Oblivion.
 3. **Does SKSE provide it?** — grepped every Papyrus native SKSE registers (`NativeFunctionN(...)` across `references/skse64-master/skse64/Papyrus*.cpp`; 644 names). Name-matching is a starting point; the per-function verdict below maps OBSE *capability* → best Skyrim target (OBSE and SKSE often name the same capability differently).
 4. **Does the converter already target it?** — grepped `script_convert/constants.py` + `converter.py`.
@@ -111,12 +111,12 @@ These ~200+ scripts are inert for engine-semantic reasons. **No amount of SKSE c
 
 ```bash
 # The grounded per-function audit (this document's numbers):
-python tools/obse_convertibility_audit.py export/Nehrim.esm
+python tools/audit/obse_convertibility_audit.py export/Nehrim.esm
 
 # Raw usage of the Skyrim-removed vanilla commands (music/flames/weather/etc.):
-python tools/nehrim_script_command_census.py export/Nehrim.esm --grep \
+python tools/script/script_command_census.py export/Nehrim.esm --grep \
     streammusic emc hasflames addflames removeflames forceweather setweather \
     moddisposition getcurrentaipackage getcurrentaiprocedure positioncell
 ```
 
-`tools/obse_convertibility_audit.py` builds the OBSE-name set from xOBSE source and the SKSE-native set from skse64 source at run time, so re-running picks up any reference-tree changes.
+`tools/audit/obse_convertibility_audit.py` builds the OBSE-name set from xOBSE source and the SKSE-native set from skse64 source at run time, so re-running picks up any reference-tree changes.

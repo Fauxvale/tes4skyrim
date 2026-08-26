@@ -557,7 +557,7 @@ def _delivery_and_cast(t4_flags: int) -> tuple:
 # --- Projectile resolution ------------------------------------------------
 # An Aimed magic item MUST reach a non-null Projectile through at least one of
 # its effects or the engine null-derefs.  The chain, read out of the GOG 1.6.659
-# exe (crash frames translated by tools/address_lib.py):
+# exe (crash frames translated by tools/disasm/address_lib.py):
 #
 #   MagicItem::GetCostliestEffectItem  (0x10c9f0)
 #       calls GetDelivery (EnchantmentItem vtable +0x2b8 -> `mov eax,[rcx+0xa0]`)

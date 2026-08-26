@@ -1,6 +1,6 @@
 # Magic Conversion: Analysis and Path to Completion
 
-Status as of 2026-07-31. Measured with `python tools/magic_audit.py export/<Plugin>`
+Status as of 2026-07-31. Measured with `python tools/audit/magic_audit.py export/<Plugin>`
 (written alongside this doc; re-run it after every change in this area).
 
 **Phase 1 is DONE (2026-07-31).** `MGEF` is a converted record type
@@ -92,16 +92,16 @@ game actually uses fall through to 0. `BACU` (Bound Cuirass, 8 uses) is
 unmapped while the phantom `BACT` is mapped.
 
 **Every new entry must be validated against `export/*/MGEF.txt`**, not against
-a name. `tools/magic_audit.py` reports phantom keys.
+a name. `tools/audit/magic_audit.py` reports phantom keys.
 
 ### 3. ~~The vanilla DATA blobs are truncated — 96 bytes where 152 are required~~ — FIXED 2026-07-25
 
 `tes5_import/vanilla_mgef_data.py` claimed "152-byte DATA hex" in its
 docstring. Every one of its 80 blobs was **96 bytes**.
 
-Cause: `tools/gen_vanilla_mgef_table.py:read_dump` did
+Cause: `tools/generators/gen_vanilla_mgef_table.py:read_dump` did
 `line[9:].split('...')[0]`, and the generic hex fallback in the dump writer
-truncates at 192 chars (`tools/tes5_esm_reader.py`) — so the `...` split
+truncates at 192 chars (`tools/esm/tes5_esm_reader.py`) — so the `...` split
 silently discarded the tail instead of failing.
 
 Consequence: every MGEF synthesized by `magic_effects.aimed_variant()` was
@@ -148,7 +148,7 @@ prerequisite for everything after it.
 
 ### Phase 0 — Fix the truncated DATA table (prerequisite) — DONE 2026-07-25
 
-1. **Typed MGEF DATA decoder** (`_dec_mgef_data` in `tools/tes5_esm_reader.py`,
+1. **Typed MGEF DATA decoder** (`_dec_mgef_data` in `tools/esm/tes5_esm_reader.py`,
    registered as `('MGEF', 'DATA')`). It emits the hex **untruncated** plus all
    38 named fields with the archetype enum resolved, so the dump is both
    lossless for the generator and readable for analysis. Adding a typed decoder
@@ -238,7 +238,7 @@ Two defects surfaced while verifying and were fixed in the same pass:
   copying the ENCH's effect list onto it (SCRL carries its effects directly),
   and `import_main` files each record by the signature its own bytes carry
   rather than by a per-signature `TYPE_MAP` entry.
-- **`tools/tes5_esm_reader.py` had EFIT Area/Duration swapped**, which made
+- **`tools/esm/tes5_esm_reader.py` had EFIT Area/Duration swapped**, which made
   every dump of a converted spell look wrong. TES5 EFIT is Magnitude, **Area**,
   **Duration** (xEdit `wbEFIT`); settled by census — all **427 vanilla ALCH
   effects** write 0 at offset 4 and 30/60/300/720 at offset 8, which are potion
@@ -248,7 +248,7 @@ Two defects surfaced while verifying and were fixed in the same pass:
 15 (Lock), 16 (Open) or 24 (Turn Undead), so a census cannot license them.
 They are legal anyway: `DispelEffect`, `LockEffect`, `OpenEffect` and
 `TurnUndeadEffect` are all present in SkyrimSE.exe as RTTI classes with real
-vtables and constructors (read via `tools/skyrim_disasm.py --find Effect`
+vtables and constructors (read via `tools/disasm/skyrim_disasm.py --find Effect`
 against the GOG build). Don't "fix" them back to a value modifier.
 
 Original field-derivation sketch, still accurate:
@@ -560,7 +560,7 @@ consumer of `vanilla_mgef_data.py`).
 - Never introduce a null `EFID` — it crashes the inventory menu as soon as the
   item card is shown. That constraint is why filler effects exist and it
   survives this plan.
-- Re-run `python tools/magic_audit.py export/Oblivion.esm` **and**
+- Re-run `python tools/audit/magic_audit.py export/Oblivion.esm` **and**
   `export/Nehrim.esm` after each change; Nehrim exercises 16 mod-authored
   effect codes (`BA01`–`BA10`, `BW09`, `BW10`, `DISE`, `DUMY`, `RSWD`, `Z020`)
   that Oblivion does not, and its strings are German (the tool forces UTF-8

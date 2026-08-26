@@ -164,7 +164,7 @@ indexes existed only in the scan, so `TES4_MG17Script.psc` referenced six
 `Package` properties and its VMAD declared 25 properties, none of them packages.
 
 **Rule: anything added to `_scan_record_lines` must be mirrored into
-`import_main`'s hand-built graph.** Verify with `tools/vmad_probe.py <esm>
+`import_main`'s hand-built graph.** Verify with `tools/script/vmad_probe.py <esm>
 <script> --props` — compare the bound set against the `.psc` declarations, and
 never assume a correct-looking `.psc` means the binding happened.
 
@@ -504,7 +504,7 @@ bindings reported all-clear while every object script was broken.
   threw on the first tick and no TG rank ever advanced.
 - **General rule: a record the importer synthesizes needs an explicit binding
   route in EVERY VMAD binder.** The export-derived EditorID map cannot see it.
-  Check with `python tools/vmad_probe.py <esm> <script> --props` — a property the
+  Check with `python tools/script/vmad_probe.py <esm> <script> --props` — a property the
   `.psc` declares but the probe does not list is unbound.
 
 ### An early `return` killed the OnUpdate poll (2026-07-31)
@@ -1047,7 +1047,7 @@ engine.**
   it in 2026-08-14 shifted every beat).
 * **Diagnostics are built in.** Every SayLine / LineBegan / LineEnded writes
   a `TES4Say …` `Debug.Trace` with real-time stamps; `python
-  tools/say_trace_stats.py` turns the Papyrus log into Say→Begin latency,
+  tools/dialog/say_trace_stats.py` turns the Papyrus log into Say→Begin latency,
   End overhead vs measured length (what SAY_TAIL must cover), pre-waits,
   drops and the dead-air gap between lines. Read those before touching the
   tail.
@@ -1643,7 +1643,7 @@ identifier and fails the CHECKER. Added 2026-08-22:
   every `< 0.1` "still transitioning" test permanently true.
 - `isplayerslastriddenhorse` — the other authored spelling of
   `GetPlayerHasLastRiddenHorse` (both are engine function `0x1153`, confirmed via
-  `tools/uesp_lookup.py`). No Skyrim equivalent; neutralised to `0` with an
+  `tools/misc/uesp_lookup.py`). No Skyrim equivalent; neutralised to `0` with an
   `;NE:` marker.
 
 ## A raw FormID in a FORM-ARGUMENT slot is never a numeric literal

@@ -24,9 +24,9 @@ The param-type table is GENERATED from xEdit's `wbConditionFunctions` array,
 never hand-written:
 
 ```bash
-python tools/gen_ctda_param_types.py <path>/wbDefinitionsTES5.pas \
+python tools/generators/gen_ctda_param_types.py <path>/wbDefinitionsTES5.pas \
     -o tes5_import/ctda_param_types.py
-python tools/gen_ctda_param_types.py <path>/wbDefinitionsTES5.pas --func N
+python tools/generators/gen_ctda_param_types.py <path>/wbDefinitionsTES5.pas --func N
 ```
 
 Everything before `ptActor` in xEdit's `TConditionParameterType` enum is a value,

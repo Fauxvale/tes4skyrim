@@ -192,7 +192,7 @@ reorders triangles, so indices captured before it stay valid.
 Which local axis a door's threshold runs along decides the whole quad's
 orientation. It is read from the door's **collision panel** — the body the
 engine collides with — in `asset_convert.collision_extract.door_panel_axis_from_data`,
-cached to `door_panel_axis_cache.json` by `tools/build_door_axis_cache.py`:
+cached to `door_panel_axis_cache.json` by `tools/generators/build_door_axis_cache.py`:
 
 > A door panel is thin THROUGH the opening and wide ACROSS it. The panel's thin
 > horizontal axis is the swing direction; the wide one is the threshold.
@@ -471,7 +471,7 @@ function of the door, computed in `corridor_doors` and passed through
   `(cos rz, −sin rz)`.
 * **The door cache measures the ORIGINAL NIF at the CLOSED pose**
   (`asset_convert.collision_extract.door_closed_geometry`, built by
-  `tools/build_door_axis_cache.py` from `export/<plugin>/meshes`; the
+  `tools/generators/build_door_axis_cache.py` from `export/<plugin>/meshes`; the
   converted-mesh scan no longer writes it).  The 'Close' controller
   sequence's FINAL key values override the animated nodes, and the union
   bbox of the KEYED shapes — the door leaf/leaves, never frames or static
@@ -726,7 +726,7 @@ can never cross a cell boundary, so any AI package with an out-of-cell
 destination starts (the actor stands up, plays its en-route dialogue) and then
 never moves. This is game-wide AI breakage — it was found while chasing
 "Pinarus/Arielle don't travel" after their PACK records were proven clean by
-`tools/pack_validate.py`. Geometry is fine: the destination cell's mesh
+`tools/esm/pack_validate.py`. Geometry is fine: the destination cell's mesh
 (`AnvilWest02`, grid -48,-7) has 1,304 verts / 1,959 tris and **does** cover the
 target marker point — it just connects to nothing.
 
@@ -952,7 +952,7 @@ missing (x,y) whose four neighbours all exist):
 
 Holes are legal in general; a hole at (0,0) is the signature of this bug.
 Guarded by `tests/test_import.py::TestGridlessWorldspaceCellPlacement` and
-checkable with `tools/cell_grid_check.py --holes`.
+checkable with `tools/validate/cell_grid_check.py --holes`.
 
 ### 🔴 The texture PRUNE must speak the importer's paths (2026-08-09)
 

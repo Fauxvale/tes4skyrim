@@ -311,8 +311,8 @@ def test_upgrade_plan_cannot_re_tick_packing_when_the_setting_is_off():
 
 def test_labels_match_release_notes_step_order():
     """The labels version.py maps are exactly the ones release_notes emits."""
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
-    import release_notes as rn
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    import tools.release.release_notes as rn
     assert [lbl for _k, lbl in v.STEP_KEYS] == rn.STEP_ORDER
 
 
@@ -867,8 +867,8 @@ def test_parser_agrees_with_what_release_notes_actually_writes(monkeypatch):
     read as "unknown" and select all twelve steps.  Build a real notes body and
     round-trip it.
     """
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
-    import release_notes as rn
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    import tools.release.release_notes as rn
 
     steps = ["3. Meshes", "8. Scripts"]
     monkeypatch.setattr(rn, "commits_between", lambda a, b: [("abc1234", "x")])

@@ -121,7 +121,7 @@ respectively. Using them instead of Sandbox is what makes an Oblivion innkeeper'
 "eat at 8pm in the tavern" actually read as eating rather than milling around.
 
 **Step 0 of implementation is still to dump every root we intend to use and freeze
-its exact `UNAM`/`BNAM` signature** (`tools/pack_template_dump.py`). The tables in
+its exact `UNAM`/`BNAM` signature** (`tools/esm/pack_template_dump.py`). The tables in
 this document are a design aid, not the source of truth — inputs are positional.
 
 ### 1.4 Substructures
@@ -392,7 +392,7 @@ exist:
 
 Each step is independently testable; **do not batch them**.
 
-0. **Dump the template roots.** Write `tools/pack_template_dump.py` — given a
+0. **Dump the template roots.** Write `tools/esm/pack_template_dump.py` — given a
    template EditorID/FormID, print its `UNAM`/`BNAM`/`PNAM` signature, `XNAM`, and
    procedure tree from `references/Skyrim.esm/PACK.txt`. Freeze the results into
    `TEMPLATES` in `pack_converter.py`. **No table in this plan is a substitute for
@@ -580,7 +580,7 @@ field, not to the storage type's range (U8 0-255). The old code clamped to 255.
 
 Settled by disassembling the **GOG** (unencrypted) `SkyrimSE.exe` 1.6.659 — the
 Steam copy is Steam-DRM packed (`.text` entropy 8.00) and cannot be read
-statically. Use `tools/skyrim_disasm.py --exe "D:/Other Games/Skyrim Anniversary
+statically. Use `tools/disasm/skyrim_disasm.py --exe "D:/Other Games/Skyrim Anniversary
 Edition/SkyrimSE.exe"`.
 
 Key RVAs:
@@ -621,10 +621,10 @@ skips building the no-template fallback. Data confirms it: vanilla instances
 carry `PLDT` values that differ from their root (Esbern type 0 ref `0x0010ff08`;
 root type 3 value 0). **Never zero `PKCU.Template`.**
 
-**Validator:** `tools/pack_validate.py` encodes all of the above.
+**Validator:** `tools/esm/pack_validate.py` encodes all of the above.
 
 ```bash
-python tools/pack_validate.py output/Oblivion.esm/Oblivion.esm \
+python tools/esm/pack_validate.py output/Oblivion.esm/Oblivion.esm \
        --ref "<SSE>/Data/Skyrim.esm" --summary
 ```
 

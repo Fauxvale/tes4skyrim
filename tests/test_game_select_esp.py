@@ -1,4 +1,4 @@
-"""Structural tests for the TESGameSelect starter plugin (tools/make_game_select_esp.py).
+"""Structural tests for the TESGameSelect starter plugin (tools/release/make_game_select_esp.py).
 
 These lock the two contracts that are invisible in-game until they are already
 broken: the MESG button/condition layout (a wrong one silently starts the wrong
@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools.make_game_select_esp import (BUTTONS, FID_MESG, FID_QUST, FID_MQ101,
+from tools.release.make_game_select_esp import (BUTTONS, FID_MESG, FID_QUST, FID_MQ101,
                                         FID_GLOB_OBLIVION, FID_GLOB_NEHRIM,
                                         FID_GLOB_MORROBLIVION, GLOBALS,
                                         QUEST_TYPE_NONE, FID_GAMEHOUR,
@@ -112,7 +112,7 @@ def test_selector_quest_is_not_start_game_enabled(built):
 def test_seq_is_empty(built, tmp_path):
     """No SGE quests means the .seq must be empty — a stale non-empty one from
     an older build would re-enable the OnInit path and double the menu."""
-    from tools.make_game_select_esp import write_seq
+    from tools.release.make_game_select_esp import write_seq
     path = write_seq(str(tmp_path))
     assert os.path.getsize(path) == 0
 
@@ -258,7 +258,7 @@ def _decode_quest_vmad(vmad):
 
 
 def _vanilla_mq101(skyrim_esm):
-    from tools.tes5_esm_reader import read_tes5_file
+    from tools.esm.tes5_esm_reader import read_tes5_file
     _hdr, recs, _loc = read_tes5_file(skyrim_esm)
     return next(r for r in recs if r.type == 'QUST' and r.form_id == FID_MQ101)
 

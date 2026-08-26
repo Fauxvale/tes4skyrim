@@ -34,7 +34,7 @@ thing left.  Morroblivion is that case and is the only default member; see
 :data:`WINDING_FIX_DEFAULT_PLUGINS` for the measurements and for why Nehrim
 was removed.
 
-Numbers here come from ``tools/collision_winding_truth.py``, which compares
+Numbers here come from ``tools/nif/collision_winding_truth.py``, which compares
 each near-horizontal collision face against the render face coincident with
 it.  Read them with care: a naive nearest-skin comparison scores vanilla stairs
 48/48 falsely inverted and furniture at 16%, because a thin slab has both its

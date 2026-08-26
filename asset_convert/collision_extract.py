@@ -700,7 +700,7 @@ def _worker_both(args: tuple):
     NOTE: the door axis/centre cache is NOT produced here any more — the scan
     reads CONVERTED meshes, and door geometry must come from the ORIGINAL
     NIF's Close-sequence pose (see door_closed_geometry).  It is built by
-    tools/build_door_axis_cache.py from the export meshes.
+    tools/generators/build_door_axis_cache.py from the export meshes.
     """
     nif_path, rel_key = args
     try:
@@ -875,7 +875,7 @@ def scan_mesh_data(mesh_dir: str, collision_cache: str, bounds_cache: str,
 
     # NOTE: door_panel_axis_cache.json is NOT written here — door geometry
     # must come from the ORIGINAL NIF's Close-sequence pose, and this scan
-    # reads the converted output meshes.  Run tools/build_door_axis_cache.py
+    # reads the converted output meshes.  Run tools/generators/build_door_axis_cache.py
     # (reads export/<plugin>/meshes) to build it.
 
     return len(col_results), len(bnd_results)

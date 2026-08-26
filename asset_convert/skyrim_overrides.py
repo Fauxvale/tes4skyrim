@@ -105,7 +105,7 @@ SBP_38_CALVES    = 38   # Calves / lower legs (boots)
 SBP_44_LOWERBODY = 44   # Lower body: hips + upper legs (greaves).  Requires the
                          # character body mesh to have a matching partition
                          # (asset_convert/modify_body_meshes.py) AND the wearing
-                         # ARMA to claim slot 44 (tools/patch_body_slots.py).
+                         # ARMA to claim slot 44 (tools/creature/patch_body_slots.py).
 SBP_130_HEAD     = 130  # Head skin (character's head mesh)
 SBP_131_HAIR     = 131  # Hair / headwear (helmets, hoods, circlets)
 

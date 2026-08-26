@@ -139,7 +139,7 @@ see the `oblivion-to-skyrim-dialog` skill.
   Skyrim resolves the outfit once and has no equivalent of Oblivion's per-spawn re-scoring, so evicting
   the guaranteed pants left ~75% of bandits bare-legged. Keep both; engine wears greaves when rolled,
   pants otherwise. The `NN` in Bethesda's list names (`...Greaves25`, `...Cuirass100`) is the equip
-  probability. Trace any actor with `python -m tools.trace_outfit export/Oblivion.esm <EditorID>`.
+  probability. Trace any actor with `python -m tools.audit.trace_outfit export/Oblivion.esm <EditorID>`.
   **A plugin WITH MASTERS must index its masters' items too** (`load_item_index(by_type,
   ctx.master_export)`): a dependent plugin dresses its actors out of its MASTER's wardrobe, so most
   inventory entries name a record the plugin does not contain. DLCBattlehornCastle draws 155 of its 165
@@ -189,7 +189,7 @@ TES5 NPC_ DNAM stores skills as arrays. The correct xEdit paths are:
 **Symptom:** most animals in converted Nehrim (river crabs, boar, deer,
 chickens, pigs) keeled over dead the instant the cell loaded. Spawning the
 *same base record* from the console produced a healthy animal, and the actor's
-health pool audited clean (`tools/actor_health_audit.py`: 0 SPAWN-DEAD, 99.9%
+health pool audited clean (`tools/audit/actor_health_audit.py`: 0 SPAWN-DEAD, 99.9%
 exact) — so health, ACBS flags, the generated RACE and the behaviour project
 were all exonerated.
 
@@ -512,7 +512,7 @@ Playable Oblivion races map directly to Skyrim equivalents by EditorID:
   So conversion **solves for the offset** that reproduces the TES4 total exactly
   (`_health_and_level` in `record_types/actors.py`) rather than copying the pool
   into the cache field. Verified against the BUILT esm with
-  `tools/actor_health_audit.py`: **Oblivion 100.0% exact (1,413/1,413), Nehrim
+  `tools/audit/actor_health_audit.py`: **Oblivion 100.0% exact (1,413/1,413), Nehrim
   99.9% (2,224/2,227)**, zero spawn-dead actors.
   - **Creatures use the same flat 50 base.** A generated creature RACE is
     **shared** by every CREA with the same mesh folder + body set (`made[key]` in
@@ -652,7 +652,7 @@ must stay in step. CNAM.CrimeGold carries across as the Steal Multiplier.
   guard against a future plugin using an unseen code.
 - **TES5 EFIT is Magnitude, Area, Duration** — offset 4 is Area, offset 8 is
   Duration (xEdit `wbEFIT`; all 427 vanilla ALCH effects put the potion duration
-  at offset 8 and 0 at offset 4). `tools/tes5_esm_reader.py` had the two labels
+  at offset 8 and 0 at offset 4). `tools/esm/tes5_esm_reader.py` had the two labels
   swapped until 2026-07-31, which made every dump of a converted spell look wrong.
 - **TES5 INGR ENIT is 8 bytes** (s32 value + u32 flags), NOT the 20-byte ALCH
   layout (xEdit wbDefinitionsTES5 INGR).
@@ -664,7 +664,7 @@ must stay in step. CNAM.CrimeGold carries across as the Steal Multiplier.
   Skyrim ships no aimed variants of plain value modifiers, so
   `tes5_import/magic_effects.py` synthesizes a companion MGEF per (vanilla
   effect, TES4 code): clone of the vanilla 152-byte DATA (baked in
-  `vanilla_mgef_data.py`, regen with `tools/gen_vanilla_mgef_table.py`),
+  `vanilla_mgef_data.py`, regen with `tools/generators/gen_vanilla_mgef_table.py`),
   patched to CastType=FF(1)/Delivery=Aimed(2) + a projectile (spectral arrow
   for hostile, sunfire for beneficial), swapped in for the first effect.
   MGEF DATA offsets: archetype 0x40, AV 0x44, projectile 0x48, cast 0x50,
@@ -700,7 +700,7 @@ must stay in step. CNAM.CrimeGold carries across as the Steal Multiplier.
 - **Zero-INFO topics are never emitted** (~856 placeholder DIALs in
   Oblivion.esm → CK "Orphaned topic" each); TCLT choices into them are
   dropped too.
-- Verify all of the above against a build with `tools/verify_ck_fixes.py`.
+- Verify all of the above against a build with `tools/validate/verify_ck_fixes.py`.
 
 ### CELL Conversion
 - **Remove Oblivion Interior Flag**: Clear bit $08 from DATA flags on interior cells

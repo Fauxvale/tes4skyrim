@@ -111,7 +111,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
 
     Returns {'initargs': tuple for _script_worker_init, 'scpt_work': [...],
     'info_work': [...], 'qust_work': [...], 'stats': dict}.  Shared by
-    convert_all_scripts (the pipeline stage) and tools/convert_scripts_subset.py
+    convert_all_scripts (the pipeline stage) and tools/script/convert_scripts_subset.py
     (a filtered rebuild of named scripts for iteration), so a subset build is
     the SAME conversion as the full one — same say-timer owners, unlock plan,
     durations and menu plans — never a parallel approximation of it.

@@ -382,7 +382,7 @@ def _encode_bc4_block(vals) -> bytes:
 # 20"; this takes the top of that range, because each retry costs them a full
 # build-and-play cycle and an over-soft height field still reads as depth
 # while an under-blurred one keeps the artifact.  Override per run with
-# `tools/parallax_check.py regen --blur N` rather than editing this.
+# `tools/audit/parallax_check.py regen --blur N` rather than editing this.
 BLUR_RADIUS_PER_1000 = 20.0
 
 # Linear size divisor applied before the blur.  A height field carries no fine
@@ -1226,7 +1226,7 @@ def normalise_height(texels, strength: float = 1.0,
 # zero `_p.dds`, Bethesda having all but dropped parallax for SSE.  0.6 is the
 # value the author confirmed in game (2026-08-19) after 0.5 read a touch flat;
 # on the reference wall it takes the authored amplitude 145 down to about 76.
-# Retune by eye with `tools/parallax_check.py regen --depth F`.
+# Retune by eye with `tools/audit/parallax_check.py regen --depth F`.
 NEUTRAL_LEVEL = 128
 DEPTH_SCALE = 0.6
 

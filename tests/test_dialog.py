@@ -423,7 +423,7 @@ class TestCTDAConversion:
         that: EXCEPTION_ACCESS_VIOLATION on the first GREETING.
 
         Skipped when the extracted engine tables are absent (they are produced
-        from a local Skyrim install by tools/dialog_engine_extract.py).
+        from a local Skyrim install by tools/disasm/dialog_engine_extract.py).
         """
         import json
         import os
@@ -1537,8 +1537,8 @@ class TestPlayerScriptQuest:
         parsing JailQuest / TutorialEnchanting out of Skyrim.esm), so the
         top-level Scripts array stays empty."""
         import sys as _sys, os as _os
-        _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), '..', 'tools'))
-        from tools.quest_walkthrough import parse_vmad, parse_qust_alias_scripts
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), '..'))
+        from tools.dialog.quest_walkthrough import parse_vmad, parse_qust_alias_scripts
         from tes5_import.dialog_converter import _make_player_script_quest
         self._fake_plan([('TES4_GlobalplayerScript', {})])
         writer = _FakeWriter()

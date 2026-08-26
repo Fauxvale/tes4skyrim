@@ -3,7 +3,7 @@
 How to test **any** converted quest, dialogue tree, or script in the running
 game, remotely and autonomously, without the user at the keyboard.
 
-The entry point is `tools/quest_labtest.py`. Nothing in it is specific to any
+The entry point is `tools/live/quest_labtest.py`. Nothing in it is specific to any
 one quest — the quest name is an argument, and every actor, stage, variable and
 topic involved is **discovered from the export** for whatever quest you name.
 
@@ -179,7 +179,7 @@ fail *silently* if ignored:
 
 Consequence for the operator: **one real keystroke-driven console command must
 run once per game session** to capture the execution context.
-`tools/game_input.py bootstrap` does this by sending real scan codes (Skyrim
+`tools/live/game_input.py bootstrap` does this by sending real scan codes (Skyrim
 reads DirectInput, so `PostMessage`/`KEYEVENTF_UNICODE` do nothing).
 
 `quest_labtest.py doctor` checks all of this and tells you which step is
@@ -191,22 +191,22 @@ missing, rather than failing later inside a test with a confusing symptom.
 
 ```bash
 # 0. is the channel healthy? (bridge, console exec, output capture, VM capture)
-python tools/quest_labtest.py doctor
+python tools/live/quest_labtest.py doctor
 
 # 1. who is involved in this quest?  (pure export read -- no game needed)
-python tools/quest_labtest.py cast --quest <QuestEDID>
+python tools/live/quest_labtest.py cast --quest <QuestEDID>
 
 # 2. build the clean room: coc to the empty cell, bring the cast in
-python tools/quest_labtest.py setup --quest <QuestEDID>
+python tools/live/quest_labtest.py setup --quest <QuestEDID>
 
 # 3. put the quest at a known start state
-python tools/quest_labtest.py reset --quest <QuestEDID> --stage <N>
+python tools/live/quest_labtest.py reset --quest <QuestEDID> --stage <N>
 
 # 4. run the thing under test and transcribe everything
-python tools/quest_labtest.py run --quest <QuestEDID> --seconds 60 --out temp/run1.log
+python tools/live/quest_labtest.py run --quest <QuestEDID> --seconds 60 --out temp/run1.log
 
 # 5. put the world back
-python tools/quest_labtest.py restore
+python tools/live/quest_labtest.py restore
 ```
 
 ### Why the steps are separate
@@ -241,7 +241,7 @@ This is the whole point: change something and see what it changed, without a
 relaunch and without the user at the keyboard.
 
 ```bash
-python tools/quest_labtest.py ab --quest <QuestEDID> --stage <N> \
+python tools/live/quest_labtest.py ab --quest <QuestEDID> --stage <N> \
     --seconds 45 --inject temp/change.txt \
     --out-a temp/A.log --out-b temp/B.log
 ```
@@ -482,7 +482,7 @@ No single channel sees everything. The harness merges four, on one clock:
 hook fires only for commands the bridge issues (delta 0 across 12s of the game
 running on its own), and converted INFO fragments contain no trace statements,
 so a fired line logs nothing. "Which INFO fired" exists *only* in
-`MenuTopicManager`, which `tools/dialog_live.py` reads and `quest_labtest.py`
+`MenuTopicManager`, which `tools/live/dialog_live.py` reads and `quest_labtest.py`
 merges into the transcript when `--dialogue` is passed.
 
 ### Reading the transcript

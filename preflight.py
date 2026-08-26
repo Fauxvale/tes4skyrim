@@ -213,7 +213,7 @@ def _ffmpeg() -> 'Missing | None':
         'git checkout -- external/ffmpeg/ffmpeg.exe\n'
         '(if that does not restore it, your antivirus may have quarantined '
         'it)\n'
-        'Or rebuild it: python tools/build_ffmpeg.py\n'
+        'Or rebuild it: python tools/generators/build_ffmpeg.py\n'
         'Or install any ffmpeg on your PATH: winget install Gyan.FFmpeg',
     )
 

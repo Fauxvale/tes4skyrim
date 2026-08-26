@@ -1386,7 +1386,7 @@ which is a different construction.
 
 ## 6q. 🛑 THE COMPLETE GRAVITY BEND MODEL — CLOSED
 
-All slots resolved with a real **esp tracker** (`tools/oblivion_disasm.py
+All slots resolved with a real **esp tracker** (`tools/disasm/oblivion_disasm.py
 --esp`), not per-block hand counting. That matters: the branch builder
 addresses the same frame slot with different `[esp+N]` offsets depending on how
 many pushes are live, and the earlier per-block naming produced wrong
@@ -1995,7 +1995,7 @@ Shipped output verified: leaf card count is exactly 2x the engine leaf count
 
 ### What is now PROVEN (disassembly + FPU simulation)
 
-`0x79a258`-`0x79a2a6`, with `tools/oblivion_disasm.py --fpu` resolving the x87
+`0x79a258`-`0x79a2a6`, with `tools/disasm/oblivion_disasm.py --fpu` resolving the x87
 stack:
 
 ```
@@ -2361,7 +2361,7 @@ Every store the branch getter makes into the caller's out-struct (`edi`):
 ### ✅ WORKING: the engine generates geometry and we write it to a NIF
 
 `spt_engine_dump.exe` now runs the full pipeline and
-`tools/spt_engine_to_nif.py` turns the result into a Skyrim NIF.
+`tools/lod/spt_engine_to_nif.py` turns the result into a Skyrim NIF.
 The harness now lives in `native/src/spt_engine/` and its built .exe is
 committed to `native/dist/` (see that README) so end users need no C++
 toolchain; `asset_convert/spt_engine_geom.py` loads it from there.

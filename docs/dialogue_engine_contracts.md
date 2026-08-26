@@ -13,13 +13,13 @@ The Steam `SkyrimSE.exe` is Steam-encrypted: its `.text` section has entropy
 at `D:\Other Games\Skyrim Anniversary Edition\SkyrimSE.exe` is **not** packed —
 `.text` entropy is 6.04 and the dialogue routines disassemble cleanly.
 
-`tools/dialog_engine_extract.py` refuses to run against a packed build rather
+`tools/disasm/dialog_engine_extract.py` refuses to run against a packed build rather
 than printing garbage.
 
-    python tools/dialog_engine_extract.py --subtypes
-    python tools/dialog_engine_extract.py --json tes5_import/dialog_engine_tables.json
+    python tools/disasm/dialog_engine_extract.py --subtypes
+    python tools/disasm/dialog_engine_extract.py --json tes5_import/dialog_engine_tables.json
 
-RTTI type names survive in both builds, so `tools/skyrim_disasm.py --find` still
+RTTI type names survive in both builds, so `tools/disasm/skyrim_disasm.py --find` still
 locates classes (`TESTopic`, `TESTopicInfo`, `MenuTopicManager`,
 `BGSDialogueBranch`) either way.
 
@@ -107,7 +107,7 @@ a wrong DATA subtype is harmless. Do not "fix" a converted DIAL by reasoning
 about its DATA bytes, and do not trust DATA when reading vanilla records to
 learn what a subtype number means.
 
-`tools/dialog_emulator.py` now derives both values from SNAM through the engine
+`tools/dialog/dialog_emulator.py` now derives both values from SNAM through the engine
 table, and reports 17 distinct tags across our Oblivion output with zero
 unresolved.
 
@@ -167,8 +167,8 @@ to be started)"*, so it starts a stopped quest. Censused on Skyrim.esm, 0 of
 
 ## Re-deriving any of this
 
-`tools/skyrim_disasm.py` locates classes and disassembles, and
-`tools/dialog_engine_extract.py` pulls the tables. To find which code touches a
+`tools/disasm/skyrim_disasm.py` locates classes and disassembles, and
+`tools/disasm/dialog_engine_extract.py` pulls the tables. To find which code touches a
 table, scan `.text` for RIP-relative `lea` instructions whose target is the
 table's RVA — there are only four such references for the two dialogue tables,
 which is what made `TESTopic::LoadForm` easy to isolate.

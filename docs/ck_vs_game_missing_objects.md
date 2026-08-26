@@ -66,7 +66,7 @@ copy is the one that works; a Steam copy is encrypted).
 
 Three real divergences found on the way, none of them the cause, none fixed.
 
-**No LOD ships at all.** `tools/lod_coverage_check.py` reports 0 `.bto` and 0
+**No LOD ships at all.** `tools/audit/lod_coverage_check.py` reports 0 `.bto` and 0
 `.btr` in the loose tree and in all three BSAs, for every worldspace including
 `TES4Tamriel` (14,686 cells). `lod_gen.py` writes
 `meshes/terrain/<EDID>/Objects/*.bto` (`asset_convert/lod_gen.py:1402,1699`),
@@ -131,7 +131,7 @@ And on the named meshes specifically (`ICMarketBlock02House03`,
 disabled-with-no-parent placements looks like a smoking gun and is entirely
 Bethesda's authoring; so are all 12 sub-0.01 scales and all 9,661 enable
 parents. Only a **delta against the authored export** is a defect.
-`tools/refr_render_audit.py --export-dir <export/Plugin>` does that diff and
+`tools/validate/refr_render_audit.py --export-dir <export/Plugin>` does that diff and
 refuses to judge those classes without one.
 
 **Census vanilla before writing a flag, not after.** Both defects here —
@@ -154,7 +154,7 @@ reports ~54 phantom missing meshes; consult the BSAs as well.
 
 ## Tool bugs found while investigating
 
-`tools/missing_mesh_refs.py` was unusable and then misleading:
+`tools/audit/missing_mesh_refs.py` was unusable and then misleading:
 
 1. imported `output_layout` without putting the repo root on `sys.path` — died
    instantly with `ModuleNotFoundError`;

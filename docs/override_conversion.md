@@ -7,7 +7,7 @@ overrides) follows xEdit's "copy as override" model. Modules:
 `overrides.py` (OverrideContext + nested-GRUP emission — the only override
 code import_main touches), `export_diff.py`, `master_manifest.py`,
 `override_builder.py` (field application), `override_merge.py` (master index).
-Audit coverage anytime with `python tools/override_audit.py
+Audit coverage anytime with `python tools/audit/override_audit.py
 export/<Plugin>` — it reports, per record type, what the override path does
 with every record and every authored field with no output mapping.
 
@@ -73,7 +73,7 @@ from comparing two conversion runs.
   owner's converted bytes are pulled from the master VERBATIM and written
   immediately before the group — the same thing xEdit's copy-as-override does.
   Anchoring only the type-6 case (the original code) leaves the WRLD case
-  broken. Gate every override plugin with `tools/esm_group_anchors.py`.
+  broken. Gate every override plugin with `tools/validate/esm_group_anchors.py`.
 - **The plugin's TES4 master NAMES come from the export `_HEADER.txt`, not the
   source binary.** `convert.py` derives its master list from the binary in the
   configured Oblivion data folder, but that file may not be there at all (a
@@ -265,7 +265,7 @@ from comparing two conversion runs.
   resolves to the file itself.
 - <a id="create-lod-order"></a>**`create_lod_order` deliberately differs from
   `_load_order`, and the difference is CONSENT.** LOD is generated for the
-  whole load order in one pass (`tools/create_lod.py`, the GUI's *Create LOD*
+  whole load order in one pass (`tools/release/create_lod.py`, the GUI's *Create LOD*
   button) and that dialog SHOWS the order, lets the user drag it, and does
   nothing until they press Generate. So the rule is the one the user asked
   for: everything `plugins.txt` lists comes FIRST in its own order, and
@@ -441,7 +441,7 @@ from comparing two conversion runs.
   the transposed key was mistaken for vanilla's in the original docstring.
 
   Guarded by `tests/test_exterior_block_order.py` and
-  `tests/test_merge_grid_groups.py`; `tools/plugin_load_audit.py` check #10
+  `tests/test_merge_grid_groups.py`; `tools/validate/plugin_load_audit.py` check #10
   reports both `grid-groups-out-of-order` and `duplicate-grid-group`.
 
   **Ruled out along the way** (all measured clean — don't re-chase): duplicate
@@ -498,7 +498,7 @@ from comparing two conversion runs.
   list of all three plugins that depend on it. An ESM-flagged `.esp` is legal and
   loads as a master.
 
-  Applied with `python tools/make_master.py <chain, lowest first>`, which sets
+  Applied with `python tools/esm/make_master.py <chain, lowest first>`, which sets
   bit `0x00000001` at byte 8 of the TES4 header **in place** — 4 bytes rewritten,
   no record reserialized, so file size is unchanged and **no FormID drift**. It
   reads each `MAST` list and refuses with exit 2, naming the missing files and

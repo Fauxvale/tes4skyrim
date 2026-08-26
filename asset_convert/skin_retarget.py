@@ -919,7 +919,7 @@ def _mat3_to_quat(R: np.ndarray) -> np.ndarray:
 # standard LBS (Linear Blend Skinning). The remaining small residual is
 # then handled by Gaussian spatial blending (Phase B.2).
 #
-# The animation pose cache is built by tools/kf_animation_explorer.py --build-cache
+# The animation pose cache is built by tools/generators/kf_animation_explorer.py --build-cache
 # which searches ALL Oblivion .kf animation files for the best per-chain pose.
 
 _ANIM_POSE_PATH = _GENERATED_DIR / 'best_animation_pose.json'
@@ -929,7 +929,7 @@ _anim_delta_cache = None
 def _load_animation_deltas():
     """Load pre-computed delta matrices (inv(rest_world) @ anim_world) per bone.
     
-    These are computed by tools/kf_animation_explorer.py --build-cache using the
+    These are computed by tools/generators/kf_animation_explorer.py --build-cache using the
     FULL Oblivion skeleton hierarchy. Each delta transforms a vertex from its
     rest-pose position to the best-matching animation pose position.
     """

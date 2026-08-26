@@ -54,7 +54,7 @@ Summary of patches
    whose hash is randomised per process, so the same source NIF produced
    different output bytes on every run — identical blocks and geometry, but a
    reordered string table and therefore different NiStringRef indices.  Made
-   insertion-ordered.  Verify with `python tools/nif_determinism.py`.
+   insertion-ordered.  Verify with `python tools/nif/nif_determinism.py`.
 """
 
 import os
@@ -864,7 +864,7 @@ def _install_no_op_struct_logging():
     if getattr(StructBase, '_tesconv_nolog', False):
         return
     if os.environ.get('TESCONV_PYFFI_NO_PERF_PATCH'):
-        return                      # A/B escape hatch (tools/nif_perf.py)
+        return                      # A/B escape hatch (tools/nif/nif_perf.py)
     if logging.getLogger("pyffi.nif.data.struct").isEnabledFor(logging.DEBUG):
         return                      # someone wants the debug output; leave it
 
@@ -965,7 +965,7 @@ def _install_deterministic_string_table():
 #
 # It is used by the main mesh path (via SpellAddTangentSpace), lod_far_gen and
 # spt_converter, so all three benefit.  Verify with
-# `python tools/nif_perf.py --baseline ...` — byte-equality is the contract.
+# `python tools/nif/nif_perf.py --baseline ...` — byte-equality is the contract.
 def _install_vectorised_tangent_space():
     try:
         import numpy as np
@@ -1184,7 +1184,7 @@ def _install_vectorised_tangent_space():
 # Falls back to the original for anything unexpected (unrelated classes, a
 # source missing an attribute the base declares).  Toggle with
 # TESCONV_PYFFI_NO_SINGLE_HOP_COPY=1 to A/B.  Byte-equality is the contract:
-# verify with `python tools/nif_perf.py --baseline ...`.
+# verify with `python tools/nif/nif_perf.py --baseline ...`.
 def _install_single_hop_interchangeable():
     from pyffi.formats.nif import NifFormat
     from pyffi.object_models.xml.struct_ import StructBase
@@ -1365,7 +1365,7 @@ def _install_single_hop_interchangeable():
 # independent: `arg`/`vercond` can reference instance fields, and PyFFI mutates
 # instance state *while* walking the list during read, so a later attribute's
 # inclusion can depend on an earlier one's just-read value.  Verify any retry
-# with `python tools/nif_perf.py --baseline ...`, which is how this was caught.
+# with `python tools/nif/nif_perf.py --baseline ...`, which is how this was caught.
 # ---------------------------------------------------------------------------
 
 

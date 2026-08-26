@@ -1,7 +1,7 @@
 """Tests for LAND VHGT decoding and NAVM/NAVI binary packing.
 
 The NVNM/NVMI/NAVI layouts are validated against real Skyrim.esm records
-(tools/navmesh_dump.py).  Those layouts are byte-exact and must not drift.
+(tools/navmesh/dump.py).  Those layouts are byte-exact and must not drift.
 
 The geometry-behaviour tests that used to live here ("floors become navmesh,
 walls do not", "an NPC walks OVER a rug but AROUND a table") drove the

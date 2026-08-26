@@ -197,6 +197,12 @@ def _door_model_sounds(rec: dict) -> dict:
 #   DOOR  SNAM 'Sound - Open'      ANAM 'Sound - Close'   BNAM 'Sound - Loop'
 #   LIGH  SNAM 'Sound'
 #
+# DOOR is confirmed against a real dump as well as the definition: Skyrim.esm's
+# WRDragonSideDoor01 has SNAM 0005AFC9, the SNDR DRSWoodImperialDouble01OpenSD.
+# LIGH's SNAM is a light's looping ambience — the crackle on every torch,
+# sconce and brazier — so although vanilla sounds only 3 lights, the slot is
+# live on hundreds of placed refs in a converted interior.
+#
 # MSTT and TACT also type SNAM as [SNDR], but neither is listed: no MSTT or
 # TACT we write can ever hold a placeholder, so an entry would only ever scan
 # and never patch.  MSTT exists solely as convert_STAT's havok retype, and TES4
@@ -300,37 +306,16 @@ def patch_sound_descriptor_slots(writer, rectype, own_soun_ids=None,
     return patched
 
 
-def patch_door_sounds(writer, own_soun_ids=None, master_sndr=None) -> int:
-    """DOOR SNAM/ANAM/BNAM -> SNDR.
-
-    Confirmed against Skyrim.esm, where WRDragonSideDoor01's SNAM 0005AFC9 is
-    the SNDR DRSWoodImperialDouble01OpenSD.
-    """
-    return patch_sound_descriptor_slots(writer, 'DOOR', own_soun_ids,
-                                        master_sndr)
-
-
-def patch_light_sounds(writer, own_soun_ids=None, master_sndr=None) -> int:
-    """LIGH SNAM -> SNDR.
-
-    A light's SNAM is its looping ambience — the crackle on every torch,
-    sconce and brazier — so this slot is live on hundreds of placed refs in a
-    typical interior, and each one arms the audio-thread fault described on
-    _SNDR_SLOTS.
-    """
-    return patch_sound_descriptor_slots(writer, 'LIGH', own_soun_ids,
-                                        master_sndr)
-
-
 def convert_DOOR(rec: dict) -> bytes:
     extra = b''
     # TES5 DOOR has SNAM (open) / ANAM (close) / BNAM (loop), and xEdit plus
     # every one of the 90 sounded vanilla Skyrim DOORs agree that all three
     # point at an SNDR — NOT at the SOUN the TES4 record names.  The
     # descriptors do not exist yet (Phase 3 mints them), so the TES4 SOUN id
-    # goes in as a placeholder and patch_door_sounds() resolves it, exactly as
-    # actors do for CSDI.  Allocating the descriptor id here instead would
-    # shift every other generated FormID (see dialog_misc._SNDR_FOR_SOUN).
+    # goes in as a placeholder and patch_sound_descriptor_slots() resolves it,
+    # exactly as actors do for CSDI.  Allocating the descriptor id here
+    # instead would shift every other generated FormID (see
+    # dialog_misc._SNDR_FOR_SOUN).
     #
     # A door whose sound lives only in its MESH (`sound: X` text keys on the
     # Open/Close sequences — Oblivion honours both channels, Skyrim only the

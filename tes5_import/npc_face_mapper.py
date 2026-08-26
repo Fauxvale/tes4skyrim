@@ -140,7 +140,7 @@ _SKIN_RACE_ALIAS = {
 }
 
 # (race, gender) -> skin-tone TINI index, from the RACE tint-mask definitions
-# in Skyrim.esm (tools/census_npc_skin.py).  The index is a property of the
+# in Skyrim.esm (tools/generators/gen_npc_skin_table.py).  The index is a property of the
 # TARGET Skyrim race, so it stays a table; only the color comes from Oblivion.
 _SKIN_TINI: dict[tuple, int] = {
     ('Imperial', 'Male'): 1,  ('Imperial', 'Female'): 13,

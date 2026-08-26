@@ -22,14 +22,14 @@ CONFIG_FILE = SCRIPT_DIR / "conversion_config.json"
 
 from worker_budget import worker_count, cpu_total, WORKERS_ENV_VAR
 
-# The cache opt-out variable name is owned by tools/navmesh_cache.py so the GUI
+# The cache opt-out variable name is owned by tools/navmesh/navmesh_cache.py so the GUI
 # and convert.py cannot drift apart (see test_no_download_env_var_is_shared...).
 # `tools/` needs its __init__.py for this to resolve from any cwd -- without it
 # the directory is only a NAMESPACE package, and a module-scope import here was
 # fatal to the entire GUI. Under gui.pyw (pythonw, no console) the traceback is
 # invisible, so the window simply never appeared; convert.py survived only
 # because it imports this lazily inside a function.
-from tools.navmesh_cache import NO_DOWNLOAD_ENV_VAR
+from tools.navmesh.navmesh_cache import NO_DOWNLOAD_ENV_VAR
 import version as version_info
 import run_log
 from preflight import RC_MISSING_DEP as _RC_MISSING_DEP
@@ -2431,8 +2431,8 @@ def gui_main():
     def _plugin_masters(name: str) -> list[str]:
         """The MAST list of a converted plugin, or [] if it cannot be read."""
         try:
-            sys.path.insert(0, str(SCRIPT_DIR / "tools"))
-            from make_master import read_header, resolve
+            sys.path.insert(0, str(SCRIPT_DIR))
+            from tools.esm.make_master import read_header, resolve
             _flags, masters = read_header(
                 resolve(name, str(_lod_out_root())))
             return masters
@@ -2507,8 +2507,8 @@ def gui_main():
                 for n in all_names}
 
         try:
-            sys.path.insert(0, str(SCRIPT_DIR / "tools"))
-            from make_master import read_header, resolve, FLAG_ESM
+            sys.path.insert(0, str(SCRIPT_DIR))
+            from tools.esm.make_master import read_header, resolve, FLAG_ESM
             is_esm = {}
             for n in all_names:
                 try:
@@ -4171,21 +4171,21 @@ def gui_main():
         """The argv for one global action."""
         if key == "package_start_mod":
             cmd = [sys.executable, "-u",
-                   str(SCRIPT_DIR / "tools" / "package_start_mod.py")]
+                   str(SCRIPT_DIR / "tools" / "release" / "package_start_mod.py")]
             if out_dir:
                 cmd += ["--output-dir", out_dir]
             return cmd
 
         if key == "pack_lod":
             cmd = [sys.executable, "-u",
-                   str(SCRIPT_DIR / "tools" / "pack_lod.py")]
+                   str(SCRIPT_DIR / "tools" / "release" / "pack_lod.py")]
             if out_dir:
                 cmd += ["--output-dir", out_dir]
             return cmd
 
         if key == "make_master":
             cmd = [sys.executable, "-u",
-                   str(SCRIPT_DIR / "tools" / "make_master.py")]
+                   str(SCRIPT_DIR / "tools" / "esm" / "make_master.py")]
             cmd += master_plugins or _default_master_plugins()
             if out_dir:
                 cmd += ["--output-dir", out_dir]
@@ -4193,7 +4193,7 @@ def gui_main():
 
         if key == "create_lod":
             cmd = [sys.executable, "-u",
-                   str(SCRIPT_DIR / "tools" / "create_lod.py")]
+                   str(SCRIPT_DIR / "tools" / "release" / "create_lod.py")]
             if out_dir:
                 cmd += ["--output-dir", out_dir]
             # Always explicit once the dialog has been confirmed: the ORDER is
@@ -4343,8 +4343,8 @@ def gui_main():
             out = []
             for n in names:
                 try:
-                    sys.path.insert(0, str(SCRIPT_DIR / "tools"))
-                    from make_master import read_header, resolve, FLAG_ESM
+                    sys.path.insert(0, str(SCRIPT_DIR))
+                    from tools.esm.make_master import read_header, resolve, FLAG_ESM
                     flags, _m = read_header(resolve(n, out_dir))
                     out.append(f"{n}:{1 if flags & FLAG_ESM else 0}")
                 except Exception:

@@ -274,7 +274,7 @@ priest). So a row may be added only when **both** hold:
 
 1. The skeleton path shows it is one distinct creature, and
 2. UESP confirms the creature identity —
-   `python tools/uesp_lookup.py --page "Morrowind:<name>"`.
+   `python tools/misc/uesp_lookup.py --page "Morrowind:<name>"`.
 
 Folder-name resemblance is not evidence. When in doubt, leave it unfilled — an
 empty cell is a valid answer and the whole table is opt-in.
@@ -396,7 +396,7 @@ Reuse the method that already caught ~30 wrong FormIDs in the current table —
    table's `skin` column becomes dead weight and should be dropped.)
 3. Round-trip the emitted ESP: re-read it and assert every `NPC_` FormID is
    unchanged from the source and only `RNAM` differs.
-4. `tools/creature_swap_report.py --by-race` shows per-race counts and which
+4. `tools/creature/creature_swap_report.py --by-race` shows per-race counts and which
    races are left generated.
 
 Traps already confirmed the hard way and worth re-checking: `BearBlackRace` uses

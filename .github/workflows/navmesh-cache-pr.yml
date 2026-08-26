@@ -1,7 +1,7 @@
 name: Navmesh cache check
 
 # The shared navmesh cache can only be rebuilt on a machine that has the game,
-# the export and the collision cache -- see tools/navmesh_cache_hook.py.  A
+# the export and the collision cache -- see tools/navmesh/navmesh_cache_hook.py.  A
 # runner has none of those, so CI cannot regenerate or validate it.
 #
 # What CI *can* do is notice that a PR changes the navmesh sources, which
@@ -100,8 +100,8 @@ jobs:
 
           \`\`\`
           python convert.py -f Oblivion.esm --import-only   # regenerate
-          python tools/navmesh_cache.py verify --plugin Oblivion.esm
-          python tools/navmesh_cache_hook.py --run          # publish
+          python tools/navmesh/navmesh_cache.py verify --plugin Oblivion.esm
+          python tools/navmesh/navmesh_cache_hook.py --run          # publish
           \`\`\`
 
           <sub>Posted by \`.github/workflows/navmesh-cache-pr.yml\`. This is a
@@ -152,7 +152,7 @@ jobs:
               echo "${{ steps.check.outputs.files }}"
               echo ""
               echo 'After merging, on a machine with the export:'
-              echo '`python tools/navmesh_cache_hook.py --run`'
+              echo '`python tools/navmesh/navmesh_cache_hook.py --run`'
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "No navmesh source changes; the shared cache stays valid." \

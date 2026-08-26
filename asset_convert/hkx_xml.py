@@ -187,7 +187,7 @@ def fmt_qtransform_rot(q_xyzw) -> str:
 # matching the documented native-Windows forward-slash crash, 0xC0000417).
 # xWMAEncode has the identical bug (also verified), so this is the shared
 # subprocess_flags helper, not an hkxcmd-only one -- kept under this name
-# since asset_convert/kf_writer.py and tools/creature_hkx_diff.py import it.
+# since asset_convert/kf_writer.py and tools/creature/creature_hkx_diff.py import it.
 _to_hkxcmd_path = to_wine_path
 
 

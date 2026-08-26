@@ -27,7 +27,7 @@ The VM bound `Faction Property ANQCORCorintheFaction` to that LAND, so every
 logged for this class: the id resolves to a REAL record, just the wrong one.
 
 Audit an output plugin with:
-    python tools/vmad_property_typecheck.py --plugin <p> --cross-master
+    python tools/validate/vmad_property_typecheck.py --plugin <p> --cross-master
 """
 
 import sys

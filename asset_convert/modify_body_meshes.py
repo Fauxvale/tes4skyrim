@@ -21,7 +21,7 @@ bra region stays in 32 (chest/clavicle-weighted) so shirts hide it instead.
 
 IMPORTANT: partition 44 only renders in-game if the wearing ARMA also claims
 biped slot 44.  The vanilla NakedTorso ARMA claims 32/34/38 only, so the
-thighs would be INVISIBLE on a naked character.  tools/patch_body_slots.py
+thighs would be INVISIBLE on a naked character.  tools/creature/patch_body_slots.py
 generates the companion plugin that adds slot 44 to every slot-32 ARMO/ARMA
 (NakedTorso and all vanilla body armor) — it must be run whenever these
 meshes are deployed.

@@ -74,6 +74,9 @@ caching, skipped record types, the export text format, and the directory layout.
 - <a id="tools-first"></a>**CHECK `tools/` BEFORE BUILDING ANYTHING BESPOKE.**
   ~147 tools already exist and one probably answers your question — the full
   catalogue is [docs/python_tools_reference.md](docs/python_tools_reference.md).
+  They live in `tools/<folder>/`: `generators` (code imports their output —
+  never delete blind), `release`, `validate`, `audit`, `live`, `disasm`, `nif`,
+  `creature`, `dialog`, `script`, `lod`, `esm`, `navmesh`, `misc`.
   The order is:
   1. **Use** the existing tool.
   2. If it *almost* fits, **extend or fix it** — new flags, wider output. Never
@@ -141,7 +144,7 @@ regenerate scripts, so a behavioural regression means reading
 2. <a id="ck-is-a-source"></a>**`CreationKit.exe` (Steam) — NOT DRM-packed, and
    the BEST source for why a record is REJECTED.** Asserts carry file+line, and
    it keeps 1,114 Bethesda source paths, 17k diagnostic strings, and 433 record
-   editor dialogs the game strips. `tools/ck_srcpaths.py`, `ck_strref.py`,
+   editor dialogs the game strips. `tools/disasm/ck_srcpaths.py`, `ck_strref.py`,
    `skyrim_disasm.py --exe <ck>`. Runtime behavior still comes from item 1;
    the CK can disagree with the game ([ck_vs_game_missing_objects.md](docs/ck_vs_game_missing_objects.md)).
    Details: [ck_exe_as_a_source.md](docs/ck_exe_as_a_source.md).
@@ -151,7 +154,7 @@ regenerate scripts, so a behavioural regression means reading
 5. The Skyrim.esm dump at `references/Skyrim.esm`, real Skyrim.esm, and
    `references/Skyrim Meshes`. **Verify binary layout against BOTH the xEdit
    definition AND a real Skyrim.esm dump — never skip either.**
-6. UESP / CK wiki via `python tools/uesp_lookup.py`. **Never WebSearch or
+6. UESP / CK wiki via `python tools/misc/uesp_lookup.py`. **Never WebSearch or
    WebFetch for these** (they 403). An empty result means fix the query.
 7. A web search for other authoritative sources.
 8. The Papyrus logs from the last in-game run — read them to diagnose a runtime
@@ -359,10 +362,10 @@ Navmesh generation is the slowest import stage; per-cell results are cached and
 published as a GitHub Release asset.
 
 ```bash
-python tools/navmesh_cache.py verify  --plugin Oblivion.esm   # publishable?
-python tools/navmesh_cache.py install --plugin Oblivion.esm   # get the cache
-python tools/navmesh_cache_hook.py --install                  # gate pushes
-python tools/navmesh_cache_hook.py --run                      # publish manually
+python tools/navmesh/navmesh_cache.py verify  --plugin Oblivion.esm   # publishable?
+python tools/navmesh/navmesh_cache.py install --plugin Oblivion.esm   # get the cache
+python tools/navmesh/navmesh_cache_hook.py --install                  # gate pushes
+python tools/navmesh/navmesh_cache_hook.py --run                      # publish manually
 ```
 
 - **NEVER ship `collision_cache.bin`** — it holds Bethesda's Havok triangles
