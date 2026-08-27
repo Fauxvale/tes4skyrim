@@ -3521,8 +3521,8 @@ class TestDestroyDoesNotCancelTheClip:
         src = ("scn T\nbegin onActivate\n"
                "  playgroup forward 0\n  setDestroyed 1\nend\n")
         out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
-        assert 'TES4Polyfill.DestroyAfterAnimation(Self)' in out
-        assert 'SetDestroyed(1)' not in out
+        assert 'TES4Polyfill.DestroyAfterAnimation(Self, TES4DestroyedRefs)' in out
+        assert 'TES4Polyfill.SetDestroyed(Self, TES4DestroyedRefs, true)' not in out
 
     def test_unrelated_destroy_is_left_alone(self, converter):
         """Only the object that was just animated is at risk."""
@@ -3535,7 +3535,82 @@ class TestDestroyDoesNotCancelTheClip:
         src = ("scn T\nbegin onActivate\n  playgroup forward 0\nend\n"
                "begin onReset\n  setDestroyed 0\nend\n")
         out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
-        assert 'SetDestroyed(0)' in out
+        assert 'TES4Polyfill.SetDestroyed(Self, TES4DestroyedRefs, false)' in out
+
+
+class TestGetDestroyedReadsWhatSetDestroyedWrote:
+    """TES4's destroyed flag must survive the round trip.
+
+    Skyrim kept ObjectReference.SetDestroyed but ships NO reader for the flag,
+    and GetCurrentDestructionStage() reads the unrelated DEST stage system that
+    this conversion never writes -- so every `getdestroyed` used to be a read
+    that could not become true.  MS48OblivionGateScript's ONLY `setstage ms48
+    50` is gated on `getdestroyed == 1`, so the Kvatch quest pinned at stage 10
+    after the gate was closed (measured in game 2026-08-27).  Both halves now
+    go through the polyfill's TES4DestroyedRefs FormList.
+    """
+
+    def test_read_and_write_share_the_formlist(self, converter):
+        src = ("scn T\nbegin gamemode\n"
+               "  if getdestroyed == 1\n    setDestroyed 0\n"
+               "  endif\nend\n")
+        out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+        assert 'TES4Polyfill.GetDestroyed(Self, TES4DestroyedRefs)' in out
+        assert 'TES4Polyfill.SetDestroyed(Self, TES4DestroyedRefs, false)' in out
+        # The dead reads that caused the bug must not come back.
+        assert 'GetCurrentDestructionStage' not in out
+        assert converter.get_property_refs()['TES4DestroyedRefs'] == 'FormList'
+
+    def test_ref_prefixed_read_uses_the_polyfill(self, converter):
+        src = ("scn T\nbegin gamemode\n"
+               "  if MS48OblivionGate.getdestroyed == 1\n"
+               "    setstage MS48 50\n  endif\nend\n")
+        out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+        assert 'TES4Polyfill.GetDestroyed(MS48OblivionGate, TES4DestroyedRefs)' in out
+        assert 'GetCurrentDestructionStage' not in out
+
+    def test_gate_close_marks_the_gate_destroyed(self, converter):
+        """The engine call that closes a gate feeds the same FormList, which is
+        what lets the gate's own `getdestroyed` poll advance the quest."""
+        src = ("scn T\nbegin onActivate\n"
+               "  CloseCurrentOblivionGate\nend\n")
+        out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+        assert 'TES4Polyfill.CloseCurrentOblivionGate(TES4DestroyedRefs)' in out
+
+
+class TestDisablingAGateStillAdvancesTheQuest:
+    """Closing a gate must remove it AND advance the quest.
+
+    Removing a closed gate needs Disable() (SetDestroyed only makes it
+    non-interactable), but MS48 and MS94 open their poll with
+    `if getdisabled == 1 / return` ABOVE the `getdestroyed` setstage. In
+    Oblivion those are independent bits and closing set only destroyed, so the
+    preamble never fired for a closed gate. Disabling ours would strand the
+    setstage forever -- the measured MS48-at-stage-10 defect. The polyfill
+    keeps them independent: a DESTROYED ref never reports as disabled.
+    """
+
+    SRC = ("scn T\nbegin gamemode\n"
+           "  if getdisabled == 1\n    return\n  endif\n"
+           "  if getdestroyed == 1 && getstage MS48 < 50\n"
+           "    setstage MS48 50\n  endif\nend\n")
+
+    def test_getdisabled_routes_through_the_polyfill(self, converter):
+        out = converter.convert_standalone('T', self.SRC, 'ObjectReference', 'T')
+        assert 'TES4Polyfill.GetDisabled(Self, TES4DestroyedRefs)' in out
+        # The bare native would let a disabled-but-destroyed gate short-circuit
+        # the setstage below it.
+        assert 'If IsDisabled()' not in out
+
+    def test_the_destroyed_branch_is_still_reachable(self, converter):
+        out = converter.convert_standalone('T', self.SRC, 'ObjectReference', 'T')
+        lines = [l.strip() for l in out.splitlines()]
+        dis = next(i for i, l in enumerate(lines) if 'GetDisabled(' in l)
+        des = next(i for i, l in enumerate(lines) if 'GetDestroyed(' in l)
+        # Preamble still comes first (faithful), but it now reads False for a
+        # destroyed gate, so the setstage below it can run.
+        assert dis < des
+        assert 'MS48.SetStage(50)' in out or 'ms48.SetStage(50)' in out
 
 
 class TestBaseItemPropertiesKeepTheirRecordType:

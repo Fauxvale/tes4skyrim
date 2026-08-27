@@ -334,6 +334,20 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict,
             if re.search(r'\bgetparentref\b', sctx, re.IGNORECASE):
                 _GETPARENTREF_BASES.add(rec_fid_str)
 
+            # An OBLIVION GATE also needs its enable parent reachable at
+            # runtime, even when its own script never reads it.  Skyrim
+            # REFUSES Disable() on a reference that has an enable-state parent
+            # ("cannot disable an object with an enable state parent" -- the
+            # live Papyrus error from the Kvatch gate, 2026-08-27), so
+            # TES4Polyfill's TurnGateOff has to switch the PARENT off instead,
+            # and the only runtime route to it is XLKR.  Without this a closed
+            # gate is correctly destroyed and still stands in Tamriel.
+            # MS48OblivionGateScript is exactly that case: it closes a gate
+            # but never calls GetParentRef.
+            if re.search(r'close(?:current)?obliviongate', sctx,
+                         re.IGNORECASE):
+                _GETPARENTREF_BASES.add(rec_fid_str)
+
             # See _CONSUME_DOOR_BASES: their keyless level-100 locks must
             # stay AI-passable (Master), not Requires Key.
             if sig == 'DOOR' and sctx_onactivate_consumes(sctx):

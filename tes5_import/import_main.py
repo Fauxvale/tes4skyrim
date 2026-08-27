@@ -531,6 +531,38 @@ def _create_force_combat_factions(writer: PluginWriter) -> dict:
             'TES4ForceCombatVictims': vic_fid}
 
 
+def _create_destroyed_formlist(writer: PluginWriter) -> dict:
+    """The conversion-owned FormList backing TES4 GetDestroyed.
+
+    TES4 keeps a per-reference "destroyed" flag: SetDestroyed writes it,
+    getdestroyed reads it, and the engine's CloseCurrentOblivionGate sets it
+    on the gate it closes.  Skyrim kept the SETTER -- ObjectReference.psc line
+    553, `Function SetDestroyed(bool abDestroyed = true) native` -- but ships
+    NO reader.  GetCurrentDestructionStage() is a different system entirely
+    (the DEST/destruction-stage data), and this conversion never writes a DEST
+    subrecord, so that call returns 0 for every converted record; every
+    converted `getdestroyed` was therefore a dead read that could not become
+    true.  That is what pinned MS48 at stage 10: its ONLY `setstage ms48 50`
+    is gated on `getdestroyed == 1`.
+
+    A script AV shadow was tried and cannot work -- SetActorValue/GetActorValue
+    are declared on Actor, not ObjectReference (Actor.psc 143/521), so they do
+    not even compile against a gate (a DOOR reference).
+
+    A FormList works on ANY reference, is native (FormList.psc AddForm /
+    HasForm / RemoveAddedForm) and its script-added entries persist in the
+    save.  TES4Polyfill.SetDestroyed adds/removes the reference here and
+    GetDestroyed queries it, so the two stay in lockstep for every record type.
+
+    Fixed FormID (base+0x44, in the reserved gap alongside the ForceCombat
+    pair) -- allocating would shift every later id and corrupt saves.
+    """
+    fid = writer.chargen_fid_base + 0x44
+    subs = pack_string_subrecord('EDID', 'TES4DestroyedRefs')
+    writer.add_record('FLST', pack_record('FLST', fid, 0, subs))
+    return {'TES4DestroyedRefs': fid}
+
+
 def _create_ambient_gmst_overrides(writer: PluginWriter, by_type: dict):
     """Carry Oblivion's GLOBAL ambient-dialogue pacing across.
 
@@ -1127,6 +1159,9 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # The ForceCombat enemy-faction pair is needed by ANY plugin that scripts
     # a StartCombat, chargen menus or not.
     _WELL_KNOWN_PROPERTIES.update(_create_force_combat_factions(writer))
+    # The destroyed-reference FormList backs every converted `getdestroyed`,
+    # so it is needed by ANY plugin regardless of what else it scripts.
+    _WELL_KNOWN_PROPERTIES.update(_create_destroyed_formlist(writer))
     _step_done('chargen menu MESGs')
 
     # --- Phase 0b2: Build FormID → EditorID map for VMAD property resolution ---

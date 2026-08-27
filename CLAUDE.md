@@ -314,7 +314,10 @@ real data, or a failing-then-passing test.
   `asset_convert/skyrim_assets.py` (cache in `export/skyrim_assets/`, else
   auto-extracted from the SSE BSAs via registry-detected install).
 - `references/` subfolders (`NIFConverter/`, `xEdit/`, `UESP/`, `nifskope`) are
-  other projects — reference only.
+  other projects — reference only. Note that these are not the ONLY references in that folder. Check before guessing
+- <a id="ck-wiki-offline"></a>**What a Papyrus native DOES: `references/SkyrimCKWiki_210522/skyrim/<Func>_-_<Script>.html`.
+  Grep it before describing one — never invent semantics.** Oblivion:
+  `references/cs_wiki/` (.txt).
 - **LE assets are SSE-compatible.** Never dig through SSE-format assets/BSAs.
   BSA meshes are SSE-format; read them with `asset_convert/sse_nif.py`
   (`read_nif` converts BSTriShape graphs to LE NiTriShape graphs in-memory;

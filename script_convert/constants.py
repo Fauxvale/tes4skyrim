@@ -355,7 +355,13 @@ FUNCTION_MAP = {
     # line 541; command 4300 / opcode 0x10CC).  An earlier mapping to
     # BlockActivation only suppressed re-activation and never broke anything,
     # which is why breakaway planks and tripwires animated but stayed solid.
-    'setdestroyed': ('SetDestroyed',       True,  None),
+    # Routed through TES4Polyfill.SetDestroyed (special handler) rather than
+    # straight to the native: TES4 pairs the setter with `getdestroyed`, and
+    # Skyrim ships NO reader for the destroyed flag, so the polyfill mirrors
+    # every write into the TES4DestroyedRefs FormList that GetDestroyed reads.
+    # Mapping direct to the native here would bypass that mirror and leave the
+    # read false forever.
+    'setdestroyed':      (None,                True,  None),  # Special handler
 
     # --- Actor State ---
     'kill':              ('Kill',              True,  None),
@@ -669,7 +675,7 @@ FUNCTION_MAP = {
     'getscale':          ('GetScale',          True,  None),
     'purgecellbuffers':  (None,                False, None),  # Special handler (no-op)
     'pcb':               (None,                False, None),  # Special handler (no-op)
-    'closeobliviongate': (None,                False, None),  # Special handler (no-op)
+    'closeobliviongate': (None,                False, None),  # Special handler (destroys the gate)
     'say':               ('Say',               True,  None),
     'reset3dstate':      (None,                False, None),  # Special handler
     'setactorsai':       (None,                True,  None),  # Special handler
@@ -912,7 +918,7 @@ FUNCTION_MAP = {
     'modamountsoldstolen':(None,               False, None),  # Special handler
     'setcellownership':  (None,                False, None),  # Special handler (no-op)
     'setpublic':         (None,                False, None),  # no-op
-    'closeCurrentOblivionGate': (None,         False, None),  # Special handler
+    'closecurrentobliviongate': (None,         False, None),  # Special handler (exits the realm)
     'setshowquestitems': (None,                False, None),  # no-op
     'setnorumors':       (None,                False, None),  # no-op
     'setsceneiscomplex': (None,                False, None),  # no-op
