@@ -238,6 +238,25 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
         stats['landscape_normals_fixed'] = fixed
         print(f"  Landscape normals: {checked} checked, {fixed} DXT1->DXT5 fixed")
 
+        # Every REMAINING normal map without a usable specular mask gets a
+        # constant one, and the shared stand-in normal is written for shapes
+        # whose own normal does not exist.  The mesh stage now writes a
+        # UNIFORM specular_strength of 1.0, so the modulation has to live here
+        # -- see nif_converter._SPEC_STRENGTH for why that trade is worth
+        # making.  Landscape is excluded: just handled, with a dimmer value.
+        n_checked, n_fixed, n_kinds = landscape_normals.normalize_specular_alpha(
+            tex_dst, skip=(os.sep + 'landscape' + os.sep,))
+        # AFTER the sweep: the stand-in is a constant alpha by design, so a
+        # sweep that saw it would count it as one more file it "fixed".
+        landscape_normals.write_default_normal(tex_dst)
+        stats['spec_alpha_fixed'] = n_fixed
+        print(f"  Specular masks: {n_checked} normal maps checked, {n_fixed} "
+              f"given a constant mask "
+              f"(alpha {landscape_normals.DEFAULT_MASK_ALPHA}/255)")
+        if n_kinds:
+            print('    ' + ', '.join(f'{k}={v}'
+                                     for k, v in sorted(n_kinds.items())))
+
         # A diffuse whose alpha was carried out to a `_p` height map has no
         # use for that channel any more, and DXT1 is half the size.  Keyed on
         # the `_p` file the mesh stage wrote, so this is a no-op unless
