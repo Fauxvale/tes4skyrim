@@ -999,7 +999,8 @@ def _strip_creature_bone_controllers(data):
     return removed
 
 
-def _resolve_source_texture(tex_rel, src_nif_path):
+def _resolve_source_texture(tex_rel, src_nif_path,
+                            fallback_roots=()):
     """Map a rewritten texture path (textures\\tes4\\fire\\x\\y.dds) back to the
     extracted source file next to the source mesh tree
     (export/<esm>/textures/fire/x/y.dds).  Returns an absolute path or None."""
@@ -1018,7 +1019,19 @@ def _resolve_source_texture(tex_rel, src_nif_path):
             rel = rel[len(prefix):]
             break
     cand = tex_root + rel.replace('\\', os.sep)
-    return cand if os.path.isfile(cand) else None
+    if os.path.isfile(cand):
+        return cand
+    # MASTER-EXPORT BLINDNESS, the asset half of it.  An imported mod ships
+    # only the files it changes; everything else lives in its MASTER's export
+    # tree, which deriving the root from the mesh path can never reach.
+    # Measured on the author's parallax mod: of the 3357 distinct texture paths
+    # its 8665 meshes reference, 1464 were in the mod and 1602 ONLY in
+    # Nehrim.esm.  Unreachable means no height map and no specular verdict.
+    for root in (fallback_roots or ()):
+        cand = os.path.join(root, rel.replace('\\', os.sep))
+        if os.path.isfile(cand):
+            return cand
+    return None
 
 
 # NiTextureTransformController.operation (TransformMember) → the Skyrim shader
@@ -1317,7 +1330,8 @@ def _plan_flipbook_atlas(frame_rels, stats):
     files = []
     dims = None
     for rel in frame_rels:
-        f = _resolve_source_texture(rel, src_nif)
+        f = _resolve_source_texture(rel, src_nif,
+                                    stats.get('_tex_fallback', ()))
         if f is None:
             return None
         info = flipbook.probe_dds(f)
@@ -1360,7 +1374,9 @@ def _plan_parallax(diffuse_rel, stats):
     knows the output tree.
     """
     from . import parallax
-    src = _resolve_source_texture(diffuse_rel, stats.get('_src_path', ''))
+    src = _resolve_source_texture(diffuse_rel,
+                                  stats.get('_src_path', ''),
+                                  stats.get('_tex_fallback', ()))
     if src is None:
         stats['parallax_texture_unresolved'] = \
             stats.get('parallax_texture_unresolved', 0) + 1
@@ -1389,6 +1405,27 @@ def _plan_parallax(diffuse_rel, stats):
     return rel
 
 
+from . import base_plugins as _base_plugins
+
+# Re-exported: convert.py writes the file, the census tools read it.
+BASE_PLUGINS_FILE = _base_plugins.FILE_NAME
+
+
+def master_texture_roots(mesh_dir):
+    """Texture trees to fall back on, in order, for the mod at `mesh_dir`.
+
+    See asset_convert/base_plugins for where a tree's base comes from.
+    """
+    mesh_dir = str(mesh_dir).replace('/', os.sep)
+    key = os.sep + 'meshes'
+    i = mesh_dir.lower().rfind(key)
+    if i < 0:
+        return ()
+    return _base_plugins.subdirs(mesh_dir[:i], 'textures')
+
+
+
+
 # Oblivion's distant-LOD tier meshes.  `_far` is the convention; `_far8` and
 # `_far16` are the coarser tiers `lod_far_gen` derives beside it.
 _LOD_TIER_SUFFIXES = ('_far', '_far8', '_far16')
@@ -1398,6 +1435,8 @@ def _is_lod_tier_mesh(src_path) -> bool:
     """True for a `_far` / `_far8` / `_far16` distant-LOD tier mesh."""
     stem = os.path.splitext(os.path.basename(str(src_path or '')))[0].lower()
     return stem.endswith(_LOD_TIER_SUFFIXES)
+
+
 
 
 def _apply_parallax(ts, shader, tex_set, tex_apply_mode, stats):
@@ -1652,6 +1691,7 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
             stats['untextured_diffuse_defaulted'] = (
                 stats.get('untextured_diffuse_defaulted', 0) + 1)
 
+
     # Sky geometry takes the dedicated sky shader instead of the lighting one.
     # Skyrim's sky pass draws these before the world, unlit and unfogged, with
     # the horizon/atmosphere blend the weather record drives; routing them
@@ -1685,6 +1725,8 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
 
     # Build BSLightingShaderProperty
     shader = NifFormat.BSLightingShaderProperty()
+
+
     # Set shader flags via bit-struct attributes
     sf1 = shader.shader_flags_1
     sf1.slsf_1_specular = 1
@@ -1903,6 +1945,7 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         # this branch: the FX/flip-book path above threw `shader` away for a
         # BSEffectShaderProperty, which has neither a height slot nor a shader
         # type to set.
+        #
         _apply_parallax(ts, shader, tex_set, tex_apply_mode, stats)
         ts.bs_properties[0] = shader
 
@@ -5335,7 +5378,7 @@ def _upgrade_skin_instances(data):
 
 def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                  creature=False, worn=False, parallax=False, biped_flags=0,
-                 hair=False):
+                 tex_fallback=(), hair=False):
     """Convert a PyFFI NifFormat.Data in-place to Skyrim format.
 
     worn=True marks the NIF as body-worn gear on the plugin's own authority (an
@@ -5366,6 +5409,7 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         'bones_remapped': 0,
         'textures_fixed': 0,
         '_src_path': str(src_path),   # for flip-book/height-map source lookup
+        '_tex_fallback': tex_fallback or (),
         '_parallax': bool(parallax),  # opt-in; see _apply_parallax
         # Sky geometry (stars/clouds/atmosphere) needs BSSkyShaderProperty
         # rather than the lighting shader — see sky_object_type_for.
@@ -6557,7 +6601,8 @@ def merge_creature_body(part_paths, dst_path, skeleton_path=None):
 
 def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
                 src_meshes_dir=None, creature=False, wearable_plan=None,
-                parallax=False, textures_only=False, hair=False):
+                parallax=False, textures_only=False, tex_fallback=(),
+                hair=False):
     """Convert a single Oblivion NIF to Skyrim format.
 
     Already-Skyrim versions are copied to dst_path unchanged.
@@ -6664,7 +6709,8 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     stats = _convert_nif(data, fix_textures=fix_textures,
                          src_path=str(src_path), creature=creature,
                          worn=_worn, parallax=parallax,
-                         biped_flags=_biped_flags, hair=hair)
+                         biped_flags=_biped_flags,
+                         tex_fallback=tex_fallback, hair=hair)
 
     # Graft the converted Oblivion flame NIF under FlameNode* markers (candle
     # flame / torch fire) — full conversion of Oblivion's own flame visuals,
@@ -6867,6 +6913,8 @@ def _finish_result(result, stats):
     # Parallax accounting.  Carried up per CATEGORY, because "skipped" on its
     # own sends the next person back to all 163 flagged textures with no lead —
     # over half of them legitimately have no height data to carry.
+    # `spec_` rides in the same bucket: both are per-category counters merged
+    # with Counter.update(), and both answer "why was this shape left alone".
     _px = {k: v for k, v in stats.items() if k.startswith('parallax_')}
     if _px:
         result['parallax'] = _px
@@ -6964,7 +7012,13 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
     skipped_list = []
 
     workers = _WORKER_COUNT
+    # Resolved once here, not per shape: reading _HEADER.txt in every
+    # worker for every mesh would be thousands of redundant opens.
+    _tex_fallback = master_texture_roots(mesh_dir)
     print(f'Found {total} NIF files in {mesh_dir} (workers={workers})')
+    if _tex_fallback:
+        print(f'  Texture fallback: {len(_tex_fallback)} master tree(s) '
+              f'-- {", ".join(os.path.basename(os.path.dirname(r)) for r in _tex_fallback)}')
     if skipped_by_path:
         print(f'  Skipped {skipped_by_path} files matching SKIP_PATHS: {sorted(SKIP_PATHS)}')
 
@@ -6974,7 +7028,7 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
     work_args = [
         (str(nif_file), str(out_base / nif_file.relative_to(mesh_path)),
          fix_textures, remap_skeleton, str(mesh_path), wearable_plan,
-         parallax, textures_only)
+         parallax, textures_only, _tex_fallback)
         for nif_file in nif_files
     ]
 
@@ -7079,6 +7133,8 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
             # Oblivion renders no parallax there either.
             print(f'  left flat, {cat[len("parallax_"):]}: {cnt} shapes')
 
+
+
     # plain ASCII: cp1252 consoles/pipes choke on the arrow character
     print(f'\nDetailed stats: Strips->Shape={stats["strips"]}, '
           f'Properties={stats["properties"]}, '
@@ -7089,7 +7145,7 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
 
 def _batch_worker(args):
     (nif_str, out_path, fix_textures, remap_skeleton, src_meshes_dir,
-     wearable_plan, parallax, textures_only) = args
+     wearable_plan, parallax, textures_only, tex_fallback) = args
     global _worker_warn_log
     _worker_warn_log = []
     try:
@@ -7097,7 +7153,8 @@ def _batch_worker(args):
                         fix_textures=fix_textures, remap_skeleton=remap_skeleton,
                         src_meshes_dir=src_meshes_dir,
                         wearable_plan=wearable_plan, parallax=parallax,
-                        textures_only=textures_only)
+                        textures_only=textures_only,
+                        tex_fallback=tex_fallback)
         r['warn_counts'] = _categorize_pyffi_warnings(_worker_warn_log)
         return ('ok', nif_str, r)
     except Exception as e:

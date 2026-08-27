@@ -177,9 +177,33 @@ def build_plan(export_dir) -> dict:
 
     *export_dir* is the per-plugin export directory (e.g. export/Oblivion.esm).
     Paths absent from the result are referenced by no ARMO/CLOT record.
+
+    The BASE's records count too.  An asset-only mod -- a retexture stack, or
+    an ordered merge -- has no ARMO/CLOT of its own, so on its own evidence no
+    mesh is ever worn and no weight variants are written.  The armour then
+    falls back to the base conversion's `_0`/`_1` pair, which was decided
+    without any of the mod's textures, and every improvement to those meshes is
+    silently unused.  Worn gear is exactly what benefits most from a specular
+    map, so this is not a corner case.
+
+    The base's plan is laid down FIRST and the tree's own records are merged on
+    top, so a mod that does ship ARMO/CLOT still wins for the meshes it names.
     """
     export_dir = Path(export_dir)
     plan: dict = {}
+
+    from . import base_plugins
+    for base in base_plugins.export_dirs(export_dir):
+        if Path(base) == export_dir:
+            continue
+        inherited = build_plan(base)
+        # BIPED_FLAGS_KEY holds a nested map, so a plain update() would drop
+        # the base's flags wholesale instead of merging them.
+        for k, v in inherited.items():
+            if k == BIPED_FLAGS_KEY:
+                plan.setdefault(k, {}).update(v)
+            else:
+                plan[k] = v
 
     def want(path: str, flags: int):
         if path:
@@ -216,7 +240,10 @@ def build_plan(export_dir) -> dict:
 
     # Carry the authored slot data alongside, so callers that need to know what
     # a mesh IS (not just which variants to write) do not re-parse the export.
-    plan[BIPED_FLAGS_KEY] = build_biped_flags(export_dir)
+    # Merged, not assigned: an inherited base's flags are already in here
+    # (see the base_plugins loop above) and this tree's own must win
+    # per entry rather than replacing the map wholesale.
+    plan.setdefault(BIPED_FLAGS_KEY, {}).update(build_biped_flags(export_dir))
     return plan
 
 

@@ -234,11 +234,34 @@ def _mod_commands(args, export_dir: str, tes4_data: str) -> int:
               f"See --list-mods.")
         return 1
 
-    # --import-mod
-    src = args.import_mod
-    if not os.path.exists(src):
-        print(f"ERROR: not found: {src}")
+    # --import-mod.  One or more sources, applied IN ORDER: later sources
+    # overwrite earlier ones in the shared asset tree, exactly as a mod manager
+    # would resolve them.  Doing it here rather than at convert time means every
+    # later stage keeps seeing a single coherent tree and needs no changes.
+    sources = args.import_mod
+    if isinstance(sources, str):
+        sources = [sources]
+    # A source may be an archive, a mod folder, or the NAME of an export tree
+    # that already exists -- which is how the base game joins the stack rather
+    # than sitting beside it.
+    missing_src = [x for x in sources
+                   if not os.path.exists(x)
+                   and not (Path(export_dir) / x).is_dir()]
+    if missing_src:
+        for x in missing_src:
+            print(f"ERROR: not found: {x}")
         return 1
+    if len(sources) > 1 and not args.merge_as:
+        print("ERROR: several sources need --as NAME to say which asset tree "
+              "they merge into.")
+        print("  python convert.py --import-mod A B C --as \"My Overhaul\"")
+        return 1
+
+    if len(sources) > 1:
+        return _import_ordered(sources, args, export_dir, tes4_data,
+                               mod_ingest)
+
+    src = sources[0]
     try:
         manifest = mod_ingest.inspect(src)
     except mod_ingest.IngestError as exc:
@@ -284,6 +307,7 @@ def _mod_commands(args, export_dir: str, tes4_data: str) -> int:
     first = sorted(results)[0]
     quoted = f'"{first}"' if ' ' in first else first
     caps = (results[first] or {}).get('capabilities') or {}
+    _write_base_plugins(export_dir, first, args.base)
     print()
     if caps.get('plugin', True):
         print("Imported. Convert it with:")
@@ -319,6 +343,128 @@ def _is_asset_only(file_name: str, export_dir: str) -> bool:
     if isinstance(caps, dict) and 'plugin' in caps:
         return not caps['plugin']
     return not entry.get('plugin')
+
+
+def _import_ordered(sources, args, export_dir, tes4_data, mod_ingest):
+    """Import several sources IN ORDER into one shared asset tree.
+
+    This is the conflict resolution a mod manager does, moved to import time.
+    It has to happen here because the conversion's decisions are cross-mod: a
+    shape's specular comes from whichever normal map WINS, its parallax from
+    whichever diffuse wins.  Convert each mod on its own and it decides against
+    textures the player will never see -- measured on the author's own stack,
+    a single forgotten folder left 5139 shapes without a height map.
+
+    Plugins are NOT pooled: each still registers under its own name, so the
+    same list yields both orderings by projection -- assets from the entries
+    that ship assets, plugins from the entries that ship plugins.
+    """
+    target = args.merge_as
+    index = mod_ingest.new_index()
+    tgt_dir = Path(export_dir) / target
+
+    if args.fresh and tgt_dir.is_dir():
+        n = sum(1 for p in tgt_dir.rglob('*') if p.is_file())
+        print(f"--fresh: clearing the previous '{target}' assets ({n} files)")
+        for cat in mod_ingest.ASSET_DIRS:
+            d = tgt_dir / cat
+            if d.is_dir():
+                shutil.rmtree(d)
+    elif tgt_dir.is_dir():
+        print(f"NOTE: '{target}' already exists and sources are layered ON "
+              f"TOP of it.\n      Files from an earlier import survive; use "
+              f"--fresh to start clean.\n")
+
+    print(f"Merging {len(sources)} source(s) into '{target}', in order:\n")
+
+    results = {}
+    for n, src in enumerate(sources, 1):
+        print(f"[{n}/{len(sources)}] {src}")
+        if not os.path.exists(src) and (Path(export_dir) / src).is_dir():
+            # An export tree that already exists: this is the base game
+            # joining the stack instead of sitting beside it, so its own
+            # meshes are converted against the retextures that will win.
+            try:
+                mod_ingest.seed_from_export(export_dir, src, target,
+                                            index=index)
+            except mod_ingest.IngestError as exc:
+                print(f"  ERROR: {exc}")
+                return 1
+            print()
+            continue
+        try:
+            man = mod_ingest.inspect(src)
+        except mod_ingest.IngestError as exc:
+            print(f"  ERROR: {exc}")
+            return 1
+        print(f"  {man.summary()}"
+              + (f"; plugins: {', '.join(man.plugins)}" if man.plugins
+                 else "; no plugin"))
+        try:
+            # force=True: a merge is an explicit request, and the idempotence
+            # cache is keyed per source, so it cannot see that the SHARED tree
+            # still needs this source re-applied on top of the others.
+            res = mod_ingest.ingest(
+                src, export_dir,
+                plugin_members=args.plugin_member,
+                keep_archive=not args.no_keep_archive,
+                manifest=man, force=True,
+                asset_target=target, index=index)
+        except mod_ingest.IngestError as exc:
+            print(f"  ERROR: {exc}")
+            return 1
+        results.update(res)
+        print()
+
+    print("=" * 60)
+    print(f"Asset index for '{target}'")
+    print("=" * 60)
+    total = len(index['files'])
+    for label, placed in index['per_source'].items():
+        won = sum(1 for v in index['files'].values() if v == label)
+        share = won * 100.0 / total if total else 0.0
+        note = '  <- contributed nothing that survived' if not won else ''
+        print(f"  {label:<44} {placed:>6} placed, {won:>6} winning "
+              f"({share:5.1f}%){note}")
+    print(f"  {'TOTAL':<44} {total:>6} files")
+
+    if index['overwrites']:
+        print(f"\n{len(index['overwrites'])} file(s) overwritten by a later "
+              f"source:")
+        for rel, prev, now in index['overwrites'][:15]:
+            print(f"  {rel}\n      {prev}  ->  {now}")
+        if len(index['overwrites']) > 15:
+            print(f"  ... ({len(index['overwrites']) - 15} more)")
+
+    missing = _missing_master_exports(results, export_dir, tes4_data)
+    if missing:
+        print("\nWARNING: these masters have no export yet:")
+        for master, users in sorted(missing.items()):
+            print(f"  {master}  (needed by {', '.join(sorted(users))})")
+
+    quoted = f'"{target}"' if ' ' in target else target
+    _write_base_plugins(export_dir, target, args.base)
+    print(f"\nMerged. Convert it with:\n  python convert.py -f {quoted}")
+    return 0
+
+
+def _write_base_plugins(export_dir, name, bases):
+    """Record which plugins a mod builds on, for the texture fallback.
+
+    An asset-only mod declares no master -- it has no plugin and so no
+    `_HEADER.txt` -- but its meshes still reference the base game's textures.
+    Without this the converter cannot resolve them: measured on the author's
+    parallax mod, 1602 of 3357 referenced texture paths existed ONLY in the
+    base export.  See nif_converter.master_texture_roots.
+    """
+    if not bases:
+        return
+    from asset_convert.nif_converter import BASE_PLUGINS_FILE
+    d = Path(export_dir) / name / '_source'
+    d.mkdir(parents=True, exist_ok=True)
+    (d / BASE_PLUGINS_FILE).write_text('\n'.join(bases) + '\n',
+                                       encoding='utf-8')
+    print(f"  Base: {', '.join(bases)} (textures resolve through these)")
 
 
 def _missing_master_exports(results, export_dir: str, tes4_data: str) -> dict:
@@ -550,13 +696,16 @@ def phase_assets(file_name: str, config: dict, output_dir: str = None,
     print(f"[{file_name}] Generating book inventory-art meshes...")
     # A plugin places its MASTERS' book models too, and those meshes/textures
     # were extracted into the master's export dir only.
-    from asset_convert.terrain_lod import _master_names as _tes4_masters
+    # base_plugins, not terrain_lod's _master_names: the latter reads only
+    # _HEADER.txt, which an asset-only merge does not have, so its books
+    # would find no BOOK records and ship no inventory art at all.
+    from asset_convert import base_plugins as _bp
     bstats = generate_book_inams(
         source_file=file_name,
         extract_dir=extract_dir,
         output_dir=out_dir,
         skyrim_data=tes5_data or None,
-        master_names=_tes4_masters(record_dir(extract_dir, file_name)),
+        master_names=_bp.names_for(record_dir(extract_dir, file_name)),
     )
     print(f"[{file_name}] Book INAM complete: ok={bstats['ok']} "
           f"skip={bstats['skip']} fail={bstats['fail']}")
@@ -1299,9 +1448,36 @@ def _run_pipeline():
     # Importing is not a pipeline phase: it registers a NEW conversion source
     # and exits, after which `-f <plugin>` converts it like any other plugin.
     parser.add_argument("--import-mod",          metavar="ARCHIVE",
+                        nargs="+",
                         help="Import a mod archive (.zip/.7z/.rar) or an "
                              "already-extracted mod folder as a conversion "
                              "source, then exit")
+    # Several sources import IN ORDER into one asset tree, later ones
+    # overwriting earlier -- the precedence a mod manager applies, resolved
+    # once at import time so the converter sees one coherent stack. Without
+    # it each mod converts blind to the others: a mesh-fix mod cannot see
+    # the retexture that will win beside it, and decides specular and
+    # parallax against the wrong textures.
+    # An asset-only mod declares no master -- it has no plugin and so no
+    # _HEADER.txt -- but its meshes still reference the base game's
+    # textures. Recording the base here is what lets the converter resolve
+    # them; see nif_converter.master_texture_roots.
+    parser.add_argument("--fresh",                action="store_true",
+                        help="With several --import-mod sources: clear the "
+                             "target asset tree first. A merge is defined "
+                             "by its FULL source list, so re-importing a "
+                             "different list without this leaves the "
+                             "dropped mod's files behind and the index "
+                             "reports something that is no longer true.")
+    parser.add_argument("--base",                nargs="+", metavar="PLUGIN",
+                        help="With --import-mod: the plugin(s) this mod "
+                             "builds on (e.g. Nehrim.esm), so its meshes "
+                             "can resolve textures it does not ship.")
+    parser.add_argument("--as",                  dest="merge_as",
+                        metavar="NAME",
+                        help="With several --import-mod sources: the name "
+                             "of the merged asset tree. Required for a "
+                             "multi-source import.")
     parser.add_argument("--plugin-member",       nargs="+", metavar="PATH",
                         help="With --import-mod: which plugin(s) inside the "
                              "archive to register (default: all found)")
