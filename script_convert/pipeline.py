@@ -43,8 +43,8 @@ def _load_music_cues(output_dir) -> dict:
     the EditorID through the SHARED helper, so a StreamMusic property can only
     ever name a record the importer actually wrote.
     """
-    import json
     from pathlib import Path as _P
+    from tes5_import.artifact_schema import read_artifact, StaleArtifactError
     from .constants import music_cue_editor_id, music_type_editor_id
 
     # The manifest sits in the plugin's OUTPUT root; scripts are written to a
@@ -59,7 +59,13 @@ def _load_music_cues(output_dir) -> dict:
         return {}
 
     try:
-        data = json.loads(cand.read_text(encoding='utf-8'))
+        data = read_artifact(str(cand))
+    except StaleArtifactError:
+        # Same contract as the importer: a stale manifest is a real failure
+        # with a fix the user can act on, not a missing file.  Silently
+        # returning {} here would strip the MUSC binding off every
+        # StreamMusic property instead.
+        raise
     except (ValueError, OSError):
         return {}
 

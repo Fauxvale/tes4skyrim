@@ -646,6 +646,7 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
     """Import using the Python tes5_import package."""
     from tes5_import.import_main import import_plugin
     from tes5_import.override_merge import MissingMasterOutputError
+    from tes5_import.artifact_schema import StaleArtifactError
 
     export_subdir = str(record_dir(export_dir, file_name))
     if not os.path.isdir(export_subdir):
@@ -702,7 +703,7 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
             is_esm=is_esm,
             output_root=out_root,
         )
-    except MissingMasterOutputError as e:
+    except (MissingMasterOutputError, StaleArtifactError) as e:
         print(f"[{file_name}] ERROR: {e}")
         return False
 
@@ -757,6 +758,7 @@ def phase_sounds(file_name: str, config: dict, output_dir: str = None):
 def phase_scripts(file_name: str, config: dict, output_dir: str = None):
     """Convert TES4 scripts to Papyrus .psc source files."""
     from script_convert.pipeline import convert_all_scripts
+    from tes5_import.artifact_schema import StaleArtifactError
 
     export_root = str(SCRIPT_DIR / "export")
     export_subdir = str(record_dir(export_root, file_name))
@@ -769,7 +771,14 @@ def phase_scripts(file_name: str, config: dict, output_dir: str = None):
                   / "scripts" / "source")
 
     print(f"[{file_name}] Converting scripts to Papyrus...")
-    stats = convert_all_scripts(export_subdir, str(script_dir))
+    try:
+        stats = convert_all_scripts(export_subdir, str(script_dir))
+    except StaleArtifactError as e:
+        # Scripts read music_tracks.json to bind StreamMusic properties; a
+        # stale one is actionable, so print the instruction rather than a
+        # traceback (same contract as phase_import).
+        print(f"[{file_name}] ERROR: {e}")
+        return False
     errs = stats['scpt_err'] + stats['info_err'] + stats['qust_err']
     return errs == 0
 

@@ -305,10 +305,11 @@ def convert_music(
     tracks.sort(key=lambda t: t['source_rel'])
     stats['tracks'] = len(tracks)
     out_root.mkdir(parents=True, exist_ok=True)
-    (out_root / MANIFEST_NAME).write_text(
-        json.dumps({'plugin': source_name, 'tracks': tracks},
-                   indent=2, sort_keys=True),
-        encoding='utf-8')
+    # Versioned envelope so a manifest written by an older converter is
+    # reported as stale instead of half-read (tes5_import/artifact_schema.py).
+    from tes5_import.artifact_schema import write_artifact
+    write_artifact(str(out_root / MANIFEST_NAME), source_name,
+                   {'plugin': source_name, 'tracks': tracks})
 
     import collections
     spread = collections.Counter(t['bitrate'] // 1000 for t in tracks)

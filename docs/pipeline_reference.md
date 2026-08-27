@@ -205,6 +205,50 @@ either way.
 - Processing `Knights.esp` reuses the cached `Oblivion.esm` export + mappings.
 - `--no-cache` forces a re-export.
 
+### Versioned stage artifacts
+
+Some stages hand data to the import stage through JSON on disk. Those files
+outlive the run that wrote them, and — when a plugin has a TES4 master — they
+outlive the PLUGIN that wrote them: a dependent plugin reads its master's
+`creature_projects.json` and never rewrites it. So a file on disk can predate
+the code reading it by any amount.
+
+Registered artifacts carry an envelope (`tes5_import/artifact_schema.py`):
+
+```json
+{"version": 1, "plugin": "Oblivion.esm", "stage": "--creatures-only",
+ "data": {...}}
+```
+
+`plugin` and `stage` are what make a stale file's error ACTIONABLE — the
+consumer can infer neither (the file may belong to a master, and only the
+producer knows which flag rebuilds it). Reading a stale file raises
+`StaleArtifactError`, which `convert.py` prints as an `ERROR:` naming the
+plugin to re-run and the exact command.
+
+| Artifact | Rebuilt by |
+|---|---|
+| `creature_projects.json` | `--creatures-only` |
+| `music_tracks.json` | `--sounds-only` |
+
+**Adding a required field to one of these means bumping its `version` AND the
+frozen digest in `tests/test_artifact_schema.py`, in the same commit.** That
+test fails when a `required` set changes without a version bump — the slip that
+caused `KeyError: 'behavior_hkx'` on every plugin with a master after a4fdb47
+added the field with no version to detect it. A second, runtime check rejects a
+file missing a required key even at a matching version, as the backstop for
+when the test is bypassed.
+
+A file with no `version` key reads as v0, so every artifact written before this
+existed is rejected cleanly rather than half-read. Users upgrading past this
+point hit the error once per stale artifact and re-run the named stage.
+
+This does NOT apply to pure caches (mesh bounds, extracted-BSA bookkeeping,
+voice durations) — a stale cache is discarded and recomputed, never fatal.
+`collision_extract.BOUNDS_SCHEMA_VERSION` does that with an in-band
+`__schema__` sentinel. `master_manifest.py` predates all of this and carries
+its own equivalent envelope.
+
 ### Generated FormIDs are stable across builds
 
 Every record the importer *invents* (ARMA, OTFT, NAVM, VTYP, SNDR, …) gets its

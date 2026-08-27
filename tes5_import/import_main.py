@@ -718,6 +718,13 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
             output_path, os.path.basename(os.path.normpath(output_path)))
     plugin_out_dir = os.path.dirname(output_path)
 
+    # Fail on a stale stage artifact NOW, not 15 phase-0 steps in.  The
+    # consumers (creature projects, music manifest) sit deep in the run, so
+    # without this the user waits through the master load, fid maps, cross-ref
+    # graph and script plans before being told to re-run a stage.
+    from .artifact_schema import preflight_artifacts
+    preflight_artifacts(export_dir, plugin_out_dir)
+
     # World-map cloud banks are generated per worldspace as convert_WRLD runs,
     # sized to that worldspace's own bounds (see asset_convert/worldmap_clouds).
     set_cloud_bank_output(plugin_out_dir)

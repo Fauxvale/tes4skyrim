@@ -743,9 +743,13 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
         # ActionIdleWarn IDLE entry records (creature_idles)
         'vocal_events': m.get('vocal_events', []),
     } for name, m in all_manifests.items()}
-    with open(os.path.join(export_dir, 'creature_projects.json'), 'w',
-              encoding='utf-8') as f:
-        json.dump(summary, f, indent=1)
+    # Versioned envelope: the import stage reads this back, possibly from a
+    # DIFFERENT plugin (a dependent plugin uses its master's projects and never
+    # rewrites them), so the file has to name the plugin and stage that rebuild
+    # it.  See tes5_import/artifact_schema.py.
+    from tes5_import.artifact_schema import write_artifact
+    write_artifact(os.path.join(export_dir, 'creature_projects.json'),
+                   os.path.basename(os.path.normpath(export_dir)), summary)
 
     return {'projects': projects, 'errors': errors}
 

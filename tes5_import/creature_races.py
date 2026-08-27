@@ -1122,11 +1122,14 @@ def _load_projects(export_dir: str) -> dict:
     are shared, exactly as the source plugin intended. Own projects win on
     conflict — this plugin's own conversion of a folder is the authoritative
     one for the records it ships."""
+    from .artifact_schema import read_artifact
     own_path = os.path.join(export_dir, 'creature_projects.json')
     own = {}
     if os.path.exists(own_path):
-        with open(own_path, encoding='utf-8') as f:
-            own = json.load(f)
+        # Raises StaleArtifactError (surfaced by convert.py) when this file
+        # predates a field the builders below subscript without a default.
+        own = read_artifact(
+            own_path, os.path.basename(os.path.normpath(export_dir)))
 
     header = os.path.join(export_dir, '_HEADER.txt')
     if not os.path.isfile(header):
@@ -1151,11 +1154,13 @@ def _load_projects(export_dir: str) -> dict:
                              'creature_projects.json')
         if not os.path.exists(mpath):
             continue
-        with open(mpath, encoding='utf-8') as f:
-            for folder, proj in json.load(f).items():
-                if folder not in own and folder not in merged:
-                    merged[folder] = proj
-                    inherited += 1
+        # The MASTER's file, so the master is what has to be re-run -- pass it
+        # as the hint or a v0 file (no envelope, no plugin field) would blame
+        # whichever plugin happened to be converting.
+        for folder, proj in read_artifact(mpath, name).items():
+            if folder not in own and folder not in merged:
+                merged[folder] = proj
+                inherited += 1
     if inherited:
         print(f'  Creature projects: inherited {inherited} from master(s) '
               f'{", ".join(names)} (own: {len(own)})')
