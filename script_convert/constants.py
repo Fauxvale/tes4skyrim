@@ -1370,6 +1370,31 @@ def _sanitize_name(name: str) -> str:
 PAPYRUS_MAX_SCRIPT_NAME = 38
 
 
+def music_type_editor_id(plugin: str, category: str) -> str:
+    """EditorID of the MUSC a TES4 music category converts to.
+
+    MUST match tes5_import.record_types.music.musc_editor_id exactly: the
+    importer writes the record under this name and the script converter
+    declares a Papyrus property under it, so the two disagreeing means every
+    StreamMusic call binds to nothing.
+    """
+    stem = ''.join(c for c in plugin if c.isalnum())
+    return 'MUS%s%s' % (stem, category.capitalize())
+
+
+def music_cue_editor_id(plugin: str, source_rel: str) -> str:
+    """EditorID of the per-cue MUSC built for one `Special/` track.
+
+    A script names a specific FILE (`StreamMusic "data/music/special/x.mp3"`),
+    so each Special track gets its own addressable MUSC.  Mirrors the
+    'MUSC_TRACK' branch of tes5_import.record_types.music.build_music_records.
+    """
+    stem = ''.join(c for c in plugin if c.isalnum())
+    tail = source_rel.rsplit('/', 1)[-1].rsplit('.', 1)[0]
+    tail = ''.join(c if c.isalnum() else '_' for c in tail)
+    return 'MUSCue%s_%s' % (stem, tail)
+
+
 def papyrus_script_name(edid: str, prefix: str = 'TES4_') -> str:
     """Return the Papyrus ScriptName for a TES4 script EditorID.
 

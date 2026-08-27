@@ -730,6 +730,23 @@ def phase_sounds(file_name: str, config: dict, output_dir: str = None):
     failed    = stats.get('failed', 0)
     print(f"[{file_name}] Sounds complete "
           f"({converted} converted to XWM, {copied} copied, {failed} failed)")
+
+    # Music rides the sound phase: same encoders (ffmpeg + xWMAEncode), so a
+    # single --sounds-only rebuilds both.  It writes music_tracks.json, which
+    # the importer reads to build MUST/MUSC, so it must run before --import-only
+    # for the records to name real files.
+    from asset_convert.music_convert import convert_music
+    print(f"[{file_name}] Converting music to xWMA...")
+    mstats = convert_music(
+        source_file=file_name,
+        extract_dir=extract_dir,
+        output_dir=out_dir,
+    )
+    print(f"[{file_name}] Music complete "
+          f"({mstats.get('converted', 0)} converted, "
+          f"{mstats.get('cached', 0)} cached, "
+          f"{mstats.get('failed', 0)} failed, "
+          f"{mstats.get('tracks', 0)} tracks)")
     return True
 
 

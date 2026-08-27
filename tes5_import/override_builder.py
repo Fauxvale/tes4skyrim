@@ -142,7 +142,6 @@ _INEXPRESSIBLE = frozenset({
     ('*', 'ACBS.SpellPoints'),    # TES5 derives magicka; converter drops it
     ('CREA', 'RNAM.AttackReach'), # attack reach is race-level in Skyrim
     ('CREA', 'NIFZ[]'),           # creature geometry is converted asset-side
-    ('CELL', 'XCMT.MusicType'),   # convert_CELL emits no music subrecord
     ('SPEL', 'SPIT.Level'),       # TES5 SPIT has no spell level
     # TES4 attributes with no TES5 field and no derived subrecord: _npc_acbs
     # reads Endurance/Intelligence/Strength, _npc_skills_dnam reads

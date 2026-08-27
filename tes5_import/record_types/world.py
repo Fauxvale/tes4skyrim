@@ -49,6 +49,24 @@ _GRID_LOCATION: dict = {}
 # WRLD FormID -> LCTN FormID, the catch-all location for that worldspace.
 _WORLD_LOCATION: dict = {}
 
+# TES4 music enum value -> the MUSC FormID built from that category's folder.
+# Populated by register_music_types() once the music manifest is converted; an
+# empty dict simply means this plugin shipped no music, and CELL/WRLD then omit
+# the subrecord exactly as they did before.
+_MUSIC_BY_ENUM: dict = {}
+
+
+# TES4's implicit default when a CELL/WRLD authors no music at all: enum 0,
+# "Default", which Oblivion resolves to the Explore set.
+TES4_DEFAULT_MUSIC_ENUM = 0
+
+
+def register_music_types(by_enum: dict):
+    """Register {tes4 XCMT/SNAM enum -> MUSC FormID} for CELL/WRLD emission."""
+    _MUSIC_BY_ENUM.clear()
+    _MUSIC_BY_ENUM.update(by_enum or {})
+
+
 # Door REFR FormID -> (NAVM FormID, triangle index), the reference side of a
 # navmesh door link.  Populated from the navmesh metas once every mesh exists
 # (Phase 4a) and read by convert_REFR to emit XNDP.  See set_door_navmesh_links.
@@ -624,6 +642,29 @@ def convert_CELL(rec: dict) -> bytes:
     if xcwt:
         subs += pack_formid_subrecord('XCWT', xcwt)
 
+    # XCMO — music type.  TES4 stores only a 3-value enum (XCMT: 0 Default,
+    # 1 Public, 2 Dungeon) because Oblivion's engine picks the actual track by
+    # scanning Data/Music/<Category>/; Skyrim needs a MUSC FormID instead.
+    # Measured source: 1,104 Dungeon + 767 Public cells in Oblivion.esm,
+    # 386 + 227 in Nehrim.esm.  Vanilla Skyrim.esm sets XCMO on 701 cells.
+    # An INTERIOR with no authored XCMT gets the same enum-0 default the engine
+    # applies (see convert_WRLD's ZNAM note): it has no worldspace to inherit
+    # from, so leaving the subrecord off makes it silent.  382 Oblivion and 219
+    # Nehrim interiors are in this state.
+    #
+    # EXTERIORS are deliberately left alone -- 33,241 of Oblivion's 33,560 have
+    # no XCMT, and stamping every one with an explicit XCMO would add ~33k
+    # subrecords to say what the worldspace's single ZNAM already says, and
+    # would override any future per-region music with a cell-level value.
+    xcmt = get_int(rec, 'XCMT.MusicType', None)
+    is_exterior = get_int(rec, 'XCLC.X', None) is not None
+    if xcmt is None and not is_exterior:
+        xcmt = TES4_DEFAULT_MUSIC_ENUM
+    if xcmt is not None:
+        musc = _MUSIC_BY_ENUM.get(xcmt)
+        if musc:
+            subs += pack_formid_subrecord('XCMO', musc)
+
     return pack_record('CELL', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
 
@@ -749,6 +790,29 @@ def convert_WRLD(rec: dict) -> bytes:
     n9y_raw = get_float(rec, 'NAM9.MaxY')
     subs += pack_subrecord('NAM0', struct.pack('<ff', n0x_raw, n0y_raw))
     subs += pack_subrecord('NAM9', struct.pack('<ff', n9x_raw, n9y_raw))
+
+    # ZNAM — the worldspace's default music.  xEdit places it immediately after
+    # the world object bounds (wbWorldObjectBounds, ZNAM, NNAM, XNAM...).
+    # TES4 stores the same 3-value enum here that CELL uses (SNAM), so it
+    # resolves through the same category table: 23 Dungeon + 16 Public in
+    # Oblivion.esm, 18 + 5 in Nehrim.esm.  Vanilla sets ZNAM on 27 worldspaces.
+    # 🛑 A worldspace with NO authored SNAM still needs music.  TES4 leaves the
+    # field off entirely for the main open worlds -- Tamriel, SEWorld,
+    # NehrimWorldspace and Arktwend all omit it (45 of Oblivion's 84
+    # worldspaces, 11 of Nehrim's 34) -- because Oblivion's engine defaults an
+    # unauthored exterior to the Explore set.  UESP, Oblivion:Music: "Explore:
+    # All of these tracks are randomly played one after another while the player
+    # is in the countryside (outside cities and dungeons)."
+    #
+    # Skyrim has no such default: with no ZNAM and no XCMO the world is SILENT,
+    # which is exactly what "city music works, countryside has none" looks like
+    # -- cities are the authored 1/Public cells, and the 33,241 of 33,560
+    # Oblivion exterior cells carrying no XCMT at all fall through to here.
+    snam = get_int(rec, 'SNAM.Music', None)
+    musc = _MUSIC_BY_ENUM.get(snam if snam is not None
+                              else TES4_DEFAULT_MUSIC_ENUM)
+    if musc:
+        subs += pack_formid_subrecord('ZNAM', musc)
 
     return pack_record('WRLD', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 

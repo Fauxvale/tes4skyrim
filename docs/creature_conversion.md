@@ -807,6 +807,213 @@ The `IdleStop` root wildcard was fixed in the same pass (vanilla routes
 `idleStop` only out of idle states; ours yanked any state — including a cast
 — back to Default). Keep both.
 
+<a id="ragdoll-less-death"></a>
+<a id="ghost-dissolve"></a>
+### Ghost/wraith death dissolve — SOLVED with Skyrim's native ash pile (2026-08-26)
+
+**Symptom (in-game):** a killed ghost stayed upright at standing height for
+ever, and never left a pile of ectoplasm.
+
+**Diagnosis.** Oblivion's ghost never falls over: `ghost/death.kf` keeps
+`Bip01 NonAccum` at standing height for the whole 1.17 s clip (Z 65.01 ->
+66.03, measured) and the accumulation bone only slides back in Y. The
+*disappearance* is 47 non-transform controlled blocks that a Havok clip
+cannot carry, so `kf_decode` drops them all:
+
+| channel | nodes | what it does |
+|---|---|---|
+| `NiVisController` | `SkinAttachment`, `AttachmentsBip`, `AttachmentsHead`, `Attachments{Left,Right}Hand`, `AttachmentsShrink` | hides the body, reveals the ectoplasm |
+| `NiGeomMorpherController` | `Shrinker:0` (Base->Shrunk), `Bip01 ectoplasm:0` | collapses the blob |
+| `NiAlphaController` | `Shrinker:0`, `Bip01 ectoplasm:0` | fades it out |
+| `NiPSysEmitterCtlr` | 10 `PArray*` | the wisp burst |
+
+Authored timeline: body visible to t=0.33 -> **t=0.40 body hides, shrink blob
+appears** -> t=0.67 ectoplasm puddle appears -> t=1.00 blob goes. With those
+channels gone, no ragdoll (`has_ragdoll=False`) and a `Death` state with no
+end trigger, the graph held the clip's last frame.
+
+<a id="ghost-dissolve-solution"></a>
+### ✅ THE FIX: `Actor.AttachAshPile` — Skyrim does this natively
+
+**Skyrim dissolves creatures into piles of goo exactly like Oblivion, and
+ships a GHOST-tinted pile for it.** The pieces were already in the engine:
+
+- `Actor.AttachAshPile(Form)` — native Papyrus. Drops a non-lootable pile at
+  the actor's feet which, when activated, **passes the activation onto the
+  actor**, so the corpse's inventory stays reachable. The CK wiki's own
+  example for the function is a **spectre**.
+- `DefaultAshPileGhost` — ACTI `0x00101048`, `Effects\AshPileGhost01.nif`.
+  Vanilla also ships `DefaultAshPileDarkGhost` (`0x0010C649`) and
+  `DefaultAshPileGhostBlack` (`0x0010D6EF`).
+
+So the conversion is: keep the authored death ANIMATION, drop the pile as it
+plays, then take the body out of view.
+`script_convert/static_scripts/TES4_GhostDissolve.psc` does exactly that --
+`AttachAshPile(AshPile)` on `OnDying`, `Utility.Wait(DeathAnimSeconds)`, then
+`SetScale(0.01)`.
+
+<a id="ghost-pile-is-oblivions"></a>
+**THE PILE IS OBLIVION'S OWN, NOT `DefaultAshPileGhost`.** `AttachAshPile`
+takes any base object, so the importer passes a STAT built from the ectoplasm
+geometry lifted straight out of the creature's own `skeleton.nif`:
+
+| creature | node the death clip reveals | geometry | verts |
+|---|---|---|---|
+| ghost | `AttachmentsBip` | `Bip01 ectoplasm:0` | 47 |
+| wraith | `Attachments` | `Cloak06:0` (a flat slab UNDER the body -- its remains, despite the name) | 278 |
+
+`nif_converter.extract_death_pile` lifts the subtree, bakes it where the death
+clip leaves it, and the pipeline runs it through `convert_nif` (the raw
+extract is still Oblivion-format uv2=11 and SSE cannot load it -- the shipped
+piles are uv2=83 with `BSLightingShaderProperty` + `NiAlphaProperty`).
+`creature_races.build_creature_death_piles` wraps each in an ACTI (a STAT
+cannot be activated — all six vanilla `DefaultAshPile*` are ACTI) that the
+CREA VMAD then binds. Skyrim's `DefaultAshPileGhost` survives only as the
+fallback for a dissolving creature whose skeleton carries no pile.
+
+<a id="ghost-pile-phantom"></a>
+**THE PILE'S CLICK TARGET IS A `bhkSimpleShapePhantom`, NOT A RIGID BODY.**
+Byte-read from `references/Skyrim Meshes/meshes/effects/ashpileghost01.nif`
+(ashpile01 / ashpileghostblack are the same shape): a child NiNode `Box01`
+carries `bhkSPCollisionObject(flags 129)` → `bhkSimpleShapePhantom(layer 15
+NONCOLLIDABLE)` → `bhkTransformShape(radius 0.1, z +0.1143)` →
+`bhkBoxShape(0.4572, 0.4572, 0.1143)` — a 64×64×16 game-unit box raised to
+z 0..16, with BSX 147. That is the only collision in the file. The
+crosshair pick sees the phantom; it does NOT see a fixed `bhkRigidBodyT` on
+the same layer: the first shipped version used one, measured correct on the
+shipped mesh (half-extents 10.4/10.4/2 game units on the pile's own
+geometry, body at z 10.2, ACTI OBND `(-11,-11,8)→(11,11,12)` read from the
+mesh) — and the in-game report was still *"hitbox incredibly small and
+offset from the ectoplasm"* (the tiny target was something else nearby,
+presumably the 0.01-scaled corpse). `_fit_pile_collision` now builds the
+vanilla chain verbatim, box = the FULL geometry extents with the Z
+half-extent floored at vanilla's 8 units. **The phantom alone did not fix
+it either** ("hitbox still nonexistent"): the ACTI had NO `FULL`, and a
+nameless activator gets no crosshair rollover and cannot be activated by
+the player at all — vanilla `DefaultAshPileGhost` is named. The record now
+carries `FULL = "Ectoplasm"`. *Unconfirmed in game.* The extract writes it in Oblivion
+havok units (÷7) and `collision._convert_collision`'s existing
+`bhkSPCollisionObject` path (the trap-tripwire route) rescales the transform
+shape and box ×0.1; layer 15 is an identity remap. The phantom float block
+is copied from a real Oblivion-authored phantom (`ctrigtripwire01.nif`).
+
+**Placement is computed, not guessed:**
+
+```
+final_world = parent_of_holder_world
+            + holder_local_on_the_clip's_LAST_frame
+            + (shape_rest_world - holder_rest_world)
+```
+
+Three traps, all hit in one session: (1) a *delta* leaves the wraith floating
+at world Z 43-58, because its holder sits at a CONSTANT clip value so the
+delta is zero; (2) using the clip value as a raw offset raises the ghost to
+Z 17-24, double-counting the shape's rest position; (3) pyffi's `tree()`
+yields a block once PER REFERENCE and the ghost's ectoplasm is referenced
+twice, so an un-deduped loop applies the offset twice (Z 21.2 instead of
+10.6). With all three handled the ghost pile lands at world Z 8.4-11.9 and
+the wraith's at 1.6-16.6, with `Scene Root` at 0 -- both on the ground.
+
+<a id="ghost-pile-no-disable"></a>
+**NEVER `Disable()` THE CORPSE -- THE PILE IS ITS ENABLE CHILD.** The first
+shipped version called `DisableNoWait(true)` and the in-game report was *"the
+ectoplasm pile appears but then it also fades away"*. An attached ash pile is
+an enable child of the actor, so disabling the corpse takes the pile with it;
+the CK wiki says as much under `Disable` ("If this is an enable parent the
+children will not be faded"). `SetScale(0.01)` removes the body from view and
+leaves the pile -- a separate reference -- untouched. Not 0.0: `SetScale`
+rejects zero. The corpse is never disabled or deleted, so its inventory,
+quest aliases and the pile's activation forwarding all keep working, and the
+ghost stays lootable for its Ectoplasm exactly as in Oblivion.
+
+**THE TRIGGER IS THE AUTHORED ANIMATION, NEVER A NAME.**
+`hkx_behavior.detect_dissolve` marks a project whose `death.kf` hides the
+actor's own skin holder (`SkinAttachment`) with a `NiVisController` instead of
+dropping the body; the flag rides the project manifest
+(`dissolves_on_death`, `death_duration`) into `creature_projects.json`, and
+`creature_races.creature_dissolve_info` turns it into the VMAD that
+`convert_CREA` attaches.
+
+Measured over every creature folder in all three test plugins the test fires
+on exactly the right set and nothing else — and note it correctly REJECTS
+`willothewisp`, which has a literal `Bip01 ContainerGoo01` node and
+visibility channels but never hides its body. It also found four dissolving
+creatures in Morrowind_ob nobody had looked at (`ancestralghost`, `bonelord`,
+`dwarvenspectre`, `ascendedsleeper` — they reuse the wraith's 3.67 s death).
+
+**Two scripts on one record.** `build_vmad_object_script` writes a fixed
+"1 attached script" count, so a ghost that ALSO has a converted TES4 SCRI
+(`MS02HouseGhost`, the three `WrathofSithis` actors) needs
+`append_vmad_object_script`, which bumps the count and concatenates the entry.
+
+**Shipped result:** 83 ghost/wraith NPCs across the three plugins carry the
+script (38 Oblivion / 21 Nehrim / 24 Morrowind_ob), with 1,198 other scripted
+NPCs untouched; every one binds `AshPile=0x00101048` and its own creature's
+death-clip duration (1.167 s ghost, 3.667 s wraith).
+
+<a id="ghost-dissolve-two-failures"></a>
+### ⛔ TWO ANIMATION-SIDE FIXES FAILED FIRST. DO NOT RETRY THEM.
+
+**Attempt 1 — re-parent merged shapes under their attachment node and
+collapse that bone's SCALE.** Shipped, and the in-game report was: *"the
+ghosts completely lost the main part of their body while still alive, only
+the smoke effect is still visible."*
+
+**A skinned shape still inherits its parent chain.** Vertices are placed by
+bone weights, but the engine applies the shape's parent transform ON TOP of
+the skinned result. `SkinAttachment` is a child of the animated
+`Bip01 NonAccum`, so the torso got that animation twice and left the view.
+The "smoke" is the 10 `NiParticleSystem`s that live in the SKELETON nif.
+
+Vanilla agrees with the flat layout: the working dog merge keeps `WolfBody`
+at the ROOT and only `Prn` parts under bones, and Oblivion's own part NIFs
+are standalone roots the engine attaches at runtime — never children inside a
+mesh file. **The body merge must parent every shape at the root.**
+
+**Attempt 2 — keep flat parenting, hide purely by bone scale.** Killed by
+measurement before shipping:
+
+| shape | skin bones | can scale hide it? |
+|---|---|---|
+| `HeadMorph:0`, both hands, `Shrinker:0` | 1 attachment bone each | yes |
+| `InnerBody` | **28 posing `Bip01*` bones** | no |
+| `OuterBody` | **26 posing `Bip01*` bones** | no |
+
+Oblivion attaches the skin parts *into* `SkinAttachment` at RUNTIME, and that
+node is a **sibling** of the Bip01 rig, never an ancestor — so no bone scale
+reaches the torso, and scaling the posing bones would destroy the death pose.
+Shipping the half that works decapitates the corpse.
+
+Hence `decode_kf(..., emit_vis_scale=False)` is the default: the visibility
+curves are still decoded into `clip.vis_tracks` (which is what
+`detect_dissolve` reads) but **no scale track is emitted**, so nothing
+collapses. Turn it on only if you can hide the torso too.
+
+**Kept from those attempts, and independently correct:**
+- `clip_to_animation_data` MERGES tracks per bone instead of overwriting.
+  `AttachmentsShrink`/`AttachmentsBip` carry BOTH a `NiTransformController`
+  and a `NiVisController`; the old dict comprehension kept only the last.
+- `Shrinker:0` ships with the hidden bit set, from the source skeleton's
+  authored `AttachmentsShrink` `flags=21` — without it the living ghost wore
+  its own shrink blob. **Read that bit from the SKELETON, never the body
+  parts:** a census of every Oblivion creature skeleton found it set exactly
+  ONCE, while the part NIFs set it on ~1165 ordinary `Bip01` bones.
+- Ragdoll-less creatures get vanilla's WITCHLIGHT record layout: no
+  `DeathWait` IDLE tree, blank ENAM on `Knockdown`/`RagdollInstant`. The
+  witchlight has one `bhkRigidBody`, zero constraints, `ragdoll` appears
+  **zero times** in its behavior graph, and `WitchlightRagdollInstant`
+  deliberately carries no ENAM.
+- Do NOT add `RemoveCharacterControllerFromWorld` to the ragdoll-less Death
+  state: absent from `witchlightbehavior.hkx`, and dropping the controller
+  with no ragdoll is the documented cause of corpses falling through floors.
+
+**Scope (measured):** 29 of 186 creature projects have no ragdoll, but only 9
+ship a `death.kf` under `meshes/creatures`. Of the non-dissolving ones,
+`steamcenturion` lands normally (root drops 54u) and `bettynetch`, `horker`,
+`shalk`, `spherecenturion` collapse via LIMB rotation with a stationary root
+(horker: 19 bones rotate >15 deg). **Do not "fix" those** — a constant
+`NonAccum` Z is just the creature's hip height.
+
 <a id="rigid-part-bind"></a>
 ### "Attached parts have no hitbox / corpse falls through ground" — it was AddRagdollToWorld (2026-08-08)
 
@@ -1848,6 +2055,157 @@ attacking/casting/staggering/blocking/swimming, each a sibling state.
     `CreatureScamp` / `CreatureScampStunted` (`player.placeatme 1203E9CB`
     with Oblivion.esm at load index 12).
 
+<a id="cast-pin"></a>
+### 7b-ii. Casters slide while casting — pinned with `bAnimationDriven` (2026-08-26)
+
+**Symptom:** the scamp glides across the ground while its cast animation
+plays. **Why it appeared now:** the strafe-locomotion pass (`5e868c8`) put
+the `Left`/`Right` clips' root-motion speed into the MOVT strafe columns,
+which were 0 before. The combat AI circles a target while it casts; with a
+0 lateral max speed that command produced no movement, and now it does. The
+cast slices themselves carry no root motion (`split_cast_clip` strips it;
+scamp casttarget/castself measure 0.00 u/s), so any commanded velocity is a
+slide. Melee attacks never slid because `BSIsActiveModifier_IsAttacking`
+holds `IsAttacking`, which stops the combat controller's steering; the cast
+chain held only `IsCasting`, which does not (mages walk while casting).
+
+**The fix is vanilla's own:** `BSIsActiveModifier_Spells` now also binds
+`bIsActive1 → bAnimationDriven`, so while the In/Loop/Out chain is active
+the engine takes the actor's motion from the clip's (empty) root motion and
+ignores the commanded velocity; the modifier clears it on exit. This is the
+walking creature caster's mechanism, pointer-traced (not name-guessed) in
+`chaurusbehavior.hkx`: `Casting_SpitAttack_MG` → modifier
+`bAnimationDriven_IsActive` (BSIsActiveModifier, `bIsActive0 →
+bAnimationDriven`) → clip `Attack_CastingA`; the same modifier wraps its
+bite attacks, and the chaurus declares ONLY `ChaurusDefault_MT`. The vanilla
+slaughterfish does it as an expression (`bAnimationDriven = IsStaggering ||
+IsRecoiling`). Vanilla's MOVT records confirm casters never use a zeroed
+movement type for this: `Hagraven_Magic_MT` and `NPC_MagicCasting_MT` carry
+full speeds.
+
+<a id="rooted-movt-failed"></a>
+**⛔ DO NOT RETRY: an all-zero `TES4<x>Rooted` MOVT switched by
+`iState = cond((IsCasting == 1), iState_<x>Rooted, iState_<x>Default)` at
+the root.** The draugr-blocking shape (`DraugrBlocking_MT` is all-zero
+SPED, and vanilla does switch iState onto it) shipped 2026-08-26 and
+**broke casting entirely in game** — the scamp never cast at all. The
+earlier claim that `IsActive_AnimDriven` appears only in vanilla get-up
+subtrees was wrong; see the chaurus trace above. *bAnimationDriven pin
+confirmed in game 2026-08-26 ("scamp sliding while casting seems better").*
+`bAllowRotation` was added to the same modifier afterwards: the report also
+said the scamp "has a hard time casting / throws fewer flares", and an
+animation-driven actor cannot turn by itself while the AI faces its target
+before releasing — falmerbehavior keeps `bAllowRotation` on for ranged
+(hand type 7), as does our own attack modifier. *Unconfirmed.*
+
+<a id="strafe-direction-blend"></a>
+**Strafing is a `Direction` blend, never an event-entered state
+(2026-08-26).** After `5e868c8` the scamp "slides while strafing instead of
+moving its legs": the StrafeLeft/StrafeRight STATES waited for
+`moveLeft`/`moveRight` events that the engine never sends — a census of
+every cached vanilla behavior (quadruped, wolf, chaurus, draugr, falmer,
+slaughterfish) has no such event. The engine writes the `Direction`
+variable and vanilla blends the gait clips on it: slaughterfish/chaurus
+`DirectionalBlend` = `hkbBlenderGenerator` flags **48 (PARAMETRIC|CYCLIC)**,
+min 0 / max 1, `blendParameter` bound to `Direction`, children anchored
+Forward 0.0 / ForwardR45 0.125 / BackwardR45 0.375 / Backward 0.5 /
+BackwardL45 0.625 / ForwardL45 0.875 (decoded from the child `weight`
+fields; the speed blends are flags 17 SYNC|PARAMETRIC). So **Direction:
+0 forward, 0.25 right, 0.5 back, 0.75 left, cyclic at 1.** The forward
+`moveLeft`/`moveRight` events are gone.
+
+**Second pass, same day — every direction child must be a SPEED BLEND,
+and the blend goes UNDER the walk/run split.** The first pass hung bare
+strafe clips beside the forward *state machine* in one flags-48 blend, and
+the report was *"strafes and floats, legs move only a little, especially
+at a distance"*: at a 32 u/s sideways walk the forward child's SpeedSampled
+blend sits near its 5 u/s creep child, so any Direction short of a pure
+strafe shows creeping legs under a translating body. Vanilla never does
+that: chaurus `DirectionalBlend` (flags **49**, SYNC on) has four children
+that are each `Slow@5 / Walk@nat / Run@350` blends, and draugr
+`MT_Direction_Blend` (49) has eight, all blenders — never a state machine
+under SYNC. Ours now: `_direction_family` wraps EACH gait family
+(ForwardWalkState / ForwardRunState) in its own flags-49 blend whose
+strafe/backward children are `_gait_speed_blend`s (creep@5 + clip@natural).
+*Unconfirmed in game.*
+
+Reading 64-bit SSE behavior graphs: `hkxcmd` cannot, but the packfile's
+fixup tables can be walked directly — section headers at 0x40 (19-byte name
++ 7 u32: abs, local, global, virtual, exports, imports, end), local fixups
+= strings/arrays, **global fixups = object pointers**, virtual fixups =
+object starts with class names. That is enough to print every
+`hkbModifierGenerator`'s modifier/generator by name.
+
+<a id="cast-engine-protocol"></a>
+### 7b-iii. WHY THE SCAMP RARELY CASTS — the engine side, measured live (2026-08-26)
+
+Live readback (`tools/live/graph_vars.py`, read-only) of a circling scamp
+that never fired: `bWantCastLeft=1`, `bMLh_Ready=1`, `IsCasting=0`,
+`iLeftHandType=9` (spell in the left hand) for minutes, and the engine sent
+the graph ONLY locomotion events (`moveStart/turnLeft/...` — never
+`Spell_FireForget_LH`). The scamp's left-hand `ActorMagicCaster`
+(`Actor+0x1A8+8*source`, state at `+0x30`) sat in **state 1** with the
+flare spell loaded. Decoded from the GOG exe (all RVAs 1.6.659):
+
+1. The AI's `CombatMagicCaster` calls `ActorMagicCaster` slot 3
+   (`0x563030`): `CheckCast` ok → `Actor::SetWantCast(actor, hand, true)`
+   (`0x641e30`, just `SetGraphVariableBool("bWantCastLeft")`) → state 1 →
+   **return**. The engine never reads `bWantCastLeft` back and its own
+   `IsCastReady` (`0x65eee0`, reads `bMLh_Ready`, refuses if actor flag
+   bit 21 at `+0x204`) is only used by combat-behavior-tree nodes.
+2. State 1 → 2 happens ONLY in `LeftHandSpellCastHandler::executeHandler`
+   (`0x75d950`; right hand `0x75d9a0`): `GetMagicCaster(hand)`, and if its
+   state is 1, `0x571820` sets state 2 and calls slot 4 (`0x5630e0`) =
+   `PerformAction(DefaultObject 45 = ActionLeftAttack)` → the IDLE tree →
+   `ENAM Spell_FireForget_LH` into the graph. `Spell_Ready/Release/Stop`
+   are likewise IDLE ENAMs (`AtronachFlameActionLeftReady/Release/
+   Interrupt`), and `MLh_SpellFire_Event` is the one cast tag the exe knows
+   by name (animation-string table `+0x430`). **None of
+   `Spell_FireForget_LH`, `Spell_Release`, `Magic_Equip`, `BeginCastLeft`
+   is a literal in the exe** — every engine→graph cast event comes from
+   IDLE records, and every graph→engine one is looked up by name.
+3. Handlers are `BSTCreateFactoryManager` entries keyed by CLASS name
+   (93 of them live: `LeftHandSpellCastHandler`, `LeftHandSpellFireHandler`,
+   `InterruptCastHandler`, `HitFrameHandler`, `WeaponRightSwingHandler`,
+   `MTStateHandler`, `MotionDrivenHandler`, …). At dispatch
+   (`Actor::ProcessEvent 0x645160` → `0x657600`) the event TAG is looked up
+   in a **per-actor** hash map hanging off `MiddleHighProcess+0xF8`
+   (entries `+0x38`, capacity `+0x1C`, parent map `+0x40`), whose values are
+   handler instances. That map is the only place the binding *event name →
+   handler* exists; `tools/live/anim_event_handlers.py` dumps it for any
+   loaded actor. Vanilla graphs (atronach, chaurus, draugr, falmer, human
+   0_master/magicbehavior) all raise `BeginCastLeft` from a
+   `SEND_ON_FALSE_TO_TRUE` expression, so the expected binding is
+   `BeginCastLeft → LeftHandSpellCastHandler`; ours raises the same event
+   once — and the engine did not advance. The dump will show whether our
+   actor's map lacks the binding (a per-graph/per-project population issue)
+   or the event never reaches dispatch. **Dumped 2026-08-26: the scamp's
+   map binds `BeginCastLeft -> LeftHandSpellCastHandler` (also
+   `BeginCastRight/Voice`, `InterruptCast -> InterruptCastHandler`,
+   `weaponSwing -> WeaponRightSwingHandler`, `weaponDraw ->
+   RightHandWeaponDrawHandler`, `HitFrame`, `preHitFrame ->
+   AnticipateAttackHandler`, `StartAnimationDriven`, `MTState`, 88 in
+   all; `BSResponse<BSFixedStringCI, Actor>`, case-insensitive). So the
+   graph raises the right event; the failure is the EDGE: `BeginCast_EEM`
+   was `SEND_ON_FALSE_TO_TRUE` (vanilla's mode), the engine never
+   rewrites `bWantCastLeft` while its caster waits in state 1, and once
+   the single edge is spent nothing can re-fire it. Now
+   `EVENT_MODE_SEND_ON_TRUE`: the handler is a no-op outside state 1 and
+   `IsCasting=1` silences it once the cast starts, so repeating the event
+   costs nothing and cannot be missed. *Shipped 2026-08-26, unconfirmed.*
+   (The chaurus's `(iCurrentStateID == 0)` and the falmer's `(iCombatState
+   == 0)` terms are Bethesda's own re-arm hacks for the same edge problem;
+   they would not have helped an actor that never left DefaultState.)
+4. The `sae` console command does NOT reach these handlers (it injects into
+   the graph; handlers fire on graph-RAISED events), so `sae BeginCastLeft`
+   proves nothing either way.
+
+🛑 Two crashes while probing: (a) `GetAnimationGraphManager` called ~100×
+from the bridge thread preceded a CommunityShaders render-thread crash
+(unproven); (b) a bridge `hook` on `RightHandSpellCastHandler::
+executeHandler` crashed the game on its first firing (frame 0 = the hook
+trampoline, id 42820+0x11). **Read memory; never hook engine handlers.**
+
 ### 7c. Swimming (implemented 2026-08-22)
 
 The engine sends `swimStart`/`swimStop` (already routed by the
@@ -1870,6 +2228,41 @@ What ships:
   graph declares `isSwimming` + the vanilla-verbatim iState switch
   expression; `creature_races._build_movts` emits the matching MOVT with
   the swim clips' own speeds (`_movt_sped_swim`).
+
+<a id="water-native"></a>
+**Water natives get NO SwimState — the swim set IS the locomotion
+(2026-08-26).** In-game: *"the slaughterfish does not attack"*. Two causes,
+both measured:
+
+1. `EQUIP_STANCES` listed no `swim*` spellings, so the fish's
+   `swimhandtohandattackequip/unequip` (NiControllerSequence names literally
+   `Equip`/`Unequip`) fell to the attack sweep and shipped as two of its
+   five "attacks"; it was the only creature in a 235-folder census with no
+   equip stance. The swim spellings are now in the table (slaughterfish ×2,
+   baliwog `swimhandtohandequip`, murkdweller `swimequip`).
+2. **Structural, and the real blocker:** attack transitions are LOCAL to
+   `DefaultState`, but a fish spawns in water, the engine sends `swimStart`
+   immediately, and the graph parks in the `SwimState` sibling for good —
+   `attackStart_*` reaches no transition. Vanilla `slaughterfishbehavior.hkx`
+   has no land/swim split at all: `DefaultBehavior` IS the swim gait
+   (Swim_Forward/FastForward blend, canned Swim_Left90/Right90, MainIdle →
+   SwimIdleBehavior), with `AttackState`/`StaggerState`/`RecoilState` as
+   root siblings driven by the ordinary `moveStart`/`turnStart`/
+   `attackStart_*` events and ONE movement type (`SlaughterfishSwim_MT`).
+   `classify_clips._promote_water_native` now builds exactly that: when a
+   creature has `swimforward` and no land gait clip of ANY spelling
+   (`forward`/`backward`/`turnleft`/`turnright` substrings — grummite's
+   `forwardwalk` and horker's `walkforward` keep them amphibious), the swim
+   clips move into the MoveForward/run/Turn/idle slots, `swimhandtohandidle`
+   becomes the combat idle, and `swim` is emptied so no SwimState, Swim MOVT
+   or iState switch is built; the Default MOVT carries the swim speeds.
+   Census: slaughterfish (Oblivion, Nehrim) and dreugh (Morrowind_ob) are
+   the water natives.
+
+Known gap, untouched: an AMPHIBIAN (baliwog, horker, mudcrab…) still cannot
+attack while in its SwimState for the same reason — its attack transitions
+live on DefaultState. *Fish promotion shipped 2026-08-26, awaiting in-game
+confirmation.*
 
 ### 7d. Blocking (implemented 2026-08-22)
 
@@ -1902,7 +2295,7 @@ Remaining classes of authored-but-unused clips, by cost:
 | Class | Files | Creatures | What is lost |
 |---|---|---|---|
 | Stance locomotion (`handtohand*`, `onehand*`, `twohand*`, `staff*`, `bow*`) | ~500 | 47 | An armed creature walks with the generic unarmed `forward.kf`; the authored `onehandforward.kf` etc. is never used. Vanilla drives these from `iRightHandType`, which we already declare and set. |
-| `left` / `right` strafe | 76 | 38 | No strafe states; the locomotion machine has no sideways entry. |
+| ~~`left` / `right` strafe~~ | 76 | 38 | **Implemented 2026-08-26 (`5e868c8`)**: StrafeLeft/StrafeRight locomotion states + MOVT strafe columns. Side effect on casters: see [7b-ii](#cast-pin). |
 | `jumpstart` / `jumploop` / `jumpland` | 9 | 3 | No jump states. |
 
 ---

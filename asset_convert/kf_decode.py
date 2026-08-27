@@ -58,6 +58,9 @@ class DecodedClip:
     tracks: list = field(default_factory=list)          # [BoneTrack]
     text_keys: list = field(default_factory=list)       # [(time, str)]
     skipped_blocks: list = field(default_factory=list)  # [(bone, reason)]
+    # [(bone, float array of 1.0 shown / 0.0 hidden)] -- the raw visibility
+    # curve behind the scale tracks above, kept so callers can report it
+    vis_tracks: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -330,10 +333,60 @@ def _controlled_block_target(cb) -> Optional[str]:
     return name or None
 
 
+def _controlled_block_ctrl_type(cb) -> Optional[str]:
+    """Controller class name of a controlled block (palette or direct field).
+
+    Needed to tell a NiVisController's NiBoolInterpolator (node visibility --
+    which we convert to a bone-scale collapse, see _decode_sequence) apart
+    from the other bool channels in the same sequence (particle-emitter
+    EmitterActive, bhkBlendController enables), which have no bone meaning.
+    """
+    name = None
+    if getattr(cb, 'string_palette', None) is not None:
+        name = _palette_string(cb.string_palette,
+                               getattr(cb, 'controller_type_offset', -1))
+    if not name and getattr(cb, 'controller_type', None):
+        name = bytes(cb.controller_type).decode('latin-1').rstrip('\x00')
+    return name or None
+
+
+def _sample_vis_bool(interp, times: np.ndarray):
+    """Sample a NiVisController's NiBoolInterpolator over `times`.
+
+    Returns a float array of 1.0 (shown) / 0.0 (hidden), or None if the
+    channel carries no keys.  NiBoolData visibility keys are STEP keys
+    (nif.xml type 5), so the value holds until the next key -- never lerp.
+    """
+    data = getattr(interp, 'data', None)
+    kg = getattr(data, 'data', None) if data is not None else None
+    n = int(getattr(kg, 'num_keys', 0) or 0) if kg is not None else 0
+    if not n:
+        bv = getattr(interp, 'bool_value', None)
+        if bv is None or int(bv) == 2:      # 2 = "no authored value"
+            return None
+        return np.full(len(times), 1.0 if int(bv) else 0.0)
+    kt = np.array([float(k.time) for k in kg.keys], dtype=np.float64)
+    kv = np.array([1.0 if int(k.value) else 0.0 for k in kg.keys],
+                  dtype=np.float64)
+    order = np.argsort(kt, kind='stable')
+    kt, kv = kt[order], kv[order]
+    # step lookup: value of the last key at or before t (first key before it)
+    idx = np.searchsorted(kt, times, side='right') - 1
+    np.clip(idx, 0, len(kv) - 1, out=idx)
+    return kv[idx]
+
+
 def decode_kf(kf_path: str, fps: float = DEFAULT_FPS) -> list:
     """Decode all NiControllerSequences in a .kf file.
 
     Returns a list of DecodedClip (Oblivion creature KFs have exactly one).
+
+    NiVisController channels are decoded into `clip.vis_tracks` (the authored
+    show/hide curve per node) but never become animation tracks: a Havok clip
+    carries bone transforms only.  hkx_behavior.detect_dissolve reads those
+    curves to recognise a creature whose death HIDES the body instead of
+    dropping it (ghost, wraith), and the dissolve is then reproduced with
+    Skyrim's own ash pile rather than in the animation.
     """
     data = NifFormat.Data()
     with open(kf_path, 'rb') as f:
@@ -386,12 +439,43 @@ def _decode_sequence(seq, fps: float) -> DecodedClip:
                 trans, rots, scales = _sample_bspline(interp, times)
         elif isinstance(interp, NifFormat.NiTransformInterpolator):
             trans, rots, scales = _sample_transform_data(interp, times)
+        elif (isinstance(interp, NifFormat.NiBoolInterpolator)
+              and _controlled_block_ctrl_type(cb)
+              == 'NiVisController'):
+            # NODE VISIBILITY.  A Havok clip carries bone transforms only, so
+            # a NiVisController has no direct destination -- but hiding a node
+            # and collapsing it to zero scale look identical, and SCALE is a
+            # channel hkx_anim already writes per bone.  Oblivion's ghost and
+            # wraith deaths are built entirely out of these: the death.kf
+            # hides SkinAttachment / AttachmentsBip / AttachmentsHead / the
+            # hand attachments while REVEALING AttachmentsShrink, whose
+            # shrink.nif morphs Base->Shrunk and fades out (the ectoplasm
+            # collapse).  Dropping the channel left the body fully visible at
+            # standing height for ever -- the hovering-ghost bug.
+            #
+            # A hidden node's CHILDREN are hidden too in Gamebryo, and a zero
+            # scale likewise collapses the whole subtree, so the semantics
+            # carry.  Emitted as scale only: translation/rotation stay None so
+            # the consumer holds the skeleton rest pose for those channels.
+            vis = _sample_vis_bool(interp, times)
+            if vis is None:
+                clip.skipped_blocks.append((bone, 'NiVisController (no keys)'))
+                continue
+            if float(vis.min()) == float(vis.max()):
+                # constant channel: nothing animates, let the rest pose stand
+                clip.skipped_blocks.append(
+                    (bone, 'NiVisController (constant)'))
+                continue
+            clip.vis_tracks.append((bone, vis))
+            clip.skipped_blocks.append((bone, 'NiVisController'))
+            continue
         elif isinstance(interp, (NifFormat.NiFloatInterpolator,
                                  NifFormat.NiBSplineFloatInterpolator,
                                  NifFormat.NiBoolInterpolator)):
-            # float/bool channels drive bhkBlendControllers & visibility —
-            # not needed for Skyrim clips (the behavior graph owns ragdoll
-            # blending)
+            # float/bool channels drive bhkBlendControllers, morph weights,
+            # material alpha and particle emitters -- none of which a Havok
+            # clip can carry (Skyrim has no morph-controller class at all).
+            # Visibility is the one exception, handled above.
             clip.skipped_blocks.append((bone, type(interp).__name__))
             continue
         else:

@@ -89,11 +89,21 @@ LOCOMOTION_STATES = {
     # which rotate in place).  Census over 53 vanilla creature folders: left 37,
     # right 37, handtohandleft/right 30 each -- every one of them was landing in
     # the dead 'extra' bucket and never reaching the output folder.
+    #
+    # NOT states and NOT event-entered: no vanilla graph has a moveLeft/
+    # moveRight event (census of every cached vanilla behavior: quadruped,
+    # wolf, chaurus, draugr, falmer, slaughterfish -- none).  The engine
+    # writes the `Direction` variable and vanilla blends the gait clips on it
+    # (slaughterfish/chaurus `DirectionalBlend`), so these clips are children
+    # of the forward state's Direction blend -- see build_behavior_xml.  As
+    # event-entered STATES they never played: the forward clip kept running
+    # while the MOVT strafe columns moved the actor sideways ("scamp slides
+    # while strafing instead of moving its legs", in game 2026-08-26).
     'StrafeLeft': (['left', 'handtohandleft', 'onehandleft', 'twohandleft',
-                    'staffleft', 'bowleft'], 'moveLeft', 'moveStop'),
+                    'staffleft', 'bowleft'], None, None),
     'StrafeRight': (['right', 'handtohandright', 'onehandright',
                      'twohandright', 'staffright', 'bowright'],
-                    'moveRight', 'moveStop'),
+                    None, None),
 }
 
 # Swimming. The engine sends swimStart/swimStop when the actor enters/leaves
@@ -171,10 +181,25 @@ SINGLE_PLAY = {
 # handtohandattackequip 2, bare equip 14 -- so the 'attack'-infixed spelling is
 # rare but real (the minotaur ships ONLY that one), and a table listing just
 # '<prefix>equip' silently finds no equip clip at all for those creatures.
+#
+# A WATER creature spells the whole set with a `swim` prefix, and those must be
+# listed too or the claim below misses and the attack sweep steals them on the
+# bare `'attack' in name` test.  Census over 235 creature folders in all three
+# test plugins: swimhandtohandattackequip/unequip 2 each (SLAUGHTERFISH),
+# swimhandtohandequip/unequip 1 each (baliwog), swimequip/unequip 1 each
+# (murkdweller).  The slaughterfish is the only creature in the whole census
+# with NO equip stance at all -- every clip it ships is swim-prefixed, so a
+# table without these spellings leaves `equip` empty, builds no stance, and
+# files its Equip/Unequip clips (their own NiControllerSequence names are
+# literally 'Equip' and 'Unequip') as two of its five ATTACKS.
 EQUIP_STANCES = {
     # state suffix -> (equip kf names, unequip kf names, hand types)
-    'H2H':   (['handtohandequip', 'handtohandattackequip', 'equip'],
-              ['handtohandunequip', 'handtohandattackunequip', 'unequip'],
+    'H2H':   (['handtohandequip', 'handtohandattackequip',
+               'swimhandtohandequip', 'swimhandtohandattackequip',
+               'equip', 'swimequip'],
+              ['handtohandunequip', 'handtohandattackunequip',
+               'swimhandtohandunequip', 'swimhandtohandattackunequip',
+               'unequip', 'swimunequip'],
               (0,)),
     'OneH':  (['onehandequip', 'onehandattackequip'],
               ['onehandunequip', 'onehandattackunequip'], (1, 2, 3, 4)),
@@ -346,6 +371,7 @@ def classify_clips(creature_dir: str) -> dict:
         else:
             out['extra'].append(path)
     out['attacks'].sort()
+    _promote_water_native(out, kfs)
     # Which weapon stance each attack belongs to (see ATTACK_STANCE_PREFIXES).
     # Oblivion stores ONE AnimGroup per weapon class and the engine picks by
     # what is equipped: minotaur handtohandattackleft and twohandattackleft
@@ -355,6 +381,77 @@ def classify_clips(creature_dir: str) -> dict:
     # node ~70 units off the hand, dragging the held weapon with it.
     out['attack_stance'] = {p: attack_stance(p) for p in out['attacks']}
     return out
+
+
+# Land-gait clip stems, ANY spelling.  Used to tell a true water native
+# (slaughterfish, dreugh: every gait clip is swim-prefixed) from an
+# amphibian whose land gait uses a spelling the claim tables miss
+# (grummite `forwardwalk`, horker `walkforward`) — those must keep the
+# land graph + SwimState split.
+_LAND_GAIT_MARKERS = ('forward', 'backward', 'turnleft', 'turnright')
+
+
+def _is_water_native(out: dict, kfs: dict) -> bool:
+    if not out['swim'].get('forward'):
+        return False
+    return not any(any(m in stem for m in _LAND_GAIT_MARKERS)
+                   for stem in kfs if not stem.startswith('swim'))
+
+
+def _promote_water_native(out: dict, kfs: dict) -> None:
+    """A creature whose ONLY gait is swimming gets its swim set AS the base
+    locomotion, and no bolted-on SwimState.
+
+    This is vanilla's own structure: slaughterfishbehavior.hkx has no
+    land/swim split at all — its DefaultBehavior IS the swim gait
+    (Swim_Forward/Swim_FastForward blend, canned Swim_Left90/Right90 turns,
+    SwimIdleBehavior), with AttackState/StaggerState/RecoilState as ROOT
+    siblings driven by the ordinary moveStart/turnStart/attackStart_*
+    events, and a single movement type (SlaughterfishSwim_MT).
+
+    Without this, a converted water native parked in the SwimState sibling
+    forever (the engine sends swimStart the moment it spawns in water) and
+    its attack transitions — LOCAL to DefaultState — were unreachable: the
+    slaughterfish chased the player and never attacked (reported in game
+    2026-08-26).  Promoting the swim clips into the land slots routes
+    everything (attacks, equip, stagger, recoil) through the ordinary
+    proven paths, exactly as vanilla structures the same animal.
+
+    Amphibians (baliwog, horker, grummite: land + swim sets) are untouched
+    and keep the land graph + SwimState split.
+    """
+    if not _is_water_native(out, kfs):
+        return
+    sw = out['swim']
+    out['locomotion']['MoveForward'] = sw['forward']
+    if sw.get('fast'):
+        out['run'] = sw['fast']
+    if sw.get('backward'):
+        out['locomotion']['MoveBackward'] = sw['backward']
+    if sw.get('left'):
+        out['locomotion']['TurnLeft'] = sw['left']
+    if sw.get('right'):
+        out['locomotion']['TurnRight'] = sw['right']
+    # The swim idle is the resting pose of a creature that never leaves the
+    # water (vanilla fish MainIdle plays its swim idle); the land idle.kf,
+    # where one exists, is retired to extra.
+    if sw.get('idle'):
+        if out['idle']:
+            out['extra'].append(out['idle'])
+        out['idle'] = sw['idle']
+    # ...and the guard-up combat idle, spelled with the swim prefix
+    # (slaughterfish swimhandtohandidle), which the land-name sweep missed.
+    if not out['combat_idle']:
+        for cand in COMBAT_IDLE_CANDIDATES:
+            p = kfs.get('swim' + cand)
+            if p:
+                out['combat_idle'] = p
+                if p in out['extra']:
+                    out['extra'].remove(p)
+                break
+    # No swim dict left => no SwimState, no Swim MOVT, no iState switch;
+    # the Default movement type carries the swim speeds.
+    out['swim'] = {}
 
 
 # kf filename prefix -> EQUIP_STANCES key.  Longest first: 'swimhandtohand'
@@ -914,12 +1011,42 @@ def movement_type_names(name: str, has_swim: bool = False) -> list:
     (vanilla quadruped: `iState = cond((isSwimming ==1),
     iState_BearSwimDefault, iState_BearDefault)`), which is what gives the
     actor its swim speeds.
+
+    NO movement type for casting.  A `<base>Rooted` all-zero MOVT selected by
+    `iState = cond((IsCasting == 1), ...)` at the root was tried 2026-08-26
+    and BROKE casting entirely in game — do not retry it.  Pinning a caster
+    is done with bAnimationDriven in the cast chain's modifier list instead,
+    which is what vanilla's own walking creature caster does (chaurus
+    Casting_SpitAttack_MG → bAnimationDriven_IsActive, pointer-traced from
+    chaurusbehavior.hkx; the chaurus declares only ChaurusDefault_MT).
     """
     base = f'TES4{name.lower()}'
     out = [f'{base}Default', f'{base}Run']
     if has_swim:
         out.append(f'{base}Swim')
     return out
+
+
+def graph_variables(clips: dict, movement_types: list) -> list:
+    """The graph's variable table, in declaration order: (name, type,
+    initial word value).  Shared with tools/live/graph_vars.py, which reads
+    a LIVE actor's hkbVariableValueSet back by this same order.
+
+    iState family: vanilla-style movement-type tags (dogbehavior:
+    iState_DogDefault=30/iState_DogRun=31, iState initialized to Default).
+    """
+    variables = [(n, t, iv) for n, t, iv in ENGINE_VARIABLES]
+    if cast_phase_defs(clips):
+        variables += MAGIC_VARIABLES
+    if clips.get('block', {}).get('idle'):
+        variables += BLOCK_VARIABLES
+    if any(mt.endswith('Swim') for mt in movement_types):
+        # engine-written while the actor is in deep water; drives the
+        # iState movement-type switch (vanilla quadruped verbatim)
+        variables.append(('isSwimming', 'BOOL', 0))
+    variables += [(f'iState_{mt}', 'INT32', 30 + i)
+                  for i, mt in enumerate(movement_types)]
+    return variables
 
 
 def build_behavior_xml(behavior_name: str, clips: dict,
@@ -971,7 +1098,6 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     speeds = speeds or {}
     # ---- event vocabulary: standard + per-attack ----
     events = ['moveStart', 'moveStop', 'moveForward', 'moveBackward',
-              'moveLeft', 'moveRight',
               'turnLeft', 'turnRight', 'turnStop', 'swimStart', 'swimStop',
               'runStart', 'walkStart',
               'recoilStart', 'recoilStop', 'recoilLargeStart',
@@ -1038,20 +1164,8 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         obj.param('blendCurve', 'BLEND_CURVE_SMOOTH')
 
     # variable table is fixed up-front so bindings can reference indices.
-    # iState family: vanilla-style movement-type tags (dogbehavior:
-    # iState_DogDefault=30/iState_DogRun=31, iState initialized to Default).
-    variables = [(n, t, iv) for n, t, iv in ENGINE_VARIABLES]
-    if cast_defs:
-        variables += MAGIC_VARIABLES
-    if clips.get('block', {}).get('idle'):
-        variables += BLOCK_VARIABLES
+    variables = graph_variables(clips, movement_types)
     has_swim_mt = any(mt.endswith('Swim') for mt in movement_types)
-    if has_swim_mt:
-        # engine-written while the actor is in deep water; drives the
-        # iState movement-type switch below (vanilla quadruped verbatim)
-        variables.append(('isSwimming', 'BOOL', 0))
-    variables += [(f'iState_{mt}', 'INT32', 30 + i)
-                  for i, mt in enumerate(movement_types)]
     var_values = [30 if n == 'iState' else iv for n, _t, iv in variables]
     vidx = {n: i for i, (n, _t, _iv) in enumerate(variables)}
 
@@ -1187,6 +1301,96 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         blender.param_array('children', [c.ref for c in children])
         return blender
 
+    def _direction_blend(name, children, flags=49):
+        """SYNC|PARAMETRIC|CYCLIC blend on the engine-written `Direction`:
+        vanilla chaurus `DirectionalBlend` / draugr `MT_Direction_Blend`
+        verbatim (flags 49, min 0 / max 1, blendParameter bound to
+        Direction; the swimming fish drops SYNC = 48).  Anchors: 0.0
+        forward, 0.25 right, 0.5 backward, 0.75 left; CYCLIC wraps 1.0 back
+        onto forward (no vanilla graph has a child at 1.0).
+
+        EVERY CHILD IS A SPEED BLENDER, never a state machine: all eight
+        draugr children and all four chaurus children are SpeedSampled
+        blends (chaurus RightBlend = RightSlow@5 / Right@87.5 /
+        Right_Run@350).  That is what keeps a strafe's leg rate matched to
+        the actor's real speed -- with a bare strafe clip beside the
+        forward SPEED blend, a 32 u/s sideways walk read as a 5 u/s creep on
+        the forward child and the scamp "floated with its legs barely
+        moving" (in game 2026-08-26).  children: [(generator ref, anchor)].
+        """
+        kids = []
+        for gen_ref, anchor in children:
+            ch = pf.add('hkbBlenderGeneratorChild')
+            ch.param('variableBindingSet', 'null')
+            ch.param('generator', gen_ref)
+            ch.param('boneWeights', 'null')
+            ch.param('weight', f'{anchor:.6f}')
+            ch.param('worldFromModelWeight', '1.000000')
+            kids.append(ch)
+        bind = _binding_set([('blendParameter', 'Direction')])
+        blender = pf.add('hkbBlenderGenerator')
+        blender.param('variableBindingSet', bind.ref)
+        blender.param('userData', 0)
+        blender.param('name', name)
+        blender.param('referencePoseWeightThreshold', '0.000000')
+        blender.param('blendParameter', '0.000000')
+        blender.param('minCyclicBlendParameter', '0.000000')
+        blender.param('maxCyclicBlendParameter', '1.000000')
+        blender.param('indexOfSyncMasterChild', -1)
+        blender.param('flags', flags)
+        blender.param('subtractLastChild', False)
+        blender.param_array('children', [c.ref for c in kids])
+        return blender
+
+    def _gait_speed_blend(nm, kf, spd):
+        """slow-creep@5 + clip@natural + clip@2x SpeedSampled blend for one
+        gait clip (the chaurus per-direction layout, RightSlow / Right /
+        Right_Run); a bare clip when the clip has no measurable root-motion
+        speed.
+
+        The 2x child is the same clip at playbackSpeed 2.0 (vanilla sabrecat
+        ForwardRunBlend: RunSlow@0.75 / Run@1.15, one clip at two rates).
+        It exists because the engine's commanded speed at a strafe heading
+        is a blend of the MOVT columns, not the strafe column alone: live
+        readback of a circling scamp (2026-08-26) showed Direction
+        0.72-0.75 with Speed 33-53 u/s against a 31.8 u/s strafe clip, so
+        the legs ran at 31.8 while the ground moved at 45 -- "slides to
+        the side".  With SYNC|PARAMETRIC the rate interpolates between the
+        anchors, so the feet keep pace up to twice the clip's own speed.
+        Oblivion ships no run-strafe clip (the chaurus has Right_Run), so
+        rate-scaling the walk strafe is the only source of a faster gait."""
+        if not spd:
+            return _clip(nm, kf, True)
+        return _parametric_blend(
+            f'{nm}Blend',
+            [(f'{nm}Slow', kf, max(0.02, round(5.0 / spd, 3)), 5.0),
+             (nm, kf, 1.0, spd),
+             (f'{nm}Fast', kf, 2.0, round(spd * 2.0, 3))])
+
+    def _direction_family(prefix, fwd_ref):
+        """The Direction blend around ONE gait family (walk or run):
+        forward @0 plus whatever strafe/backward clips the creature ships,
+        each as its own speed blend.  None when there is nothing to blend
+        (no strafe clips) -- the family then stays a plain forward gait."""
+        loco_ = clips['locomotion']
+        kids = [(fwd_ref, 0.0)]
+        if 'StrafeRight' in loco_:
+            kids.append((_gait_speed_blend(
+                f'{prefix}StrafeRight', loco_['StrafeRight'],
+                speeds.get('right')).ref, 0.25))
+        if 'MoveBackward' in loco_ and ('StrafeRight' in loco_
+                                        or 'StrafeLeft' in loco_):
+            kids.append((_gait_speed_blend(
+                f'{prefix}BackwardDir', loco_['MoveBackward'],
+                speeds.get('back')).ref, 0.5))
+        if 'StrafeLeft' in loco_:
+            kids.append((_gait_speed_blend(
+                f'{prefix}StrafeLeft', loco_['StrafeLeft'],
+                speeds.get('left')).ref, 0.75))
+        if len(kids) == 1:
+            return None
+        return _direction_blend(f'{prefix}DirectionalBlend', kids)
+
     # =====================================================================
     # Nested state machines (the vanilla quadruped topology, 2026-07-16).
     # The old FLAT graph made every engine event a root wildcard: combat
@@ -1206,6 +1410,11 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         fplan = speed_blend_plan(clips, speeds)
         walk_gen = (_parametric_blend('ForwardWalkBlend', fplan) if fplan
                     else _clip('MoveForward', loco['MoveForward'], True))
+        # Direction blend per gait FAMILY (walk / run), each child a speed
+        # blend -- vanilla draugr keeps its walk and run families apart and
+        # wraps each in its own flags-49 direction blend; a state machine
+        # is never a direction-blend child (see _direction_blend).
+        walk_gen = _direction_family('Walk', walk_gen.ref) or walk_gen
         rplan = run_blend_plan(clips, speeds)
         if rplan:
             # Two gait FAMILIES in two states (vanilla forwardlocomotion
@@ -1213,6 +1422,7 @@ def build_behavior_xml(behavior_name: str, clips: dict,
             # runStart/walkStart switch between them on SpeedSampled with
             # hysteresis, and iMovementSpeed picks the start state.
             run_gen = _parametric_blend('ForwardRunBlend', rplan)
+            run_gen = _direction_family('Run', run_gen.ref) or run_gen
             lo, hi = gait_thresholds(speeds)
             fwd_sm = _make_sm(
                 'ForwardLocomotionBehavior',
@@ -1248,20 +1458,16 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         else:
             fwd_gen = walk_gen
         has_back = 'MoveBackward' in loco
-        # Strafes (the Left/Right AnimGroups) sit alongside forward/backward
-        # in the same SM; every gait can be entered from any other, so each
-        # state carries transitions to all the others.
-        strafes = [(st, ev) for st, ev in (('StrafeLeft', 'moveLeft'),
-                                           ('StrafeRight', 'moveRight'))
-                   if st in loco]
-        fwd_trans = []
-        if has_back:
-            fwd_trans.append((eid['moveBackward'], 1, _F_LOCAL))
-        for i, (_st, ev) in enumerate(strafes):
-            fwd_trans.append((eid[ev], 2 + i, _F_LOCAL))
+        # Strafes live inside the gait families' Direction blends above
+        # (see LOCOMOTION_STATES for why they cannot be event-entered
+        # states).  The engine writes Direction every frame: 0 = forward,
+        # 0.25 = right, 0.5 = backward, 0.75 = left; the engine's
+        # moveBackward event still owns the dedicated
+        # BackwardLocomotionState below.
         fwd_state = _state(
             0, 'ForwardLocomotionState', fwd_gen.ref,
-            transitions=fwd_trans or None)
+            transitions=([(eid['moveBackward'], 1, _F_LOCAL)]
+                         if has_back else None))
         loco_states = [fwd_state]
         if has_back:
             bplan = backward_blend_plan(clips, speeds)
@@ -1269,22 +1475,9 @@ def build_behavior_xml(behavior_name: str, clips: dict,
                         if bplan
                         else _clip('MoveBackward', loco['MoveBackward'],
                                    True))
-            back_trans = [(eid['moveForward'], 0, _F_LOCAL)]
-            for i, (_st, ev) in enumerate(strafes):
-                back_trans.append((eid[ev], 2 + i, _F_LOCAL))
             loco_states.append(_state(
                 1, 'BackwardLocomotionState', back_gen.ref,
-                transitions=back_trans))
-        for i, (st, _ev) in enumerate(strafes):
-            st_trans = [(eid['moveForward'], 0, _F_LOCAL)]
-            if has_back:
-                st_trans.append((eid['moveBackward'], 1, _F_LOCAL))
-            for j, (_o, oev) in enumerate(strafes):
-                if j != i:
-                    st_trans.append((eid[oev], 2 + j, _F_LOCAL))
-            loco_states.append(_state(
-                2 + i, f'{st}LocomotionState',
-                _clip(st, loco[st], True).ref, transitions=st_trans))
+                transitions=[(eid['moveForward'], 0, _F_LOCAL)]))
         loco_sm = _make_sm('LocomotionBehavior', loco_states)
 
     # ---- StandingIdleBehavior: NonCombatIdle(0) <-> CombatIdle(1) ----
@@ -1391,6 +1584,36 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         end_evt = 'returnToDefault' if st != 'Death' else None
         clip = _clip(st, clips['single'][st], False,
                      _clip_triggers(st, end_evt))
+        # A RAGDOLL-LESS creature (ghost, wraith, spectre: no bhk bodies in
+        # the source skeleton, so hkx_ragdoll extracts nothing) never reaches
+        # the AnimateToRagdoll / Fully Ragdoll wrapper below, and its Death
+        # clip has no end trigger -- so the state holds the clip's LAST frame
+        # forever.  For those creatures the last frame is NOT a corpse on the
+        # ground: Oblivion's ghost death.kf keeps `Bip01 NonAccum` at
+        # standing height (Z 65.0 -> 66.0 over the whole 1.17s clip) because
+        # the body is meant to be HIDDEN by the NiVisController / morph /
+        # alpha channels that a Havok clip cannot carry.  With the body still
+        # shown and the character controller still under it, the corpse
+        # hovers upright at head height -- the reported bug.
+        #
+        # Vanilla's ragdoll-less creature is the WITCHLIGHT: its skeleton
+        # has one bhkRigidBody and ZERO constraints, its behavior graph
+        # contains the string 'ragdoll' zero times, it has NO Death state
+        # at all, and its `WitchlightRagdollInstant` IDLE deliberately
+        # carries NO ENAM (the wisp's carries `RagdollInstant`) -- so no
+        # death event ever reaches its graph and the engine disposes of
+        # the actor itself.  Note what vanilla does NOT do: it never sends
+        # RemoveCharacterControllerFromWorld (the string is absent from
+        # witchlightbehavior.hkx entirely).  Dropping the controller with
+        # no ragdoll to take over is the documented cause of corpses
+        # falling through the floor, so we must not add it either.
+        #
+        # We keep the death ANIMATION -- Oblivion's ghosts have a real,
+        # authored one the witchlight simply lacks -- and the visibility
+        # channels recovered by kf_decode make it end on a hidden body
+        # plus a visible ectoplasm puddle rather than an upright corpse.
+        # The state itself stays exactly as vanilla builds a single-play
+        # state: no enter notify, no exit notify, no end trigger.
         root_states_inner.append(_state(
             next_id, f'{st}State', clip.ref,
             exit_events=[stop_evt] if stop_evt else None))
@@ -1659,9 +1882,41 @@ def build_behavior_xml(behavior_name: str, clips: dict,
         # IsCasting is held true for the whole chain via one IsActive
         # modifier over the sub-machine (vanilla BSIsActiveModifier_Spells);
         # the engine's `!IsCasting` guard blocks a second overlapping cast.
+        #
+        # bAnimationDriven is held true alongside it: while set, the engine
+        # takes the actor's motion from the clip's root motion instead of
+        # the commanded AI velocity, and the cast slices carry no root
+        # motion at all — so the actor stands planted for the whole
+        # In/Loop/Out chain and moves again the moment it exits.  Without
+        # this the combat AI keeps commanding ground movement under the
+        # full-body cast clip and the actor slides on planted feet (scamp,
+        # reported in game 2026-08-26; the slide became visible when the
+        # strafe MOVT columns went live in the strafe-locomotion pass —
+        # before that, commanded circling multiplied into a 0 max speed).
+        #
+        # This is vanilla's own mechanism for a walking creature caster:
+        # chaurusbehavior's Casting_SpitAttack_MG wraps its cast clip in
+        # `bAnimationDriven_IsActive` (BSIsActiveModifier, bIsActive0 →
+        # bAnimationDriven — pointer-traced, not name-guessed), and the
+        # chaurus declares ONLY ChaurusDefault_MT.  The vanilla
+        # slaughterfish does the same for stagger/recoil as an expression
+        # (`bAnimationDriven = IsStaggering || IsRecoiling`).  An all-zero
+        # `Rooted` MOVT switched by `iState = cond((IsCasting == 1), ...)`
+        # at the root — the draugr-blocking shape — was tried 2026-08-26
+        # and broke casting entirely in game; do not retry it.
         cast_iso = pf.add('BSIsActiveModifier')
+        #
+        # bAllowRotation is held too: an animation-driven actor cannot turn
+        # by itself, and the AI faces its target before it will release a
+        # cast, so a pinned caster that cannot rotate waits on a player who
+        # keeps circling (Oblivion scamps turn while casting).  Vanilla
+        # keeps rotation on for ranged actions (falmerbehavior's
+        # bAllowRotation guard names hand type 7 = ranged explicitly), and
+        # our own attack modifier already holds it the same way.
         cast_iso.param('variableBindingSet',
-                       _binding_set([('bIsActive0', 'IsCasting')]).ref)
+                       _binding_set([('bIsActive0', 'IsCasting'),
+                                     ('bIsActive1', 'bAnimationDriven'),
+                                     ('bIsActive2', 'bAllowRotation')]).ref)
         cast_iso.param('userData', 1)
         cast_iso.param('name', 'BSIsActiveModifier_Spells')
         cast_iso.param('enable', True)
@@ -1827,13 +2082,29 @@ def build_behavior_xml(behavior_name: str, clips: dict,
             'BeginCastLeft if (bWantCastLeft && bMLh_Ready && !IsCasting)',
             'BeginCastRight if (bWantCastRight && bMRh_Ready && !IsCasting)',
         ]
+        # EVENT_MODE_SEND_ON_TRUE, not vanilla's SEND_ON_FALSE_TO_TRUE.
+        # The engine binds BeginCastLeft -> LeftHandSpellCastHandler (read
+        # out of the live per-actor dispatcher map, 2026-08-26), whose whole
+        # job is: if this hand's ActorMagicCaster is in state 1 ("want-cast
+        # issued, waiting for the animation"), advance it to state 2 and
+        # PerformAction(ActionLeftAttack) -> the IDLE tree -> the
+        # Spell_FireForget_LH that enters our cast chain.  It is a no-op in
+        # every other state.  A live scamp sat for minutes with
+        # bWantCastLeft=1, bMLh_Ready=1, IsCasting=0 and the caster parked
+        # in state 1: the one false->true edge had come and gone with
+        # nothing to show for it, and the engine never rewrites the flag
+        # while it waits, so an edge-triggered expression can never fire
+        # again ("the scamp only casts when the graph is hit just right").
+        # Raising the event every frame the condition holds makes the
+        # handshake un-missable; the moment the cast starts IsCasting=1
+        # turns it off, and the handler ignores it in any other state.
         arr = pf.add('hkbExpressionDataArray')
         arr.param_raw('expressionsData', '\n'.join(
             '<hkobject>\n'
             f'\t<hkparam name="expression">{e}</hkparam>\n'
             '\t<hkparam name="assignmentVariableIndex">-1</hkparam>\n'
             '\t<hkparam name="assignmentEventIndex">-1</hkparam>\n'
-            '\t<hkparam name="eventMode">EVENT_MODE_SEND_ON_FALSE_TO_TRUE'
+            '\t<hkparam name="eventMode">EVENT_MODE_SEND_ON_TRUE'
             '</hkparam>\n'
             '</hkobject>' for e in exprs), numelements=len(exprs))
         eem = pf.add('hkbEvaluateExpressionModifier')
@@ -1850,6 +2121,13 @@ def build_behavior_xml(behavior_name: str, clips: dict,
     # Default. Without this the engine keeps the land movement type in
     # water. (`iState = cond((isSwimming ==1), iState_BearSwimDefault,
     # iState_BearDefault)` is the vanilla original.)
+    #
+    # iState is for SWIM ONLY.  Wrapping this expression in
+    # `cond((IsCasting == 1), iState_<base>Rooted, ...)` onto an all-zero
+    # MOVT — to pin a caster — was tried 2026-08-26 and BROKE casting
+    # entirely in game.  The working pin is bAnimationDriven in the cast
+    # chain's own modifier list (see BSIsActiveModifier_Spells above),
+    # which is chaurusbehavior verbatim.
     swim_eem = None
     if has_swim_mt:
         default_mt, swim_mt = None, None
@@ -2547,6 +2825,93 @@ def project_layout(name: str, namespace: str = '') -> dict:
     }
 
 
+# Nodes Oblivion uses to hold an actor's own SKIN (the body proper).  A death
+# animation that hides one of these is dissolving the creature rather than
+# laying it down -- see detect_dissolve.
+_SKIN_HOLDER_NODES = ('skinattachment',)
+
+
+def detect_dissolve(decoded):
+    """What a creature's death clip does, when it dissolves rather than falls.
+
+    Returns {'dissolves': bool, 'duration': float, 'reveals': [node],
+             'offsets': {node: (dx, dy, dz)}}.
+
+    THE AUTHORED INDICATOR.  Oblivion's ghost and wraith do not fall over on
+    death: their death.kf keeps `Bip01 NonAccum` at standing height for the
+    whole clip and makes the body disappear with NiVisController toggles --
+    hiding `SkinAttachment` (the actor's own skin holder) while REVEALING an
+    ectoplasm holder.  A Havok clip carries bone transforms only, so all of
+    that is lost in conversion and the corpse stands in mid-air for ever.
+
+    `reveals` are the nodes the clip turns ON (0 -> 1).  For the ghost that is
+    `AttachmentsBip`, whose subtree holds the authored ectoplasm pile that
+    nif_converter.extract_death_pile lifts out; the wraith reveals
+    `Attachments`, whose `Cloak06:0` is a flat slab parked UNDER the body --
+    its remains, despite the name -- and ships as that creature's pile.
+
+    `offsets` is each revealed node's LOCAL TRANSLATION on the clip's last
+    frame (not a delta -- see the code).  The pile is authored at body height and the clip LOWERS it to the
+    ground (ghost `AttachmentsBip`: z +14.04 -> -56.80), so a pile baked
+    without this floats at chest height.
+
+    Measured over every creature folder in all three test plugins, the
+    dissolve test fires on exactly the ghost/wraith family and nothing else --
+    and correctly REJECTS willothewisp, which has a `Bip01 ContainerGoo01`
+    node but never hides its body.
+    """
+    empty = {'dissolves': False, 'duration': 0.0, 'reveals': [], 'offsets': {}}
+    entry = (decoded or {}).get('death')
+    if not entry:
+        return empty
+    clip = entry[0]
+    duration = float(getattr(clip, 'duration', 0.0) or 0.0)
+    vis = list(getattr(clip, 'vis_tracks', ()) or ())
+    if not vis:
+        return dict(empty, duration=duration)
+
+    hides = any(bone.lower() in _SKIN_HOLDER_NODES
+                and len(curve) and float(curve[0]) == 1.0
+                and float(curve[-1]) == 0.0
+                for bone, curve in vis)
+    if not hides:
+        return dict(empty, duration=duration)
+
+    reveals = [bone for bone, curve in vis
+               if len(curve) and float(curve[0]) == 0.0
+               and float(curve[-1]) == 1.0]
+
+    offsets = {}
+    by_bone = {}
+    for tr in getattr(clip, 'tracks', ()) or ():
+        by_bone.setdefault(tr.bone, tr)
+    for bone in reveals:
+        tr = by_bone.get(bone)
+        t = getattr(tr, 'translations', None) if tr is not None else None
+        if t is not None and len(t):
+            # The clip's LAST-FRAME position, not a delta.  A .kf track
+            # is the node's full local translation, so the final sample IS
+            # where the pile comes to rest.  (A delta only works when the
+            # node's rest translation is zero: the ghost's AttachmentsBip
+            # animates 14.04 -> -56.80 from rest 0, but the wraith's
+            # Attachments sits at a CONSTANT -41.6 with rest 0, so its
+            # delta is 0 and the pile floated at world Z 43-58.)
+            #
+            # X/Y ARE DELIBERATELY DROPPED.  They are where the ectoplasm
+            # drifted to under the collapsing body (ghost: 10.45, 2.11) --
+            # meaningful inside the creature's own skeleton, meaningless
+            # for a placed object.  Actor.AttachAshPile already puts the
+            # pile at the actor's feet, so keeping the drift shifts the
+            # mesh ~10 units off the point the engine places, and the
+            # activation box (built from the record's OBND about the
+            # origin) ends up beside the visible pile.  Only Z is real:
+            # it is what lowers the pile from body height to the ground.
+            offsets[bone] = (0.0, 0.0, float(t[-1][2]))
+
+    return {'dissolves': True, 'duration': duration,
+            'reveals': reveals, 'offsets': offsets}
+
+
 def generate_creature_project(creature_dir: str, name: str, out_root: str,
                               fps: float = 30.0, sound_slots: dict = None,
                               sound_chances: dict = None,
@@ -2959,6 +3324,7 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
                      for kf, evt in zip(clips['attacks'],
                                         build_attack_events(clips))]
     converted = {c['name'] for c in clip_meta}
+    dissolve_info = detect_dissolve(decoded)
     manifest = {
         'name': lname,
         'namespace': namespace,
@@ -2985,6 +3351,21 @@ def generate_creature_project(creature_dir: str, name: str, out_root: str,
         'movement_types': move_types,
         'speeds': speeds,
         'has_ragdoll': bool(ragdoll),
+        # Authored DISSOLVE: the death clip hides the actor's own skin
+        # holder via NiVisController instead of dropping the body (an
+        # Oblivion ghost/wraith -- `Bip01 NonAccum` never leaves standing
+        # height).  Those channels cannot survive into a Havok clip, so
+        # tes5_import attaches TES4_GhostDissolve, which reproduces the
+        # effect with Skyrim's native Actor.AttachAshPile + a faded
+        # Disable.  Detected from the ANIMATION, never from a name.
+        'dissolves_on_death': dissolve_info['dissolves'],
+        'death_duration': dissolve_info['duration'],
+        # nodes the death clip REVEALS, and how far it moves them
+        # by the last frame -- the authored ectoplasm pile lives
+        # under one of these and has to be baked where the clip
+        # leaves it (on the ground, not at body height)
+        'death_reveals': dissolve_info['reveals'],
+        'death_offsets': dissolve_info['offsets'],
         # ragdoll part bone names -> the race's generated BPTD (body part
         # data); node names must exist in THIS skeleton or the engine's
         # ragdoll/hit binding has nothing to attach to

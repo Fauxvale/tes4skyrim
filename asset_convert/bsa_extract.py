@@ -15,6 +15,7 @@ Voice file organization:
 """
 import json
 import os
+import shutil
 import struct
 import zlib
 from pathlib import Path
@@ -221,7 +222,7 @@ def _should_extract_file(filepath):
 
 # The top-level asset folders that keep their own name under export/<plugin>/.
 # Anything else is filed under misc/ (Oblivion's DistantLOD\, Docs\, ...).
-ASSET_CATEGORIES = ('meshes', 'trees', 'textures', 'sound')
+ASSET_CATEGORIES = ('meshes', 'trees', 'textures', 'sound', 'music')
 
 
 def split_category(filepath):
@@ -483,7 +484,80 @@ def extract_assets_for_file(source_file, data_path, extract_dir, force=False):
     print(f"\nBSA extraction complete: {totals['bsas_extracted']} extracted, "
           f"{totals['bsas_cached']} cached, "
           f"{totals['total_extracted']} files written")
+
+    totals['music'] = extract_loose_music(source_file, data_path, extract_dir,
+                                          asset_dir_name, force=force)
     return totals
+
+
+# ---------------------------------------------------------------------------
+# Loose music
+# ---------------------------------------------------------------------------
+
+# Music is the one asset class no record names a file for: the TES4 engine
+# scans the Data/Music/<Category>/ folder and shuffles whatever it finds, so
+# XCMT/SNAM carry only the 3-value {Default, Public, Dungeon} enum.  Measured:
+# Oblivion.esm references ZERO music paths and Nehrim.esm references 35 (all
+# from SCPT/SOUN) while 76 files sit on disk -- so an "only take what the plugin
+# references" filter would ship nothing for Oblivion and 36% for Nehrim,
+# silencing every town and every fight.  The whole folder comes across.
+MUSIC_EXTS = ('.mp3', '.wav', '.xwm')
+
+
+def _is_masterless(extract_dir, source_file) -> bool:
+    """True when this plugin declares no TES4 masters.
+
+    Music lives loose in a SHARED Data folder: Nehrim's holds five plugins
+    (Nehrim.esm, ORN.esp, Translation.esp, ...) beside one Music folder.  Only
+    the game's own masterless plugin owns it -- attributing it to every plugin
+    in the folder would re-ship 329 MB per dependent ESP.
+    """
+    try:
+        from output_layout import record_dir
+        from .terrain_lod import _master_names
+        return not _master_names(record_dir(str(extract_dir), source_file))
+    except Exception:
+        return False
+
+
+def extract_loose_music(source_file, data_path, extract_dir, asset_dir_name,
+                        force=False) -> dict:
+    """Copy loose Data/Music into extract_dir/<plugin>/music/.
+
+    Loose-only by design: the BSA pass already routes a music entry here via
+    ASSET_CATEGORIES, and Nehrim/Oblivion both ship music as loose files that no
+    BSA contains.  Files already present are left alone so a re-run is cheap.
+    """
+    stats = {'copied': 0, 'cached': 0, 'bytes': 0, 'skipped_reason': None}
+
+    if not _is_masterless(extract_dir, source_file):
+        stats['skipped_reason'] = 'has masters'
+        return stats
+
+    src_root = Path(data_path) / 'Music'
+    if not src_root.is_dir():
+        stats['skipped_reason'] = 'no loose Music folder'
+        return stats
+
+    dst_root = Path(extract_dir) / asset_dir_name / 'music'
+    for root, _dirs, files in os.walk(src_root):
+        for fname in files:
+            src = Path(root) / fname
+            if src.suffix.lower() not in MUSIC_EXTS:
+                continue
+            dst = dst_root / src.relative_to(src_root)
+            if dst.is_file() and not force and dst.stat().st_size:
+                stats['cached'] += 1
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            stats['copied'] += 1
+            stats['bytes'] += src.stat().st_size
+
+    if stats['copied'] or stats['cached']:
+        print(f"Loose music: {stats['copied']} copied, {stats['cached']} cached "
+              f"({stats['bytes'] / 1024 / 1024:.1f} MB)")
+    return stats
 
 
 # ---------------------------------------------------------------------------

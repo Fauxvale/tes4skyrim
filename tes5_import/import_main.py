@@ -1457,9 +1457,19 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     from .record_types.world import reset_emitted_regions
     reset_emitted_regions()
 
-    from .creature_races import build_creature_races
+    from .creature_races import (build_creature_races,
+                                 build_creature_death_piles)
     build_creature_races(by_type, writer, export_dir,
                          ctx.master_export if ctx else None)
+    # Dissolving creatures (ghost/wraith) leave an AUTHORED ectoplasm pile
+    # that asset_convert lifted out of their skeleton; wrap each one in an
+    # ACTI so TES4_GhostDissolve can drop Oblivion's own pile instead of
+    # Skyrim's DefaultAshPileGhost.  Must run BEFORE the CREA pass, which
+    # binds the ACTI into each creature's VMAD.
+    n_piles = build_creature_death_piles(writer)
+    if n_piles:
+        print(f'  Creature death piles: {n_piles} ACTI '
+              f'(authored ectoplasm, replaces the vanilla ash pile)')
     _step_done('creature races')
 
     # --- Phase 0g: plan AI packages -------------------------------------
@@ -1908,6 +1918,31 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
 
     set_teleport_grid(*_build_teleport_grid(
         by_type, ctx.master_export if ctx else None))
+
+    # --- Phase 3c: MUSC/MUST from the converted music folder ---
+    # Must precede Phase 4: convert_CELL/convert_WRLD read the enum->MUSC table
+    # this registers to emit XCMO/ZNAM.  The manifest is written by the sound
+    # stage (asset_convert.music_convert), so an import run whose music has not
+    # been converted yet simply registers nothing and omits the subrecords.
+    try:
+        from .record_types.music import (build_music_records,
+                                         load_music_manifest)
+        from .record_types.world import register_music_types
+        _music_manifest = load_music_manifest(plugin_out_dir)
+        if _music_manifest.get('tracks'):
+            _plugin_name = _music_manifest.get('plugin') or os.path.basename(
+                os.path.normpath(plugin_out_dir))
+            _music = build_music_records(_music_manifest, writer, _plugin_name)
+            for _fid, _b in _music['must']:
+                writer.add_record('MUST', _b)
+            for _fid, _b in _music['musc']:
+                writer.add_record('MUSC', _b)
+            register_music_types(_music['by_enum'])
+            print(f"  Music: {len(_music['must'])} MUST + "
+                  f"{len(_music['musc'])} MUSC records "
+                  f"({len(_music['by_enum'])} enum categories)")
+    except Exception as e:
+        print(f"  ERROR building music records: {e}")
 
     # --- Phase 4: CELL/WRLD hierarchy (+ PGRD→NAVM navmeshes) ---
     # Base-object model index for navmesh static-footprint carving. Only
