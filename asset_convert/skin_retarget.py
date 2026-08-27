@@ -1371,7 +1371,7 @@ def _deform_vertices_animation_fk(skinned_geoms, skel_root, bone_deltas):
 def retarget_skin_to_skyrim(data, src_path: str = '', prn_out: set | None = None,
                             allow_wrap: bool = True, weight: int = 0,
                             authored_body_part: int | None = None,
-                            authored_allowed=None) -> int:
+                            authored_allowed=None, race=None) -> int:
     """Retarget skinned armor from Oblivion skeleton to Skyrim skeleton.
 
     Called BEFORE _remap_bone_names() — bones still have Oblivion names.
@@ -1493,7 +1493,7 @@ def retarget_skin_to_skyrim(data, src_path: str = '', prn_out: set | None = None
             if _wrap_field is not None:
                 wrapped = deform_geoms_wrap(skinned_geoms, skel_root,
                                             _wrap_field, female,
-                                            weight=weight)
+                                            weight=weight, race=race)
         except Exception as e:
             import traceback
             traceback.print_exc()

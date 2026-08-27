@@ -5052,27 +5052,14 @@ from .skin_replacement import (collect_skin_info, strip_body_skin_geometry, spli
 _PRN_HEAD_BONES = (b'NPC Head [Head]', b'Bip01 Head')
 
 
-def _fit_prn_head_blocks(data, prn_block_ids, src_path) -> set:
-    """Fit head-attached Prn blocks onto the Skyrim head (head_fit).
+def _collect_prn_head_blocks(data, prn_block_ids):
+    """The Prn blocks of a NIF that hang on the HEAD bone.
 
-    Runs AFTER retarget: Prn verts are face-space (authored coords, the shape
-    transform baked in) and render as ``verts + head bone world``, so the fit
-    maps them into Skyrim head space directly — the same frame the old
-    ARMOR_PIECE_OFFSETS_PRN affine operated in.  All head blocks of the NIF
-    are solved as ONE system so multi-shape helmets keep their seams.
-
-    Returns the ids of the blocks that were fitted (empty when the fit data
-    is unavailable — callers then fall back to the legacy constants).
+    Walks the LIVE tree, never data.blocks: the strips->shape conversion
+    replaces geometry objects, so data.blocks is stale by this point and an
+    id() lookup over it silently matches nothing (the fit then never ran and
+    every helmet fell back to the legacy PRN scale table).
     """
-    from . import head_fit
-    female = '/f/' in str(src_path).replace('\\', '/').lower()
-    if not head_fit.fit_available(female):
-        return set()
-
-    # Walk the LIVE tree, never data.blocks: the strips->shape conversion
-    # replaces geometry objects, so data.blocks is stale by this point and
-    # an id() lookup over it silently matches nothing (the fit then never
-    # ran and every helmet fell back to the legacy PRN scale table).
     blocks = []
     seen = set()
     for root in data.roots:
@@ -5095,6 +5082,32 @@ def _fit_prn_head_blocks(data, prn_block_ids, src_path) -> set:
                 continue
             seen.add(id(block))
             blocks.append(block)
+    return blocks
+
+
+def _fit_prn_head_blocks(data, prn_block_ids, src_path, race=None) -> set:
+    """Fit head-attached Prn blocks onto the Skyrim head (head_fit).
+
+    Runs AFTER retarget: Prn verts are face-space (authored coords, the shape
+    transform baked in) and render as ``verts + head bone world``, so the fit
+    maps them into Skyrim head space directly — the same frame the old
+    ARMOR_PIECE_OFFSETS_PRN affine operated in.  All head blocks of the NIF
+    are solved as ONE system so multi-shape helmets keep their seams.
+
+    `race` selects a beast head pack (head_fit.BEAST_RACES); None fits the
+    shared human head.  A hood is ONE Oblivion record worn by every race,
+    so the caller re-runs this per race and writes a mesh per race exactly
+    as vanilla Skyrim ships one - see head_fit.BEAST_RACES.
+
+    Returns the ids of the blocks that were fitted (empty when the fit data
+    is unavailable — callers then fall back to the legacy constants).
+    """
+    from . import head_fit
+    female = '/f/' in str(src_path).replace('\\', '/').lower()
+    if not head_fit.fit_available(female):
+        return set()
+
+    blocks = _collect_prn_head_blocks(data, prn_block_ids)
     if not blocks:
         return set()
 
@@ -5113,7 +5126,7 @@ def _fit_prn_head_blocks(data, prn_block_ids, src_path) -> set:
             tris = np.zeros((0, 3), dtype=np.int64)
         shapes.append((verts, tris))
 
-    fitted = head_fit.fit_head_gear(shapes, female)
+    fitted = head_fit.fit_head_gear(shapes, female, race=race)
     if fitted is None:
         return set()
     for block, new_v in zip(blocks, fitted):
@@ -5470,7 +5483,7 @@ def _upgrade_skin_instances(data):
 
 def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                  creature=False, worn=False, parallax=False, biped_flags=0,
-                 hair=False):
+                 hair=False, race=None):
     """Convert a PyFFI NifFormat.Data in-place to Skyrim format.
 
     worn=True marks the NIF as body-worn gear on the plugin's own authority (an
@@ -6379,7 +6392,8 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         _prn_block_ids: set = set()
         _retarget(data, src_path=src_path, prn_out=_prn_block_ids,
                   weight=weight, authored_body_part=_authored_bp,
-                  authored_allowed=_authored_allowed)
+                  authored_allowed=_authored_allowed,
+                  race=race)
 
         # NOW rename bones to Skyrim names — AFTER skin transforms are correct.
         stats['bones_remapped'] += _remap_bone_names(data)
@@ -6420,7 +6434,7 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         _prn_head_ids = set()
         if _prn_block_ids and not hair:
             _prn_head_ids = _fit_prn_head_blocks(data, _prn_block_ids,
-                                                 src_path)
+                                                 src_path, race=race)
         if not hair:
             # Skinned helmet/hood geometry: exact under the wrap once the
             # field carries a head surface; FK constants only as fallback.
@@ -6434,6 +6448,22 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                 _cfg_prn = ARMOR_PIECE_OFFSETS_PRN.get(
                     _piece_type, ARMOR_PIECE_OFFSETS_PRN['default'])
                 apply_armor_offset(data, _cfg_prn, only_block_ids=_prn_legacy)
+
+        # BEAST RACES GET THEIR OWN MESH, exactly as vanilla ships one
+        # (head_fit.BEAST_RACES).  A hood is ONE Oblivion record worn by
+        # every race, so unlike hair -- whose EDID names its race -- there
+        # is nothing on the record to read: the only way to serve a khajiit
+        # and a human from one source is to write a mesh per race and let
+        # the per-race ARMA pick.  Mark the NIF here; convert_nif re-runs
+        # the WHOLE conversion per race afterwards.
+        #
+        # It must be a re-run, not a re-fit of the finished mesh: a hood is
+        # multi-bone SKINNED geometry (Bip01 Head + Neck + Clavicles), so
+        # its head fit happens inside the retarget wrap, not in the rigid
+        # Prn pass -- there is no later point where the head verts can be
+        # displaced again without redoing the skin solve.
+        if _piece_type == 'helmet' and (_prn_head_ids or has_skin):
+            stats['_head_gear'] = True
 
     # Splice Skyrim body geometry AFTER retarget + bone rename so that bone
     # NiNodes in the armor NIF already have Skyrim names to match against.
@@ -7094,7 +7124,7 @@ def merge_creature_body(part_paths, dst_path, skeleton_path=None,
 
 def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
                 src_meshes_dir=None, creature=False, wearable_plan=None,
-                parallax=False, textures_only=False, hair=False):
+                parallax=False, textures_only=False, hair=False, race=None):
     """Convert a single Oblivion NIF to Skyrim format.
 
     Already-Skyrim versions are copied to dst_path unchanged.
@@ -7120,6 +7150,10 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     that needs exactly the same treatment as a helmet: a dismember skin bound
     to the head bone in slot 131.  Without this the mesh ships unskinned and
     also picks up a meaningless BSInvMarker (hair is never an inventory item).
+
+    race: fit head gear to a BEAST race's skull instead of the shared human
+    one (head_fit.BEAST_RACES).  Set only by the beast-variant pass below,
+    which re-runs this conversion once per race; None is the normal path.
     """
     result = {
         'converted': False,
@@ -7201,7 +7235,7 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     stats = _convert_nif(data, fix_textures=fix_textures,
                          src_path=str(src_path), creature=creature,
                          worn=_worn, parallax=parallax,
-                         biped_flags=_biped_flags, hair=hair)
+                         biped_flags=_biped_flags, hair=hair, race=race)
 
     # Graft the converted Oblivion flame NIF under FlameNode* markers (candle
     # flame / torch fire) — full conversion of Oblivion's own flame visuals,
@@ -7352,7 +7386,10 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # non-wearables keep their plain conversion either way, while gear filed
     # outside meshes\armor finally gets the _0/_1 pair its ARMA asks for.
     _srcl = str(src_path).lower().replace('\\', '/')
-    _wearable = not creature and not _is_ground_model(_srcl.rsplit('/', 1)[-1])
+    # A beast variant is a copy of ONE mesh, never a weight pair: head gear
+    # has the slider off, and _0/_1 would collide with the race suffix.
+    _wearable = (not creature and race is None
+                 and not _is_ground_model(_srcl.rsplit('/', 1)[-1]))
     if _wearable and wearable_plan is not None:
         from . import wearable_plan as _wp
         want = _wp.variants_for(wearable_plan, src_path, src_meshes_dir)
@@ -7384,7 +7421,62 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
             with open(_root + '_1' + _ext, 'wb') as f:
                 f.write(w1_bytes if w1_bytes is not None else buf.getvalue())
 
+    # BEAST-RACE HEAD GEAR VARIANTS.  The mesh written above is fitted to the
+    # SHARED HUMAN skull; on a khajiit or argonian that same geometry sits
+    # inside the head.  Measured on blades/m/helmet against the real beast
+    # heads: the human-fitted mesh puts 447 verts inside the khajiit skull
+    # (max depth 2.76) and 409 inside the argonian one (max 2.81), against 44
+    # for the human mesh on the human head; the per-race fits cut that to 56
+    # and 20 -- see head_fit.BEAST_RACES for the field measurements.
+    #
+    # Vanilla Skyrim's own answer is a mesh per race family selected by a
+    # per-race ARMA, so we write <name>_khajiit.nif / <name>_argonian.nif here
+    # and tes5_import.record_types.equipment emits the ARMA naming each.
+    if stats.get('_head_gear') and not creature and not hair and race is None:
+        _write_beast_head_variants(
+            src_path, dst_path,
+            fix_textures=fix_textures, src_meshes_dir=src_meshes_dir,
+            wearable_plan=wearable_plan, parallax=parallax)
+
     return _finish_result(result, stats)
+
+
+def _write_beast_head_variants(src_path, dst_path, *, fix_textures,
+                               src_meshes_dir, wearable_plan, parallax):
+    """Write the per-beast-race copies of a head-gear NIF.
+
+    The whole conversion is RE-RUN per race from the source file rather than
+    the finished mesh being re-fitted.  A hood is multi-bone SKINNED geometry
+    (Bip01 Head + Neck + Clavicles), so its head fit happens inside the
+    retarget wrap -- there is no later point at which the head verts can be
+    displaced again without redoing the skin solve.  Re-reading also keeps
+    each variant a FIRST fit through its race's field, never a second
+    displacement stacked on the human result.
+
+    A variant that fails for any reason is simply not written: the ARMA for it
+    then points at a missing mesh, which the engine falls back from to the
+    default armature -- the pre-existing behaviour, never worse than it.
+    """
+    from . import head_fit
+    female = '/f/' in str(src_path).replace(chr(92), '/').lower()
+    races = head_fit.beast_races_available(female)
+    if not races:
+        return
+
+    root, ext = os.path.splitext(str(dst_path))
+    for race in races:
+        out = root + head_fit.beast_variant_suffix(race) + ext
+        try:
+            convert_nif(src_path, out, fix_textures=fix_textures,
+                        src_meshes_dir=src_meshes_dir,
+                        wearable_plan=wearable_plan, parallax=parallax,
+                        race=race)
+        except Exception:
+            try:
+                if os.path.isfile(out):
+                    os.remove(out)
+            except OSError:
+                pass
 
 
 def _finish_result(result, stats):
