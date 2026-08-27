@@ -4490,6 +4490,138 @@ class TestClimateConversion:
         assert 'REGN' in IMPORT_DISPATCH
 
 
+class TestSunlessSkies:
+    """Oblivion realms must have no sun.
+
+    Oblivion says "no sun" with the CLMT sun SPRITE alone (Sky\\Void.dds), but
+    Skyrim's sun is a sprite PLUS a directional light (NAM0 slot 4) PLUS a
+    glare pass (slot 15), so the void sprite alone leaves both burning.
+    Vanilla BlackreachClimate/BlackreachWeather is the authored reference:
+    FNAM=GNAM=Black.dds, Sunlight zeroed, Sun zeroed.
+    """
+
+    def _clmt(self, **over):
+        rec = {
+            'Signature': 'CLMT', 'FormID': '00032E16', 'RecordFlags': '0',
+            'EditorID': 'Obliviondefaultclimate',
+            'WeatherCount': '1',
+            'Weather[0].FormID': '00032E15', 'Weather[0].Chance': '100',
+            'FNAM.SunTexture': 'Sky\\Void.dds',
+            'GNAM.GlareTexture': 'Sky\\VoidGlare.dds',
+            'TNAM.SunriseBegin': '23', 'TNAM.SunriseEnd': '42',
+            'TNAM.SunsetBegin': '102', 'TNAM.SunsetEnd': '127',
+            'TNAM.Volatility': '255', 'TNAM.MoonsPhaseLength': '3',
+        }
+        rec.update(over)
+        return rec
+
+    def _wthr(self, sunlight=(193, 130, 87), ambient=(124, 65, 50)):
+        """A realm weather: TES4 NAM0 is 10 slots x 4 times x RGBA."""
+        nam0 = bytearray(160)
+        for time in range(4):
+            off = (3 * 4 + time) * 4
+            nam0[off:off + 3] = bytes(ambient)
+            off = (4 * 4 + time) * 4
+            nam0[off:off + 3] = bytes(sunlight)
+        return {
+            'Signature': 'WTHR', 'FormID': '00032E15', 'RecordFlags': '0',
+            'EditorID': 'Obliviondefault',
+            'NAM0.Data': nam0.hex().upper(),
+            'DATA.Classification': '0', 'DATA.WindSpeed': '0',
+        }
+
+    def _register(self, clmt):
+        from tes5_import.record_types.dialog_misc import (
+            record_sunless_climate, reset_sunless_climates)
+        reset_sunless_climates()
+        record_sunless_climate(clmt)
+
+    def _slot(self, nam0, slot, time=1):
+        off = (slot * 4 + time) * 4
+        return tuple(nam0[off:off + 3])
+
+    def test_void_sun_climate_writes_vanilla_black(self):
+        """Black.dds is a VANILLA path — it must not take the tes4\\ prefix,
+        and the GLARE must be black too (VoidGlare.dds is a real sprite)."""
+        from tes5_import.record_types.dialog_misc import convert_CLMT
+        out = convert_CLMT(self._clmt())
+        assert _find_subrecord(out, b'FNAM') == b'Black.dds\x00'
+        assert _find_subrecord(out, b'GNAM') == b'Black.dds\x00'
+
+    def test_climate_with_no_fnam_is_sunless(self):
+        """ClimateSigil / MQ14OblivionClimate author no FNAM at all —
+        Oblivion draws nothing, which is the same authored intent as Void."""
+        from tes5_import.record_types.dialog_misc import convert_CLMT
+        rec = self._clmt()
+        del rec['FNAM.SunTexture']
+        del rec['GNAM.GlareTexture']
+        assert _find_subrecord(convert_CLMT(rec), b'FNAM') == b'Black.dds\x00'
+
+    def test_real_sun_climate_is_untouched(self):
+        from tes5_import.record_types.dialog_misc import convert_CLMT
+        out = convert_CLMT(self._clmt(**{
+            'FNAM.SunTexture': 'Sky\\Sun.dds',
+            'GNAM.GlareTexture': 'Sky\\SunGlare.dds'}))
+        assert _find_subrecord(out, b'FNAM') == b'tes4\\Sky\\Sun.dds\x00'
+        assert _find_subrecord(out, b'GNAM') == b'tes4\\Sky\\SunGlare.dds\x00'
+
+    def test_sunless_weather_zeroes_sun_sunlight_and_glare(self):
+        """The whole point: slot 5 (disc), slot 4 (directional light) and
+        slot 15 (glare) all go to zero, at every time of day."""
+        from tes5_import.record_types.dialog_misc import _wthr_nam0
+        self._register(self._clmt())
+        nam0 = _wthr_nam0(self._wthr())
+        for time in range(4):
+            assert self._slot(nam0, 5, time) == (0, 0, 0)
+            assert self._slot(nam0, 4, time) == (0, 0, 0)
+            assert self._slot(nam0, 15, time) == (0, 0, 0)
+
+    def test_sunlight_folds_into_ambient_not_dropped(self):
+        """The Deadlands' red fill lives in TES4 Sunlight while the sun
+        sprite is voided.  Zeroing it outright (as Blackreach can, being a
+        cave) would black out the realm; half of it folds into Ambient."""
+        from tes5_import.record_types.dialog_misc import _wthr_nam0
+        self._register(self._clmt())
+        plain = _wthr_nam0(self._wthr(sunlight=(0, 0, 0)))
+        folded = _wthr_nam0(self._wthr(sunlight=(200, 100, 60)))
+        base = self._slot(plain, 3)
+        lit = self._slot(folded, 3)
+        assert lit != base
+        assert lit == (min(255, base[0] + 100), min(255, base[1] + 50),
+                       min(255, base[2] + 30))
+
+    def test_dalc_object_lighting_gets_the_same_fold(self):
+        """DALC lights OBJECTS.  With the directional light gone it must get
+        the same Sunlight fold as NAM0 Ambient, or the sky glows red while
+        everything under it stays dim.  Vanilla BlackreachWeather's DALC
+        faces track its NAM0 Ambient ~1:1, so vanilla does not compensate
+        DALC separately -- it authors Ambient and lets DALC follow."""
+        from tes5_import.record_types.dialog_misc import _wthr_dalc
+        self._register(self._clmt())
+        dark = _wthr_dalc(self._wthr(sunlight=(0, 0, 0)))
+        lit = _wthr_dalc(self._wthr(sunlight=(200, 100, 60)))
+        # Second DALC subrecord (day): 6-byte header + 32-byte payload each.
+        face_dark = tuple(dark[6 + 38:6 + 38 + 3])
+        face_lit = tuple(lit[6 + 38:6 + 38 + 3])
+        assert face_lit > face_dark
+
+    def test_normal_weather_keeps_its_sun(self):
+        """A weather not reachable from a sunless climate is untouched."""
+        from tes5_import.record_types.dialog_misc import _wthr_nam0
+        from tes5_import.record_types.dialog_misc import reset_sunless_climates
+        reset_sunless_climates()
+        nam0 = _wthr_nam0(self._wthr())
+        assert self._slot(nam0, 4) != (0, 0, 0)
+
+    def test_registry_resets_between_plugins(self):
+        from tes5_import.record_types.dialog_misc import (
+            _SUNLESS_WEATHER_FIDS, reset_sunless_climates)
+        self._register(self._clmt())
+        assert _SUNLESS_WEATHER_FIDS
+        reset_sunless_climates()
+        assert not _SUNLESS_WEATHER_FIDS
+
+
 class TestWorldspaceClimate:
     def _rec(self, **over):
         rec = {'Signature': 'WRLD', 'FormID': '0000003C', 'RecordFlags': '0',

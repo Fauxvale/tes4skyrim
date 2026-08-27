@@ -1157,3 +1157,90 @@ class TestWaterNativePromotion:
                                      'slaughterfish'))
         assert 'SwimState' not in xml
         assert 'Attack_swimhandtohandattackpowerState' in xml
+
+
+# ---------------------------------------------------------------------------
+# AnimGroup locomotion fallback (the nix hound slide)
+# ---------------------------------------------------------------------------
+
+NIXHOUND_DIR = os.path.join(REPO, 'export', 'Morrowind_ob.esm', 'meshes',
+                            'creatures', 'nixhound')
+ASHSLAVE_DIR = os.path.join(REPO, 'export', 'Morrowind_ob.esm', 'meshes',
+                            'morroblivion', 'creatures', 'sixthhouse',
+                            'ashslave')
+MURK_DIR = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                        'creatures', 'murkdweller')
+
+needs_mw = pytest.mark.skipif(not os.path.isdir(NIXHOUND_DIR),
+                              reason='Morrowind_ob export assets missing')
+
+
+class TestAnimGroupFallback:
+    """A gait clip is bound by its AnimGroup, not its filename.
+
+    Morrowind_ob spells the nix hound's gaits walkforward.kf /
+    walkfastforward.kf, which no stem table matches; every one fell into the
+    dead 'extra' bucket, the graph got no MoveForward state, and the engine
+    translated the actor with the idle pose playing (it slid).
+    """
+
+    def test_read_animgroup_is_the_sequence_name(self):
+        from asset_convert.hkx_behavior import read_animgroup
+        if not os.path.isdir(NIXHOUND_DIR):
+            pytest.skip('Morrowind_ob export assets missing')
+        assert read_animgroup(
+            os.path.join(NIXHOUND_DIR, 'walkforward.kf')) == 'Forward'
+        assert read_animgroup(
+            os.path.join(NIXHOUND_DIR, 'walkfastforward.kf')) == 'FastForward'
+
+    def test_read_animgroup_rejects_non_nif(self):
+        from asset_convert.hkx_behavior import read_animgroup
+        assert read_animgroup(__file__) is None
+        assert read_animgroup(
+            os.path.join(REPO, 'no', 'such', 'file.kf')) is None
+
+    @needs_mw
+    def test_nixhound_gets_a_forward_state(self):
+        from asset_convert.hkx_behavior import classify_clips
+        c = classify_clips(NIXHOUND_DIR)
+        fwd = c['locomotion'].get('MoveForward')
+        assert fwd, 'nix hound has no MoveForward state - it will slide'
+        # the BASE gait wins the single MoveForward slot, not the
+        # weapon-stance variant (handtohandforward.kf declares `Forward` too)
+        assert os.path.basename(fwd) == 'walkforward.kf'
+        assert os.path.basename(c['run'] or '') == 'walkfastforward.kf'
+
+    @needs_mw
+    def test_ash_slave_gets_a_forward_state(self):
+        # same defect, different folder tree (meshes/morroblivion/**)
+        from asset_convert.hkx_behavior import classify_clips
+        if not os.path.isdir(ASHSLAVE_DIR):
+            pytest.skip('Morroblivion sixthhouse assets missing')
+        c = classify_clips(ASHSLAVE_DIR)
+        assert c['locomotion'].get('MoveForward'), 'ash slave will slide'
+
+    def test_land_run_never_takes_a_swim_clip(self):
+        # swimhandtohandfastforward.kf declares AnimGroup 'FastForward' too;
+        # the murkdweller ships a full land set AND a full swim set, so the
+        # land slots must not be filled from swim-prefixed clips.
+        from asset_convert.hkx_behavior import classify_clips
+        if not os.path.isdir(MURK_DIR):
+            pytest.skip('murkdweller export assets missing')
+        c = classify_clips(MURK_DIR)
+        for slot in ('run', 'run_back'):
+            got = c.get(slot)
+            assert not got or not os.path.basename(got).startswith('swim'), (
+                '%s took a swim clip: %s' % (slot, got))
+        for state, path in c['locomotion'].items():
+            assert not os.path.basename(path).startswith('swim'), (
+                '%s took a swim clip: %s' % (state, path))
+        assert c['swim'].get('forward'), 'murkdweller lost its swim set'
+
+    @needs_assets
+    def test_stem_claims_still_win(self):
+        # the fallback is additive only: a folder the stem tables already
+        # cover must classify exactly as before (dog ships forward.kf)
+        from asset_convert.hkx_behavior import classify_clips
+        c = classify_clips(DOG_DIR)
+        assert os.path.basename(
+            c['locomotion']['MoveForward']) == 'forward.kf'

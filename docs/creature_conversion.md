@@ -2356,3 +2356,108 @@ while running. `timescale_clip` now RESAMPLES the tracks (linear / sign-
 continuous quaternion nlerp) onto exactly 1/30 s frames and snaps the
 duration to the grid (lion run: 46 frames @1.5 s → 24 frames @0.767 s,
 `frameDuration` 0.03333 — identical timing fields to a native clip).
+
+---
+
+## 9. Clip claiming: the AnimGroup is the binding, not the filename (2026-08-27)
+
+**Symptom:** "the Morrowind_ob nix hound slides while moving forward" — the
+actor translates across the ground with the idle pose playing.
+
+**Cause:** `classify_clips()` claimed locomotion clips by exact FILENAME stem
+(`forward` / `runforward` / `fastforward`). The nix hound spells its gaits
+`walkforward.kf` and `walkfastforward.kf`, so nothing matched, every gait clip
+fell into the dead `extra` bucket, and the generated graph had **no
+MoveForward state at all** (measured: `MoveForward` occurred 0 times in the
+built behavior hkx, and all eight `speeds` in the manifest were `null`).
+The engine still drives translation from MOVT, so the actor slid.
+
+What actually binds a clip to a behaviour is the **NiControllerSequence name**
+— the AnimGroup — stored inside the .kf; the CS Animation tab and the engine
+both read that, and a folder is free to spell the file however it likes.
+Decoded from the nix hound's own KFs:
+
+| File | AnimGroup |
+|---|---|
+| `walkforward.kf` | `Forward` |
+| `walkfastforward.kf` | `FastForward` |
+| `handtohandforward.kf` | `Forward` |
+| `handtohandstagger.kf` | `Stagger` |
+
+**Fix:** `read_animgroup()` + `_claim_by_animgroup()` in `hkx_behavior.py`.
+The AnimGroup pass runs AFTER every stem table and fills only slots still
+empty, from clips no stem claim took. Three contracts make it safe:
+
+1. **Stems stay authoritative.** An AnimGroup is deliberately NOT unique —
+   `idle.kf`, `handtohandidle.kf` and `twohandidle.kf` all declare `idle`, so
+   AnimGroup alone cannot tell a stance variant from the base clip.
+2. **Swim clips never fill land slots.** `swimhandtohandfastforward.kf`
+   declares `FastForward` too; the murkdweller ships a full land set AND a
+   full swim set, and without the guard its land run gait was filled with a
+   swim clip.
+3. **The base gait outranks a stance variant** (sorted by
+   `ATTACK_STANCE_PREFIXES`): the graph builds ONE MoveForward, and
+   `walkforward.kf` is the right base for it, not `handtohandforward.kf`.
+
+`read_animgroup()` is a header-only read — the name is the first field of
+block 0, so nothing past the header is decoded (0.057 ms/file vs a full pyffi
+parse). The layout is nif.xml's `Header` compound verbatim; the three traps
+are that Export Info and User Version 2 share the `User Version >= 10` gate,
+`Block Size` starts at **20.2.0.7** (not 20.2.0.5), and the string table at
+20.1.0.3. Verified against pyffi's own header read on all **3211** creature
+KFs in the three test plugins: **zero mismatches**.
+
+**Scope (measured A/B over all 182 folders holding skeleton.nif + .kf):**
+0 regressions, 124 unchanged, 58 gained states — **48 creature folders were
+sliding**, not one. Nearly the whole Morroblivion tree was affected: ash
+slave, ash vampire, ash ghoul, ash zombie, ascended sleeper, corprus
+lame/stalker, bone lord/walker, greater bonewalker, ancestral ghost, dwarven
+spectre, golden saint, daedroth, ogrim, winged twilight, frost/storm
+atronach, bull netch, kagouti, hulking fabricant — plus alit, bettynetch,
+cliffracer, horker, shalk, sphere/steam centurion and the `aa_blood` set.
+
+Two extras the fallback picks up for free: `mehrunesdagon` gains its turns
+(`handtohandturnleft/right`), and the ogre's run gait is claimed from a
+**typo'd** `fastfoward.kf` that no stem table could ever match.
+
+Post-build check on the nix hound: `walkforward.hkx` + `walkfastforward.hkx`
+now ship, and the previously-null speeds are baked from real root motion —
+walk **88.686**, run **366.768**. Of the 64 built Morrowind_ob projects, 60
+have a MoveForward; the 4 without (kwamaqueen, lastdwarf, motrapanims, raven)
+ship no forward clip of any spelling in the source and are stationary or
+scripted actors.
+
+Guarded by `TestAnimGroupFallback` in `tests/test_creature_anim.py`.
+
+### 9a. MOVT lives in the ESM — `--creatures-only` is only half the build
+
+Rebuilding creatures after the §9 fix made the nix hound walk, but
+**incredibly slowly** in game. The clips were correct; the RECORD was not.
+
+`_movt_sped()` (`tes5_import/creature_races.py`) reads `proj['speeds']` from
+the creature project manifest and falls back to the vanilla dog's
+`_DOG_WALK = 74.54` when a speed is missing. Before §9 the nix hound had no
+gait clip at all, so every `speeds` entry was `null` and its MOVT shipped
+**74.54 walk / 74.54 run**. `--creatures-only` regenerates the meshes and the
+manifest but does NOT rewrite the ESM, so those stale dog speeds survived the
+creature rebuild: the engine commanded 74.54 while the animation was baked
+for 88.69/366.77, and the actor crawled.
+
+**Any change that moves a manifest `speeds` value needs `--import-only` too.**
+The MOVT/animation invariant (commanded speed == the shipped clip's natural
+speed at rate 1.0) is only true when both halves are built from the same
+manifest. After the import rerun: nix hound MOVT reads 88.69 / 366.77 and
+agrees with its clips.
+
+Post-rebuild census: of 143 MOVT records, exactly **4** still carry the 74.54
+fallback — `raven` and `kwamaqueen`, the two built creatures that ship no
+forward clip of any spelling. That is the fallback doing its job, not a gap.
+
+**Known separate limitation (pre-existing, not from §9):** the speed bake is
+capped at ×1.4 walk / ×2.0 run, so a creature whose authored `DATA.Speed`
+demands more than its clip's natural speed × 1.4 never reaches its Oblivion
+speed. Measured: nix hound target 87.60, natural 68.36, factor 1.281 — reached
+exactly. Ash vampire target 46.30, natural 15.64 — **capped at 21.90**; ash
+ghoul target 176.10, natural 98.89 — **capped at 138.45**. Raising the cap
+means resampling more aggressively (`timescale_clip`), which is what the cap
+exists to bound; not changed here.

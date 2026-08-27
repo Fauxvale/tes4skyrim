@@ -1659,6 +1659,23 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
         for rec in by_type[sig]:
             work_items.append((sig, target_sig, rec))
 
+    # Sunless-sky registry: a CLMT with a void/absent sun sprite marks every
+    # weather in its WLST as sunless, and convert_WTHR (Phase 2b) zeroes those
+    # weathers' sun slots.  Reset per plugin, then seed from the MASTER export
+    # before Phase 1 runs: an override plugin's climates take the ctx.build()
+    # short-circuit and never reach convert_CLMT, and a plugin may add a
+    # weather to a climate its master owns.  Without the seed those weathers
+    # keep Skyrim's sun over the Deadlands.
+    from .record_types.dialog_misc import (
+        record_sunless_climate, reset_sunless_climates)
+    reset_sunless_climates()
+    if ctx and getattr(ctx, 'master_export', None):
+        for mrec in ctx.master_export.values():
+            if (mrec.get('Signature') or '') == 'CLMT':
+                record_sunless_climate(mrec)
+    for rec in by_type.get('CLMT', []):
+        record_sunless_climate(rec)
+
     # Serial on purpose: this whole phase is ~1.5s of GIL-bound Python, so a
     # thread pool adds no speed — but it DID make the output nondeterministic:
     # converters that emit companion records (ARMA, aimed-MGEF clones, …) added

@@ -418,6 +418,95 @@ vanilla blizzard. **No Oblivion weather matches it** — Oblivion authors no
 thundering snow — so it is listed for completeness but is not a substitution
 target.
 
+## Sunless skies — the Oblivion realms must have no sun
+
+**Oblivion says "this sky has no sun" with the CLMT sun SPRITE alone.** The
+realm climates set `FNAM=Sky\Void.dds` / `GNAM=Sky\VoidGlare.dds`, and
+Oblivion's `Sun` class (vtable `0x00a571dc`) draws only that sprite, so voiding
+it is sufficient there.
+
+**It is not sufficient in Skyrim.** Skyrim's sun is three separate things:
+
+| piece | fed by |
+|---|---|
+| the disc sprite | CLMT `FNAM` |
+| a **directional light** that visibly tracks the sun | `WTHR` NAM0 **slot 4** (Sunlight) |
+| a **glare/bloom pass** | `WTHR` NAM0 **slot 15** (Sun Glare) |
+
+Passing the Void textures through therefore leaves a tracking light and a glare
+burning over the Deadlands — the symptom reported in game as "the realms have a
+sun and a day/night cycle."
+
+### Vanilla is the reference: `BlackreachClimate`
+
+Skyrim.esm's one sunless outdoor sky solves exactly this. Measured from
+`references/Skyrim.esm`:
+
+```
+BlackreachClimate   FNAM=Black.dds   GNAM=Black.dds      <- NOT Sky\Void.dds,
+                                                            and the GLARE is
+                                                            black too
+BlackreachWeather   NAM0 slot 4 Sunlight = (0,0,0) x4    <- kills the light
+                    NAM0 slot 5 Sun      = (0,0,0) x3, (128,128,128) night
+```
+
+`Black.dds` is a **vanilla** path (confirmed present in the SSE BSAs at 1540
+bytes via `skyrim_assets.get_asset_bytes('textures/black.dds')`), so it must
+**not** take the `tes4\` prefix.
+
+### What the converter does
+
+`_clmt_is_sunless()` in `dialog_misc.py` detects the authored indicator — FNAM
+naming a void sprite, **or no FNAM at all** (`ClimateSigil` and
+`MQ14OblivionClimate` author none, which in Oblivion also draws nothing). This
+is derived from authored data, not a hardcoded EditorID list, so it carries to
+arbitrary plugins. Measured over `Oblivion.esm`: **4 climates by FNAM + 2 by
+absent FNAM → 6 weathers** (`Obliviondefault`, `OblivionElectrical`,
+`OblivionStormOblivion`, `OblivionMountainFog`, `OblivionStormTamrielMQ16`,
+`OblivionSigil`).
+
+`import_main` seeds `_SUNLESS_WEATHER_FIDS` from the plugin's climates **and the
+master export** before Phase 1 — an override plugin's climates take the
+`ctx.build()` short-circuit and never reach `convert_CLMT`
+([master blindness](../CLAUDE.md#master-blindness)). Then:
+
+1. **CLMT** → `FNAM`/`GNAM` both become `Black.dds`, unprefixed.
+2. **WTHR NAM0 slot 5 (Sun) and slot 15 (Sun Glare)** → hard zero.
+3. **WTHR NAM0 slot 4 (Sunlight)** → zeroed, but **half its value is folded
+   into slot 3 (Ambient)**.
+4. **WTHR DALC** → the same fold, on every face. DALC lights *objects*, and
+   `_wthr_dalc` derives from the TES4 Ambient independently of NAM0, so
+   without this the sky glows red while everything under it stays lit only by
+   the dim TES4 ambient. Vanilla confirms the coupling: BlackreachWeather's
+   DALC faces track its NAM0 Ambient ~1:1 (`10,11,12` → `11,11,12`, only Z-
+   boosted for the mushroom uplight), i.e. vanilla does **not** compensate
+   DALC separately for a missing sun — it authors Ambient at the level it
+   wants and lets DALC follow.
+
+**Why the fold, and why this differs from Blackreach.** Blackreach is a cave
+lit purely by ambient, so vanilla zeroes its Sunlight outright. The Deadlands
+are lit by a warm red fill that Oblivion authors *in Sunlight* while the sprite
+is voided — in Oblivion those are independent; in Skyrim slot 4 drives the
+tracking light. Zeroing it outright would black out the realm's red glow (the
+authored values are substantial: `Obliviondefault` 193,130,87). Half, because
+the directional light lit roughly the half of each surface facing it while
+ambient lights all of it. That the authors used a literal `(0,0,0)` Sunlight on
+`OblivionSigil` — the one realm weather with no fill — confirms zero is their
+"no light" value, so a non-zero value there is a deliberate fill worth keeping.
+
+**No DATA change is needed:** all six realm weathers already author
+`SunGlare=0` and `SunDamage=0`, which pass through correctly.
+
+**Every realm weather authors its four time slots identically** — Oblivion's way
+of encoding "no day/night cycle" — so the transform is time-invariant by
+construction. Note the realm climates still author real `TNAM` timings
+(`Obliviondefaultclimate` 23/42→102/127), i.e. vanilla Oblivion *does* run a
+clock in the Deadlands; the perpetual gloom comes from the void sun plus the
+weather art, not from stopping time.
+
+Regression tests: `TestSunlessSkies` in `tests/test_import.py`. This is record
+content only — no records minted, so **no FormID drift**.
+
 ### Deliberately NOT mapped — keep the converted record
 
 These have no vanilla counterpart, and substituting the nearest-looking one
