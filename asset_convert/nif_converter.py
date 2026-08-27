@@ -2082,8 +2082,9 @@ def _accum_root_mode(seq, root, resolve_name):
     t = anode.translation
     m = anode.rotation
     root_t = (t.x, t.y, t.z)
-    rot_identity = (abs(m.m_11 - 1) < 1e-3 and abs(m.m_22 - 1) < 1e-3
-                    and abs(m.m_33 - 1) < 1e-3)
+    _trace = m.m_11 + m.m_22 + m.m_33
+    _cos = max(-1.0, min(1.0, (_trace - 1.0) / 2.0))
+    rot_identity = math.degrees(math.acos(_cos)) < 0.1
     root_moved = max(abs(v) for v in root_t) >= 0.05
     if not root_moved and rot_identity:
         return None
@@ -2225,6 +2226,51 @@ def _fan_out_shared_entries(seq, extras):
     return added
 
 
+def _apply_rotation(m, quat):
+    """Write quaternion (w,x,y,z) into an existing pyffi Matrix33."""
+    w, x, y, z = quat
+    m.m_11 = 1 - 2 * (y * y + z * z)
+    m.m_12 = 2 * (x * y - z * w)
+    m.m_13 = 2 * (x * z + y * w)
+    m.m_21 = 2 * (x * y + z * w)
+    m.m_22 = 1 - 2 * (x * x + z * z)
+    m.m_23 = 2 * (y * z - x * w)
+    m.m_31 = 2 * (x * z - y * w)
+    m.m_32 = 2 * (y * z + x * w)
+    m.m_33 = 1 - 2 * (x * x + y * y)
+
+
+def _dropped_accum_root_pose(root, mgr, resolve_name):
+    """Apply the accum-root entry's pose to the root NODE, since the entry dies.
+
+    Only for an entry that names the FILE ROOT -- that is the one dropped by the
+    root-name rule.  TES4 applies the entry (an identity placeholder in 815 of
+    853 vanilla accum-root entries), overriding the node's authored bind; we
+    cannot ship the entry, so the node has to carry the value instead.
+    """
+    root_name = bytes(getattr(root, 'name', b'') or b'')
+    if not root_name:
+        return None
+    for seq in mgr.controller_sequences:
+        accum = getattr(seq, 'target_name', b'') or b''
+        accum = accum.encode('latin-1') if isinstance(accum, str) else bytes(accum)
+        if accum != root_name:
+            continue
+        for cb in seq.controlled_blocks:
+            nm = resolve_name(cb, seq, 'node_name')
+            nm = nm.encode('latin-1') if isinstance(nm, str) else bytes(nm or b'')
+            if nm != accum:
+                continue
+            it = cb.interpolator
+            if (isinstance(it, NifFormat.NiTransformInterpolator) and
+                    it.data is None and it.rotation.w > _NO_VALUE):
+                q = it.rotation
+                return (float(q.w), float(q.x), float(q.y), float(q.z))
+            break
+        break
+    return None
+
+
 def _process_controller_manager(node, palette):
     """Strip unsupported NiControllerManager sequences.
 
@@ -2259,6 +2305,15 @@ def _process_controller_manager(node, palette):
                                getattr(blk, attr + '_offset', None))
 
     prop_index = None      # id(property ctrl) -> shapes; built on first use
+
+    # TES4 APPLIES the accum-root entry, overriding the node's authored bind --
+    # but that entry names the file root, so it must be DROPPED (it crashes the
+    # engine; see the census and crash dumps below).  Capture its pose now,
+    # while the entry still exists, and bake it onto the NODE after the loop so
+    # the playing transform matches TES4 and the NonAccum entry can stay exactly
+    # as authored.  Captured before, applied after: _accum_root_mode classifies
+    # from the AUTHORED bind, so baking first would make it read identity.
+    _pending_bake = _dropped_accum_root_pose(node, mgr, _resolve_name)
     for seq in mgr.controller_sequences:
         accum_mode = _accum_root_mode(seq, node, _resolve_name)
         accum_name = getattr(seq, 'target_name', b'') or b''
@@ -2336,7 +2391,9 @@ def _process_controller_manager(node, palette):
                 interp = blk.interpolator
                 _nn = node_name.encode('latin-1') if isinstance(node_name, str) else bytes(node_name or b'')
                 is_accum_root = bool(_nn) and _nn == accum_name
-                if is_accum_root and accum_mode == 'transferred':
+                _keeps = (accum_mode == 'transferred' and bool(_nn) and
+                          (is_accum_root or _nn == accum_name + b' NonAccum'))
+                if _keeps:
                     pass
                 else:
                     if is_accum_root and interp.data is not None:
@@ -2552,6 +2609,10 @@ def _process_controller_manager(node, palette):
             key += 1
 
         _fan_out_shared_entries(seq, shared_extras)
+
+
+    if _pending_bake is not None:
+        _apply_rotation(node.rotation, _pending_bake)
 
 
 def _apply_rest_visibility(root, stats=None):
