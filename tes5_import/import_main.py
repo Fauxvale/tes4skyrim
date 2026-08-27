@@ -1457,9 +1457,19 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     from .record_types.world import reset_emitted_regions
     reset_emitted_regions()
 
-    from .creature_races import build_creature_races
+    from .creature_races import (build_creature_races,
+                                 build_creature_death_piles)
     build_creature_races(by_type, writer, export_dir,
                          ctx.master_export if ctx else None)
+    # Dissolving creatures (ghost/wraith) leave an AUTHORED ectoplasm pile
+    # that asset_convert lifted out of their skeleton; wrap each one in an
+    # ACTI so TES4_GhostDissolve can drop Oblivion's own pile instead of
+    # Skyrim's DefaultAshPileGhost.  Must run BEFORE the CREA pass, which
+    # binds the ACTI into each creature's VMAD.
+    n_piles = build_creature_death_piles(writer)
+    if n_piles:
+        print(f'  Creature death piles: {n_piles} ACTI '
+              f'(authored ectoplasm, replaces the vanilla ash pile)')
     _step_done('creature races')
 
     # --- Phase 0g: plan AI packages -------------------------------------

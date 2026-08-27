@@ -3743,6 +3743,75 @@ def _make_scale_ramp_from_growfade(gf):
     return scales
 
 
+def _sample_color_keys(keys, t):
+    """Linearly sample a NiColorData key list at normalised time `t`."""
+    if not keys:
+        return (1.0, 1.0, 1.0, 1.0)
+    pts = sorted(((float(k.time), k.value) for k in keys),
+                 key=lambda kv: kv[0])
+    t0, t1 = pts[0][0], pts[-1][0]
+    span = (t1 - t0) or 1.0
+    want = t0 + t * span
+    prev = pts[0]
+    for cur in pts:
+        if cur[0] >= want:
+            if cur[0] == prev[0]:
+                c = cur[1]
+                return (c.r, c.g, c.b, c.a)
+            f = (want - prev[0]) / (cur[0] - prev[0])
+            a, b = prev[1], cur[1]
+            return (a.r + (b.r - a.r) * f, a.g + (b.g - a.g) * f,
+                    a.b + (b.b - a.b) * f, a.a + (b.a - a.a) * f)
+        prev = cur
+    c = pts[-1][1]
+    return (c.r, c.g, c.b, c.a)
+
+
+def _simple_color_from(mod):
+    """BSPSysSimpleColorModifier carrying the AUTHORED colour gradient.
+
+    Skyrim's modifier holds exactly three colours (plus the percentages at
+    which each is reached), while Oblivion's NiPSysColorModifier points at a
+    NiColorData curve of arbitrary length -- so sample that curve at its
+    start, middle and end.
+
+    THE AUTHORED COLOUR IS THE POINT.  This used to write a fixed warm-orange
+    "fire palette" for every particle system in every plugin, which is why the
+    ghost's ectoplasm smoke came out orange/black instead of the pale green
+    its NiColorData actually specifies (0.70, 0.83, 0.75 -> 0.51, 0.65, 0.56).
+    """
+    cm = NifFormat.BSPSysSimpleColorModifier()
+    cm.fade_in_percent = 0.1
+    cm.fade_out_percent = 0.25
+    cm.color_1_start_percent = 0.0
+    cm.color_1_end_percent = 0.15
+    cm.color_2_start_percent = 1.0
+    cm.color_2_end_percent = 0.5
+
+    keys = []
+    data = getattr(mod, 'data', None)
+    kg = getattr(data, 'data', None) if data is not None else None
+    if kg is not None:
+        keys = list(getattr(kg, 'keys', []) or [])
+
+    if not keys:
+        # No authored curve: a neutral white ramp with an alpha envelope is
+        # the honest default -- it tints nothing rather than inventing a hue.
+        cols = [(1.0, 1.0, 1.0, 0.0), (1.0, 1.0, 1.0, 1.0),
+                (1.0, 1.0, 1.0, 0.0)]
+    else:
+        cols = [_sample_color_keys(keys, 0.0),
+                _sample_color_keys(keys, 0.5),
+                _sample_color_keys(keys, 1.0)]
+
+    for i, (r, g, b, a) in enumerate(cols):
+        cm.colors[i].r = float(r)
+        cm.colors[i].g = float(g)
+        cm.colors[i].b = float(b)
+        cm.colors[i].a = float(a)
+    return cm
+
+
 def _skyrimize_modifiers(node):
     """Rewrite a NiParticleSystem's modifier list to the Skyrim vocabulary so
     the SSE particle engine actually drives it (else particles are invisible).
@@ -3768,19 +3837,7 @@ def _skyrimize_modifiers(node):
                 sm.floats[i] = v
             new.append(sm)
         elif isinstance(m, NifFormat.NiPSysColorModifier):
-            cm = NifFormat.BSPSysSimpleColorModifier()
-            cm.fade_in_percent = 0.1
-            cm.fade_out_percent = 0.25
-            cm.color_1_start_percent = 0.0
-            cm.color_1_end_percent = 0.15
-            cm.color_2_start_percent = 1.0
-            cm.color_2_end_percent = 0.5
-            # Fire palette: warm→bright→cool, alpha in→hold→out.
-            cols = [(1.0, 0.75, 0.5, 0.0), (1.0, 1.0, 1.0, 1.0), (1.0, 0.6, 0.3, 0.0)]
-            for i, (r, g, b, a) in enumerate(cols):
-                cm.colors[i].r = r; cm.colors[i].g = g
-                cm.colors[i].b = b; cm.colors[i].a = a
-            new.append(cm)
+            new.append(_simple_color_from(m))
         else:
             new.append(m)
 
@@ -3836,6 +3893,7 @@ def _convert_particle_system(node, fix_textures):
     # emitter's NiMaterialProperty exactly as the geometry path does.  A smoke
     # emitter authored at (0.35, 0.35, 0.35) must not be promoted to white.
     psys_emissive = None
+    psys_vertex_coloured = False
     psys_alpha = 1.0
 
     # Harvest UV-scroll controllers before the Oblivion properties are cleared.
@@ -3856,6 +3914,8 @@ def _convert_particle_system(node, fix_textures):
             if ec.r > 0.0 or ec.g > 0.0 or ec.b > 0.0:
                 psys_emissive = (ec.r, ec.g, ec.b)
             psys_alpha = float(prop.alpha)
+        elif isinstance(prop, NifFormat.NiVertexColorProperty):
+            psys_vertex_coloured = True
         elif isinstance(prop, NifFormat.NiAlphaProperty):
             alpha_prop = prop
 
@@ -3958,7 +4018,21 @@ def _convert_particle_system(node, fix_textures):
     # (harvested below), so the multiple stays neutral and the authored color
     # does the dimming.
     shader.emissive_multiple = 1.0
-    if psys_emissive is not None:
+    # ...UNLESS the particles carry their own colour.  When the system has
+    # a NiPSysColorModifier (or a NiVertexColorProperty), the PER-PARTICLE
+    # colour is what Oblivion draws and the NiMaterialProperty emissive is
+    # inert -- the ghost's smoke pairs an authored pale-green colour curve
+    # with a near-black (0.04) material.  Skyrim's effect shader MULTIPLIES
+    # by emissive_color, so copying that 0.04 across rendered the smoke
+    # black in game.  Keep the tint neutral and let the converted
+    # BSPSysSimpleColorModifier supply the hue, which is also vanilla's
+    # overwhelming default (98/167 effect shaders are pure white).
+    has_colour_mod = any(
+        isinstance(m, (NifFormat.NiPSysColorModifier,
+                       NifFormat.BSPSysSimpleColorModifier))
+        for m in (node.modifiers or []) if m is not None)
+    if psys_emissive is not None and not (has_colour_mod
+                                          or psys_vertex_coloured):
         shader.emissive_color.r = psys_emissive[0]
         shader.emissive_color.g = psys_emissive[1]
         shader.emissive_color.b = psys_emissive[2]
@@ -6426,6 +6500,371 @@ def _append_child(node, child):
     node.children[node.num_children - 1] = child
 
 
+# The pile box is written in OBLIVION havok units, because convert_nif runs
+# collision through the usual Oblivion->Skyrim rescale afterwards
+# (collision._HAVOK_SCALE = 0.1).  Oblivion havok -> game units is x7, so a
+# game-unit extent is divided by 7 here and ends up correct after the x0.1.
+# Writing Skyrim-scale values here instead produced a box exactly 0.10x the
+# geometry on every axis -- the double-scale that measurement caught.
+_PILE_HAVOK_SCALE = 7.0
+# SkyrimLayer 15: collides with nothing, still ray-cast for activation --
+# exactly what vanilla's ash-pile phantom uses.
+_PILE_COLL_LAYER = 15
+
+
+def _pile_bounds(root):
+    """(min, max) of every shape under `root`, in root space, or None."""
+    lo = [float('inf')] * 3
+    hi = [float('-inf')] * 3
+    seen = set()
+    for blk in root.tree():
+        if not isinstance(blk, NifFormat.NiTriBasedGeom) or id(blk) in seen:
+            continue
+        seen.add(id(blk))
+        data = getattr(blk, 'data', None)
+        verts = getattr(data, 'vertices', None) if data is not None else None
+        if not verts:
+            continue
+        s = float(getattr(blk, 'scale', 1.0) or 1.0)
+        t = blk.translation
+        base = (t.x, t.y, t.z)
+        for v in verts:
+            for i, c in enumerate((v.x, v.y, v.z)):
+                w = c * s + base[i]
+                if w < lo[i]:
+                    lo[i] = w
+                if w > hi[i]:
+                    hi[i] = w
+    if lo[0] > hi[0]:
+        return None
+    return lo, hi
+
+
+def _centre_pile_xy(root):
+    """Shift every shape so the pile straddles the origin in X and Y.
+
+    A placed object is dropped AT its origin, and the activation box the
+    engine builds comes from the record's OBND about that origin -- so a mesh
+    that sits 10 units to one side gives a click target beside the visible
+    pile (reported in game).  Z is preserved: that is the authored ground
+    drop, not drift.
+    """
+    b = _pile_bounds(root)
+    if b is None:
+        return False
+    lo, hi = b
+    dx = (lo[0] + hi[0]) / 2.0
+    dy = (lo[1] + hi[1]) / 2.0
+    if abs(dx) < 1e-4 and abs(dy) < 1e-4:
+        return False
+    seen = set()
+    for blk in root.tree():
+        if not isinstance(blk, NifFormat.NiTriBasedGeom) or id(blk) in seen:
+            continue
+        seen.add(id(blk))
+        blk.translation.x -= dx
+        blk.translation.y -= dy
+    return True
+
+
+def _fit_pile_collision(root):
+    """Attach vanilla's ash-pile PHANTOM, box-fitted to `root`'s geometry.
+
+    A pile's activation volume must be a bhkSimpleShapePhantom, NOT a rigid
+    body.  Every vanilla ash pile is built the same way (ashpileghost01/
+    ashpile01/ashpileghostblack, byte-read from `references/Skyrim Meshes`):
+    a child NiNode `Box01` carries bhkSPCollisionObject(flags 129) ->
+    bhkSimpleShapePhantom(layer 15 NONCOLLIDABLE) -> bhkTransformShape ->
+    bhkBoxShape, with the transform shape lifting the box over the mesh
+    (vanilla ghost pile: 64x64x16 game units, raised z 0..16).  A fixed
+    bhkRigidBodyT on the same layer 15 was tried first: it shipped with the
+    box measured correct (half-extents 10.4/10.4/2 on the pile's own
+    geometry) and the pile was still unselectable in game — the crosshair
+    pick never sees the body, only the phantom.
+
+    The box covers the FULL geometry extents; the Z half-extent floors at
+    8 game units, vanilla's own pick-box thickness, so a flat puddle still
+    has a comfortable crosshair target.
+    """
+    b = _pile_bounds(root)
+    if b is None:
+        return False
+    lo, hi = b
+    # Full-size half-extents; Z floored at vanilla's 8-game-unit thickness.
+    half = [(hi[i] - lo[i]) / 2.0 for i in range(3)]
+    half[2] = max(half[2], 8.0)
+    centre = [(hi[i] + lo[i]) / 2.0 for i in range(3)]
+
+    box = NifFormat.bhkBoxShape()
+    box.material.material = 0
+    box.radius = 1.0                # x0.1 in conversion -> vanilla's 0.1
+    box.dimensions.x = half[0] / _PILE_HAVOK_SCALE
+    box.dimensions.y = half[1] / _PILE_HAVOK_SCALE
+    box.dimensions.z = half[2] / _PILE_HAVOK_SCALE
+
+    # The box's placement rides a bhkTransformShape exactly as vanilla
+    # ships it (the phantom itself carries no usable offset).  Translation
+    # is in the 4th column; the converter rescales m_14/24/34 by x0.1.
+    xf = NifFormat.bhkTransformShape()
+    xf.material.material = 0
+    xf.unknown_float_1 = 0.1        # radius; not rescaled by the converter
+    xf.shape = box
+    xf.transform.set_identity()
+    xf.transform.m_14 = centre[0] / _PILE_HAVOK_SCALE
+    xf.transform.m_24 = centre[1] / _PILE_HAVOK_SCALE
+    xf.transform.m_34 = centre[2] / _PILE_HAVOK_SCALE
+
+    phantom = NifFormat.bhkSimpleShapePhantom()
+    phantom.shape = xf
+    phantom.havok_col_filter.layer = _PILE_COLL_LAYER
+    # Float block layout copied from a real Oblivion-authored phantom
+    # (ctrigtripwire01.nif): 7 zeros, then three [1,0,0,0,0] rows.
+    for i in range(3):
+        phantom.unknown_floats_2[i][0] = 1.0
+
+    # Vanilla hangs the phantom on a dedicated child node.
+    box_node = NifFormat.NiNode()
+    box_node.name = b'Box01'
+    box_node.flags = NIF_FLAGS
+    co = NifFormat.bhkSPCollisionObject()
+    co.flags = 129
+    co.target = box_node
+    co.body = phantom
+    box_node.collision_object = co
+    _append_child(root, box_node)
+    return True
+
+
+def extract_death_pile(src_skeleton_path, dst_path, reveal_holders=None,
+                       holder_offsets=None):
+    """Lift a dissolving creature's AUTHORED death pile into its own NIF.
+
+    An Oblivion ghost's ectoplasm is not a standalone mesh: it is geometry
+    parked inside skeleton.nif under an attachment node that the death
+    animation REVEALS -- `AttachmentsBip` -> `Bip01 ectoplasm` ->
+    `Bip01 ectoplasm:0` (47 verts, textures\\creatures\\ghost\\Ghost03.dds,
+    alpha blended).  Those NiVisController reveals cannot survive into a Havok
+    clip, so the conversion drops a real placed object instead -- and it must
+    be THIS geometry, not Skyrim's DefaultAshPileGhost.
+
+    reveal_holders: node names the death clip turns ON (from the decoded
+        clip's vis_tracks -- an authored signal, not a guess).  Only geometry
+        under one of these is a pile; the wraith's `Attachments` holds a CLOAK
+        and is never revealed, so it is correctly skipped.
+    holder_offsets: {holder name: (dx, dy, dz)} the death clip applies to that
+        node by its LAST frame.  The pile is authored at body height and the
+        clip lowers it to the ground (ghost: z +14.04 -> -56.80, resting at
+        world z ~ -3.4), so without this the pile floats at chest height.
+
+    Writes a plain unskinned NIF with each shape baked to its final world
+    transform, visible, and stripped of the reveal controllers (which mean
+    nothing on a static).  Returns True when something was written.
+    """
+    reveal_holders = tuple(reveal_holders or ())
+    holder_offsets = holder_offsets or {}
+    if not reveal_holders:
+        return False
+    try:
+        data = NifFormat.Data()
+        with open(src_skeleton_path, 'rb') as f:
+            data.read(f)
+    except Exception:
+        return False
+
+    root = data.roots[0] if data.roots else None
+    if root is None:
+        return False
+
+    picked = []          # (shape, holder name, holder node)
+    seen_shapes = set()
+    for want in reveal_holders:
+        for blk in root.tree():
+            if not isinstance(blk, NifFormat.NiNode):
+                continue
+            nm = bytes(blk.name).rstrip(b'\x00').decode('latin-1', 'replace')
+            if nm != want:
+                continue
+            for sub in blk.tree():
+                # DEDUPE BY IDENTITY: pyffi's tree() yields a block once
+                # per reference, and the ghost's ectoplasm shape is
+                # referenced twice -- transforming it twice moved the
+                # pile by the clip offset TWICE (Z 21.2 instead of 10.6).
+                if (isinstance(sub, NifFormat.NiTriBasedGeom)
+                        and id(sub) not in seen_shapes):
+                    seen_shapes.add(id(sub))
+                    picked.append((sub, nm, blk))
+    if not picked:
+        return False
+
+    out_root = NifFormat.NiNode()
+    out_root.name = os.path.basename(dst_path).encode('latin-1')
+    out_root.flags = NIF_FLAGS
+
+
+    # parent-of-holder world transforms, so the clip's holder position can
+    # be turned back into world space
+    parent_of = {}
+    for blk in root.tree():
+        if isinstance(blk, NifFormat.NiNode):
+            for ch in blk.children:
+                if ch is not None:
+                    parent_of[id(ch)] = blk
+
+    for shape, holder, holder_node in picked:
+        # Where the death clip LEAVES this pile:
+        #   final = parent_of_holder_world
+        #         + holder_local_on_the_clip's_last_frame
+        #         + (shape_rest_world - holder_rest_world)
+        # The last term keeps the shape's offset relative to its holder;
+        # the middle term is where the clip actually parks the holder.
+        # Both source creatures land on the ground this way (ghost pile
+        # world Z 6.7..12.9, wraith 1.6..16.6, with Scene Root at 0).
+        try:
+            tm = shape.get_transform(root)
+        except Exception:
+            tm = None
+        if tm is None:
+            _append_child(out_root, shape)
+            continue
+        # Write the composed WORLD transform straight onto the node rather
+        # than round-tripping the matrix: the ghost's ectoplasm shape has a
+        # 0.57 SCALE baked into its rotation rows, and set_transform()
+        # re-decomposes that, so arithmetic on m_43 did not survive (the
+        # pile came out at Z 21.2 instead of 10.6).
+        shape.set_transform(tm)          # rotation + scale, world-relative
+        dx = dy = dz = 0.0
+        if holder in holder_offsets:
+            parent = parent_of.get(id(holder_node))
+            try:
+                pw = (parent.get_transform(root) if parent is not None
+                      else None)
+                hw = holder_node.get_transform(root)
+            except Exception:
+                pw = hw = None
+            if pw is not None and hw is not None:
+                fx, fy, fz = holder_offsets[holder]
+                dx = (pw.m_41 + float(fx)) - hw.m_41
+                dy = (pw.m_42 + float(fy)) - hw.m_42
+                dz = (pw.m_43 + float(fz)) - hw.m_43
+        shape.translation.x = tm.m_41 + dx
+        shape.translation.y = tm.m_42 + dy
+        shape.translation.z = tm.m_43 + dz
+        # The source hides this until the death animation reveals it; a placed
+        # pile must be visible, and the reveal controllers (transform + geom
+        # morpher) have no meaning on a static.
+        shape.flags = NIF_FLAGS
+        shape.controller = None
+        _append_child(out_root, shape)
+
+    # Collision: vanilla's ash-pile PHANTOM, box-fitted to the pile (see
+    # _fit_pile_collision).  The holder's own bhkCollisionObject is NOT
+    # reusable -- it belongs to the living creature's rig (a limb proxy), so
+    # it is the wrong size and in the wrong place: measured on the shipped
+    # meshes it covered 38% of the ghost pile's width at 2.3x its height,
+    # offset 10 units sideways, and just 4% of the wraith pile's width.
+    #
+    # Centre the pile on its own origin in X/Y.  Whatever offset survives
+    # here is drift inside the creature's rig -- the ghost's from the
+    # death clip, the wraith's from the shape's authored rest position --
+    # and a placed object must straddle the point AttachAshPile drops it
+    # at, which is also the point the engine builds the activation target
+    # around.  Z is left alone: that is the ground drop.
+    _centre_pile_xy(out_root)
+
+    has_coll = _fit_pile_collision(out_root)
+
+    # BSXFlags: vanilla's own ash piles ship 147.  Bit 1 (Havok) is what
+    # tells the engine this static has collision to trace against at all;
+    # without a BSXFlags the converted pile is inert even with a phantom.
+    if has_coll:
+        bsx = NifFormat.BSXFlags()
+        bsx.name = b'BSX'
+        bsx.integer_data = 2
+        out_root.num_extra_data_list += 1
+        out_root.extra_data_list.update_size()
+        out_root.extra_data_list[out_root.num_extra_data_list - 1] = bsx
+
+    data.roots = [out_root]
+    dst_dir = os.path.dirname(dst_path)
+    if dst_dir:
+        os.makedirs(dst_dir, exist_ok=True)
+    with open(dst_path, 'wb') as f:
+        data.write(f)
+    return True
+
+
+def source_hidden_attachment_nodes(src_skeleton_path):
+    """Attachment nodes the SOURCE skeleton hides at rest.
+
+    Oblivion authors a creature's rest visibility on the attachment NODE:
+    the ghost skeleton ships AttachmentsShrink with flags=21 (hidden set)
+    because the shrink blob belongs to the death dissolve only, while
+    every other attachment is flags=20 (visible).  Conversion normalises
+    node flags to NIF_FLAGS and the body merge flattens shapes out of the
+    subtree, so the bit has to be carried onto the shape explicitly or a
+    LIVING ghost wears its own ectoplasm.
+
+    Census (every Oblivion creature skeleton, 2026-08-26): exactly one
+    hidden node exists -- ghost/AttachmentsShrink.  Reading the bit from
+    the SKELETON and not from the body parts is deliberate: the parts set
+    the same bit on ~1165 ordinary Bip01 bones, where it means nothing.
+    """
+    out = set()
+    try:
+        data = NifFormat.Data()
+        with open(src_skeleton_path, 'rb') as f:
+            data.read(f)
+    except Exception:
+        return out
+    for r in data.roots:
+        if r is None:
+            continue
+        for blk in r.tree():
+            if isinstance(blk, NifFormat.NiNode) and \
+                    int(getattr(blk, 'flags', 0)) & 1:
+                out.add(bytes(blk.name).rstrip(b'\x00').decode(
+                    'latin-1', 'replace'))
+    return out
+
+
+def source_attachment_node(src_nif_path):
+    """Attachment node of an UNCONVERTED Oblivion creature body part.
+
+    convert_nif strips the `Prn` NiStringExtraData, so the creature
+    pipeline reads this from the source file and hands the result to
+    merge_creature_body via its `attachments` argument.  Same rule as
+    _part_attachment_node: the `Prn` value, else 'SkinAttachment'.
+    """
+    data = NifFormat.Data()
+    with open(src_nif_path, 'rb') as f:
+        data.read(f)
+    for r in data.roots:
+        if r is None:
+            continue
+        return _part_attachment_node(r)
+    return 'SkinAttachment'
+
+
+def _part_attachment_node(src_root):
+    """Name of the node an Oblivion creature body part attaches to.
+
+    `Prn` NiStringExtraData when the part carries one (heademissive ->
+    'AttachmentsHead', shrink.nif -> 'AttachmentsShrink'); otherwise the
+    part is a plain skin part and Oblivion attaches it under
+    'SkinAttachment'.  The ghost/wraith death animation drives
+    NiVisControllers on exactly these nodes, so the association has to
+    survive the body merge.
+    """
+    for blk in src_root.tree():
+        if isinstance(blk, NifFormat.NiStringExtraData) and \
+                bytes(blk.name).rstrip(b'\x00') == b'Prn':
+            v = bytes(blk.string_data).rstrip(
+                b'\x00').decode('latin-1')
+            if v:
+                return v
+    return 'SkinAttachment'
+
+
 def _copy_bone_tree(src_node, dst_parent, mapping):
     """Recursively copy the NiNode-only hierarchy under src_node into
     dst_parent (name, flags, full local transform — no collision objects,
@@ -6443,7 +6882,8 @@ def _copy_bone_tree(src_node, dst_parent, mapping):
         _copy_bone_tree(child, cp, mapping)
 
 
-def merge_creature_body(part_paths, dst_path, skeleton_path=None):
+def merge_creature_body(part_paths, dst_path, skeleton_path=None,
+                        attachments=None, hidden_nodes=None):
     """Merge the converted creature body-part NIFs into ONE skinned NIF.
 
     Vanilla Skyrim creatures ship the WHOLE animal (body + head + eyes + tail
@@ -6469,6 +6909,11 @@ def merge_creature_body(part_paths, dst_path, skeleton_path=None):
 
     part_paths: already-converted .nif paths (Skyrim version).
     skeleton_path: the creature's converted 'character assets/skeleton.nif'.
+    attachments: {converted part path: attachment node name} read from
+    the SOURCE parts' `Prn` before conversion strips it (see
+    _part_attachment_node).  Shapes are parented under that node so a
+    death animation's NiVisController -> bone-scale collapse can hide
+    them; without it every shape is a root sibling and nothing hides.
     Writes the merged NIF to dst_path.  Returns {'grafted': int,
     'shapes': int, 'bones': int}.
     """
@@ -6502,6 +6947,18 @@ def merge_creature_body(part_paths, dst_path, skeleton_path=None):
         for src_root in d.roots:
             if src_root is None:
                 continue
+            # The part's attachment node: Oblivion names it in a `Prn`
+            # NiStringExtraData (head/hands/shrink blob) and leaves it
+            # off the plain SKIN parts (body), which the engine attaches
+            # under 'SkinAttachment'.  We keep the association because a
+            # creature death animation HIDES these nodes -- see
+            # kf_decode's NiVisController handling, which converts hiding
+            # to a bone-scale collapse.  That only reaches geometry
+            # actually hanging off the bone, and a flat merge (every
+            # shape a sibling at the root) left the ghost's body fully
+            # visible throughout its dissolve.
+            prn = (attachments or {}).get(_path) or \
+                _part_attachment_node(src_root)
             for shape in _shape_blocks(src_root):
                 si = shape.skin_instance
                 if si is not None:
@@ -6522,6 +6979,23 @@ def merge_creature_body(part_paths, dst_path, skeleton_path=None):
                         si.bones[bi] = tgt
                     if si.skeleton_root is not None:
                         si.skeleton_root = root
+                # ALWAYS parent at the root.  Do NOT hang a skinned shape
+                # off its attachment bone: the engine applies the shape's
+                # parent chain ON TOP of the skinned result, so a body
+                # under `SkinAttachment` (a child of the animated
+                # `Bip01 NonAccum`) gets that animation twice and leaves
+                # the view entirely -- reported in game 2026-08-26 as the
+                # ghost losing its whole body while still alive, with only
+                # the skeleton-owned smoke left.  Vanilla agrees: the
+                # working dog merge keeps `WolfBody` at the root, and
+                # Oblivion's own part NIFs are standalone roots the engine
+                # attaches at runtime, never children inside a mesh file.
+                #
+                # The attachment node still matters for REST visibility:
+                # carry the authored hidden bit onto the shape (the shrink
+                # blob must not show on a living ghost) without moving it.
+                if prn in (hidden_nodes or ()):
+                    shape.flags = int(shape.flags) | 1
                 _append_child(root, shape)
                 grafted += 1
 

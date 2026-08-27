@@ -2086,6 +2086,57 @@ def build_vmad_object_script(script_name: str,
     return bytes(buf)
 
 
+def append_vmad_object_script(existing: bytes, script_name: str,
+                              object_props: dict = None,
+                              value_props: dict = None) -> bytes:
+    """Add one more attached script to an already-built object VMAD.
+
+    build_vmad_object_script writes a fixed "attached scripts = 1" count, so a
+    record that needs TWO scripts (a converted TES4 creature SCRI *and* the
+    generated TES4_GhostDissolve) has to have the count bumped and the second
+    script's entry concatenated.  `existing` may be empty, in which case this
+    is just build_vmad_object_script.
+
+    Both scripts then run side by side, which is what Skyrim does natively --
+    a record's VMAD is a list, and each attached script gets its own event
+    handlers.  Layout is otherwise identical (version 5, objectFormat 2), and
+    the entries after the count are a flat sequence, so appending is safe
+    without reparsing the first script's properties.
+    """
+    if not existing:
+        return build_vmad_object_script(script_name, object_props,
+                                        value_props)
+
+    # header is <H version><H objectFormat><H scriptCount>
+    version, obj_format, count = struct.unpack_from('<HHH', existing, 0)
+    body = existing[6:]
+
+    tail = bytearray()
+    tail += _pack_wstring(script_name)
+    tail += struct.pack('<B', 0)                 # flags=0
+    object_props = object_props or {}
+    value_props = value_props or {}
+    tail += struct.pack('<H', len(object_props) + len(value_props))
+    for pname, fid in object_props.items():
+        tail += _pack_wstring(pname)
+        tail += struct.pack('<BB', _VMAD_PROP_OBJECT, 1)
+        tail += struct.pack('<HhI', 0, -1, fid)
+    for pname, (kind, value) in value_props.items():
+        tail += _pack_wstring(pname)
+        if kind == 'float':
+            tail += struct.pack('<BB', _VMAD_PROP_FLOAT, 1)
+            tail += struct.pack('<f', float(value))
+        elif kind == 'bool':
+            tail += struct.pack('<BB', _VMAD_PROP_BOOL, 1)
+            tail += struct.pack('<B', 1 if value else 0)
+        else:
+            tail += struct.pack('<BB', _VMAD_PROP_INT, 1)
+            tail += struct.pack('<i', int(value))
+
+    return (struct.pack('<HHH', version, obj_format, count + 1)
+            + body + bytes(tail))
+
+
 def _pack_wstring(s: str) -> bytes:
     """Pack a VMAD wstring: U16 length + UTF-8 bytes."""
     encoded = s.encode('utf-8')

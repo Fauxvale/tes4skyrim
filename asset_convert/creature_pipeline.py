@@ -74,7 +74,9 @@ def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
     None, every .nif in the folder is treated as one set."""
     from asset_convert.hkx_behavior import generate_creature_project
     from asset_convert.hkx_xml import convert_hkx_to_amd64
-    from asset_convert.nif_converter import convert_nif, merge_creature_body
+    from asset_convert.nif_converter import (
+        convert_nif, merge_creature_body, source_attachment_node,
+        source_hidden_attachment_nodes, extract_death_pile)
 
     manifest = generate_creature_project(creature_dir, name, out_meshes_dir,
                                          fps=fps, sound_slots=sound_slots,
@@ -108,9 +110,52 @@ def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
     # pick up earlier whole-body merge outputs as "parts" — compounding the
     # entire body into every subsequent file (mangled overlapping geometry,
     # 70x file sizes, quadratic merge times).
+    # Attachment nodes the SOURCE skeleton hides at rest (ghost's
+    # AttachmentsShrink is the only one in all of Oblivion) -- the
+    # merge re-applies the bit to the shapes hanging off them.
+    src_skel = next(
+        (os.path.join(creature_dir, f)
+         for f in sorted(os.listdir(creature_dir))
+         if f.lower().startswith('skeleton')
+         and f.lower().endswith('.nif')), None)
+    hidden_nodes = (source_hidden_attachment_nodes(src_skel)
+                    if src_skel else set())
+
     parts_dir = os.path.join(proj_dir, '_parts')
     converted = {}       # lower filename -> pristine converted part path
+    attachments = {}     # converted part path -> attachment node name
     nif_failures = []
+
+    # A dissolving creature (ghost/wraith) leaves an AUTHORED pile that
+    # lives inside skeleton.nif under the node its death clip reveals.
+    # Lift it into its own NIF so the import can place Oblivion's own
+    # ectoplasm rather than Skyrim's DefaultAshPileGhost.
+    death_pile = None
+    if src_skel and manifest.get('dissolves_on_death'):
+        pile_name = f'{name.lower()}deathpile.nif'
+        try:
+            # Extract to a staging path first: the pile comes straight out of
+            # the SOURCE skeleton, so it is still Oblivion-format (uv2=11) and
+            # SSE cannot load it.  convert_nif does the version upgrade,
+            # shader conversion and texture fixups the same way it does for
+            # every other creature mesh.
+            raw_pile = os.path.join(parts_dir, pile_name)
+            if extract_death_pile(
+                    src_skel, raw_pile,
+                    reveal_holders=manifest.get('death_reveals'),
+                    holder_offsets=manifest.get('death_offsets')):
+                res = convert_nif(raw_pile,
+                                  os.path.join(proj_dir, pile_name),
+                                  creature=True)
+                if os.path.exists(os.path.join(proj_dir, pile_name)):
+                    death_pile = pile_name
+                else:
+                    nif_failures.append(
+                        (pile_name, res.get('error')
+                         or f"skipped ({res.get('skip_reason')})"))
+        except Exception as e:
+            nif_failures.append((pile_name, f'{type(e).__name__}: {e}'))
+    manifest['death_pile'] = death_pile
     for fn in sorted(os.listdir(creature_dir)):
         if not fn.lower().endswith('.nif'):
             continue
@@ -119,6 +164,15 @@ def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
             convert_nif(os.path.join(creature_dir, fn), dst, creature=True)
             continue
         dst = os.path.join(parts_dir, fn.lower())
+        # Read the part's attachment node from the SOURCE, before
+        # convert_nif strips the `Prn` extra data.  The death animation
+        # hides these nodes (kf_decode NiVisController -> bone scale), so
+        # the merge has to hang each shape off the right one.
+        try:
+            attachments[dst] = source_attachment_node(
+                os.path.join(creature_dir, fn))
+        except Exception:
+            pass
         res = convert_nif(os.path.join(creature_dir, fn), dst, creature=True)
         if res.get('error'):
             nif_failures.append((fn, res['error']))
@@ -152,7 +206,9 @@ def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
             merge_creature_body(
                 paths, os.path.join(proj_dir, merged_name),
                 skeleton_path=os.path.join(proj_dir, 'character assets',
-                                           'skeleton.nif'))
+                                           'skeleton.nif'),
+                attachments=attachments,
+                hidden_nodes=hidden_nodes)
         except Exception as e:
             nif_failures.append((merged_name, f'{type(e).__name__}: {e}'))
             shutil.copy2(paths[0], os.path.join(proj_dir, merged_name))
@@ -668,6 +724,14 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
         # clip root-motion speeds (u/s) → per-creature MOVT SPED columns
         'speeds': m.get('speeds', {}),
         'has_ragdoll': m.get('has_ragdoll', False),
+        # authored dissolve (ghost/wraith): the death clip hides the
+        # actor's skin holder instead of dropping the body -> the import
+        # attaches TES4_GhostDissolve (Skyrim's native ash pile)
+        'dissolves_on_death': m.get('dissolves_on_death', False),
+        'death_duration': m.get('death_duration', 0.0),
+        # the extracted Oblivion ectoplasm pile (filename in the
+        # project dir), placed by the import as an ACTI
+        'death_pile': m.get('death_pile'),
         # cast/block graph lanes -> their IDLE action routing (creature_idles)
         'has_cast': m.get('has_cast', False),
         'has_block': m.get('has_block', False),

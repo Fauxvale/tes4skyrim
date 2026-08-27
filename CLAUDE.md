@@ -398,7 +398,7 @@ relevant doc when working in that area.
 | [TES5_Binary_Format.md](docs/TES5_Binary_Format.md) | TES5 binary structure reference |
 | [TES4_Record_Definitions.md](docs/TES4_Record_Definitions.md) | TES4 record structure reference |
 | [xedit_scripting_reference.md](docs/xedit_scripting_reference.md) | xEdit Pascal API + globals (historical — the pipeline is pure Python now; kept for ad-hoc verification scripts) |
-| [in_app_update_plan.md](docs/in_app_update_plan.md) | PLAN (unimplemented): in-app update downloading only changed files via the GitHub compare API (0.8–3.5 MB vs a 45 MB tree; truncates at 300 files). No git needed — zip installs have no `.git`. `conversion_config.json` is the one tracked file the app writes |
+| [in_app_update_plan.md](docs/in_app_update_plan.md) | PLAN (unimplemented): in-app update downloading only changed files via the GitHub compare API (0.8–3.5 MB vs a 45 MB tree; truncates at 300 files). No git needed — zip installs have no `.git`. Dev trees protected by `is_dev_version()`. Optional launch check. `conversion_config.json` is the one tracked file the app writes |
 
 ### Records & data
 | Doc | Covers |

@@ -55,7 +55,31 @@ def clip_to_animation_data(clip: DecodedClip, bone_names: list,
     # KF tracks carry Oblivion bone names; the skeleton bone list has the
     # engine-contract root rename applied (Bip01 -> 'NPC Root [Root]').
     from asset_convert.hkx_skeleton import BONE_RENAMES
-    track_map = {BONE_RENAMES.get(t.bone, t.bone): t for t in clip.tracks}
+    # MERGE tracks that target the same bone -- never overwrite.  One
+    # sequence can drive a node from several controlled blocks, and the
+    # channels are disjoint: Oblivion's ghost death.kf gives
+    # AttachmentsShrink and AttachmentsBip a NiTransformController
+    # (translation/rotation) AND a NiVisController, which kf_decode
+    # converts to a SCALE channel.  A dict comprehension keeps only the
+    # last block per bone, which dropped the visibility scale on exactly
+    # the two bones that reveal the ectoplasm (the shrink blob never
+    # appeared and the body never hid).
+    # Merged COPIES, never in-place mutation: a decoded clip can be
+    # written more than once (cast splits reuse one decode), so the
+    # caller's tracks must come back out untouched.
+    from asset_convert.kf_decode import BoneTrack
+    track_map = {}
+    for t in clip.tracks:
+        name = BONE_RENAMES.get(t.bone, t.bone)
+        prev = track_map.get(name)
+        if prev is None:
+            track_map[name] = BoneTrack(
+                bone=t.bone, translations=t.translations,
+                rotations=t.rotations, scales=t.scales)
+            continue
+        for chan in ('translations', 'rotations', 'scales'):
+            if getattr(prev, chan) is None and getattr(t, chan) is not None:
+                setattr(prev, chan, getattr(t, chan))
 
     anim = AnimationData()
     anim.duration = float(clip.duration)
