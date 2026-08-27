@@ -72,10 +72,33 @@ ERROR_RE = re.compile(
 )
 
 
+def documents_dir() -> Path:
+    """The real 'Documents' folder, honouring OneDrive Known Folder Move.
+
+    OneDrive relocates Documents to %USERPROFILE%\\OneDrive\\Documents and records
+    the new path in the registry, so %USERPROFILE%\\Documents no longer exists.
+    The authoritative location is the 'Personal' shell-folder value; fall back to
+    the classic path only when that cannot be read (non-Windows, locked registry).
+    """
+    try:
+        import winreg  # Windows-only; import lazily so the module loads elsewhere
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            raw, _ = winreg.QueryValueEx(key, "Personal")
+        expanded = os.path.expandvars(raw)
+        if expanded and Path(expanded).is_dir():
+            return Path(expanded)
+    except OSError:
+        pass
+    return Path(os.environ.get("USERPROFILE", Path.home())) / "Documents"
+
+
 def log_dir() -> Path:
     return (
-        Path(os.environ.get("USERPROFILE", Path.home()))
-        / "Documents"
+        documents_dir()
         / "My Games"
         / "Skyrim Special Edition"
         / "Logs"
