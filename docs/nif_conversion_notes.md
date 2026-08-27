@@ -1554,6 +1554,53 @@ The single most important havok-conversion fact, and the root cause of both "con
 - Consequence of passing them through: every constraint frame and collision shape is rotated out from under the solver → constraint assemblies act welded solid; ordinary clutter collision sits askew from the visual mesh.
 - Fix in `_convert_collision`: non-T bodies get translation=(0,0,0,0) AND rotation=(0,0,0,1). bhkRigidBodyT keeps its (scaled) transform. NOTE: field-level dumps looked "fine" for months because everyone (and the docs) believed the non-T fields were dead — when a converted mesh matches vanilla on every OTHER field, byte-diff the remaining "ignored" ones.
 
+## Hoisted collision dropped the child node's ROTATION (SOLVED 2026-08-27)
+"citadelballconystandardendleft02.nif has no collision" — but the output carried a
+complete `bhkCollisionObject` + MOPP + CMS with 373 non-degenerate triangles. The
+collision was **present and correctly formed, just parked in the wrong half of the
+world**, so nothing the player walks on ever touched it.
+
+Measured (game units): render Y `-956.8..-494.2`, collision Y `+508.7..+1035.6`,
+Z off by ~286. X matched exactly — the tell that this is a transform bug, not a
+geometry one.
+
+Cause: Skyrim requires collision on the root, so `hoist_collision` moves it up from
+a child NiNode — but it read **only `child.translation`**, and only for the two
+strips shape types via `_offset_collision_shape_verts`. This mesh hangs its
+collision on `collisionCitadelBallconyStandardEndRight04`, whose rotation is
+`diag(1,-1,-1)` (180° about X). That flip was silently discarded, negating Y and Z.
+
+**The A/B that isolates it**: sibling `citadelballconystandardendleft.nif` — same
+author, same geometry, same 373-tri hull, same code path — converts correctly, and
+its collision node's rotation is identity. The node rotation is the only
+discriminator; the shape type, mesh and plugin are all constants across the pair.
+
+Fix: `hoist_collision` now composes the child's FULL `(R, T, s)`:
+- **`bhkRigidBody(T)`** → `bake_node_transform_into_body` (promotes to
+  `bhkRigidBodyT`). Shape-agnostic, so it also fixes convex hulls, list shapes and
+  primitives — none of which have a vertex array the old path could rewrite, so
+  they had been dropping the translation too.
+- **`bhkSimpleShapePhantom`** (trap-damage volumes, trigger zones) has no body
+  transform field and cannot be promoted → `_wrap_shape_in_node_transform` composes
+  `L` into a `bhkTransformShape` wrapper instead (composing into an existing
+  transform shape rather than double-wrapping).
+
+Safe against the bodyT+CMS CTD above: mesh collision folds any bodyT back into the
+triangles in `_bake_body_transform_into_tris` and demotes the body to plain
+identity, so no shipped CMS mesh gains a `bhkRigidBodyT`.
+
+**Blast radius, measured over 28,470 exported NIFs**: 645 reach the hoist path; 55
+have a non-identity rotation/scale there; 19 are creature assets (`creature=True`
+skips the hoist) and 15 more take the `wrapped` path (which already baked rotation
+correctly) — leaving **14 meshes that actually changed**, across Oblivion.esm and
+Nehrim.esm. Verified: collision/render overlap ≥0.97 on the balcony pair, 0 issues
+from `collision_sanity.py`, and the phantom's composed transform matches a hand
+computation to 4 decimals.
+
+The `wrapped` gate in `nif_converter.py` still skips hoisting — not because
+rotation is unsupported any more, but because that case would have to compose the
+WRAPPER's transform too.
+
 ## Inverted collision winding — "I fall through the floor" (SOLVED 2026-07-20; **rewritten 2026-08-20, see round 3 below**)
 Falling through floors in Nehrim (worst in caves) that are solid in Oblivion. **Source-data corruption, not a conversion bug** — the converter faithfully reproduced broken input.
 

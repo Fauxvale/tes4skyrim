@@ -2865,6 +2865,74 @@ def _quat_xyzw_from_m3(m):
     return x, y, z, w
 
 
+def _is_identity(rotation):
+    """Return True if a PyFFI Matrix33 is the identity matrix."""
+    return (abs(rotation.m_11 - 1.0) < 1e-4 and abs(rotation.m_22 - 1.0) < 1e-4 and
+            abs(rotation.m_33 - 1.0) < 1e-4 and abs(rotation.m_12) < 1e-4 and
+            abs(rotation.m_13) < 1e-4 and abs(rotation.m_21) < 1e-4 and
+            abs(rotation.m_23) < 1e-4 and abs(rotation.m_31) < 1e-4 and
+            abs(rotation.m_32) < 1e-4)
+
+
+def _wrap_shape_in_node_transform(body, node):
+    """Compose a node's local transform into a phantom body's shape.
+
+    bhkSimpleShapePhantom (trigger volumes, trap damage zones) carries no
+    translation/rotation fields of its own, so a hoisted phantom cannot use
+    bake_node_transform_into_body.  Wrap its shape in a bhkTransformShape
+    holding L instead — Skyrim reads bhkTransformShape inside a phantom
+    normally, and _convert_shape already scales its m_14/m_24/m_34 column.
+
+    An existing bhkTransformShape / bhkConvexTransformShape at the top is
+    composed into rather than double-wrapped.  Translation stays in Oblivion
+    havok units at this stage (the _HAVOK_SCALE pass runs later).
+    """
+    shape = getattr(body, 'shape', None)
+    if shape is None:
+        return False
+
+    r = node.rotation
+    R = [[r.m_11, r.m_21, r.m_31],
+         [r.m_12, r.m_22, r.m_32],
+         [r.m_13, r.m_23, r.m_33]]  # column-vector convention
+    s = float(node.scale)
+    T = (node.translation.x / _OB_GAME_UNITS_PER_HAVOK,
+         node.translation.y / _OB_GAME_UNITS_PER_HAVOK,
+         node.translation.z / _OB_GAME_UNITS_PER_HAVOK)
+
+    if isinstance(shape, (NifFormat.bhkTransformShape,
+                          NifFormat.bhkConvexTransformShape)):
+        # Compose into the existing wrapper: M' = R·M, t' = R·(t·s) + T
+        m = shape.transform
+        M_old = [[m.m_11, m.m_21, m.m_31],
+                 [m.m_12, m.m_22, m.m_32],
+                 [m.m_13, m.m_23, m.m_33]]
+        t_old = (m.m_14, m.m_24, m.m_34)
+        target = shape
+    else:
+        M_old = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        t_old = (0.0, 0.0, 0.0)
+        target = NifFormat.bhkTransformShape()
+        target.shape = shape
+        if hasattr(shape, 'material') and hasattr(target, 'material'):
+            target.material = shape.material
+        body.shape = target
+
+    M_new = [[sum(R[i][k] * M_old[k][j] for k in range(3)) for j in range(3)]
+             for i in range(3)]
+    t_new = [sum(R[i][k] * t_old[k] * s for k in range(3)) + T[i]
+             for i in range(3)]
+
+    m = target.transform
+    m.m_11, m.m_21, m.m_31 = M_new[0][0], M_new[1][0], M_new[2][0]
+    m.m_12, m.m_22, m.m_32 = M_new[0][1], M_new[1][1], M_new[2][1]
+    m.m_13, m.m_23, m.m_33 = M_new[0][2], M_new[1][2], M_new[2][2]
+    m.m_14, m.m_24, m.m_34 = t_new[0], t_new[1], t_new[2]
+    m.m_41 = m.m_42 = m.m_43 = 0.0
+    m.m_44 = 1.0
+    return True
+
+
 def bake_node_transform_into_body(coll_obj, node, extra_z=0.0):
     """Compose a node's local transform L=(R,T,s) into its collision body.
 
@@ -2936,14 +3004,35 @@ def hoist_collision(root):
     Oblivion meshes sometimes put it on a child NiNode (e.g. 'CollisionXxx').
     We take the first one found, assign it to root, and null it on the child.
 
-    If the source child NiNode has a non-zero translation, that offset is baked
-    into the collision shape vertices so the collision stays in the correct world
-    position after being moved to the root (which is at the world origin).
+    The child's FULL local transform (R, T, s) must follow the collision to the
+    root, which sits at the origin with an identity rotation.  Two mechanisms:
+
+      * bhkRigidBody(T) → bake_node_transform_into_body composes L into the
+        body transform (promoting to bhkRigidBodyT).  Shape-agnostic, so it
+        works for convex hulls, list shapes and primitives, none of which have
+        a vertex array _offset_collision_shape_verts could rewrite.  Mesh
+        collision later folds that bodyT back into the triangles in
+        _bake_body_transform_into_tris and demotes the body to plain identity,
+        matching all 6341 vanilla CMS meshes (a bhkRigidBodyT paired with
+        MOPP/CMS makes the engine emit HK_INVALID_SHAPE_KEY and CTD).
+
+      * bhkSimpleShapePhantom (trigger volumes / trap damage zones) has no
+        body transform field at all and cannot be promoted, so its transform
+        is composed into the inner shape via a bhkTransformShape wrapper.
+
+    Previously only the child's TRANSLATION was applied, and only for the two
+    strips shape types — so a rotated collision node silently lost its
+    rotation.  citadelballconystandardendleft02 is the case in point: a
+    180-degree flip about X put its collision at Y +508..+1035 while the
+    balcony it belongs to sits at Y -957..-494, i.e. no collision at all where
+    the player walks.  Its sibling citadelballconystandardendleft has the same
+    geometry with an identity collision node and always converted correctly —
+    the pair is the A/B that isolates the node rotation as the discriminator.
 
     Returns True if a collision was hoisted.
     """
     def _find_and_clear(node):
-        """Return (collision_object, child_node_translation_xyz) or None."""
+        """Return (collision_object, child_node) or None."""
         if not isinstance(node, NifFormat.NiNode):
             return None
         for child in node.children:
@@ -2953,25 +3042,45 @@ def hoist_collision(root):
                     child.collision_object is not None):
                 co = child.collision_object
                 child.collision_object = None
-                t = child.translation
-                return co, (t.x, t.y, t.z)
+                return co, child
             result = _find_and_clear(child)
             if result is not None:
                 return result
         return None
 
     found = _find_and_clear(root)
-    if found is not None:
-        co, (ox, oy, oz) = found
-        root.collision_object = co
-        co.target = root
-        # If the source NiNode was not at the origin, bake its world-space
-        # translation into the bhkNiTriStripsShape vertices so the collision
-        # lands in the correct position after being placed on the root node.
-        if ox != 0.0 or oy != 0.0 or oz != 0.0:
-            _offset_collision_shape_verts(co, ox, oy, oz)
+    if found is None:
+        return False
+
+    co, child = found
+    root.collision_object = co
+    co.target = root
+
+    t = child.translation
+    ox, oy, oz = t.x, t.y, t.z
+    has_translation = (ox != 0.0 or oy != 0.0 or oz != 0.0)
+    has_rotation = not _is_identity(child.rotation)
+    has_scale = abs(float(child.scale) - 1.0) > 1e-4
+
+    if not (has_translation or has_rotation or has_scale):
         return True
-    return False
+
+    body = getattr(co, 'body', None)
+
+    if isinstance(body, NifFormat.bhkSimpleShapePhantom):
+        # No body transform field — compose L into the shape instead.
+        _wrap_shape_in_node_transform(body, child)
+        return True
+
+    if bake_node_transform_into_body(co, child):
+        return True
+
+    # No rigid body to carry the transform (unknown body type): fall back to
+    # the translation-only vertex bake, which is still better than dropping
+    # the offset entirely.  Rotation/scale cannot be represented here.
+    if has_translation:
+        _offset_collision_shape_verts(co, ox, oy, oz)
+    return True
 
 
 def _collect_psys_referenced_nodes(root):

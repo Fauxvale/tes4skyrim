@@ -6259,9 +6259,11 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
 
         # Skyrim requires collision on the root node only.
         # If we did NOT wrap, check whether a child holds the collision and hoist it.
-        # (When wrapped, the root's own collision was kept on the root above;
-        # hoisting from under the rotated wrapper is not supported because
-        # hoist_collision only bakes the child's translation, not rotation.)
+        # (When wrapped, the root's own collision was kept on the root above.
+        # Hoisting from under the rotated wrapper would have to compose the
+        # WRAPPER's transform as well as the child's — hoist_collision only
+        # composes the child's — so that case stays on the wrap path, which
+        # already absorbs the root transform via bake_node_transform_into_body.)
         # Exception 1: animated objects (NiControllerManager on root) keep collision on
         # the animated child node so the KEYFRAMED rigid body follows the animation.
         # Exception 2: NIFs with Havok constraints (hinge/ragdoll/malleable) need the
