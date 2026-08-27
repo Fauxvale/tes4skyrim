@@ -1497,6 +1497,50 @@ being mesh products.
   - Laplacian-smoothed mesh weights: Created discontinuities. REVERTED.
   - Global/per-mesh inverse filter, RBF interpolation, 2x global overshoot: All failed (see repo memory for full list)
 
+## Distorted worn clothing — nested bones placed with the wrong operand order (SOLVED 2026-08-25)
+
+- **Symptom**: worn shirts and armour render with long tapering spikes shooting
+  out of the body, while torso and trousers sit correctly. Reported in game on
+  Nehrim's `LowerShirt10` ("Flickweste", `Clothes\LowerClass\10\M\shirt.NIF`).
+- **Cause**: Phase A of `retarget_skin_to_skyrim` computed a nested bone's local
+  transform as `inv(parent_W) @ W_sk` — the COLUMN-vector form. This module is
+  row-vector throughout (`_m44_to_np` puts translation in row 3, and
+  `get_transform` composes `world = local @ parent`), so the correct expression
+  is `W_sk @ inv(parent_W)`. Now `skin_retarget.local_for_world`, guarded by
+  `tests/test_skin_retarget.py::TestLocalForWorld`.
+- 🔴 **Why it hid for months although the line never changed.** `git log -L`
+  shows it untouched since the initial commit. Bones parented DIRECTLY to the
+  skeleton root take the `parent is skel_root` shortcut and never multiply at
+  all — and the output's bone tree used to be **flat**, every bone a direct
+  child of the root. `7c6e3df` ("bake geometry to skeleton space before
+  retargeting", 2026-07-28) made the tree **nested**, and from then on every
+  bone below the first level ran through the faulty line. Verified by building
+  the same mesh in a throwaway worktree at `f43ec32`, the commit before: 0
+  misplaced bones there, 14 of 22 one commit later.
+- **The signature to recognise it by**: clavicle, pelvis and neck are EXACTLY
+  right (depth 1) while everything below them is displaced, and the error
+  compounds down each chain. Measured on the shirt: UpperArm 85.87, Forearm
+  162.78, Hand 275.97, Spine2 20.76 units — and the wrong operand order
+  reproduces those four numbers to four decimals.
+- 🔴 **Why no structural check could see it, and what to check instead.**
+  `_manual_update_bind_position` derives the bind matrices FROM these node
+  positions, so the file stays internally consistent: weight pairs (587/587),
+  `_0`/`_1` rig equality, skin partitions, dismember slots, bone names, no
+  missing bones, and `S @ B_i @ W_i = I` all pass. The game animates the
+  ACTOR's skeleton instead, which is where the disagreement lives. The only
+  check that sees it compares bone node positions against the skeleton —
+  `tools/skin_skeleton_check.py`. This is the concrete case behind CLAUDE.md's
+  "a CLEAN audit is not an alibi".
+- **After the fix** (full `--meshes-only` rebuild, spot-checked in game by the
+  user 2026-08-26): clothes and armour female 100% correct nodes, armour male
+  99.1%, clothes male 94.1%; the reported shirt 14/22 → 0. `weight_pair_check`
+  unchanged at 587/587, so nothing that worked before regressed.
+- **Not yet diagnosed**: about a dozen male meshes keep 1–2 misplaced nodes
+  each (`upperclass\01|03|05\m\shirt`, `middleclass\02\m\pants`,
+  `middleclass\mcshirtsneaky\m\shirt`, `nehrimsoldier\m\cuirass03`), offsets
+  6.7–67.4 units. Smaller, and mechanically different from the Phase A fault.
+
+
 ## Creature skin render crash — >80 skin bones per shape (SOLVED 2026-07-10)
 - Symptom: render-thread `EXCEPTION_ACCESS_VIOLATION` in a VCRUNTIME140 memcpy
   (`vmovdqa [rcx+…]`) inside BSBatchRenderer pass setup (BSUtilityShader =

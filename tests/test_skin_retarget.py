@@ -1153,3 +1153,95 @@ def test_bake_block_transform_folds_offset_into_verts():
     assert data_blk.vertices[0].y == pytest.approx(3.0)
     assert data_blk.vertices[0].z == pytest.approx(4.0)
     assert shape.scale == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# 8. Nested-bone placement (row-vector operand order)
+# ---------------------------------------------------------------------------
+
+class TestLocalForWorld:
+    """`local_for_world` must satisfy `local @ parent == target`.
+
+    Regression for the distorted-clothing bug: Phase A of the retarget used
+    `inv(parent) @ target`, which is the COLUMN-vector form.  Bones parented
+    straight to the skeleton root never hit that branch, so the error only
+    surfaced once the output's bone tree became nested -- and then every bone
+    below the first level was displaced, compounding down each chain, while
+    the bind matrices (derived from those same positions) still agreed with
+    them.  The file looked perfect; the game drew spikes.
+    """
+
+    @staticmethod
+    def _parent():
+        """A parent with BOTH rotation and translation.
+
+        A pure translation is not enough: the two operand orders differ only
+        once the parent rotates, which is exactly why an axis-aligned toy case
+        would pass either way.
+
+        `math` is imported locally on purpose: upstream dropped the
+        module-level `import math` from this file, and a test that leans on a
+        module-level import someone else owns breaks on the next merge rather
+        than on a real defect.
+        """
+        import math
+        c, s = math.cos(0.7), math.sin(0.7)
+        P = np.eye(4)
+        P[:3, :3] = [[c, -s, 0.0],
+                     [s, c, 0.0],
+                     [0.0, 0.0, 1.0]]
+        P[3, :3] = [12.0, -5.0, 103.0]
+        return P
+
+    @staticmethod
+    def _target():
+        import math          # see _parent
+        c, s = math.cos(-0.4), math.sin(-0.4)
+        W = np.eye(4)
+        W[:3, :3] = [[1.0, 0.0, 0.0],
+                     [0.0, c, -s],
+                     [0.0, s, c]]
+        W[3, :3] = [30.0, 2.5, 118.0]
+        return W
+
+    def test_local_composes_back_to_target(self):
+        from asset_convert.skin_retarget import local_for_world
+        P, W = self._parent(), self._target()
+        local = local_for_world(W, P)
+        np.testing.assert_allclose(local @ P, W, atol=1e-9)
+
+    def test_reversed_order_would_miss(self):
+        """The wrong order must be measurably wrong, not merely different.
+
+        Without this the first test would still pass if someone "fixed" it by
+        also flipping the composition it is checked against.
+        """
+        P, W = self._parent(), self._target()
+        wrong = np.linalg.inv(P) @ W
+        err = float(np.linalg.norm((wrong @ P)[3, :3] - W[3, :3]))
+        assert err > 1.0, f'reversed order should displace the node, got {err}'
+
+    def test_identity_parent_is_a_noop(self):
+        """A bone parented to the root keeps its target verbatim.
+
+        This is the branch that hid the bug for months -- it must stay exact.
+        """
+        from asset_convert.skin_retarget import local_for_world
+        W = self._target()
+        np.testing.assert_allclose(local_for_world(W, np.eye(4)), W, atol=1e-12)
+
+    def test_chain_does_not_accumulate_error(self):
+        """Three nested levels, as in clavicle -> upper arm -> forearm -> hand.
+
+        The shipped bug compounded down exactly such a chain (85.87 -> 162.78
+        -> 275.97 units), so the guard walks a chain rather than one joint.
+        """
+        from asset_convert.skin_retarget import local_for_world
+        P = self._parent()
+        world = P
+        for step in range(3):
+            target = self._target().copy()
+            target[3, :3] += np.array([step * 7.0, step * -3.0, step * 11.0])
+            local = local_for_world(target, world)
+            world = local @ world
+            np.testing.assert_allclose(world, target, atol=1e-9)
