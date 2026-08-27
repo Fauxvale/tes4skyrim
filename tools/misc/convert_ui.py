@@ -1,8 +1,8 @@
-"""Build the standalone Oblivion-UI mod: Oblivion's message box in Skyrim.
+"""Build the standalone Oblivion-UI mod: Oblivion's message box + menu cursor.
 
 Reads the user's own Oblivion menu XML and art plus their own vanilla
-`Interface/messagebox.swf`, reskins the movie in place, and writes an
-installable mod. Nothing Bethesda ships is redistributed -- every input comes
+`Interface/messagebox.swf` and `Interface/cursormenu.swf`, reskins those movies
+in place, and writes an installable mod. Nothing Bethesda ships is redistributed -- every input comes
 off the machine this runs on, exactly like the rest of the pipeline.
 
 Unlike every other stage this takes NO `-f` plugin: Oblivion's UI lives in
@@ -11,18 +11,20 @@ to convert. It is a GLOBAL action (the GUI's "Convert UI" button), run once,
 producing one shared artefact.
 
     output/Oblivion UI/Interface/messagebox.swf     working copy, loose
+    output/Oblivion UI/Interface/cursormenu.swf     working copy, loose
     output/Finished Mods/Oblivion UI.zip            installable, Data-rooted
 
 Usage:
   python tools/misc/convert_ui.py
   python tools/misc/convert_ui.py --output-dir PATH
   python tools/misc/convert_ui.py --keep-divider --keep-marker
+  python tools/misc/convert_ui.py --no-cursor       # message box only
   python tools/misc/convert_ui.py --oblivion-data PATH --skyrim-data PATH
   python tools/misc/convert_ui.py --preview            # + a PNG of the frame
 
-What lands in the archive is ONE file. That is the point: a UI mod that
-replaces a single movie conflicts with exactly the mods that replace that same
-movie, and nothing else.
+What lands in the archive is one movie per feature and nothing else. That is
+the point: a UI mod that replaces two named movies conflicts with exactly the
+mods that replace those same movies -- and `--no-cursor` narrows it to one.
 
 The HUD stat bars were built here too and REVERTED: they rendered broken in
 game. See docs/ui_conversion.md for what was measured before that was undone.
@@ -39,12 +41,14 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from asset_convert import ui_cursor                      # noqa: E402
 from asset_convert import ui_menus                       # noqa: E402
 from asset_convert.bsa_extract import read_bsa_files     # noqa: E402
 from output_layout import finished_dir                   # noqa: E402
 
 MOD_NAME = "Oblivion UI"
 MESSAGE_BOX_SWF = r'interface\messagebox.swf'
+CURSOR_SWF = r'interface\cursormenu.swf'
 
 # BSA search order per file category. Oblivion splits menu XML and menu art
 # across two archives, and Skyrim keeps every movie in one; listing the likely
@@ -102,9 +106,16 @@ def find_data_dirs(oblivion=None, skyrim=None):
 
 def convert(out_root: Path, oblivion_data=None, skyrim_data=None,
             hide_divider=True, hide_marker=True, opaque=True,
-            mute_shadow=True, scale9=True, preview=False) -> int:
+            mute_shadow=True, scale9=True, messagebox=True, cursor=True,
+            preview=False) -> int:
+    if not messagebox and not cursor:
+        print('ERROR: nothing selected to convert (both message box and cursor '
+              'are off).')
+        return 1
+    feats = ' + '.join(f for f, on in (('message boxes', messagebox),
+                                       ('cursor', cursor)) if on)
     print('=' * 54)
-    print('  CONVERT UI  (message boxes)')
+    print(f'  CONVERT UI  ({feats})')
     print('=' * 54)
 
     ob_dir, sk_dir = find_data_dirs(oblivion_data, skyrim_data)
@@ -120,29 +131,36 @@ def convert(out_root: Path, oblivion_data=None, skyrim_data=None,
     print(f'  Skyrim:   {sk_dir}')
     print()
 
-    # -- Oblivion's authored layout.
-    try:
-        menu_xml = read_game_file(ob_dir, ui_menus.MESSAGE_MENU_XML).decode(
-            'latin1')
-        prefab_xml = read_game_file(
-            ob_dir, ui_menus.GENERIC_BACKGROUND_XML).decode('latin1')
-    except FileNotFoundError as exc:
-        print(f'ERROR: {exc}')
-        return 1
+    # -- Oblivion's authored layout (only the message box needs it).
+    layout = None
+    if messagebox:
+        try:
+            menu_xml = read_game_file(ob_dir, ui_menus.MESSAGE_MENU_XML).decode(
+                'latin1')
+            prefab_xml = read_game_file(
+                ob_dir, ui_menus.GENERIC_BACKGROUND_XML).decode('latin1')
+        except FileNotFoundError as exc:
+            print(f'ERROR: {exc}')
+            return 1
+        layout, warnings = ui_menus.read_oblivion_layout(menu_xml, prefab_xml)
+        print('  Oblivion layout (read from the menu XML):')
+        for key in sorted(layout):
+            print(f'    {key:<14} {layout[key]:g}')
+        for warning in warnings:
+            print(f'    WARNING: {warning}')
+        print()
 
-    layout, warnings = ui_menus.read_oblivion_layout(menu_xml, prefab_xml)
-    print('  Oblivion layout (read from the menu XML):')
-    for key in sorted(layout):
-        print(f'    {key:<14} {layout[key]:g}')
-    for warning in warnings:
-        print(f'    WARNING: {warning}')
-    print()
-
-    # -- Oblivion's frame art.
+    # -- Oblivion's frame art (only what the selected features need).
+    art_sets = []
+    if messagebox:
+        art_sets += [(ui_menus.BACKGROUND_TEXTURE_DIR,
+                      ui_menus.BACKGROUND_TEXTURES),
+                     (ui_menus.FOCUS_TEXTURE_DIR, ui_menus.FOCUS_TEXTURES)]
+    if cursor:
+        art_sets.append((ui_cursor.CURSOR_TEXTURE_DIR,
+                         ui_cursor.CURSOR_TEXTURES))
     textures = {}
-    for directory, names in (
-            (ui_menus.BACKGROUND_TEXTURE_DIR, ui_menus.BACKGROUND_TEXTURES),
-            (ui_menus.FOCUS_TEXTURE_DIR, ui_menus.FOCUS_TEXTURES)):
+    for directory, names in art_sets:
         for name in names:
             try:
                 textures[name] = read_game_file(
@@ -150,31 +168,90 @@ def convert(out_root: Path, oblivion_data=None, skyrim_data=None,
             except FileNotFoundError as exc:
                 print(f'ERROR: {exc}')
                 return 1
-    print(f'  Frame art: {len(textures)} textures '
+    print(f'  Menu art: {len(textures)} textures '
           f'({sum(len(v) for v in textures.values()):,} bytes)')
 
-    # -- Skyrim's movie.
-    try:
-        movie = read_game_file(sk_dir, MESSAGE_BOX_SWF)
-    except FileNotFoundError as exc:
-        print(f'ERROR: {exc}')
-        return 1
-    print(f'  Vanilla movie: {len(movie):,} bytes')
+    built = {}
+
+    # -- the message box.
+    if messagebox:
+        try:
+            movie = read_game_file(sk_dir, MESSAGE_BOX_SWF)
+        except FileNotFoundError as exc:
+            print(f'ERROR: {exc}')
+            return 1
+        print(f'  Vanilla movie: {len(movie):,} bytes')
+        print()
+        try:
+            patched, report = ui_menus.patch_message_box(
+                movie, textures, layout,
+                hide_divider=hide_divider, hide_marker=hide_marker,
+                opaque=opaque, mute_shadow=mute_shadow, scale9=scale9)
+        except ui_menus.UiConvertError as exc:
+            print(f'ERROR: {exc}')
+            print('The installed messagebox.swf is not the one this reskin was '
+                  'written against, so nothing was written.')
+            return 1
+        built['messagebox.swf'] = patched
+        _print_messagebox_report(report, len(movie), len(patched))
+
+    # -- the menu cursor.
+    if cursor:
+        try:
+            cur_movie = read_game_file(sk_dir, CURSOR_SWF)
+        except FileNotFoundError as exc:
+            print(f'ERROR: {exc}')
+            return 1
+        try:
+            cur_patched, cur_report = ui_cursor.patch_cursor(
+                cur_movie, textures[ui_cursor.CURSOR_TEXTURE])
+        except ui_cursor.CursorConvertError as exc:
+            print(f'ERROR: {exc}')
+            print('The installed cursormenu.swf is not the one the cursor '
+                  'reskin was written against, so nothing was written.')
+            return 1
+        built['cursormenu.swf'] = cur_patched
+        print('  Reskinned cursormenu.swf:')
+        print(f'    cursor       shape {cur_report["shape"]}, '
+              f'{cur_report["size"]} -- {cur_report["note"]}')
+        print(f'    size         {len(cur_movie):,} -> {len(cur_patched):,} '
+              f'bytes')
+        print()
+
+    # -- write the working copies, then the installable archive.
+    mod_root = Path(out_root) / MOD_NAME
+    interface = mod_root / 'Interface'
+    interface.mkdir(parents=True, exist_ok=True)
+    for name, data in built.items():
+        (interface / name).write_bytes(data)
+
+    zip_path = finished_dir(out_root) / f'{MOD_NAME}.zip'
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for name in built:
+            zf.write(interface / name,
+                     arcname=str(Path('Interface') / name))
+
+    if preview and messagebox:
+        png = mod_root / 'preview.png'
+        _write_preview(png, textures, layout)
+        print(f'  Preview: {png}')
+
+    for name in sorted(built):
+        print(f'  Loose:  {interface / name}')
+    print(f'  Zipped: {zip_path} ({zip_path.stat().st_size:,} bytes)')
     print()
+    print('Install it like any other converted mod: the archive root is the '
+          'Data folder.')
+    replaced = ', '.join('Interface\\' + n for n in sorted(built))
+    print(f'It replaces {len(built)} file(s) -- {replaced} -- so it conflicts '
+          'only with other mods that replace those same movies.')
+    return 0
 
-    try:
-        patched, report = ui_menus.patch_message_box(
-            movie, textures, layout,
-            hide_divider=hide_divider, hide_marker=hide_marker,
-            opaque=opaque, mute_shadow=mute_shadow, scale9=scale9)
-    except ui_menus.UiConvertError as exc:
-        print(f'ERROR: {exc}')
-        print('The installed messagebox.swf is not the one this reskin was '
-              'written against, so nothing was written.')
-        return 1
 
-    print('  Reskinned messagebox.swf:')
+def _print_messagebox_report(report: dict, old_size: int, new_size: int):
+    """The per-field summary of what the message-box reskin changed."""
     frame = report['frame']
+    print('  Reskinned messagebox.swf:')
     print(f'    frame        {frame["base"]} shape from a {frame["bitmap"]} '
           f'bitmap, {frame["border"]}px border')
     print(f'                 {frame["note"]}')
@@ -182,41 +259,15 @@ def convert(out_root: Path, oblivion_data=None, skyrim_data=None,
         print(f'    {name:<24} {old} -> {new}')
     for name, (old, new) in sorted(report['literals'].items()):
         print(f'    {name:<24} {old} -> {new}')
-    for label, (old, new, html) in sorted(report.get('text_color',
-                                                     {}).items()):
+    for label, (old, new, html) in sorted(report.get('text_color', {}).items()):
         extra = f', {html} html color(s)' if html else ''
         print(f'    text ({label}){"":<10} {old} -> {new}{extra}')
     for key in ('is_vertical', 'divider', 'marker', 'opacity',
                 'shadow', 'scale9', 'message_field'):
         if key in report:
             print(f'    {key:<24} {report[key]}')
-    print(f'    size         {len(movie):,} -> {len(patched):,} bytes')
+    print(f'    size         {old_size:,} -> {new_size:,} bytes')
     print()
-
-    # -- write the working copy, then the installable archive.
-    mod_root = Path(out_root) / MOD_NAME
-    interface = mod_root / 'Interface'
-    interface.mkdir(parents=True, exist_ok=True)
-    swf_path = interface / 'messagebox.swf'
-    swf_path.write_bytes(patched)
-
-    zip_path = finished_dir(out_root) / f'{MOD_NAME}.zip'
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.write(swf_path, arcname=str(Path('Interface') / 'messagebox.swf'))
-
-    if preview:
-        png = mod_root / 'preview.png'
-        _write_preview(png, textures, layout)
-        print(f'  Preview: {png}')
-
-    print(f'  Loose:  {swf_path}')
-    print(f'  Zipped: {zip_path} ({zip_path.stat().st_size:,} bytes)')
-    print()
-    print('Install it like any other converted mod: the archive root is the '
-          'Data folder.')
-    print('It replaces ONE file, so it conflicts only with other mods that '
-          'replace Interface\\messagebox.swf.')
-    return 0
 
 
 def _write_preview(path: Path, textures: dict, layout: dict,
@@ -265,6 +316,10 @@ def main() -> int:
                          "border; the frame then rides the panel's uniform "
                          'scale, which stretches the carving on tall or wide '
                          'boxes')
+    ap.add_argument('--no-messagebox', action='store_true',
+                    help="Skip the message box and convert only the cursor")
+    ap.add_argument('--no-cursor', action='store_true',
+                    help="Skip the menu cursor and convert only the message box")
     ap.add_argument('--preview', action='store_true',
                     help='Also write a PNG of the frame next to the mod')
     args = ap.parse_args()
@@ -279,6 +334,8 @@ def main() -> int:
                    opaque=not args.keep_transparency,
                    mute_shadow=not args.keep_shadow,
                    scale9=not args.no_scale9,
+                   messagebox=not args.no_messagebox,
+                   cursor=not args.no_cursor,
                    preview=args.preview)
 
 

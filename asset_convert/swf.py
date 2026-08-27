@@ -345,7 +345,9 @@ def define_scaling_grid(character_id: int, left: float, top: float,
 def define_shape3_bitmap_rects(character_id: int, pieces: list) -> Tag:
     """DefineShape3 drawing one clipped-bitmap rectangle per piece.
 
-    pieces: [(bitmap_id, x, y, w, h)] in PIXELS, in the shape's own space.
+    pieces: [(bitmap_id, x, y, w, h)] in PIXELS, in the shape's own space. A
+    sixth element `(pixel_w, pixel_h)` gives the bitmap's own pixel size when it
+    differs from the rect -- the fill then SCALES the bitmap into the rect.
 
     Each piece gets its own fill style whose matrix places that bitmap so it
     exactly covers its rectangle -- so a piece is a 1:1 blit at the base size,

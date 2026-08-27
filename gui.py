@@ -171,9 +171,10 @@ GLOBAL_ACTIONS = [
     # It is also a once-ever action: the inputs are GAME FILES, which do not
     # change, so a permanent button would sit greyed out forever after one use.
     ("convert_ui", "Convert UI",
-     "Build the standalone Oblivion UI mod: Skyrim's message boxes reskinned "
-     "with Oblivion's own frame art and layout, read from your Oblivion "
-     "install. Replaces one file (Interface\\messagebox.swf)",
+     "Build the standalone Oblivion UI mod: Skyrim's message boxes and menu "
+     "cursor reskinned with Oblivion's own art, read from your Oblivion "
+     "install. Replaces two files "
+     "(Interface\\messagebox.swf, Interface\\cursormenu.swf)",
      "Convert UI", None),
 ]
 
@@ -2556,6 +2557,10 @@ def gui_main():
     # confirmed", same convention as the LOD lists above.
     master_plugins: list[str] = []
 
+    # "Convert UI": which movies to reskin, set by the options dialog and read
+    # by _global_cmd. Both on by default.
+    convert_ui_opts = {"messagebox": True, "cursor": True}
+
     def _lod_out_root() -> Path:
         return Path(output_var.get().strip() or str(SCRIPT_DIR / "output"))
 
@@ -2814,6 +2819,81 @@ def gui_main():
         card.update_idletasks()
         card.place(in_=outer, anchor="center", relx=0.5, rely=0.5)
         card.lift()
+
+    def _open_convert_ui_panel(on_continue=None):
+        """The 'Slopping of Screens' options card: pick which movies to reskin.
+
+        Two checkboxes, both on by default. Continue is greyed out when NEITHER
+        is checked -- there would be nothing to build. Reached from a MENU,
+        where there is no tooltip or button state to explain the action, so the
+        card doubles as the explanation.
+        """
+        card = tk.Frame(outer, bg=CLR["panel"],
+                        highlightbackground=CLR["border"], highlightthickness=1)
+
+        tk.Label(card, text="Slopping of Screens", bg=CLR["panel"],
+                 fg=CLR["text"], font=("Segoe UI", 10, "bold")).pack(
+                     anchor="w", padx=16, pady=(14, 0))
+        ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16, pady=8)
+        tk.Label(card, text=(
+            "Build a standalone mod that reskins Skyrim's UI with Oblivion's "
+            "own art, read from your local game install. Choose what to "
+            "convert:"),
+            bg=CLR["panel"], fg=CLR["subtext"], font=("Segoe UI", 9),
+            justify=tk.LEFT, anchor="w", wraplength=380).pack(
+                anchor="w", padx=16, pady=(0, 8))
+
+        mb_var = tk.BooleanVar(value=convert_ui_opts["messagebox"])
+        cur_var = tk.BooleanVar(value=convert_ui_opts["cursor"])
+        for var, label in ((mb_var, "Message boxes  (Interface\\messagebox.swf)"),
+                           (cur_var, "Menu cursor  (Interface\\cursormenu.swf) (EXPERIMENTAL)")):
+            ttk.Checkbutton(card, text=label, variable=var,
+                            style="TCheckbutton").pack(
+                                anchor="w", padx=20, pady=1)
+
+        note = tk.Label(card, text=(
+            "Nothing Bethesda ships is redistributed. The result lands in "
+            "output/Finished Mods as \"Oblivion UI.zip\"; it conflicts only "
+            "with mods that replace those same movies."),
+            bg=CLR["panel"], fg=CLR["subtext"], font=("Segoe UI", 8),
+            justify=tk.LEFT, anchor="w", wraplength=380)
+        note.pack(anchor="w", padx=16, pady=(8, 12))
+
+        btn_row = tk.Frame(card, bg=CLR["panel"])
+        btn_row.pack(fill=tk.X, padx=16, pady=(0, 14))
+
+        def _close():
+            card.grab_release()
+            card.destroy()
+
+        def _continue():
+            convert_ui_opts["messagebox"] = mb_var.get()
+            convert_ui_opts["cursor"] = cur_var.get()
+            _close()
+            if on_continue:
+                on_continue()
+
+        cancel_btn = ttk.Button(btn_row, text="Cancel", width=10,
+                                command=_close)
+        cancel_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        continue_btn = ttk.Button(btn_row, text="Continue", width=10,
+                                  style="Accent.TButton", command=_continue)
+        continue_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+        def _sync_continue(*_a):
+            # Nothing selected -> nothing to build, so Continue is disabled.
+            state = "normal" if (mb_var.get() or cur_var.get()) else "disabled"
+            continue_btn.configure(state=state)
+        mb_var.trace_add("write", _sync_continue)
+        cur_var.trace_add("write", _sync_continue)
+        _sync_continue()
+
+        card.update_idletasks()
+        card.place(in_=outer, anchor="center", relx=0.5, rely=0.5)
+        card.lift()
+        card.bind("<Escape>", lambda _e: _close())
+        card.focus_set()
+        card.grab_set()
 
     def _open_create_lod_panel(on_generate=None):
         """Pick the plugins (left, ordered) and worldspaces (right) to build.
@@ -4486,6 +4566,11 @@ def gui_main():
                    str(SCRIPT_DIR / "tools" / "misc" / "convert_ui.py")]
             if out_dir:
                 cmd += ["--output-dir", out_dir]
+            # The options dialog chose which movies to reskin.
+            if not convert_ui_opts["messagebox"]:
+                cmd += ["--no-messagebox"]
+            if not convert_ui_opts["cursor"]:
+                cmd += ["--no-cursor"]
             return cmd
 
         if key == "make_master":
@@ -4634,15 +4719,19 @@ def gui_main():
             # menus\*.xml) or patching either game invalidates this and
             # nothing else does. A handful of stats, because every global
             # stamp runs before the window first paints.
-            from tools.misc.convert_ui import MESSAGE_BOX_SWF, find_data_dirs
+            from tools.misc.convert_ui import (MESSAGE_BOX_SWF, CURSOR_SWF,
+                                               find_data_dirs)
             from asset_convert import ui_menus as _ui
+            from asset_convert import ui_cursor as _cur
             ob_dir, sk_dir = find_data_dirs()
             wanted = [(ob_dir, _ui.MESSAGE_MENU_XML),
                       (ob_dir, _ui.GENERIC_BACKGROUND_XML),
-                      (sk_dir, MESSAGE_BOX_SWF)]
+                      (sk_dir, MESSAGE_BOX_SWF),
+                      (sk_dir, CURSOR_SWF)]
             for directory, names in (
                     (_ui.BACKGROUND_TEXTURE_DIR, _ui.BACKGROUND_TEXTURES),
-                    (_ui.FOCUS_TEXTURE_DIR, _ui.FOCUS_TEXTURES)):
+                    (_ui.FOCUS_TEXTURE_DIR, _ui.FOCUS_TEXTURES),
+                    (_cur.CURSOR_TEXTURE_DIR, _cur.CURSOR_TEXTURES)):
                 wanted += [(ob_dir, os.path.join(directory, n))
                            for n in names]
             archives = {'Oblivion - Misc.bsa',
@@ -4788,26 +4877,12 @@ def gui_main():
                 on_apply=lambda: _start_global_action(key))
             return
         if key == "convert_ui":
-            # Confirm first: this one is reached from a MENU, where there is no
-            # tooltip to explain it and no button state to say it has already
-            # run. It also replaces a vanilla interface file for the whole game
-            # rather than producing something per-plugin, which is worth saying
-            # out loud before it happens.
-            if not _confirm(
-                    "Slopping of Screens",
-                    "This will create a standalone mod which replaces ALL "
-                    "Skyrim message boxes with an Oblivion-styled one, built "
-                    "from your own local game assets.\n\n"
-                    "Nothing Bethesda ships is redistributed: your installed "
-                    "Oblivion menu art and layout are read off this machine "
-                    "and composed over Skyrim's own messagebox.swf.\n\n"
-                    "The result lands in output/Finished Mods as "
-                    "\"Oblivion UI.zip\", ready to install like any other "
-                    "converted mod. It replaces one file, so it conflicts "
-                    "only with other mods that replace Interface"
-                    "\\messagebox.swf.",
-                    yes="Continue", no="Cancel"):
-                return
+            # An options card, not a plain confirm: it is reached from a MENU
+            # (no tooltip, no button state), and the user picks which movies to
+            # reskin. The card's Continue is what fires the action.
+            _open_convert_ui_panel(
+                on_continue=lambda: _start_global_action(key))
+            return
         _start_global_action(key)
 
     def _start_global_action(key: str):

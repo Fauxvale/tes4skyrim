@@ -2,9 +2,11 @@
 
 What is implemented, what the two engines actually do, and what cannot be
 ported. Code: `asset_convert/swf.py`, `asset_convert/ui_menus.py`,
-`tools/misc/convert_ui.py`. Tests: `tests/test_ui_convert.py`.
+`asset_convert/ui_cursor.py`, `tools/misc/convert_ui.py`. Tests:
+`tests/test_ui_convert.py`, `tests/test_ui_cursor.py`.
 
-**Implemented: the message box.** Nothing else. The HUD stat bars were built
+**Implemented: the message box and the menu cursor.** The HUD stat bars were
+built
 and then REVERTED — see [The HUD stat bars, attempted and
 reverted](#the-hud-stat-bars-attempted-and-reverted). See
 [Why only the message box](#why-only-the-message-box) for what blocks each
@@ -17,6 +19,7 @@ button, next to "Create LOD" and "Pack Start Mod" — and writes its own mod:
 
 ```
 output/Oblivion UI/Interface/messagebox.swf
+output/Oblivion UI/Interface/cursormenu.swf
 output/Finished Mods/Oblivion UI.zip
 ```
 
@@ -248,18 +251,20 @@ carries a single fill. `compose_frame` does the assembly;
 
 ### What that costs, and the base size
 
-A composed frame cannot 9-slice: it rides `Background_mc`'s uniform scale, so
-the border stretches with the panel instead of holding a constant thickness.
+The composed frame IS 9-sliced -- `patch_message_box` re-cuts `Background_mc`'s
+own scaling grid to our 44 px border (see
+[Rule 1](#-rule-1-rewritten-9-slice-over-a-bitmap-fill-does-work)) -- so the
+border holds a constant 44 px at any panel size and the base size is no longer
+the thing that keeps the carving from squashing. What the base size still
+decides is DETAIL: the composed bitmap is `CENTER_BASE_* + 2*border` =
+**560x800**, and a panel much larger than that shows the border upscaled (soft),
+while a much smaller one wastes pixels. 560x800 sits near a real ten-choice
+menu (~515x722 observed in game), so the upscale stays mild.
 
-The mitigation is to put the base near a real panel. Observed in game: about
-**515x722** for a ten-choice chargen menu. `CENTER_BASE_*` makes the composed
-frame **472x488**, so that panel scales 1.09x by 1.48x and the border keeps
-close to its authored weight; a two-choice box comes out around half the height
-with a correspondingly thinner border.
-
-Supersampling was the obvious alternative and is the wrong trade — doubling the
-pixels quadruples the file (187 KB to 748 KB) and fixes only blur, where moving
-the base fixes blur *and* aspect for a fraction of that.
+Supersampling was the obvious alternative for the blur and is the wrong trade
+-- doubling the pixels roughly quadruples the file and fixes only blur, where
+sizing the base near a real panel fixes blur for a fraction of that.
+`FRAME_SUPERSAMPLE` is therefore 1.
 
 ### The separate-clip path, and why it is gone
 
@@ -386,52 +391,45 @@ base scales to the panel:
 | vertical motif at a 762 px panel | ~0.59x | 0.66x | 0.95x |
 
 So `build_frame_slices` returns the edges at their **source length** and
-`compose_frame` tiles them into the band, leaving only the panel's own scale.
-This deliberately matches Oblivion's *appearance* rather than its *mechanism*,
-because our geometry is not its geometry — a fixed-size box can stretch a motif
-where a size-following one cannot.
+`compose_frame` tiles them into the band, giving full motif density at the base
+size. On a panel that differs from the base the scaling grid then stretches
+those edge strips (one-dimensionally -- corners stay fixed), which is a mild
+stretch because the base sits near real panels, and is the same direction
+Oblivion stretches. So the tiling sets the density and the grid handles the
+panel-size difference; between them the carving no longer compresses to half
+its weight the way a single compose-then-uniform-scale did.
 
 It also made the file smaller: a crop compresses better than a resampled
-stretch, so the frame went from 580 KB to 367 KB.
+stretch (a measured 580 KB → 367 KB for that change at the time; the finished
+movie is ~391 KB after later base and margin changes).
 
 The center still stretches, which is right — it is a soft parchment wash and
 Oblivion `zoom`s it across the whole box.
 
-### The base size is a layout constraint, not just a quality one
+### The base size, and the HISTORICAL layout constraint
 
-> With the scaling grid re-cut (Rule 1 above), the border no longer rides the
-> panel's scale, so the base size no longer decides how squashed the carving
-> looks. It still decides how far the border draws INTO the margin, which is
-> what the invariant below is about.
+Under scale9 the base size is a QUALITY choice (detail vs file size) and nothing
+more. It used to be a hard layout constraint, and that history is why the
+numbers are large:
 
+> **(HISTORICAL, pre-scale9.)** Before the grid was re-cut, the frame rode
+> `Background_mc`'s uniform scale, so a panel taller than the base drew the
+> border THICKER than its authored 44 px while the fixed-pixel margins stayed
+> put -- past a point the border grew into the text. A ten-choice menu was
+> 762 px tall against a 488 px base, scaling the border to 69 px against a
+> `HEIGHT_MARGIN` of 59, and "More ..." rendered on top of it. The base was
+> then enlarged so `border * panel / base < margin` held across the envelope
+> (`MAX_PANEL_W`/`MAX_PANEL_H` = 700 x 1040). scale9 makes the border constant,
+> so that invariant no longer bites -- but the enlarged base was kept, because
+> a bigger base is also sharper.
 
-The frame rides `Background_mc`'s uniform scale, so a panel **taller than the
-base draws the border thicker than its authored 44 px** — while the margins
-that keep text clear of it are fixed pixel values. Past a point the border
-grows into the text.
-
-Measured in game: a ten-choice menu was **762 px tall** against a 488 px base,
-scaling the border to **69 px** against a `HEIGHT_MARGIN` of 59 — and the last
-choice, "More ...", rendered on top of it. A four-choice box scaled to 42 px
-and was fine, which is exactly why it only ever went wrong with many options.
-
-The invariant is
-
-```
-border * panel / base  <  margin        on each axis
-```
-
-so `base > border/margin * panel`: 0.75x the tallest panel and 0.79x the
-widest. `MAX_PANEL_W`/`MAX_PANEL_H` state the envelope the base is sized for
-(700 x 880), and a test asserts the invariant across it.
-
-Raising the base costs file size, which is why the **center** is composed at a
-quarter resolution and scaled back up (`CENTER_DETAIL_DIVISOR`). It is the only
-slice with photographic detail, so it dominates the file — and it is also the
-slice Oblivion itself stretches hardest, a 1024x1024 texture across the whole
-box, so softening it is faithful rather than a compromise. The border, which is
-what the eye reads, keeps full detail. On the 560x660 base that is 565 KB
-instead of roughly 850.
+The one live cost is file size, which is why the **center** is composed at
+1/`CENTER_DETAIL_DIVISOR` (currently 1/6) resolution and scaled back up. It is
+the only slice with photographic detail, so it dominates the file -- and it is
+also the slice Oblivion itself stretches hardest (a 1024x1024 texture across the
+whole box), so softening it is faithful rather than a compromise. The border,
+which is what the eye reads, keeps full detail. The finished movie is ~391 KB,
+nearly all of it this frame bitmap.
 
 ### 🛑 The dead space is the field's RUNTIME height, and it is not reachable
 
@@ -542,17 +540,59 @@ silently.
 
 ---
 
+## The menu cursor
+
+The cleanest port in this mod -- smaller than the message box and on the same
+proven path. Skyrim's `Interface/cursormenu.swf` (949 bytes) draws the menu
+cursor as a SINGLE vector shape: character 1, a 42x42 shape placed at the movie
+origin. A cursor's hotspot -- the click point -- is the movie's (0,0), and this
+shape's box is x[0,42] y[0,42], so its **top-left corner is the hotspot**,
+exactly where a pointer's tip belongs.
+
+Oblivion's pointer is `textures/menus/misc/cursor.dds`, a 64x64 texture whose
+arrow art sits at the top-left with the tip in the corner (measured: the
+topmost opaque pixel is at x=1, the leftmost at y=2, inside a 33x34 opaque
+region). Cropping to the art's alpha bounds puts the tip at the crop's
+top-left, and placing that crop at the shape origin lands the tip on the
+hotspot -- the one thing a cursor port has to get right, settled by geometry
+rather than tuning.
+
+**The size is not the 42 px shape box.** cursormenu.swf's root places the
+cursor sprite at scale ~0.63 (measured), so a 42 px shape draws at ~26 px, and
+Oblivion's chunkier pointer filling that whole box read noticeably larger than
+Skyrim's thin arrow. The art is therefore sized DOWN inside the shape --
+`CURSOR_HEIGHT` = 30 px, ~19 px on screen -- with Oblivion's aspect preserved
+(29x30). No ActionScript is touched -- the one `DoAction` and the timeline are
+byte-identical -- so the cursor tracks the mouse and hides in gameplay exactly
+as vanilla. The movie goes 949 -> ~3.5 KB.
+
+This is the port the reverted HUD taught: a new `DefineBitsLossless2` referenced
+by an EXISTING replaced shape renders (the HUD proved that in game, broken only
+in its geometry), and here the geometry is trivial -- one rectangle, tip at the
+origin -- with no mask, no scale9, no layout maths. It affects only the MENU
+cursor (inventory, map, message boxes, favorites); there is no cursor during
+normal gameplay.
+
+**Not yet confirmed in game.** Offline the arrow composes correctly with the
+tip within ~1 px of the hotspot, the shape carries one bitmap fill, and every
+other character and AS2 block is byte-identical to vanilla. What a look would
+confirm: that the hotspot feels right (a 1-2 px tip offset is expected and
+should be imperceptible) and the size reads well against Skyrim's UI.
+
 ## The HUD stat bars, attempted and reverted
 
-Built, unit-tested, rendered correct offline against the shipped movie — and
-**broken in game**. The code (`asset_convert/ui_hud.py`, `tests/test_ui_hud.py`,
-the `--no-hud` flag and the HUD half of `convert_ui.py`) is reverted. What
-follows is kept only so nobody re-derives it.
+Built, unit-tested, correct in an offline compositor -- and **it DID render in
+game, just BROKEN**. That distinction matters: the engine ACCEPTED our art and
+drew it (so this is not the "added characters do not render" wall the message
+box hit in rounds 2-4; a new `DefineBitsLossless2` referenced by an existing
+shape draws here exactly as it does for the frame). What was wrong was the
+GEOMETRY, not acceptance. The code (`asset_convert/ui_hud.py`,
+`tests/test_ui_hud.py`, the `--no-hud` flag and the HUD half of `convert_ui.py`)
+is reverted; what follows is kept so nobody re-derives it.
 
-**Do not restart from these notes assuming they are sufficient.** They were
-sufficient to make the bars render correctly in an offline compositor that
-reads the real bitmaps through the real matrices and mask, and that was still
-not enough. Whatever the engine objects to is NOT in this list.
+**Do not restart from these notes assuming they are sufficient.** They made the
+bars correct in an offline compositor, and that was not enough to make them
+correct in game.
 
 ### What was measured (all verified against the shipped `hudmenu.swf`)
 
@@ -566,7 +606,7 @@ not enough. Whatever the engine objects to is NOT in this list.
   behind a static clip-depth mask — fill `scaleX` has exactly ONE distinct
   value against 200 distinct translations, +184.15 (frame 1, full) to −181.70
   (frame 200, empty). `HealthLeft` does the opposite: the fill is placed once
-  and never moves, and the MASK is scaled, 0.9866 down to 0.0014. Generalising
+  and never moves, and the MASK is scaled, 0.9866 down to 0.0014. Generalizing
   one to the other is a mistake this made once already.
 * **🛑 The shapes are NOT centered on their origin.** 756 draws in
   x[−28.30, 395.85] y[−55.60, −26.20]; 757 in x[−0.10, 369.60]
@@ -594,15 +634,25 @@ three meter clips byte-identical; all 39 AS2 blocks byte-identical; one bitmap
 fill per replaced shape. An offline compositor reading the shipped movie's own
 bitmaps, matrices and mask drew all three bars correctly at 100/75/50/25/0%.
 
-So the next attempt should start by asking what the ENGINE does that the file
-format does not describe — the same class of answer as
-[Rule 1](#-rule-1-rewritten-9-slice-over-a-bitmap-fill-does-work) and
-[Rule 2](#-rule-2-one-bitmap-fill-per-shape), both of which were found only by
-looking at what vanilla never does. Candidates not yet ruled out: whether a
-masked shape may be a bitmap fill at all (the mask is a solid-filled shape and
-every masked child here was a GRADIENT before it was replaced), and whether
-`DefineBitsLossless2` is accepted in this movie at all — `hudmenu.swf` uses
-`DefineBitsJPEG3`/lossless art elsewhere and that was never censused.
+Because it RENDERED, one thing once suspected is now RULED OUT: the engine draws
+our bitmaps -- a `DefineBitsLossless2` on a replaced shape is not rejected, the
+same as the message-box frame. (What "broken" showed is not recorded per-part,
+so whether the MASKED fills specifically drew, versus only the unmasked backdrop
+756, is not settled -- see the mask question below.)
+
+So the bug is geometric, not acceptance. The leading suspect is the CENTERING error above -- the
+first build placed the backdrop 184 px off, and a bar drawn 184 px from where
+the mask sits reveals wrong or not at all. The shelved code fixes that (writes
+each replacement back into the vanilla box via `EXPECTED_BOX`), **but a build
+with that fix was never re-confirmed in game.** The next attempt should install
+the shelved (box-corrected) build first and look, rather than re-deriving from
+these notes. If it is still wrong with the boxes correct, the open question is
+whether the clip-depth mask REVEALS a bitmap-filled child the same way it
+reveals the GRADIENT it clipped in vanilla -- that is the one mask-interaction
+question the render does not settle. (The health fill's mirrored placement is
+NOT a suspect: the engine handles a negative `scaleX` fine and the ribbon art is
+near-symmetric; the 1 px collapse it caused was a bug in the offline compositor,
+not in game.)
 
 ---
 
@@ -633,8 +683,9 @@ every masked child here was a GRADIENT before it was replaced), and whether
   `MessageButtons` (populated by `MessageButtons.push(button)`). That is new
   bytecode rather than a length-preserving edit, which is why it is a gap and
   not a fix.
-* **Conflicts** with any other mod replacing `Interface\messagebox.swf`. It
-  replaces exactly one file, so nothing else.
+* **Conflicts** with any other mod replacing `Interface\messagebox.swf` or
+  `Interface\cursormenu.swf`. It replaces exactly those two files, so nothing
+  else; `--no-cursor` / `--no-messagebox` narrow it to one.
 * Output is ~391 KB, up from 17 KB; the frame art is nearly all of it.
 
 ### Verification status
