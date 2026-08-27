@@ -1140,3 +1140,70 @@ def _read_fill_styles(shape_data):
         bits.align()
         out.append((kind, bitmap_id, scale, translate))
     return out
+
+
+# ---------------------------------------------------------------------------
+# main menu (asset_convert/ui_main_menu.py)
+# ---------------------------------------------------------------------------
+
+def _mini_startmenu():
+    """A movie in the shape patch_main_menu needs: a character with the
+    MenuHolder id (604) placed at depth 1 at the root, nothing else there."""
+    from asset_convert.ui_main_menu import MENUHOLDER_CHARACTER, STAGE_W, STAGE_H
+    empty_sprite = swf.Tag(
+        swf.TAG_DEFINE_SPRITE,
+        struct.pack('<HH', MENUHOLDER_CHARACTER, 1)
+        + struct.pack('<H', swf.TAG_SHOW_FRAME << 6)
+        + struct.pack('<H', swf.TAG_END << 6))
+    tags = [empty_sprite,
+            swf.place_object2(1, MENUHOLDER_CHARACTER, name='MenuHolder'),
+            swf.Tag(swf.TAG_SHOW_FRAME, b''),
+            swf.Tag(swf.TAG_END, b'')]
+    movie = swf.Swf(15, swf.pack_rect(0, STAGE_W * 20, 0, STAGE_H * 20),
+                    256 * 30, 1, tags)
+    return movie.serialize(compress=False)
+
+
+def test_main_menu_injection_keeps_the_movie_and_moves_menuholder():
+    from asset_convert import ui_main_menu
+    movie = _mini_startmenu()
+    out, report = ui_main_menu.patch_main_menu(
+        movie, _dds_bgra(8, 8, (200, 180, 140, 255)),
+        _dds_bgra(16, 4, (40, 30, 20, 255)))
+    patched = swf.Swf.parse(out)
+
+    ids = set(report['new_char_ids'])
+    assert len(ids) == 6
+    assert ids <= {t.character_id for t in patched.tags}
+
+    depths = {struct.unpack_from('<H', t.data, 3)[0]:
+              struct.unpack_from('<H', t.data, 1)[0]
+              for t in patched.tags
+              if t.code == swf.TAG_PLACE_OBJECT_2 and t.data[0] & 0x02}
+    assert depths[ui_main_menu.MENUHOLDER_CHARACTER] == 3   # bumped behind ours
+    bg_sprite, logo_sprite = report['new_char_ids'][4], report['new_char_ids'][5]
+    assert depths[bg_sprite] == 1 and depths[logo_sprite] == 2
+
+    # every original tag but the MenuHolder placement (depth) survives verbatim
+    kept = {(t.code, bytes(t.data)) for t in patched.tags}
+    orig = swf.Swf.parse(movie).tags
+    survivors = sum((t.code, bytes(t.data)) in kept for t in orig)
+    assert survivors == len(orig) - 1
+
+    once = patched.serialize(compress=False)
+    assert swf.Swf.parse(once).serialize(compress=False) == once
+
+
+def test_place_move_flags_and_multiframe_sprite():
+    move = swf.place_move(2, (5, 7), alpha=100)
+    assert move.code == swf.TAG_PLACE_OBJECT_2
+    assert move.data[0] & 0x01 and move.data[0] & 0x04 and move.data[0] & 0x08
+    plain = swf.place_move(2, (5, 7))
+    assert not plain.data[0] & 0x08                         # no cxform without alpha
+
+    sp = swf.define_sprite_frames(700, [
+        [swf.place_object2(1, 10)],
+        [swf.place_move(1, (2, 3))],
+        [swf.place_move(1, (0, 0), alpha=255), swf.do_action(swf.STOP_ACTION)]])
+    cid, framecount = struct.unpack_from('<HH', sp.data, 0)
+    assert cid == 700 and framecount == 3

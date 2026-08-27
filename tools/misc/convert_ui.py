@@ -43,6 +43,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from asset_convert import ui_cursor                      # noqa: E402
 from asset_convert import ui_menus                       # noqa: E402
+from asset_convert import ui_main_menu                   # noqa: E402
 from asset_convert.bsa_extract import read_bsa_files     # noqa: E402
 from output_layout import finished_dir                   # noqa: E402
 
@@ -107,13 +108,14 @@ def find_data_dirs(oblivion=None, skyrim=None):
 def convert(out_root: Path, oblivion_data=None, skyrim_data=None,
             hide_divider=True, hide_marker=True, opaque=True,
             mute_shadow=True, scale9=True, messagebox=True, cursor=True,
-            preview=False) -> int:
-    if not messagebox and not cursor:
-        print('ERROR: nothing selected to convert (both message box and cursor '
-              'are off).')
+            main_menu=True, preview=False) -> int:
+    if not messagebox and not cursor and not main_menu:
+        print('ERROR: nothing selected to convert (message box, cursor and '
+              'main menu are all off).')
         return 1
     feats = ' + '.join(f for f, on in (('message boxes', messagebox),
-                                       ('cursor', cursor)) if on)
+                                       ('cursor', cursor),
+                                       ('main menu', main_menu)) if on)
     print('=' * 54)
     print(f'  CONVERT UI  ({feats})')
     print('=' * 54)
@@ -218,18 +220,59 @@ def convert(out_root: Path, oblivion_data=None, skyrim_data=None,
               f'bytes')
         print()
 
+    # -- the main menu: reskin startmenu.swf and blank the 3D scene meshes.
+    #    `extra` holds files that live OUTSIDE Interface\ (the blank meshes),
+    #    keyed by their Data-relative path.
+    extra = {}
+    if main_menu:
+        try:
+            mm_movie = read_game_file(sk_dir, ui_main_menu.STARTMENU_SWF)
+            bg_dds = read_game_file(ob_dir, ui_main_menu.OB_BACKGROUND)
+            logo_dds = read_game_file(ob_dir, ui_main_menu.OB_LOGO)
+        except FileNotFoundError as exc:
+            print(f'ERROR: {exc}')
+            return 1
+        try:
+            mm_patched, mm_report = ui_main_menu.patch_main_menu(
+                mm_movie, bg_dds, logo_dds)
+        except ui_main_menu.MainMenuError as exc:
+            print(f'ERROR: {exc}')
+            print('The installed startmenu.swf is not the one this reskin was '
+                  'written against, so nothing was written.')
+            return 1
+        built['startmenu.swf'] = mm_patched
+        blank = ui_main_menu.blank_nif_bytes()
+        for mesh_rel in ui_main_menu.MENU_SCENE_MESHES:
+            extra[mesh_rel] = blank
+        print('  Reskinned startmenu.swf:')
+        print(f'    backdrop     {mm_report["bg_tex"]} parchment, '
+              f'{ui_main_menu.BG_PAN_FRAMES}-frame drift')
+        print(f'    logo         {mm_report["logo_tex"]} lockup, '
+              f'{ui_main_menu.LOGO_FLYIN_FRAMES}-frame fly-in')
+        print(f'    new chars    {mm_report["new_char_ids"]}')
+        print(f'    blank meshes {len(ui_main_menu.MENU_SCENE_MESHES)} '
+              f'(3D scene suppressed)')
+        print(f'    size         {len(mm_movie):,} -> {len(mm_patched):,} bytes')
+        print()
+
     # -- write the working copies, then the installable archive.
     mod_root = Path(out_root) / MOD_NAME
     interface = mod_root / 'Interface'
     interface.mkdir(parents=True, exist_ok=True)
     for name, data in built.items():
         (interface / name).write_bytes(data)
+    for rel, data in extra.items():
+        dest = mod_root / Path(*rel.split('\\'))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
 
     zip_path = finished_dir(out_root) / f'{MOD_NAME}.zip'
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         for name in built:
             zf.write(interface / name,
                      arcname=str(Path('Interface') / name))
+        for rel in extra:
+            zf.write(mod_root / Path(*rel.split('\\')), arcname=rel)
 
     if preview and messagebox:
         png = mod_root / 'preview.png'
@@ -238,13 +281,17 @@ def convert(out_root: Path, oblivion_data=None, skyrim_data=None,
 
     for name in sorted(built):
         print(f'  Loose:  {interface / name}')
+    for rel in sorted(extra):
+        print(f'  Loose:  {mod_root / Path(*rel.split(chr(92)))}')
     print(f'  Zipped: {zip_path} ({zip_path.stat().st_size:,} bytes)')
     print()
     print('Install it like any other converted mod: the archive root is the '
           'Data folder.')
-    replaced = ', '.join('Interface\\' + n for n in sorted(built))
-    print(f'It replaces {len(built)} file(s) -- {replaced} -- so it conflicts '
-          'only with other mods that replace those same movies.')
+    replaced = ', '.join(['Interface\\' + n for n in sorted(built)]
+                         + sorted(extra))
+    total = len(built) + len(extra)
+    print(f'It replaces {total} file(s) -- {replaced} -- so it conflicts '
+          'only with other mods that replace those same files.')
     return 0
 
 
@@ -320,6 +367,9 @@ def main() -> int:
                     help="Skip the message box and convert only the cursor")
     ap.add_argument('--no-cursor', action='store_true',
                     help="Skip the menu cursor and convert only the message box")
+    ap.add_argument('--no-mainmenu', action='store_true',
+                    help="Skip the Oblivion main menu (startmenu.swf + the four "
+                         'blank 3D-scene meshes)')
     ap.add_argument('--preview', action='store_true',
                     help='Also write a PNG of the frame next to the mod')
     args = ap.parse_args()
@@ -336,6 +386,7 @@ def main() -> int:
                    scale9=not args.no_scale9,
                    messagebox=not args.no_messagebox,
                    cursor=not args.no_cursor,
+                   main_menu=not args.no_mainmenu,
                    preview=args.preview)
 
 

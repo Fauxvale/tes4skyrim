@@ -512,6 +512,61 @@ def place_object2(depth: int, character_id: int = None, name: str = None,
     return Tag(TAG_PLACE_OBJECT_2, bytes(out))
 
 
+def place_move(depth: int, translate: tuple = (0, 0), alpha: int = None) -> Tag:
+    """PlaceObject2 with the MOVE flag: retarget the clip already at `depth`.
+
+    This is how a self-contained animated sprite tweens by hand -- frame 1
+    `place_object2`s the character at a depth, and each later frame `place_move`s
+    the SAME depth to a new translation (and optionally a new `alpha`, 0..255,
+    via a CXFORMWITHALPHA multiply). No character id and no name are written, so
+    the engine keeps the existing instance rather than reinstantiating it, which
+    is what lets the motion be continuous instead of restarting each frame.
+    """
+    flags = 0x01 | 0x04               # Move + HasMatrix (matrix always, per above)
+    if alpha is not None:
+        flags |= 0x08                 # HasColorTransform
+    out = bytearray([flags])
+    out += struct.pack('<H', depth)
+    tx, ty = translate
+    out += pack_matrix(1.0, 1.0, int(round(tx * TWIPS)), int(round(ty * TWIPS)))
+    if alpha is not None:
+        a = max(0, min(256, int(round(alpha * 256 / 255))))
+        w = BitWriter()
+        w.ub(0, 1)                    # HasAddTerms = 0
+        w.ub(1, 1)                    # HasMultTerms = 1
+        nbits = _sbits_needed(256, a)
+        w.ub(nbits, 4)
+        for v in (256, 256, 256, a):  # R,G,B mult = 1.0 (256), A mult = alpha
+            w.sb(v, nbits)
+        out += w.bytes()
+    return Tag(TAG_PLACE_OBJECT_2, bytes(out))
+
+
+def define_sprite_frames(character_id: int, frames: list) -> Tag:
+    """A multi-frame sprite. `frames` is a list of tag-lists, one per frame; a
+    ShowFrame is appended after each and an End after the last. Unlike
+    `define_sprite` (one frame), the framecount is `len(frames)`, so the clip
+    animates and loops on its own timeline at the movie's frame rate."""
+    body = bytearray(struct.pack('<HH', character_id, len(frames)))
+    stream = []
+    for frame in frames:
+        stream.extend(frame)
+        stream.append(Tag(TAG_SHOW_FRAME, b''))
+    stream.append(Tag(TAG_END, b''))
+    for tag in stream:
+        n = len(tag.data)
+        if n < 0x3F and not tag.force_long:
+            body += struct.pack('<H', (tag.code << 6) | n)
+        else:
+            body += struct.pack('<HI', (tag.code << 6) | 0x3F, n)
+        body += tag.data
+    return Tag(TAG_DEFINE_SPRITE, bytes(body))
+
+
+# AVM1 ActionStop (0x07), terminated -- a one-shot sprite plays to here and holds.
+STOP_ACTION = b'\x07\x00'
+
+
 class BitReader:
     """MSB-first bit reader over a byte buffer, tracking its bit position."""
 

@@ -704,15 +704,71 @@ broken in game. See [the section above](#the-hud-stat-bars-attempted-and-reverte
 
 ---
 
-## Why only the message box
+## The main menu (`startmenu.swf`)
+
+Implemented in `asset_convert/ui_main_menu.py` (`patch_main_menu`), wired into
+`convert_ui` as a third movie. **Offline-validated; in-game verification is
+pending.** Unlike the message box this is not a character swap — it **ADDS**
+Oblivion's animated backdrops behind Skyrim's own menu.
+
+**What Skyrim's movie is.** 1280×720, 30 fps, 894 tags. The "buttons" are not
+button sprites: `MainList` (char 552) is a data-driven `CenteredScrollingList`
+of 17 empty rows whose text `__Packages.StartMenu` (#621, 27 KB of AS2) fills at
+runtime, so the strings live nowhere in the file. The only 5 rasters are gamepad
+glyphs — **no background or logo bitmap is in the SWF**; the 3D menu scene draws
+those. The root places `MenuHolder` (char 604) at depth 1 and nothing else.
+
+**The injection.** Two self-contained sprites — a parchment backdrop that
+drifts, and the "Elder Scrolls IV / OBLIVION" lockup that flies in and fades up
+then `stop()`s — are placed at root depths 1 and 2, and `MenuHolder` is moved to
+depth 3 (its only change: two depth bytes). Because each backdrop is a sprite
+with its OWN timeline, it animates with **no ActionScript**: Flash keeps a
+same-character/same-depth instance across the root's 2-frame loop, so their
+playheads run freely. Every AS2 class, `GameDelegate` callback and timeline is
+byte-identical, so **the buttons keep their Skyrim functions for free** —
+measured: 893 of 894 vanilla tags survive verbatim.
+
+**Assets** (read off the user's Oblivion install, never redistributed):
+`textures\menus\loading\loading_background.dds` (1024² parchment; Oblivion's real
+main-menu backdrop) and `…\tes_oblivion_logo_final.dds` (1024×256 lockup holding
+BOTH the header and OBLIVION). Backdrop is drawn 1500² (overscan) and drifts a
+seamless 480-frame Lissajous loop; the logo sits at `screen/4 + 22` (Oblivion's
+own placement) and eases in over 48 frames.
+
+**`swf.py` gained** three additive builders (the byte-identical round trip is
+unaffected — `serialize` is untouched): `place_move` (a MOVE PlaceObject2 with a
+matrix and an optional alpha CXFORM, for per-frame tweening), `define_sprite_frames`
+(a multi-frame clip), and `STOP_ACTION` (AVM1 `ActionStop`).
+
+**The 3D scene** is blanked by shipping four empty NIFs over
+`meshes\Interface\Logo\logo.nif`, `logo01ae.nif`, `intmenufogparticles.nif` and
+`intmenufogparticles_.nif` (`ui_main_menu.blank_nif_bytes`: one empty `NiNode`,
+built from scratch at 20.2.0.7/user 12/stream 83 — **the header's endian field
+must be set on a fresh PyFFI `Data()`, or it writes big-endian and nothing reads
+it back**).
+
+**Not yet done / open:** the list text is still Skyrim's colour (recolouring the
+rows to Oblivion brown is a separate literal-patch pass, like the message box's);
+the menu list stays Skyrim's **vertical** layout, not Oblivion's horizontal row
+(that is `CenteredScrollingList` AS2, outside the byte-safe envelope); and
+vanilla Oblivion's own logo intro is a Bink video, so the fly-in here is a
+faithful reproduction, not a rip. Vanilla's backdrop is plain parchment — a
+Cyrodiil-map background is a one-line texture swap in `OB_BACKGROUND`.
+
+---
+
+## Why only the message box (historical — the main menu now ships too)
 
 Tiering the rest, since the blocker is usually missing DATA rather than
 missing art:
 
+**Done:** the message box, the cursor, and the **main menu** (see
+[The main menu](#the-main-menu-startmenuswf) above).
+
 **Portable in principle** (a reskin, no new game systems): the HUD
 (health/magicka/**fatigue** → health/magicka/**stamina** maps exactly, though
-the first attempt at the bars did not survive contact with the engine), the
-main menu, loading screens, and the book menu — whose Oblivion art already
+the first attempt at the bars did not survive contact with the engine),
+loading screens, and the book menu — whose Oblivion art already
 ships, since `tes5_import.record_types.equipment._fix_book_html` rewrites book
 images to `img://textures/tes4/menus/…`.
 

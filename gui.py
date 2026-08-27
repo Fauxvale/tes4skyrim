@@ -2559,7 +2559,7 @@ def gui_main():
 
     # "Convert UI": which movies to reskin, set by the options dialog and read
     # by _global_cmd. Both on by default.
-    convert_ui_opts = {"messagebox": True, "cursor": True}
+    convert_ui_opts = {"messagebox": True, "cursor": True, "main_menu": True}
 
     def _lod_out_root() -> Path:
         return Path(output_var.get().strip() or str(SCRIPT_DIR / "output"))
@@ -2845,8 +2845,10 @@ def gui_main():
 
         mb_var = tk.BooleanVar(value=convert_ui_opts["messagebox"])
         cur_var = tk.BooleanVar(value=convert_ui_opts["cursor"])
+        mm_var = tk.BooleanVar(value=convert_ui_opts.get("main_menu", True))
         for var, label in ((mb_var, "Message boxes  (Interface\\messagebox.swf)"),
-                           (cur_var, "Menu cursor  (Interface\\cursormenu.swf) (EXPERIMENTAL)")):
+                           (cur_var, "Menu cursor  (Interface\\cursormenu.swf) (EXPERIMENTAL)"),
+                           (mm_var, "Main menu  (Interface\\startmenu.swf + blank 3D scene) (EXPERIMENTAL)")):
             ttk.Checkbutton(card, text=label, variable=var,
                             style="TCheckbutton").pack(
                                 anchor="w", padx=20, pady=1)
@@ -2869,6 +2871,7 @@ def gui_main():
         def _continue():
             convert_ui_opts["messagebox"] = mb_var.get()
             convert_ui_opts["cursor"] = cur_var.get()
+            convert_ui_opts["main_menu"] = mm_var.get()
             _close()
             if on_continue:
                 on_continue()
@@ -2882,10 +2885,12 @@ def gui_main():
 
         def _sync_continue(*_a):
             # Nothing selected -> nothing to build, so Continue is disabled.
-            state = "normal" if (mb_var.get() or cur_var.get()) else "disabled"
+            state = ("normal" if (mb_var.get() or cur_var.get() or mm_var.get())
+                     else "disabled")
             continue_btn.configure(state=state)
         mb_var.trace_add("write", _sync_continue)
         cur_var.trace_add("write", _sync_continue)
+        mm_var.trace_add("write", _sync_continue)
         _sync_continue()
 
         card.update_idletasks()
@@ -4571,6 +4576,8 @@ def gui_main():
                 cmd += ["--no-messagebox"]
             if not convert_ui_opts["cursor"]:
                 cmd += ["--no-cursor"]
+            if not convert_ui_opts.get("main_menu", True):
+                cmd += ["--no-mainmenu"]
             return cmd
 
         if key == "make_master":
