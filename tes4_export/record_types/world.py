@@ -400,7 +400,17 @@ def export_REGN(rec: Record) -> list:
                 "override": sub.data[4],
                 "priority": sub.data[5],
                 "weathers": [],
+                "music": None,
             })
+        elif sub.type == "RDMD" and entries and len(sub.data) >= 4:
+            # Region music type -- the same 3-value wbMusicEnum as CELL.XCMT
+            # (0 Default/Explore, 1 Public, 2 Dungeon).  This is the ONLY
+            # authored per-area music in TES4, and it is how Skyrim delivers
+            # exterior music too (REGN.RDMO): vanilla Tamriel's WRLD.ZNAM
+            # points at a SILENT track, and every real explore type reaches
+            # the player through a region.  127 of Oblivion's 211 regions and
+            # 60 of Nehrim's 78 carry one.
+            entries[-1]["music"] = struct.unpack_from("<I", sub.data, 0)[0]
         elif sub.type == "RDWT" and entries:
             # TES4 entry is 8 bytes: Weather FormID, Chance u32.
             for off in range(0, len(sub.data) - 7, 8):
@@ -419,6 +429,8 @@ def export_REGN(rec: Record) -> list:
             lines.append(f"RegionData[{i}].Type={e['type']}")
             lines.append(f"RegionData[{i}].Override={e['override']}")
             lines.append(f"RegionData[{i}].Priority={e['priority']}")
+            if e.get("music") is not None:
+                lines.append(f"RegionData[{i}].MusicType={e['music']}")
             if e["weathers"]:
                 lines.append(f"RegionData[{i}].WeatherCount={len(e['weathers'])}")
                 for j, (fid, chance) in enumerate(e["weathers"]):

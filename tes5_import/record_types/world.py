@@ -67,6 +67,18 @@ def register_music_types(by_enum: dict):
     _MUSIC_BY_ENUM.update(by_enum or {})
 
 
+# WRLD FormID -> its authored SNAM music enum.  Regions are converted in
+# Phase 1, BEFORE the WRLD records, so convert_REGN cannot read the worldspace
+# itself and needs this index (populated in Phase 0c).
+_WORLD_MUSIC_ENUM: dict = {}
+
+
+def register_world_music(by_world: dict):
+    """Register {WRLD FormID -> authored SNAM enum} for convert_REGN."""
+    _WORLD_MUSIC_ENUM.clear()
+    _WORLD_MUSIC_ENUM.update(by_world or {})
+
+
 # Door REFR FormID -> (NAVM FormID, triangle index), the reference side of a
 # navmesh door link.  Populated from the navmesh metas once every mesh exists
 # (Phase 4a) and read by convert_REFR to emit XNDP.  See set_door_navmesh_links.
@@ -1268,6 +1280,7 @@ def build_land_layers(rec: dict) -> bytes:
 # wbDefinitionsTES4/TES5): 2 Objects, 3 Weather, 4 Map, 5 Land, 6 Grass,
 # 7 Sound.
 _REGN_DATA_WEATHER = 3
+_REGN_DATA_SOUND = 7
 
 # Remapped FormIDs of the regions convert_REGN actually emitted.  The engine
 # activates a region's weather through the CELL's XCLR region list (verified
@@ -1304,7 +1317,32 @@ def convert_REGN(rec: dict):
     """
     n_entries = get_int(rec, 'RegionDataCount')
     weather_entries = []
+    music_entries = []
     for i in range(n_entries):
+        # RDMD -- the region's music type.  This is the ONLY authored
+        # per-area music TES4 has, and it is how Skyrim delivers exterior
+        # music as well: vanilla Tamriel's WRLD.ZNAM points at a SILENT
+        # 30-second track (_MUSExploreSILENT30) and every real explore type
+        # reaches the player through REGN.RDMO instead.  Emitting ZNAM alone
+        # therefore leaves the countryside quiet, which is exactly what
+        # "cities have music, outside does not" looks like.
+        mus = get_int(rec, f'RegionData[{i}].MusicType', None)
+        # 🛑 RDMD is almost always the CS's unset default, not a choice:
+        # 126 of Oblivion's 127 values are 0 (Explore) and only
+        # WaitingRoomRegion authors anything else.  Every city region --
+        # Bruma, Chorrol, all 8 IC districts, 21 in total -- says 0 while its
+        # own worldspace says SNAM=1 (Public).  Honouring the region there
+        # pins the whole city to Explore and the track never changes on
+        # entering.  So a DEFAULT-valued RDMD yields to an authored SNAM;
+        # only a region that actually names a non-default type wins.
+        if (mus == TES4_DEFAULT_MUSIC_ENUM
+                and _WORLD_MUSIC_ENUM.get(get_formid(rec, 'WNAM.Worldspace'))
+                not in (None, TES4_DEFAULT_MUSIC_ENUM)):
+            mus = None
+        if mus is not None:
+            music_entries.append((get_int(rec, f'RegionData[{i}].Override'),
+                                  get_int(rec, f'RegionData[{i}].Priority'),
+                                  mus))
         if get_int(rec, f'RegionData[{i}].Type') != _REGN_DATA_WEATHER:
             continue
         wlist = b''
@@ -1329,7 +1367,7 @@ def convert_REGN(rec: dict):
             'RPLI', struct.pack('<I', get_int(rec, f'Area[{i}].EdgeFalloff')))
         areas += pack_subrecord('RPLD', points)
 
-    if not weather_entries or not areas:
+    if not areas or (not weather_entries and not music_entries):
         return None
 
     subs = b''
@@ -1346,6 +1384,17 @@ def convert_REGN(rec: dict):
         subs += pack_formid_subrecord('WNAM', wnam)
 
     subs += areas
+
+    # Sound (type 7) entries first: xEdit sorts Region Data Entries by the
+    # RDAT type key, and vanilla's RDMO regions all carry type 7.
+    for override, priority, mus in music_entries:
+        musc = _MUSIC_BY_ENUM.get(mus)
+        if not musc:
+            continue
+        subs += pack_subrecord('RDAT', struct.pack(
+            '<IBBxx', _REGN_DATA_SOUND, 1 if override else 0,
+            min(255, priority)))
+        subs += pack_formid_subrecord('RDMO', musc)
 
     for override, priority, wlist in weather_entries:
         subs += pack_subrecord('RDAT', struct.pack(

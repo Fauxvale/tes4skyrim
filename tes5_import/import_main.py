@@ -1670,6 +1670,71 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
 
     _phase_done('phase 0 pre-scans')
 
+    # --- Phase 0c: MUSC/MUST from the converted music folder ---
+    # Must precede Phase 1: convert_REGN reads the enum->MUSC table to emit
+    # RDMO, and convert_CELL/convert_WRLD later read it for XCMO/ZNAM.
+    # The manifest is normally written by the SOUND stage, which runs AFTER
+    # this one, so load_music_manifest scans the extracted music folder itself
+    # when the file is not there yet.
+    try:
+        from .record_types.music import (build_music_records,
+                                         load_music_manifest)
+        from .record_types.world import (register_music_types,
+                                         register_world_music)
+        # Regions convert in Phase 1, before WRLD, so index each worldspace's
+        # authored SNAM now: convert_REGN needs it to tell an authored region
+        # music type from the CS's unset default (see its RDMD note).
+        from .text_reader import get_formid as _gf, get_int as _gi
+        register_world_music({
+            _gf(_w, 'FormID'): _gi(_w, 'SNAM.Music', None)
+            for _w in by_type.get('WRLD', [])
+            if _gi(_w, 'SNAM.Music', None) is not None})
+        # scan_music resolves <export-root>/<plugin>/music itself, so it needs
+        # the export ROOT -- export_dir here is already the per-plugin subdir.
+        _music_manifest = load_music_manifest(
+            plugin_out_dir,
+            export_dir=os.path.dirname(os.path.normpath(export_dir)),
+            plugin=os.path.basename(output_path))
+        if _music_manifest.get('tracks'):
+            _plugin_name = _music_manifest.get('plugin') or os.path.basename(
+                os.path.normpath(plugin_out_dir))
+            _music = build_music_records(_music_manifest, writer, _plugin_name)
+            for _fid, _b in _music['must']:
+                writer.add_record('MUST', _b)
+            for _fid, _b in _music['musc']:
+                writer.add_record('MUSC', _b)
+            register_music_types(_music['by_enum'])
+            # The engine reaches combat music ONLY through DOBJ's BTMS
+            # default object (hardcoded to vanilla MUSCombat), so a Battle
+            # MUSC that nothing points at can never play.  Override the
+            # master's DOBJ, copying every other entry unchanged -- the same
+            # full-array override each official DLC ships.
+            if _music.get('battle'):
+                try:
+                    from .record_types.music import build_DOBJ_override
+                    from asset_convert.skyrim_assets import find_skyrim_data
+                    _sk = find_skyrim_data()
+                    _esm = os.path.join(_sk, 'Skyrim.esm') if _sk else None
+                    if _esm and os.path.isfile(_esm):
+                        _dobj = build_DOBJ_override(_music['battle'], _esm)
+                        if _dobj:
+                            writer.add_record('DOBJ', _dobj[1])
+                            print('  Music: DOBJ BTMS -> our Battle music '
+                                  '(combat music was otherwise unreachable)')
+                        else:
+                            print('  WARNING: master DOBJ has no BTMS entry; '
+                                  'combat music stays vanilla.')
+                    else:
+                        print('  WARNING: Skyrim.esm not found; combat music '
+                              'stays vanilla.')
+                except Exception as _de:
+                    print(f'  WARNING: DOBJ override failed: {_de}')
+            print(f"  Music: {len(_music['must'])} MUST + "
+                  f"{len(_music['musc'])} MUSC records "
+                  f"({len(_music['by_enum'])} enum categories)")
+    except Exception as e:
+        print(f"  ERROR building music records: {e}")
+
     # --- Phase 1: Simple record types (flat top-level groups) ---
     print("\nConverting records...")
     t2 = time.time()
@@ -1978,30 +2043,6 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     set_teleport_grid(*_build_teleport_grid(
         by_type, ctx.master_export if ctx else None))
 
-    # --- Phase 3c: MUSC/MUST from the converted music folder ---
-    # Must precede Phase 4: convert_CELL/convert_WRLD read the enum->MUSC table
-    # this registers to emit XCMO/ZNAM.  The manifest is written by the sound
-    # stage (asset_convert.music_convert), so an import run whose music has not
-    # been converted yet simply registers nothing and omits the subrecords.
-    try:
-        from .record_types.music import (build_music_records,
-                                         load_music_manifest)
-        from .record_types.world import register_music_types
-        _music_manifest = load_music_manifest(plugin_out_dir)
-        if _music_manifest.get('tracks'):
-            _plugin_name = _music_manifest.get('plugin') or os.path.basename(
-                os.path.normpath(plugin_out_dir))
-            _music = build_music_records(_music_manifest, writer, _plugin_name)
-            for _fid, _b in _music['must']:
-                writer.add_record('MUST', _b)
-            for _fid, _b in _music['musc']:
-                writer.add_record('MUSC', _b)
-            register_music_types(_music['by_enum'])
-            print(f"  Music: {len(_music['must'])} MUST + "
-                  f"{len(_music['musc'])} MUSC records "
-                  f"({len(_music['by_enum'])} enum categories)")
-    except Exception as e:
-        print(f"  ERROR building music records: {e}")
 
     # --- Phase 4: CELL/WRLD hierarchy (+ PGRD→NAVM navmeshes) ---
     # Base-object model index for navmesh static-footprint carving. Only
