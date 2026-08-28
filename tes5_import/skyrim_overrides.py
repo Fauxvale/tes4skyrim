@@ -956,3 +956,42 @@ ARMA_ADDITIONAL_RACES = [
     0x00013748,  # RedguardRace
     0x00013749,  # WoodElfRace
 ]
+
+
+# BEAST-RACE HEAD GEAR (2026-08-27).  A converted hood/helmet mesh is fitted
+# to the SHARED HUMAN skull, which on a khajiit or argonian puts the geometry
+# inside the head: measured head-local, the khajiit Skyrim head reaches
+# z 14.85 and abs(x) 8.47 against the human head's 11.51 / 6.85, and over the
+# scalp region a hood sits on, beast verts stand a mean 1.91 (khajiit) / 1.40
+# (argonian) proud of the human surface (max 6.87 / 4.29).
+#
+# Vanilla Skyrim's answer is one ARMA PER RACE FAMILY, each naming its own
+# reshaped NIF -- ArmorIronHelmet lists IronHelmetAA (RNAM=DefaultRace,
+# Helmet.nif), IronHelmetKhajiitAA (RNAM=KhajiitRace, HelmetKhajiit.nif) and
+# IronHelmetArgonianAA (RNAM=ArgonianRace, HelmetArgonian.nif).  ARMA carries
+# no alternate-model slot; race targeting is RNAM plus the MODL[] additional
+# races, so a per-race MESH requires a per-race ARMA.  The same split runs
+# through BoneCrown, Blades, Orcish, Dragonscale, Draugr, Dragonplate, Falmer,
+# ThalmorHood and every Circlet.
+#
+# We mirror it: asset_convert.nif_converter writes <name>_khajiit.nif /
+# <name>_argonian.nif beside the base mesh and equipment._build_arma emits the
+# ARMA naming each.  Khajiit and Argonian stay SEPARATE (never one shared
+# "beast" mesh) because the two skulls differ from each other as much as
+# either differs from the human one.
+#
+# race key -> (RNAM race FormID, [additional races], mesh suffix).  The
+# additional race is that race's vampire variant, exactly as vanilla lists it.
+ARMA_BEAST_RACES = {
+    'khajiit': (0x00013745, [0x00088845], '_khajiit'),
+    'argonian': (0x00013740, [0x0008883A], '_argonian'),
+}
+
+# The races the DEFAULT (human-fitted) ARMA should claim once beast variants
+# exist: everything in ARMA_ADDITIONAL_RACES except the beast races, which are
+# served by their own ARMA.  Leaving them in makes the engine pick whichever
+# armature it finds first and the beast mesh never renders.
+ARMA_BEAST_RACE_FIDS = {fid for fid, _extra, _sfx in ARMA_BEAST_RACES.values()}
+ARMA_ADDITIONAL_RACES_NONBEAST = [
+    fid for fid in ARMA_ADDITIONAL_RACES if fid not in ARMA_BEAST_RACE_FIDS
+]

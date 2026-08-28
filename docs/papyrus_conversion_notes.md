@@ -1663,3 +1663,137 @@ phantom `Form Property d7` — `_safe_property_name` prefixing the digit.
 binders (`dialog_converter`, `object_scripts`) hardcoded the reference id; the VM
 refuses a reference into an `ActorBase` property and the script's whole init
 aborts. Skyrim's Player ActorBase is `0x00000007`, the same id as TES4's.
+
+## TES4's destroyed flag has no Papyrus READER — mirror it in a FormList (2026-08-27)
+
+**Symptom.** Closing the Kvatch Oblivion gate teleported the player out
+correctly, but the gate stayed standing and MS48 never advanced past stage 10.
+
+**Cause.** `MS48OblivionGateScript`'s only `setstage ms48 50` is gated on
+`getdestroyed == 1`:
+
+```
+begin gamemode
+  if getdisabled == 1
+    return
+  endif
+  if getdestroyed == 1 && getstage ms48 < 50
+    setstage ms48 50
+  endif
+```
+
+**What `SetDestroyed` actually does**, per the CK wiki's own page:
+
+> "Objects that have been Destroyed no longer present mouseover text and
+> cannot be activated. Note that they still exist, and continue to render and
+> process events normally — they are **not Disabled or Deleted**, and their
+> visual **Destruction State, if any, is unaffected**."
+
+So it is *only* non-interactability. Three states share the word "destroyed"
+and are all distinct — in Oblivion.exe they are literally different bits of
+`[ref+8]`:
+
+| State | Oblivion bit | Read in Papyrus by |
+|---|---|---|
+| destroyed **flag** | `0x2000` | *(no member — see below)* |
+| enable state | `0x800` | `IsDisabled()` |
+| DEST destruction **stage** | *(not a flag)* | `GetCurrentDestructionStage()` |
+
+**Availability of the reader.** Skyrim exposes the setter to Papyrus
+(`ObjectReference.psc:553`) but **not** the getter. `GetDestroyed` is real —
+it is a console command (`0x10CB` / 4299) and a condition function (CTDA
+index 203, no params, per xEdit `wbDefinitionsTES5.pas:336`) — but it has no
+`ObjectReference` member: **0 hits across every vanilla `.psc`**, and it is
+absent from the CK wiki's ObjectReference member list.
+
+The CTDA route is not usable either, and not worth building: **0 of 134,748
+conditions** across all 16 exported plugins use function 203.
+
+**This conversion never writes a DEST subrecord** (grep `tes5_import/` — the
+signature appears only in comments), so `GetCurrentDestructionStage()` returns
+0 for *every* converted record. Both spellings of `getdestroyed` were
+therefore dead reads that could never become true, and every quest advancing
+off its own destruction was stuck.
+
+**Do not shadow it in a script Actor Value.** `SetActorValue`/`GetActorValue`
+are declared on `Actor.psc` (lines 521/143), **not** on `ObjectReference`, so
+they do not compile against the things TES4 destroys — the Kvatch gate is a
+`DOOR`, and the rest are activators, statics and trap triggers.
+
+**The fix.** A conversion-owned FormList, `TES4DestroyedRefs`:
+
+* `tes5_import._create_destroyed_formlist` mints it at
+  `writer.chargen_fid_base + 0x44`, in the already-reserved 0x800 gap beside
+  the ForceCombat FACT pair — a fixed slot, so **no FormID drift**.
+* `TES4Polyfill.SetDestroyed(ref, list, bool)` calls the real native *and*
+  mirrors the write into the list; `GetDestroyed(ref, list)` reads it back.
+  `AddForm` / `HasForm` / `RemoveAddedForm` are native and work on any
+  reference type, and script-added entries persist in the save.
+* Every writer routes through the polyfill — `setdestroyed` is a special
+  handler in `converter.py`, **not** a `constants.py` direct-native mapping.
+  A direct mapping there silently bypasses the mirror and reproduces the bug.
+* `CloseCurrentOblivionGate` / `CloseOblivionGate` / `DestroyAfterAnimation`
+  all take the list and go through the same setter.
+
+**Measured in the built artifacts (Oblivion.esm):** FLST `0118E17B`
+`TES4DestroyedRefs`; 138 `SetDestroyed` writers, 26 `GetDestroyed` readers and
+19 `DestroyAfterAnimation` calls across 69 scripts; 89 VMAD properties, all
+bound to `0118E17B`, none misbound; zero remaining bare-native writes and zero
+`GetCurrentDestructionStage` reads. `DOOR 011778C8` (MS48OblivionGate) and the
+sigil-stone scripts are both bound, so the read and the write meet.
+
+It is general, not gate-specific: tripwires, breakaway planks, cave-ins,
+pressure plates, crumbling walls, Elven statues, the MQ06 Paradise portal and
+all 20 gate-closing scripts use the same mechanism, including the
+`setDestroyed 0` re-arm path (`TES4Polyfill.SetDestroyed(Self, list, false)`).
+
+## Closing an Oblivion gate is the destroyed FLAG and nothing else (2026-08-27)
+
+Decompiled from `Oblivion.exe` (the Nehrim install), so this is the engine's
+own answer rather than an inference:
+
+| | Address | What it does |
+|---|---|---|
+| `CloseOblivionGate` handler | `0x515ef0` | opcode `0x10DE` |
+| `CloseCurrentOblivionGate` handler | `0x515d20` | opcode `0x10C0` |
+| destroyed-flag setter | `0x46aa50` | `or [ref+8], 0x2000` / `and ...,~0x2000` |
+| `GetDestroyed` handler | `0x4f82c0` | `[ref+8] >> 0xD & 1` — same bit |
+| `Disable` handler | `0x50a240` | tests/sets bit `0x800` — a DIFFERENT flag |
+
+Walking every call target transitively from `0x515ef0`: the flag setter
+`0x46aa50` **is** reachable; `Disable` `0x50a240` is **not**, at any depth.
+So closing a gate sets one bit and does nothing else.
+
+**Then why does the gate visibly disappear?** Because the visible portal is an
+*animation*, not the reference's presence. The gate NIF
+(`Oblivion\Gate\OblivionArchGate01.NIF`) carries exactly three sequences —
+`Forward`, `Backward`, `SpecialIdle` — and the gate's own `GameMode` re-issues
+the looping one only while it is not destroyed:
+
+```
+if GetDisabled == 0 && GetDestroyed == 0
+    if IsAnimPlaying == 0
+        playgroup specialidle 1
+```
+
+Once the flag is set that branch stops running, the loop is no longer
+re-issued, and the portal closes itself. UESP's "the gate ... disappearing" is
+describing this, not a `Disable`.
+
+**Do NOT `Disable()` the gate.** Two independent reasons:
+
+1. Oblivion never does (measured above), and Bethesda's own MQ14 stage script
+   closes three gates with bare `CloseOblivionGate` while disabling only a
+   *sound* marker (`MQ13Gate2Sound.disable`) — proof they reached for
+   `.disable` when they wanted it, and did not here.
+2. It would break the quest. The gate's poll opens with
+   `if getdisabled == 1 / return`, *above* the `getdestroyed` stage check, so
+   a disabled gate can never run its own `setstage`.
+
+It is also not available: Skyrim refuses `Disable()` on a reference with an
+enable-state parent (`SkyrimSE.exe`: "cannot disable an object with an enable
+state parent" — and symmetrically "cannot enable ..."), and `MS48KvatchGate`
+has `XESP.Reference=00091229`. Disabling that parent instead is wrong too —
+`MQ13CountessBattleMarker` parents all four MQ13 gates, so it would close
+gates the script left open.
+

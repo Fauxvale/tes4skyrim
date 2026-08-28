@@ -988,6 +988,11 @@ class ScriptConverter:
         blocks_activation = (extends in ('ObjectReference', 'Actor')
                             and self._onactivate_consumes(blocks))
 
+        # Oblivion gate: capture which gate the player is entering, before the
+        # authored body clears the only variable that names it.
+        gate_entry = (extends in ('ObjectReference', 'Actor')
+                      and self._is_oblivion_gate_entry(blocks))
+
         for merge_key in block_order:
             segments = merged_blocks[merge_key]
             # merge_key is already the event_begin string (or the block_type if unmapped)
@@ -998,6 +1003,15 @@ class ScriptConverter:
                            else f';TODO: Unknown event block: {merge_key}')
             else:
                 out.append(merge_key)
+
+            # Remember the gate the player just walked into, so
+            # CloseCurrentOblivionGate has somewhere to send them back to.
+            # MUST precede the authored body: its very next act is to clear
+            # MQ00.nearOblivionGate, the only reference to this gate there is.
+            if gate_entry and merge_key == BLOCK_MAP['onactivate'][0]:
+                out.append('  If akActionRef == Game.GetPlayer()')
+                out.append('    TES4Polyfill.EnterOblivionGate(Self)')
+                out.append('  EndIf')
 
             # Oblivion's AI door-open BYPASSES locks and OnActivate scripts —
             # the CharacterGen back gate is level-100 locked with a "nobody
@@ -2342,8 +2356,13 @@ class ScriptConverter:
         # destroy still runs (it is what stops the trap re-triggering), just
         # after the polyfill has waited out the animation.
         _playanim_re = re.compile(r'^(\s*)(.+?)\.PlayAnimation\("([^"]+)"\)\s*$')
+        # Matches the polyfill form the setdestroyed handler now emits --
+        # TES4Polyfill.SetDestroyed(<ref>, TES4DestroyedRefs, true) -- not the
+        # bare native, which is no longer emitted anywhere.  Capturing the
+        # FormList argument keeps it on the deferred call.
         _setdestroyed_re = re.compile(
-            r'^(\s*)(?:(.+?)\.)?SetDestroyed\(\s*(?:1|true)\s*\)\s*$',
+            r'^(\s*)TES4Polyfill\.SetDestroyed\(\s*(.+?)\s*,\s*'
+            r'(\w+)\s*,\s*true\s*\)\s*$',
             re.IGNORECASE)
         _anim_targets: dict[str, int] = {}
         for idx, line in enumerate(lines):
@@ -2359,7 +2378,7 @@ class ScriptConverter:
             # anything else is untouched.
             if tgt in _anim_targets or (tgt == 'Self' and 'Self' in _anim_targets):
                 lines[idx] = (f'{dm.group(1)}TES4Polyfill.DestroyAfterAnimation('
-                              f'{tgt})')
+                              f'{tgt}, {dm.group(3)})')
         # Consecutive PlayGroups on the SAME reference (Nehrim MQ23's loose
         # planks: Forward / Backward / Unequip in one frame) are left as plain
         # PlayAnimation calls: the last event wins and the object snaps to the
@@ -3411,6 +3430,41 @@ class ScriptConverter:
             out.append('EndEvent')
             out.append('')
         return out
+
+    @staticmethod
+    def _is_oblivion_gate_entry(blocks) -> bool:
+        """True when this script's OnActivate carries the player INTO a realm.
+
+        The authored indicator is `set MQ00.nearOblivionGate to 0` inside a
+        player-guarded OnActivate.  That line exists for one reason: the ref
+        is an Oblivion gate, and the player who just activated it is being
+        taken through to the realm, so the "player is standing near a gate"
+        tracking variable no longer applies ("we aren't 'near' any gate
+        anymore -- we're in Oblivion!" is Bethesda's own comment on it).
+
+        It is the only moment in the game where the identity of the gate the
+        player entered is known, and the authored code DISCARDS it on that
+        very line -- so the capture has to be injected ahead of the clear.
+
+        Matching the authored write rather than a script name keeps this
+        generic: any plugin that adds its own gate follows the same idiom
+        (all five vanilla gate scripts do, and nothing else in Oblivion.esm
+        writes that variable to 0).
+        """
+        for btype, _bf, blines in blocks:
+            if btype != 'onactivate':
+                continue
+            saw_player_guard = False
+            for raw in blines:
+                line = raw.split(';', 1)[0].strip().lower()
+                if not line:
+                    continue
+                if re.search(r'isactionref\s+player', line):
+                    saw_player_guard = True
+                if saw_player_guard and re.search(
+                        r'\bset\s+\w+\.nearobliviongate\s+to\s+0\b', line):
+                    return True
+        return False
 
     @staticmethod
     def _onactivate_consumes(blocks) -> bool:
@@ -4989,8 +5043,32 @@ class ScriptConverter:
                 if extends == 'ActiveMagicEffect':
                     return 'GetTargetActor().GetParentCell().IsInterior()'
                 return 'Self.GetParentCell().IsInterior()'
+            if bare_low in ('getdisabled', 'isdisabled'):
+                # Through the polyfill, not the bare native: a DESTROYED
+                # reference must not report as disabled.  Oblivion keeps the
+                # two as independent bits and closing a gate sets only
+                # destroyed, so its poll preambles (`if getdisabled == 1 /
+                # return`, above the `getdestroyed` setstage) were never meant
+                # to fire for a closed gate.  Our removal has to Disable(),
+                # which would otherwise strand every such setstage.
+                ref = 'Self' if extends != 'ActiveMagicEffect' else 'GetTargetActor()'
+                return (f'TES4Polyfill.GetDisabled({ref}, '
+                        f'{self._destroyed_formlist()})')
             if bare_low == 'getdestroyed':
-                return 'IsDisabled()'
+                # NOT IsDisabled() and NOT GetCurrentDestructionStage().
+                # Destroyed, disabled and destruction-STAGE are three different
+                # engine states.  Skyrim exposes no reader for the destroyed
+                # flag at all, and this conversion writes no DEST subrecord, so
+                # GetCurrentDestructionStage() is 0 for every converted record
+                # -- a read that can never become true.  That is what broke
+                # every quest advancing off its own destruction: MS48's Kvatch
+                # gate reads `if getdestroyed == 1 && getstage ms48 < 50 /
+                # setstage ms48 50`, the ONLY setstage 50 in the chain, so the
+                # quest pinned at stage 10 (measured live 2026-08-27).
+                # The polyfill reads the FormList its SetDestroyed mirrors into.
+                ref = 'Self' if extends != 'ActiveMagicEffect' else 'GetTargetActor()'
+                return (f'TES4Polyfill.GetDestroyed({ref}, '
+                        f'{self._destroyed_formlist()})')
             # Handle bare function references that need special handling
             if bare_low == 'getbuttonpressed':
                 # A script that shows a button MessageBox of its own reads the
@@ -5581,6 +5659,19 @@ class ScriptConverter:
         return (f'TES4Polyfill.ForceCombat({ref}, {target}, '
                 'TES4ForceCombatAttackers, TES4ForceCombatVictims)')
 
+    def _destroyed_formlist(self) -> str:
+        """Register and name the conversion-owned destroyed-reference FormList.
+
+        Skyrim has ObjectReference.SetDestroyed but NO reader for the flag, so
+        TES4's `getdestroyed` has nothing native to read.  The import writes a
+        FormList (TES4DestroyedRefs, fixed FormID) that the polyfill's
+        SetDestroyed mirrors every write into and GetDestroyed queries.  A
+        FormList rather than a script AV because AVs are Actor-only and the
+        references TES4 destroys are doors, activators and statics.
+        """
+        self._property_refs['TES4DestroyedRefs'] = 'FormList'
+        return 'TES4DestroyedRefs'
+
     def _convert_function_call(self, line: str, extends: str) -> str:
         """Convert an Oblivion function call line to Papyrus."""
         stripped = line.strip()
@@ -5680,6 +5771,45 @@ class ScriptConverter:
             return self.xref.get_script_owner_packages_of_type(
                 self._current_script_edid, pkg_type)
         return []
+
+    # Music cues converted for THIS plugin: {source_rel -> cue EditorID}.
+    # Populated by set_music_cues() from the same music_tracks.json the importer
+    # builds MUSC from, so the two sides cannot drift apart.
+    _music_cues: dict = {}
+
+    @classmethod
+    def set_music_cues(cls, cues: dict):
+        """Register {lowercase source_rel -> MUSC EditorID} for StreamMusic."""
+        cls._music_cues = dict(cues or {})
+
+    def _music_cue_property(self, raw_path: str):
+        """Papyrus property name for a StreamMusic argument, or None.
+
+        `raw_path` is spelled as the TES4 script spells it: a backslash or
+        forward-slash path, or a bare category name.  Normalise to the
+        manifest's `source_rel` form (forward slashes, lowercase, no `data/`
+        prefix, no extension) and look it up; a miss returns None so the caller
+        emits the inert marker rather than binding a property to a record that
+        does not exist.
+        """
+        if not raw_path or not self._music_cues:
+            return None
+        norm = raw_path.replace(chr(92), '/').strip().lower()
+        while '//' in norm:
+            norm = norm.replace('//', '/')
+        norm = norm.lstrip('/')
+        if norm.startswith('data/'):
+            norm = norm[5:]
+        if not norm.startswith('music/'):
+            # A bare category (`StreamMusic dungeon`) names the whole folder.
+            norm = 'music/' + norm
+        stem = norm.rsplit('.', 1)[0]
+
+        for key, edid in self._music_cues.items():
+            if key.rsplit('.', 1)[0] == stem:
+                self._property_refs[edid] = 'MusicType'
+                return edid
+        return None
 
     def _resolve_self_ref(self, ref_name, extends, actor_func=False):
         """Resolve the reference for a function call.
@@ -6414,22 +6544,40 @@ class ScriptConverter:
             self._line_comments.append(';NE: StopSound has no Papyrus equivalent')
             return '0'
 
-        # Music playback by FILE PATH: vanilla `StreamMusic "data\music\..."` and
-        # Nehrim's emc* plugin commands.  Skyrim's music system is form-driven
-        # (MusicType.Add()/Remove() on a MUSC record) and neither Papyrus nor
-        # SKSE can start a track from a path, so there is nothing to call — the
-        # MUSC records would have to be authored first.  Emit an inert marker
-        # rather than a call that cannot compile.
-        # `emc*` is Nehrim's bundled music-control plugin (emcPlayTrack,
-        # emcSetMusicType, emcIsBattleOverridden, ...); match the whole family by
-        # prefix rather than chasing each name.  `emcount` is a local variable in
-        # some scripts, not a command, so require a longer name.
-        if fname_low in ('streammusic',) or (
-                fname_low.startswith('emc') and fname_low != 'emcount'
+        # Music playback by FILE PATH.  Skyrim's music system is form-driven
+        # (MusicType.Add()/Remove() on a MUSC record), so a path cannot be
+        # played directly -- but the importer now authors one MUSC per Special
+        # cue, named deterministically from that same path
+        # (music_cue_editor_id), so the call resolves to a real record.
+        #
+        # `StreamMusic "data/music/special/theme_01.mp3"` -> Add() on the cue
+        # MUSC.  Measured: 38 StreamMusic calls in Nehrim.esm, 35 by path and 3
+        # by bare category (`StreamMusic dungeon`); Oblivion.esm has none.
+        # A path with no converted file behind it (8 of Nehrim's references are
+        # dead on disk -- theme_06_part01, the specialevent_05 typo) still gets
+        # the inert marker, because binding a property to a record that was
+        # never written would abort the whole function at runtime.
+        if fname_low == 'streammusic':
+            raw = (args_str.strip() if args_str else '').strip('"\'')
+            cue = self._music_cue_property(raw)
+            if cue:
+                return f'{cue}.Add()'
+            self._line_comments.append(
+                f';NE: {func_name} — no converted music for '
+                f'({args_str.strip()})')
+            return '0'
+
+        # `emc*` is Nehrim's bundled music-control plugin (Elys Music Control:
+        # emcMusicStop, emcSetMusicHold, emcIsBattleOverridden, ...).  These
+        # control the PLAYLIST rather than naming a track, and Papyrus exposes
+        # no equivalent even with MUSC authored, so they stay inert.  `emcount`
+        # is a local variable in some scripts, not a command, so require a
+        # longer name.
+        if (fname_low.startswith('emc') and fname_low != 'emcount'
                 and len(fname_low) > 5):
             self._line_comments.append(
-                f';NE: {func_name} — Skyrim music is MusicType-based, '
-                f'no path playback ({args_str.strip()})')
+                f';NE: {func_name} — no Papyrus equivalent for the Elys '
+                f'music-control API ({args_str.strip()})')
             return '0'
 
         # OBSE IsCasting: "is this actor playing a cast animation".  Skyrim
@@ -6912,12 +7060,20 @@ class ScriptConverter:
             ref = self._resolve_self_ref(ref_name, extends)
             return f'{ref}.MoveTo({ref})'
 
-        # GetDestroyed → destruction stage > 0.  Skyrim has no native bool
-        # reader for the destroyed state, but GetCurrentDestructionStage() is
-        # native and a destroyed ref always sits above stage 0.
+        # GetDestroyed -> the polyfill's FormList shadow.  Skyrim has NO reader
+        # for the destroyed flag, and GetCurrentDestructionStage() reads the
+        # unrelated DEST stage system, which this conversion never writes --
+        # so it returned 0 for every record and the read was always false.
+        if fname_low in ('getdisabled', 'isdisabled'):
+            # See the bare path: destroyed must not read as disabled.
+            ref = self._resolve_self_ref(ref_name, extends)
+            return (f'TES4Polyfill.GetDisabled({ref}, '
+                    f'{self._destroyed_formlist()})')
+
         if fname_low == 'getdestroyed':
             ref = self._resolve_self_ref(ref_name, extends)
-            return f'({ref}.GetCurrentDestructionStage() > 0)'
+            return (f'TES4Polyfill.GetDestroyed({ref}, '
+                    f'{self._destroyed_formlist()})')
 
         # ClearOwnership
         if fname_low == 'clearownership':
@@ -7321,8 +7477,9 @@ class ScriptConverter:
         _NO_OP_FUNCS = {
             'removetopic', 'refreshtopiclist', 'setquestobject',
             'setcellpublicflag', 'disablelinkedpathpoints', 'enablelinkedpathpoints',
-            'addachievement', 'closecurrentobliviongate', 'forcecloseobliviongate',
-            'closeobliviongate', 'setignorefriendlyhits', 'setsceneiscomplex',
+            # NOTE: the three Oblivion-gate functions are NOT no-ops — they
+            # are the only way out of a realm, and are handled below.
+            'addachievement', 'setignorefriendlyhits', 'setsceneiscomplex',
             'setnorumors', 'trapupdate', 'setdoordisabletakeoff',
             'setinvestmentgold', 'setpackduration', 'purgecellbuffers', 'pcb',
             'showdialogsubtitles', 'setpublic', 'essentialdeathreload',
@@ -8485,10 +8642,51 @@ class ScriptConverter:
             self._line_comments.append(';NE: SetPlayerInSEWorld')
             return '0'
 
-        # ForceCloseOblivionGate / CloseCurrentOblivionGate: no-op
-        if fname_low in ('forcecloseobliviongate', 'closecurrentobliviongate'):
-            self._line_comments.append(f';NE: {func_name}')
-            return '0'
+        # SetDestroyed -> the polyfill, never the bare native.  TES4 pairs the
+        # setter with `getdestroyed`, and Skyrim ships no reader for the flag,
+        # so the polyfill mirrors the write into TES4DestroyedRefs.
+        if fname_low == 'setdestroyed':
+            ref = self._resolve_self_ref(ref_name, extends)
+            arg = args_str.strip().lower() if args_str else '1'
+            val = 'false' if arg in ('0', 'false') else 'true'
+            return (f'TES4Polyfill.SetDestroyed({ref}, '
+                    f'{self._destroyed_formlist()}, {val})')
+
+        # CloseCurrentOblivionGate / CloseOblivionGate / ForceCloseOblivionGate.
+        #
+        # These were the ONLY way out of an Oblivion realm, and converting them
+        # to a no-op stranded the player there permanently: the Sigil Stone
+        # gave its item, fame and fireworks, and nothing else ever happened.
+        # Both of Bethesda's redundant exit routes (SigilRingBoomSCRIPT's
+        # 8.666s gateTimer, and the eleven TrigZoneCloseCurrentOblivion*
+        # trigger zones gated on `gotSigil == 1`) terminate in this one call.
+        #
+        # CloseCurrentOblivionGate is the player-facing one: teleport out to
+        # the gate, destroy it, release the gate weather.  The other two only
+        # destroy a gate on the Tamriel side and never move the player, so
+        # they map to the plain form.  See the "oblivion gates" section of
+        # TES4Polyfill for how the return target is captured.
+        if fname_low == 'closecurrentobliviongate':
+            # TES4's optional integer argument does NOT control whether the
+            # gate is destroyed -- it is the "no reset" flag, suppressing the
+            # RESPAWN/RESET of the Oblivion cell, and the gate is destroyed
+            # either way.  The two callers that pass 1 are named for it
+            # (SigilRingBoomNoResetSCRIPT, TrigZoneCloseCurrentOblivion*
+            # NoResetSCRIPT) and are otherwise byte-identical to the variants
+            # that pass nothing.
+            #
+            # Reading it as "don't destroy" was measured wrong IN GAME: the
+            # Kvatch gate stayed standing and MS48 pinned at stage 10, because
+            # MS48OblivionGateScript's ONLY `setstage ms48 50` is gated on
+            # `getdestroyed == 1`.  MS13 is the same shape.  So the gate is
+            # ALWAYS destroyed; the flag has no Skyrim analogue (cell reset is
+            # not something a converted script controls) and is dropped.
+            return ('TES4Polyfill.CloseCurrentOblivionGate('
+                    f'{self._destroyed_formlist()})')
+        if fname_low in ('forcecloseobliviongate', 'closeobliviongate'):
+            ref = self._resolve_self_ref(ref_name, extends)
+            return (f'TES4Polyfill.CloseOblivionGate({ref}, '
+                    f'{self._destroyed_formlist()})')
 
         # IsInFaction: ref.IsInFaction faction -> ref.IsInFaction(faction)  
         if fname_low == 'isinfaction':

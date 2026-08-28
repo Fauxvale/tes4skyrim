@@ -172,7 +172,7 @@ def body_parts_for_flags(biped_flags: int) -> list:
     return out
 
 
-def build_plan(export_dir) -> dict:
+def build_plan(export_dir, _seen=None) -> dict:
     """Map mesh-relative NIF path -> bitmask of the variants the plugin uses.
 
     *export_dir* is the per-plugin export directory (e.g. export/Oblivion.esm).
@@ -193,10 +193,16 @@ def build_plan(export_dir) -> dict:
     plan: dict = {}
 
     from . import base_plugins
+    # `_seen` closes a base CYCLE.  A chain is user-authored (`--base` at
+    # one end, `_HEADER.txt` masters at the other), so nothing stops it
+    # looping; comparing against export_dir alone catches only A->A, and
+    # A->B->A recursed until the interpreter died.
+    _seen = set(_seen or ())
+    _seen.add(Path(export_dir).resolve())
     for base in base_plugins.export_dirs(export_dir):
-        if Path(base) == export_dir:
+        if Path(base).resolve() in _seen:
             continue
-        inherited = build_plan(base)
+        inherited = build_plan(base, _seen)
         # BIPED_FLAGS_KEY holds a nested map, so a plain update() would drop
         # the base's flags wholesale instead of merging them.
         for k, v in inherited.items():

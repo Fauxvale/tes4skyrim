@@ -1152,6 +1152,89 @@ bandwidth per *month* — about three clones).
 
 Commands are in [CLAUDE.md](../CLAUDE.md#shared-navmesh-cache).
 
+### GAP (unfixed): the download path ignores `PUBLISHABLE_PLUGINS`
+
+**Measured 2026-08-26.** `auto_install` makes its anonymous releases API call
+for **any** plugin, including ones whose cache is never published. The allowlist
+that should gate it already exists and is already correct:
+
+```python
+PUBLISHABLE_PLUGINS = ('Oblivion.esm', 'Nehrim.esm', 'Morrowind_ob.esm')
+def is_publishable(plugin): ...   # case-insensitive
+```
+([navmesh_cache.py:149](../tools/navmesh/navmesh_cache.py#L149))
+
+It gates **publishing** — `discover_plugins`
+([:171](../tools/navmesh/navmesh_cache.py#L171)) and the `publish` command
+([:1390](../tools/navmesh/navmesh_cache.py#L1390)) both filter on it — but
+**nothing on the download side consults it**. `auto_install`
+([:1138](../tools/navmesh/navmesh_cache.py#L1138)) walks
+already-current → drop-ins → `allow_download` → `_api_releases()`
+([:1222](../tools/navmesh/navmesh_cache.py#L1222)) with no plugin-name check
+anywhere.
+
+Cost per non-cacheable plugin, per import run: **one wasted API call (~0.5 s
+measured)** that can only ever end in "no matching asset". `auto_install` is
+invoked once per plugin ([convert.py:662](../convert.py#L662)), so a user
+converting their own mods pays it every run for a lookup guaranteed to miss.
+
+**The fix is a single early return** in `auto_install`, after the
+already-up-to-date and drop-in checks but **before** `allow_download` /
+`_api_releases()`. Ordering matters:
+
+- Drop-ins must still work for *any* plugin — a user who builds and drops in
+  their own zip is a supported path and must not be gated by an allowlist about
+  what *we* host.
+- Only the **network** step is restricted, so the gate belongs immediately
+  before it.
+
+**Verified safe — nothing is lost.** Two off-allowlist assets exist
+(`navmesh-cache-DLCBattlehornCastle.zip`, `navmesh-cache-ElsweyrAnequina.zip`),
+but they appear on exactly one historical release, `navmesh-cache-0.586-0.586`
+(2026-08-11). That range covers 0.586 only; current builds report 0.616, so the
+existing version-range gate already rejects them. Every current release
+(`0.616+`, `0.609-0.615`, `0.600-0.608`, …) carries only the three allowlisted
+plugins.
+
+Keep the user-facing message honest when gating: for a non-hosted plugin the
+truth is "no cache is published for this plugin", **not** the existing "could
+not reach the releases API" wording, which would be a false diagnosis.
+
+### GitHub anonymous rate limit — measured, not a practical risk
+
+The download path is anonymous (`_api_releases`,
+[navmesh_cache.py:307](../tools/navmesh/navmesh_cache.py#L307)) and GitHub's
+anonymous REST limit is **60 requests/hour, counted per source IP** — shared by
+everyone behind that IP. Measured 2026-08-26, this is nonetheless fine:
+
+- **A cache install costs exactly ONE API call.** `auto_install` is invoked once
+  per plugin per import run ([convert.py:662](../convert.py#L662)), and its only
+  API call is the single `releases?per_page=100` request. Verified: remaining
+  went 60 → 59.
+- **The asset download itself costs ZERO.** `browser_download_url` redirects to
+  `release-assets.githubusercontent.com`, which is outside the API. Verified by
+  range-fetching 1 MB of the real 114 MB `navmesh-cache-Oblivion.zip` — API
+  remaining was unchanged (56 → 56).
+- So a user converting all three plugins spends **3 of 60**. Even a shared
+  university/office NAT would need ~20 simultaneous first-time users in one hour
+  to exhaust it.
+- Today that is **1 call per plugin converted**, not per *cacheable* plugin —
+  see the gap above. Gating on `is_publishable` caps it at 3 per run no matter
+  how many plugins a user converts.
+
+**On exhaustion it degrades safely, and this is already handled.** A 429 makes
+`_api_releases` return `[]`, which the caller treats exactly like being offline:
+it prints "could not reach the releases API (offline or blocked); generating
+normally", names the manual drop-in route, and regenerates
+([navmesh_cache.py:1223](../tools/navmesh/navmesh_cache.py#L1223)). The cost is
+slow generation, never wrong geometry or a failed run.
+
+The one aggravating factor to keep in mind: **any future anonymous API caller
+shares this same 60/hour budget** — notably the update check
+([version.py:965](../version.py#L965)) and the planned in-app updater
+([in_app_update_plan.md](in_app_update_plan.md)). That is why the updater's
+launch check caches its result rather than polling every start.
+
 **Never ship `collision_cache.bin`.** It maps Oblivion mesh *paths* to verbatim
 Havok collision triangles lifted from Bethesda's NIFs — derived asset data keyed
 by asset name. Only the generated `navmesh_geom_cache` pickles (hash + verts +

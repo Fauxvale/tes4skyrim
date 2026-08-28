@@ -436,3 +436,811 @@ class TestCastLane:
         stop_id = order.index('Spell_Stop')
         assert f'<hkparam name="id">{fire_id}</hkparam>' in xml
         assert f'<hkparam name="id">{stop_id}</hkparam>' in xml
+
+
+# ---------------------------------------------------------------------------
+# Ghost/wraith dissolve: NiVisController -> bone scale (docs/creature_conversion
+# .md "Ghosts hovered in the air instead of dissolving")
+# ---------------------------------------------------------------------------
+
+GHOST_DIR = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                         'creatures', 'ghost')
+GHOST_DEATH = os.path.join(GHOST_DIR, 'death.kf')
+
+needs_ghost = pytest.mark.skipif(
+    not os.path.exists(GHOST_DEATH), reason='ghost export assets missing')
+
+
+@needs_ghost
+class TestVisibilityChannels:
+    """The ghost's whole death is visibility, not motion.  Dropping these
+    channels left the corpse hovering upright at standing height."""
+
+    def _clip(self):
+        return decode_kf(GHOST_DEATH)[0]
+
+    def test_death_clip_never_lowers_the_body(self):
+        # The premise of the bug: holding the last frame is NOT a corpse on
+        # the ground for this creature.
+        clip = self._clip()
+        na = next(t for t in clip.tracks if t.bone == 'Bip01 NonAccum')
+        z = na.translations[:, 2]
+        assert z.min() > 60.0, f'expected standing height, got {z.min()}'
+
+    def test_visibility_channels_are_captured(self):
+        clip = self._clip()
+        got = {b for b, _ in clip.vis_tracks}
+        for bone in ('SkinAttachment', 'AttachmentsBip', 'AttachmentsShrink',
+                     'AttachmentsHead', 'AttachmentsLeftHand',
+                     'AttachmentsRightHand'):
+            assert bone in got, f'{bone} visibility channel dropped'
+
+    def test_body_hides_and_ectoplasm_reveals(self):
+        clip = self._clip()
+        vis = dict(clip.vis_tracks)
+        # body: visible -> hidden
+        for bone in ('SkinAttachment', 'AttachmentsHead',
+                     'AttachmentsLeftHand', 'AttachmentsRightHand'):
+            v = vis[bone]
+            assert v[0] == 1.0 and v[-1] == 0.0, f'{bone} {v[0]}->{v[-1]}'
+        # ectoplasm: hidden -> visible
+        v = vis['AttachmentsBip']
+        assert v[0] == 0.0 and v[-1] == 1.0
+        # shrink blob: appears then goes again
+        v = vis['AttachmentsShrink']
+        assert v[0] == 0.0 and v[-1] == 0.0 and v.max() == 1.0
+
+    def test_visibility_never_becomes_an_animation_track(self):
+        # A Havok clip carries bone transforms only.  Converting these curves
+        # to a bone-SCALE collapse was tried and REVERTED: our merged bodies
+        # skin the torso to the posing Bip01 bones (Oblivion attaches the skin
+        # parts into `SkinAttachment` at RUNTIME, and that node is a SIBLING of
+        # the rig), so only the single-bone head/hand parts would hide -- a
+        # decapitated corpse.  The dissolve is done with AttachAshPile instead.
+        clip = self._clip()
+        assert clip.vis_tracks, 'visibility curves should still be decoded'
+        vis_bones = {b for b, _ in clip.vis_tracks}
+        stray = [t.bone for t in clip.tracks
+                 if t.bone in vis_bones and t.scales is not None
+                 and t.translations is None and t.rotations is None]
+        assert not stray, f'visibility leaked into animation tracks: {stray}'
+
+    def test_bool_keys_are_step_not_lerped(self):
+        # every sample must be exactly shown or hidden, never in between
+        clip = self._clip()
+        for bone, v in clip.vis_tracks:
+            assert set(np.unique(v)).issubset({0.0, 1.0}), bone
+
+
+@needs_ghost
+class TestTrackMerge:
+    """A bone driven by BOTH a transform and a vis controller must keep both
+    channels -- the old dict comprehension kept only the last one, which
+    dropped the visibility scale on exactly the two ectoplasm bones."""
+
+    def test_duplicate_bone_tracks_merge_not_overwrite(self):
+        from asset_convert.hkx_anim import (clip_to_animation_data,
+                                            reference_pose_from_bones)
+        from asset_convert.hkx_skeleton import load_skeleton_bones
+
+        skel = os.path.join(REPO, 'output', 'Oblivion.esm', 'meshes',
+                            'actors', 'tes4', 'oblivion', 'ghost',
+                            'character assets', 'skeleton.nif')
+        if not os.path.exists(skel):
+            pytest.skip('converted ghost skeleton missing')
+
+        from asset_convert.kf_decode import BoneTrack
+
+        bones = load_skeleton_bones(skel)
+        order = [b.name for b in bones]
+        clip = decode_kf(GHOST_DEATH)[0]
+
+        # Build the duplicate directly: one sequence CAN drive a node from
+        # several controlled blocks with disjoint channels, and the old dict
+        # comprehension kept only the last, silently dropping the other.
+        bone = 'Bip01 Pelvis'
+        base = next(t for t in clip.tracks if t.bone == bone)
+        n = len(clip.times)
+        clip.tracks.append(BoneTrack(bone=bone, translations=None,
+                                     rotations=None,
+                                     scales=np.linspace(1.0, 0.25, n)))
+
+        anim = clip_to_animation_data(clip, order,
+                                      reference_pose_from_bones(bones))
+        idx = {n2: i for i, n2 in enumerate(order)}
+        td = anim.tracks[idx[bone]]
+        s = np.array([v[0] for v in td.scales])
+        # the appended SCALE survived...
+        assert abs(s[-1] - 0.25) < 1e-6, s[-1]
+        # ...and so did the original TRANSLATION channel
+        assert base.translations is not None
+        t0 = np.array(td.translations[0])
+        assert np.allclose(t0, base.translations[0], atol=1e-4), t0
+
+    def test_merge_does_not_mutate_the_source_clip(self):
+        # a clip can be written more than once (cast splits reuse one decode)
+        from asset_convert.hkx_anim import (clip_to_animation_data,
+                                            reference_pose_from_bones)
+        from asset_convert.hkx_skeleton import load_skeleton_bones
+
+        skel = os.path.join(REPO, 'output', 'Oblivion.esm', 'meshes',
+                            'actors', 'tes4', 'oblivion', 'ghost',
+                            'character assets', 'skeleton.nif')
+        if not os.path.exists(skel):
+            pytest.skip('converted ghost skeleton missing')
+        bones = load_skeleton_bones(skel)
+        clip = decode_kf(GHOST_DEATH)[0]
+        before = [(t.bone, t.translations is None, t.rotations is None,
+                   t.scales is None) for t in clip.tracks]
+        clip_to_animation_data(clip, [b.name for b in bones],
+                               reference_pose_from_bones(bones))
+        after = [(t.bone, t.translations is None, t.rotations is None,
+                  t.scales is None) for t in clip.tracks]
+        assert before == after
+
+# ---------------------------------------------------------------------------
+# Ghost dissolve: authored detection + the two-script VMAD
+# (docs/creature_conversion.md "Ghosts hover on death")
+# ---------------------------------------------------------------------------
+
+class TestDissolveDetection:
+    """The trigger is the AUTHORED animation -- a death clip that HIDES the
+    actor's own skin holder instead of dropping the body -- never a name."""
+
+    def _detect(self, path):
+        from asset_convert.hkx_behavior import detect_dissolve
+        clip = decode_kf(path)[0]
+        return detect_dissolve({'death': (clip, None)})
+
+    @needs_ghost
+    def test_ghost_death_is_a_dissolve(self):
+        got = self._detect(GHOST_DEATH)
+        assert got['dissolves'] is True
+        assert got['duration'] > 1.0
+
+    @needs_ghost
+    def test_duration_is_the_clip_length(self):
+        clip = decode_kf(GHOST_DEATH)[0]
+        got = self._detect(GHOST_DEATH)
+        assert abs(got['duration'] - clip.duration) < 1e-6
+
+    def test_wraith_death_is_a_dissolve(self):
+        p = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                         'creatures', 'wraith', 'death.kf')
+        if not os.path.exists(p):
+            pytest.skip('wraith assets missing')
+        assert self._detect(p)['dissolves'] is True
+
+    def test_ordinary_creature_is_not_a_dissolve(self):
+        # willothewisp is the trap: it HAS a 'Bip01 ContainerGoo01' node and
+        # visibility channels, but never hides its body -- so it must not be
+        # mistaken for a dissolving creature.
+        p = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                         'creatures', 'willothewisp', 'death.kf')
+        if not os.path.exists(p):
+            pytest.skip('willothewisp assets missing')
+        assert self._detect(p)['dissolves'] is False
+
+    def test_missing_death_clip_is_not_a_dissolve(self):
+        from asset_convert.hkx_behavior import detect_dissolve
+        assert detect_dissolve({})['dissolves'] is False
+        assert detect_dissolve(None)['dissolves'] is False
+
+
+class TestVmadAppend:
+    """A dissolving creature that ALSO has a converted TES4 script must carry
+    both -- build_vmad_object_script writes a fixed '1 attached script'."""
+
+    def _parse(self, data):
+        import struct
+        _v, _f, count = struct.unpack_from('<HHH', data, 0)
+        off = 6
+        out = []
+        for _ in range(count):
+            ln = struct.unpack_from('<H', data, off)[0]
+            off += 2
+            name = data[off:off + ln].decode()
+            off += ln + 1
+            nprops = struct.unpack_from('<H', data, off)[0]
+            off += 2
+            props = {}
+            for _p in range(nprops):
+                pl = struct.unpack_from('<H', data, off)[0]
+                off += 2
+                pn = data[off:off + pl].decode()
+                off += pl
+                ptype = data[off]
+                off += 2
+                if ptype == 1:
+                    props[pn] = struct.unpack_from('<HhI', data, off)[2]
+                    off += 8
+                elif ptype == 4:
+                    props[pn] = struct.unpack_from('<f', data, off)[0]
+                    off += 4
+                elif ptype == 3:
+                    props[pn] = struct.unpack_from('<i', data, off)[0]
+                    off += 4
+            out.append((name, props))
+        return out, off
+
+    def test_append_to_existing_keeps_both(self):
+        from script_convert.pipeline import (build_vmad_object_script,
+                                             append_vmad_object_script)
+        first = build_vmad_object_script('TES4_Existing', {'X': 0x00012345})
+        both = append_vmad_object_script(
+            first, 'TES4_GhostDissolve',
+            object_props={'AshPile': 0x00101048},
+            value_props={'DeathAnimSeconds': ('float', 1.25)})
+        scripts, consumed = self._parse(both)
+        assert [n for n, _ in scripts] == ['TES4_Existing',
+                                           'TES4_GhostDissolve']
+        assert scripts[0][1]['X'] == 0x00012345
+        assert scripts[1][1]['AshPile'] == 0x00101048
+        assert abs(scripts[1][1]['DeathAnimSeconds'] - 1.25) < 1e-6
+        # every byte accounted for -- a short read here means a corrupt VMAD
+        assert consumed == len(both)
+
+    def test_append_to_empty_builds_one(self):
+        from script_convert.pipeline import append_vmad_object_script
+        only = append_vmad_object_script(
+            b'', 'TES4_GhostDissolve',
+            object_props={'AshPile': 0x00101048})
+        scripts, consumed = self._parse(only)
+        assert [n for n, _ in scripts] == ['TES4_GhostDissolve']
+        assert consumed == len(only)
+
+
+class TestDeathPileExtraction:
+    """The pile a ghost leaves is AUTHORED geometry inside its own skeleton,
+    not Skyrim's DefaultAshPileGhost (docs/creature_conversion.md
+    "THE PILE IS OBLIVION'S OWN")."""
+
+    def _extract(self, folder, tmp_path):
+        import numpy as np
+        from asset_convert.nif_converter import extract_death_pile
+        from asset_convert.hkx_behavior import detect_dissolve
+        from pyffi.formats.nif import NifFormat
+
+        skel = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                            'creatures', folder, 'skeleton.nif')
+        kf = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                          'creatures', folder, 'death.kf')
+        if not (os.path.exists(skel) and os.path.exists(kf)):
+            pytest.skip(f'{folder} assets missing')
+        info = detect_dissolve({'death': (decode_kf(kf)[0], None)})
+        dst = str(tmp_path / f'{folder}pile.nif')
+        ok = extract_death_pile(skel, dst,
+                                reveal_holders=info['reveals'],
+                                holder_offsets=info['offsets'])
+        if not ok:
+            return None
+        d = NifFormat.Data()
+        with open(dst, 'rb') as f:
+            d.read(f)
+        out = []
+        for b in d.roots[0].tree():
+            cn = b.__class__.__name__
+            if ('TriShape' in cn or 'TriStrips' in cn) and 'Data' not in cn:
+                v = np.array([[p.x, p.y, p.z] for p in b.data.vertices])
+                wz = v[:, 2] * b.scale + b.translation.z
+                out.append((bytes(b.name).rstrip(b'\x00').decode('latin-1'),
+                            len(v), float(wz.min()), float(wz.max()),
+                            int(b.flags) & 1))
+        return out
+
+    def test_ghost_pile_is_the_authored_ectoplasm(self, tmp_path):
+        got = self._extract('ghost', tmp_path)
+        assert got, 'no pile extracted'
+        names = [g[0] for g in got]
+        assert 'Bip01 ectoplasm:0' in names, names
+
+    def test_pile_rests_on_the_ground(self, tmp_path):
+        # Scene Root is world Z 0; a pile left at body height means the clip's
+        # final holder position was not applied (or was applied twice).
+        for folder in ('ghost', 'wraith'):
+            got = self._extract(folder, tmp_path)
+            if not got:
+                continue
+            _nm, _n, zmin, zmax, _h = got[0]
+            assert -20.0 < zmin < 30.0, f'{folder} pile at Z {zmin}..{zmax}'
+
+    def test_pile_shapes_are_visible(self, tmp_path):
+        # the source hides this geometry until the death clip reveals it
+        for folder in ('ghost', 'wraith'):
+            got = self._extract(folder, tmp_path)
+            for nm, _n, _a, _b, hidden in (got or []):
+                assert hidden == 0, f'{folder}/{nm} still hidden'
+
+    def test_each_shape_extracted_once(self, tmp_path):
+        # pyffi's tree() yields a block once PER REFERENCE and the ghost's
+        # ectoplasm is referenced twice -- an un-deduped loop applies the
+        # placement offset twice and the pile ends up at body height.
+        got = self._extract('ghost', tmp_path)
+        assert got is not None
+        names = [g[0] for g in got]
+        assert len(names) == len(set(names)), names
+
+    def test_no_pile_when_nothing_is_revealed(self, tmp_path):
+        from asset_convert.nif_converter import extract_death_pile
+        skel = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                            'creatures', 'ghost', 'skeleton.nif')
+        if not os.path.exists(skel):
+            pytest.skip('ghost assets missing')
+        dst = str(tmp_path / 'none.nif')
+        assert extract_death_pile(skel, dst, reveal_holders=()) is False
+        assert not os.path.exists(dst)
+
+
+class TestParticleColour:
+    """A converted particle system must keep its AUTHORED colour, and its
+    shader tint must stay neutral when the particles carry their own colour
+    (docs/creature_conversion.md -- the ghost's smoke rendered black)."""
+
+    GHOST_SKEL = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                              'creatures', 'ghost', 'skeleton.nif')
+
+    def _convert(self, tmp_path):
+        from asset_convert.nif_converter import convert_nif
+        from pyffi.formats.nif import NifFormat
+        if not os.path.exists(self.GHOST_SKEL):
+            pytest.skip('ghost assets missing')
+        dst = str(tmp_path / 'skeleton.nif')
+        convert_nif(self.GHOST_SKEL, dst, creature=True)
+        d = NifFormat.Data()
+        with open(dst, 'rb') as f:
+            d.read(f)
+        return d
+
+    def test_authored_colour_survives(self, tmp_path):
+        # source NiColorData starts at a pale green (0.70, 0.83, 0.75); the
+        # converter used to overwrite every system with a fire palette
+        d = self._convert(tmp_path)
+        checked = 0
+        for b in d.roots[0].tree():
+            if b.__class__.__name__ != 'NiParticleSystem':
+                continue
+            for m in b.modifiers:
+                if m is None or m.__class__.__name__ != \
+                        'BSPSysSimpleColorModifier':
+                    continue
+                c = m.colors[0]
+                assert c.g >= c.r and c.g >= c.b, (c.r, c.g, c.b)
+                assert abs(c.g - 0.83) < 0.05, c.g
+                checked += 1
+            if checked:
+                break
+        assert checked, 'no colour modifier found'
+
+    def test_shader_tint_is_neutral_when_particles_are_coloured(self,
+                                                                tmp_path):
+        # BSEffectShaderProperty.emissive_color MULTIPLIES the texture, so the
+        # source's near-black (0.04) NiMaterialProperty made the smoke black
+        d = self._convert(tmp_path)
+        checked = 0
+        for b in d.roots[0].tree():
+            if b.__class__.__name__ != 'NiParticleSystem':
+                continue
+            for p in getattr(b, 'bs_properties', []):
+                if p is None or p.__class__.__name__ != \
+                        'BSEffectShaderProperty':
+                    continue
+                ec = p.emissive_color
+                assert min(ec.r, ec.g, ec.b) > 0.5, (ec.r, ec.g, ec.b)
+                checked += 1
+            if checked:
+                break
+        assert checked, 'no effect shader found'
+
+
+class TestPileCollision:
+    """The pile has to be clickable: it needs vanilla's ash-pile PHANTOM.
+
+    A fixed bhkRigidBodyT on layer 15 shipped first with the box measured
+    correct on the pile geometry, and the pile was still unselectable in
+    game (2026-08-26) — the crosshair pick only sees the phantom.  Every
+    vanilla ash pile is Box01 -> bhkSPCollisionObject ->
+    bhkSimpleShapePhantom(layer 15) -> bhkTransformShape -> bhkBoxShape."""
+
+    def _pile(self, folder, tmp_path):
+        from asset_convert.nif_converter import (extract_death_pile,
+                                                 convert_nif)
+        from asset_convert.hkx_behavior import detect_dissolve
+        from pyffi.formats.nif import NifFormat
+        skel = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                            'creatures', folder, 'skeleton.nif')
+        kf = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                          'creatures', folder, 'death.kf')
+        if not (os.path.exists(skel) and os.path.exists(kf)):
+            pytest.skip(f'{folder} assets missing')
+        info = detect_dissolve({'death': (decode_kf(kf)[0], None)})
+        raw = str(tmp_path / 'raw.nif')
+        out = str(tmp_path / 'pile.nif')
+        if not extract_death_pile(skel, raw, reveal_holders=info['reveals'],
+                                  holder_offsets=info['offsets']):
+            return None
+        convert_nif(raw, out, creature=True)
+        if not os.path.exists(out):
+            return None
+        d = NifFormat.Data()
+        with open(out, 'rb') as f:
+            d.read(f)
+        return d
+
+    def test_pile_has_collision(self, tmp_path):
+        d = self._pile('ghost', tmp_path)
+        assert d is not None
+        names = {b.__class__.__name__ for b in d.blocks}
+        assert any(n.startswith('bhk') for n in names), sorted(names)
+
+    def test_pile_collision_is_the_vanilla_phantom(self, tmp_path):
+        d = self._pile('ghost', tmp_path)
+        assert d is not None
+        names = [b.__class__.__name__ for b in d.blocks]
+        # a rigid body is exactly what did NOT work in game
+        assert 'bhkRigidBody' not in names and 'bhkRigidBodyT' not in names
+        phantoms = [b for b in d.blocks
+                    if b.__class__.__name__ == 'bhkSimpleShapePhantom']
+        assert phantoms, names
+        ph = phantoms[0]
+        assert int(ph.havok_col_filter.layer) == 15, ph.havok_col_filter.layer
+        xf = ph.shape
+        assert xf.__class__.__name__ == 'bhkTransformShape', xf
+        box = xf.shape
+        assert box.__class__.__name__ == 'bhkBoxShape', box
+        # box covers the full pile: the ghost geometry is ~21x21x3.5 game
+        # units, so half-extents in Skyrim havok units (x69.99) are ~0.15
+        # in X/Y with the 8-unit Z floor (~0.114)
+        assert 0.10 < float(box.dimensions.x) < 0.25, box.dimensions.x
+        assert 0.10 < float(box.dimensions.y) < 0.25, box.dimensions.y
+        assert 0.08 < float(box.dimensions.z) < 0.25, box.dimensions.z
+        # ...and the transform shape centres it on the geometry (z ~10 gu)
+        assert 0.05 < float(xf.transform.m_34) < 0.30, xf.transform.m_34
+        spco = [b for b in d.blocks
+                if b.__class__.__name__ == 'bhkSPCollisionObject']
+        assert spco and int(spco[0].flags) == 129
+
+    def test_pile_declares_havok_in_bsx(self, tmp_path):
+        d = self._pile('ghost', tmp_path)
+        assert d is not None
+        bsx = [b for b in d.blocks if b.__class__.__name__ == 'BSXFlags']
+        assert bsx, 'no BSXFlags'
+        assert int(bsx[0].integer_data) & 2, bsx[0].integer_data
+
+
+# ---------------------------------------------------------------------------
+# Swim-prefixed equip clips, the water-native promotion, and pinning a
+# caster with bAnimationDriven so it stops sliding
+# ---------------------------------------------------------------------------
+
+FISH_DIR = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                        'creatures', 'slaughterfish')
+needs_fish = pytest.mark.skipif(
+    not os.path.exists(os.path.join(
+        FISH_DIR, 'swimhandtohandattackequip.kf')),
+    reason='Oblivion slaughterfish export assets missing')
+
+
+@needs_fish
+class TestSwimEquipClips:
+    """A water creature spells its whole clip set with a `swim` prefix.
+
+    The slaughterfish was the ONLY creature in a 235-folder census with no
+    equip stance at all: EQUIP_STANCES listed no swim spellings, so the equip
+    claim missed and the attack sweep stole the clips on its bare
+    `'attack' in name` test -- filing Equip and Unequip as two of its five
+    attacks.  Their own NiControllerSequence names are literally 'Equip' and
+    'Unequip', which is the authored proof they are not attacks.
+    """
+
+    def _clips(self):
+        from asset_convert.hkx_behavior import classify_clips
+        return classify_clips(FISH_DIR)
+
+    def test_equip_stance_is_claimed(self):
+        eq = self._clips()['equip']
+        assert 'H2H' in eq, eq
+        equip, unequip = eq['H2H']
+        assert os.path.basename(equip) == 'swimhandtohandattackequip.kf'
+        assert os.path.basename(unequip) == 'swimhandtohandattackunequip.kf'
+
+    def test_equip_clips_are_not_attacks(self):
+        atks = [os.path.basename(a) for a in self._clips()['attacks']]
+        assert not [a for a in atks if 'equip' in a], atks
+
+    def test_only_the_real_attacks_remain(self):
+        atks = sorted(os.path.basename(a) for a in self._clips()['attacks'])
+        assert atks == ['swimhandtohandattackleftpower.kf',
+                        'swimhandtohandattackpower.kf',
+                        'swimhandtohandattackrightpower.kf'], atks
+
+    def test_sequence_names_confirm_the_classification(self):
+        # the authored indicator: the clips say what they are
+        for stem, seq in (('swimhandtohandattackequip', 'Equip'),
+                          ('swimhandtohandattackunequip', 'Unequip')):
+            c = decode_kf(os.path.join(FISH_DIR, stem + '.kf'))
+            c = c[0] if isinstance(c, list) else c
+            assert c.name == seq, (stem, c.name)
+
+
+class TestCastPin:
+    """A caster must be PINNED while the full-body cast plays.
+
+    An Oblivion cast .kf has no root motion, so with the AI still commanding
+    ground velocity the actor slides on planted feet (scamp, in game
+    2026-08-26).  The pin is bAnimationDriven held over the FireForget
+    chain — vanilla chaurusbehavior verbatim (Casting_SpitAttack_MG wraps
+    its cast clip in bAnimationDriven_IsActive, pointer-traced).
+
+    An all-zero `Rooted` MOVT switched by `iState = cond((IsCasting==1),..)`
+    at the root was tried first and BROKE casting entirely in game — these
+    tests also pin its removal.
+    """
+
+    def _cast_bindings(self, xml):
+        # variable indices as the emitted graph numbers them
+        import re
+        from asset_convert.hkx_behavior import (ENGINE_VARIABLES,
+                                                MAGIC_VARIABLES)
+        names = [n for n, _t, _iv in ENGINE_VARIABLES]
+        names += [n for n, _t, _iv in MAGIC_VARIABLES]   # scamp: no block/swim
+        binding = ('memberPath">bIsActive{slot}</hkparam>\\s*'
+                   '<hkparam name="variableIndex">{idx}<')
+        return {
+            'IsCasting': re.search(binding.format(
+                slot=0, idx=names.index('IsCasting')), xml) is not None,
+            'bAnimationDriven': re.search(binding.format(
+                slot=1, idx=names.index('bAnimationDriven')), xml)
+            is not None,
+        }
+
+    @needs_scamp
+    def test_cast_chain_holds_banimationdriven(self):
+        from asset_convert.hkx_behavior import (build_behavior_xml,
+                                                classify_clips,
+                                                movement_type_names)
+        clips = classify_clips(SCAMP_DIR)
+        xml = build_behavior_xml('tes4oblivion_scampbehavior', clips,
+                                 movement_types=movement_type_names('scamp'))
+        got = self._cast_bindings(xml)
+        assert got['IsCasting'], 'IsCasting binding missing from cast chain'
+        assert got['bAnimationDriven'], \
+            'bAnimationDriven binding missing from cast chain'
+
+    @needs_scamp
+    def test_cast_chain_allows_rotation(self):
+        # pinned caster must still turn to face (falmer ranged guard)
+        import re
+        from asset_convert.hkx_behavior import (build_behavior_xml,
+                                                classify_clips,
+                                                movement_type_names,
+                                                ENGINE_VARIABLES)
+        clips = classify_clips(SCAMP_DIR)
+        xml = build_behavior_xml('tes4oblivion_scampbehavior', clips,
+                                 movement_types=movement_type_names('scamp'))
+        names = [n for n, _t, _iv in ENGINE_VARIABLES]
+        pat = ('memberPath">bIsActive2</hkparam>\\s*'
+               f'<hkparam name="variableIndex">{names.index("bAllowRotation")}<')
+        assert re.search(pat, xml), 'bAllowRotation binding missing'
+
+    @needs_scamp
+    def test_begincast_is_level_triggered(self):
+        # BeginCastLeft -> LeftHandSpellCastHandler is idempotent (acts only
+        # in caster state 1); an edge-triggered expression parked a live
+        # scamp in state 1 for minutes with the condition already true
+        from asset_convert.hkx_behavior import (build_behavior_xml,
+                                                classify_clips,
+                                                movement_type_names)
+        clips = classify_clips(SCAMP_DIR)
+        xml = build_behavior_xml('tes4oblivion_scampbehavior', clips,
+                                 movement_types=movement_type_names('scamp'))
+        i = xml.index('BeginCastLeft if (bWantCastLeft')
+        blk = xml[i:i + 400]
+        assert 'EVENT_MODE_SEND_ON_TRUE' in blk, blk
+        assert 'SEND_ON_FALSE_TO_TRUE' not in blk
+
+    @needs_scamp
+    def test_rooted_movt_stays_dead(self):
+        from asset_convert.hkx_behavior import (build_behavior_xml,
+                                                classify_clips,
+                                                movement_type_names)
+        mts = movement_type_names('scamp')
+        assert mts == ['TES4scampDefault', 'TES4scampRun'], mts
+        clips = classify_clips(SCAMP_DIR)
+        xml = build_behavior_xml('tes4oblivion_scampbehavior', clips,
+                                 movement_types=mts)
+        assert 'Rooted' not in xml
+        assert 'cond((IsCasting' not in xml
+
+
+@needs_scamp
+class TestDirectionBlend:
+    """Strafing is a Direction blend, never an event-entered state.
+
+    No vanilla graph has a moveLeft/moveRight event; the engine writes the
+    `Direction` variable and vanilla (slaughterfish/chaurus DirectionalBlend,
+    flags 48 PARAMETRIC|CYCLIC) blends the gait clips on it.  As states the
+    strafe clips never played and the scamp slid sideways on the forward
+    clip (in game 2026-08-26).
+    """
+
+    def _xml(self):
+        from asset_convert.hkx_behavior import (build_behavior_xml,
+                                                classify_clips,
+                                                movement_type_names)
+        clips = classify_clips(SCAMP_DIR)
+        assert 'StrafeLeft' in clips['locomotion']
+        assert 'StrafeRight' in clips['locomotion']
+        # the scamp's measured root-motion speeds (creature_projects.json)
+        speeds = {'walk': 92.8, 'run': 336.4, 'back': 99.0,
+                  'left': 31.8, 'right': 32.1}
+        return build_behavior_xml('tes4oblivion_scampbehavior', clips,
+                                  movement_types=movement_type_names('scamp'),
+                                  speeds=speeds)
+
+    def test_no_strafe_states_or_events(self):
+        xml = self._xml()
+        assert 'StrafeLeftLocomotionState' not in xml
+        assert 'moveLeft' not in xml and 'moveRight' not in xml
+
+    def test_direction_blend_anchors(self):
+        import re
+        from asset_convert.hkx_behavior import ENGINE_VARIABLES
+        xml = self._xml()
+        # one direction blend per gait family (scamp has walk + run)
+        for fam in ('Walk', 'Run'):
+            assert f'{fam}DirectionalBlend' in xml, fam
+            i = xml.index(f'<hkparam name="name">{fam}DirectionalBlend'
+                          '</hkparam>')
+            blk = xml[i:i + 1200]
+            # flags 49 = SYNC|PARAMETRIC|CYCLIC (chaurus/draugr verbatim)
+            assert '<hkparam name="flags">49</hkparam>' in blk, blk
+        # every strafe child is a SPEED blend (slow creep + natural rate)
+        for nm in ('WalkStrafeRightBlend', 'WalkStrafeLeftBlend',
+                   'WalkBackwardDirBlend', 'RunStrafeRightBlend'):
+            assert f'<hkparam name="name">{nm}</hkparam>' in xml, nm
+        assert 'MoveBackwardDir' not in xml.replace('BackwardDirBlend', '')\
+            .replace('BackwardDirSlow', '').replace('BackwardDir<', '<')
+        names = [n for n, _t, _iv in ENGINE_VARIABLES]
+        assert re.search('memberPath">blendParameter</hkparam>\\s*'
+                         f'<hkparam name="variableIndex">'
+                         f'{names.index("Direction")}<', xml)
+        # the fish's anchors: right 0.25, back 0.5, left 0.75
+        for w in ('0.250000', '0.500000', '0.750000'):
+            assert f'<hkparam name="weight">{w}</hkparam>' in xml, w
+
+
+@needs_fish
+class TestWaterNativePromotion:
+    """A creature whose only gait is swimming gets the vanilla slaughterfish
+    structure: the swim set IS the base locomotion, no SwimState sibling.
+
+    Bolted onto a land graph as a SwimState, the fish parked there forever
+    (the engine sends swimStart at spawn) while the attack transitions —
+    local to DefaultState — were unreachable: it chased and never attacked
+    (in game 2026-08-26).
+    """
+
+    def _clips(self):
+        from asset_convert.hkx_behavior import classify_clips
+        return classify_clips(FISH_DIR)
+
+    def test_swim_clips_are_the_base_locomotion(self):
+        c = self._clips()
+        loco = {st: os.path.basename(p) for st, p in c['locomotion'].items()}
+        assert loco['MoveForward'] == 'swimforward.kf', loco
+        assert loco['TurnLeft'] == 'swimturnleft.kf', loco
+        assert loco['TurnRight'] == 'swimturnright.kf', loco
+        assert os.path.basename(c['run']) == 'swimfastforward.kf'
+        assert os.path.basename(c['idle']) == 'swimidle.kf'
+        assert os.path.basename(c['combat_idle']) == 'swimhandtohandidle.kf'
+        assert c['swim'] == {}, c['swim']
+
+    def test_amphibians_keep_the_split(self):
+        # the mudcrab walks AND swims -- it must keep the land graph
+        from asset_convert.hkx_behavior import classify_clips
+        crab = os.path.join(os.path.dirname(FISH_DIR), 'mudcrab')
+        if not os.path.isdir(crab):
+            pytest.skip('mudcrab export assets missing')
+        c = classify_clips(crab)
+        assert c['swim'].get('forward'), 'mudcrab lost its swim set'
+        assert os.path.basename(
+            c['locomotion']['MoveForward']) == 'forward.kf'
+
+    def test_attacks_reachable_from_default_state(self):
+        # the promoted fish keeps DefaultState active (no SwimState), so
+        # the DefaultState-local attackStart transitions can actually fire
+        from asset_convert.hkx_behavior import (build_behavior_xml,
+                                                movement_type_names)
+        c = self._clips()
+        xml = build_behavior_xml('tes4oblivion_slaughterfishbehavior', c,
+                                 movement_types=movement_type_names(
+                                     'slaughterfish'))
+        assert 'SwimState' not in xml
+        assert 'Attack_swimhandtohandattackpowerState' in xml
+
+
+# ---------------------------------------------------------------------------
+# AnimGroup locomotion fallback (the nix hound slide)
+# ---------------------------------------------------------------------------
+
+NIXHOUND_DIR = os.path.join(REPO, 'export', 'Morrowind_ob.esm', 'meshes',
+                            'creatures', 'nixhound')
+ASHSLAVE_DIR = os.path.join(REPO, 'export', 'Morrowind_ob.esm', 'meshes',
+                            'morroblivion', 'creatures', 'sixthhouse',
+                            'ashslave')
+MURK_DIR = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                        'creatures', 'murkdweller')
+
+needs_mw = pytest.mark.skipif(not os.path.isdir(NIXHOUND_DIR),
+                              reason='Morrowind_ob export assets missing')
+
+
+class TestAnimGroupFallback:
+    """A gait clip is bound by its AnimGroup, not its filename.
+
+    Morrowind_ob spells the nix hound's gaits walkforward.kf /
+    walkfastforward.kf, which no stem table matches; every one fell into the
+    dead 'extra' bucket, the graph got no MoveForward state, and the engine
+    translated the actor with the idle pose playing (it slid).
+    """
+
+    def test_read_animgroup_is_the_sequence_name(self):
+        from asset_convert.hkx_behavior import read_animgroup
+        if not os.path.isdir(NIXHOUND_DIR):
+            pytest.skip('Morrowind_ob export assets missing')
+        assert read_animgroup(
+            os.path.join(NIXHOUND_DIR, 'walkforward.kf')) == 'Forward'
+        assert read_animgroup(
+            os.path.join(NIXHOUND_DIR, 'walkfastforward.kf')) == 'FastForward'
+
+    def test_read_animgroup_rejects_non_nif(self):
+        from asset_convert.hkx_behavior import read_animgroup
+        assert read_animgroup(__file__) is None
+        assert read_animgroup(
+            os.path.join(REPO, 'no', 'such', 'file.kf')) is None
+
+    @needs_mw
+    def test_nixhound_gets_a_forward_state(self):
+        from asset_convert.hkx_behavior import classify_clips
+        c = classify_clips(NIXHOUND_DIR)
+        fwd = c['locomotion'].get('MoveForward')
+        assert fwd, 'nix hound has no MoveForward state - it will slide'
+        # the BASE gait wins the single MoveForward slot, not the
+        # weapon-stance variant (handtohandforward.kf declares `Forward` too)
+        assert os.path.basename(fwd) == 'walkforward.kf'
+        assert os.path.basename(c['run'] or '') == 'walkfastforward.kf'
+
+    @needs_mw
+    def test_ash_slave_gets_a_forward_state(self):
+        # same defect, different folder tree (meshes/morroblivion/**)
+        from asset_convert.hkx_behavior import classify_clips
+        if not os.path.isdir(ASHSLAVE_DIR):
+            pytest.skip('Morroblivion sixthhouse assets missing')
+        c = classify_clips(ASHSLAVE_DIR)
+        assert c['locomotion'].get('MoveForward'), 'ash slave will slide'
+
+    def test_land_run_never_takes_a_swim_clip(self):
+        # swimhandtohandfastforward.kf declares AnimGroup 'FastForward' too;
+        # the murkdweller ships a full land set AND a full swim set, so the
+        # land slots must not be filled from swim-prefixed clips.
+        from asset_convert.hkx_behavior import classify_clips
+        if not os.path.isdir(MURK_DIR):
+            pytest.skip('murkdweller export assets missing')
+        c = classify_clips(MURK_DIR)
+        for slot in ('run', 'run_back'):
+            got = c.get(slot)
+            assert not got or not os.path.basename(got).startswith('swim'), (
+                '%s took a swim clip: %s' % (slot, got))
+        for state, path in c['locomotion'].items():
+            assert not os.path.basename(path).startswith('swim'), (
+                '%s took a swim clip: %s' % (state, path))
+        assert c['swim'].get('forward'), 'murkdweller lost its swim set'
+
+    @needs_assets
+    def test_stem_claims_still_win(self):
+        # the fallback is additive only: a folder the stem tables already
+        # cover must classify exactly as before (dog ships forward.kf)
+        from asset_convert.hkx_behavior import classify_clips
+        c = classify_clips(DOG_DIR)
+        assert os.path.basename(
+            c['locomotion']['MoveForward']) == 'forward.kf'

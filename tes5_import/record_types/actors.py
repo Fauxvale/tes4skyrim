@@ -1433,6 +1433,35 @@ def convert_NPC_(rec: dict, writer=None) -> bytes:
     return pack_record('NPC_', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
 
+def _crea_vmad(rec: dict, packed: bytes) -> bytes:
+    """The creature's VMAD subrecord, plus TES4_GhostDissolve when it applies.
+
+    A creature whose AUTHORED death animation dissolves it (ghost, wraith: the
+    death.kf hides `SkinAttachment` via NiVisController rather than dropping
+    the body) carries TES4_GhostDissolve alongside any converted TES4 script.
+    The script reproduces the effect with Skyrim's native ash pile; without it
+    the corpse stands upright in mid-air for ever, because those visibility
+    channels cannot survive into a Havok clip.
+
+    `packed` is a packed VMAD subrecord (or b''), so it is unwrapped, extended
+    and repacked -- build_vmad_object_script writes a fixed "1 attached
+    script" count, which append_vmad_object_script bumps.
+    """
+    from ..creature_races import creature_dissolve_info
+    dissolve = creature_dissolve_info(get_formid(rec, 'FormID'))
+    if dissolve is None:
+        return packed
+
+    from script_convert.pipeline import append_vmad_object_script
+    ash_pile, death_secs = dissolve
+    raw = packed[6:] if packed else b''      # strip 'VMAD' + u16 length
+    raw = append_vmad_object_script(
+        raw, 'TES4_GhostDissolve',
+        object_props={'AshPile': ash_pile},
+        value_props={'DeathAnimSeconds': ('float', death_secs or 1.2)})
+    return pack_subrecord('VMAD', raw)
+
+
 def convert_CREA(rec: dict, writer=None) -> bytes:
     """CREA → NPC_ (creatures become NPCs in TES5).
 
@@ -1447,7 +1476,7 @@ def convert_CREA(rec: dict, writer=None) -> bytes:
     # VMAD — converted TES4 creature script (SCRI), attached to the base so
     # every placed reference gets an instance (mirrors TES4 semantics).
     from ..object_scripts import get_object_vmad
-    subs += get_object_vmad(get_formid(rec, 'FormID'))
+    subs += _crea_vmad(rec, get_object_vmad(get_formid(rec, 'FormID')))
 
     subs += pack_obnd(-12, -12, 0, 12, 12, 60)  # NPC_ default bounds
 

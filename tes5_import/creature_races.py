@@ -101,6 +101,8 @@ def _movt_sped_swim(speeds: dict) -> bytes:
     back = speeds.get('swimback') or swim * 0.8
     return struct.pack('<11f', 0.0, 0.0, 0.0, 0.0, swim, max(fast, swim),
                        back, back, _ROT_WALK, _ROT_RUN, _ROT_RUN)
+
+
 _MTNM_CODES = (b'WALK', b'RUN1', b'SNEK', b'BLDO', b'SWIM')
 _EGT_MALE = 'Actors\\Character\\UpperBodyHumanMale.egt'
 _EGT_FEMALE = 'Actors\\Character\\UpperBodyHumanFemale.egt'
@@ -220,6 +222,169 @@ _CREA_ARMA_FOLDER = {}
 def get_creature_arma_folders() -> dict:
     """{generated body ARMA FormID: creature folder}, for footstep wiring."""
     return _CREA_ARMA_FOLDER
+
+
+# Vanilla Skyrim ACTI DefaultAshPileGhost (Effects\\AshPileGhost01.nif) -- a
+# ghost-tinted pile of goo, which is exactly Oblivion's ectoplasm.  Vanilla
+# also ships DefaultAshPileDarkGhost (0x0010C649) and DefaultAshPileGhostBlack
+# (0x0010D6EF); the plain ghost pile is the right default for both the ghost
+# and the wraith.  Master
+# index 0, written unremapped (same convention as the AACT ids in
+# creature_idles).
+DEFAULT_ASH_PILE_GHOST = 0x00101048
+
+
+# folder -> generated pile ACTI FormID (one per dissolving creature folder)
+_CREA_PILE_ACTI = {}
+
+
+def _pile_mesh_bounds(proj, pile_name):
+    """Integer OBND bounds of an emitted death-pile NIF, or None.
+
+    Read from the shipped mesh rather than assumed: the two piles differ by
+    4x in size, and the activation target the engine builds from OBND has to
+    cover the geometry the player is looking at.
+    """
+    import os
+
+    rel = os.path.join('meshes', proj.get('body_dir', ''), pile_name)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = []
+    out = os.path.join(root, 'output')
+    if os.path.isdir(out):
+        for plugin in sorted(os.listdir(out)):
+            candidates.append(os.path.join(out, plugin, rel))
+    path = next((p for p in candidates if os.path.exists(p)), None)
+    if path is None:
+        return None
+    try:
+        from asset_convert import pyffi_monkey_patch  # noqa: F401
+        from pyffi.formats.nif import NifFormat
+        data = NifFormat.Data()
+        with open(path, 'rb') as f:
+            data.read(f)
+    except Exception:
+        return None
+    lo = [float('inf')] * 3
+    hi = [float('-inf')] * 3
+    seen = set()
+    for r in data.roots:
+        if r is None:
+            continue
+        for blk in r.tree():
+            if not isinstance(blk, NifFormat.NiTriBasedGeom) or \
+                    id(blk) in seen:
+                continue
+            seen.add(id(blk))
+            geom = getattr(blk, 'data', None)
+            verts = getattr(geom, 'vertices', None) if geom else None
+            if not verts:
+                continue
+            s = float(getattr(blk, 'scale', 1.0) or 1.0)
+            t = blk.translation
+            base = (t.x, t.y, t.z)
+            for v in verts:
+                for i, c in enumerate((v.x, v.y, v.z)):
+                    w = c * s + base[i]
+                    if w < lo[i]:
+                        lo[i] = w
+                    if w > hi[i]:
+                        hi[i] = w
+    if lo[0] > hi[0]:
+        return None
+    import math
+    return ([int(math.floor(v)) for v in lo],
+            [int(math.ceil(v)) for v in hi])
+
+
+def build_creature_death_piles(writer) -> int:
+    """One ACTI per dissolving creature, pointing at its EXTRACTED pile mesh.
+
+    The pile an Oblivion ghost leaves is authored geometry inside its own
+    skeleton.nif, which asset_convert lifts into `<folder>deathpile.nif` next
+    to the creature project (see nif_converter.extract_death_pile).  This
+    wraps that mesh in a record `Actor.AttachAshPile` can place -- Oblivion's
+    own ectoplasm rather than Skyrim's DefaultAshPileGhost.
+
+    ACTI, NOT STAT.  A static cannot be activated, so a STAT pile is visible
+    and solid but gives the player no prompt (in-game 2026-08-26: "I still
+    can't activate the ectoplasm on the ground").  Vanilla agrees without
+    exception: all six `DefaultAshPile*` records in Skyrim.esm are ACTI and
+    none is a STAT.  Layout copied from DefaultAshPileGhost (0x00101048):
+    EDID OBND FULL MODL PNAM FNAM, where PNAM is the required marker colour.
+
+    Creatures whose skeleton carries no pile keep the vanilla fallback.
+    """
+    _CREA_PILE_ACTI.clear()
+    for folder in sorted(_PROJECTS):
+        proj = _PROJECTS[folder]
+        if not proj.get('dissolves_on_death'):
+            continue
+        pile = proj.get('death_pile')
+        if not pile:
+            continue
+        fid = writer.derive_formid('CREA_PILE', folder)
+        subs = pack_string_subrecord(
+            'EDID', f'TES4Cr{folder.capitalize()}DeathPile')
+        # OBND is what the engine builds the activation target from, so it
+        # must match the MESH -- a guessed symmetric box put the click
+        # target beside the visible pile (in-game 2026-08-26), and one
+        # fixed size cannot serve both piles anyway (the ghost's is ~21
+        # units across, the wraith's ~92).  The mesh is centred on its own
+        # origin in X/Y by extract_death_pile, so these bounds are
+        # symmetric there and carry the real Z range.
+        bounds = _pile_mesh_bounds(proj, pile)
+        if bounds is None:
+            subs += pack_obnd(-24, -24, -4, 24, 24, 16)
+        else:
+            (x1, y1, z1), (x2, y2, z2) = bounds
+            subs += pack_obnd(x1, y1, z1, x2, y2, z2)
+        # FULL — the crosshair prompt.  An ACTI with no name gets NO
+        # rollover and cannot be activated by the player at all: with the
+        # name missing, both a rigid-body and a phantom collision shipped
+        # "hitbox nonexistent" in game (2026-08-26) while the mesh, OBND and
+        # collision all measured correct.  Vanilla DefaultAshPileGhost is
+        # named; ours is named for what the player sees.
+        subs += pack_string_subrecord('FULL', 'Ectoplasm')
+        subs += pack_string_subrecord(
+            'MODL', f"{proj['body_dir']}\\{pile}")
+        # PNAM — marker colour, required by the engine (xEdit: SetRequired).
+        subs += pack_subrecord('PNAM', b'\x00\x00\x00\x00')
+        # FNAM — U16 flags; 0 = neither "No Displacement" nor "Ignored by
+        # Sandbox", matching DefaultAshPileGhost.
+        subs += pack_subrecord('FNAM', struct.pack('<H', 0))
+        writer.add_record('ACTI', pack_record('ACTI', fid, 0, subs))
+        _CREA_PILE_ACTI[folder] = fid
+    return len(_CREA_PILE_ACTI)
+
+
+def creature_dissolve_info(crea_fid: int):
+    """(ash pile FormID, death-clip seconds) when this CREA dissolves on death.
+
+    None for every ordinary creature.  The trigger is the AUTHORED animation,
+    never a name: asset_convert.hkx_behavior.detect_dissolve marks a project
+    whose death.kf hides the actor's own skin holder (`SkinAttachment`) with a
+    NiVisController instead of dropping the body.  Measured over every creature
+    folder in all three test plugins, that fires on exactly four -- ghost and
+    wraith in Oblivion and Nehrim -- and correctly rejects willothewisp, which
+    has a `Bip01 ContainerGoo01` node but never hides its body.
+
+    Those visibility channels have no destination in a Havok clip (and ghosts
+    have no ragdoll to collapse them either), so without this the corpse stands
+    upright in mid-air for ever.  Skyrim's own mechanism for the same effect is
+    Actor.AttachAshPile -- see script_convert/static_scripts/TES4_GhostDissolve.psc.
+    """
+    folder = _CREA_FOLDER_MAP.get(crea_fid & 0x00FFFFFF)
+    if not folder:
+        return None
+    proj = _PROJECTS.get(folder)
+    if not proj or not proj.get('dissolves_on_death'):
+        return None
+    # This creature's OWN extracted ectoplasm when it has one; vanilla's
+    # ghost pile only as a fallback for a creature whose skeleton carries
+    # no authored pile.
+    pile = _CREA_PILE_ACTI.get(folder) or DEFAULT_ASH_PILE_GHOST
+    return pile, float(proj.get('death_duration') or 0.0)
 
 
 def build_creature_voice_types(writer) -> int:
@@ -957,11 +1122,14 @@ def _load_projects(export_dir: str) -> dict:
     are shared, exactly as the source plugin intended. Own projects win on
     conflict — this plugin's own conversion of a folder is the authoritative
     one for the records it ships."""
+    from .artifact_schema import read_artifact
     own_path = os.path.join(export_dir, 'creature_projects.json')
     own = {}
     if os.path.exists(own_path):
-        with open(own_path, encoding='utf-8') as f:
-            own = json.load(f)
+        # Raises StaleArtifactError (surfaced by convert.py) when this file
+        # predates a field the builders below subscript without a default.
+        own = read_artifact(
+            own_path, os.path.basename(os.path.normpath(export_dir)))
 
     header = os.path.join(export_dir, '_HEADER.txt')
     if not os.path.isfile(header):
@@ -986,11 +1154,13 @@ def _load_projects(export_dir: str) -> dict:
                              'creature_projects.json')
         if not os.path.exists(mpath):
             continue
-        with open(mpath, encoding='utf-8') as f:
-            for folder, proj in json.load(f).items():
-                if folder not in own and folder not in merged:
-                    merged[folder] = proj
-                    inherited += 1
+        # The MASTER's file, so the master is what has to be re-run -- pass it
+        # as the hint or a v0 file (no envelope, no plugin field) would blame
+        # whichever plugin happened to be converting.
+        for folder, proj in read_artifact(mpath, name).items():
+            if folder not in own and folder not in merged:
+                merged[folder] = proj
+                inherited += 1
     if inherited:
         print(f'  Creature projects: inherited {inherited} from master(s) '
               f'{", ".join(names)} (own: {len(own)})')

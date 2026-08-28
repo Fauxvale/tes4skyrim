@@ -314,7 +314,10 @@ real data, or a failing-then-passing test.
   `asset_convert/skyrim_assets.py` (cache in `export/skyrim_assets/`, else
   auto-extracted from the SSE BSAs via registry-detected install).
 - `references/` subfolders (`NIFConverter/`, `xEdit/`, `UESP/`, `nifskope`) are
-  other projects — reference only.
+  other projects — reference only. Note that these are not the ONLY references in that folder. Check before guessing
+- <a id="ck-wiki-offline"></a>**What a Papyrus native DOES: `references/SkyrimCKWiki_210522/skyrim/<Func>_-_<Script>.html`.
+  Grep it before describing one — never invent semantics.** Oblivion:
+  `references/cs_wiki/` (.txt).
 - **LE assets are SSE-compatible.** Never dig through SSE-format assets/BSAs.
   BSA meshes are SSE-format; read them with `asset_convert/sse_nif.py`
   (`read_nif` converts BSTriShape graphs to LE NiTriShape graphs in-memory;
@@ -398,12 +401,14 @@ relevant doc when working in that area.
 | [TES5_Binary_Format.md](docs/TES5_Binary_Format.md) | TES5 binary structure reference |
 | [TES4_Record_Definitions.md](docs/TES4_Record_Definitions.md) | TES4 record structure reference |
 | [xedit_scripting_reference.md](docs/xedit_scripting_reference.md) | xEdit Pascal API + globals (historical — the pipeline is pure Python now; kept for ad-hoc verification scripts) |
+| [in_app_update_plan.md](docs/in_app_update_plan.md) | PLAN (unimplemented): in-app update downloading only changed files via the GitHub compare API (0.8–3.5 MB vs a 45 MB tree; truncates at 300 files). No git needed — zip installs have no `.git`. Dev trees protected by `is_dev_version()`. Optional launch check. `conversion_config.json` is the one tracked file the app writes |
 
 ### Records & data
 | Doc | Covers |
 |---|---|
 | [record_mapping_reference.md](docs/record_mapping_reference.md) | Full TES4→TES5 record type mapping, OBND/structural requirements, skipped/problem records, skill/weapon/biped-slot/enchantment tables, Skyblivion conversion rules |
 | [magic_conversion_plan.md](docs/magic_conversion_plan.md) | SPEL/ENCH/MGEF: dropped effect families, phantom effect codes, archetype mapping, ARTO/PROJ/SEFF |
+| [music_conversion.md](docs/music_conversion.md) | MUSC/MUST built from TES4's `Music\<Category>\` FOLDERS (no TES4 record exists); the masterless-plugin gate, xWMAEncode's fixed bitrate list, StreamMusic revival |
 | [weather_climate_conversion.md](docs/weather_climate_conversion.md) | WTHR/CLMT: the WRLD→CNAM→CLMT→WLST chain, NAM0 slot remap, cloud-speed units, DALC weights |
 
 ### Actors, AI & dialogue

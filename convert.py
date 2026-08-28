@@ -307,7 +307,17 @@ def _mod_commands(args, export_dir: str, tes4_data: str) -> int:
     first = sorted(results)[0]
     quoted = f'"{first}"' if ' ' in first else first
     caps = (results[first] or {}).get('capabilities') or {}
-    _write_base_plugins(export_dir, first, args.base)
+    # The ASSET tree, not the plugin name.  `results` is keyed by plugin,
+    # but a mod's assets land in its GROUP folder (named for the mod's
+    # label), and those differ whenever the archive is not named for the
+    # esp inside -- the normal case.  Writing `.base_plugins` under the
+    # plugin name put it in a directory holding no meshes, so the texture
+    # fallback never saw it and --base silently did nothing for any mod
+    # that ships a plugin.  asset_root_name reads the registry entry the
+    # ingest above just wrote, so it is right on the cached path too.
+    from asset_convert import source_registry as _sr
+    _asset_tree = _sr.asset_root_name(export_dir, first)
+    _write_base_plugins(export_dir, _asset_tree, args.base)
     print()
     if caps.get('plugin', True):
         print("Imported. Convert it with:")
@@ -795,6 +805,7 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
     """Import using the Python tes5_import package."""
     from tes5_import.import_main import import_plugin
     from tes5_import.override_merge import MissingMasterOutputError
+    from tes5_import.artifact_schema import StaleArtifactError
 
     export_subdir = str(record_dir(export_dir, file_name))
     if not os.path.isdir(export_subdir):
@@ -851,7 +862,7 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
             is_esm=is_esm,
             output_root=out_root,
         )
-    except MissingMasterOutputError as e:
+    except (MissingMasterOutputError, StaleArtifactError) as e:
         print(f"[{file_name}] ERROR: {e}")
         return False
 
@@ -879,6 +890,23 @@ def phase_sounds(file_name: str, config: dict, output_dir: str = None):
     failed    = stats.get('failed', 0)
     print(f"[{file_name}] Sounds complete "
           f"({converted} converted to XWM, {copied} copied, {failed} failed)")
+
+    # Music rides the sound phase: same encoders (ffmpeg + xWMAEncode), so a
+    # single --sounds-only rebuilds both.  It writes music_tracks.json, which
+    # the importer reads to build MUST/MUSC, so it must run before --import-only
+    # for the records to name real files.
+    from asset_convert.music_convert import convert_music
+    print(f"[{file_name}] Converting music to xWMA...")
+    mstats = convert_music(
+        source_file=file_name,
+        extract_dir=extract_dir,
+        output_dir=out_dir,
+    )
+    print(f"[{file_name}] Music complete "
+          f"({mstats.get('converted', 0)} converted, "
+          f"{mstats.get('cached', 0)} cached, "
+          f"{mstats.get('failed', 0)} failed, "
+          f"{mstats.get('tracks', 0)} tracks)")
     return True
 
 
@@ -889,6 +917,7 @@ def phase_sounds(file_name: str, config: dict, output_dir: str = None):
 def phase_scripts(file_name: str, config: dict, output_dir: str = None):
     """Convert TES4 scripts to Papyrus .psc source files."""
     from script_convert.pipeline import convert_all_scripts
+    from tes5_import.artifact_schema import StaleArtifactError
 
     export_root = str(SCRIPT_DIR / "export")
     export_subdir = str(record_dir(export_root, file_name))
@@ -901,7 +930,14 @@ def phase_scripts(file_name: str, config: dict, output_dir: str = None):
                   / "scripts" / "source")
 
     print(f"[{file_name}] Converting scripts to Papyrus...")
-    stats = convert_all_scripts(export_subdir, str(script_dir))
+    try:
+        stats = convert_all_scripts(export_subdir, str(script_dir))
+    except StaleArtifactError as e:
+        # Scripts read music_tracks.json to bind StreamMusic properties; a
+        # stale one is actionable, so print the instruction rather than a
+        # traceback (same contract as phase_import).
+        print(f"[{file_name}] ERROR: {e}")
+        return False
     errs = stats['scpt_err'] + stats['info_err'] + stats['qust_err']
     return errs == 0
 

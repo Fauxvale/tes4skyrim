@@ -54,7 +54,7 @@ jobs:
           # the failure the whole check exists to prevent.
           python - "$BASE_SHA" "$HEAD_SHA" <<'PY' >> "$GITHUB_OUTPUT"
           import subprocess, sys
-          from tools import navmesh_cache_hook as h
+          from tools.navmesh import navmesh_cache_hook as h
 
           base, head = sys.argv[1], sys.argv[2]
           changed = subprocess.run(

@@ -36,12 +36,63 @@ def _new_stats() -> dict:
     }
 
 
+def _load_music_cues(output_dir) -> dict:
+    """{source_rel -> MUSC EditorID} for this plugin's converted music.
+
+    Reads the same music_tracks.json the importer builds MUSC from, and derives
+    the EditorID through the SHARED helper, so a StreamMusic property can only
+    ever name a record the importer actually wrote.
+    """
+    from pathlib import Path as _P
+    from tes5_import.artifact_schema import read_artifact, StaleArtifactError
+    from .constants import music_cue_editor_id, music_type_editor_id
+
+    # The manifest sits in the plugin's OUTPUT root; scripts are written to a
+    # subfolder of it, so walk up until it turns up.
+    d = _P(output_dir).resolve()
+    for _ in range(4):
+        cand = d / 'music_tracks.json'
+        if cand.is_file():
+            break
+        d = d.parent
+    else:
+        return {}
+
+    try:
+        data = read_artifact(str(cand))
+    except StaleArtifactError:
+        # Same contract as the importer: a stale manifest is a real failure
+        # with a fix the user can act on, not a missing file.  Silently
+        # returning {} here would strip the MUSC binding off every
+        # StreamMusic property instead.
+        raise
+    except (ValueError, OSError):
+        return {}
+
+    plugin = data.get('plugin') or ''
+    cues = {}
+    for t in data.get('tracks') or []:
+        rel = (t.get('source_rel') or '').lower()
+        if not rel:
+            continue
+        cat = (t.get('category') or '').lower()
+        # Special tracks get a per-cue MUSC (a script names one FILE); every
+        # other category shares its folder's MUSC, which is what a bare
+        # `StreamMusic dungeon` should resolve to.
+        cues[rel] = (music_cue_editor_id(plugin, rel) if cat == 'special'
+                     else music_type_editor_id(plugin, cat))
+        if cat and cat != 'special':
+            cues.setdefault('music/' + cat, music_type_editor_id(plugin, cat))
+    return cues
+
+
 def _script_worker_init(xref, output_dir, info_reveals, service_topics,
                         stage_reveals, say_durations=None,
                         quest_script_vars=None,
                         quest_edid_by_fid=None, topic_unlock_globals=None,
                         message_menus=None, mesh_bounds_cache=None,
-                        chargen_menus=None, say_topics=None):
+                        chargen_menus=None, say_topics=None,
+                        music_cues=None):
     # Windows spawns workers, so module-level caches loaded in the parent do
     # NOT carry over — each worker reloads the mesh-bounds cache or every
     # needs_havok_release() lookup answers 0 and no trap gets its release.
@@ -73,6 +124,11 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
     # spell grants (message_menus.build_chargen_menus; importer authors the
     # MESG records at fixed FormIDs).
     ScriptConverter.chargen_menus = chargen_menus or {}
+    # StreamMusic "<path>" -> the MUSC EditorID the importer authored for that
+    # exact file.  Windows SPAWNS workers, so this has to ride initargs like
+    # say_topics above; a dict built only in the parent leaves every worker with
+    # an empty map and every StreamMusic falls back to the inert marker.
+    ScriptConverter.set_music_cues(music_cues or {})
 
 
 def _script_worker_run(job):
@@ -375,7 +431,8 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
     initargs = (xref, output_dir, info_reveals, service_topics,
                 unlock_plan['stage_reveals'], say_durations,
                 quest_script_vars, quest_edid_by_fid, topic_unlock_globals,
-                message_menus, _bounds_cache, chargen_menus, say_topics)
+                message_menus, _bounds_cache, chargen_menus, say_topics,
+                _load_music_cues(output_dir))
     return {'initargs': initargs, 'scpt_work': scpt_work,
             'info_work': info_work, 'qust_work': qust_work, 'stats': stats}
 
@@ -2033,6 +2090,57 @@ def build_vmad_object_script(script_name: str,
             buf += struct.pack('<i', int(value))
 
     return bytes(buf)
+
+
+def append_vmad_object_script(existing: bytes, script_name: str,
+                              object_props: dict = None,
+                              value_props: dict = None) -> bytes:
+    """Add one more attached script to an already-built object VMAD.
+
+    build_vmad_object_script writes a fixed "attached scripts = 1" count, so a
+    record that needs TWO scripts (a converted TES4 creature SCRI *and* the
+    generated TES4_GhostDissolve) has to have the count bumped and the second
+    script's entry concatenated.  `existing` may be empty, in which case this
+    is just build_vmad_object_script.
+
+    Both scripts then run side by side, which is what Skyrim does natively --
+    a record's VMAD is a list, and each attached script gets its own event
+    handlers.  Layout is otherwise identical (version 5, objectFormat 2), and
+    the entries after the count are a flat sequence, so appending is safe
+    without reparsing the first script's properties.
+    """
+    if not existing:
+        return build_vmad_object_script(script_name, object_props,
+                                        value_props)
+
+    # header is <H version><H objectFormat><H scriptCount>
+    version, obj_format, count = struct.unpack_from('<HHH', existing, 0)
+    body = existing[6:]
+
+    tail = bytearray()
+    tail += _pack_wstring(script_name)
+    tail += struct.pack('<B', 0)                 # flags=0
+    object_props = object_props or {}
+    value_props = value_props or {}
+    tail += struct.pack('<H', len(object_props) + len(value_props))
+    for pname, fid in object_props.items():
+        tail += _pack_wstring(pname)
+        tail += struct.pack('<BB', _VMAD_PROP_OBJECT, 1)
+        tail += struct.pack('<HhI', 0, -1, fid)
+    for pname, (kind, value) in value_props.items():
+        tail += _pack_wstring(pname)
+        if kind == 'float':
+            tail += struct.pack('<BB', _VMAD_PROP_FLOAT, 1)
+            tail += struct.pack('<f', float(value))
+        elif kind == 'bool':
+            tail += struct.pack('<BB', _VMAD_PROP_BOOL, 1)
+            tail += struct.pack('<B', 1 if value else 0)
+        else:
+            tail += struct.pack('<BB', _VMAD_PROP_INT, 1)
+            tail += struct.pack('<i', int(value))
+
+    return (struct.pack('<HHH', version, obj_format, count + 1)
+            + body + bytes(tail))
 
 
 def _pack_wstring(s: str) -> bytes:

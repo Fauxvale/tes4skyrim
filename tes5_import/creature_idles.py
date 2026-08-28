@@ -93,6 +93,13 @@ _LEAVES = [
      '000000740000'),
 ]
 
+# Leaves whose graph event only exists inside the RAGDOLL wrapper states.
+# A ragdoll-less creature (ghost, wraith, spectre) has no such states, so
+# these events reach no transition; vanilla's ragdoll-less witchlight
+# ships `WitchlightRagdollInstant` with NO ENAM and no death IDLE at all,
+# leaving the corpse to the engine.  See build_creature_idles.
+_RAGDOLL_ONLY_LEAVES = {'Knockdown', 'RagdollInstant'}
+
 # IsSwimming == 1 condition, verbatim from vanilla DogSwimStart
 _SWIM_CTDA = bytes.fromhex(
     '000F8B000000803FB900933300000000000000000000000000000000FFFFFFFF')
@@ -273,7 +280,15 @@ def build_creature_idles(writer, folder: str, proj: dict) -> None:
     dnam = proj['behavior_hkx']
     base = f'TES4{folder}'
 
+    # A creature whose skeleton yielded no ragdoll (ghost/wraith/spectre:
+    # hkx_ragdoll extracts nothing) gets no ragdoll wrapper states in its
+    # graph, so the ragdoll events below would fire into nothing.  Vanilla
+    # strips exactly these for the witchlight -- ENAM omitted, so the IDLE
+    # resolves and sends no event.
+    has_ragdoll = bool(proj.get('has_ragdoll'))
     for suffix, event, action, data_hex in _LEAVES:
+        if not has_ragdoll and suffix in _RAGDOLL_ONLY_LEAVES:
+            event = ''
         _idle(writer, f'{base}{suffix}', dnam, event, _ACTIONS[action], 0,
               bytes.fromhex(data_hex))
 
@@ -293,12 +308,29 @@ def build_creature_idles(writer, folder: str, proj: dict) -> None:
     # AddRagdollToWorld — the ONLY raiser) and Ragdoll straight into Fully
     # Ragdoll (fired when the engine already ragdolled the actor);
     # without this tree `kill` leaves the actor idling upright forever.
+    # A RAGDOLL-LESS creature still needs a death IDLE -- it just sends a
+    # different event.  Skyrim's own ragdoll-less-but-animated creature is
+    # the DRAGON PRIEST (it dissolves to a pile like our ghosts), and it
+    # ships DragonPriestDeathWaitRoot (parent ActionDeathWait, no ENAM) ->
+    # DragonPriestDeathWait (ENAM `deathStart`) -- the same AACT slot,
+    # sending the event our generated graph's Death state is entered on,
+    # instead of the DeathAnimation/Ragdoll pair that would fire into
+    # ragdoll wrapper states a ragdoll-less graph does not have.
+    #
+    # The witchlight, which has NO death animation at all, ships no death
+    # IDLE -- that is why it looked like the tree should be dropped
+    # entirely.  Doing so left our ghosts with no death event and their
+    # authored death animation never played.
     droot = _idle(writer, f'{base}DeathWaitRoot', dnam, '',
                   _ACTIONS['ActionDeathWait'], 0, _DEATH_ROOT_DATA)
-    danim = _idle(writer, f'{base}DeathWait', dnam, 'DeathAnimation', droot,
-                  0, _DEATH_ANIM_DATA, ctda=_DEATH_ANIM_CTDAS)
-    _idle(writer, f'{base}DeathWaitRagdoll', dnam, 'Ragdoll', droot, danim,
-          _DEATH_RAGDOLL_DATA)
+    if has_ragdoll:
+        danim = _idle(writer, f'{base}DeathWait', dnam, 'DeathAnimation',
+                      droot, 0, _DEATH_ANIM_DATA, ctda=_DEATH_ANIM_CTDAS)
+        _idle(writer, f'{base}DeathWaitRagdoll', dnam, 'Ragdoll', droot,
+              danim, _DEATH_RAGDOLL_DATA)
+    else:
+        _idle(writer, f'{base}DeathWait', dnam, 'deathStart', droot, 0,
+              _DEATH_ANIM_DATA)
 
     # Spellcasting / blocking action routing (see the helpers above). A
     # creature with both lanes blocks on the LEFT-hand actions and casts on

@@ -550,6 +550,29 @@ def tag_exists(tag: str) -> bool:
                           capture_output=True, cwd=repo_root()).returncode == 0
 
 
+def release_target(tag: str) -> str:
+    """A `target_commitish` GitHub will accept for the release at *tag*.
+
+    MUST be a COMMIT, never the tag name.  tag-on-push.yml creates ANNOTATED
+    tags, so `refs/tags/0.616` resolves to a tag OBJECT; passing the name makes
+    the API reject the whole create with
+    'Release.target_commitish is invalid' (HTTP 422, measured 2026-08-26 --
+    it closed the previous cache release and then failed to create the new
+    one, leaving no open range at all).  `^{commit}` peels the annotation to
+    the commit underneath, which the API accepts.
+
+    Falls back to 'master' when the tag is not present locally -- publishing
+    can run before the tag has been fetched.
+    """
+    if tag_exists(tag):
+        out = subprocess.run(['git', 'rev-parse', '%s^{commit}' % tag],
+                             capture_output=True, text=True, cwd=repo_root())
+        sha = out.stdout.strip()
+        if out.returncode == 0 and sha:
+            return sha
+    return 'master'
+
+
 def cache_release_notes(tag: str) -> str:
     """Body for a cache release: say what it is NOT, and where the code is."""
     return '\n'.join((
@@ -820,7 +843,7 @@ def publish(plugins: list[str], tag: str, out_dir: str,
              '--latest=false', '--prerelease',
              # Point the release at the code tag it belongs to, so the "N
              # commits to master since this release" line reads correctly.
-             '--target', tag if tag_exists(tag) else 'master']
+             '--target', release_target(tag)]
         ).returncode
         if rc != 0:
             print('ERROR: could not create release %s.' % rel_tag)

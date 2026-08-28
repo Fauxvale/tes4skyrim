@@ -99,7 +99,7 @@ def grass_model_dest(model_path):
     return 'landscape\\grass\\tes4_' + base
 
 
-def load_grass_model_paths(export_dir):
+def load_grass_model_paths(export_dir, _seen=None):
     """Return the set of GRAS Model.MODL paths (lowercase, backslash form)
     from an export directory's GRAS.txt.
 
@@ -110,9 +110,14 @@ def load_grass_model_paths(export_dir):
     """
     from . import base_plugins
     paths = set()
+    # `_seen` closes a base CYCLE; comparing against export_dir alone
+    # catches only A->A, and A->B->A recursed until the interpreter died.
+    _seen = set(_seen or ())
+    _seen.add(Path(export_dir).resolve())
     for base in base_plugins.export_dirs(export_dir):
-        if Path(base) != Path(export_dir):
-            paths |= load_grass_model_paths(base)
+        if Path(base).resolve() in _seen:
+            continue
+        paths |= load_grass_model_paths(base, _seen)
     paths |= _own_grass_model_paths(export_dir)
     return paths
 
