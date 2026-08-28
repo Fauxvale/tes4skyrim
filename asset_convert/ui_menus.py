@@ -155,13 +155,10 @@ FOCUS_CONTENT_H = 17
 # Supersampling was the obvious alternative and is the wrong trade: doubling
 # the pixels quadruples the file to fix blur, while sizing the base fixes blur,
 # aspect AND this overlap for a fraction of that.
-# The panel sizes the base is sized to cover. Ten choices measured 762 px tall
-# in game before the MessageText fix and about 707 after, so this is generous
-# headroom rather than a guess -- and `tests/test_ui_convert.py` asserts the
-# invariant holds across it.
-MAX_PANEL_W = 700
-MAX_PANEL_H = 1040
-
+#
+# The sizes below cover a 700x1040 panel. Ten choices measured 762 px tall in
+# game before the MessageText fix and about 707 after, so that is generous
+# headroom rather than a guess.
 CENTER_BASE_W = 472         # -> 560 px base, covers 700 px wide
 CENTER_BASE_H = 712         # -> 800 px base, covers 1072 px tall
 
@@ -592,7 +589,8 @@ def patch_as2_constants(block: bytes, values: dict) -> tuple:
     return bytes(out), applied
 
 
-def force_as2_boolean(block: bytes, name: str, value: bool) -> tuple:
+def force_as2_boolean(block: bytes, name: str, value: bool,
+                      required: bool = True) -> tuple:
     """Rewrite `this.<name> = <register>` into `this.<name> = <value>`.
 
     Used to pin `IsVertical`. Skyrim stacks a message box's choices only when
@@ -605,9 +603,21 @@ def force_as2_boolean(block: bytes, name: str, value: bool) -> tuple:
 
     A register push and a boolean push are both two bytes, so this is an
     in-place edit and the block keeps its length.
+
+    🛑 `required=False` returns `(block, None)` instead of raising when the
+    symbol is absent. This pin is a LAYOUT PREFERENCE, not part of the movie
+    contract: everything else the reskin does -- the frame, the margins, the
+    colors -- is independent of it, and a movie without the symbol still
+    produces a correct Oblivion-styled box that merely lays chargen choices
+    out the way vanilla would. UI replacers recompile these classes and drop
+    the name (measured: a loose modded messagebox.swf passes every export-id
+    guard above and then has no `IsVertical` in its pool), so raising here
+    threw away an otherwise complete conversion over a cosmetic detail.
     """
     pool = _constant_pool(block)
     if name not in pool:
+        if not required:
+            return bytes(block), None
         raise UiConvertError(f'{name!r} is not in the AS2 constant pool')
     want = pool.index(name)
     hits = []
@@ -618,6 +628,8 @@ def force_as2_boolean(block: bytes, name: str, value: bool) -> tuple:
                     and b[0] == _PUSH_REGISTER):
                 hits.append(b)
     if len(hits) != 1:
+        if not required:
+            return bytes(block), None
         raise UiConvertError(
             f'{name!r}: expected exactly one register assignment, '
             f'found {len(hits)}')
@@ -721,14 +733,6 @@ def compose_frame(slices: dict, border: int, supersample: int = 1):
     }.items():
         out.alpha_composite(tile_image(slices[name], w, h), (x, y))
     return out
-
-
-# The eight border slices, in the order build_frame_slices returns them
-# around the center. compose_frame places each one.
-_BORDER_ORDER = ('top_left', 'top', 'top_right',
-                 'left', 'right',
-                 'bottom_left', 'bottom', 'bottom_right')
-
 
 
 def tile_image(image, width, height):
@@ -1188,8 +1192,15 @@ def patch_message_box(movie_bytes: bytes, textures: dict, layout: dict,
                 block, register, old, int(round(derive(constants))))
             report['literals'][f'reg{register}:{old}'] = change
         if force_vertical:
-            block, change = force_as2_boolean(block, 'IsVertical', True)
-            report['is_vertical'] = change
+            # Not required: see force_as2_boolean. A recompiled class (any UI
+            # replacer) can lack the symbol, and that is not a reason to throw
+            # away a conversion whose every other part applied cleanly.
+            block, change = force_as2_boolean(block, 'IsVertical', True,
+                                              required=False)
+            report['is_vertical'] = change if change is not None else (
+                'not pinned: no IsVertical setter in this movie (a recompiled '
+                'MessageBox class) -- the frame is converted; chargen choices '
+                'lay out as this movie already does')
         movie.tags[index] = swf.Tag(swf.TAG_DO_INIT_ACTION,
                                     tag.data[:2] + block, tag.force_long)
         break

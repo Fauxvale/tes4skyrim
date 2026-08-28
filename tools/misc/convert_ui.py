@@ -273,19 +273,46 @@ def _print_messagebox_report(report: dict, old_size: int, new_size: int):
 def _write_preview(path: Path, textures: dict, layout: dict,
                    width: int = 788, height: int = 268):
     """A PNG of the frame at a representative size, for eyeballing the result
-    without launching the game."""
+    without launching the game.
+
+    🛑 Composed by `ui_menus.compose_frame` -- the SAME function that builds
+    the bitmap actually written into the movie -- then 9-sliced to the preview
+    size exactly as the re-cut scaling grid slices it in game: corners at their
+    own size, edges stretched along one axis only, the center along both.
+
+    It must not re-implement the composition. An earlier version resized each
+    slice into its cell, which STRETCHED the edge motifs where compose_frame
+    TILES them (measured: the 1024 px top slice squeezed to 0.68x here against
+    no squeeze in the real output). A preview whose whole job is to show the
+    result without launching the game is worse than none if it renders the
+    border at a different density than the movie does.
+    """
     from PIL import Image
     border = int(round(layout['border']))
-    slices = ui_menus.build_frame_slices(textures, border)
+    frame = ui_menus.compose_frame(
+        dict(ui_menus.build_frame_slices(textures, border)), border,
+        ui_menus.FRAME_SUPERSAMPLE)
+
     inner_w = max(1, width - 2 * border)
     inner_h = max(1, height - 2 * border)
-    cols = ((0, border), (border, inner_w), (border + inner_w, border))
-    rows = ((0, border), (border, inner_h), (border + inner_h, border))
+    src_inner_w = max(1, frame.width - 2 * border)
+    src_inner_h = max(1, frame.height - 2 * border)
+    # (source box, destination box) per 9-slice cell.
+    cols = ((0, border, 0, border),
+            (border, src_inner_w, border, inner_w),
+            (frame.width - border, border, border + inner_w, border))
+    rows = ((0, border, 0, border),
+            (border, src_inner_h, border, inner_h),
+            (frame.height - border, border, border + inner_h, border))
+
     out = Image.new('RGBA', (width, height), (0, 0, 0, 0))
-    for i, (_name, image) in enumerate(slices):
-        x, w = cols[i % 3]
-        y, h = rows[i // 3]
-        out.alpha_composite(image.resize((w, h), Image.LANCZOS), (x, y))
+    for sy, sh, dy, dh in rows:
+        for sx, sw, dx, dw in cols:
+            cell = frame.crop((sx, sy, sx + sw, sy + sh))
+            if (sw, sh) != (dw, dh):
+                cell = cell.resize((dw, dh), Image.LANCZOS)
+            out.alpha_composite(cell, (dx, dy))
+
     backdrop = Image.new('RGBA', out.size, (28, 24, 20, 255))
     backdrop.alpha_composite(out)
     backdrop.convert('RGB').save(path)

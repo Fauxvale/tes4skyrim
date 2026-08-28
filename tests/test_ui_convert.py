@@ -100,6 +100,29 @@ def _action_block(values=(20, 30, 10), extra_literal=60):
     return bytes(block)
 
 
+def _recompiled_action_block(names, values=(20, 30, 10)):
+    """The same initialiser with an ARBITRARY constant pool.
+
+    Models a UI replacer's recompiled class: the margins survive (the reskin
+    still has something to patch) but a name it does not use -- `IsVertical`
+    -- is simply absent from the pool.
+    """
+    pool = bytearray(struct.pack('<H', len(names)))
+    for name in names:
+        pool += name.encode('latin1') + b'\x00'
+    block = bytearray()
+    block.append(0x88)
+    block += struct.pack('<H', len(pool)) + pool
+    for i, value in enumerate(values):
+        payload = (bytes([4, 1]) + bytes([8, i])
+                   + bytes([7]) + struct.pack('<i', value))
+        block.append(0x96)
+        block += struct.pack('<H', len(payload)) + payload
+        block.append(0x4F)                             # SetMember
+    block.append(0)                                    # End
+    return bytes(block)
+
+
 def _edit_text(character_id, alpha):
     """A DefineEditText with HasFont + HasTextColor, as vanilla's are."""
     data = bytearray(struct.pack('<H', character_id))
@@ -535,6 +558,39 @@ def test_unnamed_literal_is_rewritten_by_its_push_shape():
     assert change == (60, 112)
     with pytest.raises(ui_menus.UiConvertError):
         ui_menus.patch_as2_literal(patched, 3, 60, 112)   # no longer present
+
+
+def test_is_vertical_is_pinned_in_place():
+    block = _action_block()
+    patched, change = ui_menus.force_as2_boolean(block, 'IsVertical', True)
+    assert len(patched) == len(block)      # register push and boolean push
+    assert change == ('reg2', True)
+
+
+def test_missing_is_vertical_is_not_fatal_when_optional():
+    """A recompiled MessageBox class (any UI replacer) can lack the symbol.
+
+    Measured on a real modded messagebox.swf: it passes every export-id guard
+    in patch_message_box and then has no `IsVertical` in its constant pool.
+    Raising there threw away a conversion whose frame, margins and colors had
+    all applied -- so the pin is a preference that degrades, not a contract.
+    """
+    names = tuple(n for n in _AS2_NAMES if n != 'IsVertical')
+    block = _recompiled_action_block(names)
+    assert 'IsVertical' not in ui_menus._constant_pool(block)
+
+    with pytest.raises(ui_menus.UiConvertError):
+        ui_menus.force_as2_boolean(block, 'IsVertical', True)
+
+    patched, change = ui_menus.force_as2_boolean(
+        block, 'IsVertical', True, required=False)
+    assert patched == block          # untouched
+    assert change is None
+
+    # The named margins still patch on that same block, which is what makes
+    # skipping the pin worth doing rather than failing the run.
+    _out, applied = ui_menus.patch_as2_constants(block, {'WIDTH_MARGIN': 56})
+    assert applied == {'WIDTH_MARGIN': (20, 56)}
 
 
 # ---------------------------------------------------------------------------
