@@ -99,9 +99,30 @@ def grass_model_dest(model_path):
     return 'landscape\\grass\\tes4_' + base
 
 
-def load_grass_model_paths(export_dir):
+def load_grass_model_paths(export_dir, _seen=None):
     """Return the set of GRAS Model.MODL paths (lowercase, backslash form)
-    from an export directory's GRAS.txt."""
+    from an export directory's GRAS.txt.
+
+    The BASE's records count too.  An asset-only tree -- a retexture stack or
+    an ordered merge -- ships no GRAS record of its own, so on its own evidence
+    the plugin places no grass at all and every grass model silently loses its
+    vanilla shader profile.  See asset_convert/base_plugins.
+    """
+    from . import base_plugins
+    paths = set()
+    # `_seen` closes a base CYCLE; comparing against export_dir alone
+    # catches only A->A, and A->B->A recursed until the interpreter died.
+    _seen = set(_seen or ())
+    _seen.add(Path(export_dir).resolve())
+    for base in base_plugins.export_dirs(export_dir):
+        if Path(base).resolve() in _seen:
+            continue
+        paths |= load_grass_model_paths(base, _seen)
+    paths |= _own_grass_model_paths(export_dir)
+    return paths
+
+
+def _own_grass_model_paths(export_dir):
     gras_txt = Path(export_dir) / 'GRAS.txt'
     paths = set()
     if not gras_txt.exists():

@@ -185,13 +185,17 @@ def load_music_manifest(out_root) -> dict:
     Returns {} when music was never converted, which is the normal state for a
     plugin with masters (music is only ingested for masterless plugins).
     """
-    import json
     from pathlib import Path
+    from ..artifact_schema import read_artifact, StaleArtifactError
     p = Path(out_root) / 'music_tracks.json'
     if not p.is_file():
         return {}
     try:
-        return json.loads(p.read_text(encoding='utf-8'))
+        return read_artifact(str(p))
+    except StaleArtifactError:
+        # Deliberately NOT swallowed by the except below: a stale manifest is
+        # a real failure with a fix the user can act on, not a missing file.
+        raise
     except (ValueError, OSError):
         return {}
 

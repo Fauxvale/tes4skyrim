@@ -398,6 +398,27 @@ def _write_skin_transform(st, M: np.ndarray):
     st.scale = 1.0
 
 
+def local_for_world(W_target: np.ndarray, parent_W: np.ndarray) -> np.ndarray:
+    """Local transform that lands a node on `W_target` under `parent_W`.
+
+    ROW-VECTOR convention throughout this module (see `_m44_to_np`, which puts
+    translation in row 3, and `NiAVObject.get_transform`, which composes the
+    same way): world = local @ parent.  Therefore
+
+        local = W_target @ inv(parent_W)
+
+    and NOT ``inv(parent_W) @ W_target``.  The reversed form was shipped for
+    months without symptoms because the output's bone tree used to be FLAT --
+    every bone a direct child of the skeleton root, which takes the
+    `parent is skel_root` shortcut and never multiplies at all.  Once the tree
+    became nested, every bone below the first level was displaced and the error
+    compounded down each chain (measured on a Nehrim shirt: UpperArm 85.87,
+    Forearm 162.78, Hand 275.97 units).  Guarded by
+    tests/test_skin_retarget.py::TestLocalForWorld.
+    """
+    return W_target @ np.linalg.inv(parent_W)
+
+
 def _get_block_name(block) -> str:
     """Get a NIF block's name as a Python string."""
     return bytes(block.name).rstrip(b'\x00').decode('latin-1', errors='replace')
@@ -1371,7 +1392,7 @@ def _deform_vertices_animation_fk(skinned_geoms, skel_root, bone_deltas):
 def retarget_skin_to_skyrim(data, src_path: str = '', prn_out: set | None = None,
                             allow_wrap: bool = True, weight: int = 0,
                             authored_body_part: int | None = None,
-                            authored_allowed=None) -> int:
+                            authored_allowed=None, race=None) -> int:
     """Retarget skinned armor from Oblivion skeleton to Skyrim skeleton.
 
     Called BEFORE _remap_bone_names() — bones still have Oblivion names.
@@ -1493,7 +1514,7 @@ def retarget_skin_to_skyrim(data, src_path: str = '', prn_out: set | None = None
             if _wrap_field is not None:
                 wrapped = deform_geoms_wrap(skinned_geoms, skel_root,
                                             _wrap_field, female,
-                                            weight=weight)
+                                            weight=weight, race=race)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1543,7 +1564,15 @@ def retarget_skin_to_skyrim(data, src_path: str = '', prn_out: set | None = None
         else:
             try:
                 parent_W = _m44_to_np(parent_node.get_transform(skel_root))
-                new_local = np.linalg.inv(parent_W) @ W_sk
+                # See local_for_world: row-vector order, and why reversing it
+                # stayed invisible until the bone tree became nested.
+                #
+                # _manual_update_bind_position then derives the bind matrices
+                # FROM these node positions, so a wrong position leaves the
+                # file internally consistent and no structural check can see
+                # it.  In game the engine uses the ACTOR's skeleton instead,
+                # and the vertices shoot off as spikes.
+                new_local = local_for_world(W_sk, parent_W)
             except (ValueError, RuntimeError):
                 new_local = W_sk
 

@@ -7,6 +7,8 @@ from ..constants import ENCH_CAST_TYPE_MAP, ENCH_TYPE_MAP, WEAPON_TYPE_MAP, ARMA
 from ..magic_effects import aimed_variant, has_projectile
 from ..skyrim_overrides import (
     ARMA_ADDITIONAL_RACES,
+    ARMA_ADDITIONAL_RACES_NONBEAST,
+    ARMA_BEAST_RACES,
     CLOTHING_FOOTSTEP_SET,
     DEFAULT_ARROW_PROJECTILE,
     HEAVY_ARMOR_FOOTSTEP_SET,
@@ -448,10 +450,29 @@ def convert_ARMO(rec: dict, is_clothing: bool = False, writer=None) -> bytes:
     # neither, so a female-only armature is legal and an empty one never is.
     if writer is not None and (male_model or female_model):
         arma_fid = writer.derive_formid('ARMA', get_formid(rec, 'FormID'))
+        # HEAD GEAR GETS ONE ARMATURE PER RACE FAMILY, as vanilla ships it
+        # (see skyrim_overrides.ARMA_BEAST_RACES).  The converted mesh is
+        # fitted to the shared HUMAN skull, so on a khajiit or argonian the
+        # same geometry sits inside the head; asset_convert writes a
+        # <name>_khajiit / <name>_argonian mesh fitted to that race's own
+        # skull and these ARMAs are what make the engine pick them.
+        # Non-head gear is unaffected: _beast_arma_races returns () and the
+        # single all-races armature below is emitted exactly as before.
+        beast = _beast_arma_races(rec)
         arma_bytes = _build_arma(rec, arma_fid, tes5_biped, armor_type,
-                                 is_shield=is_shield)
+                                 is_shield=is_shield,
+                                 exclude_beast_races=bool(beast))
         writer.add_record('ARMA', arma_bytes)
         subs += pack_formid_subrecord('MODL', arma_fid)
+        for race in beast:
+            # Keyed on (source FormID, race) so the existing human ARMA id
+            # -- derived from the bare source FormID -- never moves.
+            b_fid = writer.derive_formid(
+                'ARMA', (get_formid(rec, 'FormID'), race))
+            writer.add_record('ARMA', _build_arma(
+                rec, b_fid, tes5_biped, armor_type, is_shield=is_shield,
+                beast_race=race))
+            subs += pack_formid_subrecord('MODL', b_fid)
 
     # DATA: Value(4) + Weight(4) = 8 bytes in TES5
     value = get_int(rec, 'DATA.Value')
@@ -465,16 +486,60 @@ def convert_ARMO(rec: dict, is_clothing: bool = False, writer=None) -> bytes:
     return pack_record('ARMO', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
 
+def _beast_arma_races(rec: dict) -> tuple:
+    """The beast races this record needs its own armature for.
+
+    HEAD GEAR ONLY, and decided by the record's AUTHORED BMDT flags -- never by
+    the filename.  TES4 biped bit 0 (Head) and bit 1 (Hair) are the slots a
+    helmet or hood is authored into; a mesh in either rides Skyrim's head bone
+    and is fitted to the skull, which is exactly the geometry that breaks on a
+    beast race.  Body gear is fitted to the BODY and is race-independent, so it
+    keeps its single all-races armature.
+
+    A record must claim ONLY head slots.  A multi-slot suit (Knight of Order:
+    head + torso + legs + hands + feet in one NIF, flags 0x3D) is fitted by
+    where its vertex MASS sits, which is the body -- asset_convert resolves it
+    to a body piece and writes no per-race mesh for it, so emitting a beast
+    ARMA here would point the engine at a file that does not exist and the
+    wearer would render invisible.  Measured on Oblivion.esm: 14 of 484 beast
+    ARMAs pointed at a missing mesh before this gate, all of them that suit.
+
+    Returns () when the record is not head-only gear, which leaves the ARMA
+    output byte-identical to what it was before beast variants existed.
+    """
+    tes4_biped = get_int(rec, 'BMDT.BipedFlags')
+    HEAD_BITS = 0b11                    # bit 0 Head, bit 1 Hair
+    BODY_BITS = 0b111100                # bits 2-5 UpperBody/LowerBody/Hand/Foot
+    if not tes4_biped & HEAD_BITS:
+        return ()
+    if tes4_biped & BODY_BITS:
+        return ()
+    return tuple(ARMA_BEAST_RACES)
+
+
 def _build_arma(rec: dict, arma_fid: int, tes5_biped: int, armor_type: int,
-                is_shield: bool = False) -> bytes:
+                is_shield: bool = False, beast_race=None,
+                exclude_beast_races: bool = False) -> bytes:
     """Build an ARMA (Armor Addon) companion record for an ARMO.
 
     ARMA holds the actual worn mesh models.
     Order: EDID BOD2 RNAM DNAM MOD2 MOD3 [SNDD] MODL[]
+
+    `beast_race` builds the KHAJIIT or ARGONIAN armature instead of the
+    default one: its RNAM is that race, its MODL[] that race's vampire
+    variant, and its meshes are the per-race NIFs asset_convert fitted to
+    that race's own skull.  `exclude_beast_races` drops the beast races
+    from the DEFAULT armature's additional-race list, so the engine cannot
+    satisfy a khajiit with the human-fitted mesh and skip the beast one.
+    Both mirror vanilla -- see skyrim_overrides.ARMA_BEAST_RACES.
     """
     subs = b''
     edid = get_str(rec, 'EditorID', '')
-    subs += pack_string_subrecord('EDID', edid + '_AA')
+    if beast_race:
+        subs += pack_string_subrecord(
+            'EDID', edid + '_' + beast_race.capitalize() + 'AA')
+    else:
+        subs += pack_string_subrecord('EDID', edid + '_AA')
 
     # BOD2 — body coverage flags (may be wider than the ARMO's equipment slot).
     # ARMA declares which body regions the mesh covers, e.g. a cuirass mesh
@@ -500,7 +565,11 @@ def _build_arma(rec: dict, arma_fid: int, tes5_biped: int, armor_type: int,
     subs += pack_subrecord('BOD2', struct.pack('<II', arma_biped, armor_type))
 
     # RNAM — Race (must match parent ARMO)
-    subs += pack_formid_subrecord('RNAM', 0x00000019)
+    if beast_race:
+        subs += pack_formid_subrecord(
+            'RNAM', ARMA_BEAST_RACES[beast_race][0])
+    else:
+        subs += pack_formid_subrecord('RNAM', 0x00000019)
 
     # Weight-slider morphing follows the vanilla convention: ONLY gear
     # covering body/hands/feet uses it (ARMA path <name>_1.nif + slider
@@ -522,7 +591,14 @@ def _build_arma(rec: dict, arma_fid: int, tes5_biped: int, armor_type: int,
 
     def _weighted(path: str) -> str:
         p = _prefix_path(path)
-        if use_slider and p.lower().endswith('.nif'):
+        if not p.lower().endswith('.nif'):
+            return p
+        if beast_race:
+            # The per-race mesh asset_convert fitted to THIS race's skull.
+            # Head gear never sets the weight slider (vanilla helmets ship a
+            # plain path), so the two suffixes can never both apply.
+            return p[:-4] + ARMA_BEAST_RACES[beast_race][2] + '.nif'
+        if use_slider:
             return p[:-4] + '_1.nif'
         return p
 
@@ -541,7 +617,13 @@ def _build_arma(rec: dict, arma_fid: int, tes5_biped: int, armor_type: int,
 
     # MODL[] — Additional Races that can equip this armor addon.
     # Per TES5 record definition: MODL (Additional Races) comes BEFORE SNDD.
-    for race_fid in ARMA_ADDITIONAL_RACES:
+    if beast_race:
+        race_list = ARMA_BEAST_RACES[beast_race][1]
+    elif exclude_beast_races:
+        race_list = ARMA_ADDITIONAL_RACES_NONBEAST
+    else:
+        race_list = ARMA_ADDITIONAL_RACES
+    for race_fid in race_list:
         subs += pack_formid_subrecord('MODL', race_fid)
 
     # SNDD — Footstep sound (boots need footstep set)

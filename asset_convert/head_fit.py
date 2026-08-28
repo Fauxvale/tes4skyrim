@@ -801,6 +801,53 @@ def fit_race_for_hair(edid: str):
     return None
 
 
+# BEAST HEAD GEAR NEEDS ITS OWN MESH (2026-08-27).  Hair is authored per race
+# and so carries its race in the EDID (fit_race_for_hair above), but a HOOD or
+# HELMET is ONE Oblivion record worn by every race — there is no token to read.
+# Fitting that one mesh through the human field is what put converted hoods
+# inside khajiit/argonian skulls: measured head-local, the khajiit SK head
+# reaches z 14.85 and |x| 8.47 against the human head's 11.51 / 6.85, and over
+# the scalp region a hood sits on, beast verts stand a mean 1.91 (khajiit) /
+# 1.40 (argonian) — max 6.87 / 4.29 — proud of the human surface.  A uniform
+# 0.8-unit authored standoff run through the human field lands 0.90 mean /
+# 2.01 max from the real khajiit head (0.95 / 2.89 argonian); through the
+# race's own field it stays 0.48 / 1.08 (0.51 / 0.94).
+#
+# Vanilla Skyrim answers this with a MESH PER RACE FAMILY, not with an
+# alternate model slot on one record: ArmorIronHelmet lists three armatures
+# (IronHelmetAA RNAM=DefaultRace, IronHelmetKhajiitAA RNAM=KhajiitRace,
+# IronHelmetArgonianAA RNAM=ArgonianRace), each naming its own reshaped NIF
+# (Helmet.nif / HelmetKhajiit.nif / HelmetArgonian.nif).  The same split runs
+# through BoneCrown, Blades, Orcish, Dragonscale, Draugr, Dragonplate, Falmer,
+# ThalmorHood and every Circlet.  We mirror it exactly: the converter writes a
+# <name>_khajiit.nif / <name>_argonian.nif beside the base mesh (nif_converter)
+# and the importer emits the matching per-race ARMA (record_types.equipment).
+#
+# Khajiit and Argonian get SEPARATE variants, never one shared "beast" mesh:
+# the two skulls differ from each other as much as either differs from the
+# human one (khajiit ears sit on TOP of the crown, argonian snout runs to
+# y 15.39 against khajiit's 13.63).
+BEAST_RACES = ('khajiit', 'argonian')
+
+
+def beast_variant_suffix(race: str) -> str:
+    """Filename suffix for a beast head-gear variant ('_khajiit')."""
+    return '_' + race
+
+
+def beast_races_available(female: bool) -> tuple:
+    """The beast race packs whose field data is actually built, in order.
+
+    Empty when the fit data is missing entirely — callers then write only the
+    base mesh and emit only the default ARMA, which is the pre-2026-08-27
+    behaviour and never worse than it.
+    """
+    fit = _get(female)
+    if fit is None:
+        return ()
+    return tuple(r for r in BEAST_RACES if r in fit.races)
+
+
 def _load_unskinned(char_dir, rel):
     """(verts_face_local, tris) of an unskinned OB face-part mesh, or None."""
     from .body_wrap import _read_nif, _geom_triangles

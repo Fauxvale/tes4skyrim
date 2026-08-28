@@ -324,11 +324,74 @@ def _write_manifest(plugin_dir, data):
         json.dump(data, fh, indent=2, sort_keys=True)
 
 
-def _place_payload(staged_root, plugin_dir, counts, log):
+def _link_or_copy(src, dst):
+    """Hard-link `src` to `dst`, falling back to a copy across volumes.
+
+    One archive can hold several plugins sharing one asset payload (both TWMP
+    archives do). Linking means a 400 MB mod costs 400 MB, not 400 MB per
+    plugin.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except (OSError, NotImplementedError):
+        shutil.copy2(src, dst)
+
+
+ASSET_DIRS = ('meshes', 'textures', 'sound', 'trees', 'misc')
+
+
+def seed_from_export(export_dir, source_name, target, index=None, log=print):
+    """Lay an EXISTING export tree down as the bottom layer of a merge.
+
+    The base game belongs in the stack, not beside it.  Otherwise its own
+    meshes convert without ever seeing the retextures that will win in game --
+    measured on the author's setup, 3257 of 12437 Nehrim meshes exist in no mod
+    and would have been decided against Nehrim's own textures alone.
+
+    Hard-linked, so seeding a multi-GB base costs no disk and takes seconds.
+    """
+    src_root = Path(export_dir) / source_name
+    dst_root = Path(export_dir) / target
+    if not src_root.is_dir():
+        raise IngestError(f'no such export tree: {src_root}')
+    if src_root.resolve() == dst_root.resolve():
+        raise IngestError(f'{source_name} cannot seed itself')
+
+    placed = 0
+    for cat in ASSET_DIRS:
+        base = src_root / cat
+        if not base.is_dir():
+            continue
+        for dirpath, _dirs, files in os.walk(base):
+            for fn in files:
+                full = Path(dirpath) / fn
+                rel = full.relative_to(src_root).as_posix()
+                _link_or_copy(full, archive.safe_join(dst_root, rel))
+                if index is not None:
+                    index['files'][rel.lower()] = source_name
+                placed += 1
+    if index is not None:
+        index['per_source'][source_name] = placed
+    log(f"  Seeded {placed} files from export/{source_name}")
+    return placed
+
+
+def _place_payload(staged_root, plugin_dir, counts, log, index=None,
+                   source=None):
     """Route every staged file into `plugin_dir` by asset category.
 
     Returns the number of files placed. Loose files overwrite whatever the BSA
     pass put there, which is the engine's own precedence rule.
+
+    `index`, when given, records provenance for an ORDERED import: it maps
+    each output path to the source that last wrote it, so a later source
+    overwriting an earlier one is visible afterwards instead of silent. That
+    report is the whole point of importing a stack in order -- a mod that
+    contributes nothing, or one that unexpectedly overwrites another, is
+    otherwise only discoverable by converting and reading the result.
     """
     placed = 0
     for dirpath, _dirs, files in os.walk(staged_root):
@@ -347,6 +410,12 @@ def _place_payload(staged_root, plugin_dir, counts, log):
             if target.exists():
                 target.unlink()
             shutil.move(str(full), str(target))
+            if index is not None:
+                key = out_rel.lower()
+                prev = index['files'].get(key)
+                index['files'][key] = source
+                if prev is not None and prev != source:
+                    index['overwrites'].append((out_rel, prev, source))
             cat = out_rel.split('/', 1)[0]
             counts[cat] = counts.get(cat, 0) + 1
             placed += 1
@@ -489,13 +558,27 @@ def _resolve_members(requested, man):
     return chosen
 
 
+def new_index():
+    """Provenance record for an ordered import; see `_place_payload`."""
+    return {'files': {}, 'overwrites': [], 'per_source': {}}
+
+
 def ingest(path, export_dir, plugin_members=None, keep_archive=True,
-           force=False, log=print, manifest=None):
+           force=False, log=print, manifest=None, asset_target=None,
+           index=None):
     """Import `path` (archive or folder) into `export_dir`.
 
     `plugin_members`: which plugins to register (default: all found).
     `keep_archive`:   retain a copy of the archive under `_source/` so the
                       import can be re-run after the download is deleted.
+    `asset_target`:   name of the export tree the ASSETS go to, overriding
+                      the per-plugin default.  This is what lets several
+                      sources be imported IN ORDER into one tree, later
+                      ones overwriting earlier -- the same precedence a
+                      mod manager applies, resolved once at import time so
+                      the converter sees a single coherent stack.  Plugins
+                      are unaffected and still register individually.
+    `index`:          a `new_index()` dict to record provenance into.
     Returns a dict of per-plugin results.
     """
     path = Path(path)
@@ -547,8 +630,11 @@ def ingest(path, export_dir, plugin_members=None, keep_archive=True,
     primary = names[0]
     # ONE asset tree per mod, named for the mod. Every plugin in the archive
     # reads from it, so there is nothing to copy or hard-link per plugin.
+    # `asset_target` overrides that so several mods can be merged into one tree
+    # in load order -- plugins are never pooled that way.
     group_name = source_registry._sanitize_folder(man.label) or primary
-    primary_dir = export_dir / group_name
+    asset_name = asset_target or group_name
+    primary_dir = export_dir / asset_name
 
     with tempfile.TemporaryDirectory(prefix='tesconv_ingest_') as staging:
         staged = Path(staging) / 'payload'
@@ -566,12 +652,15 @@ def ingest(path, export_dir, plugin_members=None, keep_archive=True,
             # Into the GROUP folder, the same tree the loose payload lands
             # in -- otherwise loose files could not overwrite BSA content.
             bsa_extract.extract_bsa(bsa_path, str(export_dir), force=True,
-                                    source_name=group_name)
+                                    source_name=asset_name)
             bsa_path.unlink(missing_ok=True)
 
         # 2) Loose payload overlays whatever the BSAs wrote.
-        placed = _place_payload(staged, primary_dir, counts, log)
+        placed = _place_payload(staged, primary_dir, counts, log,
+                                index=index, source=man.label)
         log(f"  Placed {placed} loose files")
+        if index is not None:
+            index['per_source'][man.label] = placed
 
         # 3) The plugin binaries: all into the ONE shared _source/.
         dest_dir = primary_dir / source_registry.SOURCE_SUBDIR

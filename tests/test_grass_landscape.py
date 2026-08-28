@@ -278,3 +278,136 @@ class TestLandscapeNormals:
         path.write_bytes(_make_dxt1_dds(4, 4, 1, [top]))
         assert landscape_normals.fix_normal_specular(path) is True
         assert landscape_normals.fix_normal_specular(path) is False
+
+
+def _make_dds(fourcc, width, height, mip_count, blocks_per_mip):
+    """Minimal DDS around pre-encoded blocks, for DXT3/DXT5 as well as DXT1."""
+    hdr = bytearray(128)
+    hdr[0:4] = b'DDS '
+    struct.pack_into('<I', hdr, 4, 124)
+    struct.pack_into('<I', hdr, 12, height)
+    struct.pack_into('<I', hdr, 16, width)
+    struct.pack_into('<I', hdr, 28, mip_count)
+    struct.pack_into('<I', hdr, 76, 32)
+    struct.pack_into('<I', hdr, 80, 0x4)
+    hdr[84:88] = fourcc
+    return bytes(hdr) + b''.join(b''.join(m) for m in blocks_per_mip)
+
+
+class TestConstantSpecularAlpha:
+    """`set_constant_alpha` gives a maskless normal map a usable one.
+
+    The property that matters is NOT the alpha -- it is that the RGB normal
+    survives untouched.  A wrong specular value is a cosmetic error; a damaged
+    normal map is a broken surface.
+    """
+
+    RED, BLUE = 0xF800, 0x001F
+
+    def _dxt3(self, alpha_nibbles=0xFF):
+        """One DXT3 block: 8 bytes of 4-bit alpha, then the colour block."""
+        return bytes([alpha_nibbles] * 8) + _opaque_block(
+            self.RED, self.BLUE, 0x1B1B1B1B)
+
+    def _dxt5(self, a0, a1):
+        return (bytes([a0, a1]) + b'\x00' * 6
+                + _opaque_block(self.RED, self.BLUE, 0x1B1B1B1B))
+
+    def test_dxt3_becomes_dxt5_with_exact_alpha(self, tmp_path):
+        """DXT3's nibbles cannot hold 64 (multiples of 17), so it must convert.
+
+        This is Nehrim's poster case: 33 sign/poster normals ship as DXT3 with
+        a constant 255 alpha, which Skyrim reads as full specular on flat
+        signage.  The alpha is a format artefact, not authored intent.
+        """
+        path = tmp_path / 'poster_n.dds'
+        path.write_bytes(_make_dds(b'DXT3', 4, 4, 1, [[self._dxt3(0xFF)]]))
+        colour_before = path.read_bytes()[128 + 8:128 + 16]
+
+        assert landscape_normals.set_constant_alpha(path, 64) is True
+        data = path.read_bytes()
+        assert data[84:88] == b'DXT5'
+        assert data[128] == 64 and data[129] == 64
+        assert data[130:136] == b'\x00' * 6, 'alpha indices must select alpha0'
+        assert data[128 + 8:128 + 16] == colour_before, 'RGB was modified'
+        assert len(data) == 128 + 16, 'DXT3 and DXT5 are both 16 bytes/block'
+
+    def test_dxt5_alpha_replaced_colour_kept(self, tmp_path):
+        path = tmp_path / 'flat_n.dds'
+        path.write_bytes(_make_dds(b'DXT5', 4, 4, 1, [[self._dxt5(25, 25)]]))
+        colour_before = path.read_bytes()[128 + 8:128 + 16]
+
+        assert landscape_normals.set_constant_alpha(path, 64) is True
+        data = path.read_bytes()
+        assert data[128] == 64 and data[129] == 64
+        assert data[128 + 8:128 + 16] == colour_before
+
+    def test_mip_chain_is_walked(self, tmp_path):
+        """Every mip must be rewritten, not just the top one.
+
+        A half-converted file still decodes, so a wrong offset would show up
+        only as distant surfaces keeping the old alpha.
+        """
+        path = tmp_path / 'mips_n.dds'
+        path.write_bytes(_make_dds(b'DXT5', 8, 8, 2,
+                                   [[self._dxt5(200, 200)] * 4,
+                                    [self._dxt5(200, 200)]]))
+        assert landscape_normals.set_constant_alpha(path, 64) is True
+        data = path.read_bytes()
+        assert len(data) == 128 + 5 * 16
+        for blk in range(5):
+            off = 128 + blk * 16
+            assert data[off] == 64, f'mip block {blk} kept its old alpha'
+
+    def test_idempotent(self, tmp_path):
+        path = tmp_path / 'twice_n.dds'
+        path.write_bytes(_make_dds(b'DXT5', 4, 4, 1, [[self._dxt5(25, 25)]]))
+        landscape_normals.set_constant_alpha(path, 64)
+        once = path.read_bytes()
+        landscape_normals.set_constant_alpha(path, 64)
+        assert path.read_bytes() == once
+
+    def test_uncompressed_is_refused(self, tmp_path):
+        """Only the block formats are understood; anything else stays put."""
+        hdr = bytearray(128)
+        hdr[0:4] = b'DDS '
+        hdr[84:88] = b'\x00' * 4
+        path = tmp_path / 'raw_n.dds'
+        path.write_bytes(bytes(hdr) + b'\xff' * 64)
+        assert landscape_normals.set_constant_alpha(path, 64) is False
+
+    def test_default_normal_is_flat_and_masked(self, tmp_path):
+        """The shared stand-in must classify as a real DXT5 with our alpha."""
+        from asset_convert import parallax
+        landscape_normals.write_default_normal(tmp_path)
+        dest = tmp_path / 'tes4' / 'default_n.dds'
+        assert dest.is_file()
+        info = parallax.classify_alpha(dest.read_bytes())
+        assert info.fmt == 'dxt5'
+        assert info.mean == pytest.approx(landscape_normals.DEFAULT_MASK_ALPHA)
+
+    def _dxt5_varied(self):
+        """A block that really modulates: 8 interpolated levels across texels.
+
+        Endpoints alone are not enough -- alpha0/alpha1 with all-zero INDICES
+        gives every texel alpha0, i.e. ONE level, which is exactly the
+        constant case `spec_mask` rejects (and the mistake this test made on
+        its first writing).  The variation lives in the 3-bit-per-texel index
+        block, not in the endpoints.
+        """
+        bits = 0
+        for i in range(16):
+            bits |= (i % 8) << (3 * i)
+        return (bytes([255, 0]) + bits.to_bytes(6, 'little')
+                + _opaque_block(self.RED, self.BLUE, 0x1B1B1B1B))
+
+    def test_authored_mask_is_left_alone(self, tmp_path):
+        """The sweep must never touch a real per-texel mask."""
+        path = tmp_path / 'authored_n.dds'
+        path.write_bytes(_make_dds(b'DXT5', 4, 4, 1, [[self._dxt5_varied()]]))
+        before = path.read_bytes()
+        checked, fixed, kinds = landscape_normals.normalize_specular_alpha(
+            tmp_path)
+        assert checked == 1
+        assert fixed == 0, f'an authored mask was rewritten ({kinds})'
+        assert path.read_bytes() == before

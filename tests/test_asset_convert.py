@@ -3017,6 +3017,83 @@ class TestControllerComputeScaledTime:
 
 _ARENA_SPECTATOR = 'architecture/arena/arenaspectatorm01.nif'
 _LOAD_DOOR_ACCUM = 'architecture/bravil/bravilloaddoorlowerint01.nif'
+_CLAW_STAND = 'oblivion/clutter/containers/clawstandcontainer.nif'
+_CANDLE_SKINNY = 'lights/candleskinny02.nif'
+_MINE_TRAP = 'oblivion/clutter/traps/obminetrap01.nif'
+
+
+def _playing_world_rotations(path):
+    """{shape name: world rotation angle (deg)} while the first sequence plays.
+
+    Walks the real parent chain, substituting each node's sequence POSE for its
+    bind rotation wherever the sequence drives it (a -FLT_MAX sentinel means
+    "no value", i.e. keep the bind).  Grafted flame subtrees are skipped -- they
+    do not exist in the TES4 source.
+    """
+    import math
+    import numpy as np
+    NF, d = _read_nif(path)
+    root = d.roots[0]
+    parent = {}
+
+    def walk(n):
+        for c in (getattr(n, 'children', None) or ()):
+            if c is None or not isinstance(c, NF.NiAVObject):
+                continue
+            parent[id(c)] = n
+            walk(c)
+    walk(root)
+
+    def m3(n):
+        m = n.rotation
+        return np.array([[getattr(m, 'm_%d%d' % (i + 1, j + 1))
+                          for j in range(3)] for i in range(3)])
+
+    def q2m(q):
+        w, x, y, z = q.w, q.x, q.y, q.z
+        return np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+    seqs = [b for b in root.tree() if isinstance(b, NF.NiControllerSequence)]
+    if not seqs:
+        return {}
+    seq = seqs[0]
+    pal = getattr(seq, 'string_palette', None)
+    buf = bytes(pal.palette.palette) if pal is not None else b''
+    poses = {}
+    for cb in seq.controlled_blocks:
+        off = getattr(cb, 'node_name_offset', 0xFFFFFFFF)
+        if buf and off != 0xFFFFFFFF:
+            nm = buf[off:buf.index(bytes([0]), off)]
+        else:
+            nm = bytes(getattr(cb, 'node_name', b'') or b'')
+        it = cb.interpolator
+        if isinstance(it, NF.NiTransformInterpolator) and it.data is None:
+            poses[nm] = q2m(it.rotation) if it.rotation.w > -3.0e38 else None
+
+    out = {}
+    for n in root.tree():
+        if not isinstance(n, NF.NiTriBasedGeom):
+            continue
+        nm = bytes(getattr(n, 'name', b'') or b'')
+        if b'FireCandleFlame' in nm or b'FireTorch' in nm or b'FireOpen' in nm:
+            continue
+        chain = []
+        c = n
+        while c is not None:
+            chain.append(c)
+            c = parent.get(id(c))
+        chain.reverse()
+        W = np.eye(3)
+        for c in chain:
+            cn = bytes(getattr(c, 'name', b'') or b'')
+            pz = poses.get(cn, 'absent')
+            W = W @ (m3(c) if (pz is None or isinstance(pz, str)) else pz)
+        tr = max(-1.0, min(1.0, (W.trace() - 1.0) / 2.0))
+        out[nm.decode('latin-1')] = math.degrees(math.acos(tr))
+    return out
 
 
 def _read_nif(path):
@@ -3086,6 +3163,37 @@ class TestAmbientSequences:
             cb = next(c for c in seq.controlled_blocks if bytes(c.node_name) == b'DoorLowerINT01')
             it = cb.interpolator
             assert round(it.rotation.w, 3) == 1.0 and it.scale == 1.0,                 'accum-root rotation sentinelled -> door rotation doubles'
+
+    # The accum root and its "<accum> NonAccum" child are ONE transform split
+    # across a PAIR of entries.  The root-named entry must be DROPPED (naming
+    # the file root crashes the engine), so the NonAccum entry has to absorb
+    # the difference: X = Abind^-1 @ Apose @ NApose.  Leaving it sentinelled
+    # (X = I) or merely un-sentinelling it (X = NApose) are both wrong unless
+    # Abind happens to be identity.  The invariant that matters is the WORLD
+    # rotation of the geometry while the sequence plays, so assert that
+    # against the TES4 source rather than any raw pose value.
+    @pytest.mark.parametrize('rel', [
+        _CLAW_STAND,      # "The Punished" (REFR 0009503A) -- stood 90 deg over
+        _CANDLE_SKINNY,   # 2.5 deg tilt: under the old diagonal identity test
+        _MINE_TRAP,       # script-driven, was already correct -- must not regress
+        'lights/wallsconcesingle01fake.nif',
+        'lights/lampsconce01fake.nif',
+    ])
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_playing_world_rotation_matches_tes4(self, tmp_path, rel):
+        src = EXPORT_MESHES / rel
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+        want = _playing_world_rotations(str(src))
+        got = _playing_world_rotations(str(dst))
+        shared = set(want) & set(got)
+        assert shared, 'no comparable geometry'
+        for name in sorted(shared):
+            assert abs(want[name] - got[name]) < 0.5, (
+                f'{rel}: {name} plays at {got[name]:.2f} deg, '
+                f'TES4 plays it at {want[name]:.2f} deg')
 
 
 _PALACE_FONT = 'architecture/palace/interior/palacefont01.nif'

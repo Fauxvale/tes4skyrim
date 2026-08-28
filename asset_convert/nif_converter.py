@@ -37,6 +37,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from worker_budget import worker_count  # noqa: E402
 
+from . import landscape_normals   # owns the shared stand-in normal's path
 from .skyrim_overrides import (
     ARMOR_DEFAULT_BODY_PART,
     ARMOR_GEOMETRY_BODY_PARTS,
@@ -999,7 +1000,8 @@ def _strip_creature_bone_controllers(data):
     return removed
 
 
-def _resolve_source_texture(tex_rel, src_nif_path):
+def _resolve_source_texture(tex_rel, src_nif_path,
+                            fallback_roots=()):
     """Map a rewritten texture path (textures\\tes4\\fire\\x\\y.dds) back to the
     extracted source file next to the source mesh tree
     (export/<esm>/textures/fire/x/y.dds).  Returns an absolute path or None."""
@@ -1018,7 +1020,19 @@ def _resolve_source_texture(tex_rel, src_nif_path):
             rel = rel[len(prefix):]
             break
     cand = tex_root + rel.replace('\\', os.sep)
-    return cand if os.path.isfile(cand) else None
+    if os.path.isfile(cand):
+        return cand
+    # MASTER-EXPORT BLINDNESS, the asset half of it.  An imported mod ships
+    # only the files it changes; everything else lives in its MASTER's export
+    # tree, which deriving the root from the mesh path can never reach.
+    # Measured on the author's parallax mod: of the 3357 distinct texture paths
+    # its 8665 meshes reference, 1464 were in the mod and 1602 ONLY in
+    # Nehrim.esm.  Unreachable means no height map and no specular verdict.
+    for root in (fallback_roots or ()):
+        cand = os.path.join(root, rel.replace('\\', os.sep))
+        if os.path.isfile(cand):
+            return cand
+    return None
 
 
 # NiTextureTransformController.operation (TransformMember) → the Skyrim shader
@@ -1317,7 +1331,8 @@ def _plan_flipbook_atlas(frame_rels, stats):
     files = []
     dims = None
     for rel in frame_rels:
-        f = _resolve_source_texture(rel, src_nif)
+        f = _resolve_source_texture(rel, src_nif,
+                                    stats.get('_tex_fallback', ()))
         if f is None:
             return None
         info = flipbook.probe_dds(f)
@@ -1360,7 +1375,9 @@ def _plan_parallax(diffuse_rel, stats):
     knows the output tree.
     """
     from . import parallax
-    src = _resolve_source_texture(diffuse_rel, stats.get('_src_path', ''))
+    src = _resolve_source_texture(diffuse_rel,
+                                  stats.get('_src_path', ''),
+                                  stats.get('_tex_fallback', ()))
     if src is None:
         stats['parallax_texture_unresolved'] = \
             stats.get('parallax_texture_unresolved', 0) + 1
@@ -1389,6 +1406,151 @@ def _plan_parallax(diffuse_rel, stats):
     return rel
 
 
+# Vanilla Skyrim's shader-type-0 glossiness, measured over a random 1500-mesh
+# sample of references/Skyrim Meshes: 80.0 is both the median and the modal
+# value (1333 of 2961 type-0 shaders) and the modal value in 12 of 15 top
+# folders.  See tools/shader_value_census.py.
+from . import base_plugins as _base_plugins
+
+# Re-exported: convert.py writes the file, the census tools read it.
+BASE_PLUGINS_FILE = _base_plugins.FILE_NAME
+
+
+def master_texture_roots(mesh_dir):
+    """Texture trees to fall back on, in order, for the mod at `mesh_dir`.
+
+    See asset_convert/base_plugins for where a tree's base comes from.
+    """
+    mesh_dir = str(mesh_dir).replace('/', os.sep)
+    key = os.sep + 'meshes'
+    i = mesh_dir.lower().rfind(key)
+    if i < 0:
+        return ()
+    return _base_plugins.subdirs(mesh_dir[:i], 'textures')
+
+
+_DEFAULT_GLOSSINESS = 80.0
+
+# EVERY shape gets the same specular strength, and the modulation lives in the
+# normal map's alpha where Skyrim expects it.  Where a source has no usable
+# mask, `landscape_normals.normalize_specular_alpha` bakes a constant 64/255
+# into the texture instead -- 64/255 = 0.251, i.e. EXACTLY the per-mesh 0.25
+# this used to write, so the two encodings render identically.
+#
+# 🔴 The point is not the pixels, it is who can change them afterwards.  A
+# strength baked into 20,000 NIFs is a TRAP for anyone who later ships real
+# specular maps: their good mask would be multiplied by 0.25, and fixing it
+# means editing every mesh rather than dropping in a texture.  The alpha is
+# overridable by definition.  Uniform 1.0 is also vanilla's mode (44.7%).
+#
+# It also retires the double damping recorded in shader_value_mapping.md:
+# landscape was 0.125 (alpha) x 0.25 (strength) = 0.03, and is now 0.125.
+_SPEC_STRENGTH = 1.0
+
+# Classifying a normal map means reading its first mip, and one texture is
+# shared by many shapes -- the same reason _PARALLAX_ALPHA_CACHE exists.  Keyed
+# on the resolved absolute path, so it holds per worker process.
+_SPEC_MASK_CACHE = {}
+
+
+# The shared stand-in normal map, written once per plugin by the texture stage
+# (landscape_normals.write_default_normal).  Named here so the mesh stage and
+# the texture stage cannot drift apart.
+_DEFAULT_NORMAL_TEXTURE = 'Textures\\' + \
+    landscape_normals.DEFAULT_NORMAL_REL.split('\\', 1)[1]
+
+
+def _normal_exists(normal_rel, stats):
+    """Is there a real source file behind this DERIVED `_n` path?
+
+    Uses the same resolution as `_has_spec_mask`, master fallback included --
+    a mod's mesh usually names a normal that lives in its BASE's tree, and
+    without the fallback every one of those would look absent and get
+    needlessly replaced by the stand-in.
+    """
+    if not normal_rel:
+        return False
+    return _resolve_source_texture(normal_rel, stats.get('_src_path', ''),
+                                   stats.get('_tex_fallback', ())) is not None
+
+
+def _resolve_map_for(diffuse, suffix, stats):
+    """The best real `<diffuse base><suffix>.dds` for a diffuse, or None.
+
+    Oblivion's base-name rule is not specific to normal maps -- it applies to
+    every derived map, glow (`_g`) included.  Keeping this generic means the
+    next slot we implement inherits it instead of reinventing it, which is the
+    failure mode this replaced: `_n` had the rule, nothing else would have.
+    """
+    base = diffuse.rsplit('.', 1)[0] if '.' in diffuse else diffuse
+    own = base + suffix + '.dds'
+    if _normal_exists(own, stats):
+        return own
+    head, sep, _tail = base.rpartition('_')
+    if sep and head:
+        shared = head + suffix + '.dds'
+        if _normal_exists(shared, stats):
+            return shared
+    return None
+
+
+def _resolve_normal_for(diffuse, stats):
+    """The best real normal map for a diffuse, or None.
+
+    Oblivion does not store the normal's path -- it appends `_n` to the
+    diffuse -- and when the variant's own `_n` is absent it falls back to the
+    BASE name, the part before the last `_`.  That is intended engine
+    behaviour, confirmed by the project owner from their own research
+    (2026-08-26); it is why `BrumaWoodPost_Dark.dds` and
+    `BrumaWoodPost_Grey.dds` both render with `BrumaWoodPost_n.dds` and ship
+    no normal of their own.  Deriving from the full name alone invents
+    `BrumaWoodPost_Dark_n.dds`, which exists nowhere, and dropping straight to
+    a flat stand-in would discard a real normal sitting right beside it.
+
+    Measured over the merged Nehrim texture tree: of the variants whose own
+    `_n` is missing, 201 have one under the base name, against 48 that ship
+    their own alongside the base's -- and those 48 are unaffected, because the
+    variant's own is tried FIRST.  The suffixes involved are colour and state
+    words throughout (`_dark`, `_black`, `_red`, `_harvested`, `_haunted`,
+    `_01`), i.e. variants of one surface rather than different materials.
+
+    Only ONE separator is stripped, and only when the result actually exists
+    on disk -- this never guesses a path into being.
+    """
+    return _resolve_map_for(diffuse, '_n', stats)
+
+
+def _has_spec_mask(normal_rel, stats):
+    """True when slot 1's alpha is a usable specular mask.
+
+    Counts its verdict into `stats` per category, because "no specular" has
+    three quite different causes and a build log that says only "off" sends the
+    next person back to every normal map in the tree.
+    """
+    from . import spec_mask
+    if not normal_rel or stats is None:
+        return False
+    rel = normal_rel.decode('utf-8', 'replace') \
+        if isinstance(normal_rel, bytes) else normal_rel
+    src = _resolve_source_texture(rel, stats.get('_src_path', ''),
+                                  stats.get('_tex_fallback', ()))
+    if src is None:
+        stats['spec_missing_normal'] = stats.get('spec_missing_normal', 0) + 1
+        return False
+    key = src.lower()
+    kind = _SPEC_MASK_CACHE.get(key)
+    if kind is None:
+        try:
+            with open(src, 'rb') as f:
+                raw = f.read()
+        except OSError:
+            raw = b''
+        kind = spec_mask.classify_bytes(raw)
+        _SPEC_MASK_CACHE[key] = kind
+    stats[f'spec_{kind}'] = stats.get(f'spec_{kind}', 0) + 1
+    return kind == 'mask'
+
+
 # Oblivion's distant-LOD tier meshes.  `_far` is the convention; `_far8` and
 # `_far16` are the coarser tiers `lod_far_gen` derives beside it.
 _LOD_TIER_SUFFIXES = ('_far', '_far8', '_far16')
@@ -1398,6 +1560,86 @@ def _is_lod_tier_mesh(src_path) -> bool:
     """True for a `_far` / `_far8` / `_far16` distant-LOD tier mesh."""
     stem = os.path.splitext(os.path.basename(str(src_path or '')))[0].lower()
     return stem.endswith(_LOD_TIER_SUFFIXES)
+
+
+# Slot 2 and shader type 2, per Arcane University's texture-slot table:
+# "2 | Glow | Glow map / Skin Tint | none | _g / _sk.dds | BC1".
+GLOW_SLOT = 2
+SHADER_TYPE_GLOWMAP = 2
+
+
+def _apply_glow(shader, tex_set, glow_path, stats):
+    """Give a shape Skyrim's GLOW shader when Oblivion had a glow map for it.
+
+    Oblivion does not require the NIF to name this texture.  It derives
+    `<diffuse base>_g.dds` exactly as it derives `_n`, so most glowing shapes
+    name nothing at all: measured over a random 1200-mesh sample of Nehrim,
+    227 shapes have a `_g` on disk for their diffuse and only 31 name it in
+    NiTexturingProperty's glow slot.  Reading the slot alone therefore missed
+    86% of the glow content.  The named path still wins when present -- it is
+    authored -- and derivation is the fallback, base-name aware via
+    `_resolve_map_for` (see there for Oblivion's variant rule).
+
+    🔴 This is not only about missing glow: without it the conversion is
+    actively WRONG.  Arcane University on Emissive Color -- "if the shader
+    type is not 'Glow Shader', it will make the WHOLE MESH glow" -- while the
+    glow shader "allows per-texel glow ... applied additively using the color
+    map in texture slot 2".  So a rune stone whose glyph should glow was
+    flooding its entire surface with the emissive colour instead.
+
+    Emissive is set to match vanilla when the source left it black: of 60
+    type-2 shapes sampled across Skyrim's own meshes, ALL set `own_emit` and
+    carry the glow flag, 55 of 60 carry a slot-2 texture, the modal emissive
+    colour is white (21) and the modal multiple is 1.0.  Leaving it black
+    would keep the glow map and show nothing, because emissive modulates it.
+
+    Returns True when the shape became a glow shape, which BLOCKS parallax:
+    `skyrim_shader_type` holds ONE value, so type 2 (glow) and type 3 (height)
+    cannot coexist.  Glow wins -- the glow map is authored content while our
+    height map is derived from the diffuse, and a surface that was meant to
+    glow and does not is far more noticeable than one that is merely flat.
+    """
+    if stats is None:
+        return False
+
+    rel = None
+    if glow_path:
+        # Named in the NIF: authored, so it is used as given.
+        named = _rewrite_tex_path(glow_path)
+        if _normal_exists(named, stats):
+            rel = named
+    if rel is None:
+        _diffuse = tex_set.textures[0]
+        if isinstance(_diffuse, bytes):
+            _diffuse = _diffuse.decode('utf-8', errors='replace')
+        if _diffuse and _diffuse != _DEFAULT_DIFFUSE_TEXTURE.decode('utf-8'):
+            rel = _resolve_map_for(_diffuse, '_g', stats)
+        if rel is not None and not glow_path:
+            stats['glow_derived'] = stats.get('glow_derived', 0) + 1
+    if rel is None:
+        if glow_path:
+            # The NIF named one and it is nowhere -- worth counting, but never
+            # worth inventing: absence of glow is the neutral state.
+            stats['glow_unresolved'] = stats.get('glow_unresolved', 0) + 1
+        return False
+
+    tex_set.textures[GLOW_SLOT] = rel.encode('utf-8')
+    shader.skyrim_shader_type = SHADER_TYPE_GLOWMAP
+    shader.shader_flags_2.slsf_2_glow_map = 1
+    # AU: "The environment map shader is incompatible with glow mapping."
+    shader.shader_flags_1.slsf_1_environment_mapping = 0
+    shader.shader_flags_1.slsf_1_own_emit = 1
+    _e = shader.emissive_color
+    if max(_e.r, _e.g, _e.b) <= 0.0:
+        # Oblivion showed this glow map without an emissive colour; Skyrim
+        # multiplies by it, so black would silently discard the whole effect.
+        # White with multiple 1.0 is vanilla's mode.
+        _e.r = _e.g = _e.b = 1.0
+        stats['glow_emissive_defaulted'] =             stats.get('glow_emissive_defaulted', 0) + 1
+    if float(shader.emissive_multiple) <= 0.0:
+        shader.emissive_multiple = 1.0
+    stats['glow_applied'] = stats.get('glow_applied', 0) + 1
+    return True
 
 
 def _apply_parallax(ts, shader, tex_set, tex_apply_mode, stats):
@@ -1557,6 +1799,7 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
 
     # Collect shader inputs from old Oblivion properties
     diffuse_path = b''
+    glow_path = b''         # NiTexturingProperty glow slot -> Skyrim slot 2
     has_double_sided = False
     alpha_prop = None
     tex_apply_mode = None   # NiTexturingProperty.apply_mode (detail-overlay detection)
@@ -1584,6 +1827,12 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         if isinstance(prop, NifFormat.NiTexturingProperty):
             if prop.has_base_texture and prop.base_texture.source:
                 diffuse_path = prop.base_texture.source.file_name
+            # Oblivion NAMES its glow map (unlike the normal, which it derives)
+            # -- authored data, so it is taken verbatim rather than guessed.
+            if getattr(prop, 'has_glow_texture', False):
+                _gsrc = getattr(prop.glow_texture, 'source', None)
+                if _gsrc is not None and _gsrc.file_name:
+                    glow_path = _gsrc.file_name
             tex_apply_mode = int(prop.apply_mode)
             # Detect NiFlipController: Oblivion fire/effect quads animate through
             # multiple NiSourceTexture frames.  We'll move this to the NiTriShape
@@ -1631,7 +1880,38 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         diffuse = _rewrite_tex_path(diffuse_path) if fix_textures else diffuse_path.decode('utf-8', errors='replace')
         tex_set.textures[0] = diffuse.encode('utf-8')
         base = diffuse.rsplit('.', 1)[0] if '.' in diffuse else diffuse
-        tex_set.textures[1] = (base + '_n.dds').encode('utf-8')
+        # The normal path is DERIVED from the diffuse, so it is a guess, not
+        # authored data -- and Oblivion content frequently has no `_n` beside
+        # the diffuse at all.  Measured on the shipped tree before this check
+        # existed: 1904 of 20696 lighting shaders (9.2%) named a normal map
+        # with no file behind it, all of them fabricated right here.
+        #
+        # Skyrim null-checks slot 1, so a dangling path does not crash -- it
+        # simply renders with NO normal, which vanilla never does (0 of 8740
+        # shapes sampled across architecture, dungeons, clutter and weapons
+        # ship an empty slot 1).  Point those at the shared flat normal
+        # instead; it carries the same constant specular mask the texture
+        # stage bakes into maskless maps, so the shape stays consistent with
+        # everything around it.
+        #
+        # But the stand-in is the LAST resort -- see _resolve_normal_for, which
+        # first tries the variant's own `_n` and then the one its base name
+        # shares across colour variants.
+        _norm = base + '_n.dds'
+        if stats is not None:
+            _found = _resolve_normal_for(diffuse, stats)
+            if _found is None:
+                _norm = _DEFAULT_NORMAL_TEXTURE
+                # `spec_` prefix so it rides the bucket _finish_result already
+                # merges with Counter.update() -- see the note there.
+                stats['spec_normal_defaulted'] = \
+                    stats.get('spec_normal_defaulted', 0) + 1
+            else:
+                _norm = _found
+                if _found != base + '_n.dds':
+                    stats['spec_normal_from_base'] = \
+                        stats.get('spec_normal_from_base', 0) + 1
+        tex_set.textures[1] = _norm.encode('utf-8')
     else:
         # No NiTexturingProperty at all: Oblivion renders these shapes with the
         # flat NiMaterialProperty color, so the source legitimately names no
@@ -1651,6 +1931,10 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         if stats is not None:
             stats['untextured_diffuse_defaulted'] = (
                 stats.get('untextured_diffuse_defaulted', 0) + 1)
+
+    # Does slot 1 actually carry a specular mask?  See asset_convert/spec_mask
+    # -- the normal map's alpha decides, not the mesh's NiSpecularProperty.
+    _spec_mask = _has_spec_mask(tex_set.textures[1], stats)
 
     # Sky geometry takes the dedicated sky shader instead of the lighting one.
     # Skyrim's sky pass draws these before the world, unlit and unfogged, with
@@ -1685,6 +1969,28 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
 
     # Build BSLightingShaderProperty
     shader = NifFormat.BSLightingShaderProperty()
+
+    # Material values.  These were never assigned, so every shape shipped at
+    # pyffi's defaults -- glossiness 0.0 with a BLACK specular colour and the
+    # specular flag on, measured at 100% of 3931 shaders in our own output.
+    # Vanilla's shader type 0 has glossiness 80 as both median AND mode (1333
+    # of 2961 sampled shaders, and the modal value in 12 of 15 top folders);
+    # specular is white in 56% and black in 3%; strength 1.0 is the mode, and
+    # Arcane University puts the typical band at 0.25-1.0 -- which vanilla's
+    # own 2.2 and 3.0 outliers ignore, so the mode is taken and the tail is not.
+    #
+    # Oblivion's glossiness is NOT carried over: its median is 10 with 59.4% of
+    # shapes sitting on exactly 10, an authoring default rather than a chosen
+    # value, and 10 in Skyrim is what HAIR uses -- a very wide highlight.
+    shader.glossiness = _DEFAULT_GLOSSINESS
+    shader.specular_color.r = 1.0
+    shader.specular_color.g = 1.0
+    shader.specular_color.b = 1.0
+    # Uniform, deliberately: the modulation belongs in the alpha, not here.
+    # See _SPEC_STRENGTH.  `_spec_mask` is still evaluated -- its per-category
+    # counters are what tell the texture stage how much it had to synthesise.
+    shader.specular_strength = _SPEC_STRENGTH
+
     # Set shader flags via bit-struct attributes
     sf1 = shader.shader_flags_1
     sf1.slsf_1_specular = 1
@@ -1903,7 +2209,15 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         # this branch: the FX/flip-book path above threw `shader` away for a
         # BSEffectShaderProperty, which has neither a height slot nor a shader
         # type to set.
-        _apply_parallax(ts, shader, tex_set, tex_apply_mode, stats)
+        #
+        # Glow FIRST, and it vetoes parallax: `skyrim_shader_type` holds one
+        # value, so a shape is type 2 (glow) or type 3 (height), never both.
+        # The glow map is AUTHORED; our height map is derived from the diffuse.
+        if not _apply_glow(shader, tex_set, glow_path, stats):
+            _apply_parallax(ts, shader, tex_set, tex_apply_mode, stats)
+        elif tex_apply_mode == _APPLY_HILIGHT2 and stats is not None:
+            stats['parallax_skipped_glow'] = \
+                stats.get('parallax_skipped_glow', 0) + 1
         ts.bs_properties[0] = shader
 
     # Record the diffuse as a DETAIL OVERLAY when the source authored it that
@@ -2082,8 +2396,9 @@ def _accum_root_mode(seq, root, resolve_name):
     t = anode.translation
     m = anode.rotation
     root_t = (t.x, t.y, t.z)
-    rot_identity = (abs(m.m_11 - 1) < 1e-3 and abs(m.m_22 - 1) < 1e-3
-                    and abs(m.m_33 - 1) < 1e-3)
+    _trace = m.m_11 + m.m_22 + m.m_33
+    _cos = max(-1.0, min(1.0, (_trace - 1.0) / 2.0))
+    rot_identity = math.degrees(math.acos(_cos)) < 0.1
     root_moved = max(abs(v) for v in root_t) >= 0.05
     if not root_moved and rot_identity:
         return None
@@ -2225,6 +2540,51 @@ def _fan_out_shared_entries(seq, extras):
     return added
 
 
+def _apply_rotation(m, quat):
+    """Write quaternion (w,x,y,z) into an existing pyffi Matrix33."""
+    w, x, y, z = quat
+    m.m_11 = 1 - 2 * (y * y + z * z)
+    m.m_12 = 2 * (x * y - z * w)
+    m.m_13 = 2 * (x * z + y * w)
+    m.m_21 = 2 * (x * y + z * w)
+    m.m_22 = 1 - 2 * (x * x + z * z)
+    m.m_23 = 2 * (y * z - x * w)
+    m.m_31 = 2 * (x * z - y * w)
+    m.m_32 = 2 * (y * z + x * w)
+    m.m_33 = 1 - 2 * (x * x + y * y)
+
+
+def _dropped_accum_root_pose(root, mgr, resolve_name):
+    """Apply the accum-root entry's pose to the root NODE, since the entry dies.
+
+    Only for an entry that names the FILE ROOT -- that is the one dropped by the
+    root-name rule.  TES4 applies the entry (an identity placeholder in 815 of
+    853 vanilla accum-root entries), overriding the node's authored bind; we
+    cannot ship the entry, so the node has to carry the value instead.
+    """
+    root_name = bytes(getattr(root, 'name', b'') or b'')
+    if not root_name:
+        return None
+    for seq in mgr.controller_sequences:
+        accum = getattr(seq, 'target_name', b'') or b''
+        accum = accum.encode('latin-1') if isinstance(accum, str) else bytes(accum)
+        if accum != root_name:
+            continue
+        for cb in seq.controlled_blocks:
+            nm = resolve_name(cb, seq, 'node_name')
+            nm = nm.encode('latin-1') if isinstance(nm, str) else bytes(nm or b'')
+            if nm != accum:
+                continue
+            it = cb.interpolator
+            if (isinstance(it, NifFormat.NiTransformInterpolator) and
+                    it.data is None and it.rotation.w > _NO_VALUE):
+                q = it.rotation
+                return (float(q.w), float(q.x), float(q.y), float(q.z))
+            break
+        break
+    return None
+
+
 def _process_controller_manager(node, palette):
     """Strip unsupported NiControllerManager sequences.
 
@@ -2259,6 +2619,15 @@ def _process_controller_manager(node, palette):
                                getattr(blk, attr + '_offset', None))
 
     prop_index = None      # id(property ctrl) -> shapes; built on first use
+
+    # TES4 APPLIES the accum-root entry, overriding the node's authored bind --
+    # but that entry names the file root, so it must be DROPPED (it crashes the
+    # engine; see the census and crash dumps below).  Capture its pose now,
+    # while the entry still exists, and bake it onto the NODE after the loop so
+    # the playing transform matches TES4 and the NonAccum entry can stay exactly
+    # as authored.  Captured before, applied after: _accum_root_mode classifies
+    # from the AUTHORED bind, so baking first would make it read identity.
+    _pending_bake = _dropped_accum_root_pose(node, mgr, _resolve_name)
     for seq in mgr.controller_sequences:
         accum_mode = _accum_root_mode(seq, node, _resolve_name)
         accum_name = getattr(seq, 'target_name', b'') or b''
@@ -2336,7 +2705,9 @@ def _process_controller_manager(node, palette):
                 interp = blk.interpolator
                 _nn = node_name.encode('latin-1') if isinstance(node_name, str) else bytes(node_name or b'')
                 is_accum_root = bool(_nn) and _nn == accum_name
-                if is_accum_root and accum_mode == 'transferred':
+                _keeps = (accum_mode == 'transferred' and bool(_nn) and
+                          (is_accum_root or _nn == accum_name + b' NonAccum'))
+                if _keeps:
                     pass
                 else:
                     if is_accum_root and interp.data is not None:
@@ -2552,6 +2923,10 @@ def _process_controller_manager(node, palette):
             key += 1
 
         _fan_out_shared_entries(seq, shared_extras)
+
+
+    if _pending_bake is not None:
+        _apply_rotation(node.rotation, _pending_bake)
 
 
 def _apply_rest_visibility(root, stats=None):
@@ -4991,27 +5366,14 @@ from .skin_replacement import (collect_skin_info, strip_body_skin_geometry, spli
 _PRN_HEAD_BONES = (b'NPC Head [Head]', b'Bip01 Head')
 
 
-def _fit_prn_head_blocks(data, prn_block_ids, src_path) -> set:
-    """Fit head-attached Prn blocks onto the Skyrim head (head_fit).
+def _collect_prn_head_blocks(data, prn_block_ids):
+    """The Prn blocks of a NIF that hang on the HEAD bone.
 
-    Runs AFTER retarget: Prn verts are face-space (authored coords, the shape
-    transform baked in) and render as ``verts + head bone world``, so the fit
-    maps them into Skyrim head space directly — the same frame the old
-    ARMOR_PIECE_OFFSETS_PRN affine operated in.  All head blocks of the NIF
-    are solved as ONE system so multi-shape helmets keep their seams.
-
-    Returns the ids of the blocks that were fitted (empty when the fit data
-    is unavailable — callers then fall back to the legacy constants).
+    Walks the LIVE tree, never data.blocks: the strips->shape conversion
+    replaces geometry objects, so data.blocks is stale by this point and an
+    id() lookup over it silently matches nothing (the fit then never ran and
+    every helmet fell back to the legacy PRN scale table).
     """
-    from . import head_fit
-    female = '/f/' in str(src_path).replace('\\', '/').lower()
-    if not head_fit.fit_available(female):
-        return set()
-
-    # Walk the LIVE tree, never data.blocks: the strips->shape conversion
-    # replaces geometry objects, so data.blocks is stale by this point and
-    # an id() lookup over it silently matches nothing (the fit then never
-    # ran and every helmet fell back to the legacy PRN scale table).
     blocks = []
     seen = set()
     for root in data.roots:
@@ -5034,6 +5396,32 @@ def _fit_prn_head_blocks(data, prn_block_ids, src_path) -> set:
                 continue
             seen.add(id(block))
             blocks.append(block)
+    return blocks
+
+
+def _fit_prn_head_blocks(data, prn_block_ids, src_path, race=None) -> set:
+    """Fit head-attached Prn blocks onto the Skyrim head (head_fit).
+
+    Runs AFTER retarget: Prn verts are face-space (authored coords, the shape
+    transform baked in) and render as ``verts + head bone world``, so the fit
+    maps them into Skyrim head space directly — the same frame the old
+    ARMOR_PIECE_OFFSETS_PRN affine operated in.  All head blocks of the NIF
+    are solved as ONE system so multi-shape helmets keep their seams.
+
+    `race` selects a beast head pack (head_fit.BEAST_RACES); None fits the
+    shared human head.  A hood is ONE Oblivion record worn by every race,
+    so the caller re-runs this per race and writes a mesh per race exactly
+    as vanilla Skyrim ships one - see head_fit.BEAST_RACES.
+
+    Returns the ids of the blocks that were fitted (empty when the fit data
+    is unavailable — callers then fall back to the legacy constants).
+    """
+    from . import head_fit
+    female = '/f/' in str(src_path).replace('\\', '/').lower()
+    if not head_fit.fit_available(female):
+        return set()
+
+    blocks = _collect_prn_head_blocks(data, prn_block_ids)
     if not blocks:
         return set()
 
@@ -5052,7 +5440,7 @@ def _fit_prn_head_blocks(data, prn_block_ids, src_path) -> set:
             tris = np.zeros((0, 3), dtype=np.int64)
         shapes.append((verts, tris))
 
-    fitted = head_fit.fit_head_gear(shapes, female)
+    fitted = head_fit.fit_head_gear(shapes, female, race=race)
     if fitted is None:
         return set()
     for block, new_v in zip(blocks, fitted):
@@ -5409,7 +5797,7 @@ def _upgrade_skin_instances(data):
 
 def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                  creature=False, worn=False, parallax=False, biped_flags=0,
-                 hair=False):
+                 tex_fallback=(), hair=False, race=None):
     """Convert a PyFFI NifFormat.Data in-place to Skyrim format.
 
     worn=True marks the NIF as body-worn gear on the plugin's own authority (an
@@ -5440,6 +5828,7 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         'bones_remapped': 0,
         'textures_fixed': 0,
         '_src_path': str(src_path),   # for flip-book/height-map source lookup
+        '_tex_fallback': tex_fallback or (),
         '_parallax': bool(parallax),  # opt-in; see _apply_parallax
         # Sky geometry (stars/clouds/atmosphere) needs BSSkyShaderProperty
         # rather than the lighting shader — see sky_object_type_for.
@@ -6198,9 +6587,11 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
 
         # Skyrim requires collision on the root node only.
         # If we did NOT wrap, check whether a child holds the collision and hoist it.
-        # (When wrapped, the root's own collision was kept on the root above;
-        # hoisting from under the rotated wrapper is not supported because
-        # hoist_collision only bakes the child's translation, not rotation.)
+        # (When wrapped, the root's own collision was kept on the root above.
+        # Hoisting from under the rotated wrapper would have to compose the
+        # WRAPPER's transform as well as the child's — hoist_collision only
+        # composes the child's — so that case stays on the wrap path, which
+        # already absorbs the root transform via bake_node_transform_into_body.)
         # Exception 1: animated objects (NiControllerManager on root) keep collision on
         # the animated child node so the KEYFRAMED rigid body follows the animation.
         # Exception 2: NIFs with Havok constraints (hinge/ragdoll/malleable) need the
@@ -6316,7 +6707,8 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         _prn_block_ids: set = set()
         _retarget(data, src_path=src_path, prn_out=_prn_block_ids,
                   weight=weight, authored_body_part=_authored_bp,
-                  authored_allowed=_authored_allowed)
+                  authored_allowed=_authored_allowed,
+                  race=race)
 
         # NOW rename bones to Skyrim names — AFTER skin transforms are correct.
         stats['bones_remapped'] += _remap_bone_names(data)
@@ -6357,7 +6749,7 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         _prn_head_ids = set()
         if _prn_block_ids and not hair:
             _prn_head_ids = _fit_prn_head_blocks(data, _prn_block_ids,
-                                                 src_path)
+                                                 src_path, race=race)
         if not hair:
             # Skinned helmet/hood geometry: exact under the wrap once the
             # field carries a head surface; FK constants only as fallback.
@@ -6371,6 +6763,22 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
                 _cfg_prn = ARMOR_PIECE_OFFSETS_PRN.get(
                     _piece_type, ARMOR_PIECE_OFFSETS_PRN['default'])
                 apply_armor_offset(data, _cfg_prn, only_block_ids=_prn_legacy)
+
+        # BEAST RACES GET THEIR OWN MESH, exactly as vanilla ships one
+        # (head_fit.BEAST_RACES).  A hood is ONE Oblivion record worn by
+        # every race, so unlike hair -- whose EDID names its race -- there
+        # is nothing on the record to read: the only way to serve a khajiit
+        # and a human from one source is to write a mesh per race and let
+        # the per-race ARMA pick.  Mark the NIF here; convert_nif re-runs
+        # the WHOLE conversion per race afterwards.
+        #
+        # It must be a re-run, not a re-fit of the finished mesh: a hood is
+        # multi-bone SKINNED geometry (Bip01 Head + Neck + Clavicles), so
+        # its head fit happens inside the retarget wrap, not in the rigid
+        # Prn pass -- there is no later point where the head verts can be
+        # displaced again without redoing the skin solve.
+        if _piece_type == 'helmet' and (_prn_head_ids or has_skin):
+            stats['_head_gear'] = True
 
     # Splice Skyrim body geometry AFTER retarget + bone rename so that bone
     # NiNodes in the armor NIF already have Skyrim names to match against.
@@ -7031,7 +7439,8 @@ def merge_creature_body(part_paths, dst_path, skeleton_path=None,
 
 def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
                 src_meshes_dir=None, creature=False, wearable_plan=None,
-                parallax=False, textures_only=False, hair=False):
+                parallax=False, textures_only=False, tex_fallback=(),
+                hair=False, race=None):
     """Convert a single Oblivion NIF to Skyrim format.
 
     Already-Skyrim versions are copied to dst_path unchanged.
@@ -7057,6 +7466,10 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     that needs exactly the same treatment as a helmet: a dismember skin bound
     to the head bone in slot 131.  Without this the mesh ships unskinned and
     also picks up a meaningless BSInvMarker (hair is never an inventory item).
+
+    race: fit head gear to a BEAST race's skull instead of the shared human
+    one (head_fit.BEAST_RACES).  Set only by the beast-variant pass below,
+    which re-runs this conversion once per race; None is the normal path.
     """
     result = {
         'converted': False,
@@ -7138,7 +7551,8 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     stats = _convert_nif(data, fix_textures=fix_textures,
                          src_path=str(src_path), creature=creature,
                          worn=_worn, parallax=parallax,
-                         biped_flags=_biped_flags, hair=hair)
+                         biped_flags=_biped_flags,
+                         tex_fallback=tex_fallback, hair=hair, race=race)
 
     # Graft the converted Oblivion flame NIF under FlameNode* markers (candle
     # flame / torch fire) — full conversion of Oblivion's own flame visuals,
@@ -7289,7 +7703,10 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # non-wearables keep their plain conversion either way, while gear filed
     # outside meshes\armor finally gets the _0/_1 pair its ARMA asks for.
     _srcl = str(src_path).lower().replace('\\', '/')
-    _wearable = not creature and not _is_ground_model(_srcl.rsplit('/', 1)[-1])
+    # A beast variant is a copy of ONE mesh, never a weight pair: head gear
+    # has the slider off, and _0/_1 would collide with the race suffix.
+    _wearable = (not creature and race is None
+                 and not _is_ground_model(_srcl.rsplit('/', 1)[-1]))
     if _wearable and wearable_plan is not None:
         from . import wearable_plan as _wp
         want = _wp.variants_for(wearable_plan, src_path, src_meshes_dir)
@@ -7321,7 +7738,62 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
             with open(_root + '_1' + _ext, 'wb') as f:
                 f.write(w1_bytes if w1_bytes is not None else buf.getvalue())
 
+    # BEAST-RACE HEAD GEAR VARIANTS.  The mesh written above is fitted to the
+    # SHARED HUMAN skull; on a khajiit or argonian that same geometry sits
+    # inside the head.  Measured on blades/m/helmet against the real beast
+    # heads: the human-fitted mesh puts 447 verts inside the khajiit skull
+    # (max depth 2.76) and 409 inside the argonian one (max 2.81), against 44
+    # for the human mesh on the human head; the per-race fits cut that to 56
+    # and 20 -- see head_fit.BEAST_RACES for the field measurements.
+    #
+    # Vanilla Skyrim's own answer is a mesh per race family selected by a
+    # per-race ARMA, so we write <name>_khajiit.nif / <name>_argonian.nif here
+    # and tes5_import.record_types.equipment emits the ARMA naming each.
+    if stats.get('_head_gear') and not creature and not hair and race is None:
+        _write_beast_head_variants(
+            src_path, dst_path,
+            fix_textures=fix_textures, src_meshes_dir=src_meshes_dir,
+            wearable_plan=wearable_plan, parallax=parallax)
+
     return _finish_result(result, stats)
+
+
+def _write_beast_head_variants(src_path, dst_path, *, fix_textures,
+                               src_meshes_dir, wearable_plan, parallax):
+    """Write the per-beast-race copies of a head-gear NIF.
+
+    The whole conversion is RE-RUN per race from the source file rather than
+    the finished mesh being re-fitted.  A hood is multi-bone SKINNED geometry
+    (Bip01 Head + Neck + Clavicles), so its head fit happens inside the
+    retarget wrap -- there is no later point at which the head verts can be
+    displaced again without redoing the skin solve.  Re-reading also keeps
+    each variant a FIRST fit through its race's field, never a second
+    displacement stacked on the human result.
+
+    A variant that fails for any reason is simply not written: the ARMA for it
+    then points at a missing mesh, which the engine falls back from to the
+    default armature -- the pre-existing behaviour, never worse than it.
+    """
+    from . import head_fit
+    female = '/f/' in str(src_path).replace(chr(92), '/').lower()
+    races = head_fit.beast_races_available(female)
+    if not races:
+        return
+
+    root, ext = os.path.splitext(str(dst_path))
+    for race in races:
+        out = root + head_fit.beast_variant_suffix(race) + ext
+        try:
+            convert_nif(src_path, out, fix_textures=fix_textures,
+                        src_meshes_dir=src_meshes_dir,
+                        wearable_plan=wearable_plan, parallax=parallax,
+                        race=race)
+        except Exception:
+            try:
+                if os.path.isfile(out):
+                    os.remove(out)
+            except OSError:
+                pass
 
 
 def _finish_result(result, stats):
@@ -7341,7 +7813,11 @@ def _finish_result(result, stats):
     # Parallax accounting.  Carried up per CATEGORY, because "skipped" on its
     # own sends the next person back to all 163 flagged textures with no lead —
     # over half of them legitimately have no height data to carry.
-    _px = {k: v for k, v in stats.items() if k.startswith('parallax_')}
+    # `spec_` rides in the same bucket: both are per-category counters merged
+    # with Counter.update(), and both answer "why was this shape left alone".
+    _px = {k: v for k, v in stats.items()
+           if k.startswith('parallax_') or k.startswith('spec_')
+           or k.startswith('glow_')}
     if _px:
         result['parallax'] = _px
     # Carried separately from the counters above: this one is a SET of texture
@@ -7438,7 +7914,13 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
     skipped_list = []
 
     workers = _WORKER_COUNT
+    # Resolved once here, not per shape: reading _HEADER.txt in every
+    # worker for every mesh would be thousands of redundant opens.
+    _tex_fallback = master_texture_roots(mesh_dir)
     print(f'Found {total} NIF files in {mesh_dir} (workers={workers})')
+    if _tex_fallback:
+        print(f'  Texture fallback: {len(_tex_fallback)} master tree(s) '
+              f'-- {", ".join(os.path.basename(os.path.dirname(r)) for r in _tex_fallback)}')
     if skipped_by_path:
         print(f'  Skipped {skipped_by_path} files matching SKIP_PATHS: {sorted(SKIP_PATHS)}')
 
@@ -7448,7 +7930,7 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
     work_args = [
         (str(nif_file), str(out_base / nif_file.relative_to(mesh_path)),
          fix_textures, remap_skeleton, str(mesh_path), wearable_plan,
-         parallax, textures_only)
+         parallax, textures_only, _tex_fallback)
         for nif_file in nif_files
     ]
 
@@ -7553,6 +8035,47 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
             # Oblivion renders no parallax there either.
             print(f'  left flat, {cat[len("parallax_"):]}: {cnt} shapes')
 
+    _glow = {k[len('glow_'):]: v for k, v in stats['parallax'].items()
+             if k.startswith('glow_')}
+    if _glow:
+        print(f"\nGlow: {_glow.get('applied', 0)} shapes carry Oblivion's "
+              f'authored glow map into slot {GLOW_SLOT} (shader type '
+              f'{SHADER_TYPE_GLOWMAP})')
+        if _glow.get('unresolved'):
+            print(f"  {_glow['unresolved']} named a glow texture that does "
+                  f'not exist -- left unlit rather than guessed')
+        _pg = stats['parallax'].get('parallax_skipped_glow', 0)
+        if _pg:
+            print(f'  {_pg} of them also asked for parallax; glow wins '
+                  f'(one shader type, and the glow map is authored while the '
+                  f'height map is derived)')
+
+    _spec = {k[len('spec_'):]: v for k, v in stats['parallax'].items()
+             if k.startswith('spec_')}
+    if _spec:
+        _on = _spec.get('mask', 0)
+        # Only the VERDICT categories form the base.  `normal_from_base` and
+        # `normal_defaulted` ride the same `spec_` bucket for plumbing reasons
+        # but describe where the normal came FROM, not what its alpha holds --
+        # counting them diluted the share from 92.9% to a meaningless 86.2%.
+        _verdicts = ('mask', 'no_alpha', 'flat', 'binary', 'missing_normal')
+        _tot = sum(_spec.get(k, 0) for k in _verdicts)
+        print(f'\nSpecular: strength {_SPEC_STRENGTH} on every shape; '
+              f'{_on} of {_tot} ({_on * 100.0 / max(1, _tot):.1f}%) modulate '
+              f"it with an AUTHORED mask in the normal map's alpha")
+        for _k in ('no_alpha', 'flat', 'binary', 'missing_normal'):
+            if _spec.get(_k):
+                print(f'  {_k}: {_spec[_k]} shapes -> the texture stage bakes '
+                      f'a constant mask instead')
+        if _spec.get('normal_from_base'):
+            print(f"  normal shared with the base name: "
+                  f"{_spec['normal_from_base']} shapes (a colour variant "
+                  f"reuses its base's _n, the way the artists authored it)")
+        if _spec.get('normal_defaulted'):
+            print(f"  normal map absent: {_spec['normal_defaulted']} shapes "
+                  f'-> {_DEFAULT_NORMAL_TEXTURE} (a fabricated _n path would '
+                  f'only dangle; vanilla never ships an empty slot 1)')
+
     # plain ASCII: cp1252 consoles/pipes choke on the arrow character
     print(f'\nDetailed stats: Strips->Shape={stats["strips"]}, '
           f'Properties={stats["properties"]}, '
@@ -7563,7 +8086,7 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
 
 def _batch_worker(args):
     (nif_str, out_path, fix_textures, remap_skeleton, src_meshes_dir,
-     wearable_plan, parallax, textures_only) = args
+     wearable_plan, parallax, textures_only, tex_fallback) = args
     global _worker_warn_log
     _worker_warn_log = []
     try:
@@ -7571,7 +8094,8 @@ def _batch_worker(args):
                         fix_textures=fix_textures, remap_skeleton=remap_skeleton,
                         src_meshes_dir=src_meshes_dir,
                         wearable_plan=wearable_plan, parallax=parallax,
-                        textures_only=textures_only)
+                        textures_only=textures_only,
+                        tex_fallback=tex_fallback)
         r['warn_counts'] = _categorize_pyffi_warnings(_worker_warn_log)
         return ('ok', nif_str, r)
     except Exception as e:
