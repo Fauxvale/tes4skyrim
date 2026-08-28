@@ -8,6 +8,13 @@ bug (2026-08-18):
   * is it changing frame to frame (animating) or frozen?
   * which NiControllerSequences does the NiControllerManager hold, what are
     their cycle types, and which are ANIMATING / INACTIVE right now?
+  * and at what RATE is one actually playing (`sequences --watch`)?  Samples
+    `seq+0x50` lastTime against the wall clock: 1.0x is correct, N means the
+    sequence advances N seconds of animation per real second.  This is the
+    measurement that separates "the sequence data is wrong" from "the time fed
+    into it is inflated" -- the engine's only divisor is the sequence's own
+    `frequency` (duration getter, GOG/AE exe 0x5050a0, computes
+    (end-begin)/freq), so a high rate with freq==1.0 means inflated input time.
   * and, to prove a fix before rebuilding: flip a loaded sequence's cycle type
     or a controlled block's pose in memory, `sae AutoReset`, and watch.
 
@@ -18,6 +25,7 @@ Usage:
     python tools/live/nif_live.py nodes 1318B6C5 --names "Bip01,Bip01 NonAccum" --samples 6
     python tools/live/nif_live.py tree 1318B6C5 [--depth 3]
     python tools/live/nif_live.py sequences 1318B6C5
+    python tools/live/nif_live.py sequences 1209D838 --watch --sequence Forward
     python tools/live/nif_live.py set-cycle 1318B6C5 AutoLoop 0        # 0 LOOP 1 REVERSE 2 CLAMP
     python tools/live/nif_live.py set-pose 1318B6C5 AutoPlay Bip01 --identity   # or --sentinel
     python tools/live/nif_live.py sae 1318B6C5 AutoReset
@@ -159,6 +167,11 @@ class Live:
             'begin': struct.unpack_from('<f', d, 0x48)[0],
             'end': struct.unpack_from('<f', d, 0x4C)[0],
             'lastTime': struct.unpack_from('<f', d, 0x50)[0],
+            # raw floats +0x54..+0x64: the remaining NiControllerSequence
+            # timing fields (offset / weighted last time / ease in-out) --
+            # printed by --watch so the REAL playback position shows itself
+            # (lastTime is the app clock and always advances at 1.0x)
+            'raw': struct.unpack_from('<5f', d, 0x54),
             'state': struct.unpack_from('<I', d, 0x68)[0],
             'accum': self.cstr(struct.unpack_from('<Q', d, 0x88)[0]),
             'accumRoot': struct.unpack_from('<Q', d, 0x90)[0],
@@ -228,11 +241,14 @@ def cmd_sequences(a):
         root = L.root_3d(int(a.ref, 16))
         mgr = L.manager(root)
         seqs = L.sequences(mgr)
+        if a.watch:
+            return _watch_rate(L, seqs, a)
         print(f'manager {mgr:#x}: {len(seqs)} sequence(s)')
         for s in seqs:
             i = L.seq_info(s)
             print(f"  {i['name']!r}: cycle={CYCLES.get(i['cycle'], i['cycle'])} "
                   f"state={STATES.get(i['state'], i['state'])} keys[{i['begin']:.3f},{i['end']:.3f}] "
+                  f"freq={i['freq']:.4f} "
                   f"lastTime={i['lastTime']:.3f} blocks={i['n']} accumRoot={i['accum']!r}"
                   f"{'' if i['accumRoot'] else ' (unbound)'}")
             if a.blocks:
@@ -250,6 +266,138 @@ def cmd_sequences(a):
                     print(f"      {nm!r}: pose t=({f(tr[0])},{f(tr[1])},{f(tr[2])}) "
                           f"q=({f(q[0])},{f(q[1])},{f(q[2])},{f(q[3])}) s={f(sc)} "
                           f"data={'yes' if data else 'no'}")
+    return 0
+
+
+# NiParticleSystem vtable RVA (GOG/AE build; used only as a HINT -- the
+# command falls back to name matching, and prints the live vtable so a build
+# mismatch is obvious rather than silent).
+_PSYS_VTABLE_RVA = 0x1869880
+
+
+def cmd_particles(a):
+    """Sample the LIVE particle systems under a reference.
+
+    Answers the question static analysis kept getting wrong: when a converted
+    effect "plays for a split second and then nothing", are particles still
+    being BORN (emitter running, they die too fast / are invisible) or does
+    the emitter STOP (nothing to draw)?
+
+    Prints, per system and per sample: the node's flags (bit 0 = hidden), its
+    world position, and a window of raw u16/u32 counters near the data block.
+    The counter that tracks the visible spray is the one that rises while the
+    effect is on screen -- reading it live is the only reliable way to pin the
+    runtime field, since NiPSysData's in-memory layout is not the file layout.
+    """
+    names = [n.strip() for n in a.names.split(',')] if a.names else None
+    with Bridge() as b:
+        L = Live(b)
+        root = L.root_3d(int(a.ref, 16))
+        systems = []
+        for node, nm, _, parent in L.walk(root):
+            if names is not None:
+                if nm not in names:
+                    continue
+            else:
+                try:
+                    vt = L.u64(node) - 0x140000000
+                except Exception:
+                    continue
+                if vt != _PSYS_VTABLE_RVA:
+                    continue
+            systems.append((nm, node))
+        if not systems:
+            print('no particle systems found; pass --names to select by node name')
+            return 1
+        for nm, node in systems:
+            try:
+                vt = L.u64(node) - 0x140000000
+            except Exception:
+                vt = 0
+            print(f'{nm!r} @ {node:#x} vtable_rva={vt:#x}')
+
+        for k in range(a.samples):
+            for nm, node in systems:
+                d = L.rd(node, 0x160)
+                flags = struct.unpack_from('<I', d, 0x2C)[0]
+                wt = struct.unpack_from('<3f', d, 0xA0)
+                # NiGeometry data pointer sits after the NiAVObject block; scan
+                # a window of plausible pointers and report the small integers
+                # each one leads to, so the live count field reveals itself by
+                # CHANGING while the effect plays.
+                counters = []
+                for off in range(0x110, 0x160, 8):
+                    p = struct.unpack_from('<Q', d, off)[0]
+                    if p < 0x10000 or p > 0x7FFFFFFFFFFF:
+                        continue
+                    try:
+                        blob = L.rd(p, 0x60)
+                    except Exception:
+                        continue
+                    u16 = struct.unpack_from('<8H', blob, 0x10)
+                    counters.append((off, [v for v in u16 if v < 5000]))
+                print(f'  [{k}] {nm!r} flags={flags} (hidden={flags & 1}) '
+                      f'pos=({wt[0]:.1f},{wt[1]:.1f},{wt[2]:.1f}) '
+                      f'counters={counters}', flush=True)
+            if k + 1 < a.samples:
+                time.sleep(a.interval)
+    return 0
+
+
+def _watch_rate(L, seqs, a):
+    """Sample seq+0x50 `lastTime` against the wall clock to get the REAL rate.
+
+    Answers "the animation plays, but far too fast": rate = d(lastTime)/d(wall).
+    1.0 means the sequence advances one second of animation per second of real
+    time (correct).  N>1 means it is running N times too fast -- and because
+    the engine's only divisor is the sequence's own `frequency` (the duration
+    getter at exe 0x5050a0 computes (end-begin)/freq), a rate of N with
+    freq==1.0 means the TIME BEING FED IN is inflated, not the sequence data.
+
+    Prints per-sample deltas so a mid-run restart (lastTime jumping backwards,
+    i.e. a loop wrap) is visible rather than averaged away.
+    """
+    infos = [L.seq_info(s) for s in seqs]
+    if a.sequence:
+        infos = [i for i in infos if i['name'].lower() == a.sequence.lower()]
+        if not infos:
+            raise SystemExit(f'no sequence named {a.sequence!r} on this reference')
+    for i in infos:
+        span = i['end'] - i['begin']
+        print(f"{i['name']!r}: keys[{i['begin']:.3f},{i['end']:.3f}] span={span:.3f}s "
+              f"freq={i['freq']:.4f} cycle={CYCLES.get(i['cycle'], i['cycle'])}")
+    print(f'sampling {a.samples}x every {a.interval}s '
+          f'(rate 1.0 = correct; N = N times too fast)', flush=True)
+
+    prev = {i['addr']: (time.perf_counter(), i['lastTime']) for i in infos}
+    totals = {i['addr']: [0.0, 0.0] for i in infos}   # [anim, wall]
+    for k in range(a.samples):
+        time.sleep(a.interval)
+        for i in infos:
+            cur = L.seq_info(i['addr'])
+            t1, w1 = time.perf_counter(), cur['lastTime']
+            t0, w0 = prev[i['addr']]
+            dt, dw = t1 - t0, w1 - w0
+            prev[i['addr']] = (t1, w1)
+            state = STATES.get(cur['state'], cur['state'])
+            if dw < 0:
+                note = ' (wrapped/restarted)'
+            else:
+                totals[i['addr']][0] += dw
+                totals[i['addr']][1] += dt
+                note = ''
+            rate = (dw / dt) if dt > 0 else float('nan')
+            raw = ' '.join(f'{v:.3f}' for v in cur['raw'])
+            print(f"  [{k}] {cur['name']!r} state={state} lastTime={w1:.4f} "
+                  f"d_anim={dw:+.4f}s d_wall={dt:.4f}s rate={rate:.2f}x{note} "
+                  f"raw+54..64=[{raw}]",
+                  flush=True)
+    print()
+    for i in infos:
+        anim, wall = totals[i['addr']]
+        if wall > 0:
+            print(f"{i['name']!r}: mean rate {anim / wall:.2f}x over {wall:.2f}s "
+                  f"(1.00x = correct)")
     return 0
 
 
@@ -307,7 +455,21 @@ def main(argv=None):
     s = sub.add_parser('tree'); s.add_argument('ref'); s.add_argument('--depth', type=int, default=4); s.set_defaults(fn=cmd_tree)
     s = sub.add_parser('nodes'); s.add_argument('ref'); s.add_argument('--names', required=True)
     s.add_argument('--samples', type=int, default=1); s.add_argument('--interval', type=float, default=0.4); s.set_defaults(fn=cmd_nodes)
-    s = sub.add_parser('sequences'); s.add_argument('ref'); s.add_argument('--blocks', action='store_true'); s.set_defaults(fn=cmd_sequences)
+    s = sub.add_parser('sequences'); s.add_argument('ref'); s.add_argument('--blocks', action='store_true')
+    s.add_argument('--watch', action='store_true',
+                   help='sample lastTime over time and report the REAL playback '
+                        'rate (1.0 = correct, N = N times too fast)')
+    s.add_argument('--sequence', help='with --watch: only this sequence')
+    s.add_argument('--samples', type=int, default=20)
+    s.add_argument('--interval', type=float, default=0.25)
+    s.set_defaults(fn=cmd_sequences)
+
+    s = sub.add_parser('particles'); s.add_argument('ref')
+    s.add_argument('--names', help='comma-separated particle-system node names '
+                                   '(default: find by NiParticleSystem vtable)')
+    s.add_argument('--samples', type=int, default=20)
+    s.add_argument('--interval', type=float, default=0.25)
+    s.set_defaults(fn=cmd_particles)
     s = sub.add_parser('set-cycle'); s.add_argument('ref'); s.add_argument('sequence'); s.add_argument('cycle', type=int, choices=(0, 1, 2)); s.set_defaults(fn=cmd_set_cycle)
     s = sub.add_parser('set-pose'); s.add_argument('ref'); s.add_argument('sequence'); s.add_argument('node')
     g = s.add_mutually_exclusive_group(required=True); g.add_argument('--identity', action='store_true'); g.add_argument('--sentinel', action='store_true'); s.set_defaults(fn=cmd_set_pose)

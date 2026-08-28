@@ -84,3 +84,5 @@ Minor Issues:
 	20 - Tree LOD as real Skyrim billboards (.btt instance tables) instead of baked + cards
 
 	21 - FaceGen: Oblivion.exe statically links the FaceGen SDK (matrixVT.hpp, BSFaceGenModelMap, EGM/EGT basis load+apply). Use it like the SpeedTree engine harness to turn FGGS/FGGA coefficients into real vertex deltas
+
+	22 - OblivionBloodFountain01: geyser (SpecialIdle) never plays as the default state

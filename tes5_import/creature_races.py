@@ -1121,7 +1121,17 @@ def _load_projects(export_dir: str) -> dict:
     this plugin's generated RACE chain at them is correct: the assets exist and
     are shared, exactly as the source plugin intended. Own projects win on
     conflict — this plugin's own conversion of a folder is the authoritative
-    one for the records it ships."""
+    one for the records it ships — EXCEPT when the own project ships no body
+    mesh at all, which is never authoritative for anything: see _usable().
+
+    Projects are keyed on the model folder's LEAF name, so a plugin that
+    happens to ship its own folder with a master's leaf name shadows the
+    master's project even when its CREA records point at the MASTER's path.
+    Morroblivion ships meshes\\morroblivion\\creatures\\daedra\\scamp (dead
+    assets no CREA references, only a mesh.nif that is in no NIFZ set) while
+    its 0Scamp record points at Oblivion's Creatures\\Scamp; the empty own
+    project won, _bodies_of found no body for the record's NIFZ set, no race
+    was generated and the scamp shipped as a vanilla SkeletonRace actor."""
     from .artifact_schema import read_artifact
     own_path = os.path.join(export_dir, 'creature_projects.json')
     own = {}
@@ -1148,7 +1158,14 @@ def _load_projects(export_dir: str) -> dict:
     # master's creature folder shipped as a BASE SKYRIM creature.
     from .overrides import _export_root, _master_export_dir
     root = _export_root(export_dir)
-    merged, inherited = {}, 0
+
+    def _usable(proj) -> bool:
+        """A project can serve a CREA record only if it merged at least one
+        body NIF.  One with none can never satisfy _bodies_of, so letting it
+        shadow a master's real project costs the record its generated race."""
+        return bool(proj.get('bodies') or proj.get('body_map'))
+
+    merged, inherited, rescued = {}, 0, []
     for name in names:
         mpath = os.path.join(_master_export_dir(root, name),
                              'creature_projects.json')
@@ -1158,13 +1175,26 @@ def _load_projects(export_dir: str) -> dict:
         # as the hint or a v0 file (no envelope, no plugin field) would blame
         # whichever plugin happened to be converting.
         for folder, proj in read_artifact(mpath, name).items():
-            if folder not in own and folder not in merged:
-                merged[folder] = proj
-                inherited += 1
+            if folder in merged:
+                continue
+            if folder in own and _usable(own[folder]):
+                continue
+            if folder in own and _usable(proj):
+                # Own project has no body mesh; the master's does. Take the
+                # master's — the own folder is dead assets sharing a leaf name.
+                rescued.append(folder)
+            merged[folder] = proj
+            inherited += 1
     if inherited:
         print(f'  Creature projects: inherited {inherited} from master(s) '
               f'{", ".join(names)} (own: {len(own)})')
-    merged.update(own)
+    if rescued:
+        print(f'  Creature projects: {len(rescued)} bodyless own project(s) '
+              f'superseded by the master\'s: {", ".join(sorted(rescued))}')
+    for folder, proj in own.items():
+        if folder in merged and not _usable(proj):
+            continue        # keep the master's usable project
+        merged[folder] = proj
     return merged
 
 

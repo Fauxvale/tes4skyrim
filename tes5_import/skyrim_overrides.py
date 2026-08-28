@@ -87,7 +87,7 @@ _SKY_MAMMOTH         = 0x0001320A  # MammothRace (Skyrim.esm)
 _SKY_RABBIT          = 0x00059339  # RabbitRace (Skyrim.esm)
 _SKY_FOX             = 0x000A0EB2  # FoxRace (Skyrim.esm)
 _SKY_DEER            = 0x000131ED  # ElkRace (closest for deer)
-_SKY_DEFAULT         = 0x000B7998  # Nord (last-resort fallback)
+_SKY_DEFAULT         = 0x000B7998  # SkeletonRace (last-resort fallback)
 #   CC ESLs — file-local FormIDs (prefix 05 is placeholder load-order byte)
 _CC025_GOLDEN_SAINT  = 0x000816    # ccbgssse025-advdsgs.esm: ccBGSSSE025_GoldenSaintRace
 _CC025_DARK_SEDUCER  = 0x000817    # ccbgssse025-advdsgs.esm: ccBGSSSE025_DarkSeducerRace
@@ -201,13 +201,15 @@ def resolve_creature_race(edid: str, full_name: str) -> tuple:
 
     Matches EditorID and full name against CREA_RACE_PATTERNS keyword list.
     Returns (race_formid, source_note, alternate_note).
-    Falls back to DefaultRace (Nord) if no pattern matches.
+    Falls back to SkeletonRace if no pattern matches.
     """
     search_text = ((edid or '') + ' ' + (full_name or '')).lower()
     for keyword, fid, source, alt in CREA_RACE_PATTERNS:
         if keyword in search_text:
             return fid, source, alt
-    return _SKY_DEFAULT, 'Skyrim.esm 0x00013746 Nord (fallback — no match found)', None
+    return (_SKY_DEFAULT,
+            'Skyrim.esm 0x000B7998 SkeletonRace (fallback — no match found)',
+            None)
 
 
 # ---------------------------------------------------------------------------
