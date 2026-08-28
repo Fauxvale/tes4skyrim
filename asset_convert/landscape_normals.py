@@ -66,6 +66,85 @@ def _dxt1_to_dxt5_blocks(color_data, alpha):
     return out.tobytes()
 
 
+def _dxt3_to_dxt5_blocks(block_data, alpha):
+    """DXT3 -> DXT5 blocks, replacing the explicit alpha with a constant.
+
+    Both are 16 bytes per block and share the trailing 8-byte COLOUR block
+    verbatim; only the leading alpha block differs.  Going to DXT5 rather than
+    rewriting DXT3's nibbles in place buys an EXACT value -- DXT3 quantises
+    alpha to multiples of 17, so 64 would land on 68.
+    """
+    n_blocks = len(block_data) // 16
+    src = np.frombuffer(block_data, dtype=np.uint8).reshape(n_blocks, 16)
+    out = np.zeros((n_blocks, 16), dtype=np.uint8)
+    out[:, 0] = alpha       # alpha0
+    out[:, 1] = alpha       # alpha1; index bytes stay 0 -> every texel alpha0
+    out[:, 8:] = src[:, 8:]
+    return out.tobytes()
+
+
+def _dxt5_set_alpha_blocks(block_data, alpha):
+    """Rewrite DXT5 blocks to a constant alpha; colour untouched."""
+    n_blocks = len(block_data) // 16
+    src = np.frombuffer(block_data, dtype=np.uint8).reshape(n_blocks, 16)
+    out = src.copy()
+    out[:, 0] = alpha
+    out[:, 1] = alpha
+    out[:, 2:8] = 0         # every alpha index -> alpha0
+    return out.tobytes()
+
+
+def set_constant_alpha(path, alpha):
+    """Give one normal map a constant specular mask, whatever its format.
+
+    Three different ways a normal map ends up with no usable mask, all of
+    which Skyrim reads as a specular instruction:
+
+      DXT1  no alpha channel at all -- sampled as 1.0, FULL specular.
+      DXT3  an explicit 4-bit alpha that is written whether the author cared
+            or not.  Nehrim's 33 poster/sign normals are exactly this: a
+            constant 255, i.e. mirror-glossy signage, with no intent behind it.
+      DXT5  a constant or near-constant alpha, same story.
+
+    All three are rewritten as DXT5 carrying `alpha`.  Returns True if the
+    file was rewritten.
+    """
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data[:4] != b'DDS ':
+        return False
+    fourcc = data[84:88]
+    if fourcc not in (b'DXT1', b'DXT3', b'DXT5'):
+        return False
+    height, width = struct.unpack_from('<II', data, 12)
+    mip_count = max(1, struct.unpack_from('<I', data, 28)[0])
+
+    hdr = bytearray(data[:128])
+    hdr[84:88] = b'DXT5'
+    top_blocks = max(1, (width + 3) // 4) * max(1, (height + 3) // 4)
+    struct.pack_into('<I', hdr, 20, top_blocks * 16)
+
+    out = [bytes(hdr)]
+    off = 128
+    for w, h in _mip_dims(width, height, mip_count):
+        nb = max(1, (w + 3) // 4) * max(1, (h + 3) // 4)
+        n = nb * (8 if fourcc == b'DXT1' else 16)
+        chunk = data[off:off + n]
+        if len(chunk) < n:
+            return False            # truncated file -- leave it alone
+        if fourcc == b'DXT1':
+            out.append(_dxt1_to_dxt5_blocks(chunk, alpha))
+        elif fourcc == b'DXT3':
+            out.append(_dxt3_to_dxt5_blocks(chunk, alpha))
+        else:
+            out.append(_dxt5_set_alpha_blocks(chunk, alpha))
+        off += n
+
+    with open(path, 'wb') as f:
+        f.write(b''.join(out))
+    return True
+
+
 def fix_normal_specular(path, alpha=SPECULAR_ALPHA):
     """Convert one DXT1 DDS to DXT5 with constant alpha.  Returns True if
     the file was rewritten (False = not DXT1, left untouched)."""
@@ -106,6 +185,142 @@ def run(landscape_dir):
         if fix_normal_specular(path):
             fixed += 1
     return checked, fixed
+
+
+# Constant mask written where a normal map carries none.  64/255 = 0.251 is
+# EXACTLY the `specular_strength` the mesh stage used to write for a maskless
+# shape, so moving the value out of the mesh and into the texture is visually
+# neutral -- and from then on a modder who ships a real mask simply overrides
+# it, instead of having to discover and undo a shader parameter baked into
+# thousands of NIFs.  See docs/shader_value_mapping.md.
+DEFAULT_MASK_ALPHA = 64
+
+
+# Where the shared stand-in normal map lives, and what a mesh names when its
+# own normal does not exist.  ONE file for the whole conversion: a flat normal
+# has no detail to lose, so 32x32 is as good as 2048 and costs ~1.4 KB.
+DEFAULT_NORMAL_REL = r'textures\tes4\default_n.dds'
+
+
+def write_default_normal(textures_root, alpha=None, size=32):
+    """Write the shared flat normal (128,128,255) with a constant mask.
+
+    DXT5 rather than the uncompressed form `lod_gen` uses for atlases,
+    because the alpha has to be a REAL specular mask here -- `spec_mask`
+    classifies an uncompressed DDS as 'no_alpha' regardless of its content.
+    """
+    if alpha is None:
+        alpha = DEFAULT_MASK_ALPHA
+    dest = Path(textures_root) / 'tes4' / 'default_n.dds'
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # RGB565 for (128,128,255): R=16, G=32, B=31
+    c565 = (16 << 11) | (32 << 5) | 31
+    colour = struct.pack('<HHI', c565, c565, 0)      # c0, c1, all indices -> c0
+    alpha_blk = bytes((alpha, alpha, 0, 0, 0, 0, 0, 0))
+    block = alpha_blk + colour                        # 16 bytes
+
+    dims = []
+    w = h = size
+    while True:
+        dims.append((w, h))
+        if w == 1 and h == 1:
+            break
+        w = max(1, w // 2)
+        h = max(1, h // 2)
+
+    hdr = bytearray(128)
+    hdr[0:4] = b'DDS '
+    struct.pack_into('<I', hdr, 4, 124)
+    # CAPS | HEIGHT | WIDTH | PIXELFORMAT | MIPMAPCOUNT | LINEARSIZE
+    struct.pack_into('<I', hdr, 8, 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x80000)
+    struct.pack_into('<I', hdr, 12, size)             # height
+    struct.pack_into('<I', hdr, 16, size)             # width
+    top_blocks = max(1, size // 4) * max(1, size // 4)
+    struct.pack_into('<I', hdr, 20, top_blocks * 16)  # linear size
+    struct.pack_into('<I', hdr, 28, len(dims))        # mip count
+    struct.pack_into('<I', hdr, 76, 32)               # ddspf size
+    struct.pack_into('<I', hdr, 80, 0x4)              # DDPF_FOURCC
+    hdr[84:88] = b'DXT5'
+    struct.pack_into('<I', hdr, 108, 0x1000 | 0x400000 | 0x8)   # TEXTURE|MIPMAP|COMPLEX
+
+    body = []
+    for w, h in dims:
+        nb = max(1, (w + 3) // 4) * max(1, (h + 3) // 4)
+        body.append(block * nb)
+    with open(dest, 'wb') as f:
+        f.write(bytes(hdr) + b''.join(body))
+    return dest
+
+
+def _read_top_mip(path):
+    """DDS header plus the FIRST mip only -- all a classifier looks at.
+
+    Reading whole files here meant several GB of I/O across a texture tree
+    (5171 normal maps, many of them 2.8 MB) to inspect data that lives
+    entirely in the top mip.
+    """
+    with open(path, 'rb') as f:
+        hdr = f.read(128)
+        if len(hdr) < 128 or hdr[:4] != b'DDS ':
+            return None
+        fourcc = hdr[84:88]
+        if fourcc not in (b'DXT1', b'DXT3', b'DXT5'):
+            return hdr + f.read()      # uncompressed: let the classifier say
+        height, width = struct.unpack_from('<II', hdr, 12)
+        blocks = max(1, (width + 3) // 4) * max(1, (height + 3) // 4)
+        return hdr + f.read(blocks * (8 if fourcc == b'DXT1' else 16))
+
+
+def normalize_specular_alpha(tex_dir, alpha=DEFAULT_MASK_ALPHA, skip=()):
+    """Give every maskless normal map under `tex_dir` a constant mask.
+
+    `spec_mask` decides what counts: a real mask is left ALONE -- authored
+    per-texel data is exactly what we want to keep.  Only 'no_alpha', 'flat'
+    and 'binary' are rewritten, and 'binary' includes the constant-255 case
+    that Skyrim reads as full specular.
+
+    `skip` is a sequence of lowercase path fragments to leave untouched (the
+    landscape tree has its own, dimmer, value).
+
+    Returns (checked, fixed, per-verdict Counter).
+    """
+    from collections import Counter
+    from . import parallax, spec_mask
+
+    tex_dir = Path(tex_dir)
+    counts = Counter()
+    checked = fixed = 0
+    if not tex_dir.exists():
+        return checked, fixed, counts
+    for path in sorted(tex_dir.rglob('*_n.dds')):
+        low = str(path).lower()
+        if any(s in low for s in skip):
+            continue
+        checked += 1
+        try:
+            blob = _read_top_mip(path)
+        except OSError:
+            continue
+        if blob is None:
+            continue
+        info = parallax.classify_alpha(blob)
+        verdict = spec_mask.verdict(info)
+        if verdict == 'mask':
+            counts['mask'] += 1
+            continue
+        # Our own constant is itself 'binary' (one level), so a second run
+        # would rewrite every file it already fixed and report the same count
+        # forever -- which would make the log number useless as a health
+        # signal.  Recognise the finished state instead.
+        if (info is not None and getattr(info, 'levels', 0) == 1
+                and abs(getattr(info, 'mean', -1) - alpha) < 0.5):
+            counts['already'] += 1
+            continue
+        counts[verdict] += 1
+        if set_constant_alpha(path, alpha):
+            fixed += 1
+    return checked, fixed, counts
 
 
 def main(argv):
