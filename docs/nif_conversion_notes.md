@@ -1386,6 +1386,13 @@ being mesh products.
   - **The fit surfaces are NECK-EXTENDED** (round 5): the OB head mesh ends at local z -3.5 on the back of the neck, so hair below it had nothing to conform to and kept the occiput's backward delta all the way down — a visible gap off the nape/neck. `_neck_surfaces` appends the body meshes' neck columns (OB body T-pose + SK malebody/femalebody _0, z>103, |x|<7) to BOTH fit surfaces, so the field, refinement and ear-cover floor all see real skin there. Side effect: helmet widening dropped (iron helm x +2.26 -> +0.77) because lower helmet verts now correspond to the neck instead of the jaw.
   - **Round-4 fit refinements (2026-08-24):** the ear cap projects SK ear verts onto the SK's OWN surrounding skull (an OB-socket cap recessed the region: short hair sat 0.4-0.8 under the skin around the ears); an exact-clearance refinement (capped ±0.5, graph-smoothed) removes the sampler's residual bias at the front hairline/nape (signed bias now −0.01); hair (not helmets) gets an EAR-COVER floor — near-skin verts under the REAL eared skin push out to +0.15 (cap 1.3), so short styles drape over the ear like vanilla (style07 below-skin verts 32→4). Hair specular: converted normal-map alpha masks average 94 vs vanilla ~17, so `specular_strength` is scaled per texture (`_spec_strength_for_normal`) — the flat 0.9 read as plastic shine. `HAIR_ALPHA_THRESHOLD` = 16 (35 still cut visible texels of the blindfold band).
   - 🛑 **Never look converted geometry up in `data.blocks`** — it is STALE after the strips→shape conversion replaces block objects. `_fit_prn_head_blocks` did, matched nothing silently, and every helmet fell back to the legacy `ARMOR_PIECE_OFFSETS_PRN` scale table (sy 1.165 — the in-game "extremely oversized, stretched wide" helmets). Walk `root.tree()` like `apply_armor_offset` does. Guarded by `test_converted_helmet_is_fitted_not_scaled`.
+  - 🛑 **BEAST RACES GET THEIR OWN HEAD-GEAR MESH (2026-08-27).** Hair carries its race in the EditorID (`head_fit.fit_race_for_hair`), but a HOOD or HELMET is ONE Oblivion record worn by every race -- there is nothing on the record to route on, so every converted hood/helmet was fitted to the SHARED HUMAN skull and then sat inside a khajiit or argonian head. **Measured head-local:** the khajiit SK head reaches z 14.85 / |x| 8.47 against the human head's 11.51 / 6.85, and over the scalp region beast verts stand mean 1.91 (khajiit) / 1.40 (argonian) proud of the human surface (max 6.87 / 4.29). Signed penetration into the real beast skull, scalp region, blades/m/helmet: **khajiit 342.9 -> 43.0, argonian 466.1 -> 16.4** against a human-on-human baseline of 43.7; robemagearch/hood (skinned): **khajiit 37.1 -> 16.6, argonian 27.2 -> 7.2** against a baseline of 20.6.
+    - **The fix mirrors vanilla exactly: a MESH PER RACE FAMILY named by a PER-RACE ARMA.** ARMA has no alternate-model slot -- race targeting is `RNAM` + the `MODL[]` additional races -- so a per-race mesh *requires* a per-race ARMA. Vanilla `ArmorIronHelmet` lists three armatures: `IronHelmetAA` (RNAM=DefaultRace, `Helmet.nif`), `IronHelmetKhajiitAA` (RNAM=KhajiitRace, `HelmetKhajiit.nif`), `IronHelmetArgonianAA` (RNAM=ArgonianRace, `HelmetArgonian.nif`); the same split runs through BoneCrown, Blades, Orcish, Dragonscale, Draugr, Dragonplate, Falmer, ThalmorHood and every Circlet. We write `<name>_khajiit.nif` / `<name>_argonian.nif` (`nif_converter._write_beast_head_variants`) and emit the matching ARMAs (`equipment._build_arma(beast_race=...)`, races in `skyrim_overrides.ARMA_BEAST_RACES`).
+    - **The default ARMA must DROP the beast races** (`ARMA_ADDITIONAL_RACES_NONBEAST`) or the engine satisfies a khajiit with the human-fitted armature and never reaches the beast one. Each beast ARMA lists that race's VAMPIRE variant as its additional race (KhajiitRaceVampire 0x88845 / ArgonianRaceVampire 0x8883A), exactly as vanilla does.
+    - **Khajiit and Argonian stay SEPARATE, never one shared "beast" mesh** -- the two skulls differ from each other as much as either differs from the human one (khajiit ears sit on TOP of the crown, argonian snout runs to y 15.39 vs khajiit's 13.63).
+    - **A beast variant is a full RE-CONVERSION, not a re-fit of the finished mesh.** A hood is multi-bone SKINNED geometry (Bip01 Head + Neck + Clavicles), so its head fit happens inside the retarget wrap (`deform_geoms_wrap`), not in the rigid Prn pass -- there is no later point at which the head verts can be displaced again without redoing the skin solve. `race` therefore threads `convert_nif` -> `_convert_nif` -> `retarget_skin_to_skyrim` -> `deform_geoms_wrap` -> `field_deltas`, AND into `_fit_prn_head_blocks` for the rigid case. Re-reading also keeps each variant a FIRST fit through its race's field rather than a second displacement stacked on the human result.
+    - **The gate is the AUTHORED BMDT flags, never the filename**, and the record must claim ONLY head slots (bits 0/1) and NO body slots (bits 2-5). A multi-slot suit (Knight of Order, flags 0x3D) is fitted by where its vertex MASS sits -- the body -- so asset_convert writes no per-race mesh for it; emitting a beast ARMA anyway pointed at a missing file (measured: 14 of 484 beast ARMAs before the gate, all that suit) and a missing mesh renders INVISIBLE, which is worse than a slightly-wrong fit.
+    - **No FormID drift**: beast ARMAs are keyed `derive_formid('ARMA', (source_fid, race))` while the human one keeps the bare `source_fid`, so no existing id moves. Measured over Oblivion.esm: 0 main records moved, 0 companions lost, 470 gained across 235 head-gear records. Guarded by `tests/test_beast_head_gear.py`.
   - **Skinned head gear (guard helmets, cloth hoods) takes the SAME field, blended by head weight.** The wrap's correction field is graph-smoothed (DELTA_SMOOTH_PASSES), which smeared the real jaw widening across the whole head: the townguardcho skinned helmet shipped +2.5 units of head-band width and a +31% nose guard ("comically large" in game) even after the wrap's head dst rows were replaced with the exact field. `deform_geoms_wrap` now maps head-weighted verts directly through `head_fit.field_deltas` on their PRE-FK authored positions (per-vertex head-weight-fraction blend; measured after: ear-band +0.07, nose guard +0.02) while clavicle/spine-weighted drape keeps the wrap; field-fitted verts skip the clearance push. The wrap npz's head dst rows are ALSO the field mapping (build_field replaces the ICP head fit), so enforcement measures against the true SK skin. `ARMOR_PIECE_OFFSETS['helmet']` constants apply only when no field with a head exists.
 - **`malehead.nif`/`femalehead.nif` are `BSDynamicTriShape`: verts inline, UVs+normals+tangents in the SKIN PARTITION (2026-08-23)**. `sse_nif._geometry_arrays` returned early on `sse_verts is not None` and handed back the inline buffer's `None` for every other attribute, so both heads read with **zero UVs and zero normals** — silently, since nothing checked. It now falls back **per attribute**, not just for triangles (length-checked against the vertex count). Body/hands/feet targets are unaffected (verified: all 7 wrap targets report uvs == verts).
 - **When the field exists, `ARMOR_PIECE_OFFSETS` are SKIPPED** (nif_converter checks `body_wrap.wrap_available`) -- the field's far-range constant extrapolation replaces that hand-tuned drift table. PRN offsets (`ARMOR_PIECE_OFFSETS_PRN`) still apply to NON-head Prn pieces (shields); head-attached Prn pieces take the head fit instead (see above), and both constant tables survive only as the fallback when the fit/field data is unavailable.
@@ -1553,6 +1560,53 @@ The single most important havok-conversion fact, and the root cause of both "con
 - **Skyrim applies BOTH fields on BOTH body classes.** Proof: vanilla `trapmace01.nif` Base01 — the node is rotated +0.5° about X and the plain bhkRigidBody carries exactly the inverse quaternion (-0.0044,0,0,1) so its root-space MOPP stays aligned; every other vanilla non-T body is exactly identity/zero, unlike Bethesda's genuinely-garbage padding fields.
 - Consequence of passing them through: every constraint frame and collision shape is rotated out from under the solver → constraint assemblies act welded solid; ordinary clutter collision sits askew from the visual mesh.
 - Fix in `_convert_collision`: non-T bodies get translation=(0,0,0,0) AND rotation=(0,0,0,1). bhkRigidBodyT keeps its (scaled) transform. NOTE: field-level dumps looked "fine" for months because everyone (and the docs) believed the non-T fields were dead — when a converted mesh matches vanilla on every OTHER field, byte-diff the remaining "ignored" ones.
+
+## Hoisted collision dropped the child node's ROTATION (SOLVED 2026-08-27)
+"citadelballconystandardendleft02.nif has no collision" — but the output carried a
+complete `bhkCollisionObject` + MOPP + CMS with 373 non-degenerate triangles. The
+collision was **present and correctly formed, just parked in the wrong half of the
+world**, so nothing the player walks on ever touched it.
+
+Measured (game units): render Y `-956.8..-494.2`, collision Y `+508.7..+1035.6`,
+Z off by ~286. X matched exactly — the tell that this is a transform bug, not a
+geometry one.
+
+Cause: Skyrim requires collision on the root, so `hoist_collision` moves it up from
+a child NiNode — but it read **only `child.translation`**, and only for the two
+strips shape types via `_offset_collision_shape_verts`. This mesh hangs its
+collision on `collisionCitadelBallconyStandardEndRight04`, whose rotation is
+`diag(1,-1,-1)` (180° about X). That flip was silently discarded, negating Y and Z.
+
+**The A/B that isolates it**: sibling `citadelballconystandardendleft.nif` — same
+author, same geometry, same 373-tri hull, same code path — converts correctly, and
+its collision node's rotation is identity. The node rotation is the only
+discriminator; the shape type, mesh and plugin are all constants across the pair.
+
+Fix: `hoist_collision` now composes the child's FULL `(R, T, s)`:
+- **`bhkRigidBody(T)`** → `bake_node_transform_into_body` (promotes to
+  `bhkRigidBodyT`). Shape-agnostic, so it also fixes convex hulls, list shapes and
+  primitives — none of which have a vertex array the old path could rewrite, so
+  they had been dropping the translation too.
+- **`bhkSimpleShapePhantom`** (trap-damage volumes, trigger zones) has no body
+  transform field and cannot be promoted → `_wrap_shape_in_node_transform` composes
+  `L` into a `bhkTransformShape` wrapper instead (composing into an existing
+  transform shape rather than double-wrapping).
+
+Safe against the bodyT+CMS CTD above: mesh collision folds any bodyT back into the
+triangles in `_bake_body_transform_into_tris` and demotes the body to plain
+identity, so no shipped CMS mesh gains a `bhkRigidBodyT`.
+
+**Blast radius, measured over 28,470 exported NIFs**: 645 reach the hoist path; 55
+have a non-identity rotation/scale there; 19 are creature assets (`creature=True`
+skips the hoist) and 15 more take the `wrapped` path (which already baked rotation
+correctly) — leaving **14 meshes that actually changed**, across Oblivion.esm and
+Nehrim.esm. Verified: collision/render overlap ≥0.97 on the balcony pair, 0 issues
+from `collision_sanity.py`, and the phantom's composed transform matches a hand
+computation to 4 decimals.
+
+The `wrapped` gate in `nif_converter.py` still skips hoisting — not because
+rotation is unsupported any more, but because that case would have to compose the
+WRAPPER's transform too.
 
 ## Inverted collision winding — "I fall through the floor" (SOLVED 2026-07-20; **rewritten 2026-08-20, see round 3 below**)
 Falling through floors in Nehrim (worst in caves) that are solid in Oblivion. **Source-data corruption, not a conversion bug** — the converter faithfully reproduced broken input.

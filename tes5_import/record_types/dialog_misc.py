@@ -767,6 +767,7 @@ def _wthr_cloud_sig(layer: int) -> bytes:
 #   0 Sky-Upper, 1 Fog, 2 Clouds-Lower, 3 Ambient, 4 Sunlight, 5 Sun,
 #   6 Stars, 7 Sky-Lower, 8 Horizon, 9 Clouds-Upper
 _T4_SKY_UPPER, _T4_FOG, _T4_CLOUDS_LOWER, _T4_AMBIENT = 0, 1, 2, 3
+_T4_SUNLIGHT = 4
 _T4_SUNLIGHT, _T4_SUN, _T4_STARS, _T4_SKY_LOWER = 4, 5, 6, 7
 _T4_HORIZON, _T4_CLOUDS_UPPER = 8, 9
 
@@ -924,6 +925,74 @@ _NAM0_KNEE_CEILING = 200.0    # 255 maps here
 _NAM0_SUN_KNEE = 30.0
 _NAM0_SUN_CEILING = 60.0
 _T5_SUN = 5
+_T5_AMBIENT = 3
+_T5_SUNLIGHT = 4
+_T5_SUN_GLARE = 15
+
+# --- Sunless skies (Oblivion realms) --------------------------------------
+#
+# Oblivion expresses "this sky has no sun" entirely through the CLMT sun
+# SPRITE: the realm climates set FNAM=Sky\Void.dds / GNAM=Sky\VoidGlare.dds
+# (or author no FNAM at all, as ClimateSigil and MQ14OblivionClimate do), and
+# Oblivion's Sun class draws only that sprite.  Skyrim's sun is three separate
+# things -- the sprite, a DIRECTIONAL LIGHT fed by NAM0 slot 4, and a glare
+# pass fed by slot 15 -- so voiding the sprite alone leaves a tracking light
+# and a glare burning over the Deadlands.
+#
+# Vanilla solves exactly this for Blackreach, the one sunless outdoor sky in
+# Skyrim.esm.  Measured from references/Skyrim.esm:
+#
+#   BlackreachClimate  FNAM=Black.dds  GNAM=Black.dds       (NOT Sky\Void.dds,
+#                                                            and the GLARE is
+#                                                            black too)
+#   BlackreachWeather  NAM0 slot 4 Sunlight = (0,0,0) x4    <- kills the light
+#                      NAM0 slot 5 Sun      = (0,0,0) x3, (128,128,128) night
+#
+# `Black.dds` is a VANILLA path and must not take the tes4\ prefix.
+_SUNLESS_SUN_TEXTURE = 'Black.dds'
+
+# TES4 sun sprites that mean "no sun".  Matched case-insensitively on the
+# basename so a plugin using its own path to the same idiom still hits.
+_SUNLESS_SUN_MARKERS = ('void.dds',)
+
+# Weather FormIDs reachable from a sunless CLMT's WLST, read by convert_WTHR.
+# import_main populates this from BOTH the plugin's own climates and the
+# master export, before Phase 1 -- not from convert_CLMT, which an override
+# plugin's climates never reach (they take the ctx.build() short-circuit).
+_SUNLESS_WEATHER_FIDS = set()
+
+
+def _clmt_is_sunless(rec: dict) -> bool:
+    r"""True when a TES4 climate authors no visible sun.
+
+    Two authored idioms, both meaning the same thing:
+      * FNAM names a void/black sun sprite, or
+      * the record carries NO FNAM at all (Oblivion draws nothing).
+    A climate with a real FNAM (Sky\Sun.dds) is never sunless.
+    """
+    sun = (get_str(rec, 'FNAM.SunTexture') or '').strip()
+    if not sun:
+        return True
+    base = sun.replace('/', '\\').rsplit('\\', 1)[-1].lower()
+    return base in _SUNLESS_SUN_MARKERS
+
+
+def record_sunless_climate(rec: dict) -> None:
+    """Register a sunless climate's weathers so convert_WTHR can zero their sun.
+
+    Called for EVERY climate; only sunless ones contribute.  Idempotent.
+    """
+    if not _clmt_is_sunless(rec):
+        return
+    for i in range(get_int(rec, 'WeatherCount')):
+        fid = get_formid(rec, f'Weather[{i}].FormID')
+        if fid:
+            _SUNLESS_WEATHER_FIDS.add(fid)
+
+
+def reset_sunless_climates() -> None:
+    """Clear the registry between plugins (and between tests)."""
+    _SUNLESS_WEATHER_FIDS.clear()
 
 # Vanilla targets: (per-time medians, per-time p90 luminance), keyed by TES5
 # NAM0 slot, measured over the 84 Skyrim.esm weathers.  RETAINED ONLY as the
@@ -1049,7 +1118,81 @@ def _wthr_nam0(rec: dict) -> bytes:
         for time in range(4):
             dst = (_T5_STARS * 4 + time) * 4
             out[dst:dst + 3] = b'\x00\x00\x00'
+
+    if get_formid(rec, 'FormID') in _SUNLESS_WEATHER_FIDS:
+        _nam0_kill_sun(out, raw)
     return bytes(out)
+
+
+def _nam0_kill_sun(out: bytearray, raw: bytes) -> None:
+    """Zero the sun for a weather reachable from a sunless climate.
+
+    Skyrim splits what Oblivion kept in one sprite across three NAM0 slots,
+    and only slot 5 is the disc.  Handling each on its own terms:
+
+    * **Slot 5 Sun** and **slot 15 Sun Glare** -> hard zero.  These are the
+      disc and its bloom; vanilla BlackreachWeather zeroes both.
+
+    * **Slot 4 Sunlight** -> folded into **slot 3 Ambient**, NOT zeroed.
+      This is where the realms differ from Blackreach, and zeroing it would
+      be wrong.  Blackreach is a cave lit purely by ambient, so vanilla can
+      zero its Sunlight outright.  The Deadlands are lit by a warm red fill
+      that Oblivion authors IN Sunlight (Obliviondefault 193,130,87) while
+      the sun sprite is voided -- in Oblivion the two are independent, in
+      Skyrim slot 4 drives a directional light that visibly tracks the sun.
+      Dropping it would black out the realm's red glow; keeping it would
+      leave a tracking light with no disc.  Folding its luminance into
+      Ambient preserves the fill as the non-directional light it always was.
+      That the authors used a literal (0,0,0) Sunlight on OblivionSigil, the
+      one realm weather with no fill, confirms zero is their "no light" value
+      and a non-zero value here is a deliberate fill.
+
+    Every realm weather authors its four time slots IDENTICALLY -- Oblivion's
+    way of saying the sky has no day/night cycle -- so this is time-invariant
+    by construction and needs no per-slot special casing.
+
+    `raw` is the TES4 table; sunlight is re-read from it because `out` already
+    carries the knee-compressed value and the fold wants the authored one.
+    """
+    for time in range(4):
+        for slot in (_T5_SUN, _T5_SUN_GLARE):
+            dst = (slot * 4 + time) * 4
+            out[dst:dst + 3] = b'\x00\x00\x00'
+
+    if not raw or len(raw) < 160:
+        return
+
+    for time in range(4):
+        dst = (_T5_SUNLIGHT * 4 + time) * 4
+        out[dst:dst + 3] = b'\x00\x00\x00'
+        amb = (_T5_AMBIENT * 4 + time) * 4
+        out[amb:amb + 3] = bytes(
+            _fold_sunlight_into_ambient(raw, time,
+                                        out[amb], out[amb + 1], out[amb + 2]))
+
+
+def _fold_sunlight_into_ambient(raw: bytes, time: int,
+                                ar: int, ag: int, ab: int) -> tuple:
+    """Add half the TES4 Sunlight for `time` onto an already-resolved ambient.
+
+    Half, because the directional light lit roughly the half of every surface
+    that faced it while ambient lights all of it -- folding the whole value in
+    over-brightens the realm.  A zero Sunlight (OblivionSigil) is a no-op.
+
+    Applied to BOTH NAM0 slot 3 and every DALC face, so the sky ambient and
+    the OBJECT lighting stay consistent: vanilla BlackreachWeather's DALC
+    faces track its NAM0 Ambient ~1:1 (10,11,12 -> 11,11,12), i.e. vanilla
+    does not compensate DALC separately for a missing sun -- it authors
+    Ambient at the level it wants and lets DALC follow.
+    """
+    if not raw or len(raw) < 160:
+        return (ar, ag, ab)
+    src = (_T4_SUNLIGHT * 4 + time) * 4
+    sr, sg, sb = raw[src], raw[src + 1], raw[src + 2]
+    if not (sr or sg or sb):
+        return (ar, ag, ab)
+    return (min(255, ar + sr // 2), min(255, ag + sg // 2),
+            min(255, ab + sb // 2))
 
 
 def _cloud_speed_tes4_to_tes5(speed: int) -> int:
@@ -1326,6 +1469,11 @@ def _wthr_dalc(rec: dict) -> bytes:
     Fresnel Power f32 = 32 bytes.  Fresnel is 1.0 in every vanilla record.
     """
     raw = get_hex_bytes(rec, 'NAM0.Data')
+    # A sunless sky (Oblivion realm) has had its directional light removed, so
+    # the same Sunlight->Ambient fold NAM0 applies must reach the object
+    # lighting too -- otherwise the sky glows red and everything under it is
+    # lit only by the dim TES4 ambient.  See _fold_sunlight_into_ambient.
+    sunless = get_formid(rec, 'FormID') in _SUNLESS_WEATHER_FIDS
     out = b''
     for time in range(4):
         if raw and len(raw) >= 160:
@@ -1335,6 +1483,8 @@ def _wthr_dalc(rec: dict) -> bytes:
             # median), which left shadows black under blown highlights.
             r, g, b = _normalize_rgb(3, time,
                                      raw[src], raw[src + 1], raw[src + 2])
+            if sunless:
+                r, g, b = _fold_sunlight_into_ambient(raw, time, r, g, b)
         else:
             r = g = b = 0
         block = bytearray()
@@ -1889,12 +2039,22 @@ def convert_CLMT(rec: dict) -> bytes:
         subs += pack_subrecord('WLST', wlst)
 
     # Sun and sun-glare textures.
-    sun = get_str(rec, 'FNAM.SunTexture')
-    if sun:
-        subs += pack_string_subrecord('FNAM', _prefix_path(sun))
-    glare = get_str(rec, 'GNAM.GlareTexture')
-    if glare:
-        subs += pack_string_subrecord('GNAM', _prefix_path(glare))
+    #
+    # A SUNLESS climate (Oblivion realm) gets vanilla's Black.dds on BOTH,
+    # exactly as BlackreachClimate does -- see the _SUNLESS_SUN_TEXTURE block.
+    # Passing TES4's Sky\Void.dds through is not enough: VoidGlare.dds is a
+    # real glare sprite, so the glare pass keeps drawing a sun-shaped bloom.
+    # Black.dds is a vanilla path, so it must NOT take the tes4\ prefix.
+    if _clmt_is_sunless(rec):
+        subs += pack_string_subrecord('FNAM', _SUNLESS_SUN_TEXTURE)
+        subs += pack_string_subrecord('GNAM', _SUNLESS_SUN_TEXTURE)
+    else:
+        sun = get_str(rec, 'FNAM.SunTexture')
+        if sun:
+            subs += pack_string_subrecord('FNAM', _prefix_path(sun))
+        glare = get_str(rec, 'GNAM.GlareTexture')
+        if glare:
+            subs += pack_string_subrecord('GNAM', _prefix_path(glare))
 
     # MODL — the night-sky/stars mesh.  Every vanilla Skyrim climate has one;
     # without it the engine draws no stars at night.

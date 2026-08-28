@@ -672,12 +672,14 @@ EndFunction
 ; cannot fire a second time.  Same 1.0s budget as ReleaseBreakaway, chosen the
 ; same way -- Papyrus cannot query a Gamebryo sequence's length, and every
 ; converted break clip but one outlier finishes well inside it.
-Function DestroyAfterAnimation(ObjectReference akRef) Global
+Function DestroyAfterAnimation(ObjectReference akRef, FormList akDestroyed) Global
   If akRef == None
     Return
   EndIf
   Utility.Wait(1.0)
-  akRef.SetDestroyed(true)
+  ; Through the mirroring setter, never the bare native: a converted
+  ; `getdestroyed` reads the FormList (see SetDestroyed/GetDestroyed below).
+  SetDestroyed(akRef, akDestroyed)
 EndFunction
 
 ; ==========================================================================
@@ -1299,4 +1301,278 @@ EndFunction
 Float Function SpeakAsLineNoWait(ObjectReference akSpeaker, Float afFallbackLength, Bool abInHead = False, Topic akTopic = None) Global
   SpeakAs(akSpeaker, abInHead, akTopic)
   Return afFallbackLength
+EndFunction
+
+
+; ======================================================== oblivion gates ==
+;
+; TES4's CloseCurrentOblivionGate / CloseOblivionGate / ForceCloseOblivionGate
+; are ENGINE calls with no Papyrus counterpart.  CloseCurrentOblivionGate does
+; three things at once (UESP, "Oblivion:Oblivion Gates", console section:
+; "This will close the gate you entered through and teleport you back to
+; Cyrodiil"):
+;
+;   1. teleport the player out of the Oblivion worldspace, back to the gate;
+;   2. mark that gate destroyed, so its ACTI stops spawning and the sigil
+;      chain's `getdestroyed == 1` branches fire;
+;   3. drop the gate's forced weather override.
+;
+; Converting it to a no-op severed the ONLY way out of every Oblivion realm:
+; the player took the Sigil Stone, got the item, the fame and the fireworks,
+; and then stood there forever.  Both of Bethesda's redundant exit routes end
+; in this same call -- SigilRingBoomSCRIPT's 8.666s `gateTimer`, and the
+; eleven TrigZoneCloseCurrentOblivion* trigger zones gated on `gotSigil == 1`
+; -- so a single no-op killed all of them at once.  (Oblivion itself shipped
+; this as a known bug on the Bruma gate, whose UESP workaround is to type
+; CloseCurrentOblivionGate in the console: that function IS the exit.)
+;
+; WHICH GATE.  Skyrim has no "the gate you came through" concept, so the
+; return target has to be captured on the way IN.  MQ00Script.nearOblivionGate
+; holds exactly that reference while the player is beside the gate in Tamriel
+; -- but every gate script CLEARS it to 0 in its own OnActivate ("we aren't
+; 'near' any gate anymore -- we're in Oblivion!"), which is the same event
+; that carries the player through.  So the converter injects a capture call
+; BEFORE that clear (see _is_oblivion_gate_entry): the gate records ITSELF
+; here as the player entered, and the clear then proceeds untouched so the
+; authored weather/proximity logic is unchanged.
+;
+; WHERE IT IS STORED.  As the FormID of the gate, split hi/lo across two
+; script Actor Values ON THE PLAYER -- the same mechanism LineBegan uses to
+; remember the last actor to speak in the player's menu, and for the same
+; reasons: it is vanilla-only, it persists across save/load and worldspace
+; changes, and it needs no property binding on either side.
+;
+;   Variable01  hi half of the entered gate's FormID (0 = no gate held)
+;   Variable02  lo half
+;
+; Variable01/02 are the only two of the engine's ten script AVs this
+; conversion does not already use (03-10 are the say-line state above).
+;
+; A script variable on the GATE could not do this job: the gate's own cell is
+; unloaded the entire time the player is inside the realm.  Nor could a
+; linked ref -- Papyrus has GetLinkedRef but NO SetLinkedRef (it exists only
+; in po3's SKSE plugin), so linked refs are editor-authored and read-only at
+; runtime.
+
+; Record `akGate` as the gate the player is currently entering.
+Function EnterOblivionGate(ObjectReference akGate) Global
+  If akGate == None
+    Return
+  EndIf
+  Int fid = (akGate as Form).GetFormID()
+  Actor p = Game.GetPlayer()
+  p.SetActorValue("Variable01", Math.Floor(fid / 65536) as Float)
+  p.SetActorValue("Variable02", (fid - Math.Floor(fid / 65536) * 65536) as Float)
+EndFunction
+
+; The gate the player entered through, or None if none was captured.
+ObjectReference Function GetCurrentOblivionGate() Global
+  Actor p = Game.GetPlayer()
+  Float hi = p.GetActorValue("Variable01")
+  Float lo = p.GetActorValue("Variable02")
+  If hi <= 0.0 && lo <= 0.0
+    Return None
+  EndIf
+  ; A runtime-created (FF……) reference cannot be rebuilt from an Int — the
+  ; same guard PlayerIsInDialogue uses.  No vanilla or converted gate is
+  ; runtime-created, but a PlaceAtMe'd one would land here.
+  If hi >= 32768.0
+    ClearOblivionGate()
+    Return None
+  EndIf
+  Return Game.GetForm((hi as Int) * 65536 + (lo as Int)) as ObjectReference
+EndFunction
+
+Function ClearOblivionGate() Global
+  Actor p = Game.GetPlayer()
+  p.SetActorValue("Variable01", 0.0)
+  p.SetActorValue("Variable02", 0.0)
+EndFunction
+
+; TES4 GetDisabled.
+;
+; In Oblivion "disabled" and "destroyed" are INDEPENDENT bits of the same
+; reference (0x800 and 0x2000 of [ref+8]), and closing a gate set only the
+; destroyed one -- so a closed gate stayed enabled and `getdisabled` kept
+; reporting 0.  Scripts rely on that: MS48 and MS94 both open their poll with
+;   if getdisabled == 1
+;       return
+;   endif
+;   if getdestroyed == 1 && getstage <q> < N
+;       setstage <q> N
+; where the preamble is meant to skip a gate that was never OPENED, not one
+; that has just been CLOSED.
+;
+; Skyrim has no separate "present" bit we can clear, so removing a closed gate
+; has to use Disable() (see TurnGateOff).  That makes the native IsDisabled()
+; true and turns those preambles into a blocker, permanently stranding the
+; setstage below them -- the measured MS48-at-stage-10 defect.
+;
+; Restoring Oblivion's independence is one line: a DESTROYED reference is not
+; reported as disabled.  The preamble keeps its original meaning (skip an
+; unopened gate) and the destroyed branch stays reachable.
+Bool Function GetDisabled(ObjectReference akRef, FormList akDestroyed) Global
+  If akRef == None
+    Return False
+  EndIf
+  If GetDestroyed(akRef, akDestroyed)
+    Return False
+  EndIf
+  Return akRef.IsDisabled()
+EndFunction
+
+; Switch a gate off so it stops being drawn (and stops emitting its DOOR
+; BNAM loop sound).
+;
+; SetDestroyed alone does NOT do this -- per the CK wiki a destroyed object
+; "still exists, and continues to render and process events normally".  It is
+; only non-interactable.  Taking it out of the world is Disable().
+;
+; A GATE CANNOT ALWAYS Disable() ITSELF.  Skyrim refuses Disable() on a
+; reference that has an enable-state parent, logging
+;   "(1201E8A3): cannot disable an object with an enable state parent."
+; and doing nothing -- the live Papyrus error from the Kvatch gate, whose
+; REFR carries XESP.Reference=00091229.  The parent IS the authored on/off
+; switch: OblivionGateRandomScript reopens a spent gate with
+; `set mySpawnMarker to getParentRef / mySpawnMarker.enable`.
+;
+; So: try the direct Disable() first and ASK THE ENGINE whether it took
+; (IsDisabled()), rather than predicting which case applies.  If it was
+; refused, walk up the enable-parent chain instead -- it can nest
+; (OblivionRD001Gate01 -> 03 -> 02), hence the loop and the guard.
+; The importer mirrors XESP into XLKR for gate-closing bases so GetLinkedRef
+; can reach the parent at runtime (object_scripts._GETPARENTREF_BASES).
+Function TurnGateOff(ObjectReference akGate) Global
+  If akGate == None
+    Return
+  EndIf
+  akGate.Disable()
+  If akGate.IsDisabled()
+    Return
+  EndIf
+  ; Refused => it has an enable parent.  Switch that off instead, walking up
+  ; in case the chain nests.
+  ObjectReference enabler = akGate.GetLinkedRef()
+  Int guard = 0
+  While enabler != None && guard < 8
+    enabler.Disable()
+    If enabler.IsDisabled()
+      Return
+    EndIf
+    enabler = enabler.GetLinkedRef()
+    guard += 1
+  EndWhile
+EndFunction
+
+; CloseCurrentOblivionGate: teleport the player back to the gate they entered
+; through, set its destroyed flag, and release the gate weather.
+;
+; That flag IS the whole closure -- verified against Oblivion.exe.  The
+; command handler (0x515ef0) reaches ONLY the flag setter (0x46aa50, which
+; ORs 0x2000 into [ref+8]); Disable (0x50a240, bit 0x800) is NOT reachable
+; from it at any depth.  The visible portal is the looping `SpecialIdle` the
+; gate's own GameMode re-issues while `GetDestroyed == 0`; once the flag is
+; set the poll stops re-issuing it and the portal closes on its own.  So the
+; conversion must NOT Disable() the gate -- Oblivion never does, and doing so
+; would also make the poll's `if getdisabled == 1 / return` preamble swallow
+; the `setstage` that the same poll owes the quest.
+;
+; The gate is ALWAYS destroyed.  TES4's optional integer argument is a "no
+; reset" flag about the Oblivion CELL respawning, not about the gate: the two
+; callers that pass 1 are named for it (SigilRingBoomNoResetSCRIPT and the
+; TrigZone*NoResetSCRIPTs) and are otherwise byte-identical to the variants
+; that pass nothing.  Treating it as "don't destroy" was measured wrong in
+; game -- the Kvatch gate stayed standing and MS48 pinned at stage 10, since
+; MS48OblivionGateScript's only `setstage ms48 50` is gated on
+; `getdestroyed == 1`.
+;
+; Returns False when no gate was captured -- the player reached a realm by
+; some route that never ran a gate OnActivate (a coc, a scripted MoveTo).
+; Nothing sensible can be done in that case, and teleporting to a stale
+; reference would be worse than staying put.
+Bool Function CloseCurrentOblivionGate(FormList akDestroyed) Global
+  ObjectReference gate = GetCurrentOblivionGate()
+  If gate == None
+    Return False
+  EndIf
+  ; Clear the capture FIRST: whatever happens below, this gate is spent, and a
+  ; stale hold would send a later realm's exit to the wrong worldspace.
+  ClearOblivionGate()
+  ; Out of the realm first, matching the engine: the gate is a reference in
+  ; the DESTINATION cell, so flagging it before the move would touch an
+  ; object the player is still transitioning toward.
+  Game.GetPlayer().MoveTo(gate)
+  ; Order matters, and no timer is needed.  The gate's own GameMode poll
+  ; opens with `if getdisabled == 1 / return`, ABOVE its `getdestroyed`
+  ; stage check -- so switching the gate off is what once made the quest
+  ; unreachable.  It no longer can: `getdestroyed` now reads the FormList,
+  ; which SetDestroyed writes on THIS line, before the gate goes away.  The
+  ; stage branch is satisfied by state, not by catching a live poll tick.
+  SetDestroyed(gate, akDestroyed)
+  TurnGateOff(gate)
+  ; The realm's weather override does not survive the player leaving it, and
+  ; the gate's own GameMode poll re-applies OblivionStormTamriel while the
+  ; player stands next to it.
+  Weather.ReleaseOverride()
+  Return True
+EndFunction
+
+; TES4 GetDestroyed / SetDestroyed -- the destroyed FLAG.
+;
+; CK wiki, SetDestroyed: "Objects that have been Destroyed no longer present
+; mouseover text and cannot be activated.  Note that they still exist, and
+; continue to render and process events normally - they are not Disabled or
+; Deleted, and their visual Destruction State, if any, is unaffected."
+;
+; So it is ONLY non-interactability -- three separate states share the word
+; "destroyed" and must not be conflated: the FLAG (bit 0x2000 of [ref+8] in
+; Oblivion.exe), enable state (bit 0x800, what Disable() writes), and the DEST
+; destruction STAGE.  GetCurrentDestructionStage() and IsDisabled() each read
+; one of the other two, and using either made `if getdestroyed == 1 / setstage`
+; unreachable -- that is what pinned MS48 at stage 10.
+;
+; Skyrim exposes the setter to Papyrus (ObjectReference.SetDestroyed) but NOT
+; the getter: GetDestroyed is a console/condition function (CTDA index 203),
+; with no ObjectReference member -- 0 hits across every vanilla .psc.  So the
+; flag is mirrored into a conversion-owned FormList as it is written.
+; A FormList works on ANY reference type (the AV store used elsewhere here is
+; Actor-only, and a gate is a DOOR) and its added entries persist in the save.
+Function SetDestroyed(ObjectReference akRef, FormList akDestroyed, Bool abDestroyed = True) Global
+  If akRef == None
+    Return
+  EndIf
+  akRef.SetDestroyed(abDestroyed)
+  If akDestroyed == None
+    Return
+  EndIf
+  ; HasForm first: AddForm would otherwise stack duplicate entries on a
+  ; reference destroyed twice, and RemoveAddedForm only drops one of them.
+  If abDestroyed
+    If !akDestroyed.HasForm(akRef)
+      akDestroyed.AddForm(akRef)
+    EndIf
+  Else
+    While akDestroyed.HasForm(akRef)
+      akDestroyed.RemoveAddedForm(akRef)
+    EndWhile
+  EndIf
+EndFunction
+
+Bool Function GetDestroyed(ObjectReference akRef, FormList akDestroyed) Global
+  If akRef == None || akDestroyed == None
+    Return False
+  EndIf
+  Return akDestroyed.HasForm(akRef)
+EndFunction
+
+; ForceCloseOblivionGate / CloseOblivionGate: destroy a gate WITHOUT moving the
+; player.  Called on the Tamriel side -- OblivionGateRandomScript and
+; MS94/MQ11OblivionGateScript each call it from OnLoad to clean up gates still
+; standing after MQ16 ends.  `akGate` is the calling reference itself.
+Function CloseOblivionGate(ObjectReference akGate, FormList akDestroyed) Global
+  If akGate == None
+    Return
+  EndIf
+  SetDestroyed(akGate, akDestroyed)
+  TurnGateOff(akGate)
 EndFunction

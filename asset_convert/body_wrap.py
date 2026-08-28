@@ -1216,13 +1216,17 @@ def _blended_clearance(field, pts, verts_surf, tri_normals, tree,
 
 
 def deform_geoms_wrap(skinned_geoms, skel_root, field, female: bool,
-                      weight: int = 0) -> int:
+                      weight: int = 0, race=None) -> int:
     """FK deform + exact body-fit correction for all non-PRN skinned geoms.
 
     Drop-in replacement for skin_retarget's FK Phase B: runs the standard FK
     animation deform first (smooth base), then cancels its measured error
     against the Skyrim body via the wrap correction field.  `weight` selects
-    the _0 (thin) or _1 (heavy) Skyrim body target.
+    the _0 (thin) or _1 (heavy) Skyrim body target.  `race` selects a
+    beast head pack for the head-gear correction below
+    (head_fit.BEAST_RACES): a SKINNED hood needs the same per-race fit
+    a rigid Prn one does, or it sits inside the khajiit/argonian skull
+    exactly as the rigid path did.
 
     ALL blocks are solved as ONE system — a single cross-block weld, one
     correction query, one deficit diffusion graph.  Per-block solving split
@@ -1403,7 +1407,8 @@ def deform_geoms_wrap(skinned_geoms, skel_root, field, female: bool,
         from . import head_fit
         hfit = head_fit._get(female)
         if hfit is not None:
-            delta = head_fit.field_deltas(PRE[m_head] - hfit.o_ob, female)
+            delta = head_fit.field_deltas(PRE[m_head] - hfit.o_ob, female,
+                                          race=race)
             if delta is not None:
                 tgt = PRE[m_head] + (hfit.o_sk - hfit.o_ob) + delta
                 w_h = HW[m_head][:, None]

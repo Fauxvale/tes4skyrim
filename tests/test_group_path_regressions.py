@@ -266,8 +266,16 @@ def test_creature_projects_are_inherited_from_a_master(tmp_path):
                                      encoding='utf-8')
     master = exp / 'Oblivion.esm'
     master.mkdir()
-    (master / 'creature_projects.json').write_text(
-        json.dumps({'rat': {'project': 'RatProject'}}), encoding='utf-8')
+    # Written through the real producer: the file carries a versioned
+    # envelope, and a stub entry missing a required key is now rejected as
+    # stale (tes5_import/artifact_schema.py).
+    from tes5_import.artifact_schema import write_artifact
+    write_artifact(str(master / 'creature_projects.json'), 'Oblivion.esm',
+                   {'rat': {'project_hkx': 'Actors\TES4\rat\p.hkx',
+                            'behavior_hkx': 'Actors\TES4\rat\b.hkx',
+                            'body_dir': 'Actors\TES4\rat',
+                            'skeleton_nif': 'actors\rat\skeleton.nif',
+                            'bodies': ['rat.nif']}})
 
     got = _load_projects(str(rec))
     assert 'rat' in got, got

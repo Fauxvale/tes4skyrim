@@ -355,7 +355,13 @@ FUNCTION_MAP = {
     # line 541; command 4300 / opcode 0x10CC).  An earlier mapping to
     # BlockActivation only suppressed re-activation and never broke anything,
     # which is why breakaway planks and tripwires animated but stayed solid.
-    'setdestroyed': ('SetDestroyed',       True,  None),
+    # Routed through TES4Polyfill.SetDestroyed (special handler) rather than
+    # straight to the native: TES4 pairs the setter with `getdestroyed`, and
+    # Skyrim ships NO reader for the destroyed flag, so the polyfill mirrors
+    # every write into the TES4DestroyedRefs FormList that GetDestroyed reads.
+    # Mapping direct to the native here would bypass that mirror and leave the
+    # read false forever.
+    'setdestroyed':      (None,                True,  None),  # Special handler
 
     # --- Actor State ---
     'kill':              ('Kill',              True,  None),
@@ -669,7 +675,7 @@ FUNCTION_MAP = {
     'getscale':          ('GetScale',          True,  None),
     'purgecellbuffers':  (None,                False, None),  # Special handler (no-op)
     'pcb':               (None,                False, None),  # Special handler (no-op)
-    'closeobliviongate': (None,                False, None),  # Special handler (no-op)
+    'closeobliviongate': (None,                False, None),  # Special handler (destroys the gate)
     'say':               ('Say',               True,  None),
     'reset3dstate':      (None,                False, None),  # Special handler
     'setactorsai':       (None,                True,  None),  # Special handler
@@ -912,7 +918,7 @@ FUNCTION_MAP = {
     'modamountsoldstolen':(None,               False, None),  # Special handler
     'setcellownership':  (None,                False, None),  # Special handler (no-op)
     'setpublic':         (None,                False, None),  # no-op
-    'closeCurrentOblivionGate': (None,         False, None),  # Special handler
+    'closecurrentobliviongate': (None,         False, None),  # Special handler (exits the realm)
     'setshowquestitems': (None,                False, None),  # no-op
     'setnorumors':       (None,                False, None),  # no-op
     'setsceneiscomplex': (None,                False, None),  # no-op
@@ -1368,6 +1374,31 @@ def _sanitize_name(name: str) -> str:
 # silently does nothing in-game.  81 Oblivion script EditorIDs overflow once the
 # TES4_ prefix is added.
 PAPYRUS_MAX_SCRIPT_NAME = 38
+
+
+def music_type_editor_id(plugin: str, category: str) -> str:
+    """EditorID of the MUSC a TES4 music category converts to.
+
+    MUST match tes5_import.record_types.music.musc_editor_id exactly: the
+    importer writes the record under this name and the script converter
+    declares a Papyrus property under it, so the two disagreeing means every
+    StreamMusic call binds to nothing.
+    """
+    stem = ''.join(c for c in plugin if c.isalnum())
+    return 'MUS%s%s' % (stem, category.capitalize())
+
+
+def music_cue_editor_id(plugin: str, source_rel: str) -> str:
+    """EditorID of the per-cue MUSC built for one `Special/` track.
+
+    A script names a specific FILE (`StreamMusic "data/music/special/x.mp3"`),
+    so each Special track gets its own addressable MUSC.  Mirrors the
+    'MUSC_TRACK' branch of tes5_import.record_types.music.build_music_records.
+    """
+    stem = ''.join(c for c in plugin if c.isalnum())
+    tail = source_rel.rsplit('/', 1)[-1].rsplit('.', 1)[0]
+    tail = ''.join(c if c.isalnum() else '_' for c in tail)
+    return 'MUSCue%s_%s' % (stem, tail)
 
 
 def papyrus_script_name(edid: str, prefix: str = 'TES4_') -> str:

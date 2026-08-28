@@ -32,10 +32,13 @@ identical journal text resolves to one entry wherever it appears and no
 per-plugin bookkeeping is needed. Keys are normalised with `_key()` -- the same
 whitespace collapse the table was built with.
 
-Coverage is Oblivion.esm, Morrowind_ob.esm, Nehrim.esm (German) and
-Translation.esp (the English Nehrim strings). Anything not in the table falls
-back to the long text, which is exactly the previous behaviour, so an unknown
-plugin degrades to the status quo rather than to something worse.
+Coverage is Oblivion.esm, the official Oblivion DLCs (Knights.esp,
+DLCBattlehornCastle, DLCFrostcrag, DLCHorseArmor, DLCMehrunesRazor, DLCOrrery,
+DLCThievesDen and DLCVileLair -- DLCSpellTomes ships no QUST, and
+DLCShiveringIsles.esp is a zero-byte stub), Morrowind_ob.esm, Nehrim.esm
+(German) and Translation.esp (the English Nehrim strings). Anything not in the
+table falls back to the long text, which is exactly the previous behaviour, so
+an unknown plugin degrades to the status quo rather than to something worse.
 """
 import json
 import os
