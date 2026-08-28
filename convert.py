@@ -307,7 +307,17 @@ def _mod_commands(args, export_dir: str, tes4_data: str) -> int:
     first = sorted(results)[0]
     quoted = f'"{first}"' if ' ' in first else first
     caps = (results[first] or {}).get('capabilities') or {}
-    _write_base_plugins(export_dir, first, args.base)
+    # The ASSET tree, not the plugin name.  `results` is keyed by plugin,
+    # but a mod's assets land in its GROUP folder (named for the mod's
+    # label), and those differ whenever the archive is not named for the
+    # esp inside -- the normal case.  Writing `.base_plugins` under the
+    # plugin name put it in a directory holding no meshes, so the texture
+    # fallback never saw it and --base silently did nothing for any mod
+    # that ships a plugin.  asset_root_name reads the registry entry the
+    # ingest above just wrote, so it is right on the cached path too.
+    from asset_convert import source_registry as _sr
+    _asset_tree = _sr.asset_root_name(export_dir, first)
+    _write_base_plugins(export_dir, _asset_tree, args.base)
     print()
     if caps.get('plugin', True):
         print("Imported. Convert it with:")
