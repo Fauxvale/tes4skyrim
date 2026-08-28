@@ -396,29 +396,87 @@ def _decode_name(node):
     return bytes(node.name).decode('latin-1').rstrip('\x00')
 
 
-def plan_ragdoll_tree(data):
-    """Plan the single constrained tree over EVERY collision body in a
-    creature skeleton.nif (works on Oblivion source or mid-conversion data).
+# Oblivion collision-TOGGLE proxies, which are NOT ragdoll limbs.
+#
+# Morroblivion's alit hangs a CollisionNode -> EnableCollisions pair off each
+# of its 12 bones: the CollisionNode body is a 95%-scale DUPLICATE of the
+# bone's own capsule at mass 0.0001 (the bone's real mass is 5..30), and the
+# EnableCollisions body is a bhkSphereShape of radius 0.0.  They are a shadow
+# copy of each bone's collision that Oblivion could switch on and off; the
+# alit is ONE creature with 12 limbs, not a 36-part assembly, and no vanilla
+# Skyrim creature ships anything like them (census of all 35 LE
+# skeleton.hkx in references/Skyrim Animations).  Alit is the only rig of 90
+# across Oblivion/Nehrim/Morrowind_ob that has them.
+#
+# Keyed on physical content (no volume, or a mass three orders below any
+# authored limb), never on the node NAME.  Evaluated on the SOURCE (Oblivion
+# units) in both consumers: extract_ragdoll reads the source NIF, and
+# nif_converter strips them BEFORE collision conversion rescales mass/radius.
+_MARKER_MAX_MASS = 0.01
 
-    ENGINE CONTRACT (2026-07-09 Storm Atronach / Skeleton Load3D crash): the
-    SSE ragdoll attach walks constraints across ALL bhkBlendCollisionObject
-    bodies; any body outside one connected constrained tree leaves the walk
-    dereferencing an uninitialized hkpPositionConstraintMotor pointer ->
-    EXCEPTION_ACCESS_VIOLATION.  Vanilla atronachstorm constrains all 26
-    free orbiting rocks to their parent bones (27 bodies / 26 constraints);
-    Oblivion ships those rocks UNCONSTRAINED, so joints must be synthesized.
+
+def _is_marker_body(node, body):
+    """True when this collision body is an Oblivion collision-toggle proxy
+    rather than a real ragdoll limb (see _MARKER_MAX_MASS)."""
+    shape = getattr(body, 'shape', None)
+    if shape is None:
+        return True
+    radius = getattr(shape, 'radius', None)
+    if radius is not None and float(radius) <= 0.01:
+        return True     # zero-volume marker (alit's EnableCollisions)
+    return float(getattr(body, 'mass', 0.0)) <= _MARKER_MAX_MASS
+
+
+def plan_ragdoll_tree(data, exclude_markers=True):
+    """Plan the single constrained tree over EVERY collision body in a
+    creature skeleton.nif (works on Oblivion source or mid-conversion data;
+    `exclude_markers` applies _is_marker_body, whose thresholds are SOURCE
+    units -- pass False on converted data, where the markers are already
+    physically stripped and every surviving body is real).
+
+    THE ENGINE CONTRACT (SkyrimSE ragdoll attach at actor Load3D, Address
+    Library id 63792 = GOG/AE exe 0xb33f70, read 2026-08-28 for the
+    Morroblivion alit crash): the engine walks the skeleton.NIF in pre-order
+    DFS, collecting every blend body into list A and EVERY constraint of every
+    body into list B; then for each hkx ragdoll body i it finds the NIF body
+    j with the same bone name and overwrites hkx constraint[i-1] with NIF
+    constraint B[j-1] -- no bounds check, no entity check.  Hence:
+      * the FIRST body in DFS order is the ragdoll root: index 0 in the hkx,
+        0 constraints in the NIF;
+      * every other body carries EXACTLY ONE constraint in the NIF -- its
+        joint to an EARLIER body -- and sits at the same index in the hkx;
+      * an hkx root that is not the NIF's first body reads B[-1]
+        (uninitialized stack) -> EXCEPTION_ACCESS_VIOLATION in
+        hkpConstraintUtils::convertToPowered (the alit crash: Spine and Neck
+        constrain EACH OTHER and nothing constrains Bip01 NonAccum, the first
+        body, so the old cycle-breaker made Spine the root); a body with 2
+        constraints shifts every later slot (mudcrab); a first body
+        constrained to a LATER body put the root second (landdreugh).
+    Bodies outside one connected tree also crash (2026-07-09 Storm Atronach:
+    an uninitialized hkpPositionConstraintMotor) -- vanilla atronachstorm
+    constrains all 26 orbiting rocks to their parent bones.
+
+    Per body, in DFS order, the parent joint is: (1) its own authored
+    constraint to an EARLIER body, else (2) an earlier body's authored
+    constraint that names it -- the same joint with its ends swapped, else
+    (3) a synthetic vanilla-template joint to its nearest body-carrying NIF
+    ancestor (fallback: the root).  Every other authored constraint is
+    dropped by the NIF side (collision.enforce_ragdoll_tree), which rebuilds
+    each body's list from this same plan so both files agree.
 
     Returns None when there are fewer than 2 bodies, else a dict:
-      body_nodes  [NiNode] every body-carrying node under the bone root, DFS
-      edges       {id(child): parent NiNode} existing constraint links
-                  (first valid constraint per body; cycles broken)
-      synthetic   [(child NiNode, parent NiNode)] joints to ADD so the graph
-                  becomes one tree (nearest body-carrying NIF ancestor,
-                  fallback = the main tree root)
+      body_nodes  [NiNode] every body-carrying node under the bone root,
+                  pre-order DFS == the hkx part order
+      edges       {id(child): parent NiNode} authored joints (cases 1 and 2)
+      edge_con    {id(child): (constraint block, reversed)} the block behind
+                  each authored edge; reversed=True means it was authored on
+                  the parent with the child as entity B
+      synthetic   [(child NiNode, parent NiNode)] joints to ADD (case 3)
       worlds      {id(node): (R 3x3 row-conv, t vec3)} world transforms in
                   game units
-      root        the main tree root NiNode
+      root        body_nodes[0]
       node_of_id  {id(node): NiNode}
+      bone_order  {id(node): DFS index over ALL NiNodes} == the anim bone index
     """
     from asset_convert.hkx_skeleton import find_skeleton_root
     try:
@@ -429,6 +487,12 @@ def plan_ragdoll_tree(data):
     body_nodes = []
     node_parent = {}
     worlds = {}
+    # DFS visit order == hkx_skeleton.collect_bones' anim bone index: both
+    # walk this same tree, from the same find_skeleton_root(), taking
+    # NiNode children in order.  This is the ONLY stable identity for a node
+    # across the two parses (extract_ragdoll re-reads the NIF, so id() does
+    # not carry), and unlike the node NAME it is unique — see anim_idx.
+    bone_order = {}
 
     def _local(node):
         m = node.rotation
@@ -446,8 +510,10 @@ def plan_ragdoll_tree(data):
         t_w = t_l @ R_p + t_p
         worlds[id(node)] = (R_w, t_w)
         node_parent[id(node)] = parent
+        bone_order[id(node)] = len(bone_order)
         co = getattr(node, 'collision_object', None)
-        if co is not None and getattr(co, 'body', None) is not None:
+        if (co is not None and getattr(co, 'body', None) is not None
+                and not (exclude_markers and _is_marker_body(node, co.body))):
             body_nodes.append(node)
         for child in node.children:
             if isinstance(child, NifFormat.NiNode):
@@ -460,86 +526,117 @@ def plan_ragdoll_tree(data):
 
     dfs_index = {id(n): i for i, n in enumerate(body_nodes)}
     body_of = {id(n): n.collision_object.body for n in body_nodes}
-    node_of_body = {id(b): nid for nid, b in
-                    ((id(n), body_of[id(n)]) for n in body_nodes)}
+    node_of_body = {id(b): nid for nid, b in body_of.items()}
     node_of_id = {id(n): n for n in body_nodes}
 
-    # existing constraint links: first valid constraint per body whose
-    # entities are (self, another body)
-    edges = {}
+    # every convertible authored joint whose two entities are both ragdoll
+    # bodies, as (holder, other, block), holders in DFS order
+    authored = []
     for n in body_nodes:
         body = body_of[id(n)]
         for con in getattr(body, 'constraints', []):
-            kind, d = _descriptor(con)
+            kind, _d = _descriptor(con)
             if kind is None:
                 continue
             ents = list(con.entities)
             if (len(ents) == 2 and ents[0] is body
                     and id(ents[1]) in node_of_body):
-                edges[id(n)] = node_of_id[node_of_body[id(ents[1])]]
-                break
+                authored.append((id(n), node_of_body[id(ents[1])], con))
 
-    # break constraint cycles (defensive; each body has <= 1 outgoing edge)
-    for n in list(body_nodes):
-        seen = set()
-        nid = id(n)
-        while nid in edges and nid not in seen:
-            seen.add(nid)
-            nid = id(edges[nid])
-        if nid in seen:
-            del edges[nid]
-
-    # connected components (union-find over edges)
-    uf = {}
-
-    def find(x):
-        r = x
-        while uf.get(r, r) != r:
-            r = uf[r]
-        while uf.get(x, x) != x:
-            uf[x], x = r, uf[x]
-        return r
-
-    for cid, pnode in edges.items():
-        uf[find(cid)] = find(id(pnode))
-
-    comps = {}
-    for n in body_nodes:
-        comps.setdefault(find(id(n)), []).append(id(n))
-    comp_roots = {}     # component key -> tree root id (no outgoing edge)
-    for key, members in comps.items():
-        roots = [m for m in members if m not in edges]
-        comp_roots[key] = roots[0]
-
-    # main root = root of the largest component (ties: earliest DFS)
-    main_key = max(comps, key=lambda k: (len(comps[k]),
-                                         -dfs_index[comp_roots[k]]))
-    main_root = node_of_id[comp_roots[main_key]]
-
-    # synthesize joints: link every other component root to its nearest
-    # body-carrying NIF ancestor outside its own component (vanilla rock
-    # pattern), fallback = the main tree root
+    root = body_nodes[0]
+    edges = {}
+    edge_con = {}
     synthetic = []
-    other_roots = sorted((comp_roots[k] for k in comps if k != main_key),
-                         key=lambda nid: dfs_index[nid])
-    for rid in other_roots:
-        child = node_of_id[rid]
+    for n in body_nodes[1:]:
+        nid = id(n)
+        # (1) the body's own joint to an EARLIER body
+        pick = next(((pid, con) for hid, pid, con in authored
+                     if hid == nid and dfs_index[pid] < dfs_index[nid]), None)
+        if pick is not None:
+            edges[nid] = node_of_id[pick[0]]
+            edge_con[nid] = (pick[1], False)
+            continue
+        # (2) an EARLIER body's joint that names this body: same joint,
+        #     ends swapped
+        pick = next(((hid, con) for hid, pid, con in authored
+                     if pid == nid and dfs_index[hid] < dfs_index[nid]), None)
+        if pick is not None:
+            edges[nid] = node_of_id[pick[0]]
+            edge_con[nid] = (pick[1], True)
+            continue
+        # (3) synthesize: nearest body-carrying NIF ancestor (always earlier
+        #     in pre-order), else the root
         target = None
-        anc = node_parent.get(rid)
+        anc = node_parent.get(nid)
         while anc is not None:
-            if id(anc) in body_of and find(id(anc)) != find(rid):
+            if id(anc) in body_of:
                 target = anc
                 break
             anc = node_parent.get(id(anc))
-        if target is None and find(id(main_root)) != find(rid):
-            target = main_root
-        if target is None:
-            continue
-        synthetic.append((child, target))
-        uf[find(rid)] = find(id(target))
+        synthetic.append((n, target if target is not None else root))
 
-    return {'body_nodes': body_nodes, 'edges': edges, 'synthetic': synthetic,
-            'worlds': worlds, 'root': main_root, 'node_of_id': node_of_id}
+    return {'body_nodes': body_nodes, 'edges': edges, 'edge_con': edge_con,
+            'synthetic': synthetic, 'worlds': worlds, 'root': root,
+            'node_of_id': node_of_id, 'bone_order': bone_order}
+
+
+def _joint_info(kind, d, cid, pid, _to_bone):
+    """Bone-space game-unit info dict for an authored joint descriptor with
+    entity A = node cid and entity B = node pid."""
+    if kind == 'ragdoll':
+        return {
+            'rows_a': _basis_rows(_to_bone(cid, _v4(d.twist_a), 0),
+                                  _to_bone(cid, _v4(d.plane_a), 0)),
+            'rows_b': _basis_rows(_to_bone(pid, _v4(d.twist_b), 0),
+                                  _to_bone(pid, _v4(d.plane_b), 0)),
+            'piv_a': _to_bone(cid, _v4(d.pivot_a, _OB_TO_GAME), 1),
+            'piv_b': _to_bone(pid, _v4(d.pivot_b, _OB_TO_GAME), 1),
+            'cone': float(d.cone_max_angle),
+            'plane_min': float(d.plane_min_angle),
+            'plane_max': float(d.plane_max_angle),
+            'twist_min': float(d.twist_min_angle),
+            'twist_max': float(d.twist_max_angle),
+            'friction': 0.0,
+        }
+    axle_a = _to_bone(cid, _v4(d.axle_a), 0)
+    perp_a = getattr(d, 'perp_2_axle_in_a_1', None)
+    rows_a = (_basis_rows(axle_a, _to_bone(cid, _v4(perp_a), 0))
+              if perp_a is not None
+              else _basis_rows(axle_a, np.array([0.0, 0.0, 1.0])))
+    axle_b = _to_bone(pid, _v4(d.axle_b), 0)
+    p2b = getattr(d, 'perp_2_axle_in_b_2', None)
+    if p2b is not None:
+        # stored basis B = (axle, p1, p2); p1 = p2 x axle
+        p1b = np.cross(_unit(_v4(p2b)), _unit(_v4(d.axle_b)))
+        rows_b = _basis_rows(axle_b, _to_bone(pid, p1b, 0))
+    else:
+        rows_b = _basis_rows(axle_b, np.array([0.0, 0.0, 1.0]))
+    if kind == 'hinge':
+        min_a, max_a = float(d.min_angle), float(d.max_angle)
+    else:
+        min_a, max_a = -math.pi, math.pi
+    return {
+        'rows_a': rows_a, 'rows_b': rows_b,
+        'piv_a': _to_bone(cid, _v4(d.pivot_a, _OB_TO_GAME), 1),
+        'piv_b': _to_bone(pid, _v4(d.pivot_b, _OB_TO_GAME), 1),
+        'min': min_a, 'max': max_a,
+        'friction': 0.0,
+    }
+
+
+def _swap_joint_ends(kind, info):
+    """The same joint seen from the other entity: frames and pivots swap,
+    and the relative-rotation limits negate (the inverse of a rotation by
+    theta about a shared axis is -theta; the cone is symmetric)."""
+    out = dict(info)
+    out['rows_a'], out['rows_b'] = info['rows_b'], info['rows_a']
+    out['piv_a'], out['piv_b'] = info['piv_b'], info['piv_a']
+    if kind == 'ragdoll':
+        out['plane_min'], out['plane_max'] = -info['plane_max'], -info['plane_min']
+        out['twist_min'], out['twist_max'] = -info['twist_max'], -info['twist_min']
+    else:
+        out['min'], out['max'] = -info['max'], -info['min']
+    return out
 
 
 def extract_ragdoll(skeleton_nif_path: str, bones: list):
@@ -559,11 +656,25 @@ def extract_ragdoll(skeleton_nif_path: str, bones: list):
         return None
 
     from asset_convert.hkx_skeleton import BONE_RENAMES
+    # Resolve a body's NiNode to its anim bone by TREE POSITION, not by name.
+    # Both walks are the same pre-order DFS over the same NiNode tree, so the
+    # positional key is exact even when a rig repeats a bone name (Oblivion
+    # rigs do: Morroblivion's alit names all 24 of its collision proxies
+    # CollisionNode/EnableCollisions).  The name lookup stays as a fallback
+    # for a rig whose two walks disagree — a shape we have not seen.
     bone_index = {b.name: i for i, b in enumerate(bones)}
+    bone_order = plan['bone_order']
 
     def anim_idx(node):
         name = _decode_name(node)
-        return bone_index.get(BONE_RENAMES.get(name, name))
+        name = BONE_RENAMES.get(name, name)
+        idx = bone_order.get(id(node))
+        # Trust the positional key only when it lands on the bone the node
+        # actually names; otherwise the two walks disagree (a rig shape we
+        # have not seen) and the name lookup is the safer answer.
+        if idx is not None and idx < len(bones) and bones[idx].name == name:
+            return idx
+        return bone_index.get(name)
 
     if any(anim_idx(n) is None for n in plan['body_nodes']):
         return None     # body outside the anim skeleton — no usable ragdoll
@@ -599,63 +710,24 @@ def extract_ragdoll(skeleton_nif_path: str, bones: list):
     parent_of = {}          # id(child node) -> parent NiNode
     con_of = {}             # id(child node) -> (kind, info dict)
     for n in plan['body_nodes']:
-        pnode = plan['edges'].get(id(n))
-        if pnode is None:
+        pick = plan['edge_con'].get(id(n))
+        if pick is None:
             continue
-        body, pbody = body_of[id(n)], body_of[id(pnode)]
-        for con in getattr(body, 'constraints', []):
-            kind, d = _descriptor(con)
-            if kind is None:
-                continue
-            ents = list(con.entities)
-            if not (len(ents) == 2 and ents[0] is body and ents[1] is pbody):
-                continue
-            cid, pid = id(n), id(pnode)
-            if kind == 'ragdoll':
-                info = {
-                    'rows_a': _basis_rows(_to_bone(cid, _v4(d.twist_a), 0),
-                                          _to_bone(cid, _v4(d.plane_a), 0)),
-                    'rows_b': _basis_rows(_to_bone(pid, _v4(d.twist_b), 0),
-                                          _to_bone(pid, _v4(d.plane_b), 0)),
-                    'piv_a': _to_bone(cid, _v4(d.pivot_a, _OB_TO_GAME), 1),
-                    'piv_b': _to_bone(pid, _v4(d.pivot_b, _OB_TO_GAME), 1),
-                    'cone': float(d.cone_max_angle),
-                    'plane_min': float(d.plane_min_angle),
-                    'plane_max': float(d.plane_max_angle),
-                    'twist_min': float(d.twist_min_angle),
-                    'twist_max': float(d.twist_max_angle),
-                    'friction': 0.0,
-                }
-            else:
-                axle_a = _to_bone(cid, _v4(d.axle_a), 0)
-                perp_a = getattr(d, 'perp_2_axle_in_a_1', None)
-                rows_a = (_basis_rows(axle_a, _to_bone(cid, _v4(perp_a), 0))
-                          if perp_a is not None
-                          else _basis_rows(axle_a, np.array([0.0, 0.0, 1.0])))
-                axle_b = _to_bone(pid, _v4(d.axle_b), 0)
-                p2b = getattr(d, 'perp_2_axle_in_b_2', None)
-                if p2b is not None:
-                    # stored basis B = (axle, p1, p2); p1 = p2 × axle
-                    p1b = np.cross(_unit(_v4(p2b)), _unit(_v4(d.axle_b)))
-                    rows_b = _basis_rows(axle_b, _to_bone(pid, p1b, 0))
-                else:
-                    rows_b = _basis_rows(axle_b, np.array([0.0, 0.0, 1.0]))
-                if kind == 'hinge':
-                    min_a, max_a = float(d.min_angle), float(d.max_angle)
-                else:
-                    min_a, max_a = -math.pi, math.pi
-                info = {
-                    'rows_a': rows_a, 'rows_b': rows_b,
-                    'piv_a': _to_bone(cid, _v4(d.pivot_a, _OB_TO_GAME), 1),
-                    'piv_b': _to_bone(pid, _v4(d.pivot_b, _OB_TO_GAME), 1),
-                    'min': min_a, 'max': max_a,
-                    'friction': 0.0,
-                }
-            _legalize_limits(kind, info, plan['worlds'][cid][0],
-                             plan['worlds'][pid][0])
-            parent_of[id(n)] = pnode
-            con_of[id(n)] = (kind, info)
-            break
+        con, reversed_ = pick
+        pnode = plan['edges'][id(n)]
+        kind, d = _descriptor(con)
+        cid, pid = id(n), id(pnode)
+        if reversed_:
+            # authored on the parent with (A=parent, B=child): build it as
+            # authored, then swap the ends so A is the child (the hkx and
+            # vanilla convention, see the module docstring)
+            info = _swap_joint_ends(kind, _joint_info(kind, d, pid, cid, _to_bone))
+        else:
+            info = _joint_info(kind, d, cid, pid, _to_bone)
+        _legalize_limits(kind, info, plan['worlds'][cid][0],
+                         plan['worlds'][pid][0])
+        parent_of[id(n)] = pnode
+        con_of[id(n)] = (kind, info)
 
     for child, pnode in plan['synthetic']:
         body = body_of[id(child)]
@@ -680,40 +752,40 @@ def extract_ragdoll(skeleton_nif_path: str, bones: list):
             'friction': _SYNTH_FRICTION,
         })
 
-    # part order: DFS over the final tree (parent-before-child by
-    # construction, required by hkaSkeleton parentIndices)
-    dfs_index = {id(n): i for i, n in enumerate(plan['body_nodes'])}
-    children = {}
-    for cid, pnode in parent_of.items():
-        children.setdefault(id(pnode), []).append(cid)
-    for lst in children.values():
-        lst.sort(key=dfs_index.__getitem__)
-
+    # part order == the NIF's pre-order DFS (the engine contract, see
+    # plan_ragdoll_tree).  Every parent is earlier by construction.
     node_of_id = plan['node_of_id']
-    order = []
-    stack = [id(plan['root'])]
-    while stack:
-        nid = stack.pop()
-        order.append(nid)
-        stack.extend(reversed(children.get(nid, [])))
-    if len(order) != len(plan['body_nodes']):
-        return None     # tree did not cover every body — bail to anim-only
+    order = [id(n) for n in plan['body_nodes']]
 
     part_of_node = {}
     parts = []
+    used_names = {}
     for nid in order:
         node = node_of_id[nid]
         body = body_of[nid]
         idx = anim_idx(node)
         p = RagdollPart()
         p.anim_index = idx
-        p.name = 'Ragdoll_' + bones[idx].name
+        # Ragdoll bone names index the hkaSkeletonMapper and the resource
+        # container tree, so they must be UNIQUE even when the source rig
+        # reuses a bone name (alit's 12 'CollisionNode' proxies).  Suffix
+        # only the repeats, so every rig that already had unique names keeps
+        # byte-identical output.
+        base = 'Ragdoll_' + bones[idx].name
+        n = used_names.get(base, 0)
+        used_names[base] = n + 1
+        p.name = base if n == 0 else f'{base}_{n}'
         pnode = parent_of.get(nid)
+        if pnode is not None and id(pnode) not in part_of_node:
+            raise ValueError(
+                f'ragdoll part {p.name!r} has parent {_decode_name(pnode)!r} '
+                f'AFTER it in NIF order -- plan_ragdoll_tree must only pick '
+                f'earlier bodies')
         p.parent = part_of_node[id(pnode)] if pnode is not None else -1
         p.constraint = con_of.get(nid)
 
         # /_OB_MASS_DIV: Oblivion mass is authored against Oblivion-scale
-        # lengths (see the constant) — carrying it through unconverted while
+        # lengths (see the constant) -- carrying it through unconverted while
         # scaling lengths x7 made every corpse feel immovable.
         p.mass = (float(body.mass) / _OB_MASS_DIV if body.mass > 0
                   else 1.0 / _OB_MASS_DIV)
@@ -1324,8 +1396,52 @@ def _add_constraint_instance(pf, data_ref, child_body_ref, parent_body_ref,
     return inst
 
 
+def _assert_ragdoll_invariants(parts):
+    """Fail LOUDLY here rather than as an access violation in the user's game.
+
+    hkaRagdollInstance requires a bijection between ragdoll bones and rigid
+    bodies: `boneToRigidBodyMap` is written as range(len(parts)), and the
+    hkaSkeletonMapper keys bones by NAME.  If either the anim-bone mapping
+    or the part names alias, the engine's ragdoll attach leaves constraint
+    instances with a null hkpConstraintData and
+    hkpConstraintUtils::convertToPowered dereferences it at actor Load3D
+    (2026-08-27 Morroblivion alit crash).  Both defects are silent in every
+    offline check -- the file loads fine -- so assert on the OUTPUT.  So is
+    the part ORDER: it must be the NIF's DFS order, parents first, because
+    the engine indexes constraint[i-1] by it (see plan_ragdoll_tree).
+    """
+    dup_names = sorted({p.name for p in parts
+                        if sum(q.name == p.name for q in parts) > 1})
+    if dup_names:
+        raise ValueError(
+            f'ragdoll part names are not unique: {dup_names} '
+            f'({len(parts)} parts) — would null the constraint data and '
+            f'crash SSE at actor Load3D')
+    seen = {}
+    for p in parts:
+        if p.anim_index in seen:
+            raise ValueError(
+                f'ragdoll parts {seen[p.anim_index]!r} and {p.name!r} both '
+                f'map to anim bone {p.anim_index} — ragdoll bones must map '
+                f'1:1 onto rigid bodies or SSE crashes at actor Load3D')
+        seen[p.anim_index] = p.name
+    for i, p in enumerate(parts):
+        if p.parent >= 0 and p.constraint is None:
+            raise ValueError(
+                f'ragdoll part {p.name!r} (index {i}) has a parent but no '
+                f'constraint — its hkpConstraintInstance would carry null '
+                f'data and crash SSE at actor Load3D')
+    for i, p in enumerate(parts):
+        if p.parent >= i:
+            raise ValueError(
+                f'ragdoll part {p.name!r} (index {i}) has parent index '
+                f'{p.parent} -- parents must precede children (the NIF DFS '
+                f'order the engine indexes constraints by)')
+
+
 def emit_ragdoll(pf, bones, parts, anim_skel_ref):
     """Emit the full ragdoll object set; returns the extra namedVariants."""
+    _assert_ragdoll_invariants(parts)
     worlds = _bone_worlds(bones)
 
     # ragdoll hkaSkeleton — reference pose relative to the ragdoll parent

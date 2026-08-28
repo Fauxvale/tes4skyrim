@@ -1244,3 +1244,278 @@ class TestAnimGroupFallback:
         c = classify_clips(DOG_DIR)
         assert os.path.basename(
             c['locomotion']['MoveForward']) == 'forward.kf'
+
+
+# ---------------------------------------------------------------------------
+# Ragdoll bone <-> rigid body bijection, and the engine's ORDERING contract
+#
+# hkaRagdollInstance writes boneToRigidBodyMap as range(len(parts)) and the
+# hkaSkeletonMapper keys PARTS by NAME, so ragdoll parts must map 1:1 onto
+# anim bones and carry unique part names.  On top of that, SkyrimSE's attach
+# (Address Library id 63792) walks the skeleton.NIF in pre-order DFS, collects
+# EVERY constraint of every body into one list, and overwrites hkx
+# constraint[i-1] with NIF constraint[j-1] where i is the hkx part index and
+# j the NIF body index -- no bounds check.  So the hkx part order must BE the
+# NIF DFS order with the first body as root, and every later NIF body must
+# carry exactly one constraint (see hkx_ragdoll.plan_ragdoll_tree).  The
+# 2026-08-27/28 Morroblivion alit crash was an hkx root (Spine) that was the
+# NIF's SECOND body: constraint[-1] is uninitialized stack.
+# ---------------------------------------------------------------------------
+
+ALIT_SKEL = os.path.join(REPO, 'export', 'Morrowind_ob.esm', 'meshes',
+                         'creatures', 'alit', 'skeleton.nif')
+LANDDREUGH_SKEL = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                               'creatures', 'landdreugh', 'skeleton.nif')
+MUDCRAB_SKEL = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
+                            'creatures', 'mudcrab', 'skeleton.nif')
+needs_alit = pytest.mark.skipif(not os.path.exists(ALIT_SKEL),
+                                reason='Morrowind_ob export assets missing')
+needs_landdreugh = pytest.mark.skipif(not os.path.exists(LANDDREUGH_SKEL),
+                                      reason='Oblivion export assets missing')
+needs_mudcrab = pytest.mark.skipif(not os.path.exists(MUDCRAB_SKEL),
+                                   reason='Oblivion export assets missing')
+
+
+class TestRagdollBijection:
+
+    def _parts(self, skel):
+        from asset_convert.hkx_skeleton import load_skeleton_bones
+        from asset_convert.hkx_ragdoll import extract_ragdoll
+        bones = load_skeleton_bones(skel)
+        return bones, extract_ragdoll(skel, bones)
+
+    @pytest.mark.skipif(not os.path.exists(ALIT_SKEL),
+                        reason='Morrowind_ob export assets missing')
+    def test_alit_duplicate_named_bodies_map_to_distinct_bones(self):
+        # alit hangs a CollisionNode/EnableCollisions proxy pair under each
+        # of its 12 bones: 24 bodies sharing 2 names.  A name-keyed lookup
+        # collapsed all 24 onto anim bones 73/74.
+        bones, parts = self._parts(ALIT_SKEL)
+        assert parts, 'alit lost its ragdoll'
+        idxs = [p.anim_index for p in parts]
+        assert len(set(idxs)) == len(idxs), 'ragdoll parts alias an anim bone'
+        names = [p.name for p in parts]
+        assert len(set(names)) == len(names), 'ragdoll part names collide'
+        # every part must land on the bone it is actually named after
+        for p in parts:
+            assert bones[p.anim_index].name in p.name
+
+    @pytest.mark.skipif(not os.path.exists(ALIT_SKEL),
+                        reason='Morrowind_ob export assets missing')
+    def test_alit_every_child_part_has_a_constraint(self):
+        # a parented part with no constraint would ship null constraint data
+        _bones, parts = self._parts(ALIT_SKEL)
+        missing = [p.name for p in parts
+                   if p.parent >= 0 and p.constraint is None]
+        assert not missing, 'parts with a parent but no constraint: %s' % missing
+
+    @needs_assets
+    def test_unique_named_rig_keeps_legacy_part_names(self):
+        # the uniquifying suffix is additive: a rig that never had duplicates
+        # must keep byte-identical part names (no FormID/asset churn)
+        bones, parts = self._parts(DOG_SKEL)
+        assert parts, 'dog lost its ragdoll'
+        assert [p.name for p in parts] == \
+            ['Ragdoll_' + bones[p.anim_index].name for p in parts]
+
+    def test_invariant_assert_catches_aliasing(self):
+        from asset_convert.hkx_ragdoll import (RagdollPart,
+                                               _assert_ragdoll_invariants)
+
+        def _part(name, idx, parent, con=('ragdoll', {})):
+            p = RagdollPart()
+            p.name, p.anim_index, p.parent, p.constraint = name, idx, parent, con
+            return p
+
+        _assert_ragdoll_invariants([_part('A', 0, -1, None), _part('B', 1, 0)])
+
+        with pytest.raises(ValueError, match='anim bone'):
+            _assert_ragdoll_invariants([_part('A', 0, -1, None),
+                                        _part('B', 0, 0)])
+        with pytest.raises(ValueError, match='not unique'):
+            _assert_ragdoll_invariants([_part('A', 0, -1, None),
+                                        _part('A', 1, 0)])
+        with pytest.raises(ValueError, match='no constraint'):
+            _assert_ragdoll_invariants([_part('A', 0, -1, None),
+                                        _part('B', 1, 0, None)])
+
+    @needs_alit
+    def test_collision_toggle_proxies_are_not_ragdoll_parts(self):
+        # alit is ONE creature with 12 limbs.  Each bone also carries a
+        # 'CollisionNode' child holding a 95%-scale duplicate of the bone's
+        # own capsule at mass 1e-4, plus an 'EnableCollisions' grandchild of
+        # radius 0.0: Oblivion collision-toggle proxies, not limbs.
+        _bones, parts = self._parts(ALIT_SKEL)
+        assert parts
+        assert len(parts) == 12, 'expected 12 real limbs, got %d parts' % len(parts)
+
+    # -- the engine's ordering contract ------------------------------------
+
+    def _dfs_bodies(self, skel):
+        from asset_convert.hkx_ragdoll import plan_ragdoll_tree, _decode_name
+        from asset_convert.hkx_skeleton import BONE_RENAMES
+        from pyffi.formats.nif import NifFormat
+        d = NifFormat.Data()
+        with open(skel, 'rb') as f:
+            d.read(f)
+        plan = plan_ragdoll_tree(d)
+        names = [_decode_name(n) for n in plan['body_nodes']]
+        return plan, ['Ragdoll_' + BONE_RENAMES.get(n, n) for n in names]
+
+    @needs_alit
+    def test_alit_parts_follow_nif_dfs_order_root_first(self):
+        # Spine and Neck constrain EACH OTHER and nothing constrains the
+        # first body (Bip01 NonAccum).  The old cycle-breaker rooted the tree
+        # at Spine, which the engine then matched to NIF body 1 while NIF
+        # body 0 landed on hkx index 1 -> NIF constraint[-1] -> crash.
+        _bones, parts = self._parts(ALIT_SKEL)
+        _plan, dfs = self._dfs_bodies(ALIT_SKEL)
+        assert [p.name for p in parts] == dfs
+        assert parts[0].name == 'Ragdoll_Bip01 NonAccum'
+        assert parts[0].parent == -1 and parts[0].constraint is None
+        for i, p in enumerate(parts[1:], 1):
+            assert p.parent < i, '%s parent %d not before %d' % (p.name, p.parent, i)
+            assert p.constraint is not None
+        # the duplicate Spine->Neck joint is dropped; Neck keeps its own
+        spine = next(p for p in parts if p.name == 'Ragdoll_BBip01 Spine')
+        assert parts[spine.parent].name == 'Ragdoll_Bip01 NonAccum'
+
+    @needs_landdreugh
+    def test_forward_authored_joint_is_reversed_not_dropped(self):
+        # landdreugh's FIRST body (Pelvis) holds a joint to Spine01, a LATER
+        # body.  The root cannot have a parent, so the same joint is given to
+        # Spine01 with its ends exchanged -- an authored joint, not a
+        # synthetic one.
+        _bones, parts = self._parts(LANDDREUGH_SKEL)
+        plan, dfs = self._dfs_bodies(LANDDREUGH_SKEL)
+        assert [p.name for p in parts] == dfs
+        assert parts[0].name == 'Ragdoll_Bip01 Pelvis'
+        spine = next(p for p in parts if p.name == 'Ragdoll_Bip01 Spine01')
+        assert parts[spine.parent].name == 'Ragdoll_Bip01 Pelvis'
+        rev = [r for (_con, r) in plan['edge_con'].values() if r]
+        assert len(rev) == 1
+        assert not plan['synthetic']
+
+    @needs_assets
+    def test_dog_order_and_root_unchanged(self):
+        _bones, parts = self._parts(DOG_SKEL)
+        _plan, dfs = self._dfs_bodies(DOG_SKEL)
+        assert [p.name for p in parts] == dfs
+        for i, p in enumerate(parts[1:], 1):
+            assert p.parent < i
+
+    def test_swap_joint_ends_negates_limits_and_swaps_frames(self):
+        from asset_convert.hkx_ragdoll import _swap_joint_ends
+        info = {'rows_a': 'A', 'rows_b': 'B', 'piv_a': 'pa', 'piv_b': 'pb',
+                'cone': 0.5, 'plane_min': -0.2, 'plane_max': 0.7,
+                'twist_min': -0.1, 'twist_max': 0.3, 'friction': 0.0}
+        out = _swap_joint_ends('ragdoll', info)
+        assert (out['rows_a'], out['rows_b']) == ('B', 'A')
+        assert (out['piv_a'], out['piv_b']) == ('pb', 'pa')
+        assert (out['plane_min'], out['plane_max']) == (-0.7, 0.2)
+        assert (out['twist_min'], out['twist_max']) == (-0.3, 0.1)
+        assert out['cone'] == 0.5
+        h = _swap_joint_ends('hinge', {'rows_a': 'A', 'rows_b': 'B',
+                                       'piv_a': 1, 'piv_b': 2,
+                                       'min': -0.8, 'max': 0.1, 'friction': 0})
+        assert (h['min'], h['max']) == (-0.1, 0.8)
+        # involution: swapping twice is the identity
+        assert _swap_joint_ends('ragdoll', out) == info
+
+    @needs_alit
+    def test_nif_side_lists_match_the_plan(self):
+        # collision.enforce_ragdoll_tree rebuilds every body's constraint
+        # list to exactly its planned joint: first body bare, every other
+        # body ONE joint to an earlier body -- the list the engine indexes.
+        from asset_convert.collision import enforce_ragdoll_tree
+        from asset_convert.hkx_ragdoll import plan_ragdoll_tree, _decode_name
+        from pyffi.formats.nif import NifFormat
+        d = NifFormat.Data()
+        with open(ALIT_SKEL, 'rb') as f:
+            d.read(f)
+        root = d.roots[0]
+        assert enforce_ragdoll_tree(d, root) > 0
+        plan = plan_ragdoll_tree(d)
+        bodies = plan['body_nodes']
+        assert len(bodies[0].collision_object.body.constraints) == 0
+        for n in bodies[1:]:
+            cons = list(n.collision_object.body.constraints)
+            assert len(cons) == 1, _decode_name(n)
+            ents = list(cons[0].entities)
+            assert ents[0] is n.collision_object.body
+            parent = next(b for b in bodies if b.collision_object.body is ents[1])
+            assert bodies.index(parent) < bodies.index(n)
+        spine = next(n for n in bodies if _decode_name(n) == 'BBip01 Spine')
+        con = spine.collision_object.body.constraints[0]
+        assert con.__class__.__name__ == 'bhkRagdollConstraint'
+        assert _decode_name(bodies[0]) == 'Bip01 NonAccum'
+        assert con.entities[1] is bodies[0].collision_object.body
+        # idempotent: a second pass changes nothing
+        assert enforce_ragdoll_tree(d, root) == 0
+
+    @needs_mudcrab
+    def test_nif_side_drops_second_constraints(self):
+        # mudcrab authors three bodies with TWO constraints each, which
+        # shifts every later slot the engine indexes by body order
+        from asset_convert.collision import enforce_ragdoll_tree
+        from asset_convert.hkx_ragdoll import plan_ragdoll_tree
+        from pyffi.formats.nif import NifFormat
+        d = NifFormat.Data()
+        with open(MUDCRAB_SKEL, 'rb') as f:
+            d.read(f)
+        plan = plan_ragdoll_tree(d)
+        doubled = [n for n in plan['body_nodes']
+                   if len(n.collision_object.body.constraints) > 1]
+        assert doubled, 'fixture changed: mudcrab no longer authors doubles'
+        enforce_ragdoll_tree(d, d.roots[0])
+        counts = [len(n.collision_object.body.constraints)
+                  for n in plan['body_nodes']]
+        assert counts == [0] + [1] * (len(counts) - 1)
+
+    @needs_landdreugh
+    def test_nif_side_reverses_a_forward_joint_in_place(self):
+        from asset_convert.collision import (enforce_ragdoll_tree,
+                                             _joint_descriptor,
+                                             _reverse_constraint_ends)
+        from asset_convert.hkx_ragdoll import plan_ragdoll_tree, _decode_name
+        from pyffi.formats.nif import NifFormat
+        d = NifFormat.Data()
+        with open(LANDDREUGH_SKEL, 'rb') as f:
+            d.read(f)
+        plan = plan_ragdoll_tree(d)
+        pelvis, spine = plan['body_nodes'][0], next(
+            n for n in plan['body_nodes'] if _decode_name(n) == 'Bip01 Spine01')
+        con = pelvis.collision_object.body.constraints[0]
+        kind, rd = _joint_descriptor(con)       # the source wraps it malleable
+        lo, hi = (('twist_min_angle', 'twist_max_angle') if kind == 'ragdoll'
+                  else ('min_angle', 'max_angle'))
+        before = [(v.x, v.y, v.z) for v in (rd.pivot_a, rd.pivot_b)]
+        limits = (float(getattr(rd, lo)), float(getattr(rd, hi)))
+        enforce_ragdoll_tree(d, d.roots[0])
+        assert len(pelvis.collision_object.body.constraints) == 0
+        assert list(spine.collision_object.body.constraints) == [con]
+        assert con.entities[0] is spine.collision_object.body
+        assert con.entities[1] is pelvis.collision_object.body
+        after = [(v.x, v.y, v.z) for v in (rd.pivot_a, rd.pivot_b)]
+        assert after == before[::-1]
+        assert (float(getattr(rd, lo)),
+                float(getattr(rd, hi))) == (-limits[1], -limits[0])
+        # involution
+        _reverse_constraint_ends(con)
+        assert [(v.x, v.y, v.z) for v in (rd.pivot_a, rd.pivot_b)] == before
+
+    @needs_assets
+    def test_marker_exclusion_leaves_normal_rigs_alone(self):
+        # the predicate keys on physical content, so a rig with only real
+        # capsules must keep every body
+        import asset_convert.hkx_ragdoll as R
+        from asset_convert.hkx_skeleton import load_skeleton_bones
+        bones = load_skeleton_bones(DOG_SKEL)
+        real = R._is_marker_body
+        try:
+            R._is_marker_body = lambda n, b: False
+            before = R.extract_ragdoll(DOG_SKEL, bones)
+        finally:
+            R._is_marker_body = real
+        after = R.extract_ragdoll(DOG_SKEL, bones)
+        assert len(before) == len(after)

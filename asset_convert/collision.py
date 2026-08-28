@@ -2539,75 +2539,204 @@ def _constraint_descriptors(block):
             yield kind, d
 
 
-def add_missing_creature_constraints(data, root):
-    """Give every unconstrained creature blend body a joint to its nearest
-    body-carrying ancestor, so the NIF ragdoll is a CONNECTED tree.
+def strip_marker_collision_bodies(data, root):
+    """Remove Oblivion collision-TOGGLE proxies from a creature skeleton so
+    they never become ragdoll bodies (see hkx_ragdoll._is_marker_body: the
+    alit's 95%-scale duplicate capsules at mass 1e-4 and its radius-0
+    spheres -- shadow collision Oblivion could switch on and off, not limbs).
+    `plan_ragdoll_tree` excludes the same bodies from the .hkx ragdoll; the
+    engine matches the two files body-for-body, so the NIF must agree.
 
-    **This is the 2026-08-08 "corpse never falls over" root cause.**  Vanilla
-    creature skeleton.nifs ship exactly `bodies - 1` constraints — every body
-    except the ragdoll root is constrained, no orphans (dog 22/21, wolf 22/21,
-    sabrecat 28/27, skeever 21/20).  A `bhkRigidBody` with NO constraint is not
-    part of the ragdoll's constraint island, so the chain through it cannot
-    collapse and the corpse stays standing.
-
-    Oblivion leaves some bodies unconstrained (its animators only needed them
-    as collision, not as joints).  `hkx_ragdoll` already synthesizes joints for
-    these on the skeleton.**hkx** side — but the engine also reads the NIF, and
-    nothing was closing the tree there.  Census of our output before this fix,
-    which matched the in-game reports exactly (4/4, no false positives):
-
-        stormatronach  70 bodies, 16 constraints (53 missing)  never fell
-        mehrunesdagon  23 bodies,  0 constraints (22 missing)  never fell
-        shambles       17 bodies, 13 constraints ( 3 missing)  never fell
-        skeleton       17 bodies, 13 constraints ( 3 missing)  never fell
-        ...all 39 other creatures complete                     all fell
-
-    The synthesized joint is a `bhkRagdollConstraint` on the vanilla atronach
-    rock template (cone 50 deg, plane +-90, twist +-5) with friction 0, pivoted
-    at the child body's centre — the same template and pivot rule
-    `hkx_ragdoll._SYNTH_*` uses, so the two files stay consistent.
+    Runs BEFORE collision conversion so the predicate sees the same source
+    units extract_ragdoll does.  The NiNode itself is KEPT (animations bind
+    to it) -- only its collision object and any constraints naming its body
+    go.  Returns the count.
     """
-    # body -> owning node, in tree order, plus each node's parent
-    node_of_body = {}
-    parent_of = {}
+    from asset_convert.hkx_ragdoll import _is_marker_body
 
-    def walk(n, parent):
-        parent_of[id(n)] = parent
-        co = getattr(n, 'collision_object', None)
+    doomed = []
+    for block in data.blocks:
+        if block.__class__.__name__ != 'NiNode':
+            continue
+        co = getattr(block, 'collision_object', None)
         body = getattr(co, 'body', None) if co is not None else None
-        if body is not None and isinstance(body, NifFormat.bhkRigidBody):
-            node_of_body[id(body)] = n
-        for c in getattr(n, 'children', []) or []:
-            if isinstance(c, NifFormat.NiNode):
-                walk(c, n)
-
-    walk(root, None)
-    if not node_of_body:
+        if body is None:
+            continue
+        if _is_marker_body(block, body):
+            doomed.append((block, body))
+    if not doomed:
         return 0
 
-    # id(node) -> body object
-    body_of_node = {}
-    for _bid, n in node_of_body.items():
-        body_of_node[id(n)] = n.collision_object.body
-
-    added = 0
-    for bid, node in list(node_of_body.items()):
-        body = body_of_node[id(node)]
-        if len(list(getattr(body, 'constraints', []) or [])) > 0:
+    dead_bodies = {id(b) for _n, b in doomed}
+    # Drop constraints on the SURVIVING bodies that reference a dead one, so
+    # no constraint is left pointing at a body that no longer exists.
+    for block in data.blocks:
+        if block.__class__.__name__ not in ('bhkRigidBody', 'bhkRigidBodyT'):
             continue
-        # nearest ancestor that carries a body = this body's ragdoll parent
-        anc = parent_of.get(id(node))
-        target = None
-        while anc is not None:
-            if id(anc) in body_of_node:
-                target = body_of_node[id(anc)]
-                break
-            anc = parent_of.get(id(anc))
-        if target is None:
-            continue        # genuinely the ragdoll ROOT — vanilla leaves it bare
-        _add_synth_ragdoll_constraint(data, body, target)
-        added += 1
-    return added
+        if id(block) in dead_bodies:
+            continue
+        cons = list(getattr(block, 'constraints', []))
+        keep = [c for c in cons
+                if not any(id(e) in dead_bodies
+                           for e in getattr(c, 'entities', []))]
+        if len(keep) != len(cons):
+            block.num_constraints = len(keep)
+            block.constraints.update_size()
+            for i, c in enumerate(keep):
+                block.constraints[i] = c
+
+    for node, _body in doomed:
+        node.collision_object = None
+    return len(doomed)
+
+
+# Descriptor fields that swap when a constraint's two ends are exchanged,
+# keyed by descriptor kind, plus the (min, max) limit pairs that negate.
+_JOINT_END_SWAPS = {
+    'ragdoll': ((('twist_a', 'twist_b'), ('plane_a', 'plane_b'),
+                 ('motor_a', 'motor_b'), ('pivot_a', 'pivot_b')),
+                (('plane_min_angle', 'plane_max_angle'),
+                 ('twist_min_angle', 'twist_max_angle'))),
+    'limited_hinge': ((('axle_a', 'axle_b'),
+                       ('perp_2_axle_in_a_1', 'perp_2_axle_in_b_1'),
+                       ('perp_2_axle_in_a_2', 'perp_2_axle_in_b_2'),
+                       ('pivot_a', 'pivot_b')),
+                      (('min_angle', 'max_angle'),)),
+    'hinge': ((('axle_a', 'axle_b'),
+               ('perp_2_axle_in_a_1', 'perp_2_axle_in_b_1'),
+               ('perp_2_axle_in_a_2', 'perp_2_axle_in_b_2'),
+               ('pivot_a', 'pivot_b')),
+              ()),
+}
+_JOINT_KIND_OF_BLOCK = {'bhkRagdollConstraint': 'ragdoll',
+                        'bhkLimitedHingeConstraint': 'limited_hinge',
+                        'bhkHingeConstraint': 'hinge'}
+_JOINT_KIND_OF_SUBTYPE = {7: 'ragdoll', 2: 'limited_hinge', 1: 'hinge'}
+
+
+def _joint_descriptor(con):
+    """(kind, descriptor) of a ragdoll-tree joint block, looking through a
+    bhkMalleableConstraint wrapper; (None, None) for other kinds."""
+    name = con.__class__.__name__
+    if name == 'bhkMalleableConstraint':
+        sub = con.sub_constraint
+        kind = _JOINT_KIND_OF_SUBTYPE.get(int(sub.type))
+        return kind, (getattr(sub, kind) if kind else None)
+    kind = _JOINT_KIND_OF_BLOCK.get(name)
+    return kind, (getattr(con, kind) if kind else None)
+
+
+def _vec_is_zero(v):
+    return v is not None and v.x == 0.0 and v.y == 0.0 and v.z == 0.0
+
+
+def _reverse_constraint_ends(con):
+    """Re-express a constraint block with its entities exchanged: the same
+    physical joint, now held by the other body.  Frames/pivots swap sides
+    and the relative-rotation limits negate (mirrors
+    hkx_ragdoll._swap_joint_ends).  Works on the Skyrim layout the creature
+    path reaches it in, and on an unconverted Oblivion block (whose hinge
+    descriptors lack axle_a / perp_2_axle_in_b_1 -- derived here exactly as
+    _fix_hinge / _fix_limited_hinge derive them)."""
+    kind, d = _joint_descriptor(con)
+    if kind is None:
+        raise ValueError(f'cannot reverse a {con.__class__.__name__}')
+    if kind != 'ragdoll':
+        axle_a = getattr(d, 'axle_a', None)
+        if _vec_is_zero(axle_a):
+            _vec_set_unit(axle_a, _vec_cross(d.perp_2_axle_in_a_1,
+                                             d.perp_2_axle_in_a_2))
+        perp_b1 = getattr(d, 'perp_2_axle_in_b_1', None)
+        if _vec_is_zero(perp_b1):
+            _vec_set_unit(perp_b1, _vec_cross(d.perp_2_axle_in_b_2, d.axle_b),
+                          w=-1.0)
+    vec_pairs, limit_pairs = _JOINT_END_SWAPS[kind]
+    for na, nb in vec_pairs:
+        va, vb = getattr(d, na, None), getattr(d, nb, None)
+        if va is None or vb is None:
+            continue
+        ta = (va.x, va.y, va.z, getattr(va, 'w', None))
+        tb = (vb.x, vb.y, vb.z, getattr(vb, 'w', None))
+        va.x, va.y, va.z = tb[:3]
+        vb.x, vb.y, vb.z = ta[:3]
+        if ta[3] is not None and tb[3] is not None:
+            va.w, vb.w = tb[3], ta[3]
+    for lo, hi in limit_pairs:
+        l, h = float(getattr(d, lo)), float(getattr(d, hi))
+        setattr(d, lo, -h)
+        setattr(d, hi, -l)
+    con.entities[0], con.entities[1] = con.entities[1], con.entities[0]
+    sub = getattr(con, 'sub_constraint', None)
+    if sub is not None and int(getattr(sub, 'num_entities', 0)) == 2:
+        sub.entities[0], sub.entities[1] = sub.entities[1], sub.entities[0]
+
+
+def enforce_ragdoll_tree(data, root):
+    """Rebuild every creature ragdoll body's constraint list to EXACTLY the
+    joint `hkx_ragdoll.plan_ragdoll_tree` chose for it -- the tree the
+    skeleton.hkx ships -- so the NIF satisfies the engine's ragdoll-attach
+    contract (the contract, and the 2026-08-28 alit crash it explains, are
+    documented on plan_ragdoll_tree): the first body in pre-order DFS has 0
+    constraints, every later body exactly 1, its joint to an earlier body.
+
+    Per body: the chosen authored joint is kept and every other one dropped
+    (mudcrab ships bodies with 2, which shifts every later slot the engine
+    indexes); a joint authored on the parent's side (landdreugh's first
+    body is constrained to a LATER body) moves to the child with its ends
+    exchanged; an unconstrained body gets the synthetic vanilla rock joint to
+    its nearest body-carrying ancestor -- the 2026-08-08 "corpse never
+    falls over" fix: an unconstrained bhkRigidBody is not in the ragdoll's
+    constraint island, so the chain through it cannot collapse (vanilla
+    ships exactly bodies-1 constraints: dog 22/21, wolf 22/21, sabrecat
+    28/27, skeever 21/20; stormatronach/mehrunesdagon/shambles/skeleton were
+    the incomplete rigs).  Returns the number of bodies whose list changed.
+    """
+    from asset_convert.hkx_ragdoll import plan_ragdoll_tree
+
+    # markers were stripped before collision conversion (source units);
+    # every body left is real, and the converted mass/radius would fool the
+    # source-unit predicate (azura's static bodies convert to mass 0)
+    plan = plan_ragdoll_tree(data, exclude_markers=False)
+    if plan is None:
+        return 0
+    body_of = {id(n): n.collision_object.body for n in plan['body_nodes']}
+    before = {nid: list(getattr(b, 'constraints', []) or [])
+              for nid, b in body_of.items()}
+
+    # decide every list first: a reversed joint is taken from the PARENT's
+    # old list, which is rebuilt in the same pass
+    new_lists = {}
+    kept = set()
+    for n in plan['body_nodes']:
+        pick = plan['edge_con'].get(id(n))
+        if pick is None:
+            new_lists[id(n)] = []
+            continue
+        con, reversed_ = pick
+        if reversed_:
+            _reverse_constraint_ends(con)
+        new_lists[id(n)] = [con]
+        kept.add(id(con))
+
+    changed = 0
+    for n in plan['body_nodes']:
+        body = body_of[id(n)]
+        lst = new_lists[id(n)]
+        if [id(c) for c in before[id(n)]] != [id(c) for c in lst]:
+            changed += 1
+        body.num_constraints = len(lst)
+        body.constraints.update_size()
+        for i, c in enumerate(lst):
+            body.constraints[i] = c
+    for child, parent in plan['synthetic']:
+        _add_synth_ragdoll_constraint(data, body_of[id(child)],
+                                      body_of[id(parent)])
+        changed += 1
+
+    dead = {id(c) for lst in before.values() for c in lst} - kept
+    if dead:
+        data.blocks = [blk for blk in data.blocks if id(blk) not in dead]
+    return changed
 
 
 # Vanilla atronach rock-joint template, shared with hkx_ragdoll._SYNTH_*:

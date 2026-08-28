@@ -65,10 +65,10 @@ from .skyrim_overrides import (
     WEAPON_INV_MARKER_ROT_Z,
     WEAPON_INV_MARKER_ZOOM,
 )
-from .collision import (add_missing_creature_constraints,
-                        bake_node_transform_into_body, convert_all_collisions,
-                        hoist_collision, remove_empty_collision_nodes,
-                        scale_constraint_pivots)
+from .collision import (bake_node_transform_into_body, convert_all_collisions,
+                        enforce_ragdoll_tree, hoist_collision,
+                        remove_empty_collision_nodes, scale_constraint_pivots,
+                        strip_marker_collision_bodies)
 from .tri_reconstruct import (clear_match_groups, fix_missing_triangles,
                               UnreconstructibleGeometry)
 
@@ -6744,6 +6744,12 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         # Skyrim-format unknown_6_shorts; leaving them unconverted causes crashes.
         # Creature skeletons keep + convert their bhkBlendCollisionObjects
         # (ragdoll bone collision — vanilla creature skeletons have them).
+        # First drop Oblivion's collision-toggle proxies (alit), while the
+        # bodies still carry SOURCE units: hkx_ragdoll applies the same
+        # predicate to the source NIF, and the two files must agree body
+        # for body.
+        if creature and 'skeleton' in nif_basename:
+            strip_marker_collision_bodies(data, root)
         convert_all_collisions(root, keep_blend=creature)
 
         # Scale Havok constraint pivot points (Oblivion → Skyrim Havok scale).
@@ -6753,17 +6759,16 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         if has_constraints:
             scale_constraint_pivots(data)
 
-        # Creature skeletons: close the ragdoll constraint tree.  Vanilla ships
-        # exactly `bodies - 1` constraints (no orphan bodies); Oblivion leaves
-        # some bodies unconstrained and an unconstrained bhkRigidBody is not in
-        # the ragdoll's constraint island, so the chain through it cannot
-        # collapse — the "corpse never falls over" bug (skeleton, shambles,
-        # mehrunesdagon, stormatronach were exactly the 4 incomplete rigs).
+        # Creature skeletons: make the NIF's constraint lists EXACTLY the
+        # ragdoll tree the skeleton.hkx ships (first body bare, every other
+        # body one joint to an earlier body) — the engine's ragdoll attach
+        # indexes NIF constraints by body order with no bounds check (the
+        # 2026-08-28 alit crash), and an unconstrained body never falls
+        # (2026-08-08).  Contract: hkx_ragdoll.plan_ragdoll_tree.
         # AFTER scale_constraint_pivots: the synthesized pivots are built from
         # body `center` values that are already in Skyrim Havok units.
         if creature and 'skeleton' in nif_basename:
-            n_added = add_missing_creature_constraints(data, root)
-            if n_added:
+            if enforce_ragdoll_tree(data, root):
                 has_constraints = True
 
         # Skyrim requires BSXFlags extra data when collision is present

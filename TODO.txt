@@ -57,6 +57,8 @@ Later Issues:
 
 	15 - Refine armor conversion: rings don't properly attach
 
+	16 - Creatures with geometry baked into skeleton.nif (no body-part NIFs, no NIFZ) get no generated race and alias to a vanilla one: scrib (28 records, Morroblivion), willothewisp (5, Oblivion)
+
 Minor Issues:
 
 	2 - Improve landscape layer blending

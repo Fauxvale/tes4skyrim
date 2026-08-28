@@ -1735,6 +1735,55 @@ creature is fully proven.
   `type=TYPE_POSITION` explicitly (omitted param = TYPE_INVALID, solver dispatches on
   it) with vanilla values maxForce=100/prop=5.0/const=0.2. Fixed in hkx_ragdoll.py
   (`_constraints(motor_ref)` builds the motored + null sets).
+- **THE RAGDOLL-ATTACH CONTRACT: hkx part order == NIF DFS order, first body
+  bare, every other body exactly ONE joint to an EARLIER body (2026-08-28, the
+  Morroblivion alit Load3D crash, seven crash logs)**. Read out of the GOG/AE
+  exe: frame 0 `62885+0x35` = `hkpConstraintUtils::convertToPowered`, caller
+  `63792+0x4d3` = `0xb33f70` (the actor's ragdoll attach). That function (a)
+  walks the skeleton.NIF in pre-order DFS (`0xe27280`, NiNode children in
+  order) pushing every blend body's `hkpRigidBody` into list A and EVERY
+  constraint of every body into list B (`0xe286a0`); (b) for each hkx ragdoll
+  body i finds the NIF body j whose node name equals the ragdoll bone name
+  (minus `Ragdoll_`), swaps the hkx body for the NIF one, and overwrites hkx
+  `constraints[i-1]` with `B[j-1]` after `convertToPowered` — **no bounds
+  check, no entity check**. So an hkx root that is not the NIF's first body
+  makes some body i>0 match j=0 and read `B[-1]` (uninitialized stack: the last
+  log's `rsi` held the tail of the behavior file's `HitFrame` string); a body
+  with 2 constraints shifts every later slot; a body constrained to a LATER
+  body cannot be honored. Alit: its Spine and Neck constrain EACH OTHER and
+  nothing constrains `Bip01 NonAccum` (NIF body 0), so the old cycle-breaker
+  rooted the tree at Spine → hkx index 1 = NonAccum = NIF index 0 → `B[-1]`.
+  Census (`temp/ragdoll_order_census.py`, 110 rigs): alit + boxtest + scorpion
+  + snake had a non-first root, landdreugh (both plugins) authors its FIRST
+  body's joint to a later body, cliffracer has the same 2-cycle, mudcrab ships
+  three bodies with TWO constraints, and stormatronach/dreugh emitted a
+  permuted order (constraints on the wrong bones — no crash, mangled corpse).
+  Fix: `plan_ragdoll_tree` picks each body's parent as (1) its own authored
+  joint to an earlier body, else (2) an earlier body's authored joint naming
+  it — the same joint with its ends exchanged (`_swap_joint_ends` /
+  `collision._reverse_constraint_ends`: frames and pivots swap, limits negate),
+  else (3) a synthetic joint to the nearest body-carrying ancestor (fallback:
+  the root). `extract_ragdoll` emits parts in NIF DFS order and
+  `collision.enforce_ragdoll_tree` rebuilds every NIF body's constraint list to
+  exactly that joint (extra authored joints dropped), so both files agree.
+  `_assert_ragdoll_invariants` rejects a parent index >= the child's.
+  **The four earlier rounds (name-keyed anim-bone aliasing, duplicate bone
+  names, zero-volume-body mass/radius floors, "the engine builds a powered
+  constraint on a volumeless body") were NOT the crash** — each shipped and
+  the game still crashed at the same site. The positional anim-bone lookup is
+  kept (exact: both walks are the same DFS, so it needs no unique names). The
+  mass/radius floors and the ANIM-bone name suffixing are reverted — the
+  latter only ever renamed 2 of 120 rigs and the positional key then stripped
+  the suffix back off to compare. RAGDOLL PART names are still suffixed
+  (`extract_ragdoll`): the hkaSkeletonMapper keys parts by name.
+  Alit's 12 `CollisionNode` (95%-scale
+  duplicate capsule at mass 1e-4) / `EnableCollisions` (radius 0) pairs are
+  still dropped as collision-toggle proxies (`_is_marker_body`, applied on
+  SOURCE units only — `nif_converter` strips them before collision conversion,
+  and `enforce_ragdoll_tree` runs the plan with `exclude_markers=False`
+  because azura's static bodies convert to mass 0). The alit is one creature
+  with 12 limbs; that part of the previous analysis was right.
+  Regression tests: `TestRagdollBijection` in `tests/test_creature_anim.py`.
 - **iState_* graph variables ↔ MOVT records are the movement-type registration contract
   (2026-07-09, stuck-in-idle root cause #2 — locomotion/movement)**: the engine gives an actor its
   movement types by enumerating the root behavior graph's variables named
