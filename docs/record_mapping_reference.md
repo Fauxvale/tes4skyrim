@@ -219,6 +219,48 @@ needs to be a sane non-zero seed, not any particular creature's stats.
 **Rule:** a template shell's Required subrecords may be neutral, but never
 *zero* for a field the engine caches and reads before template resolution.
 
+### LVLN shell NPC_ must carry the LVLC's scripts (fixed 2026-08-27)
+
+TES4 attaches scripts to a leveled creature in **two independent places**, and
+Skyrim's LVLN has a field for neither:
+
+| TES4 field | Runs on | Count in Oblivion.esm |
+|---|---|---|
+| `SCRI` on the LVLC record itself | the placed leveled marker | 27 lists |
+| `SCRI` on the CREA named by the LVLC's `TNAM` (template) | the creature the list SPAWNS | 176 lists |
+
+Both died in the `ACHR → shell NPC_ → TPLT → LVLN` chain. The shell's TPLT
+points at the LVLN, whose entries are ordinary unscripted creatures, so ACBS
+Use Script (bit 9, `wbTemplateFlags` in `wbDefinitionsCommon.pas:7715`)
+inherited an **empty** script list and silently discarded both.
+
+Measured: **1063 placed refs across 96 leveled lists** lost their script —
+MS48's Kvatch southern plaza, MS49's castle courtyard, MQ12/15/16, MG14/16,
+SE03/04/10/12 and Dark07 among them.
+
+The observed symptom was "Clear the southern plaza of Kvatch" never completing.
+`MS48PlazaCreatureFinalScript` increments `MS48.monsterskilled` on each death
+and sets stage 80 at six; live `sqv MS48` showed **stage 70 with
+`monsterskilled = 0` while all six plaza creatures returned `GetDead >> 1.00`**.
+
+`leveled_actors._attach_lvlc_script` now attaches BOTH scripts to the shell via
+`object_scripts.attach_scripts_to_record`, and `_shell_acbs(own_script=True)`
+clears **only** bit 9 (`0x1FFF` → `0x1DFF`) so the shell's own list survives
+while every other category still inherits.
+
+**They are not alternatives.** Keying on `SCRI` alone attaches the list-marker
+housekeeping script (`MS48PlazaCreatureFinalLLScript`, a `setdestroyed` guard)
+and still loses the counter. Skyrim's VMAD is a script LIST — both attach side
+by side, each keeping its own handlers, exactly as Oblivion ran them.
+
+Audit a built ESM with `temp/shell_vmad_audit.py`: 442 shells, 96 with a VMAD,
+103 attached scripts, and Use Script cleared on exactly the scripted ones.
+
+**Rule:** when a TES4 record's data reaches the engine through a field Skyrim's
+target record lacks, check whether the *template* can carry it — and if the
+shell must own that data, clear the matching template bit or the empty
+inherited value wins.
+
 ## Hair conversion
 
 Oblivion hair is CONVERTED, not substituted with a vanilla Skyrim hairstyle.

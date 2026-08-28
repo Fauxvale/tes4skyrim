@@ -43,6 +43,11 @@ from .writer import (pack_formid_subrecord, pack_obnd, pack_record,
 # it should own nothing.  40 vanilla shells use exactly this value.
 _TEMPLATE_FLAGS = 0x1FFF
 
+# Bit 9 = 'Script' (wbTemplateFlags, wbDefinitionsCommon.pas:7715).  Set, the
+# engine inherits the script list from the template.  A shell that carries the
+# LVLC's own script must therefore CLEAR it -- see _shell_acbs(own_script).
+_USE_SCRIPT = 1 << 9
+
 _CLAS_DEFAULT = 0x00017008      # CLAS EncClassDremoraMelee (vanilla shell class)
 _NAM8_SOUND_LEVEL = 1           # Normal
 
@@ -80,8 +85,13 @@ def _shell_dnam() -> bytes:
             + bytes(10))
 
 
-def _shell_acbs() -> bytes:
+def _shell_acbs(own_script: bool = False) -> bytes:
     """NPC_ ACBS (24 bytes) for a template shell.
+
+    `own_script` clears the Use Script template bit (bit 9) so a script this
+    shell carries in its OWN VMAD survives.  With the bit set the engine takes
+    the script list from whatever the LVLN rolls -- which is a generic creature
+    with no VMAD -- and silently discards the shell's.
 
     Layout (wbDefinitionsTES5.pas): Flags(U32) MagickaOffset(S16)
     StaminaOffset(S16) Level(S16) CalcMin(U16) CalcMax(U16) SpeedMult(U16)
@@ -97,7 +107,7 @@ def _shell_acbs() -> bytes:
                        0, 0,               # Calc min / max
                        100,                # Speed multiplier
                        0,                  # Disposition (unused)
-                       _TEMPLATE_FLAGS,
+                       _TEMPLATE_FLAGS & ~(_USE_SCRIPT if own_script else 0),
                        0,                  # Health offset
                        0)                  # Bleedout override
 
@@ -146,7 +156,7 @@ def _shell_race(lvlc_rec: dict, crea_by_fid: dict, npc_by_fid: dict,
 
 
 def _build_shell(shell_fid: int, lvln_fid: int, race_fid: int,
-                 edid: str) -> bytes:
+                 edid: str, own_script: bool = False) -> bytes:
     """Pack one shell NPC_.
 
     Subrecord order follows the TES5 NPC_ definition (EDID OBND ACBS ... TPLT
@@ -156,8 +166,13 @@ def _build_shell(shell_fid: int, lvln_fid: int, race_fid: int,
     the same neutral values the vanilla shells use.
     """
     subs = pack_string_subrecord('EDID', edid)
+    # Skyrim NPC_ order is EDID VMAD OBND ...  _attach_lvlc_script registered
+    # the VMAD against this shell's FormID before we were called.
+    if own_script:
+        from .object_scripts import get_object_vmad
+        subs += get_object_vmad(shell_fid)
     subs += pack_obnd(-12, -12, 0, 12, 12, 60)
-    subs += pack_subrecord('ACBS', _shell_acbs())
+    subs += pack_subrecord('ACBS', _shell_acbs(own_script))
     subs += pack_formid_subrecord('TPLT', lvln_fid)
     subs += pack_formid_subrecord('RNAM', race_fid)
     subs += pack_subrecord('AIDT', _SHELL_AIDT)
@@ -192,6 +207,7 @@ def build_leveled_actor_shells(by_type: dict, writer) -> int:
     shell_by_lvlc = {}
     keep_refrs = []
     new_achrs = []
+    n_scripted = 0
 
     for refr in refrs:
         lvlc = lvlc_by_fid.get(get_formid(refr, 'NAME'))
@@ -205,8 +221,13 @@ def build_leveled_actor_shells(by_type: dict, writer) -> int:
             shell_fid = writer.derive_formid('LVLN_SHELL', lvln_fid)
             race = _shell_race(lvlc, crea_by_fid, npc_by_fid, lvlc_by_fid)
             edid = (get_str(lvlc, 'EditorID') or f'LVLN{lvln_fid:08X}') + '_Lvl'
-            writer.add_record('NPC_', _build_shell(shell_fid, lvln_fid, race, edid))
+            scripted = _attach_lvlc_script(lvlc, shell_fid,
+                                           crea_by_fid, npc_by_fid)
+            writer.add_record('NPC_', _build_shell(shell_fid, lvln_fid, race,
+                                                   edid, scripted))
             shell_by_lvlc[lvln_fid] = shell_fid
+            if scripted:
+                n_scripted += 1
 
         # convert_ACHR reads NAME through get_formid(), which re-applies the
         # load-order index offset, so store the pre-offset form here.
@@ -220,7 +241,57 @@ def build_leveled_actor_shells(by_type: dict, writer) -> int:
 
     by_type['REFR'] = keep_refrs
     by_type.setdefault('ACHR', []).extend(new_achrs)
+    if n_scripted:
+        print(f"  Leveled-actor shells carrying the list's own script: "
+              f"{n_scripted}")
     return len(new_achrs)
+
+
+def _attach_lvlc_script(lvlc: dict, shell_fid: int, crea_by_fid: dict,
+                        npc_by_fid: dict) -> bool:
+    """Give the shell NPC_ the scripts its source LVLC ran on spawned creatures.
+
+    TES4 attaches scripts to a leveled creature in two INDEPENDENT places, and
+    Skyrim's LVLN has a field for neither:
+
+      * ``SCRI`` on the LVLC RECORD ITSELF -- runs on the placed leveled marker
+        (27 lists in Oblivion.esm).  Typically housekeeping, e.g.
+        MS48PlazaCreatureFinalLLScript's ``setdestroyed`` on an already-cleared
+        plaza.
+      * ``TNAM`` -- the template CREA, whose OWN ``SCRI`` runs on the creature
+        the list actually spawns (176 lists).  This is where the gameplay logic
+        lives: MS48PlazaCreatureFinalScript increments ``MS48.monsterskilled``
+        on each death and sets stage 80 at six.
+
+    Both are needed, and they are NOT alternatives -- keying on SCRI alone
+    attaches the ``setdestroyed`` marker script and still loses the counter.
+    Skyrim's VMAD is a script LIST, so both attach side by side and each keeps
+    its own event handlers, which is what Oblivion did.
+
+    Both died in the ACHR -> shell -> LVLN chain: the shell's TPLT points at
+    the LVLN, whose entries are ordinary unscripted creatures, so Use Script
+    inherited an empty list.  Measured on Oblivion.esm, that silently dropped
+    the script on **1063 placed refs across 96 leveled lists** -- MS48's Kvatch
+    southern plaza (six creatures that could never advance the quest past
+    stage 70), MS49's castle courtyard, MQ12/15/16, MG14/16, SE03/04/10/12 and
+    Dark07 among them.
+
+    The caller must also clear the Use Script template bit, or the empty
+    inherited list wins.
+    """
+    scris = [(lvlc.get('SCRI') or '').strip()]
+
+    tnam = get_formid(lvlc, 'TNAM.Template')
+    if tnam:
+        base = crea_by_fid.get(tnam) or npc_by_fid.get(tnam)
+        if base is not None:
+            scris.append((base.get('SCRI') or '').strip())
+
+    if not any(scris):
+        return False
+
+    from .object_scripts import attach_scripts_to_record
+    return attach_scripts_to_record(shell_fid, scris) > 0
 
 
 def _index_offset() -> int:
