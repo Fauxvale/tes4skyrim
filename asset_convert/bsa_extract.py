@@ -410,6 +410,15 @@ def extract_bsa(bsa_path, extract_dir, force=False, source_name=None):
 
         try:
             os.makedirs(out_path.parent, exist_ok=True)
+            # UNLINK first, never truncate in place.  An ordered merge seeds
+            # its base by HARD-LINKING (mod_ingest.seed_from_export), so an
+            # extracted file can share an inode with the base export tree --
+            # `write_bytes` alone would truncate through the link and rewrite
+            # export/<base>/ with this mod's content.  Breaking the link is
+            # what the tree's other two writers already do (_place_payload,
+            # _link_or_copy); this one has to match them.
+            if out_path.is_file():
+                out_path.unlink()
             out_path.write_bytes(file_data)
             stats['extracted'] += 1
         except Exception as e:
