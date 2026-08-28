@@ -26,7 +26,8 @@ from script_convert.constants import (_safe_property_name, papyrus_script_name,
                                       resolve_property_formid,
                                       wants_placed_reference,
                                       PLAYER_ALIAS_EXTENDS)
-from script_convert.pipeline import build_vmad_object_script
+from script_convert.pipeline import (append_vmad_object_script,
+                                     build_vmad_object_script)
 from .text_reader import (get_formid_index_offset,
                           remap_formid, unescape_value)
 from .constants import ENGINE_GLOBAL_FORMIDS
@@ -128,6 +129,60 @@ def base_is_consume_door(base_fid: str) -> bool:
 def get_object_vmad(record_fid: int) -> bytes:
     """Packed VMAD subrecord for a record's attached object script (b'' if none)."""
     return _OBJECT_VMAD.get(record_fid, b'')
+
+
+# Context captured by build_object_script_plan so a LATER pass can attach a
+# script to a record that does not exist yet.  build_leveled_actor_shells mints
+# its shell NPC_ records long after the plan is built, and each shell has to
+# carry the script its source LVLC named -- see attach_script_to_record().
+_PLAN_CTX: dict = {}
+
+
+def attach_scripts_to_record(record_fid: int, scris) -> int:
+    """Bind one or more SCPTs (raw TES4 FormID strings) onto output `record_fid`.
+
+    For records minted after build_object_script_plan() has already run.  Uses
+    the same SCPT index and property resolution as the main pass, so each
+    script's VMAD entry is byte-identical to the one it would have received
+    inline.  Skyrim's VMAD is a script LIST, so several TES4 scripts that ran
+    on one Oblivion object attach side by side.  Returns how many attached.
+    """
+    if not _PLAN_CTX:
+        return 0
+    from .writer import pack_subrecord
+
+    packed = b''
+    n = 0
+    seen = set()
+    for scri in scris:
+        scri = (scri or '').strip()
+        if not scri or scri in seen:
+            continue
+        entry = _PLAN_CTX['scpt_by_fid'].get(scri)
+        if entry is None:
+            continue
+        seen.add(scri)
+        edid, sctx, extends = entry
+        script_name = papyrus_script_name(edid or f'Script_{scri}')
+
+        memo = _PLAN_CTX['props_memo']
+        obj_props = memo.get(scri)
+        if obj_props is None:
+            try:
+                obj_props = _resolve_props(sctx, edid, extends,
+                                           _PLAN_CTX['xref'],
+                                           _PLAN_CTX['fid_to_edid'],
+                                           _PLAN_CTX['offset'])
+            except Exception:
+                obj_props = {}
+            memo[scri] = obj_props
+
+        packed = append_vmad_object_script(packed, script_name, obj_props)
+        n += 1
+
+    if n:
+        _OBJECT_VMAD[record_fid] = pack_subrecord('VMAD', packed)
+    return n
 
 
 def get_quest_script(record_fid: int):
@@ -294,6 +349,10 @@ def build_object_script_plan(by_type: dict, xref, fid_to_edid: dict,
     # record it is attached to. Many records share one script (3297 scripted
     # records / 2090 unique scripts in Oblivion.esm), so memoise per SCRI.
     props_memo: dict[str, dict] = {}
+
+    _PLAN_CTX.clear()
+    _PLAN_CTX.update(scpt_by_fid=scpt_by_fid, props_memo=props_memo, xref=xref,
+                     fid_to_edid=fid_to_edid, offset=offset)
 
     count = 0
     for sig in SCRIPTABLE_TYPES:

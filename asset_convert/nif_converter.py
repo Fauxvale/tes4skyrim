@@ -1120,52 +1120,115 @@ _ALPHA_DST_ONE = 0
 _SOFT_FALLOFF_DEPTH = 100.0
 
 
-# Vanilla's own FLAME shapes -- the ones mounted against geometry, which is
-# exactly our torch/sconce case -- ship soft_effect OFF and a boosted emissive:
-#   torchsconce01  pFireballCore04  soft=0 mult=1.50
-#   slighthousefire Fireball/Flames soft=0 mult=1.50
-#   campfire01burning Glow:2/Glow:3 soft=0 mult=2.50/1.60
-# Only the free-standing smoke/glow planes take the fade (smoke02, Glow02,
-# Hot_Center: soft=1 mult=1.00).  A soft fade on a flame pinned to its sconce
-# attenuates it against the very surface it is mounted on -- the flame reads
-# dim and see-through -- and 1.0 then removes the over-brighten fire needs.
-_FIRE_TEX_HINTS = (b'fire', b'flame', b'torch')
-_FIRE_EMISSIVE_MULTIPLE = 1.5
+# A FLAME is not identified by its texture NAME.  An earlier revision matched
+# b'fire'/b'flame'/b'torch' in the diffuse path (minus a
+# smoke/mist/fog/dust/steam/cloud veto) and boosted anything that hit to
+# emissive_multiple 1.5.  That is classification by filename, and it is wrong
+# in both directions: in Oblivion's own tree it caught textures\lights\torch02.dds
+# -- the WOODEN HANDLE, whose host lights\torch02noflame.nif has no flame in it
+# at all -- and it can only ever work for meshes that follow Bethesda's naming,
+# never for Nehrim, Morroblivion or any third-party plugin.
+#
+# Oblivion states the brightness itself, per SHAPE, in
+# NiMaterialProperty.emissive_color.  Measured across every particle system in
+# meshes/ (all 778 of them) the two populations do not overlap:
+#
+#   flames   fire\firetorchlarge "Fire"        (1.000, 1.000, 1.000)
+#            crtfirelogs "PCloud08BigFlame"    (1.000, 1.000, 1.000)
+#   fog      fx\fxcloudthick01 "Cloud"         (0.078, 0.078, 0.078)
+#            fx\fxcloudthin01  "Cloud"         (0.047, 0.047, 0.047)
+#            fx\fxdustcloud01  "PCloud02v"     (0.337, 0.337, 0.294)
+#
+# Distribution: 227 author full 1.0 white, 190 a dim <0.5, 202 in between, and
+# 159 author black (which already falls back to white).
+#
+# So the authored value IS the discriminator, at better than 12x separation,
+# and it is per-shape -- which matters because firetorchlargesmoke.nif holds a
+# flame AND a smoke plume in one file and any per-file test must give them the
+# same answer.  Carry emissive_color through verbatim and hold the multiple at
+# the vanilla-neutral 1.0; a flame authored full white is already at full
+# emission and needs no boost.
 
 
-def _is_fire_fx(texture_path):
-    """Is this FX surface a FLAME (vs smoke/mist/dust/glow)?
+# A SELF-LIT flame must not be soft-faded, and the authored emissive says so.
+#
+# The depth fade attenuates a quad against whatever it intersects.  On ambient
+# fog that is the whole point -- it removes the rectangular quad edge where the
+# plane cuts the floor.  On a FLAME it is destructive: a candle flame sits
+# directly on its own wax and a sconce flame against its own bracket, so the
+# fade dims the flame into the very object it is mounted on.  Vanilla Skyrim
+# authors exactly this split inside ONE mesh -- mps\mpscandleflame01.nif, both
+# particle systems, both additive 0x100d, both emissive_multiple 1.0:
+#
+#   CandleFlame01  (the flame)  soft_effect=0  falloff 2.0
+#   CandleGlow01   (the halo)   soft_effect=1  falloff 6.0
+#
+# and the same holds for every mounted fire core in the vanilla corpus:
+# slighthousefire "Fireball", torchsconce01 "pFireballCore04",
+# giantcampfire01burning "PFireball" -- all soft_effect=0 (49 such particle
+# systems across 281 vanilla fire meshes).
+#
+# Skyrim's own value is NOT reconstructible from structure -- measured over
+# those 511 vanilla FX shaders, neither block type (particle 119/168 soft=1 vs
+# geometry 159/343), nor alpha flags (0x100d splits 163/74), nor double_sided
+# (78% vs 44%) predicts it; it is authored per effect.  Oblivion has no
+# equivalent field to carry across either.  So key it on the one authored
+# quantity that DOES separate the two populations -- the same
+# NiMaterialProperty.emissive_color that drives brightness:
+#
+#   flames    fire\firetorchlarge, firecandleflame, fireopen*   (1.0, 1.0, 1.0)
+#   fog/dust  fxcloudthick01 0.078, fxcloudthin01 0.047,
+#             fxdustcloud01 0.337, sefxmistdemen 0.310          all <= 0.34
+#
+# A surface authored at FULL WHITE is declaring "I am the light source" and is
+# left hard; anything dimmer is ambient haze and takes the fade.  Erring here
+# is asymmetric: a missing fade only leaves a Skyrim-era nicety off a flame,
+# while a wrongly-applied one erases the flame outright.
+_FX_SELF_LIT_EMISSIVE = 0.999
 
-    Read off the AUTHORED diffuse path, which is how Oblivion names these
-    (fire/FireTorchLargeS01.dds, fire/FireFlameParticle.dds).  Smoke shares
-    the fire/ folder, so an explicit smoke/mist/dust/steam match wins.
-    """
-    t = bytes(texture_path or b'').lower()
-    if not t:
-        return False
-    for neg in (b'smoke', b'mist', b'fog', b'dust', b'steam', b'cloud'):
-        if neg in t:
-            return False
-    return any(h in t for h in _FIRE_TEX_HINTS)
+# ...and a self-lit surface is BOOSTED, not left neutral.  1.0 is the mode
+# across all vanilla FX, but that population is mostly smoke, mist and glow
+# planes.  Restrict the census to the shapes that actually match this branch --
+# vanilla FX that are full-white AND soft_effect=0, i.e. self-lit surfaces
+# mounted against geometry -- and 1.0 is the minority:
+#
+#   mult  1.0  1.1  1.25  1.5  1.6  2.0  3.0
+#   n      16    9     6    5   43    6    5     (74 of 90 are ABOVE 1.0)
+#
+# with a median of 1.6 and the burning cores clustered at the top:
+# torchsconce01 pFireballCore04 1.50 (Torch:0 1.25), giantcampfire01burning
+# PCloudForgeSparks 1.25, fxsmokelargeclose01 Flames 1.60.  The 1.0 entries are
+# `*off*` variants and non-flame parts (GlowMesh, lamp bodies).
+#
+# The flames commit's 1.5 was therefore the RIGHT VALUE on the wrong test: it
+# keyed on the texture filename.  Holding every flame at the neutral 1.0 made
+# fire\fireopensmall.nif and its siblings visibly dimmer than they had been,
+# which the project owner spotted in game.  1.5 sits inside the vanilla cluster
+# and is what the previous build shipped, so it is also the no-regression
+# choice.
+_FX_SELF_LIT_MULTIPLE = 1.5
 
 
-def _apply_fx_soft_effect(eff_shader, alpha_prop, texture_path=None):
+def _apply_fx_soft_effect(eff_shader, alpha_prop, emissive_rgb=None):
     """Enable the soft-particle depth fade on a blended FX shader.
 
     Keyed on the source's own NiAlphaProperty: blending on -> fade, off/absent
     -> leave hard (matching the vanilla split above).  A quad that does not
     blend has no soft edge to preserve in the first place.
 
-    FLAMES are excluded and instead get vanilla's fire emissive boost -- see
-    the census beside _FIRE_TEX_HINTS.
+    SELF-LIT surfaces (authored full-white emissive) are excluded -- see the
+    census above: a fade on a mounted flame attenuates it against its own
+    holder and the flame disappears.  They also take vanilla's emissive BOOST,
+    for which see _FX_SELF_LIT_MULTIPLE.
     """
-    if _is_fire_fx(texture_path):
-        eff_shader.shader_flags_1.slsf_1_soft_effect = 0
-        eff_shader.emissive_multiple = _FIRE_EMISSIVE_MULTIPLE
-        return False
     if alpha_prop is None:
         return False
     if not (int(alpha_prop.flags) & _ALPHA_BLEND_ENABLED):
+        return False
+    if emissive_rgb is not None and all(
+            c >= _FX_SELF_LIT_EMISSIVE for c in emissive_rgb):
+        eff_shader.shader_flags_1.slsf_1_soft_effect = 0
+        eff_shader.emissive_multiple = _FX_SELF_LIT_MULTIPLE
         return False
     eff_shader.shader_flags_1.slsf_1_soft_effect = 1
     eff_shader.soft_falloff_depth = _SOFT_FALLOFF_DEPTH
@@ -2171,8 +2234,14 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         # alpha, which is what the engine multiplies the sampled texel by.
         eff_shader.emissive_color.a = material_alpha
         # Kill the rectangular hard edge where the quad intersects walls/floor.
+        # The AUTHORED emissive, not the shader's final value -- a shape that
+        # authored BLACK was defaulted to white just above, and that fallback
+        # must not read as "self-lit flame" and lose the fade.
+        _authored = ((emissive_r, emissive_g, emissive_b)
+                     if (emissive_r > 0.0 or emissive_g > 0.0
+                         or emissive_b > 0.0) else None)
         if _apply_fx_soft_effect(eff_shader, alpha_prop,
-                                 effective_path) and stats is not None:
+                                 _authored) and stats is not None:
             stats['fx_soft_effect'] = stats.get('fx_soft_effect', 0) + 1
 
         if atlas is not None:
@@ -4191,6 +4260,52 @@ def _simple_color_from(mod):
     return cm
 
 
+def _color_curve_carries_hue(node):
+    """Does this system's NiPSysColorModifier supply an actual COLOR?
+
+    Oblivion uses the modifier for two unrelated jobs and they need opposite
+    handling when deciding what the shader tint should be:
+
+      * an ALPHA ENVELOPE -- an achromatic ramp, R==G==B at every key, whose
+        only real content is the alpha fade-in/fade-out.  fxcloudthick01,
+        fxcloudthin01 and fxdustcloud01 all ship exactly
+        (0,0,0,0) -> (1,1,1,1) -> (0,0,0,0).  It contributes NO color, so the
+        material's emissive_color is the only brightness the effect has.
+
+      * a real COLOR CURVE -- chromatic keys, R!=G!=B.  creatures/ghost's
+        PArray* systems ramp (0.702, 0.831, 0.745) -> (0.514, 0.647, 0.561),
+        the ghost's pale green, against a near-black 0.039 material.  Here the
+        CURVE is the authored color and the material is just a carrier, so
+        deferring to the curve is right -- carrying 0.039 through would
+        multiply the green down to ~0.027 and render the ghost black.
+
+    Measured over 778 particle systems in meshes/: of the 190 that author a dim
+    (<0.5) emissive, 120 have an achromatic curve and 70 a chromatic one.
+    Telling them apart by whether the keys carry chroma is the authored test;
+    "has a modifier at all" conflates the two and whitens both.
+    """
+    def _chromatic(r, g, b):
+        hi, lo = max(r, g, b), min(r, g, b)
+        # Ignore keys that are essentially black -- the endpoints of an alpha
+        # envelope -- and call it chroma only on a real spread.
+        return hi > 0.02 and (hi - lo) > 0.03
+
+    for m in (node.modifiers or []):
+        if isinstance(m, NifFormat.NiPSysColorModifier):
+            data = getattr(m, 'data', None)
+            kg = getattr(data, 'data', None) if data is not None else None
+            for k in (getattr(kg, 'keys', None) or []):
+                c = k.value
+                if _chromatic(c.r, c.g, c.b):
+                    return True
+        elif isinstance(m, NifFormat.BSPSysSimpleColorModifier):
+            # Already rewritten by _skyrimize_modifiers -- the sampled curve.
+            for c in (getattr(m, 'colors', None) or []):
+                if _chromatic(c.r, c.g, c.b):
+                    return True
+    return False
+
+
 def _skyrimize_modifiers(node):
     """Rewrite a NiParticleSystem's modifier list to the Skyrim vocabulary so
     the SSE particle engine actually drives it (else particles are invisible).
@@ -4272,8 +4387,11 @@ def _convert_particle_system(node, fix_textures):
     # emitter's NiMaterialProperty exactly as the geometry path does.  A smoke
     # emitter authored at (0.35, 0.35, 0.35) must not be promoted to white.
     psys_emissive = None
-    psys_vertex_coloured = False
     psys_alpha = 1.0
+
+    # Sample the authored color curve BEFORE _skyrimize_modifiers rewrites
+    # NiPSysColorModifier into its Skyrim equivalent.
+    psys_curve_hue = _color_curve_carries_hue(node)
 
     # Harvest UV-scroll controllers before the Oblivion properties are cleared.
     tex_transforms = _collect_tex_transform_ctrls(node.properties)
@@ -4293,8 +4411,6 @@ def _convert_particle_system(node, fix_textures):
             if ec.r > 0.0 or ec.g > 0.0 or ec.b > 0.0:
                 psys_emissive = (ec.r, ec.g, ec.b)
             psys_alpha = float(prop.alpha)
-        elif isinstance(prop, NifFormat.NiVertexColorProperty):
-            psys_vertex_coloured = True
         elif isinstance(prop, NifFormat.NiAlphaProperty):
             alpha_prop = prop
 
@@ -4368,8 +4484,8 @@ def _convert_particle_system(node, fix_textures):
 
     # Build BSEffectShaderProperty (Skyrim particle shader) — flags match
     # vanilla fire (slighthousefire.nif Fireball): flags1 = z_buffer_test only,
-    # flags2 = vertex_colors only; emissive_multiple 1.5 (fire glows; vanilla
-    # uses 1.25–1.5).  soft_effect is NOT set on vanilla fire particle shaders.
+    # flags2 = vertex_colors only.  emissive_multiple stays at the vanilla
+    # neutral 1.0 and the AUTHORED emissive_color supplies the brightness.
     shader = NifFormat.BSEffectShaderProperty()
     # PyFFI defaults UV Scale to (0,0) — that collapses EVERY particle UV to
     # the texture's top-left texel (transparent on flame textures) = invisible
@@ -4397,21 +4513,24 @@ def _convert_particle_system(node, fix_textures):
     # (harvested below), so the multiple stays neutral and the authored color
     # does the dimming.
     shader.emissive_multiple = 1.0
-    # ...UNLESS the particles carry their own colour.  When the system has
-    # a NiPSysColorModifier (or a NiVertexColorProperty), the PER-PARTICLE
-    # colour is what Oblivion draws and the NiMaterialProperty emissive is
-    # inert -- the ghost's smoke pairs an authored pale-green colour curve
-    # with a near-black (0.04) material.  Skyrim's effect shader MULTIPLIES
-    # by emissive_color, so copying that 0.04 across rendered the smoke
-    # black in game.  Keep the tint neutral and let the converted
-    # BSPSysSimpleColorModifier supply the hue, which is also vanilla's
-    # overwhelming default (98/167 effect shaders are pure white).
-    has_colour_mod = any(
-        isinstance(m, (NifFormat.NiPSysColorModifier,
-                       NifFormat.BSPSysSimpleColorModifier))
-        for m in (node.modifiers or []) if m is not None)
-    if psys_emissive is not None and not (has_colour_mod
-                                          or psys_vertex_coloured):
+    # ...UNLESS the particles carry a real COLOR of their own.  When the
+    # system's NiPSysColorModifier ramps an actual hue, that curve is the
+    # authored color and the NiMaterialProperty emissive is only its carrier:
+    # the ghost pairs a pale-green curve with a near-black 0.039 material, and
+    # since Skyrim's effect shader MULTIPLIES by emissive_color, carrying the
+    # 0.039 across crushed the green to ~0.027 and rendered the smoke black.
+    #
+    # But an ACHROMATIC curve is not a color -- it is an alpha envelope, and
+    # deferring to it throws the material away for nothing.  That is what made
+    # Ayleid-ruin fog blinding: fxcloudthick01 authors (0.078, 0.078, 0.078)
+    # against a plain (0,0,0,0)->(1,1,1,1)->(0,0,0,0) ramp, so whitening the
+    # shader over-brightened it 12.8x on ADDITIVELY blended geometry that Belda
+    # layers several planes deep.  190 of 778 particle systems author a dim
+    # (<0.5) emissive and 120 of those have an achromatic curve like this.
+    #
+    # A NiVertexColorProperty alone is likewise not a color source -- every one
+    # of the fog meshes above carries one -- so it no longer forces the tint.
+    if psys_emissive is not None and not psys_curve_hue:
         shader.emissive_color.r = psys_emissive[0]
         shader.emissive_color.g = psys_emissive[1]
         shader.emissive_color.b = psys_emissive[2]
@@ -4441,8 +4560,15 @@ def _convert_particle_system(node, fix_textures):
     # a smoke plume drifting into a wall otherwise cuts off along a hard line,
     # and every billboard shows its own quad edge.  alpha_prop is always set by
     # this point (defaulted to additive above), so blended systems all qualify.
-    _apply_fx_soft_effect(shader, alpha_prop,
-                          getattr(shader, 'source_texture', b''))
+    # The AUTHORED emissive, never the shader's final value.  The shader ends
+    # up white in three different situations and only one of them is a flame:
+    # authored full white (109 systems), a fallback because the source authored
+    # BLACK (159), and a fallback because a chromatic curve supplies the color
+    # instead (320).  Keying the flame test on the final value would skip the
+    # depth fade on all 479 fallback cases -- including the smoke plume in
+    # fire\fireopensmallsmoke.nif, which authors (0,0,0) and is exactly the
+    # kind of surface the fade exists for.
+    _apply_fx_soft_effect(shader, alpha_prop, psys_emissive)
 
 
 # Skyrim billboard axis correction (see the root-billboard handling for the

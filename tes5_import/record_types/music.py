@@ -18,8 +18,9 @@ Structure follows wbDefinitionsTES5.pas and a real Skyrim.esm dump:
 Vanilla census (Skyrim.esm, 258 MUST / 50 MUSC) drove the shape:
   * 240 Single Track, 13 Palette, 5 Silent Track -- so single tracks are the
     norm and this writes those plus one Silent Track for a silence source.
-  * Only 1 record carries LNAM loop data, 10 carry FNAM cue points and 10 a
-    BNAM finale, so all three are omitted rather than invented.
+  * Only 1 record carries LNAM loop data and only the 10 combat tracks carry
+    FNAM cue points / BNAM finales.  LNAM is omitted; combat tracks get FNAM
+    (tiled over the measured duration) and NO BNAM -- see build_MUST.
   * 210 of 240 ANAMs start with a leading backslash; the 30 that do not load
     identically.  We follow the majority form.
 """
@@ -70,11 +71,13 @@ CATEGORY_SPECS = {
     'explore':  {'priority': 49, 'flags': F_CYCLE_TRACKS, 'fade': 4.0},
     'public':   {'priority': 48, 'flags': F_CYCLE_TRACKS, 'fade': 4.0},
     'dungeon':  {'priority': 50, 'flags': F_CYCLE_TRACKS, 'fade': 4.0},
-    # Combat -- vanilla MUSCombat: priority 2, ducking 10000, flags 0x24
-    # (Cycle Tracks | Ducks Current Track).
+    # Combat -- vanilla MUSCombat (0003418E): priority 2, ducking 10000, flags
+    # 0x24 (Cycle Tracks | Ducks Current Track), WNAM 9.0 -- the fade the
+    # engine applies to the running track when the type is removed or
+    # restarted (BGSMusicType vtbl[3] passes WNAM as the DoFinish fade).
     'battle':   {'priority': 2, 'ducking': 10000,
                  'flags': F_CYCLE_TRACKS | F_DUCKS_CURRENT_TRACK,
-                 'fade': 2.0},
+                 'fade': 9.0},
     # Special tracks are one-shot quest/event cues fired by script
     # (38 StreamMusic calls in Nehrim.esm), so they must not cycle: each gets
     # its own MUSC that plays exactly one selection and ducks whatever is on.
@@ -134,11 +137,92 @@ def must_editor_id(plugin: str, source_rel: str) -> str:
     return 'MUSTrk%s_%s' % (stem, tail)
 
 
+# Combat cue points: the timestamps at which the engine may ENTER a combat
+# track, and -- per the CK wiki (Music Track, "Choose Finale") -- the points it
+# crossfades OUT from "when combat ends before the completion of a Combat
+# track".  Without them a combat MUSC is selected but never engages.
+#
+# Measured over every vanilla MUST that has them (10 of 258, and ALL 10 are
+# combat tracks -- no ambient track carries FNAM):
+#
+#   cue counts   12-20        gaps 3.74-8.00 s
+#   the cues TILE the track: evenly spaced, first cue one gap in, last cue
+#   roughly one gap before the end.
+#
+# The gap is that track's musical bar length, which TES4 gives us no way to
+# read.  We tile the measured duration instead, at a spacing inside vanilla's
+# range and a count inside vanilla's -- so the engine always has a cue to
+# enter and leave on, which is what actually gates combat music.
+# Skyrim.esm keyword ActorTypeDragon.  Every vanilla combat track carries one
+# condition -- GetCombatTargetHasKeyword(ActorTypeDragon) == 0 -- which keeps
+# the normal combat set off dragon fights (those have their own music).  All
+# 10 have it; none is unconditioned, and CITC/CTDA travel with BNAM/FNAM as
+# one shape.  Skyrim.esm is always our master, so the id resolves.
+KYWD_ACTOR_TYPE_DRAGON = 0x00035D59
+CTDA_GET_COMBAT_TARGET_HAS_KEYWORD = 707
+CTDA_RUN_ON_TARGET = 2
+
+
+def _combat_track_condition() -> bytes:
+    """CITC+CTDA: GetCombatTargetHasKeyword(ActorTypeDragon) == 0.
+
+    Byte-for-byte the condition every vanilla combat track carries (read from
+    Skyrim.esm, not the text dump).
+    """
+    ctda = struct.pack(
+        '<BBBB f HH I I I I',
+        0x00,                    # operator: Equal To
+        0x5c, 0xb5, 0x18,        # unused padding, as vanilla writes it
+        0.0,                     # comparison value
+        CTDA_GET_COMBAT_TARGET_HAS_KEYWORD,
+        0x0000,                  # padding
+        KYWD_ACTOR_TYPE_DRAGON,  # param1: the keyword
+        0x00000000,              # param2
+        CTDA_RUN_ON_TARGET,
+        0x00000014,              # reference: the player
+    )
+    ctda += struct.pack('<i', -1)   # unknown trailing dword, vanilla = -1
+    return (pack_subrecord('CITC', struct.pack('<I', 1))
+            + pack_subrecord('CTDA', ctda))
+
+
+CUE_TARGET_GAP = 6.0        # seconds; vanilla mean is 5.9
+CUE_MIN, CUE_MAX = 12, 20   # vanilla's observed count range
+
+
+def combat_cue_points(duration: float) -> list:
+    """Evenly spaced cue points tiling `duration`, vanilla-shaped.
+
+    Returns [] when the duration is unusable, in which case no FNAM is
+    written -- an absent array is legal (xEdit does not mark FNAM required).
+    """
+    if not duration or duration <= CUE_TARGET_GAP * 2:
+        return []
+    # Choose the count that puts the spacing nearest CUE_TARGET_GAP while
+    # staying inside vanilla's 12-20.
+    n = int(round(duration / CUE_TARGET_GAP)) - 1
+    n = max(CUE_MIN, min(CUE_MAX, n))
+    gap = duration / (n + 1)
+    return [round(gap * (i + 1), 3) for i in range(n)]
+
+
 def build_MUST(track: dict, form_id: int, plugin: str) -> bytes:
     """Pack one MUST music track record from a music_tracks.json entry.
 
-    `track` carries the measured duration; FLTV is a real float in seconds the
-    engine schedules against, so it must be probed rather than guessed.
+    Subrecord set is exactly what the track TYPE takes.  Censused over all 258
+    vanilla MUST in Skyrim.esm (`references/Skyrim.esm/MUST.txt`):
+
+      Single (240)  EDID CNAM ANAM          -- 203 are exactly this; the rest
+                                               add BNAM/FNAM/LNAM/CTDA only.
+                                               FLTV: 0/240.  DNAM: 0/240.
+      Silent   (5)  EDID CNAM FLTV          -- FLTV 5/5, DNAM 0/5.
+      Palette (13)  EDID CNAM FLTV DNAM     -- both 13/13.
+
+    So FLTV is the duration of a track with no FILE to measure, and DNAM is
+    the PALETTE fade-out (CK wiki, Music Track: "when the duration of the
+    Palette has been reached, the Palette will be faded out over this value").
+    Neither belongs on a single track: writing DNAM without FLTV produces a
+    combination that occurs in NO vanilla record and silences the track.
     """
     silent = is_silent_stem(track.get('stem', ''))
 
@@ -147,11 +231,35 @@ def build_MUST(track: dict, form_id: int, plugin: str) -> bytes:
     subs += pack_subrecord('CNAM', struct.pack(
         '<I', TRACK_SILENT if silent else TRACK_SINGLE))
 
-    if not silent:
-        # Duration and fade-out. A silent track carries neither in vanilla.
+    if silent:
+        # No ANAM to measure, so the length of the gap must be stated.
+        # Vanilla's five silent tracks range 10-300 s.
         subs += pack_subrecord('FLTV', _f32(track.get('duration') or 0.0))
-        subs += pack_subrecord('DNAM', _f32(2.0))
+    else:
+        # EDID CNAM ANAM -- the vanilla single-track shape (203 of 240).
         subs += pack_string_subrecord('ANAM', ANAM_PREFIX + track['game_path'])
+        # ...plus FNAM cue points for COMBAT tracks only, matching the 10
+        # vanilla tracks that have them.  xEdit order puts FNAM after ANAM
+        # (BNAM/LNAM sit between, and we author neither: Oblivion ships no
+        # finale file, and with no BNAM the engine exits on a cue point
+        # instead of crossfading into one).
+        if (track.get('category') or '').lower() == 'battle':
+            cues = combat_cue_points(track.get('duration') or 0.0)
+            if cues:
+                # 🛑 NO BNAM.  Read from SkyrimSE.exe (BGSMusicSingleTrack
+                # DoFinish 0x2e0400 / DoUpdate 0x2e00f0, GOG AE build): on
+                # combat end the track waits for the next cue point, then
+                # EITHER crossfades into the finale stream when BNAM names one
+                # OR, with no finale, seeks to the LAST cue and plays the
+                # track's own ending -- and the track (so the combat type) is
+                # not finished until every stream has stopped.  An earlier
+                # version pointed BNAM at the track itself, which made the
+                # whole 1-2 minute battle track replay as its own "finale"
+                # after every fight.  Oblivion authors no finale file, so the
+                # authored ending (last cue -> end, about one gap) is the exit.
+                subs += pack_subrecord(
+                    'FNAM', b''.join(_f32(c) for c in cues))
+                subs += _combat_track_condition()
 
     return pack_record('MUST', form_id, 0, subs)
 
@@ -179,15 +287,35 @@ def build_MUSC(category: str, track_fids: list, form_id: int,
     return pack_record('MUSC', form_id, 0, subs)
 
 
-def load_music_manifest(out_root) -> dict:
-    """Read music_tracks.json written by asset_convert.music_convert.
+def load_music_manifest(out_root, export_dir=None, plugin=None) -> dict:
+    """Read music_tracks.json, building it from the extracted tree if absent.
 
-    Returns {} when music was never converted, which is the normal state for a
-    plugin with masters (music is only ingested for masterless plugins).
+    The manifest is normally written by the SOUND stage -- but that stage runs
+    AFTER the import (phase 7 vs phase 6), so on a plugin's first conversion
+    the file does not exist yet and every MUST/MUSC would be silently skipped.
+    Everything the records need is derivable from the extracted music folder
+    alone, so we scan it here rather than depending on stage order.
+
+    Returns {} when the plugin genuinely has no music, which is the normal
+    state for a plugin with masters (music is only ingested for masterless
+    plugins).
     """
     from pathlib import Path
     from ..artifact_schema import read_artifact, StaleArtifactError
     p = Path(out_root) / 'music_tracks.json'
+
+    if not p.is_file() and export_dir and plugin:
+        # No manifest yet: derive one from the extracted tree.  Pure directory
+        # walk -- no ffmpeg, no xWMAEncode, no subprocess.
+        try:
+            from asset_convert.music_convert import scan_music
+            n = scan_music(plugin, export_dir, str(Path(out_root).parent))
+            if n:
+                print(f'  Music: manifest absent, scanned {n} tracks from '
+                      f'the extracted folder.')
+        except Exception as e:
+            print(f'  WARNING: could not scan music folder: {e}')
+
     if not p.is_file():
         return {}
     try:
@@ -208,12 +336,14 @@ def build_music_records(manifest: dict, writer, plugin: str) -> dict:
       'musc'      : [(formid, bytes), ...]
       'by_enum'   : {tes4 enum value -> MUSC formid}  for CELL.XCMO / WRLD.ZNAM
       'by_source' : {source_rel -> MUSC formid}       for StreamMusic in scripts
+      'battle'    : the Battle MUSC formid, for the DOBJ BTMS override
 
     FormIDs are derived from AUTHORED data only -- the track's own source path,
     or the category folder name -- so ids never move between builds.
     """
     tracks = manifest.get('tracks') or []
-    out = {'must': [], 'musc': [], 'by_enum': {}, 'by_source': {}}
+    out = {'must': [], 'musc': [], 'by_enum': {}, 'by_source': {},
+           'battle': None}
     if not tracks:
         return out
 
@@ -257,5 +387,87 @@ def build_music_records(manifest: dict, writer, plugin: str) -> dict:
         for enum_val, enum_cat in MUSIC_ENUM_CATEGORY.items():
             if enum_cat == cat:
                 out['by_enum'][enum_val] = mfid
+        # Battle has no TES4 enum and no CELL/WRLD/REGN route -- the engine
+        # only reaches it through DOBJ's BTMS default object.
+        if cat == 'battle':
+            out['battle'] = mfid
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# DOBJ -- the Default Object Manager
+# ---------------------------------------------------------------------------
+# 🛑 THIS is how the engine finds combat music.  It does NOT scan MUSC records
+# for the combat flags; it asks BGSDefaultObjectManager for `kBattleMusic`,
+# whose form comes from the DOBJ record's `BTMS` entry -- hardcoded in
+# Skyrim.esm to MUSCombat (0003418E).
+#
+# Confirmed against SeaSparrowOG/CombatMusic (an SKSE combat-music plugin),
+# whose every hook is keyed on exactly that lookup:
+#
+#     const auto MUSCombat = defaultObjects->GetObject<RE::BGSMusicType>(
+#         RE::BGSDefaultObjectManager::DefaultObject::kBattleMusic);
+#     if (!MUSCombat || a_music != MUSCombat) { return a_music; }
+#
+# So a Battle MUSC that nothing points at is unreachable no matter how
+# correctly it is built -- which is why ours stayed silent with vanilla-perfect
+# flags, priority, ducking, cue points and conditions.  Battle is the ONE
+# category with no CELL/WRLD/REGN route: `by_enum` only carries the 3 TES4
+# enum values (explore/public/dungeon), so nothing else can ever name it.
+#
+# Every DLC overrides DOBJ with the FULL array (Dawnguard 324, Dragonborn 346,
+# HearthFires 346, Update 366 entries), so that is the established pattern: we
+# copy the winning master's entries and replace only BTMS.
+DOBJ_BATTLE_MUSIC_TAG = b'BTMS'
+
+
+def _read_master_dobj(skyrim_esm: str):
+    """(FormID, [(tag, formid), ...]) for Skyrim.esm's DOBJ, or None."""
+    with open(skyrim_esm, 'rb') as fh:
+        data = fh.read()
+    pos = 24 + struct.unpack('<I', data[4:8])[0]
+    end = len(data)
+    while pos < end:
+        sig = data[pos:pos + 4]
+        if sig == b'GRUP':
+            pos += 24
+            continue
+        size = struct.unpack('<I', data[pos + 4:pos + 8])[0]
+        if sig == b'DOBJ':
+            fid = struct.unpack('<I', data[pos + 12:pos + 16])[0]
+            body = data[pos + 24:pos + 24 + size]
+            i = 0
+            while i + 6 <= len(body):
+                sub = body[i:i + 4]
+                sz = struct.unpack('<H', body[i + 4:i + 6])[0]
+                val = body[i + 6:i + 6 + sz]
+                if sub == b'DNAM':
+                    return fid, [(val[j:j + 4],
+                                  struct.unpack('<I', val[j + 4:j + 8])[0])
+                                 for j in range(0, len(val), 8)]
+                i += 6 + sz
+        pos += 24 + size
+    return None
+
+
+def build_DOBJ_override(battle_musc_fid: int, skyrim_esm: str):
+    """Skyrim.esm's DOBJ with BTMS repointed at our Battle MUSC.
+
+    Returns (formid, record_bytes), or None when the master has no DOBJ or no
+    BTMS entry -- in which case we write nothing and leave vanilla combat
+    music in place rather than inventing a default-object table.
+    """
+    found = _read_master_dobj(skyrim_esm)
+    if not found:
+        return None
+    fid, entries = found
+    if not any(tag == DOBJ_BATTLE_MUSIC_TAG for tag, _ in entries):
+        return None
+    dnam = b''.join(
+        tag + struct.pack('<I', battle_musc_fid
+                          if tag == DOBJ_BATTLE_MUSIC_TAG else old)
+        for tag, old in entries)
+    subs = pack_string_subrecord('EDID', 'DefaultObjectManager')
+    subs += pack_subrecord('DNAM', dnam)
+    return fid, pack_record('DOBJ', fid, 0, subs)

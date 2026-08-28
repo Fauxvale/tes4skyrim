@@ -222,6 +222,104 @@ def music_rel_dir(source_name: str) -> str:
     return 'music/tes4/' + source_name
 
 
+def _track_entry(rel, source_name, duration=0.0, src_kbps=0, bitrate=0):
+    """One manifest entry for a source file at `rel` under the music root.
+
+    Everything the IMPORTER reads is derived from the PATH alone; the numeric
+    fields are encode-side and stay 0 in a scan-only manifest.
+    """
+    parts = rel.as_posix().split('/')
+    game_rel = rel.with_suffix('.xwm').as_posix().replace('/', BS)
+    return {
+        # Category = the TOP folder, the authored unit of meaning in TES4
+        # (Battle/Dungeon/Explore/Public/Special).
+        'category': parts[0] if len(parts) > 1 else '',
+        # Source path as the plugin's own scripts spell it, so a StreamMusic
+        # "data\\music\\special\\x.mp3" can be resolved back.
+        'source_rel': ('music/' + rel.as_posix()).lower(),
+        'game_path': (BS.join(['Data', 'Music', 'tes4', source_name])
+                      + BS + game_rel),
+        'duration': round(duration, 3),
+        'stem': rel.stem,
+        'source_kbps': src_kbps,
+        'bitrate': bitrate,
+    }
+
+
+def _music_sources(src_root):
+    """Every convertible source under `src_root`, relative to it, sorted."""
+    rels = []
+    for root, _dirs, files in os.walk(src_root):
+        for fname in sorted(files):
+            src = Path(root) / fname
+            if src.suffix.lower() in MUSIC_SRC_EXTS:
+                rels.append(src.relative_to(src_root))
+    return rels
+
+
+def write_music_manifest(out_root, source_name, tracks) -> int:
+    """Write music_tracks.json for `tracks`; returns the track count."""
+    tracks.sort(key=lambda t: t['source_rel'])
+    Path(out_root).mkdir(parents=True, exist_ok=True)
+    # Versioned envelope so a manifest written by an older converter is
+    # reported as stale instead of half-read (tes5_import/artifact_schema.py).
+    from tes5_import.artifact_schema import write_artifact
+    write_artifact(str(Path(out_root) / MANIFEST_NAME), source_name,
+                   {'plugin': source_name, 'tracks': tracks})
+    return len(tracks)
+
+
+def scan_music(
+    source_file: str,
+    extract_dir: str = 'export',
+    output_dir: str = 'output',
+) -> int:
+    """Write music_tracks.json from the extracted tree WITHOUT encoding.
+
+    Everything the importer reads -- source_rel, category, stem, game_path --
+    comes from the directory walk, so this needs no ffmpeg, no xWMAEncode and
+    no subprocess.  It exists because the stage order is import (6) then
+    sounds (7) and music rides the SOUND stage: without this the first run of
+    a plugin builds zero MUST/MUSC, and the audio ships with nothing pointing
+    at it.  Called by tes5_import.record_types.music.load_music_manifest.
+
+    Returns the number of tracks written (0 when the plugin has no music).
+    """
+    source_name = _asset_root(extract_dir, source_file).name
+    src_root = Path(_asset_root(extract_dir, source_file)) / 'music'
+    out_root = Path(_out_root(output_dir, source_file, extract_dir))
+    if not src_root.is_dir():
+        return 0
+    rels = _music_sources(src_root)
+    if not rels:
+        return 0
+
+    # Two kinds of entry need a real duration in the record:
+    #   * a SILENT track carries no ANAM, so MUST.FLTV is the only thing
+    #     telling the engine how long the gap lasts;
+    #   * a BATTLE track's FNAM cue points tile its length, and without them
+    #     the combat MUSC is selected but never engages.
+    # Everything else takes its length from its own file at playback, so this
+    # probes ~9 files rather than all 76.
+    needs_duration = [r for r in rels
+                      if 'silence' in r.stem.lower()
+                      or r.as_posix().split('/')[0].lower() == 'battle']
+    durations = {}
+    if needs_duration:
+        ffmpeg = find_ffmpeg(None)
+        if ffmpeg:
+            for r in needs_duration:
+                durations[r] = probe_audio(ffmpeg, src_root / r)['duration']
+        else:
+            print('  WARNING: ffmpeg not found; silent and combat music '
+                  'tracks will get no duration (run --sounds-only to write '
+                  'the real values).')
+
+    tracks = [_track_entry(rel, source_name, duration=durations.get(rel, 0.0))
+              for rel in rels]
+    return write_music_manifest(out_root, source_name, tracks)
+
+
 def convert_music(
     source_file: str,
     extract_dir: str = 'export',
@@ -232,7 +330,9 @@ def convert_music(
     """Convert every extracted music file and write the track manifest.
 
     Returns a stats dict; the manifest lands in the plugin's output root as
-    `music_tracks.json` for the importer to build MUST/MUSC from.
+    `music_tracks.json` for the importer to build MUST/MUSC from.  The import
+    stage can also write that manifest itself via `scan_music`; this rewrites
+    it with the measured encode data.
     """
     source_name = _asset_root(extract_dir, source_file).name
     src_root = Path(_asset_root(extract_dir, source_file)) / 'music'
@@ -252,14 +352,8 @@ def convert_music(
         stats['failed'] = 1
         return stats
 
-    jobs = []
-    for root, _dirs, files in os.walk(src_root):
-        for fname in sorted(files):
-            src = Path(root) / fname
-            if src.suffix.lower() not in MUSIC_SRC_EXTS:
-                continue
-            rel = src.relative_to(src_root)
-            jobs.append((src, dst_root / rel.with_suffix('.xwm'), rel))
+    jobs = [(src_root / rel, dst_root / rel.with_suffix('.xwm'), rel)
+            for rel in _music_sources(src_root)]
 
     if not jobs:
         print('  No music files to convert.')
@@ -270,8 +364,8 @@ def convert_music(
 
     def _one(job):
         src, dst, rel = job
-        # One probe per file: the duration goes in the manifest for MUST.FLTV
-        # and the bitrate/channels choose the encode rate.
+        # One probe per file: the bitrate/channels choose the encode rate, and
+        # the duration is recorded for diagnostics (no record reads it).
         info = probe_audio(ffmpeg, src)
         rate = pick_bitrate(info['kbps'], info['channels'])
         cached = dst.is_file() and dst.stat().st_size > 0 and not force
@@ -294,33 +388,12 @@ def convert_music(
                 print('    FAILED ' + rel.as_posix())
                 continue
             stats['cached' if cached else 'converted'] += 1
-            parts = rel.as_posix().split('/')
-            game_rel = rel.with_suffix('.xwm').as_posix().replace('/', BS)
-            tracks.append({
-                # Category = the TOP folder, the authored unit of meaning in
-                # TES4 (Battle/Dungeon/Explore/Public/Special).
-                'category': parts[0] if len(parts) > 1 else '',
-                # Source path as the plugin's own scripts spell it, so a
-                # StreamMusic "data\music\special\x.mp3" can be resolved back.
-                'source_rel': ('music/' + rel.as_posix()).lower(),
-                'game_path': (BS.join(['Data', 'Music', 'tes4', source_name])
-                              + BS + game_rel),
-                'duration': round(dur, 3),
-                'stem': rel.stem,
-                'source_kbps': src_kbps,
-                'bitrate': rate,
-            })
+            tracks.append(_track_entry(rel, source_name, duration=dur,
+                                       src_kbps=src_kbps, bitrate=rate))
 
     if _progress:
         _progress.report('Music', _mtotal, _mtotal, force=True)
-    tracks.sort(key=lambda t: t['source_rel'])
-    stats['tracks'] = len(tracks)
-    out_root.mkdir(parents=True, exist_ok=True)
-    # Versioned envelope so a manifest written by an older converter is
-    # reported as stale instead of half-read (tes5_import/artifact_schema.py).
-    from tes5_import.artifact_schema import write_artifact
-    write_artifact(str(out_root / MANIFEST_NAME), source_name,
-                   {'plugin': source_name, 'tracks': tracks})
+    stats['tracks'] = write_music_manifest(out_root, source_name, tracks)
 
     import collections
     spread = collections.Counter(t['bitrate'] // 1000 for t in tracks)

@@ -1174,6 +1174,11 @@ class PluginWriter:
             # order-sensitively at load (ours carry no conditions), but keep
             # the canonical slot rather than letting it append after DLVW.
             'MESG',
+            # DOBJ sits between MESG and MUSC in vanilla (…LCTN MESG RGDL
+            # DOBJ LGTM MUSC…).  Ours overrides the master's default-object
+            # table to repoint BTMS at our Battle music, so it must precede
+            # MUSC for the form it names to already be in the file.
+            'DOBJ',
             # MUSC/MUST sit AFTER CELL in vanilla (measured on the real
             # Skyrim.esm top-level order: CELL 57, WRLD 58, LCTN 86, MUSC 91,
             # DLBR 97, MUST 98).  Unlike a REFR base object, a cell's XCMO is
