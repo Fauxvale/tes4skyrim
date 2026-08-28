@@ -140,6 +140,30 @@ therefore keeps its output and simply has no `# Finished:` footer, which is
 itself the signal that it did not terminate cleanly. Logging never fails a
 conversion: every filesystem step degrades to "no logging" rather than raising.
 
+### GUI progress bars (`TESCONV_PROGRESS`)
+
+The GUI shows two progress bars during a run: a **per-phase** bar (files done /
+files to process for the current phase, captioned literally "Current Phase",
+reset to 0 only at each new phase banner) and a **whole-run** bar (the former
+throbber, now a determinate fill weighted equally per selected step). Both show
+only a percent — no time estimate (too inaccurate to be worth the arithmetic).
+Both are **clamped monotonic**: a phase reported in several batches (multiple
+plugins, or Import's Records/Landscape/Navmesh under one banner) keeps the
+per-phase bar rising instead of dropping to 0 when the next batch's count
+restarts, so the bar never jumps backward mid-phase.
+
+The mechanism is a `progress.report(phase, done, total)` call in each phase's
+parent-process aggregator loop (`progress.py`). It prints one throttled
+`@@PROG <phase>\t<done>\t<total>` line to stdout, which `gui.py` (`_set_progress`)
+parses to drive the bars and never renders to the log. It is a no-op unless the
+child sees `TESCONV_PROGRESS=1` — which only the GUI sets — so a plain
+`python convert.py` and the test suite emit nothing. Workers never call it (only
+the parent's aggregator loop does), so there is no cross-process stdout
+interleaving and no change to any output artifact. Whole-run progress is stepped
+by the `Phase N:` banners the pipeline already prints; a count-less phase
+(Papyrus compile, LOD) has no `@@PROG` and leaves the per-phase bar spinning
+while the whole-run bar still advances by its step slice.
+
 <a id="running-off-windows"></a>
 ### Running off Windows (Linux / Mac, via Wine)
 

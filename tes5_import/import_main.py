@@ -29,6 +29,10 @@ intend, see `tools/navmesh_cache_hook.py --check`.
 import argparse
 import json
 import os
+try:
+    import progress as _progress          # optional GUI progress reporting
+except ImportError:
+    _progress = None
 import struct
 import sys
 import time
@@ -1724,7 +1728,10 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # them in thread-completion order, so record order shuffled between runs. A
     # plain loop keeps the ESM byte-reproducible. (The genuinely heavy
     # conversion work — text parse, LAND, navmeshes — runs in pools elsewhere.)
-    for sig, target_sig, rec in work_items:
+    _rtotal = len(work_items)
+    for _ridx, (sig, target_sig, rec) in enumerate(work_items, 1):
+        if _progress:
+            _progress.report('Records', _ridx, _rtotal)
         converter = IMPORT_DISPATCH[sig]
         try:
             src_fid = (rec.get('FormID') or '').upper()
@@ -1773,6 +1780,8 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
             edid = get_str(rec, 'EditorID', '?')
             print(f"  ERROR converting {sig} '{edid}': {e}")
             errors += 1
+    if _progress:
+        _progress.report('Records', _rtotal, _rtotal, force=True)
     _phase_done(f'phase 1 simple records ({len(work_items)})')
 
     # --- Phase 2: LTEX (creates TXST companion records) ---
@@ -2998,12 +3007,20 @@ def _precompute_land(by_type: dict, export_dir: str) -> dict:
     t0 = time.time()
 
     cache: dict = {}
+    _ltotal = len(lands)
+    _ldone = 0
     with ProcessPoolExecutor(max_workers=workers,
                              initializer=convert_worker.init_worker,
                              initargs=initargs) as ex:
-        for results in ex.map(convert_worker.convert_chunk, chunks):
+        # ex.map preserves order, so zip against chunks to count records done.
+        for chunk, results in zip(chunks, ex.map(convert_worker.convert_chunk, chunks)):
             for (kind, fid), ok, payload in results:
                 cache[fid] = (ok, payload)
+            _ldone += len(chunk)
+            if _progress:
+                _progress.report('Landscape', _ldone, _ltotal)
+    if _progress:
+        _progress.report('Landscape', _ltotal, _ltotal, force=True)
     print(f"    LAND conversion: {len(lands)} records in {time.time() - t0:.2f}s")
     return cache
 
@@ -3072,6 +3089,8 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
           f"across {n_workers} processes...")
     t0 = time.time()
     cache: dict = {}
+    _ntotal = len(jobs)
+    _ndone = 0
 
     # A single tiny job isn't worth a process pool's spin-up cost.
     if len(jobs) == 1 or n_workers == 1:
@@ -3085,6 +3104,9 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
         for job in jobs:
             key, result = navm_worker.run_job(job)
             cache[key] = result
+            _ndone += 1
+            if _progress:
+                _progress.report('Navmesh', _ndone, _ntotal)
     else:
         # Run the initializer ONCE IN THE PARENT before spawning workers.
         #
@@ -3126,7 +3148,12 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
                 _map_kwargs['buffersize'] = n_workers * chunksize * 4
             for key, result in ex.map(navm_worker.run_job, jobs, **_map_kwargs):
                 cache[key] = result
+                _ndone += 1
+                if _progress:
+                    _progress.report('Navmesh', _ndone, _ntotal)
 
+    if _progress:
+        _progress.report('Navmesh', _ntotal, _ntotal, force=True)
     hits = sum(1 for (_b, m) in cache.values()
                if m and m.get('geom_cached'))
     print(f"    Navmesh generation: {len(jobs)} cells in "

@@ -23,6 +23,10 @@ override system. This pipeline is for everything CREA.
 
 import json
 import os
+try:
+    import progress as _progress          # optional GUI progress reporting
+except ImportError:
+    _progress = None
 import re
 import shutil
 import sys
@@ -623,6 +627,8 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
     # (pyffi NIF conversion, KF decode, spline compression) — threads
     # serialize on the GIL and give no speedup at all.
     projects, errors = {}, {}
+    _ctotal = len(dirs)
+    _cdone = 0
     with ProcessPoolExecutor(max_workers=workers or _WORKERS) as pool:
         futs = {pool.submit(_convert_creature, cdir, name, out_meshes_dir,
                             part_sets.get(name.lower()), 30.0,
@@ -633,6 +639,9 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
                 name for cdir, name in dirs}
         for fut in as_completed(futs):
             name = futs[fut]
+            _cdone += 1
+            if _progress:
+                _progress.report('Creatures', _cdone, _ctotal)
             try:
                 manifest = fut.result()
             except Exception as e:
@@ -644,6 +653,9 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
             log(f'  [ok] {name}: {len(manifest["clips"])} clips, '
                 f'{len(manifest["bodies"])} body nifs'
                 + (f', {n_fail} failures' if n_fail else ''))
+
+    if _progress:
+        _progress.report('Creatures', _ctotal, _ctotal, force=True)
 
     # Registration: merged singlefiles (vanilla base + ALL projects on disk).
     # A subset run (--names) must not drop the other creatures' registrations,

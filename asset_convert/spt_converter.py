@@ -31,6 +31,10 @@ Usage (CLI):
 import io
 import re
 import sys
+try:
+    import progress as _progress          # optional GUI progress reporting
+except ImportError:
+    _progress = None
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -570,20 +574,30 @@ def convert_spt_directory(src_dir: Path, dst_dir: Path,
 
     dst_dir.mkdir(parents=True, exist_ok=True)
     counts = {'ok': 0, 'fail': 0, 'skip': 0}
+    total = len(jobs)
+    done = 0
 
     if workers == 1:
         results = (_convert_job(j) for j in jobs)
         for _name, ok, err in results:
             counts['ok' if ok else 'fail'] += 1
+            done += 1
+            if _progress:
+                _progress.report('SpeedTrees', done, total)
             if err:
                 print(f'  [SPT] ERROR {err}')
     else:
         with ProcessPoolExecutor(max_workers=workers) as pool:
             for _name, ok, err in pool.map(_convert_job, jobs, chunksize=1):
                 counts['ok' if ok else 'fail'] += 1
+                done += 1
+                if _progress:
+                    _progress.report('SpeedTrees', done, total)
                 if err:
                     print(f'  [SPT] ERROR {err}')
 
+    if _progress:
+        _progress.report('SpeedTrees', total, total, force=True)
     print(f"  [SPT] Done: {counts['ok']} ok, {counts['fail']} fail")
     return counts
 

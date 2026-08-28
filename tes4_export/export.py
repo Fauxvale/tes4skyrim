@@ -14,6 +14,10 @@ Usage:
 import argparse
 import mmap
 import os
+try:
+    import progress as _progress          # optional GUI progress reporting
+except ImportError:
+    _progress = None
 import sys
 import time
 from collections import defaultdict
@@ -360,6 +364,8 @@ def _write_format_results(by_type: dict, output_dir: str, job_sigs: list,
             print(f"    Wrote {_type_filepath(cur_sig, output_dir)} "
                   f"({len(by_type[cur_sig])} records)")
 
+    _etotal = len(job_sigs)
+    _edone = 0
     for sig, text in zip(job_sigs, results):
         if sig != cur_sig:
             _close_current()
@@ -371,7 +377,12 @@ def _write_format_results(by_type: dict, output_dir: str, job_sigs: list,
             cur_file.write("\n\n")
         cur_file.write(text)
         first_chunk = False
+        _edone += 1
+        if _progress:
+            _progress.report('Export', _edone, _etotal)
     _close_current()
+    if _progress:
+        _progress.report('Export', _etotal, _etotal, force=True)
 
 
 def export_header(header: Record, output_dir: str):

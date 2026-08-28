@@ -41,6 +41,10 @@ directory is on a different drive.
 """
 import glob as _glob
 import os
+try:
+    import progress as _progress          # optional GUI progress reporting
+except ImportError:
+    _progress = None
 import shutil
 import subprocess
 import sys
@@ -430,10 +434,17 @@ def pack_bsas(
     # its own overflow counter and they share the loader plugins by index.
     loaders_needed = 0
 
-    for subdir_names, bsa_suffix, compress in specs:
+    # Collect every spec's files up front (one walk each, the same walk the loop
+    # used to do) so the total file count is known for the progress bar.
+    spec_files = [((subdir_names, bsa_suffix, compress),
+                   _collect_files(plugin_dir, subdir_names, texture_keep))
+                  for subdir_names, bsa_suffix, compress in specs]
+    _ptotal = sum(len(f) for _spec, f in spec_files)
+    _pdone = 0
+
+    for (subdir_names, bsa_suffix, compress), files in spec_files:
         base_name = f"{stem} - {bsa_suffix}.bsa" if bsa_suffix else f"{stem}.bsa"
 
-        files = _collect_files(plugin_dir, subdir_names, texture_keep)
         if not files:
             print(f"  SKIP  {base_name} (no source content)")
             results['skipped'].append(base_name)
@@ -488,6 +499,12 @@ def pack_bsas(
             finally:
                 if stage_root.exists():
                     shutil.rmtree(stage_root, ignore_errors=True)
+            _pdone += len(entries)
+            if _progress:
+                _progress.report('Packing', min(_pdone, _ptotal), _ptotal)
+
+    if _progress:
+        _progress.report('Packing', _ptotal, _ptotal, force=True)
 
     # Generate one dummy ESL per overflow slot so the game mounts those BSAs.
     for i in range(loaders_needed):

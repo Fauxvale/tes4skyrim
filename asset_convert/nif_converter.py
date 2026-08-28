@@ -25,6 +25,10 @@ import collections as _collections
 import io as _io
 import logging as _logging
 import os
+try:
+    import progress as _progress          # optional GUI progress reporting
+except ImportError:
+    _progress = None
 import re
 import shutil
 import struct
@@ -7964,6 +7968,8 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
         with mp.Pool(processes=workers, initializer=_pyffi_capture_init) as pool:
             for status, nif_str, payload in pool.imap_unordered(_batch_worker, work_args):
                 done += 1
+                if _progress:
+                    _progress.report('Meshes', done, total)
                 if status == 'ok':
                     _update(nif_str, payload)
                 else:
@@ -7984,6 +7990,8 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
         _pyffi_capture_init()
         for i, args in enumerate(work_args):
             status, nif_str, payload = _batch_worker(args)
+            if _progress:
+                _progress.report('Meshes', i + 1, total)
             if status == 'ok':
                 _update(nif_str, payload)
             else:
@@ -8000,6 +8008,9 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
                     folder = Path(nif_str).parent.name
                 print(f'  {i + 1}/{total} [{folder}] -- converted={stats["converted"]} '
                       f'copied={stats["copied"]} errors={stats["errors"]}')
+
+    if _progress:
+        _progress.report('Meshes', total, total, force=True)
 
     print(f'\nResults: {stats["converted"]} converted, {stats["copied"]} copied, '
           f'{stats["skipped"]} skipped, {stats["errors"]} errors / {total} total')

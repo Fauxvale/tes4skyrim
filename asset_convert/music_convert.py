@@ -24,6 +24,10 @@ is a real float in seconds the engine schedules against.
 """
 import json
 import os
+try:
+    import progress as _progress          # optional GUI progress reporting
+except ImportError:
+    _progress = None
 import re
 import shutil
 import subprocess
@@ -276,10 +280,15 @@ def convert_music(
         return src, dst, rel, ok, cached, info['duration'], rate, info['kbps']
 
     tracks = []
+    _mtotal = len(jobs)
+    _mdone = 0
     with ThreadPoolExecutor(max_workers=worker_count()) as pool:
         futs = [pool.submit(_one, j) for j in jobs]
         for fut in as_completed(futs):
             src, dst, rel, ok, cached, dur, rate, src_kbps = fut.result()
+            _mdone += 1
+            if _progress:
+                _progress.report('Music', _mdone, _mtotal)
             if not ok:
                 stats['failed'] += 1
                 print('    FAILED ' + rel.as_posix())
@@ -302,6 +311,8 @@ def convert_music(
                 'bitrate': rate,
             })
 
+    if _progress:
+        _progress.report('Music', _mtotal, _mtotal, force=True)
     tracks.sort(key=lambda t: t['source_rel'])
     stats['tracks'] = len(tracks)
     out_root.mkdir(parents=True, exist_ok=True)

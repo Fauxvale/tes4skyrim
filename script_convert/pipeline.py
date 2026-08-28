@@ -2,6 +2,10 @@
 
 import argparse
 import os
+try:
+    import progress as _progress          # optional GUI progress reporting
+except ImportError:
+    _progress = None
 import re
 import struct
 
@@ -458,18 +462,33 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
     jobs = ([('scpt', c) for c in _chunk(scpt_work, 48)]
             + [('info', c) for c in _chunk(info_work, 128)]
             + [('qust', c) for c in _chunk(qust_work, 8)])
+    # Progress is at CHUNK granularity (workers write .psc directly and only
+    # report counts), but each chunk carries a known number of scripts, so the
+    # bar still advances by real work done, not by chunk index.
+    _stotal = len(scpt_work) + len(info_work) + len(qust_work)
+    _sdone = 0
     if workers <= 1 or len(jobs) <= 2:
         _script_worker_init(*initargs)
         for job in jobs:
             _merge_stats(stats, _script_worker_run(job))
+            _sdone += len(job[1])
+            if _progress:
+                _progress.report('Scripts', _sdone, _stotal)
         _WORKER_CTX.clear()
     else:
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=min(workers, len(jobs)),
                                  initializer=_script_worker_init,
                                  initargs=initargs) as ex:
-            for part in ex.map(_script_worker_run, jobs):
+            # ex.map preserves input order, so zip against jobs to know each
+            # completed chunk's script count.
+            for job, part in zip(jobs, ex.map(_script_worker_run, jobs)):
                 _merge_stats(stats, part)
+                _sdone += len(job[1])
+                if _progress:
+                    _progress.report('Scripts', _sdone, _stotal)
+    if _progress:
+        _progress.report('Scripts', _stotal, _stotal, force=True)
 
     _fix_udf_call_arg_types(output_dir)
     _comment_undeclared_identifiers(output_dir)

@@ -27,6 +27,10 @@ on a named Fonix mutex, capping throughput at ~8 lips/s regardless of
 process count.
 """
 import os
+try:
+    import progress as _progress          # optional GUI progress reporting
+except ImportError:
+    _progress = None
 import queue
 import re
 import shutil
@@ -501,14 +505,21 @@ def convert_sounds(
             return r.returncode == 0 and dst.is_file() and dst.stat().st_size > 0
 
         # I/O- and subprocess-bound: threads are the right pool here.
+        _stotal = len(jobs)
+        _sdone = 0
         with ThreadPoolExecutor(max_workers=(os.cpu_count() or 4)) as pool:
             for ok in pool.map(_encode, jobs):
+                _sdone += 1
+                if _progress:
+                    _progress.report('Sounds', _sdone, _stotal)
                 if ok is None:
                     copied += 1
                 elif ok:
                     count += 1
                 else:
                     failed += 1
+        if _progress:
+            _progress.report('Sounds', _stotal, _stotal, force=True)
         print(f'  Copied {copied} sounds'
               + (f', transcoded {count} mp3 -> wav' if count else '')
               + (f', {failed} FAILED' if failed else ''))
@@ -988,11 +999,16 @@ def organize_voice_files(
         except Exception as e:
             return f'exception:{e}'
 
+    _vtotal = len(conversion_jobs)
+    _vdone = 0
     try:
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = {pool.submit(_process_one, job): job for job in conversion_jobs}
             for fut in as_completed(futures):
                 result = fut.result()
+                _vdone += 1
+                if _progress:
+                    _progress.report('Voices', _vdone, _vtotal)
                 if result == 'ok':
                     stats['organized'] += 1
                 elif result == 'error':
@@ -1007,6 +1023,8 @@ def organize_voice_files(
     finally:
         if lip_pool_dir is not None:
             shutil.rmtree(lip_pool_dir, ignore_errors=True)
+    if _progress:
+        _progress.report('Voices', _vtotal, _vtotal, force=True)
 
     if unmapped_races:
         print('  Warning: unmapped race/gender combos (synthesised folder names):')

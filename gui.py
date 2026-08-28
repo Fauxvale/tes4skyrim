@@ -31,6 +31,7 @@ from worker_budget import worker_count, cpu_total, WORKERS_ENV_VAR
 # because it imports this lazily inside a function.
 from tools.navmesh.navmesh_cache import NO_DOWNLOAD_ENV_VAR
 import version as version_info
+import progress as _progressmod
 import run_log
 from preflight import RC_MISSING_DEP as _RC_MISSING_DEP
 from collision_options import (
@@ -3489,13 +3490,38 @@ def gui_main():
     #
     # Grid, not pack: `sidebar` is grid-managed now, and the two geometry
     # managers cannot share a parent.
-    prog_bar = ttk.Progressbar(sidebar, mode="indeterminate", length=200)
-    prog_bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14,
+    # Two stacked bars during a run: a per-phase bar (resets each phase) above
+    # the whole-run bar.  The whole-run bar is the former throbber, now a
+    # determinate fill across the entire pipeline.  Each has a small caption
+    # above it (phase name / "Overall") carrying its percent and rough ETA.
+    phase_prog_var = tk.StringVar(value="")
+    _phase_prog_lbl = ttk.Label(sidebar, textvariable=phase_prog_var,
+                                style="PanelSub.TLabel", anchor="w")
+    _phase_prog_lbl.grid(row=1, column=0, columnspan=2, sticky="ew",
+                         padx=14, pady=(0, 1))
+    _phase_prog_lbl.grid_remove()
+
+    phase_bar = ttk.Progressbar(sidebar, mode="determinate", maximum=1000,
+                                length=200)
+    phase_bar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=14,
+                   pady=(0, 6))
+    phase_bar.grid_remove()
+
+    overall_prog_var = tk.StringVar(value="")
+    _overall_prog_lbl = ttk.Label(sidebar, textvariable=overall_prog_var,
+                                  style="PanelSub.TLabel", anchor="w")
+    _overall_prog_lbl.grid(row=3, column=0, columnspan=2, sticky="ew",
+                           padx=14, pady=(0, 1))
+    _overall_prog_lbl.grid_remove()
+
+    prog_bar = ttk.Progressbar(sidebar, mode="indeterminate", maximum=1000,
+                               length=200)
+    prog_bar.grid(row=4, column=0, columnspan=2, sticky="ew", padx=14,
                   pady=(0, 6))
     prog_bar.grid_remove()
 
     status_row = ttk.Frame(sidebar, style="Panel.TFrame")
-    status_row.grid(row=2, column=0, columnspan=2, sticky="ew", padx=14,
+    status_row.grid(row=5, column=0, columnspan=2, sticky="ew", padx=14,
                     pady=(0, 10))
 
     status_var = tk.StringVar(value="Ready")
@@ -3835,6 +3861,14 @@ def gui_main():
         _log(f"Log saved: {shown} ({run_log.format_size(size)})")
 
     def _log(line: str):
+        # Progress sentinel lines drive the bars and are never shown in the log.
+        prog = _progressmod.parse(line)
+        if prog is not None:
+            _set_progress(*prog)
+            return
+        # A pipeline phase banner advances the whole-run bar by one slice.
+        if _prog_state['active'] and _PHASE_BANNER_RE.match(line):
+            _progress_new_phase()
         log_text.configure(state=tk.NORMAL)
         tag = _classify(line)
         _record_error(line, tag)
@@ -4378,7 +4412,96 @@ def gui_main():
             root.after_cancel(_timer_job[0])
             _timer_job[0] = None
 
-    def _set_running(state: bool):
+    # ── Per-phase / whole-run progress ────────────────────────────────────────
+    # Driven entirely by the `@@PROG` lines the pipeline prints (parsed in
+    # `_log`) plus the phase banners it already emits.  All arithmetic is here,
+    # on the UI thread; the conversion never spends a cycle on it.
+    _prog_state = {
+        'steps_total': 1, 'phases_started': 0,
+        'phase_max': 0.0, 'determinate': False, 'overall': 0.0,
+        'active': False,
+    }
+    _PHASE_BANNER_RE = re.compile(r'^\s*phase\s+\d+\s*:', re.IGNORECASE)
+
+    def _progress_begin(steps_total: int):
+        _prog_state.update(steps_total=max(1, steps_total), phases_started=0,
+                           phase_max=0.0, determinate=False, overall=0.0,
+                           active=True)
+        phase_prog_var.set("Current Phase")
+        overall_prog_var.set("Overall  0%")
+        _phase_prog_lbl.grid()
+        _overall_prog_lbl.grid()
+        phase_bar.grid()
+        prog_bar.grid()
+        prog_bar.configure(mode="determinate")
+        prog_bar['value'] = 0
+        # No counts yet for the first phase: spin the phase bar until the first
+        # @@PROG line so a count-less phase (compile, LOD) still animates.
+        phase_bar.configure(mode="indeterminate")
+        phase_bar.start(12)
+
+    def _progress_end():
+        _prog_state['active'] = False
+        try:
+            phase_bar.stop()
+        except tk.TclError:
+            pass
+        phase_bar.grid_remove()
+        _phase_prog_lbl.grid_remove()
+        _overall_prog_lbl.grid_remove()
+        phase_prog_var.set("")
+        overall_prog_var.set("")
+
+    def _progress_new_phase():
+        """A pipeline phase banner arrived -> reset the per-phase bar to 0."""
+        if not _prog_state['active']:
+            return
+        _prog_state['phases_started'] += 1
+        _prog_state['phase_max'] = 0.0
+        _prog_state['determinate'] = False
+        # Counts for the new phase are unknown until its first @@PROG line, so
+        # spin the phase bar (count-less phases keep spinning the whole time).
+        phase_bar.configure(mode="indeterminate")
+        try:
+            phase_bar.start(12)
+        except tk.TclError:
+            pass
+
+    def _set_progress(label: str, done: int, total: int):
+        """Apply one parsed `@@PROG` line to both bars.  UI thread only.
+
+        The per-phase bar is `files-done / files-to-process` for the CURRENT
+        phase, clamped monotonic so it never slips backward: a phase that
+        reports in several batches (multiple plugins, or Import's
+        Records/Landscape/Navmesh under one banner) keeps rising instead of
+        dropping to 0 when the next batch's count restarts.  It resets to 0 only
+        at the next phase banner.  `label` is not shown -- the caption is the
+        literal words "Current phase".
+        """
+        if not _prog_state['active']:
+            return
+        st = _prog_state
+        if st['phases_started'] == 0:
+            # A global action or a run with no banner: treat as phase 1.
+            st['phases_started'] = 1
+        if not st['determinate']:
+            # First @@PROG of this phase: stop the spinner, switch to a real bar.
+            st['determinate'] = True
+            phase_bar.configure(mode="determinate")
+        frac = (done / total) if total else 0.0
+        st['phase_max'] = max(st['phase_max'], frac)
+        phase_bar['value'] = st['phase_max'] * 1000
+        phase_prog_var.set(f"Current Phase  {int(st['phase_max'] * 100)}%")
+        # Whole-run: phases weighted equally by step, clamped monotonic.
+        overall = _progressmod.overall_fraction(
+            st['phases_started'], st['phase_max'], st['steps_total'],
+            st['overall'])
+        st['overall'] = overall
+        prog_bar.configure(mode="determinate")
+        prog_bar['value'] = overall * 1000
+        overall_prog_var.set(f"Overall  {int(overall * 100)}%")
+
+    def _set_running(state: bool, steps_total: int = 0):
         running.set() if state else running.clear()
         if not state:
             cancel_evt.clear()
@@ -4391,13 +4514,20 @@ def gui_main():
             # grid() puts the bar back exactly where it was configured. It
             # must NOT re-state the options: an explicit grid(row=...) here
             # is how the bar used to reappear at the top of the sidebar.
-            prog_bar.grid()
-            prog_bar.start(12)
+            if steps_total > 0:
+                # Determinate two-bar mode, driven by @@PROG lines.
+                _progress_begin(steps_total)
+            else:
+                # Legacy throbber for flows that emit no @@PROG (mod ingest).
+                prog_bar.grid()
+                prog_bar.configure(mode="indeterminate")
+                prog_bar.start(12)
             status_var.set("Running...")
             _start_timer()
         else:
             prog_bar.stop()
             prog_bar.grid_remove()
+            _progress_end()
             status_var.set("Ready")
             _stop_timer()
             # The run just rewrote the conversion state, so what is still
@@ -4755,12 +4885,13 @@ def gui_main():
                 _run_log_size_note()
                 _run_log_end(f"EXIT: {'OK' if not _run_errors else 'ERRORS'}")
 
-        run_env = {WORKERS_ENV_VAR: str(_get_workers())}
+        run_env = {WORKERS_ENV_VAR: str(_get_workers()),
+                   _progressmod.ENV_VAR: "1"}
         # This process owns the run log; a child must not rotate it.
         run_env.update(_run_log_env())
 
         def _worker():
-            _set_running(True)
+            _set_running(True, 1)
             ret = 1
             try:
                 q.put(f"Running: {' '.join(cmd)}")
@@ -4878,7 +5009,8 @@ def gui_main():
 
         # Propagate the chosen worker count to every child process (and the
         # multiprocessing workers they spawn) via the environment.
-        run_env = {WORKERS_ENV_VAR: str(_get_workers())}
+        run_env = {WORKERS_ENV_VAR: str(_get_workers()),
+                   _progressmod.ENV_VAR: "1"}
         # Same channel for the cache opt-out. Only set when the user turned it
         # OFF: the variable is read as "1/true means skip", so an unset value is
         # the enabled default and inheriting a stale "1" from the parent
@@ -4890,7 +5022,7 @@ def gui_main():
         run_env.update(_run_log_env())
 
         def _worker():
-            _set_running(True)
+            _set_running(True, len(steps))
             try:
                 # The one-process fast path fires when the selection IS the
                 # default one. That default now depends on the Pack-by-default
