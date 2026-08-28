@@ -1351,24 +1351,33 @@ class TestFlameNodeConversion:
             f'(RotX=-90 on these lights) will lay it on its side')
 
     @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
-    @pytest.mark.parametrize('rel', [
-        'fire/firetorchlargesmoke.nif',
-        'fire/firecandleflame.nif',
-        'fire/fireopenlarge.nif',
-        'fire/firetorchsmall.nif',
+    @pytest.mark.parametrize('rel,shape,expect', [
+        # Flames author FULL WHITE and must stay bright.
+        ('fire/firetorchlarge.nif', 'Fire', 1.0),
+        ('fire/firetorchlarge.nif', 'FireTorchLarge:0', 1.0),
+        ('fire/firecandleflame.nif', 'FlameParticles', 1.0),
+        # Ayleid-ruin fog authors a DIM grey and must stay dim -- this is the
+        # Belda "blinding fog" regression.  0.078 promoted to white is 12.8x
+        # too bright on additively-blended planes layered several deep.
+        ('dungeons/misc/fx/fxcloudthick01.nif', 'Cloud', 0.078),
+        ('dungeons/misc/fx/fxcloudthin01.nif', 'Cloud', 0.047),
     ])
-    def test_flames_are_bright_and_not_soft_faded(self, rel, tmp_path):
-        """Flames: soft_effect OFF and emissive_multiple 1.5.  Smoke: 1.0.
+    def test_fx_emissive_is_the_authored_value(self, rel, shape, expect,
+                                               tmp_path):
+        """FX brightness comes from the SOURCE, never from the texture name.
 
-        Vanilla census of the mounted-fire meshes, which is our torch/sconce
-        case: torchsconce01 pFireballCore04, slighthousefire Fireball and
-        Flames, campfire01burning Glow:2/Glow:3 are ALL soft=0 with a boosted
-        multiple (1.5-2.5).  Only the free-standing smoke and glow planes take
-        the fade (smoke02, Glow02, Hot_Center: soft=1, mult=1.0).
+        Oblivion states it per shape in NiMaterialProperty.emissive_color, and
+        the populations do not overlap: flames author 1.0 white, fog authors
+        0.047-0.078.  An earlier revision classified by diffuse PATH instead
+        (b'fire'/b'flame'/b'torch' minus a smoke/mist/fog/dust veto) and forced
+        emissive_multiple 1.5 on every hit.  That is wrong in both directions:
+        it matched textures/lights/torch02.dds -- the WOODEN HANDLE, whose host
+        lights/torch02noflame.nif contains no flame at all -- and it can only
+        work for meshes following Bethesda's naming, never for Nehrim,
+        Morroblivion or any third-party plugin.
 
-        A soft-particle fade on a flame pinned to its sconce attenuates it
-        against the surface it is mounted on, so the flame reads dim and
-        see-through; mult=1.0 then drops the over-brighten fire needs.
+        emissive_multiple must stay at the vanilla-neutral 1.0 throughout: a
+        flame authored full white is already at full emission.
         """
         import time
         if not hasattr(time, '_original_clock'):
@@ -1388,33 +1397,93 @@ class TestFlameNodeConversion:
             f.seek(0)
             data.read(f)
 
-        fires = smokes = 0
+        seen = None
         for blk in data.blocks:
             if not isinstance(blk, (NifFormat.NiParticleSystem,
                                     NifFormat.NiTriBasedGeom)):
                 continue
-            name = bytes(getattr(blk, 'name', b'') or b'').decode('latin1')
+            if bytes(getattr(blk, 'name', b'') or b'').decode('latin1') != shape:
+                continue
             for pr in (getattr(blk, 'bs_properties', None) or []):
                 if pr is None or type(pr).__name__ != 'BSEffectShaderProperty':
                     continue
-                tex = bytes(getattr(pr, 'source_texture', b'') or b'').lower()
-                soft = pr.shader_flags_1.slsf_1_soft_effect
-                mult = pr.emissive_multiple
-                if b'smoke' in tex or b'mist' in tex:
-                    smokes += 1
-                    assert mult == pytest.approx(1.0), (
-                        f'{rel}: smoke {name} mult={mult}, expected the '
-                        f'neutral 1.0 (the fire boost must not leak onto it)')
-                elif b'fire' in tex or b'flame' in tex or b'torch' in tex:
-                    fires += 1
-                    assert soft == 0, (
-                        f'{rel}: flame {name} has soft_effect=1 -- it will '
-                        f'fade against the surface it is mounted on and read '
-                        f'dim/transparent')
-                    assert mult == pytest.approx(1.5), (
-                        f'{rel}: flame {name} mult={mult}, expected 1.5 to '
-                        f'match vanilla mounted fires')
-        assert fires, f'{rel}: fixture expects flame FX shapes'
+                seen = pr
+        assert seen is not None, f'{rel}: no effect shader on shape {shape!r}'
+        assert float(seen.emissive_color.r) == pytest.approx(expect, abs=0.02), (
+            f'{rel} {shape}: emissive_color.r={float(seen.emissive_color.r):.3f}, '
+            f'expected the AUTHORED {expect} -- brightness must come from '
+            f'NiMaterialProperty, not from the texture filename')
+        # A self-lit surface is BOOSTED; ambient haze stays neutral.  Among
+        # vanilla FX that are full-white AND soft_effect=0 (the mounted,
+        # self-lit population this branch matches), 74 of 90 sit above 1.0 with
+        # a median of 1.6 -- torchsconce01 pFireballCore04 1.50,
+        # giantcampfire01burning PCloudForgeSparks 1.25, fxsmokelargeclose01
+        # Flames 1.60.  Holding flames at 1.0 made them visibly DIMMER than the
+        # previous build, which was caught in game.
+        want_mult = 1.5 if expect >= 0.999 else 1.0
+        assert float(seen.emissive_multiple) == pytest.approx(want_mult,
+                                                              abs=0.01), (
+            f'{rel} {shape}: emissive_multiple={float(seen.emissive_multiple)}, '
+            f'expected {want_mult}')
+        # A self-lit (full-white) surface must NOT take the soft depth fade:
+        # a candle flame sits on its own wax, so the fade attenuates it against
+        # the very object it is mounted on and the flame vanishes, leaving only
+        # the wax's own emissive glow.  Vanilla mps\mpscandleflame01.nif splits
+        # exactly this way -- CandleFlame01 soft=0, CandleGlow01 soft=1.
+        # Ambient fog DOES take it (that is the rectangular-edge fix).
+        soft = int(seen.shader_flags_1.slsf_1_soft_effect)
+        want_soft = 0 if expect >= 0.999 else 1
+        assert soft == want_soft, (
+            f'{rel} {shape}: soft_effect={soft}, expected {want_soft} -- a '
+            f'self-lit flame must stay hard or it fades into its own holder; '
+            f'dim ambient FX must fade or it shows its quad edge')
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_chromatic_color_curve_still_defers_to_the_curve(self, tmp_path):
+        """The ghost: near-black material + a real GREEN curve.
+
+        creatures/ghost/skeleton.nif authors emissive (0.039, 0.039, 0.039) --
+        a carrier, not a color -- alongside a NiPSysColorModifier ramping the
+        ghost's pale green (0.702, 0.831, 0.745) -> (0.514, 0.647, 0.561).
+        Skyrim's effect shader MULTIPLIES by emissive_color, so carrying the
+        0.039 through would crush the green to ~0.027 and render the ghost
+        black.  When the curve carries actual chroma the curve is the authored
+        color, so the shader tint stays neutral.
+
+        This must not be confused with an ACHROMATIC curve (fog's plain
+        (0,0,0,0)->(1,1,1,1)->(0,0,0,0) alpha envelope), which supplies no
+        color at all -- that is the case guarded above.
+        """
+        import time
+        if not hasattr(time, '_original_clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat
+
+        src = EXPORT_MESHES / 'creatures/ghost/skeleton.nif'
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'meshes' / 'ghost.nif'
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        assert convert_nif(str(src), str(dst)).get('converted')
+
+        data = NifFormat.Data()
+        with open(str(dst), 'rb') as f:
+            data.inspect(f)
+            f.seek(0)
+            data.read(f)
+
+        checked = 0
+        for blk in data.blocks:
+            if not isinstance(blk, NifFormat.NiParticleSystem):
+                continue
+            for pr in (getattr(blk, 'bs_properties', None) or []):
+                if pr is None or type(pr).__name__ != 'BSEffectShaderProperty':
+                    continue
+                assert float(pr.emissive_color.r) > 0.5, (
+                    'ghost tint was crushed to the 0.039 carrier value -- the '
+                    'chromatic color curve is the authored color here')
+                checked += 1
+        assert checked, 'fixture expects ghost particle systems'
 
     @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
     @pytest.mark.parametrize('rel', [
@@ -4397,3 +4466,127 @@ class TestCollisionWindingRepair:
                 assert len(normals) == len(soup[0])
                 checked += 1
         assert checked, 'expected a mesh collision shape in seisland.nif'
+
+
+class TestLuminanceGlowMapsBecomeRGB:
+    r"""Oblivion's L8 glow maps must not reach Skyrim as single-channel.
+
+    User report (2026-08-27): candles such as
+    `lights\uppersilverplatecandles01.nif` "glow red instead of the flames".
+
+    Oblivion ships glow maps as 8-bit DDPF_LUMINANCE with the channel under
+    the RED mask (R 0xFF, G 0x00, B 0x00) -- measured over Oblivion's texture
+    tree, 469 files are L8 and every one of them is a `_g` glow map.  Its
+    shader replicates that channel across RGB; Skyrim's glow shader
+    (shader type 2, slot 2) samples slot 2 as ordinary RGB and does not, so
+    green and blue read zero and the surface glows PURE RED.  Vanilla Skyrim
+    never ships L8 -- its own glow maps are RGB textures whose CONTENT is grey
+    (spriggan_g.dds: DXT1, R==G==B==17.2 mean).
+    """
+
+    SRC = 'export/Oblivion.esm/textures/clutter/candle_g.dds'
+
+    @pytest.mark.skipif(not Path(SRC).exists(),
+                        reason='Oblivion candle glow map not available')
+    def test_l8_glow_map_expands_to_grey_rgb(self, tmp_path):
+        import shutil as _sh
+        import struct as _st
+        from asset_convert import luminance_textures as lt
+
+        dst = tmp_path / 'candle_g.dds'
+        _sh.copy2(self.SRC, str(dst))
+        assert lt.is_luminance(str(dst)), 'fixture must start as L8'
+
+        orig = open(self.SRC, 'rb').read()
+        assert lt.convert_file(str(dst)) is True
+        assert not lt.is_luminance(str(dst)), 'still L8 after conversion'
+        assert lt.convert_file(str(dst)) is False, 'must be idempotent'
+
+        blob = open(str(dst), 'rb').read()
+        pf = _st.unpack('<I', blob[80:84])[0]
+        bits = _st.unpack('<I', blob[88:92])[0]
+        masks = _st.unpack('<IIII', blob[92:108])
+        assert pf & 0x40, 'pixel format must declare DDPF_RGB'
+        assert bits == 32, f'expected 32bpp, got {bits}'
+        assert masks[1] and masks[2], (
+            'green and blue masks must be non-zero -- a zero G/B mask is '
+            'exactly what made the glow render red')
+
+        # Every channel carries the ORIGINAL luminance: grey, not red.
+        lum = orig[128]
+        b, g, r, a = blob[128:132]
+        assert (b, g, r) == (lum, lum, lum), (
+            f'L={lum} expanded to ({b},{g},{r}) -- must replicate across RGB')
+        assert a == 0xFF, 'alpha must be opaque'
+
+        # The whole mip chain survives, or the glow vanishes at distance.
+        h, w = _st.unpack('<II', blob[12:20])
+        mips = _st.unpack('<I', blob[28:32])[0]
+        total, ww, hh = 0, w, h
+        for _ in range(mips):
+            total += ww * hh * 4
+            ww, hh = max(1, ww // 2), max(1, hh // 2)
+        assert len(blob) - 128 == total, (
+            f'mip chain truncated: body {len(blob)-128} != expected {total}')
+
+
+class TestFallbackWhiteIsNotAFlame:
+    r"""White-by-FALLBACK must still take the soft depth fade.
+
+    The shader emissive ends up white in three different situations and only
+    one of them is a flame.  Measured over 778 particle systems in meshes/:
+
+        authored full white ......... 109   <- self-lit, no fade
+        fallback, source authored BLACK  159   <- must still fade
+        fallback, chromatic curve ... 320   <- must still fade
+
+    Keying the flame test on the shader's FINAL emissive would skip the fade
+    on all 479 fallback cases.  `fire\fireopensmallsmoke.nif` is the clean
+    proof: its "Smoke" plume authors emissive (0,0,0) -- so it is defaulted to
+    white, since black would render it invisible -- while the flame shapes in
+    the very same mesh author real white.  The smoke is exactly the kind of
+    surface the fade exists for.
+    """
+
+    SRC = 'export/Oblivion.esm/meshes/fire/fireopensmallsmoke.nif'
+
+    @pytest.mark.skipif(not Path(SRC).exists(),
+                        reason='Oblivion smoke-fire mesh not available')
+    def test_smoke_fades_while_flames_in_the_same_mesh_do_not(self, tmp_path):
+        import time as _t
+        if not hasattr(_t, '_original_clock'):
+            _t.clock = _t.perf_counter
+        from pyffi.formats.nif import NifFormat
+
+        dst = tmp_path / 'meshes' / 'out.nif'
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        assert convert_nif(self.SRC, str(dst)).get('converted')
+
+        data = NifFormat.Data()
+        with open(str(dst), 'rb') as f:
+            data.inspect(f)
+            f.seek(0)
+            data.read(f)
+
+        soft = {}
+        for blk in data.blocks:
+            if not isinstance(blk, (NifFormat.NiParticleSystem,
+                                    NifFormat.NiTriBasedGeom)):
+                continue
+            name = bytes(getattr(blk, 'name', b'') or b'').decode('latin1')
+            for pr in (getattr(blk, 'bs_properties', None) or []):
+                if pr is None or type(pr).__name__ != 'BSEffectShaderProperty':
+                    continue
+                soft[name] = int(pr.shader_flags_1.slsf_1_soft_effect)
+
+        assert 'Smoke' in soft, 'fixture expects a Smoke shape'
+        assert soft['Smoke'] == 1, (
+            'the smoke plume authors emissive (0,0,0) and is only white by '
+            'FALLBACK -- it must still take the soft depth fade, or every '
+            'billboard shows its own quad edge')
+        flames = [n for n in soft if n.startswith('FireParticles')]
+        assert flames, 'fixture expects flame particle systems'
+        for n in flames:
+            assert soft[n] == 0, (
+                f'{n} authors real white and must stay hard, or it fades '
+                f'against the surface it is mounted on')

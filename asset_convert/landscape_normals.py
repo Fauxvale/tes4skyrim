@@ -19,6 +19,7 @@ CLI:
     # e.g. python -m asset_convert.landscape_normals \
     #          output/Oblivion.esm/textures/tes4/landscape
 """
+import os
 import struct
 import sys
 from pathlib import Path
@@ -293,29 +294,56 @@ def normalize_specular_alpha(tex_dir, alpha=DEFAULT_MASK_ALPHA, skip=()):
     checked = fixed = 0
     if not tex_dir.exists():
         return checked, fixed, counts
-    for path in sorted(tex_dir.rglob('*_n.dds')):
-        low = str(path).lower()
-        if any(s in low for s in skip):
-            continue
-        checked += 1
+    paths = [p for p in sorted(tex_dir.rglob('*_n.dds'))
+             if not any(s in str(p).lower() for s in skip)]
+
+    def _classify(path):
+        """Read + classify one normal map.  Returns (path, verdict) or None.
+
+        Pure I/O and decode with no shared state, which is what makes this
+        safe to fan out.  The WRITE decision is returned rather than made
+        here, so the mutation stays in the caller and the counters stay
+        deterministic regardless of completion order.
+        """
         try:
             blob = _read_top_mip(path)
         except OSError:
-            continue
+            return None
         if blob is None:
-            continue
+            return None
         info = parallax.classify_alpha(blob)
         verdict = spec_mask.verdict(info)
         if verdict == 'mask':
-            counts['mask'] += 1
-            continue
+            return (path, 'mask')
         # Our own constant is itself 'binary' (one level), so a second run
         # would rewrite every file it already fixed and report the same count
         # forever -- which would make the log number useless as a health
         # signal.  Recognise the finished state instead.
         if (info is not None and getattr(info, 'levels', 0) == 1
                 and abs(getattr(info, 'mean', -1) - alpha) < 0.5):
-            counts['already'] += 1
+            return (path, 'already')
+        return (path, verdict)
+
+    # Reading and decoding 5k+ DDS files dominated this stage (measured in
+    # MINUTES on Oblivion's tree, against ~2s for every other texture sweep).
+    # It is I/O plus a decode that releases the GIL, so THREADS are the right
+    # tool here -- see docs/performance_notes.md; processes would pay pickling
+    # for every blob.  Results are collected first and applied in sorted path
+    # order, so the counters and the set of rewritten files are identical to
+    # the serial version no matter how the pool schedules.
+    workers = min(32, (os.cpu_count() or 4) * 2)
+    results = []
+    if len(paths) > 1 and workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = [r for r in pool.map(_classify, paths) if r is not None]
+    else:
+        results = [r for r in map(_classify, paths) if r is not None]
+
+    checked = len(paths)
+    for path, verdict in results:
+        if verdict in ('mask', 'already'):
+            counts[verdict] += 1
             continue
         counts[verdict] += 1
         if set_constant_alpha(path, alpha):

@@ -20,7 +20,8 @@ import shutil
 from pathlib import Path
 
 from . import (bsa_extract, grass_profile, hair_pipeline, landscape_normals,
-               nif_converter, spt_converter, texture_prune, wearable_plan)
+               luminance_textures, nif_converter, spt_converter, texture_prune,
+               wearable_plan)
 
 
 # Shared-folder resolution lives in output_layout (one module, three
@@ -229,6 +230,18 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
         tex_dst = plugin_dir / 'textures' / 'tes4'
         stats['textures_copied'] = _copy_tree(tex_src, tex_dst)
         print(f"  Textures: {stats['textures_copied']} files -> {tex_dst}")
+
+        # Oblivion ships its GLOW maps as 8-bit DDPF_LUMINANCE, whose single
+        # channel sits under the RED mask (R 0xFF, G 0, B 0).  Skyrim's glow
+        # shader samples slot 2 as ordinary RGB and does not replicate that
+        # channel, so the glow renders PURE RED -- the "candles glow red"
+        # report (clutter\candle_g.dds on uppersilverplatecandles01).  Expand
+        # L into R=G=B.  Runs after the copy so re-copies can't resurrect the
+        # L8 originals; re-running is a no-op once converted.
+        lum_checked, lum_fixed = luminance_textures.run(tex_dst)
+        stats['luminance_textures_fixed'] = lum_fixed
+        print(f"  Luminance textures: {lum_checked} L8 found, "
+              f"{lum_fixed} expanded to BGRA")
 
         # Landscape normal maps: DXT1 has no alpha channel, which Skyrim's
         # landscape shader reads as a full-strength specular mask (shiny
