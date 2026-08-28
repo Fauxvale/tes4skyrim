@@ -257,11 +257,9 @@ def write_music_manifest(out_root, source_name, tracks) -> int:
     """Write music_tracks.json for `tracks`; returns the track count."""
     tracks.sort(key=lambda t: t['source_rel'])
     Path(out_root).mkdir(parents=True, exist_ok=True)
-    # Versioned envelope so a manifest written by an older converter is
-    # reported as stale instead of half-read (tes5_import/artifact_schema.py).
-    from tes5_import.artifact_schema import write_artifact
-    write_artifact(str(Path(out_root) / MANIFEST_NAME), source_name,
-                   {'plugin': source_name, 'tracks': tracks})
+    payload = {'plugin': source_name, 'tracks': tracks}
+    with open(Path(out_root) / MANIFEST_NAME, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=1, sort_keys=True)
     return len(tracks)
 
 

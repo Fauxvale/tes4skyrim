@@ -32,7 +32,6 @@ def _schema_hash(art):
 # Literal digests -- deriving them from ARTIFACTS would make this test vacuous.
 FROZEN = {
     'creature_projects.json': (1, '1538a9ac96e2b58a'),
-    'music_tracks.json': (1, '1a6ecdbb4da40885'),
 }
 
 
@@ -134,59 +133,6 @@ class TestStaleDetection(unittest.TestCase):
                 read_artifact(p)
             self.assertIn('behavior_hkx', str(cm.exception))
 
-    def test_music_manifest_checks_top_level_keys(self):
-        """per_entry=False: required keys apply to `data` itself."""
-        with tempfile.TemporaryDirectory() as td:
-            p = self._write_raw(td, {'version': 1, 'plugin': 'Oblivion.esm',
-                                     'stage': '--sounds-only',
-                                     'data': {'tracks': []}},
-                                name='music_tracks.json')
-            with self.assertRaises(StaleArtifactError) as cm:
-                read_artifact(p)
-            self.assertIn('plugin', str(cm.exception))
-
-
-class TestEveryConsumerReadsTheEnvelope(unittest.TestCase):
-    """Each registered artifact has more than one reader.
-
-    music_tracks.json is read by the IMPORTER (record_types/music.py) and,
-    separately, by the SCRIPT converter (script_convert/pipeline.py) to bind
-    StreamMusic properties.  The script one was missed when the envelope went
-    in: it kept doing a bare json.loads and `data.get('tracks')` then returned
-    {} against the new shape, silently stripping the MUSC binding off every
-    StreamMusic property rather than failing.  Pin both.
-    """
-
-    def test_importer_reads_music_manifest(self):
-        from tes5_import.record_types.music import load_music_manifest
-        with tempfile.TemporaryDirectory() as td:
-            write_artifact(os.path.join(td, 'music_tracks.json'),
-                           'Oblivion.esm',
-                           {'plugin': 'Oblivion.esm',
-                            'tracks': [{'source_rel': 'music/dungeon/a.mp3',
-                                        'category': 'dungeon'}]})
-            got = load_music_manifest(td)
-            self.assertEqual(len(got['tracks']), 1)
-            self.assertEqual(got['plugin'], 'Oblivion.esm')
-
-    def test_script_converter_reads_music_manifest(self):
-        from script_convert.pipeline import _load_music_cues
-        with tempfile.TemporaryDirectory() as td:
-            write_artifact(os.path.join(td, 'music_tracks.json'),
-                           'Oblivion.esm',
-                           {'plugin': 'Oblivion.esm',
-                            'tracks': [{'source_rel': 'music/dungeon/a.mp3',
-                                        'category': 'dungeon'}]})
-            cues = _load_music_cues(td)
-            self.assertTrue(cues, 'StreamMusic cues lost against the envelope')
-            self.assertIn('music/dungeon/a.mp3', cues)
-
-    def test_script_converter_still_tolerates_a_missing_manifest(self):
-        """No music converted is the normal state for a plugin with masters."""
-        from script_convert.pipeline import _load_music_cues
-        with tempfile.TemporaryDirectory() as td:
-            self.assertEqual(_load_music_cues(td), {})
-
 
 class TestPreflight(unittest.TestCase):
     """Fail at the TOP of the import, not 15 phase-0 steps in.
@@ -226,7 +172,7 @@ class TestPreflight(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             self._patch_layout(td)
             d = self._plugin(td, 'Bare.esp')
-            preflight_artifacts(d, None)      # must not raise
+            preflight_artifacts(d)      # must not raise
 
     def test_own_stale_artifact_names_this_plugin(self):
         from tes5_import.artifact_schema import preflight_artifacts
@@ -235,7 +181,7 @@ class TestPreflight(unittest.TestCase):
             d = self._plugin(td, 'Nehrim.esm',
                              projects={'rat': {'project_hkx': 'x'}})
             with self.assertRaises(StaleArtifactError) as cm:
-                preflight_artifacts(d, None)
+                preflight_artifacts(d)
             self.assertIn('-f Nehrim.esm --creatures-only', str(cm.exception))
 
     def test_stale_master_artifact_names_the_MASTER(self):
@@ -247,23 +193,10 @@ class TestPreflight(unittest.TestCase):
                          projects={'rat': {'project_hkx': 'x'}})
             child = self._plugin(td, 'DLCFrostcrag.esp', master='Oblivion.esm')
             with self.assertRaises(StaleArtifactError) as cm:
-                preflight_artifacts(child, None)
+                preflight_artifacts(child)
             msg = str(cm.exception)
             self.assertIn('-f Oblivion.esm --creatures-only', msg)
             self.assertNotIn('-f DLCFrostcrag.esp', msg)
-
-    def test_stale_music_manifest_in_the_output_root(self):
-        from tes5_import.artifact_schema import preflight_artifacts
-        with tempfile.TemporaryDirectory() as td:
-            self._patch_layout(td)
-            d = self._plugin(td, 'Oblivion.esm')
-            out = os.path.join(td, 'out'); os.makedirs(out)
-            with open(os.path.join(out, 'music_tracks.json'), 'w',
-                      encoding='utf-8') as f:
-                json.dump({'plugin': 'Oblivion.esm', 'tracks': []}, f)
-            with self.assertRaises(StaleArtifactError) as cm:
-                preflight_artifacts(d, out)
-            self.assertIn('--sounds-only', str(cm.exception))
 
 
 if __name__ == '__main__':

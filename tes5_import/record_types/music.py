@@ -24,6 +24,7 @@ Vanilla census (Skyrim.esm, 258 MUST / 50 MUSC) drove the shape:
   * 210 of 240 ANAMs start with a leading backslash; the 30 that do not load
     identically.  We follow the majority form.
 """
+import json
 import struct
 
 from ..writer import pack_record, pack_string_subrecord, pack_subrecord
@@ -301,31 +302,32 @@ def load_music_manifest(out_root, export_dir=None, plugin=None) -> dict:
     plugins).
     """
     from pathlib import Path
-    from ..artifact_schema import read_artifact, StaleArtifactError
     p = Path(out_root) / 'music_tracks.json'
 
-    if not p.is_file() and export_dir and plugin:
-        # No manifest yet: derive one from the extracted tree.  Pure directory
-        # walk -- no ffmpeg, no xWMAEncode, no subprocess.
+    def _read():
+        try:
+            with open(p, encoding='utf-8') as f:
+                data = json.load(f)
+            # Older builds wrapped the payload in a {'version','data'}
+            # envelope; either shape yields the same {plugin, tracks}.
+            return data.get('data', data)
+        except (AttributeError, ValueError, OSError):
+            return {}
+
+    manifest = _read() if p.is_file() else {}
+    if not manifest.get('tracks') and export_dir and plugin:
+        # No usable manifest: derive one from the extracted tree.  Pure
+        # directory walk -- no ffmpeg, no xWMAEncode, no subprocess.
         try:
             from asset_convert.music_convert import scan_music
             n = scan_music(plugin, export_dir, str(Path(out_root).parent))
             if n:
-                print(f'  Music: manifest absent, scanned {n} tracks from '
-                      f'the extracted folder.')
+                print(f'  Music: scanned {n} tracks from the extracted '
+                      f'folder.')
+                manifest = _read()
         except Exception as e:
             print(f'  WARNING: could not scan music folder: {e}')
-
-    if not p.is_file():
-        return {}
-    try:
-        return read_artifact(str(p))
-    except StaleArtifactError:
-        # Deliberately NOT swallowed by the except below: a stale manifest is
-        # a real failure with a fix the user can act on, not a missing file.
-        raise
-    except (ValueError, OSError):
-        return {}
+    return manifest
 
 
 def build_music_records(manifest: dict, writer, plugin: str) -> dict:

@@ -84,9 +84,6 @@ ARTIFACTS = {
         # kills the import.
         required=('behavior_hkx', 'body_dir', 'skeleton_nif', 'project_hkx',
                   'bodies')),
-    'music_tracks.json': Artifact(
-        version=1, stage='--sounds-only',
-        required=('plugin', 'tracks'), per_entry=False),
 }
 
 
@@ -171,9 +168,9 @@ def read_artifact(path, plugin_hint=None):
         plugin = payload.get('plugin') or plugin_hint
         data = payload.get('data')
     else:
-        # v0: no envelope.  Some payloads carry their own plugin name inside
-        # the data (music_tracks.json does); prefer it over the hint so the
-        # error still names the right file to rebuild.
+        # v0: no envelope.  Some payloads carry their own plugin name
+        # inside the data; prefer it over the hint so the error still names
+        # the right file to rebuild.
         found, data = 0, payload
         plugin = plugin_hint
         if not plugin and isinstance(payload, dict):
@@ -207,7 +204,7 @@ def _master_names(export_dir):
     return names
 
 
-def preflight_artifacts(export_dir, output_root=None):
+def preflight_artifacts(export_dir):
     """Validate every artifact this plugin will read, BEFORE any real work.
 
     The consumers sit deep in the import (creature projects are read ~15 steps
@@ -218,12 +215,12 @@ def preflight_artifacts(export_dir, output_root=None):
     Checks this plugin's own artifacts AND its masters' -- a dependent plugin
     reads its master's creature projects and never rewrites them, so the stale
     file is often the master's.  Raises StaleArtifactError; a MISSING file is
-    not an error (plenty of plugins ship no creatures and no music).
+    not an error (plenty of plugins ship no creatures).
     """
     from .overrides import _export_root, _master_export_dir
 
     seen = []
-    # Export-dir artifacts: this plugin's, then each master's.  The hint names
+    # This plugin's artifacts, then each master's.  The hint names
     # the plugin whose stage rebuilds each file -- for the plugin's own export
     # that is the export dir's name, for a master's it is the master.
     own = os.path.basename(os.path.normpath(export_dir))
@@ -240,12 +237,6 @@ def preflight_artifacts(export_dir, output_root=None):
         p = os.path.join(base, 'creature_projects.json')
         if os.path.isfile(p):
             seen.append((p, plugin))
-
-    # Output-tree artifacts (music is written to the plugin's output root).
-    if output_root:
-        p = os.path.join(output_root, 'music_tracks.json')
-        if os.path.isfile(p):
-            seen.append((p, own))
 
     for path, plugin in seen:
         read_artifact(path, plugin)
