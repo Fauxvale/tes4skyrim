@@ -11,7 +11,7 @@ Every number below was **measured 2026-08-17** against `export/Oblivion.esm/`,
 the built `output/Oblivion.esm/Oblivion.esm`. Nothing here is inferred.
 
 Companion docs: [package_ai_contracts.md](../reference/package_ai_contracts.md) (the verified
-engine contracts) and [package_conversion_plan.md](../notes/package_conversion.md)
+engine contracts) and [package_conversion_plan.md](../commentary/tes5_import_package.md)
 (the original design).
 
 ---
@@ -19,6 +19,11 @@ engine contracts) and [package_conversion_plan.md](../notes/package_conversion.m
 ## Gaps found
 
 ### 1. `PTDT.Type=1` (Object ID) is unhandled — 388 packages silently sandbox
+
+> **CLOSED since this audit.** `_choose()` now branches on `t_type == 1` in
+> `tes5_import/pack_converter.py` (lines 389, 803, 1204, 1259), including
+> sole-placement resolution and travel/acquire routing. The finding below is
+> the state on the audit date, kept as the record of what was measured.
 
 **Highest-value fix, and mechanical.**
 

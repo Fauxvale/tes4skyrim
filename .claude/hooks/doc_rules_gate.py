@@ -39,11 +39,21 @@ SKIP_PARTS = ('temp', 'references', 'external', 'output', 'export', 'build',
 
 
 def judged(path):
-    """Is this a Python file the rules judge?"""
-    if not path or not path.endswith('.py'):
+    """Is this a Python file INSIDE the repo that the rules judge?
+
+    Containment, not a component scan: a scratchpad under `AppData\\Local\\
+    Temp` shares no component with SKIP_PARTS, and its `Temp` never matched
+    the lowercase `temp` either, so the gate used to score throwaway probes.
+    """
+    if not path or not path.endswith('.py') or not os.path.isfile(path):
         return False
-    parts = os.path.normpath(os.path.abspath(path)).split(os.sep)
-    return not any(p in SKIP_PARTS for p in parts) and os.path.isfile(path)
+    try:
+        rel = os.path.relpath(os.path.realpath(path), os.path.realpath(ROOT))
+    except ValueError:
+        return False
+    if rel.startswith(os.pardir):
+        return False
+    return not any(p.lower() in SKIP_PARTS for p in rel.split(os.sep))
 
 
 def dirty_python():

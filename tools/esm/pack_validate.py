@@ -3,7 +3,7 @@
 
 Every rule here was derived from disassembling the GOG (unencrypted) SkyrimSE.exe
 and/or a census of Skyrim.esm — not from xEdit field names.  See
-docs/notes/package_conversion.md §7-10 and the engine notes below.
+docs/commentary/tes5_import_package.md §7-10 and the engine notes below.
 
 Engine facts this encodes (GOG 1.6.659 RVAs):
   * TESPackage::LoadBuffer = 0x451990.  Subrecords it reads: PKDT PSDT PLDT PTDT

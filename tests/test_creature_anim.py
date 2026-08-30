@@ -580,7 +580,7 @@ class TestTrackMerge:
 
 # ---------------------------------------------------------------------------
 # Ghost dissolve: authored detection + the two-script VMAD
-# (docs/notes/creature_conversion.md "Ghosts hover on death")
+# (docs/commentary/asset_convert_creature.md "Ghosts hover on death")
 # ---------------------------------------------------------------------------
 
 class TestDissolveDetection:
@@ -692,7 +692,7 @@ class TestVmadAppend:
 
 class TestDeathPileExtraction:
     """The pile a ghost leaves is AUTHORED geometry inside its own skeleton,
-    not Skyrim's DefaultAshPileGhost (docs/notes/creature_conversion.md
+    not Skyrim's DefaultAshPileGhost (docs/commentary/asset_convert_creature.md
     "THE PILE IS OBLIVION'S OWN")."""
 
     def _extract(self, folder, tmp_path):
@@ -774,7 +774,7 @@ class TestDeathPileExtraction:
 class TestParticleColour:
     """A converted particle system must keep its AUTHORED colour, and its
     shader tint must stay neutral when the particles carry their own colour
-    (docs/notes/creature_conversion.md -- the ghost's smoke rendered black)."""
+    (docs/commentary/asset_convert_creature.md -- the ghost's smoke rendered black)."""
 
     GHOST_SKEL = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
                               'creatures', 'ghost', 'skeleton.nif')

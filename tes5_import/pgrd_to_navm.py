@@ -79,7 +79,7 @@ easy to reinvent:
     contours → triangles).  Correct in principle, but it introduced seams that
     fought connectivity, which is what the corridor model exists to avoid.
 
-See docs/notes/navmesh_corridor.md and tes5_import/navmesh/corridor.py.
+See docs/commentary/tes5_import_navmesh.md and tes5_import/navmesh/corridor.py.
 
 Returns per-navmesh metadata (centroid, parent) so the caller can build NAVI.
 =============================================================================

@@ -43,8 +43,11 @@ LINE_ANCHOR = re.compile(r'^L\d+(?:-L\d+)?$')
 #: A filename may not repeat the kind its folder already states.
 KIND_SUFFIX = {'audits': ('_audit', '_audits'),
                'plans': ('_plan', '_plans'),
-               'notes': ('_notes',),
+               'commentary': ('_commentary', '_notes'),
                'reference': ('_reference',)}
+
+#: Every `commentary/` file names the code it explains on this line.
+CODE_LINE = '**Code:**'
 
 #: Files outside docs/ that link into it and must be rewritten on a move.
 EXTRA_SOURCES = ('CLAUDE.md', 'README.md', 'TODO.txt')
@@ -119,6 +122,13 @@ def misnamed() -> list:
     return bad
 
 
+def unbound() -> list:
+    """Commentary files that do not name the code they explain."""
+    folder = DOCS / 'commentary'
+    return [d for d in sorted(folder.glob('*.md'))
+            if CODE_LINE not in d.read_text(encoding='utf-8', errors='replace')]
+
+
 def unindexed() -> list:
     """Docs missing a row in `docs/README.md`, which is the index."""
     index = DOCS / 'README.md'
@@ -150,6 +160,10 @@ def main(argv=None) -> int:
         for doc, suffix in misnamed():
             print('  %s: drop the `%s` suffix -- the folder says the kind'
                   % (doc.relative_to(ROOT), suffix), file=sys.stderr)
+            total += 1
+        for doc in unbound():
+            print('  %s has no %s line naming the code it explains'
+                  % (doc.relative_to(ROOT), CODE_LINE), file=sys.stderr)
             total += 1
         for doc in unindexed():
             print('  %s is in no docs/README.md row' % doc.relative_to(ROOT),

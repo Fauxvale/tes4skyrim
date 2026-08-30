@@ -635,7 +635,7 @@ def _leaf_groups_from_centres(tree, centres: np.ndarray, seed: int | None):
     skeleton the bark was built from.
 
     Card size, map selection and the UV crop follow the rules already proven
-    in docs/notes/speedtree_engine_decomp.md (sections 6g/6t): the map is a uniform
+    in docs/commentary/asset_convert_speedtree.md (sections 6g/6t): the map is a uniform
     random index per leaf, and the card is `size.x/size.y * K * 0.5`.
     """
     from .spt_generator import _leaf_card
@@ -705,7 +705,7 @@ def build_tree_engine(tree, spt_path: Path, seed: int | None = None,
 
     `with_leaves` grafts the Python generator's leaf groups onto the engine
     bark.  The engine's own leaves are camera-facing billboards Skyrim cannot
-    render, so they are not used (see docs/notes/speedtree_engine_decomp.md).
+    render, so they are not used (see docs/commentary/asset_convert_speedtree.md).
     """
     spt_path = Path(spt_path)
     # Availability is checked BEFORE the cache lookup: a stale dump left over

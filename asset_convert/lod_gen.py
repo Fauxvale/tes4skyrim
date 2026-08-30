@@ -195,23 +195,7 @@ def _zstr(b: bytes) -> str:
     return b.rstrip(b'\x00').decode('latin-1', errors='replace')
 
 
-# ---------------------------------------------------------------------------
-# Cross-plugin FormID identity
-# ---------------------------------------------------------------------------
-#
-# A raw FormID is meaningful only INSIDE the file it came from. Its top byte is
-# an index into that file's OWN master list, so the same number names unrelated
-# records in different plugins: Morrowind_ob.esm and Tamriel.esp both use 02 for
-# THEMSELVES, and they collide on 4 CELL FormIDs. Merging overlays on the raw id
-# therefore invents overrides out of numeric coincidence — those 4 collisions
-# dragged 183 Morrowind INTERIOR objects into Cyrodiil's distant terrain, and
-# among the plugins that genuinely share TES4Tamriel another 1,278 references
-# collide between plugins that are not each other's masters.
-#
-# The fix is the one the importer already applies when writing overrides (see
-# docs/notes/override_conversion.md, "the same bug existed in FOUR places"): resolve
-# every id to (owning FILE, local id) by looking the index byte up in the file's
-# master list BY NAME, and merge on that pair instead.
+# See: docs/commentary/tes5_import_override.md#cross-plugin-formid-identity
 #
 # This mirrors the engine. Skyrim resolves a plugin's index bytes through that
 # plugin's own master list at load time; two files' 02s are the same record only

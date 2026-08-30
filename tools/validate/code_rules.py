@@ -46,10 +46,6 @@ VULTURE_IGNORE_DECORATORS = '@command,@command.*'
 #: A citation to a doc, the route prose takes out of the code.
 CITATION = re.compile(r'docs/[A-Za-z0-9_./-]+\.md(?:#[A-Za-z0-9-]+)?')
 
-#: A line that CITES a doc, as opposed to naming one as data or an argument.
-REFERENCE = re.compile(r'(?i)(?:see|per|details?|rationale|documented)'
-                       r'|\]\(')
-
 #: A line that CITES a doc, not one naming a path as data or a CLI argument.
 REFERENCE = re.compile(r'(?i)\b(?:see|per|details?|rationale|documented)\b'
                        r'|\]\(')
@@ -332,8 +328,12 @@ def _git(path: Path, *args) -> tuple:
 
 
 def _baseline_source(path: Path) -> str:
-    """`path` before this branch's edits: HEAD's copy, else the INDEX's."""
-    for spec in ('HEAD:{}', ':{}'):
+    """`path` as the INDEX holds it, else HEAD's copy.
+
+    The index comes first so that work someone else STAGED is baseline, not
+    the edit's own: git bills a staged change to whoever asks next.
+    """
+    for spec in (':{}', 'HEAD:{}'):
         ok, text = _git(path, 'show', spec)
         if ok:
             return text
@@ -341,10 +341,16 @@ def _baseline_source(path: Path) -> str:
 
 
 def _touched_lines(path: Path):
-    """Line numbers this branch ADDED or CHANGED; None if git knows nothing."""
-    ok, out = _git(path, 'diff', '-U0', 'HEAD', '--', '{}')
-    if not ok:
-        ok, out = _git(path, 'diff', '-U0', '--', '{}')
+    """Line numbers this edit ADDED or CHANGED; None if git knows nothing.
+
+    Diffed against the INDEX, never `HEAD`: `git diff HEAD` folds in staged
+    changes, which billed one edit for every violation in 10 files it had
+    never opened.
+    """
+    tracked, _ = _git(path, 'ls-files', '--error-unmatch', '{}')
+    if not tracked:
+        return None
+    ok, out = _git(path, 'diff', '-U0', '--', '{}')
     if not ok:
         return None
     touched = set()

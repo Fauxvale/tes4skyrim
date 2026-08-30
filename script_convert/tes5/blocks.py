@@ -3,7 +3,7 @@
 Five passes each re-derived block structure from text with their own keyword
 spellings, and disagreed: one matched `if(` and one did not, one knew a typed
 `Int Function` header and one did not, one flattened embedded newlines and one
-did not.  Each disagreement was a latent bug (docs/notes/script_conversion_bugs.md
+did not.  Each disagreement was a latent bug (docs/commentary/script_convert.md
 §5), so the classification lives here ONCE and the passes above it express
 intent -- balance, delete, reorder -- against `Line` records instead.
 
@@ -153,12 +153,7 @@ def scan(lines):
                 pass
 
 
-# `<Quest>.Start()` and a write to a property of that same quest's script.
-# 🛑 If the emitted shape of a `StartQuest` conversion ever changes, this
-# regex must change with it: a post-pass that silently stops matching
-# FAILS OPEN -- no error, just the original bug back (measured: renaming
-# this call once re-clobbered 91 seed writes across 43 scripts).  See
-# docs/notes/papyrus_conversion.md.
+# See: docs/commentary/script_convert.md#startquest-postpass-fails-open
 _QUEST_START_RE = re.compile(r'^(\s*)(\w+)\.Start\(\)\s*(;.*)?$')
 _QUEST_PROP_WRITE_RE = re.compile(r'^(\s*)(\w+)\.(\w+)\s*=(?!=)')
 

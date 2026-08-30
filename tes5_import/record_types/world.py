@@ -433,7 +433,7 @@ def build_wrld_mnam(rec: dict):
     The NW/SE cell pair is what the world map clamps SCROLLING to: the engine
     builds a border polygon from it and clamps the camera into that polygon
     (SkyrimSE RVA 0x9213e0; NAM0/NAM9 is only the fallback used when all four
-    cell values are zero).  See docs/notes/world_land_navmesh.md.
+    cell values are zero).  See docs/commentary/tes5_import_navmesh.md.
 
     So the measured cell grid wins over the authored value, exactly as it does
     for the cloud bank in build_wrld_cloud_modl -- an authored MNAM routinely
@@ -466,7 +466,7 @@ def restamp_wrld_mnam(rec: bytes, out_fid: int) -> bytes:
     Used on the ANCHOR path, where a plugin that adds land to a master's
     worldspace emits the MASTER's converted bytes verbatim to parent its new
     cells. Those bytes hold the master's narrow rectangle, which silently
-    re-clamps the world map (see docs/notes/world_land_navmesh.md).
+    re-clamps the world map (see docs/commentary/tes5_import_navmesh.md).
 
     Only the 8 cell bytes inside an existing 28-byte MNAM are replaced, in
     place, so the record's size and every other subrecord are untouched. A

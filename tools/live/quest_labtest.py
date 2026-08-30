@@ -6,7 +6,7 @@ and the whole cast -- speakers, their placed references, the stage list -- is
 DISCOVERED from the export for whatever quest you name. There are no hardcoded
 actor, variable or topic names anywhere in this file.
 
-Full methodology: docs/notes/ingame_test_methodology.md
+Full methodology: docs/commentary/ingame_testing.md
 
 WHY A CLEAN ROOM
 ----------------

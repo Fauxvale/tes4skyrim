@@ -34,6 +34,12 @@ MAX_FILE_LINES = 1000
 #: A section heading is a `# ----` or `# ====` rule above and below a title.
 BANNER_RE = re.compile(r'^#\s*(?:-{4,}|={4,})\s*$')
 
+#: Widest legal `# See:` line; past this the citation is carrying prose.
+MAX_SEE_CHARS = 80
+
+#: A whole-line citation and NOTHING else, at most MAX_SEE_CHARS wide.
+SEE_ONLY = re.compile(r'^#\s*See:\s*docs/[A-Za-z0-9_./-]+\.md(?:#[A-Za-z0-9-]+)?\s*$')
+
 BRANCH_NODES = (ast.If, ast.For, ast.While, ast.And, ast.Or,
                 ast.ExceptHandler, ast.Assert, ast.comprehension)
 NEST_NODES = (ast.If, ast.For, ast.While, ast.With, ast.Try)
@@ -151,11 +157,19 @@ def inline_comments(path, text: str, tree) -> list:
             if any(a <= h[1] <= b for a, b in spans)]
 
 
+def _is_citation(lines: list, row: int) -> bool:
+    """True for a whole-line `# See: docs/...` carrying no other prose."""
+    raw = lines[row - 1].strip() if row <= len(lines) else ''
+    return len(raw) <= MAX_SEE_CHARS and bool(SEE_ONLY.match(raw))
+
+
 def stray_comments(path, text: str, tree) -> list:
-    """Prose comments outside every function body."""
+    """Prose comments outside every function body, bare citations aside."""
     spans = function_spans(tree)
+    lines = text.splitlines()
     return [h for h in _scored_comments(path, text)
-            if not any(a <= h[1] <= b for a, b in spans)]
+            if not any(a <= h[1] <= b for a, b in spans)
+            and not _is_citation(lines, h[1])]
 
 
 def comment_blocks(path, text: str, tree) -> list:

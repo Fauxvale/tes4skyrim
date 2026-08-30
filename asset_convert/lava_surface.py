@@ -288,7 +288,7 @@ def build_lava_nif(texture_rel: str, size: float = CELL_SIZE,
     # still, with no crash and no warning.  Vanilla's own lava
     # (DweSpecialForgeLava01) ships BSX=1, which is the collisionless
     # "animated only" value this plane also wants.  Same trap as the
-    # particle-mesh fire bug — see docs/notes/nif_conversion.md.
+    # particle-mesh fire bug — see docs/commentary/asset_convert_nif.md.
     bsx = NifFormat.BSXFlags()
     bsx.name = b'BSX'
     bsx.integer_data = 1

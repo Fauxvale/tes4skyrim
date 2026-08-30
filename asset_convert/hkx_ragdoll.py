@@ -821,33 +821,7 @@ def extract_ragdoll(skeleton_nif_path: str, bones: list):
     return parts
 
 
-# ---------------------------------------------------------------------------
-# DEAD END, do not rebuild: "re-root the ragdoll at anim bone 1"
-#
-# A `_ensure_root_at_bone1()` used to live here, on the theory that the ragdoll
-# root must map to ANIM BONE 1 because vanilla dog's mapper #0121 maps ragdoll
-# `A0 -> Canine_COM` (anim bone 1).  THREE variants were built and all three
-# were user-confirmed BROKEN (corpses stopped ragdolling entirely and stood
-# upright).  The theory itself is wrong:
-#
-#   vanilla dog bone 1 'Canine_COM'  world z = 59.3  <- UP IN THE BODY
-#   scamp/rat  bone 1 'Bip01 NonAccum' world z = 71.7 / 27.3  (their NPC Root
-#       carries the elevation, so NonAccum IS the trunk bone -> they work)
-#   lion/boar/dog bone 1 'Bip01 NonAccum' world z = 0.0  <- AT THE FEET,
-#       and 'Bip01 Spine0' (bone 2) is the trunk, 33-53 units up.
-#
-# The real invariant is "the ragdoll root is the TRUNK bone directly under
-# NPC Root", NOT "bone index 1".  On lion/boar/dog `Spine0` ALREADY satisfies
-# it, so `extract_ragdoll`'s natural root choice is correct and needs no
-# adjustment; re-targeting moved the trunk body's FRAME to the ground while
-# compensating the capsule offsets, and the engine's pose mapper /
-# worldFromModel work off bone frames, not capsule offsets -> no simulation.
-#
-# The three variants, for the record: (1) hub inserted with a capsule spanning
-# bone 1 -> old root = a 67-unit r=16.8 bar through the whole creature;
-# (2) compact hub at the trunk = an exact duplicate of Spine0, doubling trunk
-# mass; (3) re-target the existing root body onto bone 1 = trunk frame at the
-# feet.  See docs/notes/creature_conversion.md#ragdoll-root-bone1-dead-end.
+# See: docs/commentary/asset_convert_creature.md#ragdoll-root-bone1-dead-end
 # ---------------------------------------------------------------------------
 
 

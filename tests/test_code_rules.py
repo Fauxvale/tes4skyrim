@@ -7,9 +7,11 @@ subprocess -- so the whole file runs in well under a second.
 
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from tools.validate import code_rules as CR
+from tools.validate import code_rules_ast as D
 
 ROOT = Path(__file__).resolve().parent.parent
 FAKE = Path('t.py')
@@ -260,3 +262,102 @@ def test_multiplier_is_gone():
     source = (ROOT / 'tools' / 'validate' / 'code_rules_ast.py').read_text(
         encoding='utf-8')
     assert 'DOC_CHARS_PER_LINE' not in source
+
+
+# ---------------------------------------------------------------------------
+# What the gate must NOT bill: staged work, and files outside the repo
+# ---------------------------------------------------------------------------
+
+
+def _run_gate(*args):
+    """`--gate-diff` on `args`, returning the finished process."""
+    return subprocess.run(
+        [sys.executable, str(ROOT / 'tools' / 'validate' / 'code_rules.py'),
+         '--gate-diff'] + list(args), cwd=ROOT, capture_output=True, text=True)
+
+
+def test_a_staged_file_with_a_clean_worktree_owes_nothing():
+    """`git diff HEAD` folds in the INDEX, billing an edit for staged work.
+
+    Reproduced with 10 files staged by a rename: every later tool call was
+    blamed for `oversized-files` in two files it had never opened.
+    """
+    staged = subprocess.run(['git', 'diff', '--cached', '--name-only'],
+                            cwd=ROOT, capture_output=True, text=True).stdout
+    dirty = subprocess.run(['git', 'diff', '--name-only'], cwd=ROOT,
+                           capture_output=True, text=True).stdout
+    for name in staged.split():
+        if not name.endswith('.py') or name in dirty:
+            continue
+        got = _run_gate(name)
+        assert got.returncode == 0, '%s: %s' % (name, got.stderr)
+
+
+def test_an_untracked_file_is_still_scored_whole():
+    """The index fix must not blind the gate to a brand-new file."""
+    probe = ROOT / 'tools' / 'validate' / '_gate_probe_tmp.py'
+    probe.write_text(OWN_LINE, encoding='utf-8')
+    try:
+        got = _run_gate(str(probe))
+        assert got.returncode == 1
+        assert 'inline-comments' in got.stderr
+    finally:
+        probe.unlink()
+
+
+def test_a_file_outside_the_repo_is_not_judged():
+    """A scratchpad shares no component with SKIP_PARTS, and Temp != temp."""
+    sys.path.insert(0, str(ROOT / '.claude' / 'hooks'))
+    try:
+        import doc_rules_gate as gate
+    finally:
+        sys.path.pop(0)
+    outside = Path(tempfile.gettempdir()) / 'claude_gate_probe.py'
+    outside.write_text(OWN_LINE, encoding='utf-8')
+    try:
+        assert not gate.judged(str(outside))
+        assert gate.judged(str(ROOT / 'tools' / 'validate' / 'code_rules.py'))
+    finally:
+        outside.unlink()
+
+
+# ---------------------------------------------------------------------------
+# The `See:` exemption: a bare citation only, never a carrier for prose
+# ---------------------------------------------------------------------------
+
+
+def _module_comment(comment):
+    """A module-level constant carrying `comment` above it."""
+    return '"""M."""\n\n%s\nVALUE = 1\n' % comment
+
+
+def test_a_bare_see_line_is_legal():
+    """The outflow route needs one legal line to point at what it moved."""
+    for good in ('# See: docs/commentary/performance.md',
+                 '# See: docs/commentary/performance.md#parallelism-rules'):
+        assert sites(_module_comment(good), 'stray-comments') == [], good
+
+
+def test_a_see_line_may_not_carry_prose():
+    """`See:` must not become the prefix that launders a sentence."""
+    for bad in ('# See: docs/commentary/performance.md, but only when the '
+                'writer is single-process',
+                '# a measured census. See: docs/commentary/performance.md',
+                '# See: docs/commentary/performance.md and the notes above'):
+        assert sites(_module_comment(bad), 'stray-comments') == [3], bad
+
+
+def test_a_see_line_is_capped_at_eighty_characters():
+    """Past the cap the line is prose wearing a citation."""
+    fits = '# See: docs/%s.md' % ('a' * 60)
+    over = '# See: docs/%s.md' % ('a' * 70)
+    assert len(fits) <= D.MAX_SEE_CHARS < len(over)
+    assert sites(_module_comment(fits), 'stray-comments') == []
+    assert sites(_module_comment(over), 'stray-comments') == [3]
+
+
+def test_the_exemption_does_not_reach_inside_a_function():
+    """A citation is module-level bookkeeping, not an in-body comment."""
+    src = ('"""M."""\n\n\ndef f(x) -> int:\n    """D."""\n'
+           '    # See: docs/commentary/performance.md\n    return x\n')
+    assert sites(src, 'inline-comments') == [6]

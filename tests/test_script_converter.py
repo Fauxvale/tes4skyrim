@@ -1322,7 +1322,7 @@ class TestIntegration:
 # Creation Kit PapyrusCompiler contracts
 #
 # Each of these was verified against Skyrim's own PapyrusCompiler.exe (see
-# docs/notes/script_conversion.md).  A violated contract means the script does
+# docs/commentary/script_convert.md).  A violated contract means the script does
 # not compile, produces no .pex, and the record it is bound to silently does
 # nothing in-game — so these are regression tests, not style checks.
 # ===========================================================================
@@ -3212,7 +3212,7 @@ class TestRuntimeGameSettingWrites:
 
     def test_a_setting_with_no_actor_value_keeps_a_visible_marker(self, converter):
         """A call that silently does nothing is the dangerous conversion; a
-        marker is the healthy failure (docs/notes/papyrus_conversion.md)."""
+        marker is the healthy failure (docs/commentary/script_convert.md)."""
         out = converter.convert_standalone(
             'T', 'scn T\nbegin gamemode\nSetNumericGameSetting fNoSuchSetting 5\nend',
             'Quest', 'T')
@@ -3471,7 +3471,7 @@ class TestTriggerEntryFires:
 
     The body stays on OnTrigger (per-frame semantics: Nehrim's Magieverbot
     scripts count their own executions), and a generated OnTriggerEnter
-    delegates to it.  BOTH are required -- see docs/notes/papyrus_conversion.md.
+    delegates to it.  BOTH are required -- see docs/commentary/script_convert.md.
     """
 
     SRC = """scn T
@@ -3527,7 +3527,7 @@ class TestPhysicalTrapDamage:
     Skyrim keeps the layer-14 contact detection but dispatches it as
     OnTrapHitStart and leaves the damage to the script (vanilla
     TrapHitBase.psc -> native ProcessTrapHit).  In-game confirmed 2026-08-09;
-    see docs/notes/papyrus_conversion.md.
+    see docs/commentary/script_convert.md.
     """
 
     # CTrapSwingMace01SCRIPT's shape: armed at 0, 20 on release, 5 after 6s.
@@ -3992,7 +3992,7 @@ class TestObjectReferenceMethodsDoNotPromoteToActor:
     ArenaGalleryMarkerRef, ICArenaPlayerMarkerRef, ICMonsterFightPlayerRef) are
     XMarker **STAT** refs, so `Actor Property` refused to bind, the property was
     None, and the first call on it aborted the whole announcer function.
-    See docs/notes/papyrus_conversion.md.
+    See docs/commentary/script_convert.md.
     """
 
     def test_say_does_not_promote_receiver(self, converter):
@@ -4044,7 +4044,7 @@ class TestQuestStartDoesNotClobberSeededWrites:
     its scripts and resets every Auto property, silently erasing the seed.
     This softlocked the Imperial City Arena: `Arena.ReadyMatch = 1` then
     `Arena.Start()` left ReadyMatch at 0, so the announcer never fired.
-    See docs/notes/papyrus_conversion.md.
+    See docs/commentary/script_convert.md.
     """
 
     def _hoist(self, converter, body):
@@ -4395,7 +4395,7 @@ class TestTes5Blocks:
     """The single structural classifier the post-emit passes share.
 
     Before it existed each pass carried its own keyword list and they
-    disagreed; see docs/notes/script_conversion_bugs.md §5.
+    disagreed; see docs/commentary/script_convert.md §5.
     """
 
     def test_classify_keywords(self):

@@ -16,7 +16,7 @@ The two hard problems are different ones: **size/orientation mismatch** and
 |---|---|---|
 | Items (MISC / INGR / food) | [item_swap_table.md](../reference/item_swap_table.md) — measured here | override record or REFR (§1) |
 | Creatures | [creature_race_equivalence.md](../reference/creature_race_equivalence.md) | override `NPC_.RNAM` |
-| **Weather** | [weather_climate_conversion.md](../notes/weather_climate.md#vanilla-substitution-map-oblivion-wthr---vanilla-skyrim-wthr) — **already written and verified** | FormID redirect at every referrer (§4b) |
+| **Weather** | [weather_climate_conversion.md](../commentary/tes5_import_weather.md#vanilla-substitution-map-oblivion-wthr---vanilla-skyrim-wthr) — **already written and verified** | FormID redirect at every referrer (§4b) |
 
 ---
 
@@ -245,7 +245,7 @@ Extend the swap modal (same card/`CLR[...]` styling as
 
 ## 4b. Weather — a third swap category, already mapped
 
-[weather_climate_conversion.md](../notes/weather_climate.md#vanilla-substitution-map-oblivion-wthr---vanilla-skyrim-wthr)
+[weather_climate_conversion.md](../commentary/tes5_import_weather.md#vanilla-substitution-map-oblivion-wthr---vanilla-skyrim-wthr)
 already contains a **complete, verified substitution map** for exactly this
 feature: 18 Oblivion weathers mapped to vanilla Skyrim WTHR records, derived from
 the authored discriminators on both sides (`DATA.Classification`, `WindSpeed`,

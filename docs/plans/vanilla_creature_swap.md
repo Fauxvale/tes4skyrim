@@ -1,6 +1,10 @@
 # Plan — "Vanilla Creature Swap" ESP generator + GUI
 
-**Status: PLAN ONLY. Nothing here is implemented.**
+**Status: PLAN, partly built.** The match table and resolver of section 2
+ship as `tes5_import/vanilla_creature_swap.py` (233 lines), read only by
+`tools/creature/creature_swap_report.py` -- the pipeline imports neither.
+The ESP generator (section 4) and the GUI action (section 6) are unbuilt,
+and they are what this plan still describes.
 
 Goal: a top-bar GUI action that builds a **separate override ESP** which makes
 converted creatures use their vanilla Skyrim counterparts — vanilla mesh,

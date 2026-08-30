@@ -183,7 +183,7 @@ def _is_bool_valued(conv, node: N.Expr) -> bool:
     name = node.name if name_low else ''
     # A command with NO Papyrus equivalent converts to the bare literal `0`.
     # Whether the comparison then collapses depends on WHICH bool list names
-    # it -- the two disagree (docs/notes/script_conversion_bugs.md #6), and this is
+    # it -- the two disagree (docs/commentary/script_convert.md #6), and this is
     # the position where that shows: `GetIsCurrentPackage == 0` collapses to
     # `!(0)` (it is a comparison-position name) while `HasFlames == 0` stays
     # `0 == 0` (bare-read name only).  Both are TRUE, so this preserves a

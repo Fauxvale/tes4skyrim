@@ -261,7 +261,7 @@ Two things still renumber a plugin and require a new game:
 - Changing the hash input, the derived region, or `FORMID_SCHEME_VERSION`.
 - Changing which authored records exist (a different source plugin version).
 
-Full contract: [performance_notes.md](../notes/performance.md#formid-determinism--the-save-game-contract-rewritten-2026-08-17).
+Full contract: [performance_notes.md](../commentary/performance.md#formid-determinism--the-save-game-contract-rewritten-2026-08-17).
 
 Historical note: this used to be a bare `+1` counter, and a shifted id made
 `ErothinKampfmagier01` appear **naked** in an old save with the outfit,
@@ -296,7 +296,7 @@ and **every** path that used to be `os.path.join(tes4_data, name)` must go
 through it. With no imported mods the registry is absent and behaviour is
 byte-for-byte what it was (`tests/test_mod_ingest.py` asserts this).
 
-See [mod_archive_ingest_plan.md](../notes/mod_archive_ingest.md) for the layout
+See [mod_archive_ingest_plan.md](../commentary/asset_convert_mod_ingest.md) for the layout
 rule, nesting, precedence and path-safety contract.
 
 `import_main.py` runs a long phase sequence (Phase 0 pre-scans through Phase 5
@@ -342,7 +342,7 @@ Notably **converted** (do not assume otherwise): GLOB, CLAS, CLMT, WATR, PACK,
 WTHR, REGN. PACK is converted in its own phase (3b2, after QUST) rather than
 via the generic dispatch, and so is WTHR (Phase 2b — it mints four IMGS
 companions per weather for HDR tone mapping, see
-[weather_climate_conversion.md](../notes/weather_climate.md)). REGN is
+[weather_climate_conversion.md](../commentary/tes5_import_weather.md)). REGN is
 converted for its **weather** entries only (RDWT lists + RPLI/RPLD areas);
 its object/grass/sound/map generators stay dropped — that is where all of
 Cyrodiil's weather variety lives, since TamrielClimate's own WLST is a single

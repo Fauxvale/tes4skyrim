@@ -190,7 +190,7 @@ enable state parent` — separate and minor.
 `MQMythicDawnLowM` (TestParadiseCave), `CGMythicDawnAssassinAmbushC`
 (ImperialDungeon), plus clutter in QASmoke/ChorrolHouseForSale.
 
-⚠️ **Read [ck_vs_game_missing_objects.md](../notes/ck_vs_game_missing_objects.md) before
+⚠️ **Read [ck_vs_game_missing_objects.md](../commentary/ck_vs_game_missing_objects.md) before
 acting.** Force-persisting on the strength of this warning is exactly the fix
 that was tried and refuted there — it made objects vanish in game.
 
@@ -276,8 +276,8 @@ All 19 are interiors: 11 Chorrol castle/wall towers
 `SkingradCastleSouthHall`, `OblivionRDCitadel04`, `OblivionMqKvatchCitadel`.
 
 Missing NVNM bounds data on generated navmeshes. See
-[world_land_navmesh_notes.md](../notes/world_land_navmesh.md) and
-[ck_navmesh_generation.md](../notes/ck_navmesh_generation.md).
+[world_land_navmesh_notes.md](../commentary/tes5_import_navmesh.md) and
+[ck_navmesh_generation.md](../commentary/ck_navmesh_generation.md).
 
 ---
 

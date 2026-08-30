@@ -147,8 +147,8 @@ regenerate scripts, so a behavioural regression means reading
    it keeps 1,114 Bethesda source paths, 17k diagnostic strings, and 433 record
    editor dialogs the game strips. `tools/disasm/ck_srcpaths.py`, `ck_strref.py`,
    `skyrim_disasm.py --exe <ck>`. Runtime behavior still comes from item 1;
-   the CK can disagree with the game ([ck_vs_game_missing_objects.md](docs/notes/ck_vs_game_missing_objects.md)).
-   Details: [ck_exe_as_a_source.md](docs/notes/ck_exe_as_a_source.md).
+   the CK can disagree with the game ([ck_vs_game_missing_objects.md](docs/commentary/ck_vs_game_missing_objects.md)).
+   Details: [ck_exe_as_a_source.md](docs/commentary/ck_exe_disassembly.md).
 3. The Oblivion/Nehrim install at `D:\Other Games\Nehrim At Fate's Edge\Data`.
 4. xEdit source at `references/xEdit` — `Core/` documents the binary structure of
    every record type. This is the first stop for any format question. Or if working with meshes, go to the Nifskope source at `references/Nifskope`
@@ -338,7 +338,7 @@ real data, or a failing-then-passing test.
 
 - Use multiprocessing, not threads, for pure-Python work; **ThreadPoolExecutor is
   only for I/O and subprocesses.** The output ESM must stay byte-reproducible.
-  Rules and measured results: [docs/notes/performance.md](docs/notes/performance.md).
+  Rules and measured results: [docs/commentary/performance.md](docs/commentary/performance.md).
 - **Never exhaust memory**: some pool tools load the ~2.1 GB export index per
   worker. Cap `--workers` or run single-process.
 - **<a id="formid-drift"></a>FORMIDS ARE HASHED, NOT COUNTED.**
@@ -352,7 +352,7 @@ real data, or a failing-then-passing test.
     Changing the hash input, region, or `FORMID_SCHEME_VERSION` renumbers
     everything.
   Guarded by `tests/test_formid_determinism.py`; details:
-  [performance_notes.md](docs/notes/performance.md#formid-determinism--the-save-game-contract-rewritten-2026-08-17).
+  [performance_notes.md](docs/commentary/performance.md#formid-determinism--the-save-game-contract-rewritten-2026-08-17).
 
 ### Output paths
 
@@ -383,7 +383,7 @@ python tools/navmesh/navmesh_cache_hook.py --run                      # publish 
   republishes the whole cache. Check with `navmesh_cache_hook.py --check`.
 
 Why, and the invalidation/tag contracts:
-[world_land_navmesh_notes.md](docs/notes/world_land_navmesh.md#the-shared-navmesh-cache--design-rationale).
+[world_land_navmesh_notes.md](docs/commentary/tes5_import_navmesh.md#the-shared-navmesh-cache--design-rationale).
 
 ---
 
@@ -395,7 +395,7 @@ Deep reference material lives in `docs/`, sorted by KIND.
 | Folder | Holds |
 |---|---|
 | [reference/](docs/reference/) | What a format or contract IS — stable, no dates |
-| [notes/](docs/notes/) | What we LEARNED building it — measurements, engine behaviour, reverted attempts |
+| [commentary/](docs/commentary/) | Why the SHIPPED code is the way it is — named `<package>_<subsystem>.md` after the code it explains, opens with `**Code:**`. Measurements, engine behaviour, reverted attempts. The DEFAULT |
 | [plans/](docs/plans/) | Designed, NOT yet built |
 | [audits/](docs/audits/) | A dated sweep over a corpus, with counts |
 | [assets/](docs/assets/) | Images and icons; `banner.png`/`favicon.ico` load at RUNTIME |

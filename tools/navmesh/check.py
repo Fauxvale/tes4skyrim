@@ -3,7 +3,7 @@
 The CK ships a `NavMesh::CheckNavMesh` pass (Check NavMeshes / Finalize) that
 enumerates exactly what Bethesda considers a malformed navmesh.  Its rule set
 was recovered from CreationKit.exe's error strings at .text:0x02142410-0x02142f80
-(the exe is unpacked — see docs/notes/ck_navmesh_generation.md), and this module
+(the exe is unpacked — see docs/commentary/ck_navmesh_generation.md), and this module
 reimplements every one of them against our WRITTEN NVNM records.
 
 Why validate the written records rather than the generator's in-memory output:

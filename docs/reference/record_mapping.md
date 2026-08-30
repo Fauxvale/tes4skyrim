@@ -3,7 +3,7 @@
 Linked from [CLAUDE.md](../../CLAUDE.md). Reference tables for record type mapping,
 structural requirements, and known problem records. For narrative conversion
 notes (NIF/mesh/collision/particle/creature), see
-[nif_conversion_notes.md](../notes/nif_conversion.md). For dialogue/quest specifics,
+[nif_conversion_notes.md](../commentary/asset_convert_nif.md). For dialogue/quest specifics,
 see the `oblivion-to-skyrim-dialog` skill.
 
 ## Record Format Differences: TES4 vs TES5
@@ -64,7 +64,7 @@ see the `oblivion-to-skyrim-dialog` skill.
 | LVLC | LVLN | Leveled Creature → Leveled NPC. Same entry format (LVLO). |
 | LVLI | LVLI | Same entry format. Minor flag differences. |
 | LVSP | LVSP | Same entry format. |
-| MGEF | MGEF | **Converted since 2026-07-31** (`record_types/magic.py`) — was in SKIP_TYPES, which cost 796 dropped effects and 382 filler records. TES4's 4-char code picks a TES5 **Archtype** (152-byte DATA, FormVersion 44); the code table covers all 161 codes any export defines. Extra MGEFs are emitted per **actor value** (one TES4 `DGAT` is Damage Strength on one spell and Damage Endurance on the next — Skyrim moved the AV onto the MGEF) and per **script** (a TES4 `SEFF` names its script per-effect; archetype 1 + VMAD). `Assoc. Item` is written only for the 10 archetypes that read it, and its target is re-type-checked. See [magic_conversion_plan.md](../notes/magic_conversion.md). |
+| MGEF | MGEF | **Converted since 2026-07-31** (`record_types/magic.py`) — was in SKIP_TYPES, which cost 796 dropped effects and 382 filler records. TES4's 4-char code picks a TES5 **Archtype** (152-byte DATA, FormVersion 44); the code table covers all 161 codes any export defines. Extra MGEFs are emitted per **actor value** (one TES4 `DGAT` is Damage Strength on one spell and Damage Endurance on the next — Skyrim moved the AV onto the MGEF) and per **script** (a TES4 `SEFF` names its script per-effect; archetype 1 + VMAD). `Assoc. Item` is written only for the 10 archetypes that read it, and its target is re-type-checked. See [magic_conversion_plan.md](../commentary/tes5_import_magic.md). |
 | MISC | MISC | Add OBND. Minor changes. |
 | NPC_ | NPC_ | **Massive restructuring**: ACBS different fields. DATA(33B)→empty marker. Skills/stats→DNAM(52+B). Hair→PNAM(HDPT array). Voice→VTCK(VTYP). Outfits→DOFT/SOFT(OTFT). Perks new. Template system new. Add OBND, keywords. |
 | PACK | PACK | **Completely incompatible**: TES4 type-based (Find/Follow/Escort/Eat/Sleep). TES5 procedure-tree based. Must create skeleton records. |
@@ -102,7 +102,7 @@ see the `oblivion-to-skyrim-dialog` skill.
 | VTYP | Voice Type | NPC_ voice assignment. |
 | CLFM | Color | Hair color (replaces inline HCLR). |
 | LGTM | Lighting Template | Interior CELL lighting. |
-| MUSC | Music Type | Built from the TES4 `Music\<Category>\` FOLDERS (no TES4 record exists). CELL `XCMT`/WRLD `SNAM` enum -> `XCMO`/`ZNAM` FormID. See [music_conversion.md](../notes/music_conversion.md). |
+| MUSC | Music Type | Built from the TES4 `Music\<Category>\` FOLDERS (no TES4 record exists). CELL `XCMT`/WRLD `SNAM` enum -> `XCMO`/`ZNAM` FormID. See [music_conversion.md](../commentary/asset_convert_audio.md). |
 | MUST | Music Track | One per converted music file; `ANAM` names the xWMA, `FLTV` the measured duration. |
 | SNDR | Sound Descriptor | Sound data (SOUN is just a marker in TES5). |
 | MATT | Material Type | Landscape material (was HNAM enum). |
@@ -361,7 +361,7 @@ generic hair is instead BAKED per race group (base / `__ev` elves / `__or`
 orc) with four HDPTs per variant gated by the vanilla RNAM race lists, and
 the NPC face mapper routes each NPC to its race group's variant.** Full
 details and the measured gates in
-[nif_conversion_notes.md](../notes/nif_conversion.md).
+[nif_conversion_notes.md](../commentary/asset_convert_nif.md).
 
 **Hair is emitted PER GENDER** (`stem` / `stem__f`, gendered HDPTs): the
 Skyrim male and female scalps differ by up to **1.23 units** (mean 0.46),
@@ -847,7 +847,7 @@ WEAP's NAM8/NAM9 are also `[SNDR]` slots but are already correct: they are
 written from `WEAPON_ANIM_NAM8/9`, which name vanilla Skyrim.esm descriptors.
 
 ### CLAS Conversion
-- **Trainer classes**: Skyrim's training menu reads skill/cap from CLAS DATA (Teaches S8 + MaxTrainingLevel U8 at offset 4), but Oblivion trainers store them per-NPC in AIDT (92/114 vanilla trainers disagree with their class). Phase 0c `create_trainer_records` clones each trainer NPC's class with the AIDT values and repoints CNAM; the NPC also joins `TES4JobTrainerFaction`, which gates the generated Training dialogue topic. Vendor barter gold becomes carried Gold001 (no TES5 field). See [dialogue_conversion_notes.md](../notes/dialogue_conversion.md) (Barter/Training services).
+- **Trainer classes**: Skyrim's training menu reads skill/cap from CLAS DATA (Teaches S8 + MaxTrainingLevel U8 at offset 4), but Oblivion trainers store them per-NPC in AIDT (92/114 vanilla trainers disagree with their class). Phase 0c `create_trainer_records` clones each trainer NPC's class with the AIDT values and repoints CNAM; the NPC also joins `TES4JobTrainerFaction`, which gates the generated Training dialogue topic. Vendor barter gold becomes carried Gold001 (no TES5 field). See [dialogue_conversion_notes.md](../commentary/tes5_import_dialogue.md) (Barter/Training services).
 - **VendorItem keywords (2026-07-10)**: Skyrim vendors only buy/sell items whose keywords appear in their faction's VEND formlist — converted items with NO keywords are invisible in the barter menu ("vendor missing nearly their entire inventory"). Every sellable converter now emits KSIZ/KWDA from `VENDOR_KYWD` (record_types/common.py): WEAP→Weapon (type 4→Staff), AMMO→Arrow, ARMO/CLOT→Armor/Clothing (TES4 biped bits 6/7/8 ring/amulet→Jewelry), BOOK→Book (flag 0x01→Scroll), ALCH→Potion/Poison/Food, INGR→Ingredient, SLGM→SoulGem, SGST→Scroll, APPA/MISC→Clutter, KEYM→Key. The service-bit→FLST table in actors.py must stay in sync (Weapons list includes Arrow; Books includes Scroll; Ingredients includes Food; Misc includes Clutter).
 - **Skill Weight Algorithm** (from Skyblivion):
   1. Start with all TES5 skills at weight 0

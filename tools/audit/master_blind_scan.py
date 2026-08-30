@@ -92,7 +92,7 @@ def measure(plugin):
 
     Covers the base-record family of the defect (navmesh carving, door
     handling, package targets). Other families (SCPT, VTYP, PACK) need their
-    own probes -- see docs/notes/override_conversion.md.
+    own probes -- see docs/commentary/tes5_import_override.md.
     """
     sys.path.insert(0, os.getcwd())
     from tes5_import.text_reader import (parse_export_directory,

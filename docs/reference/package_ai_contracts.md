@@ -3,7 +3,7 @@
 Linked from [CLAUDE.md](../../CLAUDE.md). Verified engine behavior for converted AI
 packages and condition items. Implemented in `tes5_import/pack_converter.py`,
 `pack_templates.py`, `packages.py`, and `dialog_conditions`. For the original
-design analysis see [package_conversion_plan.md](../notes/package_conversion.md)
+design analysis see [package_conversion_plan.md](../commentary/tes5_import_package.md)
 (note: its "PACK is in SKIP_TYPES" status header is stale — PACK is converted).
 For measured OPEN gaps and the list of things verified correct (so they are not
 re-litigated), see [package_conversion.md](../audits/package_conversion.md).
@@ -44,7 +44,7 @@ are never remapped.
 Run-on-Target CTDAs in `Say()`-driven topics can never pass (Say has no dialogue
 target) — the importer retargets them to RunOn=Reference (unique script target,
 usually PlayerRef) or drops them (mixed targets); see
-[dialogue_conversion_notes.md](../notes/dialogue_conversion.md) 2026-07-19.
+[dialogue_conversion_notes.md](../commentary/tes5_import_dialogue.md) 2026-07-19.
 
 **IDENTITY functions are exempt** (GetIsID / GetIsRace / GetIsSex / GetIsClass /
 GetInFaction / GetFactionRank): they ask WHO is being addressed, so retargeting
@@ -149,7 +149,7 @@ suppressed combat well beyond CharacterGen; the converted plugin now writes
 Ignore Combat on **zero** packages.
 
 Related: the guards also needed the scripted-aggression fix (see
-[papyrus_conversion_notes.md](../notes/papyrus_conversion.md), "Aggression must not
+[papyrus_conversion_notes.md](../commentary/script_convert.md), "Aggression must not
 collapse 6..105 onto tier 2"). Both were required — aggression governs whether
 they pick a target, this flag governs whether they may fight at all.
 

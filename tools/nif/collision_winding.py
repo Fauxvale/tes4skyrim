@@ -15,7 +15,7 @@ withdrawn.  rocks/seisland/seisland.nif alone scores 553 bad edge-pairs, and
 14.5% of decidable floor faces in meshes/rocks are genuinely inverted.  A
 detector that lights up on an Oblivion tree may well be right.  The authored
 per-triangle normal is the ground truth to check against instead; see
-docs/notes/nif_conversion.md "round 3".
+docs/commentary/asset_convert_nif.md "round 3".
 
 IMPORTANT — the default scan has a blind spot.  It only fires on a MIXED pair,
 so a surface that is UNIFORMLY reversed reports zero: Morrowind_ob's
@@ -36,7 +36,7 @@ Usage:
     # Control test — should report very few hits:
     python tools/nif/collision_winding.py ../TESConversion/export/Oblivion.esm/meshes/dungeons
 
-See docs/notes/nif_conversion.md "Inverted collision winding in Nehrim source
+See docs/commentary/asset_convert_nif.md "Inverted collision winding in Nehrim source
 meshes" for the repair (`asset_convert.collision._repair_inverted_floors`).
 """
 import argparse

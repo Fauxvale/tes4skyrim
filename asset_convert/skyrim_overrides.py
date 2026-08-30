@@ -283,17 +283,7 @@ ARMOR_PIECE_OFFSETS: dict[str, ArmorOffsetConfig] = {
     'default':   ArmorOffsetConfig(),
 }
 
-# PRN-attached rigid pieces (no real skin in the Oblivion NIF; rigid-skinned
-# to the Skyrim bone by nif_converter._add_prn_skin).  Their verts are
-# authored in an upright bone-pivot frame and land EXACTLY in the Skyrim bone
-# frame after retarget, so the FK-deformation compensation offsets in
-# ARMOR_PIECE_OFFSETS (e.g. helmet dz=+7, tuned on genuinely skinned helms
-# like TownguardCho) must NOT be applied — they pushed rigid helms on top of
-# the head.  The only correction needed is the anatomical difference between
-# the heads in their respective head-pivot frames, measured from
-# OB headhuman.nif vs SK malehead.nif (see docs/notes/nif_conversion.md):
-#   skull top   OB +13.6  SK +11.5  -> dz = -2.1
-#   Y span      OB [-3.75, +11.31]  SK [-5.97, +11.58] -> the SK skull
+# See: docs/commentary/asset_convert_armor.md#prn-rigid-piece-offsets
 #     reaches 2.2 further BACK with only 0.27 front slack, so translation
 #     alone cannot fix back-of-head clipping: sy = 17.55/15.06 = 1.165 and
 #     dy = -1.6 map the OB span exactly onto the SK span

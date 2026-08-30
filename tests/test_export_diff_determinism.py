@@ -3,7 +3,7 @@
 Its result becomes `pending` in override_builder, whose insert loop places
 newly-inserted subrecords relative to each other in dict order -- so a
 non-deterministic key order reaches the emitted subrecord order and the output
-ESM stops being byte-reproducible (docs/notes/performance.md).
+ESM stops being byte-reproducible (docs/commentary/performance.md).
 
 The real failure: CATShipCabinDoorExteriorREF in Morrowind_ob came out
 `... DATA EDID XTEL` in one build and `... DATA XTEL EDID` in the next,

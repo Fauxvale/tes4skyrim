@@ -32,7 +32,7 @@ the CK adds; pass --no-diff for the raw set.  Follow up with
 `tools/disasm/ck_strref.py --pattern <regex>` to get the referencing code RVAs, then
 `tools/disasm/skyrim_disasm.py --exe <ck> --disasm <rva>` to read the check.
 
-See docs/notes/ck_exe_as_a_source.md for the measured findings.
+See docs/commentary/ck_exe_disassembly.md for the measured findings.
 """
 
 import argparse

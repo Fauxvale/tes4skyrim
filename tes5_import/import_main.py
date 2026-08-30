@@ -2074,7 +2074,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # boundary, so any AI package with an out-of-cell destination starts (the
     # actor stands up) and never moves. Must run after every mesh exists (it
     # needs neighbour NAVM FormIDs + final triangle indices) and before the group
-    # builders serialise them. See docs/notes/world_land_navmesh.md.
+    # builders serialise them. See docs/commentary/tes5_import_navmesh.md.
     # Debug hook: TESCONV_DUMP_NAVM_CACHE=<path> pickles the precomputed cache
     # so the edge-link / split post-passes can be profiled in isolation without
     # paying for a full import each iteration (temp/edge_link_profile.py).
@@ -2193,7 +2193,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # adds land to a MASTER's worldspace never converts a WRLD of its own, so
     # the override rebuilders and the anchor paths are the only consumers that
     # ever see them.  _build_world_groups re-registers for the own-hierarchy
-    # case.  See docs/notes/world_land_navmesh.md.
+    # case.  See docs/commentary/tes5_import_navmesh.md.
     ext_by_wrld = defaultdict(list)
     for cell in by_type.get('CELL', []):
         wrld_fid = get_formid(cell, 'ParentWRLD')
@@ -3652,7 +3652,7 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
     # Forcing the flag made the objects vanish in game while the CK kept
     # showing them: ICMarketBlock03House01 (forced persistent) was invisible
     # where its neighbour ICMarketBlock03House02 (untouched) rendered, same
-    # cell, same mesh family.  See docs/notes/ck_vs_game_missing_objects.md.
+    # cell, same mesh family.  See docs/commentary/ck_vs_game_missing_objects.md.
 
     # Re-home misplaced exterior refs.  Oblivion.esm ships a handful of
     # refs attached to a grid cell that does not match their coordinates (the

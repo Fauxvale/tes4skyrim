@@ -6,7 +6,7 @@ returns zero hits. What a mountable actor IS lives in
 
 Feasibility + implementation plan for making converted Oblivion horses behave like
 vanilla Skyrim horses (player can approach and mount them). This sits ON TOP of the
-existing creature pipeline (see [docs/notes/creature_conversion.md](../notes/creature_conversion.md)) —
+existing creature pipeline (see [docs/commentary/asset_convert_creature.md](../commentary/asset_convert_creature.md)) —
 horses already convert through that path as ordinary quadrupeds (locomotion, combat,
 death). This doc covers only the DELTA needed for the ridden state.
 

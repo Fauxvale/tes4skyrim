@@ -137,7 +137,7 @@ def quest_state(ctx, call) -> str:
     """Quest lifecycle.
 
     StopQuest is `Stop()` -- a run-bit global was tried and REVERTED (see
-    docs/notes/script_conversion_bugs.md); the fix is the Start() hoist and nothing
+    docs/commentary/script_convert.md); the fix is the Start() hoist and nothing
     more.
     """
     parts = ctx.arg_srcs()

@@ -47,7 +47,7 @@ Later Issues:
 
 	6 - Some converted books (scrolls) are using the wrong Skyrim base mesh
 
-	7 - Restore Oblivion's remaining NPC-to-NPC conversations (see docs/notes/ambient_dialogue_channel.md)
+	7 - Restore Oblivion's remaining NPC-to-NPC conversations (see docs/commentary/tes5_import_dialogue.md)
 		DONE 2026-08-07: the 15 QUEST-ADVANCING chains are replayed by a generated driver quest
 		REMAINING: the ~240 pure-flavor chatter families are still dropped; they need SCEN synthesis with invented actor pairing.
 

@@ -1,7 +1,7 @@
 """Navmesh build entry point.
 
 CURRENT MODEL (Phase 1): pathgrid CORRIDOR RIBBONS — see corridor.py and
-docs/notes/navmesh_corridor.md.  The navmesh is built directly on the
+docs/commentary/tes5_import_navmesh.md.  The navmesh is built directly on the
 pathgrid as a flat, fixed-width ribbon of triangles per edge; edges meeting at
 a node share the node vertex, so NVNM adjacency links by construction.  Doors
 get a threshold quad welded into the ribbon; cross-cell edge links and NAVI are
@@ -65,7 +65,7 @@ def build_navmesh(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     """Build a navmesh for one cell.  Returns (verts3d, tris) or ([], []).
 
     Phase-1 corridor model: delegates to corridor.build_corridors.  See
-    corridor.py and docs/notes/navmesh_corridor.md.
+    corridor.py and docs/commentary/tes5_import_navmesh.md.
 
     doors: [(x, y, z, rot_z, is_teleport, width), ...] door REFRs (teleport AND
     interior).  When None, teleport doors are recovered from XTEL alone.

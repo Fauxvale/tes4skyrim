@@ -1187,7 +1187,7 @@ def _is_npc_to_npc_conversation(rec: dict) -> bool:
     EditorID ("SEMiscQuestResponses", "FGD02Insults", "SE"), because they never
     had a player-facing FULL prompt to use. Dropping them is deliberate: better
     absent than wrong. Tracked in TODO.txt "Later Issues" #16, restored by
-    docs/notes/ambient_dialogue_channel.md Step 4.
+    docs/commentary/tes5_import_dialogue.md Step 4.
 
     CRITICAL — script-driven topics are NOT dropped. 293 of the 535 Type-1
     topics are spoken by an explicit `Say`/`SayTo`/`StartConversation` call in a

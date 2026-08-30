@@ -14,7 +14,7 @@ Skyrim.esm lack XCLC.  Any nonzero count here is a real defect.
 
 Oblivion leaves the persistent bit (RecordFlags & 0x400) CLEAR on ~30 such
 cells, so classifying on the flag alone is not enough — see
-docs/notes/world_land_navmesh.md.
+docs/commentary/tes5_import_navmesh.md.
 
 Usage:
     # check a converted plugin
