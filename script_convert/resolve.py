@@ -4,7 +4,6 @@ Lookups against the plugin graph, moved out of `constants.py` so that stays
 data.
 """
 
-import re
 
 def resolve_property_formid(xref, prop_name: str) -> str:
     """EditorID lookup for a (possibly sanitized) property name.

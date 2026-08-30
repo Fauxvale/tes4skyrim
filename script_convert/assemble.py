@@ -460,7 +460,7 @@ def events(conv, tree, extends: str, skip_poll: bool = False) -> list:
         if consumes:
             body = door_preamble(conv, extends) + body
         if block.btype.lower() == 'onactivate':
-            body = gate_capture(conv, tree, extends) + body
+            body = gate_capture(tree, extends) + body
         if header not in merged:
             merged[header] = []
             order.append(header)
@@ -705,7 +705,7 @@ def lifecycle(conv, tree, extends: str) -> list:
         # references that are actually loaded, so this cannot re-create the
         # "every scripted object in the game starts ticking at load" failure
         # an unconditional OnInit register caused.
-        out += ([f'Event OnInit()', f'  If ({conv._GAMEMODE_GATE})']
+        out += (['Event OnInit()', f'  If ({conv._GAMEMODE_GATE})']
                 + [f'  {line}' for line in start]
                 + ['  EndIf', 'EndEvent', ''])
     return out
@@ -795,7 +795,7 @@ def _consumes_activation(conv, tree) -> bool:
     return conv._onactivate_consumes(blocks)
 
 
-def gate_capture(conv, tree, extends: str) -> list:
+def gate_capture(tree, extends: str) -> list:
     """Remember the Oblivion gate the player just entered, before it is lost.
 
     The authored line `set MQ00.nearOblivionGate to 0` marks the entry AND

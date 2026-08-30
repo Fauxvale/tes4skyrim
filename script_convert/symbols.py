@@ -260,15 +260,9 @@ def _names_a_typed_call(value) -> bool:
     -- neither is a `Call` node, though all three are calls.  The test is
     whether the NAME is one, not what the parser had to shape it as.
     """
-    if isinstance(value, N.Call):
-        name = value.name
-    elif isinstance(value, N.Member):
-        name = value.name
-    elif isinstance(value, N.Ident):
-        name = value.name
-    else:
+    if not isinstance(value, (N.Call, N.Member, N.Ident)):
         return False
-    low = name.lower()
+    low = value.name.lower()
     # Resolve the alias too: `_FORM_RETURNING` is keyed by the PAPYRUS name,
     # and TES4 reaches it under others -- `GetEquippedObject` is Skyrim's
     # `GetEquippedWeapon`, so testing the authored spelling alone missed it

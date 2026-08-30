@@ -665,3 +665,169 @@ and every LOSS of an event, call or write was listed individually.
 7 changed, each verified: 6 are the redundant-cast and bool-collapse
 improvements above; the 7th (`CGRopeBucketScript`) is a body master had
 disabled entirely.
+
+### The results table
+
+Regenerate with `python temp/drift_causes.py` against the master-head baselines
+in `temp/psc_master/` (built from the `temp/headtree` worktree at `e96bb7b`).
+Every row is verified; **none is a regression**.
+
+| Scripts | Plugin | Model difference | Verdict |
+|---:|---|---|---|
+| 165 | Nehrim | `writes: +epwert` / `numbers[15]: None -> 1` | **master bug**: `Set EPWert to 15` dropped, so the XP-award call got 0 |
+| 163 | Oblivion | `gamedayspassed.getvalue` -> `getvalueint` | same value, drops a redundant `as Int` |
+| 76 | Oblivion | `strings[...skill.Anyone]` -> `[...skill. Anyone]` | **master bug**: sentence spacing stripped from message text |
+| 34 | Oblivion | `properties[myself]: 'Actor' -> None` | unused property no longer emitted |
+| 25 | Oblivion | `numbers[1]: 3 -> 2` | `HasLOS(...) == 1` collapsed to `HasLOS(...)` |
+| 23 | Oblivion | `getparentcell` -> `<ref>.getparentcell` | redundant `(X as Actor)` cast removed |
+| 18 | Nehrim | `+MusicType` properties, `+.Add()` calls | **master bug**: `;NE: no converted music` where a real MUSC resolves |
+| 17 | Oblivion | `properties[combattarget]: 'ObjectReference' -> 'Actor'` | narrower, correct type |
+| 13 | Oblivion | `debug.messagebox` -> `tes4_showmsg` + `Message` property | multi-button MessageBox (bugs doc #11) |
+| 12 | all | `game.advanceskill` -> `modactorvalue` on `Game.GetPlayer()` | **regression FIXED**: skill gains ran on `(Self as Actor)` = None |
+| 11 | Oblivion | two `<ref>.say/1` calls -> one | measure-then-deliver Say pair collapsed |
+| 10 | Oblivion | `numbers[1]: 1 -> None` | **master bug**: `X == Y == 1`, a double comparison |
+| 8 | Oblivion | `events: -oneffectfinish` | empty event dropped -- does nothing in Papyrus |
+| 6 | Oblivion | `numbers[0.25] -> [0.5]` | tree-derived `uses_timer` (bugs doc #17) |
+| 6 | Oblivion | `-oneffectfinish` `+onupdate` | the same, plus the poll gaining its own event |
+| 5 | Oblivion | `getpositionx` -> `self.getpositionx` | explicit receiver; identical at runtime |
+| 5 | Nehrim | `+ghosteffectspektral.stop`, `+removespell` | **master bug**: body commented out by an unconvertible block filter |
+| 5 | Morrowind | `properties[actorref]: 'Actor' -> None` | property shadowed a UDF parameter of the same name |
+| 4 | Oblivion | `properties[darkbrotherhood]: None -> 'Faction'` | property now bound |
+| 4 | Nehrim | `+target.isdead`, `+target.isonmount` | **master bug**: `If True` where one `&&` term was unconvertible |
+
+**686 changed, 0 added, 0 removed.** Per plugin: Oblivion 266, Nehrim 357,
+Morrowind_ob 42, Knights 21. 77 distinct causes; the 20 above cover 610.
+
+Losses were audited separately (`temp/drift_losses.py`, which lists every
+script that lost an event, a call or a write): 15 empty `OnEffectFinish`, 2
+empty `OnEffectStart`, 1 empty `OnPackageEnd`, 1 empty `OnDeath` -- all inert
+-- plus the renames above. **Nothing executable was lost.**
+
+---
+
+## 20. Conversion speed after the rewrite
+
+Timed with `temp/time_scripts.py` (wall time of one `--scripts-only` run,
+minus the compiler's own `Batch compile` figure), master head in the
+`temp/headtree` worktree:
+
+| Tree | Total | Compile | Convert + I/O |
+|---|---:|---:|---:|
+| master `e96bb7b` | 37.5s | 9.3s | 28.2s |
+| rewrite, before | 39.3s | 9.6s | 29.7s |
+| **rewrite, after** | **36.1s** | 9.4s | **26.7s** |
+
+**The converter itself is 2.5x faster; the stage is not.** cProfile over 600
+real SCPT bodies, a fresh `ScriptConverter` each (which is what `pipeline.py`
+does): master 6.55s, rewrite 2.59s. Master's top cost was
+`symbols.property_declarations` -> `_safe_property_name`, **836,018 calls for
+2.58s of 6.5s**; the assembler does not call it that way and it is gone.
+
+The stage only gains ~3s of that because 4s of the 29s is `load_from_export`,
+`build_ref_as_int_map` and file I/O -- all outside the converter.
+
+🛑 **Profile with a FRESH converter per script.** Reusing one across the sample
+carries `property_refs` forward (the `convert_standalone` contract), so the
+table grows to 864 entries and `properties()` scans all of them -- an O(n^2)
+artifact of the harness that does not exist in the pipeline.
+
+### The one optimisation taken: `nodes.walk_expr`
+
+It did seven blind `getattr` calls per node for fields most classes do not
+have -- **1,869,248 calls / 0.37s per 600 scripts**, and 2.3M `getattr`.
+Memoising each node class's actual child fields cuts it to **651,248 calls /
+0.11s**. Semantic diff unchanged at 266 for Oblivion, so it is behaviour-free.
+
+**Not taken:** `cross_ref.get_cell_family` scans all 38k EditorIDs per call
+(3.2M `startswith`), but only 55 calls happen in a whole run -- 0.24s of 36s,
+already memoised upstream. `unique_placed_ref` is a one-time index build.
+
+## 21. Dead code, unused imports, duplicated code -- the REAL tools
+
+🛑 **A word-frequency scan is not a dead-code check.** The first pass here
+counted `\w+` occurrences per name, never looked at imports at all, and
+answered "duplicated code" from a string-literal metric that is not clone
+detection. It reported CLEAN. `ruff` then found **14 errors it could not see**.
+
+    python -m ruff check script_convert/ --select F,E9,B,ARG,RET,SIM,C4,PIE,PERF
+    python -m pylint --disable=all --enable=duplicate-code         --min-similarity-lines=4 script_convert/
+
+### 9 SHADOWED `COMMAND_ROWS` entries (ruff F601)
+
+`getdisplayname`, `equipitem2`, `removeallitems`, `moveto`, `getdisabled`,
+`isdisabled`, `setdoordefaultopen`, `setsize`, `getpcmiscstat` were each
+defined TWICE. Python keeps the last, and in all 9 the later row is the richer
+one, so behaviour was already correct -- but `getdisabled`/`isdisabled` would
+have lost `objref_self`/`bare_bool`/`zero_arg` had the order ever flipped, and
+a table with silently dead rows invites editing the wrong one. Removed; 481
+rows remain, every surviving row verified byte-identical.
+
+### 3 unused imports, 1 legitimate re-export, 4 fake `noqa`
+
+`converter._lexer`, `emit/expr.re` and `resolve.re` were dead (`expr.py` looked
+used only because `re.` appears in its PROSE). `constants` re-exports
+`resolve_property_formid`/`_digit_stripped_formid` for
+`tes5_import/dialog_converter.py:1348` -- kept, now marked `# noqa: E402,F401`.
+Four `# noqa: plugin-path` markers were a project convention nothing reads,
+which ruff correctly reported as MALFORMED. DELETED: `output_dir` and the
+`.psc` literal already say what the marker said. Rewriting them as ordinary
+trailing comments would have been WRONG -- the doc rules ban an inline comment,
+and `_plain_comments`/`_narration` only match a line whose first character is
+`#`, so a TRAILING comment is invisible to both and the gate cannot catch it.
+
+### Duplicated code: pylint at 4 lines found ONE clone
+
+`pipeline.py:1446` inlined `symbols.property_declarations` -- the same
+merge/dedupe/emit loop, differing only in inserting at an index rather than
+appending. Replaced with a call to the function the file already imports.
+Also `symbols.py:263`: three `elif isinstance(...)` arms with identical bodies
+collapsed to one `isinstance(value, (Call, Member, Ident))` (8 lines -> 3).
+
+Nothing at 5 or 8 lines. **Rated 10.00/10 after the fix.**
+
+### Genuinely dead definitions: still none
+
+**0 unreferenced functions or classes** and **0 unreferenced module
+constants**, once `@command` handlers are excluded (they are reached through
+the registry, so a name-based scan reports all 32 as false positives).
+
+`ruff ARG` flags 22 unused parameters; nearly all are the uniform dispatch
+signature (`@command` handlers, `_CONVERTER_VALUES` lambdas, the
+`(files, texts, trees)` check signature) and must stay. One was real and mine:
+`gate_capture(conv, ...)` never read `conv`. Removed.
+
+**Net: -5 CODE lines, and all four plugins still compile 100% with the
+semantic diff unchanged at 686 (266/357/42/21).**
+
+Of the plan's deletion list, these are **already gone**: `_tree_expression`,
+`USE_TREE_EXPRESSIONS`, `_postprocess_lines`, `_shadow_controls_writes`,
+`_fix_ref_zero`, `_is_ref_value`, `emit_line`, `_top_level_bool_op`,
+`_CALL_HEAD_RE`, `emits_bool`, `_reset`, and the `_coerce_*` family. What
+remains under those names is a MENTION IN A DOCSTRING, not code.
+
+**`emit_source` survives at 27 sites and should stay.** The anti-pattern it
+scored was the AST -> text -> AST *round trip*, and that is measurably gone:
+`reparse-round-trip` reads 0 and `parser.parse` has no non-test call site left
+in the package. Every surviving call renders a node back to source for a
+`;NE:`/`;TODO:` comment or a name lookup -- never to re-parse it.
+
+**Genuinely left (S6):** `pipeline._fix_udf_call_arg_types` (51 lines) and
+`_comment_dangling` (35) still read generated `.psc`. Measured live: the UDF
+pass fires on **2 Morrowind_ob scripts**, zero elsewhere. Removing them means
+building the UDF signature table before emission, not deleting a dead path.
+
+### Line count: the rewrite is BIGGER than master
+
+Canonical rule (non-blank, not comment-only, docstrings included):
+
+| | CODE | COMMENT | BLANK |
+|---|---:|---:|---:|
+| master `e96bb7b` | 9,678 | 4,242 | 1,529 |
+| rewrite | 10,259 | 3,092 | 1,942 |
+| delta | **+581** | -1,150 | +413 |
+
+`converter.py` fell 3,701 -> 1,846, but `commands.py` (1,008), `assemble.py`
+(781) and `resolve_name.py` (204) are new. **Four files are still over 1,000**
+(converter, pipeline, constants, commands) and the package is 7,652 by the
+fitness counter against a 6,500 target -- **1,152 lines short, with no dead
+code left to delete.** Reaching it needs the S6/S7 structural work, not tidying.

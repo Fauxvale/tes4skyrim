@@ -1000,9 +1000,7 @@ def regressions(now: dict, base: dict) -> list:
             if was and is_ > was * SPEED_TOLERANCE:
                 out.append('%s: %s -> %s ms (>%sx slower)'
                            % (key, was, is_, SPEED_TOLERANCE))
-        elif direction == LOWER and is_ > was:
-            out.append('%s: %s -> %s (worse)' % (key, was, is_))
-        elif direction == HIGHER and is_ < was:
+        elif (is_ > was) if direction == LOWER else (is_ < was):
             out.append('%s: %s -> %s (worse)' % (key, was, is_))
     return out
 

@@ -1310,7 +1310,6 @@ COMMAND_ROWS = {
     'getnumfollowers': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     'getnthfollower': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     'getspells': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
-    'getdisplayname': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     'setattackdamage': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     'togglespecialanim': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     'setavmod': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
@@ -1366,7 +1365,6 @@ COMMAND_ROWS = {
     'getitemcount': Cmd('GetItemCount', MAP, flags='actor_only objref_self objref_shared'),
     'equipitem': Cmd('EquipItem', MAP, flags='actor_only'),
     'unequipitem': Cmd('UnequipItem', MAP, flags='actor_only'),
-    'removeallitems': Cmd('RemoveAllItems', MAP),
     'getnumitems': Cmd('GetNumItems', MAP),
     'getinventoryobject': Cmd('GetNthForm', MAP),
     'drop': Cmd('DropObject', MAP),
@@ -1380,7 +1378,6 @@ COMMAND_ROWS = {
     'dispelallspells': Cmd('DispelAllSpells', MAP, flags='actor_only zero_arg'),
 
     #: --- Movement / Position ---
-    'moveto': Cmd('MoveTo', MAP),
     'getdistance': Cmd('GetDistance', MAP, flags='actor_only objref_shared'),
     'getparentcell': Cmd('GetParentCell', MAP, flags='objref_self'),
     'setposition': Cmd('SetPosition', MAP),
@@ -1519,7 +1516,6 @@ COMMAND_ROWS = {
     # argument types and `NS`/`Silent` suppress the equip sound — Skyrim carries
     # both on the SAME natives (abSilent), so they map like the variants above
     # rather than being neutralised.
-    'equipitem2': Cmd('EquipItem', MAP),
     'equipitem2ns': Cmd('EquipItem', MAP),
     'unequipitem2': Cmd('UnequipItem', MAP),
     'unequipitem2ns': Cmd('UnequipItem', MAP),
@@ -1618,7 +1614,6 @@ COMMAND_ROWS = {
     'setfactionreaction': Cmd('SetReaction', MAP, bare=True),
     'modfactionreaction': Cmd('ModReaction', MAP, bare=True),
     'triggerscreenblood': Cmd('Game.TriggerScreenBlood', MAP, bare=True),
-    'setdoordefaultopen': Cmd('SetOpen', MAP),
     'removeme': Cmd('Delete', MAP),
 
     #: --- Object state ---
@@ -1642,7 +1637,6 @@ COMMAND_ROWS = {
 
     #: --- Additional Actor/Combat ---
     'getcombattarget': Cmd('GetCombatTarget', MAP, flags='zero_arg'),
-    'isdisabled': Cmd('IsDisabled', MAP),
     'getparentcellowner': Cmd('GetParentCell', MAP),
     'hasmagiceffect': Cmd('HasMagicEffect', MAP, flags='actor_only'),
     'setopendoor': Cmd('SetOpen', MAP),
@@ -1663,12 +1657,10 @@ COMMAND_ROWS = {
 
     #: --- Object Interaction ---
     'removeallitems': Cmd('RemoveAllItems', MAP, flags='actor_only objref_shared'),
-    'getdisabled': Cmd('IsDisabled', MAP),
     # Special handlers in _emit_function (see there for why each is inert):
     # path-based music has no Skyrim API, IsCasting maps to the animation graph.
     # The same engine function (0x1153) under its other authored spelling —
     # Knights.esp writes `<horse>.IsPlayersLastRiddenHorse == 0`.
-    'setsize': Cmd('SetScale', MAP),
 
     # --- Cell/Location ---
     # 'isininterior' handled by special handler in _emit_function
@@ -1706,7 +1698,6 @@ COMMAND_ROWS = {
     #: --- Player Skill/Misc ---
     'modpcskill': Cmd('Game.AdvanceSkill', MAP, bare=True, flags='av'),
     'modpcmiscstat': Cmd('Game.IncrementStat', MAP, bare=True),
-    'getpcmiscstat': Cmd('Game.QueryStat', MAP, bare=True),
 
     #: --- Trap/Custom functions that are quest-specific ---
 
@@ -2230,7 +2221,7 @@ SERVICE_MENU_CALL = {
 # ===========================================================================
 
 #: Moved to resolve.py; re-exported so the docs/ §5 boundary is unchanged.
-from script_convert.resolve import (  # noqa: E402
+from script_convert.resolve import (  # noqa: E402,F401
     resolve_property_formid, _digit_stripped_formid,
 )
 

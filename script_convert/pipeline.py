@@ -260,7 +260,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
             for name in os.listdir(static_dir):
                 if not name.endswith('.psc'):
                     continue
-                stale_psc = os.path.join(output_dir, name)   # noqa: plugin-path (.psc filename)
+                stale_psc = os.path.join(output_dir, name)
                 stale_pex = os.path.join(os.path.dirname(output_dir),
                                          name[:-4] + '.pex')
                 for stale in (stale_psc, stale_pex):
@@ -272,7 +272,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
             for name in os.listdir(static_dir):
                 if name.endswith('.psc'):
                     shutil.copy2(os.path.join(static_dir, name),
-                                 os.path.join(output_dir, name))   # noqa: plugin-path (.psc filename)
+                                 os.path.join(output_dir, name))
 
     # Phase 1: Build cross-reference graph
     print('  Building cross-reference graph...')
@@ -484,7 +484,7 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
 
     total = stats['scpt_ok'] + stats['info_ok'] + stats['qust_ok']
     errs = stats['scpt_err'] + stats['info_err'] + stats['qust_err']
-    print(f'\n  Script conversion complete:')
+    print('\n  Script conversion complete:')
     print(f'    SCPT: {stats["scpt_ok"]}/{stats["scpt_total"]} converted')
     print(f'    INFO: {stats["info_ok"]}/{stats["info_total"]} fragments')
     print(f'    QUST: {stats["qust_ok"]}/{stats["qust_total"]} stage scripts')
@@ -520,7 +520,7 @@ def write_psc(output_dir: str, script_name: str, text: str) -> None:
     every `.psc` the converter had just written.  It needs nothing but the
     file's own lines, so it belongs at the write.
     """
-    path = os.path.join(output_dir, script_name + '.psc')   # noqa: plugin-path
+    path = os.path.join(output_dir, script_name + '.psc')
     with open(path, 'w', encoding='utf-8') as fh:
         fh.write(_comment_dangling(text))
 
@@ -595,7 +595,7 @@ def _fix_udf_call_arg_types(output_dir: str, sigs: dict, callers: dict) -> None:
                           f'{prop}.TES4Call({", ".join(cast)})'))
         if not edits:
             continue
-        path = os.path.join(output_dir, script_name + '.psc')   # noqa: plugin-path
+        path = os.path.join(output_dir, script_name + '.psc')
         try:
             with open(path, encoding='utf-8') as fh:
                 text = fh.read()
@@ -1443,15 +1443,9 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 # — so without this seed the same name is declared twice
                 # ("property with `TES4Unlock_...` name already exists").
                 declared = {g.lower() for g in quest_globals}
-                count = 0
-                for pname, ptype in sorted(merged.values(), key=lambda x: x[0].lower()):
-                    safe = _safe_property_name(pname)
-                    if safe.lower() in declared:
-                        continue
-                    declared.add(safe.lower())
-                    out_lines.insert(insert_idx + count, f'{ptype} Property {safe} Auto')
-                    count += 1
-                out_lines.insert(insert_idx + count, '')
+                lines = property_declarations(
+                    {n: t for n, t in merged.values()}, declared)
+                out_lines[insert_idx:insert_idx] = lines + ['']
 
             # GetInCell prefix-family helpers the stage bodies call by name.
             out_lines.extend(conv.get_cell_family_helpers())

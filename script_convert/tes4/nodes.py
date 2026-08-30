@@ -258,6 +258,30 @@ class Script:
 # Traversal
 # --------------------------------------------------------------------------
 
+#: Expression fields that hold a child node, checked in this order.
+_CHILD_FIELDS = ('left', 'right', 'operand', 'owner', 'target', 'index',
+                 'receiver')
+
+#: Per node class: which of `_CHILD_FIELDS` it declares, and whether it has args.
+_CHILDREN: dict = {}
+
+
+def _child_fields(cls) -> tuple:
+    """`(child field names, has args)` for one node class, memoised.
+
+    Blind `getattr` over all seven fields cost 2.3M calls per 600 scripts,
+    nearly all returning None.
+    """
+    known = _CHILDREN.get(cls)
+    if known is None:
+        names = tuple(f for f in _CHILD_FIELDS if hasattr(cls, f)
+                      or f in getattr(cls, '__annotations__', ()))
+        known = (names, hasattr(cls, 'args')
+                 or 'args' in getattr(cls, '__annotations__', ()))
+        _CHILDREN[cls] = known
+    return known
+
+
 def walk_expr(node) -> Iterator[Expr]:
     """Every node reachable from an expression, itself included.
 
@@ -267,11 +291,14 @@ def walk_expr(node) -> Iterator[Expr]:
     if node is None:
         return
     yield node
-    for attr in ('left', 'right', 'operand', 'owner', 'target', 'index',
-                 'receiver'):
-        yield from walk_expr(getattr(node, attr, None))
-    for arg in getattr(node, 'args', ()) or ():
-        yield from walk_expr(arg)
+    fields, has_args = _child_fields(type(node))
+    for attr in fields:
+        child = getattr(node, attr, None)
+        if child is not None:
+            yield from walk_expr(child)
+    if has_args:
+        for arg in node.args or ():
+            yield from walk_expr(arg)
 
 
 def walk_stmts(body) -> Iterator[Stmt]:

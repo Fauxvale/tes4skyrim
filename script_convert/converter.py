@@ -4,7 +4,6 @@ import re
 
 from script_convert.emit import expr as _expr
 from script_convert.emit import script as _script
-from script_convert.tes4 import lexer as _lexer
 from script_convert.tes4 import nodes as _tes4_nodes
 from script_convert.constants import (
     BLOCK_FILTER_PARAM, COMMAND_ROWS, DISPATCH_EVENTS, ENUM_ACTOR_VALUES,

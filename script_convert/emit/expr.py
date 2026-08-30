@@ -17,7 +17,6 @@ bindings.  So every function here takes the converter and may write to it.
 
 from __future__ import annotations
 
-import re
 
 from script_convert.constants import (
     BASE_FORM_TYPES, PAPYRUS_BOOL_FUNCTIONS, EVENT_REF_PARAMS, MISMATCH_TYPES,
