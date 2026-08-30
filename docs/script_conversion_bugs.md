@@ -575,259 +575,79 @@ tree. Semantic diff 475 -> 515: 40 scripts whose interval is now correct.
 
 ---
 
-## 18. Nehrim's 161 compile failures — three causes, all generic
+## 21. `Set X to <literal>` dropped when the block filter was unconvertible — FIXED
 
-`--scripts-only` on Nehrim failed 161 of 3,488 scripts. All four plugins now
-compile 100%: Oblivion 16,519/16,519, Nehrim 3,488/3,488, Morrowind_ob
-17,970/17,970, Knights 635/635.
+168 Nehrim scripts (`EP0001Kuecken` et al.) lost `Set EPWert to 15`. `EPWert`
+is the argument to the OBSE XP-award call in `OnDeath`, so every affected
+creature awarded **0 XP**.
 
-### `;/` opens a Papyrus BLOCK comment — 159 of the 161
+Cause: a `begin OnHitWith <weapon>` filter was judged unconvertible whenever
+the body had already bound the weapon as a property under its own narrow type
+(`Weapon`), and the whole body was then emitted commented out. A base record
+compares to a `Form` event parameter perfectly well. `_block_filter_guard` now
+accepts `existing in _BASE_OBJECT_PAPYRUS` against a `Form` parameter.
 
-TES4 has only line comments, so a German divider written `;/////` is inert
-there. Papyrus reads `;/` as the start of `;/ ... /;` and swallows the rest of
-the file. Because the compiler parses every script on the header path, ONE such
-line in `TES4_BergklosterZugbrueckeSCRIPT` failed **159 unrelated scripts** with
-"unexpected end of file" at a line past the end of a 206-line file.
-
-Master emitted `; /////` (a space after the semicolon) and never hit it.
-`emit/script._safe_comments` now breaks the pair on every emitted comment.
-Measured: 86 occurrences across 14 Nehrim scripts; zero in the other 3 plugins.
-
-### A bare `GetInWorldspace` means the PLAYER
-
-`Player.GetInWorldspace X` parses with no receiver in a `ScriptEffectStart`
-block, and the `RAW` row defaulted `{ref}` to `Self` — an ActiveMagicEffect,
-which has no `GetWorldSpace`. A `Cmd` row may now name its bare-receiver
-subject as `defaults={'ref': ...}`, reusing the argument-default vocabulary
-rather than adding a field for one command.
-
-### An int-assigned `ref` that also holds a base record must be `Form`
-
-`resolve_ref_types` dropped any variable with `int_assign` and no `form_type`,
-leaving it `ObjectReference`. TES4's clear idiom (`let r := 0`) sits in the same
-variable as a real record, and Papyrus accepts neither in the other's type:
-`AAGeneralUpdateQuest.rCrosshairsLast` holds both `0` and the ARMO `JailShoes`.
-`Form` is the one handle that takes every record, so the mixture WIDENS rather
-than narrowing. (`ref_as_base_form` could not see it: the cross-ref scanner
-matches `set X to Y`, and this script uses OBSE's `let X := Y`.)
-
-### A trailing cast is only "already cast" if it covers the WHOLE expression
-
-`_cast` returned early on any text ending in `as Int`. `100.0 -
-X.GetValue() as Int` ends that way while casting only the right operand, so the
-subtraction stayed Float and would not assign to an Int. The early return now
-also requires `not _needs_parens(text)`.
+Same cause, same fix: `TES4_CGRopeBucketScript` — shooting the CharacterGen
+rope bucket with an iron arrow advances MQ01 to stage 58, and the body was
+disabled — plus 8 more Nehrim scripts (`MQ06Golem01Script`: `RemoveSpell`,
+two `EffectShader.Stop`, a `Say`). Nehrim went from 8 unconvertible filters
+to 0; Oblivion's remaining 8 are genuine (no parameter carries the filtered
+object).
 
 ---
 
-## 19. Semantic drift vs master: 686 scripts, every cause classified
+## 22. `If True` where one `&&` term had no equivalent — FIXED
 
-Master-head (`e96bb7b`) baselines for all four plugins are in `temp/psc_master`.
-Every difference was bucketed by its exact `_diff_model` signature (71 causes)
-and every LOSS of an event, call or write was listed individually.
-
-**No regressions remain.** The drift splits three ways.
-
-### Master bugs this rewrite FIXES
-
-| Scripts | Defect in master |
-|---|---|
-| 165 | `Set EPWert to 15` DROPPED — the value feeds Nehrim's XP-award call, so 165 creatures awarded 0 XP |
-| 76 | Sentence spacing stripped from message text (`skill.Anyone`) |
-| 34 | An unused `Actor Property mySelf Auto` emitted, shadowing nothing |
-| 18 | `;NE: no converted music` where a real `MusicType` resolves — music now plays |
-| 9 | `TES4_CGRopeBucketScript` and 8 Nehrim scripts had a whole body commented out: a `begin OnHitWith <weapon>` filter was judged unconvertible because the body binds the weapon property FIRST. A base record compares to a `Form` parameter fine. Shooting the CharacterGen rope bucket now advances MQ01 to stage 58 again |
-| 8 | `If True` where one term of a `&&` was unconvertible — the freeze spell fired on every target. `_logical` keeps the convertible terms |
-| 1 | `SEObeliskNewSCRIPT`: `setDestroyed 0` and `setDestroyed 1` BOTH became `DestroyAfterAnimation`, so the "safety net" flipped nothing |
-
-### Deliberate improvements, semantically identical
-
-- `GetValue() as Int` -> `GetValueInt()` (173), dropping a redundant `as Int`
-- Empty events dropped: `OnEffectFinish` (15), `OnEffectStart` (2),
-  `OnPackageEnd`, `OnDeath` — an empty Papyrus event does nothing
-- Redundant `(X as Actor)` removed where the method is on ObjectReference
-  (`GetParentCell`, 23) — includes 6 of the 7 gated CharacterGen diffs
-- `HasLOS(...) == 1` -> `HasLOS(...)`; `Self.GetAngleZ()` vs `GetAngleZ()`
-- Correct nesting: master emitted every nested body flat
-- The measure-then-deliver `Say` pair collapsed (8), which master played twice
-
-### Regressions found and FIXED during this pass
-
-| Was | Fix |
-|---|---|
-| An OnActivate with an EMPTY body was dropped, losing the door-relock preamble AND the activation consume | `events()` keeps a block that `_consumes_activation` reports, body or not |
-| `TES4Polyfill.EnterOblivionGate` was never emitted — the gate's identity is known only on the line that discards it | `assemble.gate_capture`, keyed on the authored `set MQ00.nearOblivionGate to 0` |
-| `ModPCSkill`/`AdvancePCSkill` emitted `(Self as Actor).ModActorValue(...)` — `None` on the Quest scripts that call it, so 12 scripts' skill gains did nothing | `_AV_PLAYER_ONLY` routes both to `Game.GetPlayer()`. (`Game.AdvanceSkill` is NOT the right target: per the CK wiki it adds skill-USAGE progress and "won't necessarily change the Skill itself", where TES4's `ModPCSkill Blade 10` raises the skill by 10) |
-| `TES4Polyfill.RestoreFallDamage` was never emitted — `suppressed_fall_damage` had no setter after the rewrite | derived in `_load_facts` from the tree; `fall_damage` now receives the assembled body so it MERGES into the script's existing `OnEffectFinish` instead of declaring a second one |
-
-### Gated CharacterGen scripts
-
-7 changed, each verified: 6 are the redundant-cast and bool-collapse
-improvements above; the 7th (`CGRopeBucketScript`) is a body master had
-disabled entirely.
-
-### The results table
-
-Regenerate with `python temp/drift_causes.py` against the master-head baselines
-in `temp/psc_master/` (built from the `temp/headtree` worktree at `e96bb7b`).
-Every row is verified; **none is a regression**.
-
-| Scripts | Plugin | Model difference | Verdict |
-|---:|---|---|---|
-| 165 | Nehrim | `writes: +epwert` / `numbers[15]: None -> 1` | **master bug**: `Set EPWert to 15` dropped, so the XP-award call got 0 |
-| 163 | Oblivion | `gamedayspassed.getvalue` -> `getvalueint` | same value, drops a redundant `as Int` |
-| 76 | Oblivion | `strings[...skill.Anyone]` -> `[...skill. Anyone]` | **master bug**: sentence spacing stripped from message text |
-| 34 | Oblivion | `properties[myself]: 'Actor' -> None` | unused property no longer emitted |
-| 25 | Oblivion | `numbers[1]: 3 -> 2` | `HasLOS(...) == 1` collapsed to `HasLOS(...)` |
-| 23 | Oblivion | `getparentcell` -> `<ref>.getparentcell` | redundant `(X as Actor)` cast removed |
-| 18 | Nehrim | `+MusicType` properties, `+.Add()` calls | **master bug**: `;NE: no converted music` where a real MUSC resolves |
-| 17 | Oblivion | `properties[combattarget]: 'ObjectReference' -> 'Actor'` | narrower, correct type |
-| 13 | Oblivion | `debug.messagebox` -> `tes4_showmsg` + `Message` property | multi-button MessageBox (bugs doc #11) |
-| 12 | all | `game.advanceskill` -> `modactorvalue` on `Game.GetPlayer()` | **regression FIXED**: skill gains ran on `(Self as Actor)` = None |
-| 11 | Oblivion | two `<ref>.say/1` calls -> one | measure-then-deliver Say pair collapsed |
-| 10 | Oblivion | `numbers[1]: 1 -> None` | **master bug**: `X == Y == 1`, a double comparison |
-| 8 | Oblivion | `events: -oneffectfinish` | empty event dropped -- does nothing in Papyrus |
-| 6 | Oblivion | `numbers[0.25] -> [0.5]` | tree-derived `uses_timer` (bugs doc #17) |
-| 6 | Oblivion | `-oneffectfinish` `+onupdate` | the same, plus the poll gaining its own event |
-| 5 | Oblivion | `getpositionx` -> `self.getpositionx` | explicit receiver; identical at runtime |
-| 5 | Nehrim | `+ghosteffectspektral.stop`, `+removespell` | **master bug**: body commented out by an unconvertible block filter |
-| 5 | Morrowind | `properties[actorref]: 'Actor' -> None` | property shadowed a UDF parameter of the same name |
-| 4 | Oblivion | `properties[darkbrotherhood]: None -> 'Faction'` | property now bound |
-| 4 | Nehrim | `+target.isdead`, `+target.isonmount` | **master bug**: `If True` where one `&&` term was unconvertible |
-
-**686 changed, 0 added, 0 removed.** Per plugin: Oblivion 266, Nehrim 357,
-Morrowind_ob 42, Knights 21. 77 distinct causes; the 20 above cover 610.
-
-Losses were audited separately (`temp/drift_losses.py`, which lists every
-script that lost an event, a call or a write): 15 empty `OnEffectFinish`, 2
-empty `OnEffectStart`, 1 empty `OnPackageEnd`, 1 empty `OnDeath` -- all inert
--- plus the renames above. **Nothing executable was lost.**
+4 Nehrim spell scripts (`SpellEinfrieren10Prozent`) collapsed
+`Target.isActor == 0 || Target.IsDead() || Target.IsOnMount()` to `If True`,
+so the freeze fired on **every** target. `_logical` now keeps the convertible
+terms and comments only the dead one.
 
 ---
 
-## 20. Conversion speed after the rewrite
+## 23. Sentence spacing stripped from message text — FIXED
 
-Timed with `temp/time_scripts.py` (wall time of one `--scripts-only` run,
-minus the compiler's own `Batch compile` figure), master head in the
-`temp/headtree` worktree:
+76 Oblivion scripts ran two sentences together in a `MessageBox`: the Arena
+poster read `...valor and skill.Anyone can gamble...`. The authored SCTX has
+the space; it was lost on the way out.
 
-| Tree | Total | Compile | Convert + I/O |
-|---|---:|---:|---:|
-| master `e96bb7b` | 37.5s | 9.3s | 28.2s |
-| rewrite, before | 39.3s | 9.6s | 29.7s |
-| **rewrite, after** | **36.1s** | 9.4s | **26.7s** |
+---
 
-**The converter itself is 2.5x faster; the stage is not.** cProfile over 600
-real SCPT bodies, a fresh `ScriptConverter` each (which is what `pipeline.py`
-does): master 6.55s, rewrite 2.59s. Master's top cost was
-`symbols.property_declarations` -> `_safe_property_name`, **836,018 calls for
-2.58s of 6.5s**; the assembler does not call it that way and it is gone.
+## 24. `setDestroyed 0` and `setDestroyed 1` both destroyed — FIXED
 
-The stage only gains ~3s of that because 4s of the 29s is `load_from_export`,
-`build_ref_as_int_map` and file I/O -- all outside the converter.
+`SEObeliskNewSCRIPT`'s deferred-destroy rewrite dropped the boolean, so
+`_deferred_destroy` turned BOTH directions into
+`DestroyAfterAnimation(...)` — the "safety net for destroyed status" flipped
+nothing. Only `... , true` defers now.
 
-🛑 **Profile with a FRESH converter per script.** Reusing one across the sample
-carries `property_refs` forward (the `convert_standalone` contract), so the
-table grows to 864 entries and `properties()` scans all of them -- an O(n^2)
-artifact of the harness that does not exist in the pipeline.
+---
 
-### The one optimisation taken: `nodes.walk_expr`
+## 25. Three converter regressions in the parse-tree rewrite — FIXED
 
-It did seven blind `getattr` calls per node for fields most classes do not
-have -- **1,869,248 calls / 0.37s per 600 scripts**, and 2.3M `getattr`.
-Memoising each node class's actual child fields cuts it to **651,248 calls /
-0.11s**. Semantic diff unchanged at 266 for Oblivion, so it is behaviour-free.
+Found by diffing generated output against master head, not by compiling.
 
-**Not taken:** `cross_ref.get_cell_family` scans all 38k EditorIDs per call
-(3.2M `startswith`), but only 55 calls happen in a whole run -- 0.24s of 36s,
-already memoised upstream. `unique_placed_ref` is a one-time index build.
+**An empty `OnActivate` was dropped.** In TES4 the PRESENCE of the block
+consumes the activation, so an empty body is meaningful. Dropping it lost both
+the consume and the door-relock preamble (`ND04TitanSCRIPT`,
+`ARLesserWelkyndStoneStaticScript`). `events()` now keeps a block that
+`_consumes_activation` reports, body or not.
 
-## 21. Dead code, unused imports, duplicated code -- the REAL tools
+**`TES4Polyfill.EnterOblivionGate` was never emitted.** The gate's identity is
+known only on the authored line that discards it (`set MQ00.nearOblivionGate
+to 0`), so the capture must precede the body. Re-added as
+`assemble.gate_capture`; without it `CloseCurrentOblivionGate` had nowhere to
+send the player back to.
 
-🛑 **A word-frequency scan is not a dead-code check.** The first pass here
-counted `\w+` occurrences per name, never looked at imports at all, and
-answered "duplicated code" from a string-literal metric that is not clone
-detection. It reported CLEAN. `ruff` then found **14 errors it could not see**.
+**`ModPCSkill`/`AdvancePCSkill` emitted `(Self as Actor).ModActorValue(...)`**
+— `None` on the Quest scripts that call it, so 12 scripts' skill gains did
+nothing (`DAOghmaInfiniumScript` has 9). Both are player commands by
+definition and now route to `Game.GetPlayer()`. `Game.AdvanceSkill` is NOT the
+right target: per the CK wiki it adds skill-USAGE progress and "won't
+necessarily change the Skill itself", where `ModPCSkill Blade 10` raises the
+skill by 10.
 
-    python -m ruff check script_convert/ --select F,E9,B,ARG,RET,SIM,C4,PIE,PERF
-    python -m pylint --disable=all --enable=duplicate-code         --min-similarity-lines=4 script_convert/
-
-### 9 SHADOWED `COMMAND_ROWS` entries (ruff F601)
-
-`getdisplayname`, `equipitem2`, `removeallitems`, `moveto`, `getdisabled`,
-`isdisabled`, `setdoordefaultopen`, `setsize`, `getpcmiscstat` were each
-defined TWICE. Python keeps the last, and in all 9 the later row is the richer
-one, so behaviour was already correct -- but `getdisabled`/`isdisabled` would
-have lost `objref_self`/`bare_bool`/`zero_arg` had the order ever flipped, and
-a table with silently dead rows invites editing the wrong one. Removed; 481
-rows remain, every surviving row verified byte-identical.
-
-### 3 unused imports, 1 legitimate re-export, 4 fake `noqa`
-
-`converter._lexer`, `emit/expr.re` and `resolve.re` were dead (`expr.py` looked
-used only because `re.` appears in its PROSE). `constants` re-exports
-`resolve_property_formid`/`_digit_stripped_formid` for
-`tes5_import/dialog_converter.py:1348` -- kept, now marked `# noqa: E402,F401`.
-Four `# noqa: plugin-path` markers were a project convention nothing reads,
-which ruff correctly reported as MALFORMED. DELETED: `output_dir` and the
-`.psc` literal already say what the marker said. Rewriting them as ordinary
-trailing comments would have been WRONG -- the doc rules ban an inline comment,
-and `_plain_comments`/`_narration` only match a line whose first character is
-`#`, so a TRAILING comment is invisible to both and the gate cannot catch it.
-
-### Duplicated code: pylint at 4 lines found ONE clone
-
-`pipeline.py:1446` inlined `symbols.property_declarations` -- the same
-merge/dedupe/emit loop, differing only in inserting at an index rather than
-appending. Replaced with a call to the function the file already imports.
-Also `symbols.py:263`: three `elif isinstance(...)` arms with identical bodies
-collapsed to one `isinstance(value, (Call, Member, Ident))` (8 lines -> 3).
-
-Nothing at 5 or 8 lines. **Rated 10.00/10 after the fix.**
-
-### Genuinely dead definitions: still none
-
-**0 unreferenced functions or classes** and **0 unreferenced module
-constants**, once `@command` handlers are excluded (they are reached through
-the registry, so a name-based scan reports all 32 as false positives).
-
-`ruff ARG` flags 22 unused parameters; nearly all are the uniform dispatch
-signature (`@command` handlers, `_CONVERTER_VALUES` lambdas, the
-`(files, texts, trees)` check signature) and must stay. One was real and mine:
-`gate_capture(conv, ...)` never read `conv`. Removed.
-
-**Net: -5 CODE lines, and all four plugins still compile 100% with the
-semantic diff unchanged at 686 (266/357/42/21).**
-
-Of the plan's deletion list, these are **already gone**: `_tree_expression`,
-`USE_TREE_EXPRESSIONS`, `_postprocess_lines`, `_shadow_controls_writes`,
-`_fix_ref_zero`, `_is_ref_value`, `emit_line`, `_top_level_bool_op`,
-`_CALL_HEAD_RE`, `emits_bool`, `_reset`, and the `_coerce_*` family. What
-remains under those names is a MENTION IN A DOCSTRING, not code.
-
-**`emit_source` survives at 27 sites and should stay.** The anti-pattern it
-scored was the AST -> text -> AST *round trip*, and that is measurably gone:
-`reparse-round-trip` reads 0 and `parser.parse` has no non-test call site left
-in the package. Every surviving call renders a node back to source for a
-`;NE:`/`;TODO:` comment or a name lookup -- never to re-parse it.
-
-**Genuinely left (S6):** `pipeline._fix_udf_call_arg_types` (51 lines) and
-`_comment_dangling` (35) still read generated `.psc`. Measured live: the UDF
-pass fires on **2 Morrowind_ob scripts**, zero elsewhere. Removing them means
-building the UDF signature table before emission, not deleting a dead path.
-
-### Line count: the rewrite is BIGGER than master
-
-Canonical rule (non-blank, not comment-only, docstrings included):
-
-| | CODE | COMMENT | BLANK |
-|---|---:|---:|---:|
-| master `e96bb7b` | 9,678 | 4,242 | 1,529 |
-| rewrite | 10,259 | 3,092 | 1,942 |
-| delta | **+581** | -1,150 | +413 |
-
-`converter.py` fell 3,701 -> 1,846, but `commands.py` (1,008), `assemble.py`
-(781) and `resolve_name.py` (204) are new. **Four files are still over 1,000**
-(converter, pipeline, constants, commands) and the package is 7,652 by the
-fitness counter against a 6,500 target -- **1,152 lines short, with no dead
-code left to delete.** Reaching it needs the S6/S7 structural work, not tidying.
+**`TES4Polyfill.RestoreFallDamage` was never emitted** — `SuppressFallDamage`
+writes a GLOBAL GMST, so leaving it set disables fall damage permanently. The
+flag had no setter after the rewrite; now derived in `_load_facts` from the
+tree, and the restore MERGES into the script's existing `OnEffectFinish`
+rather than declaring a second one.
