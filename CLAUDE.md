@@ -441,19 +441,28 @@ relevant doc when working in that area.
 
 🛑 <a id="doc-rules"></a>**THE CODE RULES ARE A REQUIREMENT, NOT A GUIDELINE.
 EVERY `.py` FILE YOU TOUCH — ANYWHERE IN THE REPO — MUST PASS
-`arch_fitness.py --gate-file <path>`.** Not "improve it", not "as time
-allows" — pass. Enforced automatically by `.claude/hooks/doc_rules_gate.py`
-after every Edit/Write, so it is not yours to skip; each violation prints its
-`file:line` and its fix.
+`python tools/validate/code_rules.py --gate-file <path>`.** Not "improve it",
+not "as time allows" — pass. Enforced automatically by
+`.claude/hooks/doc_rules_gate.py` after every Edit/Write (it runs `--gate-diff`,
+which charges you for the lines you changed **plus the comments above them**),
+so it is not yours to skip; each violation prints what the rule means, its fix,
+and its `file:line`.
 
 - **Prose:** the only legal forms are a docstring, a ONE-line 120-char `#:`
   attribute doc, and a `# ----` section heading. A **docstring states the
-  CONTRACT** — what it does and returns, not the story of why. Rationale and
-  measurements go in `docs/`.
+  CONTRACT** — what it does, takes and returns, never the story of why.
+  Rationale and measurements go in `docs/`.
+- **A comment is prose wherever it sits** — the scanner tokenizes, so moving one
+  to the end of a line hides nothing. Only a `# noqa` carrying a real ruff code
+  is exempt; nothing reads `# pragma`/`# type:` here, so they are prose too.
 - **Shape:** ≤60 lines and complexity ≤25 per function, ≤4 nesting, ≤10
   returns, ≤1000 lines per file, no class-level `dict`/`list`/`set`.
 - **Compress, never delete:** keep every measured count, script name and
-  mechanism; drop the narration. **No dates.**
+  mechanism; drop the narration. **No dates.** If prose carries a measurement
+  the code cannot state, move it to a `docs/` file and end the docstring with
+  `See: docs/<file>.md#anchor` — the gate checks the path and anchor exist.
+- **No dead code:** no unused import or variable, no undefined name, nothing
+  unreachable. `code_rules.py --dead-code` is the whole-program sweep.
 - An inline comment means the code cannot state its own intent — fix the code.
 
 | Doc | Covers |

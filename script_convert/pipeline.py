@@ -754,7 +754,6 @@ def _seq_counter_condition(rec: dict):
         quest = names.get(quest_fid, '')
         if name and quest:
             return quest, name, int(comp)
-    return None
 
 
 def _sequence_gate(rec: dict) -> str:

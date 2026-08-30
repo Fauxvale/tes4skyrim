@@ -28,7 +28,6 @@ Usage:
 import argparse
 import os
 import re
-import sys
 from collections import Counter, defaultdict
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

@@ -19,7 +19,7 @@ from fontTools.pens.svgPathPen import SVGPathPen
 from fontTools.ttLib import TTFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-import tools.generators.dwemer_palette  # noqa: E402  (needs the path above)
+from tools.generators import dwemer_palette  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 FONT = ROOT / "references" / "oblivion-font.ttf"

@@ -1,0 +1,262 @@
+"""The repo-wide code rules: the escape hatches that used to let edits pass.
+
+Each test names a bypass that was measured before the rules moved into
+`tools/validate/code_rules.py`.  They are pure in-memory calls -- no git, no
+subprocess -- so the whole file runs in well under a second.
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+from tools.validate import code_rules as CR
+
+ROOT = Path(__file__).resolve().parent.parent
+FAKE = Path('t.py')
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def sites(source, rule):
+    """Lines flagged for `rule` in `source`."""
+    found = CR.rule_sites(FAKE, source, with_tools=False)
+    return sorted(s[1] for s in found.get(rule, ()))
+
+
+def blame(before, after, touched, rule):
+    """Lines an edit owns for `rule`, given the lines it changed."""
+    text, tree = CR._parse(FAKE, after)
+    now = CR.rule_sites(FAKE, after, with_tools=False)
+    was = CR.rule_sites(FAKE, before, with_tools=False)
+    owned = CR._blame(now, was, set(touched), text, tree)
+    return sorted(s[1] for s in owned.get(rule, ()))
+
+
+# ---------------------------------------------------------------------------
+# Comments: the scanner must tokenize, not read the first character
+# ---------------------------------------------------------------------------
+
+
+OWN_LINE = '''"""M."""
+
+
+def f(x) -> int:
+    """D."""
+    # a measured 2026 census of 3,740 records
+    return x
+'''
+
+TRAILING = '''"""M."""
+
+
+def f(x) -> int:
+    """D."""
+    return x  # a measured 2026 census of 3,740 records
+'''
+
+
+def test_trailing_comment_is_not_an_escape_hatch():
+    """The same prose must be flagged wherever on the line it sits."""
+    assert sites(OWN_LINE, 'inline-comments') == [6]
+    assert sites(TRAILING, 'inline-comments') == [6]
+
+
+def test_no_comment_is_exempt_by_its_prefix():
+    """A directive is still a comment: nothing may be waved past by prefix.
+
+    An exemption keyed on `# noqa` would let any sentence through by prepending
+    one, and the repo's own `# noqa: plugin-path` (14 uses, no reader) shows
+    the costume is already worn.
+    """
+    for comment in ('# noqa: F401', '# noqa', '# noqa: plugin-path (.psc)',
+                    '# pragma: no cover', '# type: ignore'):
+        src = '"""M."""\nVALUE = 1  %s\n' % comment
+        assert sites(src, 'stray-comments') == [2], comment
+
+
+def test_banner_prefix_cannot_launder_prose():
+    """`# --- text ---` is not a heading; a heading is a bare rule line."""
+    src = '''"""M."""
+
+
+def f(x) -> int:
+    """D."""
+    # --- anything I want to say at length ---
+    return x
+'''
+    assert sites(src, 'inline-comments') == [6]
+
+
+# ---------------------------------------------------------------------------
+# Docstrings: a flat cap, never a multiple of the body
+# ---------------------------------------------------------------------------
+
+
+def _fn(doc_chars, body_lines):
+    """A function with a docstring of `doc_chars` over `body_lines` lines."""
+    body = '\n'.join('    a%d = %d' % (i, i) for i in range(body_lines))
+    return '"""M."""\n\n\ndef f():\n    """%s"""\n%s\n    return 0\n' % (
+        'x' * doc_chars, body)
+
+
+def test_long_body_does_not_buy_prose_budget():
+    """A 600-char docstring is over the cap however long the body is."""
+    assert sites(_fn(600, 10), 'bloated-docstrings') == [4]
+    assert sites(_fn(600, 40), 'bloated-docstrings') == [4]
+
+
+def test_short_body_keeps_the_tight_limit():
+    """A one- or two-line body gets one line of docstring."""
+    assert sites(_fn(200, 1), 'bloated-docstrings') == [4]
+    assert sites(_fn(60, 1), 'bloated-docstrings') == []
+
+
+def test_citation_line_is_not_counted_as_prose():
+    """The `See:` route must not be punished by the rule that asks for it."""
+    doc = 'x' * 70 + '\n\n    See: docs/pipeline_reference.md'
+    src = '"""M."""\n\n\ndef f():\n    """%s"""\n    return 0\n' % doc
+    assert sites(src, 'bloated-docstrings') == []
+
+
+# ---------------------------------------------------------------------------
+# Blame: what an edit owns
+# ---------------------------------------------------------------------------
+
+
+LEGACY = '''"""M."""
+
+
+def big(x) -> int:
+    """D."""
+    # legacy one
+    a = x + 1
+    # legacy two
+    b = a + 1
+    return b
+'''
+
+
+def test_legacy_comment_above_an_edited_line_is_owned():
+    """Editing a line adopts the comment sitting above it."""
+    after = LEGACY.replace('b = a + 1', 'b = a + 9')
+    assert blame(LEGACY, after, [9], 'inline-comments') == [8]
+
+
+def test_edit_with_no_comment_above_owes_nothing():
+    """The common case: 91% of one-line edits owe zero."""
+    after = LEGACY.replace('    """D."""', '    """D2."""')
+    assert blame(LEGACY, after, [5], 'inline-comments') == []
+
+
+def test_new_comment_is_owned():
+    """A comment the edit wrote is always its own."""
+    after = LEGACY.replace('    return b', '    # mine\n    return b')
+    assert 10 in blame(LEGACY, after, [10, 11], 'inline-comments')
+
+
+def test_shape_debt_is_not_inherited_by_a_small_edit():
+    """A one-line edit never adopts a long function's pre-existing shape."""
+    body = '\n'.join('    a%d = %d' % (i, i) for i in range(80))
+    src = '"""M."""\n\n\ndef f():\n    """D."""\n%s\n    return 0\n' % body
+    assert sites(src, 'long-functions') == [4]
+    assert blame(src, src.replace('a5 = 5', 'a5 = 6'), [10],
+                 'long-functions') == []
+
+
+def _sized(body_lines):
+    """A function with a one-line docstring over `body_lines` of body."""
+    return _fn(4, body_lines)
+
+
+def _branchy(branches):
+    """A function whose cyclomatic complexity is `branches` plus one."""
+    body = '\n'.join('    if x == %d:\n        pass' % i
+                     for i in range(branches))
+    return '"""M."""\n\n\ndef f(x):\n    """D."""\n%s\n    return 0\n' % body
+
+
+def test_growing_an_already_long_function_is_blamed():
+    """A shape metric may never get worse: 100 lines -> 130 is blamed."""
+    assert blame(_sized(100), _sized(130), range(106, 136),
+                 'long-functions') == [4]
+
+
+def test_shrinking_a_long_function_passes_even_while_over():
+    """Improving is always allowed: the bill is what you added, not the debt."""
+    assert blame(_sized(130), _sized(100), range(56, 106),
+                 'long-functions') == []
+
+
+def test_growing_complexity_of_a_god_function_is_blamed():
+    """Same ratchet for complexity, which is also one site per function."""
+    assert blame(_branchy(29), _branchy(59), range(60, 120),
+                 'god-functions') == [4]
+
+
+def test_nesting_added_below_the_def_is_owned():
+    """The site is the `def`, but the edit that deepened it still owns it."""
+    before = '''"""M."""
+
+
+def f(x) -> int:
+    """D."""
+    if x:
+        return 1
+    return 0
+'''
+    after = '''"""M."""
+
+
+def f(x) -> int:
+    """D."""
+    if x:
+        for i in range(3):
+            while i:
+                with open('a') as h:
+                    if h:
+                        return 1
+    return 0
+'''
+    assert blame(before, after, list(range(7, 12)), 'deep-nesting') == [4]
+
+
+# ---------------------------------------------------------------------------
+# The tool itself
+# ---------------------------------------------------------------------------
+
+
+def test_help_does_not_crash():
+    """`--help` must work on a cp1252 console: no emoji in the description."""
+    got = subprocess.run(
+        [sys.executable, str(ROOT / 'tools' / 'validate' / 'code_rules.py'),
+         '--help'], capture_output=True, text=True, timeout=60)
+    assert got.returncode == 0
+    assert got.stderr == ''
+
+
+def test_a_situational_fix_beats_the_generic_one():
+    """A rule with several causes must name the cure for the one it found."""
+    sites_found = [(FAKE, 8, 'noqa: E402')]
+    hints = CR._specific_hints('stray-comments', sites_found)
+    assert any('pythonpath' in h for h in hints)
+    assert CR._specific_hints('stray-comments', [(FAKE, 3, 'a plain note')]) == []
+
+
+def test_every_situational_hint_names_a_real_rule():
+    """A hint keyed on a rule that does not exist would never print."""
+    assert {rule for rule, _ in CR.SPECIFIC} <= set(CR.EXPLAIN)
+
+
+def test_every_gated_rule_defines_itself():
+    """EXPLAIN and REMEDY are the rule's whole definition to the agent."""
+    assert set(CR.EXPLAIN) == set(CR.REMEDY)
+
+
+def test_multiplier_is_gone():
+    """A prose budget must never be a function of the code around it."""
+    source = (ROOT / 'tools' / 'validate' / 'code_rules_ast.py').read_text(
+        encoding='utf-8')
+    assert 'DOC_CHARS_PER_LINE' not in source

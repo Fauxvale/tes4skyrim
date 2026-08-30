@@ -30,7 +30,6 @@ the Oblivion skeleton — hits still register, dismember targeting is off),
 and ARMA has no footstep SNDD yet.
 """
 
-import json
 import os
 import struct
 

@@ -238,6 +238,12 @@ def audit_effect_records(export_dir):
     return out
 
 
+def _vanilla_name(form_id) -> str:
+    """The vanilla MGEF's editor id, or its FormID when it has no entry."""
+    row = VANILLA_MGEF_DATA.get(form_id)
+    return row[0] if row else hex(form_id)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -338,7 +344,7 @@ def main():
             if args.unmapped_only and (r['mapped'] or r['per_av']):
                 continue
             tgt = ('per-ActorValue' if r['per_av']
-                   else vanilla_name.get(r['mapped'], hex(r['mapped']))
+                   else _vanilla_name(r['mapped'])
                    if r['mapped'] else '*** DROPPED ***')
             print(f"  {r['school']:12s} {r['code']:6s} {r['name'][:34]:34s} -> {tgt}")
 

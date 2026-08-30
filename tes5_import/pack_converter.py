@@ -1563,7 +1563,6 @@ def _condition_quest(rec: dict) -> int:
         if struct.unpack_from('<H', d, 8)[0] in _QUEST_PARAM_FUNCS:
             from .text_reader import remap_formid
             return remap_formid(struct.unpack_from('<I', d, 12)[0])
-    return 0
 
 # The Topic input is the FIRST data input of a ForceGreet instance, so its PDTO
 # is the first PDTO in the record. The POBA/POEA/POCA blocks that follow also

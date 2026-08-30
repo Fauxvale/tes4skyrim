@@ -1,6 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tesconversion"
+version = "0.1.0"
+description = "TES4 (Oblivion) to TES5 (Skyrim) conversion pipeline"
+requires-python = ">=3.14"
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "vulture"]
+
+[tool.setuptools]
+py-modules = ["collision_options", "convert", "gui", "output_layout",
+              "preflight", "process_job", "run_log", "subprocess_flags",
+              "version", "worker_budget"]
+
+[tool.setuptools.packages.find]
+include = ["tes4_export*", "tes5_import*", "asset_convert*",
+           "script_convert*", "tools*"]
+
 [tool.ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = [
@@ -29,3 +51,4 @@ known-first-party = ["tes4_export", "tes5_import", "asset_convert", "run"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

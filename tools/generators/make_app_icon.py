@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-import tools.generators.dwemer_palette  # noqa: E402  (needs the path above)
+from tools.generators import dwemer_palette  # noqa: E402
 
 SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "docs/lexicon.webp")
 DST = Path(sys.argv[2] if len(sys.argv) > 2 else "docs/favicon.ico")

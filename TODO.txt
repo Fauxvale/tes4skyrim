@@ -94,3 +94,6 @@ Minor Issues:
 	21 - FaceGen: Oblivion.exe statically links the FaceGen SDK (matrixVT.hpp, BSFaceGenModelMap, EGM/EGT basis load+apply). Use it like the SpeedTree engine harness to turn FGGS/FGGA coefficients into real vertex deltas
 
 	22 - OblivionBloodFountain01: geyser (SpecialIdle) never plays as the default state
+
+	23 - Navmesh door-grouping block has NEVER executed (dead since 2026-07-24, commit 31c2594)
+	
