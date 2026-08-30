@@ -209,7 +209,7 @@ def _zstr(b: bytes) -> str:
 # collide between plugins that are not each other's masters.
 #
 # The fix is the one the importer already applies when writing overrides (see
-# docs/override_conversion.md, "the same bug existed in FOUR places"): resolve
+# docs/notes/override_conversion.md, "the same bug existed in FOUR places"): resolve
 # every id to (owning FILE, local id) by looking the index byte up in the file's
 # master list BY NAME, and merge on that pair instead.
 #

@@ -794,7 +794,7 @@ def gui_main():
     root.configure(bg=CLR["bg"])
     root.option_add("*Background", CLR["bg"])
     root.option_add("*Foreground", CLR["text"])
-    icon_path = SCRIPT_DIR / "docs" / "favicon.ico"
+    icon_path = SCRIPT_DIR / "docs" / "assets" / "favicon.ico"
     root.iconbitmap(default=str(icon_path))
     _set_window_icon(root, icon_path)
     _style_titlebar(root)
@@ -1672,7 +1672,7 @@ def gui_main():
     tf.pack(fill=tk.X, padx=14, pady=(16, 0))
 
     banner_img = None
-    banner_path = SCRIPT_DIR / "docs" / "banner.png"
+    banner_path = SCRIPT_DIR / "docs" / "assets" / "banner.png"
     if banner_path.exists():
         try:
             from PIL import Image, ImageTk

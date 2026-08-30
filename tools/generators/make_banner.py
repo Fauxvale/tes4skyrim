@@ -1,7 +1,7 @@
 """Regenerate the GUI banner: TESRACT in the Oblivion font, Dwemer brass.
 
 Usage:
-    python tools/generators/make_banner.py [--svg docs/banner.svg] [--png docs/banner.png]
+    python tools/generators/make_banner.py [--svg docs/assets/banner.svg] [--png docs/assets/banner.png]
 
 The title is traced from `references/oblivion-font.ttf` into real SVG outlines
 rather than a `font-family` reference, so the banner renders identically on a

@@ -116,7 +116,7 @@ def test_short_body_keeps_the_tight_limit():
 
 def test_citation_line_is_not_counted_as_prose():
     """The `See:` route must not be punished by the rule that asks for it."""
-    doc = 'x' * 70 + '\n\n    See: docs/pipeline_reference.md'
+    doc = 'x' * 70 + '\n\n    See: docs/reference/pipeline.md'
     src = '"""M."""\n\n\ndef f():\n    """%s"""\n    return 0\n' % doc
     assert sites(src, 'bloated-docstrings') == []
 

@@ -3,8 +3,8 @@
 Usage:
     python tools/generators/make_app_icon.py [SRC.webp] [DST.ico]
 
-Defaults: docs/lexicon.webp -> docs/favicon.ico (plus a full-size
-docs/lexicon_dwemer.png preview beside the source, for eyeballing the tint).
+Defaults: docs/assets/lexicon.webp -> docs/assets/favicon.ico (plus a full-size
+docs/assets/lexicon_dwemer.png preview beside the source, for eyeballing the tint).
 
 The source is a near-black stone cube covered in saturated red glowing runes.
 Two independent recolors, split by how saturated-and-red a pixel is:
@@ -23,8 +23,8 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from tools.generators import dwemer_palette  # noqa: E402
 
-SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "docs/lexicon.webp")
-DST = Path(sys.argv[2] if len(sys.argv) > 2 else "docs/favicon.ico")
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "docs/assets/lexicon.webp")
+DST = Path(sys.argv[2] if len(sys.argv) > 2 else "docs/assets/favicon.ico")
 
 BLUE_HUE = dwemer_palette.RUNE_HUE_DEG / 360.0
 RED_ARC = dwemer_palette.RUNE_RED_ARC_DEG / 360.0

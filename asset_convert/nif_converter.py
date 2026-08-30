@@ -5224,7 +5224,7 @@ def _convert_sound_text_keys(data):
        hkx behavior graph to route through — 38 of the 39 vanilla meshes using
        a `SoundPlay.<name>` key carry `BSBehaviorGraphExtraData`.  Converted
        doors deliberately have NO graph (attaching one to an Open/Close door
-       CTDs it on cell load — see docs/nif_conversion_notes.md), so the
+       CTDs it on cell load — see docs/notes/nif_conversion.md), so the
        rewritten key matched nothing and was dropped.
 
     Kept as a no-op returning 0 so the call site stays explicit about the

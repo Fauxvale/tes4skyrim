@@ -847,7 +847,7 @@ def extract_ragdoll(skeleton_nif_path: str, bones: list):
 # bone 1 -> old root = a 67-unit r=16.8 bar through the whole creature;
 # (2) compact hub at the trunk = an exact duplicate of Spine0, doubling trunk
 # mass; (3) re-target the existing root body onto bone 1 = trunk frame at the
-# feet.  See docs/creature_conversion.md#ragdoll-root-bone1-dead-end.
+# feet.  See docs/notes/creature_conversion.md#ragdoll-root-bone1-dead-end.
 # ---------------------------------------------------------------------------
 
 

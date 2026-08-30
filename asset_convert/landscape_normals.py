@@ -193,7 +193,7 @@ def run(landscape_dir):
 # shape, so moving the value out of the mesh and into the texture is visually
 # neutral -- and from then on a modder who ships a real mask simply overrides
 # it, instead of having to discover and undo a shader parameter baked into
-# thousands of NIFs.  See docs/shader_value_mapping.md.
+# thousands of NIFs.  See docs/notes/shader_value_mapping.md.
 DEFAULT_MASK_ALPHA = 64
 
 
@@ -327,7 +327,7 @@ def normalize_specular_alpha(tex_dir, alpha=DEFAULT_MASK_ALPHA, skip=()):
     # Reading and decoding 5k+ DDS files dominated this stage (measured in
     # MINUTES on Oblivion's tree, against ~2s for every other texture sweep).
     # It is I/O plus a decode that releases the GIL, so THREADS are the right
-    # tool here -- see docs/performance_notes.md; processes would pay pickling
+    # tool here -- see docs/notes/performance.md; processes would pay pickling
     # for every blob.  Results are collected first and applied in sorted path
     # order, so the counters and the set of rewritten files are identical to
     # the serial version no matter how the pool schedules.

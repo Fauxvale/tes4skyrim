@@ -5,7 +5,7 @@ Every detector returns `[(path, line, detail), ...]` so the gate and any
 score table read the SAME definition of a rule.  No CLI, no git, no
 subprocess: `code_rules.py` owns those.
 
-See: docs/script_convert_architecture.md
+See: docs/reference/script_convert_architecture.md
 """
 
 import ast

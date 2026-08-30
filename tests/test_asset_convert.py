@@ -3178,7 +3178,7 @@ def _read_nif(path):
 
 class TestAmbientSequences:
     """The arena crowd: read out of the live engine 2026-08-18 (see
-    docs/nif_conversion_notes.md, 'Ambient (self-playing) meshes')."""
+    docs/notes/nif_conversion.md, 'Ambient (self-playing) meshes')."""
 
     @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
     def test_idle_becomes_autoloop_loop_plus_autoplay_clamp(self, tmp_path):
@@ -3930,7 +3930,7 @@ class TestAnimationBlockLayout:
 
     Both round-trip cleanly through PyFFI and NifSkope, so nothing but the
     engine notices -- these are the invariants that caught the Vilverin
-    ctrigtripwire01 CTDs.  See docs/nif_conversion_notes.md.
+    ctrigtripwire01 CTDs.  See docs/notes/nif_conversion.md.
     """
 
     @staticmethod
@@ -3989,7 +3989,7 @@ class TestAnimationBlockLayout:
         'Vilverin.  _emulate_morphs is back to the pre-90d04a3 '
         'NiVisController version, so this test asserts a design that is no '
         'longer shipped.  Re-enable it together with a real fix - see '
-        'docs/nif_conversion_notes.md "NiGeomMorpherController does not exist '
+        'docs/notes/nif_conversion.md "NiGeomMorpherController does not exist '
         'in Skyrim" for the bisection, the four failed fixes, the verified exe '
         'field offsets, and the one unchased lead (the ref persistent flag).')
     def test_morph_emulation_never_targets_geometry(self):
@@ -4016,7 +4016,7 @@ class TestAnimationBlockLayout:
         'Same revert as test_morph_emulation_never_targets_geometry: the '
         'SCALE swap freezes the game, so ctrigtripwire01 no longer ships '
         'wrapper "<shape> Swap" nodes or inverse scale curves.  See '
-        'docs/nif_conversion_notes.md before re-enabling.')
+        'docs/notes/nif_conversion.md before re-enabling.')
     def test_tripwire_morph_ships_a_scale_swap(self):
         """End-to-end on the mesh the bug was reported against: converting
         ctrigtripwire01 must produce paired wrapper NiNodes whose scale curves

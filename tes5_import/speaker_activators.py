@@ -51,7 +51,7 @@ KNOWN OPEN DEFECT: a scripted `Say()` on a non-actor does not retire its
 subtitle (the engine's countdown/KillSubtitles path is TESObjectREFR vtable
 slot 0x40, which nothing drives for a plain reference).  No verified fix
 exists; audio is the higher-value behaviour.  See
-docs/dialogue_engine_contracts.md.
+docs/reference/dialogue_engine_contracts.md.
 
 PER PAIR, NOT PER EMITTER
 -------------------------

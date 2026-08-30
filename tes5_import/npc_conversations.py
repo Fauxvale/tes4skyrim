@@ -15,7 +15,7 @@ quests stall.
 
 Skyrim's native vessel would be a SCEN scene, but scenes need quest-alias
 plumbing per conversation and are unverifiable without many in-game cycles
-(docs/ambient_dialogue_channel_plan.md Step 4 — deferred).  These chains,
+(docs/notes/ambient_dialogue_channel.md Step 4 — deferred).  These chains,
 however, are IDENTITY-PINNED: the head names both actors via GetIsID, so the
 proven `Actor.Say()` machinery (which drives every scripted CharGen
 conversation already) can replay them from a generated driver script:
@@ -35,7 +35,7 @@ conversation already) can replay them from a generated driver script:
 Only QUEST-ADVANCING chains are restored (a chain whose closure carries a
 setstage/startquest/quest-variable result).  Pure flavor chatter stays
 dropped per the "better absent than wrong" decision in
-docs/ambient_dialogue_channel_plan.md — restoring it wholesale is still
+docs/notes/ambient_dialogue_channel.md — restoring it wholesale is still
 TODO.txt Later-Issues #16.
 
 This module is the SHARED analysis both stages must agree on (the

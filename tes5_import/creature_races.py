@@ -24,7 +24,7 @@ damage) and 100 (unarmed reach). One race is created per unique
 folder/project but list different NIFZ parts — get separate races that
 reference the same generated behavior project.
 
-Deliberate v1 simplifications (documented in docs/creature_conversion.md):
+Deliberate v1 simplifications (documented in docs/notes/creature_conversion.md):
 GNAM points at the vanilla canine body-part data (bone names won't match
 the Oblivion skeleton — hits still register, dismember targeting is off),
 and ARMA has no footstep SNDD yet.

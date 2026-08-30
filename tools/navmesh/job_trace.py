@@ -17,7 +17,7 @@ the native extension aborts the process with no Python traceback at all, which i
 a pool worker surfaces only as an opaque `BrokenProcessPool`. With `--all`, each
 job's identity is flushed BEFORE the call, so a hard crash leaves the culprit as
 the last line printed (this is how Nehrim's cell 011E4FEC was found -- see
-docs/performance_notes.md).
+docs/notes/performance.md).
 
 `tools/navmesh/cell_check.py` names cells by EditorID out of an audit index and
 checks CK rules; this takes the raw FormID straight from an error message and

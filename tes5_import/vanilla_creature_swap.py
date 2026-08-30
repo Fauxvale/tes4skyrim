@@ -30,7 +30,7 @@ MATCH QUALITY
 archetype but a visibly different species (mountain lion vs sabre cat) and
 should require an explicit opt-in. Everything absent from this table has no
 honest Skyrim equivalent and must be generated — see
-docs/creature_race_equivalence.md for the full reasoning, including why the
+docs/reference/creature_race_equivalence.md for the full reasoning, including why the
 keyword fallbacks in skyrim_overrides.CREA_RACE_PATTERNS are not equivalences.
 
 Inspect coverage with `python tools/creature/creature_swap_report.py -f <plugin>`.

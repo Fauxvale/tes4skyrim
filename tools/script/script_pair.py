@@ -1,6 +1,6 @@
 """Print a TES4 script's original source beside its converted Papyrus.
 
-The quest-script conversion audit (docs/quest_script_conversion_audit.md) needs
+The quest-script conversion audit (docs/audits/quest_script_conversion.md) needs
 the SCTX source of a SCPT record and the emitted .psc side by side. The export
 stores SCTX with \r\n escaped, so it is unreadable without unescaping.
 

@@ -11,7 +11,7 @@ Two things still come from vanilla:
   own packages (the fallback that keeps an actor doing *something* when none of
   its own packages apply).
 * Creatures — creature AI is driven by the generated behaviour graph, not by
-  TES4 packages (see docs/creature_conversion.md), and every vanilla creature
+  TES4 packages (see docs/notes/creature_conversion.md), and every vanilla creature
   carries exactly one package: DefaultMasterPackageCreature.  Keep that.
 
 Quest packages are NOT in the actor's PKID list: they hang off a QUST reference

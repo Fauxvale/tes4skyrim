@@ -3196,7 +3196,7 @@ class TestMasterWorldspaceAnchorWithOwnWorldspaces:
     (Tamriel.esp) but dropped every new cell of a plugin that does both --
     100% of new cells lost, 0% of overrides, the signature of the defect.
 
-    See docs/override_conversion.md#anchor-per-worldspace.
+    See docs/notes/override_conversion.md#anchor-per-worldspace.
     """
 
     MASTER_WRLD = 0x0000003C        # Oblivion.esm's Tamriel
@@ -3534,7 +3534,7 @@ class TestNpcToNpcConversationDrop:
     """Oblivion Type-1 Conversation topics are NPC-to-NPC chatter with no
     Skyrim equivalent short of a SCEN scene, so they are dropped rather than
     converted into player-menu entries labelled with their EditorID
-    (2026-07-25). See docs/ambient_dialogue_channel_plan.md Step 1."""
+    (2026-07-25). See docs/notes/ambient_dialogue_channel.md Step 1."""
 
     def _dial(self, edid, dtype=1, fid='00001234'):
         return {'EditorID': edid, 'DATA.Type': str(dtype), 'FormID': fid}

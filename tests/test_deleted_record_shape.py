@@ -3,7 +3,7 @@
 Measured 2026-08-25 across Update/Dawnguard/HearthFires/Dragonborn (279
 deleted records): REFR-likes keep NAME only, NAVM is emptied, and EVERY other
 type keeps its full body.  A zero-size non-NAVM deletion is a shape vanilla
-never writes -- see docs/override_conversion.md.
+never writes -- see docs/notes/override_conversion.md.
 """
 import struct
 

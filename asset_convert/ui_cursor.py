@@ -13,7 +13,7 @@ alpha bounds therefore puts the tip at the crop's top-left, and placing that
 crop at the shape origin lands the tip on the hotspot.
 
 So the port is the SAME one-shape swap the message-box frame uses (see
-ui_menus / docs/ui_conversion.md): replace character 1 with a single
+ui_menus / docs/notes/ui_conversion.md): replace character 1 with a single
 bitmap-filled shape of Oblivion's arrow, TOP-LEFT aligned rather than centered.
 No ActionScript is touched, so the cursor tracks the mouse and hides in
 gameplay exactly as vanilla -- the failure mode of a bad swap is "it looks

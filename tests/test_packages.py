@@ -1,7 +1,7 @@
 """TES4 PACK -> TES5 PACK conversion tests.
 
 Every invariant asserted here was verified against real Skyrim.esm records (see
-docs/package_conversion_plan.md); the constants are not guesses.
+docs/notes/package_conversion.md); the constants are not guesses.
 """
 
 import struct

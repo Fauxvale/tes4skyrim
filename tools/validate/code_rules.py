@@ -15,7 +15,7 @@ Per-file rules are an ABSOLUTE gate with no baseline: a single file either has
 the property or it does not.  Only package AGGREGATES get a baseline, because
 only a trend is meaningful for those.
 
-See: docs/script_convert_architecture.md
+See: docs/reference/script_convert_architecture.md
 """
 
 import argparse
@@ -45,6 +45,17 @@ VULTURE_IGNORE_DECORATORS = '@command,@command.*'
 
 #: A citation to a doc, the route prose takes out of the code.
 CITATION = re.compile(r'docs/[A-Za-z0-9_./-]+\.md(?:#[A-Za-z0-9-]+)?')
+
+#: A line that CITES a doc, as opposed to naming one as data or an argument.
+REFERENCE = re.compile(r'(?i)(?:see|per|details?|rationale|documented)'
+                       r'|\]\(')
+
+#: A line that CITES a doc, not one naming a path as data or a CLI argument.
+REFERENCE = re.compile(r'(?i)\b(?:see|per|details?|rationale|documented)\b'
+                       r'|\]\(')
+
+#: An explicit `<a id="...">` target, used by docs for mid-section anchors.
+EXPLICIT_ANCHOR = re.compile(r'<a\s+id=["\']([^"\']+)["\']')
 
 #: What each rule MEANS; with REMEDY it is the rule's whole definition.
 EXPLAIN = {
@@ -188,12 +199,13 @@ def _ruff_sites(path: Path) -> list:
 
 
 def _headings(doc: Path) -> set:
-    """GitHub-style anchor slugs for every heading in a markdown file."""
-    out = set()
-    for line in doc.read_text(encoding='utf-8', errors='replace').split('\n'):
+    """Anchor targets in a markdown file: heading slugs and `<a id>` tags."""
+    text = doc.read_text(encoding='utf-8', errors='replace')
+    out = set(EXPLICIT_ANCHOR.findall(text))
+    for line in text.split('\n'):
         if not line.startswith('#'):
             continue
-        title = line.lstrip('#').strip().lower()
+        title = EXPLICIT_ANCHOR.sub('', line).lstrip('#').strip().lower()
         out.add(re.sub(r'[^a-z0-9\s-]', '', title).replace(' ', '-'))
     return out
 
@@ -207,6 +219,8 @@ def _citation_sites(path: Path, text: str) -> list:
     """
     hits = []
     for num, line in enumerate(text.split('\n'), 1):
+        if not REFERENCE.search(line):
+            continue
         for ref in CITATION.findall(line):
             rel, _, anchor = ref.partition('#')
             target = ROOT / rel

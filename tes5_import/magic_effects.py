@@ -10,7 +10,7 @@ has no Magic Effects with Projectiles assigned", 369 items) implies.
 MagicItem::GetCostliestEffectItem skips every projectile-less effect when the
 delivery is Aimed and returns null; the combat-AI item rating function then
 dereferences that null.  Full exe trace and the vanilla census in
-docs/magic_conversion_plan.md, Phase 3.
+docs/notes/magic_conversion.md, Phase 3.
 
 Fix: when an aimed ENCH/SPEL/SCRL ends up with no projectile-bearing effect,
 synthesize ONE companion MGEF here — a clone of the vanilla effect the primary

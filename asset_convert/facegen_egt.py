@@ -41,7 +41,7 @@ import struct
 # built-in control: Redguard shares HeadHuman.dds and recolors it via race
 # FGTS, and Oblivion ALSO ships a standalone Characters\Redguard body
 # texture at (89,54,35).  The scale that makes the reconstruction agree with
-# that independent texture is ~0.25; see docs/npc_skin_tone_conversion.md.
+# that independent texture is ~0.25; see docs/notes/npc_skin_tone.md.
 FGTS_SCALE = 0.25
 
 _EGT_MAGIC = b'FREGT003'

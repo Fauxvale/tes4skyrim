@@ -125,7 +125,7 @@ _RACE_HEAD_TXST: dict[str, dict[str, int]] = {
 # them with a non-zero FGTS -- which is exactly how High Elf reads gold,
 # Redguard brown and Nord pale while all three point at
 # Characters\Imperial\HeadHuman.dds.  See asset_convert/facegen_egt.py for the
-# reconstruction and docs/npc_skin_tone_conversion.md for the measurements.
+# reconstruction and docs/notes/npc_skin_tone.md for the measurements.
 #
 # Per-NPC FGTS is deliberately NOT used: measured across all 2482 Oblivion
 # NPCs it shifts the color by a standard deviation of ~1 unit in 255, so

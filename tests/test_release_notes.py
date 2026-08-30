@@ -64,7 +64,7 @@ def test_export_also_implies_import():
 # ── Non-pipeline paths cost nothing ───────────────────────────────────────
 
 @pytest.mark.parametrize("path", [
-    "docs/pipeline_reference.md",
+    "docs/reference/pipeline.md",
     "tests/test_import.py",
     "tools/release/release_notes.py",
     "TODO.txt",

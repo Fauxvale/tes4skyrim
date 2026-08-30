@@ -102,7 +102,7 @@ def scan_plugin(src_dir, workers):
 
     Hashing 16,519 files single-threaded measured 75.7s, which would put a
     full-corpus scan over the 120s budget for a check command.  This is pure
-    I/O, so threads are the right tool (see docs/performance_notes.md).
+    I/O, so threads are the right tool (see docs/notes/performance.md).
     """
     files = sorted(p for p in src_dir.rglob('*.psc'))
     if not files:

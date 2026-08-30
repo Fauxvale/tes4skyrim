@@ -2,7 +2,7 @@
 """Fitness functions for `script_convert/` -- the architecture, as numbers.
 
 `script_convert/` is being rewritten from a line-by-line regex rewriter into an
-AST compiler (docs/script_convert_architecture.md).  A refactor that large
+AST compiler (docs/reference/script_convert_architecture.md).  A refactor that large
 cannot be policed by review: the failure mode of the last attempt was that
 every named helper was DELETED from its old file and RECREATED in a new one,
 which reads as progress in a diff and is none.
@@ -17,7 +17,7 @@ by arithmetic rather than judgement.
     python tools/script/arch_fitness.py --fail-on-regression   # the edit loop
     python tools/script/arch_fitness.py --update-baseline      # after a stage
 
-`--fail-on-regression` compares against `docs/script_convert_fitness.json` and
+`--fail-on-regression` compares against `tools/script/script_convert_fitness.json` and
 exits non-zero ONLY when a metric moved the wrong way.  It never blocks
 progress toward a target, which is what keeps it from being switched off.
 
@@ -77,7 +77,7 @@ _complexity = D.complexity
 _depth = D.depth
 
 PKG = ROOT / 'script_convert'
-BASELINE = ROOT / 'docs' / 'script_convert_fitness.json'
+BASELINE = Path(__file__).resolve().parent / 'script_convert_fitness.json'
 
 #: Scratch and vendored trees, excluded from every rule.
 REPO_SKIP = ('temp', 'references', 'external', 'output', 'export', 'build')

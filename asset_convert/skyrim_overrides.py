@@ -291,7 +291,7 @@ ARMOR_PIECE_OFFSETS: dict[str, ArmorOffsetConfig] = {
 # like TownguardCho) must NOT be applied — they pushed rigid helms on top of
 # the head.  The only correction needed is the anatomical difference between
 # the heads in their respective head-pivot frames, measured from
-# OB headhuman.nif vs SK malehead.nif (see docs/nif_conversion_notes.md):
+# OB headhuman.nif vs SK malehead.nif (see docs/notes/nif_conversion.md):
 #   skull top   OB +13.6  SK +11.5  -> dz = -2.1
 #   Y span      OB [-3.75, +11.31]  SK [-5.97, +11.58] -> the SK skull
 #     reaches 2.2 further BACK with only 0.27 front slack, so translation

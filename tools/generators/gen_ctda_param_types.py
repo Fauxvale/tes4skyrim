@@ -27,7 +27,7 @@ _FIRST_FORMID_TYPE = 'ptActor'
 # enum but which the engine's own function table types as plain values. The
 # positional rule alone cannot catch them: xEdit orders the enum by name, not
 # by whether a type is a form. Verified against the parameter descriptors in
-# the unpacked SkyrimSE.exe -- see docs/dialogue_engine_contracts.md and
+# the unpacked SkyrimSE.exe -- see docs/reference/dialogue_engine_contracts.md and
 # `python tools/disasm/dialog_engine_extract.py --functions <name>`. Remapping one of
 # these shifts an enum the engine uses as an array index, which is the same
 # defect class as the GetBaseActorValue crash.

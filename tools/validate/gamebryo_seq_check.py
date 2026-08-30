@@ -17,7 +17,7 @@ Gamebryo generator, extracted from Skyrim - Animations.bsa: 0 violations):
      and never an empty name (that null sequence is deref'd on activation)
   2. the Rest generator's pSequence is EMPTY.  Empty is CORRECT there --
      nothing should play on cell load, and the working doors ship exactly
-     this (see "The Rest state is CORRECT" in docs/nif_conversion_notes.md).
+     this (see "The Rest state is CORRECT" in docs/notes/nif_conversion.md).
      A Rest naming a real sequence animates the object on load (the
      self-opening secret doors)
   3. no sequence in a graph-carrying NIF has an EMPTY text key value.  On

@@ -54,7 +54,7 @@ _ACTOR_ONLY_ANY_RE = re.compile(
 # time: TES4Polyfill.SayLine blocks until the INFO's OnBegin fragment reports
 # the selected line's own length (say_durations, `info:<FID>`), and only falls
 # back to this when the line has no voice file at all.  See the "Say() timers"
-# section of docs/papyrus_conversion_notes.md.
+# section of docs/notes/papyrus_conversion.md.
 SAY_LINE_SECONDS = 3.0
 # SayLine's start timeout: how long it waits for the engine's OnBegin fragment
 # before declaring the line dropped.  Mirrors SAY_START_WAIT in
@@ -692,7 +692,7 @@ class ScriptConverter:
         """Does this TES4 name collapse `X == 0/1` in a COMPARISON position?
 
         Narrower than `returns_bool`: only the comparison-position list, which
-        differs from the bare-read one (docs/script_conversion_bugs.md #6).
+        differs from the bare-read one (docs/notes/script_conversion_bugs.md #6).
         """
         return name.lower() in _COMPARISON_BOOL_FUNCTIONS
 

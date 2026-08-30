@@ -23,7 +23,7 @@ room-filling floor.  A completely functional, zero-bad-triangle navmesh that is
 a bit narrow beats a dense one that is broken.  Width-grow (fill out to the
 walls) is a later phase; this one gets the corridors + doors + links right.
 
-Design principles (see docs/navmesh_corridor_redesign.md):
+Design principles (see docs/notes/navmesh_corridor.md):
   1. The pathgrid CENTERLINE is sacred — never cut or moved, even where it
      clips a wall.  Only grown width (a later phase) may ever be clipped.
   2. Downward snap follows the pathgrid LINE'S OWN SLOPE.  A pathgrid edge

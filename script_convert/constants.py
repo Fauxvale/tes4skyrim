@@ -1277,7 +1277,7 @@ COMMAND_ROWS = {
     # equivalent.  Each was checked against Actor.psc,
     # ObjectReference.psc, Form.psc, Game.psc and Utility.psc and
     # exists in none of them.  Some are available through SKSE
-    # (docs/skse_conversion_audit.md); nothing here targets SKSE
+    # (docs/audits/skse_conversion.md); nothing here targets SKSE
     # today, so they are neutralised for now.
     'preloadmagiceffect': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     'closeallmenus': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
@@ -1566,7 +1566,7 @@ COMMAND_ROWS = {
     # --- OBSE commands with no VANILLA Papyrus equivalent (neutralised) ---
     # Each has been checked against Actor/ObjectReference/Game/Form/Utility and
     # exists in none of them.  Several are reachable via SKSE — see
-    # docs/skse_conversion_audit.md — and neutralising is only the current
+    # docs/audits/skse_conversion.md — and neutralising is only the current
     # behaviour, not a judgement that SKSE is off the table.
 
     # --- Camera / 3D refresh (OBSE) ---
@@ -2338,7 +2338,7 @@ _OBJREF_SHARED_FUNCTIONS = _flagged('objref_shared') | frozenset({
 # parameters not 1") or dropped the token and acted on the wrong actor, so the
 # receiver has to be promoted for precisely this set.
 # Derived from the `ref.` rows with an empty argument column in
-# docs/skyrim_commands.md, intersected with FUNCTION_MAP.  (IsInCombat's
+# docs/reference/skyrim_commands.md, intersected with FUNCTION_MAP.  (IsInCombat's
 # "Integer" column there is its RETURN type, not a parameter.)
 _ZERO_ARG_REF_FUNCTIONS = _flagged('zero_arg') | frozenset({
     'getalarmed', 'getdisease', 'getwantblocking', 'isactor',

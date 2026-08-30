@@ -21,7 +21,7 @@ Locations, schedules and conditions are *copied*, so an NPC keeps the same
 destination, the same hours and the same activation logic.  Only the procedure
 is re-expressed in Skyrim's vocabulary.
 
-See docs/package_conversion_plan.md for the fidelity analysis (which TES4 types
+See docs/notes/package_conversion.md for the fidelity analysis (which TES4 types
 map exactly, which degrade, and why).
 """
 

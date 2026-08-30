@@ -206,7 +206,7 @@ LOD_SIZE_THRESHOLD = 256
 # on every STAT/TREE over 1024 units on that assumption; the vanilla census
 # says it is a FURN flag -- Skyrim.esm sets it on 143 FURN, 16 REFR and
 # exactly 1 STAT of 9,720, and never on a TREE.  We were setting it on 1,372
-# STATs and 70 TREEs.  See docs/ck_vs_game_missing_objects.md.
+# STATs and 70 TREEs.  See docs/notes/ck_vs_game_missing_objects.md.
 
 def map_lock_level(tes4_level: int, leveled: bool = False) -> int:
     """TES4 lock level -> TES5 lock level.
