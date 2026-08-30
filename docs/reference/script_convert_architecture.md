@@ -334,3 +334,40 @@ fire until roughly 100 lines. At an 80-line cap the two rules nearly coincide
 and the length rule adds little; at 60 it catches the shape complexity cannot
 see, a **long straight-line function** (70 lines of sequential assignment at
 complexity 3 — what `measure` was before it was split into phases).
+
+### Why `oversized-files` does not judge `tests/`
+
+Measured across 465 first-party files: **median = 150 code lines**, and only
+26 (5.6%) exceed 1000 — so the cap is not fighting the tree. Six of those 26
+are test files, and they are the extreme tail: `test_import.py` is 4,433 lines
+over **459 functions — 9.7 lines per test**.
+
+The cap exists because ~1000 lines is 25-50 functions at the 20-45 line/function
+density of the source violators, which is where a module stops having one
+describable responsibility. A test file has no such responsibility to split
+along: its length is a COUNT of independent cases, each read by grepping one
+test name, never reasoned about whole. Applying a cognitive-load rule to a flat
+list of 10-line functions charges a cost that is not being paid.
+
+Excluding `tests/` drops the violator count 26 → 20 and leaves the pressure on
+the files where splitting genuinely helps. The threshold stays 1000 for source:
+raising it to 1500 would absolve `record_types/actors.py` (1,101) and
+`pipeline.py` (1,104), which are exactly the marginal cases the rule is for.
+
+Every other rule still judges `tests/` — only `oversized-files` is lifted.
+
+### Splitting a legacy file: sparingly
+
+`oversized-files` is charged only when a file GROWS or CROSSES 1000 (the site
+detail keys `_worsened` by name, so a shrink or a same-size edit is absolved).
+That is deliberate: a file already far over is meant to be chipped at, not
+rewritten to clear the gate.
+
+**Do not split an oversized legacy file as a side effect of an unrelated fix.**
+A wholesale reorganization buries the one-line behavioral change inside a
+thousand lines of movement, so the diff can no longer be reviewed and a
+regression cannot be bisected to it. Land the fix; leave the file long.
+
+Split when the split IS the task, or when the responsibility you are adding
+genuinely belongs in its own module. Otherwise the correct response to a
+1,000-line file you had to touch is to leave it no longer than you found it.

@@ -283,8 +283,7 @@ def unsectioned_defs(path, text: str, tree) -> list:
     if not heads:
         return []
     first = min(heads)
-    return [(path, n.lineno, '%s above the first heading (line %d)'
-             % (n.name, first))
+    return [(path, n.lineno, '%s: above the first heading' % n.name)
             for n in tree.body
             if isinstance(n, FUNC_NODES + (ast.ClassDef,))
             and n.lineno < first]

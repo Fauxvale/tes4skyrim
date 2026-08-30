@@ -128,12 +128,88 @@ def gate_docs():
     return got.returncode, got.stderr
 
 
+def pending_text(payload):
+    """(path, post-edit text) this call WOULD write, or (None, None).
+
+    Only Edit/Write can be predicted: their arguments fully determine the
+    result.  A `Bash` heredoc's effect is unknowable without running it, so
+    Bash stays on the PostToolUse sweep.
+    """
+    tool = payload.get('tool_name')
+    args = payload.get('tool_input') or {}
+    path = args.get('file_path')
+    if not path or not path.endswith('.py'):
+        return None, None
+    if tool == 'Write':
+        return path, args.get('content') or ''
+    if tool != 'Edit':
+        return None, None
+    try:
+        with open(path, encoding='utf-8') as fh:
+            text = fh.read()
+    except OSError:
+        return None, None
+    old, new = args.get('old_string') or '', args.get('new_string') or ''
+    if old not in text:
+        return None, None
+    count = -1 if args.get('replace_all') else 1
+    return path, text.replace(old, new, count)
+
+
+def gate_pending(path, text):
+    """(exit code, report) for the text an edit WOULD leave on disk.
+
+    The gate reads the file from disk and diffs it against git, so the
+    candidate is written in place, scored, and the original restored.  A
+    crash between the two would leave the candidate behind, so the restore
+    runs in `finally`.
+    """
+    try:
+        with open(path, 'rb') as fh:
+            original = fh.read()
+    except OSError:
+        return 0, ''
+    try:
+        with open(path, 'w', encoding='utf-8', newline='') as fh:
+            fh.write(text)
+        return gate(path)
+    except OSError:
+        return 0, ''
+    finally:
+        try:
+            with open(path, 'wb') as fh:
+                fh.write(original)
+        except OSError:
+            pass
+
+
+def gate_pre(payload):
+    """Deny an Edit/Write that would leave a violation on code it owns."""
+    path, text = pending_text(payload)
+    if not path or not judged(path):
+        return 0
+    code, report = gate_pending(path, text)
+    if not code or not report:
+        return 0
+    sys.stderr.write(report)
+    sys.stderr.write(
+        '\nTHIS EDIT WAS NOT APPLIED. Revise it to clear the violations '
+        'above -- they are on the lines this edit touches -- then retry. Do '
+        'not route around this with Bash.\n')
+    return 2
+
+
 def main():
     """Read the hook payload, gate what was written, block on a violation."""
     try:
         payload = json.load(sys.stdin)
     except Exception:
         return 0
+    event = payload.get('hook_event_name')
+    if not os.path.isfile(GATE):
+        return 0
+    if event == 'PreToolUse':
+        return gate_pre(payload)
     if touched_docs(payload) and os.path.isfile(LINKS):
         code, report = gate_docs()
         if code:

@@ -378,3 +378,20 @@ def test_growing_or_crossing_an_oversized_file_is_charged():
     """Climbing while over, and crossing from under, are both owed."""
     assert CR._worsened(_size_site(1210), _size_site(1200))
     assert CR._worsened(_size_site(1010), [])
+
+
+def test_a_test_file_is_not_judged_on_length():
+    """Length is a COUNT of cases there, not a responsibility to split."""
+    got = CR.rule_sites(Path(__file__).resolve(), with_tools=False)
+    assert 'oversized-files' not in got
+
+
+def test_the_length_exemption_reaches_no_other_rule():
+    """Only `oversized-files` is lifted; a test file owes every other rule."""
+    src = '"""M."""\n\n\ndef f(x) -> int:\n    """D."""\n    x += 1  # bump\n    return x\n'
+    probe = ROOT / 'tests' / '_gate_probe_tmp.py'
+    probe.write_text(src, encoding='utf-8')
+    try:
+        assert 'inline-comments' in CR.rule_sites(probe, with_tools=False)
+    finally:
+        probe.unlink()

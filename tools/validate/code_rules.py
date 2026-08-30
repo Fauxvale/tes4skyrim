@@ -229,6 +229,20 @@ def _citation_sites(path: Path, text: str) -> list:
     return hits
 
 
+def _is_test(path: Path) -> bool:
+    """True for a file under `tests/`, which `oversized-files` does not judge.
+
+    A test file is a flat list of small independent cases, so its length is a
+    COUNT of tests, not a responsibility that can be split.
+    See: docs/reference/script_convert_architecture.md#why-oversized-files-does-not-judge-tests
+    """
+    try:
+        parts = path.resolve().relative_to(ROOT).parts
+    except ValueError:
+        parts = path.parts
+    return 'tests' in parts
+
+
 def rule_sites(path: Path, text: str = None, with_tools: bool = True,
                tree=None) -> dict:
     """`{rule: [(path, line, detail), ...]}` for one file's repo-wide rules."""
@@ -246,6 +260,8 @@ def rule_sites(path: Path, text: str = None, with_tools: bool = True,
         'dead-citations': _citation_sites(path, text),
     }
     checks.update(D.structural_sites(path, text, tree))
+    if _is_test(path):
+        checks.pop('oversized-files', None)
     if with_tools:
         checks['dead-imports'] = _ruff_sites(path)
     return {k: v for k, v in checks.items() if v}
