@@ -28,6 +28,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GATE = os.path.join(ROOT, 'tools', 'validate', 'code_rules.py')
+LINKS = os.path.join(ROOT, 'tools', 'validate', 'doc_links.py')
+DOCS = os.path.join(os.path.realpath(ROOT), 'docs')
 
 #: A fresh clone has no checkers and no import path until this is run once.
 SETUP = ('  SET UP THIS REPO FIRST:  python -m pip install -e ".[dev]"\n'
@@ -65,7 +67,7 @@ def dirty_python():
     exactly how nine rule-breaking edits reached `script_convert/` unchecked.
     """
     try:
-        got = subprocess.run(['git', 'diff', '--name-only', 'HEAD'], cwd=ROOT,
+        got = subprocess.run(['git', 'diff', '--name-only'], cwd=ROOT,
                              capture_output=True, text=True, timeout=30)
     except Exception:
         return []
@@ -99,12 +101,46 @@ def gate(path):
     return got.returncode, (got.stderr or got.stdout)
 
 
+def touched_docs(payload):
+    """True when this call may have written a file under `docs/`."""
+    tool = payload.get('tool_name')
+    if tool in ('Edit', 'Write', 'NotebookEdit'):
+        path = (payload.get('tool_input') or {}).get('file_path') or ''
+        return path.endswith('.md') and DOCS in os.path.realpath(path)
+    if tool not in ('Bash', 'PowerShell'):
+        return False
+    try:
+        got = subprocess.run(['git', 'diff', '--name-only'], cwd=ROOT,
+                             capture_output=True, text=True, timeout=30)
+    except Exception:
+        return False
+    return any(n.startswith('docs/') for n in got.stdout.split('\n'))
+
+
+def gate_docs():
+    """(exit code, report) for the doc tree: links, anchors, index, bindings."""
+    try:
+        got = subprocess.run(
+            [sys.executable, LINKS, '--index'], cwd=ROOT,
+            capture_output=True, text=True, timeout=60)
+    except Exception:
+        return 0, ''
+    return got.returncode, got.stderr
+
+
 def main():
     """Read the hook payload, gate what was written, block on a violation."""
     try:
         payload = json.load(sys.stdin)
     except Exception:
         return 0
+    if touched_docs(payload) and os.path.isfile(LINKS):
+        code, report = gate_docs()
+        if code:
+            sys.stderr.write(report)
+            sys.stderr.write('\nA broken link or an unindexed doc loses the '
+                             'knowledge it points at. Fix it now.\n')
+            return 2
     paths = edited_paths(payload)
     if not paths:
         return 0

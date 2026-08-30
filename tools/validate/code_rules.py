@@ -455,9 +455,17 @@ def gate_diff(path: Path, limit: int = 10) -> int:
 
 
 def repo_files() -> list:
-    """Every first-party `.py` file the rules judge."""
-    return sorted(p for p in ROOT.rglob('*.py')
-                  if not any(part in SKIP_PARTS for part in p.parts))
+    """Every first-party `.py` file the rules judge.
+
+    Prunes as it walks: `rglob` descends into `output/` and `references/`
+    to find 2,752 files and then discards 83% of them, which cost 5.9s of
+    every run.  See: docs/commentary/performance.md
+    """
+    found = []
+    for base, dirs, names in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in SKIP_PARTS]
+        found += [Path(base) / n for n in names if n.endswith('.py')]
+    return sorted(found)
 
 
 def dead_code(limit: int = 40) -> int:
