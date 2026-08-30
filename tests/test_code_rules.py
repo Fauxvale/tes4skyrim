@@ -361,3 +361,20 @@ def test_the_exemption_does_not_reach_inside_a_function():
     src = ('"""M."""\n\n\ndef f(x) -> int:\n    """D."""\n'
            '    # See: docs/commentary/performance.md\n    return x\n')
     assert sites(src, 'inline-comments') == [6]
+
+
+def _size_site(n):
+    """The `oversized-files` site a file of `n` code lines reports."""
+    return [(ROOT / 'x.py', 1, 'file: %d code lines' % n)]
+
+
+def test_shrinking_an_oversized_file_is_absolved():
+    """A same-size or smaller file owes nothing, however far over it sits."""
+    assert CR._worsened(_size_site(1190), _size_site(1200)) == []
+    assert CR._worsened(_size_site(1200), _size_site(1200)) == []
+
+
+def test_growing_or_crossing_an_oversized_file_is_charged():
+    """Climbing while over, and crossing from under, are both owed."""
+    assert CR._worsened(_size_site(1210), _size_site(1200))
+    assert CR._worsened(_size_site(1010), [])

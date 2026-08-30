@@ -384,10 +384,9 @@ def edit_region(touched: set, text: str) -> set:
 def _worsened(found: list, before: list) -> list:
     """Sites whose MEASURE rose, not merely whose count rose.
 
-    `long-functions` and `god-functions` are one site per function, so a count
-    comparison never moves for a function that already broke the rule: growing
-    a 100-line function to 130, or complexity 30 to 60, scored as unchanged.
-    The number lives in the detail, so compare that instead, per function.
+    Keyed on the detail before its colon, compared on the first number after.
+    Every detail MUST name its site there: a detail that is only a number keys
+    on the number, so shrinking mints a new key and scores as worsening.
     """
     old = {}
     for site in before:

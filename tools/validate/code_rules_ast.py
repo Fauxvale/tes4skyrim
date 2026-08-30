@@ -323,6 +323,6 @@ def structural_sites(path, text: str, tree) -> dict:
             for st in cls.body if isinstance(st, ast.Assign)
             and isinstance(st.value, (ast.Dict, ast.List, ast.Set))],
         'oversized-files': [
-            (path, 1, '%d code lines' % n)
+            (path, 1, 'file: %d code lines' % n)
             for n in [code_lines(text, tree)] if n > MAX_FILE_LINES],
     }
