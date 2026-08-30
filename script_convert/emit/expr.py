@@ -19,16 +19,14 @@ from __future__ import annotations
 
 
 from script_convert.constants import (
-    BASE_FORM_TYPES, PAPYRUS_BOOL_FUNCTIONS, EVENT_REF_PARAMS, MISMATCH_TYPES,
+    BASE_FORM_TYPES, OP_MAP, PAPYRUS_BOOL_FUNCTIONS, EVENT_REF_PARAMS,
+    MISMATCH_TYPES,
     _PAPYRUS_VALUE_TYPES)
 from script_convert.emit.commands import (
     BOOL_TEMPLATE_COMMANDS, COMPARISON_COMMANDS, INERT_COMMANDS,
 )
 from script_convert import resolve_name as _resolve
 from script_convert.tes4 import lexer as L, nodes as N
-
-# TES4 spelled inequality `<>`; Papyrus spells it `!=`.
-_OP_MAP = {'<>': '!='}
 
 # Papyrus binds `as` tighter than the arithmetic operators, so a cast applied
 # to one operand does not type the whole expression.  These are the operators
@@ -455,7 +453,7 @@ def _apply_cmp_rules(conv, node: N.BinOp, extends: str):
 
 
 def _binop(conv, node: N.BinOp, extends: str) -> str:
-    op = _OP_MAP.get(node.op, node.op)
+    op = OP_MAP.get(node.op, node.op)
     left, right = node.left, node.right
 
     packaged = _package_comparison(conv, node, extends)

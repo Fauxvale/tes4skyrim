@@ -11,7 +11,8 @@ later phase's state.
 """
 
 from script_convert.constants import (
-    BLOCK_MAP, COMMAND_ROWS, _ACTOR_ONLY_FUNCTIONS,
+    BLOCK_MAP, COMMAND_ROWS, COMBAT_STATE_GUARDS, POLL_BLOCKS,
+    REF_SPECIFICITY, _ACTOR_ONLY_FUNCTIONS,
     _OBJREF_SHARED_FUNCTIONS, TYPE_MAP, _safe_property_name, papyrus_script_name,
 )
 from script_convert import symbols as _symbols
@@ -500,9 +501,6 @@ def helpers(conv) -> list:
     return out
 
 
-#: TES4 blocks that become the OnUpdate poll rather than an event of their own.
-_POLL_BLOCKS = ('gamemode', 'scripteffectupdate')
-
 #: The insurance arm's interval.  Long ON PURPOSE -- see `poll`.
 _INSURANCE_SECS = '5.0'
 
@@ -569,7 +567,7 @@ def poll(conv, tree, extends: str) -> list:
 
     for block in (tree.blocks if tree else ()):
         btype = block.btype.lower()
-        if btype in _POLL_BLOCKS or (btype == 'menumode'
+        if btype in POLL_BLOCKS or (btype == 'menumode'
                                      and _menumode_kind(block) == 'poll'):
             out += _script.emit_body(conv, block.body, extends, 1)
 
@@ -884,12 +882,6 @@ def block_activation(conv, tree, extends: str, body: list) -> list:
     return body + ['Event OnLoad()', '  BlockActivation(true)', 'EndEvent', '']
 
 
-#: TES4 blocks that land on OnCombatStateChanged, which ALSO fires when combat
-#: ENDS.  Each body is gated on the state its own block meant; without this
-#: every OnStartCombat body re-ran when the fight finished.
-_COMBAT_STATE_GUARDS = {'onalarm': 'aeCombatState != 0',
-                        'onstartcombat': 'aeCombatState == 1'}
-
 
 def _guarded(conv, block, body: list) -> list:
     """Wrap a block body in the condition its TES4 FILTER stood for.
@@ -902,7 +894,7 @@ def _guarded(conv, block, body: list) -> list:
     """
     btype = block.btype.lower()
     guard = conv._block_filter_guard(btype, block.filter or '')
-    state = _COMBAT_STATE_GUARDS.get(btype)
+    state = COMBAT_STATE_GUARDS.get(btype)
     if state and guard is not None:
         guard = f'{state} && {guard}' if guard else state
 
@@ -1046,10 +1038,6 @@ def chargen_latch(conv) -> list:
     return ['', 'Bool TES4_ChargenMenuBusy = False']
 
 
-#: Papyrus reference types, WIDEST first: a later entry is more specific, so
-#: `Actor` beats `ObjectReference` when the two tables disagree.
-_REF_SPECIFICITY = ('Form', 'ObjectReference', 'Actor')
-
 
 def _specific(a: str, b: str) -> str:
     """The more specific of two candidate types for one variable."""
@@ -1057,8 +1045,8 @@ def _specific(a: str, b: str) -> str:
         return b
     if not b or a == b:
         return a
-    if a in _REF_SPECIFICITY and b in _REF_SPECIFICITY:
-        return max(a, b, key=_REF_SPECIFICITY.index)
+    if a in REF_SPECIFICITY and b in REF_SPECIFICITY:
+        return max(a, b, key=REF_SPECIFICITY.index)
     # A script type (`TES4_Foo`) is the most specific thing there is: it is
     # what cross-script variable reads through the property need.
     return a if a.startswith('TES4_') else (b if b.startswith('TES4_') else a)

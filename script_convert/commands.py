@@ -18,7 +18,7 @@ argument text -- so those are properties of the CALL and live on it.
 
 from script_convert import resolve_name as _resolve_name
 from script_convert.constants import (
-    ACTOR_VALUE_MAP, ANIM_GROUP_EVENTS, ATTRIBUTE_STUB_VALUE,
+    ACTOR_VALUE_MAP, ANIM_GROUP_EVENTS, ATTRIBUTE_STUB_VALUE, CASTABLE,
     GMST_TO_ACTOR_VALUE, param_types,
     PLACED_REF_SIGS, TES4_ATTRIBUTES, _ACTOR_VALUE_FUNCTIONS,
     _ACTOR_VALUE_READ_FUNCTIONS, TES4_ASSAULT_BOUNTY, TES4_MURDER_BOUNTY,
@@ -48,15 +48,6 @@ def dispatch(ctx, call) -> str:
     handler = REGISTRY.get(call.name)
     return handler(ctx, call) if handler is not None else None
 
-
-#: Source types a declared parameter type may be cast FROM.  Only these: any
-#: wider rule would hide a real mismatch behind a silent conversion.
-_CASTABLE = {
-    'Int': ('Float',),
-    'Spell': ('Form', 'ObjectReference'),
-    'Faction': ('Form', 'ObjectReference'),
-    'ObjectReference': ('Form',),
-}
 
 
 class Call:
@@ -94,7 +85,7 @@ class Call:
         """
         text = self._conv.arg_expr(n, self.extends, default)
         want = param_types(self.name).get(n)
-        if want and self._conv.type_of(text) in _CASTABLE.get(want, ()):
+        if want and self._conv.type_of(text) in CASTABLE.get(want, ()):
             return self._conv._cast(text, want)
         return text
 

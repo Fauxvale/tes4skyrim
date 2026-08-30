@@ -20,7 +20,8 @@ the graph.
 import re
 
 from script_convert.constants import (
-    KNOWN_GLOBALS, COMMAND_ROWS, HANDLED_COMMANDS, TES4_MURDER_BOUNTY,
+    FAME_GLOBALS, KNOWN_GLOBALS, COMMAND_ROWS, HANDLED_COMMANDS,
+    TES4_MURDER_BOUNTY,
     _ACTOR_VALUE_MAP_LOW, _BARE_NO_EQUIV_COMMANDS, _FORM_TYPE_TESTS,
     _canonical_global, _safe_property_name,
 )
@@ -77,12 +78,6 @@ BARE_COMMANDS = frozenset({
     'gettalkedtopc', 'payfine', 'getdayofweek', 'getdayoftheweek',
 })
 
-#: The global a bare fame/infamy/crime read resolves to.
-_FAME_GLOBALS = {
-    'getpcfame': ('TES4Fame', 'TES4Fame.GetValueInt()'),
-    'getpcinfamy': ('TES4Infamy', 'TES4Infamy.GetValueInt()'),
-    'getinfame': ('TES4Infamy', 'TES4Infamy.GetValueInt()'),
-}
 
 #: Names meaning "the player is a murderer".  Takes NO arguments, so it is
 #: always read bare -- which meant the real handler was unreachable dead code
@@ -157,8 +152,8 @@ def _fixed_reading(conv, low: str, extends: str):
     if low in BARE_INERT:
         return '0'
 
-    if low in _FAME_GLOBALS:
-        prop, text = _FAME_GLOBALS[low]
+    if low in FAME_GLOBALS:
+        prop, text = FAME_GLOBALS[low]
         conv.sc.property_refs[prop] = 'GlobalVariable'
         return text
     if low in _MURDERER_NAMES:

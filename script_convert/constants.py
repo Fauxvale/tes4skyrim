@@ -1392,19 +1392,7 @@ COMMAND_ROWS = {
     'delete': Cmd('Delete', MAP, flags='objref_self'),
     'markfordelete': Cmd('Delete', MAP, flags='zero_arg'),
     'placeatme': Cmd('PlaceAtMe', MAP, flags='actor_only objref_shared'),
-    # TES4 SetDestroyed drives the ENGINE destruction system: the ref switches
-    # to its destroyed state — geometry breaks apart and collision drops — while
-    # staying present in the world.  Skyrim keeps the same system and exposes it
-    # natively as ObjectReference.SetDestroyed(bool) (vanilla ObjectReference.psc
-    # line 541; command 4300 / opcode 0x10CC).  An earlier mapping to
-    # BlockActivation only suppressed re-activation and never broke anything,
-    # which is why breakaway planks and tripwires animated but stayed solid.
-    # Routed through TES4Polyfill.SetDestroyed (special handler) rather than
-    # straight to the native: TES4 pairs the setter with `getdestroyed`, and
-    # Skyrim ships NO reader for the destroyed flag, so the polyfill mirrors
-    # every write into the TES4DestroyedRefs FormList that GetDestroyed reads.
-    # Mapping direct to the native here would bypass that mirror and leave the
-    # read false forever.
+    #: Native SetDestroyed (4300/0x10CC) has NO reader, so the polyfill mirrors every write into TES4DestroyedRefs.
 
     #: --- Actor State ---
     'kill': Cmd('Kill', MAP, flags='actor_only'),
@@ -2347,3 +2335,41 @@ _ZERO_ARG_REF_FUNCTIONS = _flagged('zero_arg') | frozenset({
 
 #: What `emit/expr.py` reads: every name either list above calls boolean.
 _BOOL_VALUED_FUNCTIONS = _BARE_BOOL_FUNCTIONS | _COMPARISON_BOOL_FUNCTIONS
+
+#: TES4 block types whose body becomes the OnUpdate poll.
+POLL_BLOCKS = ('gamemode', 'scripteffectupdate')
+
+#: TES4 block type -> the Papyrus combat-state test its filter stood for.
+COMBAT_STATE_GUARDS = {'onalarm': 'aeCombatState != 0',
+                       'onstartcombat': 'aeCombatState == 1'}
+
+#: Reference types, WIDEST first: the later one is the more specific.
+REF_SPECIFICITY = ('Form', 'ObjectReference', 'Actor')
+
+#: Numeric types, widest first.  Mixed arithmetic takes the widest operand.
+NUMERIC_RANK = ('Float', 'Int', 'Bool')
+
+#: Declared parameter type -> the source types it may be cast FROM, only these.
+CASTABLE = {
+    'Int': ('Float',),
+    'Spell': ('Form', 'ObjectReference'),
+    'Faction': ('Form', 'ObjectReference'),
+    'ObjectReference': ('Form',),
+}
+
+#: The types an OBSE user function declares when nothing narrows its `ref`.
+UDF_WIDE_TYPES = {'form', 'objectreference'}
+
+#: TES4 spelled inequality `<>`; Papyrus spells it `!=`.
+OP_MAP = {'<>': '!='}
+
+#: Operators binding LOOSER than Papyrus `as`, so a cast over one needs parens.
+LOOSE_OPS = (' + ', ' - ', ' * ', ' / ', ' % ', ' && ', ' || ',
+             ' == ', ' != ', ' < ', ' > ', ' <= ', ' >= ')
+
+#: TES4 fame/infamy read -> (global property, the Papyrus read).
+FAME_GLOBALS = {
+    'getpcfame': ('TES4Fame', 'TES4Fame.GetValueInt()'),
+    'getpcinfamy': ('TES4Infamy', 'TES4Infamy.GetValueInt()'),
+    'getinfame': ('TES4Infamy', 'TES4Infamy.GetValueInt()'),
+}

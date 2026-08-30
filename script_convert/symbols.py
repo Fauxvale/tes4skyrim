@@ -31,7 +31,7 @@ from script_convert.tes4 import nodes as N
 from dataclasses import dataclass, field
 
 from script_convert.constants import (
-    AXIS_COMMANDS,
+    AXIS_COMMANDS, NUMERIC_RANK,
     _ACTOR_ARG_FUNCTIONS,
     _ACTOR_ONLY_FUNCTIONS,
     _OBJREF_SHARED_FUNCTIONS,
@@ -60,25 +60,18 @@ IMPLICIT_NAMES = frozenset({
 
 #: Numeric types, widest first.  Arithmetic over a mixed expression takes the
 #: widest operand's type, exactly as Papyrus does.
-_NUMERIC_RANK = ('Float', 'Int', 'Bool')
 
 
 def type_of_expr(node, lookup) -> str:
     """Papyrus type of an expression NODE, or '' when nothing says.
 
-    This is what the `_coerce_*` family re-derives from emitted text.  Reading
-    the tree instead is not merely tidier, it is more correct in two ways the
-    text scan cannot be:
+    Reading the TREE beats the text scan it replaced twice over: a name inside
+    a string literal cannot be mistaken for a variable, and arithmetic is typed
+    by its OPERANDS.  `/` included -- Papyrus types `Int / Int` as Int exactly
+    as TES4 did, and always-Float changed every integer ratio in the corpus.
 
-      * a name inside a STRING LITERAL cannot be mistaken for a variable --
-        `Debug.MessageBox("your GetScale is off")` matched the Float regex;
-      * arithmetic is typed by its OPERANDS rather than by whether the
-        rendering happens to contain a `.` and a digit, so `a * 2` is Int when
-        `a` is and Float when it is not.
-
-    `lookup(name) -> str` supplies the type of a bare name; the converter
-    passes its own `type_of`, so locals, properties and cross-script members
-    all resolve through the one chain that already exists.
+    `lookup(name) -> str` supplies a bare name's type; the converter passes its
+    own `type_of`, so locals, properties and remote members all resolve there.
     """
 
     if node is None:
@@ -125,12 +118,7 @@ def type_of_expr(node, lookup) -> str:
             return 'Bool'
         left = type_of_expr(node.left, lookup)
         right = type_of_expr(node.right, lookup)
-        # Division does NOT widen.  Papyrus types `Int / Int` as Int, exactly
-        # as TES4 did, so treating `/` as always-Float added a cast to
-        # `Strecke / Zeit` (both Int) that the compiler neither needs nor
-        # wants -- and would have changed the value of every integer ratio in
-        # the corpus.  The operand types decide, for `/` like everything else.
-        for rank in _NUMERIC_RANK:
+        for rank in NUMERIC_RANK:
             if rank in (left, right):
                 return rank
         return left or right

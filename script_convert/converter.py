@@ -7,6 +7,7 @@ from script_convert.emit import script as _script
 from script_convert.tes4 import nodes as _tes4_nodes
 from script_convert.constants import (
     BLOCK_FILTER_PARAM, COMMAND_ROWS, DISPATCH_EVENTS, ENUM_ACTOR_VALUES,
+    LOOSE_OPS,
     ENUM_AV_LADDERS, GMST_TO_ACTOR_VALUE, KNOWN_COMMANDS, KNOWN_GLOBALS,
     PAPYRUS_BOOL_FUNCTIONS, PLACED_REF_SIGS, PLAYER_ALIAS_EXTENDS,
     RETURN_TYPES, SAY_SPEAKAS_MIN_TOKENS, SELF_NAMES, TYPE_MAP,
@@ -2729,13 +2730,6 @@ def _outermost_call(value: str) -> str:
                     tail = head
     return tail.rsplit('.', 1)[-1].strip().lower()
 
-
-#: Operators that bind LOOSER than Papyrus's `as`, so an expression containing
-#: one at its top level must be parenthesised before it is cast.
-_LOOSE_OPS = (' + ', ' - ', ' * ', ' / ', ' % ', ' && ', ' || ',
-              ' == ', ' != ', ' < ', ' > ', ' <= ', ' >= ')
-
-
 def _needs_parens(text: str) -> bool:
     """Would a trailing `as T` bind to only PART of this expression?"""
     depth = 0
@@ -2744,7 +2738,7 @@ def _needs_parens(text: str) -> bool:
             depth += 1
         elif ch in ')]':
             depth -= 1
-        elif not depth and any(text.startswith(op, i) for op in _LOOSE_OPS):
+        elif not depth and any(text.startswith(op, i) for op in LOOSE_OPS):
             return True
     return False
 

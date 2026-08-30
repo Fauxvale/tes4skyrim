@@ -11,7 +11,8 @@ from tes5_import.text_reader import parse_export_file
 from worker_budget import worker_count
 
 from script_convert.constants import (_sanitize_name, _safe_property_name, _record_type_to_papyrus, papyrus_script_name,
-                                     KNOWN_COMMANDS, SERVICE_MENU_CALL)
+                                     KNOWN_COMMANDS, SERVICE_MENU_CALL,
+                                     UDF_WIDE_TYPES)
 from script_convert.cross_ref import CrossRefGraph, master_names
 from script_convert.converter import ScriptConverter
 from script_convert.symbols import property_declarations, IMPLICIT_NAMES
@@ -503,10 +504,6 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
     return stats
 
 
-#: Papyrus converts freely UP to these; only a DOWNCAST needs an `as`.
-_UDF_WIDE_TYPES = {'form', 'objectreference'}
-
-
 def write_psc(output_dir: str, script_name: str, text: str) -> None:
     """Write one generated script, commenting out its dangling references.
 
@@ -618,8 +615,8 @@ def _fix_udf_call_arg_types(output_dir: str, sigs: dict, callers: dict) -> None:
 
 def _needs_cast(have: str, want: str, arg: str) -> bool:
     """Papyrus converts freely UP, so only a DOWNCAST needs an explicit `as`."""
-    return (bool(have) and have.lower() in _UDF_WIDE_TYPES
-            and want.lower() not in _UDF_WIDE_TYPES and ' as ' not in arg)
+    return (bool(have) and have.lower() in UDF_WIDE_TYPES
+            and want.lower() not in UDF_WIDE_TYPES and ' as ' not in arg)
 
 
 # `Owner.member` at the head of a statement, which is the shape a dangling
