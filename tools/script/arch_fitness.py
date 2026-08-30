@@ -12,7 +12,8 @@ a target; a change is scored before and after, and "did that help?" is answered
 by arithmetic rather than judgement.
 
     python tools/script/arch_fitness.py                        # the table
-    python tools/script/arch_fitness.py --json                 # machine readable
+    python tools/script/arch_fitness.py --legend               # what each means
+    python tools/script/arch_fitness.py --why stray-comments   # the file:lines
     python tools/script/arch_fitness.py --fail-on-regression   # the edit loop
     python tools/script/arch_fitness.py --update-baseline      # after a stage
 
@@ -20,13 +21,22 @@ by arithmetic rather than judgement.
 exits non-zero ONLY when a metric moved the wrong way.  It never blocks
 progress toward a target, which is what keeps it from being switched off.
 
-Two families:
+Every metric is NAMED, not numbered.  `F10: 32` needs a legend to act on and
+reads as noise in a report; `satellite-cmd-sets: 32` says what to go fix.  The
+`group` column ties one back to the anti-pattern it scores (AP1-AP8) or marks
+it `doc` for the documentation rules.
 
-  F1-F12   one per anti-pattern recorded in the architecture doc.  These score
-           the ABSENCE of a known disease.
-  F13-F23  simple / organised / deduplicated / maintainable / fast.  These
-           score the GOAL, so the package cannot rot in a way the original
-           audit failed to anticipate.
+Three families:
+
+  AP1-AP8  one per anti-pattern in the architecture doc -- the ABSENCE of a
+           known disease.
+  (blank)  simple / organised / deduplicated / maintainable / fast -- the GOAL,
+           so the package cannot rot in a way the original audit missed.
+  doc      the documentation rules: docstrings carry the prose, comments do not.
+
+🛑 EVERY RULE IS PACKAGE-SCOPED.  The doc rules once ran repo-wide, which made
+them dead weight here: `stray-comments` read 26,952 with only 2,857 of them in
+`script_convert/`, so no amount of work on this package could move the number.
 
 This is a FITNESS FUNCTION, not the correctness gate.  It says the code is
 SHAPED right; only `psc_semantic_diff.py` says it still DOES the same thing,
@@ -51,8 +61,8 @@ import ast
 import json
 import re
 import statistics
-import sys
 import subprocess
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -63,65 +73,104 @@ sys.path.insert(0, str(ROOT))
 PKG = ROOT / 'script_convert'
 BASELINE = ROOT / 'docs' / 'script_convert_fitness.json'
 
-#: Repo-wide scope for the comment rules; structural rules stay package-only.
-REPO_DIRS = ('script_convert', 'tes4_export', 'tes5_import', 'asset_convert',
-             'tools', 'tests')
-
 #: Scratch and vendored trees, excluded from every rule.
 REPO_SKIP = ('temp', 'references', 'external', 'output', 'export', 'build')
 
-#: F2 counts fat functions; F2T counts BRANCHES, which splitting cannot move.
+#: Roughly seven lines of prose -- a contract, not a narrative.
+MAX_DOC_CHARS = 480
+
+#: Measured p90 of 7,320 functions is 49 lines; see the architecture doc.
+MAX_FUNCTION_LINES = 60
+
 #: 'le': lower is better.  'ge': higher is better.
 LOWER, HIGHER = 'le', 'ge'
 
-#: key, target, direction, label -- in printed order.
+#: key, target, direction, group -- in printed order; the key IS the name.
 METRICS = [
-    ('F1', 0, LOWER, 'AP2  functions consuming emitted Papyrus'),
-    ('F2', 0, LOWER, '     functions with complexity >25'),
-    ('F2T', 1500, LOWER, '     TOTAL branch points (split-proof)'),
-    ('F3', 0, LOWER, 'AP4  private reach-ins from emit/commands/assemble'),
-    ('F4', 6500, LOWER, '     package CODE lines'),
-    ('F5', 0, LOWER, '     files over 1000 code lines'),
-    ('F6', 0, LOWER, 'AP1  AST->text->AST round-trip references'),
-    ('F7', 0, LOWER, 'AP3  raw-source scans after parse'),
-    ('F8', 0, LOWER, 'AP4  mutable class-level dict/list/set'),
-    ('F9', 10, LOWER, 'AP5  data constants outside constants.py'),
-    ('F10', 0, LOWER, 'AP6  satellite per-command sets'),
-    ('F11', 0, LOWER, 'AP7  logic + import-time I/O in constants.py'),
-    ('F12', 0, LOWER, 'AP8  emitted-.psc read sites'),
-    ('F13', 0, LOWER, '     duplicated string-literal collections'),
-    ('F14', 0, LOWER, '     functions over 80 physical lines'),
-    ('F15', 0, LOWER, '     functions with >10 return points'),
-    ('F16', 0, LOWER, '     functions nested >4 deep'),
-    ('F17', 10, LOWER, '     function-local imports'),
-    ('F18', 25, LOWER, '     regex operations'),
-    ('F19', 0, LOWER, '     module comment blocks over 400 chars'),
-    ('F21', 0, LOWER, '     ms/script on the frozen fixture'),
-    ('F22', 0, LOWER, '     duck-typed getattr on AST nodes'),
-    ('F23', 95, HIGHER, '     pct public fns with a return annotation'),
-    ('F24', 0, LOWER, '     inline comments in a function body'),
-    ('F26', 0, LOWER, '     docstrings over 400 chars'),
-    ('F27', 0, LOWER, '     defs outside a section in a SECTIONED file'),
-    ('F28', 0, LOWER, '     section headings over 400 chars'),
-    ('F29', 0, LOWER, '     functions with NO docstring'),
-    ('F30', 0, LOWER, '     docstrings out of proportion to the body'),
-    ('F31', 0, LOWER, '     `#:` docs over one 80-char line'),
-    ('F32', 0, LOWER, '     plain `#` comments outside a section heading'),
+    ('text-repair-fns', 0, LOWER, 'AP2'),
+    ('god-functions', 0, LOWER, ''),
+    ('branch-points', 1500, LOWER, ''),
+    ('private-reach-ins', 0, LOWER, 'AP4'),
+    ('code-lines', 6500, LOWER, ''),
+    ('oversized-files', 0, LOWER, ''),
+    ('reparse-round-trip', 0, LOWER, 'AP1'),
+    ('source-rescans', 0, LOWER, 'AP3'),
+    ('mutable-class-state', 0, LOWER, 'AP4'),
+    ('stray-constants', 10, LOWER, 'AP5'),
+    ('satellite-cmd-sets', 0, LOWER, 'AP6'),
+    ('logic-in-constants', 0, LOWER, 'AP7'),
+    ('psc-readback', 0, LOWER, 'AP8'),
+    ('duplicate-literals', 0, LOWER, ''),
+    ('long-functions', 0, LOWER, ''),
+    ('multi-return-fns', 0, LOWER, ''),
+    ('deep-nesting', 0, LOWER, ''),
+    ('local-imports', 10, LOWER, ''),
+    ('regex-ops', 25, LOWER, ''),
+    ('ms-per-script', 0, LOWER, ''),
+    ('duck-typed-nodes', 0, LOWER, ''),
+    ('return-annotations', 95, HIGHER, ''),
+    ('comment-blocks', 0, LOWER, 'doc'),
+    ('inline-comments', 0, LOWER, 'doc'),
+    ('fat-docstrings', 0, LOWER, 'doc'),
+    ('unsectioned-defs', 0, LOWER, 'doc'),
+    ('fat-sections', 0, LOWER, 'doc'),
+    ('missing-docstrings', 0, LOWER, 'doc'),
+    ('bloated-docstrings', 0, LOWER, 'doc'),
+    ('fat-attr-docs', 0, LOWER, 'doc'),
+    ('stray-comments', 0, LOWER, 'doc'),
 ]
 
-#: F1 is layer-scoped: unscoped it wrongly flags the parser and classifier.
-F1_SCOPE = frozenset({'converter.py', 'emit/expr.py', 'emit/stmt.py',
+#: One line each, printed by `--legend`.  A name says WHAT; this says WHY.
+EXPLAIN = {
+    'text-repair-fns': 'takes emitted Papyrus back as input (fix the NODE)',
+    'god-functions': 'cyclomatic complexity over 25',
+    'branch-points': 'total branches; splitting a function cannot move it',
+    'private-reach-ins': 'emit/commands/assemble touching conv._ / ctx._',
+    'code-lines': 'package implementation lines (docstrings excluded)',
+    'oversized-files': 'files over 1000 code lines',
+    'reparse-round-trip': 'a node flattened to TES4 text and re-parsed',
+    'source-rescans': 'feature flags regexed from raw source after parse',
+    'mutable-class-state': 'class-level dict/list/set as a global channel',
+    'stray-constants': 'data tables living outside constants.py',
+    'satellite-cmd-sets': 'per-command flag sets shadowing COMMAND_ROWS',
+    'logic-in-constants': 'constants.py taking a graph, or reading at import',
+    'psc-readback': 'a symbol table rebuilt by grepping generated .psc',
+    'duplicate-literals': 'redundant copies of one string-literal collection',
+    'long-functions': 'over %d physical lines' % MAX_FUNCTION_LINES,
+    'multi-return-fns': 'over 10 return points -- a dispatch chain',
+    'deep-nesting': 'if/for/while/with/try nested over 4 deep',
+    'local-imports': 'function-local imports (they hide layering breaks)',
+    'regex-ops': 'the string-era footprint in one number',
+    'ms-per-script': 'median ms on the frozen fixture, vs baseline',
+    'duck-typed-nodes': 'getattr on an AST node instead of a real field',
+    'return-annotations': 'pct of public functions with one',
+    'comment-blocks': 'module-level comment block over %d chars'
+                      % MAX_DOC_CHARS,
+    'inline-comments': 'a comment inside a function body',
+    'fat-docstrings': 'docstring over %d chars' % MAX_DOC_CHARS,
+    'unsectioned-defs': 'a def above the first heading in a sectioned file',
+    'fat-sections': 'section heading over %d chars of prose'
+                    % MAX_DOC_CHARS,
+    'missing-docstrings': 'function with no docstring at all',
+    'bloated-docstrings': 'docstring out of proportion to its body',
+    'fat-attr-docs': 'a `#:` doc running past one 120-char line',
+    'stray-comments': 'a plain `#` that is not a section heading',
+}
+
+#: The doc-rule keys; scoped to the package, they read 2,857 / 1,617 / 57.
+DOC_METRICS = frozenset(k for k, _t, _d, g in METRICS if g == 'doc')
+
+#: Layer-scoped: unscoped this wrongly flags the parser and the classifier.
+TEXT_REPAIR_SCOPE = frozenset({'converter.py', 'emit/expr.py', 'emit/stmt.py',
                       'emit/commands.py'})
-F1_PARAMS = frozenset({'lines', 'line', 'text', 'emitted', 'psc'})
+TEXT_REPAIR_PARAMS = frozenset({'lines', 'line', 'text', 'emitted', 'psc'})
 #: (file, function) exempt for a legitimate reason.
-F1_ALLOW = frozenset({
+TEXT_REPAIR_ALLOW = frozenset({
     ('converter.py', 'emit_string'),   # a TES4 string LITERAL, not our output
     ('emit/expr.py', '_number'),       # a numeric literal's source spelling
 })
 
-#: Names proving the string layer is still alive.
-#: The round trip is a node flattened to TES4 text and RE-PARSED.  `emit_source`
-#: alone is node->text for a `;NE:` marker, which never re-enters the parser.
+#: The round trip: a node flattened to TES4 text and RE-PARSED.
 ROUND_TRIP = re.compile(
     r'_convert_expression\(|_tree_expression|USE_TREE_EXPRESSIONS'
     r'|emit_source\([^)]*\)\s*(?:,\s*extends)?\s*\)\s*$'
@@ -144,28 +193,25 @@ DUCK_GETATTR = re.compile(r'getattr\(\s*(?:st|node|n|stmt|expr)\b[^)]*\)')
 BRANCH_NODES = (ast.If, ast.For, ast.While, ast.And, ast.Or,
                 ast.ExceptHandler, ast.Assert, ast.comprehension)
 
-#: Unused: F24 now bans an inline comment at any complexity.
-F24_SIMPLE = 10
-
-#: Roughly six lines of prose -- a contract, not a narrative.
-F26_MAX_DOC = 400
-
 #: A one- or two-line body gets one line of docstring, nothing more.
-F30_TINY_BODY = 2
-F30_TINY_DOC = 80
+TINY_BODY_LINES = 2
+TINY_DOC_CHARS = 80
 
 #: Chars per code line above that: the measured 90th percentile (median 35).
-F30_MAX_RATIO = 200
+DOC_CHARS_PER_LINE = 200
 
 #: A `#:` doc is ONE line: it labels a declaration, it does not argue.
-F31_MAX_ATTR = 80
+MAX_ATTR_DOC_CHARS = 120
 
 #: A section heading is a `# ----` or `# ====` rule above and below a title.
 BANNER_RE = re.compile(r'^#\s*(?:-{4,}|={4,})\s*$')
 
 #: Exempt from F24; both are capped by F28/F31 so neither can launder prose.
-F24_EXEMPT_PREFIX = ('#:', '# ---', '# ===')
+COMMENT_EXEMPT_PREFIX = ('#:', '# ---', '# ===')
 NEST_NODES = (ast.If, ast.For, ast.While, ast.With, ast.Try)
+
+#: A set built by this call is DERIVED from the rows, not authored beside them.
+FLAGGED = '_flagged'
 
 #: The command universe, not per-command flags.
 SET_UNIVERSE = frozenset({'KNOWN_COMMANDS', 'HANDLED_COMMANDS',
@@ -192,10 +238,29 @@ FIXTURE_RUNS, FIXTURE_ITERS = 5, 40
 SPEED_TOLERANCE = 1.5
 
 
-def code_lines(text: str) -> int:
-    """Non-blank, not-comment-only lines; docstrings COUNT (one definition)."""
-    return sum(1 for line in text.split('\n')
-               if line.strip() and not line.strip().startswith('#'))
+def code_lines(text: str, tree=None) -> int:
+    """Non-blank, not-comment-only, NOT-docstring lines (one definition).
+
+    Docstrings are documentation, not code, and counting them made F4 punish
+    the very thing this refactor wants: a `Cmd` row carrying a 3-line
+    rationale scored WORSE than the 12-line branch it replaced.  They are
+    still measured -- by F26, F29 and F30 -- so what F4 reports is the size of
+    the IMPLEMENTATION.
+    """
+    doc_lines = set()
+    for node in ast.walk(tree) if tree is not None else ():
+        if not isinstance(node, (ast.Module, ast.ClassDef,
+                                 ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, 'body', None)
+        first = body[0] if body else None
+        if (isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            doc_lines.update(range(first.lineno, first.end_lineno + 1))
+    return sum(1 for n, line in enumerate(text.split('\n'), 1)
+               if line.strip() and not line.strip().startswith('#')
+               and n not in doc_lines)
 
 
 def _complexity(node) -> int:
@@ -212,17 +277,49 @@ def _depth(node, level: int = 0) -> int:
     return deepest
 
 
-def _satellite_sets() -> int:
-    """Per-command flag sets that should be fields on a COMMAND_ROWS row."""
+def _satellite_sets(trees, pkg: Path) -> list:
+    """`(path, line, detail)` per name set authored apart from its row.
+
+    Read from SOURCE, not runtime: a derived frozenset is indistinguishable
+    from a typed-out one.  Skips a set built by `_flagged`, and one whose names
+    are mostly not in `COMMAND_ROWS`.
+    """
+    tree = trees.get(pkg / 'constants.py')
+    if tree is None:
+        return []
     try:
         from script_convert import constants as C
+        commands = set(C.COMMAND_ROWS)
     except Exception:
-        return -1
-    return sum(1 for name, value in vars(C).items()
-               if isinstance(value, (set, frozenset))
-               and CONST_NAME.match(name)
-               and 3 < len(value) < 300
-               and name not in SET_UNIVERSE)
+        return []
+    hits = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        name = getattr(node.targets[0], 'id', '')
+        if not CONST_NAME.match(name) or name in SET_UNIVERSE:
+            continue
+        if any(isinstance(x, ast.Call) and getattr(x.func, 'id', '') == FLAGGED
+               for x in ast.walk(node.value)):
+            continue
+        literal = node.value
+        if (isinstance(literal, ast.Call)
+                and getattr(literal.func, 'id', '') == 'frozenset'
+                and literal.args):
+            literal = literal.args[0]
+        if not isinstance(literal, ast.Set):
+            continue
+        if not 3 < len(literal.elts) < 300:
+            continue
+        members = [e.value.lower() for e in literal.elts
+                   if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        named = sum(1 for m in members if m in commands)
+        if named * 2 <= len(members):
+            continue
+        hits.append((pkg / 'constants.py', node.lineno,
+                     '%s: %d of %d names have a row'
+                     % (name, named, len(members))))
+    return hits
 
 
 def _constants_logic(trees, pkg: Path) -> int:
@@ -274,7 +371,7 @@ def _duplicate_literals(files, trees) -> list:
 
 
 def _module_blocks(files, texts, trees) -> list:
-    """Module-level comment blocks running past F26_MAX_DOC.
+    """Module-level comment blocks running past MAX_DOC_CHARS.
 
     Function bodies are F24's, `#:` is F31's and banners are F28's, so what is
     left here is the free-floating module-level block.
@@ -296,10 +393,10 @@ def _module_blocks(files, texts, trees) -> list:
                     start = i
                 run += len(stripped.lstrip('#').strip())
             else:
-                if run > F26_MAX_DOC:
+                if run > MAX_DOC_CHARS:
                     hits.append((path, start, '%d chars' % run))
                 run = 0
-        if run > F26_MAX_DOC:
+        if run > MAX_DOC_CHARS:
             hits.append((path, start, '%d chars' % run))
     return hits
 
@@ -318,7 +415,7 @@ def _narration(files, texts, trees) -> list:
             stripped = raw.strip()
             if not stripped.startswith('#'):
                 continue
-            if stripped.startswith(F24_EXEMPT_PREFIX):
+            if stripped.startswith(COMMENT_EXEMPT_PREFIX):
                 continue
             if any(a <= i <= b for a, b in spans):
                 hits.append((path, i, stripped[:60]))
@@ -348,11 +445,11 @@ def _functions(trees) -> list:
 
 
 def _fat_docstrings(trees) -> list:
-    """Functions whose docstring runs past F26_MAX_DOC."""
+    """Functions whose docstring runs past MAX_DOC_CHARS."""
     return [(p, node.lineno, '%s: %d chars' % (node.name, len(doc)))
             for p, node in _functions(trees)
             for doc in [ast.get_docstring(node) or '']
-            if len(doc) > F26_MAX_DOC]
+            if len(doc) > MAX_DOC_CHARS]
 
 
 def _bloated_docstrings(files, texts, trees) -> list:
@@ -360,7 +457,7 @@ def _bloated_docstrings(files, texts, trees) -> list:
 
     F26's flat cap is the same limit at one line or eighty.  A one- or two-line
     body gets ONE LINE; above that the limit is per code line.  See
-    F30_TINY_DOC and F30_MAX_RATIO for the measured thresholds.
+    TINY_DOC_CHARS and DOC_CHARS_PER_LINE for the measured thresholds.
     """
     hits = []
     for path, node in _functions(trees):
@@ -371,8 +468,8 @@ def _bloated_docstrings(files, texts, trees) -> list:
         body = [l for l in lines[node.lineno - 1:node.end_lineno]
                 if l.strip() and not l.strip().startswith('#')]
         code = max(len(body) - len(doc.split(chr(10))) - 2, 1)
-        limit = (F30_TINY_DOC if code <= F30_TINY_BODY
-                 else F30_MAX_RATIO * code)
+        limit = (TINY_DOC_CHARS if code <= TINY_BODY_LINES
+                 else DOC_CHARS_PER_LINE * code)
         if len(doc) > limit:
             hits.append((path, node.lineno,
                          '%s: %d chars of doc on %d code lines (limit %d)'
@@ -414,7 +511,7 @@ def _unsectioned(files, texts, trees) -> list:
 
 
 def _fat_attr_docs(files, texts) -> list:
-    """`#:` docs running past ONE line of F31_MAX_ATTR characters.
+    """`#:` docs running past ONE line of MAX_ATTR_DOC_CHARS characters.
 
     `#:` was the one uncapped location, on the theory that a doc bound to a
     single declaration cannot sprawl.  It can: this file carried an 11-line and
@@ -431,11 +528,11 @@ def _fat_attr_docs(files, texts) -> list:
                 run += 1
                 length += len(stripped.lstrip('#:').strip())
                 continue
-            if run > 1 or length > F31_MAX_ATTR:
+            if run > 1 or length > MAX_ATTR_DOC_CHARS:
                 hits.append((path, start,
                              '%d lines, %d chars' % (run, length)))
             run = length = 0
-        if run > 1 or length > F31_MAX_ATTR:
+        if run > 1 or length > MAX_ATTR_DOC_CHARS:
             hits.append((path, start, '%d lines, %d chars' % (run, length)))
     return hits
 
@@ -469,7 +566,7 @@ def _fat_sections(files, texts) -> list:
     """Section headings whose prose exceeds the docstring limit.
 
     A section tag is a LABEL: `nodes.py` reads `Expressions`, `Statements`,
-    `Traversal`.  Held to the same F26_MAX_DOC as a docstring, because the
+    `Traversal`.  Held to the same MAX_DOC_CHARS as a docstring, because the
     banner is F24-exempt and an uncapped exemption is a laundering route --
     an essay wrapped in dashes would otherwise score nothing at all.
     """
@@ -485,7 +582,7 @@ def _fat_sections(files, texts) -> list:
                 if not stripped.startswith('#') or BANNER_RE.match(stripped):
                     break
                 prose.append(stripped.lstrip('#').strip())
-            if sum(len(x) for x in prose) > F26_MAX_DOC:
+            if sum(len(x) for x in prose) > MAX_DOC_CHARS:
                 hits.append((path, i + 1, '%d chars of prose'
                              % sum(len(x) for x in prose)))
     return hits
@@ -514,40 +611,26 @@ def _speed() -> float:
     return round(statistics.median(runs), 3)
 
 
-def _changed_files(root: Path) -> list:
-    """First-party .py files touched vs HEAD, for the fast edit-loop check.
+def _package_files(pkg: Path) -> list:
+    """Every .py file in the package under measurement."""
+    return sorted(f for f in pkg.rglob('*.py')
+                  if not any(part in REPO_SKIP for part in f.parts))
 
-    The full repo scan is 5.1s across 439 files, which is too slow to run on
-    every edit.  Almost always only a handful changed, and a rule broken in a
-    file nobody touched is pre-existing debt rather than something this edit
-    introduced.
+
+def _changed_files(pkg: Path) -> list:
+    """Package files this working tree has touched vs the MERGE BASE.
+
+    A rule broken in a file nobody edited is inherited debt, and scoring it
+    hides whether THIS change helped.  Merge base, not HEAD, so a file
+    rewritten earlier on the branch still counts as this rewrite's work.
     """
-    try:
-        out = subprocess.run(['git', 'diff', '--name-only', 'HEAD'],
-                             cwd=root, capture_output=True, text=True,
-                             timeout=30)
-        names = out.stdout.split(chr(10))
-    except Exception:
-        return []
-    keep = []
-    for name in names:
-        if not name.endswith('.py'):
-            continue
-        path = root / name
-        if path.is_file() and any(part in REPO_DIRS for part in path.parts)                 and not any(part in REPO_SKIP for part in path.parts):
-            keep.append(path)
-    return sorted(keep)
-
-
-def _repo_files(root: Path) -> list:
-    """Every first-party .py file, for the repo-wide comment rules."""
-    out = []
-    for name in REPO_DIRS:
-        base = root / name
-        if base.is_dir():
-            out += [f for f in base.rglob('*.py')
-                    if not any(part in REPO_SKIP for part in f.parts)]
-    return sorted(out)
+    base = subprocess.run(['git', 'merge-base', 'HEAD', 'master'],
+                          cwd=ROOT, capture_output=True, text=True)
+    ref = base.stdout.strip() or 'HEAD'
+    out = subprocess.run(['git', 'diff', '--name-only', ref, '--', str(pkg)],
+                         cwd=ROOT, capture_output=True, text=True)
+    names = [n for n in out.stdout.split(chr(10)) if n.endswith('.py')]
+    return sorted({ROOT / n for n in names if (ROOT / n).is_file()})
 
 
 def _parse_all(paths) -> tuple:
@@ -570,103 +653,314 @@ def _parse_all(paths) -> tuple:
     return texts, trees
 
 
+def _pattern_counts(files, texts) -> dict:
+    """The regex-based metrics: one findall per pattern per file."""
+    return {key: sum(len(rx.findall(texts[p])) for p in files)
+            for key, rx in (('reparse-round-trip', ROUND_TRIP),
+                            ('source-rescans', RAW_SCAN),
+                            ('psc-readback', PSC_READ),
+                            ('regex-ops', REGEX_OP),
+                            ('duck-typed-nodes', DUCK_GETATTR))}
+
+
+def _size_counts(files, texts, trees, fns) -> dict:
+    """The size and shape metrics, over the shared function walk."""
+    return {
+        'branch-points': sum(_complexity(fn) - 1 for _, fn in fns),
+        'code-lines': sum(code_lines(texts[p], trees[p]) for p in files),
+        'local-imports': sum(
+            1 for p in files for n in ast.walk(trees[p])
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for x in ast.walk(n)
+            if isinstance(x, (ast.Import, ast.ImportFrom))),
+    }
+
+
+def _package_only(files, texts, trees, rel, fns, pkg) -> dict:
+    """Metrics that mean something only inside `script_convert/`."""
+    inner = ('emit/', 'commands/', 'assemble/')
+    return {
+        'text-repair-fns': sum(
+            1 for path, fn in fns
+            if rel[path] in TEXT_REPAIR_SCOPE
+            and ({a.arg for a in fn.args.args}
+                 | {a.arg for a in fn.args.kwonlyargs}) & TEXT_REPAIR_PARAMS
+            and (rel[path], fn.name) not in TEXT_REPAIR_ALLOW),
+        'private-reach-ins': sum(
+            texts[p].count('conv._') + texts[p].count('ctx._')
+            for p in files if rel[p].startswith(inner)),
+        'stray-constants': sum(
+            1 for p in files if rel[p] != 'constants.py'
+            for n in ast.walk(trees[p]) if isinstance(n, ast.Assign)
+            for t in n.targets
+            if isinstance(t, ast.Name) and t.id.lstrip('_').isupper()
+            and isinstance(n.value, (ast.Dict, ast.Set, ast.List, ast.Tuple))),
+        'logic-in-constants': _constants_logic(trees, pkg),
+    }
+
+
+def _all_sites(files, texts, trees, pkg) -> dict:
+    """Every metric that can name its own `(path, line, detail)`.
+
+    The gate and the table read the SAME functions, so a rule cannot be
+    enforced on one file under a definition the score does not share.
+    """
+    sites = dict(_structural_sites(files, texts, trees))
+    sites.update({
+        'satellite-cmd-sets': _satellite_sets(trees, pkg),
+        'duplicate-literals': _duplicate_literals(files, trees),
+        'comment-blocks': _module_blocks(files, texts, trees),
+        'inline-comments': _narration(files, texts, trees),
+        'fat-docstrings': _fat_docstrings(trees),
+        'unsectioned-defs': _unsectioned(files, texts, trees),
+        'fat-sections': _fat_sections(files, texts),
+        'missing-docstrings': _missing_docstrings(trees),
+        'bloated-docstrings': _bloated_docstrings(files, texts, trees),
+        'fat-attr-docs': _fat_attr_docs(files, texts),
+        'stray-comments': _plain_comments(files, texts),
+    })
+    return sites
+
+
 def measure(pkg: Path = PKG, with_speed: bool = True,
             scope: list = None) -> dict:
-    """Every metric, from ONE parse per file.
-
-    The comment rules judge the whole repo; the architecture rules judge only
-    this package.  The package is a subset, so everything is parsed once and
-    the package metrics read a slice of it.  Parsing twice cost 5.7s
-    against 1.6s, and a slow fitness function stops being run.
-    """
-    rfiles = scope if scope is not None else _repo_files(pkg.parent)
-    rtexts, rtrees = _parse_all(rfiles)
-    files = [f for f in rfiles if pkg in f.parents]
-    texts = {f: rtexts[f] for f in files}
-    trees = {f: rtrees[f] for f in files}
-
+    """Every metric for one package, from ONE parse per file."""
+    files = scope if scope is not None else _package_files(pkg)
+    texts, trees = _parse_all(files)
     rel = {p: p.relative_to(pkg).as_posix() for p in files}
     fns = [(p, n) for p in files for n in ast.walk(trees[p])
            if isinstance(n, ast.FunctionDef)]
+
     out = {}
+    out.update(_pattern_counts(files, texts))
+    out.update(_size_counts(files, texts, trees, fns))
+    out.update(_package_only(files, texts, trees, rel, fns, pkg))
 
-    out['F1'] = sum(
-        1 for path, fn in fns
-        if rel[path] in F1_SCOPE
-        and ({a.arg for a in fn.args.args}
-             | {a.arg for a in fn.args.kwonlyargs}) & F1_PARAMS
-        and (rel[path], fn.name) not in F1_ALLOW)
-
-    out['F2'] = sum(1 for _, fn in fns if _complexity(fn) > 25)
-    out['F2T'] = sum(_complexity(fn) - 1 for _, fn in fns)
-    out['F4'] = sum(code_lines(texts[p]) for p in files)
-    out['F5'] = sum(1 for p in files if code_lines(texts[p]) > 1000)
-
-    inner = ('emit/', 'commands/', 'assemble/')
-    out['F3'] = sum(texts[p].count('conv._') + texts[p].count('ctx._')
-                    for p in files if rel[p].startswith(inner))
-
-    out['F6'] = sum(len(ROUND_TRIP.findall(texts[p])) for p in files)
-    out['F7'] = sum(len(RAW_SCAN.findall(texts[p])) for p in files)
-    out['F12'] = sum(len(PSC_READ.findall(texts[p])) for p in files)
-    out['F18'] = sum(len(REGEX_OP.findall(texts[p])) for p in files)
-    out['F22'] = sum(len(DUCK_GETATTR.findall(texts[p])) for p in files)
-
-    out['F8'] = sum(1 for p in files for n in ast.walk(trees[p])
-                    if isinstance(n, ast.ClassDef)
-                    for st in n.body
-                    if isinstance(st, ast.Assign)
-                    and isinstance(st.value, (ast.Dict, ast.List, ast.Set)))
-
-    out['F9'] = sum(1 for p in files if rel[p] != 'constants.py'
-                    for n in ast.walk(trees[p]) if isinstance(n, ast.Assign)
-                    for t in n.targets
-                    if isinstance(t, ast.Name) and t.id.lstrip('_').isupper()
-                    and isinstance(n.value, (ast.Dict, ast.Set, ast.List,
-                                             ast.Tuple)))
-
-    out['F10'] = _satellite_sets()
-    out['F11'] = _constants_logic(trees, pkg)
-    out['F14'] = sum(1 for _, fn in fns
-                     if fn.end_lineno - fn.lineno + 1 > 80)
-    out['F15'] = sum(1 for _, fn in fns
-                     if sum(1 for x in ast.walk(fn)
-                            if isinstance(x, ast.Return)) > 10)
-    out['F16'] = sum(1 for _, fn in fns if _depth(fn) > 4)
-    out['F17'] = sum(1 for p in files for n in ast.walk(trees[p])
-                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                     for x in ast.walk(n)
-                     if isinstance(x, (ast.Import, ast.ImportFrom)))
-
-    sites = {
-        'F13': _duplicate_literals(files, trees),
-        'F19': _module_blocks(rfiles, rtexts, rtrees),
-        'F24': _narration(rfiles, rtexts, rtrees),
-        'F26': _fat_docstrings(rtrees),
-        'F27': _unsectioned(rfiles, rtexts, rtrees),
-        'F28': _fat_sections(rfiles, rtexts),
-        'F29': _missing_docstrings(rtrees),
-        'F30': _bloated_docstrings(rfiles, rtexts, rtrees),
-        'F31': _fat_attr_docs(rfiles, rtexts),
-        'F32': _plain_comments(rfiles, rtexts),
-    }
+    sites = _all_sites(files, texts, trees, pkg)
     SITES.clear()
     SITES.update(sites)
-    for key, found in sites.items():
-        out[key] = len(found)
+    out.update({key: len(found) for key, found in sites.items()})
 
     public = [(p, fn) for p, fn in fns if not fn.name.startswith('_')]
-    out['F23'] = round(100 * sum(1 for _, fn in public
-                                 if fn.returns is not None)
-                       / max(len(public), 1))
-
-    out['F21'] = _speed() if with_speed else 0.0
+    out['return-annotations'] = round(
+        100 * sum(1 for _, fn in public if fn.returns is not None)
+        / max(len(public), 1))
+    out['ms-per-script'] = _speed() if with_speed else 0.0
     return out
+
+
+#: How to FIX each gated rule; the locator says where, this says what to do.
+REMEDY = {
+    'stray-comments':
+        'move the prose into the nearest docstring, or delete it',
+    'inline-comments':
+        'lift it into the function docstring, or name a helper after it',
+    'comment-blocks':
+        'move it into the module docstring',
+    'fat-docstrings':
+        'compress: keep every count, name and mechanism, cut the narration',
+    'bloated-docstrings':
+        'the body is short -- one line of docstring is enough',
+    'missing-docstrings':
+        'add a one-line docstring saying what it returns',
+    'fat-attr-docs':
+        'a `#:` doc is ONE line of 120 chars; longer goes in a docstring',
+    'fat-sections':
+        'a section heading is a LABEL; move the prose to a docstring',
+    'unsectioned-defs':
+        'this file uses `# ----` sections; move the def under one',
+    'god-functions':
+        'split it: extract the branch arms, or drive them from a table',
+    'long-functions':
+        'split it into named phases',
+    'deep-nesting':
+        'invert the guards and return early, or extract the inner block',
+    'multi-return-fns':
+        'a dispatch chain -- make it a table lookup',
+    'mutable-class-state':
+        'a class-level dict/list/set is a global; make it an instance field',
+    'oversized-files':
+        'split the file by responsibility (CLAUDE.md: keep files under ~1000)',
+}
+
+
+def _structural_sites(files, texts, trees) -> dict:
+    """Locators for the structural rules, which `measure` only counts.
+
+    A count tells the agent a rule broke; `file:line: name` tells it what to
+    open.  Without the second the only way to find a violation is to
+    reimplement the metric in a probe, which is how a one-unit regression once
+    survived a dozen tool calls unlocated.
+    """
+    fns = [(p, n) for p in files for n in ast.walk(trees[p])
+           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    out = {
+        'god-functions': [(p, f.lineno, '%s: complexity %d' % (f.name, c))
+                          for p, f in fns
+                          for c in [_complexity(f)] if c > 25],
+        'long-functions': [(p, f.lineno, '%s: %d lines'
+                            % (f.name, f.end_lineno - f.lineno + 1))
+                           for p, f in fns
+                           if f.end_lineno - f.lineno + 1 > MAX_FUNCTION_LINES],
+        'deep-nesting': [(p, f.lineno, '%s: nested %d deep' % (f.name, d))
+                         for p, f in fns
+                         for d in [_depth(f)] if d > 4],
+        'multi-return-fns': [(p, f.lineno, '%s: %d returns' % (f.name, r))
+                             for p, f in fns
+                             for r in [sum(1 for x in ast.walk(f)
+                                           if isinstance(x, ast.Return))]
+                             if r > 10],
+        'mutable-class-state': [
+            (p, st.lineno, '%s.%s is a class-level %s'
+             % (cls.name, getattr(st.targets[0], 'id', '?'),
+                type(st.value).__name__.lower()))
+            for p in files for cls in ast.walk(trees[p])
+            if isinstance(cls, ast.ClassDef)
+            for st in cls.body
+            if isinstance(st, ast.Assign)
+            and isinstance(st.value, (ast.Dict, ast.List, ast.Set))],
+        'oversized-files': [(p, 1, '%d code lines' % n) for p in files
+                            for n in [code_lines(texts[p], trees[p])]
+                            if n > 1000],
+    }
+    return out
+
+
+def rule_sites(path: Path, text: str = None) -> dict:
+    """`{rule: [(path, line, detail), ...]}` for one file's repo-wide rules.
+
+    `text` scores that source instead of the file on disk, which is how the
+    HEAD side of `--gate-diff` is measured without a checkout.
+    """
+    files = [path]
+    if text is None:
+        texts, trees = _parse_all(files)
+    else:
+        texts, trees = {path: text}, {path: ast.parse(text)}
+    checks = {
+        'comment-blocks': _module_blocks(files, texts, trees),
+        'inline-comments': _narration(files, texts, trees),
+        'fat-docstrings': _fat_docstrings(trees),
+        'unsectioned-defs': _unsectioned(files, texts, trees),
+        'fat-sections': _fat_sections(files, texts),
+        'missing-docstrings': _missing_docstrings(trees),
+        'bloated-docstrings': _bloated_docstrings(files, texts, trees),
+        'fat-attr-docs': _fat_attr_docs(files, texts),
+        'stray-comments': _plain_comments(files, texts),
+    }
+    checks.update(_structural_sites(files, texts, trees))
+    return {k: v for k, v in checks.items() if v}
+
+
+def _report(path: Path, broken: dict, limit: int, headline: str) -> int:
+    """Print each violation with its fix; 1 when there was any, else 0."""
+    if not broken:
+        return 0
+    try:
+        shown = path.relative_to(ROOT)
+    except ValueError:
+        shown = path
+    total = sum(len(v) for v in broken.values())
+    print('  %s in %s -- %d violation%s'
+          % (headline, shown, total, '' if total == 1 else 's'),
+          file=sys.stderr)
+    for key, found in sorted(broken.items()):
+        print('', file=sys.stderr)
+        print('    %s (%d) -- %s' % (key, len(found), EXPLAIN.get(key, '')),
+              file=sys.stderr)
+        print('    FIX: %s' % REMEDY.get(key, ''), file=sys.stderr)
+        for _p, line, detail in sorted(found, key=lambda x: x[1])[:limit]:
+            print('      %s:%d: %s' % (shown, line, detail), file=sys.stderr)
+        if len(found) > limit:
+            print('      ... %d more (same fix)' % (len(found) - limit),
+                  file=sys.stderr)
+    return 1
+
+
+def gate_file(path: Path, limit: int = 25) -> int:
+    """1 if `path` breaks any repo-wide rule, printing each site and its fix."""
+    if not path.exists() or path.suffix != '.py':
+        return 0
+    return _report(path, rule_sites(path), limit, 'RULES BROKEN')
+
+
+def _git(path: Path, *args) -> tuple:
+    """(ok, stdout) for a git command about `path`, plus its repo-relative name.
+
+    Returns `(False, '')` when the file is outside the repo or git refuses.
+    """
+    try:
+        rel = path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return False, ''
+    got = subprocess.run(['git'] + [a.replace('{}', rel) for a in args],
+                         cwd=ROOT, capture_output=True, text=True, timeout=30)
+    return got.returncode == 0, got.stdout
+
+
+def _baseline_source(path: Path) -> str:
+    """`path` before this branch's edits: HEAD's copy, else the INDEX's.
+
+    A file `git add`ed this branch has no HEAD copy, but its staged blob is
+    still a real prior version -- reading only HEAD made every such file score
+    as brand new and inherit its whole comment history as "your edit".
+    """
+    for spec in ('HEAD:{}', ':{}'):
+        ok, text = _git(path, 'show', spec)
+        if ok:
+            return text
+    return ''
+
+
+def _touched_lines(path: Path) -> set:
+    """Working-tree line numbers this branch ADDED or CHANGED in `path`.
+
+    `None` when git knows nothing of the file at all -- a wholly new file,
+    every line of which is the edit's own.
+    """
+    ok, out = _git(path, 'diff', '-U0', 'HEAD', '--', '{}')
+    if not ok:
+        ok, out = _git(path, 'diff', '-U0', '--', '{}')
+    if not ok:
+        return None
+    touched = set()
+    for hunk in re.finditer(r'^@@ -\S+ \+(\d+)(?:,(\d+))? @@', out,
+                            re.MULTILINE):
+        start = int(hunk.group(1))
+        touched.update(range(start, start + int(hunk.group(2) or 1)))
+    return touched
+
+
+def gate_diff(path: Path, limit: int = 25) -> int:
+    """1 when the agent's OWN edit broke a rule; inherited debt is ignored.
+
+    The whole-file gate made one line in a 3,900-line legacy file inherit all
+    1,010 of its violations -- unpayable, so it gets switched off.  An edit is
+    answerable for its own lines: a violation counts only when it sits on a
+    line this branch added or changed AND its rule got no better file-wide.
+    Improving a rule, or leaving it alone, passes.
+    """
+    if not path.exists() or path.suffix != '.py':
+        return 0
+    now = rule_sites(path)
+    touched = _touched_lines(path)
+    if touched == set():
+        return 0
+    before = _baseline_source(path)
+    was = rule_sites(path, before) if before else {}
+    blame = {}
+    for rule, found in now.items():
+        if len(found) <= len(was.get(rule, ())):
+            continue
+        mine = [s for s in found if touched is None or s[1] in touched]
+        if mine:
+            blame[rule] = mine
+    return _report(path, blame, limit, 'YOUR EDIT BROKE RULES')
 
 
 def _print_sites(keys: str, limit: int) -> int:
     """Print `file:line: detail` for each requested metric."""
-    wanted = [k.strip().upper() for k in keys.split(',') if k.strip()]
+    wanted = [k.strip().lower() for k in keys.split(',') if k.strip()]
     missing = [k for k in wanted if k not in SITES]
     for key in wanted:
         found = SITES.get(key)
@@ -693,16 +987,16 @@ def regressions(now: dict, base: dict) -> list:
     """Metrics that moved the WRONG way.
 
     Movement TOWARD a target is never reported: a fitness function that blocks
-    partial progress gets switched off halfway through a stage.  F21 is judged
+    partial progress gets switched off halfway through a stage.  Speed is judged
     relative to the baseline, never absolutely, so a slower MACHINE cannot fail
     the gate.
     """
     out = []
-    for key, _target, direction, _label in METRICS:
+    for key, _target, direction, _group in METRICS:
         if key not in base or key not in now:
             continue
         was, is_ = base[key], now[key]
-        if key == 'F21':
+        if key == 'ms-per-script':
             if was and is_ > was * SPEED_TOLERANCE:
                 out.append('%s: %s -> %s ms (>%sx slower)'
                            % (key, was, is_, SPEED_TOLERANCE))
@@ -716,9 +1010,9 @@ def regressions(now: dict, base: dict) -> list:
 def _print_table(now: dict, base: dict, elapsed: float) -> None:
     """Render the metric table, marking each against its target."""
     print('\n  script_convert/ fitness      (%.2fs)\n' % elapsed)
-    for key, target, direction, label in METRICS:
+    for key, target, direction, group in METRICS:
         value = now[key]
-        if key == 'F21':
+        if key == 'ms-per-script':
             limit = base.get(key, 0) * SPEED_TOLERANCE
             mark = '   ' if not base.get(key) else (
                 ' ok' if value <= limit else ' !!')
@@ -730,13 +1024,24 @@ def _print_table(now: dict, base: dict, elapsed: float) -> None:
         delta = ''
         if key in base and base[key] != value:
             delta = '  (%g -> %g)' % (base[key], value)
-        print('  %s %-4s %9s  target %-10s %s%s'
-              % (mark, key, value, goal, label, delta))
+        print('  %s %-20s %8s  %-10s %-4s%s'
+              % (mark, key, value, goal, group, delta))
     print()
 
 
-def main(argv=None) -> int:
-    """Parse arguments, measure, and report or gate."""
+def _print_legend() -> int:
+    """One line per metric: what the name means and why it is scored."""
+    print()
+    for key, target, direction, group in METRICS:
+        goal = '%s%s' % ('<=' if direction == LOWER else '>=', target)
+        print('  %-20s %-8s %-4s %s'
+              % (key, goal, group, EXPLAIN.get(key, '')))
+    print()
+    return 0
+
+
+def _parser() -> argparse.ArgumentParser:
+    """The command line."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -750,34 +1055,88 @@ def main(argv=None) -> int:
                              'metric that moved AWAY from its target')
     parser.add_argument('--baseline', default=str(BASELINE))
     parser.add_argument('--no-speed', action='store_true',
-                        help='skip F21 (avoids importing the package)')
+                        help='skip ms-per-script (avoids importing the pkg)')
     parser.add_argument('--why', metavar='METRIC',
                         help='list the offending file:line for one metric '
-                             '(e.g. --why F30); repeatable as F30,F31')
+                             '(e.g. --why stray-comments); comma-separated')
+    parser.add_argument('--legend', action='store_true',
+                        help='explain every metric name, one line each')
+    parser.add_argument('--gate-file', metavar='PATH', action='append',
+                        help='score ONE file against the repo-wide rules and '
+                             'exit non-zero if any is broken; repeatable. The '
+                             'enforcement half -- absolute, not relative to a '
+                             'baseline, so it cannot be satisfied by an '
+                             'unrelated improvement elsewhere')
+    parser.add_argument('--gate-diff', metavar='PATH', action='append',
+                        help='score only the LINES this branch changed in one '
+                             'file, against the same file at HEAD; repeatable. '
+                             'What the post-edit hook runs -- inherited debt in '
+                             'a legacy file is not the edit\'s to pay')
+    parser.add_argument('--changed', action='store_true',
+                        help='score only the package files this branch has '
+                             'touched, so inherited debt is not counted')
     parser.add_argument('--limit', type=int, default=40,
                         help='max sites to print per --why metric')
-    parser.add_argument('--changed', action='store_true',
-                        help='score the comment rules on files changed vs '
-                             'HEAD only (fast; the full scan is 5s)')
-    args = parser.parse_args(argv)
+    return parser
+
+
+def _write_baseline(path: Path, now: dict, base: dict, accept: bool) -> int:
+    """Record `now` as the baseline, refusing to bake in a regression."""
+    bad = regressions(now, base) if base else []
+    if bad and not accept:
+        print('  REFUSING to bake in a regression:', file=sys.stderr)
+        for line in bad:
+            print('    %s' % line, file=sys.stderr)
+        print('  fix it, or re-run with --accept-regression.', file=sys.stderr)
+        return 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'metrics': now}, indent=2, sort_keys=True)
+                    + chr(10), encoding='utf-8')
+    print('  baseline written: %s' % path)
+    return 0
+
+
+def _check_regressions(now: dict, base: dict) -> int:
+    """1 if any metric moved away from its target since the baseline."""
+    if not base:
+        print('  no baseline; run --update-baseline first', file=sys.stderr)
+        return 1
+    bad = regressions(now, base)
+    if not bad:
+        print('  no regressions')
+        return 0
+    print('  REGRESSED:', file=sys.stderr)
+    for line in bad:
+        print('    %s' % line, file=sys.stderr)
+    return 1
+
+
+def main(argv=None) -> int:
+    """Parse arguments, measure, and report or gate."""
+    args = _parser().parse_args(argv)
+    if args.legend:
+        return _print_legend()
+    if args.gate_file:
+        return max(gate_file(Path(n).resolve(), args.limit)
+                   for n in args.gate_file)
+    if args.gate_diff:
+        return max(gate_diff(Path(n).resolve(), args.limit)
+                   for n in args.gate_diff)
 
     start = time.perf_counter()
-    scope = _changed_files(ROOT) if args.changed else None
+    scope = _changed_files(PKG) if args.changed else None
     if args.changed and not scope:
-        print('  no changed first-party .py files')
+        print('  no changed package files')
         return 0
     now = measure(with_speed=not args.no_speed, scope=scope)
     elapsed = time.perf_counter() - start
 
-    base = {}
     baseline_path = Path(args.baseline)
-    if baseline_path.exists():
-        base = json.loads(
-            baseline_path.read_text(encoding='utf-8')).get('metrics', {})
+    base = (json.loads(baseline_path.read_text(encoding='utf-8'))
+            .get('metrics', {})) if baseline_path.exists() else {}
 
     if args.why:
         return _print_sites(args.why, args.limit)
-
     if args.json:
         print(json.dumps({'metrics': now, 'elapsed': round(elapsed, 3)},
                          indent=2, sort_keys=True))
@@ -785,32 +1144,10 @@ def main(argv=None) -> int:
         _print_table(now, base, elapsed)
 
     if args.update_baseline:
-        bad = regressions(now, base) if base else []
-        if bad and not args.accept_regression:
-            print('  REFUSING to bake in a regression:', file=sys.stderr)
-            for line in bad:
-                print('    %s' % line, file=sys.stderr)
-            print('  fix it, or re-run with --accept-regression.',
-                  file=sys.stderr)
-            return 1
-        baseline_path.parent.mkdir(parents=True, exist_ok=True)
-        baseline_path.write_text(
-            json.dumps({'metrics': now}, indent=2, sort_keys=True) + '\n',
-            encoding='utf-8')
-        print('  baseline written: %s' % baseline_path)
-        return 0
-
+        return _write_baseline(baseline_path, now, base,
+                               args.accept_regression)
     if args.fail_on_regression:
-        if not base:
-            print('  no baseline; run --update-baseline first', file=sys.stderr)
-            return 1
-        bad = regressions(now, base)
-        if bad:
-            print('  REGRESSED:', file=sys.stderr)
-            for line in bad:
-                print('    %s' % line, file=sys.stderr)
-            return 1
-        print('  no regressions')
+        return _check_regressions(now, base)
     return 0
 
 

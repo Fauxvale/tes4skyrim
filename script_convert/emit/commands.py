@@ -31,7 +31,9 @@ A row's `emit` is a Papyrus template over:
 `(Self as Actor)` the way every actor-only branch did by hand, `AV` resolves as
 an actor WITHOUT that promotion, `OBJREF` routes through the reference an
 effect/topic acts on, and `RAW` is the plain converted receiver defaulting to
-`Self`.
+`Self` -- or to `defaults['ref']`, for a command whose bare form names a fixed
+subject rather than the running script (`GetInWorldspace` asks about the
+PLAYER).
 
 `types` registers `_property_refs[<arg n source>] = <type>`, which is how a
 command tells the property writer that its argument names a Faction/Quest/Spell
@@ -44,9 +46,10 @@ defaults to the inert `0` (`None` or `""` where the caller needs that type).
 import re
 
 from script_convert.constants import (
-    ACTOR, AV, OBJREF, RAW, COMMAND_ROWS, _COMPARISON_BOOL_FUNCTIONS,
-    _safe_property_name,
+    ACTOR, AV, OBJREF, RAW, COMMAND_ROWS, PAPYRUS_BOOL_FUNCTIONS,
+    _COMPARISON_BOOL_FUNCTIONS, _safe_property_name,
 )
+
 from script_convert.tes4 import lexer as L
 
 #: A placeholder is one atom: `{a0} == {a1}` compares, `Foo({a0})` does not.
@@ -69,6 +72,16 @@ def _template_compares(template: str) -> bool:
     return False
 
 
+def _template_head(template: str) -> str:
+    """Lowercased name a template calls: `X.GetDisabled({r})` -> `getdisabled`."""
+    m = _TEMPLATE_HEAD_RE.match((template or '').strip())
+    return m.group(1).lower() if m else ''
+
+
+#: The call at the head of a row template: an optional receiver, then a name.
+_TEMPLATE_HEAD_RE = re.compile(r'^\(?(?:[\w.()]*\.)?([A-Za-z_]\w*)\s*\(')
+
+
 #: Comparison branches no row and no bool table names; getincell is dynamic.
 _BRANCH_COMPARISONS = frozenset({'getinworldspace', 'ispcrace'})
 
@@ -80,11 +93,21 @@ COMPARISON_COMMANDS = frozenset(
 
 
 def _ref(conv, row, ref_name, extends):
-    """The receiver `{ref}` stands for, per the row's `subj`."""
+    """The receiver `{ref}` stands for, per the row's `subj`.
+
+    An OBJREF receiver is CAST when it holds a wider handle: an OBSE user
+    function declares its `ref` parameter `Form` when nothing narrows it, and
+    Papyrus will not convert down implicitly (`TES4Polyfill.Update3D(Form)`).
+    """
     if row.subj == OBJREF:
-        return conv._resolve_objref_ref(ref_name, extends)
+        ref = conv._resolve_objref_ref(ref_name, extends)
+        if conv.type_of(ref) == 'Form':
+            return conv._cast(ref, 'ObjectReference')
+        return ref
     if row.subj == RAW:
-        return conv._convert_ref(ref_name, extends) if ref_name else 'Self'
+        if ref_name:
+            return conv._convert_ref(ref_name, extends)
+        return row.defaults.get('ref', 'Self')
     ref = conv._resolve_self_ref(ref_name, extends,
                                  actor_func=row.subj in (ACTOR, AV))
     # The promotion 10 branches spelled out inline: an actor-only call on a
@@ -107,6 +130,13 @@ class _Args(dict):
         self._c, self._r, self._a, self._e = conv, row, args_str, extends
 
     def __missing__(self, key):
+        """Render one `{...}` placeholder; see the module docstring for each.
+
+        `{gN}` UPPERCASES the axis letter because it is spliced into the
+        function NAME, where case is part of the identifier -- `GetPositionx`
+        is not a Papyrus function, and failed 4 Nehrim scripts reading a
+        coordinate.
+        """
         if key in _CONVERTER_VALUES:
             return _CONVERTER_VALUES[key](self._c, self._e)
         if key == 'fmt':
@@ -126,6 +156,8 @@ class _Args(dict):
             return self._r.arms[0] if got == want.lower() else self._r.arms[1]
         kind, n = key[0], int(key[1:])
         default = self._r.defaults.get(n, '')
+        if kind == 'g':
+            return self._c.arg_src(n, default).strip().upper()[:1]
         if kind == 's':
             return self._c.arg_src(n, default)
         if kind == 'p':
@@ -156,11 +188,11 @@ def emit_row(conv, row, ref_name, func_name, args_str, extends):
             ';NE: ' + row.note.format(f=written, a=args_str or '').rstrip())
         return row.emit
     if row.self_type:
-        conv._property_refs[row.self_type[0]] = row.self_type[1]
+        conv.sc.property_refs[row.self_type[0]] = row.self_type[1]
     for n, ptype in row.types.items():
         name = conv.arg_src(n)
         if name:
-            conv._property_refs[_safe_property_name(name)] = ptype
+            conv.sc.property_refs[_safe_property_name(name)] = ptype
     args = _Args(conv, row, args_str, extends)
     if '{ref}' in row.emit:
         args['ref'] = _ref(conv, row, ref_name, extends)
@@ -174,3 +206,17 @@ _CONVERTER_VALUES = {
     'self_ref': lambda conv, extends: conv._self_reference(extends),
     'action_ref': lambda conv, extends: conv._get_action_ref_param(),
 }
+
+
+#: Commands converting to a Bool call. A MAP row's `emit` is a bare name.
+BOOL_TEMPLATE_COMMANDS = frozenset(
+    name for name, row in COMMAND_ROWS.items()
+    if getattr(row, 'emit', None) and not row.note
+    and (_template_head(row.emit) in PAPYRUS_BOOL_FUNCTIONS
+         or row.emit.strip().rsplit('.', 1)[-1].lower()
+         in PAPYRUS_BOOL_FUNCTIONS))
+
+
+#: Commands with no Papyrus equivalent: an inert literal plus a `;NE:` marker.
+INERT_COMMANDS = frozenset(
+    name for name, row in COMMAND_ROWS.items() if row.note)

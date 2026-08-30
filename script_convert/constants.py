@@ -229,20 +229,7 @@ ACTOR_VALUE_MAP = {
     'responsibility': 'Morality',
 }
 
-# Every TES4 command whose FIRST argument is an actor-value name.  Used both to
-# quote that argument and to detect calls naming a removed attribute.
-_ACTOR_VALUE_FUNCTIONS = frozenset({
-    'getactorvalue', 'setactorvalue', 'modactorvalue', 'forceactorvalue',
-    'getav', 'setav', 'modav', 'forceav', 'getbaseactorvalue', 'getbaseav',
-    'modpcskill', 'advancepcskill',
-    'modav2', 'modactorvalue2', 'getav2', 'setav2',
-})
 
-# The subset that READS an actor value, so a call naming a removed attribute
-# has to yield a value.  The rest write, and are dropped instead.
-_ACTOR_VALUE_READ_FUNCTIONS = frozenset({
-    'getactorvalue', 'getav', 'getbaseactorvalue', 'getbaseav', 'getav2',
-})
 
 # TES4 global variables that exist in Skyrim — these need GlobalVariable property access
 KNOWN_GLOBALS = {
@@ -305,39 +292,7 @@ TES4_ASSAULT_BOUNTY = 40
 TES4_STEAL_BOUNTY = 100
 
 
-# TES4 functions that are boolean (return 0/1) and can be used as bare checks
-_BARE_BOOL_FUNCTIONS = {
-    'getdead', 'isdead', 'isincombat', 'issneaking', 'isweaponout',
-    'isswimming', 'isghost', 'isenabled', 'isdisabled', 'islocked',
-    'getlocked', 'is3dloaded', 'getis3dloaded', 'isininterior',
-    'getforcesneak', 'getknockedstate',
-    # OBSE IsCasting and vanilla HasFlames are read bare/as `ref.X == 1`
-    'iscasting', 'hasflames', 'getplayerhaslastriddenhorse',
-    'isplayerslastriddenhorse',
-    'getignorefriendlyhits',
-}
 
-# TES4 functions returning 0/1 that are collapsed in a COMPARISON position:
-# `X == 1` is `X`, `X == 0` is `!X`.  Papyrus rejects Bool-vs-Int, so a literal
-# conversion of the TES4 idiom does not compile.
-#
-# 🛑 This is a SECOND list, and that is a known defect (docs/script_conversion_
-# bugs.md #6): it and `_BARE_BOOL_FUNCTIONS` agree on only 10 of 45 names, so
-# whether a call collapses depends on which list happens to name it.  Merging
-# them changes 3,577 sites across 1,944 scripts, so it is deliberately deferred
-# until the parse-tree rewrite is verified -- at which point it is one edit
-# here and the diff is attributable.  Until then BOTH are the current
-# behaviour, and `_BOOL_VALUED_FUNCTIONS` below is what the emitter reads.
-_COMPARISON_BOOL_FUNCTIONS = {
-    'isactionref', 'getdead', 'isdead', 'isincombat', 'issneaking',
-    'isweaponout', 'isswimming', 'isghost', 'getlocked', 'isenabled',
-    'hasspell', 'getinfaction', 'getquestrunning', 'getstagedone',
-    'getdetected', 'isactordetected', 'getisid', 'getisrace', 'getpcisrace',
-    'getisref', 'getpcisclass', 'getisclass', 'getincell', 'getinsamecell',
-    'getissex', 'isinfaction', 'isessential', 'isininterior',
-    'getiscurrentpackage', 'isowner', 'gettalkedtopcparam', 'gettalkedtopc',
-    'isactorusingatorch', 'isridinghorse',
-}
 
 # PAPYRUS function names that return Bool.  Checked against the EMITTED text,
 # because a TES4 command whose own name is in no table can still convert into a
@@ -384,65 +339,12 @@ BASE_FORM_TYPES = frozenset({'MiscObject', 'Ingredient', 'Potion', 'Weapon',
 EVENT_REF_PARAMS = frozenset({'akactionref', 'akactor', 'aktarget',
                               'aksource', 'akspeaker', 'akcaster'})
 
-#: The TES4 name of a bool-returning Papyrus function, lowercased once.
-#: DERIVED from the one list above, never retyped.
-BOOL_FUNCS_LOW = frozenset(n.lower() for n in PAPYRUS_BOOL_FUNCTIONS)
-
-#: What `emit/expr.py` reads: every name either list calls boolean.  The two
-#: sources stay separate above so the deferred merge is still a real decision.
-_BOOL_VALUED_FUNCTIONS = _BARE_BOOL_FUNCTIONS | _COMPARISON_BOOL_FUNCTIONS
-
-# Papyrus return type of a call, keyed by the PAPYRUS name (lowercase).
-#
-# `symbols.type_of_expr` reads this to type an expression from its parse tree.
-# The converter's old answer to the same question was three regex alternations
-# matched against ALREADY-EMITTED text (`_FLOAT_RETURNING_FUNCS`,
-# `_BOOL_FUNC_NAMES`, `_BOOL_RETURNING_FUNCS`), which matched a name inside a
-# string literal just as happily as a real call.
-#
-# The Bool half is DERIVED from PAPYRUS_BOOL_FUNCTIONS rather than retyped:
-# that set already answers "does this Papyrus name return Bool", and a second
-# hand-kept copy would only be a copy to keep in sync.  TES4's aliases cost
-# nothing either -- keying on the Papyrus name means `getav`, `getactorvalue`
-# and `getbaseav` all resolve through FUNCTION_MAP, which already lists them.
-_FLOAT_RETURNING = frozenset({
-    'getactorvalue', 'getbaseactorvalue', 'getsecondspassed', 'getdistance',
-    'getheadingangle', 'getscale', 'getlevel', 'getwalkspeed',
-    'getcurrenttime', 'randomfloat', 'getheight', 'getwidth', 'getlength',
-    'getvalue', 'getvaluepercentage',
-    # The elapsed-time reads, under every spelling they arrive in.  TES4 has
-    # three names for the same seconds-since-last-pass Float, and the
-    # conversion rewrites all of them to `TES4_SecondsPassed` (or
-    # `Utility.GetCurrentRealTime()` arithmetic), so the TYPE has to be known
-    # for the authored name as well as the emitted one.
-    'scripteffectelapsedseconds', 'tes4_secondspassed',
-    'getcurrentrealtime',
-} | {f'get{kind}{axis}' for kind in ('position', 'angle') for axis in 'xyz'})
-
-#: Papyrus accessors that return a whole number.  `GetValueInt` matters
-#: because several conversions read a Float global through it deliberately
-#: (`GetDayOfWeek` is `GameDaysPassed.GetValueInt() % 7`), so the result is Int
-#: and a further `as Int` on assignment is redundant -- the old text scan added
-#: one, producing `... % 7 as Int`.
-_INT_RETURNING = frozenset({
-    'getvalueint', 'getcrimegold', 'getitemcount', 'getgoldamount',
-    'getlocklevel',
-    # Whole-number reads spelled with their TES4 name, because their whole
-    # conversion is a fixed expression rather than a renamed call (see
-    # COMMAND_ROWS).
-    'getdayofweek', 'getdayoftheweek', 'getrandompercent', 'getrandpercent',
-    'getpcfame', 'getpcinfamy', 'getinfame',
-})
-assert not (_INT_RETURNING & _FLOAT_RETURNING), (
-    'a name cannot return both Int and Float: '
-    f'{sorted(_INT_RETURNING & _FLOAT_RETURNING)}')
-
 #: Papyrus calls returning a FORM type narrower (or simply other) than
 #: ObjectReference.  TES4 spelled every handle `ref`, and Papyrus converts
 #: between none of these implicitly, so a `ref` variable assigned from one of
 #: them must be DECLARED as that type -- see the retype pass in
-#: `convert_standalone`.  They live here with the other return types because
-#: that is the question they answer.
+#: `convert_standalone`.  Named rather than inlined into `RETURN_TYPES` because
+#: `symbols.py` asks the narrower question "is this call form-typed at all".
 _FORM_RETURNING = {
     'getbaseobject': 'Form',
     'getequippedweapon': 'Weapon',
@@ -450,15 +352,40 @@ _FORM_RETURNING = {
     'getworncoveringitem': 'Armor',
     'getactorowner': 'ActorBase',
     'getfactionowner': 'Faction',
-    # A TES4 `ref` holding the result of GetParentCell is a Cell, which
-    # Papyrus will not store in an ObjectReference.
     'getparentcell': 'Cell',
 }
 
+#: Papyrus return type, keyed by PAPYRUS name so aliases resolve via FUNCTION_MAP.
 RETURN_TYPES = dict(
     [(n, 'Bool') for n in PAPYRUS_BOOL_FUNCTIONS]
-    + [(n, 'Float') for n in _FLOAT_RETURNING]
-    + [(n, 'Int') for n in _INT_RETURNING]
+
+    #: Float reads, under both authored and emitted elapsed-time spellings.
+    + [(n, 'Float') for n in (
+        'getactorvalue', 'getbaseactorvalue', 'getsecondspassed',
+        'getdistance', 'getheadingangle', 'getscale', 'getlevel',
+        'getwalkspeed', 'getcurrenttime', 'randomfloat', 'getheight',
+        'getwidth', 'getlength', 'getvalue', 'getvaluepercentage',
+        'scripteffectelapsedseconds', 'tes4_secondspassed',
+        'getcurrentrealtime')]
+    + [('get%s%s' % (kind, axis), 'Float')
+       for kind in ('position', 'angle') for axis in 'xyz']
+
+    #: Whole-number reads, plus TES4 names converting to a fixed expression.
+    + [(n, 'Int') for n in (
+        'getvalueint', 'getcrimegold', 'getitemcount', 'getgoldamount',
+        'getlocklevel', 'getdayofweek', 'getdayoftheweek', 'getrandompercent',
+        'getrandpercent', 'getpcfame', 'getpcinfamy', 'getinfame')]
+
+    #: Reference-valued names; the `ak*` event parameters need a downcast.
+    + [(n, 'ObjectReference') for n in (
+        'getlinkedref', 'placeatme', 'getparentref', 'placeactoratme',
+        'geteditorlocation', 'getiteminslot', 'akactionref', 'aknewcontainer',
+        'akoldcontainer', 'akcastref', 'akaggressor', 'akcaster')]
+    + [(n, 'Actor') for n in (
+        'gettargetactor', 'getcasteractor', 'getactorreference',
+        'game.getplayer', 'getplayer', 'getcombattarget', 'getkiller',
+        'getlastridden', 'findrandomactorfromref')]
+
     + list(_FORM_RETURNING.items())
 )
 
@@ -475,154 +402,11 @@ AXIS_COMMANDS = {
     'getstartingangle': 'getangle',
 }
 
-_BARE_NO_EQUIV_COMMANDS = {
-    'streammusic',
-    'emcplaytrack', 'emcmusicstop', 'emcmusicresume', 'emcmusicnexttrack',
-    'emcsetmusictype', 'emcsetmusichold', 'emcsetbattleoverride',
-    'emcisbattleoverridden', 'emcismusiconhold', 'emcgetplaylist',
-    # Read bare, mid-expression, with no same-named Papyrus form: without
-    # routing they survive as undefined identifiers and fail the whole script.
-    'flee', 'skipanim',
-    # Takes no arguments, so it is ALWAYS read bare — without routing, the
-    # fallback list won and the special handler (TES4ControlsDisabled) was
-    # unreachable dead code.  Same trap as ispcamurderer (R6-2).
-    # Zero-argument state read, so it is always bare: routed here so the
-    # GetCurrentDestructionStage() handler is reachable.
-    'getdestroyed',
-    'con_runmemorypass',
-    'disablekey', 'enablekey', 'tapkey', 'holdkey', 'releasekey', 'playback', 'playbackalt', 'disablecontrol', 'enablecontrol', 'tapcontrol',
-    'getmenuhastrait', 'getmenufloatvalue', 'getmenustringvalue',
-    'unlockachievement',
-}
 
-# TES4 `ref.` commands that take NO arguments.  Oblivion let the receiver be
-# written after a comma instead of a dot — `StopCombat, Player` and
-# `IsInCombat, Player == 1` mean exactly `Player.StopCombat` /
-# `Player.IsInCombat`.  Because the generic comma-stripping treats whatever
-# follows as an argument, these emitted `IsInCombat(Player)` ("function takes 0
-# parameters not 1") or dropped the token and acted on the wrong actor, so the
-# receiver has to be promoted for precisely this set.
-# Derived from the `ref.` rows with an empty argument column in
-# docs/skyrim_commands.md, intersected with FUNCTION_MAP.  (IsInCombat's
-# "Integer" column there is its RETURN type, not a parameter.)
-_ZERO_ARG_REF_FUNCTIONS = {
-    'addflames', 'clearownership', 'disablelinkedpathpoints',
-    'dispelallspells', 'enablelinkedpathpoints', 'evaluatepackage',
-    'getclothingvalue', 'getcombattarget', 'getcurrentaipackage',
-    'getcurrentaiprocedure', 'getdead', 'getdestroyed', 'getdisabled',
-    'getforcesneak', 'getgold', 'getignorefriendlyhits', 'getisalerted',
-    'getiscreature', 'getisplayablerace', 'getknockedstate', 'getlevel',
-    'getlocked', 'getlocklevel', 'getopenstate', 'getparentref',
-    'getrestrained', 'getscale', 'getsitting', 'getsleeping',
-    'gettalkedtopc', 'getweaponanimtype', 'hasflames', 'isactor',
-    'iscasting', 'isessential', 'isguard', 'isidleplaying',
-    'isindangerouswater', 'issneaking', 'isswimming', 'istalking',
-    'isplayerslastriddenhorse', 'getplayerhaslastriddenhorse',
-    'isweaponout', 'markfordelete', 'pickidle', 'removeflames', 'resetai',
-    'resetfalldamagetimer', 'stopcombat', 'stopcombatalarmonactor',
-    'stoplook',
-    # Same zero-argument shape; listed with a return type in the table.
-    #
-    # 🛑 `getlos` is deliberately ABSENT: it takes a TARGET
-    # (`GetLOS, Player` asks whether SELF can see the player), so promoting
-    # that argument to the receiver inverted the test -- it emitted
-    # `Game.GetPlayer().HasLOS()`, which asks about the player's line of
-    # sight to nothing and does not even compile ("takes 1 parameters not 0",
-    # 9 Nehrim scripts).
-    'isincombat', 'getattacked', 'isdead', 'skipanim',
-    'getdisease', 'getalarmed', 'ismoving', 'isturning', 'getwantblocking',
-}
 
-# Functions that can ONLY be called on Actor (not ObjectReference)
-# Used to infer correct property type for callers
-_ACTOR_ONLY_FUNCTIONS = {
-    'startcombat', 'stopcombat', 'getincombat', 'isincombat',
-    'getdead', 'isdead', 'kill', 'resurrect',
-    'addspell', 'removespell', 'hasspell', 'dispelallspells',
-    'additem', 'removeitem', 'getitemcount', 'removeallitems',
-    'equipitem', 'unequipitem',
-    'getactorvalue', 'setactorvalue', 'modactorvalue', 'forceactorvalue',
-    'getav', 'setav', 'modav', 'forceav', 'getbaseactorvalue', 'getbaseav',
-    'startconversation', 'setrelationshiprank',
-    'getinfaction', 'setfactionrank', 'getfactionrank',
-    'modcrimegold', 'setcrimegold', 'getcrimegold',
-    'evaluatepackage', 'evp', 'addscriptpackage', 'removescriptpackage', 'stopwaiting',
-    'setessential', 'setghost', 'setunconscious',
-    'setscale', 'getscale',
-    'setforcerun', 'setforcesneak', 'getforcesneak', 'getknockedstate',
-    'setrace', 'getrace',
-    'getlevel', 'getclass',
-    'setplayerteammate', 'pathtoref',
-    'getweapondrawn', 'isweaponout',
-    'setactoralpha', 'setopacity',
-    'issneaking', 'isswimming', 'isghost',
-    'say', 'saycustom', 'sayto',
-    'getdistance', 'setcell',
-    'getsitting', 'getsitstate', 'getsleeping', 'getsleepstate',
-    'getequipped', 'isequipped', 'hasmagiceffect',
-    'clearlookat', 'stoplook', 'stoplooking', 'setlookat', 'lookat', 'look',
-    'getweaponanimtype', 'getdeadcount',
-    'getgold', 'getgoldamount', 'saa', 'gaa', 'getactoralpha',
-    'resethealth', 'setalpha', 'getalpha', 'getarmorrating',
-    'isessential', 'getlos', 'haslos',
-    'dispel', 'dispelspell', 'placeatme',
-    'drawweapon', 'sheatheweapon', 'isinfaction',
-}
 
-# Functions that exist on ObjectReference (not truly Actor-only).
-# These should NOT trigger type promotion from ObjectReference→Actor
-# because they can be called on ObjectReference refs legally.
-_OBJREF_SHARED_FUNCTIONS = {
-    'placeatme', 'getdistance', 'additem', 'removeitem', 'getitemcount',
-    'removeallitems', 'setscale', 'getscale', 'say', 'saycustom', 'sayto',
-    'setalpha', 'getalpha', 'setcell',
-    # NOT dispel/dispelspell: Actor.psc declares `bool DispelSpell(Spell)` and
-    # ObjectReference has no such method, so listing them here suppressed the
-    # `as Actor` cast and left an ObjectReference receiver calling an undefined
-    # function (SERelmynaExperimentSpellScript).
-}
 
-# TES4 functions that name their target as an ARGUMENT rather than acting on the
-# calling reference (`GetDeadCount JesanRilian`, `SetEssential SEMuurine 0`).
-# Skyrim declares both on `ActorBase`, not `Actor`, so a bare occurrence says
-# nothing about the enclosing script's own base type.  Used ONLY to keep
-# `_infer_extends` from upgrading an ACTI/DOOR script to `extends Actor`, which
-# the engine then refuses to bind ("base types do not match").  They stay in
-# `_ACTOR_ONLY_FUNCTIONS` because the call-site emitter still needs the cast.
-_ACTORBASE_ARG_FUNCTIONS = {
-    'getdeadcount', 'setessential',
-    # `saa`/`SetActorAlpha` is Actor-only in Skyrim, but Oblivion lets any
-    # reference call it and simply does nothing off an actor — `SE32GhostObject`
-    # rides on INGR/KEYM items.  Upgrading on its account made the script
-    # unbindable and lost the `pms` shader beside it; the call site already
-    # degrades the bare form to `(Self as Actor).SetAlpha(...)`, which compiles
-    # and is the same no-op TES4 gave it.
-    'saa', 'setactoralpha', 'gaa', 'getactoralpha',
-}
 
-# TES4 functions whose Papyrus signature declares an **Actor** parameter, taken
-# from the vanilla headers in Data/Scripts.zip:
-#   Actor.StartCombat(Actor akTarget)
-#   Actor.IsHostileToActor(Actor akActor)
-#   Actor.GetRelationshipRank(Actor akOther)
-#   Actor.SetRelationshipRank(Actor akOther, int aiRank)
-# An argument typed as the SCRIPT attached to the record it names (see
-# pipeline._add_scro_ref) has to be cast at the call site for these, or the
-# checker rejects it — `StartCombat(NQ05Soldat01nRef)` in
-# NQ05StartCombatTrigBoxScript.  SetLookAt/Say/GetDistance are deliberately
-# ABSENT: their parameters are ObjectReference, which a script-typed property
-# converts to implicitly.
-_ACTOR_ARG_FUNCTIONS = {
-    'startcombat', 'ishostiletoactor',
-    'getrelationshiprank', 'setrelationshiprank',
-    # The polyfill functions declared `Function X(Actor akActor)`, reached
-    # under their TES4 spellings.  A `ref` handed to one of these IS an Actor,
-    # which is how the pre-emission resolver learns to declare it that way --
-    # `actionRef = akActionRef` needs the cast only a declared Actor triggers.
-    'getiscreature', 'iscreature', 'isguard', 'isessential',
-    'evaluatepackage', 'evp', 'setactorrefraction', 'isspelltarget',
-    'getdetected', 'getdetectionlevel', 'isdetectedby',
-}
 
 # Methods declared on ObjectReference that a TES4 script calls BARE, relying on
 # the implicit "me".  ActiveMagicEffect and TopicInfo are not references, so an
@@ -641,19 +425,6 @@ _FORM_TYPE_TESTS = {
 }
 
 
-_OBJREF_IMPLICIT_SELF_FUNCTIONS = {
-    'disable', 'enable', 'getdisabled', 'isdisabled', 'delete',
-    'getlinkedref', 'getparentref', 'activate', 'reset',
-    'getparentcell', 'getpos', 'setpos', 'getangle', 'setangle',
-    'moveto', 'playgroup', 'playanimation', 'setopenstate',
-    'getitemcount', 'isininterior',
-    # Lock state.  A TES4 `scripteffectstart` block calls these bare, on the
-    # effect's TARGET (Morroblivion's two lock spells do exactly that).  Emitted
-    # without a receiver they are undefined functions — ActiveMagicEffect has no
-    # such method — which fails the whole script to compile.
-    'islocked', 'lock', 'getlocked', 'getlocklevel',
-    'getbaseobject', 'setactorowner', 'is3dloaded', 'isdeleted',
-}
 
 
 # Canonical names for known TES4 globals
@@ -914,21 +685,61 @@ def _record_type_to_base_papyrus(rtype: str) -> str:
     return mapped
 
 
-# Commands the branch chain in `_emit_function` handles by name but that no
-# other table lists.  Derived by reading that chain rather than kept by hand,
-# because a hand-kept list drifts from it: these twelve were missing, so the
-# node path judged them unknown and emitted `;TODO:` over lines the string
-# path converted correctly (`setforcerun 1` becomes the SpeedMult write --
-# 62 statements in Oblivion.esm alone).  `foreach` is deliberately absent: it
-# is a STATEMENT keyword intercepted before the command layer, and listing it
-# here would let a bare `foreach` be treated as a call.
-_BRANCH_ONLY_COMMANDS = frozenset({
-    'deletefullactorcopy', 'emc', 'emcount', 'getcrosshairreference',
-    'getequippeditemtype', 'getplayercontrolsdisabled_', 'reset',
-    'resethealth', 'setforcerun', 'setgamesetting', 'setnumericgamesetting',
-    'setnumericgamesettingfloat',
+
+
+
+#: Oblivion animation GROUP -> Skyrim behavior-graph event.
+ANIM_GROUP_EVENTS = {
+    'forward': 'moveStart', 'backward': 'moveStartBackward',
+    'left': 'moveStartStrafeLeft', 'right': 'moveStartStrafeRight',
+    'idle': 'IdleForceDefaultState', 'specialidle': 'SpecialIdle',
+    'unequip': 'Unequip', 'equip': 'Equip',
+    'torchidle': 'IdleForceDefaultState',
+    'castself': 'MagicCastSelf', 'casttouch': 'attackStart',
+    'casttarget': 'attackStart',
+    'jumpstart': 'JumpStandingStart', 'jumpland': 'JumpLand',
+    'handstohandsattack': 'attackStart',
+}
+
+
+#: Papyrus types holding a REFERENCE rather than a value.
+_REF_TYPES = frozenset({
+    'ObjectReference', 'Actor', 'ActorBase', 'Form', 'Cell', 'Quest',
+    'Faction', 'Race', 'Package', 'Spell', 'Sound', 'Topic', 'Weapon',
+    'Armor', 'Book', 'Potion', 'Ingredient', 'Key', 'MiscObject', 'Light',
+    'Container', 'Door', 'Activator', 'Static', 'Furniture', 'Flora',
+    'EffectShader', 'WorldSpace', 'Location', 'Keyword', 'FormList',
 })
 
+
+#: Papyrus natives whose parameter N needs a cast; keyed by PAPYRUS name.
+PARAM_TYPES = {
+    'additem': {1: 'Int'},
+    'removeitem': {1: 'Int'},
+    'additemhealthpercent': {1: 'Int'},
+    'addspell': {0: 'Spell'},
+    'removespell': {0: 'Spell'},
+    'isinfaction': {0: 'Faction'},
+    'addtofaction': {0: 'Faction'},
+    'removefromfaction': {0: 'Faction'},
+    'getfactionrank': {0: 'Faction'},
+    'setfactionrank': {0: 'Faction'},
+    'modfactionrank': {0: 'Faction'},
+    'tes4polyfill.update3d': {0: 'ObjectReference'},
+}
+
+
+def param_types(tes4_name: str) -> dict:
+    """`{index: Papyrus type}` for a command, under any of its spellings."""
+    direct = PARAM_TYPES.get(tes4_name)
+    if direct is not None:
+        return direct
+    row = COMMAND_ROWS.get(tes4_name)
+    emit = (row.emit or '') if row is not None else ''
+    return PARAM_TYPES.get(emit.split('(')[0].lower(), {})
+
+#: Every OBSE raw-input command converts to the same inert marker.
+_OBSE_INPUT_NOTE = '{f} {a}  ;OBSE input command, no Papyrus equivalent'
 
 ACTOR, AV, SELF, OBJREF, RAW, MAP = ('ACTOR', 'AV', 'SELF', 'OBJREF',
                                     'RAW', 'MAP')
@@ -942,10 +753,10 @@ class Cmd:
     """
 
     __slots__ = ('emit', 'subj', 'types', 'defaults', 'note', 'self_type',
-                 'bare', 'arms')
+                 'bare', 'arms', 'flags')
 
     def __init__(self, emit='0', subj=SELF, types=(), defaults=(), note='',
-                 self_type=None, bare=False, arms=()):
+                 self_type=None, bare=False, arms=(), flags=''):
         self.emit = emit
         self.subj = subj
         self.types = dict(types)
@@ -955,6 +766,8 @@ class Cmd:
         self.bare = bare
         #: The two alternatives a `{?n<want>}` placeholder picks between.
         self.arms = arms
+        #: Per-command properties, space separated; `HAS_FLAG` is the vocabulary.
+        self.flags = frozenset(flags.split()) if flags else frozenset()
 
 
 # Commands whose whole conversion is "resolve a receiver, convert a couple of
@@ -967,22 +780,22 @@ COMMAND_ROWS = {
     'isanimplaying': Cmd(
         '({ref}.GetAnimationVariableBool("bAnimPlaying") as Int)', OBJREF),
 
-    # GetArmorRating -> DamageResist actor value (what armor rating feeds).
-    'getarmorrating': Cmd('{ref}.GetActorValue("DamageResist")', ACTOR),
+    #: GetArmorRating -> DamageResist actor value (what armor rating feeds).
+    'getarmorrating': Cmd('{ref}.GetActorValue("DamageResist")', ACTOR, flags='actor_only'),
 
     # GetIsCreature: Skyrim marks people via the ActorTypeNPC race keyword;
     # converted creatures use generated races without it.
-    'getiscreature': Cmd('TES4Polyfill.GetIsCreature({ref})', ACTOR),
-    'iscreature': Cmd('TES4Polyfill.GetIsCreature({ref})', ACTOR),
+    'getiscreature': Cmd('TES4Polyfill.GetIsCreature({ref})', ACTOR, flags='actor_arg zero_arg'),
+    'iscreature': Cmd('TES4Polyfill.GetIsCreature({ref})', ACTOR, flags='actor_arg'),
 
-    # IsGuard: membership in Skyrim's guard dialogue faction.
-    'isguard': Cmd('TES4Polyfill.IsGuard({ref})', ACTOR),
+    #: IsGuard: membership in Skyrim's guard dialogue faction.
+    'isguard': Cmd('TES4Polyfill.IsGuard({ref})', ACTOR, flags='actor_arg zero_arg'),
 
     # SetActorRefraction: no Papyrus refraction control; a translucent alpha
     # fade is the closest visual (0 restores full opacity).
     'setactorrefraction': Cmd(
         'TES4Polyfill.SetActorRefraction({ref}, {a0})', ACTOR,
-        defaults={0: '0'}),
+        defaults={0: '0'}, flags='actor_arg'),
 
     # SetAlert -> Actor.SetAlert (native, same name and semantics both ways).
     # NOT DrawWeapon: Oblivion's SetAlert sets the AI combat-READINESS flag,
@@ -996,31 +809,31 @@ COMMAND_ROWS = {
     # intro soft-locked with controls disabled.
     'setalert': Cmd('{ref}.SetAlert({b0})', ACTOR, defaults={0: '0'}),
 
-    # Reset3DState -> MoveTo self (reloads 3D).
+    #: Reset3DState -> MoveTo self (reloads 3D).
     'reset3dstate': Cmd('{ref}.MoveTo({ref})'),
 
-    # SetRestrained -> SetDontMove.
+    #: SetRestrained -> SetDontMove.
     'setrestrained': Cmd('{ref}.SetDontMove({b0})', ACTOR, defaults={0: '0'}),
 
-    # IsOnGround: Skyrim has only the inverse.
+    #: IsOnGround: Skyrim has only the inverse.
     'isonground': Cmd('!({ref}.IsFlying())', RAW),
 
-    # IsInAir: cast to Int because TES4 call sites compare/assign 0/1.
+    #: IsInAir: cast to Int because TES4 call sites compare/assign 0/1.
     'isinair': Cmd('({ref}.IsFlying() as Int)', ACTOR),
 
     # GetAttacked -> IsAlarmed, the nearest Skyrim state: an actor that has
     # noticed a hostile action against it.
-    'getattacked': Cmd('({ref}.IsAlarmed() as Int)', ACTOR),
+    'getattacked': Cmd('({ref}.IsAlarmed() as Int)', ACTOR, flags='zero_arg'),
 
-    # IsActorUsingATorch: equipped-item type 11 is the torch slot.
-    'isactorusingatorch': Cmd('({ref}.GetEquippedItemType(0) == 11)', ACTOR),
+    #: IsActorUsingATorch: equipped-item type 11 is the torch slot.
+    'isactorusingatorch': Cmd('({ref}.GetEquippedItemType(0) == 11)', ACTOR, flags='cmp_bool'),
 
-    # Unlock takes no argument in TES4; Skyrim's Lock(false) is the unlock.
+    #: Unlock takes no argument in TES4; Skyrim's Lock(false) is the unlock.
     'unlock': Cmd('{ref}.Lock(false)', OBJREF),
 
-    # GetIsReference / GetIsRef: identity comparison against the argument.
+    #: GetIsReference / GetIsRef: identity comparison against the argument.
     'getisreference': Cmd('{ref} == {a0}', AV, defaults={0: 'None'}),
-    'getisref': Cmd('{ref} == {a0}', AV, defaults={0: 'None'}),
+    'getisref': Cmd('{ref} == {a0}', AV, defaults={0: 'None'}, flags='cmp_bool'),
 
     # CreateFullActorCopy: Papyrus can only place a fresh instance of the
     # actor's BASE, which is the copy TES4's callers use it for.
@@ -1056,7 +869,7 @@ COMMAND_ROWS = {
     # OBSE IsCasting: "is this actor playing a cast animation".  Skyrim exposes
     # exactly that natively through the animation graph, so no SKSE dependency.
     'iscasting': Cmd('({ref}.GetAnimationVariableBool("bIsCastingRight") || '
-                     '{ref}.GetAnimationVariableBool("bIsCastingLeft"))', ACTOR),
+                     '{ref}.GetAnimationVariableBool("bIsCastingLeft"))', ACTOR, flags='bare_bool zero_arg'),
 
     # OBSE `SetCurrentHealth <value>` takes only the value -- the actor value is
     # implicit in the name, so it cannot map straight onto SetActorValue (which
@@ -1064,7 +877,7 @@ COMMAND_ROWS = {
     'setcurrenthealth': Cmd('{ref}.SetActorValue("Health", {a0})', RAW,
                             defaults={0: '0'}),
 
-    # SetPCExpelled: Skyrim's exact native.  See getpcexpelled above.
+    #: SetPCExpelled: Skyrim's exact native.  See getpcexpelled above.
     'setpcexpelled': Cmd('{p0}.SetPlayerExpelled({b1})', types={0: 'Faction'},
                          defaults={0: 'None', 1: '1'}),
 
@@ -1078,14 +891,14 @@ COMMAND_ROWS = {
         '{p0}.Stop({ref})', OBJREF, types={0: 'EffectShader'},
         defaults={0: 'Self'}),
 
-    # `pms`/PlayMagicShaderVisuals: same ObjectReference contract as `sms`.
+    #: `pms`/PlayMagicShaderVisuals: same ObjectReference contract as `sms`.
     'pms': Cmd('{p0}.Play({ref}, {a1})', OBJREF, types={0: 'EffectShader'},
                defaults={0: 'Self', 1: '-1.0'}),
     'playmagicshadervisuals': Cmd(
         '{p0}.Play({ref}, {a1})', OBJREF, types={0: 'EffectShader'},
         defaults={0: 'Self', 1: '-1.0'}),
 
-    # GetIsCurrentWeather / GetWeatherPercent: Weather.psc globals.
+    #: GetIsCurrentWeather / GetWeatherPercent: Weather.psc globals.
     'getweatherpercent': Cmd('Weather.GetCurrentWeatherTransition()'),
     'getcurrentweatherpercent': Cmd('Weather.GetCurrentWeatherTransition()'),
     'getiscurrentweather': Cmd('(Weather.GetCurrentWeather() == {a0})',
@@ -1156,7 +969,7 @@ COMMAND_ROWS = {
     'getcrosshairref': Cmd(
         'None', note='getCrosshairRef has no Papyrus equivalent (read as None)'),
     'getcrosshairreference': Cmd(
-        'None', note='getCrosshairRef has no Papyrus equivalent (read as None)'),
+        'None', note='getCrosshairRef has no Papyrus equivalent (read as None)', flags='branch_only'),
     'getstringgamesetting': Cmd(
         '""', note='GetStringGameSetting has no Papyrus equivalent (read as "")'),
     'getpackagetarget': Cmd(
@@ -1173,57 +986,57 @@ COMMAND_ROWS = {
     # stopping only the player's own aggression left everyone still hostile.
     'scaonactor': Cmd('{ref}.StopCombatAlarm()', AV),
     'sca': Cmd('{ref}.StopCombatAlarm()', AV),
-    'stopcombatalarmonactor': Cmd('{ref}.StopCombatAlarm()', AV),
-    # ClearOwnership
-    'clearownership': Cmd('{ref}.SetActorOwner(Game.GetPlayer().GetActorBase())', SELF),
-    # Reset → ref.Reset()
-    'reset': Cmd('{ref}.Reset()', AV),
-    # DeleteFullActorCopy
-    'deletefullactorcopy': Cmd('{ref}.Delete()', AV),
+    'stopcombatalarmonactor': Cmd('{ref}.StopCombatAlarm()', AV, flags='zero_arg'),
+    #: ClearOwnership
+    'clearownership': Cmd('{ref}.SetActorOwner(Game.GetPlayer().GetActorBase())', SELF, flags='zero_arg'),
+    #: Reset → ref.Reset()
+    'reset': Cmd('{ref}.Reset()', AV, flags='branch_only objref_self'),
+    #: DeleteFullActorCopy
+    'deletefullactorcopy': Cmd('{ref}.Delete()', AV, flags='branch_only'),
     'opendoor': Cmd('{ref}.SetOpen(true)', SELF),
     'closedoor': Cmd('{ref}.SetOpen(false)', SELF),
     'getsize': Cmd('{ref}.GetScale()', SELF),
-    # ResetHealth: TES4 ResetHealth -> RestoreActorValue("Health", 9999)
-    'resethealth': Cmd('{ref}.RestoreActorValue("Health", 9999)', AV),
+    #: ResetHealth: TES4 ResetHealth -> RestoreActorValue("Health", 9999)
+    'resethealth': Cmd('{ref}.RestoreActorValue("Health", 9999)', AV, flags='actor_only branch_only'),
     # EvaluatePackage/EVP/AddScriptPackage/RemoveScriptPackage/StopWaiting:
     # Skyrim version takes no args (drop TES4 package arg)
-    'evaluatepackage': Cmd('{ref}.EvaluatePackage()', AV),
-    'evp': Cmd('{ref}.EvaluatePackage()', AV),
-    'addscriptpackage': Cmd('{ref}.EvaluatePackage()', AV),
-    'removescriptpackage': Cmd('{ref}.EvaluatePackage()', AV),
-    'stopwaiting': Cmd('{ref}.EvaluatePackage()', AV),
-    # ClearLookAt / StopLook: Skyrim version takes no args (drop TES4 target arg)
-    'clearlookat': Cmd('{ref}.ClearLookAt()', AV),
-    'stoplook': Cmd('{ref}.ClearLookAt()', AV),
-    'stoplooking': Cmd('{ref}.ClearLookAt()', AV),
-    # GetEquippedItemType: Skyrim requires hand param (0=left, 1=right)
-    'getweaponanimtype': Cmd('{ref}.GetEquippedItemType(1)', AV),
-    'getequippeditemtype': Cmd('{ref}.GetEquippedItemType(1)', AV),
-    # IsRidingHorse: Actor.IsOnMount() in Skyrim
-    'isridinghorse': Cmd('{ref}.IsOnMount()', AV),
-    # GetRace: ref.GetRace() -> ref.GetRace()
-    'getrace': Cmd('{ref}.GetRace()', AV),
-    # IsInInterior: ref.IsInInterior -> ref.GetParentCell().IsInterior()
-    'isininterior': Cmd('{ref}.GetParentCell().IsInterior()', AV),
-    # GetContainer: item.GetContainer -> item.GetContainer()
+    'evaluatepackage': Cmd('{ref}.EvaluatePackage()', AV, flags='actor_arg actor_only zero_arg'),
+    'evp': Cmd('{ref}.EvaluatePackage()', AV, flags='actor_arg actor_only'),
+    'addscriptpackage': Cmd('{ref}.EvaluatePackage()', AV, flags='actor_only drop_args'),
+    'removescriptpackage': Cmd('{ref}.EvaluatePackage()', AV, flags='actor_only drop_args'),
+    'stopwaiting': Cmd('{ref}.EvaluatePackage()', AV, flags='actor_only'),
+    #: ClearLookAt / StopLook: Skyrim version takes no args (drop TES4 target arg)
+    'clearlookat': Cmd('{ref}.ClearLookAt()', AV, flags='actor_only'),
+    'stoplook': Cmd('{ref}.ClearLookAt()', AV, flags='actor_only zero_arg'),
+    'stoplooking': Cmd('{ref}.ClearLookAt()', AV, flags='actor_only'),
+    #: GetEquippedItemType: Skyrim requires hand param (0=left, 1=right)
+    'getweaponanimtype': Cmd('{ref}.GetEquippedItemType(1)', AV, flags='actor_only zero_arg'),
+    'getequippeditemtype': Cmd('{ref}.GetEquippedItemType(1)', AV, flags='branch_only'),
+    #: IsRidingHorse: Actor.IsOnMount() in Skyrim
+    'isridinghorse': Cmd('{ref}.IsOnMount()', AV, flags='cmp_bool'),
+    #: GetRace: ref.GetRace() -> ref.GetRace()
+    'getrace': Cmd('{ref}.GetRace()', AV, flags='actor_only'),
+    #: IsInInterior: ref.IsInInterior -> ref.GetParentCell().IsInterior()
+    'isininterior': Cmd('{ref}.GetParentCell().IsInterior()', AV, flags='bare_bool cmp_bool objref_self'),
+    #: GetContainer: item.GetContainer -> item.GetContainer()
     'getcontainer': Cmd('{ref}.GetContainer()', SELF),
     # The crime/fame/infamy WRITES.  Each was a branch that registered the
     # same fixed property, converted argument 0 and cast it -- identical apart
     # from the property and the cast, so they are rows.  `{int}`/`{float}` is
     # argument 0 cast to what the Papyrus setter declares.
-    'setcrimegold': Cmd('TES4CyrodiilCrimeFaction.SetCrimeGold({i0})', self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
-    'modcrimegold': Cmd('TES4CyrodiilCrimeFaction.ModCrimeGold({c0}, false)', self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
+    'setcrimegold': Cmd('TES4CyrodiilCrimeFaction.SetCrimeGold({i0})', self_type=('TES4CyrodiilCrimeFaction', 'Faction'), flags='actor_only'),
+    'modcrimegold': Cmd('TES4CyrodiilCrimeFaction.ModCrimeGold({c0}, false)', self_type=('TES4CyrodiilCrimeFaction', 'Faction'), flags='actor_only'),
     'modpcfame': Cmd('TES4Fame.Mod({f0})', self_type=('TES4Fame', 'GlobalVariable')),
     'modpcinfamy': Cmd('TES4Infamy.Mod({f0})', self_type=('TES4Infamy', 'GlobalVariable')),
     'setpcfame': Cmd('TES4Fame.SetValueInt({i0})', self_type=('TES4Fame', 'GlobalVariable')),
     'setpcinfamy': Cmd('TES4Infamy.SetValueInt({i0})', self_type=('TES4Infamy', 'GlobalVariable')),
-    # GotoJail → faction.SendPlayerToJail()
+    #: GotoJail → faction.SendPlayerToJail()
     'gotojail': Cmd('TES4CyrodiilCrimeFaction.SendPlayerToJail()', self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
-    # Crime gold functions → TES4CyrodiilCrimeFaction proxy
-    'getcrimegold': Cmd('TES4CyrodiilCrimeFaction.GetCrimeGold()', self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
+    #: Crime gold functions → TES4CyrodiilCrimeFaction proxy
+    'getcrimegold': Cmd('TES4CyrodiilCrimeFaction.GetCrimeGold()', self_type=('TES4CyrodiilCrimeFaction', 'Faction'), flags='actor_only'),
     'payfine': Cmd('TES4CyrodiilCrimeFaction.PlayerPayCrimeGold(false, false)', self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
     'payfinethief': Cmd('TES4CyrodiilCrimeFaction.PlayerPayCrimeGold(false, false)', self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
-    # Fame/Infamy → GlobalVariable
+    #: Fame/Infamy → GlobalVariable
     'getpcfame': Cmd('TES4Fame.GetValueInt()', self_type=('TES4Fame', 'GlobalVariable')),
     'getpcinfamy': Cmd('TES4Infamy.GetValueInt()', self_type=('TES4Infamy', 'GlobalVariable')),
     'getinfame': Cmd('TES4Infamy.GetValueInt()', self_type=('TES4Infamy', 'GlobalVariable')),
@@ -1233,7 +1046,7 @@ COMMAND_ROWS = {
     # attracted a second cast on assignment (`... % 7 as Int`).
     'getdayofweek': Cmd('(GameDaysPassed.GetValueInt() % 7)', self_type=('GameDaysPassed', 'GlobalVariable')),
     'getdayoftheweek': Cmd('(GameDaysPassed.GetValueInt() % 7)', self_type=('GameDaysPassed', 'GlobalVariable')),
-    # GetAmountSoldStolen: gold fenced, paired with ModAmountSoldStolen above.
+    #: GetAmountSoldStolen: gold fenced, paired with ModAmountSoldStolen above.
     'getamountsoldstolen': Cmd('TES4GoldFenced.GetValue()', self_type=('TES4GoldFenced', 'GlobalVariable')),
     # Player-controls state.  Skyrim exposes the two WRITERS as natives
     # (Game.DisablePlayerControls/EnablePlayerControls) but no getter, so
@@ -1244,7 +1057,7 @@ COMMAND_ROWS = {
     # branch (`== 1`) permanently false while the combat branch (`== 0`)
     # fired immediately — so Mannimarco never spoke and attacked at once.
     'getplayercontrolsdisabled': Cmd('TES4ControlsDisabled.GetValue()', self_type=('TES4ControlsDisabled', 'GlobalVariable')),
-    'getplayercontrolsdisabled_': Cmd('TES4ControlsDisabled.GetValue()', self_type=('TES4ControlsDisabled', 'GlobalVariable')),
+    'getplayercontrolsdisabled_': Cmd('TES4ControlsDisabled.GetValue()', self_type=('TES4ControlsDisabled', 'GlobalVariable'), flags='branch_only'),
 
     # AdvancePCLevel: raise the player exactly one level.  Skyrim's vanilla
     # Game.psc (Scripts.zip) has NO level setter — Game.SetPlayerLevel is a
@@ -1262,10 +1075,10 @@ COMMAND_ROWS = {
     'con_save': Cmd('Game.RequestSave()'),
     'con_savegame': Cmd('Game.RequestSave()'),
     'getdisposition': Cmd('50'),
-    # GetIsPlayableRace
-    'getisplayablerace': Cmd('true'),
+    #: GetIsPlayableRace
+    'getisplayablerace': Cmd('true', flags='zero_arg'),
     'getplayerinjail': Cmd('Game.GetPlayer().IsArrested()'),
-    # GetRandomPercent -> Utility.RandomInt(0, 99)
+    #: GetRandomPercent -> Utility.RandomInt(0, 99)
     'getrandompercent': Cmd('Utility.RandomInt(0, 99)'),
     # HasVampireFed: Skyrim's PlayerVampireQuestScript.VampireStatus is 1
     # exactly while the vampire has recently fed.
@@ -1290,17 +1103,17 @@ COMMAND_ROWS = {
     'triggerhitshader': Cmd('Game.TriggerScreenBlood(3)'),
 
     'addachievement': Cmd(note='{f}'),
-    'addflames': Cmd(note='{f} has no Skyrim equivalent'),
+    'addflames': Cmd(note='{f} has no Skyrim equivalent', flags='zero_arg'),
     'attachashpile': Cmd(note='{f}'),
     'bookread': Cmd(note='GetBookRead'),
-    'disablelinkedpathpoints': Cmd(note='{f}'),
-    'enablelinkedpathpoints': Cmd(note='{f}'),
+    'disablelinkedpathpoints': Cmd(note='{f}', flags='zero_arg'),
+    'enablelinkedpathpoints': Cmd(note='{f}', flags='zero_arg'),
     'essentialdeathreload': Cmd(note='{f}'),
     'flamesoff': Cmd(note='{f} has no Skyrim equivalent'),
     'flameson': Cmd(note='{f} has no Skyrim equivalent'),
-    # ForceFlee → StartCombat avoidance (approximate)
+    #: ForceFlee → StartCombat avoidance (approximate)
     'getaltcontrol': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
-    # GetBookRead -> no direct equivalent, return 0
+    #: GetBookRead -> no direct equivalent, return 0
     'getbookread': Cmd(note='{f}'),
     # OBSE reads with no vanilla-Papyrus counterpart at all: raw input
     # bindings (getControl/getAltControl), UI introspection
@@ -1312,8 +1125,8 @@ COMMAND_ROWS = {
     # arithmetic, where a trailing comment would eat the rest of the line.
     'getcontrol': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'getcrimeknown': Cmd(note='{f}'),
-    'getcurrentaipackage': Cmd(note='{f}'),
-    'getcurrentaiprocedure': Cmd(note='{f}'),
+    'getcurrentaipackage': Cmd(note='{f}', flags='zero_arg'),
+    'getcurrentaiprocedure': Cmd(note='{f}', flags='zero_arg'),
     'getcurrentpackage': Cmd(note='{f}'),
     'getfullgoldvalue': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     # GetGameRestarted / IsPlayerMovingIntoNewSpace (OBSE): both report a
@@ -1326,8 +1139,8 @@ COMMAND_ROWS = {
     'getgamerestarted': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     # ObjectReference.IgnoreFriendlyHits is a SETTER in Skyrim; TES4's
     # GetIgnoreFriendlyHits reads the flag back and Papyrus cannot.
-    'getignorefriendlyhits': Cmd(note='GetIgnoreFriendlyHits — Skyrim exposes only the setter'),
-    'getisalerted': Cmd(note='{f}'),
+    'getignorefriendlyhits': Cmd(note='GetIgnoreFriendlyHits — Skyrim exposes only the setter', flags='bare_bool zero_arg'),
+    'getisalerted': Cmd(note='{f}', flags='zero_arg'),
     'getisplayerbirthsign': Cmd(note='{f}'),
     'getitems': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'getmousecontrol': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
@@ -1340,32 +1153,32 @@ COMMAND_ROWS = {
     'getobjecttype': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     # Vanilla TES4 GetPlayerHasLastRiddenHorse — no Skyrim equivalent (the
     # engine tracks no "last ridden" horse), and SKSE adds none.
-    'getplayerhaslastriddenhorse': Cmd(note='{f} has no Skyrim equivalent'),
-    'getrestrained': Cmd(note='GetRestrained'),
+    'getplayerhaslastriddenhorse': Cmd(note='{f} has no Skyrim equivalent', flags='bare_bool zero_arg'),
+    'getrestrained': Cmd(note='GetRestrained', flags='zero_arg'),
     'getstartingpos': Cmd(note='{f}'),
     # GetTalkedToPC
     # Both spellings answer with the canonical command name, as the branch
     # they replace did -- GetTalkedToPCP is a variant of the same command.
-    'gettalkedtopc': Cmd(note='GetTalkedToPC'),
+    'gettalkedtopc': Cmd(note='GetTalkedToPC', flags='cmp_bool zero_arg'),
     'gettalkedtopcp': Cmd(note='GetTalkedToPC'),
     'gettype': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'getweaponskilltype': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'hasbeenpickedup': Cmd(note='{f}'),
     # Vanilla TES4 HasFlames / light-state toggles on a light reference.
     # Skyrim lights carry no scriptable flame state.
-    'hasflames': Cmd(note='HasFlames has no Skyrim equivalent'),
+    'hasflames': Cmd(note='HasFlames has no Skyrim equivalent', flags='bare_bool zero_arg'),
     'hasvariable': Cmd(note='{f}'),
     # IsActorDetected takes no argument — "am I detected by ANYONE".  Skyrim
     # only offers IsDetectedBy(specificActor), so there is nothing to call.
     # Emitting IsDetectedBy with the default player arg produced
     # `Game.GetPlayer().IsDetectedBy(Game.GetPlayer())` (always true).
-    'isactordetected': Cmd(note='IsActorDetected (no Skyrim equivalent)'),
+    'isactordetected': Cmd(note='IsActorDetected (no Skyrim equivalent)', flags='cmp_bool'),
     'isbuttonpressed': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'iscontrolpressed': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'iscurrentfurnitureobj': Cmd(note='{f}'),
     'iscurrentfurnitureref': Cmd(note='{f}'),
-    'isidleplaying': Cmd(note='{f}'),
-    'isindangerouswater': Cmd(note='{f}'),
+    'isidleplaying': Cmd(note='{f}', flags='zero_arg'),
+    'isindangerouswater': Cmd(note='{f}', flags='zero_arg'),
     # isKeyPressed / isKeyPressed2 / isControlPressed (OBSE): raw input
     # polling.  Papyrus has no key-state read outside SKSE, so these read as
     # "not pressed".  A BARE 0 — the call sits inside a larger condition
@@ -1378,9 +1191,9 @@ COMMAND_ROWS = {
     'isplayable': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'isplayable2': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'isplayermovingintonewspace': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
-    'isplayerslastriddenhorse': Cmd(note='{f} has no Skyrim equivalent'),
-    # IsSwimming → no vanilla equivalent, approximate with submerged check
-    'isswimming': Cmd(note='IsSwimming'),
+    'isplayerslastriddenhorse': Cmd(note='{f} has no Skyrim equivalent', flags='bare_bool zero_arg'),
+    #: IsSwimming → no vanilla equivalent, approximate with submerged check
+    'isswimming': Cmd(note='IsSwimming', flags='actor_only bare_bool cmp_bool zero_arg'),
     'istimepassing': Cmd(note='{f}'),
     'menumode': Cmd(note='{f}'),
     'offerhorse': Cmd(note='{f}'),
@@ -1389,48 +1202,48 @@ COMMAND_ROWS = {
     'playbink': Cmd(note='{f}'),
     'purgecellbuffers': Cmd(note='{f}'),
     'refreshtopiclist': Cmd(note='{f}'),
-    'removeflames': Cmd(note='{f} has no Skyrim equivalent'),
+    'removeflames': Cmd(note='{f} has no Skyrim equivalent', flags='zero_arg'),
     'removetopic': Cmd(note='{f}'),
     'respawnhorse': Cmd(note='{f}'),
-    # Rotate → no-op
+    #: Rotate → no-op
     'rotate': Cmd(note='Rotate'),
     'sendtrespassalarm': Cmd(note='{f}'),
-    # SetActorFullName → no-op (SKSE required for SetDisplayName)
+    #: SetActorFullName → no-op (SKSE required for SetDisplayName)
     'setactorfullname': Cmd(note='SetActorFullName'),
-    # SetActorsAI → no-op
+    #: SetActorsAI → no-op
     'setactorsai': Cmd(note='SetActorsAI'),
     'setallreachable': Cmd(note='{f}'),
     'setallvisible': Cmd(note='{f}'),
-    # SetCellFullName no-op
+    #: SetCellFullName no-op
     'setcellfullname': Cmd(note='{f}'),
     'setcellownership': Cmd(note='{f}'),
     'setcellpublicflag': Cmd(note='{f}'),
     'setclass': Cmd(note='{f}'),
-    # SetCombatStyle → no-op (managed by CK/race)
+    #: SetCombatStyle → no-op (managed by CK/race)
     'setcombatstyle': Cmd(note='SetCombatStyle'),
     # SetName is the same capability as SetDisplayName (both rename a form)
     # and neither exists in vanilla Papyrus — Form.psc has no name setter.
     'setdisplayname': Cmd(note='{f}'),
     'setdoordisabletakeoff': Cmd(note='{f}'),
-    # SetForceSneaking
-    'setforcesneak': Cmd(note='SetForceSneak'),
+    #: SetForceSneaking
+    'setforcesneak': Cmd(note='SetForceSneak', flags='actor_only'),
     'setignorefriendlyhits': Cmd(note='{f}'),
-    # SetInCharGen: no-op
+    #: SetInCharGen: no-op
     'setinchargen': Cmd(note='SetInCharGen'),
     'setinvestmentgold': Cmd(note='{f}'),
-    # SetItemValue → no-op
+    #: SetItemValue → no-op
     'setitemvalue': Cmd(note='SetItemValue'),
-    # SetLevel → no-op
+    #: SetLevel → no-op
     'setlevel': Cmd(note='SetLevel'),
     'setname': Cmd(note='{f}'),
     'setnoavoidance': Cmd(note='{f}'),
     'setnorumors': Cmd(note='{f}'),
     'setpackduration': Cmd(note='{f}'),
-    # SetPlayerInSEWorld: no-op
+    #: SetPlayerInSEWorld: no-op
     'setplayerinseworld': Cmd(note='SetPlayerInSEWorld'),
     'setpublic': Cmd(note='{f}'),
     'setquestobject': Cmd(note='{f}'),
-    # SetRigidBodyMass → no-op
+    #: SetRigidBodyMass → no-op
     'setrigidbodymass': Cmd(note='SetRigidBodyMass'),
     'setsceneiscomplex': Cmd(note='{f}'),
     'setshowquestitems': Cmd(note='{f}'),
@@ -1439,7 +1252,7 @@ COMMAND_ROWS = {
     'showspellmaking': Cmd(note='{f}'),
     'stopsound': Cmd(note='StopSound has no Papyrus equivalent'),
     'trapupdate': Cmd(note='{f}'),
-    # Wait → no-op (TES4 Wait is a package instruction, not a time delay)
+    #: Wait → no-op (TES4 Wait is a package instruction, not a time delay)
     'wait': Cmd(note='Wait is a package instruction'),
     # WakeUpPC kicks the player OUT OF SLEEP.  It does not move them, change
     # the camera, or play an animation — the old mapping to
@@ -1536,53 +1349,52 @@ COMMAND_ROWS = {
 
     # --- Commands the generic mapped-call rendering covers.
     # --- Actor Values ---
-    'getactorvalue': Cmd('GetActorValue', MAP),
-    'setactorvalue': Cmd('SetActorValue', MAP),
-    'modactorvalue': Cmd('ModActorValue', MAP),
-    'forceactorvalue': Cmd('ForceActorValue', MAP),
-    'getav': Cmd('GetActorValue', MAP),
-    'setav': Cmd('SetActorValue', MAP),
-    'modav': Cmd('ModActorValue', MAP),
-    'forceav': Cmd('ForceActorValue', MAP),
-    'getbaseactorvalue': Cmd('GetBaseActorValue', MAP),
-    'getbaseav': Cmd('GetBaseActorValue', MAP),
+    'getactorvalue': Cmd('GetActorValue', MAP, flags='actor_only av av_read'),
+    'setactorvalue': Cmd('SetActorValue', MAP, flags='actor_only av'),
+    'modactorvalue': Cmd('ModActorValue', MAP, flags='actor_only av'),
+    'forceactorvalue': Cmd('ForceActorValue', MAP, flags='actor_only av'),
+    'getav': Cmd('GetActorValue', MAP, flags='actor_only av av_read'),
+    'setav': Cmd('SetActorValue', MAP, flags='actor_only av'),
+    'modav': Cmd('ModActorValue', MAP, flags='actor_only av'),
+    'forceav': Cmd('ForceActorValue', MAP, flags='actor_only av'),
+    'getbaseactorvalue': Cmd('GetBaseActorValue', MAP, flags='actor_only av av_read'),
+    'getbaseav': Cmd('GetBaseActorValue', MAP, flags='actor_only av av_read'),
 
-    # --- Items / Inventory ---
-    'additem': Cmd('AddItem', MAP),
-    'removeitem': Cmd('RemoveItem', MAP),
-    'getitemcount': Cmd('GetItemCount', MAP),
-    'equipitem': Cmd('EquipItem', MAP),
-    'unequipitem': Cmd('UnequipItem', MAP),
+    #: --- Items / Inventory ---
+    'additem': Cmd('AddItem', MAP, flags='actor_only objref_shared'),
+    'removeitem': Cmd('RemoveItem', MAP, flags='actor_only objref_shared'),
+    'getitemcount': Cmd('GetItemCount', MAP, flags='actor_only objref_self objref_shared'),
+    'equipitem': Cmd('EquipItem', MAP, flags='actor_only'),
+    'unequipitem': Cmd('UnequipItem', MAP, flags='actor_only'),
     'removeallitems': Cmd('RemoveAllItems', MAP),
     'getnumitems': Cmd('GetNumItems', MAP),
     'getinventoryobject': Cmd('GetNthForm', MAP),
     'drop': Cmd('DropObject', MAP),
 
-    # --- Spells ---
-    'addspell': Cmd('AddSpell', MAP),
-    'removespell': Cmd('RemoveSpell', MAP),
-    'hasspell': Cmd('HasSpell', MAP),
-    'cast': Cmd('Cast', MAP),
-    'dispel': Cmd('DispelSpell', MAP),
-    'dispelspell': Cmd('DispelSpell', MAP),
-    'dispelallspells': Cmd('DispelAllSpells', MAP),
+    #: --- Spells ---
+    'addspell': Cmd('AddSpell', MAP, flags='actor_only'),
+    'removespell': Cmd('RemoveSpell', MAP, flags='actor_only'),
+    'hasspell': Cmd('HasSpell', MAP, flags='actor_only cmp_bool'),
+    'dispel': Cmd('DispelSpell', MAP, flags='actor_only'),
+    'dispelspell': Cmd('DispelSpell', MAP, flags='actor_only'),
+    'dispelallspells': Cmd('DispelAllSpells', MAP, flags='actor_only zero_arg'),
 
-    # --- Movement / Position ---
+    #: --- Movement / Position ---
     'moveto': Cmd('MoveTo', MAP),
-    'getdistance': Cmd('GetDistance', MAP),
-    'getparentcell': Cmd('GetParentCell', MAP),
+    'getdistance': Cmd('GetDistance', MAP, flags='actor_only objref_shared'),
+    'getparentcell': Cmd('GetParentCell', MAP, flags='objref_self'),
     'setposition': Cmd('SetPosition', MAP),
-    'getlinkedref': Cmd('GetLinkedRef', MAP),
+    'getlinkedref': Cmd('GetLinkedRef', MAP, flags='objref_self'),
     'getheadingangle': Cmd('GetHeadingAngle', MAP),
 
-    # --- Enable / Disable ---
-    'enable': Cmd('Enable', MAP),
-    'disable': Cmd('Disable', MAP),
-    'isenabled': Cmd('IsEnabled', MAP),
-    'activate': Cmd('Activate', MAP),
-    'delete': Cmd('Delete', MAP),
-    'markfordelete': Cmd('Delete', MAP),
-    'placeatme': Cmd('PlaceAtMe', MAP),
+    #: --- Enable / Disable ---
+    'enable': Cmd('Enable', MAP, flags='objref_self'),
+    'disable': Cmd('Disable', MAP, flags='objref_self'),
+    'isenabled': Cmd('IsEnabled', MAP, flags='bare_bool cmp_bool'),
+    'activate': Cmd('Activate', MAP, flags='objref_self'),
+    'delete': Cmd('Delete', MAP, flags='objref_self'),
+    'markfordelete': Cmd('Delete', MAP, flags='zero_arg'),
+    'placeatme': Cmd('PlaceAtMe', MAP, flags='actor_only objref_shared'),
     # TES4 SetDestroyed drives the ENGINE destruction system: the ref switches
     # to its destroyed state — geometry breaks apart and collision drops — while
     # staying present in the world.  Skyrim keeps the same system and exposes it
@@ -1597,20 +1409,20 @@ COMMAND_ROWS = {
     # Mapping direct to the native here would bypass that mirror and leave the
     # read false forever.
 
-    # --- Actor State ---
-    'kill': Cmd('Kill', MAP),
+    #: --- Actor State ---
+    'kill': Cmd('Kill', MAP, flags='actor_only'),
     'killandresurrect': Cmd('Kill', MAP), # then Resurrect manually
-    'resurrect': Cmd('Resurrect', MAP),
-    'getdead': Cmd('IsDead', MAP),
-    'isdead': Cmd('IsDead', MAP),
-    'isincombat': Cmd('IsInCombat', MAP),
+    'resurrect': Cmd('Resurrect', MAP, flags='actor_only drop_args'),
+    'getdead': Cmd('IsDead', MAP, flags='actor_only bare_bool cmp_bool zero_arg'),
+    'isdead': Cmd('IsDead', MAP, flags='actor_only bare_bool cmp_bool zero_arg'),
+    'isincombat': Cmd('IsInCombat', MAP, flags='actor_only bare_bool cmp_bool zero_arg'),
     # SetForceSneak is neutralised (no Skyrim equivalent), so the live sneak
     # state is the closest readable value for its getter.
-    'getforcesneak': Cmd('IsSneaking', MAP),
-    # TES4 knocked-down state ~ Skyrim's bleedout/recovery state.
-    'getknockedstate': Cmd('IsBleedingOut', MAP),
-    'startcombat': Cmd('StartCombat', MAP),
-    'stopcombat': Cmd('StopCombat', MAP),
+    'getforcesneak': Cmd('IsSneaking', MAP, flags='actor_only bare_bool zero_arg'),
+    #: TES4 knocked-down state ~ Skyrim's bleedout/recovery state.
+    'getknockedstate': Cmd('IsBleedingOut', MAP, flags='actor_only bare_bool zero_arg'),
+    'startcombat': Cmd('StartCombat', MAP, flags='actor_arg actor_only'),
+    'stopcombat': Cmd('StopCombat', MAP, flags='actor_only drop_args zero_arg'),
     # IsActorDetected takes NO argument (UESP opcode 0x10B5, 0 params): "is this
     # actor detected by ANYONE".  GetDetected takes 1 Actor and asks the
     # OPPOSITE question from Skyrim's IsDetectedBy: `<observer>.GetDetected
@@ -1623,15 +1435,15 @@ COMMAND_ROWS = {
     # place and asked the mirror-image question.  Both now have special handlers
     # in _emit_function: IsActorDetected is a no-op (Skyrim has no "detected by
     # anyone" primitive, like GetDetectionLevel), GetDetected swaps the two refs.
-    'issneaking': Cmd('IsSneaking', MAP),
-    'isweaponout': Cmd('IsWeaponDrawn', MAP),
-    'getsitting': Cmd('GetSitState', MAP),
-    'getsleeping': Cmd('GetSleepState', MAP),
-    'getequipped': Cmd('IsEquipped', MAP),
-    'istalking': Cmd('IsInDialogueWithPlayer', MAP),
-    'setunconscious': Cmd('SetUnconscious', MAP),
-    'setghost': Cmd('SetGhost', MAP),
-    'isghost': Cmd('IsGhost', MAP),
+    'issneaking': Cmd('IsSneaking', MAP, flags='actor_only bare_bool cmp_bool zero_arg'),
+    'isweaponout': Cmd('IsWeaponDrawn', MAP, flags='actor_only bare_bool cmp_bool zero_arg'),
+    'getsitting': Cmd('GetSitState', MAP, flags='actor_only zero_arg'),
+    'getsleeping': Cmd('GetSleepState', MAP, flags='actor_only zero_arg'),
+    'getequipped': Cmd('IsEquipped', MAP, flags='actor_only'),
+    'istalking': Cmd('IsInDialogueWithPlayer', MAP, flags='zero_arg'),
+    'setunconscious': Cmd('SetUnconscious', MAP, flags='actor_only'),
+    'setghost': Cmd('SetGhost', MAP, flags='actor_only'),
+    'isghost': Cmd('IsGhost', MAP, flags='actor_only bare_bool cmp_bool'),
     # TES4 spells the ghost/unconscious GETTERS `GetIsGhost` / `GetUnconscious`
     # while Skyrim names them IsGhost() / IsUnconscious().  Only the SETTERS
     # were mapped, so a read emitted a bare member access
@@ -1640,12 +1452,12 @@ COMMAND_ROWS = {
     # every script declaring a property of its type then fails to LINK.
     'getisghost': Cmd('IsGhost', MAP),
     'getunconscious': Cmd('IsUnconscious', MAP),
-    'resetai': Cmd('ResetAI', MAP),
+    'resetai': Cmd('ResetAI', MAP, flags='zero_arg'),
 
-    # --- Factions ---
-    'getinfaction': Cmd('IsInFaction', MAP),
-    'getfactionrank': Cmd('GetFactionRank', MAP),
-    'setfactionrank': Cmd('SetFactionRank', MAP),
+    #: --- Factions ---
+    'getinfaction': Cmd('IsInFaction', MAP, flags='actor_only cmp_bool'),
+    'getfactionrank': Cmd('GetFactionRank', MAP, flags='actor_only'),
+    'setfactionrank': Cmd('SetFactionRank', MAP, flags='actor_only'),
     'modfactionrank': Cmd('ModFactionRank', MAP),
     'addfaction': Cmd('AddToFaction', MAP),
     'removefaction': Cmd('RemoveFromFaction', MAP),
@@ -1656,17 +1468,17 @@ COMMAND_ROWS = {
     # here.  It carried ('SetDontMove', ...) — the exact inverse of "force this
     # actor to run" — which was unreachable only because the handler runs first.
 
-    # --- Quest ---
+    #: --- Quest ---
     'setstage': Cmd('SetStage', MAP, bare=True),
     'getstage': Cmd('GetStage', MAP, bare=True),
-    'getstagedone': Cmd('GetStageDone', MAP, bare=True),
+    'getstagedone': Cmd('GetStageDone', MAP, bare=True, flags='cmp_bool'),
     'startquest': Cmd('Start', MAP, bare=True),
     'stopquest': Cmd('Stop', MAP, bare=True),
-    'getquestrunning': Cmd('IsRunning', MAP, bare=True),
+    'getquestrunning': Cmd('IsRunning', MAP, bare=True, flags='cmp_bool'),
     'isquestcompleted': Cmd('IsCompleted', MAP, bare=True),
     'completequest': Cmd('CompleteQuest', MAP, bare=True),
 
-    # --- UI / Messages ---
+    #: --- UI / Messages ---
     'message': Cmd('Debug.Notification', MAP, bare=True),
     'messagebox': Cmd('Debug.MessageBox', MAP, bare=True),
     'showmessage': Cmd('Debug.MessageBox', MAP, bare=True),
@@ -1712,13 +1524,13 @@ COMMAND_ROWS = {
     'unequipitem2': Cmd('UnequipItem', MAP),
     'unequipitem2ns': Cmd('UnequipItem', MAP),
     'unequipitemsilent': Cmd('UnequipItem', MAP),
-    # OBSE aliases that only widen the vanilla command's argument types.
-    'modav2': Cmd('ModActorValue', MAP),
-    'modactorvalue2': Cmd('ModActorValue', MAP),
-    'getav2': Cmd('GetActorValue', MAP),
-    'setav2': Cmd('SetActorValue', MAP),
+    #: OBSE aliases that only widen the vanilla command's argument types.
+    'modav2': Cmd('ModActorValue', MAP, flags='av'),
+    'modactorvalue2': Cmd('ModActorValue', MAP, flags='av'),
+    'getav2': Cmd('GetActorValue', MAP, flags='av av_read'),
+    'setav2': Cmd('SetActorValue', MAP, flags='av'),
     'rand': Cmd('Utility.RandomFloat', MAP, bare=True),
-    'islocked': Cmd('IsLocked', MAP),
+    'islocked': Cmd('IsLocked', MAP, flags='bare_bool objref_self'),
     'getequippedobject': Cmd('GetEquippedWeapon', MAP),
     # TES4 `LoopGroup <group>` plays an idle animation on repeat;
     # PlayGamebryoAnimation is Skyrim's own looping Gamebryo-animation call.
@@ -1779,47 +1591,47 @@ COMMAND_ROWS = {
     # own refresh idiom is a disable/enable cycle, which tears down and rebuilds
     # exactly the same 3D.
 
-    # --- Game State ---
+    #: --- Game State ---
     'getgamesetting': Cmd('Game.GetGameSettingFloat', MAP, bare=True),
     'getgs': Cmd('Game.GetGameSettingFloat', MAP, bare=True),
     'getpcinfaction': Cmd('Game.GetPlayer().IsInFaction', MAP, bare=True),
     'showracemenu': Cmd('Game.ShowRaceMenu', MAP, bare=True),
-    'getlevel': Cmd('GetLevel', MAP),
-    # 'isininterior' handled by special handler in _emit_function
+    'getlevel': Cmd('GetLevel', MAP, flags='actor_only zero_arg'),
+    #: 'isininterior' handled by special handler in _emit_function
     'getcurrentgametime': Cmd('Utility.GetCurrentGameTime', MAP, bare=True),
     'getcurrenttime': Cmd('Utility.GetCurrentGameTime', MAP, bare=True),
 
-    # --- Sound ---
+    #: --- Sound ---
 
-    # --- Animation ---
-    'lookat': Cmd('SetLookAt', MAP),
+    #: --- Animation ---
+    'lookat': Cmd('SetLookAt', MAP, flags='actor_only'),
 
-    # --- Misc ---
-    'getparentref': Cmd('GetLinkedRef', MAP),
-    'lock': Cmd('Lock', MAP),
-    'getlocked': Cmd('IsLocked', MAP),
-    'getlocklevel': Cmd('GetLockLevel', MAP),
+    #: --- Misc ---
+    'getparentref': Cmd('GetLinkedRef', MAP, flags='objref_self zero_arg'),
+    'lock': Cmd('Lock', MAP, flags='objref_self'),
+    'getlocked': Cmd('IsLocked', MAP, flags='bare_bool cmp_bool objref_self zero_arg'),
+    'getlocklevel': Cmd('GetLockLevel', MAP, flags='objref_self zero_arg'),
     'setownership': Cmd('SetActorOwner', MAP), # handled by special handler above
-    'setscale': Cmd('SetScale', MAP),
-    'getscale': Cmd('GetScale', MAP),
-    'say': Cmd('Say', MAP),
+    'setscale': Cmd('SetScale', MAP, flags='actor_only objref_shared'),
+    'getscale': Cmd('GetScale', MAP, flags='actor_only objref_shared zero_arg'),
+    'say': Cmd('Say', MAP, flags='actor_only objref_shared'),
     'setfactionreaction': Cmd('SetReaction', MAP, bare=True),
     'modfactionreaction': Cmd('ModReaction', MAP, bare=True),
     'triggerscreenblood': Cmd('Game.TriggerScreenBlood', MAP, bare=True),
     'setdoordefaultopen': Cmd('SetOpen', MAP),
     'removeme': Cmd('Delete', MAP),
 
-    # --- Object state ---
+    #: --- Object state ---
     'setdisabled': Cmd('Disable', MAP),
     'setenabled': Cmd('Enable', MAP),
-    'getis3dloaded': Cmd('Is3DLoaded', MAP),
+    'getis3dloaded': Cmd('Is3DLoaded', MAP, flags='bare_bool'),
 
     # --- Weather ---
     # Same reading, spelled out in full.  Takes no arguments, so it is ALWAYS
     # read bare — without a FUNCTION_MAP entry the bare-identifier path had
     # nothing to route and the name survived into the output undefined.
 
-    # --- Special compound player.X ---
+    #: --- Special compound player.X ---
     'player.additem': Cmd('Game.GetPlayer().AddItem', MAP, bare=True),
     'player.removeitem': Cmd('Game.GetPlayer().RemoveItem', MAP, bare=True),
     'player.getitemcount': Cmd('Game.GetPlayer().GetItemCount', MAP, bare=True),
@@ -1828,15 +1640,14 @@ COMMAND_ROWS = {
     'player.moveto': Cmd('Game.GetPlayer().MoveTo', MAP, bare=True),
     'player.placeatme': Cmd('Game.GetPlayer().PlaceAtMe', MAP, bare=True),
 
-    # --- Additional Actor/Combat ---
-    'getcombattarget': Cmd('GetCombatTarget', MAP),
+    #: --- Additional Actor/Combat ---
+    'getcombattarget': Cmd('GetCombatTarget', MAP, flags='zero_arg'),
     'isdisabled': Cmd('IsDisabled', MAP),
     'getparentcellowner': Cmd('GetParentCell', MAP),
-    'hasmagiceffect': Cmd('HasMagicEffect', MAP),
-    'getdeadcount': Cmd('GetDeadCount', MAP),
+    'hasmagiceffect': Cmd('HasMagicEffect', MAP, flags='actor_only'),
     'setopendoor': Cmd('SetOpen', MAP),
 
-    # --- Player state ---
+    #: --- Player state ---
     'disableplayercontrols': Cmd('Game.DisablePlayerControls', MAP, bare=True),
     'enableplayercontrols': Cmd('Game.EnablePlayerControls', MAP, bare=True),
     'enablefasttravel': Cmd('Game.EnableFastTravel', MAP, bare=True),
@@ -1848,10 +1659,10 @@ COMMAND_ROWS = {
     # OBSE string_var builder; Papyrus String is the literal.  Special handler
     # in _emit_function — the inert ar_/sv_ catch-all would leave it undefined.
 
-    # --- AI/Package ---
+    #: --- AI/Package ---
 
-    # --- Object Interaction ---
-    'removeallitems': Cmd('RemoveAllItems', MAP),
+    #: --- Object Interaction ---
+    'removeallitems': Cmd('RemoveAllItems', MAP, flags='actor_only objref_shared'),
     'getdisabled': Cmd('IsDisabled', MAP),
     # Special handlers in _emit_function (see there for why each is inert):
     # path-based music has no Skyrim API, IsCasting maps to the animation graph.
@@ -1862,56 +1673,56 @@ COMMAND_ROWS = {
     # --- Cell/Location ---
     # 'isininterior' handled by special handler in _emit_function
 
-    # --- Faction/Crime ---
+    #: --- Faction/Crime ---
 
-    # --- Dialog/Topic ---
-    'saycustom': Cmd('Say', MAP),
+    #: --- Dialog/Topic ---
+    'saycustom': Cmd('Say', MAP, flags='actor_only objref_shared'),
 
-    # --- Look/Perception ---
-    'look': Cmd('SetLookAt', MAP),
+    #: --- Look/Perception ---
+    'look': Cmd('SetLookAt', MAP, flags='actor_only'),
 
     # --- Display/Name ---
     # GetDisplayName is SKSE, not vanilla — Form.psc/ObjectReference.psc/
     # Actor.psc have no name accessor at all, so these emitted a call that does
     # not exist.  Neutralised via COMMAND_ROWS.
 
-    # --- Travel ---
+    #: --- Travel ---
     'movetomyeditorlocation': Cmd('MoveToMyEditorLocation', MAP),
-    'moveto': Cmd('MoveTo', MAP),
+    'moveto': Cmd('MoveTo', MAP, flags='objref_self'),
     'movetomarker': Cmd('MoveTo', MAP),
 
-    # --- Path/Linked Points ---
+    #: --- Path/Linked Points ---
 
-    # --- Shader/Visual Effects ---
+    #: --- Shader/Visual Effects ---
 
-    # --- AI/Wait ---
-    'sayto': Cmd('Say', MAP),
+    #: --- AI/Wait ---
+    'sayto': Cmd('Say', MAP, flags='actor_only objref_shared'),
 
-    # --- Detection ---
+    #: --- Detection ---
 
-    # --- Door/Object State ---
-    'setopenstate': Cmd('SetOpen', MAP),
+    #: --- Door/Object State ---
+    'setopenstate': Cmd('SetOpen', MAP, flags='objref_self'),
 
-    # --- Player Skill/Misc ---
-    'modpcskill': Cmd('Game.AdvanceSkill', MAP, bare=True),
+    #: --- Player Skill/Misc ---
+    'modpcskill': Cmd('Game.AdvanceSkill', MAP, bare=True, flags='av'),
     'modpcmiscstat': Cmd('Game.IncrementStat', MAP, bare=True),
     'getpcmiscstat': Cmd('Game.QueryStat', MAP, bare=True),
 
-    # --- Trap/Custom functions that are quest-specific ---
+    #: --- Trap/Custom functions that are quest-specific ---
 
-    # --- Gold ---
-    'getgold': Cmd('GetGoldAmount', MAP),
+    #: --- Gold ---
+    'getgold': Cmd('GetGoldAmount', MAP, flags='actor_only zero_arg'),
 
-    # --- Alpha ---
-    'saa': Cmd('SetAlpha', MAP),
-    'setactoralpha': Cmd('SetAlpha', MAP),
-    'gaa': Cmd('GetAlpha', MAP),
-    'getactoralpha': Cmd('GetAlpha', MAP),
+    #: --- Alpha ---
+    'saa': Cmd('SetAlpha', MAP, flags='actor_only actorbase_arg'),
+    'setactoralpha': Cmd('SetAlpha', MAP, flags='actor_only actorbase_arg'),
+    'gaa': Cmd('GetAlpha', MAP, flags='actor_only actorbase_arg'),
+    'getactoralpha': Cmd('GetAlpha', MAP, flags='actor_only actorbase_arg'),
 
     # --- Interior ---
     # 'isininterior' handled by special handler in _emit_function
 
-    # --- Save ---
+    #: --- Save ---
     'autosave': Cmd('Game.RequestAutoSave', MAP, bare=True),
 
     # --- Misc unmapped ---
@@ -1920,11 +1731,11 @@ COMMAND_ROWS = {
     # name is a FUNCTION_MAP key.  Without the alias the read fell through to a
     # raw member access on a type that has no such property, failing the whole
     # compile.  Routed to the same polyfill handler as `getiscreature`.
-    'getclothingvalue': Cmd(note='{f} {a}  (clothing value not tracked in Skyrim; 0)'),
+    'getclothingvalue': Cmd(note='{f} {a}  (clothing value not tracked in Skyrim; 0)', flags='zero_arg'),
     'getshouldattack': Cmd(note='{f} {a}  (no Papyrus equivalent; 0 -- sibling IsInCombat term carries the check)'),
-    'getopenstate': Cmd('GetOpenState', MAP),
-    'isessential': Cmd('IsEssential', MAP),
-    'getlos': Cmd('HasLOS', MAP),
+    'getopenstate': Cmd('GetOpenState', MAP, flags='zero_arg'),
+    'isessential': Cmd('IsEssential', MAP, flags='actor_arg actor_only cmp_bool zero_arg'),
+    'getlos': Cmd('HasLOS', MAP, flags='actor_only'),
     # TES4 `IsOwner [owner]` asks whether the ACTOR owns this reference, and is
     # written bare (`if IsOwner != 1`) to mean the player.  Mapping it to
     # IsInFaction was wrong twice over: it is a different question, and the bare
@@ -1933,20 +1744,20 @@ COMMAND_ROWS = {
     # No native bool reader for the destroyed state, but the destruction STAGE
     # is native: stage > 0 means the ref has been destroyed.  IsDisabled() was
     # unrelated (a destroyed ref is still enabled) and always returned false.
-    'setlookat': Cmd('SetLookAt', MAP),
+    'setlookat': Cmd('SetLookAt', MAP, flags='actor_only'),
     # GetSelf / GetActionRef: what the script's subject and the activating
     # reference are called in this base type.
     'getself': Cmd('{self_ref}'),
     'getactionref': Cmd('{action_ref}'),
 
-    # GetPCIsSex: Skyrim's ActorBase.GetSex() is 0 male / 1 female.
+    #: GetPCIsSex: Skyrim's ActorBase.GetSex() is 0 male / 1 female.
     'getpcissex': Cmd(
         'Game.GetPlayer().GetActorBase().GetSex() == {?0female}',
         arms=('1', '0'), defaults={0: 'male'}),
 
-    # GetIsSex on any actor, same encoding.
+    #: GetIsSex on any actor, same encoding.
     'getissex': Cmd('({ref}.GetActorBase().GetSex() == {?0female})', ACTOR,
-                    arms=('1', '0'), defaults={0: 'male'}),
+                    arms=('1', '0'), defaults={0: 'male'}, flags='cmp_bool'),
 
     # OBSE `GetLocalGravity <axis>` -- the per-axis gravity acting on the
     # calling reference.  Papyrus exposes no gravity accessor at all (the
@@ -1971,11 +1782,11 @@ COMMAND_ROWS = {
     # has NO reader for the destroyed flag, and GetCurrentDestructionStage()
     # reads the unrelated DEST stage system this conversion never writes -- so
     # it returned 0 for every record and the read was always false.
-    'getdisabled': Cmd('TES4Polyfill.GetDisabled({ref}, {destroyed})'),
-    'isdisabled': Cmd('TES4Polyfill.GetDisabled({ref}, {destroyed})'),
-    'getdestroyed': Cmd('TES4Polyfill.GetDestroyed({ref}, {destroyed})'),
+    'getdisabled': Cmd('TES4Polyfill.GetDisabled({ref}, {destroyed})', flags='objref_self zero_arg'),
+    'isdisabled': Cmd('TES4Polyfill.GetDisabled({ref}, {destroyed})', flags='bare_bool objref_self'),
+    'getdestroyed': Cmd('TES4Polyfill.GetDestroyed({ref}, {destroyed})', flags='bare_no_equiv zero_arg'),
 
-    # SetDestroyed writes that same shadow list.
+    #: SetDestroyed writes that same shadow list.
     'setdestroyed': Cmd(
         'TES4Polyfill.SetDestroyed({ref}, {destroyed}, {b0})',
         defaults={0: '1'}),
@@ -2018,10 +1829,10 @@ COMMAND_ROWS = {
     # comment reads "close Elder Council door", flung it open instead.
     'setdoordefaultopen': Cmd('{ref}.SetOpen({b0})', defaults={0: '1'}),
 
-    # SetScale / SetSize.
+    #: SetScale / SetSize.
     'setsize': Cmd('{ref}.SetScale({a0})', defaults={0: '1.0'}),
 
-    # GetPCMiscStat reads one of the game's own tracked statistics.
+    #: GetPCMiscStat reads one of the game's own tracked statistics.
     'getpcmiscstat': Cmd('Game.QueryStat("{s0}")',
                          defaults={0: 'Items Stolen'}),
 
@@ -2029,7 +1840,7 @@ COMMAND_ROWS = {
     # GetParentCell is an ObjectReference method, so the subject must NOT
     # be promoted to Actor: `(Self as Actor)` on a non-actor yields None.
     'getinsamecell': Cmd('({ref}.GetParentCell() == {a0}.GetParentCell())',
-                         defaults={0: 'Game.GetPlayer()'}),
+                         defaults={0: 'Game.GetPlayer()'}, flags='cmp_bool'),
     'getinsamecellas': Cmd('({ref}.GetParentCell() == {a0}.GetParentCell())',
                            defaults={0: 'Game.GetPlayer()'}),
 
@@ -2044,7 +1855,183 @@ COMMAND_ROWS = {
     'getmodindex': Cmd('1',
                        note='GetModIndex - Papyrus cannot read load order'),
     'unlockachievement': Cmd(
-        note='UnlockAchievement {a}  ;no Papyrus equivalent'),
+        note='UnlockAchievement {a}  ;no Papyrus equivalent', flags='bare_no_equiv'),
+
+    # --- Migrated from `_emit_function`'s branch chain --------------------
+    # Each row below replaced a name-guarded branch that resolved a receiver,
+    # converted an argument or two and returned one template.  The rationale
+    # that sat above the branch sits above its row.
+
+    # SkipAnim / SetNumericIniSetting: the ;NE: text IS the emission, not a
+    # comment beside a value -- both are written in STATEMENT position
+    # (Nehrim's portcullis calls <ref>.SkipAnim on its own line), so the
+    # whole line becomes the comment.
+    'skipanim': Cmd(note='SkipAnim  ;no Papyrus equivalent', flags='bare_no_equiv zero_arg'),
+    'setnumericinisetting': Cmd(note='{f} {a}  ;no Papyrus INI access'),
+
+    # Update3D: the operand is the reference to refresh, named either as the
+    # receiver or as the first argument; the player is TES4's default subject.
+    'update3d': Cmd('TES4Polyfill.Update3D({ref})', OBJREF),
+
+    # TES4 UncompleteQuest <Quest> reopens a finished quest, naming the quest
+    # as an ARGUMENT.  Papyrus spells it as a method on the quest itself, so
+    # the argument has to become the receiver -- mapping it straight onto Reset
+    # emitted Reset(fbmwEBBone) ("function takes 0 parameters not 1").
+    'uncompletequest': Cmd('{a0}.Reset()', RAW, defaults={0: 'Self'}),
+
+    # GetPos/GetAngle/GetStartingAngle: the axis argument picks the accessor.
+    # These are declared on ObjectReference, so the subject must NOT be
+    # promoted to Actor -- TES4 reads the position of plain scenery
+    # (SEXedPuzStatue1-5 are STATs the Xeddefen puzzle rotates), and an
+    # Actor Property on a STAT never binds, so the read came back None.
+    'getpos': Cmd('{ref}.GetPosition{g0}()', OBJREF, defaults={0: 'X'}, flags='objref_self'),
+    'getangle': Cmd('{ref}.GetAngle{g0}()', OBJREF, defaults={0: 'X'}, flags='objref_self'),
+    'getstartingangle': Cmd('{ref}.GetAngle{g0}()', OBJREF,
+                            defaults={0: 'X'}),
+
+    # Sound playback.  Vanilla writes the EditorID QUOTED (PlaySound
+    # "AMBBaenlinDeath") as often as bare, and the property must be registered
+    # under the name that is actually EMITTED -- registering the raw argument
+    # kept the quotes and _safe_property_name turned each into an underscore,
+    # declaring a second, never-bindable Sound Property _X_ alongside the real
+    # one (75 dead properties across 23 files).
+    'playsound': Cmd('{p0}.Play(Game.GetPlayer())', types={0: 'Sound'}),
+    'playsound3d': Cmd('{p0}.Play({ref})', OBJREF, types={0: 'Sound'}),
+
+    # GetPCFaction{Murder,Attack,Steal}: no Papyrus native, so rebuilt from the
+    # crime-gold split -- Steal = non-violent, Attack = violent below the murder
+    # bounty, Murder = violent at or above.  All 14 Skyrim.esm crime factions
+    # use murder=1000 assault=40, which the importer also writes.  One shared
+    # GetCrimeGoldViolent() shadowed every murder branch (FGExpulsionScript,
+    # TGCastOut, both MGExpulsion scripts).
+    'getpcfactionsteal': Cmd(
+        '({a0}.GetCrimeGoldNonViolent() > 0) as Int',
+        defaults={0: 'None'}, types={0: 'Faction'}),
+    'getpcfactionmurder': Cmd(
+        '({a0}.GetCrimeGoldViolent() >= 1000) as Int',
+        defaults={0: 'None'}, types={0: 'Faction'}),
+    'getpcfactionattack': Cmd(
+        '({a0}.GetCrimeGoldViolent() > 0 && '
+        '{a0}.GetCrimeGoldViolent() < 1000) as Int',
+        defaults={0: 'None'}, types={0: 'Faction'}),
+
+    # GetNextRef -- OBSE's walk over every reference in the loaded cells.
+    # Papyrus has no such iterator, but Skyrim ships the engine's own "an actor
+    # near here" primitive, so an ACTOR walk becomes repeated
+    # FindRandomActorFromRef sampling; the authored loop re-assigns the
+    # variable each pass, so a fresh sample per pass is exactly the iteration
+    # it asked for.  GetFirstRef carries the form TYPE and has its own handler:
+    # only form type 69 (actors) has an Actor-typed primitive behind it.
+    'getnextref': Cmd(
+        'Game.FindRandomActorFromRef(Game.GetPlayer(), 4096.0)'),
+
+    #: ShowMap: the marker is the subject; bare it maps Self.
+    'showmap': Cmd('{p0}.AddToMap(true)', types={0: 'ObjectReference'},
+                   defaults={0: 'Self'}),
+
+    # SetForceRun -> SpeedMult.  Skyrim has no force-run flag; the actor value
+    # is what the engine actually reads for movement speed.
+    'setforcerun': Cmd('{ref}.SetActorValue("SpeedMult", {?01})', ACTOR,
+                       defaults={0: '0'}, arms=('150.0', '100.0'), flags='actor_only branch_only'),
+
+    #: ResetInterior -> Cell.Reset().
+    'resetinterior': Cmd('{p0}.Reset()', RAW, types={0: 'Cell'},
+                         defaults={0: 'Self'}),
+
+    #: IsPCRace / GetPCIsRace -> the player's race compared to the argument.
+    'ispcrace': Cmd('Game.GetPlayer().GetRace() == {a0}',
+                    defaults={0: 'None'}, types={0: 'Race'}),
+    'getpcisrace': Cmd('Game.GetPlayer().GetRace() == {a0}',
+                       defaults={0: 'None'}, types={0: 'Race'}, flags='cmp_bool'),
+
+    #: Expel -> faction.SetPlayerExpelled(true).
+    'expel': Cmd('{a0}.SetPlayerExpelled(true)', defaults={0: 'None'},
+                 types={0: 'Faction'}),
+
+    #: GetIsRace: ref.GetIsRace RaceRef -> ref.GetRace() == raceRef.
+    'getisrace': Cmd('{ref}.GetRace() == {a0}', ACTOR,
+                     defaults={0: 'None'}, types={0: 'Race'}, flags='cmp_bool'),
+
+    # GetInWorldSpace -> a WorldSpace comparison.  GetPlayerInSEWorld stays a
+    # literal 0: an SI interior has no worldspace and no invariant to key on,
+    # and 11 of 16 sites test == 0 (suppression guards, right in Cyrodiil).
+    'getinworldspace': Cmd('{ref}.GetWorldSpace() == {a0}', RAW,
+                           defaults={0: 'None', 'ref': 'Game.GetPlayer()'},
+                           types={0: 'WorldSpace'}),
+
+    # GetDetected is the OBSERVER's question; IsDetectedBy is the TARGET's, so
+    # receiver and argument SWAP.  Mapping them positionally made every call
+    # ask the mirror-image question: CharGenQuest's GlenroyRef.getdetected
+    # player (has Glenroy spotted the player, which advances the Ambush-B
+    # stage) became "has the player spotted Glenroy", true the moment the
+    # player looks down the corridor.
+    'getdetected': Cmd('{a0}.IsDetectedBy({ref})', ACTOR,
+                       defaults={0: 'Game.GetPlayer()'},
+                       types={0: 'Actor'}, flags='actor_arg cmp_bool'),
+
+    # GetDetectionLevel has the SAME shape (UESP opcode 0x10B4, receiver is the
+    # observer), so it gets the same swap.  The threshold must be RESCALED, not
+    # just wrapped: TES4 levels run 0..3 but IsDetectedBy is a Bool, and all 56
+    # call sites read >= 2, >= 3 or == 3.  Scaling to TES4's top level yields
+    # 0 or 3, satisfying every threshold exactly when detected.  A bare
+    # Bool >= 2 is rejected by the CK compiler outright.
+    'getdetectionlevel': Cmd('(({a0}.IsDetectedBy({ref}) as Int) * 3)', ACTOR,
+                             defaults={0: 'Game.GetPlayer()'},
+                             types={0: 'Actor'}, flags='actor_arg'),
+
+    # ForceFlee / Flee (UESP function index 407).  Skyrim has no Flee call --
+    # fleeing is driven by the Confidence actor value, so dropping the actor to
+    # Cowardly and re-evaluating its package makes the ENGINE break off combat.
+    # That is the engine's own mechanism rather than a Papyrus approximation.
+    'flee': Cmd('{ref}.SetActorValue("Confidence", 0)\n'
+                '  {ref}.EvaluatePackage()', ACTOR, flags='bare_no_equiv'),
+    'forceflee': Cmd('{ref}.SetActorValue("Confidence", 0)\n'
+                     '  {ref}.EvaluatePackage()', ACTOR),
+
+    # FileExists "<path>" -- OBSE probes a loose file, which Papyrus cannot see.
+    # It answers PRESENT, not absent, and polarity is the whole point: every
+    # caller uses it as an installation check against Oblivion-side artifacts
+    # (BSAs, inis) that do not exist after conversion BY DESIGN.  Answering 0
+    # fired every "missing file" branch and greeted the player with a bogus
+    # installation-error box on load.
+    'fileexists': Cmd('1', note='FileExists - converted assets are deployed '
+                                'by the pipeline, not under the TES4 path'),
+
+    # SetCanFastTravelFromWorld: Skyrim's toggle is GLOBAL, so the worldspace
+    # operand has nowhere to go.  Keep the flag, note the widened scope.
+    'setcanfasttravelfromworld': Cmd(
+        'Game.EnableFastTravel({b1})', defaults={1: '1'},
+        note='Skyrim fast travel is global, not per-worldspace'),
+
+    #: PickIdle / PlayIdle -> a behavior-graph event on the actor.
+    'pickidle': Cmd('Debug.SendAnimationEvent({ref}, "{s0}")', ACTOR,
+                    defaults={0: 'IdleForceDefaultState'}, flags='zero_arg'),
+    'playidle': Cmd('Debug.SendAnimationEvent({ref}, "{s0}")', ACTOR,
+                    defaults={0: 'IdleForceDefaultState'}),
+
+    # OBSE raw-INPUT control.  Skyrim has no vanilla input API (SKSE-only), so
+    # the writers no-op and the readers return 0.  Kept as ONE family because
+    # enumerating them one build at a time is how disableKey survived to fail
+    # on its own.
+    'disablekey': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
+    'enablekey': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
+    'tapkey': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
+    'holdkey': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
+    'releasekey': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
+    'playback': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
+    'playbackalt': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
+    'disablecontrol': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
+    'enablecontrol': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
+    'tapcontrol': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
+
+    # ResetFallDamageTimer (OBSE) cleared accumulated fall distance.  Skyrim
+    # has the console command (opcode 4404) but no Papyrus binding, so the
+    # substitute is the GMST the fall-damage formula actually reads
+    # (fJumpFallHeightMin, default 600): pushing the threshold beyond any
+    # reachable fall makes the landing survivable, which is the whole
+    # observable behaviour.  TES4Polyfill restores the original on release.
+    'resetfalldamagetimer': Cmd(
+        'TES4Polyfill.SuppressFallDamage({event_actor})', flags='zero_arg'),
 
 }
 
@@ -2158,15 +2145,10 @@ def command_prefix_row(name: str):
     return best[1] if best else None
 
 
-#: Events whose Papyrus signature declares akActionRef.
-EVENTS_WITH_ACTIONREF = frozenset({'ontriggerenter', 'ontrigger', 'onactivate'})
 
 #: Compound `ref.func` names whose bare form has its own handler.
 COMPOUND_HAS_OWN_HANDLER = ('placeatme', 'moveto', 'movetomarker')
 
-#: Commands whose Papyrus equivalent takes fewer arguments; drop the extras.
-DROP_ARGS_FUNCS = frozenset({'addscriptpackage', 'removescriptpackage',
-                             'stopcombat', 'resurrect'})
 
 #: TES4 commands that imply `player` when bare; Papyrus requires it written.
 DEFAULT_ARGS = {
@@ -2178,20 +2160,6 @@ DEFAULT_ARGS = {
     'isdetectedby': 'Game.GetPlayer()',
     'setownership': 'Game.GetPlayer().GetActorBase()',
     'setactorowner': 'Game.GetPlayer().GetActorBase()',
-}
-
-
-#: Papyrus natives whose first argument is narrower than a TES4 `ref`.
-UDF_ARG_DOWNCASTS = {
-    'addspell': 'Spell',
-    'removespell': 'Spell',
-    'isinfaction': 'Faction',
-    'addtofaction': 'Faction',
-    'removefromfaction': 'Faction',
-    'getfactionrank': 'Faction',
-    'setfactionrank': 'Faction',
-    'modfactionrank': 'Faction',
-    'tes4polyfill.update3d': 'ObjectReference',
 }
 
 #: Events on the engine's dispatch path, where a blocking Say stalls it.
@@ -2213,9 +2181,6 @@ GMST_TO_ACTOR_VALUE = {
     'fmoverunathleticsmult': 'SpeedMult',
 }
 
-#: Event parameters already typed ObjectReference, so they need no cast.
-OBJREF_PARAMS = frozenset({'akactionref', 'aknewcontainer', 'akoldcontainer',
-                           'akcastref', 'akaggressor', 'akcaster'})
 
 #: Actor values TES5 stores as an enum tier, with the tier count.
 ENUM_ACTOR_VALUES = {
@@ -2268,3 +2233,126 @@ SERVICE_MENU_CALL = {
 from script_convert.resolve import (  # noqa: E402
     resolve_property_formid, _digit_stripped_formid,
 )
+
+
+def _flagged(flag):
+    """Every command whose COMMAND_ROWS row carries `flag`; rowless ones cannot."""
+    return frozenset(name for name, row in COMMAND_ROWS.items()
+                     if flag in row.flags)
+
+
+#: Commands whose Papyrus equivalent takes fewer arguments; drop the extras.
+DROP_ARGS_FUNCS = _flagged('drop_args')
+
+# TES4 functions naming their target as an ARGUMENT (`GetDeadCount X`,
+# `SetEssential X 0`).  Skyrim declares both on ActorBase, so a bare occurrence
+# says nothing about the script's own type: used ONLY to stop `_infer_extends`
+# upgrading an ACTI/DOOR script to `extends Actor`, which will not bind.  They
+# stay in `_ACTOR_ONLY_FUNCTIONS`; the call site still needs the cast.
+_ACTORBASE_ARG_FUNCTIONS = _flagged('actorbase_arg') | frozenset({
+    'getdeadcount', 'setessential',
+})
+
+# TES4 functions whose Papyrus signature declares an Actor parameter, per the
+# vanilla headers: StartCombat, IsHostileToActor, Get/SetRelationshipRank.  A
+# script-typed argument must be cast at the call site or the checker rejects it
+# (`StartCombat(NQ05Soldat01nRef)`).  SetLookAt/Say/GetDistance are ABSENT --
+# their parameters are ObjectReference, which converts implicitly.
+_ACTOR_ARG_FUNCTIONS = _flagged('actor_arg') | frozenset({
+    'getrelationshiprank', 'isdetectedby', 'ishostiletoactor',
+    'isspelltarget', 'setrelationshiprank',
+})
+
+# Functions that can ONLY be called on Actor (not ObjectReference)
+# Used to infer correct property type for callers
+_ACTOR_ONLY_FUNCTIONS = _flagged('actor_only') | frozenset({
+    'drawweapon', 'getalpha', 'getclass', 'getdeadcount',
+    'getgoldamount', 'getincombat', 'getsitstate', 'getsleepstate',
+    'getweapondrawn', 'haslos', 'isequipped', 'isinfaction',
+    'pathtoref', 'setalpha', 'setcell', 'setessential',
+    'setopacity', 'setplayerteammate', 'setrace',
+    'setrelationshiprank', 'sheatheweapon', 'startconversation',
+})
+
+# Every TES4 command whose FIRST argument is an actor-value name.  Used both to
+# quote that argument and to detect calls naming a removed attribute.
+_ACTOR_VALUE_FUNCTIONS = _flagged('av') | frozenset({
+    'advancepcskill',
+})
+
+# The subset that READS an actor value, so a call naming a removed attribute
+# has to yield a value.  The rest write, and are dropped instead.
+_ACTOR_VALUE_READ_FUNCTIONS = _flagged('av_read')
+
+# TES4 functions that are boolean (return 0/1) and can be used as bare checks
+_BARE_BOOL_FUNCTIONS = _flagged('bare_bool') | frozenset({
+    'is3dloaded',
+})
+
+_BARE_NO_EQUIV_COMMANDS = _flagged('bare_no_equiv') | frozenset({
+    'con_runmemorypass', 'emcgetplaylist', 'emcisbattleoverridden',
+    'emcismusiconhold', 'emcmusicnexttrack', 'emcmusicresume',
+    'emcmusicstop', 'emcplaytrack', 'emcsetbattleoverride',
+    'emcsetmusichold', 'emcsetmusictype', 'getmenufloatvalue',
+    'getmenuhastrait', 'getmenustringvalue', 'streammusic',
+})
+
+# Commands the branch chain in `_emit_function` handles by name but that no
+# other table lists.  Derived by reading that chain rather than kept by hand,
+# because a hand-kept list drifts from it: these twelve were missing, so the
+# node path judged them unknown and emitted `;TODO:` over lines the string
+# path converted correctly (`setforcerun 1` becomes the SpeedMult write --
+# 62 statements in Oblivion.esm alone).  `foreach` is deliberately absent: it
+# is a STATEMENT keyword intercepted before the command layer, and listing it
+# here would let a bare `foreach` be treated as a call.
+_BRANCH_ONLY_COMMANDS = _flagged('branch_only') | frozenset({
+    'setgamesetting', 'setnumericgamesetting',
+    'setnumericgamesettingfloat',
+})
+
+# TES4 functions returning 0/1 that are collapsed in a COMPARISON position:
+# `X == 1` is `X`, `X == 0` is `!X`.  Papyrus rejects Bool-vs-Int, so a literal
+# conversion of the TES4 idiom does not compile.
+#
+# 🛑 This is a SECOND list, and that is a known defect (docs/script_conversion_
+# bugs.md #6): it and `_BARE_BOOL_FUNCTIONS` agree on only 10 of 45 names, so
+# whether a call collapses depends on which list happens to name it.  Merging
+# them changes 3,577 sites across 1,944 scripts, so it is deliberately deferred
+# until the parse-tree rewrite is verified -- at which point it is one edit
+# here and the diff is attributable.  Until then BOTH are the current
+# behaviour, and `_BOOL_VALUED_FUNCTIONS` below is what the emitter reads.
+_COMPARISON_BOOL_FUNCTIONS = _flagged('cmp_bool') | frozenset({
+    'getincell', 'getisclass', 'getiscurrentpackage', 'getisid',
+    'getpcisclass', 'gettalkedtopcparam', 'isactionref',
+    'isinfaction', 'isowner',
+})
+
+_OBJREF_IMPLICIT_SELF_FUNCTIONS = _flagged('objref_self') | frozenset({
+    'getbaseobject', 'is3dloaded', 'isdeleted', 'playanimation',
+    'playgroup', 'setactorowner', 'setangle', 'setpos',
+})
+
+# Functions that exist on ObjectReference (not truly Actor-only).
+# These should NOT trigger type promotion from ObjectReference→Actor
+# because they can be called on ObjectReference refs legally.
+_OBJREF_SHARED_FUNCTIONS = _flagged('objref_shared') | frozenset({
+    'getalpha', 'setalpha', 'setcell',
+})
+
+# TES4 `ref.` commands that take NO arguments.  Oblivion let the receiver be
+# written after a comma instead of a dot — `StopCombat, Player` and
+# `IsInCombat, Player == 1` mean exactly `Player.StopCombat` /
+# `Player.IsInCombat`.  Because the generic comma-stripping treats whatever
+# follows as an argument, these emitted `IsInCombat(Player)` ("function takes 0
+# parameters not 1") or dropped the token and acted on the wrong actor, so the
+# receiver has to be promoted for precisely this set.
+# Derived from the `ref.` rows with an empty argument column in
+# docs/skyrim_commands.md, intersected with FUNCTION_MAP.  (IsInCombat's
+# "Integer" column there is its RETURN type, not a parameter.)
+_ZERO_ARG_REF_FUNCTIONS = _flagged('zero_arg') | frozenset({
+    'getalarmed', 'getdisease', 'getwantblocking', 'isactor',
+    'ismoving', 'isturning',
+})
+
+#: What `emit/expr.py` reads: every name either list above calls boolean.
+_BOOL_VALUED_FUNCTIONS = _BARE_BOOL_FUNCTIONS | _COMPARISON_BOOL_FUNCTIONS

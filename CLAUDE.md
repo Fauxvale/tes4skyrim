@@ -439,6 +439,23 @@ relevant doc when working in that area.
 ### Scripts
 🛑 **Before writing ANY `script_convert/` code, run the decision procedure in [script_convert_architecture.md](docs/script_convert_architecture.md) §3** and score the change with `python tools/script/arch_fitness.py --fail-on-regression`.
 
+🛑 <a id="doc-rules"></a>**THE CODE RULES ARE A REQUIREMENT, NOT A GUIDELINE.
+EVERY `.py` FILE YOU TOUCH — ANYWHERE IN THE REPO — MUST PASS
+`arch_fitness.py --gate-file <path>`.** Not "improve it", not "as time
+allows" — pass. Enforced automatically by `.claude/hooks/doc_rules_gate.py`
+after every Edit/Write, so it is not yours to skip; each violation prints its
+`file:line` and its fix.
+
+- **Prose:** the only legal forms are a docstring, a ONE-line 120-char `#:`
+  attribute doc, and a `# ----` section heading. A **docstring states the
+  CONTRACT** — what it does and returns, not the story of why. Rationale and
+  measurements go in `docs/`.
+- **Shape:** ≤60 lines and complexity ≤25 per function, ≤4 nesting, ≤10
+  returns, ≤1000 lines per file, no class-level `dict`/`list`/`set`.
+- **Compress, never delete:** keep every measured count, script name and
+  mechanism; drop the narration. **No dates.**
+- An inline comment means the code cannot state its own intent — fix the code.
+
 | Doc | Covers |
 |---|---|
 | [script_convert_architecture.md](docs/script_convert_architecture.md) | ★ **The code map: layers, where new code goes, the invariants, the compatibility boundary.** Read before touching `script_convert/` |

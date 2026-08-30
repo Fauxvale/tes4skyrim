@@ -20,9 +20,12 @@ from __future__ import annotations
 import re
 
 from script_convert.constants import (
-    BASE_FORM_TYPES, BOOL_FUNCS_LOW, EVENT_REF_PARAMS, MISMATCH_TYPES,
+    BASE_FORM_TYPES, PAPYRUS_BOOL_FUNCTIONS, EVENT_REF_PARAMS, MISMATCH_TYPES,
     _PAPYRUS_VALUE_TYPES)
-from script_convert.emit.commands import COMPARISON_COMMANDS
+from script_convert.emit.commands import (
+    BOOL_TEMPLATE_COMMANDS, COMPARISON_COMMANDS, INERT_COMMANDS,
+)
+from script_convert import resolve_name as _resolve
 from script_convert.tes4 import lexer as L, nodes as N
 
 # TES4 spelled inequality `<>`; Papyrus spells it `!=`.
@@ -33,9 +36,6 @@ _OP_MAP = {'<>': '!='}
 # whose result needs parenthesising before a cast can apply to it.
 _ARITH = frozenset({'+', '-', '*', '/', '%'})
 
-# The LAST `.Name(` in an emitted call: `TES4Polyfill.GetDisabled(x)` asks
-# about `GetDisabled`, not about `TES4Polyfill`.
-_CALL_HEAD_RE = re.compile(r'^(?:.*\.)?([A-Za-z_]\w*)\s*\(')
 #: Papyrus types whose values compare against `None`, not `0`.  TES4 spelled a
 #: null reference `0`, so `if ref == 0` has to become `if ref == None` -- and
 #: never for a value type, because an Int that happens to hold 0 must not.
@@ -159,7 +159,7 @@ def _is_zero(node: N.Expr) -> bool:
         and node.text.strip() in ('0', '0.0')
 
 
-def _is_bool_valued(conv, node: N.Expr, emitted: str) -> bool:
+def _is_bool_valued(conv, node: N.Expr) -> bool:
     """Is this already a Papyrus Bool, so `== 1` is redundant?
 
     TES4 comparisons yield 0/1 and the idiom `if (a == b) == 1` is common; so
@@ -168,9 +168,9 @@ def _is_bool_valued(conv, node: N.Expr, emitted: str) -> bool:
 
     `COMPARISON_COMMANDS` answers for a command that CONVERTS into a
     comparison (`GetInCell X` is one Call node emitting `GetParentCell() == X`)
-    -- derived from the row TEMPLATES at import, never from emitted output.
-    The last arm still reads the emitted call head, which is what `Value.ptype`
-    replaces once the seam is cut.
+    Every arm reads the NODE and the row tables, never emitted output: the
+    command's own name is what the tables are keyed by, and what its row
+    renders is known at import.
     """
     if isinstance(node, N.BinOp):
         return node.op in L.BOOL_OPS
@@ -192,14 +192,15 @@ def _is_bool_valued(conv, node: N.Expr, emitted: str) -> bool:
     # `0 == 0` (bare-read name only).  Both are TRUE, so this preserves a
     # spelling difference, not a behaviour one -- but preserving it is the
     # contract until the lists are merged.
-    if emitted.strip() in ('0', '1'):
+    if name_low in INERT_COMMANDS or name_low in _resolve.BARE_INERT:
         return bool(name) and conv.compares_bool(name)
     if name and conv.returns_bool(name):
         return True
-    # Last: the emitted PAPYRUS name.  A TES4 command in no source table can
-    # still convert into a bool call (`GetDisabled` -> TES4Polyfill.GetDisabled).
-    m = _CALL_HEAD_RE.match(emitted.strip())
-    return bool(m) and conv.emits_bool(m.group(1))
+    # Last: a TES4 command in no source table can still CONVERT into a bool
+    # call (`GetDisabled` -> TES4Polyfill.GetDisabled).  Answered from the
+    # row's TEMPLATE, derived at import -- this was the one place left where an
+    # emitter inspected its own output to decide something.
+    return name_low in BOOL_TEMPLATE_COMMANDS
 
 
 def emit(conv, node: N.Expr, extends: str) -> str:
@@ -304,7 +305,7 @@ def _form_typed(conv, node: N.Expr) -> bool:
     if not isinstance(node, N.Ident):
         return False
     low = node.name.lower()
-    if conv._var_types.get(low) or low in conv._local_vars:
+    if conv.sc.var_types.get(low) or low in conv.sc.local_vars:
         return False
     if conv._is_known_command(node.name):
         return False
@@ -358,7 +359,7 @@ def _base_object(conv, ref, base, node, extends):
              or conv._base_record_type(base.name))
     if btype not in BASE_FORM_TYPES or not is_ref_typed(conv, ref):
         return None
-    if isinstance(ref, N.Ident) and ref.name.lower() in conv._udf_params:
+    if isinstance(ref, N.Ident) and ref.name.lower() in conv.sc.udf_params:
         return None
     return (f'{emit(conv, ref, extends)}.GetBaseObject()',
             emit(conv, base, extends))
@@ -391,7 +392,7 @@ def _bool_as_int(conv, a, b, node, extends):
     number; Papyrus refuses to relatively compare a Bool.
     """
     if not (_is_number(b) and isinstance(a, N.Call)
-            and a.name.lower() in BOOL_FUNCS_LOW):
+            and a.name.lower() in PAPYRUS_BOOL_FUNCTIONS):
         return None
     return f'({emit(conv, a, extends)} as Int)', emit(conv, b, extends)
 
@@ -495,7 +496,7 @@ def _binop(conv, node: N.BinOp, extends: str) -> str:
             value = (conv.emit_call(left, extends, promote_subject=True)
                      if isinstance(left, N.Call)
                      else emit(conv, left, extends))
-            is_bool = _is_bool_valued(conv, left, value)
+            is_bool = _is_bool_valued(conv, left)
             inner = str(value)
             if not is_bool:
                 return f'{inner} {op} {emit(conv, right, extends)}'
@@ -524,8 +525,43 @@ def _binop(conv, node: N.BinOp, extends: str) -> str:
         null_op = '==' if op == '<=' else '!='
         return f'{_operand(conv, left, node, extends)} {null_op} None'
 
+    if op in ('&&', '||'):
+        return _logical(conv, left, right, op, node, extends)
     return (f'{_operand(conv, left, node, extends)} {op} '
             f'{_operand(conv, right, node, extends, right=True)}')
+
+
+def _logical(conv, left, right, op: str, node, extends: str) -> str:
+    """`&&`/`||`, keeping the terms that convert and trailing those that do not.
+
+    A term with no Papyrus equivalent renders as a `;` note, which comments out
+    the REST OF THE LINE -- every later operand is lost and the `If` is left
+    dangling.  TES4 conditions are long chains (`KimMaleScript` ANDs four
+    terms, one of them `GetFriendHit`, a Skyrim CONDITION function with no
+    Papyrus native), so the note is lifted out of the operand and re-attached
+    after the whole expression, where it comments out nothing.
+
+    The surviving terms keep their meaning: dropping a term from an `&&` widens
+    the guard and from an `||` narrows it.  Neutralising the condition to
+    `True` instead would run the guarded body unconditionally -- for that
+    script, healing the player with no distance, stage or combat check at all.
+    """
+    a, a_note = _split_note(_operand(conv, left, node, extends))
+    b, b_note = _split_note(_operand(conv, right, node, extends, right=True))
+    notes = [n for n in (a_note, b_note) if n]
+    if a and b:
+        return f'{a} {op} {b}  ;{" ".join(notes)}' if notes else f'{a} {op} {b}'
+    kept = a or b or 'True'
+    return f'{kept}  ;{op} {" ".join(notes)}'
+
+
+def _split_note(text: str) -> tuple:
+    """`(expression, note)` -- the value part of an operand and its `;` note."""
+    head, sep, tail = text.partition(';')
+    if not sep:
+        return text.strip(), ''
+    return head.strip(), tail.strip()
+
 
 
 #: Operators where `a op (b op c)` differs from `(a op b) op c`, so an

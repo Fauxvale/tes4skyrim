@@ -572,3 +572,96 @@ load, forever, because of a word in a comment. `DLCOrreryConsoleScript`,
 
 Replaced by `script_convert/facts.py`, which derives all six from the parse
 tree. Semantic diff 475 -> 515: 40 scripts whose interval is now correct.
+
+---
+
+## 18. Nehrim's 161 compile failures — three causes, all generic
+
+`--scripts-only` on Nehrim failed 161 of 3,488 scripts. All four plugins now
+compile 100%: Oblivion 16,519/16,519, Nehrim 3,488/3,488, Morrowind_ob
+17,970/17,970, Knights 635/635.
+
+### `;/` opens a Papyrus BLOCK comment — 159 of the 161
+
+TES4 has only line comments, so a German divider written `;/////` is inert
+there. Papyrus reads `;/` as the start of `;/ ... /;` and swallows the rest of
+the file. Because the compiler parses every script on the header path, ONE such
+line in `TES4_BergklosterZugbrueckeSCRIPT` failed **159 unrelated scripts** with
+"unexpected end of file" at a line past the end of a 206-line file.
+
+Master emitted `; /////` (a space after the semicolon) and never hit it.
+`emit/script._safe_comments` now breaks the pair on every emitted comment.
+Measured: 86 occurrences across 14 Nehrim scripts; zero in the other 3 plugins.
+
+### A bare `GetInWorldspace` means the PLAYER
+
+`Player.GetInWorldspace X` parses with no receiver in a `ScriptEffectStart`
+block, and the `RAW` row defaulted `{ref}` to `Self` — an ActiveMagicEffect,
+which has no `GetWorldSpace`. A `Cmd` row may now name its bare-receiver
+subject as `defaults={'ref': ...}`, reusing the argument-default vocabulary
+rather than adding a field for one command.
+
+### An int-assigned `ref` that also holds a base record must be `Form`
+
+`resolve_ref_types` dropped any variable with `int_assign` and no `form_type`,
+leaving it `ObjectReference`. TES4's clear idiom (`let r := 0`) sits in the same
+variable as a real record, and Papyrus accepts neither in the other's type:
+`AAGeneralUpdateQuest.rCrosshairsLast` holds both `0` and the ARMO `JailShoes`.
+`Form` is the one handle that takes every record, so the mixture WIDENS rather
+than narrowing. (`ref_as_base_form` could not see it: the cross-ref scanner
+matches `set X to Y`, and this script uses OBSE's `let X := Y`.)
+
+### A trailing cast is only "already cast" if it covers the WHOLE expression
+
+`_cast` returned early on any text ending in `as Int`. `100.0 -
+X.GetValue() as Int` ends that way while casting only the right operand, so the
+subtraction stayed Float and would not assign to an Int. The early return now
+also requires `not _needs_parens(text)`.
+
+---
+
+## 19. Semantic drift vs master: 686 scripts, every cause classified
+
+Master-head (`e96bb7b`) baselines for all four plugins are in `temp/psc_master`.
+Every difference was bucketed by its exact `_diff_model` signature (71 causes)
+and every LOSS of an event, call or write was listed individually.
+
+**No regressions remain.** The drift splits three ways.
+
+### Master bugs this rewrite FIXES
+
+| Scripts | Defect in master |
+|---|---|
+| 165 | `Set EPWert to 15` DROPPED — the value feeds Nehrim's XP-award call, so 165 creatures awarded 0 XP |
+| 76 | Sentence spacing stripped from message text (`skill.Anyone`) |
+| 34 | An unused `Actor Property mySelf Auto` emitted, shadowing nothing |
+| 18 | `;NE: no converted music` where a real `MusicType` resolves — music now plays |
+| 9 | `TES4_CGRopeBucketScript` and 8 Nehrim scripts had a whole body commented out: a `begin OnHitWith <weapon>` filter was judged unconvertible because the body binds the weapon property FIRST. A base record compares to a `Form` parameter fine. Shooting the CharacterGen rope bucket now advances MQ01 to stage 58 again |
+| 8 | `If True` where one term of a `&&` was unconvertible — the freeze spell fired on every target. `_logical` keeps the convertible terms |
+| 1 | `SEObeliskNewSCRIPT`: `setDestroyed 0` and `setDestroyed 1` BOTH became `DestroyAfterAnimation`, so the "safety net" flipped nothing |
+
+### Deliberate improvements, semantically identical
+
+- `GetValue() as Int` -> `GetValueInt()` (173), dropping a redundant `as Int`
+- Empty events dropped: `OnEffectFinish` (15), `OnEffectStart` (2),
+  `OnPackageEnd`, `OnDeath` — an empty Papyrus event does nothing
+- Redundant `(X as Actor)` removed where the method is on ObjectReference
+  (`GetParentCell`, 23) — includes 6 of the 7 gated CharacterGen diffs
+- `HasLOS(...) == 1` -> `HasLOS(...)`; `Self.GetAngleZ()` vs `GetAngleZ()`
+- Correct nesting: master emitted every nested body flat
+- The measure-then-deliver `Say` pair collapsed (8), which master played twice
+
+### Regressions found and FIXED during this pass
+
+| Was | Fix |
+|---|---|
+| An OnActivate with an EMPTY body was dropped, losing the door-relock preamble AND the activation consume | `events()` keeps a block that `_consumes_activation` reports, body or not |
+| `TES4Polyfill.EnterOblivionGate` was never emitted — the gate's identity is known only on the line that discards it | `assemble.gate_capture`, keyed on the authored `set MQ00.nearOblivionGate to 0` |
+| `ModPCSkill`/`AdvancePCSkill` emitted `(Self as Actor).ModActorValue(...)` — `None` on the Quest scripts that call it, so 12 scripts' skill gains did nothing | `_AV_PLAYER_ONLY` routes both to `Game.GetPlayer()`. (`Game.AdvanceSkill` is NOT the right target: per the CK wiki it adds skill-USAGE progress and "won't necessarily change the Skill itself", where TES4's `ModPCSkill Blade 10` raises the skill by 10) |
+| `TES4Polyfill.RestoreFallDamage` was never emitted — `suppressed_fall_damage` had no setter after the rewrite | derived in `_load_facts` from the tree; `fall_damage` now receives the assembled body so it MERGES into the script's existing `OnEffectFinish` instead of declaring a second one |
+
+### Gated CharacterGen scripts
+
+7 changed, each verified: 6 are the redundant-cast and bool-collapse
+improvements above; the 7th (`CGRopeBucketScript`) is a body master had
+disabled entirely.

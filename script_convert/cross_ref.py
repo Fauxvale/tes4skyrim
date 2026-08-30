@@ -865,8 +865,14 @@ class CrossRefGraph:
                     all_vars[vname] = TYPE_MAP.get(vtype, 'Int')
             if ref_vars:
                 script_ref_vars[scn_low] = ref_vars
+                # COMMENTS ARE NOT USES.  DAHermaeusScript's only
+                # `target.GetDead` sits behind a `;`, and counting it declared
+                # `Actor Property target` on a variable the script never uses
+                # as one -- every cross-script write into it then needed a
+                # downcast that the owning script's real type does not want.
                 actor_used = {m.group(1).lower()
-                              for m in _actor_call_re.finditer(sctx)}
+                              for m in _actor_call_re.finditer(
+                                  _strip_comments(sctx))}
                 actor_used &= ref_vars
                 if actor_used:
                     script_actor_vars[scn_low] = actor_used
@@ -1114,3 +1120,14 @@ class CrossRefGraph:
 # Script converter
 # ===========================================================================
 
+
+
+def _strip_comments(text: str) -> str:
+    """TES4 source with `;` comments removed, line structure preserved.
+
+    A scan for uses must not see commented-out code: it is exactly the code
+    the author DISABLED, so counting it types variables off statements that
+    never run.
+    """
+    nl = chr(10)
+    return nl.join(line.split(';', 1)[0] for line in text.split(nl))

@@ -66,7 +66,7 @@ L8  pipeline.py                    L0-L7
 
 🛑 **This includes function-local imports.** A deferred
 `from script_convert.emit import expr` inside a method is still an import, and
-that pattern is exactly how the current layering violation survives (F17 counts
+that pattern is exactly how the current layering violation survives (local-imports counts
 them; there are 60 today). If you need a lower layer to reach a higher one, the
 design is wrong — pass a value in, do not import upward.
 
@@ -232,31 +232,31 @@ Run this before writing code. It terminates at exactly one file.
 
 Measured by `tools/script/arch_fitness.py`; the metric id is in brackets.
 
-1. **Imports point strictly downward**, at any nesting depth. [F17]
+1. **Imports point strictly downward**, at any nesting depth. [local-imports]
 2. **No function in `emit/`, `commands/`, `assemble/` or `converter.py` takes
    emitted Papyrus.** No parameter named `line`/`lines`/`text`/`emitted`/`psc`;
-   no `_fix_*`, `_repair_*`, `_coerce_*`, `_postprocess*`. [F1]
+   no `_fix_*`, `_repair_*`, `_coerce_*`, `_postprocess*`. [text-repair-fns]
 3. **One parse.** Exactly one non-test call site of `parser.parse`; zero
    references to `emit_source`, `_convert_expression`, `_tree_expression`,
-   `USE_TREE_EXPRESSIONS`. [F6]
+   `USE_TREE_EXPRESSIONS`. [reparse-round-trip]
 4. **`constants.py` is data**: no parameter named `xref`/`conv`/`ctx`, no
-   `open(`, at most a handful of pure `def`s. [F11]
-5. **No module-level I/O at import.** [F11]
-6. **No mutable class-level `dict`/`list`/`set`.** [F8]
+   `open(`, at most a handful of pure `def`s. [logic-in-constants]
+5. **No module-level I/O at import.** [logic-in-constants]
+6. **No mutable class-level `dict`/`list`/`set`.** [mutable-class-state]
 7. **Zero private reach-in**: `conv._` / `ctx._` absent from `emit/`,
-   `commands/`, `assemble/`. [F3]
+   `commands/`, `assemble/`. [private-reach-ins]
 8. **One out-channel**: `_line_comments` appears nowhere; emitters return
-   `Value`. [F1]
+   `Value`. [text-repair-fns]
 9. **Per-script state is declared**: `ScriptContext` is a dataclass and there is
-   **no `_reset`** — a new script gets a new instance. [F8]
+   **no `_reset`** — a new script gets a new instance. [mutable-class-state]
 10. **No source re-scanning after parse** in `assemble/`, `emit/`, `commands/`,
-    `converter.py`. [F7]
+    `converter.py`. [source-rescans]
 11. **Command knowledge in one table**: `set(COMMAND_ROWS) & set(registry)` is
-    empty; their union defines "known command". [F10]
-12. **No satellite per-command flag sets** — flags are fields on the row. [F10]
-13. **No `.py` over 1,000 code lines.** [F5]
+    empty; their union defines "known command". [satellite-cmd-sets]
+12. **No satellite per-command flag sets** — flags are fields on the row. [satellite-cmd-sets]
+13. **No `.py` over 1,000 code lines.** [oversized-files]
 14. **The compatibility surface is frozen** (§5).
-15. **Comments compress, knowledge does not.** [F19 down, F20 flat]
+15. **Comments compress, knowledge does not.** [`stray-comments`/`inline-comments` down, the anchors kept]
 
 ---
 
@@ -386,12 +386,12 @@ before cutting, since the cut depends on the two channels agreeing:
 from the row engine's `_Args`. `_convert_expression` and `_tree_expression` are
 deleted -- 38 call sites became `arg_expr(n)`, which emits from the node.
 
-**F6 measures the ROUND TRIP, not `emit_source`.** The old pattern counted every
+**reparse-round-trip measures the ROUND TRIP, not `emit_source`.** The old pattern counted every
 `emit_source` mention, which was right while it fed the re-parse. It is now a
 node->text formatter for `;NE:`/`;TODO:` markers and for keying a lookup on the
 authored spelling -- neither re-enters the parser. The pattern was narrowed to
 `_convert_expression(` / `_tree_expression` / `parse(emit_source` /
-`tokenize(emit_source`, and F6 is 0.
+`tokenize(emit_source`, and reparse-round-trip is 0.
 
 **One real regression, caught by the semantic diff and fixed.** Routing the
 printf helpers at `_format_string_call` onto the node list made them ignore the
@@ -401,15 +401,29 @@ SpellRank, 10` emitted the trailing display-duration as text
 of a rebuilt string, so the trim happens on nodes and both helpers stop
 reconstructing text at all.
 
-### F21 is noisy; sample it before believing it
+### Why `long-functions` is 60, not 80
 
-F21 is a median of 5 runs x 40 iterations, which is not enough to reject
+Measured across 7,320 first-party functions: **p50 = 12 lines, p75 = 25,
+p90 = 49, p95 = 75.** A 60-line cap fires on 534 (7.3%); 80 fires on 320
+(4.4%) and 40 on 978 (13.4%).
+
+The deciding argument is not the percentile but the OVERLAP with
+`god-functions`. Median complexity by length runs **10 at 40-59, 14.5 at
+60-79, 19.5 at 80-99 and 25 at 100-119** — so a complexity-25 rule does not
+fire until roughly 100 lines. At an 80-line cap the two rules nearly coincide
+and the length rule adds little; at 60 it catches the shape complexity cannot
+see, a **long straight-line function** (70 lines of sequential assignment at
+complexity 3 — what `measure` was before it was split into phases).
+
+### ms-per-script is noisy; sample it before believing it
+
+ms-per-script is a median of 5 runs x 40 iterations, which is not enough to reject
 background load. It read 0.75-0.82 ms three times during S2 -- an apparent
 1.8x regression -- while six clean samples on the same code gave 0.452-0.495
 (median 0.465 against a 0.443 baseline, i.e. 1.05x). Every high reading
 coincided with another job on the machine.
 
-So a single F21 flag is not evidence. Re-sample it 5-6 times with nothing else
+So a single ms-per-script flag is not evidence. Re-sample it 5-6 times with nothing else
 running before acting; a real regression holds its value across samples.
 
 ### The baseline is not a scratchpad
@@ -448,10 +462,10 @@ fix, verify with `--fail-on-regression`, THEN refresh.
 - **Comment volume is not comment value.** The comment-to-code ratio correlates
   *inversely* with code quality here: `converter.py` sits at 0.59 and the clean
   AST layer at 0.13, because prose was compensating for code that could not
-  express its own intent. Compression is F19 down with F20 flat — the same
+  express its own intent. Compression is the comment counts down with every anchor kept — the same
   knowledge in fewer characters, never fewer facts.
 - 🛑 **Inline comments are a SYMPTOM OF COMPLEXITY, not a style choice — so
-  there is no comment rule, only F2.** Measured across the package: inline
+  there is no comment rule, only god-functions.** Measured across the package: inline
   comments per 10 code lines run **1.16** at complexity 1-5, 2.18 at 6-10,
   2.80 at 11-25 and **7.42 at 26+** — a 6.4x spread. `_emit_function`
   (complexity 295) carries 869 inline comments against 882 code lines, roughly
@@ -461,7 +475,7 @@ fix, verify with `--fail-on-regression`, THEN refresh.
   So do **not** add a "docstring only" rule: it would ban the ~92 inline
   comments that carry real evidence (a measured date, a census count, a
   reverted attempt) pinned to the line they justify, while doing nothing about
-  the cause. Drive F2 to 0 and the narration becomes unnecessary on its own.
+  the cause. Drive god-functions to 0 and the narration becomes unnecessary on its own.
 
   What IS forbidden, at any complexity: a comment that narrates the next line.
   If a function of complexity <10 needs inline signposts, the docstring is

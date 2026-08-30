@@ -401,8 +401,10 @@ def resolve_ref_types(stmts, ref_vars, lookup, record_type_of):
             out[low] = 'Actor'
             continue
         if use.int_assign:
-            if use.form_type:
-                out[low] = use.form_type
+            out[low] = use.form_type or _mixed_record_type(
+                use, record_type_of)
+            if not out[low]:
+                del out[low]
             continue
         kinds = set()
         for value in use.assigned:
@@ -440,6 +442,21 @@ def resolve_ref_types(stmts, ref_vars, lookup, record_type_of):
         elif use.form_type:
             out[low] = use.form_type
     return out
+
+
+def _mixed_record_type(use, record_type_of) -> str:
+    """`Form` when an int-assigned `ref` ALSO holds base records, else ''.
+
+    TES4's clear idiom (`let r := 0`) sits in the same variable as a real base
+    record, and Papyrus accepts neither in the other's declared type: an Armor
+    will not go into an ObjectReference, and 0 will not go into an Armor.
+    `Form` is the one handle that takes every record, so the mixture widens
+    rather than narrowing to the record's own class.
+    """
+    for value in use.assigned:
+        if isinstance(value, N.Ident) and record_type_of(value.name):
+            return 'Form'
+    return ''
 
 
 def _needs_actor(name: str) -> bool:

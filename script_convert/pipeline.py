@@ -187,7 +187,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
     # 🛑 START FROM AN EMPTY DIRECTORY.  Which scripts the conversion produces
     # changes with the plan and with the source records, and nothing used to
     # delete the ones that stopped being generated — so they SURVIVED in
-    # output/ and kept being attached.  Measured 2026-08-15: scoping
+    # output/ and kept being attached.  Measured: scoping
     # speaker-kind Say-timer owners stopped generating 10,268 bogus INFO
     # fragments, but the stale .psc/.pex stayed on disk, so Uriel Septim's
     # GREETING went on binding a fragment that cast him to two scripts he does
@@ -489,6 +489,16 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
     print(f'    INFO: {stats["info_ok"]}/{stats["info_total"]} fragments')
     print(f'    QUST: {stats["qust_ok"]}/{stats["qust_total"]} stage scripts')
     print(f'    Total: {total} converted, {errs} errors, {stats["todo_count"]} TODOs')
+    if stats['errors']:
+        # One line per DISTINCT failure, with a count and an example: 2,393
+        # identical messages say no more than one does, and hiding them
+        # entirely (as this did) turned a total conversion failure into a
+        # number nobody could act on.
+        buckets = {}
+        for msg in stats['errors']:
+            buckets.setdefault(msg.split(': ', 1)[-1], []).append(msg)
+        for text, msgs in sorted(buckets.items(), key=lambda kv: -len(kv[1]))[:8]:
+            print(f'      [{len(msgs):5d}] {text}   e.g. {msgs[0].split(":")[0]}')
 
     return stats
 
@@ -506,7 +516,7 @@ def write_psc(output_dir: str, script_name: str, text: str) -> None:
     dangling name silently; Papyrus rejects the whole file, and a fragment
     that fails to compile takes its quest stage with it.
 
-    This ran as a second sweep of the output tree until 2026-08-28, re-reading
+    This ran as a second sweep of the output tree, re-reading
     every `.psc` the converter had just written.  It needs nothing but the
     file's own lines, so it belongs at the write.
     """
@@ -560,7 +570,7 @@ def _fix_udf_call_arg_types(output_dir: str, sigs: dict, callers: dict) -> None:
     converted.  Both inputs are collected AS each script converts: `sigs` is
     {script -> parameter types} and `callers` is {script -> (calls, types)}.
 
-    Until 2026-08-29 this re-derived both by reading every generated `.psc` and
+    Until this re-derived both by reading every generated `.psc` and
     regexing `Function TES4Call` headers and `X Property Y` declarations out of
     the output -- 40,586 files held to recover 36 signatures, then narrowed to
     the files containing a call.  It now rewrites the exact call TEXT the
@@ -649,16 +659,16 @@ def _scpt_batch(records: list, output_dir: str, xref: CrossRefGraph, stats: dict
             # the compiler cannot find the script by name.
             script_name = papyrus_script_name(name)
             write_psc(output_dir, script_name, papyrus)
-            if conv.udf_signature is not None:
-                stats['udf_sigs'][script_name.lower()] = conv.udf_signature
-            if conv.udf_calls:
+            if conv.sc.udf_signature is not None:
+                stats['udf_sigs'][script_name.lower()] = conv.sc.udf_signature
+            if conv.sc.udf_calls:
                 # BOTH type sources: an external ref becomes a property, and a
                 # script-local `ref` is promoted to one.  The old pass saw both
                 # because it regexed `X Property Y` out of the OUTPUT.
                 types = {k.lower(): v
                          for k, v in conv.get_property_refs().items()}
-                types.update(conv._var_types)
-                stats['udf_callers'][script_name] = (conv.udf_calls, types)
+                types.update(conv.sc.var_types)
+                stats['udf_callers'][script_name] = (conv.sc.udf_calls, types)
             stats['scpt_ok'] += 1
             stats['todo_count'] += papyrus.count(';TODO')
         except Exception as e:
@@ -851,7 +861,7 @@ def _split_turn_handoff(counter_step, gated_rest):
 
     Emitting the handoff in the End fragment makes every line pay a serial
     round trip: the next speaker cannot even LOOK until the previous line
-    has completely finished.  Measured 2026-08-16 (temp/chargen_rec_5.log):
+    has completely finished.  Measured (temp/chargen_rec_5.log):
 
         79.11  LineBegan Renault len=2.06     <- line starts
         81.54  LineEnded Renault              <- 2.43s later
@@ -1051,7 +1061,7 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 conv.set_scro_aliases(resolve_scro_aliases(
                     result_script, _scro_list(rec), xref))
                 body_lines = conv.convert_fragment(result_script, 'TopicInfo')
-                prop_refs = dict(conv._property_refs)
+                prop_refs = dict(conv.sc.property_refs)
 
             script_name = f'TES4_TIF__{formid}'
             out_lines = [
@@ -1385,7 +1395,7 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
                     # convert_fragment resets per-fragment state; accumulate
                     # the chargen-menu latch across all of this QF's fragments.
                     uses_chargen_latch = (uses_chargen_latch
-                                          or conv._uses_chargen_menus)
+                                          or conv.sc.uses_chargen_menus)
                 out_lines.append('EndFunction')
                 out_lines.append('')
 
@@ -1646,7 +1656,7 @@ def _add_scro_ref(conv: 'ScriptConverter', fid: str, xref: CrossRefGraph):
     # Don't downgrade a type already upgraded by _convert_ref (e.g. Quest → TES4_FGQuestTrack).
     # _preload_stage_scro_refs is called once per stage and would otherwise reset types
     # that were promoted when a prior stage's result script accessed cross-script vars.
-    cur = conv._property_refs.get(key, '')
+    cur = conv.sc.property_refs.get(key, '')
     if cur and cur != 'Quest' and ptype == 'Quest':
         return
     # Never overwrite an ActorBase typing set by a base-semantics function
@@ -1655,7 +1665,7 @@ def _add_scro_ref(conv: 'ScriptConverter', fid: str, xref: CrossRefGraph):
     # script's init. ActorBase is a hard constraint, not a promotable guess.
     if cur == 'ActorBase':
         return
-    conv._property_refs[key] = ptype
+    conv.sc.property_refs[key] = ptype
 
 
 # ===========================================================================
@@ -1845,7 +1855,7 @@ def info_needs_fragment(rec: dict, info_reveals: dict = None,
     bit with no function behind it makes the engine bind a missing function,
     and a .pex nothing attaches is dead weight.  Both call THIS.
 
-    WHY NOT ALWAYS (the 2026-08-17 stutter fix)
+    WHY NOT ALWAYS (the stutter fix)
     -------------------------------------------
     Every INFO used to get one, so the plugin shipped 19,278 per-INFO .pex
     files against vanilla Skyrim's ~5,500 -- 100% of INFOs carrying a fragment
