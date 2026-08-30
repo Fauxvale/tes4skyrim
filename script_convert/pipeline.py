@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import shutil
 import os
 import re
 import struct
@@ -10,9 +11,16 @@ from tes5_import.text_reader import parse_export_file
 from worker_budget import worker_count
 
 from script_convert.constants import (_sanitize_name, _safe_property_name, _record_type_to_papyrus, papyrus_script_name,
-                                     FUNCTION_MAP)
+                                     KNOWN_COMMANDS, SERVICE_MENU_CALL)
 from script_convert.cross_ref import CrossRefGraph, master_names
 from script_convert.converter import ScriptConverter
+from script_convert.symbols import property_declarations, IMPLICIT_NAMES
+from script_convert.tes5.blocks import (
+    Kind,
+    classify,
+    hoist_quest_start_above_writes,
+    scan,
+)
 from output_layout import assets_for  # noqa: E402
 
 
@@ -34,6 +42,11 @@ def _new_stats() -> dict:
         'info_total': 0, 'info_ok': 0, 'info_err': 0,
         'qust_total': 0, 'qust_ok': 0, 'qust_err': 0,
         'todo_count': 0, 'errors': [],
+        # script name (lower) -> OBSE user-function parameter types, in order.
+        # Collected AS each script converts, so the cross-script cast pass is
+        # a lookup rather than a second read of every generated .psc.
+        'udf_sigs': {},
+        'udf_callers': {},
     }
 
 
@@ -145,8 +158,10 @@ def _script_worker_run(job):
 
 def _merge_stats(into: dict, part: dict):
     for k, v in part.items():
-        if k == 'errors':
-            into['errors'].extend(v)
+        if isinstance(v, list):
+            into[k].extend(v)
+        elif isinstance(v, dict):
+            into[k].update(v)
         else:
             into[k] += v
 
@@ -187,8 +202,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
     # compiled output are cleared: a stale .pex is worse than a stale .psc,
     # because the VM loads it whether or not the source is still there.
     if os.path.isdir(output_dir):
-        import shutil
-        shutil.rmtree(output_dir)
+            shutil.rmtree(output_dir)
     pex_dir = os.path.dirname(output_dir)
     if os.path.isdir(pex_dir):
         for _n in os.listdir(pex_dir):
@@ -255,7 +269,6 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
                         print(f'    removed stale master-owned copy: {stale}')
     else:
         if os.path.isdir(static_dir):
-            import shutil
             for name in os.listdir(static_dir):
                 if name.endswith('.psc'):
                     shutil.copy2(os.path.join(static_dir, name),
@@ -368,12 +381,10 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
             conv_by_type, script_vars=quest_script_vars, plugin_stem=_stem)
         conv_psc = generate_driver_psc(conv_plan, say_durations)
         if conv_psc:
-            _pname = conv_plan['script_name'] + '.psc'
-            with open(os.path.join(output_dir, _pname), 'w',
-                      encoding='utf-8') as f:
-                f.write(conv_psc)
+            write_psc(output_dir, conv_plan['script_name'], conv_psc)
             print(f"    NPC conversations: {len(conv_plan['chains'])} chains "
-                  f"-> {_pname} ({len(conv_plan['skipped'])} skipped)")
+                  f"-> {conv_plan['script_name']}.psc "
+                  f"({len(conv_plan['skipped'])} skipped)")
 
     # `AddTopic X` in a SCRIPT body is the third reveal route (alongside INFO
     # fragments and quest stages), so it needs the gated topic's global by
@@ -468,8 +479,8 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
             for part in ex.map(_script_worker_run, jobs):
                 _merge_stats(stats, part)
 
-    _fix_udf_call_arg_types(output_dir)
-    _comment_undeclared_identifiers(output_dir)
+    _fix_udf_call_arg_types(output_dir, stats['udf_sigs'],
+                            stats['udf_callers'])
 
     total = stats['scpt_ok'] + stats['info_ok'] + stats['qust_ok']
     errs = stats['scpt_err'] + stats['info_err'] + stats['qust_err']
@@ -482,91 +493,107 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
     return stats
 
 
-_UDF_SIG_RE = re.compile(
-    r'^\s*(?:\w+\s+)?Function\s+TES4Call\s*\((.*)\)\s*$', re.IGNORECASE)
-_UDF_CALL_RE = re.compile(
-    r'\b([A-Za-z_]\w*)\.TES4Call\(([^()]*)\)')
-# Papyrus converts freely UP to these, so only a DOWNCAST needs the explicit
-# `as`. Anything already this type, or a literal, is left alone.
+#: Papyrus converts freely UP to these; only a DOWNCAST needs an `as`.
 _UDF_WIDE_TYPES = {'form', 'objectreference'}
 
 
-def _fix_udf_call_arg_types(output_dir: str) -> None:
+def write_psc(output_dir: str, script_name: str, text: str) -> None:
+    """Write one generated script, commenting out its dangling references.
+
+    Morroblivion's scripts contain references the mod itself never defines --
+    `fbmwMQHlaaluSuccess.hortvotes`, `fbmwMVRichTrader.follownow` -- pointing
+    at records that exist in no plugin, master included.  Oblivion ignored the
+    dangling name silently; Papyrus rejects the whole file, and a fragment
+    that fails to compile takes its quest stage with it.
+
+    This ran as a second sweep of the output tree until 2026-08-28, re-reading
+    every `.psc` the converter had just written.  It needs nothing but the
+    file's own lines, so it belongs at the write.
+    """
+    path = os.path.join(output_dir, script_name + '.psc')   # noqa: plugin-path
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(_comment_dangling(text))
+
+
+def _comment_dangling(text: str) -> str:
+    """Comment out statements whose SUBJECT was never declared in `text`.
+
+    Only a statement whose leading `Owner.` is neither a declared property, a
+    local, nor a Papyrus built-in is touched, so a legitimate call is never
+    suppressed.  Mirrors ScriptConverter._dangling_cross_script_target, which
+    handles the case where the owner DOES resolve but the variable does not.
+    """
+    lines = text.split('\n')
+    known = set(IMPLICIT_NAMES)
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower().startswith('scriptname'):
+            continue
+        if classify(line) is Kind.HEADER:
+            sig = _SIG_PARAMS_RE.search(stripped)
+            if sig:
+                known.update(
+                    bits[1].strip('=').lower()
+                    for bits in (q.split() for q in sig.group(1).split(','))
+                    if len(bits) >= 2)
+            continue
+        decl = _DECL_RE.match(stripped)
+        if decl and not stripped.startswith(';'):
+            known.add(decl.group(1).lower())
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(';'):
+            continue
+        m = _MEMBER_STMT_RE.match(line)
+        if m and m.group(2).lower() not in known:
+            lines[i] = (f'{m.group(1)};{stripped}  ;NE: {m.group(2)} is not '
+                        f'declared anywhere (dangling in the original mod)')
+    return '\n'.join(lines)
+
+
+def _fix_udf_call_arg_types(output_dir: str, sigs: dict, callers: dict) -> None:
     """Insert the casts a cross-script `X.TES4Call(...)` needs to compile.
 
     An OBSE user function's parameter type is inferred from how its OWN body
-    uses the value, so a callee that calls GetRace() takes an `Actor` while the
-    caller holds the same thing in an `ObjectReference` property (TES4 spelled
-    both `ref`).  Papyrus refuses that implicit downcast and fails the CALLER —
-    and a script that fails to compile takes down every script declaring a
-    property of its type, so one mismatch can silently disable a quest line.
+    uses the value, so a caller cannot know it until every script has
+    converted.  Both inputs are collected AS each script converts: `sigs` is
+    {script -> parameter types} and `callers` is {script -> (calls, types)}.
 
-    Signatures are only known once every script has been converted, which is why
-    this runs here rather than in the converter: it reads each generated
-    `Function TES4Call(...)` header, then rewrites the argument at each call
-    site whose property is typed wider than the parameter.
+    Until 2026-08-29 this re-derived both by reading every generated `.psc` and
+    regexing `Function TES4Call` headers and `X Property Y` declarations out of
+    the output -- 40,586 files held to recover 36 signatures, then narrowed to
+    the files containing a call.  It now rewrites the exact call TEXT the
+    converter recorded, so the file is a string substitution rather than a
+    parse of emitted Papyrus.
     """
-    if not os.path.isdir(output_dir):
+    if not sigs or not callers or not os.path.isdir(output_dir):
         return
-    # Parameter types per callee script name, e.g. TES4_Foo -> ['Actor', 'String'].
-    sigs: dict = {}
-    sources: dict = {}
-    for name in os.listdir(output_dir):
-        if not name.endswith('.psc'):
+    fixed = 0
+    for script_name, (calls, types) in sorted(callers.items()):
+        edits = []
+        for prop, args in calls:
+            want = sigs.get(types.get(prop.lower(), '').lower())
+            if not want or len(args) != len(want):
+                continue
+            cast = [f'({a} as {t})'
+                    if _needs_cast(types.get(a.lower(), ''), t, a) else a
+                    for a, t in zip(args, want)]
+            if list(cast) == list(args):
+                continue
+            edits.append((f'{prop}.TES4Call({", ".join(args)})',
+                          f'{prop}.TES4Call({", ".join(cast)})'))
+        if not edits:
             continue
-        path = os.path.join(output_dir, name)   # noqa: plugin-path (.psc filename)
+        path = os.path.join(output_dir, script_name + '.psc')   # noqa: plugin-path
         try:
             with open(path, encoding='utf-8') as fh:
                 text = fh.read()
         except OSError:
             continue
-        sources[name[:-4]] = (path, text)
-        for line in text.splitlines():
-            m = _UDF_SIG_RE.match(line)
-            if not m:
-                continue
-            params = [p.strip() for p in m.group(1).split(',') if p.strip()]
-            sigs[name[:-4].lower()] = [p.split()[0] for p in params if p.split()]
-            break
-
-    if not sigs:
-        return
-
-    _prop_re = re.compile(
-        r'^\s*([A-Za-z_][\w]*)\s+Property\s+(\w+)\b', re.IGNORECASE)
-    fixed = 0
-    for script, (path, text) in sources.items():
-        if '.TES4Call(' not in text:
-            continue
-        # The CALLER's own property types, to know what each argument is.
-        prop_types = {}
-        for line in text.splitlines():
-            pm = _prop_re.match(line)
-            if pm:
-                prop_types[pm.group(2).lower()] = pm.group(1)
-
-        def _fix(m):
-            callee = m.group(1)
-            # The property naming the callee is typed as that script.
-            callee_type = prop_types.get(callee.lower(), '')
-            want = sigs.get(callee_type.lower())
-            if not want:
-                return m.group(0)
-            args = [a.strip() for a in m.group(2).split(',')]
-            if len(args) != len(want):
-                return m.group(0)
-            out_args = []
-            for arg, ptype in zip(args, want):
-                have = prop_types.get(arg.lower(), '')
-                if (have and have.lower() in _UDF_WIDE_TYPES
-                        and ptype.lower() not in _UDF_WIDE_TYPES
-                        and ' as ' not in arg):
-                    out_args.append(f'({arg} as {ptype})')
-                else:
-                    out_args.append(arg)
-            return f'{callee}.TES4Call({", ".join(out_args)})'
-
-        new_text = _UDF_CALL_RE.sub(_fix, text)
+        new_text = text
+        for before, after in edits:
+            new_text = new_text.replace(before, after)
         if new_text != text:
             try:
                 with open(path, 'w', encoding='utf-8') as fh:
@@ -578,93 +605,23 @@ def _fix_udf_call_arg_types(output_dir: str) -> None:
         print(f'    UDF call arg casts inserted in {fixed} script(s)')
 
 
+
+def _needs_cast(have: str, want: str, arg: str) -> bool:
+    """Papyrus converts freely UP, so only a DOWNCAST needs an explicit `as`."""
+    return (bool(have) and have.lower() in _UDF_WIDE_TYPES
+            and want.lower() not in _UDF_WIDE_TYPES and ' as ' not in arg)
+
+
 # `Owner.member` at the head of a statement, which is the shape a dangling
 # cross-script reference takes.  Anchored so it only sees the STATEMENT's
 # subject, never an identifier deeper in an expression.
 _MEMBER_STMT_RE = re.compile(r'^(\s*)([A-Za-z_]\w*)\.(\w+)')
 
-# Names a generated script may use without declaring them: Papyrus globals,
-# script-scope keywords, and the event parameters the fragments are handed.
-_IMPLICIT_NAMES = {
-    'game', 'debug', 'utility', 'self', 'parent', 'math', 'input',
-    # 'weather' is the CLASS in `Weather.ReleaseOverride()` /
-    # `Weather.GetCurrentWeather()` global calls, not a variable.
-    'weather',
-    'akspeakerref', 'akactionref', 'aktarget', 'akcaster', 'akaggressor',
-    'akkiller', 'akactor', 'akitem', 'aksource', 'akrefself',
-    'tes4polyfill', 'form', 'true', 'false', 'none',
-}
-
-
-def _comment_undeclared_identifiers(output_dir: str) -> None:
-    """Comment out statements whose SUBJECT was never declared.
-
-    Morroblivion's scripts contain references the mod itself never defines --
-    `fbmwMQHlaaluSuccess.hortvotes`, `fbmwMVRichTrader.follownow` -- pointing at
-    records that exist in no plugin, master included.  Oblivion ignored the
-    dangling name silently; Papyrus rejects the whole file, and a fragment that
-    fails to compile takes its quest stage with it.
-
-    Only a statement whose leading `Owner.` is neither a declared property, a
-    local, nor a Papyrus built-in is touched, so a legitimate call is never
-    suppressed.  Mirrors ScriptConverter._dangling_cross_script_target, which
-    handles the case where the owner DOES resolve but the variable does not.
-    """
-    if not os.path.isdir(output_dir):
-        return
-    _decl_re = re.compile(
-        r'^\s*(?:\w+(?:\[\])?)\s+(?:Property\s+)?(\w+)\b', re.IGNORECASE)
-    _sig_re = re.compile(r'\((.*)\)')
-    commented = 0
-    for name in sorted(os.listdir(output_dir)):
-        if not name.endswith('.psc'):
-            continue
-        path = os.path.join(output_dir, name)   # noqa: plugin-path (.psc filename)
-        try:
-            with open(path, encoding='utf-8') as fh:
-                lines = fh.read().splitlines()
-        except OSError:
-            continue
-
-        known = set(_IMPLICIT_NAMES)
-        for line in lines:
-            s = line.strip()
-            low = s.lower()
-            if low.startswith('scriptname'):
-                continue
-            if (low.startswith('function ') or low.startswith('event ')
-                    or re.match(r'^\w+\s+function\s', low)):
-                sm = _sig_re.search(s)
-                if sm:
-                    for p in sm.group(1).split(','):
-                        bits = p.split()
-                        if len(bits) >= 2:
-                            known.add(bits[1].strip('=').lower())
-                continue
-            dm = _decl_re.match(s)
-            if dm and not s.startswith(';'):
-                known.add(dm.group(1).lower())
-
-        changed = False
-        for i, line in enumerate(lines):
-            s = line.strip()
-            if not s or s.startswith(';'):
-                continue
-            m = _MEMBER_STMT_RE.match(line)
-            if not m or m.group(2).lower() in known:
-                continue
-            lines[i] = (f'{m.group(1)};{s}  ;NE: {m.group(2)} is not declared '
-                        f'anywhere (dangling in the original mod)')
-            changed = True
-            commented += 1
-        if changed:
-            try:
-                with open(path, 'w', encoding='utf-8') as fh:
-                    fh.write('\n'.join(lines) + '\n')
-            except OSError:
-                pass
-    if commented:
-        print(f'    dangling references commented out: {commented} line(s)')
+# A declaration's name: `Int foo`, `Foo Property bar Auto`, `Actor[] baz`.
+_DECL_RE = re.compile(r'^\s*(?:\w+(?:\[\])?)\s+(?:Property\s+)?(\w+)\b',
+                      re.IGNORECASE)
+# The parameter list of a Function/Event header.
+_SIG_PARAMS_RE = re.compile(r'\((.*)\)')
 
 
 def _scpt_batch(records: list, output_dir: str, xref: CrossRefGraph, stats: dict):
@@ -690,9 +647,18 @@ def _scpt_batch(records: list, output_dir: str, xref: CrossRefGraph, stats: dict
 
             # The FILENAME must match the ScriptName the converter emitted, or
             # the compiler cannot find the script by name.
-            out_path = os.path.join(output_dir, papyrus_script_name(name) + '.psc')
-            with open(out_path, 'w', encoding='utf-8') as f:
-                f.write(papyrus)
+            script_name = papyrus_script_name(name)
+            write_psc(output_dir, script_name, papyrus)
+            if conv.udf_signature is not None:
+                stats['udf_sigs'][script_name.lower()] = conv.udf_signature
+            if conv.udf_calls:
+                # BOTH type sources: an external ref becomes a property, and a
+                # script-local `ref` is promoted to one.  The old pass saw both
+                # because it regexed `X Property Y` out of the OUTPUT.
+                types = {k.lower(): v
+                         for k, v in conv.get_property_refs().items()}
+                types.update(conv._var_types)
+                stats['udf_callers'][script_name] = (conv.udf_calls, types)
             stats['scpt_ok'] += 1
             stats['todo_count'] += papyrus.count(';TODO')
         except Exception as e:
@@ -703,10 +669,6 @@ def _scpt_batch(records: list, output_dir: str, xref: CrossRefGraph, stats: dict
 # Fragment lines that open the Skyrim service menus (appended to scripted
 # INFOs under the Barter/Training topics; script-less ones get the shared
 # static scripts of the same content instead).
-_SERVICE_MENU_CALL = {
-    'barter': '  (akSpeakerRef as Actor).ShowBarterMenu()',
-    'training': '  Game.ShowTrainingMenu(akSpeakerRef as Actor)',
-}
 
 
 def build_quest_script_vars(by_type: dict) -> dict:
@@ -956,23 +918,21 @@ def _split_stage_advances(body: list) -> tuple:
     in the body's own If/While block stays where the author put it.
     """
     gated, advances = [], []
-    depth = 0
-    for line in body:
-        m = _STAGE_ADVANCE_RE.match(line) if depth == 0 else None
-        if m:
-            indent, quest, stage, comment = m.groups()
-            advances.append(f'{indent}If {quest}.GetStage() < {stage}'
-                            '  ; advance survives a rejected turn')
-            advances.append(f'{indent}  {quest}.SetStage({stage})'
-                            + (f'  {comment}' if comment else ''))
-            advances.append(f'{indent}EndIf')
+    # A fragment body carries no header of its own, so `scan` is given one
+    # to track against; `not stack` is then "top level of the body".
+    for ln in scan(['Function _()'] + list(body)):
+        if ln.kind is Kind.HEADER:
             continue
-        gated.append(line)
-        s = line.strip().lower()
-        if s.startswith('if ') or s.startswith('while '):
-            depth += 1
-        elif s == 'endif' or s == 'endwhile':
-            depth -= 1
+        m = _STAGE_ADVANCE_RE.match(ln.text) if not ln.stack else None
+        if not m:
+            gated.append(ln.text)
+            continue
+        indent, quest, stage, comment = m.groups()
+        advances.append(f'{indent}If {quest}.GetStage() < {stage}'
+                        '  ; advance survives a rejected turn')
+        advances.append(f'{indent}  {quest}.SetStage({stage})'
+                        + (f'  {comment}' if comment else ''))
+        advances.append(f'{indent}EndIf')
     return gated, advances
 
 
@@ -996,10 +956,11 @@ def _state_writes_before_setstage(lines: list) -> list:
     if first is None:
         return lines
     # Only hoist from a FLAT tail — a nested block (If/While) after the
-    # SetStage may depend on what the stage did.
+    # SetStage may depend on what the stage did.  `classify` is the shared
+    # barrier; it also stops on a Return, which this pass's own regex did
+    # not (measured: no fragment body has one in the tail, 0 of 75,170).
     tail = lines[first + 1:]
-    if any(re.match(r'\s*(If|While|Else|ElseIf|EndIf|EndWhile)\b', ln,
-                    re.IGNORECASE) for ln in tail):
+    if any(classify(ln) is not Kind.OTHER for ln in tail):
         return lines
     hoist = [ln for ln in tail if _is_state_write(ln)]
     if not hoist:
@@ -1010,12 +971,11 @@ def _state_writes_before_setstage(lines: list) -> list:
     # same quest, which is the one reordering that silently destroys it:
     # Skyrim's Start() resets every Auto property, so the seeded value is gone
     # (ArenaICGrandChampion's `CrazyIdea`, 2 sites).  The converter already
-    # hoists Start() above such writes, but it ran BEFORE this pass, so re-run
-    # it on the reordered result.  Both passes are order-preserving elsewhere,
-    # so applying it twice is idempotent.
-    from .converter import ScriptConverter
-    return ScriptConverter._hoist_quest_start_above_writes(
-        ScriptConverter.__new__(ScriptConverter), out)
+    # hoists Start() above such writes, but it ran BEFORE this pass, so the
+    # invariant "no Start() below a write to its own quest" has to be
+    # RE-ESTABLISHED on the reordered result.  It is a fixup of this
+    # function's own output, not a second pass over the script.
+    return hoist_quest_start_above_writes(out)
 
 
 def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
@@ -1112,21 +1072,8 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 # different keys.  The generic one won and every cross-script
                 # variable read through it failed ("field or property StartTimer
                 # not found" on a plain Quest).
-                _merged: dict[str, tuple[str, str]] = {}
-                for pname, ptype in sorted(prop_refs.items()):
-                    key = _safe_property_name(pname).lower()
-                    if key in _merged:
-                        _, ex_type = _merged[key]
-                        if ex_type == 'Quest' and ptype != 'Quest':
-                            _merged[key] = (pname, ptype)
-                    else:
-                        _merged[key] = (pname, ptype)
-                for pname, ptype in sorted(_merged.values(), key=lambda x: x[0].lower()):
-                    safe = _safe_property_name(pname)
-                    if safe.lower() in declared:
-                        continue
-                    declared.add(safe.lower())
-                    out_lines.append(f'{ptype} Property {safe} Auto')
+                out_lines += property_declarations(prop_refs,
+                                                   declared)
             if declared:
                 out_lines.append('')
 
@@ -1196,7 +1143,7 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             else:
                 out_lines.extend(body_lines)
             if service_kind:
-                out_lines.append(_SERVICE_MENU_CALL[service_kind])
+                out_lines.append(SERVICE_MENU_CALL[service_kind])
             out_lines.append(f'  TES4Polyfill.LineEnded(akSpeakerRef, {length:g})')
             out_lines.append('EndFunction')
             out_lines.append('')
@@ -1207,9 +1154,7 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 out_lines.extend(conv.get_cell_family_helpers())
 
             papyrus = '\n'.join(out_lines)
-            out_path = os.path.join(output_dir, f'{script_name}.psc')
-            with open(out_path, 'w', encoding='utf-8') as f:
-                f.write(papyrus)
+            write_psc(output_dir, script_name, papyrus)
             if has_script:
                 stats['info_ok'] += 1
             stats['todo_count'] += papyrus.count(';TODO')
@@ -1502,9 +1447,7 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
             out_lines.extend(conv.get_cell_family_helpers())
 
             papyrus = '\n'.join(out_lines)
-            out_path = os.path.join(output_dir, f'{script_name}.psc')
-            with open(out_path, 'w', encoding='utf-8') as f:
-                f.write(papyrus)
+            write_psc(output_dir, script_name, papyrus)
             stats['qust_ok'] += scripted_count
             stats['todo_count'] += papyrus.count(';TODO')
         except Exception as e:
@@ -1580,14 +1523,14 @@ def _scro_body_tokens(body: str) -> list:
     # a form reference like any other, so drop the quotes rather than the name:
     # stripping the whole literal made TG03LlathasasBust look like a SCRO the
     # body never spells, and that stage's `IsXBox` — an OBSE command with no
-    # FUNCTION_MAP entry — then looked like the rename it paired with.
+    # command entry — then looked like the rename it paired with.
     text = re.sub(r'"([^"]*)"', r' \1 ', '\n'.join(lines))
     out = []
     for m in re.finditer(r'[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?',
                          text):
         head = m.group(0).split('.', 1)[0]
         low = head.lower()
-        if low in _SCRO_WALK_SKIP_KEYWORDS or low in FUNCTION_MAP:
+        if low in _SCRO_WALK_SKIP_KEYWORDS or low in KNOWN_COMMANDS:
             continue
         out.append(head)
     return out

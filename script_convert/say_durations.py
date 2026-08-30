@@ -30,6 +30,7 @@ import json
 import os
 import re
 from output_layout import assets_for  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor
 
 # MPEG-1 Layer III bitrate table (kbps), index 0/15 invalid.
 _BITRATES_V1_L3 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224,
@@ -136,7 +137,6 @@ def scan_voice_durations(export_dir: str, use_cache: bool = True,
         workers = max(1, (os.cpu_count() or 2) - 1)
 
     # Pure file I/O + a tight byte scan: a thread pool is the right tool.
-    from concurrent.futures import ThreadPoolExecutor
     durations = {}
     # (info key, voice-type dir) -> summed length of that voice type's
     # responses for the INFO. Collapsed to the per-INFO maximum below.

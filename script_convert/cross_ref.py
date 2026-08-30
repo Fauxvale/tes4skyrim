@@ -1,12 +1,13 @@
 """Cross-reference graph for TES4 FormID/EditorID/Script lookups."""
 
+import mmap
 import os
 import re
 from pathlib import Path
 
 from script_convert.constants import (
-    papyrus_script_name, _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS,
-    PLAYER_ALIAS_EXTENDS)
+    papyrus_script_name, PLACED_REF_SIGS, SCHOOL_ENCHANT_SHADER, TYPE_MAP,
+    _ACTOR_ONLY_FUNCTIONS, _OBJREF_SHARED_FUNCTIONS, PLAYER_ALIAS_EXTENDS)
 from tes5_import.text_reader import parse_export_file
 from worker_budget import worker_count
 
@@ -195,7 +196,7 @@ def _scan_record_lines(sig: str, lines: list, out: dict):
         out['enchanted_books'].add(formid)
     if scri:
         out['record_scri'][formid] = scri
-    if name_fid and sig in ('ACHR', 'ACRE', 'REFR'):
+    if name_fid and sig in PLACED_REF_SIGS:
         out['record_base'][formid] = name_fid
     out['record_type'][formid] = sig
     if model:
@@ -225,7 +226,6 @@ def _scan_range(args: tuple) -> dict:
     args = (fpath, sig, start, end). Module-level so it is picklable for
     ProcessPoolExecutor; boundary rule matches text_reader.parse_file_range.
     """
-    import mmap
 
     from tes5_import.text_reader import (_DELIM_BEGIN, _DELIM_END,
                                          _find_delim_line)
@@ -323,7 +323,7 @@ class CrossRefGraph:
         # GLOB EditorID (lower) -> FLTV value as authored by the plugin.
         # Needed because several TES4 timing idioms hardcode a REAL-SECONDS
         # constant that the author tuned against their own TimeScale (see
-        # _scaled_debounce_seconds in converter.py).  Nehrim ships TimeScale
+        # the chime debounce).  Nehrim ships TimeScale
         # 10, Oblivion 30, so the same script means different things in each.
         self.global_values: dict[str, float] = {}
         # PACK FormID -> PKDT.Type (0 Find, 1 Follow, 2 Escort, 3 Eat,
@@ -462,12 +462,6 @@ class CrossRefGraph:
     # Fallback for MGEFs with neither an EffectShader nor an EnchantEffect
     # (bound armor, summons): the school glow is what Oblivion shows on the
     # enchant anyway, and every one of these EditorIDs exists in Oblivion.esm.
-    _SCHOOL_ENCHANT_SHADER = {
-        0: 'effectenchantalteration', 1: 'effectenchantconjuration',
-        2: 'effectenchantdestruction', 3: 'effectenchantillusion',
-        4: 'effectenchantmysticism',  5: 'effectenchantrestoration',
-    }
-
     def get_mgef_shader_edid(self, code: str) -> str:
         """EFSH EditorID for a TES4 magic-effect code (pme/sme argument).
 
@@ -484,7 +478,7 @@ class CrossRefGraph:
                 edid = self.formid_to_edid.get(fid, '')
                 if edid:
                     return edid
-        fallback = self._SCHOOL_ENCHANT_SHADER.get(school, '')
+        fallback = SCHOOL_ENCHANT_SHADER.get(school, '')
         if fallback and fallback in self.edid_to_formid:
             return self.formid_to_edid.get(self.edid_to_formid[fallback], '')
         return ''
@@ -833,7 +827,6 @@ class CrossRefGraph:
         # Phase A: collect variable declarations per script
         _decl_re = re.compile(r'^\s*ref\s+(\w+)', re.IGNORECASE)
         _all_decl_re = re.compile(r'^\s*(short|long|float|ref)\s+(\w+)', re.IGNORECASE)
-        _TES4_TO_PAPYRUS_TYPE = {'short': 'Int', 'long': 'Int', 'float': 'Float', 'ref': 'ObjectReference'}
         script_ref_vars: dict[str, set[str]] = {}
         script_all_vars: dict[str, dict[str, str]] = {}
         script_actor_vars: dict[str, set[str]] = {}
@@ -869,7 +862,7 @@ class CrossRefGraph:
                 if am:
                     vtype = am.group(1).lower()
                     vname = am.group(2).lower()
-                    all_vars[vname] = _TES4_TO_PAPYRUS_TYPE.get(vtype, 'Int')
+                    all_vars[vname] = TYPE_MAP.get(vtype, 'Int')
             if ref_vars:
                 script_ref_vars[scn_low] = ref_vars
                 actor_used = {m.group(1).lower()
@@ -966,8 +959,7 @@ class CrossRefGraph:
                                     value.lower(), '')
                                 v_rtype = (self.record_type.get(v_fid, '')
                                            if v_fid else '')
-                                if v_rtype and v_rtype not in (
-                                        'ACHR', 'ACRE', 'REFR'):
+                                if v_rtype and v_rtype not in PLACED_REF_SIGS:
                                     usage[key].add('baseform')
                                 elif not v_fid:
                                     # Not a record name -- it is another

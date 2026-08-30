@@ -2,7 +2,7 @@
 
 from script_convert.constants import (
     BLOCK_MAP, TYPE_MAP, ACTOR_VALUE_MAP, KNOWN_GLOBALS,
-    FUNCTION_MAP,
+    COMMAND_ROWS,
 )
 from script_convert.cross_ref import CrossRefGraph
 from script_convert.converter import ScriptConverter
@@ -10,6 +10,6 @@ from script_convert.pipeline import convert_all_scripts, build_vmad_quest_fragme
 
 __all__ = [
     'BLOCK_MAP', 'TYPE_MAP', 'ACTOR_VALUE_MAP', 'KNOWN_GLOBALS',
-    'FUNCTION_MAP', 'CrossRefGraph', 'ScriptConverter',
+    'COMMAND_ROWS', 'CrossRefGraph', 'ScriptConverter',
     'convert_all_scripts', 'build_vmad_quest_fragments', 'build_vmad_info_fragment',
 ]

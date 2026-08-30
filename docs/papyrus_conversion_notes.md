@@ -1548,9 +1548,17 @@ fails open — no error, no warning, just the original bug back.
 `SetStage` (so an inline stage fragment's `EvaluatePackage` sees committed
 state). That runs AFTER the converter's post-processing, and it can lift a
 write above `SetStage` while leaving the `Start()` below it — stranding the
-seed again (`ArenaICGrandChampion.CrazyIdea`, 2 sites). Fixed by re-running
-the quest-start hoist on that pass's result; both passes are order-preserving
-elsewhere, so applying it twice is idempotent.
+seed again (`ArenaICGrandChampion.CrazyIdea`, 2 sites). Fixed by
+re-establishing the invariant on that pass's own output.
+
+**This was a fixpoint re-run until 2026-08-28**, and read like one: the hoist
+was called a second time, from a fabricated `ScriptConverter.__new__(...)`
+instance (it never touched `self` — only three class-level regexes). Nothing
+proved the two reordering passes could not ping-pong. It is now
+`tes5.blocks.hoist_quest_start_above_writes`, a module function
+`_state_writes_before_setstage` calls on its own result as an ordinary fixup
+— the same emitted lines, but a pass repairing what it just did rather than
+two passes iterating to agreement.
 
 **Guard:** the invariant is "no write to `Q.<prop>` may precede a `Start()` /
 `TES4Polyfill.StartQuest` on the same `Q` within one straight-line run".

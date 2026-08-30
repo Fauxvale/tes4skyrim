@@ -29,9 +29,17 @@ Major Issues for V1:
 
 	11 - All-in-one installer that people can just click and expect to work
 
+	12 - Quest stages aren't properly closed (MS48)
+
+	13 - Weather particle conversion (snow, rain) SPGD
+
+	14 - AutoUpdater
+
 Later Issues:
+	1 - Bound items like dagger not removed from inventory, only hands
 	
 	3 - Ajust zip step to pack loose files if bsas are out of date or not generated
+		Also zip should work on mod without plugin
 
 	4 - Fix walking up stairs
 
