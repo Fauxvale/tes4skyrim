@@ -64,19 +64,15 @@ DOOR_OVERLAP = 32.0
 def _sides_disconnected(nodes, pg_edges, dx, dy, dz, fcx, fcy, ztol):
     """True when the pathgrid on the door's two faces is DISCONNECTED.
 
-    The far-side bridge exists for exactly one situation: walkable ground on
-    both faces of a doorway with no pathgrid route between them (the prison
-    cell gates — nodes inside the cell and out in the corridor are separate
-    pathgrid components, so the ribbons never join).  Where the pathgrid IS
-    connected across the door, the ribbon already runs through or around the
-    doorway, and an extra quad only adds overlapping ground — measured, it
-    severed the staircase sheets in Pinarus's and Arvena's houses.
+    The only case that earns a far-side bridge quad.
+    See: docs/commentary/tes5_import_navmesh.md#door-far-side-bridge
     """
     if not nodes or not pg_edges:
         return False
     parent = list(range(len(nodes)))
 
     def find(a):
+        """Union-find root of node `a`, path-halving as it climbs."""
         while parent[a] != a:
             parent[a] = parent[parent[a]]
             a = parent[a]
@@ -101,307 +97,217 @@ def _sides_disconnected(nodes, pg_edges, dx, dy, dz, fcx, fcy, ztol):
     return find(best[1][1]) != find(best[-1][1])
 
 
-def door_footprints(verts, tris, doors, wall_hit=None, nodes=None,
-                    pg_edges=None):
-    """Per door, the base line + connecting footprint to feed the union.
+def _mesh_z_index(verts, tris, cell=128.0):
+    """Bucket triangle indices by a `cell`-sized plan grid."""
+    grid = {}
+    for ti, t in enumerate(tris):
+        xs = [verts[i][0] for i in t]
+        ys = [verts[i][1] for i in t]
+        for gx in range(int(min(xs) // cell), int(max(xs) // cell) + 1):
+            for gy in range(int(min(ys) // cell), int(max(ys) // cell) + 1):
+                grid.setdefault((gx, gy), []).append(ti)
+    return grid
 
-    Returns a list of dicts, one per door that has a reachable corridor edge:
 
-        {'base':  ((blx, bly), (brx, bry)),      # long side, on the door line
-         'poly':  [(x, y), ...],                  # footprint to union in as ground
-         'z':     storey_z}                        # height of that ground
+def _mesh_z_near(verts, tris, grid, px, py, near_z, ztol, cell=128.0):
+    """Corridor-mesh height at (px, py) nearest near_z, or None.
 
-    The footprint is the quad BL-BR-E1-E0 bridging the door base to the nearest
-    corridor edge, handed to the boolean union as an ordinary polygon so the
-    union owns its triangles, while the base line is forced to be a triangle
-    edge.  This produces the vanilla Skyrim door triangle: one big triangle whose
-    long side lies on the door line.
-
-    Conservative: a door whose nearest corridor edge is beyond
-    DOOR_BRIDGE_RADIUS is walled off from the pathgrid and yields nothing.
+    See: docs/commentary/tes5_import_navmesh.md#door-mesh-height-probe
     """
-    verts = [list(map(float, v)) for v in verts]
-    tris = [tuple(map(int, t)) for t in tris]
-    out = []
-    if not doors or not tris:
-        return out
+    best = None
+    for ti in grid.get((int(px // cell), int(py // cell)), ()):
+        a, b, c = (verts[i] for i in tris[ti])
+        d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+        if abs(d) < 1e-9:
+            continue
+        l0 = ((b[1] - c[1]) * (px - c[0]) + (c[0] - b[0]) * (py - c[1])) / d
+        l1 = ((c[1] - a[1]) * (px - c[0]) + (a[0] - c[0]) * (py - c[1])) / d
+        l2 = 1.0 - l0 - l1
+        if l0 < -0.02 or l1 < -0.02 or l2 < -0.02:
+            continue
+        z = l0 * a[2] + l1 * b[2] + l2 * c[2]
+        if abs(z - near_z) > ztol:
+            continue
+        if best is None or abs(z - near_z) < abs(best - near_z):
+            best = z
+    return best
 
-    ztol = params.DOOR_QUAD_ZTOL
-    br2 = DOOR_BRIDGE_RADIUS ** 2
 
-    # Mesh-height probe for the quad's FAR edge (see z_far in _sweep).
-    # Bucketed point-in-triangle over the raw corridor mesh.
-    _zcell = 128.0
-    _zgrid = {}
-    for _ti, _t in enumerate(tris):
-        _xs = [verts[_i][0] for _i in _t]
-        _ys = [verts[_i][1] for _i in _t]
-        for _gx in range(int(min(_xs) // _zcell), int(max(_xs) // _zcell) + 1):
-            for _gy in range(int(min(_ys) // _zcell),
-                             int(max(_ys) // _zcell) + 1):
-                _zgrid.setdefault((_gx, _gy), []).append(_ti)
-
-    def _mesh_z_near(px, py, near_z):
-        """Corridor-mesh height at (px, py) nearest near_z, or None."""
-        best = None
-        for _ti in _zgrid.get((int(px // _zcell), int(py // _zcell)), ()):
-            a, b, c = (verts[_i] for _i in tris[_ti])
-            d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
-            if abs(d) < 1e-9:
-                continue
-            l0 = ((b[1] - c[1]) * (px - c[0])
-                  + (c[0] - b[0]) * (py - c[1])) / d
-            l1 = ((c[1] - a[1]) * (px - c[0])
-                  + (a[0] - c[0]) * (py - c[1])) / d
-            l2 = 1.0 - l0 - l1
-            if l0 < -0.02 or l1 < -0.02 or l2 < -0.02:
-                continue
-            z = l0 * a[2] + l1 * b[2] + l2 * c[2]
-            if abs(z - near_z) > ztol:
-                continue
-            if best is None or abs(z - near_z) < abs(best - near_z):
-                best = z
-        return best
-
-    # Corridor edges once (this reads the RAW ribbon union, unmodified).
+def _mesh_edges(tris):
+    """Every undirected edge of the raw corridor mesh, as sorted index pairs."""
     edges = set()
     for t in tris:
         for k in range(3):
             a, b = t[k], t[(k + 1) % 3]
             edges.add((a, b) if a < b else (b, a))
+    return edges
 
-    for (dx, dy, dz, rz, _is_tp, door_w) in doors:
-        # Rank every candidate corridor edge by distance, then take the NEAREST
-        # one the door can reach WITHOUT crossing a wall.  A blocked candidate is
-        # never used — it is skipped and the search continues outward to the next
-        # one.  (Checking only candidates nearer than the current best let a
-        # near-but-blocked edge shadow a slightly farther clear one, and the door
-        # then produced no footprint at all.)
-        # Rank candidates by DISTANCE and take the nearest one the door can reach
-        # without crossing a wall, restricted to corridor on THIS door's storey.
-        # The height gate matters: without it a door bridges to whatever ribbon
-        # is nearest in plan view, which in Pinarus's house meant reaching up the
-        # staircase and laying a triangle across the floor below it.  (The gate
-        # is not what made doors fail to connect — that was the walk hitting the
-        # door's OWN panel collision; see _blocked_between.)
-        # The quad sweeps the base line along the door's FACING, so it can only
-        # ever reach a corridor edge lying in the frontal strip: within the
-        # doorway's span across the facing (plus a ribbon width of slack).  A
-        # candidate displaced mostly ALONG the threshold axis is unreachable by
-        # the sweep — accepting one laid a floating 5-triangle patch beside
-        # ImperialDungeon01's tower door, whose only corridor runs 283u to the
-        # door's SIDE (the pathgrid never approaches that door frontally).
-        w_half = 0.5 * door_w if door_w else DOOR_LINE_HALF
-        w_half = min(w_half, DOOR_LINE_HALF_MAX)
-        # Directions under the TRANSPOSE placement convention (see
-        # navmesh/world.py _rot_matrix): threshold = (sin rz, cos rz),
-        # facing = (cos rz, -sin rz).  The old CCW forms drew/swept doors
-        # mirrored for any rotation off 0/180.
-        ttx, tty = math.sin(rz), math.cos(rz)       # threshold direction
-        strip_half = w_half + params.RIBBON_HALF_WIDTH
-        cands = []
-        for (a, b) in edges:
-            va, vb = verts[a], verts[b]
-            mz = 0.5 * (va[2] + vb[2])
-            if abs(mz - dz) > ztol:
-                continue
-            mx = 0.5 * (va[0] + vb[0])
-            my = 0.5 * (va[1] + vb[1])
-            d2 = (mx - dx) ** 2 + (my - dy) ** 2
-            if d2 > br2:
-                continue
-            if abs((mx - dx) * ttx + (my - dy) * tty) > strip_half:
-                continue
-            cands.append((d2, mx, my, a, b))
-        cands.sort(key=lambda c: c[0])
 
-        # Which side the actor walks in from, decided by the PATHGRID -- the
-        # only input that asserts "an actor walks here".  Derived ribbon edges
-        # run past BOTH faces of most doorways, so nearest-edge / majority /
-        # distance-weighted votes all disagreed with the pathgrid on ~47% of
-        # doors; the nearest NODE is unambiguous.
-        want_side = 0
-        if nodes:
-            ftx, fty = math.cos(rz), -math.sin(rz)  # == fx,fy below
-            bn = None
-            for n in nodes:
-                proj = (n[0] - dx) * ftx + (n[1] - dy) * fty
-                if abs(proj) < 1.0:
-                    continue
-                d2n = (n[0] - dx) ** 2 + (n[1] - dy) ** 2
-                if bn is None or d2n < bn[0]:
-                    bn = (d2n, proj)
-            if bn is not None:
-                want_side = 1 if bn[1] > 0 else -1
+def _door_half_width(door_w):
+    """Half the base line: the measured panel width, capped, else the default."""
+    half = 0.5 * door_w if door_w else DOOR_LINE_HALF
+    return min(half, DOOR_LINE_HALF_MAX)
 
-        # Nearest CLEAR candidate on each FACE of the door.  A door has two
-        # faces 180 degrees apart; an interior door joins the walkable ground
-        # on BOTH of them (the player's prison-cell gate has pathgrid inside
-        # the cell and out in the corridor with no pathgrid edge across, so a
-        # single-sided quad left the cell interior a disconnected island an
-        # actor could never leave).  A teleport door's far side is another
-        # cell — it gets the primary side only.
-        fcx, fcy = math.cos(rz), -math.sin(rz)     # facing (transpose conv.)
-        best_by_side = {}
-        for (d2, mx, my, a, b) in cands:
-            side = 1 if (mx - dx) * fcx + (my - dy) * fcy >= 0.0 else -1
-            if side in best_by_side:
-                continue
-            if wall_hit is not None and _blocked_between(
-                    wall_hit, dx, dy, dz, mx, my):
-                continue
-            best_by_side[side] = (d2, a, b, mx, my)
-            if len(best_by_side) == 2:
-                break
-        if not best_by_side:
+
+def _door_candidates(verts, edges, dx, dy, dz, rz, w_half, ztol):
+    """Corridor edges this door could bridge to, nearest first.
+
+    Gated on storey height, DOOR_BRIDGE_RADIUS and the frontal strip.
+    See: docs/commentary/tes5_import_navmesh.md#door-candidate-edge-gating
+    """
+    ttx, tty = math.sin(rz), math.cos(rz)
+    strip_half = w_half + params.RIBBON_HALF_WIDTH
+    br2 = DOOR_BRIDGE_RADIUS ** 2
+    cands = []
+    for (a, b) in edges:
+        va, vb = verts[a], verts[b]
+        if abs(0.5 * (va[2] + vb[2]) - dz) > ztol:
             continue
+        mx = 0.5 * (va[0] + vb[0])
+        my = 0.5 * (va[1] + vb[1])
+        d2 = (mx - dx) ** 2 + (my - dy) ** 2
+        if d2 > br2:
+            continue
+        if abs((mx - dx) * ttx + (my - dy) * tty) > strip_half:
+            continue
+        cands.append((d2, mx, my, a, b))
+    cands.sort(key=lambda c: c[0])
+    return cands
 
-        # The PRIMARY side (the one that carries the base-line constraint and
-        # so the Door Triangle) is the side the pathgrid says the door serves;
-        # when that side has no clear corridor, whichever side does.
-        if want_side in best_by_side:
-            primary = want_side
-        else:
-            primary = sorted(best_by_side)[0]
-        # Each footprint sits on ITS corridor's height (see _sweep): the quad
-        # has to meet the ribbon it bridges to, and the door REFR's own z is
-        # only approximate.
-        # A door mesh's LOCAL +X points THROUGH the opening and local +Y runs
-        # ALONG the threshold: measured on impdundoor01.nif, whose panel is
-        # 5.6u thick in X and 115.3u wide in Y — a panel is thin through the
-        # doorway and wide across it.  `_door_threshold` agrees: it rotates the
-        # hinge->doorway-centre offset (which lies along local X) by the same
-        # standard matrix, so local +X == (cos rz, sin rz) is the FACING.
-        #
-        # Using the facing as the base line laid the threshold across the axis
-        # the door actually opens along — every door quad rotated 90 degrees
-        # from its real opening, visible as a sideways door line in
-        # navmesh_preview.  The base line is local +Y.
-        tx, ty = math.sin(rz), math.cos(rz)
-        # Span the REAL doorway.  Door panels run from 16u to 764u wide (median
-        # 121), measured off each model's collision panel, so the old constant
-        # 90u base line was simply the wrong size for most doors: on
-        # impdundoor01 (115u) it left the first 30u of the threshold with no
-        # mesh under it, and the Door Triangle came out a 571-unit scrap — below
-        # the smallest of 1,659 vanilla door triangles (min 992, median 9,614),
-        # too narrow for an actor to stand on.  That is what stopped the
-        # CharacterGen assassins dead at their cell door.
-        half = w_half                    # computed with the candidate gate
-        blx, bly = dx + tx * half, dy + ty * half
-        brx, bry = dx - tx * half, dy - ty * half
 
-        # The footprint is a RECTANGLE: the door base line, swept to the corridor
-        # along the door's facing.  Using the corridor edge's own two endpoints as
-        # the far side (the previous shape) made the quad's width arbitrary — when
-        # those endpoints projected close together the quad pinched to a wedge and
-        # the door ended up joined to the mesh AT A POINT, with a long thin
-        # triangle reaching off to whatever the other end was.  A rectangle
-        # guarantees instead that
-        #   * the base line BL-BR is one FULL edge (the vanilla door triangle's
-        #     long side, and the union is told to keep it via `base`), and
-        #   * the two triangles the rectangle splits into share the full diagonal,
-        #     so the second is attached along an EDGE, never at a corner.
-        # Depth = how far the corridor is, measured along the door's facing
-        # (perpendicular to the base line), so the sweep is square to the door.
-        #
-        # The nearest corridor edge is usually RIGHT AT the threshold, so this
-        # projection alone gave depths of 1-20u: a 90x1.3u sliver that cannot
-        # connect to anything and shows up as a rogue scrap.  The quad must be
-        # deep enough to actually overlap the corridor it is bridging to, so the
-        # depth is floored at DOOR_MIN_DEPTH and pushed PAST the corridor edge by
-        # DOOR_OVERLAP, guaranteeing the union merges the two.
-        # Facing = local +X = perpendicular to the base line (tx, ty).
-        # (fcx, fcy) above is the same vector; (fx, fy) keeps the historical
-        # name for the sweep math below.
-        fx, fy = ty, -tx
+def _served_side(nodes, dx, dy, rz):
+    """Which face of the door the nearest pathgrid node stands on (+1/-1/0).
 
-        # The door TRIANGLE is fixed analytically here, not discovered by the
-        # triangulation: base = the full doorway, apex on the perpendicular
-        # bisector at a depth that is a pure function of the width, on the
-        # side the pathgrid serves.  The old apex search
-        # (corridor_union._door_apex) tried BOTH normals and a ladder of
-        # shrinking depths until a candidate fit inside the walkable polygon —
-        # so a cramped near side flipped the whole triangle to the FAR side of
-        # the door (three doors in ImperialDungeon01 had their reserved
-        # triangle on the opposite side from the pathgrid), and the area
-        # varied build to build with the surrounding geometry.
-        apex_depth = max(w_half, DOOR_TRI_MIN_DEPTH)
+    See: docs/commentary/tes5_import_navmesh.md#door-side-comes-from-the-pathgrid
+    """
+    if not nodes:
+        return 0
+    ftx, fty = math.cos(rz), -math.sin(rz)
+    best = None
+    for n in nodes:
+        proj = (n[0] - dx) * ftx + (n[1] - dy) * fty
+        if abs(proj) < 1.0:
+            continue
+        d2n = (n[0] - dx) ** 2 + (n[1] - dy) ** 2
+        if best is None or d2n < best[0]:
+            best = (d2n, proj)
+    if best is None:
+        return 0
+    return 1 if best[1] > 0 else -1
 
-        def _sweep(side, entry, with_base):
-            """Footprint quad sweeping the base line toward `side`."""
-            _sd2, sea, seb, semx, semy = entry
-            s_z = 0.5 * (verts[sea][2] + verts[seb][2])
-            depth = abs((semx - dx) * fx + (semy - dy) * fy)
-            # The quad must reach past the corridor edge it bridges to
-            # (DOOR_OVERLAP) AND past the door triangle's apex, so the wedge
-            # reserved out of the union always sits on ground the quad itself
-            # contributed.
-            depth = float(side) * max(depth + DOOR_OVERLAP, DOOR_MIN_DEPTH,
-                                      apex_depth + DOOR_OVERLAP)
-            sflx, sfly = blx + fx * depth, bly + fy * depth
-            sfrx, sfry = brx + fx * depth, bry + fy * depth
-            # The quad spans EXACTLY the doorway — never wider.  Widening it
-            # past the door line pushes the footprint through the wall on
-            # either side of the frame.  The door triangle is protected by
-            # reserving it out of the triangulation; see
-            # corridor_union._triangulate.
-            apex = (dx + fx * float(side) * apex_depth,
-                    dy + fy * float(side) * apex_depth)
-            # THE QUAD IS A RAMP, NOT A SHELF.  Its depth is driven by the
-            # apex (a wide door sweeps deep), so over a staircase the far
-            # edge stands on ground well below the threshold — a flat quad
-            # at s_z then hangs 30-40u above the real treads, the level
-            # lookup answers BOTH heights, and emission bridges them with a
-            # near-vertical triangle (measured on ImperialDungeon01's
-            # 139.5u-wide prison gate at the stair head: quad 513.8 over
-            # stair mesh at 474).  The corridor mesh knows the real height
-            # under the far edge; carry it so the strip can slope to meet it.
-            z_far = _mesh_z_near(0.5 * (sflx + sfrx), 0.5 * (sfly + sfry),
-                                 s_z)
-            return {'base': ((blx, bly), (brx, bry)) if with_base else None,
-                    'apex': apex if with_base else None,
-                    'poly': [(blx, bly), (brx, bry), (sfrx, sfry),
-                             (sflx, sfly)],
-                    'z': s_z,
-                    'z_far': z_far if z_far is not None else s_z}
 
-        # PRIMARY quad: sweeps toward the side the PATHGRID says the door
-        # serves (nearest node — derived ribbon edges run past BOTH faces of
-        # most doorways, so nearest-edge/majority votes disagreed with the
-        # pathgrid on 14 of 30 doors; keying on the node cut that to 2), and
-        # carries the base-line constraint that becomes the Door Triangle.
-        out.append(_sweep(primary, best_by_side[primary], True))
+def _clear_by_side(cands, wall_hit, dx, dy, dz, fcx, fcy):
+    """Nearest UNBLOCKED candidate on each face, as {side: (d2, a, b, mx, my)}.
 
-        # FAR-SIDE quad: bridges a doorway whose two faces have walkable
-        # ground but NO pathgrid route between them (see _sides_disconnected)
-        # — the prison-cell gates, whose interiors were unreachable islands.
-        # No base constraint: one Door Triangle per door, on the primary side.
-        other = -primary
-        if (not _is_tp and other in best_by_side
-                and _sides_disconnected(nodes, pg_edges, dx, dy, dz,
-                                        fcx, fcy, ztol)):
-            out.append(_sweep(other, best_by_side[other], False))
+    A blocked candidate is skipped and the search continues outward.
+    See: docs/commentary/tes5_import_navmesh.md#door-candidate-edge-gating
+    """
+    best_by_side = {}
+    for (d2, mx, my, a, b) in cands:
+        side = 1 if (mx - dx) * fcx + (my - dy) * fcy >= 0.0 else -1
+        if side in best_by_side:
+            continue
+        if wall_hit is not None and _blocked_between(
+                wall_hit, dx, dy, dz, mx, my):
+            continue
+        best_by_side[side] = (d2, a, b, mx, my)
+        if len(best_by_side) == 2:
+            break
+    return best_by_side
+
+
+def _sweep_quad(ctx, side, entry, with_base):
+    """The footprint quad sweeping the base line toward `side`.
+
+    See: docs/commentary/tes5_import_navmesh.md#door-footprint-is-a-rectangle
+    """
+    blx, bly, brx, bry = ctx['base']
+    dx, dy, fx, fy = ctx['dx'], ctx['dy'], ctx['fx'], ctx['fy']
+    _sd2, sea, seb, semx, semy = entry
+    verts = ctx['verts']
+    s_z = 0.5 * (verts[sea][2] + verts[seb][2])
+    depth = abs((semx - dx) * fx + (semy - dy) * fy)
+    depth = float(side) * max(depth + DOOR_OVERLAP, DOOR_MIN_DEPTH,
+                              ctx['apex_depth'] + DOOR_OVERLAP)
+    sflx, sfly = blx + fx * depth, bly + fy * depth
+    sfrx, sfry = brx + fx * depth, bry + fy * depth
+    apex = (dx + fx * float(side) * ctx['apex_depth'],
+            dy + fy * float(side) * ctx['apex_depth'])
+    z_far = _mesh_z_near(verts, ctx['tris'], ctx['zgrid'],
+                         0.5 * (sflx + sfrx), 0.5 * (sfly + sfry),
+                         s_z, ctx['ztol'])
+    return {'base': ((blx, bly), (brx, bry)) if with_base else None,
+            'apex': apex if with_base else None,
+            'poly': [(blx, bly), (brx, bry), (sfrx, sfry), (sflx, sfly)],
+            'z': s_z,
+            'z_far': z_far if z_far is not None else s_z}
+
+
+def _door_quads(door, verts, tris, zgrid, edges, wall_hit, nodes, pg_edges,
+                ztol):
+    """Every footprint quad for one door: the primary, plus a far side if owed.
+
+    See: docs/commentary/tes5_import_navmesh.md#door-base-line-is-local-y
+    """
+    dx, dy, dz, rz, is_tp, door_w = door
+    w_half = _door_half_width(door_w)
+    fcx, fcy = math.cos(rz), -math.sin(rz)
+    cands = _door_candidates(verts, edges, dx, dy, dz, rz, w_half, ztol)
+    best_by_side = _clear_by_side(cands, wall_hit, dx, dy, dz, fcx, fcy)
+    if not best_by_side:
+        return []
+    want_side = _served_side(nodes, dx, dy, rz)
+    primary = want_side if want_side in best_by_side else sorted(best_by_side)[0]
+
+    tx, ty = math.sin(rz), math.cos(rz)
+    ctx = {'verts': verts, 'tris': tris, 'zgrid': zgrid, 'ztol': ztol,
+           'dx': dx, 'dy': dy, 'fx': ty, 'fy': -tx,
+           'apex_depth': max(w_half, DOOR_TRI_MIN_DEPTH),
+           'base': (dx + tx * w_half, dy + ty * w_half,
+                    dx - tx * w_half, dy - ty * w_half)}
+
+    out = [_sweep_quad(ctx, primary, best_by_side[primary], True)]
+    other = -primary
+    if (not is_tp and other in best_by_side
+            and _sides_disconnected(nodes, pg_edges, dx, dy, dz,
+                                    fcx, fcy, ztol)):
+        out.append(_sweep_quad(ctx, other, best_by_side[other], False))
+    return out
+
+
+def door_footprints(verts, tris, doors, wall_hit=None, nodes=None,
+                    pg_edges=None):
+    """Per door, the base line + connecting footprint to feed the union.
+
+    One dict per door with a reachable corridor edge: `base` is the long side
+    lying on the door line, `poly` the footprint to union in as ground, `z` its
+    height.  A door whose nearest corridor edge is beyond DOOR_BRIDGE_RADIUS is
+    walled off from the pathgrid and yields nothing.
+    See: docs/commentary/tes5_import_navmesh.md#door-footprints
+    """
+    verts = [list(map(float, v)) for v in verts]
+    tris = [tuple(map(int, t)) for t in tris]
+    if not doors or not tris:
+        return []
+    zgrid = _mesh_z_index(verts, tris)
+    edges = _mesh_edges(tris)
+    out = []
+    for door in doors:
+        out += _door_quads(door, verts, tris, zgrid, edges, wall_hit,
+                           nodes, pg_edges, params.DOOR_QUAD_ZTOL)
     return out
 
 
 def _d(a, b):
+    """Plan-view distance between two points."""
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
 def _blocked_between(wall_hit, x0, y0, z0, x1, y1):
     """True if blocking collision stands between the door and a corridor edge.
 
-    Walks the bridge in RIBBON_GROW_STEP steps with the same thin actor slab the
-    width-grow uses, starting just above the door's own floor so the threshold
-    lip and the floor itself are not read as a wall.
-
-    THE DOOR'S OWN COLLISION IS SKIPPED.  A door REFR is a placed mesh standing
-    exactly on the threshold, so a walk that begins at the door position hits the
-    door panel on its very first step and every candidate looks blocked — which
-    left doors with wide open floor in front of them unconnected.  The walk
-    therefore starts DOOR_SELF_CLEARANCE away from the door and stops the same
-    distance short of the corridor edge; only genuine geometry BETWEEN them can
-    reject the bridge.
+    Both ends are skipped by DOOR_SELF_CLEARANCE, the door's own panel included.
+    See: docs/commentary/tes5_import_navmesh.md#door-own-collision-is-skipped
     """
     dx, dy = x1 - x0, y1 - y0
     dist = math.hypot(dx, dy)

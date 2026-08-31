@@ -94,3 +94,6 @@ Minor Issues:
 	21 - FaceGen: Oblivion.exe statically links the FaceGen SDK (matrixVT.hpp, BSFaceGenModelMap, EGM/EGT basis load+apply). Use it like the SpeedTree engine harness to turn FGGS/FGGA coefficients into real vertex deltas
 
 	22 - OblivionBloodFountain01: geyser (SpecialIdle) never plays as the default state
+
+	23 - safe_run.py must REVERT a rule-breaking write, not just report it. Snapshot the bytes of every first-party .py before running, gate the changed set with --gate-file after, then restore (or delete, if newly created) only the files that broke a rule - clean files the same command wrote stay. Exit 2 naming each restored path, and say the write did NOT stand, because the child has already printed its own success. Same contract Edit/Write already gets from gate_pre; the Bash path reports instead of blocking, which is how union_mesh.py landed with 26 violations.
+		Add local imports prevention rule

@@ -41,11 +41,14 @@ from ._native_loader import load_native
 _native = load_native('_navgrow_native')
 
 
+# ---------------------------------------------------------------------------
+# Batched native march
+# ---------------------------------------------------------------------------
+
 def _native_params():
     """The tunables the native march needs, mirrored from params.py.
 
-    Passed per call rather than compiled in, so the C++ and the Python can
-    never drift apart when a constant is retuned.
+    See: docs/commentary/tes5_import_navmesh.md#grow-is-batched-into-one-native-call
     """
     return {
         'step': float(params.RIBBON_GROW_STEP),
@@ -66,16 +69,10 @@ def _native_params():
 def grow_batch(blocking, walkable, nodes, edges, node_z, stations):
     """Grown half-width for every march station, in ONE native call.
 
-    THE REASON THIS IS BATCHED: the march is ~890k wall-slab probes for a
-    single dense interior cell (Wendir02, 938 edges), each of which tests ~140
-    candidate triangles.  At ~170us per probe in Python that is ~150s for one
-    cell -- the dominant cost of the whole navmesh pipeline.  Crossing the
-    Python/C boundary once per CELL instead of once per probe is what makes it
-    tractable; a native wall_hit alone would still pay 890k crossings.
-
     stations: (N, 9) float64 -- cx, cy, cz, dirx, diry, tanx, tany, lo,
     edge_index.  edge_index selects the endpoint pair excluded from the
     neighbour query (-1 for none).  Returns an (N,) float64 array.
+    See: docs/commentary/tes5_import_navmesh.md#grow-is-batched-into-one-native-call
     """
     if not len(stations):
         return np.zeros(0, dtype=np.float64)
@@ -100,17 +97,14 @@ def grow_batch(blocking, walkable, nodes, edges, node_z, stations):
 class _TriGrid:
     """Coarse XY bucket index over a triangle soup, with a 3x3-bucket query.
 
-    The single-bucket lookups elsewhere miss a triangle whenever the query point
-    sits near a bucket boundary — which for a wall test means growth walks
-    straight through the wall.  This queries the point's bucket AND its eight
-    neighbours, so a triangle within one bucket (>= the probe extent) is never
-    missed.
+    See: docs/commentary/tes5_import_navmesh.md#trigrid-queries-nine-buckets
     """
 
     __slots__ = ('B', 'cell', 'minx', 'miny', 'grid',
                  'x0', 'x1', 'y0', 'y1', 'z0', 'z1')
 
     def __init__(self, tris, cell=128.0):
+        """Bucket every triangle by the plan cells its bbox spans."""
         self.B = np.asarray(tris, dtype=float).reshape(-1, 3, 3)
         self.cell = cell
         self.grid = {}
@@ -136,6 +130,7 @@ class _TriGrid:
                     self.grid.setdefault((gx, gy), []).append(i)
 
     def candidates(self, x, y):
+        """Triangle indices in the bucket at (x, y) and its eight neighbours."""
         if not self.grid:
             return ()
         gx = int((x - self.minx) // self.cell)
@@ -162,6 +157,7 @@ def walkable_sampler(walkable):
     B = tg.B
 
     def sample(x, y, near_z):
+        """Interpolated walkable Z at (x, y) closest to near_z, or None."""
         best = None
         for i in tg.candidates(x, y):
             a, b, c = B[i]
@@ -188,12 +184,7 @@ def walkable_sampler(walkable):
 def _tri_hits_slab(tri, cx, cy, ux, uy, half_w, tx, ty, depth, z_lo, z_hi):
     """True if triangle `tri` intersects the thin oriented slab.
 
-    The slab is an oriented box centred at (cx, cy): extent `half_w` along the
-    edge-tangent (tx, ty) (~actor width), `depth` along the march direction
-    (ux, uy) (thin), full Z span [z_lo, z_hi].  We test in the slab's own 2D
-    frame (tangent = X', march = Y') by projecting the triangle's vertices and
-    doing a cheap separating-axis check of the triangle vs the axis-aligned
-    rectangle [-half_w, half_w] x [-depth, depth], gated by Z overlap.
+    See: docs/commentary/tes5_import_navmesh.md#slab-test-is-a-2d-sat
     """
     # Z gate first (cheap): the triangle must reach into the column.
     tzs = (tri[0][2], tri[1][2], tri[2][2])
@@ -230,16 +221,15 @@ def wall_slab_sampler(blocking):
     """Return f(cx, cy, ux, uy, tx, ty, z_lo, z_hi, depth=None) -> True if a wall
     stands in the actor slab there.  (ux,uy)=march dir, (tx,ty)=edge tangent.
 
-    `depth` is the half-extent along the march direction.  Callers marching in
-    steps pass HALF THE STEP (plus the sliver) and centre the slab on the step's
-    midpoint, so consecutive probes sweep a continuous corridor and no wall can
-    fall between two samples.
+    `depth` is the half-extent along the march direction.
+    See: docs/commentary/tes5_import_navmesh.md#wall-probe-sweeps-the-interval
     """
     tg = _TriGrid(blocking)
     B = tg.B
     half_w = params.RIBBON_GROW_SLAB_HALF_WIDTH
 
     def hit(cx, cy, ux, uy, tx, ty, z_lo, z_hi, depth=None):
+        """True if any blocking triangle reaches into the slab."""
         if depth is None:
             depth = params.RIBBON_GROW_SLAB_DEPTH
         for i in tg.candidates(cx, cy):
@@ -260,12 +250,11 @@ def wall_slab_sampler(blocking):
 class NeighbourField:
     """Nearest perpendicular distance to a roughly-parallel OTHER pathgrid edge.
 
-    Only edges whose direction is within RIBBON_GROW_PARALLEL_DOT of THIS edge's
-    direction count: a crossing or diverging edge is not an opposing corridor
-    wall and must not cap this one's width (that pinched dense junctions).
+    See: docs/commentary/tes5_import_navmesh.md#only-parallel-edges-cap-a-width
     """
 
     def __init__(self, nodes, edges, node_z):
+        """Index every pathgrid edge into a padded plan-cell grid."""
         self.segs = []          # (ax, ay, bx, by, dirx, diry, i, j, midz)
         for (i, j) in edges:
             if i >= len(nodes) or j >= len(nodes) or i == j:
@@ -297,6 +286,7 @@ class NeighbourField:
                     self.grid.setdefault((gx, gy), []).append(si)
 
     def nearest(self, x, y, z, exclude_nodes, dirx, diry):
+        """Distance to the closest parallel edge at this height, else inf."""
         if not self.segs:
             return math.inf
         gx = int((x - self.minx) // self.cell)
@@ -317,6 +307,7 @@ class NeighbourField:
 
 
 def _seg_dist(px, py, ax, ay, bx, by):
+    """Plan distance from a point to the segment AB."""
     dx, dy = bx - ax, by - ay
     d2 = dx * dx + dy * dy
     if d2 < 1e-9:
@@ -333,23 +324,61 @@ def grow_node_disc(cx, cy, floor_z, exclude_nodes, wall_hit, walk_sample,
                    field, lo):
     """Radial fan around a pathgrid NODE -> a closed polygon (list of (x, y)).
 
-    Ribbons grow only PERPENDICULAR to their own edge, so where two edges meet
-    at an angle the outer corner is a notch no ribbon reaches — a right-angle
-    junction leaves a square bite out of the mesh.  Growing the node itself
-    radially fills exactly that corner: march outward on RIBBON_GROW_DISC_RAYS
-    evenly-spaced bearings under the same stop rules as a rail, and close the
-    ray ends into a polygon.  It joins the union like any other strip.
+    Each ray's slab width axis is the perpendicular to that ray.
+    See: docs/commentary/tes5_import_navmesh.md#node-discs-fill-junction-notches
     """
     n = params.RIBBON_GROW_DISC_RAYS
     pts = []
     for k in range(n):
         ang = 2.0 * math.pi * k / n
         dx, dy = math.cos(ang), math.sin(ang)
-        # tangent for the slab's width axis is perpendicular to the ray
         d = grow_half_width(cx, cy, floor_z, dx, dy, -dy, dx, exclude_nodes,
                             wall_hit, walk_sample, field, lo)
         pts.append((cx + dx * d, cy + dy * d))
     return pts
+
+
+def _wall_in_interval(wall_hit, cx, cy, dirx, diry, tanx, tany, z_lo, z_hi,
+                      prev, d):
+    """True if a wall stands anywhere in the swept interval (prev, d].
+
+    See: docs/commentary/tes5_import_navmesh.md#wall-probe-sweeps-the-interval
+    """
+    mid = 0.5 * (prev + d)
+    sweep = 0.5 * (d - prev) + params.RIBBON_GROW_SLAB_DEPTH
+    return wall_hit(cx + dirx * mid, cy + diry * mid, dirx, diry,
+                    tanx, tany, z_lo, z_hi, sweep)
+
+
+def _bisect_wall(wall_hit, cx, cy, dirx, diry, tanx, tany, z_lo, z_hi,
+                 prev, d):
+    """Distance at which the ribbon meets the wall known to lie in (prev, d].
+
+    See: docs/commentary/tes5_import_navmesh.md#wall-probe-sweeps-the-interval
+    """
+    lo_d, hi_d = prev, d
+    for _ in range(params.RIBBON_GROW_BISECT):
+        md = 0.5 * (lo_d + hi_d)
+        mm = 0.5 * (lo_d + md)
+        if wall_hit(cx + dirx * mm, cy + diry * mm, dirx, diry,
+                    tanx, tany, z_lo, z_hi,
+                    0.5 * (md - lo_d) + params.RIBBON_GROW_SLAB_DEPTH):
+            hi_d = md
+        else:
+            lo_d = md
+    return lo_d
+
+
+def _floor_departs(walk_sample, cx, cy, dirx, diry, floor_z, d, lo):
+    """True if the walkable floor has left the centreline plane by distance d.
+
+    Binds only BEYOND the soft floor `lo`.
+    See: docs/commentary/tes5_import_navmesh.md#soft-floor-never-beats-a-wall
+    """
+    if walk_sample is None or d <= lo:
+        return False
+    s = walk_sample(cx + dirx * d, cy + diry * d, floor_z)
+    return s is None or abs(s - floor_z) > params.MAX_CLIMB
 
 
 def grow_half_width(cx, cy, floor_z, dirx, diry, tanx, tany, exclude_nodes,
@@ -358,8 +387,9 @@ def grow_half_width(cx, cy, floor_z, dirx, diry, tanx, tany, exclude_nodes,
     (dirx,diry).  (tanx,tany) is the edge tangent (slab width axis).
 
     Stops at the first of: wall slab, walkable-floor departure (> MAX_CLIMB or
-    no walkable there), neighbour midpoint, or the cap.  Never returns less than
-    `lo` (the caller's per-station floor).
+    no walkable there), neighbour midpoint, or the cap.  `lo` is the caller's
+    SOFT per-station floor, which a wall overrides.
+    See: docs/commentary/tes5_import_navmesh.md#soft-floor-never-beats-a-wall
     """
     step = params.RIBBON_GROW_STEP
     cap = params.RIBBON_GROW_MAX_HALF
@@ -373,53 +403,17 @@ def grow_half_width(cx, cy, floor_z, dirx, diry, tanx, tany, exclude_nodes,
     z_lo = floor_z + params.RIBBON_GROW_SLAB_Z_BOTTOM
     z_hi = floor_z + params.AGENT_HEIGHT
 
-    # `lo` is the caller's SOFT minimum (it keeps junctions overlapping).  A WALL
-    # always overrides it: forcing the ribbon out to a connectivity floor drove
-    # mesh straight through walls near every junction — the same defect the
-    # Phase-1 unconditional width has.  So march the soft floor too, from zero,
-    # and let the wall test cut it short.
     grown = 0.0
     d = 0.0
     while d < hard:
-        nd_step = min(step, hard - d)
         prev = d
-        d += nd_step
-        # (a) WALL — test the SWEPT interval [prev, d], not the end point.  A
-        # point probe with a thin slab steps straight OVER a wall whenever the
-        # wall falls between two samples (measured: a 2u-deep slab on an 8u step
-        # missed a wall by 2u on both sides and produced 124 through-wall
-        # triangles in the Fighters Guild).  Centring the slab on the interval
-        # midpoint with half the interval as depth (plus the slab's own sliver)
-        # makes the sweep continuous, so a wall can never be skipped.
-        mid = 0.5 * (prev + d)
-        px = cx + dirx * mid
-        py = cy + diry * mid
-        sweep = 0.5 * nd_step + params.RIBBON_GROW_SLAB_DEPTH
-        if wall_hit(px, py, dirx, diry, tanx, tany, z_lo, z_hi, sweep):
-            # The wall is somewhere in (prev, d].  Bisect so the ribbon ends AT
-            # the wall rather than up to a whole step short of it — the mesh is
-            # supposed to hug collision (a step-short stop is what narrowed
-            # doorways).
-            lo_d, hi_d = prev, d
-            for _ in range(params.RIBBON_GROW_BISECT):
-                md = 0.5 * (lo_d + hi_d)
-                mm = 0.5 * (lo_d + md)
-                if wall_hit(cx + dirx * mm, cy + diry * mm, dirx, diry,
-                            tanx, tany, z_lo, z_hi,
-                            0.5 * (md - lo_d) + params.RIBBON_GROW_SLAB_DEPTH):
-                    hi_d = md
-                else:
-                    lo_d = md
-            grown = max(grown, lo_d)
+        d += min(step, hard - d)
+        if _wall_in_interval(wall_hit, cx, cy, dirx, diry, tanx, tany,
+                             z_lo, z_hi, prev, d):
+            grown = max(grown, _bisect_wall(
+                wall_hit, cx, cy, dirx, diry, tanx, tany, z_lo, z_hi, prev, d))
             break
-        # (b) walkable floor edge: the floor must stay near the centerline plane.
-        # Only binds BEYOND the soft floor `lo` — inside it the pathgrid's own
-        # assertion wins (a node sitting at a threshold or a ledge lip would
-        # otherwise collapse its corridor to nothing), and no wall was found
-        # there, so nothing can be on the far side of anything.
-        if walk_sample is not None and d > lo:
-            s = walk_sample(cx + dirx * d, cy + diry * d, floor_z)
-            if s is None or abs(s - floor_z) > params.MAX_CLIMB:
-                break
+        if _floor_departs(walk_sample, cx, cy, dirx, diry, floor_z, d, lo):
+            break
         grown = d
     return grown

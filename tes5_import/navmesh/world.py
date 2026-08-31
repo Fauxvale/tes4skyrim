@@ -55,13 +55,8 @@ def _finite_placement(pos, scale):
 def _rot_matrix(rx, ry, rz):
     """REFR placement rotation matrix (local mesh coords -> cell coords).
 
-    Oblivion/Skyrim store a REFR's rotation and the engine applies its INVERSE
-    when placing the mesh, so the placement matrix is the TRANSPOSE of the naive
-    Rz@Ry@Rx product.  Verified on Anvil Fighters Guild: the floor shell has
-    RotZ = -90 deg, and only the transpose lands its footprint (x -852..584,
-    y -822..431) under the cell's pathgrid (x -769..511, y -742..357) — 52/52
-    nodes inside, vs 34/52 with the non-transposed matrix (a ~180 deg error that
-    put the room mesh backwards relative to the furniture).
+    The transpose of the Rz@Ry@Rx product, never the product itself.
+    See: docs/commentary/tes5_import_navmesh.md#refr-placement-is-the-transpose
     """
     cx, sx = math.cos(rx), math.sin(rx)
     cy, sy = math.cos(ry), math.sin(ry)
@@ -94,20 +89,8 @@ def _place(flat, rot, scale, pos):
 def decode_vhgt(vhgt_hex):
     """Decode LAND VHGT into a 33x33 grid of absolute Z (game units).
 
-    Layout: float offset, then a 33x33 grid of SIGNED int8 gradients.  The first
-    column of each row is a delta from the previous row's first column; within a
-    row, each column is a delta from the previous column.
-
-    BOTH the offset and the accumulated deltas are in VHGT units and BOTH scale
-    by _VHGT_UNIT (=8) to reach game units.
-
-    The old converter did `offset / 8` going in and `* 8` coming out, which
-    cancels for the deltas but silently ANNIHILATES the offset's contribution —
-    so every exterior cell's terrain came out at the wrong absolute height.  For
-    Tamriel (47,6) that put the terrain at z=829..3213 while the cell's own
-    pathgrid and REFRs sat at z=18288..19776, a ~16,700u error.  Verified: with
-    the offset scaled correctly the terrain lands at 17608..19992, i.e. under
-    the objects standing on it.
+    BOTH the offset and the accumulated deltas scale by _VHGT_UNIT.
+    See: docs/commentary/tes5_import_navmesh.md#vhgt-offset-scales-too
     """
     try:
         data = bytes.fromhex(vhgt_hex)
@@ -164,112 +147,117 @@ def _split_by_slope(tris):
     return tris[walk], tris[ok & ~walk]
 
 
-def gather_cell_geometry(refr_recs, base_model_by_fid, get_collision,
-                         land_rec=None, origin_x=0.0, origin_y=0.0,
-                         split_land=False, skip_bases=None):
-    """Return (walkable, blocking) float64 (N,3,3) world-space triangle arrays.
+def _placed_soup(refr, base_model_by_fid, get_collision):
+    """Return (walkable, blocking) placed arrays for one REFR, or (None, None).
 
-    get_collision is the cache accessor (injected so workers can bind their own
-    module-global cache without this module importing asset_convert).
-
-    split_land=True returns (walkable, blocking, land_walkable) instead, keeping
-    the LAND terrain separate so the caller can send it down the vectorized
-    grid-rasterizer path (it is a regular grid of large triangles, and the
-    generic scalar rasterizer spends most of an exterior cell's build time on it).
-
-    skip_bases: low-24 base FormIDs whose refs contribute no BLOCKING
-    collision — DOOR panels.  A door is a thing an actor OPENS, never a wall:
-    vanilla navmesh runs under every door, and treating the panel as blocking
-    walls off the corridor wherever the panel happens to be parked (measured
-    on Pinarus's upstairs ANIMATED door, whose at-rest panel sits 47u from
-    its threshold ACROSS the passage — the ribbon pinched to nothing and the
-    doorway was unwalkable).  Their WALKABLE faces are kept: a trapdoor or
-    platform door IS the floor the pathgrid walks on (measured on
-    ImperialDungeon01 nodes 243-248, whose whole junction stands on a flat
-    door piece — excluding it wholesale deleted the floor).
+    Either element is None when that class is absent or the ref is unusable.
+    See: docs/commentary/tes5_import_navmesh.md#wild-placements-are-dropped
     """
-    walk_parts = []
-    block_parts = []
-    door_walk_parts = []
-    skip_bases = skip_bases or ()
+    name = refr.get('NAME')
+    if not name:
+        return None, None
+    try:
+        base_low = int(name, 16) & 0x00FFFFFF
+    except ValueError:
+        return None, None
+    key = base_model_by_fid.get(base_low)
+    soup = get_collision(key) if key else None
+    if not soup:
+        return None, None
+    scale = get_float(refr, 'XSCL.Scale', 1.0) or 1.0
+    pos = np.array([get_float(refr, 'PosX'),
+                    get_float(refr, 'PosY'),
+                    get_float(refr, 'PosZ')], dtype=np.float64)
+    if not _finite_placement(pos, scale):
+        return None, None
+    rot = _rot_matrix(get_float(refr, 'RotX'),
+                      get_float(refr, 'RotY'),
+                      get_float(refr, 'RotZ'))
+    if not np.all(np.isfinite(rot)):
+        return None, None
+    return (_place(soup.get('w'), rot, scale, pos),
+            _place(soup.get('b'), rot, scale, pos))
 
+
+def _sort_refr_parts(refr_recs, base_model_by_fid, get_collision, skip_bases):
+    """Return (walk_parts, block_parts, door_walk_parts) for a cell's REFRs.
+
+    A door's faces go to door_walk_parts whatever their cached class.
+    See: docs/commentary/tes5_import_navmesh.md#door-panels-are-never-blocking
+    """
+    walk_parts, block_parts, door_walk_parts = [], [], []
     for refr in refr_recs or []:
         name = refr.get('NAME')
-        if not name:
-            continue
         try:
-            base_low = int(name, 16) & 0x00FFFFFF
+            base_low = int(name, 16) & 0x00FFFFFF if name else None
         except ValueError:
+            base_low = None
+        w, b = _placed_soup(refr, base_model_by_fid, get_collision)
+        if w is None and b is None:
             continue
-        is_door = base_low in skip_bases
-        key = base_model_by_fid.get(base_low)
-        if not key:
-            continue
-        soup = get_collision(key)
-        if not soup:
-            continue
-
-        scale = get_float(refr, 'XSCL.Scale', 1.0) or 1.0
-        pos = np.array([get_float(refr, 'PosX'),
-                        get_float(refr, 'PosY'),
-                        get_float(refr, 'PosZ')], dtype=np.float64)
-        # Garbage/uninitialised placements are dropped before they reach the
-        # native index -- see _MAX_PLACEMENT.
-        if not _finite_placement(pos, scale):
-            continue
-        rot = _rot_matrix(get_float(refr, 'RotX'),
-                          get_float(refr, 'RotY'),
-                          get_float(refr, 'RotZ'))
-        if not np.all(np.isfinite(rot)):
-            continue
-
-        w = _place(soup.get('w'), rot, scale, pos)
-        b = _place(soup.get('b'), rot, scale, pos)
-        if is_door:
-            # A door contributes its placed FLAT faces only (a platform/
-            # trapdoor door IS floor, whatever the cache's local-space class
-            # says — gates are authored upright and laid flat by rotation),
-            # and never anything steep: the panel is opened, not walked
-            # around.  The slope re-split below does the classification.
-            for part in (w, b):
-                if part is not None and len(part):
-                    door_walk_parts.append(part)
+        if base_low in skip_bases:
+            door_walk_parts += [p for p in (w, b) if p is not None and len(p)]
             continue
         if w is not None and len(w):
             walk_parts.append(w)
         if b is not None and len(b):
             block_parts.append(b)
+    return walk_parts, block_parts, door_walk_parts
 
-    # Exterior terrain.  Rotating a static can turn a floor triangle into a wall
-    # (and vice versa), so re-derive the split from the placed normals rather
-    # than trusting the cache's local-space classification.
+
+def _resplit_placed(walk_parts, block_parts, door_walk_parts):
+    """Reclassify placed REFR faces by their PLACED slope; return walk_parts.
+
+    Steep door faces are discarded rather than demoted to blocking.
+    See: docs/commentary/tes5_import_navmesh.md#placements-are-slope-resplit
+    """
     if walk_parts:
-        placed = np.concatenate(walk_parts, axis=0)
-        rw, rb = _split_by_slope(placed)
+        rw, rb = _split_by_slope(np.concatenate(walk_parts, axis=0))
         walk_parts = [rw] if rw is not None and len(rw) else []
         if rb is not None and len(rb):
             block_parts.append(rb)
-    # Door walkable faces: keep the floor-like pieces, DISCARD the steep ones
-    # rather than demoting them to blocking (a vertical panel's edge sliver
-    # would wall the doorway right back up).
     if door_walk_parts:
-        placed = np.concatenate(door_walk_parts, axis=0)
-        rw, _rb = _split_by_slope(placed)
+        rw, _rb = _split_by_slope(np.concatenate(door_walk_parts, axis=0))
         if rw is not None and len(rw):
             walk_parts.append(rw)
+    return walk_parts
+
+
+def _terrain_parts(land_rec, origin_x, origin_y, block_parts):
+    """Return the LAND record's walkable terrain, appending its steep faces."""
+    if land_rec is None:
+        return None
+    lt = _land_tris(land_rec, origin_x, origin_y)
+    if lt is None or not len(lt):
+        return None
+    lw, lb = _split_by_slope(lt)
+    if lb is not None and len(lb):
+        block_parts.append(lb)
+    return lw if lw is not None and len(lw) else None
+
+
+def gather_cell_geometry(refr_recs, base_model_by_fid, get_collision,
+                         land_rec=None, origin_x=0.0, origin_y=0.0,
+                         split_land=False, skip_bases=None):
+    """Return (walkable, blocking) float64 (N,3,3) world-space triangle arrays.
+
+    `get_collision` is the cache accessor, injected so workers can bind their
+    own module-global cache without this module importing asset_convert.
+    `skip_bases` holds low-24 base FormIDs contributing no blocking collision.
+    `split_land=True` returns (walkable, blocking, land_walkable) instead.
+    See: docs/commentary/tes5_import_navmesh.md#land-split-for-the-grid-rasterizer
+    """
+    walk_parts, block_parts, door_walk_parts = _sort_refr_parts(
+        refr_recs, base_model_by_fid, get_collision, skip_bases or ())
+    walk_parts = _resplit_placed(walk_parts, block_parts, door_walk_parts)
 
     land_walk = np.zeros((0, 3, 3))
-    if land_rec is not None:
-        lt = _land_tris(land_rec, origin_x, origin_y)
-        if lt is not None and len(lt):
-            lw, lb = _split_by_slope(lt)
-            if lb is not None and len(lb):
-                block_parts.append(lb)
-            if lw is not None and len(lw):
-                if split_land:
-                    land_walk = lw
-                else:
-                    walk_parts.append(lw)
+    lw = _terrain_parts(land_rec, origin_x, origin_y, block_parts)
+    if lw is not None:
+        if split_land:
+            land_walk = lw
+        else:
+            walk_parts.append(lw)
 
     walkable = (np.concatenate(walk_parts, axis=0) if walk_parts
                 else np.zeros((0, 3, 3)))

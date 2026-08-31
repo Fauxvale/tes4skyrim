@@ -86,12 +86,12 @@ caching, skipped record types, the export text format, and the directory layout.
      `python_tools.md` in the same pass**, before you report back. An
      undocumented tool is one the next session will rebuild from scratch.
 - <a id="one-off-goes-in-temp"></a>**A SCRIPT THAT CHASES ONE BUG GOES IN
-  `temp/`, NOT `tools/`.** A tool re-answers its question on NEW input; if
+  `temp/` or your scratchpad, NOT `tools/`.** A tool re-answers its question on NEW input; if
   nothing new would change its output, it is a one-off. A/B and bisect
   harnesses, censuses whose answer ships as a constant, and anything naming one
   plugin/mesh/creature in code are one-offs — finding to `docs/`, script to
   `temp/`. A good docstring does not make one reusable.
-- Put throwaway files in `temp/`. Don't write one-off scripts with hardcoded
+- Put throwaway files in `temp/` or your scratchpad. Don't write one-off scripts with hardcoded
   output — `tools/` scripts take arguments and produce general output, so they are
   reusable next time.
 - **Always record new learnings** in this file or, more likely, the relevant `docs/` file.

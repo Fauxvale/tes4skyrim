@@ -159,122 +159,12 @@ from .union_geom import (
 DOOR_CLAIM_MIN_FRAC = 0.5
 
 
-def build_union_mesh(strips, extra_strips=None, door_edges=None,
-                     cell_bounds=None, wall_cut=None, probe_only=False):
-    """Union the corridor ribbons per storey and retriangulate.
+def _node_geometry(strips):
+    """(node_pts, node_half): each pathgrid node's XY and widest ribbon half.
 
-    Returns (verts, tris) with 3D vertices.  Coverage is the exact union of the
-    ribbons and the triangles do not overlap — both by construction.
-
-    extra_strips: door FOOTPRINT strips (from corridor_doors.door_footprints via
-    _poly_strip) that join the union as ordinary ground — the flat connection
-    quad from each door base to the nearest corridor edge.  Their COVERAGE is
-    preserved exactly; the union resolves any overlap with the corridor.
-
-    door_edges: [((x0,y0), (x1,y1)), ...] the door BASE lines.  Each is forced
-    to appear as a triangle edge in the retriangulation, so every door gets one
-    large triangle with its long side on the door line — the vanilla Skyrim door
-    triangle — instead of whatever the generic mesh happens to lay there.
-
-    cell_bounds: (minx, miny, maxx, maxy) — when given (exterior cells), the
-    unioned coverage is CLIPPED to this rectangle before triangulation, so a
-    cross-seam ribbon (built from a PGRI InterCell link that reaches into the
-    neighbour cell) stops exactly on the boundary plane.  That leaves a border
-    edge on the seam for build_edge_links to stitch, while each mesh stays
-    strictly within its own cell.
+    See: docs/commentary/tes5_import_navmesh.md#shared-node-points-are-seeded
     """
-    from shapely.geometry import Polygon, box
-    from shapely.ops import unary_union
-
-    # Bound the ribbon-polygon memo to one build: a worker converts thousands of
-    # cells in a row and the cache pins a Polygon (and the strip) per entry.
-    _ribbon_cache_clear()
-
-    if not strips:
-        return [], []
-
-    # Door footprints participate as ordinary geometry: they contribute their
-    # polygon to the union AND their (flat) height to the level lookup, so a
-    # vertex standing on door-only ground still knows how high it is.
-    strips = list(strips) + list(extra_strips or ())
-
-    verts = []
-    tris = []
-    # Which _triangulate emission each vertex came from (parallel to `verts`).
-    # The weld may only fuse vertices from DIFFERENT emissions: within one
-    # part the CDT already connects everything, so a same-part weld can only
-    # move a vertex sideways — measured at Pinarus's stair bottom, where the
-    # steep refinement put a stair-copy vertex and a floor vertex 15.8u apart
-    # in 3D and the weld dragged one onto the other, sweeping a triangle edge
-    # across a neighbour it shared no vertex with (overlapping triangles).
-    vert_src = []
-
-    # ONE 2D union of every ribbon, retriangulated once.  No storey buckets: a
-    # staircase has no single height, so any attempt to assign corridors to
-    # floors forces one Z threshold to be both loose enough for a stair's slope
-    # and tight enough for a 200u floor gap — which no value satisfies.
-    polys = [p for p in (_ribbon_polygon(s) for s in strips)
-             if p.is_valid and not p.is_empty]
-    if not polys:
-        return [], []
-    merged = unary_union(polys)
-    if merged.is_empty:
-        return [], []
-    # Clip to the cell rectangle (exterior only): a cross-seam ribbon is cut at
-    # the boundary plane, and shapely re-polygonises the result cleanly.
-    if cell_bounds is not None:
-        minx, miny, maxx, maxy = cell_bounds
-        merged = merged.intersection(box(minx, miny, maxx, maxy))
-        if merged.is_empty:
-            return [], []
-    # Split the coverage along every wall, so no triangle can span one.
-    if wall_cut is not None:
-        try:
-            cut = merged.difference(wall_cut)
-            if not cut.is_empty:
-                merged = cut
-        except Exception:
-            pass
-    # Each output vertex is emitted ONCE PER SURFACE that covers it: where two
-    # storeys stack, the same (x, y) yields one vertex per storey, at each
-    # storey's own height.  Surfaces are found by clustering the heights of the
-    # corridors covering that point — heights within SAME_SURFACE_Z of each
-    # other are one surface, a bigger jump is a different storey.  This is the
-    # local, per-point version of the test; nothing is classified globally.
-    door_edges = door_edges or []
-    # PER-STOREY UNION.  A single flattened union merges floors that sit on top of
-    # each other in plan view, and the triangulation then bridges them: measured
-    # in ChorrolFightersGuild, 15 triangles had corners on the -302 floor AND the
-    # -45 floor at once, 3-46u from a walked pathgrid line.  They are not
-    # stairwell edges — they are the upper and lower ribbons overlapping in plan.
-    # Emitting them stacks a near-vertical sheet between the storeys ("triangles
-    # between floors"); dropping them severs 24 shared edges and splits the floor
-    # into 7 pieces.  Neither is right, because the flattened polygon was never
-    # the correct region to triangulate.
-    #
-    # So the ribbons are grouped into storeys FIRST and each storey is unioned and
-    # triangulated on its own.  Within a storey there is exactly one surface, so a
-    # triangle can no longer span two floors and every corner has an unambiguous
-    # height.  Stairs are the reason this must group by CONNECTIVITY rather than
-    # by a Z threshold: a flight has no single height, so it is walked from ribbon
-    # to ribbon (see _storey_groups) and stays attached to both the floor it
-    # leaves and the floor it reaches.
-    _door_claimed = set()        # door_edges indices already reserved
-    sheets = _split_plan_overlaps(_storey_groups(strips))
-    # SHARED NODE POINTS.  A pathgrid node where two sheets meet is the one place
-    # they MUST connect — it is the top or bottom of a staircase.  Measured on
-    # Pinarus: node 1 is the stair top, its stair ribbon (0,1) landed in one sheet
-    # and the upper floor's ribbon (1,8) in another, and because each sheet is
-    # triangulated independently the two nearest vertices came out 31u apart —
-    # far beyond the weld radius, so the house stayed in two components with the
-    # break exactly at the top of the stairs.
-    #
-    # Forcing the node's own XY into EVERY sheet that has a ribbon there makes
-    # both sheets place a vertex at the same point, at the same height (the node's
-    # ribbons agree on it by construction), so `_weld_sheets` fuses them and the
-    # surfaces share real edges.
-    node_pts = {}
-    node_half = {}
+    node_pts, node_half = {}, {}
     for s in strips:
         (i, j) = s.get('edge', (-1, -1))
         if i < 0:
@@ -284,10 +174,16 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
         if j != i:
             node_pts.setdefault(j, (s['nb'][0], s['nb'][1]))
             node_half[j] = max(node_half.get(j, 0.0), float(s['half']))
+    return node_pts, node_half
 
-    # Which nodes are shared between two or more sheets?  Those, and only those,
-    # are the stair tops/bottoms that must be stitched.
-    node_sheets = {}
+
+def _sheet_node_sets(sheets):
+    """(node_sheets, node_owner): which sheets touch each node, and its owner.
+
+    A node is owned by the FIRST sheet reaching it, exclusively.
+    See: docs/commentary/tes5_import_navmesh.md#junction-union-is-exclusive
+    """
+    node_sheets, node_owner = {}, {}
     for gi, group in enumerate(sheets):
         for s in group:
             (i, j) = s.get('edge', (-1, -1))
@@ -295,344 +191,287 @@ def build_union_mesh(strips, extra_strips=None, door_edges=None,
                 continue
             node_sheets.setdefault(i, set()).add(gi)
             node_sheets.setdefault(j, set()).add(gi)
-
-    sheet_nodes = []
-    for gi, group in enumerate(sheets):
-        ids = set()
-        for s in group:
-            (i, j) = s.get('edge', (-1, -1))
-            if i < 0:
-                continue
-            ids.add(i)
-            ids.add(j)
-        sheet_nodes.append([node_pts[i] for i in sorted(ids) if i in node_pts])
-
-    # Nodes shared by 2+ sheets are the stair tops/bottoms.  Seeding alone can
-    # only ever give them a shared POINT — two independently triangulated polygons
-    # meeting at one vertex form a fan around it and share no EDGE, so NVNM
-    # adjacency cannot link them (measured on Pinarus: v152 at the stair top used
-    # by both components, still 2 components).  They are stitched explicitly after
-    # all sheets are meshed; see _stitch_shared_nodes.
-    stitch_nodes = [(node_pts[i][0], node_pts[i][1])
-                    for i, gset in node_sheets.items()
-                    if len(gset) >= 2 and i in node_pts]
-
-    # A ribbon that belongs to one sheet may still be COVERED by another sheet's
-    # polygon where the two floors stack.  Each sheet is therefore triangulated
-    # over its own ribbons only; the overlap is resolved in 3D by the Z of the
-    # ribbons themselves, which is why per-sheet levels (below) are correct.
-    # Ground already claimed by an earlier sheet, as (polygon, sheet index).  Two
-    # sheets that meet at a shared floor level (Chorrol's sheet0 spans z -45..143
-    # and sheet1 z -302..-40, so they meet around z=-45) otherwise BOTH mesh that
-    # ground: each sheet alone measured ZERO overlap, while 12 overlapping pairs
-    # existed across sheets.  Each piece of ground must have exactly one owner, so
-    # a later sheet is clipped against the parts of earlier sheets that describe
-    # the SAME surface height there.
-    # THE JUNCTION UNION.
-    #
-    # Corridors that meet at a pathgrid node must come out as ONE merged surface.
-    # Where both ribbons are in the same sheet the union does that already.  Where
-    # the sheet split separated them (a staircase genuinely conflicts in plan with
-    # the floor it passes UNDER, so no scoring can keep it with the landing it
-    # arrives at) the junction has to be unioned explicitly — and it must be
-    # unioned into exactly ONE sheet, never kept by both.  Keeping it in both is
-    # not a union at all: each sheet triangulates that ground independently and
-    # the result is stacked, overlapping triangles (measured on Pinarus: 16 pairs
-    # of same-surface triangles overlapping by 5,582u^2).
-    #
-    # So each node is OWNED by the first sheet that reaches it, and that sheet
-    # unions in the far ribbon of every edge arriving from another sheet, clipped
-    # to the node's own corridor width.  The junction is then a single polygon in
-    # a single sheet — one triangulation, no stacking — while the far sheet is
-    # clipped against it by the normal `claimed` pass below, exactly as any other
-    # shared ground is.
-    node_owner = {}
-    for gi, group in enumerate(sheets):
-        for s in group:
-            (i, j) = s.get('edge', (-1, -1))
-            if i < 0:
-                continue
             for nd in ((i,) if j == i else (i, j)):
                 node_owner.setdefault(nd, gi)
+    return node_sheets, node_owner
 
-    junction_extra = {}
-    junction_strips = {}
-    junction_drop = {}
-    if node_pts:
-        from shapely.geometry import Point as _Point
-        sheet_of = {}
-        for gi, group in enumerate(sheets):
-            for s in group:
-                sheet_of[s.get('edge', (-1, -1))] = gi
-        for s in strips:
-            (i, j) = s.get('edge', (-1, -1))
-            if i < 0:
-                continue
-            gi = sheet_of.get((i, j))
-            if gi is None:
-                continue
-            for nd in ((i,) if j == i else (i, j)):
-                own = node_owner.get(nd)
-                if own is None or own == gi or nd not in node_pts:
-                    continue
-                # This ribbon reaches a node owned by ANOTHER sheet: give that
-                # sheet the ribbon's ground at the node so the two merge there.
-                nx, ny = node_pts[nd]
-                r = max(float(node_half.get(nd, 0.0)),
-                        params.RIBBON_HALF_WIDTH)
-                try:
-                    piece = _ribbon_polygon(s).intersection(
-                        _Point(nx, ny).buffer(r))
-                except Exception:
-                    continue
-                if piece.is_empty or piece.area < 1.0:
-                    continue
-                junction_extra.setdefault(own, []).append(piece)
-                # The far sheet keeps its centreline height there, so the merged
-                # polygon still knows how high the arriving corridor is.
-                #
-                # CLIPPED to the junction disc, never the whole strip.  The
-                # strip joins the owning sheet's LEVEL LOOKUP, and levels are
-                # answered wherever a strip covers a point — so handing over
-                # the full stair strip leaked its heights across everything it
-                # passes under.  Measured on Pinarus: the upper-floor sheet
-                # (whose polygon spans the whole house) received the stair
-                # strip for a 64u junction at its top node, its corners above
-                # the stair BOTTOM then answered levels [-199, 69], and the
-                # sheet emitted a phantom duplicate of the ground floor there
-                # — stacked, overlapping triangles at the foot of the stairs.
-                junction_strips.setdefault(own, []).append(
-                    _clip_strip_near(s, nx, ny, r, piece))
-                # ...and the sheet that does NOT own the node gives that ground
-                # up.  Ownership has to be EXCLUSIVE or this is not a union at
-                # all: both sheets would triangulate the junction independently
-                # and the two results stack (measured before this subtraction:
-                # Chorrol 135 same-surface triangle pairs overlapping by
-                # 90,947u^2, Pinarus 20 pairs / 3,448u^2).
-                junction_drop.setdefault(gi, []).append(piece)
 
-    claimed = []
+def _junction_transfers(strips, sheets, node_pts, node_half, node_owner):
+    """(extra, strips, drop) per sheet for every cross-sheet pathgrid junction.
+
+    See: docs/commentary/tes5_import_navmesh.md#junction-union-is-exclusive
+    """
+    extra, donated, drop = {}, {}, {}
+    if not node_pts:
+        return extra, donated, drop
+    from shapely.geometry import Point as _Point
+    sheet_of = {}
     for gi, group in enumerate(sheets):
-        gpolys = [p for p in (_ribbon_polygon(s) for s in group)
-                  if p.is_valid and not p.is_empty]
-        gpolys.extend(junction_extra.get(gi, ()))
-        if not gpolys:
+        for s in group:
+            sheet_of[s.get('edge', (-1, -1))] = gi
+    for s in strips:
+        (i, j) = s.get('edge', (-1, -1))
+        if i < 0:
             continue
-        gmerged = unary_union(gpolys)
-        drop = junction_drop.get(gi)
-        if drop:
+        gi = sheet_of.get((i, j))
+        if gi is None:
+            continue
+        for nd in ((i,) if j == i else (i, j)):
+            own = node_owner.get(nd)
+            if own is None or own == gi or nd not in node_pts:
+                continue
+            nx, ny = node_pts[nd]
+            r = max(float(node_half.get(nd, 0.0)), params.RIBBON_HALF_WIDTH)
             try:
-                cut = gmerged.difference(unary_union(drop))
-                if not cut.is_empty:
-                    gmerged = cut
-            except Exception:
-                pass
-        if cell_bounds is not None:
-            minx, miny, maxx, maxy = cell_bounds
-            gmerged = gmerged.intersection(box(minx, miny, maxx, maxy))
-        for (prev_poly, prev_group) in claimed:
-            if gmerged.is_empty:
-                break
-            try:
-                shared_area = gmerged.intersection(prev_poly)
+                piece = _ribbon_polygon(s).intersection(
+                    _Point(nx, ny).buffer(r))
             except Exception:
                 continue
-            if shared_area.is_empty or shared_area.area < 1.0:
+            if piece.is_empty or piece.area < 1.0:
                 continue
-            # Only surrender ground where the two sheets agree on the HEIGHT —
-            # where they disagree they are different storeys stacked in plan and
-            # both must keep their own mesh.
-            dup = _same_surface_region(group, prev_group, shared_area)
-            if dup is None or dup.is_empty:
-                continue
-            try:
-                trimmed = gmerged.difference(dup)
-            except Exception:
-                continue
-            if not trimmed.is_empty:
-                gmerged = trimmed
+            extra.setdefault(own, []).append(piece)
+            donated.setdefault(own, []).append(
+                _clip_strip_near(s, nx, ny, r, piece))
+            drop.setdefault(gi, []).append(piece)
+    return extra, donated, drop
+
+
+def _sheet_coverage(group, gi, ctx):
+    """This sheet's own polygon after junction transfers, clip and claims.
+
+    See: docs/commentary/tes5_import_navmesh.md#sheets-claim-ground-exclusively
+    """
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+    gpolys = [p for p in (_ribbon_polygon(s) for s in group)
+              if p.is_valid and not p.is_empty]
+    gpolys.extend(ctx['junction_extra'].get(gi, ()))
+    if not gpolys:
+        return None
+    gmerged = unary_union(gpolys)
+    drop = ctx['junction_drop'].get(gi)
+    if drop:
+        try:
+            cut = gmerged.difference(unary_union(drop))
+            if not cut.is_empty:
+                gmerged = cut
+        except Exception:
+            pass
+    if ctx['cell_bounds'] is not None:
+        minx, miny, maxx, maxy = ctx['cell_bounds']
+        gmerged = gmerged.intersection(box(minx, miny, maxx, maxy))
+    for (prev_poly, prev_group) in ctx['claimed']:
         if gmerged.is_empty:
+            break
+        try:
+            shared_area = gmerged.intersection(prev_poly)
+        except Exception:
             continue
-        claimed.append((gmerged, group))
-        if wall_cut is not None:
-            try:
-                gcut = gmerged.difference(wall_cut)
-                if not gcut.is_empty:
-                    gmerged = gcut
-            except Exception:
-                pass
-        if gmerged.is_empty:
+        if shared_area.is_empty or shared_area.area < 1.0:
             continue
-        gparts = ([g for g in gmerged.geoms if isinstance(g, Polygon)]
-                  if hasattr(gmerged, 'geoms')
-                  else ([gmerged] if isinstance(gmerged, Polygon) else []))
-        # The ribbons arriving from another sheet at a node THIS sheet owns are
-        # part of this sheet's surface now (see the junction union above), so they
-        # must contribute their centreline heights and their seeds — otherwise the
-        # merged ground is triangulated here but takes its height only from the
-        # local ribbons, and the arriving corridor's end is flattened onto this
-        # floor instead of keeping its own slope.
-        group = list(group) + junction_strips.get(gi, [])
+        dup = _same_surface_region(group, prev_group, shared_area)
+        if dup is None or dup.is_empty:
+            continue
+        try:
+            trimmed = gmerged.difference(dup)
+        except Exception:
+            continue
+        if not trimmed.is_empty:
+            gmerged = trimmed
+    return None if gmerged.is_empty else gmerged
+
+
+def _sheet_parts(gmerged, wall_cut):
+    """The sheet's polygon list after the wall cut, or an empty list."""
+    from shapely.geometry import Polygon
+    if wall_cut is not None:
+        try:
+            gcut = gmerged.difference(wall_cut)
+            if not gcut.is_empty:
+                gmerged = gcut
+        except Exception:
+            pass
+    if gmerged.is_empty:
+        return []
+    if hasattr(gmerged, 'geoms'):
+        return [g for g in gmerged.geoms if isinstance(g, Polygon)]
+    return [gmerged] if isinstance(gmerged, Polygon) else []
+
+
+def _wedge_fits_part(edge, part):
+    """True if this part holds enough of the door's wedge to own the claim.
+
+    See: docs/commentary/tes5_import_navmesh.md#door-claim-is-single-and-gated
+    """
+    if len(edge) <= 2 or edge[2] is None:
+        return True
+    try:
+        from shapely.geometry import Polygon as _DCP
+        wedge = _DCP([edge[0], edge[1], edge[2]])
+        if (wedge.is_valid and wedge.area > 1.0
+                and part.intersection(wedge).area
+                < DOOR_CLAIM_MIN_FRAC * wedge.area):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _storey_holds_door(edge, group):
+    """True if this sheet has a surface at the door's own height under it.
+
+    See: docs/commentary/tes5_import_navmesh.md#door-claim-is-single-and-gated
+    """
+    if len(edge) <= 3 or edge[3] is None:
+        return True
+    mx = 0.5 * (edge[0][0] + edge[1][0])
+    my = 0.5 * (edge[0][1] + edge[1][1])
+    lv = _levels_at(group, mx, my)
+    return not lv or any(abs(q - edge[3]) <= STOREY_GAP_Z for q in lv)
+
+
+def _claim_door_edges(part, group, door_edges, claimed_ids):
+    """The door base lines this part owns, consuming each claim exactly once.
+
+    See: docs/commentary/tes5_import_navmesh.md#door-claim-is-single-and-gated
+    """
+    fixed = []
+    for ei, e in enumerate(door_edges):
+        if ei in claimed_ids or not _door_edge_on_part(e, part):
+            continue
+        if not _wedge_fits_part(e, part) or not _storey_holds_door(e, group):
+            continue
+        claimed_ids.add(ei)
+        fixed.append(e)
+    return fixed
+
+
+def _mesh_one_part(part, group, gseeds, door_edges, claimed_ids):
+    """Triangulate one part of one sheet into (verts, tris), or ([], []).
+
+    See: docs/commentary/tes5_import_navmesh.md#door-apex-inherits-base-levels
+    """
+    fixed = _claim_door_edges(part, group, door_edges, claimed_ids)
+    v2, t2 = _triangulate(part, params.TRI_TARGET_EDGE,
+                          fixed_edges=fixed, steep_seeds=gseeds)
+    if not t2:
+        return [], []
+    levels = _levels_batch(group, v2)
+    _apply_door_apex_levels(v2, levels, fixed)
+    return _emit_surfaces(v2, t2, levels)
+
+
+def _mesh_sheets(sheets, ctx, door_edges):
+    """Triangulate every sheet; returns (verts, tris, vert_src).
+
+    See: docs/commentary/tes5_import_navmesh.md#union-has-no-storey-buckets
+    """
+    from shapely.geometry import Polygon
+    verts, tris, vert_src = [], [], []
+    claimed_ids = set()
+    for gi, group in enumerate(sheets):
+        gmerged = _sheet_coverage(group, gi, ctx)
+        if gmerged is None:
+            continue
+        ctx['claimed'].append((gmerged, group))
+        parts = _sheet_parts(gmerged, ctx['wall_cut'])
+        group = list(group) + ctx['junction_strips'].get(gi, [])
         gseeds = _ribbon_seeds(group, params.TRI_TARGET_EDGE)
-        # NOTE: pathgrid nodes are no longer appended as forced seeds.  Under
-        # the point-set sampler the True flag forced a vertex at each node so
-        # cross-sheet welds could fuse stair tops; the CDT takes vertices only
-        # from the polygon rings, so a node seed cannot become a vertex — the
-        # only thing the flag did was mark every node junction "steep" and
-        # trigger 64u refinement around all of them, exploding a large cell
-        # to ~50k triangles that emission then paid for (~85s of a 118s cell)
-        # and decimation collapsed right back down.  Cross-sheet junctions
-        # are joined by _merge_at_pathgrid_nodes and _stitch_shared_nodes.
-        for part in gparts:
+        for part in parts:
             if not isinstance(part, Polygon) or part.area < 1.0:
                 continue
-            # A door base line belongs to this part when it lies inside it OR
-            # ON ITS OUTLINE — the threshold edge of a door quad IS part of the
-            # union boundary, so a strict interior test rejected it and the
-            # constraint never reached the triangulation at all.  That is what
-            # left the CharacterGen assassins' 115u cell door as a 571-unit
-            # scrap (every vanilla door triangle is >= 992): unprotected, the
-            # boundary densify chopped its base line into 26.8u + 21.6u pieces.
-            # Each door belongs to exactly ONE part.  The tolerant on-outline
-            # test above can match a door line in several sheets that meet at
-            # the threshold; reserving it more than once produces duplicate,
-            # overlapping door triangles that then collide in the weld.
-            fixed = []
-            for ei, e in enumerate(door_edges):
-                if ei in _door_claimed:
-                    continue
-                if not _door_edge_on_part(e, part):
-                    continue
-                # ...AND THE PART MUST ACTUALLY HOLD THE DOOR TRIANGLE.  The
-                # base line lies on the union boundary, so EVERY sheet that
-                # meets the threshold passes the on-outline test above and the
-                # FIRST one iterated won the claim — even when the wedge sits
-                # almost entirely in a different sheet.  The reservation then
-                # cut a wedge that was 98.6% outside its own part, the cut
-                # collapsed to nothing, and the door lost its guaranteed
-                # triangle altogether: measured on ImperialDungeon01's 99.5u
-                # prison gate (0001FC1E), claimed by the 3.49M sheet covering
-                # 1.4% of the wedge while the sheet covering 98.6% was never
-                # offered it.  What shipped instead was the fan of 8-360u^2
-                # needles through the doorway.
-                if len(e) > 2 and e[2] is not None:
-                    try:
-                        from shapely.geometry import Polygon as _DCP
-                        wedge = _DCP([e[0], e[1], e[2]])
-                        if (wedge.is_valid and wedge.area > 1.0
-                                and part.intersection(wedge).area
-                                < DOOR_CLAIM_MIN_FRAC * wedge.area):
-                            continue        # another sheet owns this doorway
-                    except Exception:
-                        pass
-                # STOREY GATE.  Parts are 2D, so where two floors stack in
-                # plan BOTH pass the containment test and iteration order
-                # decided the claim: Arvena's upstairs bedroom door was
-                # claimed by the sheet that only covers that spot DOWNSTAIRS,
-                # its wedge was cut from ground that does not span the
-                # doorway at that height, and the door triangle came back
-                # unattachable and was withdrawn.  The door knows its storey
-                # (the corridor its quad bridges to); require this sheet to
-                # actually have a surface at that height under the door.
-                if len(e) > 3 and e[3] is not None:
-                    mx = 0.5 * (e[0][0] + e[1][0])
-                    my = 0.5 * (e[0][1] + e[1][1])
-                    lv = _levels_at(group, mx, my)
-                    if lv and not any(abs(q - e[3]) <= STOREY_GAP_Z
-                                      for q in lv):
-                        continue        # another storey's part
-                _door_claimed.add(ei)
-                fixed.append(e)
-            v2, t2 = _triangulate(part, params.TRI_TARGET_EDGE,
-                                  fixed_edges=fixed, steep_seeds=gseeds)
-            if not t2:
-                continue
-            # Levels come from THIS storey's ribbons only, so a corner cannot
-            # pick up the other floor's height.
-            levels = _levels_batch(group, v2)
-            # THE DOOR APEX HAS NO RIBBON UNDER IT.  Its triangle is reserved
-            # out of the union (a hole), so no corridor covers that point and
-            # _levels_at returns nothing for it.  _emit_surfaces then drops any
-            # triangle whose corners do not all share a surface, which silently
-            # deleted 4 of every 5 reserved door triangles — the protection
-            # passes downstream never saw them because they never existed.
-            #
-            # The apex stands on the same ground as its own door line, so it
-            # inherits the levels of the two base endpoints.
-            _apply_door_apex_levels(v2, levels, fixed)
-            v3, t3 = _emit_surfaces(v2, t2, levels)
+            v3, t3 = _mesh_one_part(part, group, gseeds, door_edges,
+                                    claimed_ids)
             base = len(verts)
             verts.extend(v3)
             vert_src.extend([base] * len(v3))
             tris.extend((a + base, b + base, c + base) for (a, b, c) in t3)
+    return verts, tris, vert_src
 
-    # Each sheet was triangulated on its own, so where two sheets meet on the
-    # SAME surface their boundary vertices are coincident but carry different
-    # indices — they share no edge, and the engine cannot walk between them.
-    # Weld those together (a 3D weld, so two storeys stacked in plan are never
-    # fused: they are hundreds of units apart in Z).
-    verts, tris = _weld_sheets(verts, tris, src=vert_src)
+
+def _merged_coverage(strips, cell_bounds, wall_cut):
+    """The flattened union of every ribbon, clipped and wall-cut, or None.
+
+    See: docs/commentary/tes5_import_navmesh.md#union-inputs-and-clipping
+    """
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+    polys = [p for p in (_ribbon_polygon(s) for s in strips)
+             if p.is_valid and not p.is_empty]
+    if not polys:
+        return None
+    merged = unary_union(polys)
+    if merged.is_empty:
+        return None
+    if cell_bounds is not None:
+        minx, miny, maxx, maxy = cell_bounds
+        merged = merged.intersection(box(minx, miny, maxx, maxy))
+        if merged.is_empty:
+            return None
+    if wall_cut is not None:
+        try:
+            cut = merged.difference(wall_cut)
+            if not cut.is_empty:
+                merged = cut
+        except Exception:
+            pass
+    return merged
+
+
+def _finish_union(verts, tris, strips, node_pts, node_half, stitch_nodes,
+                  probe_only):
+    """Weld, merge, stitch and re-zip the sheet meshes into one surface.
+
+    See: docs/commentary/tes5_import_navmesh.md#t-junctions-are-split-three-times
+    """
     tris = _split_t_junctions(verts, tris)
-    # THE GUARANTEE: corridors that meet at a pathgrid node are joined, EVERY
-    # TIME — driven by the PATHGRID rather than by any property of the
-    # geometry, so there is no case it can decline to handle.  It now runs
-    # BEFORE the stitch: the merge makes each junction a shared POINT (one
-    # weld per component), and the stitch is the machinery that turns shared
-    # points into shared EDGES (fan-open + bridge, with the overlap guards).
     verts, tris = _merge_at_pathgrid_nodes(verts, tris, node_pts, node_half)
     tris = _destack(verts, tris)
     tris = _stitch_shared_nodes(verts, tris, stitch_nodes)
-    # RE-SPLIT T-JUNCTIONS after the last vertex-moving pass.  The merge and
-    # the stitch move and fuse vertices, which can land a vertex in the middle
-    # of another triangle's border edge — a hanging node the first T-split ran
-    # too early to see.  An edge left unshared reads as point-attached, and
-    # _drop_point_attached then deletes REAL coverage: measured on
-    # ImperialDungeon01, the junction triangle spanning pathgrid nodes
-    # 137/138/139 was dropped and the walked line through the prison lost its
-    # mesh (a hole an NPC cannot cross).
     tris = _split_t_junctions(verts, tris)
     tris = _drop_walls(verts, tris, strips)
-    # ...AND AGAIN AFTER THE WALL CULL, which can itself OPEN a crack.  A
-    # plan-degenerate triangle (three corners collinear in plan) reads as a
-    # 90-degree wall and is dropped correctly — but where it was the only
-    # thing bridging a hanging vertex to the edge it sits on, dropping it
-    # UN-SPLITS that T-junction and the two sides of the seam stop sharing an
-    # edge.  Measured on ImperialDungeon01's tower staircase: the zero-area
-    # triangle (-288.5,183.2)/(-270.8,286.9)/(-279.6,235.0) was the bridge,
-    # and losing it left a 105u boundary edge straight across the flight with
-    # the pathgrid running through it — the mesh looks continuous in plan but
-    # an NPC cannot cross ("a missing sliver that chokes the staircase by
-    # half").  Re-zipping restores the shared edges without restoring the
-    # wall.
     tris = _split_t_junctions(verts, tris)
     if probe_only:
-        # STOP HERE for the door-footprint probe pass.  Everything ABOVE can
-        # change which corridor edge is nearest a door -- the wall cull in
-        # particular removes edges a door must never bridge across, and
-        # dropping it moved a door in ImperialDungeon01.  What remains below
-        # only ADDS ground (notch fill) or removes triangles that hang off a
-        # point, neither of which is a bridge candidate the door search would
-        # have picked: `cands` is filtered to edges within DOOR_BRIDGE_RADIUS
-        # on the door's own storey, reached without crossing a wall.
-        # The probe's mesh is discarded either way -- the second pass rebuilds
-        # the union with the door quads unioned in.
         return verts, tris
     tris = _fill_boundary_notches(verts, tris, strips)
-    tris = _drop_point_attached(tris)
-    return verts, tris
+    return verts, _drop_point_attached(tris)
 
 
+def build_union_mesh(strips, extra_strips=None, door_edges=None,
+                     cell_bounds=None, wall_cut=None, probe_only=False):
+    """Union the corridor ribbons per storey and retriangulate.
 
+    Returns (verts, tris) with 3D vertices.  Coverage is the exact union of the
+    ribbons and the triangles do not overlap, both by construction.
+    `extra_strips` are door footprint strips joining as ordinary ground,
+    `door_edges` the door base lines forced to be triangle edges, `cell_bounds`
+    the exterior rectangle the coverage is clipped to.
+    See: docs/commentary/tes5_import_navmesh.md#union-mesh-driver
+    """
+    _ribbon_cache_clear()
+    if not strips:
+        return [], []
+    strips = list(strips) + list(extra_strips or ())
+    if _merged_coverage(strips, cell_bounds, wall_cut) is None:
+        return [], []
 
+    sheets = _split_plan_overlaps(_storey_groups(strips))
+    node_pts, node_half = _node_geometry(strips)
+    node_sheets, node_owner = _sheet_node_sets(sheets)
+    junction_extra, junction_strips, junction_drop = _junction_transfers(
+        strips, sheets, node_pts, node_half, node_owner)
 
+    ctx = {'junction_extra': junction_extra, 'junction_strips': junction_strips,
+           'junction_drop': junction_drop, 'cell_bounds': cell_bounds,
+           'wall_cut': wall_cut, 'claimed': []}
+    verts, tris, vert_src = _mesh_sheets(sheets, ctx, door_edges or [])
 
-
-
-
-
-
-
-
+    stitch_nodes = [(node_pts[i][0], node_pts[i][1])
+                    for i, gset in node_sheets.items()
+                    if len(gset) >= 2 and i in node_pts]
+    verts, tris = _weld_sheets(verts, tris, src=vert_src)
+    return _finish_union(verts, tris, strips, node_pts, node_half,
+                         stitch_nodes, probe_only)
 
 # T-junction split tolerances (module-level so diagnostics can A/B them).
 # TSPLIT_TOL: plan radius for INTERIOR hanging vertices.  TSPLIT_CRACK_TOL:
@@ -708,294 +547,123 @@ def _apply_door_apex_levels(v2, levels, door_edges):
                 levels[i] = list(lv_door)
 
 
-def _emit_surfaces(v2, t2, levels):
-    """Lift a 2D triangulation onto its walkable surfaces, WITHOUT tearing.
+def _storeys_of(lv):
+    """Cluster a sorted level list into storey bands on STOREY_GAP_Z.
 
-    THE DEFECT THIS REPLACES.  The old code chose a triangle's height as the
-    MEAN of its three corners' levels, then bound each corner to whatever vertex
-    already sat within SAME_SURFACE_Z of that mean.  A corner's height therefore
-    depended on WHICH TRIANGLE ASKED FIRST, so two triangles sharing a corner on
-    ONE surface routinely bound it to two different vertices:
-
-        corner 22, a single level at 395.3, minted vertex 370 (z=395.3) for one
-        neighbour and vertex 413 (z=356.2) for the next.
-
-    They then share no EDGE, and the engine cannot walk between them
-    (_compute_adjacency links only across shared edges).  On a STAIR every
-    consecutive triangle has a different mean, so stairs tore worst: measured on
-    ICPrisonSewerExit01, 28 of 582 shared 2D edges were lost and the mesh fell
-    into 12 components; ICPrisonEntrance01 fell into 28.  No value of
-    SAME_SURFACE_Z fixes it — widening fuses real storeys, narrowing tears more.
-    It is a first-match-wins race, not a tolerance.
-
-    THE FIX.  A point's height is a property of THE POINT AND ITS SURFACE, never
-    of whichever triangle reached it first:
-
-      1. Assign every 2D triangle to the surfaces beneath it (unchanged: cluster
-         the corners' levels on STOREY_GAP_Z, emit once per storey).
-      2. UNION-FIND the (corner, surface) pairs.  When a triangle is emitted on a
-         surface, its three corners are joined into one class.  Two triangles
-         meeting on one surface therefore ALWAYS resolve their shared corner to
-         the same class — connectivity is structural, exactly as it is for the
-         2D union itself, instead of being re-derived per triangle.
-      3. Give each class ONE height: the level at that corner nearest the class's
-         own surface.  Because the level came from the ribbon's own centreline
-         (_height_on follows the pathgrid line A->B), the lifted surface is
-         PARALLEL TO THE SEED LINE by construction — a stair comes out as one
-         straight ramp rather than a sawtooth of per-triangle averages.
-
-    Coverage is untouched: every 2D triangle is still emitted on every surface
-    beneath it, and no triangle is ever dropped.
+    See: docs/commentary/tes5_import_navmesh.md#levels-recluster-on-the-storey-gap
     """
-    # --- 0. merge each corner's levels into STOREYS.
-    #
-    # _levels_at clusters a corner's covering ribbons on SAME_SURFACE_Z (36u), so
-    # a staircase arrives already split into a level per tread-ish step: corner
-    # 162 came back as [-302.3, -254.7], two entries 47u apart that are ONE
-    # flight.  Emission then treated each as its own surface and stacked a second
-    # triangle on the stair.  Re-cluster on the STOREY gap first, so "surface"
-    # means the same thing to the level lookup and to the emission — a stair is
-    # one surface, and only a genuine floor-above is a second.
-    def storeys_of(lv):
-        if not lv:
-            return []
-        out = [[lv[0]]]
-        for z in lv[1:]:
-            if z - out[-1][-1] <= STOREY_GAP_Z:
-                out[-1].append(z)
-            else:
-                out.append([z])
-        return out
+    if not lv:
+        return []
+    out = [[lv[0]]]
+    for z in lv[1:]:
+        if z - out[-1][-1] <= STOREY_GAP_Z:
+            out[-1].append(z)
+        else:
+            out.append([z])
+    return out
 
-    # Per corner: the storey bands, and the representative height of each.  The
-    # height is the level NEAREST the triangle asking (see vert), not the band
-    # mean — a stair's band spans its whole rise, and the mean would flatten it.
-    corner_bands = [storeys_of(sorted(lv)) for lv in levels]
 
-    # --- 1. which surfaces does each triangle live on?
-    #
-    # A surface is real for this triangle only when ALL THREE corners have ground
-    # on it.  Pooling the three corners' levels and clustering the pool (the
-    # previous rule) merges storeys TRANSITIVELY: a corner standing on a stair
-    # carries heights between the two floors, chaining the -302 floor to the +127
-    # floor into one band whose mean, -89, is in MID-AIR.  That is what put 225 of
-    # 609 ChorrolFightersGuild triangles up to 213u from any walkable collision —
-    # sheets hanging between the storeys.
-    #
-    # So each corner votes with its OWN storey bands, and a surface is kept only
-    # where all three overlap.  A corner is then never dragged to a height it has
-    # no ground at, and the triangle spanning a stairwell — whose corners really
-    # are on different floors — is simply not emitted there, instead of being
-    # emitted in between.
-    # Only a corner's OWN levels count here.  (bare_clusters is derived from
-    # tri_surfaces further down, so it cannot be consulted at this point;
-    # corners with no levels take the fallback path below.)  Precomputed once
-    # per corner — the per-triangle closure recomputed these min/max pairs
-    # millions of times and was ~40% of a large cell's whole build.
-    reps_all = [[(min(b), max(b)) for b in bands] for bands in corner_bands]
+def _reaches(bands, z):
+    """Does a corner with these bands have ground on the surface at z?
 
-    def band_reps(k):
-        return reps_all[k]
+    See: docs/commentary/tes5_import_navmesh.md#reach-tolerance-is-one-step
+    """
+    for (lo, hi) in bands:
+        if lo - REACH_TOL <= z <= hi + REACH_TOL:
+            return True
+    return False
 
-    def _reaches(bands, z):
-        """Does this corner have ground on the surface at z?
 
-        A band is an interval [lo, hi]; on a stair it spans the whole rise, so a
-        plain point test is right — the corner genuinely has ground everywhere
-        between.
+def _triangle_surfaces(reps_all, tri):
+    """The storey heights every corner of `tri` has ground on.
 
-        The band is widened only by MAX_CLIMB, a single STEP.  Widening it by
-        STOREY_GAP_Z (120u) instead let a corner vote for a surface it has no
-        ground on at all, and that produced the flap that made Pinarus's only
-        floor-to-floor link unnavigable:
-
-            2D triangle (-242.7,132.5) (-316.9,134.9) (-317.5,173.3)
-            corner 1 band [30.0, 30.0]    (stair ribbon only)
-            corners 2,3 band [68.6, 68.6] (landing)
-
-        With a 120u tolerance BOTH 30.0 and 68.6 passed for every corner, so the
-        one triangle was emitted twice — once at 30.0 (tilted 27 degrees) and once
-        at 68.6 (flat) — with identical 1425u^2 plan footprints, 38.6u apart,
-        sharing edge (126,127).  That shared edge was the ONLY connection between
-        the two floors, and an actor crossing it would have to step onto a surface
-        directly beneath the one it is standing on.
-
-        A step is the right tolerance: an actor can step up/down MAX_CLIMB onto an
-        adjoining surface, so a corner one step off still legitimately belongs to
-        that surface.  Anything further and it does not.
-        """
-        tol = REACH_TOL
-        for (lo, hi) in bands:
-            if lo - tol <= z <= hi + tol:
-                return True
-        return False
-
-    tri_surfaces = []
-    for (a, b, c) in t2:
-        ba, bb, bc = band_reps(a), band_reps(b), band_reps(c)
-        present = [x for x in (ba, bb, bc) if x]
-        if not present:
-            tri_surfaces.append(())
+    See: docs/commentary/tes5_import_navmesh.md#every-corner-proposes-its-own-storeys
+    """
+    present = [x for x in (reps_all[tri[0]], reps_all[tri[1]],
+                           reps_all[tri[2]]) if x]
+    if not present:
+        return ()
+    proposals = sorted({z for bands in present for (lo, hi) in bands
+                        for z in (lo, hi)})
+    surfaces = []
+    for z in proposals:
+        if not all(_reaches(bands, z) for bands in present):
             continue
-        # EVERY corner proposes its own storeys — not just corner a, or a surface
-        # that only the other two share is silently lost and the floor splits
-        # laterally (measured: same-storey components 47-115u apart in Chorrol).
-        # A proposal is kept when every corner that HAS ground reaches it; a
-        # corner with no ground of its own abstains and takes the surface height
-        # through `vert`'s fallback, so the triangle is still emitted.
-        # Candidate surfaces are REAL band endpoints, never band midpoints: a
-        # band that spans a flight of stairs has its midpoint in mid-air, and
-        # proposing it emits a sheet hanging between the storeys.
-        proposals = sorted({z for bands in present for (lo, hi) in bands
-                            for z in (lo, hi)})
-        surfaces = []
-        for z in proposals:
-            ok = True
-            for bands in present:
-                if not _reaches(bands, z):
-                    ok = False
-                    break
-            # Collapse proposals that are the same storey, so one surface is
-            # not emitted twice under slightly different names.
-            if ok and (not surfaces or z - surfaces[-1] > STOREY_GAP_Z):
-                surfaces.append(z)
-        # If no storey is shared by all corners, the triangle is NOT emitted.
-        #
-        # Such a triangle straddles a stairwell: measured in Chorrol, corners
-        # with levels [-45], [-302] and [-302,-45] — two of them on floors 257u
-        # apart, with no ground in between.  Forcing it onto one storey (a
-        # majority vote) drags the odd corner down through the stairwell and
-        # produces exactly the near-vertical sheets that render as "triangles
-        # between floors".  That is a WALL, not walkable ground: an actor cannot
-        # traverse it, so the correct mesh does not contain it.
-        #
-        # This costs no real coverage.  The ground itself is still covered — by
-        # the upper floor's triangles at -45 and the lower floor's at -302; only
-        # the impossible bridge between them is gone.  The stair proper is a
-        # ribbon whose own levels are continuous, so its corners DO share a
-        # storey band and it is emitted normally.
-        tri_surfaces.append(tuple(surfaces))
+        if not surfaces or z - surfaces[-1] > STOREY_GAP_Z:
+            surfaces.append(z)
+    return tuple(surfaces)
 
-    # --- 2. union-find over (corner, surface-slot) pairs.
-    # A corner's surface slot is the index of ITS OWN level cluster nearest the
-    # triangle's surface height: two triangles on one storey pick the same slot
-    # at a shared corner, while a corner carrying two storeys keeps them apart.
-    # A corner with NO level of its own still has to be distinguished per storey,
-    # or every such corner in the cell collapses into one class and the mesh
-    # flattens.  It CANNOT be keyed by quantising z into fixed bands: band edges
-    # are arbitrary, so two neighbours a unit apart in Z straddle one and land in
-    # different classes — that shattered ChorrolFightersGuild into 83 components
-    # and lost two thirds of its triangles.
-    #
-    # Instead each level-less corner accumulates the surface heights that
-    # actually reach it, and those are clustered on STOREY_GAP_Z the same way a
-    # corner's own levels are.  The slot is then an index into ITS OWN clusters,
-    # so it is stable, band-free, and separates real storeys only where a real
-    # storey gap exists.
+
+def _bare_corner_clusters(t2, levels, tri_surfaces):
+    """Storey clusters for corners that carry no level of their own.
+
+    See: docs/commentary/tes5_import_navmesh.md#level-less-corners-cluster-their-own-surfaces
+    """
     bare = {}
     for ti, (a, b, c) in enumerate(t2):
         for z in tri_surfaces[ti]:
             for k in (a, b, c):
                 if not levels[k]:
                     bare.setdefault(k, []).append(z)
-    bare_clusters = {k: storeys_of(sorted(zs)) for k, zs in bare.items()}
+    return {k: _storeys_of(sorted(zs)) for k, zs in bare.items()}
 
-    def slot_of(k, z):
-        """Which STOREY of corner k this triangle's surface belongs to.
 
-        Keyed on the storey band, not on the individual level: two triangles
-        stepping along a stair ask with slightly different z but must land on the
-        same band, or they mint different vertices and the stair tears.
-        """
-        bands = corner_bands[k] or bare_clusters.get(k)
-        if not bands:
-            return 0
-        best_i = 0
-        best_d = None
-        for i, band in enumerate(bands):
-            for x in band:
-                d = x - z
-                if d < 0:
-                    d = -d
-                if best_d is None or d < best_d:
-                    best_d = d
-                    best_i = i
-        return best_i
+def _slot_of(corner_bands, bare_clusters, k, z):
+    """Which STOREY band of corner k this triangle's surface belongs to.
 
-    # --- 2b. the vertex key is (corner, slot) DIRECTLY.
-    #
-    # `slot_of` already gives a corner a stable identity per walkable surface: it
-    # indexes that corner's OWN clustered levels, which do not depend on which
-    # triangle is asking.  So two triangles meeting at a corner on one surface
-    # compute the same slot and therefore the SAME vertex — connectivity is
-    # structural, which is the whole point of the rewrite.
-    #
-    # (An earlier attempt union-found the (corner, slot) pairs and keyed the
-    # vertex on the resulting class root.  That was wrong twice over: the class
-    # merges DIFFERENT corners, so the root is not a per-corner identity, and
-    # keying on it produced a vertex per triangle — 355 of 609 triangles came out
-    # as isolated singletons.  No union-find is needed at all.)
-    keyed = []                              # per (tri, surface): the three keys
-    for ti, (a, b, c) in enumerate(t2):
-        for z in tri_surfaces[ti]:
-            keyed.append(((a, slot_of(a, z)), (b, slot_of(b, z)),
-                          (c, slot_of(c, z)), z))
+    See: docs/commentary/tes5_import_navmesh.md#vertex-key-is-corner-and-slot
+    """
+    bands = corner_bands[k] or bare_clusters.get(k)
+    if not bands:
+        return 0
+    best_i, best_d = 0, None
+    for i, band in enumerate(bands):
+        for x in band:
+            d = x - z if x >= z else z - x
+            if best_d is None or d < best_d:
+                best_d, best_i = d, i
+    return best_i
 
-    # --- 3. each vertex takes the corner's OWN level for that surface.
-    #
-    # That level was computed by _height_on along the covering ribbon's
-    # centreline, i.e. along the pathgrid line A->B — so the lifted surface is
-    # PARALLEL TO THE SEED LINE by construction and a stair keeps its exact rise.
-    # The height is never a per-triangle average, which is what made the old
-    # code's heights depend on which triangle asked first.
-    vid = {}
-    verts = []
 
-    def vert(k, fallback):
-        """The single vertex for corner k on storey k[1].
+def _emit_vertex(state, k, fallback):
+    """The single vertex for corner k on storey k[1], minting it if new.
 
-        The height depends ONLY on the key — never on which triangle asked, or
-        the first caller would win and order-dependence (the original defect)
-        would come straight back.  A band holds the heights of every ribbon
-        covering this exact point on this storey; they were each computed by
-        _height_on along that ribbon's centreline, so on a stair they agree to
-        within the ribbons' own crossing error and their median is the point's
-        height ON the pathgrid line.  A `fallback` is used only when the corner
-        carries no level at all (the union covers it but no centreline claims it).
-        """
-        got = vid.get(k)
-        if got is None:
-            bands = corner_bands[k[0]] or bare_clusters.get(k[0]) or ()
-            if 0 <= k[1] < len(bands):
-                band = sorted(bands[k[1]])
-                zz = band[len(band) // 2]
-            else:
-                zz = fallback
-            got = len(verts)
-            verts.append([float(v2[k[0]][0]), float(v2[k[0]][1]), float(zz)])
-            vid[k] = got
+    See: docs/commentary/tes5_import_navmesh.md#vertex-height-is-the-band-median
+    """
+    got = state['vid'].get(k)
+    if got is not None:
         return got
+    bands = (state['corner_bands'][k[0]]
+             or state['bare_clusters'].get(k[0]) or ())
+    if 0 <= k[1] < len(bands):
+        band = sorted(bands[k[1]])
+        zz = band[len(band) // 2]
+    else:
+        zz = fallback
+    verts = state['verts']
+    got = len(verts)
+    verts.append([float(state['v2'][k[0]][0]), float(state['v2'][k[0]][1]),
+                  float(zz)])
+    state['vid'][k] = got
+    return got
 
-    tris = []
-    # A 2D triangle is emitted once per surface beneath it, and two of a corner's
-    # storey bands can resolve to the SAME vertices — so the same triangle is
-    # emitted twice (once per winding) or several times over.  Measured on
-    # Pinarus: (167,178,152) and its reverse formed a 2-triangle "component", and
-    # a collinear sliver (57,58,59) was emitted FOUR times as four 1-triangle
-    # "components".  These are duplicates and degenerates, not islands, and they
-    # are what made a house whose corridor mesh is ONE component report seven.
-    seen = set()
+
+def _emit_triangles(state, keyed):
+    """Lift every keyed triangle, dropping duplicate windings and slivers.
+
+    See: docs/commentary/tes5_import_navmesh.md#emission-drops-duplicates-and-slivers
+    """
+    verts = state['verts']
+    tris, seen = [], set()
     for (ka, kb, kc, z) in keyed:
-        ia, ib, ic = vert(ka, z), vert(kb, z), vert(kc, z)
+        ia = _emit_vertex(state, ka, z)
+        ib = _emit_vertex(state, kb, z)
+        ic = _emit_vertex(state, kc, z)
         if ia == ib or ib == ic or ia == ic:
             continue
-        # Winding-independent identity: the same three vertices are the same
-        # triangle however they are ordered.
         key = tuple(sorted((ia, ib, ic)))
         if key in seen:
             continue
-        # Drop zero-area (collinear) triangles: they cover no ground, cannot be
-        # stood on, and only ever attach to the mesh at a point.
         pa, pb, pc = verts[ia], verts[ib], verts[ic]
         area2 = abs((pb[0] - pa[0]) * (pc[1] - pa[1]) -
                     (pb[1] - pa[1]) * (pc[0] - pa[0]))
@@ -1003,161 +671,189 @@ def _emit_surfaces(v2, t2, levels):
             continue
         seen.add(key)
         tris.append((ia, ib, ic))
-    return verts, tris
+    return tris
 
 
-def _fill_boundary_notches(verts, tris, strips):
-    """Close narrow V-shaped notches bitten out of the walkable surface.
+def _emit_surfaces(v2, t2, levels):
+    """Lift a 2D triangulation onto its walkable surfaces, WITHOUT tearing.
 
-    Where two sheets meet at an angle (a stair mouth meeting its floor), the
-    boundaries can stop short of each other and leave a sliver-shaped bite in
-    the surface, apex inward.  It is not a T-junction — no vertex lies on
-    either edge, so the zipper cannot see it — and it is not a coverage hole
-    either, because the sheet BELOW still covers the plan area, so the
-    pathgrid-coverage test passes.  What it does is break adjacency across the
-    mouth, and the notch mouth is exactly where the corridor is narrowest: the
-    author's report was "a missing sliver near the bottom of the staircase
-    that chokes the width by half" (measured on ImperialDungeon01 at the tower
-    stair bottom, vertices (-64.9,134.8,31.3)/(-66.5,149.9,31.3) against
-    (-113.1,211.8,98.5), a 4-edge open V straddling the walked line n124->n125).
-
-    Fill only a notch that is:
-      * TWO boundary edges sharing a vertex (the apex), with their far ends
-        close enough to bridge (a wide V is a real room corner, not a bite);
-      * near a walked pathgrid line — the pathgrid vouches that an actor
-        crosses here, which is what makes the bite a defect rather than
-        authored geometry;
-      * fillable without giving any edge a third owner.
+    Every 2D triangle is emitted once per surface beneath it; a triangle whose
+    corners share no storey is not emitted at all.
+    See: docs/commentary/tes5_import_navmesh.md#surface-emission
     """
-    import math as _m
-    if not strips:
-        return tris
-    tris = [tuple(t) for t in tris]
-    # Walked-line lookup, bucketed.
-    cellsz = NOTCH_NEAR_LINE
+    corner_bands = [_storeys_of(sorted(lv)) for lv in levels]
+    reps_all = [[(min(b), max(b)) for b in bands] for bands in corner_bands]
+    tri_surfaces = [_triangle_surfaces(reps_all, tri) for tri in t2]
+    bare_clusters = _bare_corner_clusters(t2, levels, tri_surfaces)
+
+    keyed = []
+    for ti, (a, b, c) in enumerate(t2):
+        for z in tri_surfaces[ti]:
+            keyed.append(((a, _slot_of(corner_bands, bare_clusters, a, z)),
+                          (b, _slot_of(corner_bands, bare_clusters, b, z)),
+                          (c, _slot_of(corner_bands, bare_clusters, c, z)), z))
+
+    state = {'v2': v2, 'corner_bands': corner_bands,
+             'bare_clusters': bare_clusters, 'vid': {}, 'verts': []}
+    tris = _emit_triangles(state, keyed)
+    return state['verts'], tris
+
+def _walked_line_index(strips, cellsz):
+    """Bucket sampled points along every ribbon centreline by plan cell."""
     lines = {}
     for s in strips:
         ax, ay, az = s['a'][0], s['a'][1], s['a'][2]
         bx, by, bz = s['b'][0], s['b'][1], s['b'][2]
-        n = max(1, int(_m.hypot(bx - ax, by - ay) / cellsz) + 1)
+        n = max(1, int(math.hypot(bx - ax, by - ay) / cellsz) + 1)
         for i in range(n + 1):
             f = i / n
             x, y = ax + (bx - ax) * f, ay + (by - ay) * f
             lines.setdefault((int(x // cellsz), int(y // cellsz)),
                              []).append((x, y, az + (bz - az) * f))
+    return lines
 
-    def _near_line(x, y, z):
-        gx, gy = int(x // cellsz), int(y // cellsz)
-        for ddx in (-1, 0, 1):
-            for ddy in (-1, 0, 1):
-                for (px, py, pz) in lines.get((gx + ddx, gy + ddy), ()):
-                    if ((px - x) ** 2 + (py - y) ** 2 <= cellsz * cellsz
-                            and abs(pz - z) <= STOREY_GAP_Z):
-                        return True
-        return False
 
-    from shapely.geometry import Polygon as _NP
-    from shapely import STRtree as _NT
+def _near_line(lines, cellsz, x, y, z):
+    """True if a walked pathgrid line passes within cellsz of (x, y, z)."""
+    gx, gy = int(x // cellsz), int(y // cellsz)
+    for ddx in (-1, 0, 1):
+        for ddy in (-1, 0, 1):
+            for (px, py, pz) in lines.get((gx + ddx, gy + ddy), ()):
+                if ((px - x) ** 2 + (py - y) ** 2 <= cellsz * cellsz
+                        and abs(pz - z) <= STOREY_GAP_Z):
+                    return True
+    return False
 
-    def _overlaps_existing(verts, tris, tri, index):
-        tree, gmap, polys = index
-        if tree is None:
-            return False
-        pa, pb, pc = verts[tri[0]], verts[tri[1]], verts[tri[2]]
+
+def _plan_index(verts, tris):
+    """(STRtree, triangle ids, polygons) over the mesh's plan footprints."""
+    from shapely import STRtree
+    from shapely.geometry import Polygon
+    geoms, gmap = [], []
+    for ti, t in enumerate(tris):
+        pa, pb, pc = verts[t[0]], verts[t[1]], verts[t[2]]
         try:
-            cand = _NP([(pa[0], pa[1]), (pb[0], pb[1]), (pc[0], pc[1])])
+            pg = Polygon([(pa[0], pa[1]), (pb[0], pb[1]), (pc[0], pc[1])])
+        except Exception:
+            continue
+        if pg.is_valid and pg.area > 1.0:
+            geoms.append(pg)
+            gmap.append(ti)
+    return (STRtree(geoms) if geoms else None), gmap, geoms
+
+
+def _overlaps_existing(verts, tris, tri, index):
+    """True if `tri` would stack on ground already meshed at its height.
+
+    See: docs/commentary/tes5_import_navmesh.md#notch-fill-must-not-stack
+    """
+    from shapely.geometry import Polygon
+    tree, gmap, polys = index
+    if tree is None:
+        return False
+    pa, pb, pc = verts[tri[0]], verts[tri[1]], verts[tri[2]]
+    try:
+        cand = Polygon([(pa[0], pa[1]), (pb[0], pb[1]), (pc[0], pc[1])])
+    except Exception:
+        return True
+    if not cand.is_valid or cand.area <= 1.0:
+        return True
+    zlo = min(pa[2], pb[2], pc[2])
+    zhi = max(pa[2], pb[2], pc[2])
+    for gi in tree.query(cand).tolist():
+        ti = gmap[gi]
+        if set(tris[ti]) & set(tri):
+            continue
+        tz = [verts[i][2] for i in tris[ti]]
+        if min(tz) > zhi + STOREY_GAP_Z or max(tz) < zlo - STOREY_GAP_Z:
+            continue
+        try:
+            if cand.intersection(polys[gi]).area > 4.0:
+                return True
         except Exception:
             return True
-        if not cand.is_valid or cand.area <= 1.0:
-            return True
-        zlo = min(pa[2], pb[2], pc[2])
-        zhi = max(pa[2], pb[2], pc[2])
-        for gi in tree.query(cand).tolist():
-            ti = gmap[gi]
-            if set(tris[ti]) & set(tri):
-                continue
-            tz = [verts[i][2] for i in tris[ti]]
-            if min(tz) > zhi + STOREY_GAP_Z or max(tz) < zlo - STOREY_GAP_Z:
-                continue
-            try:
-                if cand.intersection(polys[gi]).area > 4.0:
-                    return True
-            except Exception:
-                return True
-        return False
+    return False
 
-    for _round in range(2):
-        counts = {}
-        for t in tris:
-            for k in range(3):
-                a, b = t[k], t[(k + 1) % 3]
-                key = (a, b) if a < b else (b, a)
-                counts[key] = counts.get(key, 0) + 1
-        border = [e for e, c in counts.items() if c == 1]
-        if not border:
-            break
-        geoms = []
-        gmap = []
-        for ti, t in enumerate(tris):
-            pa, pb, pc = verts[t[0]], verts[t[1]], verts[t[2]]
-            try:
-                pg = _NP([(pa[0], pa[1]), (pb[0], pb[1]), (pc[0], pc[1])])
-            except Exception:
-                continue
-            if pg.is_valid and pg.area > 1.0:
-                geoms.append(pg)
-                gmap.append(ti)
-        index = (_NT(geoms) if geoms else None, gmap, geoms)
-        at = {}
-        for (a, b) in border:
-            at.setdefault(a, []).append(b)
-            at.setdefault(b, []).append(a)
-        added = []
-        used = set()
-        for apex, ends in at.items():
-            if len(ends) != 2 or apex in used:
-                continue
-            p, q = ends
-            if p in used or q in used:
-                continue
-            va, vp, vq = verts[apex], verts[p], verts[q]
-            gap = _m.dist(vp[:2], vq[:2])
-            if gap < 1e-6 or gap > NOTCH_MAX_MOUTH:
-                continue
-            # The notch must be DEEP relative to its mouth — a slim V bitten
-            # into the surface, not an ordinary convex corner of a room.
-            side = min(_m.dist(va[:2], vp[:2]), _m.dist(va[:2], vq[:2]))
-            if side < 1e-6 or side < gap * NOTCH_MIN_DEPTH_RATIO:
-                continue
-            key = (min(p, q), max(p, q))
-            if counts.get(key, 0) >= 1:
-                continue                # bridging edge already exists
-            mx = (va[0] + vp[0] + vq[0]) / 3.0
-            my = (va[1] + vp[1] + vq[1]) / 3.0
-            mz = (va[2] + vp[2] + vq[2]) / 3.0
-            if not _near_line(mx, my, mz):
-                continue
-            cross = ((vp[0] - va[0]) * (vq[1] - va[1])
-                     - (vq[0] - va[0]) * (vp[1] - va[1]))
-            if abs(cross) < 1.0:
-                continue
-            tri = (apex, p, q) if cross > 0 else (apex, q, p)
-            # The notch's plan area is usually still covered by the sheet
-            # BELOW (which is why the coverage test never saw a hole), so a
-            # blind fill stacks a second surface on it and the engine picks
-            # one arbitrarily — ID01's same-surface overlaps went 2 -> 7.
-            # Only fill where nothing already covers this ground at this
-            # height.
-            if _overlaps_existing(verts, tris, tri, index):
-                continue
-            added.append(tri)
-            used.update((apex, p, q))
+
+def _border_edge_counts(tris):
+    """(edge use counts, the singly-owned border edges)."""
+    counts = {}
+    for t in tris:
+        for k in range(3):
+            a, b = t[k], t[(k + 1) % 3]
+            key = (a, b) if a < b else (b, a)
             counts[key] = counts.get(key, 0) + 1
+    return counts, [e for e, c in counts.items() if c == 1]
+
+
+def _notch_triangle(verts, counts, apex, ends, lines, cellsz):
+    """The wound fill triangle for this apex, or None if it is not a notch.
+
+    See: docs/commentary/tes5_import_navmesh.md#notch-fill-has-four-gates
+    """
+    p, q = ends
+    va, vp, vq = verts[apex], verts[p], verts[q]
+    gap = math.dist(vp[:2], vq[:2])
+    if gap < 1e-6 or gap > NOTCH_MAX_MOUTH:
+        return None
+    side = min(math.dist(va[:2], vp[:2]), math.dist(va[:2], vq[:2]))
+    if side < 1e-6 or side < gap * NOTCH_MIN_DEPTH_RATIO:
+        return None
+    if counts.get((min(p, q), max(p, q)), 0) >= 1:
+        return None
+    if not _near_line(lines, cellsz, (va[0] + vp[0] + vq[0]) / 3.0,
+                      (va[1] + vp[1] + vq[1]) / 3.0,
+                      (va[2] + vp[2] + vq[2]) / 3.0):
+        return None
+    cross = ((vp[0] - va[0]) * (vq[1] - va[1])
+             - (vq[0] - va[0]) * (vp[1] - va[1]))
+    if abs(cross) < 1.0:
+        return None
+    return (apex, p, q) if cross > 0 else (apex, q, p)
+
+
+def _notch_round(verts, tris, lines, cellsz):
+    """One pass of notch filling; returns the triangles it added."""
+    counts, border = _border_edge_counts(tris)
+    if not border:
+        return []
+    index = _plan_index(verts, tris)
+    at = {}
+    for (a, b) in border:
+        at.setdefault(a, []).append(b)
+        at.setdefault(b, []).append(a)
+    added, used = [], set()
+    for apex, ends in at.items():
+        if len(ends) != 2 or apex in used:
+            continue
+        if ends[0] in used or ends[1] in used:
+            continue
+        tri = _notch_triangle(verts, counts, apex, ends, lines, cellsz)
+        if tri is None or _overlaps_existing(verts, tris, tri, index):
+            continue
+        added.append(tri)
+        used.update(tri)
+        key = (min(ends), max(ends))
+        counts[key] = counts.get(key, 0) + 1
+    return added
+
+
+def _fill_boundary_notches(verts, tris, strips):
+    """Close narrow V-shaped notches bitten out of the walkable surface.
+
+    See: docs/commentary/tes5_import_navmesh.md#notch-fill-and-levels
+    """
+    if not strips:
+        return tris
+    tris = [tuple(t) for t in tris]
+    cellsz = NOTCH_NEAR_LINE
+    lines = _walked_line_index(strips, cellsz)
+    for _round in range(2):
+        added = _notch_round(verts, tris, lines, cellsz)
         if not added:
             break
         tris.extend(added)
     return tris
-
 
 # A notch mouth wider than this is a room corner, not a bite out of the mesh.
 NOTCH_MAX_MOUTH = 160.0
@@ -1176,17 +872,8 @@ NOTCH_NEAR_LINE = 192.0
 def _drop_point_attached(tris):
     """Drop triangles that touch the rest of the mesh at a single VERTEX only.
 
-    One 2D triangle of the union is emitted once per SURFACE its corners' levels
-    suggest.  Where a corridor and a nearby quad at a different height both cover
-    a point, that produces a second copy at the other height — and because none
-    of its edges is shared with anything at that height, it hangs off the mesh by
-    a corner.  That is the rogue triangle climbing a staircase toward a door.
-
-    A triangle that shares no full EDGE with any other triangle cannot be walked
-    onto (NVNM adjacency links only across shared edges — see
-    pgrd_to_navm._compute_adjacency), so it is never useful mesh; dropping it
-    removes the artefact without touching anything reachable.  Iterated, because
-    removing one can leave its neighbour edge-isolated in turn.
+    Iterated: removing one can leave its neighbour edge-isolated in turn.
+    See: docs/commentary/tes5_import_navmesh.md#point-attached-cannot-be-walked-onto
     """
     tris = [tuple(t) for t in tris]
     for _round in range(4):
@@ -1216,15 +903,7 @@ def _drop_point_attached(tris):
 def _levels_batch(strips, points):
     """_levels_at for MANY points at once, natively.  Returns a list of lists.
 
-    THE REASON THIS IS BATCHED: per point _levels_at scans every strip (~1,900
-    in a dense cell), and a grown strip's admission test is a point-in-polygon
-    plus a min-distance over its whole outline.  Measured on Wendir02 that was
-    29.3s of a 31.9s build — 4.5ms per call over 6,491 calls — making it the
-    single hottest thing left after the width-grow went native.
-
-    The strips are flattened ONCE per union (not per point) and the native side
-    buckets them by XY bounds, so each point tests only strips that could
-    actually cover it.
+    See: docs/commentary/tes5_import_navmesh.md#levels-are-batched
     """
     from ._native_loader import load_native
     native = load_native('_navgrow_native')

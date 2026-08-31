@@ -26,17 +26,10 @@ _log = logging.getLogger(__name__)
 
 
 def teleport_door_positions(refr_recs):
-    """(x, y, z, rot_z, True) of every teleport-door REFR (XTEL) in the cell.
+    """(x, y, z, rot_z, True, 0.0) of every teleport-door REFR (XTEL) in the cell.
 
-    Fallback door list when the caller cannot supply one (tools without a DOOR
-    base-record set; interior-only doors are missed then).  A teleport door
-    leads to ANOTHER cell, so the navmesh must end at its threshold — exactly
-    as vanilla navmeshes do.  These positions become barriers for the
-    pathgrid-reach flood (see region.keep_pathgrid_heights): without them, an
-    interior cell's mesh escapes through the open doorway and spreads over the
-    decorative street/porch geometry outside the shell.  They also ANCHOR
-    island pruning: the doorstep component in front of each door is how an NPC
-    enters the cell, so it is always kept.
+    The FALLBACK door list, used only when the caller supplies none.
+    See: docs/commentary/tes5_import_navmesh.md#teleport-doors-are-barriers-and-anchors
     """
     out = []
     for refr in refr_recs or ():
@@ -64,16 +57,10 @@ def build_navmesh(refr_recs, base_model_by_fid, get_collision, nodes, edges,
                   doors=None, ledges_out=None, door_bases=None):
     """Build a navmesh for one cell.  Returns (verts3d, tris) or ([], []).
 
-    Phase-1 corridor model: delegates to corridor.build_corridors.  See
-    corridor.py and docs/commentary/tes5_import_navmesh.md.
-
     doors: [(x, y, z, rot_z, is_teleport, width), ...] door REFRs (teleport AND
     interior).  When None, teleport doors are recovered from XTEL alone.
-    door_bases: low-24 DOOR base FormIDs — those refs' panel collision is
-    EXCLUDED (a door is opened, not walked around; see world.gather_cell_geometry).
-    When None, door refs are found via XTEL plus the doors list positions.
-    budget is accepted for signature compatibility (the corridor build has no
-    per-cell time risk) and ignored.
+    door_bases: low-24 DOOR base FormIDs, whose panel collision is EXCLUDED.
+    See: docs/commentary/tes5_import_navmesh.md#ledges-are-returned-out-of-band
     """
     if not nodes:
         return [], []
