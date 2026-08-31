@@ -23,8 +23,8 @@ TINY_DOC_CHARS = 80
 #: A `#:` doc is ONE line: it labels a declaration, it does not argue.
 MAX_ATTR_DOC_CHARS = 120
 
-#: Measured p90 of 7,320 functions is 49 lines; see the architecture doc.
-MAX_FUNCTION_LINES = 60
+#: STATEMENTS, not lines, so reflow cannot move it. p90 of 7,791 fns is 30.
+MAX_FUNCTION_LINES = 35
 
 MAX_COMPLEXITY = 25
 MAX_NESTING = 4
@@ -90,6 +90,14 @@ def code_lines(text: str, tree=None) -> int:
 def complexity(node) -> int:
     """Cyclomatic complexity: 1 plus every branching node."""
     return 1 + sum(1 for x in ast.walk(node) if isinstance(x, BRANCH_NODES))
+
+
+def statements(node) -> int:
+    """Statements in a function body, excluding its own `def`.
+
+    See: docs/reference/script_convert_architecture.md#length-is-counted-in-statements
+    """
+    return sum(1 for x in ast.walk(node) if isinstance(x, ast.stmt)) - 1
 
 
 def depth(node, level: int = 0) -> int:
@@ -302,10 +310,8 @@ def structural_sites(path, text: str, tree) -> dict:
             (path, f.lineno, '%s: complexity %d' % (f.name, c))
             for f in fns for c in [complexity(f)] if c > MAX_COMPLEXITY],
         'long-functions': [
-            (path, f.lineno, '%s: %d lines'
-             % (f.name, f.end_lineno - f.lineno + 1))
-            for f in fns
-            if f.end_lineno - f.lineno + 1 > MAX_FUNCTION_LINES],
+            (path, f.lineno, '%s: %d statements' % (f.name, n))
+            for f in fns for n in [statements(f)] if n > MAX_FUNCTION_LINES],
         'deep-nesting': [
             (path, f.lineno, '%s: nested %d deep' % (f.name, d))
             for f in fns for d in [depth(f)] if d > MAX_NESTING],

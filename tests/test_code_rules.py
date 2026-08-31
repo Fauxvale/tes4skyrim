@@ -395,3 +395,87 @@ def test_the_length_exemption_reaches_no_other_rule():
         assert 'inline-comments' in CR.rule_sites(probe, with_tools=False)
     finally:
         probe.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Length is statements, so reflow cannot move it
+# ---------------------------------------------------------------------------
+
+
+def _stmts(body):
+    """Statement count of the first function in `body`."""
+    import ast
+    return D.statements(ast.parse(body).body[0])
+
+
+def test_a_line_continuation_does_not_change_the_score():
+    """Joining or splitting lines is whitespace; the work is identical."""
+    split = 'def f():\n    x = (1 +\n         2)\n    return x\n'
+    joined = 'def f():\n    x = (1 + 2)\n    return x\n'
+    assert _stmts(split) == _stmts(joined)
+
+
+def test_folding_a_temp_into_the_return_does_not_pay():
+    """The golf move that used to clear the rule now costs exactly one."""
+    named = 'def f():\n    y = g(1)\n    return y\n'
+    folded = 'def f():\n    return g(1)\n'
+    assert _stmts(named) - _stmts(folded) == 1
+
+
+# ---------------------------------------------------------------------------
+# A file the gate cannot read must never read as clean
+# ---------------------------------------------------------------------------
+
+
+def test_unparsable_python_is_a_violation():
+    """Every other rule walks the tree, so a parse failure scored zero."""
+    assert sites('def f(:\n    pass\n', 'broken-syntax') == [1]
+
+
+def test_valid_python_reports_no_syntax_site():
+    """The rule must stay silent on everything that parses."""
+    assert sites('"""M."""\n', 'broken-syntax') == []
+
+
+# ---------------------------------------------------------------------------
+# The hook: what a write must not slip past
+# ---------------------------------------------------------------------------
+
+
+BAD_SRC = ('"""M."""\n\n\ndef f(x) -> int:\n    """D."""\n'
+           '    x += 1  # bump\n    return x\n')
+
+
+def _hook(tool, tool_input):
+    """(exit code, stderr) for one PreToolUse payload."""
+    import json
+    hook = ROOT / '.claude' / 'hooks' / 'doc_rules_gate.py'
+    payload = {'hook_event_name': 'PreToolUse', 'tool_name': tool,
+               'tool_input': tool_input}
+    got = subprocess.run([sys.executable, str(hook)], input=json.dumps(payload),
+                         capture_output=True, text=True, cwd=ROOT)
+    return got.returncode, got.stderr
+
+
+def test_a_write_creating_a_new_file_is_gated():
+    """`judged()` required the file on disk, so every new file passed free."""
+    probe = ROOT / 'tools' / 'validate' / '_new_file_probe.py'
+    assert not probe.exists()
+    code, err = _hook('Write', {'file_path': str(probe), 'content': BAD_SRC})
+    assert code == 2 and 'inline-comments' in err
+    assert not probe.exists()
+
+
+def test_the_candidate_is_never_written_over_the_real_file():
+    """Gating in place made the gate its own bypass when it was killed."""
+    target = ROOT / 'tools' / 'validate' / 'code_rules.py'
+    before = target.read_bytes()
+    _hook('Write', {'file_path': str(target), 'content': BAD_SRC})
+    assert target.read_bytes() == before
+
+
+def test_a_shell_command_must_name_the_wrapper():
+    """A bare command can write a `.py` that no gate ever sees."""
+    code, err = _hook('Bash', {'command': 'python - <<PY\npass\nPY'})
+    assert code == 2 and 'safe_run.py' in err
+    assert _hook('Bash', {'command': 'python tools/validate/safe_run.py ls'})[0] == 0

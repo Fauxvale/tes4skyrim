@@ -188,6 +188,9 @@ real data, or a failing-then-passing test.
 
 ### Hard prohibitions
 
+- 🛑 **NEVER RUN A BARE SHELL COMMAND.** Every one goes through
+  `python tools/validate/safe_run.py <command>`, which gates the `.py` files
+  the command wrote. The hook refuses anything else. See [the wrapper](#safe-run).
 - **NEVER `git stash` / `git stash pop`** in this repository.
 - **NEVER `git commit` or `git push`.** The user commits after in-game testing.
 - **NEVER `git add` / `git rm`** (staging, including staged deletions). Use plain
@@ -400,34 +403,38 @@ Deep reference material lives in `docs/`, sorted by KIND.
 | [audits/](docs/audits/) | A dated sweep over a corpus, with counts |
 | [assets/](docs/assets/) | Images and icons; `banner.png`/`favicon.ico` load at RUNTIME |
 
-### Scripts
-🛑 **Before writing ANY `script_convert/` code, run the decision procedure in [script_convert_architecture.md](docs/reference/script_convert_architecture.md) §3** and score the change with `python tools/script/arch_fitness.py --fail-on-regression`.
+### Code rules — EVERY `.py` in the repo
+
+🛑 <a id="safe-run"></a>**RUN EVERY SHELL COMMAND THROUGH THE WRAPPER** —
+`python tools/validate/safe_run.py <command>`. It runs in your shell, streams
+live, returns the child's exit code, and gates the `.py` files the command
+WROTE. A bare command is refused: a heredoc writes a `.py` no gate ever sees.
 
 🛑 <a id="doc-rules"></a>**THE CODE RULES ARE A REQUIREMENT, NOT A GUIDELINE.
-EVERY `.py` FILE YOU TOUCH — ANYWHERE IN THE REPO — MUST PASS
-`python tools/validate/code_rules.py --gate-file <path>`.** Not "improve it",
-not "as time allows" — pass. Enforced automatically by
-`.claude/hooks/doc_rules_gate.py` after every Edit/Write (it runs `--gate-diff`,
-which charges you for the lines you changed **plus the comments above them**),
-so it is not yours to skip; each violation prints what the rule means, its fix,
-and its `file:line`.
+EVERY `.py` FILE YOU TOUCH MUST PASS
+`python tools/validate/code_rules.py --gate-file <path>`.**
+`.claude/hooks/doc_rules_gate.py` runs `--gate-diff` BEFORE an Edit lands and
+REFUSES it, charging the lines you changed plus the comments above them.
 
-- **Prose:** the only legal forms are a docstring, a ONE-line 120-char `#:`
-  attribute doc, and a `# ----` section heading. A **docstring states the
-  CONTRACT** — what it does, takes and returns, never the story of why.
-  Rationale and measurements go in `docs/`.
+- **Prose:** only a docstring, a ONE-line 120-char `#:` attribute doc, or a
+  `# ----` heading. A docstring states the CONTRACT, never the why; rationale
+  and measurements go in `docs/`, cited by `See: docs/<file>.md#anchor` (the
+  gate checks path and anchor).
 - **A comment is prose wherever it sits** — the scanner tokenizes, so moving it
-  to the end of a line hides nothing, and NOTHING is exempt by prefix: a
-  `# noqa`/`# pragma`/`# type:` is scored like any other comment.
-- **Shape:** ≤60 lines and complexity ≤25 per function, ≤4 nesting, ≤10
-  returns, ≤1000 lines per file, no class-level `dict`/`list`/`set`.
-- **Compress, never delete:** keep every measured count, script name and
-  mechanism; drop the narration. **No dates.** If prose carries a measurement
-  the code cannot state, move it to a `docs/` file and end the docstring with
-  `See: docs/<file>.md#anchor` — the gate checks the path and anchor exist.
+  to the end of a line hides nothing, and `# noqa`/`# pragma`/`# type:` score
+  like any other comment.
+- **Shape:** per function ≤35 statements (NOT lines — reflow moves nothing),
+  complexity ≤25, nesting ≤4, ≤10 returns; ≤1000 lines per file; no
+  class-level `dict`/`list`/`set`.
 - **No dead code:** no unused import or variable, no undefined name, nothing
   unreachable. `code_rules.py --dead-code` is the whole-program sweep.
+- **Compress, never delete:** keep every measured count, script name and
+  mechanism; drop the narration. **No dates.**
 - An inline comment means the code cannot state its own intent — fix the code.
+
+### Scripts
+
+🛑 **Before writing ANY `script_convert/` code, run the decision procedure in [script_convert_architecture.md](docs/reference/script_convert_architecture.md) §3** and score the change with `python tools/script/arch_fitness.py --fail-on-regression`.
 
 ### World, meshes & navmesh
 

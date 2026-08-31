@@ -66,7 +66,7 @@ EXPLAIN = {
     'fat-sections': 'section heading over %d chars of prose' % D.MAX_DOC_CHARS,
     'unsectioned-defs': 'a def above the first heading in a sectioned file',
     'god-functions': 'cyclomatic complexity over %d' % D.MAX_COMPLEXITY,
-    'long-functions': 'over %d physical lines' % D.MAX_FUNCTION_LINES,
+    'long-functions': 'over %d statements' % D.MAX_FUNCTION_LINES,
     'deep-nesting': 'if/for/while/with/try nested over %d deep' % D.MAX_NESTING,
     'multi-return-fns': 'over %d return points -- a dispatch chain'
                         % D.MAX_RETURNS,
@@ -75,6 +75,7 @@ EXPLAIN = {
     'dead-imports': 'an unused import, variable, or undefined name',
     'dead-code': 'a symbol or branch nothing in the repo can reach',
     'dead-citations': 'a `docs/` path or anchor that does not exist',
+    'broken-syntax': 'a file Python cannot parse',
 }
 
 #: How to FIX each rule; the locator says where, this says what to do.
@@ -116,6 +117,9 @@ REMEDY = {
         'delete it; unreachable code is a bug that cannot announce itself',
     'dead-citations':
         'fix the path or the anchor -- a citation that lies loses the knowledge',
+    'broken-syntax':
+        'fix the syntax error -- an unparsable file scores NO other rule, so '
+        'this passing is indistinguishable from a clean file',
 }
 
 #: What to run when a checker is missing, named so a new machine can recover.
@@ -145,7 +149,7 @@ NODE_SPAN_RULES = frozenset({
     'bloated-docstrings', 'missing-docstrings', 'unsectioned-defs'})
 
 #: Rules reported at line 1 or file-wide: blamed only on crossing a threshold.
-FILE_RULES = frozenset({'oversized-files'})
+FILE_RULES = frozenset({'oversized-files', 'broken-syntax'})
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +158,7 @@ FILE_RULES = frozenset({'oversized-files'})
 
 
 def _parse(path: Path, text: str = None):
-    """`(text, tree)` for one file; an unparsable file scores nothing."""
+    """`(text, tree)` for one file; an unparsable file gets an empty tree."""
     if text is None:
         text = path.read_text(encoding='utf-8', errors='replace')
     with warnings.catch_warnings():
@@ -163,6 +167,22 @@ def _parse(path: Path, text: str = None):
             return text, ast.parse(text)
         except SyntaxError:
             return text, ast.Module(body=[], type_ignores=[])
+
+
+def _syntax_sites(path: Path, text: str) -> list:
+    """The one site for a file Python cannot parse; empty when it parses.
+
+    Every other rule walks the tree, so an unparsable file scores zero and
+    reads as clean -- the loudest possible pass for the worst possible edit.
+    See: docs/reference/script_convert_architecture.md#what-the-gate-must-see
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        try:
+            ast.parse(text)
+        except SyntaxError as exc:
+            return [(path, exc.lineno or 1, 'file: %s' % (exc.msg or 'invalid'))]
+    return []
 
 
 def _missing(tool: str) -> bool:
@@ -184,7 +204,8 @@ def _ruff_sites(path: Path) -> list:
         got = subprocess.run(
             [sys.executable, '-m', 'ruff', 'check', '--select', RUFF_CODES,
              '--output-format', 'json', '--force-exclude', str(path)],
-            cwd=ROOT, capture_output=True, text=True, timeout=60)
+            cwd=ROOT, capture_output=True, text=True, encoding='utf-8',
+            errors='replace', timeout=60)
         rows = json.loads(got.stdout or '[]')
     except Exception:
         _missing('ruff')
@@ -258,6 +279,7 @@ def rule_sites(path: Path, text: str = None, with_tools: bool = True,
         'fat-sections': D.fat_sections(path, text),
         'unsectioned-defs': D.unsectioned_defs(path, text, tree),
         'dead-citations': _citation_sites(path, text),
+        'broken-syntax': _syntax_sites(path, text),
     }
     checks.update(D.structural_sites(path, text, tree))
     if _is_test(path):
@@ -337,10 +359,10 @@ def _git(path: Path, *args) -> tuple:
     try:
         got = subprocess.run(['git'] + [a.replace('{}', rel) for a in args],
                              cwd=ROOT, capture_output=True, text=True,
-                             timeout=30)
+                             encoding='utf-8', errors='replace', timeout=30)
     except Exception:
         return False, ''
-    return got.returncode == 0, got.stdout
+    return got.returncode == 0, got.stdout or ''
 
 
 def _baseline_source(path: Path) -> str:
@@ -356,25 +378,34 @@ def _baseline_source(path: Path) -> str:
     return ''
 
 
-def _touched_lines(path: Path):
-    """Line numbers this edit ADDED or CHANGED; None if git knows nothing.
-
-    Diffed against the INDEX, never `HEAD`: `git diff HEAD` folds in staged
-    changes, which billed one edit for every violation in 10 files it had
-    never opened.
-    """
-    tracked, _ = _git(path, 'ls-files', '--error-unmatch', '{}')
-    if not tracked:
-        return None
-    ok, out = _git(path, 'diff', '-U0', '--', '{}')
-    if not ok:
-        return None
+def _hunk_lines(out: str) -> set:
+    """The `+` line numbers named by every hunk header in a unified diff."""
     touched = set()
     for hunk in re.finditer(r'^@@ -\S+ \+(\d+)(?:,(\d+))? @@', out,
                             re.MULTILINE):
         start = int(hunk.group(1))
         touched.update(range(start, start + int(hunk.group(2) or 1)))
     return touched
+
+
+def _touched_lines(path: Path, candidate: str = None):
+    """Line numbers this edit ADDED or CHANGED; None if git knows nothing.
+
+    Diffed against the INDEX, never `HEAD`: `git diff HEAD` folds in staged
+    changes, which billed one edit for every violation in 10 files it had
+    never opened.  `candidate` is text not yet on disk, diffed in memory so an
+    edit is scored BEFORE it is applied.
+    """
+    import difflib
+    tracked, _ = _git(path, 'ls-files', '--error-unmatch', '{}')
+    if not tracked:
+        return None
+    if candidate is not None:
+        return _hunk_lines('\n'.join(difflib.unified_diff(
+            _baseline_source(path).splitlines(),
+            candidate.splitlines(), n=0, lineterm='')))
+    ok, out = _git(path, 'diff', '-U0', '--', '{}')
+    return _hunk_lines(out) if ok else None
 
 
 def edit_region(touched: set, text: str) -> set:
@@ -447,15 +478,21 @@ def _blame(now: dict, was: dict, touched, text: str, tree) -> dict:
     return owned
 
 
-def gate_diff(path: Path, limit: int = 10) -> int:
-    """1 when the agent's own edit owns a violation; else 0."""
-    if not path.exists() or path.suffix != '.py':
+def gate_diff(path: Path, limit: int = 10, source: Path = None) -> int:
+    """1 when the agent's own edit owns a violation; else 0.
+
+    `source` holds the CANDIDATE text while `path` names the file it would
+    become: the hook scores an edit before applying it, and git must still
+    scope the blame to the real file's diff.
+    """
+    read = source or path
+    if not read.exists() or read.suffix != '.py':
         return 0
-    touched = _touched_lines(path)
+    text, tree = _parse(read)
+    touched = _touched_lines(path, text if source is not None else None)
     if touched == set():
         return 0
-    text, tree = _parse(path)
-    now = rule_sites(path)
+    now = rule_sites(read, text, tree=tree)
     before = _baseline_source(path)
     was = rule_sites(path, before, with_tools=False) if before else {}
     headline = ('NEW FILE -- all of it is yours' if touched is None
@@ -491,7 +528,8 @@ def dead_code(limit: int = 40) -> int:
              '--min-confidence', VULTURE_CONFIDENCE,
              '--ignore-decorators', VULTURE_IGNORE_DECORATORS,
              '--exclude', ','.join(SKIP_PARTS)],
-            cwd=ROOT, capture_output=True, text=True, timeout=300)
+            cwd=ROOT, capture_output=True, text=True, encoding='utf-8',
+            errors='replace', timeout=300)
     except Exception as exc:
         if not _missing('vulture'):
             print('  vulture did not run: %s' % exc, file=sys.stderr)
@@ -534,6 +572,8 @@ def _parser() -> argparse.ArgumentParser:
                         help='score ONE file absolutely; exit 1 on any break')
     parser.add_argument('--gate-diff', metavar='PATH', action='append',
                         help='score only what THIS edit owns (the hook path)')
+    parser.add_argument('--candidate', metavar='PATH',
+                        help='read the text from here, blame --gate-diff PATH')
     parser.add_argument('--sweep', action='store_true',
                         help='gate every first-party file')
     parser.add_argument('--dead-code', action='store_true',
@@ -563,7 +603,8 @@ def main(argv=None) -> int:
         return max(gate_file(Path(n).resolve(), args.limit)
                    for n in args.gate_file)
     if args.gate_diff:
-        return max(gate_diff(Path(n).resolve(), args.limit)
+        cand = Path(args.candidate).resolve() if args.candidate else None
+        return max(gate_diff(Path(n).resolve(), args.limit, cand)
                    for n in args.gate_diff)
     _parser().print_help()
     return 0

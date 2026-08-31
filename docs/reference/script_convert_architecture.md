@@ -371,3 +371,62 @@ regression cannot be bisected to it. Land the fix; leave the file long.
 Split when the split IS the task, or when the responsibility you are adding
 genuinely belongs in its own module. Otherwise the correct response to a
 1,000-line file you had to touch is to leave it no longer than you found it.
+
+### Length is counted in statements
+
+`long-functions` scores **statements, not physical lines**. A line count is
+gameable by reflow: joining two lines with a `\`, or folding a temp into the
+`return`, drops the number without removing any work — and the rule then
+rewards the less readable edit. One transcript shows a single condition
+rewritten five times (continuation backslash, re-escape, `(motion or {})`,
+revert, folded return) purely to move a line count.
+
+Statements are immune: `ast.walk` counts `ast.stmt` nodes, so every reflow of
+the same code yields the same number and the only way down is to delete work.
+
+**Threshold 35.** Measured over 7,791 first-party functions — p50=7, p75=15,
+p90=30, p95=45. `>35 statements` fires on 599 (7.7%), matching the 562 (7.7%)
+the old 60-physical-line cap fired on, so the pressure is unchanged while the
+metric stops being gameable. 60 statements would have dropped it to 225 (2.9%).
+
+This also stops charging data tables as complex code: `_init_dispatch` in
+`tes5_import/constants.py` is 185 physical lines but **12 statements**.
+
+`oversized-files` still counts `code_lines()`: line and statement counts
+already agree there (20 files vs 22), so it needs no re-baseline.
+
+### What the gate must see
+
+`.claude/hooks/doc_rules_gate.py` blocks a write that would leave a violation on
+the code it owns. Every hole below was reached by running the hook against a
+probe, not by reading it, and each one let a real violation onto disk:
+
+| Hole | Why it passed |
+|---|---|
+| A Write creating a NEW `.py` | `judged()` required `os.path.isfile()`, false before the file exists |
+| `foo.PY` on Windows | `endswith('.py')` is case-sensitive; NTFS is not, so the write lands on `foo.py` |
+| Syntactically invalid Python | `_parse()` returned an empty module on `SyntaxError`, so the file scored zero violations |
+| A report containing `ModuleNotFoundError` | a *substring* test on stderr turned exit 2 into a pass |
+| Non-cp1252 bytes in git output | bare `text=True` decoded with the locale codec; the crash fell into an `except` that returned 0 |
+| `MultiEdit` / `NotebookEdit` | absent from the matcher, or unhandled by `pending_text()` |
+
+Two rules follow from these. **A gate that cannot run must fail closed** — every
+`except` that returned 0 was a silent pass, which is indistinguishable from a
+clean file. And **the gate must never be the write mechanism**: `gate_pending()`
+used to write the candidate over the real file and restore it in `finally`, so
+being killed mid-write (the harness caps the hook at 120s) left unvalidated,
+possibly truncated code on disk. It scores a temp copy instead.
+
+Bash cannot be gated before it runs, because a shell command's effect is not
+predictable. `tools/validate/safe_run.py` is the one allowed entry point: it
+hashes tracked `.py` files, runs the command with the streams inherited,
+re-hashes, and gates whatever changed.
+
+**The routing rule lives in the HOOK, not in `permissions`.** Rules evaluate
+deny, then ask, then allow, and the first match wins — specificity never
+reorders them. So a `deny` cannot carry an allowlist exception: `deny: ["Bash"]`
+with `allow: ["Bash(python tools/validate/safe_run.py:*)"]` blocks the wrapper
+too, and so does `Bash(*)` or even `Bash(python *)`. A hook returning
+`permissionDecision: "allow"` does not lift a deny either. What does work is a
+hook **exit 2**, which is evaluated BEFORE the permission rules — so the hook
+blocks any command that does not name the wrapper, and no deny rule is needed.
