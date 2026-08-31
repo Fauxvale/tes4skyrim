@@ -362,6 +362,36 @@ def pushed_refs(argv: list[str]) -> 'list[str] | None':
     return None
 
 
+def _try_adopt(stale: list) -> list:
+    """Adopt every stale cache whose geometry still reproduces; return the rest.
+
+    A pure refactor moves the tag without changing a single vertex, and
+    regenerating then costs ~95 minutes to rebuild bytes already on disk.
+    Adoption proves a sample reproduces and re-keys instead.  A cache that does
+    NOT reproduce is left stale, so a real behaviour change still blocks.
+    """
+    try:
+        from tools.navmesh import navmesh_adopt as na
+    except Exception as exc:
+        print('navmesh-cache: adoption unavailable (%s); '
+              'falling back to regeneration.' % exc)
+        return stale
+    remaining = []
+    for plugin in stale:
+        print('')
+        print('navmesh-cache: %s is stale -- checking whether its geometry '
+              'still reproduces...' % plugin)
+        try:
+            rc = na.adopt(plugin, sample=na.SAMPLE_DEFAULT)
+        except Exception as exc:
+            print('navmesh-cache: adoption failed for %s (%s).'
+                  % (plugin, exc))
+            rc = na.ADOPT_REFUSED
+        if rc != na.ADOPT_OK:
+            remaining.append(plugin)
+    return remaining
+
+
 def pre_push(argv: list[str]) -> int:
     """git pre-push entry point.  Only gates pushes that update master."""
     # An unreadable ref list must gate rather than skip: a false block costs one
@@ -375,6 +405,9 @@ def pre_push(argv: list[str]) -> int:
     gated, touched, stale = check(verbose=True)
     if not gated:
         return 0
+
+    if stale:
+        stale = _try_adopt(stale)
 
     if stale:
         print('')

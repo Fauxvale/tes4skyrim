@@ -55,6 +55,7 @@ from .skyrim_overrides import (
     set_voice_type,
 )
 from .navi_builder import NAVI_SINGLETON_FID, build_navi_record
+from . import navm_verify
 from .lava_placement import LavaPlanner
 from .locations import build_marker_locations
 from .record_types.world import (
@@ -3105,6 +3106,8 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
 
     n_workers = _navm_worker_count(len(jobs))
     geom_cache = _navmesh_geom_cache(collision_cache)
+    if geom_cache:
+        navm_verify.mark_jobs(jobs, navm_verify.verify_budget())
     # Door panel-centroid cache sits beside the collision cache in export_dir.
     door_centers_cache = (os.path.join(os.path.dirname(collision_cache),
                                        'door_centers_cache.json')
@@ -3174,23 +3177,8 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
           f"{time.time() - t0:.2f}s ({n_workers} workers, "
           f"{hits} geometry-cache hits)")
 
-    # Report per-cell failures HERE, in the parent. The workers cannot: they run
-    # under pythonw.exe, where stdout goes nowhere, so a cell that failed used to
-    # vanish silently and leave the plugin a navmesh short with nothing in the
-    # log to explain it.
-    failures = [(key, m) for key, (b, m) in cache.items()
-                if b is None and m and m.get('error')]
-    if failures:
-        print(f"    WARNING: {len(failures)} cells produced no navmesh:")
-        for (cell_fid, pgrd_fid), m in failures[:20]:
-            print(f"      cell {cell_fid:08X} pgrd {pgrd_fid:08X}: "
-                  f"{m['error']}")
-        if len(failures) > 20:
-            print(f"      ... and {len(failures) - 20} more")
-    else:
-        # Certify the cache ONLY after a clean, complete pass.  A run with
-        # failed cells left entries missing, so stamping it would advertise a
-        # partial cache as a full one to anyone who downloads it.
+    navm_verify.report_verification(cache, geom_cache)
+    if not navm_verify.report_failures(cache):
         _stamp_navmesh_cache_tag(geom_cache)
     return cache
 

@@ -414,11 +414,12 @@ WROTE. A bare command is refused: a heredoc writes a `.py` no gate ever sees.
 gets a literal `|` and still exits 0. Use `grep -E "a|b"` or `-e a -e b`. Zero
 matches is a broken query, never evidence about the tree.
 
-🛑 <a id="doc-rules"></a>**THE CODE RULES ARE A REQUIREMENT, NOT A GUIDELINE.
-EVERY `.py` FILE YOU TOUCH MUST PASS
-`python tools/validate/code_rules.py --gate-file <path>`.**
+🛑 <a id="doc-rules"></a>**THE CODE RULES ARE A REQUIREMENT, NOT A GUIDELINE.**
 `.claude/hooks/doc_rules_gate.py` runs `--gate-diff` BEFORE an Edit lands and
 REFUSES it, charging the lines you changed plus the comments above them.
+`--gate-file` scores a WHOLE file, including debt you did not write; use it only
+to audit a file before refactoring it. `oversized-files` is a RATCHET: it fires
+only when your edit RAISES the count, never for merely being over.
 
 - **Prose:** only a docstring, a ONE-line 120-char `#:` attribute doc, or a
   `# ----` heading. A docstring states the CONTRACT, never the why; rationale

@@ -25,6 +25,9 @@ from tes5_import import import_main as im  # noqa: E402
 from tes5_import.pgrd_to_navm import _geom_hash  # noqa: E402
 from tools.navmesh import navmesh_cache as nc  # noqa: E402
 from tools.navmesh import navmesh_cache_hook as hook  # noqa: E402
+from tools.navmesh import navmesh_adopt as adopt
+from tes5_import import navm_verify
+from tes5_import.pgrd_to_navm import geom_equal, geom_quantize
 
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1037,3 +1040,108 @@ def test_asset_name_is_stable():
     assert nc.asset_name('Morrowind_ob.esm') == 'navmesh-cache-Morrowind_ob.zip'
     # Spaces would break `gh release download --pattern`.
     assert ' ' not in nc.asset_name('Morrowind_ob - Chargen and Transport Mod.esp')
+
+
+def _job(stratum, i=0):
+    """A job dict carrying only what _stratum and mark_jobs look at."""
+    base = {'key': (i, i), 'land_rec': None, 'refr_recs': []}
+    if stratum == 'exterior':
+        base['land_rec'] = {'VHGT': 'x'}
+    elif stratum == 'door':
+        base['extra_door_refrs'] = [{'NAME': '1'}]
+    elif stratum == 'crowded':
+        base['refr_recs'] = [{}] * 150
+    return base
+
+
+def test_mark_jobs_never_exceeds_the_budget():
+    """The sample is a CEILING: a per-worker budget would multiply by workers."""
+    jobs = [_job('exterior', i) for i in range(500)]
+    jobs += [_job('interior', 500 + i) for i in range(50)]
+    assert navm_verify.mark_jobs(jobs, 40) == 40
+    assert sum(1 for j in jobs if j.get('verify')) == 40
+
+
+def test_mark_jobs_spreads_across_strata():
+    """A behaviour change may touch only one kind of cell, so sample all kinds."""
+    jobs = []
+    for n, stratum in enumerate(('interior', 'exterior', 'door', 'crowded')):
+        jobs += [_job(stratum, n * 1000 + i) for i in range(200)]
+    navm_verify.mark_jobs(jobs, 40)
+    got = {navm_verify._stratum(j) for j in jobs if j.get('verify')}
+    assert got == {'interior', 'exterior', 'door', 'crowded'}
+
+
+def test_mark_jobs_zero_budget_marks_nothing():
+    """A zero budget disables verification without touching the jobs."""
+    jobs = [_job('interior', i) for i in range(10)]
+    assert navm_verify.mark_jobs(jobs, 0) == 0
+    assert not any(j.get('verify') for j in jobs)
+
+
+def test_verify_budget_env_var(monkeypatch):
+    """The env var overrides the default; junk falls back, explicit wins."""
+    monkeypatch.setenv(navm_verify.VERIFY_ENV_VAR, '7')
+    assert navm_verify.verify_budget() == 7
+    monkeypatch.setenv(navm_verify.VERIFY_ENV_VAR, '0')
+    assert navm_verify.verify_budget() == 0
+    monkeypatch.setenv(navm_verify.VERIFY_ENV_VAR, 'nonsense')
+    assert navm_verify.verify_budget() == navm_verify.VERIFY_DEFAULT
+    assert navm_verify.verify_budget(3) == 3
+
+
+def test_geom_equal_is_exact_on_float32():
+    """Fresh builds are f64; the cache is f32.  Compare AFTER demotion."""
+    verts = [(1.0, 2.0, 3.0), (4.5, 5.5, 6.5)]
+    tris = [(0, 1, 0)]
+    assert geom_equal((verts, tris, []), (list(verts), list(tris), []))
+    moved = [(1.5, 2.0, 3.0), (4.5, 5.5, 6.5)]
+    assert not geom_equal((verts, tris, []), (moved, tris, []))
+
+
+def test_geom_equal_ignores_ledge_order():
+    """Ledges are a set of links; their order carries no meaning."""
+    a = ([(0.0, 0.0, 0.0)], [(0, 0, 0)], [(1, 2), (3, 4)])
+    b = ([(0.0, 0.0, 0.0)], [(0, 0, 0)], [(3, 4), (1, 2)])
+    assert geom_equal(a, b)
+
+
+def test_geom_quantize_matches_what_the_cache_stores():
+    """The demotion must agree with _geom_cache_store's float32 array."""
+    verts = [(1.0000001, 2.0, 3.0)]
+    stored = np.asarray(verts, dtype=np.float32).tolist()
+    assert geom_quantize(verts) == [tuple(v) for v in stored]
+
+
+def test_uncertify_removes_only_the_stamp(tmp_path):
+    """A failed run must not delete entries other cells are still reading."""
+    cdir = tmp_path / 'navmesh_geom_cache'
+    cdir.mkdir()
+    (cdir / 'CACHE_TAG').write_text('deadbeef')
+    (cdir / '00000001_00000002.pkl').write_bytes(b'payload')
+    assert navm_verify.uncertify((str(cdir), 'deadbeef')) is True
+    assert not (cdir / 'CACHE_TAG').exists()
+    assert (cdir / '00000001_00000002.pkl').exists()
+
+
+def test_rekey_rewrites_only_the_hash(tmp_path):
+    """Adoption changes the KEY, never the geometry."""
+    path = tmp_path / 'e.pkl'
+    blob = {'hash': 'old', 'verts': np.zeros((2, 3), dtype=np.float32),
+            'tris': np.zeros((1, 3), dtype=np.int32), 'ledges': [(1, 2)]}
+    with open(path, 'wb') as fh:
+        pickle.dump(blob, fh)
+    assert adopt.rekey(str(path), 'new') is True
+    got = pickle.load(open(path, 'rb'))
+    assert got['hash'] == 'new'
+    assert np.array_equal(got['verts'], blob['verts'])
+    assert np.array_equal(got['tris'], blob['tris'])
+    assert got['ledges'] == [(1, 2)]
+    assert adopt.rekey(str(path), 'new') is False
+
+
+def test_environment_records_what_the_tag_cannot_see():
+    """GEOS can change geometry without moving the source tag."""
+    env = adopt.environment()
+    assert 'python' in env
+    assert 'shapely' in env and 'geos' in env

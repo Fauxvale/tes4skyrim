@@ -1677,6 +1677,104 @@ GitHub's UI runs no local hook) — CI cannot validate a cache built from
 gitignored `export/` data. Use `--run` for the PR case.
 
 
+## Verifying a cache against fresh geometry
+<a id="verifying-a-cache-against-fresh-geometry"></a>
+
+**Code:** `pgrd_to_navm.geom_equal` / `geom_quantize`, `navm_worker.run_job`,
+`import_main._precompute_navmeshes`, `tools/navmesh/navmesh_cache.py adopt`.
+
+The source tag is a *proxy* for "the generator's behaviour changed": it hashes
+the bytes of `tes5_import/navmesh/*.py` and `pgrd_to_navm.py`. It cannot tell a
+behaviour change from a rename, a docstring edit or a file split, so a pure
+refactor invalidates every entry and forces a full regeneration.
+
+**Measured, on the `corridor_union.py` split** (−474 net lines into
+`union_cdt`/`union_geom`/`union_mesh`/`union_sheets`): comparing the 2,136
+pre-refactor entries that survived against the regenerated cache gave
+**2,136/2,136 identical** verts, tris and ledges — and a *different* per-entry
+`hash` on every one. The geometry was right and the key was wrong. That is the
+whole problem this machinery exists to solve.
+
+**Adoption** proves the output is unchanged, then re-keys the entries instead of
+rebuilding them: `_geom_hash` takes the tag as its first argument, so re-keying
+is a hash recompute per cell with no geometry rebuild. A 95-minute regeneration
+becomes a sampled verification plus a rewrite.
+
+**Comparison is exact, and that is sound.** Nothing under `tes5_import/navmesh/`
+uses randomness, clocks, threads or pools; every iterated `set` holds ints or
+int-tuples (`PYTHONHASHSEED` randomizes only `str`/`bytes`/`datetime`); the
+native extension is single-threaded and built `/fp:precise` so the compiler may
+not reassociate float ops. `convert_PGRD` demotes verts to float32 on the
+fresh-build path *before* packing or storing, so a fresh build and a cache hit
+converge on the same bits by construction — `geom_quantize` exists so a caller
+comparing `build_navmesh`'s raw f64 return applies the same demotion.
+
+**The tag does not cover shapely/GEOS or the compiled `.pyd`.** The union path
+leans on GEOS (`unary_union`, `constrained_delaunay_triangles`, `buffer(0)`,
+`STRtree`), so a library upgrade can change output *without* moving the tag.
+That is why adoption is not enough on its own: **the import re-verifies a sample
+of cache hits on every run**, rebuilding those cells and comparing. A mismatch
+warns, drops the cache for the remainder of the run, and regenerates — so a
+wrong cache costs the sample, not silently wrong navmesh. This restores the
+"slow, never incorrect" guarantee that adoption otherwise weakens.
+
+**Re-keying must never build geometry.** `_geom_hash` is a pure function of a
+cell's INPUTS -- pathgrid graph, REFRs, doors, LAND, per-mesh collision digests
+-- and `convert_PGRD` computes it *before* deciding whether to build. So
+adoption re-keys through `cell_geom_key`, which shares `_cell_graph` with
+`convert_PGRD` and stops at the hash. Routing it through `convert_PGRD` instead
+rebuilds every cell to learn a value no geometry feeds: **measured 1,869 ms/cell
+against 0.9 ms/cell — 8.7 hours against ~8 seconds for Oblivion's 8,221
+entries**, which would make adoption slower than the 95-minute regeneration it
+exists to replace. `_cell_graph` is shared rather than duplicated precisely
+because a divergence between the two derivations would silently invalidate
+every entry.
+
+**Adoption needs one process per plugin.**
+<a id="adoption-needs-one-process-per-plugin"></a>
+Per-plugin state lives in module globals: the collision soups
+(`collision_extract._COLLISION`), the door panel tables in `pgrd_to_navm`, and
+the injected-FormID map. Loading a second plugin into a process that already
+holds the first mixes them, cells build against the wrong data, and adoption
+REFUSES a cache that is perfectly good. Measured: **Morrowind_ob.esm verified
+12/12 alone, and 5/12 immediately after Nehrim.esm in the same process** —
+a false refusal that looks exactly like a real behaviour change. The real
+pipeline runs one plugin per invocation, so adoption does too.
+
+Note `load_door_centroids` is skipped entirely when no `door_centers_cache.json`
+exists, which leaves the previous plugin's door widths in place; Nehrim and
+Morrowind_ob both lack that file while Oblivion has it. Passing the path
+unconditionally makes the loader clear its tables even when the file is absent,
+but that alone does not fix the collision/FormID leak — only a fresh process
+does.
+
+**The verify budget is chosen in the parent, never held per worker.**
+`initargs` are copied into every process, so a worker-side budget would verify
+N cells *per worker* — on a 29-worker run that is ~1,160 rebuilds, turning a
+bounded check into most of a regeneration.
+
+
+## `convert_PGRD` arguments worth explaining
+<a id="convert-pgrd-arguments"></a>
+
+**Code:** `pgrd_to_navm.convert_PGRD`.
+
+- **`navm_fid`** — a pre-allocated NAVM FormID. When given, the writer is not
+  touched for allocation, which lets callers assign FormIDs deterministically
+  before farming the heavy, scipy-bound geometry work out to a pool.
+- **`geom_cache`** — `(cache_dir, tag)` enabling the on-disk geometry cache. The
+  tag must cover the generator code; collision enters per mesh via `_geom_hash`.
+- **`extra_door_refrs`** — door REFRs that stand in this cell but are PARENTED
+  elsewhere. Exterior teleport doors are persistent refs living in the
+  worldspace's persistent (dummy) cell, so the per-cell REFR list never contains
+  them. Without this, exterior meshes got door triangles on only **89 of 6,516**
+  cells and cross-door pathing died at every house door and city gate. They feed
+  the door threshold stamp and door-triangle linking only.
+- **`meta['geometry']`** — the `(verts, tris, ledges)` this call produced, so a
+  verify pass can compare a cache hit against a fresh build without re-deriving
+  the inputs.
+
+
 ## Navmesh redesign: pathgrid corridor ribbons
 <a id="navmesh-redesign-pathgrid-corridor-ribbons"></a>
 
