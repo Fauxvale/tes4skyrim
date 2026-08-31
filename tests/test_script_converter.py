@@ -41,6 +41,12 @@ from script_convert.tes4.parser import (
     split_param_names,
     split_trailing_comment,
 )
+from script_convert.objective_completion import (
+    _target_closes,
+    objective_lines,
+    parallel_stages,
+    residue_stages,
+)
 from script_convert.pipeline import (
     _sanitize_name,
     _pack_wstring,
@@ -1436,6 +1442,16 @@ _GE = 0x60
 _LE = 0xA0
 
 
+def _stage_done_gate(stage, op=_EQ, value=1):
+    """A CTDA hex for GetStageDone(quest, stage) - func 59, stage is param 2."""
+    raw = (bytes([op, 0, 0, 0])
+           + struct.pack('<f', float(value))
+           + struct.pack('<H', 59) + b'\x00' * 2
+           + b'\x13\x57\x03\x00' + struct.pack('<I', int(stage))
+           + b'\x00' * 4)
+    return raw.hex()
+
+
 def _frags(*stages):
     """fragments tuples as _convert_qust_scripts builds them."""
     return [(s, 0, f'Log text {s}.', '', False, i, 0)
@@ -1518,6 +1534,65 @@ class TestQuestObjectiveCompletion:
         sup = _superseded_stages({}, _frags(10, 20, 30))
         assert sup[(20, 0)] == [10]
         assert sup[(30, 0)] == [20]
+
+    def test_unbounded_target_never_blocks_completion(self):
+        """MS48's shape: a target gated `GetStage >= 50` stays live to the end
+        of the quest, so its liveness says nothing about whether a step ended.
+        Reading it as still-in-progress stranded objectives 50..90 forever."""
+        rec = {
+            'Target[0].FormID': '00028A7A',
+            'Target[0].Condition[0].Raw': _stage_gate(_GE, 50),
+        }
+        frags = _frags(50, 60, 70)
+        assert residue_stages(rec, frags) == [], \
+            "an open-ended gate must not leave objectives unresolvable"
+        sup = _superseded_stages(rec, frags)
+        assert sup[(60, 0)] == [50]
+        assert sup[(70, 0)] == [60]
+
+    def test_getstagedone_target_counts_as_closing(self):
+        """fbmwBMStones' six ritual targets are gated GetStageDone, not a stage
+        window. They DO close - just order-independently - so they must stay in
+        the liveness test; dropping them re-ordered the rituals sequentially."""
+        assert _target_closes([_stage_done_gate(60)]), \
+            "a GetStageDone gate has a closing edge"
+        assert not _target_closes([_stage_gate(_GE, 50)]), \
+            "an open-ended GetStage gate has none"
+        assert _target_closes([_stage_gate(_LE, 90)])
+
+    def test_terminal_stage_is_never_superseded(self):
+        """SE44: stage 200 ends the quest one way, 201 the other. TES4 has no
+        fail bit, so both carry QSDT 0x01 - mutually exclusive endings that must
+        never close each other."""
+        rec = {
+            'Stage[0].Index': 200, 'Stage[0].LogCount': 1,
+            'Stage[0].Log[0].Flags': 0x01,
+            'Stage[1].Index': 201, 'Stage[1].LogCount': 1,
+            'Stage[1].Log[0].Flags': 0x01,
+        }
+        frags = [(200, 0, 'Rewarded.', '', True, 0, 0),
+                 (201, 0, 'He is dead.', '', True, 1, 0)]
+        sup = _superseded_stages(rec, frags)
+        assert sup[(201, 0)] == [], \
+            "a quest-ending stage must not be closed by the other ending"
+
+    def test_residue_objectives_are_swept_at_runtime(self):
+        """An objective no static rule can finish is closed only if the player
+        actually saw it - a branch never taken was never Displayed."""
+        lines = objective_lines({}, [8, 50], 60, 0)
+        assert '  If IsObjectiveDisplayed(8) && !IsObjectiveCompleted(8)' in lines
+        assert '    SetObjectiveCompleted(8, true)' in lines
+        assert '  SetObjectiveDisplayed(60, true)' in lines
+        assert not any('IsObjectiveDisplayed(60)' in x for x in lines), \
+            "a stage never sweeps itself or anything later"
+
+    def test_parallel_quests_are_exempt_from_the_sweep(self):
+        """MQ11's six city gates are closable in any order, so an earlier one is
+        still a live task when a later one is displayed."""
+        assert 40 in parallel_stages('MQ11')
+        assert 45 in parallel_stages('mq11'), "lookup is case-insensitive"
+        assert parallel_stages('MS48') == frozenset(), \
+            "a quest absent from the table is swept normally"
 
 
 # ===========================================================================

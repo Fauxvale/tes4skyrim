@@ -195,6 +195,20 @@ def export_QUST(rec: Record) -> list:
                     lines.append(f"Stage[{i}].Log[{j}].ResultScript={escape_value(entry['script'])}")
                 for k, ref in enumerate(entry.get('refs', [])):
                     lines.append(f"Stage[{i}].Log[{j}].SCRO[{k}]={ref}")
+                # Per-log-entry conditions.  These were parsed above and then
+                # silently dropped, which lost 950 CTDAs across 71 quests.
+                # They are Oblivion's OWN answer to "when does this journal
+                # entry stop being shown": MS48 stage 40's two entries both
+                # carry `GetStage MS48 < 50`, i.e. stage 50 supersedes them.
+                # Skyrim has no equivalent display gate, so the importer turns
+                # them into the SetObjectiveCompleted the journal needs.
+                ctdas = entry.get('ctdas', [])
+                if ctdas:
+                    lines.append(
+                        f"Stage[{i}].Log[{j}].ConditionCount={len(ctdas)}")
+                    for k, raw in enumerate(ctdas):
+                        lines.append(
+                            f"Stage[{i}].Log[{j}].Condition[{k}].Raw={raw}")
 
     # Targets (QSTA) with their per-target conditions. These CTDAs (typically
     # GetStage/GetStageDone bounds) are what the importer replays on each

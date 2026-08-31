@@ -8,9 +8,13 @@ nothing.  This does the merge here, where the hook can run.
     python tools/release/merge_to_master.py --dry-run   # what would happen
     python tools/release/merge_to_master.py             # merge, then push
 
-Order matters.  The cache is adopted BEFORE the merge, because adoption hashes
-the WORKING TREE's navmesh sources: adopting after checking out master would
-key the cache to master's code rather than the code being merged.
+Order matters, and it is the opposite of the obvious one: the cache is settled
+AFTER the merge.  Adoption hashes the WORKING TREE's navmesh sources, and the
+merge is what brings the branch's navmesh changes into that tree -- so a cache
+adopted first is already stale when the pre-push gate looks at it, and the push
+is blocked despite a clean adoption moments earlier.  (Measured: a merge at
+00:17 adopted cleanly beforehand, was refused, and only pushed after the gate
+re-adopted at 00:22.)
 
 Nothing here force-pushes, rebases, or touches the index beyond the merge
 itself.  A dirty tree aborts: a merge is hard to unpick, and uncommitted work
@@ -31,12 +35,47 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 MASTER = 'master'
 
 
-def git(*args, capture=True, check=False):
-    """Run a git command in the repo root."""
-    root = os.path.dirname(os.path.dirname(os.path.dirname(
+def repo_root() -> str:
+    """The repository root, three levels above this file."""
+    return os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))))
-    return subprocess.run(['git', *args], cwd=root, check=check,
-                          capture_output=capture, text=True)
+
+
+def git(*args, check=False):
+    """Run a git command in the repo root, capturing its output."""
+    return subprocess.run(['git', *args], cwd=repo_root(), check=check,
+                          capture_output=True, text=True)
+
+
+def git_streamed(*args):
+    """Run git with output shown live AND kept.  (returncode, combined text).
+
+    A failing step must be able to explain itself.  Letting git write straight
+    to the terminal loses its message as soon as anything else prints -- the
+    pre-push hook emits ~40 lines while publishing -- so a generic "FAILED"
+    then replaces the only evidence of the cause.
+    """
+    proc = subprocess.Popen(['git', *args], cwd=repo_root(),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    lines = []
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        lines.append(line)
+    return proc.wait(), ''.join(lines)
+
+
+def pushed_ok() -> bool:
+    """Is local master already on origin?  The truth about a push's outcome.
+
+    git can exit non-zero on a push it actually delivered, so the REF is the
+    authority on whether the work landed -- not the exit code.
+    """
+    git('fetch', 'origin', MASTER)
+    out = git('rev-list', '--left-right', '--count',
+              'origin/%s...%s' % (MASTER, MASTER)).stdout.split()
+    return len(out) == 2 and out[1] == '0'
 
 
 def current_branch() -> str:
@@ -81,30 +120,50 @@ def ensure_cache(sample: int, dry_run: bool) -> bool:
     return True
 
 
-def do_merge(branch: str, dry_run: bool) -> int:
-    """Fast-forward-or-merge *branch* into master and push."""
+def do_merge(branch: str, sample: int, dry_run: bool) -> int:
+    """Merge *branch* into master, settle the cache, then push.
+
+    Adoption runs AFTER the merge, never before: the merge is what brings the
+    navmesh source changes into the tree, so a cache adopted beforehand is
+    already stale by the time the pre-push gate looks at it -- which is exactly
+    how a merge that had just adopted cleanly still had its push blocked.
+    """
     steps = [
         ('checkout master', ('checkout', MASTER)),
         ('merge %s' % branch, ('merge', '--no-ff', branch,
                                '-m', 'Merge branch %r' % branch)),
+        ('settle cache', None),
         ('push master', ('push', 'origin', MASTER)),
     ]
     for label, args in steps:
+        if args is None:
+            print('\n# navmesh cache, now that the merge has landed')
+            if not dry_run and not ensure_cache(sample, dry_run):
+                return 1
+            continue
         print('\n$ git %s' % ' '.join(args))
         if dry_run:
             continue
-        res = git(*args, capture=False)
-        if res.returncode != 0:
-            print('\nFAILED at: %s' % label)
-            if args[0] == 'merge':
-                print('Resolve the conflict, then re-run; or `git merge '
-                      '--abort` to back out.')
-            elif args[0] == 'push':
-                print('The merge is committed locally. Fix the push and run '
-                      '`git push origin %s`.' % MASTER)
-                print('The pre-push hook publishes the navmesh cache, so do '
-                      'not bypass it with --no-verify.')
-            return res.returncode
+        rc, output = git_streamed(*args)
+        if rc == 0:
+            continue
+        if args[0] == 'push' and pushed_ok():
+            print('\ngit exited %d but master IS up to date on origin -- '
+                  'treating the push as done.' % rc)
+            continue
+        print('\nFAILED at: %s (git exited %d)' % (label, rc))
+        print('--- git said ---')
+        print(output.strip() or '(no output)')
+        print('----------------')
+        if args[0] == 'merge':
+            print('Resolve the conflict, then re-run; or `git merge --abort` '
+                  'to back out.')
+        else:
+            print('The merge is committed locally. Re-run this script, or '
+                  '`git push origin %s`.' % MASTER)
+            print('The pre-push hook publishes the navmesh cache, so do not '
+                  'bypass it with --no-verify.')
+        return rc
     return 0
 
 
@@ -131,9 +190,7 @@ def main(argv=None) -> int:
         return 1
 
     print('Merging %r into %s.' % (branch, MASTER))
-    if not ensure_cache(args.sample, args.dry_run) and not args.dry_run:
-        return 1
-    return do_merge(branch, args.dry_run)
+    return do_merge(branch, args.sample, args.dry_run)
 
 
 if __name__ == '__main__':

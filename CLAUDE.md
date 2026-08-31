@@ -310,6 +310,7 @@ real data, or a failing-then-passing test.
   the scope, say which part and why. Never describe an unverified change as
   working.
 - We aren't British. No "colour", "centre" or the like
+- No allowlist or blocklist, it's whitelist and blacklist
 
 ### Assets and references
 

@@ -3343,3 +3343,138 @@ regex must change with it: a post-pass that silently stops matching
 FAILS OPEN -- no error, just the original bug back (measured: renaming
 this call once re-clobbered 91 seed writes across 43 scripts).  See
 docs/commentary/script_convert.md.
+
+## Journal objective completion
+
+**Code:** `script_convert/objective_completion.py`;
+`script_convert/data/parallel_objectives.json`;
+`tes4_export/record_types/dialog_misc.py` (`export_QUST`).
+**Audit:** `tools/validate/objective_completion_audit.py`.
+
+Oblivion's journal is an append-only log; Skyrim's is a set of objectives each
+independently Displayed / Completed. A Displayed-but-not-Completed objective
+renders as an open bullet with a live compass marker, so every converted quest
+must say which step each stage FINISHES.
+
+That is authored data, not something to infer. Oblivion's journal filter
+(`Oblivion.exe` 0x52af40, reached from 0x52adf0 -> the condition evaluator at
+0x56a950) walks the quest's subrecords matching `QSDT`/`CNAM` and evaluates
+each log entry's OWN CTDA set, displaying the entry only while it passes. The
+`ShowFullQuestLog` console command ("Show all log entries for a single quest")
+exists precisely because the normal journal shows a subset.
+
+Two idioms express supersession. Censused over the 950 log-entry CTDAs in
+Oblivion.esm:
+
+| Condition | Count | Meaning |
+|---|---|---|
+| `GetStage <quest> < N` | 102 | supersedes at N |
+| `GetStageDone <quest> N == 0` | 167 | supersedes at N |
+
+`GetStageDone` names its stage in **param 2**, not in the comparison value.
+Only a LATER stage is a supersede: the same function against an EARLIER stage
+(112 uses) selects WHICH WORDING to show. MS48 stage 20 is the worked example
+— two entries on `GetStageDone MS48 10`, one `== 0` and one `== 1`, choosing
+between two phrasings of the same step.
+
+Other functions appearing on log entries (79 GetQuestVariable 249x, 84, 309
+IsXBox) are not display-supersedes and are ignored.
+
+**The export dropped all of this.** `export_QUST` parsed log-entry CTDAs into
+`entry['ctdas']` and then emitted only Flags/Text/ResultScript/SCRO — targets
+got their conditions written, log entries did not. 950 CTDAs across 71 quests
+were silently lost, which is why the data looked absent and the completion
+points had to be guessed from quest-target marker gates.
+
+Where no authored gate exists the marker-gate inference remains as fallback:
+an objective's step runs while its QSTA markers are live and ends at the first
+stage they go dark. That is NOT "complete every lower-numbered objective" —
+quests legitimately hold several objectives open at once, guarded by
+`tests/test_script_converter.py::TestQuestObjectiveCompletion`.
+
+### Only a CLOSING gate is evidence
+
+A marker gate that never stops being satisfied says nothing about whether a
+step finished. Reading it as "still in progress" stranded **617 of 6,312**
+objectives (9.8%) across the big 3 — 607 of them because the marker rule
+returned nothing and, being an `elif`, never reached the sequential default.
+Quests WITH targets had 617 stuck of 4,819; quests WITHOUT targets had **0 of
+1,493**, which located the defect.
+
+MS48 is the worked example. Targets 0-3 are bounded (`GetStage >= 10, < 30`)
+and complete correctly; Target 4 (SavlianMatiusRef) is `GetStage >= 50` with no
+upper bound, so it is live at 50/60/70/80/90/200 and objectives 50-90 hung
+forever — the reported bug.
+
+`_target_closes` therefore counts a gate as evidence only when it can stop
+being satisfied: a `GetStage` comparison with a closing edge (`==`, `<`, `<=`),
+or ANY `GetStageDone` test. **GetStageDone must count.** 316 of 2,724 targets
+are not purely GetStage-gated (47 GetStageDone only, 169 both, 100 neither),
+and `fbmwBMStones`' six Standing Stone rituals are gated purely on
+`GetStageDone` with no stage window — order-independent by construction.
+Measured over every objective in every export:
+
+| predicate | unchanged | stuck->closes | closes EARLIER | residue |
+|---|---:|---:|---:|---:|
+| `GetStage` closing op only | 5181 | 498 | **51** | 65 |
+| exclude any `GetStageDone` target | 5120 | 501 | **109** | 62 |
+| **`GetStageDone` counts as closing** | 5240 | 487 | **3** | 76 |
+
+The 3 remaining early closures were each read against their quest text and are
+improvements, not regressions:
+
+| objective | was | now | why |
+|---|---:|---:|---|
+| `TrainingHeavyArmor` 10 | 30 | 20 | 10 is "go see Pranal"; 20 is Pranal's own request, so 10 is done |
+| `fbmwTR09` 60 | 90 | 70 | 60/70 are two ways to extract the same promise; 90 is the alternate "I killed him" ending |
+| `fbmwTR09` 70 | 90 | 80 | as 60 — answered by the next step, not by the later duplicate ending |
+
+### Terminal stages are mutually exclusive
+
+TES4 QSDT is `wbBoolEnum` "Complete Quest" — one boolean
+(`wbDefinitionsTES4.pas:3212`). TES5's is a flags byte with bit 0 Complete and
+bit 1 **Fail** (`wbDefinitionsTES5.pas:8811`): Bethesda added failure in
+Skyrim, and Oblivion.esm contains **zero** QSDT values of 2 or 3. Success and
+failure endings are the same bit, and **374 of 1,130 quests (33%) have 2+
+ending stages** — SE44 stage 200 "Ahjazda rewarded me" beside 201 "Ahjazda is
+dead". A sequential rule would close 200 with 201 in **572** cases, so
+`_terminal_stages` excludes any flagged stage from ever being superseded.
+
+Failure is therefore NOT inferable. The only signals are prose (39 of 2,338
+Oblivion log entries match a failure vocabulary; just 17 of those also carry
+the flag) and the stage-band convention, which **SE38 inverts** (190 failure,
+200 success). Both are heuristics and are not used. `CompleteAllObjectives()`
+on the flag settles endings dynamically instead.
+
+### The runtime sweep
+
+76 objectives across 19 quests remain unresolvable statically. Static analysis
+cannot know which branch a player walked, but the running game can, so the
+generated fragment asks it: an objective still Displayed and not Completed is
+one the player saw and has moved past. A branch never taken was never
+Displayed, so it is left alone — which is exactly "mark it only if it is
+already in the player's journal".
+
+Scored against the 76, hand-classified by reading all 19 quests:
+
+| approximation | correct | wrong |
+|---|---:|---:|
+| blind sequential fallback | 33 | 43 |
+| "run of >=3 unclosed => parallel" | ~48 | ~28 |
+| **runtime displayed-and-incomplete sweep** | **61** | **15** |
+
+The 15 are genuinely concurrent tasks — MQ11's six city gates, TGDirections'
+four fences, ND02's four relics, SE13's obelisks — listed in
+`parallel_objectives.json` and exempted from the sweep. A quest absent from
+that table is swept normally; a miss leaves an objective open, which is the
+pre-existing behaviour rather than a wrongly-ticked one.
+
+**An order-independence probe over the 10,353 `setstage` callers does NOT
+separate parallel from linear**: MS48 is linear yet has 14 ungated callers,
+because dialogue-driven stages are ungated in linear quests too. The parallel
+table is hand-read, not derived.
+
+**The residue is a biased sample** — it holds only what the rules give up on,
+so it can never reveal an objective the rules close WRONGLY. That is why
+`objective_completion_audit.py --against` sweeps all 6,338 objectives; it is
+what caught the 51 and the 109 above, neither of which appears in the residue.
