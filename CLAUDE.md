@@ -309,7 +309,7 @@ real data, or a failing-then-passing test.
 - **Report honestly.** If something is untested, say so; if you skipped part of
   the scope, say which part and why. Never describe an unverified change as
   working.
-- We aren't British. No "colour" or the like
+- We aren't British. No "colour", "centre" or the like
 
 ### Assets and references
 

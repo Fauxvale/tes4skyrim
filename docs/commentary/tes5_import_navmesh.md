@@ -526,6 +526,41 @@ function of the door, computed in `corridor_doors` and passed through
   door; and a door no pathgrid approaches within 384u still gets no
   triangle.
 
+<a id="storey-grouping-by-connectivity"></a>**Storey grouping is by CONNECTIVITY, not a Z threshold** (`corridor_union._storey_groups`). Flattening a cell into one 2D union bridges an upper and a lower floor that overlap in plan, producing triangles with corners on two floors at once. A Z threshold cannot separate them either, because a STAIRCASE legitimately spans two floors. So two ribbons join the same storey when they share a pathgrid NODE and their heights AT THAT NODE agree within `SAME_SURFACE_Z`: a stair joins the floor at its foot and the floor at its head, merging all three, while two floors that merely overlap in plan and share no node never merge.
+
+### Door sheet matching: the area tie-break is GONE (2026-08-30)
+
+**Code:** `corridor_union._storey_groups`.
+
+The door-to-sheet match had an area tie-break -- "prefer the group the door
+overlaps MOST" -- that NEVER ran once from commit 31c2594 (2026-07-24).
+`unary_union` is imported locally inside functions throughout
+`corridor_union.py`, never at module level, so both call sites raised
+`NameError` inside a bare `except`: `group_polys` filled with `None`, every
+`area` stayed `0.0`, and the key `(-area, hz)` collapsed to the HEIGHT
+tie-break alone.  Ruff `--select F821` is what surfaced it.
+
+**It is now DELETED**, along with `group_polys`: the code says what it does,
+which is match each door to the overlapping group nearest in height.  Output
+is byte-identical over 90 door-heavy cells, because that is what the engine
+was already doing.
+
+**Repairing it instead was tried and REJECTED.** Supplying the missing import
+was measured over 190 door-heavy cells (1,529 doors): exactly ONE changed,
+`Vilverin02` at 2026 -> 2021 tris, with identical coverage, one component and
+CK-rule CLEAN -- but **crack edges rose 15 -> 16**.  A crack is a boundary edge
+a walked pathgrid line crosses, an adjacency break the engine cannot path
+across, so five fewer triangles does not pay for it.
+
+The `else` branch (a door matching no group becomes its own) is NOT dead: it
+fires in ChorrolFightersGuild, and deleting it cost 2 triangles there.
+
+<a id="uniform-hex-lattice-triangulation"></a>**Uniform triangulation is a hex lattice + centroid-inside Delaunay** (`corridor_union._triangulate`). The old approach earcut the polygon after cutting it on an 8u grid and produced needles and slivers along every boundary -- **20% of triangles had an edge ratio > 3, some > 400**. Vanilla Skyrim navmeshes are near-uniform ~`target_edge` triangles, so: (1) sample interior Steiner points on a HEX lattice at `target_edge` spacing -- hex, not a square grid, so the Delaunay is near-equilateral rather than right-isoceles; (2) densify boundary rings at the same spacing so boundary triangles match interior scale; (3) Delaunay the whole point set and keep only triangles whose CENTROID lies inside the polygon, which honours the outline and every hole exactly without a constrained triangulator.
+
+`steep_seeds` are points along STEEP ribbon centrelines (stairs, ramps). A uniform `target_edge` triangle on a staircase climbs more than one storey gap across its corners and is dropped by the per-surface emission -- the whole stair vanishes. The seeds are forced in at fine spacing so the stair keeps short, gently-climbing triangles.
+
+<a id="door-triangle-is-reserved-as-a-hole"></a>**The door triangle is RESERVED as a hole, not coaxed out of the Delaunay** (`corridor_union._triangulate`). Vanilla marks a door with ONE triangle whose long edge is the whole doorway. Every attempt to get that from the triangulator failed the same way: the door line lies on the union BOUNDARY, so the ribbon's own outline corners land on it and split it into 3-4 pieces, and no amount of seeding, keep-out or constraint recovery can remove a corner already baked into the polygon. So the region is cut OUT of the polygon before triangulation -- the triangulator fills around it as a hole and cannot subdivide what it never sees. The wedge's shape is fixed by `corridor_doors` (full doorway base, deterministic depth, apex on the pathgrid's side); the reservation never moves, shrinks or flips it. A wedge that severs the sheet is allowed -- the MultiPolygon branch triangulates every significant piece. The old guard that SKIPPED reserving such a door instead demoted it to whatever sliver the fallback containing-triangle link happened to find.
+
 ### Door threshold quads (Door Triangles done right)
 
 `spanmesh._stamp_door_quads`: every door REFR (teleport AND interior) gets an
@@ -651,6 +686,14 @@ uncovered** (was 2.5% uncovered / 2452 broken pathgrid edges with contours).
   it may absorb up to `0.9*cs` of outline error instead of MAX_SIMPLIFY_ERR
   (the true wall is within half a cell of either position). Together: RATIO
   defects 113-281/cell → 0 across the test set, and 20-40% fewer triangles.
+
+  <a id="needle-split-must-improve-the-worst-shape"></a>**A needle split must
+  IMPROVE the local worst shape** (`corridor_clean._split_needles`). Bisecting
+  a triangle whose SHORT edge is tiny halves the long side but keeps the tiny
+  side, so the split is strictly worse: measured, two r=11 slivers appeared
+  where one r=4 had been. The pass therefore computes the worst badness over
+  the edge's owners before and after and abandons the split unless it strictly
+  drops — `after >= before` means leave the needle alone.
 - **Obstruction is decided in WORLD SPACE, never per-mesh.** An object obstructs
   iff it rises more than MAX_CLIMB above the floor beneath it — so rugs/pillows
   are walked over, tables/barrels are routed around, with NO size gate or rug

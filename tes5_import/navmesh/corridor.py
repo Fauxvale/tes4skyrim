@@ -408,7 +408,6 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
         if abs(node_z[j] - node_z[i]) / run > params.RIBBON_GROW_MAX_SLOPE:
             steep_count[i] = steep_count.get(i, 0) + 1
             steep_count[j] = steep_count.get(j, 0) + 1
-    steep_node = {n: (c >= 2) for n, c in steep_count.items()}
 
     # ---- Phase 2 march: plan every station, run them all natively, reassemble.
     # `widths` is indexed by the `base` offsets recorded in the plan.
@@ -1042,16 +1041,6 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     verts = [tuple(float(c) for c in v) for v in verts]
     tris = [tuple(int(i) for i in t) for t in tris]
 
-    # ADD THE DOOR TRIANGLES BACK, LAST.  They were cut out of the polygon
-    # before triangulation, so every pass above -- Delaunay, the 3D weld, the
-    # T-junction split, the pathgrid-node merge, make-manifold, the island cull
-    # -- saw the doorway as plain mesh boundary and had nothing there to split,
-    # weld or drop.  Adding them only now is what makes "one triangle per door,
-    # its long side the full width of the doorway" a guarantee rather than
-    # something the cleanup passes might survive.
-    if corridor_union.PENDING_DOOR_TRIS:
-        verts, tris = corridor_union.attach_door_triangles(
-            verts, tris, corridor_union.PENDING_DOOR_TRIS)
 
     # DROP ATTACH-ERA SCRAPS.  The island cull ran inside finalize, BEFORE the
     # door attach; de-stacking there can orphan a mesh triangle whose only

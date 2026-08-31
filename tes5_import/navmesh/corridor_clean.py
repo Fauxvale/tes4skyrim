@@ -169,19 +169,17 @@ def _make_manifold(verts, tris, pin_xy=None):
 
 def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None,
              pin_xy=None, door_pins=None, node_pins=None):
-    """V1 cleanup: drop degenerate triangles, guarantee manifold, compact.
+    """V1 cleanup: weld, guarantee manifold, drop stray islands, compact.
 
-    corridor_union already produces ONE connected, non-overlapping surface (the
-    boolean union of the ribbons, retriangulated) — manifold by construction.
-    So this welds coincident vertices (the grid-split pieces share boundary
-    coords), runs a make-manifold backstop, and drops any UNREACHABLE stray
-    component; no decimation.  `cs`/`pinned` accepted for signature stability
-    and unused.
+    corridor_union already yields ONE connected non-overlapping surface, so
+    this is a backstop, not a remesh: no decimation.  Ledges come back as
+    MARKS (centroids) because later passes shift indices; the caller resolves
+    them with `_resolve_ledges` LAST.
 
-    doors: [(x, y, z), ...] door centres — a component reaching a door leads to
-    another cell and is kept.  cell_bounds: (minx, miny, maxx, maxy) worldspace
-    bounds for an exterior cell — a component touching the border continues into
-    the neighbour cell via a worldspace edge-link and is kept.
+    doors: [(x, y, z), ...] door centres, and cell_bounds:
+    (minx, miny, maxx, maxy) for an exterior cell -- a component reaching
+    either leads out of the cell and is KEPT.  `cs`/`pinned` are accepted for
+    signature stability and unused.
 
     Returns (verts, tris) as numpy arrays (float verts, int32 tris).
     """
@@ -261,10 +259,6 @@ def finalize(verts, tris, cs=None, pinned=None, doors=None, cell_bounds=None,
     tris = _make_manifold(verts, tris, pin_xy=pin_xy)
     tris = _drop_unreachable_islands(verts, tris, doors, cell_bounds, pin_xy)
     verts, tris = _compact(verts, tris)
-    # Ledge MARKS (centroids), not indices: build_corridors still appends the
-    # door triangles (attach_door_triangles) after this, and de-stacking there
-    # can remove triangles, which would shift any index resolved here.  The
-    # caller resolves marks to final indices with _resolve_ledges LAST.
     return verts, tris, ledge_marks
 
 
@@ -958,12 +952,13 @@ def decimate(verts, tris, pinned_xy=None, seam_bounds=None, rounds=None,
 def _split_needles(verts, tris, pin, on_seam):
     """Bisect the LONGEST edge of triangles violating MAX_EDGE_RATIO.
 
-    Only edges long enough that both halves stay above DECIMATE_MIN_EDGE are
-    split (>= 2 * DECIMATE_MIN_EDGE), so a split never creates collapse bait
-    and the pass terminates.  An interior edge splits BOTH owners, so no
-    hanging node is ever created; door-wedge triangles (all corners pinned)
-    and exterior-seam edges are never touched.  Returns the new triangle list
-    or None if nothing split.
+    Only edges >= 2 * DECIMATE_MIN_EDGE split, so the pass terminates.  An
+    interior edge splits BOTH owners, so no hanging node appears; pinned
+    door wedges and exterior-seam edges are never touched.  A split is
+    abandoned unless the worst badness over the owners strictly DROPS.
+    Returns the new triangle list, or None if nothing split.
+
+    See: docs/commentary/tes5_import_navmesh.md#needle-split-must-improve-the-worst-shape
     """
     from . import params
     min_len = 2.0 * params.DECIMATE_MIN_EDGE
@@ -1012,12 +1007,6 @@ def _split_needles(verts, tris, pin, on_seam):
         mid = (verts[a][0] + dx_ * tproj,
                verts[a][1] + dy_ * tproj,
                verts[a][2] + (verts[b][2] - verts[a][2]) * tproj)
-
-        # The split must IMPROVE the local worst shape, or it just mints two
-        # thinner slivers (bisecting a triangle whose SHORT edge is tiny
-        # halves the long side but keeps the tiny side — strictly worse;
-        # measured: two r=11 slivers appeared where one r=4 had been).
-        mv = [list(v_) for v_ in ([verts[a], verts[b], list(mid)])]
 
         def _b3(pa, pb, pc):
             return _badness([pa, pb, pc], (0, 1, 2))
