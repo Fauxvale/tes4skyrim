@@ -15,7 +15,7 @@ Build everything with:
 
 (`_navmesh_native` / `decimate.cpp` served the old `spanmesh` generator and was
 deleted with it — see
-[performance_notes.md](../../docs/performance_notes.md#L588).)
+[performance_notes.md](../../docs/notes/performance.md#L588).)
 
 `grow.cpp` exists because those two kernels dominated generation: a single
 dense interior cell (Wendir02, 938 edges) spent ~150s in the width march alone

@@ -9,7 +9,7 @@ any difference is a conversion bug rather than a matter of opinion.
 Behaviour here follows the tables read out of an unpacked Oblivion.exe by
 tools/disasm/oblivion_engine_extract.py, so the condition function numbering, the
 dialogue type names and the parameter types are the engine's own. See
-docs/dialogue_engine_contracts.md.
+docs/reference/dialogue_engine_contracts.md.
 
 This models Oblivion and only Oblivion. It describes no conversion rule and
 knows nothing about Skyrim; that is the point, because a description that

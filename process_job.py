@@ -48,7 +48,7 @@ handle to the job after assigning itself. ``KILL_ON_JOB_CLOSE`` fires only when
 the *last* handle closes, so a worker that holds one keeps the job — and
 therefore itself and all its siblings — alive after the parent dies. That single
 ``CloseHandle`` is the difference between this module working and silently doing
-nothing.  Full findings: docs/performance_notes.md.
+nothing.  Full findings: docs/commentary/performance.md.
 """
 import os
 import sys

@@ -79,7 +79,7 @@ easy to reinvent:
     contours → triangles).  Correct in principle, but it introduced seams that
     fought connectivity, which is what the corridor model exists to avoid.
 
-See docs/navmesh_corridor_redesign.md and tes5_import/navmesh/corridor.py.
+See docs/commentary/tes5_import_navmesh.md and tes5_import/navmesh/corridor.py.
 
 Returns per-navmesh metadata (centroid, parent) so the caller can build NAVI.
 =============================================================================
@@ -866,6 +866,162 @@ def _geom_cache_load(path, want_hash):
         return None
 
 
+def geom_quantize(verts):
+    """Verts as the cache stores them: float32, so fresh and cached compare equal.
+
+    See: docs/commentary/tes5_import_navmesh.md#verifying-a-cache-against-fresh-geometry
+    """
+    import numpy as np
+    if not verts:
+        return []
+    return [tuple(v) for v in np.asarray(verts, dtype=np.float32).tolist()]
+
+
+def geom_equal(a, b):
+    """Do two (verts, tris, ledges) triples describe the same walking surface?"""
+    av, at, al = a
+    bv, bt, bl = b
+    if len(av) != len(bv) or len(at) != len(bt):
+        return False
+    if geom_quantize(av) != geom_quantize(bv):
+        return False
+    if [tuple(t) for t in at] != [tuple(t) for t in bt]:
+        return False
+    return sorted(tuple(x) for x in al) == sorted(tuple(x) for x in bl)
+
+
+def _pathgrid_nodes(rec):
+    """(points, degrees) for a PGRD, or (None, None) when it has no usable graph."""
+    point_count = get_int(rec, 'DATA.PointCount', 0)
+    intercell = get_int(rec, 'InterCellCount', 0)
+    if point_count < 1 or (point_count < 2 and intercell <= 0):
+        return None, None
+    points, degrees = [], []
+    for i in range(point_count):
+        if rec.get('Point[%d].X' % i) is None:
+            break
+        points.append((get_float(rec, 'Point[%d].X' % i),
+                       get_float(rec, 'Point[%d].Y' % i),
+                       get_float(rec, 'Point[%d].Z' % i)))
+        degrees.append(get_int(rec, 'Point[%d].Connections' % i, 0))
+    if not points or (len(points) < 2 and intercell <= 0):
+        return None, None
+    return points, degrees
+
+
+def _explicit_edges(rec, n, degrees, edges, seen):
+    """Edges from the exported PGRR topology, appended in record order."""
+    for i in range(n):
+        for j in range(degrees[i]):
+            tgt = rec.get('Point[%d].Edge[%d]' % (i, j))
+            if tgt is None:
+                break
+            try:
+                t = int(tgt)
+            except ValueError:
+                continue
+            if 0 <= t < n and t != i:
+                key = (min(i, t), max(i, t))
+                if key not in seen:
+                    seen.add(key)
+                    edges.append(key)
+
+
+def _nearest_edges(points, n, degrees, edges, seen):
+    """Fallback topology: join each node to its `Connections` nearest others."""
+    for i in range(n):
+        if degrees[i] == 0:
+            continue
+        others = sorted(((points[i][0] - points[j][0]) ** 2 +
+                         (points[i][1] - points[j][1]) ** 2, j)
+                        for j in range(n) if j != i)
+        for _d, j in others[:degrees[i]]:
+            key = (min(i, j), max(i, j))
+            if key not in seen:
+                seen.add(key)
+                edges.append(key)
+
+
+def _cell_graph(rec, cell_rec):
+    """(points, edges, origin_x, origin_y, is_exterior) for one PGRD.
+
+    The pathgrid graph exactly as convert_PGRD derives it, including the
+    synthetic PGRI exit nodes.  Both callers MUST share this: the value feeds
+    the cache hash, so any divergence silently invalidates every entry.
+    """
+    points, degrees = _pathgrid_nodes(rec)
+    if points is None:
+        return None, None, 0.0, 0.0, False
+    n = len(points)
+    edges, seen = [], set()
+    if rec.get('Point[0].Edge[0]') is not None:
+        _explicit_edges(rec, n, degrees, edges, seen)
+    else:
+        _nearest_edges(points, n, degrees, edges, seen)
+
+    is_exterior = get_formid(rec, 'ParentWRLD') != 0
+    origin_x = origin_y = 0.0
+    if is_exterior:
+        gx = get_int(cell_rec, 'XCLC.X', 0) if cell_rec is not None else 0
+        gy = get_int(cell_rec, 'XCLC.Y', 0) if cell_rec is not None else 0
+        origin_x, origin_y = gx * _CELL_SIZE, gy * _CELL_SIZE
+        for (lp, exit_xy) in _collect_intercell(rec, points, origin_x, origin_y):
+            new_idx = len(points)
+            points.append(exit_xy)
+            key = (min(lp, new_idx), max(lp, new_idx))
+            if key not in seen:
+                seen.add(key)
+                edges.append(key)
+    return points, edges, origin_x, origin_y, is_exterior
+
+
+def cell_geom_key(rec, land_rec, cell_rec, refr_recs, base_model_by_fid,
+                  door_fids, geom_cache, extra_door_refrs=None):
+    """This cell's cache hash, derived from its INPUTS with no geometry build.
+
+    convert_PGRD computes the same value before deciding whether to build, so
+    re-keying a cache needs only this -- not a mesh.  Building one to learn a
+    hash costs ~3.8s per cell (8.7 hours for Oblivion) to recompute something
+    that depends on no geometry at all.
+
+    Returns None when the cell has no navmesh job or no cache is configured.
+
+    See: docs/commentary/tes5_import_navmesh.md#verifying-a-cache-against-fresh-geometry
+    """
+    if geom_cache is None:
+        return None
+    points, edges, origin_x, origin_y, is_exterior = _cell_graph(rec, cell_rec)
+    if points is None:
+        return None
+    doors = []
+    if refr_recs:
+        doors = _collect_doors(refr_recs, door_fids)
+    if extra_door_refrs:
+        doors += _collect_doors(extra_door_refrs, door_fids)
+    return _geom_hash(geom_cache[1], points, edges, refr_recs,
+                      base_model_by_fid, doors,
+                      land_rec if is_exterior else None, origin_x, origin_y)
+
+
+def cached_geometry(geom_cache, cell_fid, pgrd_fid):
+    """The stored (verts, tris, ledges) for one cell, ignoring its hash, or None.
+
+    Reads the payload WITHOUT checking the tag-bearing hash, which is what makes
+    an adopt/verify pass able to compare geometry across a tag change.
+    """
+    if not geom_cache:
+        return None
+    path = os.path.join(geom_cache[0], '%08X_%08X.pkl' % (cell_fid, pgrd_fid))
+    try:
+        with open(path, 'rb') as fh:
+            stored = pickle.load(fh)
+        return ([tuple(v) for v in stored['verts'].tolist()],
+                [tuple(t) for t in stored['tris'].tolist()],
+                [tuple(l) for l in stored.get('ledges', ())])
+    except Exception:
+        return None
+
+
 def _geom_cache_store(path, geom_hash, verts, tris, ledges=()):
     import numpy as np
     try:
@@ -904,26 +1060,16 @@ def convert_PGRD(rec: dict, writer=None,
         refr_recs:          REFR records in this cell (exclusion footprints).
         base_model_by_fid:  {raw_low_base_fid: 'tes4/...nif'} for footprints.
         door_fids:          set of raw low-24 DOOR base FormIDs (for door links).
-        navm_fid:           Pre-allocated NAVM FormID.  When given, the writer is
-                            not touched for allocation — this lets callers assign
-                            FormIDs deterministically before farming the (heavy,
-                            scipy-bound) geometry work out to a thread pool.
-        geom_cache:         (cache_dir, tag) enabling the on-disk geometry
-                            cache; tag must cover the generator code and the
-                            collision cache (see _geom_hash).
-        extra_door_refrs:   Door REFRs that stand in this cell but are PARENTED
-                            elsewhere.  Exterior teleport doors are persistent
-                            refs living in the worldspace's persistent (dummy)
-                            cell, so the per-cell refr list never contains
-                            them — without this, exterior meshes got no door
-                            triangles (89/6,516) and cross-door pathing died at
-                            every house door and city gate.  They feed the door
-                            threshold stamp and door-triangle linking only.
+        navm_fid:           Pre-allocated NAVM FormID; skips writer allocation.
+        geom_cache:         (cache_dir, tag) enabling the on-disk geometry cache.
+        extra_door_refrs:   Door REFRs standing here but parented elsewhere.
 
     Returns:
         (navm_bytes, meta) where meta is a dict
         {fid, wrld_fid, cell_fid, grid_x, grid_y, is_exterior, center,
-         base_objects} — or (None, None) on failure.
+         base_objects, geom_cached, geometry} — or (None, None) on failure.
+
+    See: docs/commentary/tes5_import_navmesh.md#convert-pgrd-arguments
     """
     if writer is None and navm_fid is None:
         return None, None
@@ -1130,6 +1276,8 @@ def convert_PGRD(rec: dict, writer=None,
         'center': (cx, cy, cz),
         'base_objects': base_objects,
         'geom_cached': geom_cached,
+        'geometry': (verts3d, tris, ledges),
+        'geom_hash': geom_hash,
         # NVMI Door Links mirror the mesh's own door triangles EXACTLY —
         # verified on all 15,462 vanilla NVMI entries (the engine joins the two
         # sides of a load door through the door refs' XTEL pairing, so each

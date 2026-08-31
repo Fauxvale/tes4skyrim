@@ -171,7 +171,7 @@ Tailing the file (`tools/script/papyrus_tail.py`) is still supported and complem
 ### Actors / spawning / clean-room testing
 
 Implemented. These back `tools/live/quest_labtest.py` — see
-`docs/ingame_test_methodology.md`.
+`docs/notes/ingame_test_methodology.md`.
 
 | cmd | args | returns |
 |---|---|---|

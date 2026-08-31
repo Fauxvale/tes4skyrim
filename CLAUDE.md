@@ -29,7 +29,7 @@ python convert.py -f Oblivion.esm      # full pipeline for one file
 python -m pytest tests/test_import.py -v
 ```
 
-See [docs/pipeline_reference.md](docs/pipeline_reference.md) for all commands,
+See [docs/reference/pipeline.md](docs/reference/pipeline.md) for all commands,
 caching, skipped record types, the export text format, and the directory layout.
 
 ---
@@ -73,7 +73,7 @@ caching, skipped record types, the export text format, and the directory layout.
 - Keep files under ~1000 lines; split by responsibility when one grows.
 - <a id="tools-first"></a>**CHECK `tools/` BEFORE BUILDING ANYTHING BESPOKE.**
   ~147 tools already exist and one probably answers your question — the full
-  catalogue is [docs/python_tools_reference.md](docs/python_tools_reference.md).
+  catalogue is [docs/reference/python_tools.md](docs/reference/python_tools.md).
   They live in `tools/<folder>/`: `generators` (code imports their output —
   never delete blind), `release`, `validate`, `audit`, `live`, `disasm`, `nif`,
   `creature`, `dialog`, `script`, `lod`, `esm`, `navmesh`, `misc`.
@@ -83,15 +83,15 @@ caching, skipped record types, the export text format, and the directory layout.
      write a parallel script that duplicates a tool's job, and never leave a
      broken tool in place while working around it.
   3. Only if nothing is close, write a new one — and **add its entry to
-     `python_tools_reference.md` in the same pass**, before you report back. An
+     `python_tools.md` in the same pass**, before you report back. An
      undocumented tool is one the next session will rebuild from scratch.
 - <a id="one-off-goes-in-temp"></a>**A SCRIPT THAT CHASES ONE BUG GOES IN
-  `temp/`, NOT `tools/`.** A tool re-answers its question on NEW input; if
+  `temp/` or your scratchpad, NOT `tools/`.** A tool re-answers its question on NEW input; if
   nothing new would change its output, it is a one-off. A/B and bisect
   harnesses, censuses whose answer ships as a constant, and anything naming one
   plugin/mesh/creature in code are one-offs — finding to `docs/`, script to
   `temp/`. A good docstring does not make one reusable.
-- Put throwaway files in `temp/`. Don't write one-off scripts with hardcoded
+- Put throwaway files in `temp/` or your scratchpad. Don't write one-off scripts with hardcoded
   output — `tools/` scripts take arguments and produce general output, so they are
   reusable next time.
 - **Always record new learnings** in this file or, more likely, the relevant `docs/` file.
@@ -147,8 +147,8 @@ regenerate scripts, so a behavioural regression means reading
    it keeps 1,114 Bethesda source paths, 17k diagnostic strings, and 433 record
    editor dialogs the game strips. `tools/disasm/ck_srcpaths.py`, `ck_strref.py`,
    `skyrim_disasm.py --exe <ck>`. Runtime behavior still comes from item 1;
-   the CK can disagree with the game ([ck_vs_game_missing_objects.md](docs/ck_vs_game_missing_objects.md)).
-   Details: [ck_exe_as_a_source.md](docs/ck_exe_as_a_source.md).
+   the CK can disagree with the game ([ck_vs_game_missing_objects.md](docs/commentary/ck_vs_game_missing_objects.md)).
+   Details: [ck_exe_as_a_source.md](docs/commentary/ck_exe_disassembly.md).
 3. The Oblivion/Nehrim install at `D:\Other Games\Nehrim At Fate's Edge\Data`.
 4. xEdit source at `references/xEdit` — `Core/` documents the binary structure of
    every record type. This is the first stop for any format question. Or if working with meshes, go to the Nifskope source at `references/Nifskope`
@@ -188,6 +188,9 @@ real data, or a failing-then-passing test.
 
 ### Hard prohibitions
 
+- 🛑 **NEVER RUN A BARE SHELL COMMAND.** Every one goes through
+  `python tools/validate/safe_run.py <command>`, which gates the `.py` files
+  the command wrote. The hook refuses anything else. See [the wrapper](#safe-run).
 - **NEVER `git stash` / `git stash pop`** in this repository.
 - **NEVER `git commit` or `git push`.** The user commits after in-game testing.
 - **NEVER `git add` / `git rm`** (staging, including staged deletions). Use plain
@@ -306,7 +309,7 @@ real data, or a failing-then-passing test.
 - **Report honestly.** If something is untested, say so; if you skipped part of
   the scope, say which part and why. Never describe an unverified change as
   working.
-- We aren't British. No "colour" or the like
+- We aren't British. No "colour", "centre" or the like
 
 ### Assets and references
 
@@ -338,7 +341,7 @@ real data, or a failing-then-passing test.
 
 - Use multiprocessing, not threads, for pure-Python work; **ThreadPoolExecutor is
   only for I/O and subprocesses.** The output ESM must stay byte-reproducible.
-  Rules and measured results: [docs/performance_notes.md](docs/performance_notes.md).
+  Rules and measured results: [docs/commentary/performance.md](docs/commentary/performance.md).
 - **Never exhaust memory**: some pool tools load the ~2.1 GB export index per
   worker. Cap `--workers` or run single-process.
 - **<a id="formid-drift"></a>FORMIDS ARE HASHED, NOT COUNTED.**
@@ -352,7 +355,7 @@ real data, or a failing-then-passing test.
     Changing the hash input, region, or `FORMID_SCHEME_VERSION` renumbers
     everything.
   Guarded by `tests/test_formid_determinism.py`; details:
-  [performance_notes.md](docs/performance_notes.md#formid-determinism--the-save-game-contract-rewritten-2026-08-17).
+  [performance_notes.md](docs/commentary/performance.md#formid-determinism--the-save-game-contract-rewritten-2026-08-17).
 
 ### Output paths
 
@@ -383,80 +386,62 @@ python tools/navmesh/navmesh_cache_hook.py --run                      # publish 
   republishes the whole cache. Check with `navmesh_cache_hook.py --check`.
 
 Why, and the invalidation/tag contracts:
-[world_land_navmesh_notes.md](docs/world_land_navmesh_notes.md#the-shared-navmesh-cache--design-rationale).
+[world_land_navmesh_notes.md](docs/commentary/tes5_import_navmesh.md#the-shared-navmesh-cache--design-rationale).
 
 ---
 
 ## Documentation Map
 
-Deep reference material lives in `docs/` so this file stays short. Load the
-relevant doc when working in that area.
+Deep reference material lives in `docs/`, sorted by KIND.
+**[docs/README.md](docs/README.md) is the index and says where a NEW document goes.**
 
-### Pipeline & architecture
-| Doc | Covers |
+| Folder | Holds |
 |---|---|
-| [pipeline_reference.md](docs/pipeline_reference.md) | Orchestrator commands, stages, caching, SKIP_TYPES, export text format, directory layout, SSEEdit verification, running off Windows (Wine + native build) |
-| [python_tools_reference.md](docs/python_tools_reference.md) | Per-module and `tools/` debug utility command reference |
-| [performance_notes.md](docs/performance_notes.md) | Parallelism rules, determinism contract, navmesh optimisation results |
-| [override_conversion.md](docs/override_conversion.md) | Converting plugins with TES4 masters: export-diff authorship, GRUP nesting, ONAM, cell buckets, injected records |
-| [TES5_Binary_Format.md](docs/TES5_Binary_Format.md) | TES5 binary structure reference |
-| [TES4_Record_Definitions.md](docs/TES4_Record_Definitions.md) | TES4 record structure reference |
-| [xedit_scripting_reference.md](docs/xedit_scripting_reference.md) | xEdit Pascal API + globals (historical — the pipeline is pure Python now; kept for ad-hoc verification scripts) |
-| [in_app_update_plan.md](docs/in_app_update_plan.md) | PLAN (unimplemented): in-app update downloading only changed files via the GitHub compare API (0.8–3.5 MB vs a 45 MB tree; truncates at 300 files). No git needed — zip installs have no `.git`. Dev trees protected by `is_dev_version()`. Optional launch check. `conversion_config.json` is the one tracked file the app writes |
+| [reference/](docs/reference/) | What a format or contract IS — stable, no dates |
+| [commentary/](docs/commentary/) | Why the SHIPPED code is the way it is — named `<package>_<subsystem>.md` after the code it explains, opens with `**Code:**`. Measurements, engine behaviour, reverted attempts. The DEFAULT |
+| [plans/](docs/plans/) | Designed, NOT yet built |
+| [audits/](docs/audits/) | A dated sweep over a corpus, with counts |
+| [assets/](docs/assets/) | Images and icons; `banner.png`/`favicon.ico` load at RUNTIME |
 
-### Records & data
-| Doc | Covers |
-|---|---|
-| [record_mapping_reference.md](docs/record_mapping_reference.md) | Full TES4→TES5 record type mapping, OBND/structural requirements, skipped/problem records, skill/weapon/biped-slot/enchantment tables, Skyblivion conversion rules |
-| [magic_conversion_plan.md](docs/magic_conversion_plan.md) | SPEL/ENCH/MGEF: dropped effect families, phantom effect codes, archetype mapping, ARTO/PROJ/SEFF |
-| [music_conversion.md](docs/music_conversion.md) | MUSC/MUST built from TES4's `Music\<Category>\` FOLDERS (no TES4 record exists); the masterless-plugin gate, xWMAEncode's fixed bitrate list, StreamMusic revival |
-| [weather_climate_conversion.md](docs/weather_climate_conversion.md) | WTHR/CLMT: the WRLD→CNAM→CLMT→WLST chain, NAM0 slot remap, cloud-speed units, DALC weights |
+### Code rules — EVERY `.py` in the repo
 
-### Actors, AI & dialogue
-| Doc | Covers |
-|---|---|
-| [package_ai_contracts.md](docs/package_ai_contracts.md) | CTDA param remapping (the crash rule), PTDA Distance, Ambush→approach, force-greet packages, quest priority band |
-| [package_conversion_plan.md](docs/package_conversion_plan.md) | PACK template model + vanilla census (implemented — the design behind `pack_converter.py`) |
-| [package_conversion_audit.md](docs/package_conversion_audit.md) | Full PACK audit (2026-08-17): 5 measured gaps (PTDT type-1 unhandled, master-blind PackagePlan, 48 ungated packages) + what is verified correct |
-| [dialogue_conversion_notes.md](docs/dialogue_conversion_notes.md) | DIAL/INFO/QUST/DLBR/DLVW implementation, voice type routing, AddTopic unlocks, GetIsID injection |
-| [dialogue_engine_contracts.md](docs/dialogue_engine_contracts.md) | Verified engine rules for dialogue routing; **speak-as lines = `Say(topic, None, inHead)` on a voiced TACT stand-in** |
-| [dialogue_transfer_gaps.md](docs/dialogue_transfer_gaps.md) | Measured gaps: what Oblivion dialogue does NOT survive conversion, with counts from both emulators |
-| [ambient_dialogue_channel_plan.md](docs/ambient_dialogue_channel_plan.md) | Oblivion's 3 delivery channels vs Skyrim's 2; constant quipping, NPC-to-NPC topics in the player menu; **the NPC-to-NPC conversation scheduler Skyrim lacks** and the driver quest that replays quest-advancing chains |
-| [QUEST_AUDIT.md](docs/QUEST_AUDIT.md) | Quest completability audit via the walkthrough emulator (2026-07-17, all 390 QUSTs) |
-| [creature_conversion.md](docs/creature_conversion.md) | CREA→actor: behavior graphs, HKX skeleton/animation/ragdoll, creature records |
-| [creature_race_equivalence.md](docs/creature_race_equivalence.md) | Oblivion creature ↔ vanilla Skyrim race map (exact/near tiers) for a possible "use the vanilla creature" option; which creatures have NO equivalent |
-| [vanilla_creature_swap_plan.md](docs/vanilla_creature_swap_plan.md) | PLAN (unimplemented): override-ESP + GUI to swap exact-match creatures to vanilla; race identity = (folder, NIFZ body set), NOT folder |
-| [vanilla_item_swap_plan.md](docs/vanilla_item_swap_plan.md) | PLAN (unimplemented): item/ingredient/clutter **and WEATHER** swap; model-swap vs full-reference modes, OBND size+orientation gate, PIL preview renderer |
-| [item_swap_table.md](docs/item_swap_table.md) | Per-item MISC/INGR swap recommendations with measured size ratios and verdicts (OK/SCALE/ROT/REJECT) |
-| [horse_rideability_plan.md](docs/horse_rideability_plan.md) | Rideable horses: RACE Mount Data, horse/rider graph pair, rider-animation sourcing |
-| [npc_skin_tone_conversion.md](docs/npc_skin_tone_conversion.md) | Skin color = RACE part textures + **race FGTS** via the `.egt` basis; per-NPC FGTS is negligible (sd 1/255); the `.egt` format; why a Skyrim census pick made Imperials dark |
+🛑 <a id="safe-run"></a>**RUN EVERY SHELL COMMAND THROUGH THE WRAPPER** —
+`python tools/validate/safe_run.py <command>`. It runs in your shell, streams
+live, returns the child's exit code, and gates the `.py` files the command
+WROTE. A bare command is refused: a heredoc writes a `.py` no gate ever sees.
 
-### Interface
-| Doc | Covers |
-|---|---|
-| [ui_conversion.md](docs/ui_conversion.md) | Oblivion menus → Skyrim Scaleform, as a SILOED pipeline (no `-f`, global action, own mod — like Create LOD / Pack Start Mod). **Message box + menu cursor implemented** (`tools/misc/convert_ui.py`, GUI *Convert UI*): reskin the vanilla .swf, never rebuild it. The cursor is the cleanest case -- `cursormenu.swf` char 1 is a 42x42 vector shape at the movie origin (its top-left = the click hotspot), swapped for Oblivion's `menus/misc/cursor.dds` arrow cropped to its alpha and placed top-left so the tip lands on the hotspot; sized DOWN inside the shape (`CURSOR_HEIGHT`=30, ~19 px after the ~0.63 root scale) so it does not read larger than Skyrim's thin arrow; no AS2. A measured engine rule from 5 in-game rounds: **only a shape's FIRST bitmap fill draws** (202 of 207 vanilla shapes declare one), so the border art is one bitmap on one shape. Also: disassembled `PositionElements` layout maths; **`cropx`/`cropy` is a 1:1 crop not a scaled tile**; the border is 9-sliced by re-cutting Background_mc’s own scaling grid to our 44px border (an earlier "no 9-slice over bitmap fills" rule was a bad census — grids name sprites, fills name shapes, so they cannot intersect; vanilla 9-slices bitmap art in magic/container/craft menus); HEIGHT_MARGIN clears that constant border for the SELECTED focus box, not just the text; translucency and the header shadow live on the PLACEMENT; safe in-place AS2 literal patching. **The HUD stat bars were built and REVERTED** — correct in an offline compositor reading the shipped movie’s own bitmaps/matrices/mask, broken in game; the doc keeps the measurements (the two different reveal mechanisms, the shapes NOT being centered on their origin, the mirrored health fill) so they are not re-derived, and says what was already ruled out. And why every other menu is blocked on missing DATA rather than art |
+**`grep "a\|b"` silently finds NOTHING** — bash eats the backslash, so grep
+gets a literal `|` and still exits 0. Use `grep -E "a|b"` or `-e a -e b`. Zero
+matches is a broken query, never evidence about the tree.
+
+🛑 <a id="doc-rules"></a>**THE CODE RULES ARE A REQUIREMENT, NOT A GUIDELINE.**
+`.claude/hooks/doc_rules_gate.py` runs `--gate-diff` BEFORE an Edit lands and
+REFUSES it, charging the lines you changed plus the comments above them.
+`--gate-file` scores a WHOLE file, including debt you did not write; use it only
+to audit a file before refactoring it. `oversized-files` is a RATCHET: it fires
+only when your edit RAISES the count, never for merely being over.
+
+- **Prose:** only a docstring, a ONE-line 120-char `#:` attribute doc, or a
+  `# ----` heading. A docstring states the CONTRACT, never the why; rationale
+  and measurements go in `docs/`, cited by `See: docs/<file>.md#anchor` (the
+  gate checks path and anchor).
+- **A comment is prose wherever it sits** — the scanner tokenizes, so moving it
+  to the end of a line hides nothing, and `# noqa`/`# pragma`/`# type:` score
+  like any other comment.
+- **Shape:** per function ≤35 statements (NOT lines — reflow moves nothing),
+  complexity ≤25, nesting ≤4, ≤10 returns; ≤1000 lines per file; no
+  class-level `dict`/`list`/`set`.
+- **No dead code:** no unused import or variable, no undefined name, nothing
+  unreachable. `code_rules.py --dead-code` is the whole-program sweep.
+- **Compress, never delete:** keep every measured count, script name and
+  mechanism; drop the narration. **No dates.**
+- An inline comment means the code cannot state its own intent — fix the code.
 
 ### Scripts
-| Doc | Covers |
-|---|---|
-| [papyrus_conversion_notes.md](docs/papyrus_conversion_notes.md) | TES4→Papyrus mapping, paired on/off soft-lock trap, **Say() timers = `TES4Polyfill.SayLine` (engine-reported line length; fragments never write timers)**, **StopQuest = `Stop()` (a run-bit global was tried and REVERTED)**, syntax traps, OBSE constructs |
-| [Script_Conversion_Plan.md](docs/Script_Conversion_Plan.md) | Script conversion scope, counts, block/variable distributions |
-| [quest_script_conversion_audit.md](docs/quest_script_conversion_audit.md) | Which quest scripts have been read against their originals (don't re-audit), defects found, and verified-correct behaviours not to "fix" |
-| [skse_conversion_audit.md](docs/skse_conversion_audit.md) | SKSE/OBSE function coverage audit |
-| [skyrim_commands.md](docs/skyrim_commands.md) | Raw table of Skyrim script command IDs, names, and argument types |
-| [php_scriptconverter_analysis.md](docs/php_scriptconverter_analysis.md) | How Skyblivion's AST-based PHP converter works vs our regex approach — prior art, not a dependency |
+
+🛑 **Before writing ANY `script_convert/` code, run the decision procedure in [script_convert_architecture.md](docs/reference/script_convert_architecture.md) §3** and score the change with `python tools/script/arch_fitness.py --fail-on-regression`.
 
 ### World, meshes & navmesh
-| Doc | Covers |
-|---|---|
-| [nif_conversion_notes.md](docs/nif_conversion_notes.md) | NIF deep-dive: bhk collision/MOPP/CMS, particles, FlameNode grafting, worn armor/shields/furniture markers, skin retargeting, clutter physics, terrain LOD, SpeedTree |
-| [speedtree_engine_decomp.md](docs/speedtree_engine_decomp.md) | SpeedTreeRT decompiled from Oblivion.exe: RNG, child placement/count, spline eval, level struct, parse-stage map. |
-| [world_land_navmesh_notes.md](docs/world_land_navmesh_notes.md) | PGRD→NAVM/NAVI algorithm, LAND record structure, landscape TXST, world-map cloud banks (WRLD MODL) |
-| [navmesh_corridor_redesign.md](docs/navmesh_corridor_redesign.md) | The corridor-ribbon navmesh model |
-| [ck_navmesh_generation.md](docs/ck_navmesh_generation.md) | How the CK generates navmesh (Recast), defaults, the voxel-vs-world units trap |
-| [ck_vs_game_missing_objects.md](docs/ck_vs_game_missing_objects.md) | Objects the CK draws but the game does not: the forced-Persistent cause (confirmed in game), the vanilla censuses that refuted it, ruled-out classes with counts, and building on a 16 GB machine |
-| [ck_reference_init_hang.md](docs/ck_reference_init_hang.md) | The "Initializing References" hang: unchecked XTEL destination grid lookup, the GRUP-order ref deletion, and the stack-walk-first hang methodology |
-| [ck_warnings_audit.md](docs/ck_warnings_audit.md) | Every CK load warning bucketed easiest-to-hardest with measured counts; how to pull the live `ckpe.log` past its exclusive lock; the LCTN ref-array + WRLD OFST gap that is 96% of the log; the 2026-07 sweep fixes |
 
 ### Skills
 | Skill | Covers |

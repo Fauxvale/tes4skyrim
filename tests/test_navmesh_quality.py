@@ -1,6 +1,6 @@
 """Regression tests for the navmesh triangle-quality contract.
 
-The quality pipeline (docs/navmesh_corridor_redesign.md, "The triangle-quality
+The quality pipeline (docs/commentary/tes5_import_navmesh.md, "The triangle-quality
 contract") is a chain of guarded passes over synthetic-friendly pure functions
 in corridor_clean/corridor_union.  Each test here encodes a measured failure
 that must not come back:

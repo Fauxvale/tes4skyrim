@@ -239,7 +239,7 @@ class Bridge:
         return self.request("inject", **args)
 
     # ------------------------------------------------ clean-room testing --
-    # These back tools/live/quest_labtest.py. See docs/ingame_test_methodology.md.
+    # These back tools/live/quest_labtest.py. See docs/commentary/ingame_testing.md.
 
     def spawn(self, form_id: str | int, count: int = 1) -> dict:
         """Spawn copies of a base form, for clean-room tests.

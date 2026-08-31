@@ -48,7 +48,7 @@ any panel size.  (An earlier rule here claimed the engine will not 9-slice a
 bitmap fill "0 of 353 shapes"; that census compared scaling grids, which name a
 SPRITE, against fills, which live on a SHAPE -- disjoint kinds, so the zero was
 arithmetic, not evidence.  Vanilla 9-slices bitmap art in magic/container/craft
-menus.)  Full evidence, including what that costs: docs/ui_conversion.md.
+menus.)  Full evidence, including what that costs: docs/commentary/asset_convert_ui.md.
 
 WHAT IS NOT PORTED (and why)
 ----------------------------

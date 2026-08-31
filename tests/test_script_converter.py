@@ -23,6 +23,24 @@ from script_convert.constants import (
     _safe_property_name,
     PLAYER_ALIAS_EXTENDS,
 )
+from script_convert.tes4 import nodes as N
+from script_convert.emit import expr as _E
+from script_convert.emit import script as _S
+from script_convert.tes5.blocks import (
+    Kind,
+    classify,
+    hoist_quest_start_above_writes,
+    scan,
+)
+from script_convert.tes4.lexer import T, tokenize
+from script_convert.tes4.parser import (
+    Mode,
+    is_self_contained,
+    parse,
+    split_call_args,
+    split_param_names,
+    split_trailing_comment,
+)
 from script_convert.pipeline import (
     _sanitize_name,
     _pack_wstring,
@@ -31,6 +49,47 @@ from script_convert.pipeline import (
     build_vmad_info_fragment,
     convert_all_scripts,
 )
+
+
+# ===========================================================================
+# Node-path shims
+#
+# `_convert_line` / `_convert_expression` / `_convert_function_call` were the
+# string seams into the converter.  The parser owns that job now, so these
+# helpers do what those methods did internally: parse the source, emit the
+# node.  Tests keep asserting on the same converted text.
+# ===========================================================================
+
+def conv_expr(converter, source, extends='ObjectReference'):
+    """Convert one TES4 EXPRESSION, via the parse tree."""
+    tree = _parse(f'if {source}\nendif')
+    if not tree.body or not hasattr(tree.body[0], 'cond'):
+        return source.strip()
+    return _E.emit(converter, tree.body[0].cond, extends)
+
+
+def conv_line(converter, source, extends='ObjectReference'):
+    """Convert one TES4 STATEMENT, via the parse tree.
+
+    An empty body means the line emits nothing on its own: a declaration is
+    hoisted to `tree.variables`, and a block CLOSER (`endif`, `else`) belongs
+    to the walk that owns the block, not to a line.
+    """
+    tree = _parse(source)
+    body = [s for s in tree.body if not isinstance(s, N.Blank)]
+    if not body:
+        # A lone comment rides on the NEXT statement's `.comment`, so a
+        # fragment holding only one parses to an empty body; a declaration
+        # goes to `tree.variables` and a block closer belongs to the walk.
+        stripped = source.strip()
+        return stripped if stripped.startswith(';') else ''
+    lines = _S.emit_stmt(converter, body[0], extends, 0)
+    return lines[0].strip() if lines else ''
+
+
+def _parse(source):
+    from script_convert.tes4.parser import Mode, parse as _p
+    return _p(source, Mode.FRAGMENT)
 
 
 # ===========================================================================
@@ -192,56 +251,56 @@ class TestCrossRefGraph:
 
 class TestExpressionConversion:
     def test_simple_number(self, converter):
-        assert converter._convert_expression('42', 'ObjectReference') == '42'
+        assert conv_expr(converter, '42', 'ObjectReference') == '42'
 
     def test_simple_variable(self, converter):
-        assert converter._convert_expression('myVar', 'ObjectReference') == 'myVar'
+        assert conv_expr(converter, 'myVar', 'ObjectReference') == 'myVar'
 
     def test_player_substitution(self, converter):
-        result = converter._convert_expression('player', 'ObjectReference')
+        result = conv_expr(converter, 'player', 'ObjectReference')
         assert result == 'Game.GetPlayer()'
 
     def test_getself_substitution(self, converter):
-        result = converter._convert_expression('getSelf', 'ObjectReference')
+        result = conv_expr(converter, 'getSelf', 'ObjectReference')
         assert result == 'Self'
 
     def test_comparison_simple(self, converter):
-        result = converter._convert_expression('x == 1', 'ObjectReference')
+        result = conv_expr(converter, 'x == 1', 'ObjectReference')
         assert result == 'x == 1'
 
     def test_comparison_with_function(self, converter_with_quests):
-        result = converter_with_quests._convert_expression(
+        result = conv_expr(converter_with_quests, 
             'getstage MQ01 == 10', 'Quest')
         assert 'MQ01.GetStage()' in result
         assert '== 10' in result
 
     def test_logical_or(self, converter_with_quests):
-        result = converter_with_quests._convert_expression(
+        result = conv_expr(converter_with_quests, 
             'getstage MQ01 == 10 || getstage MQ01 == 15', 'Quest')
         assert '||' in result
         assert 'MQ01.GetStage()' in result
 
     def test_logical_and(self, converter):
-        result = converter._convert_expression('x == 1 && y == 2', 'ObjectReference')
+        result = conv_expr(converter, 'x == 1 && y == 2', 'ObjectReference')
         assert '&&' in result
 
     def test_not_equal(self, converter):
-        result = converter._convert_expression('x <> y', 'ObjectReference')
+        result = conv_expr(converter, 'x <> y', 'ObjectReference')
         assert '!=' in result
 
     def test_isactionref_eq_1(self, converter):
-        result = converter._convert_expression('IsActionRef player == 1', 'ObjectReference')
+        result = conv_expr(converter, 'IsActionRef player == 1', 'ObjectReference')
         assert 'akActionRef' in result
         assert 'Game.GetPlayer()' in result
         assert '((' not in result  # No double parens
 
     def test_isactionref_eq_0(self, converter):
-        result = converter._convert_expression('IsActionRef player == 0', 'ObjectReference')
+        result = conv_expr(converter, 'IsActionRef player == 0', 'ObjectReference')
         assert '!' in result or 'not' in result.lower()
         assert 'akActionRef' in result
 
     def test_getsecondspassed(self, converter):
-        result = converter._convert_expression('GetSecondsPassed', 'ObjectReference')
+        result = conv_expr(converter, 'GetSecondsPassed', 'ObjectReference')
         assert '0.5' in result
 
 
@@ -251,46 +310,78 @@ class TestExpressionConversion:
 
 class TestLineConversion:
     def test_set_to(self, converter):
-        result = converter._convert_line('set myVar to 42', 'ObjectReference')
+        result = conv_line(converter, 'set myVar to 42', 'ObjectReference')
         assert result == 'myVar = 42'
 
     def test_set_to_expression(self, converter):
-        result = converter._convert_line('set myVar to x', 'ObjectReference')
+        result = conv_line(converter, 'set myVar to x', 'ObjectReference')
         assert result == 'myVar = x'
 
     def test_if_statement(self, converter):
-        result = converter._convert_line('if x == 1', 'ObjectReference')
+        result = conv_line(converter, 'if x == 1', 'ObjectReference')
         assert result == 'If x == 1'
 
-    def test_else(self, converter):
-        result = converter._convert_line('else', 'ObjectReference')
-        assert result == 'Else'
+    def test_else_belongs_to_the_block_not_the_line(self, converter):
+        # A closer is emitted by the walk that owns the `If` (emit/script.py),
+        # so on its own it converts to nothing.  The string path had to emit
+        # `Else` here and then count keywords afterwards to check the block
+        # balanced -- which is what `_balance_if_endif` existed to repair.
+        assert conv_line(converter, 'else', 'ObjectReference') == ''
 
-    def test_endif(self, converter):
-        result = converter._convert_line('endif', 'ObjectReference')
-        assert result == 'EndIf'
+    def test_endif_belongs_to_the_block_not_the_line(self, converter):
+        assert conv_line(converter, 'endif', 'ObjectReference') == ''
+
+    def test_block_closers_are_emitted_by_the_walk(self, converter):
+        # The pair really is emitted -- by the statement that owns the body.
+        out = _S.emit_stmt(
+            converter, _parse('if a == 1\nset b to 2\nelse\nset b to 3\nendif')
+            .body[0], 'ObjectReference', 0)
+        assert [ln.strip() for ln in out] == [
+            'If a == 1', 'b = 2', 'Else', 'b = 3', 'EndIf']
 
     def test_return(self, converter):
-        result = converter._convert_line('return', 'ObjectReference')
+        result = conv_line(converter, 'return', 'ObjectReference')
         assert result == 'Return'
 
     def test_comment(self, converter):
-        result = converter._convert_line('; This is a comment', 'ObjectReference')
+        result = conv_line(converter, '; This is a comment', 'ObjectReference')
         assert result == '; This is a comment'
 
     def test_empty_line(self, converter):
-        result = converter._convert_line('', 'ObjectReference')
+        result = conv_line(converter, '', 'ObjectReference')
         assert result == ''
 
     def test_variable_declaration(self, converter):
         # Variable declarations are handled at script level (_parse_source),
         # _convert_line skips them (returns empty)
-        result = converter._convert_line('short myCount', 'ObjectReference')
+        result = conv_line(converter, 'short myCount', 'ObjectReference')
         assert result == ''
 
     def test_float_declaration(self, converter):
-        result = converter._convert_line('float timer', 'ObjectReference')
+        result = conv_line(converter, 'float timer', 'ObjectReference')
         assert result == ''
+
+
+
+
+def convert_args(conv, args_src, func_name, extends):
+    """`_convert_args` with `args_src` parsed into argument NODES."""
+    from script_convert.tes4.lexer import tokenize
+    from script_convert.tes4.parser import Parser
+    call = Parser(tokenize('%s %s' % (func_name, args_src))).parse_expression()
+    conv._arg_nodes = tuple(getattr(call, 'args', ()) or ())
+    return conv._convert_args(args_src, func_name, extends)
+
+
+def emit_function(conv, ref_name, func_name, args_src, extends):
+    """`_emit_function` with `args_src` parsed into argument NODES."""
+    from script_convert.tes4.lexer import tokenize
+    from script_convert.tes4.parser import Parser
+    args = ()
+    if args_src.strip():
+        call = Parser(tokenize(f'{func_name} {args_src}')).parse_expression()
+        args = tuple(getattr(call, 'args', ()) or ())
+    return conv._emit_function(ref_name, func_name, extends, args=args)
 
 
 # ===========================================================================
@@ -299,91 +390,91 @@ class TestLineConversion:
 
 class TestFunctionConversion:
     def test_additem(self, converter):
-        result = converter._emit_function('player', 'AddItem', 'Gold001 100', 'ObjectReference')
+        result = emit_function(converter, 'player', 'AddItem', 'Gold001 100', 'ObjectReference')
         assert 'Game.GetPlayer()' in result
         assert 'AddItem' in result
         assert 'Gold001' in result
 
     def test_enable(self, converter):
-        result = converter._emit_function('myRef', 'Enable', '', 'ObjectReference')
+        result = emit_function(converter, 'myRef', 'Enable', '', 'ObjectReference')
         assert 'myRef.Enable()' in result
 
     def test_disable(self, converter):
-        result = converter._emit_function(None, 'Disable', '', 'ObjectReference')
+        result = emit_function(converter, None, 'Disable', '', 'ObjectReference')
         assert 'Disable()' in result
 
     def test_messagebox(self, converter):
-        result = converter._emit_function(None, 'MessageBox', '"Hello World"', 'ObjectReference')
+        result = emit_function(converter, None, 'MessageBox', '"Hello World"', 'ObjectReference')
         assert 'Debug.MessageBox' in result
         assert 'Hello World' in result
 
     def test_getpos_x(self, converter):
-        result = converter._emit_function('myRef', 'GetPos', 'X', 'ObjectReference')
+        result = emit_function(converter, 'myRef', 'GetPos', 'X', 'ObjectReference')
         assert 'GetPositionX' in result
 
     def test_getpos_z(self, converter):
-        result = converter._emit_function('myRef', 'GetPos', 'Z', 'ObjectReference')
+        result = emit_function(converter, 'myRef', 'GetPos', 'Z', 'ObjectReference')
         assert 'GetPositionZ' in result
 
     def test_setpos(self, converter):
-        result = converter._emit_function('myRef', 'SetPos', 'X 100', 'ObjectReference')
+        result = emit_function(converter, 'myRef', 'SetPos', 'X 100', 'ObjectReference')
         assert 'SetPosition' in result
         assert '100' in result
 
     def test_getangle(self, converter):
-        result = converter._emit_function('myRef', 'GetAngle', 'Z', 'ObjectReference')
+        result = emit_function(converter, 'myRef', 'GetAngle', 'Z', 'ObjectReference')
         assert 'GetAngleZ' in result
 
     def test_setstage(self, converter_with_quests):
-        result = converter_with_quests._emit_function(None, 'SetStage', 'MQ01 20', 'Quest')
+        result = emit_function(converter_with_quests, None, 'SetStage', 'MQ01 20', 'Quest')
         assert 'MQ01.SetStage' in result
         assert '20' in result
 
     def test_getstage(self, converter_with_quests):
-        result = converter_with_quests._emit_function(None, 'GetStage', 'MQ01', 'Quest')
+        result = emit_function(converter_with_quests, None, 'GetStage', 'MQ01', 'Quest')
         assert 'MQ01.GetStage()' in result
 
     def test_startquest(self, converter):
-        result = converter._emit_function(None, 'StartQuest', 'MyQuest', 'ObjectReference')
+        result = emit_function(converter, None, 'StartQuest', 'MyQuest', 'ObjectReference')
         assert 'MyQuest.Start()' in result
 
     def test_getrandompercent(self, converter):
-        result = converter._emit_function(None, 'GetRandomPercent', '', 'ObjectReference')
+        result = emit_function(converter, None, 'GetRandomPercent', '', 'ObjectReference')
         assert 'Utility.RandomInt(0, 99)' in result
 
     def test_kill(self, converter):
-        result = converter._emit_function('myActor', 'Kill', '', 'Actor')
+        result = emit_function(converter, 'myActor', 'Kill', '', 'Actor')
         assert 'myActor.Kill()' in result
 
     def test_getdead(self, converter):
-        result = converter._emit_function('myActor', 'GetDead', '', 'Actor')
+        result = emit_function(converter, 'myActor', 'GetDead', '', 'Actor')
         assert 'IsDead' in result
 
     def test_actor_value_function(self, converter):
-        result = converter._emit_function(None, 'GetActorValue', 'Blade', 'Actor')
+        result = emit_function(converter, None, 'GetActorValue', 'Blade', 'Actor')
         assert 'GetActorValue' in result
         assert 'OneHanded' in result
 
     def test_actor_value_alchemy(self, converter):
-        result = converter._emit_function(None, 'ModActorValue', 'Alchemy 5', 'Actor')
+        result = emit_function(converter, None, 'ModActorValue', 'Alchemy 5', 'Actor')
         assert 'ModActorValue' in result
         assert 'Alchemy' in result
 
     def test_unknown_function_generates_todo(self, converter):
-        result = converter._emit_function(None, 'SomeObscureFunc', 'arg1', 'ObjectReference')
+        result = emit_function(converter, None, 'SomeObscureFunc', 'arg1', 'ObjectReference')
         assert 'TODO' in result
 
     def test_isactionref(self, converter):
-        result = converter._emit_function(None, 'IsActionRef', 'player', 'ObjectReference')
+        result = emit_function(converter, None, 'IsActionRef', 'player', 'ObjectReference')
         assert 'akActionRef' in result
         assert 'Game.GetPlayer()' in result
 
     def test_getactionref(self, converter):
-        result = converter._emit_function(None, 'GetActionRef', '', 'ObjectReference')
+        result = emit_function(converter, None, 'GetActionRef', '', 'ObjectReference')
         assert result == 'akActionRef'
 
     def test_getself(self, converter):
-        result = converter._emit_function(None, 'GetSelf', '', 'ObjectReference')
+        result = emit_function(converter, None, 'GetSelf', '', 'ObjectReference')
         assert result == 'Self'
 
 
@@ -426,20 +517,20 @@ class TestActorValueMap:
 
     def test_attribute_read_is_stubbed_open(self, converter):
         """A read of a removed attribute yields a value that passes the gate."""
-        result = converter._convert_expression(
+        result = conv_expr(converter, 
             'Player.GetAV Strength >= 30 && Player.GetAV Endurance >= 30',
             'Quest')
         assert result == '100.0 >= 30 && 100.0 >= 30'
 
     def test_attribute_write_is_dropped(self, converter):
-        result = converter._convert_function_call('Player.SetAV Strength 50',
+        result = conv_line(converter, 'Player.SetAV Strength 50',
                                                   'Quest')
         assert result.lstrip().startswith(';')
         assert 'SetActorValue' not in result
 
     def test_skill_read_still_maps(self, converter):
         """Skills survive the attribute no-op -- only attributes are stubbed."""
-        result = converter._convert_expression('Player.GetAV Armorer >= 10',
+        result = conv_expr(converter, 'Player.GetAV Armorer >= 10',
                                                'Quest')
         assert result == 'Game.GetPlayer().GetActorValue("Smithing") >= 10'
 
@@ -1150,24 +1241,24 @@ class TestTypeMaps:
 
 class TestArgParsing:
     def test_space_separated(self, converter):
-        result = converter._convert_args('Gold001 100', 'additem', 'ObjectReference')
+        result = convert_args(converter, 'Gold001 100', 'additem', 'ObjectReference')
         assert 'Gold001' in result
         assert '100' in result
         assert ', ' in result
 
     def test_comma_separated(self, converter):
-        result = converter._convert_args('DarkBrotherhood, 2', 'setfactionrank', 'ObjectReference')
+        result = convert_args(converter, 'DarkBrotherhood, 2', 'setfactionrank', 'ObjectReference')
         assert 'DarkBrotherhood' in result
         assert '2' in result
         # Should have exactly one comma
         assert result.count(',') == 1
 
     def test_actor_value_arg(self, converter):
-        result = converter._convert_args('Blade', 'getactorvalue', 'Actor')
+        result = convert_args(converter, 'Blade', 'getactorvalue', 'Actor')
         assert '"OneHanded"' in result
 
     def test_actor_value_with_amount(self, converter):
-        result = converter._convert_args('Health 50', 'setactorvalue', 'Actor')
+        result = convert_args(converter, 'Health 50', 'setactorvalue', 'Actor')
         assert '"Health"' in result
         assert '50' in result
 
@@ -1231,7 +1322,7 @@ class TestIntegration:
 # Creation Kit PapyrusCompiler contracts
 #
 # Each of these was verified against Skyrim's own PapyrusCompiler.exe (see
-# docs/script_conversion_plan.md).  A violated contract means the script does
+# docs/commentary/script_convert.md).  A violated contract means the script does
 # not compile, produces no .pex, and the record it is bound to silently does
 # nothing in-game — so these are regression tests, not style checks.
 # ===========================================================================
@@ -1463,34 +1554,34 @@ def xref_magic():
 class TestMagicEffectVisuals:
     def test_pme_own_shader(self, xref_magic):
         conv = ScriptConverter(xref_magic)
-        result = conv._convert_line('pme STRP', 'ObjectReference')
+        result = conv_line(conv, 'pme STRP', 'ObjectReference')
         assert 'effectSoulTrap.Play(Self, -1.0)' in result
         assert conv._property_refs['effectSoulTrap'] == 'EffectShader'
 
     def test_pme_duration_and_ref(self, xref_magic):
         conv = ScriptConverter(xref_magic)
         conv._property_refs['SomeRef'] = 'ObjectReference'
-        result = conv._convert_line('SomeRef.pme STRP 5', 'ObjectReference')
+        result = conv_line(conv, 'SomeRef.pme STRP 5', 'ObjectReference')
         assert 'effectSoulTrap.Play(SomeRef, 5)' in result
 
     def test_pme_enchant_fallback(self, xref_magic):
         conv = ScriptConverter(xref_magic)
-        result = conv._convert_line('pme DSPL', 'ObjectReference')
+        result = conv_line(conv, 'pme DSPL', 'ObjectReference')
         assert 'effectEnchantMysticism.Play(Self, -1.0)' in result
 
     def test_pme_school_fallback(self, xref_magic):
         conv = ScriptConverter(xref_magic)
-        result = conv._convert_line('pme BABO', 'ObjectReference')
+        result = conv_line(conv, 'pme BABO', 'ObjectReference')
         assert 'effectEnchantConjuration.Play(Self, -1.0)' in result
 
     def test_sme_stops(self, xref_magic):
         conv = ScriptConverter(xref_magic)
-        result = conv._convert_line('sme STRP', 'ObjectReference')
+        result = conv_line(conv, 'sme STRP', 'ObjectReference')
         assert 'effectSoulTrap.Stop(Self)' in result
 
     def test_pme_unknown_code_is_ne_not_todo(self, xref_magic):
         conv = ScriptConverter(xref_magic)
-        result = conv._convert_line('pme XXXX', 'ObjectReference')
+        result = conv_line(conv, 'pme XXXX', 'ObjectReference')
         assert ';TODO' not in result
 
 
@@ -1505,7 +1596,7 @@ class TestIsSpellTarget:
 
     def test_emits_polyfill_call(self, xref_magic):
         conv = ScriptConverter(xref_magic)
-        result = conv._convert_line('if player.IsSpellTarget TestDrainSpell',
+        result = conv_line(conv, 'if player.IsSpellTarget TestDrainSpell',
                                     'ObjectReference')
         assert 'TES4Polyfill.HasMagicEffectByID(Game.GetPlayer(), 0x0003EB42)' in result
         assert ';TODO' not in result
@@ -1513,32 +1604,32 @@ class TestIsSpellTarget:
 
 class TestAnimAndPackage:
     def test_isanimplaying_bare(self, converter):
-        result = converter._convert_line('if isAnimPlaying == 0', 'ObjectReference')
+        result = conv_line(converter, 'if isAnimPlaying == 0', 'ObjectReference')
         assert 'GetAnimationVariableBool("bAnimPlaying")' in result
         assert ';TODO' not in result
 
     def test_isanimplaying_on_ref(self, converter):
         converter._property_refs['DoorRef'] = 'ObjectReference'
-        result = converter._convert_line('if DoorRef.IsAnimPlaying == 0',
+        result = conv_line(converter, 'if DoorRef.IsAnimPlaying == 0',
                                          'ObjectReference')
         assert 'DoorRef.GetAnimationVariableBool("bAnimPlaying")' in result
 
     def test_getiscurrentpackage(self, xref_magic):
         conv = ScriptConverter(xref_magic)
-        result = conv._convert_line('if GetIsCurrentPackage TestWanderPkg',
+        result = conv_line(conv, 'if GetIsCurrentPackage TestWanderPkg',
                                     'Actor')
         assert 'GetCurrentPackage() == TestWanderPkg' in result
         assert conv._property_refs['TestWanderPkg'] == 'Package'
 
     def test_getcurrentaipackage_vs_form(self, xref_magic):
         conv = ScriptConverter(xref_magic)
-        result = conv._convert_line('if ( GetCurrentAIPackage == TestWanderPkg )',
+        result = conv_line(conv, 'if ( GetCurrentAIPackage == TestWanderPkg )',
                                     'Actor')
         assert 'GetCurrentPackage() == TestWanderPkg' in result
 
     def test_getcurrentaipackage_vs_number_stays_neutral(self, xref_magic):
         conv = ScriptConverter(xref_magic)
-        result = conv._convert_line('if ( GetCurrentAIPackage != 5 )', 'Actor')
+        result = conv_line(conv, 'if ( GetCurrentAIPackage != 5 )', 'Actor')
         assert 'GetCurrentPackage()' not in result
 
 
@@ -1576,30 +1667,30 @@ class TestSetAlert:
     """
 
     def test_setalert_1_alerts_not_draws(self, converter):
-        result = converter._convert_line('UrielSeptimRef.setalert 1', 'Quest')
+        result = conv_line(converter, 'UrielSeptimRef.setalert 1', 'Quest')
         assert 'UrielSeptimRef.SetAlert(true)' in result
         assert 'DrawWeapon' not in result
 
     def test_setalert_0_stands_down(self, converter):
-        result = converter._convert_line('UrielSeptimRef.setalert 0', 'Quest')
+        result = conv_line(converter, 'UrielSeptimRef.setalert 0', 'Quest')
         assert 'UrielSeptimRef.SetAlert(false)' in result
 
     def test_setalert_bare_ref_casts_to_actor(self, converter):
-        result = converter._convert_line('setalert 1', 'Quest')
+        result = conv_line(converter, 'setalert 1', 'Quest')
         assert '(Self as Actor).SetAlert(true)' in result
 
 
 class TestSingletonFixes:
     def test_getiscreature_polyfill(self, converter):
-        result = converter._convert_line('if GetIsCreature == 0', 'ActiveMagicEffect')
+        result = conv_line(converter, 'if GetIsCreature == 0', 'ActiveMagicEffect')
         assert 'TES4Polyfill.GetIsCreature(GetTargetActor())' in result
 
     def test_isguard_polyfill(self, converter):
-        result = converter._convert_line('if IsGuard == 0', 'ActiveMagicEffect')
+        result = conv_line(converter, 'if IsGuard == 0', 'ActiveMagicEffect')
         assert 'TES4Polyfill.IsGuard(GetTargetActor())' in result
 
     def test_hasvampirefed_polyfill(self, converter):
-        result = converter._convert_line('if player.HasVampireFed == 1',
+        result = conv_line(converter, 'if player.HasVampireFed == 1',
                                          'ObjectReference')
         assert 'TES4Polyfill.HasVampireFed()' in result
 
@@ -1608,7 +1699,7 @@ class TestSingletonFixes:
         # which Skyrim ignores (1,035 of 1,036 vanilla relations store 0).
         # Combat is gated on the Group Combat Reaction enum, written by
         # SetAlly/SetEnemy.
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'setfactionreaction FacA, FacB 20', 'ObjectReference')
         assert 'FacA.SetAlly(FacB, true, true)' in result
         assert 'SetReaction' not in result
@@ -1621,13 +1712,13 @@ class TestSingletonFixes:
         FactionWar member-pairing push was removed: it sampled actors
         probabilistically and paired them with relationship ranks that
         silently no-op between non-unique actors."""
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'setfactionreaction FacA FacB -100', 'ObjectReference')
         assert 'FacA.SetEnemy(FacB, false, false)' in result
         assert 'FactionWar' not in result
 
     def test_setfactionreaction_strong_positive_becalms(self, converter):
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'setfactionreaction FacA FacB 100', 'ObjectReference')
         assert 'FacA.SetAlly(FacB, true, true)' in result
         assert 'FactionPeace' not in result
@@ -1640,19 +1731,19 @@ class TestSingletonFixes:
         mirror too (CharacterGen stage 23 stands the assassins down from
         hunting the player with `setfactionreaction MythicDawnCG
         PlayerFaction 0`)."""
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'setfactionreaction FacA PlayerFaction -100', 'ObjectReference')
         assert 'TES4Polyfill.MirrorPlayerFactionRelation(FacA, 1)' in result
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'setfactionreaction FacA PlayerFaction 0', 'ObjectReference')
         assert 'TES4Polyfill.MirrorPlayerFactionRelation(FacA, 0)' in result
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'setfactionreaction FacA PlayerFaction 100', 'ObjectReference')
         assert 'TES4Polyfill.MirrorPlayerFactionRelation(FacA, 2)' in result
 
     def test_setfactionreaction_variable_amount_branches(self, converter):
         """A non-literal amount still has to reach a real enum tier."""
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'setfactionreaction FacA FacB someVar', 'ObjectReference')
         assert 'SetEnemy' in result and 'SetAlly' in result
         assert 'SetReaction' not in result
@@ -1660,24 +1751,24 @@ class TestSingletonFixes:
     def test_pushactoraway(self, converter):
         converter._property_refs['MarkerRef'] = 'ObjectReference'
         converter._property_refs['VictimRef'] = 'ObjectReference'
-        result = converter._convert_line('MarkerRef.pushActorAway VictimRef 30',
+        result = conv_line(converter, 'MarkerRef.pushActorAway VictimRef 30',
                                          'ObjectReference')
         assert 'MarkerRef.PushActorAway((VictimRef as Actor), 30)' in result
         assert ';TODO' not in result
 
     def test_getarmorrating(self, converter):
         converter._property_refs['GuardRef'] = 'Actor'
-        result = converter._convert_line('if GuardRef.GetArmorRating > 20',
+        result = conv_line(converter, 'if GuardRef.GetArmorRating > 20',
                                          'ObjectReference')
         assert 'GuardRef.GetActorValue("DamageResist")' in result
 
     def test_if_without_space_is_condition(self, converter):
-        result = converter._convert_line('if((myVar == 1))', 'ObjectReference')
+        result = conv_line(converter, 'if((myVar == 1))', 'ObjectReference')
         assert result.lstrip().lower().startswith('if')
         assert ';TODO' not in result
 
     def test_setactorrefraction(self, converter):
-        result = converter._convert_line('SetActorRefraction 1', 'Actor')
+        result = conv_line(converter, 'SetActorRefraction 1', 'Actor')
         assert 'TES4Polyfill.SetActorRefraction(Self, 1)' in result
 
 
@@ -1945,7 +2036,7 @@ class TestSayTimerConversion:
         poll tick cannot start a duplicate.
         """
         converter._property_refs['ThadonRef'] = 'Actor'
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'set timer to ThadonRef.Say DeathSpeech01', 'Quest')
         lines = [l.strip() for l in result.split('\n')]
         assert lines[0].startswith('timer = 1.75')       # pre-charge
@@ -1958,7 +2049,7 @@ class TestSayTimerConversion:
         saved = ScriptConverter.say_durations
         ScriptConverter.say_durations = {'chargentaunt2': 14.63}
         try:
-            result = converter._convert_line(
+            result = conv_line(converter, 
                 'set timer to SayTo player CharGenTaunt2 1', 'Actor')
         finally:
             ScriptConverter.say_durations = saved
@@ -2112,7 +2203,7 @@ class TestSayTimerConversion:
 
     def test_authored_offset_survives(self, converter):
         converter._property_refs['ThadonRef'] = 'Actor'
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'set timer to (ThadonRef.Say DeathSpeech01) + 2', 'Quest')
         assert 'TES4Polyfill.SayLine(ThadonRef, DeathSpeech01, 3) + 2' in result
 
@@ -2121,7 +2212,7 @@ class TestSayTimerConversion:
         the tail that covers the End fragment's latency survives."""
         converter._var_types['saylen'] = 'Int'
         converter._property_refs['ThadonRef'] = 'Actor'
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'set saylen to ThadonRef.Say DeathSpeech01', 'Quest')
         assert 'saylen = Math.Ceiling(TES4Polyfill.SayLine(ThadonRef, DeathSpeech01, 3))' in result
 
@@ -2130,8 +2221,8 @@ class TestSayTimerConversion:
         measures and delivers, so the bare delivery is dropped."""
         converter._property_refs['ArmandRef'] = 'Actor'
         lines = [
-            converter._convert_line('set InfoLength to ArmandRef.Say TG01Armand1', 'Quest'),
-            converter._convert_line('ArmandRef.SayTo Player TG01Armand1', 'Quest'),
+            conv_line(converter, 'set InfoLength to ArmandRef.Say TG01Armand1', 'Quest'),
+            conv_line(converter, 'ArmandRef.SayTo Player TG01Armand1', 'Quest'),
         ]
         out = converter._postprocess_lines(lines)
         joined = '\n'.join(out)
@@ -2224,11 +2315,11 @@ class TestGameHourFractional:
     """
 
     def test_gamehour_read_is_not_truncated(self, converter):
-        assert converter._convert_expression('GameHour', 'ObjectReference') \
+        assert conv_expr(converter, 'GameHour', 'ObjectReference') \
             == 'GameHour.GetValue()'
 
     def test_hour_boundary_window_survives(self, converter):
-        out = converter._convert_expression(
+        out = conv_expr(converter, 
             '( GameHour >= 23.98 ) || ( GameHour <= 0.02 )', 'ObjectReference')
         assert 'as Int' not in out
         assert '23.98' in out and '0.02' in out
@@ -2240,7 +2331,7 @@ class TestGameHourFractional:
         xref.formid_to_edid['00099001'] = 'MyShortGlobal'
         xref.global_types['myshortglobal'] = 's'
         conv = ScriptConverter(xref)
-        assert conv._convert_expression('MyShortGlobal', 'ObjectReference') \
+        assert conv_expr(conv, 'MyShortGlobal', 'ObjectReference') \
             == 'MyShortGlobal.GetValue() as Int'
 
     def test_float_typed_global_not_truncated(self, xref):
@@ -2249,7 +2340,7 @@ class TestGameHourFractional:
         xref.formid_to_edid['00099002'] = 'MyFloatGlobal'
         xref.global_types['myfloatglobal'] = 'f'
         conv = ScriptConverter(xref)
-        assert conv._convert_expression('MyFloatGlobal', 'ObjectReference') \
+        assert conv_expr(conv, 'MyFloatGlobal', 'ObjectReference') \
             == 'MyFloatGlobal.GetValue()'
 
 
@@ -2262,7 +2353,7 @@ class TestEnumActorValues:
     """
 
     def test_aggression_100_becomes_tier(self, converter):
-        out = converter._convert_function_call(
+        out = conv_line(converter, 
             'SetActorValue Aggression, 100', 'ObjectReference')
         assert 'SetActorValue("Aggression", 2)' in out
 
@@ -2283,32 +2374,32 @@ class TestEnumActorValues:
         directly: "a guard would attack the whole town if their aggression were
         sufficiently raised."
         """
-        out = converter._convert_function_call(
+        out = conv_line(converter, 
             'SetActorValue Aggression, 10', 'ObjectReference')
         assert 'SetActorValue("Aggression", 1)' in out
 
     def test_high_aggression_still_attacks_on_sight(self, converter):
         """The real "now attack anyone" beats (90/100) must keep tier 2."""
         for value in (70, 90, 100):
-            out = converter._convert_function_call(
+            out = conv_line(converter, 
                 f'SetActorValue Aggression, {value}', 'ObjectReference')
             assert 'SetActorValue("Aggression", 2)' in out, value
 
     def test_aggression_five_never_initiates(self, converter):
         """<=5 is Oblivion's "never attack" floor."""
-        out = converter._convert_function_call(
+        out = conv_line(converter, 
             'SetActorValue Aggression, 5', 'ObjectReference')
         assert 'SetActorValue("Aggression", 0)' in out
 
     def test_frenzy_range_attacks_everyone(self, converter):
         """>=106 is Frenzy: attacks anyone, including allies."""
-        out = converter._convert_function_call(
+        out = conv_line(converter, 
             'SetActorValue Aggression, 110', 'ObjectReference')
         assert 'SetActorValue("Aggression", 3)' in out
 
     def test_in_range_value_passes_through(self, converter):
         """An already-legal tier is a deliberate value, not re-bucketed."""
-        out = converter._convert_function_call(
+        out = conv_line(converter, 
             'SetActorValue Aggression, 0', 'ObjectReference')
         assert 'SetActorValue("Aggression", 0)' in out
 
@@ -2316,25 +2407,25 @@ class TestEnumActorValues:
         """Oblivion 100 = fearless → Foolhardy (4), the only tier that never
         flees.  Mapping it to Brave (3) left actors with a nonzero flee score
         and made them run away constantly."""
-        out = converter._convert_function_call(
+        out = conv_line(converter, 
             'SetActorValue Confidence, 100', 'ObjectReference')
         assert 'SetActorValue("Confidence", 4)' in out
 
     def test_confidence_tiers_span_full_range(self, converter):
         """Must mirror _convert_aidt: all five tiers are reachable."""
         for raw, tier in ((100, 4), (75, 3), (50, 2), (20, 1), (5, 0)):
-            out = converter._convert_function_call(
+            out = conv_line(converter, 
                 f'SetActorValue Confidence, {raw}', 'ObjectReference')
             assert f'SetActorValue("Confidence", {tier})' in out, (raw, out)
 
     def test_non_enum_actor_value_untouched(self, converter):
-        out = converter._convert_function_call(
+        out = conv_line(converter, 
             'SetActorValue Health, 100', 'ObjectReference')
         assert 'SetActorValue("Health", 100)' in out
 
     def test_variable_operand_left_alone(self, converter):
         """A non-literal cannot be bucketed at conversion time."""
-        conv_out = converter._convert_function_call(
+        conv_out = conv_line(converter, 
             'SetActorValue Aggression, myVar', 'ObjectReference')
         assert 'myVar' in conv_out
 
@@ -2347,11 +2438,11 @@ class TestZeroArgRefReceiver:
     """
 
     def test_stopcombat_comma_receiver(self, converter):
-        out = converter._convert_function_call('StopCombat, Player', 'ObjectReference')
+        out = conv_line(converter, 'StopCombat, Player', 'ObjectReference')
         assert out == 'Game.GetPlayer().StopCombat()'
 
     def test_isincombat_comma_receiver_in_comparison(self, converter):
-        out = converter._convert_expression('IsInCombat, Player == 1', 'ObjectReference')
+        out = conv_expr(converter, 'IsInCombat, Player == 1', 'ObjectReference')
         assert out == 'Game.GetPlayer().IsInCombat()'
 
     def test_getdeadcount_prefix_not_split(self, xref):
@@ -2360,7 +2451,7 @@ class TestZeroArgRefReceiver:
         xref.record_type['00099010'] = 'NPC_'
         xref.formid_to_edid['00099010'] = 'Narel'
         conv = ScriptConverter(xref)
-        out = conv._convert_expression('GetDeadCount Narel == 1', 'ObjectReference')
+        out = conv_expr(conv, 'GetDeadCount Narel == 1', 'ObjectReference')
         assert out == 'Narel.GetDeadCount() == 1'
 
     def test_arg_taking_function_keeps_its_argument(self, xref):
@@ -2369,7 +2460,7 @@ class TestZeroArgRefReceiver:
         xref.record_type['00099011'] = 'FACT'
         xref.formid_to_edid['00099011'] = 'MyFaction'
         conv = ScriptConverter(xref)
-        out = conv._convert_expression('GetInFaction, MyFaction == 1', 'ObjectReference')
+        out = conv_expr(conv, 'GetInFaction, MyFaction == 1', 'ObjectReference')
         assert 'MyFaction' in out and 'IsInFaction(' in out
 
 
@@ -2464,7 +2555,7 @@ End
         """`Return <value>` belongs to an OBSE user function, not a GameMode
         early-out, and must not have a poll re-arm spliced in front of it."""
         converter._udf_returns = True
-        assert converter._convert_line('return', 'Quest') == 'Return 0'
+        assert conv_line(converter, 'return', 'Quest') == 'Return 0'
 
 
 class TestNoPollFreeze:
@@ -2510,7 +2601,7 @@ class TestChargenMenus:
 
     def test_menu_emission(self, converter):
         converter.chargen_menus = self.PLAN
-        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        out = conv_line(converter, 'ShowBirthsignMenu', 'Quest')
         assert 'TES4Msg_ChargenBirthsign_01.Show()' in out
         # page chaining: "More ..." is button 9, global index = 9*page+button
         assert 'If TES4_menuPick1 == 9' in out
@@ -2542,7 +2633,7 @@ class TestChargenMenus:
         """
         converter.chargen_menus = self.PLAN
         converter._current_event = 'Event OnUpdate()'
-        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        out = conv_line(converter, 'ShowBirthsignMenu', 'Quest')
         assert 'If TES4_ChargenMenuBusy' in out
         assert 'TES4_ChargenMenuBusy = True' in out
         assert 'TES4_ChargenMenuBusy = False' in out
@@ -2563,7 +2654,7 @@ class TestChargenMenus:
         the menu twice."""
         converter.chargen_menus = self.PLAN
         converter._current_event = 'Function Fragment_Stage_0087_Item_0()'
-        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        out = conv_line(converter, 'ShowBirthsignMenu', 'Quest')
         assert 'If !TES4_ChargenMenuBusy' in out
         assert 'Return' not in out
         assert out.rstrip().endswith('EndIf')
@@ -2579,7 +2670,7 @@ class TestChargenMenus:
         plan = {'birthsign': dict(self.PLAN['birthsign'],
                                   choice_global='TES4ChargenBirthsignChoice')}
         converter.chargen_menus = plan
-        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        out = conv_line(converter, 'ShowBirthsignMenu', 'Quest')
         assert 'TES4ChargenBirthsignChoice.SetValue(TES4_menuPick1 + 1)' in out
         assert out.index('If TES4_menuPick1 >= 0') \
             < out.index('.SetValue(TES4_menuPick1 + 1)')
@@ -2592,14 +2683,14 @@ class TestChargenMenus:
         authored Goodbye closes the conversation).  The emission retries
         briefly instead of swallowing the player's choice."""
         converter.chargen_menus = self.PLAN
-        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        out = conv_line(converter, 'ShowBirthsignMenu', 'Quest')
         assert 'While TES4_menuPick1 < 0 && TES4_menuRetry1 < 20' in out
         assert 'Utility.Wait(0.5)' in out
 
     def test_no_plan_stays_noop(self, converter):
         """A plugin without BSGN records keeps the inert conversion."""
         converter.chargen_menus = {}
-        out = converter._convert_line('ShowBirthsignMenu', 'Quest')
+        out = conv_line(converter, 'ShowBirthsignMenu', 'Quest')
         assert 'Show()' not in out
         assert ';NE: ShowBirthsignMenu' in out
 
@@ -2684,12 +2775,12 @@ class TestJailIsNotExpulsion:
         'IsPlayerInJail', 'GetPlayerInJail', 'IsPlayerInPrison', 'SentToJail',
     ])
     def test_maps_to_isarrested(self, converter, spelling):
-        out = converter._convert_expression(spelling, 'Quest')
+        out = conv_expr(converter, spelling, 'Quest')
         assert out == 'Game.GetPlayer().IsArrested()'
         assert 'Expelled' not in out
 
     def test_does_not_register_a_crime_faction_property(self, converter):
-        converter._convert_expression('IsPlayerInJail', 'Quest')
+        conv_expr(converter, 'IsPlayerInJail', 'Quest')
         assert 'TES4CyrodiilCrimeFaction' not in converter.get_property_refs()
 
 
@@ -2702,7 +2793,7 @@ class TestScriptAddTopicOpensTheGate:
 
     def test_gated_topic_emits_the_setvalue(self, converter):
         converter.topic_unlock_globals = {'tggrayfox': 'TES4Unlock_TGGrayFox'}
-        out = converter._convert_line('AddTopic TGGrayFox', 'ObjectReference')
+        out = conv_line(converter, 'AddTopic TGGrayFox', 'ObjectReference')
         assert out == 'TES4Unlock_TGGrayFox.SetValue(1)'
         assert converter.get_property_refs()['TES4Unlock_TGGrayFox'] \
             == 'GlobalVariable'
@@ -2711,7 +2802,7 @@ class TestScriptAddTopicOpensTheGate:
         """An ungated topic is already visible and has no global to set."""
         converter.topic_unlock_globals = {}
         converter._line_comments = []
-        out = converter._convert_line('AddTopic SomeUngatedTopic',
+        out = conv_line(converter, 'AddTopic SomeUngatedTopic',
                                       'ObjectReference')
         assert 'SetValue' not in out
         assert 'TES4Unlock_' not in str(converter.get_property_refs())
@@ -2788,7 +2879,7 @@ class TestIsPCAMurdererIsNotZero:
     """
 
     def test_bare_read_asks_the_crime_faction(self, converter):
-        out = converter._convert_line('if IsPCAMurderer == 1', 'Quest')
+        out = conv_line(converter, 'if IsPCAMurderer == 1', 'Quest')
         assert '0 == 1' not in out
         assert 'GetCrimeGoldViolent()' in out
         assert converter.get_property_refs()['TES4CyrodiilCrimeFaction'] \
@@ -2798,7 +2889,7 @@ class TestIsPCAMurdererIsNotZero:
         """`> 0` is R4-1's ASSAULT test — it would make the player a murderer
         for a bar brawl.  Murder is the 1000-gold band."""
         from script_convert.constants import TES4_MURDER_BOUNTY
-        out = converter._convert_line('if IsPCAMurderer == 1', 'Quest')
+        out = conv_line(converter, 'if IsPCAMurderer == 1', 'Quest')
         assert f'>= {TES4_MURDER_BOUNTY}' in out
 
 
@@ -2813,7 +2904,7 @@ class TestGetDetectionLevelIsDetection:
     def test_receiver_and_argument_swap(self, converter):
         """`Player` converts to Game.GetPlayer(); what matters is that the
         TARGET became the receiver and the OBSERVER the argument."""
-        out = converter._convert_line(
+        out = conv_line(converter, 
             'if GuardRef.GetDetectionLevel Player == 3', 'Quest')
         assert '.IsDetectedBy(GuardRef)' in out, \
             'observer/target must swap, as for GetDetected'
@@ -2823,7 +2914,7 @@ class TestGetDetectionLevelIsDetection:
         """`true as Int` is 1, so a raw Bool would make every `>= 2` / `>= 3`
         site permanently false — trading one dead form for another."""
         for op, num in (('==', 3), ('>=', 2), ('>=', 3)):
-            out = converter._convert_line(
+            out = conv_line(converter, 
                 f'if GuardRef.GetDetectionLevel Player {op} {num}', 'Quest')
             assert '* 3)' in out, f'{op} {num} must be rescaled'
 
@@ -2844,14 +2935,14 @@ class TestPlaySoundPropertyIsNotQuoted:
     """
 
     def test_quoted_editorid_registers_the_stripped_name(self, converter):
-        out = converter._convert_line('PlaySound "AMBBaenlinDeath"', 'Quest')
+        out = conv_line(converter, 'PlaySound "AMBBaenlinDeath"', 'Quest')
         props = converter.get_property_refs()
         assert 'AMBBaenlinDeath' in props
         assert not [p for p in props if p.startswith('_') and p.endswith('_')]
         assert 'AMBBaenlinDeath.Play(' in out
 
     def test_unquoted_editorid_still_works(self, converter):
-        out = converter._convert_line('PlaySound AMBBaenlinMiss', 'Quest')
+        out = conv_line(converter, 'PlaySound AMBBaenlinMiss', 'Quest')
         assert 'AMBBaenlinMiss' in converter.get_property_refs()
         assert 'AMBBaenlinMiss.Play(' in out
 
@@ -2913,13 +3004,13 @@ class TestBareActorCallUsesTheEventActor:
 
     def test_bare_addspell_in_onequipped_targets_akactor(self, converter):
         converter._current_event = 'Event OnEquipped(Actor akActor)'
-        out = converter._convert_line('addspell MG15BloodWormHelm25',
+        out = conv_line(converter, 'addspell MG15BloodWormHelm25',
                                       'ObjectReference')
         assert out.strip().startswith('akActor.AddSpell(')
 
     def test_bare_call_outside_an_actor_event_still_casts_self(self, converter):
         converter._current_event = 'Event OnUpdate()'
-        out = converter._convert_line('addspell MG15BloodWormHelm25',
+        out = conv_line(converter, 'addspell MG15BloodWormHelm25',
                                       'ObjectReference')
         assert '(Self as Actor).AddSpell(' in out
 
@@ -3121,7 +3212,7 @@ class TestRuntimeGameSettingWrites:
 
     def test_a_setting_with_no_actor_value_keeps_a_visible_marker(self, converter):
         """A call that silently does nothing is the dangerous conversion; a
-        marker is the healthy failure (docs/papyrus_conversion_notes.md)."""
+        marker is the healthy failure (docs/commentary/script_convert.md)."""
         out = converter.convert_standalone(
             'T', 'scn T\nbegin gamemode\nSetNumericGameSetting fNoSuchSetting 5\nend',
             'Quest', 'T')
@@ -3187,8 +3278,8 @@ class TestQuotedEditorIds:
         return ScriptConverter(CrossRefGraph())
 
     def test_quoted_and_unquoted_name_the_same_property(self, converter):
-        quoted = converter._convert_line('SetStage "MQ01Tate" 20', 'Quest')
-        bare = converter._convert_line('SetStage MQ01Tate 20', 'Quest')
+        quoted = conv_line(converter, 'SetStage "MQ01Tate" 20', 'Quest')
+        bare = conv_line(converter, 'SetStage MQ01Tate 20', 'Quest')
         assert quoted == bare == 'MQ01Tate.SetStage(20)'
 
     @pytest.mark.parametrize('line,expected', [
@@ -3197,13 +3288,13 @@ class TestQuotedEditorIds:
         ('StopQuest "Charactergen"', 'Charactergen.Stop()'),
     ])
     def test_quest_commands_unquote(self, converter, line, expected):
-        assert converter._convert_line(line, 'Quest') == expected
+        assert conv_line(converter, line, 'Quest') == expected
 
     def test_dotted_member_access_unquotes_both_sides(self, converter):
         # 1AlmanachDerBeschwoerungSCN: the assignment TARGET went through
         # _convert_ref (mangling the quotes) while the VALUE went through
         # _convert_expression (leaving them), emitting un-parseable Papyrus.
-        out = converter._convert_line(
+        out = conv_line(converter, 
             'Set "NQ16"."NQ16CountBooksVar" to "NQ16"."NQ16CountBooksVar" +1',
             'Quest')
         assert out == 'NQ16.NQ16CountBooksVar = NQ16.NQ16CountBooksVar + 1'
@@ -3214,7 +3305,7 @@ class TestQuotedEditorIds:
         'MessageBox "Ihr habt Punkte erhalten."',
     ])
     def test_real_string_literals_keep_their_quotes(self, converter, line):
-        assert '"' in converter._convert_line(line, 'Quest')
+        assert '"' in conv_line(converter, line, 'Quest')
 
     def test_safe_property_name_strips_wrapping_quotes(self):
         assert _safe_property_name('"MQ01Tate"') == _safe_property_name('MQ01Tate')
@@ -3297,22 +3388,22 @@ class TestGetIsClassReadsTheActorBase:
     """
 
     def test_bare_player_read_converts(self, converter):
-        out = converter._convert_line('if GetPCIsClass CharactergenClass', 'Quest')
+        out = conv_line(converter, 'if GetPCIsClass CharactergenClass', 'Quest')
         assert 'GetPCIsClass' not in out
         assert 'Game.GetPlayer().GetActorBase().GetClass() == CharactergenClass' in out
 
     def test_compared_form_converts(self, converter):
-        out = converter._convert_line('if GetPCIsClass CharactergenClass == 0', 'Quest')
+        out = conv_line(converter, 'if GetPCIsClass CharactergenClass == 0', 'Quest')
         assert 'GetPCIsClass' not in out
         assert 'GetActorBase().GetClass() == CharactergenClass' in out
 
     def test_explicit_ref_goes_through_the_actor_base(self, converter):
-        out = converter._convert_line('if ActorRef.GetIsClass Warrior == 1', 'Quest')
+        out = conv_line(converter, 'if ActorRef.GetIsClass Warrior == 1', 'Quest')
         assert 'GetIsClass' not in out
         assert 'GetActorBase().GetClass() == Warrior' in out
 
     def test_argument_is_typed_class(self, converter):
-        converter._convert_line('if GetPCIsClass CharactergenClass', 'Quest')
+        conv_line(converter, 'if GetPCIsClass CharactergenClass', 'Quest')
         assert converter.get_property_refs()['CharactergenClass'] == 'Class'
 
 
@@ -3326,13 +3417,13 @@ class TestSvConstructIsAStringLiteral:
     """
 
     def test_literal_passes_through(self, converter):
-        out = converter._convert_line('set q to sv_Construct "Hello there."', 'Quest')
+        out = conv_line(converter, 'set q to sv_Construct "Hello there."', 'Quest')
         assert 'sv_Construct' not in out
         assert '"Hello there."' in out
 
     def test_destruct_stays_a_no_op(self, converter):
         """Papyrus strings are garbage-collected — there is nothing to free."""
-        out = converter._convert_line('set q to sv_Destruct', 'Quest')
+        out = conv_line(converter, 'set q to sv_Destruct', 'Quest')
         assert 'NE: sv_Destruct' in out
 
 
@@ -3348,23 +3439,23 @@ class TestMoveToBindsItsDestination:
     """
 
     def test_player_prefixed_form_binds_the_target(self, converter):
-        out = converter._convert_line('Player.MoveTo CGPlayerStartMarker1', 'Quest')
+        out = conv_line(converter, 'Player.MoveTo CGPlayerStartMarker1', 'Quest')
         assert out == 'Game.GetPlayer().MoveTo(CGPlayerStartMarker1)'
         assert converter.get_property_refs()['CGPlayerStartMarker1'] == 'ObjectReference'
 
     def test_explicit_ref_form_binds_the_target(self, converter):
-        out = converter._convert_line('fbmwfargothref.moveto mwCGFargothStartMarker', 'Quest')
+        out = conv_line(converter, 'fbmwfargothref.moveto mwCGFargothStartMarker', 'Quest')
         assert converter.get_property_refs()['mwCGFargothStartMarker'] == 'ObjectReference'
 
     def test_space_separated_offsets_survive(self, converter):
         """Oblivion writes the offsets space-separated; comma-splitting glued
         them onto the target name and the call did not parse."""
-        out = converter._convert_line('ref.MoveTo SomeMarker 0 100 0', 'Quest')
+        out = conv_line(converter, 'ref.MoveTo SomeMarker 0 100 0', 'Quest')
         assert out == 'ref.MoveTo(SomeMarker, 0, 100, 0)'
 
     def test_player_target_is_not_a_property(self, converter):
         """`player` is a converter keyword, never a bound property."""
-        out = converter._convert_line('Player.MoveTo Player', 'Quest')
+        out = conv_line(converter, 'Player.MoveTo Player', 'Quest')
         assert out == 'Game.GetPlayer().MoveTo(Game.GetPlayer())'
         assert 'Player' not in converter.get_property_refs()
 
@@ -3380,7 +3471,7 @@ class TestTriggerEntryFires:
 
     The body stays on OnTrigger (per-frame semantics: Nehrim's Magieverbot
     scripts count their own executions), and a generated OnTriggerEnter
-    delegates to it.  BOTH are required -- see docs/papyrus_conversion_notes.md.
+    delegates to it.  BOTH are required -- see docs/commentary/script_convert.md.
     """
 
     SRC = """scn T
@@ -3436,7 +3527,7 @@ class TestPhysicalTrapDamage:
     Skyrim keeps the layer-14 contact detection but dispatches it as
     OnTrapHitStart and leaves the damage to the script (vanilla
     TrapHitBase.psc -> native ProcessTrapHit).  In-game confirmed 2026-08-09;
-    see docs/papyrus_conversion_notes.md.
+    see docs/commentary/script_convert.md.
     """
 
     # CTrapSwingMace01SCRIPT's shape: armed at 0, 20 on release, 5 after 6s.
@@ -3901,47 +3992,47 @@ class TestObjectReferenceMethodsDoNotPromoteToActor:
     ArenaGalleryMarkerRef, ICArenaPlayerMarkerRef, ICMonsterFightPlayerRef) are
     XMarker **STAT** refs, so `Actor Property` refused to bind, the property was
     None, and the first call on it aborted the whole announcer function.
-    See docs/papyrus_conversion_notes.md.
+    See docs/commentary/script_convert.md.
     """
 
     def test_say_does_not_promote_receiver(self, converter):
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'ArenaMatchPlayerRef.Say Announcer 1 ArenaMouth 1', 'Quest')
         assert 'ArenaMatchPlayerRef.Say(' in result
         assert converter._property_refs.get('ArenaMatchPlayerRef') != 'Actor'
 
     def test_say_keeps_existing_objectreference_type(self, converter):
         converter._property_refs['ArenaGalleryMarkerRef'] = 'ObjectReference'
-        converter._convert_line('ArenaGalleryMarkerRef.Say Announcer', 'Quest')
+        conv_line(converter, 'ArenaGalleryMarkerRef.Say Announcer', 'Quest')
         assert converter._property_refs['ArenaGalleryMarkerRef'] == 'ObjectReference'
 
     def test_cast_source_does_not_promote(self, converter):
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'SEHaskillSummonMarker.Cast SummonSpell Player', 'Quest')
         assert '.Cast(SEHaskillSummonMarker' in result
         assert converter._property_refs.get('SEHaskillSummonMarker') != 'Actor'
 
     def test_pms_subject_does_not_promote(self, converter):
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'SEXedPuzStatue1.pms effectSoulTrap', 'Quest')
         assert '.Play(SEXedPuzStatue1' in result
         assert converter._property_refs.get('SEXedPuzStatue1') != 'Actor'
 
     def test_getangle_does_not_promote(self, converter):
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'set x to SEXedPuzStatue2.GetAngle Z', 'Quest')
         assert 'SEXedPuzStatue2.GetAngleZ()' in result
         assert converter._property_refs.get('SEXedPuzStatue2') != 'Actor'
 
     def test_moveto_does_not_promote_subject(self, converter):
-        result = converter._convert_line(
+        result = conv_line(converter, 
             'SEHaskillSummonMarker.MoveTo SEHaskillSummonReturnMarker', 'Quest')
         assert 'SEHaskillSummonMarker.MoveTo(' in result
         assert converter._property_refs.get('SEHaskillSummonMarker') != 'Actor'
 
     def test_actor_only_call_still_promotes(self, converter):
         """The guard must not disarm genuine Actor-only promotion."""
-        converter._convert_line('SomeGuardRef.EVP', 'Quest')
+        conv_line(converter, 'SomeGuardRef.EVP', 'Quest')
         assert converter._property_refs.get('SomeGuardRef') == 'Actor'
 
 
@@ -3953,11 +4044,15 @@ class TestQuestStartDoesNotClobberSeededWrites:
     its scripts and resets every Auto property, silently erasing the seed.
     This softlocked the Imperial City Arena: `Arena.ReadyMatch = 1` then
     `Arena.Start()` left ReadyMatch at 0, so the announcer never fired.
-    See docs/papyrus_conversion_notes.md.
+    See docs/commentary/script_convert.md.
     """
 
     def _hoist(self, converter, body):
-        return converter._hoist_quest_start_above_writes(body)
+        # `converter` is unused: the hoist moved to `tes5.blocks` when the
+        # `__new__(ScriptConverter)` hack that called it from the pipeline was
+        # deleted -- it never touched instance state, only three class-level
+        # regexes.  The parameter stays so the cases below read unchanged.
+        return hoist_quest_start_above_writes(body)
 
     def test_start_hoisted_above_its_own_writes(self, converter):
         out = self._hoist(converter, [
@@ -4006,3 +4101,428 @@ class TestQuestStartDoesNotClobberSeededWrites:
     def test_comparison_is_not_mistaken_for_a_write(self, converter):
         body = ['  If Arena.ReadyMatch == 1', '  Arena.Start()']
         assert self._hoist(converter, body) == body
+
+
+# ===========================================================================
+# TES4 lexer  (script_convert/tes4/lexer.py)
+# ===========================================================================
+
+class TestTes4Lexer:
+    """The lexer is the foundation of the parse tree: if it loses a token, the
+    parser cannot rebuild the statement, so every case here is about NOT
+    dropping input rather than about producing a pretty token list."""
+
+    def _kinds(self, src):
+        return [(t.kind.name, t.text) for t in tokenize(src)
+                if t.kind is not T.EOF]
+
+    def test_trailing_comment_is_kept_as_a_token(self):
+        toks = tokenize('short done\t\t; set to 1 when Ob 13 turned on')
+        assert toks[-2].kind is T.COMMENT
+        assert toks[-2].text == '; set to 1 when Ob 13 turned on'
+
+    def test_comment_mid_expression_does_not_eat_following_lines(self):
+        # The whole reason the tree exists: a comment ends at the newline, so
+        # a following statement is still tokenised.
+        toks = tokenize('if x == 1  ; why\nset y to 2')
+        assert any(t.kind is T.IDENT and t.text == 'set' for t in toks)
+
+    def test_member_dot_is_an_operator_not_a_number(self):
+        assert self._kinds('BaurusRef.getdisposition player') == [
+            ('IDENT', 'BaurusRef'), ('OP', '.'),
+            ('IDENT', 'getdisposition'), ('IDENT', 'player')]
+
+    def test_leading_dot_number_is_a_number(self):
+        assert self._kinds('set x to .5') == [
+            ('IDENT', 'set'), ('IDENT', 'x'), ('IDENT', 'to'), ('NUMBER', '.5')]
+
+    def test_two_char_operators_beat_one_char(self):
+        assert self._kinds('if a <= 1 && b != 2') == [
+            ('IDENT', 'if'), ('IDENT', 'a'), ('OP', '<='), ('NUMBER', '1'),
+            ('OP', '&&'), ('IDENT', 'b'), ('OP', '!='), ('NUMBER', '2')]
+
+    def test_string_literal_keeps_its_quotes_and_spaces(self):
+        toks = tokenize('MessageBox "Hello there, friend"')
+        assert toks[1].kind is T.STRING
+        assert toks[1].text == '"Hello there, friend"'
+
+    def test_semicolon_inside_a_string_is_not_a_comment(self):
+        toks = tokenize('MessageBox "a ; b"')
+        assert toks[1].text == '"a ; b"'
+        assert not any(t.kind is T.COMMENT for t in toks)
+
+    def test_unterminated_string_runs_to_end_of_line(self):
+        # Oblivion's compiler accepted this; refusing it would fail a script
+        # the source plugin actually ships.
+        toks = tokenize('MessageBox "oops\nset x to 1')
+        assert toks[1].kind is T.STRING
+        assert any(t.kind is T.IDENT and t.text == 'set' for t in toks)
+
+    def test_stray_backtick_does_not_raise(self):
+        # MG09Script line 132 ships a bare '`' after `endif` in Oblivion.esm.
+        toks = tokenize('endif`')
+        assert [t.text for t in toks if t.kind is not T.EOF] == ['endif', '`']
+
+    def test_newlines_are_significant(self):
+        toks = tokenize('a\nb')
+        assert sum(1 for t in toks if t.kind is T.NEWLINE) == 1
+
+# ===========================================================================
+# TES4 parser  (script_convert/tes4/parser.py)
+# ===========================================================================
+
+class TestTes4Parser:
+    """Verified against every script body in all 10 exports (19,013 bodies):
+    zero crashes, and 17 Raw statements total -- all of them authored typos
+    (a bare `-----` separator or a `:` where the author meant `;`)."""
+
+    def _block(self, src, btype='gamemode'):
+        tree = parse(f'scn X\nbegin {btype}\n{src}\nend\n')
+        return tree.blocks[0].body
+
+    def test_block_owns_its_body(self):
+        # The whole point of the tree: nesting is structural, so it cannot
+        # come out unbalanced and need `_balance_if_endif` to repair it.
+        body = self._block('\tif a == 1\n\t\tset b to 2\n\tendif')
+        assert len(body) == 1
+        assert isinstance(body[0], N.If)
+        assert len(body[0].body) == 1
+        assert isinstance(body[0].body[0], N.Assign)
+
+    def test_command_absorbs_its_arguments_before_a_comparison(self):
+        # `if getstage charactergen == 74` means (getstage charactergen) == 74.
+        cond = self._block('\tif getstage charactergen == 74\n\t\tset a to 1\n\tendif')[0].cond
+        assert isinstance(cond, N.BinOp) and cond.op == '=='
+        assert isinstance(cond.left, N.Call)
+        assert cond.left.name == 'getstage'
+        assert [a.name for a in cond.left.args] == ['charactergen']
+
+    def test_command_on_both_sides_of_an_operator(self):
+        # Absorbing only the leftmost operand silently dropped the right-hand
+        # arguments (Knights.esp NDBrellinSCRIPT).
+        cond = self._block(
+            '\tif getstage ND10 >= 20 && getstage ND10 < 50\n\t\tset a to 1\n\tendif')[0].cond
+        assert cond.op == '&&'
+        assert isinstance(cond.left.left, N.Call)
+        assert isinstance(cond.right.left, N.Call)
+
+    def test_parenthesised_command_call(self):
+        cond = self._block(
+            '\tif ( GetStageDone ND10 100 == 1 ) && ( Active == 0 )\n'
+            '\t\tset a to 1\n\tendif')[0].cond
+        assert cond.op == '&&'
+        assert isinstance(cond.left.left, N.Call)
+        assert len(cond.left.left.args) == 2
+
+    def test_receiver_and_whitespace_separated_args(self):
+        stmt = self._block('\tplayer.additem Gold001 100')[0]
+        call = stmt.expr
+        assert call.name == 'additem'
+        assert call.receiver.name == 'player'
+        assert len(call.args) == 2
+
+    def test_command_as_a_value_keeps_its_arguments(self):
+        # `set t to SayTo BaurusRef, CharGenMain 1` -- Say returns the line
+        # duration, which CharacterGen stores in a timer.
+        stmt = self._block(
+            '\tset CharacterGen.convTimer to SayTo BaurusRef, CharGenMain 1')[0]
+        assert isinstance(stmt.value, N.Call)
+        assert stmt.value.name == 'SayTo'
+        assert len(stmt.value.args) == 3
+
+    def test_quoted_editor_id_receiver_is_unquoted(self):
+        # Nehrim writes references quoted; 890 statements were affected.
+        call = self._block('\t"NQ15W02TresorRef" . AddItem "Gold001" , 100')[0].expr
+        assert call.receiver.name == 'NQ15W02TresorRef'
+        assert call.name == 'AddItem'
+
+    def test_quoted_member_on_both_sides_of_an_assignment(self):
+        stmt = self._block('\tSet "NQ16"."NQ16CountVar" to "NQ16"."NQ16CountVar" + 1')[0]
+        assert stmt.target.owner.name == 'NQ16'
+        assert stmt.target.name == 'NQ16CountVar'
+        assert stmt.value.left.name == 'NQ16CountVar'
+
+    def test_variables_hoist_out_of_blocks(self):
+        tree = parse('scn X\nshort a\nbegin gamemode\nfloat b\nend\n')
+        assert [(v.vtype, v.name) for v in tree.variables] == [
+            ('short', 'a'), ('float', 'b')]
+
+    def test_duplicate_declaration_is_deduped(self):
+        # SE08QuestScript declares PasswallBattleBegin twice; the current
+        # converter emits one property, so the parser keeps one.
+        tree = parse('scn X\nshort a\nshort a\n')
+        assert len(tree.variables) == 1
+
+    def test_digit_leading_script_name(self):
+        # `scn 01FlayerBladeScript` lexes as NUMBER + IDENT (31 Nehrim scripts).
+        assert parse('scn 01FlayerBladeScript\n').name == '01FlayerBladeScript'
+
+    def test_block_filter_is_preserved(self):
+        # The filter RESTRICTS the block; dropping it fires for everyone.
+        tree = parse('scn X\nbegin OnHit CGAssassinFinal\n\tkill\nend\n')
+        assert tree.blocks[0].btype == 'onhit'
+        assert tree.blocks[0].filter == 'CGAssassinFinal'
+
+    def test_elseif_chain_and_else(self):
+        body = self._block(
+            '\tif a == 1\n\t\tset b to 1\n\telseif a == 2\n\t\tset b to 2\n'
+            '\telse\n\t\tset b to 3\n\tendif')
+        node = body[0]
+        assert len(node.elifs) == 1
+        assert len(node.orelse) == 1
+
+    def test_trailing_comment_attaches_to_its_statement(self):
+        # A comment on the NODE cannot eat the rest of an expression, which is
+        # what `_repair_commented_condition` exists to clean up in the text path.
+        stmt = self._block('\tset a to 1  ; why')[0]
+        assert stmt.comment == '; why'
+        assert isinstance(stmt.value, N.Literal)
+
+    def test_unparseable_line_degrades_to_a_comment_not_a_crash(self):
+        # AkarusScript ships a bare `-----` separator with no `;`.  It is not
+        # an expression -- emitted as one it became a chain of unary minuses
+        # and failed to compile -- so the parser absorbs the authored damage
+        # and yields a Comment, keeping the text.
+        body = self._block('\t------------------')
+        assert isinstance(body[0], N.Comment)
+        assert set(body[0].text) <= {';', '-'}
+
+    def test_fragment_mode_parses_a_bare_statement_list(self):
+        # An INFO result script has no begin/end -- a parser PARAMETER, not a
+        # reason for a second hand-written line loop.
+        tree = parse('set a to 1\nplayer.additem Gold001 10\n', Mode.FRAGMENT)
+        assert len(tree.body) == 2
+        assert not tree.blocks
+
+    def test_negative_argument_without_a_comma(self):
+        # `Player.SetFactionRank SEHeretic -1` passes -1; the current
+        # converter emits `SetFactionRank(SEHeretic, -1)`.  Treating the `-`
+        # as a binary operator silently dropped the number on 229 bodies.
+        call = self._block('\tPlayer.SetFactionRank SEHeretic -1')[0].expr
+        assert call.name == 'SetFactionRank'
+        assert len(call.args) == 2
+        assert isinstance(call.args[1], N.Unary)
+
+    def test_negative_argument_after_a_comma(self):
+        call = self._block('\trotate z, -30')[0].expr
+        assert len(call.args) == 2
+
+    def test_operator_after_a_bare_name_is_not_an_argument(self):
+        # `x + 1` on a plain variable must stay arithmetic, not become a
+        # call taking `+ 1` as an argument.
+        stmt = self._block('\tset a to b + 1')[0]
+        assert isinstance(stmt.value, N.BinOp)
+        assert stmt.value.op == '+'
+
+
+# ===========================================================================
+# Symbol table  (script_convert/symbols.py)
+# ===========================================================================
+
+class TestSymbols:
+    """Verified against the generated corpus: 39,590 scripts, 36 recovered
+    UDF signatures, 526 TES4Call arguments and 184,608 `Owner.member`
+    statements, with ZERO disagreements against the two whole-tree grep
+    passes it replaces."""
+
+    def test_obse_call_args_join_across_an_operator(self):
+        # `Call GlobalScriptExpGained 30 * ( x - y ), 1, 1, -1` is FOUR
+        # arguments; the first is spelled with spaces around the operator.
+        # Naive whitespace splitting emitted `TES4Call(30, *, (...), ...)`
+        # and a bare `*` is not an expression.
+        assert split_call_args('30 * ( x - y ), 1, 1, -1') == [
+            '30 * ( x - y )', '1', '1', '-1']
+
+    def test_obse_call_args_keep_a_quoted_filename_whole(self):
+        # `IsModLoaded "Voice Overs V002.esp"` became three arguments once and
+        # emitted `IsModLoaded("Voice, Overs, V002.esp(")`, which converted to
+        # a bare `If True` and fired a warning unconditionally.
+        assert split_call_args('"Voice Overs V002.esp"') == [
+            '"Voice Overs V002.esp"']
+
+    def test_obse_call_args_treat_a_sign_as_a_new_argument(self):
+        # `-` introduces the next argument far more often than it continues
+        # this one; the comma form covers subtraction unambiguously.
+        assert split_call_args('Foo 1 -1') == ['Foo', '1', '-1']
+        assert split_call_args('10, 1, -1') == ['10', '1', '-1']
+
+    def test_obse_call_args_stop_at_a_comment(self):
+        assert split_call_args('KnightFollow ; set to 1 to follow') == [
+            'KnightFollow']
+
+    def test_digit_leading_editor_id_is_one_identifier(self):
+        # `01FlayerBladeScript`, `1TrapFireMineWorldRef` -- splitting the digit
+        # run off turned one argument into two on 709 Nehrim argument tails.
+        assert split_call_args('01FlayerBladeScript') == ['01FlayerBladeScript']
+        assert [t.text for t in tokenize('1TrapFireMineWorldRef')
+                if t.kind is T.IDENT] == ['1TrapFireMineWorldRef']
+
+    def test_number_is_still_a_number(self):
+        assert [t.kind.name for t in tokenize('100') if t.kind is not T.EOF] \
+            == ['NUMBER']
+        assert [t.kind.name for t in tokenize('1.5') if t.kind is not T.EOF] \
+            == ['NUMBER']
+
+    def test_non_ascii_identifier(self):
+        # Nehrim is German: `MQ32Spiegelsch<umlaut>ssel01SCN` is one EditorID,
+        # and an ASCII-only character class tore it into three tokens.
+        name = 'MQ32Spiegelsch\u00fcssel01SCN'
+        assert [t.text for t in tokenize(name) if t.kind is T.IDENT] == [name]
+
+    def test_split_param_names(self):
+        # `begin Function{...}` accepts commas, whitespace, or a mix.
+        assert split_param_names('{ a, b, c }') == ['a', 'b', 'c']
+        assert split_param_names('{ refRuneSpell levelRequired}') == [
+            'refRuneSpell', 'levelRequired']
+        assert split_param_names('{ }') == []
+
+    def test_split_trailing_comment_respects_strings(self):
+        assert split_trailing_comment('a == 1  ; why') == ('a == 1', '; why')
+        assert split_trailing_comment('MessageBox "a ; b"') == (
+            'MessageBox "a ; b"', '')
+
+    def test_is_self_contained_detects_a_truncated_condition(self):
+        # This is what tells a condition EATEN by a mid-expression comment
+        # from one that merely carries an ordinary trailing comment.
+        # Blanket-rewriting the latter to `True` silently deleted real guards.
+        assert is_self_contained('(x == 1)')
+        assert is_self_contained('a && b')
+        assert not is_self_contained('(False ')      # unbalanced
+        assert not is_self_contained('x == ')        # dangling operator
+        assert not is_self_contained('a and')        # TES4 spells some as words
+
+class TestTes5Blocks:
+    """The single structural classifier the post-emit passes share.
+
+    Before it existed each pass carried its own keyword list and they
+    disagreed; see docs/commentary/script_convert.md §5.
+    """
+
+    def test_classify_keywords(self):
+        assert classify('If x') is Kind.IF
+        assert classify('  ElseIf y  ') is Kind.ELSEIF
+        assert classify('Else') is Kind.ELSE
+        assert classify('EndIf') is Kind.ENDIF
+        assert classify('While x') is Kind.WHILE
+        assert classify('EndWhile') is Kind.ENDWHILE
+        assert classify('Return') is Kind.RETURN
+        assert classify('Event OnInit()') is Kind.HEADER
+        assert classify('EndEvent') is Kind.END_HEADER
+        assert classify('foo.Bar()') is Kind.OTHER
+
+    def test_typed_function_header_is_a_header(self):
+        # An OBSE user function returning a value; matching only a leading
+        # `Function ` missed these, so nothing inside them was balanced.
+        assert classify('Int Function TES4Call(Form a)') is Kind.HEADER
+        assert classify('Bool Function TES4_IsInANQDune(ObjectReference r)') is Kind.HEADER
+
+    def test_paren_opener_is_an_opener(self):
+        # The dead-code pass matched only `if `, so `If(x)` read as a plain
+        # statement and a Return inside it looked top-level.
+        assert classify('If(x)') is Kind.IF
+        assert classify('While(x)') is Kind.WHILE
+        assert classify('ElseIf(x)') is Kind.ELSEIF
+
+    def test_comment_only_line_is_never_a_keyword(self):
+        assert classify('; EndIf') is Kind.OTHER
+        assert classify(';  Return  ;dead code after Return') is Kind.OTHER
+
+    def test_inline_comment_does_not_hide_the_keyword(self):
+        assert classify('EndIf ; closes the guard') is Kind.ENDIF
+        assert classify('If x ; note') is Kind.IF
+
+    def test_scan_reports_depth_inside_the_header(self):
+        depths = [(l.text, len(l.stack)) for l in scan(
+            ['Event A()', 'If x', 'foo', 'EndIf', 'bar', 'EndEvent'])]
+        assert depths == [('Event A()', 0), ('If x', 0), ('foo', 1),
+                          ('EndIf', 1), ('bar', 0), ('EndEvent', 0)]
+
+    def test_scan_flattens_multiline_entries(self):
+        # A converted statement can be one string holding several lines; read
+        # as one, a blob starting with `If` counted a phantom open block.
+        out = [l.text for l in scan(['Event A()', 'If x\n  foo\nEndIf', 'EndEvent'])]
+        assert out == ['Event A()', 'If x', '  foo', 'EndIf', 'EndEvent']
+
+    def test_scan_header_resets_the_stack(self):
+        # An unclosed If must not leak into the next function.
+        lines = list(scan(['Event A()', 'If x', 'Event B()', 'foo', 'EndEvent']))
+        # `foo` is inside B, at B's top level -- A's unclosed If is gone.
+        assert lines[-2].text == 'foo'
+        assert lines[-2].stack == () and lines[-2].in_header
+
+    def test_scan_tolerates_an_orphan_closer(self):
+        lines = list(scan(['Event A()', 'EndIf', 'foo', 'EndEvent']))
+        assert lines[2].stack == ()
+
+class TestDeadCodeAfterReturn:
+    """`If(x)` used to hide a Return's real depth, deleting live code."""
+
+class TestTypeOf:
+    """The one property/local type lookup the coercion passes share."""
+
+    def test_locals_win_over_properties(self, converter):
+        converter._var_types = {'x': 'Int'}
+        converter._property_refs = {'x': 'ObjectReference'}
+        assert converter.type_of('x') == 'Int'
+        assert converter.type_of('x', locals_first=False) == 'ObjectReference'
+
+    def test_type_of_keeps_the_authored_spelling(self, converter):
+        # type_of must NOT match a case variant: making it do so stopped the
+        # startquest handler from registering the script's own spelling, and
+        # the emitted property became the record's `TG02taxes` instead of the
+        # script's `TG02Taxes` (2 files).
+        converter._property_refs = {'Owner': 'TES4_Remote'}
+        assert converter.type_of('Owner') == 'TES4_Remote'
+        assert converter.type_of('OWNER') == ''
+
+    def test_cross_script_resolver_is_case_insensitive(self, converter):
+        # The resolvers DO need it: `Owner.Var` may spell Owner any way.
+        converter._property_refs = {'Owner': 'TES4_Remote'}
+        for spelling in ('Owner', 'owner', 'OWNER'):
+            assert converter._property_type_ci(spelling) == 'TES4_Remote'
+
+    def test_dotted_name_is_not_matched_by_its_owner(self, converter):
+        # EmfridDEMO's script holds a variable `emfridDEMO`.  Matching the
+        # dot-split TAIL case-insensitively resolved `EmfridDEMO.emfridDEMO`
+        # to the OWNER's script type, and the assignment came out `= None`
+        # (TES4_TIF__00028A2E, 1 compile failure).
+        converter._property_refs = {'EmfridDEMO': 'TES4_EmfridDEMOScript'}
+        assert converter.type_of('EmfridDEMO.emfridDEMO') == ''
+        assert converter.type_of('EmfridDEMO') == 'TES4_EmfridDEMOScript'
+
+    def test_undeclared_name_has_no_type(self, converter):
+        converter._property_refs = {}
+        converter._var_types = {}
+        assert converter.type_of('nothing') == ''
+
+
+class TestScaleEnumAv:
+    """Tier ladders as data, verified against the thresholds they replaced."""
+
+    def test_aggression_tiers(self, converter):
+        assert converter._scale_enum_av('aggression', '5') == '0'
+        assert converter._scale_enum_av('aggression', '10') == '1'
+        assert converter._scale_enum_av('aggression', '65') == '2'
+        assert converter._scale_enum_av('aggression', '106') == '3'
+
+    def test_aggression_boundary_is_gt_five_not_ge_six(self, converter):
+        # The threshold is `> 5`, not `>= 6`: the ladder's floor must be just
+        # above 5 so a fractional 5.5 lands on tier 1, as `raw <= 5` did.
+        assert converter._scale_enum_av('aggression', '5') == '0'
+        assert converter._scale_enum_av('aggression', '5.5') == '1'
+        assert converter._scale_enum_av('aggression', '6') == '1'
+
+    def test_confidence_tiers(self, converter):
+        for value, tier in (('0', '0'), ('15', '1'), ('40', '2'),
+                            ('70', '3'), ('100', '4')):
+            assert converter._scale_enum_av('confidence', value) == tier
+
+    def test_value_already_in_range_passes_through(self, converter):
+        # A deliberate Skyrim-style tier is not re-bucketed.
+        assert converter._scale_enum_av('aggression', '2') == '2'
+
+    def test_non_literal_operand_is_declined(self, converter):
+        assert converter._scale_enum_av('aggression', 'someVar') is None
+
+    def test_non_enum_actor_value_is_declined(self, converter):
+        assert converter._scale_enum_av('health', '50') is None

@@ -21,7 +21,7 @@ Locations, schedules and conditions are *copied*, so an NPC keeps the same
 destination, the same hours and the same activation logic.  Only the procedure
 is re-expressed in Skyrim's vocabulary.
 
-See docs/package_conversion_plan.md for the fidelity analysis (which TES4 types
+See docs/commentary/tes5_import_package.md for the fidelity analysis (which TES4 types
 map exactly, which degrade, and why).
 """
 
@@ -1563,7 +1563,6 @@ def _condition_quest(rec: dict) -> int:
         if struct.unpack_from('<H', d, 8)[0] in _QUEST_PARAM_FUNCS:
             from .text_reader import remap_formid
             return remap_formid(struct.unpack_from('<I', d, 12)[0])
-    return 0
 
 # The Topic input is the FIRST data input of a ForceGreet instance, so its PDTO
 # is the first PDTO in the record. The POBA/POEA/POCA blocks that follow also

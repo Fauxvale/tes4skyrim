@@ -16,7 +16,7 @@ once from disk in the pool initializer.  Without this, every cell would voxelize
 an empty world and emit no navmesh at all.
 """
 
-from .pgrd_to_navm import convert_PGRD
+from .pgrd_to_navm import cached_geometry, convert_PGRD, geom_equal
 
 # Per-worker read-only carving context, populated by _init in each child.
 _BASE_MODEL_BY_FID: dict = {}
@@ -92,18 +92,53 @@ def init_worker(base_model_by_fid: dict, door_fids: set, collision_cache: str,
         gc.disable()
 
 
+def _verify_against_cache(job: dict, result: tuple) -> tuple:
+    """Rebuild this cell and compare; on a mismatch RETURN THE FRESH BUILD.
+
+    The tag hashes sources, so it cannot see a shapely/GEOS or `.pyd` change.
+    This is the only check that catches a cache stale in a way the hash agrees
+    with -- and keeping the fresh result means a bad cache costs accuracy in no
+    cell at all, not even the ones sampled before the mismatch was known.
+
+    See: docs/commentary/tes5_import_navmesh.md#verifying-a-cache-against-fresh-geometry
+    """
+    navm_bytes, meta = result
+    stored = cached_geometry(_GEOM_CACHE, *job['key'])
+    if stored is None:
+        return result
+    fresh_bytes, fresh_meta = convert_PGRD(
+        job['pgrd_rec'],
+        land_rec=job['land_rec'],
+        cell_rec=job['cell_rec'],
+        refr_recs=job['refr_recs'],
+        base_model_by_fid=_BASE_MODEL_BY_FID,
+        door_fids=_DOOR_FIDS,
+        navm_fid=job['navm_fid'],
+        geom_cache=None,
+        extra_door_refrs=job.get('extra_door_refrs'),
+    )
+    meta['verified'] = True
+    fresh = fresh_meta.get('geometry') if fresh_meta else None
+    if fresh is None or geom_equal(stored, fresh):
+        return result
+    fresh_meta['verified'] = True
+    fresh_meta['verify_mismatch'] = True
+    return fresh_bytes, fresh_meta
+
+
 def run_job(job: dict):
     """ProcessPool task: convert one PGRD to (navm_bytes, meta).
 
     A failing cell must not abort the whole ex.map batch, so exceptions are
-    caught -- but the message is RETURNED, not printed. `multiprocessing` runs
-    workers under pythonw.exe (subprocess_flags.configure_multiprocessing), so a
-    worker's stdout goes nowhere and a printed error is invisible: a cell could
-    silently produce no navmesh with nothing in the log. The parent prints what
-    comes back instead (see import_main._precompute_navmeshes).
+    caught -- but the message is RETURNED, not printed: workers run under
+    pythonw.exe, where stdout goes nowhere. The parent prints what comes back
+    (see import_main._precompute_navmeshes).
+
+    job['verify'] asks this cell to double-build and compare; the PARENT picks
+    which cells carry it.
     """
     try:
-        return job['key'], convert_PGRD(
+        navm_bytes, meta = convert_PGRD(
             job['pgrd_rec'],
             land_rec=job['land_rec'],
             cell_rec=job['cell_rec'],
@@ -114,6 +149,9 @@ def run_job(job: dict):
             geom_cache=_GEOM_CACHE,
             extra_door_refrs=job.get('extra_door_refrs'),
         )
+        if job.get('verify') and meta and meta.get('geom_cached'):
+            return job['key'], _verify_against_cache(job, (navm_bytes, meta))
+        return job['key'], (navm_bytes, meta)
     except Exception as e:  # noqa: BLE001 — must not kill the pool
         import traceback
         return job['key'], (None, {'error': f'{type(e).__name__}: {e}',

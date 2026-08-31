@@ -228,7 +228,7 @@ def _door_model_sounds(rec: dict) -> dict:
 # SUSPECTED, NOT CONFIRMED: that this also CRASHES the audio thread (the engine
 # taking the id at face value into the audio manager's emitter table and
 # BSAudioManagerThread faulting on `mov ecx, [r8+0x48]`).  That story is
-# recorded in docs/record_mapping_reference.md but was never reproduced, and
+# recorded in docs/reference/record_mapping.md but was never reproduced, and
 # the crash it was written for was later traced elsewhere.  Do not cite it as
 # the reason for this table — the vanilla census above is the reason.
 _SNDR_SLOTS = {

@@ -1035,7 +1035,7 @@ def _alias_name(ref_fid: int, alias_id: int, fid_to_edid: dict) -> str:
 # writes BOTH the runtime subtype (the matching row's index) and the category
 # from it, overwriting whatever DATA held -- and SNAM is stored after DATA in
 # all 15,037 vanilla DIALs, so it always wins. See
-# docs/dialogue_engine_contracts.md.
+# docs/reference/dialogue_engine_contracts.md.
 #
 # The subtype NUMBERS below therefore only have to be well-formed, not exact;
 # they are the values vanilla Skyrim.esm happens to store (Hello=73, GoodBye=72,
@@ -1187,7 +1187,7 @@ def _is_npc_to_npc_conversation(rec: dict) -> bool:
     EditorID ("SEMiscQuestResponses", "FGD02Insults", "SE"), because they never
     had a player-facing FULL prompt to use. Dropping them is deliberate: better
     absent than wrong. Tracked in TODO.txt "Later Issues" #16, restored by
-    docs/ambient_dialogue_channel_plan.md Step 4.
+    docs/commentary/tes5_import_dialogue.md Step 4.
 
     CRITICAL — script-driven topics are NOT dropped. 293 of the 535 Type-1
     topics are spoken by an explicit `Say`/`SayTo`/`StartConversation` call in a
@@ -1294,7 +1294,7 @@ def convert_DIAL(rec: dict, *, info_count: int, dlbr_fid: int,
     # The values themselves are inert at runtime -- TESTopic::LoadForm
     # re-derives both from SNAM afterwards, which is why vanilla contains stale
     # subtypes (288 HELO records say 73, 9 say 79). SNAM is the field to check
-    # when a converted topic misbehaves; see docs/dialogue_engine_contracts.md.
+    # when a converted topic misbehaves; see docs/reference/dialogue_engine_contracts.md.
     subs += pack_subrecord('DATA', struct.pack('<BBH', 0, category & 0xFF,
                                                subtype))
     subs += pack_subrecord('SNAM', snam)
@@ -1490,7 +1490,7 @@ def convert_INFO(rec: dict, *, injected_ctdas: bytes = b'',
     # sets a real value on 65% of its greetings.
     #
     # Units: the engine reads DATA/ENAM's second field as trunc(days * 65535)
-    # (docs/dialogue_engine_contracts.md -- TESTopicInfo::LoadForm mulss by
+    # (docs/reference/dialogue_engine_contracts.md -- TESTopicInfo::LoadForm mulss by
     # 65535.0), so the CK's "hours until reset" H is stored as
     # H/24 * 65535. Vanilla's values decode to clean hours: 1365=0.5h (its
     # most common, 53% of greetings), 2730=1h, 10922=4h, 32767=12h,

@@ -5,7 +5,7 @@ Why this exists: the CK "Initializing References" hang was diagnosed by
 *scanning* a 6 GB minidump's stack memory for values that happened to land
 inside `CreationKit.exe` -- which cannot tell a live return address from stale
 leftover stack bytes, so every conclusion drawn from it is a candidate, not a
-fact (see docs/ck_reference_init_hang.md).  This walks the stack for real,
+fact (see docs/commentary/ck_reference_init_hang.md).  This walks the stack for real,
 through DbgHelp's `StackWalk64`, which unwinds via each module's `.pdata`
 table exactly the way Windows SEH does.  No PDBs are needed for correct
 frames; exported names (`ntdll!NtWaitForAlertByThreadId`,

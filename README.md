@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/banner.svg" alt="TES4 AutoConvert — Oblivion to Skyrim Conversion" width="720">
+  <img src="docs/assets/banner.svg" alt="TES4 AutoConvert — Oblivion to Skyrim Conversion" width="720">
 </p>
 
 <p align="center">
@@ -50,7 +50,7 @@ conversion, and it's getting closer all the time. Contributions are very welcome
 `TODO.txt` for the current bug list and roadmap.
 
 <p align="center">
-  <img src="docs/readme_img.png" alt="An Oblivion Vista" width="720">
+  <img src="docs/assets/readme_img.png" alt="An Oblivion Vista" width="720">
 </p>
 
 ---

@@ -2,7 +2,7 @@
 """Resolve creature RACE FormIDs out of the DLC / Creation Club / Beyond Skyrim
 plugins, so the vanilla-creature-swap table can quote VERIFIED ids.
 
-The equivalence table (docs/creature_race_equivalence.md) can verify anything in
+The equivalence table (docs/reference/creature_race_equivalence.md) can verify anything in
 Skyrim.esm against references/Skyrim.esm, but Dawnguard/Dragonborn/CC/Beyond
 Skyrim have no dump in the repo — every id for those was a placeholder. This
 reads the real files and prints, for each, the RACE records whose EditorID

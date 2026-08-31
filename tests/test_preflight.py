@@ -140,7 +140,7 @@ def test_version_warning_states_the_consequence_and_the_toolchain(monkeypatch, v
     assert 'may run into issues' in w
     # The toolchain named must match the platform actually running: MSVC on
     # Windows, g++/clang++ everywhere else (native/build.py branches the same
-    # way -- see docs/pipeline_reference.md#running-off-windows).
+    # way -- see docs/reference/pipeline.md#running-off-windows).
     if preflight.sys.platform == 'win32':
         assert 'Build Tools for Visual Studio' in w
     else:

@@ -15,7 +15,7 @@ saved with alpha -- on a white or transparent background the leaf edges are
 invisible.
 
 NOTE these are 2-D renders. They cannot reveal a 3-D error, and the generator
-must never be fitted to them (see docs/speedtree_engine_decomp.md); they are
+must never be fitted to them (see docs/commentary/asset_convert_speedtree.md); they are
 for human comparison only.
 
 Usage:

@@ -202,11 +202,7 @@ TES5_SKILL_ORDER = [
 # 1 Skyrim unit ≈ 1.4 cm; 512 units ≈ ~7 m — large architecture/terrain pieces.
 # Tune upward to reduce LOD count, downward to include more mid-size objects.
 LOD_SIZE_THRESHOLD = 256
-# There is NO "Show in World Map" record-header flag.  0x10000000 was written
-# on every STAT/TREE over 1024 units on that assumption; the vanilla census
-# says it is a FURN flag -- Skyrim.esm sets it on 143 FURN, 16 REFR and
-# exactly 1 STAT of 9,720, and never on a TREE.  We were setting it on 1,372
-# STATs and 70 TREEs.  See docs/ck_vs_game_missing_objects.md.
+# See: docs/commentary/ck_vs_game_missing_objects.md#no-show-in-world-map-flag
 
 def map_lock_level(tes4_level: int, leveled: bool = False) -> int:
     """TES4 lock level -> TES5 lock level.

@@ -7,7 +7,7 @@ intact, so the REAL procedural-tree algorithm (branch counts, placement, the
 bend integrator, the RNG) is readable.  That is the ground truth for
 `asset_convert/spt_generator.py` — the billboard renders are a 2-D projection
 the generator was already fitted to, so they cannot reveal a 3-D error.
-See docs/speedtree_engine_decomp.md.
+See docs/commentary/asset_convert_speedtree.md.
 
 Two things this does that `tools/disasm/skyrim_disasm.py` cannot (that one is x64 and
 SkyrimSE-specific):

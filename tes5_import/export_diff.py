@@ -128,7 +128,7 @@ def diff_records(master_rec: dict, plugin_rec: dict) -> dict:
     # string hashing per process, so a bare set made two builds of the same
     # input disagree -- CATShipCabinDoorExteriorREF came out `DATA EDID XTEL`
     # in one run and `DATA XTEL EDID` in the next. The output ESM must stay
-    # byte-reproducible (docs/performance_notes.md).
+    # byte-reproducible (docs/commentary/performance.md).
     changed = {}
     for key in sorted(set(m_scalars) | set(p_scalars)):
         if key in _IGNORED_KEYS or _is_count_key(key):

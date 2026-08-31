@@ -23,7 +23,7 @@ room-filling floor.  A completely functional, zero-bad-triangle navmesh that is
 a bit narrow beats a dense one that is broken.  Width-grow (fill out to the
 walls) is a later phase; this one gets the corridors + doors + links right.
 
-Design principles (see docs/navmesh_corridor_redesign.md):
+Design principles (see docs/commentary/tes5_import_navmesh.md):
   1. The pathgrid CENTERLINE is sacred — never cut or moved, even where it
      clips a wall.  Only grown width (a later phase) may ever be clipped.
   2. Downward snap follows the pathgrid LINE'S OWN SLOPE.  A pathgrid edge
@@ -56,15 +56,11 @@ DISC_RAY_TRIM = True
 # Walkable surface sampler (the only collision query Phase 1 needs)
 # ---------------------------------------------------------------------------
 
-def _surface_sampler(walkable):
-    """f(x, y, near_z) -> walkable-collision height at (x,y) nearest near_z, or
-    None.  Point-in-triangle over the walkable soup, bucketed into a coarse XY
-    grid so each query only tests nearby triangles.
-    """
+def _height_grid(walkable, cell=128.0):
+    """(triangles, grid, minx, miny) bucketing a walkable soup by plan cell."""
     W = np.asarray(walkable, dtype=float).reshape(-1, 3, 3)
     if not len(W):
-        return None
-    cell = 128.0
+        return None, None, 0.0, 0.0
     minx = float(W[:, :, 0].min())
     miny = float(W[:, :, 1].min())
     grid = {}
@@ -76,36 +72,49 @@ def _surface_sampler(walkable):
         for gx in range(gx0, gx1 + 1):
             for gy in range(gy0, gy1 + 1):
                 grid.setdefault((gx, gy), []).append(i)
+    return W, grid, minx, miny
 
-    def _heights(x, y):
-        gx = int((x - minx) // cell)
-        gy = int((y - miny) // cell)
-        out = []
-        for i in grid.get((gx, gy), ()):
-            a, b, c = W[i]
-            d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
-            if abs(d) < 1e-6:
-                continue
-            l0 = ((b[1] - c[1]) * (x - c[0]) + (c[0] - b[0]) * (y - c[1])) / d
-            l1 = ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (y - c[1])) / d
-            l2 = 1.0 - l0 - l1
-            if l0 < -0.02 or l1 < -0.02 or l2 < -0.02:
-                continue
-            out.append(l0 * a[2] + l1 * b[2] + l2 * c[2])
-        return out
+
+def _bucket_heights(W, grid, minx, miny, cell, x, y):
+    """Every walkable height at (x, y) from the triangles in its bucket."""
+    out = []
+    for i in grid.get((int((x - minx) // cell), int((y - miny) // cell)), ()):
+        a, b, c = W[i]
+        d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+        if abs(d) < 1e-6:
+            continue
+        l0 = ((b[1] - c[1]) * (x - c[0]) + (c[0] - b[0]) * (y - c[1])) / d
+        l1 = ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (y - c[1])) / d
+        l2 = 1.0 - l0 - l1
+        if l0 < -0.02 or l1 < -0.02 or l2 < -0.02:
+            continue
+        out.append(l0 * a[2] + l1 * b[2] + l2 * c[2])
+    return out
+
+
+def _surface_sampler(walkable):
+    """f(x, y, near_z) -> walkable height at (x,y) nearest near_z, or None.
+
+    The returned callable carries a `.layers(x, y)` attribute listing every
+    distinct walkable height there, ascending, deduped at 2u.
+    """
+    cell = 128.0
+    W, grid, minx, miny = _height_grid(walkable, cell)
+    if W is None:
+        return None
 
     def sample(x, y, near_z):
+        """The walkable height at (x, y) closest to near_z, or None."""
         best = None
-        for z in _heights(x, y):
+        for z in _bucket_heights(W, grid, minx, miny, cell, x, y):
             if best is None or abs(z - near_z) < abs(best - near_z):
                 best = z
         return best
 
     def layers(x, y):
         """Every distinct walkable height at (x, y), ascending (2u dedupe)."""
-        zs = sorted(_heights(x, y))
         out = []
-        for z in zs:
+        for z in sorted(_bucket_heights(W, grid, minx, miny, cell, x, y)):
             if not out or z - out[-1] > 2.0:
                 out.append(z)
         return out
@@ -137,60 +146,42 @@ def _snap_node_z(sample, x, y, z):
 # Ribbon generation
 # ---------------------------------------------------------------------------
 
-def _plan_stations(nodes, edges, node_z, degree, grow):
-    """Every march station the grow needs, as a plan the native batch consumes.
+def _edge_frame(nodes, node_z, i, j):
+    """((ax,ay,az), (bx,by,bz), (ux,uy), length) for an edge, or None."""
+    if i >= len(nodes) or j >= len(nodes) or i == j:
+        return None
+    ax, ay = nodes[i][0], nodes[i][1]
+    bx, by = nodes[j][0], nodes[j][1]
+    length = math.hypot(bx - ax, by - ay)
+    if length < 1e-4:
+        return None
+    return ((ax, ay, node_z[i]), (bx, by, node_z[j]),
+            ((bx - ax) / length, (by - ay) / length), length)
 
-    Returns (stations, plan) where `stations` is an (N, 9) float64 array
-    (cx, cy, cz, dirx, diry, tanx, tany, lo, edge_index) and `plan` records how
-    to reassemble the results:
 
-        ('edge', (i, j), pa, pb, u, w, length, k, base)   k+1 stations per side
-        ('disc', ni, nx, ny, nz, base)                    DISC_RAYS stations
-
-    Splitting planning from marching is what lets the ~890k probes for a dense
-    cell cross the Python/C boundary ONCE instead of once each.  The geometry
-    each station measures against is fixed, so batching cannot change any
-    result -- the march was already order-independent by design.
-    """
+def _edge_march_rows(nodes, edges, node_z, degree):
+    """(station rows, plan entries) for every edge flat enough to grow."""
     ext = params.RIBBON_END_EXTEND
-    rows = []
-    plan = []
-    # edge -> index, so a station can name the endpoint pair to exclude from
-    # the neighbour query without shipping node ids per row.
-    edge_index = {}
-    for e, (i, j) in enumerate(edges):
-        edge_index[(i, j)] = e
-    # node -> slot in the synthetic self-pair table appended after `edges`.
-    disc_self = {}
-
-    if not grow:
-        return np.zeros((0, 9), dtype=np.float64), plan, []
-
+    edge_index = {(i, j): e for e, (i, j) in enumerate(edges)}
+    rows, plan = [], []
     for (i, j) in edges:
-        if i >= len(nodes) or j >= len(nodes) or i == j:
+        got = _edge_frame(nodes, node_z, i, j)
+        if got is None:
             continue
-        ax, ay = nodes[i][0], nodes[i][1]
-        bx, by = nodes[j][0], nodes[j][1]
-        az, bz = node_z[i], node_z[j]
-        dx, dy = bx - ax, by - ay
-        length = math.hypot(dx, dy)
-        if length < 1e-4:
-            continue
-        ux, uy = dx / length, dy / length
+        (ax, ay, az), (bx, by, bz), (ux, uy), length = got
         wx, wy = -uy, ux
         dz = bz - az
         ea = ext if degree.get(i, 0) <= 1 else 0.0
         eb = ext if degree.get(j, 0) <= 1 else 0.0
         pa = (ax - ux * ea, ay - uy * ea, az - dz * (ea / length))
         pb = (bx + ux * eb, by + uy * eb, bz + dz * (eb / length))
-        if abs(pb[2] - pa[2]) / max(length, 1e-6) > params.RIBBON_GROW_MAX_SLOPE:
-            continue                      # steep: keeps Phase-1 width, no march
-
+        if (abs(pb[2] - pa[2]) / max(length, 1e-6)
+                > params.RIBBON_GROW_MAX_SLOPE):
+            continue
         total = length + ea + eb
         k = max(1, int(round(total / params.RIBBON_STEP)))
         ramp = params.RIBBON_HALF_WIDTH
-        lo0 = params.RIBBON_HALF_WIDTH
-        lo1 = params.RIBBON_GROW_MIN_HALF
+        lo0, lo1 = params.RIBBON_HALF_WIDTH, params.RIBBON_GROW_MIN_HALF
         ei = edge_index.get((i, j), -1)
         base = len(rows)
         for s in range(k + 1):
@@ -201,96 +192,63 @@ def _plan_stations(nodes, edges, node_z, degree, grow):
             d_end = min(t, 1.0 - t) * total
             frac = min(1.0, d_end / ramp) if ramp > 1e-6 else 1.0
             floor_h = lo0 + (lo1 - lo0) * frac
-            # left (+w) then right (-w), so results interleave predictably.
             rows.append((cxs, cys, czs, wx, wy, ux, uy, floor_h, ei))
             rows.append((cxs, cys, czs, -wx, -wy, ux, uy, floor_h, ei))
         plan.append(('edge', (i, j), pa, pb, (ux, uy), (wx, wy),
                      length, k, base))
+    return rows, plan
 
-    # NODE DISCS -- radial fan filling the outer corner at each junction.
-    #
-    # A node touching a STEEP edge used to be excluded from this fan.  That was a
-    # blanket rule with no stated justification, and it is what left the corner at
-    # the top of a staircase DEAD: measured on Pinarus, nodes 0 and 1 (the stair's
-    # two endpoints) were the ONLY nodes in the cell without a disc — every other
-    # node, 2 through 38, had one.  The upper floor's ribbon coverage therefore
-    # stopped at y=146 with the corner beyond it unmeshed, and the union bridged
-    # the gap with a single tilted triangle that flapped 38.6u under the landing —
-    # the sole, unnavigable link between the two floors.
-    #
-    # The disc is a FLAT radial fan at the node's own height, which is precisely
-    # what a stair top needs: the landing there IS flat.  It cannot spill over the
-    # stairwell either, because each ray marches against real collision and stops
-    # at the drop (verified: a ray heading out over the void reads the floor below
-    # and terminates).  So there is no reason to exclude these nodes, and excluding
-    # them removes the fan exactly where the geometry most needs it.
+
+def _disc_march_rows(nodes, edges, node_z, degree, rows):
+    """Append each node's radial fan to `rows`; returns (plan, extra edges).
+
+    See: docs/commentary/tes5_import_navmesh.md#stair-nodes-get-discs-too
+    """
     nrays = params.RIBBON_GROW_DISC_RAYS
+    disc_self = {}
+    plan = []
     for ni in sorted(degree):
         if ni >= len(nodes):
             continue
         nx, ny = nodes[ni][0], nodes[ni][1]
         nz = node_z[ni]
         base = len(rows)
-        # The disc excludes only its OWN node.  There is no real edge (ni, ni)
-        # to point at, so a synthetic self-pair is appended to the edge table
-        # the native side receives (see `extra_edges` below) and indexed here.
         ei = len(edges) + disc_self.setdefault(ni, len(disc_self))
         for kk in range(nrays):
             ang = 2.0 * math.pi * kk / nrays
             ddx, ddy = math.cos(ang), math.sin(ang)
-            # Floor 0: a wall must always beat any minimum here, or the disc
-            # pushes mesh through a wall standing close to the node.
             rows.append((nx, ny, nz, ddx, ddy, -ddy, ddx, 0.0, ei))
         plan.append(('disc', ni, nx, ny, nz, base))
-
-    st = (np.asarray(rows, dtype=np.float64) if rows
-          else np.zeros((0, 9), dtype=np.float64))
-    # Synthetic (ni, ni) rows appended to the edge table so a disc station can
-    # exclude its own node.  They are only ever read as an exclusion pair; the
-    # native NeighbourField skips zero-length segments, so they add no geometry.
     extra_edges = [(ni, ni) for ni, _slot in
                    sorted(disc_self.items(), key=lambda kv: kv[1])]
+    return plan, extra_edges
+
+
+def _plan_stations(nodes, edges, node_z, degree, grow):
+    """Every march station the grow needs, as a plan the native batch consumes.
+
+    Returns (stations, plan, extra_edges): an (N, 9) float64 array of
+    (cx, cy, cz, dirx, diry, tanx, tany, lo, edge_index), the reassembly plan
+    (`edge` and `disc` entries), and the synthetic self-pairs the disc
+    stations name as their exclusion.
+    See: docs/commentary/tes5_import_navmesh.md#stations-are-planned-then-marched
+    """
+    if not grow:
+        return np.zeros((0, 9), dtype=np.float64), [], []
+    rows, plan = _edge_march_rows(nodes, edges, node_z, degree)
+    disc_plan, extra_edges = _disc_march_rows(nodes, edges, node_z, degree,
+                                              rows)
+    plan.extend(disc_plan)
+    st = (np.asarray(rows, dtype=np.float64) if rows
+          else np.zeros((0, 9), dtype=np.float64))
     return st, plan, extra_edges
 
 
-def _surface_profile(sample, pa, pb):
-    """Height profile along a STEEP edge's centreline, following the real
-    walkable surface the way an actor walks it.
-
-    The pathgrid draws a straight chord from node to node, but a real
-    staircase rarely descends along the whole chord: Pinarus's flight starts
-    ~90u east of its top node, so the chord ran 39u BELOW the actual landing
-    there, the stair ribbon reported z=30 where the real floor is 68.6, and
-    the union emitted a near-vertical triangle joining the two fictions.
-    (tools/navmesh_tri_check measured the same chord error as +46/-49u float
-    over the whole flight.)
-
-    The path is found as a shortest path over the WALKABLE LAYERS along the
-    line — at each 16u station the candidate heights are every walkable
-    surface there (within the edge's own z range), a transition between
-    stations may climb at most one step, and the path must START at the near
-    node's height and END at the far node's.  The end constraint is what
-    selects the treads: a greedy walk anchored on the previous height was
-    tried first and simply followed the GROUND FLOOR that continues UNDER the
-    flight (nearest-layer at every step), ending 260u below the far node with
-    a cliff at the anchor — the flight is the only layer path that actually
-    arrives at the far node.  Returns None (caller keeps the chord) when no
-    such path exists.
-
-    NOTE this is NOT the reverted "re-fit the line to collision" experiment
-    (_height_on's docstring): that changed the flight's overall angle.  The
-    profile keeps both endpoints and the plan line; it only replaces the
-    straight-line INTERPOLATION between them with the measured surface.
-    """
-    layers = getattr(sample, 'layers', None)
-    if layers is None:
-        return None
+def _profile_stations(sample, pa, pb, n):
+    """Per-station (x, y, candidate heights) along a steep edge's centreline."""
+    layers = sample.layers
     ax, ay, az = pa
     bx, by, bz = pb
-    run = math.hypot(bx - ax, by - ay)
-    if run < 32.0:
-        return None
-    n = max(2, int(run // 16.0))
     lo = min(az, bz) - params.MAX_CLIMB
     hi = max(az, bz) + params.MAX_CLIMB
     stations = []
@@ -298,46 +256,65 @@ def _surface_profile(sample, pa, pb):
         t = s / n
         x = ax + (bx - ax) * t
         y = ay + (by - ay) * t
-        chord = az + (bz - az) * t
         cand = [z for z in layers(x, y) if lo <= z <= hi]
         if not cand:
-            cand = [chord]      # collision gap: bridge on the chord
+            cand = [az + (bz - az) * t]
         stations.append((x, y, cand))
+    return stations
 
-    INF = float('inf')
+
+def _cheapest_layer_path(stations, az, n):
+    """(costs, backpointers) for the one-step-per-station layer walk."""
+    inf = float('inf')
     step = params.MAX_CLIMB
-    costs = [[(abs(z - az) if abs(z - az) <= step else INF)
+    costs = [[(abs(z - az) if abs(z - az) <= step else inf)
               for z in stations[0][2]]]
     back = []
     for s in range(1, n + 1):
         cand = stations[s][2]
-        prev_c = costs[-1]
-        prev_z = stations[s - 1][2]
-        row = [INF] * len(cand)
+        prev_c, prev_z = costs[-1], stations[s - 1][2]
+        row = [inf] * len(cand)
         bk = [0] * len(cand)
         for i, z in enumerate(cand):
             for j, zp in enumerate(prev_z):
-                if prev_c[j] == INF:
+                if prev_c[j] == inf or abs(z - zp) > step:
                     continue
-                d = abs(z - zp)
-                if d > step:
-                    continue
-                c = prev_c[j] + d
+                c = prev_c[j] + abs(z - zp)
                 if c < row[i]:
-                    row[i] = c
-                    bk[i] = j
+                    row[i], bk[i] = c, j
         costs.append(row)
         back.append(bk)
+    return costs, back
 
+
+def _surface_profile(sample, pa, pb):
+    """Height profile along a STEEP edge, following the real walkable surface.
+
+    Returns None (caller keeps the chord) when no layer path reaches the far
+    node's own height.
+    See: docs/commentary/tes5_import_navmesh.md#steep-heights-follow-the-treads
+    """
+    if getattr(sample, 'layers', None) is None:
+        return None
+    ax, ay, az = pa
+    bx, by, bz = pb
+    run = math.hypot(bx - ax, by - ay)
+    if run < 32.0:
+        return None
+    n = max(2, int(run // 16.0))
+    stations = _profile_stations(sample, pa, pb, n)
+    costs, back = _cheapest_layer_path(stations, az, n)
+
+    inf = float('inf')
     best = None
     for i, z in enumerate(stations[n][2]):
-        if costs[n][i] == INF or abs(z - bz) > step:
+        if costs[n][i] == inf or abs(z - bz) > params.MAX_CLIMB:
             continue
         key = (abs(z - bz), costs[n][i], i)
         if best is None or key < best:
             best = key
     if best is None:
-        return None                         # no layer path reaches the node
+        return None
     idx = best[2]
     zs = [0.0] * (n + 1)
     for s in range(n, -1, -1):
@@ -350,68 +327,175 @@ def _surface_profile(sample, pa, pb):
     return pts
 
 
-def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
-                           walk_probe=None, field=None,
-                           blocking=None, walkable=None, sample=None):
-    """One corridor per pathgrid edge.  Returns a list of dicts, each:
-
-        {'edge': (i, j),
-         'a': (ax, ay, az), 'b': (bx, by, bz),   # centerline ends (extended)
-         'u': (ux, uy), 'w': (wx, wy),           # along / perpendicular units
-         'half': half,                           # MAX half-width (for lookups)
-         'poly': [(x, y), ...]}                  # explicit outline (Phase 2)
-
-    'a'/'b' are the centerline endpoints AFTER dead-end extension, carrying the
-    line's own slope (principle 2).  The corridor lies FLAT on the centerline
-    plane.  In Phase 1 (params.RIBBON_GROW False) it is the fixed rectangle of
-    half-width RIBBON_HALF_WIDTH.  In Phase 2 each side is GROWN per cross-section
-    (corridor_grow.grow_half_width) so the outline is an explicit polygon whose
-    two long sides need not be parallel — wider out to the walls, narrower where
-    squeezed.  Corridors are NOT yet a shared mesh — corridor_union takes their
-    boolean union and retriangulates it; keeping them as parametric strips lets
-    it recover each vertex's height along the centerline.
-
-    The Phase-2 march itself runs NATIVELY and in ONE batch (see
-    corridor_grow.grow_batch): planning every station first, marching them all
-    in C++, then reassembling turns ~890k Python/C crossings per dense cell
-    into one.  The march was already order-independent (it measures against
-    fixed geometry, never against another corridor's grown width), so batching
-    cannot change any result.
-    """
-    half = params.RIBBON_HALF_WIDTH
-    ext = params.RIBBON_END_EXTEND
-    grow = params.RIBBON_GROW and blocking is not None
-
-    # Degree of every node, so only DEAD ENDS get the end extension.  Extending
-    # past a node that another corridor also uses puts this corridor's stub
-    # entirely inside that corridor — guaranteed double coverage at every
-    # junction, and the dominant residual overlap (collinear pairs sharing a
-    # node overlapped for 22 triangles each).  At a dead end there is no other
-    # corridor, so the stub is the only thing reaching the wall or door ahead
-    # and it costs nothing.
+def _node_degrees(edges):
+    """How many edges touch each node."""
     degree = {}
     for (i, j) in edges:
         degree[i] = degree.get(i, 0) + 1
         degree[j] = degree.get(j, 0) + 1
+    return degree
 
-    # A node where TWO OR MORE steep runs meet is a mid-flight landing, not the
-    # place a flight reaches a floor.  A steep ribbon must not extend flat through
-    # such a node (see below): both runs would claim the same ground at different
-    # heights and tear the mesh.
+
+def _steep_counts(nodes, edges, node_z):
+    """How many STEEP runs touch each node."""
     steep_count = {}
     for (i, j) in edges:
-        if i >= len(nodes) or j >= len(nodes) or i == j:
+        got = _edge_frame(nodes, node_z, i, j)
+        if got is None:
             continue
-        run = math.hypot(nodes[j][0] - nodes[i][0], nodes[j][1] - nodes[i][1])
-        if run < 1e-4:
-            continue
+        (_a, _b, _u, run) = got
         if abs(node_z[j] - node_z[i]) / run > params.RIBBON_GROW_MAX_SLOPE:
             steep_count[i] = steep_count.get(i, 0) + 1
             steep_count[j] = steep_count.get(j, 0) + 1
-    steep_node = {n: (c >= 2) for n, c in steep_count.items()}
+    return steep_count
 
-    # ---- Phase 2 march: plan every station, run them all natively, reassemble.
-    # `widths` is indexed by the `base` offsets recorded in the plan.
+
+def _ungrown_strip(strip, steep, sample, pa, pb):
+    """Finish a strip the march never planned: fixed width, real tread heights.
+
+    See: docs/commentary/tes5_import_navmesh.md#a-steep-ribbon-is-never-grown
+    """
+    strip['half'] = (params.RIBBON_STAIR_HALF_WIDTH if steep
+                     else params.RIBBON_HALF_WIDTH)
+    if steep and sample is not None:
+        prof = _surface_profile(sample, pa, pb)
+        if prof:
+            strip['prof'] = prof
+    return strip
+
+
+def _grown_outline(strip, entry, widths, w):
+    """Finish a grown strip: simplified rails closed into an explicit outline.
+
+    See: docs/commentary/tes5_import_navmesh.md#rails-are-simplified-before-triangulation
+    """
+    wx, wy = w
+    _, _, ppa, ppb, _u, _w, _len, k, base = entry
+    left, right = [], []
+    max_h = params.RIBBON_HALF_WIDTH
+    for s in range(k + 1):
+        t = s / k
+        cxs = ppa[0] + (ppb[0] - ppa[0]) * t
+        cys = ppa[1] + (ppb[1] - ppa[1]) * t
+        hl = float(widths[base + 2 * s])
+        hr = float(widths[base + 2 * s + 1])
+        left.append((cxs + wx * hl, cys + wy * hl))
+        right.append((cxs - wx * hr, cys - wy * hr))
+        max_h = max(max_h, hl, hr)
+    left = _simplify(left, params.RIBBON_RAIL_SIMPLIFY)
+    right = _simplify(right, params.RIBBON_RAIL_SIMPLIFY)
+    strip['poly'] = left + right[::-1]
+    strip['half'] = max_h
+    return strip
+
+
+def _edge_strip(nodes, node_z, i, j, degree, grown_edges, widths, sample):
+    """The ribbon for one pathgrid edge, or None if the edge is unusable.
+
+    See: docs/commentary/tes5_import_navmesh.md#only-dead-ends-extend
+    """
+    got = _edge_frame(nodes, node_z, i, j)
+    if got is None:
+        return None
+    (ax, ay, az), (bx, by, bz), (ux, uy), length = got
+    ext = params.RIBBON_END_EXTEND
+    ea = ext if degree.get(i, 0) <= 1 else 0.0
+    eb = ext if degree.get(j, 0) <= 1 else 0.0
+    dz = bz - az
+    pa = (ax - ux * ea, ay - uy * ea, az - dz * (ea / length))
+    pb = (bx + ux * eb, by + uy * eb, bz + dz * (eb / length))
+    strip = {
+        'edge': (i, j),
+        'na': (ax, ay, az), 'nb': (bx, by, bz),
+        'a': pa, 'b': pb,
+        'u': (ux, uy), 'w': (-uy, ux), 'len': length,
+    }
+    entry = grown_edges.get((i, j)) if widths is not None else None
+    if entry is None:
+        steep = abs(dz) / length > params.RIBBON_GROW_MAX_SLOPE
+        return _ungrown_strip(strip, steep, sample, pa, pb)
+    return _grown_outline(strip, entry, widths, (-uy, ux))
+
+
+def _trim_disc_ray(layers, nx, ny, nz, ddx, ddy, d):
+    """Shorten a disc ray where the real surface leaves the node's level.
+
+    See: docs/commentary/tes5_import_navmesh.md#disc-rays-are-trimmed-at-stairs
+    """
+    zcur = nz
+    good = params.RIBBON_HALF_WIDTH
+    dd = good
+    while dd < d - 1e-6:
+        dd = min(d, dd + 8.0)
+        cand = [z for z in layers(nx + ddx * dd, ny + ddy * dd)
+                if abs(z - zcur) <= params.MAX_CLIMB]
+        if not cand:
+            good = dd
+            continue
+        zc = min(cand, key=lambda z: abs(z - zcur))
+        if abs(zc - nz) > params.MAX_CLIMB:
+            break
+        zcur = zc
+        good = dd
+    return good
+
+
+def _disc_strip(entry, widths, layers, steep_strips, trim):
+    """The node-disc ribbon for one plan entry, or None if it degenerates."""
+    _, ni, nx, ny, nz, base = entry
+    nrays = params.RIBBON_GROW_DISC_RAYS
+    disc = []
+    for kk in range(nrays):
+        ang = 2.0 * math.pi * kk / nrays
+        ddx, ddy = math.cos(ang), math.sin(ang)
+        d = float(widths[base + kk])
+        if trim and d > params.RIBBON_HALF_WIDTH:
+            d = _trim_disc_ray(layers, nx, ny, nz, ddx, ddy, d)
+        disc.append((nx + ddx * d, ny + ddy * d))
+    disc = _simplify(disc, params.RIBBON_RAIL_SIMPLIFY)
+    if len(disc) < 3:
+        return None
+    disc = _clip_flat_poly_off_level(disc, nx, ny, nz, steep_strips)
+    if len(disc) < 3:
+        return None
+    rmax = max(math.hypot(px - nx, py - ny) for (px, py) in disc)
+    return {
+        'edge': (ni, ni),
+        'na': (nx, ny, nz), 'nb': (nx, ny, nz),
+        'a': (nx, ny, nz), 'b': (nx, ny, nz),
+        'u': (1.0, 0.0), 'w': (0.0, 1.0),
+        'len': max(rmax, 1.0), 'half': max(rmax, 1.0),
+        'poly': disc,
+    }
+
+
+def _steep_strips(strips):
+    """Every ribbon steeper than RIBBON_GROW_MAX_SLOPE."""
+    out = []
+    for s in strips:
+        if s.get('len', 0.0) < 1e-6:
+            continue
+        if (abs(s['nb'][2] - s['na'][2]) / s['len']
+                > params.RIBBON_GROW_MAX_SLOPE):
+            out.append(s)
+    return out
+
+
+def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
+                           walk_probe=None, field=None,
+                           blocking=None, walkable=None, sample=None):
+    """One corridor ribbon per pathgrid edge, plus a disc at every node.
+
+    Each strip carries its centreline ends (after dead-end extension), the
+    along/perpendicular units, a MAX half-width for level lookups, and in
+    Phase 2 an explicit grown outline.  They are NOT yet a shared mesh --
+    corridor_union takes their boolean union and retriangulates it.
+    See: docs/commentary/tes5_import_navmesh.md#ribbon-construction
+    """
+    grow = params.RIBBON_GROW and blocking is not None
+    degree = _node_degrees(edges)
+    steep_count = _steep_counts(nodes, edges, node_z)
+
     stations, plan, extra_edges = _plan_stations(nodes, edges, node_z,
                                                  degree, grow)
     widths = None
@@ -419,342 +503,172 @@ def _build_corridor_strips(nodes, edges, node_z, wall_hit=None,
         widths = corridor_grow.grow_batch(
             blocking, walkable, nodes, list(edges) + extra_edges,
             node_z, stations)
-
-    # Edges that were PLANNED (flat enough to grow) map to their plan entry;
-    # every other edge keeps the Phase-1 fixed rectangle below.
     grown_edges = {p[1]: p for p in plan if p[0] == 'edge'}
 
     strips = []
     for (i, j) in edges:
-        if i >= len(nodes) or j >= len(nodes) or i == j:
-            continue
-        ax, ay = nodes[i][0], nodes[i][1]
-        bx, by = nodes[j][0], nodes[j][1]
-        az, bz = node_z[i], node_z[j]
-        dx, dy = bx - ax, by - ay
-        length = math.hypot(dx, dy)
-        if length < 1e-4:
-            continue
-        ux, uy = dx / length, dy / length
-        wx, wy = -uy, ux
-        dz = bz - az
-        # Ribbons run node to node; at a DEAD END the ribbon extends past the
-        # node, since nothing else reaches the wall or door ahead.  Overlap
-        # between ribbons is resolved by the union, so a ribbon never needs to
-        # stop short of a junction.
-        ea = ext if degree.get(i, 0) <= 1 else 0.0
-        eb = ext if degree.get(j, 0) <= 1 else 0.0
-
-        # A STEEP edge (a flight of stairs) also extends past its END NODES, even
-        # though they are junctions.  A steep ribbon is never width-grown (see
-        # below), so it keeps the narrow Phase-1 width while the flat landing it
-        # meets has grown to ~100u+.  The stair mouth is then far narrower than
-        # the landing, and the two only meet at the landing's CORNER vertices:
-        # measured at the top of Pinarus's stairs, the entire route from the
-        # landing onto the flight ran through two 27-degree wedges (one with edge
-        # ratio 6.1) hanging off those corners, each dropping 39-45u.  The mesh
-        # was ONE component and still not walkable.
-        #
-        # Extending the flight a little onto the flat at each end gives the union
-        # a real overlap to work with, so the stair mouth becomes a proper span of
-        # shared edges instead of a pair of needles.  The extension carries the
-        # line's own slope (principle 2), so it stays on the ramp plane rather
-        # than lifting onto the landing.
-        steep = abs(dz) / length > params.RIBBON_GROW_MAX_SLOPE
-
-        # NOTE: a stair-end EXTENSION was tried here (both as a sloped projection
-        # and as a footprint-only overhang) and both are wrong.  Sloped, it drives
-        # the ramp plane past the node — up into the air above the landing at the
-        # top (measured: ramp triangles at z=93 where the landing is z=69).
-        # Footprint-only, the overhang keeps interpolating the ramp slope while the
-        # landing is flat, so the flight's last row tilts UP off the landing edge:
-        # measured a 38.9-degree joint whose ramp apex sat 14.8u above the shared
-        # edge — a connection an actor cannot cross.  A stair ribbon therefore
-        # runs node to node exactly, like any other edge.
-        eza, ezb = dz * (ea / length), dz * (eb / length)
-        pa = (ax - ux * ea, ay - uy * ea, az - eza)
-        pb = (bx + ux * eb, by + uy * eb, bz + ezb)
-
-        strip = {
-            'edge': (i, j),
-            'na': (ax, ay, az), 'nb': (bx, by, bz),
-            'a': pa, 'b': pb,
-            'u': (ux, uy), 'w': (wx, wy), 'len': length,
-        }
-
-        # A STEEP edge is a staircase/ramp and is never grown — the ribbon is a
-        # tilted plane, so a perpendicular rail immediately leaves the treads
-        # (measured: the Guild's stair edge grew to 82u and put mesh through the
-        # wall beside it).  _plan_stations applies the same test, so an edge
-        # absent from the plan is exactly a steep or ungrown one.
-        entry = grown_edges.get((i, j)) if widths is not None else None
-        if entry is None:
-            # A steep flight keeps a FIXED width (it is never grown, since a
-            # perpendicular rail would leave the treads), but a wider one than a
-            # plain corridor: it has to present a mouth comparable to the landing
-            # it joins, or the two meet only at the landing's corners.
-            strip['half'] = (params.RIBBON_STAIR_HALF_WIDTH if steep else half)
-            # A steep edge's heights follow the REAL treads, not the chord —
-            # see _surface_profile.  Only steep edges need it: a flat edge's
-            # chord IS its surface.
-            if steep and sample is not None:
-                prof = _surface_profile(sample, pa, pb)
-                if prof:
-                    strip['prof'] = prof
+        strip = _edge_strip(nodes, node_z, i, j, degree, grown_edges,
+                            widths, sample)
+        if strip is not None:
             strips.append(strip)
+
+    if widths is None:
+        return strips
+    steep = _steep_strips(strips)
+    layers = getattr(sample, 'layers', None) if sample is not None else None
+    for entry in plan:
+        if entry[0] != 'disc':
             continue
-
-        _, _, ppa, ppb, _u, _w, _len, k, base = entry
-        left = []                   # (x, y) along +w
-        right = []                  # (x, y) along -w
-        max_h = params.RIBBON_HALF_WIDTH
-        for s in range(k + 1):
-            t = s / k
-            cxs = ppa[0] + (ppb[0] - ppa[0]) * t
-            cys = ppa[1] + (ppb[1] - ppa[1]) * t
-            hl = float(widths[base + 2 * s])
-            hr = float(widths[base + 2 * s + 1])
-            left.append((cxs + wx * hl, cys + wy * hl))
-            right.append((cxs - wx * hr, cys - wy * hr))
-            max_h = max(max_h, hl, hr)
-        # SIMPLIFY each rail before it becomes an outline.  The march samples a
-        # width every RIBBON_STEP (8u), so a raw rail carries a vertex every 8u —
-        # and _triangulate FORCES every outline corner as a Steiner point, which
-        # is precisely what turns a grown room into fans of 8u slivers.  A
-        # Douglas-Peucker pass keeps the shape (a wall the rail followed stays
-        # straight, a corner stays a corner) with a fraction of the vertices, so
-        # the hex lattice governs the interior and triangles come out near
-        # equilateral.
-        left = _simplify(left, params.RIBBON_RAIL_SIMPLIFY)
-        right = _simplify(right, params.RIBBON_RAIL_SIMPLIFY)
-        # Outline: left rail a->b, then right rail b->a.  A poly strip makes
-        # corridor_union._distance_to return 0 inside it, so 'half' only needs to
-        # be a positive upper bound for the level-lookup admission test.
-        strip['poly'] = left + right[::-1]
-        strip['half'] = max_h
-        strips.append(strip)
-
-    # NODE DISCS.  A ribbon only grows perpendicular to its OWN edge, so the
-    # outer corner where two edges meet at an angle is a notch no ribbon reaches
-    # — a right-angle junction leaves a square bite out of the mesh.  The disc
-    # rays were marched in the same batch; close each fan into a polygon here.
-    if widths is not None:
-        # STEEP ribbons, for the disc clip below.  A disc is FLAT at its node's
-        # height, but nothing stops its rays marching out OVER a flight of
-        # stairs: the first MAX_CLIMB of drop is legitimately walkable, and
-        # beyond that the treads below are walkable collision, not a wall, so
-        # the ray never terminates.  The flat disc then covers ground 40u+
-        # above the real surface, the level lookup answers BOTH heights there,
-        # and emission bridges them with a near-vertical triangle (measured at
-        # the top of ImperialDungeon01's prison staircase: disc level 513.8
-        # hanging over stair ground at 457-474).
-        steep_strips = []
-        for s in strips:
-            if s.get('len', 0.0) < 1e-6:
-                continue
-            if (abs(s['nb'][2] - s['na'][2]) / s['len']
-                    > params.RIBBON_GROW_MAX_SLOPE):
-                steep_strips.append(s)
-        nrays = params.RIBBON_GROW_DISC_RAYS
-        layers = getattr(sample, 'layers', None) if sample is not None else None
-        for entry in plan:
-            if entry[0] != 'disc':
-                continue
-            _, ni, nx, ny, nz, base = entry
-            # RAY TRIM at stair nodes.  The march stops at walls and at sudden
-            # drops, but a surface that RAMPS away descends a legal step per
-            # station, so a ray at a stair-top node happily marches the whole
-            # flight and the FLAT disc then covers ground 40u+ below its own
-            # height (the phantom second level that emits vertical triangles —
-            # see _clip_disc_against_steep).  Walk the real surface outward and
-            # stop the ray where the surface has left the node's level by more
-            # than a step in total.
-            trim = (DISC_RAY_TRIM and layers is not None
-                    and steep_count.get(ni, 0) >= 1)
-            disc = []
-            for kk in range(nrays):
-                ang = 2.0 * math.pi * kk / nrays
-                ddx, ddy = math.cos(ang), math.sin(ang)
-                d = float(widths[base + kk])
-                if trim and d > params.RIBBON_HALF_WIDTH:
-                    zcur = nz
-                    good = params.RIBBON_HALF_WIDTH
-                    dd = good
-                    while dd < d - 1e-6:
-                        dd = min(d, dd + 8.0)
-                        cand = [z for z in layers(nx + ddx * dd, ny + ddy * dd)
-                                if abs(z - zcur) <= params.MAX_CLIMB]
-                        if not cand:
-                            # collision gap: bridge it (the march itself saw
-                            # ground here), only an OFF-LEVEL surface stops us
-                            good = dd
-                            continue
-                        zc = min(cand, key=lambda z: abs(z - zcur))
-                        if abs(zc - nz) > params.MAX_CLIMB:
-                            break
-                        zcur = zc
-                        good = dd
-                    d = good
-                disc.append((nx + ddx * d, ny + ddy * d))
-            disc = _simplify(disc, params.RIBBON_RAIL_SIMPLIFY)
-            if len(disc) < 3:
-                continue
-            disc = _clip_flat_poly_off_level(disc, nx, ny, nz, steep_strips)
-            if len(disc) < 3:
-                continue
-            rmax = max(math.hypot(px - nx, py - ny) for (px, py) in disc)
-            strips.append({
-                'edge': (ni, ni),
-                'na': (nx, ny, nz), 'nb': (nx, ny, nz),
-                'a': (nx, ny, nz), 'b': (nx, ny, nz),
-                'u': (1.0, 0.0), 'w': (0.0, 1.0),
-                'len': max(rmax, 1.0), 'half': max(rmax, 1.0),
-                'poly': disc,
-            })
+        trim = (DISC_RAY_TRIM and layers is not None
+                and steep_count.get(entry[1], 0) >= 1)
+        disc = _disc_strip(entry, widths, layers, steep, trim)
+        if disc is not None:
+            strips.append(disc)
     return strips
 
 
-def _clip_flat_poly_off_level(disc, nx, ny, nz, steep_strips):
-    """Remove from a FLAT polygon (node disc, door footprint) the ground where
-    a steep ribbon that MEETS it has LEFT the polygon's level by more than a
-    step.
+def _strip_z_at(strip, az, bz, t):
+    """Height along a strip at parameter t, following its profile if it has one."""
+    prof = strip.get('prof')
+    if not prof:
+        return az + (bz - az) * t
+    f = t * (len(prof) - 1)
+    k = min(len(prof) - 2, max(0, int(f)))
+    return prof[k][2] + (prof[k + 1][2] - prof[k][2]) * (f - k)
 
-    The polygon keeps the flight's mouth (the ribbon within MAX_CLIMB of its
-    own height — legitimately shared ground where the two must weld) and
-    gives up everything further down/up the flight, so a flat surface can
-    never hang mesh over a stairwell.  (nx, ny) anchors which piece survives
-    a split.
 
-    ANCHORING.  |dz| alone cannot tell "my own flight ramping away" from "an
-    unrelated flight on another storey passing under me in plan" — and cutting
-    the latter opened holes on ChorrolFightersGuild's mid-floor corridors
-    (37 pathgrid samples lost).  A cut interval is therefore taken only when
-    it is CONTIGUOUS along the strip with a mouth station that lies INSIDE
-    this polygon: the flight genuinely joins this surface here, so the ground
-    beyond the mouth is the same flight descending — while a storey-below
-    flight has its mouth somewhere else in plan and never anchors.
+def _off_level_mask(strip, az, bz, nz, ax, ay, bx, by, n):
+    """Per-station True where the strip has left the flat surface's level."""
+    if callable(nz):
+        return [abs(_strip_z_at(strip, az, bz, k / n)
+                    - nz(ax + (bx - ax) * (k / n),
+                         ay + (by - ay) * (k / n))) > params.MAX_CLIMB
+                for k in range(n + 1)]
+    return [abs(_strip_z_at(strip, az, bz, k / n) - nz) > params.MAX_CLIMB
+            for k in range(n + 1)]
+
+
+def _anchor_stations(mask, ap, ax, ay, dx, dy, n):
+    """On-level stations lying INSIDE the polygon, which anchor the flight.
+
+    See: docs/commentary/tes5_import_navmesh.md#flat-polys-are-clipped-off-level
     """
-    from shapely.geometry import Polygon as _AnchP, Point as _AnchPt
-    _apoly_cache = []
-
-    def _anchor_poly():
-        """Built lazily: most discs/quads have no steep strip in range."""
-        if not _apoly_cache:
-            try:
-                ap = _AnchP(disc)
-                if not ap.is_valid:
-                    ap = ap.buffer(0)
-                _apoly_cache.append(ap.buffer(8.0))
-            except Exception:
-                _apoly_cache.append(None)
-        return _apoly_cache[0]
-
-    hit = []
-    for s in steep_strips:
-        ax, ay, az = s['a']
-        bx, by, bz = s['b']
-        run = math.hypot(bx - ax, by - ay)
-        if run < 1e-6:
+    from shapely.geometry import Point
+    anchored = set()
+    for k in range(n + 1):
+        if mask[k]:
             continue
-        # Quick reject: strip nowhere near the disc.
-        rmax = max(math.hypot(px - nx, py - ny) for (px, py) in disc)
-        half = float(s.get('half', params.RIBBON_STAIR_HALF_WIDTH))
-        dx, dy = bx - ax, by - ay
-        t0 = max(0.0, min(1.0, ((nx - ax) * dx + (ny - ay) * dy)
-                          / (run * run)))
-        cx, cy = ax + dx * t0, ay + dy * t0
-        if math.hypot(nx - cx, ny - cy) > rmax + half + 8.0:
-            continue
-        prof = s.get('prof')
+        try:
+            if ap.contains(Point(ax + dx * (k / n), ay + dy * (k / n))):
+                anchored.add(k)
+        except Exception:
+            pass
+    return anchored
 
-        def _zat(t):
-            if not prof:
-                return az + (bz - az) * t
-            # piecewise: prof points are evenly spaced along the plan line
-            f = t * (len(prof) - 1)
-            k = min(len(prof) - 2, max(0, int(f)))
-            fr = f - k
-            return prof[k][2] + (prof[k + 1][2] - prof[k][2]) * fr
 
-        n = max(2, int(run // 8.0))
-        # nz may be a constant (node discs) or a callable (sloped door quads):
-        # the off-level test always compares against the flat surface's OWN
-        # height at the sampled point.
-        if callable(nz):
-            mask = [abs(_zat(k / n)
-                        - nz(ax + (bx - ax) * (k / n),
-                             ay + (by - ay) * (k / n)))
-                    > params.MAX_CLIMB for k in range(n + 1)]
-        else:
-            mask = [abs(_zat(k / n) - nz) > params.MAX_CLIMB
-                    for k in range(n + 1)]
-        ux, uy = dx / run, dy / run
-        wx, wy = -uy, ux
-        # Mouth stations (on-level) that lie INSIDE this polygon anchor the
-        # flight to this surface; without one the strip is another storey.
-        anchored = set()
-        ap = _anchor_poly()
-        if ap is None:
+def _cut_quads(strip, mask, anchored, frame, half, n):
+    """The quads to subtract: off-level runs contiguous with an anchored mouth."""
+    (ax, ay), (ux, uy), (wx, wy), run = frame
+    hits = []
+    k = 0
+    while k <= n:
+        if not mask[k]:
+            k += 1
             continue
-        for k in range(n + 1):
-            if mask[k]:
-                continue
-            px_ = ax + dx * (k / n)
-            py_ = ay + dy * (k / n)
-            try:
-                if ap.contains(_AnchPt(px_, py_)):
-                    anchored.add(k)
-            except Exception:
-                pass
-        if not anchored:
-            continue
-        k = 0
-        while k <= n:
-            if not mask[k]:
-                k += 1
-                continue
-            k2 = k
-            while k2 + 1 <= n and mask[k2 + 1]:
-                k2 += 1
-            # Contiguity: the off-level run must border an anchored mouth
-            # station, or it belongs to a flight that never joins this
-            # surface here.
-            if not ((k - 1) in anchored or (k2 + 1) in anchored):
-                k = k2 + 1
-                continue
+        k2 = k
+        while k2 + 1 <= n and mask[k2 + 1]:
+            k2 += 1
+        if (k - 1) in anchored or (k2 + 1) in anchored:
             d0, d1 = run * k / n, run * k2 / n
             if d1 - d0 > 1.0:
-                hit.append(((ax + ux * d0 + wx * half, ay + uy * d0 + wy * half),
-                            (ax + ux * d0 - wx * half, ay + uy * d0 - wy * half),
-                            (ax + ux * d1 - wx * half, ay + uy * d1 - wy * half),
-                            (ax + ux * d1 + wx * half, ay + uy * d1 + wy * half)))
-            k = k2 + 1
-    if not hit:
-        return disc
+                hits.append((
+                    (ax + ux * d0 + wx * half, ay + uy * d0 + wy * half),
+                    (ax + ux * d0 - wx * half, ay + uy * d0 - wy * half),
+                    (ax + ux * d1 - wx * half, ay + uy * d1 - wy * half),
+                    (ax + ux * d1 + wx * half, ay + uy * d1 + wy * half)))
+        k = k2 + 1
+    return hits
+
+
+def _strip_cut_quads(strip, disc, nx, ny, nz, rmax, anchor):
+    """Quads this steep strip contributes to the subtraction, possibly empty."""
+    ax, ay, az = strip['a']
+    bx, by, bz = strip['b']
+    run = math.hypot(bx - ax, by - ay)
+    if run < 1e-6:
+        return []
+    half = float(strip.get('half', params.RIBBON_STAIR_HALF_WIDTH))
+    dx, dy = bx - ax, by - ay
+    t0 = max(0.0, min(1.0, ((nx - ax) * dx + (ny - ay) * dy) / (run * run)))
+    if math.hypot(nx - (ax + dx * t0),
+                  ny - (ay + dy * t0)) > rmax + half + 8.0:
+        return []
+    ap = anchor()
+    if ap is None:
+        return []
+    n = max(2, int(run // 8.0))
+    mask = _off_level_mask(strip, az, bz, nz, ax, ay, bx, by, n)
+    anchored = _anchor_stations(mask, ap, ax, ay, dx, dy, n)
+    if not anchored:
+        return []
+    frame = ((ax, ay), (dx / run, dy / run), (-dy / run, dx / run), run)
+    return _cut_quads(strip, mask, anchored, frame, half, n)
+
+
+def _subtract_quads(disc, nx, ny, hits):
+    """Cut `hits` out of the polygon, keeping the piece the node stands on."""
     try:
-        from shapely.geometry import Polygon as _SP, Point as _SPt
-        from shapely.ops import unary_union as _uu
-        dp = _SP(disc)
+        from shapely.geometry import Point, Polygon
+        from shapely.ops import unary_union
+        dp = Polygon(disc)
         if not dp.is_valid:
             dp = dp.buffer(0)
-        cut = dp.difference(_uu([_SP(q) for q in hit]))
+        cut = dp.difference(unary_union([Polygon(q) for q in hits]))
         if cut.is_empty:
             return disc
         pieces = list(cut.geoms) if hasattr(cut, 'geoms') else [cut]
-        pieces = [g for g in pieces if g.geom_type == 'Polygon'
-                  and g.area > 1.0]
+        pieces = [g for g in pieces if g.geom_type == 'Polygon' and g.area > 1.0]
         if not pieces:
             return disc
-        node = _SPt(nx, ny)
-        # Keep the piece the node stands on (the node itself is never inside a
-        # subtracted region: |z - nz| is ~0 there).
-        best = min(pieces, key=lambda g: g.distance(node))
+        best = min(pieces, key=lambda g: g.distance(Point(nx, ny)))
         ring = list(best.exterior.coords)
         if len(ring) > 1 and ring[0] == ring[-1]:
             ring = ring[:-1]
         return ring
     except Exception:
         return disc
+
+
+def _clip_flat_poly_off_level(disc, nx, ny, nz, steep_strips):
+    """Remove from a FLAT polygon the ground where a steep ribbon that MEETS it
+    has LEFT the polygon's level by more than a step.
+
+    (nx, ny) anchors which piece survives a split; `nz` is the flat surface's
+    height, either a constant (node disc) or a callable (sloped door quad).
+    See: docs/commentary/tes5_import_navmesh.md#flat-polys-are-clipped-off-level
+    """
+    cache = []
+
+    def anchor():
+        """The buffered polygon, built lazily -- most callers never need it."""
+        if not cache:
+            try:
+                from shapely.geometry import Polygon
+                ap = Polygon(disc)
+                if not ap.is_valid:
+                    ap = ap.buffer(0)
+                cache.append(ap.buffer(8.0))
+            except Exception:
+                cache.append(None)
+        return cache[0]
+
+    rmax = max(math.hypot(px - nx, py - ny) for (px, py) in disc)
+    hits = []
+    for s in steep_strips:
+        hits.extend(_strip_cut_quads(s, disc, nx, ny, nz, rmax, anchor))
+    if not hits:
+        return disc
+    return _subtract_quads(disc, nx, ny, hits)
 
 
 def _simplify(pts, tol):
@@ -794,21 +708,9 @@ def _simplify(pts, tol):
 # Public entry
 # ---------------------------------------------------------------------------
 
-def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
-                    land_rec=None, origin_x=0.0, origin_y=0.0, doors=None,
-                    door_bases=None):
-    """Phase-1 corridor navmesh for one cell: (verts, tris, ledges) lists.
-
-    doors: [(x, y, z, rot_z, is_teleport, width), ...] pivot-corrected door
-        centres; width is the measured doorway span in world units.
-    door_bases: low-24 DOOR base FormIDs whose refs contribute no collision
-        (a panel is opened, never a wall).
-    ledges: [(upper_tri, lower_tri, drop), ...] drop-down pairs between
-        disconnected storeys, for NVNM Ledge Up/Down edge links.
-    """
-    if not nodes or not edges:
-        return [], [], []
-
+def _cell_geometry(refr_recs, base_model_by_fid, get_collision, land_rec,
+                   origin_x, origin_y, door_bases):
+    """(walkable, blocking) for a cell, with LAND folded into the walkable set."""
     walkable, blocking, land_walk = world.gather_cell_geometry(
         refr_recs or [], base_model_by_fid or {}, get_collision,
         land_rec=land_rec, origin_x=origin_x, origin_y=origin_y,
@@ -816,303 +718,251 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     if land_walk is not None and len(land_walk):
         walkable = (np.concatenate([walkable, land_walk])
                     if len(walkable) else land_walk)
+    return walkable, blocking
 
-    sample = _surface_sampler(walkable)
 
-    # Node heights: snap each node down onto walkable collision.
-    node_z = [_snap_node_z(sample, nodes[i][0], nodes[i][1], nodes[i][2])
-              for i in range(len(nodes))]
+def _quad_height_fn(poly, zb, zf, sweep, bm, fm):
+    """A callable giving the door quad's ramped height at any (x, y)."""
+    bmx, bmy = bm
+    fmx, fmy = fm
 
-    # The Phase-2 grow builds its own indices natively (over the same fixed
-    # geometry, so growth stays order-independent and byte-reproducible).  Only
-    # the DOOR footprint still needs a Python-side wall test — it runs a few
-    # probes per door, not the ~890k the width march does, so it is not worth
-    # crossing into C++ for.
-    #
-    # Built LAZILY: indexing the blocking soup costs ~0.4s on a dense cell, and
-    # a cell with no doors never asks a single question of it.  Once the grow
-    # went native that build was the second-largest remaining cost, spent
-    # entirely on an object most cells discard unused.
-    _wall_hit_cache = []
+    def _qz(px, py):
+        """Height of the ramping quad at this point."""
+        if sweep < 1e-6:
+            return zb
+        t = (((px - bmx) * (fmx - bmx) + (py - bmy) * (fmy - bmy))
+             / (sweep * sweep))
+        return zb + (zf - zb) * max(0.0, min(1.0, t))
 
-    def wall_hit(*a, **kw):
-        if not _wall_hit_cache:
-            _wall_hit_cache.append(corridor_grow.wall_slab_sampler(blocking))
-        return _wall_hit_cache[0](*a, **kw)
+    return _qz
 
-    from . import corridor_doors, corridor_clean, corridor_union
 
-    # One corridor (a rectangular ribbon on the pathgrid line's own slope) per
-    # edge, then a BOOLEAN UNION of those ribbons per storey, retriangulated.
-    #
-    # The union is coverage-preserving by construction: its area is exactly the
-    # ground the ribbons cover, and a triangulation of it cannot self-overlap.
-    # Cutting the ribbons pairwise instead (trim, weld, patch the junction) is an
-    # approximation that has to handle every configuration — end-to-end,
-    # crossing, wedge, collinear — and every case it got wrong appeared as lost
-    # ground or stacked sheets.
-    #
-    # Storeys are grouped by SHARED NODES with agreeing heights, so a staircase
-    # stays one storey with the floors it joins while two floors stacked in plan
-    # view are unioned separately and never flattened together.
-    corridors = _build_corridor_strips(nodes, edges, node_z,
-                                       blocking=blocking, walkable=walkable,
-                                       sample=sample)
+def _ramped_strip(ps, zb, zf, sweep, bm, fm):
+    """Point a door strip's height axis down its ramp, when it has one."""
+    if abs(zf - zb) <= 1.0 or sweep <= 1e-6:
+        return ps
+    bmx, bmy = bm
+    fmx, fmy = fm
+    ux_, uy_ = (fmx - bmx) / sweep, (fmy - bmy) / sweep
+    ps['a'] = (bmx, bmy, zb)
+    ps['b'] = (fmx, fmy, zf)
+    ps['na'], ps['nb'] = ps['a'], ps['b']
+    ps['u'] = (ux_, uy_)
+    ps['w'] = (-uy_, ux_)
+    ps['len'] = sweep
+    ps['half'] = max(float(ps['half']), sweep) + 8.0
+    return ps
 
-    # Exterior meshes are clipped to their own cell rectangle so a cross-seam
-    # ribbon (built from a PGRI InterCell link, which reaches into the neighbour
-    # cell) stops exactly at the boundary plane — leaving a border edge on the
-    # seam for build_edge_links to stitch, without importing neighbour geometry.
-    cell_clip = None
-    if land_rec is not None:
-        cell_clip = (origin_x, origin_y, origin_x + 4096.0, origin_y + 4096.0)
 
-    # Doors are computed FIRST, on the raw ribbon union: each door's footprint is
-    # the RECTANGLE sweeping its base line to the nearest reachable corridor.
-    #
-    # The rectangle joins the union as ordinary ground, and its BASE LINE is
-    # handed over as a triangulation CONSTRAINT.  The door mesh must stay part of
-    # the one union — cutting the rectangle out and emitting its triangles
-    # separately leaves them sharing no vertices with the surrounding mesh (the
-    # union's own boundary around the hole is sampled independently), which is an
-    # overlap-and-disconnect, not a fix.
-    # NOTE: splitting the union along wall footprints was tried and reverted.
-    # Walls are Z-dependent but the union is ONE 2D operation spanning every
-    # storey, so cutting on all wall footprints fragmented the polygon against
-    # walls belonging to other floors (Pinarus: 575 -> 908 triangles and MORE
-    # wall crossings, not fewer).  Per-storey handling is needed instead.
-    wall_cut = None
+def _door_quad_strip(fp, steep_list):
+    """(strip, base entry, pins) for one door footprint, or None if degenerate.
 
-    door_list = [(x, y, z, r, tp, w) for (x, y, z, r, tp, w) in (doors or ())]
-    door_strips = []
-    door_edges = []
-    door_pins = []
-    if door_list:
-        # probe_only: this mesh feeds door_footprints and is then DISCARDED --
-        # the real union below rebuilds it with the door quads included.  The
-        # probe needs coverage, heights and welded edges; it does not need the
-        # connectivity repair passes (see build_union_mesh).
-        rv, rt = corridor_union.build_union_mesh(corridors,
-                                                 cell_bounds=cell_clip,
-                                                 wall_cut=wall_cut,
-                                                 probe_only=True)
-        if rt:
-            # STEEP ribbons, to clip flat door footprints against.  A door at
-            # the top of a staircase sweeps its footprint toward the nearest
-            # corridor mesh, which is the FLIGHT below it — the flat quad then
-            # covers ramping ground 40u+ under its own height, the level
-            # lookup answers both heights there, and emission bridges them
-            # with a near-vertical triangle (measured at the top of
-            # ImperialDungeon01's prison stairs: door quad at 513.8 hanging
-            # over stair ground at 457-474).  The clip keeps the quad down to
-            # where the flight is within a step of the door's level, which is
-            # exactly where the two must weld.
-            steep_list = [s for s in corridors
-                          if s.get('len', 0.0) > 1e-6
-                          and abs(s['nb'][2] - s['na'][2]) / s['len']
-                          > params.RIBBON_GROW_MAX_SLOPE]
-            for fp in corridor_doors.door_footprints(rv, rt, door_list,
-                                                     wall_hit=wall_hit,
-                                                     nodes=nodes,
-                                                     pg_edges=edges):
-                poly = fp['poly']
-                # The quad RAMPS from the threshold (z, at the base line) to
-                # the corridor mesh under its far edge (z_far) — see
-                # corridor_doors._sweep.  Both the off-level clip and the
-                # strip's height axis use that slope.
-                zb = float(fp['z'])
-                zf = float(fp.get('z_far', fp['z']))
-                bmx = 0.5 * (poly[0][0] + poly[1][0])
-                bmy = 0.5 * (poly[0][1] + poly[1][1])
-                fmx = 0.5 * (poly[2][0] + poly[3][0])
-                fmy = 0.5 * (poly[2][1] + poly[3][1])
-                sweep = math.hypot(fmx - bmx, fmy - bmy)
-                # The ramp may only slope as steeply as ground an actor can
-                # walk (the steepest real stair at a door measures ~0.4).
-                # z_far comes from a mesh probe with a storey-scale tolerance,
-                # so a doorway over a stacked lower floor can grab the WRONG
-                # storey — the quad then paints a 45-degree cliff across the
-                # corridor and the degenerate/wall culls tear real coverage
-                # out with it (measured on Moranda02 nodes 40/41/57).
-                if abs(zf - zb) > 0.5 * max(sweep, 1.0):
-                    zf = zb
+    See: docs/commentary/tes5_import_navmesh.md#the-door-quad-ramps-and-is-clipped
+    """
+    from . import corridor_union
+    poly = fp['poly']
+    zb = float(fp['z'])
+    zf = float(fp.get('z_far', fp['z']))
+    bmx = 0.5 * (poly[0][0] + poly[1][0])
+    bmy = 0.5 * (poly[0][1] + poly[1][1])
+    fmx = 0.5 * (poly[2][0] + poly[3][0])
+    fmy = 0.5 * (poly[2][1] + poly[3][1])
+    sweep = math.hypot(fmx - bmx, fmy - bmy)
+    if abs(zf - zb) > 0.5 * max(sweep, 1.0):
+        zf = zb
+    qz = _quad_height_fn(poly, zb, zf, sweep, (bmx, bmy), (fmx, fmy))
 
-                def _qz(px, py, bmx=bmx, bmy=bmy, fmx=fmx, fmy=fmy,
-                        zb=zb, zf=zf, sweep=sweep):
-                    if sweep < 1e-6:
-                        return zb
-                    t = (((px - bmx) * (fmx - bmx) + (py - bmy) * (fmy - bmy))
-                         / (sweep * sweep))
-                    return zb + (zf - zb) * max(0.0, min(1.0, t))
+    if steep_list and len(poly) >= 3:
+        if fp['base'] is not None:
+            ax_ = 0.5 * (fp['base'][0][0] + fp['base'][1][0])
+            ay_ = 0.5 * (fp['base'][0][1] + fp['base'][1][1])
+        else:
+            ax_ = sum(p[0] for p in poly) / len(poly)
+            ay_ = sum(p[1] for p in poly) / len(poly)
+        poly = _clip_flat_poly_off_level(poly, ax_, ay_, qz, steep_list)
+    if len(poly) < 3:
+        return None
 
-                if steep_list and len(poly) >= 3:
-                    if fp['base'] is not None:
-                        ax_ = 0.5 * (fp['base'][0][0] + fp['base'][1][0])
-                        ay_ = 0.5 * (fp['base'][0][1] + fp['base'][1][1])
-                    else:
-                        ax_ = sum(p[0] for p in poly) / len(poly)
-                        ay_ = sum(p[1] for p in poly) / len(poly)
-                    poly = _clip_flat_poly_off_level(poly, ax_, ay_,
-                                                     _qz, steep_list)
-                if len(poly) < 3:
-                    continue
-                ps = corridor_union._poly_strip(poly, zb)
-                if abs(zf - zb) > 1.0 and sweep > 1e-6:
-                    ux_, uy_ = (fmx - bmx) / sweep, (fmy - bmy) / sweep
-                    ps['a'] = (bmx, bmy, zb)
-                    ps['b'] = (fmx, fmy, zf)
-                    ps['na'], ps['nb'] = ps['a'], ps['b']
-                    ps['u'] = (ux_, uy_)
-                    ps['w'] = (-uy_, ux_)
-                    ps['len'] = sweep
-                    ps['half'] = max(float(ps['half']), sweep) + 8.0
-                door_strips.append(ps)
-                # Far-side quads (interior doors) carry no base constraint —
-                # they are plain ground; ONE Door Triangle per door, on the
-                # primary side.  The entry is (base0, base1, apex, storey_z):
-                # the door triangle's exact shape, fixed by corridor_doors,
-                # plus the height of the corridor it bridges to so the claim
-                # in build_union_mesh can pick the right SHEET (two stacked
-                # floors both pass a 2D containment test).
-                if fp['base'] is not None:
-                    door_edges.append((fp['base'][0], fp['base'][1],
-                                       fp['apex'], fp['z']))
-                    # PIN the wedge's ring through the cleanup passes: base
-                    # corners, base midpoint and apex.  Where a door is wider
-                    # than the ribbon crossing it, the ground beside the
-                    # reserved wedge is thin crumb geometry that decimation
-                    # eats — taking the hole-ring vertices with it, so the
-                    # attach found nothing within snap range and withdrew the
-                    # door triangle (measured on the CharacterGen pen gate).
-                    (b0, b1), apex, fz = fp['base'], fp['apex'], fp['z']
-                    door_pins.extend((
-                        (b0[0], b0[1], fz), (b1[0], b1[1], fz),
-                        (0.5 * (b0[0] + b1[0]), 0.5 * (b0[1] + b1[1]), fz),
-                        (apex[0], apex[1], fz)))
+    ps = _ramped_strip(corridor_union._poly_strip(poly, zb),
+                       zb, zf, sweep, (bmx, bmy), (fmx, fmy))
+    if fp['base'] is None:
+        return ps, None, []
+    (b0, b1), apex, fz = fp['base'], fp['apex'], fp['z']
+    pins = [(b0[0], b0[1], fz), (b1[0], b1[1], fz),
+            (0.5 * (b0[0] + b1[0]), 0.5 * (b0[1] + b1[1]), fz),
+            (apex[0], apex[1], fz)]
+    return ps, (b0, b1, apex, fp['z']), pins
 
-    verts, tris = corridor_union.build_union_mesh(
-        corridors, extra_strips=door_strips, door_edges=door_edges,
-        cell_bounds=cell_clip, wall_cut=wall_cut)
-    if not tris:
-        return [], [], []
 
-    cs = params.CS_EXTERIOR if land_rec is not None else params.CS
-    # For dropping unreachable fringe scraps, a component is KEPT when it can
-    # reach another cell — via a door, or (exterior) by touching the cell
-    # border where a worldspace edge-link continues it.  Pass the door centres
-    # and, for an exterior cell, its world-space bounds.
-    door_xy = [(x, y, z) for (x, y, z, r, tp, w) in door_list]
-    cell_bounds = None
-    if land_rec is not None:
-        cell_bounds = (origin_x, origin_y, origin_x + 4096.0, origin_y + 4096.0)
-    # Pin the mesh over STEEP (stair/ramp) centrelines through decimation.  Such
-    # a ribbon keeps only the narrow Phase-1 width, so an edge collapse can eat
-    # it outright — measured on exterior grid(-48,-8), where all four steep
-    # hillside edges lost their mesh entirely (4/4 midpoints covered before
-    # decimation, 0/4 after) while every flat corridor was unaffected.
-    # Every pathgrid centreline is sampled: the samples both PIN the mesh over a
-    # steep ribbon through decimation and mark a component as pathgrid-carrying
-    # so the island pass can never drop it (the pathgrid asserts an actor walks
-    # there, so that ground is reachable by definition).
-    pin_xy = list(door_xy) + door_pins
+def _door_geometry(corridors, door_list, nodes, edges, wall_hit, cell_clip):
+    """(door strips, door base edges, wedge pins) from a probe union.
+
+    See: docs/commentary/tes5_import_navmesh.md#door-mesh-stays-in-the-union
+    """
+    from . import corridor_doors, corridor_union
+    strips, edges_out, pins = [], [], []
+    if not door_list:
+        return strips, edges_out, pins
+    rv, rt = corridor_union.build_union_mesh(corridors, cell_bounds=cell_clip,
+                                             wall_cut=None, probe_only=True)
+    if not rt:
+        return strips, edges_out, pins
+    steep_list = _steep_strips(corridors)
+    for fp in corridor_doors.door_footprints(rv, rt, door_list,
+                                             wall_hit=wall_hit, nodes=nodes,
+                                             pg_edges=edges):
+        got = _door_quad_strip(fp, steep_list)
+        if got is None:
+            continue
+        ps, edge, quad_pins = got
+        strips.append(ps)
+        if edge is not None:
+            edges_out.append(edge)
+            pins.extend(quad_pins)
+    return strips, edges_out, pins
+
+
+def _centreline_samples(nodes, edges, node_z):
+    """(x, y, z, ux, uy) along every pathgrid edge, at RIBBON_STEP spacing.
+
+    See: docs/commentary/tes5_import_navmesh.md#every-centreline-is-sampled
+    """
+    out = []
     for (i, j) in edges:
-        if i >= len(nodes) or j >= len(nodes) or i == j:
+        got = _edge_frame(nodes, node_z, i, j)
+        if got is None:
             continue
-        run = math.hypot(nodes[j][0] - nodes[i][0], nodes[j][1] - nodes[i][1])
-        if run < 1e-6:
-            continue
-        ux_ = (nodes[j][0] - nodes[i][0]) / run
-        uy_ = (nodes[j][1] - nodes[i][1]) / run
+        (_a, _b, (ux_, uy_), run) = got
         steps = max(2, int(run // params.RIBBON_STEP))
         for s in range(steps + 1):
             f = s / steps
-            # (x, y, z, ux, uy): the direction lets the sliver cull measure
-            # the corridor's CROSS-WIDTH at this sample (the walkable-width
-            # contract) — consumers that only read x/y/z are unaffected.
-            pin_xy.append((nodes[i][0] + (nodes[j][0] - nodes[i][0]) * f,
-                           nodes[i][1] + (nodes[j][1] - nodes[i][1]) * f,
-                           node_z[i] + (node_z[j] - node_z[i]) * f,
-                           ux_, uy_))
+            out.append((nodes[i][0] + (nodes[j][0] - nodes[i][0]) * f,
+                        nodes[i][1] + (nodes[j][1] - nodes[i][1]) * f,
+                        node_z[i] + (node_z[j] - node_z[i]) * f, ux_, uy_))
+    return out
 
-    verts, tris, ledge_marks = corridor_clean.finalize(
-        verts, tris, cs=cs, doors=door_xy, cell_bounds=cell_bounds,
-        pin_xy=pin_xy, door_pins=door_pins,
-        node_pins=[(nodes[i][0], nodes[i][1]) for i in range(len(nodes))])
 
-    verts = [tuple(float(c) for c in v) for v in verts]
-    tris = [tuple(int(i) for i in t) for t in tris]
+def _tri_carries_door(verts, tri, door_xy):
+    """Does a door threshold stand on this triangle, within a storey?"""
+    a, b, c = (verts[i] for i in tri)
+    d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+    if abs(d) < 1e-9:
+        return False
+    for (px, py, pz) in door_xy:
+        l0 = ((b[1] - c[1]) * (px - c[0]) + (c[0] - b[0]) * (py - c[1])) / d
+        l1 = ((c[1] - a[1]) * (px - c[0]) + (a[0] - c[0]) * (py - c[1])) / d
+        l2 = 1.0 - l0 - l1
+        if (l0 >= -0.05 and l1 >= -0.05 and l2 >= -0.05
+                and abs(l0 * a[2] + l1 * b[2] + l2 * c[2] - pz) <= 128.0):
+            return True
+    return False
 
-    # ADD THE DOOR TRIANGLES BACK, LAST.  They were cut out of the polygon
-    # before triangulation, so every pass above -- Delaunay, the 3D weld, the
-    # T-junction split, the pathgrid-node merge, make-manifold, the island cull
-    # -- saw the doorway as plain mesh boundary and had nothing there to split,
-    # weld or drop.  Adding them only now is what makes "one triangle per door,
-    # its long side the full width of the doorway" a guarantee rather than
-    # something the cleanup passes might survive.
-    if corridor_union.PENDING_DOOR_TRIS:
-        verts, tris = corridor_union.attach_door_triangles(
-            verts, tris, corridor_union.PENDING_DOOR_TRIS)
 
-    # DROP ATTACH-ERA SCRAPS.  The island cull ran inside finalize, BEFORE the
-    # door attach; de-stacking there can orphan a mesh triangle whose only
-    # edge-neighbours were removed, leaving 1-2 triangle specks the engine can
-    # never route onto (measured: one each in Pinarus, ChorrolFG, AnvilFG).
-    # A speck that carries a door's threshold is kept — it IS that door's
-    # triangle and the door link needs it.
+def _drop_attach_scraps(verts, tris, door_xy):
+    """Drop 1-2 triangle specks the door attach orphaned, keeping door ground.
+
+    See: docs/commentary/tes5_import_navmesh.md#attach-era-scraps-are-dropped
+    """
+    from . import corridor_clean
     comps = corridor_clean.components([list(map(int, t)) for t in tris])
-    if len(comps) > 1:
-        drop = set()
-        for comp in comps:
-            if len(comp) > 2:
-                continue
-            has_door = False
-            for ti in comp:
-                a, b, c = (verts[i] for i in tris[ti])
-                for (px, py, pz) in door_xy:
-                    d = ((b[1] - c[1]) * (a[0] - c[0])
-                         + (c[0] - b[0]) * (a[1] - c[1]))
-                    if abs(d) < 1e-9:
-                        continue
-                    l0 = ((b[1] - c[1]) * (px - c[0])
-                          + (c[0] - b[0]) * (py - c[1])) / d
-                    l1 = ((c[1] - a[1]) * (px - c[0])
-                          + (a[0] - c[0]) * (py - c[1])) / d
-                    l2 = 1.0 - l0 - l1
-                    if l0 >= -0.05 and l1 >= -0.05 and l2 >= -0.05 \
-                            and abs(l0 * a[2] + l1 * b[2] + l2 * c[2]
-                                    - pz) <= 128.0:
-                        has_door = True
-                        break
-                if has_door:
-                    break
-            if not has_door:
-                drop.update(comp)
-        if drop:
-            tris = [t for ti, t in enumerate(tris) if ti not in drop]
+    if len(comps) <= 1:
+        return tris
+    drop = set()
+    for comp in comps:
+        if len(comp) > 2:
+            continue
+        if not any(_tri_carries_door(verts, tris[ti], door_xy)
+                   for ti in comp):
+            drop.update(comp)
+    if not drop:
+        return tris
+    return [t for ti, t in enumerate(tris) if ti not in drop]
 
-    # Attach can mint plan-degenerate seam slivers of its own (measured: a
-    # zero-width 65u wall along ImperialDungeon01's prison-gate quad seam);
-    # the finalize-era cull ran before attach, so run it once more.
-    tris = corridor_clean._drop_degenerate_guarded(verts, tris)
 
-    # NORMALISE WINDING.  The mesh is a heightfield, so every triangle must be
-    # CCW in plan (Z-normal up); the engine and the CK's DOWNFACING rule both
-    # read a CW triangle as a downward-facing surface.  Edge collapses in
-    # decimation (and the weld) can flip a triangle's plan winding — measured
-    # two CW triangles in ImperialDungeon01 once the far-side door quads
-    # reshaped the local triangulation.  Orientation is a per-triangle
-    # property; flipping is always safe here.
-    tris = [((t[0], t[2], t[1])
+def _ccw_in_plan(verts, tris):
+    """Flip any triangle wound CW in plan; the mesh is a heightfield.
+
+    See: docs/commentary/tes5_import_navmesh.md#winding-must-be-ccw-in-plan
+    """
+    return [((t[0], t[2], t[1])
              if ((verts[t[1]][0] - verts[t[0]][0])
                  * (verts[t[2]][1] - verts[t[0]][1])
                  - (verts[t[2]][0] - verts[t[0]][0])
                  * (verts[t[1]][1] - verts[t[0]][1])) < 0 else t)
             for t in tris]
 
-    # Resolve drop-down pairs to FINAL triangle indices only now — the attach
-    # can both append (door + stitch fills) and remove (de-stacked overlap)
-    # triangles, so any index resolved earlier would be stale.
-    ledges = corridor_clean._resolve_ledges(verts, tris, ledge_marks)
 
+def _lazy_wall_hit(blocking):
+    """A wall-slab sampler that indexes the blocking soup on first use.
+
+    See: docs/commentary/tes5_import_navmesh.md#the-wall-sampler-is-lazy
+    """
+    cache = []
+
+    def wall_hit(*a, **kw):
+        """True if a wall stands in the actor slab; builds the index once."""
+        if not cache:
+            cache.append(corridor_grow.wall_slab_sampler(blocking))
+        return cache[0](*a, **kw)
+
+    return wall_hit
+
+
+def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
+                    land_rec=None, origin_x=0.0, origin_y=0.0, doors=None,
+                    door_bases=None):
+    """Phase-1 corridor navmesh for one cell: (verts, tris, ledges) lists.
+
+    doors: [(x, y, z, rot_z, is_teleport, width), ...] pivot-corrected door
+    centres.  door_bases: low-24 DOOR base FormIDs contributing no collision.
+    ledges: [(upper_tri, lower_tri, drop), ...] for NVNM Ledge Up/Down links.
+    See: docs/commentary/tes5_import_navmesh.md#ribbon-construction
+    """
+    if not nodes or not edges:
+        return [], [], []
+    from . import corridor_clean, corridor_union
+
+    walkable, blocking = _cell_geometry(
+        refr_recs, base_model_by_fid, get_collision, land_rec,
+        origin_x, origin_y, door_bases)
+    sample = _surface_sampler(walkable)
+    node_z = [_snap_node_z(sample, nodes[i][0], nodes[i][1], nodes[i][2])
+              for i in range(len(nodes))]
+
+    corridors = _build_corridor_strips(nodes, edges, node_z,
+                                       blocking=blocking, walkable=walkable,
+                                       sample=sample)
+    cell_clip = None
+    if land_rec is not None:
+        cell_clip = (origin_x, origin_y, origin_x + 4096.0, origin_y + 4096.0)
+
+    door_list = list(doors or ())
+    door_strips, door_edges, door_pins = _door_geometry(
+        corridors, door_list, nodes, edges, _lazy_wall_hit(blocking),
+        cell_clip)
+
+    verts, tris = corridor_union.build_union_mesh(
+        corridors, extra_strips=door_strips, door_edges=door_edges,
+        cell_bounds=cell_clip, wall_cut=None)
+    if not tris:
+        return [], [], []
+
+    door_xy = [(x, y, z) for (x, y, z, r, tp, w) in door_list]
+    pin_xy = (list(door_xy) + door_pins
+              + _centreline_samples(nodes, edges, node_z))
+    verts, tris, ledge_marks = corridor_clean.finalize(
+        verts, tris, cs=(params.CS_EXTERIOR if land_rec is not None
+                         else params.CS),
+        doors=door_xy, cell_bounds=cell_clip, pin_xy=pin_xy,
+        door_pins=door_pins,
+        node_pins=[(nodes[i][0], nodes[i][1]) for i in range(len(nodes))])
+
+    verts = [tuple(float(c) for c in v) for v in verts]
+    tris = [tuple(int(i) for i in t) for t in tris]
+    tris = _drop_attach_scraps(verts, tris, door_xy)
+    tris = corridor_clean._drop_degenerate_guarded(verts, tris)
+    tris = _ccw_in_plan(verts, tris)
+
+    ledges = corridor_clean._resolve_ledges(verts, tris, ledge_marks)
     return (verts, tris,
             [(int(a), int(b), float(d)) for (a, b, d) in ledges])

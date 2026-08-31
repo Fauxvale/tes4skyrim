@@ -1002,7 +1002,7 @@ def build_seff_variants(mgef_records: list, effect_records: list, writer,
     fid_to_edid = fid_to_edid or {}
     written = 0
     # Sorted so FormID allocation is deterministic — the output ESM must stay
-    # byte-reproducible (docs/performance_notes.md).
+    # byte-reproducible (docs/commentary/performance.md).
     for scpt, etype in sorted(wanted):
         vmad = get_magic_effect_vmad(scpt)
         if not vmad:

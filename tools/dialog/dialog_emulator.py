@@ -37,7 +37,7 @@ from tools.esm.tes5_esm_reader import read_tes5_file, TES5Record, _get, _zstring
 # Engine dialogue tables
 #
 # Extracted from the unpacked GOG/Anniversary SkyrimSE.exe by
-# tools/disasm/dialog_engine_extract.py -- see docs/dialogue_engine_contracts.md.
+# tools/disasm/dialog_engine_extract.py -- see docs/reference/dialogue_engine_contracts.md.
 # These are the engine's own tables, not xEdit's alphabetical listing, so the
 # ordering and the category each subtype belongs to are authoritative.
 # ---------------------------------------------------------------------------

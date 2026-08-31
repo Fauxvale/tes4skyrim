@@ -5,7 +5,7 @@ NW/SE CELL pair (SkyrimSE RVA 0x9213e0); NAM0/NAM9 is only the fallback used
 when all four cell values are zero.  So the rectangle has to cover the land a
 plugin actually adds, and it has to survive every path that emits a WRLD.
 
-See docs/world_land_navmesh_notes.md.
+See docs/commentary/tes5_import_navmesh.md.
 """
 import struct
 

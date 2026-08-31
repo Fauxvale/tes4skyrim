@@ -1,0 +1,432 @@
+# `script_convert/` architecture — read this BEFORE writing any code here
+
+> **The decision procedure is §3. If you are about to add or change something,
+> start there — it routes any change to exactly one file.**
+>
+> Score every change: `python tools/script/arch_fitness.py --fail-on-regression`
+> (per-file rules: `python tools/validate/code_rules.py --gate-file <path>`)
+> (0.6s). Correctness is `psc_semantic_diff.py`, never pytest — see §6.
+
+`script_convert/` converts TES4 (Oblivion) script source to Papyrus. It grew as
+a line-by-line regex rewriter: it never built a representation of the script, so
+every question needing structure — *is this expression balanced? is this
+identifier an Actor? does this `If` have its `EndIf`?* — was re-answered by
+pattern-matching **text the converter itself had just emitted**. Each new script
+exposed a shape the rewriter mangled, the fix was another repair pass, and the
+passes began to interact.
+
+A parse tree now exists and is live. This document is the target it is being
+rewritten toward, and the rules that keep it there.
+
+---
+
+## 1. The layers
+
+**The pattern is an AST compiler.** Source becomes tokens, tokens become a tree,
+the tree is resolved against a symbol table, and only then is Papyrus emitted.
+Text flows one way. Nothing ever reads back what was emitted.
+
+```
+    TES4 source
+        |  tes4/lexer.py          characters -> tokens
+        v
+     tokens
+        |  tes4/parser.py         tokens -> AST   (never raises; degrades to Raw)
+        v
+      AST  (tes4/nodes.py)
+        |  facts.py               tree -> ScriptFacts   (what this script needs)
+        |  symbols.py             tree -> types, UDF signatures, ref classes
+        v
+    resolved tree
+        |  emit/expr.py           Expr -> Value
+        |  emit/stmt.py           Stmt -> Value
+        |  emit/commands.py       Call -> Value   (COMMAND_ROWS, then commands/)
+        |  emit/script.py         bodies -> laid-out lines
+        v
+    assemble/                     events, properties, the .psc file
+        v
+    pipeline.py                   jobs, batching, VMAD, writing
+```
+
+### Layer table — a module may import only from strictly LOWER layers
+
+```
+L0  naming.py                      stdlib only
+L1  constants.py                   L0
+L2  tes4/{lexer,parser,nodes}      stdlib only
+    tes5/blocks.py                 stdlib only
+    cross_ref.py                   L0, L1
+L3  symbols.py, facts.py           L0-L2
+    context.py                     L0, L1          (dataclasses only)
+L4  resolve.py, emit/api.py        L0-L3
+L5  emit/*, commands/*             L0-L4  (commands reach L4 via api ONLY)
+L6  assemble/*, udf.py             L0-L5
+L7  converter.py                   L0-L6
+L8  pipeline.py                    L0-L7
+```
+
+🛑 **This includes function-local imports.** A deferred
+`from script_convert.emit import expr` inside a method is still an import, and
+that pattern is exactly how the current layering violation survives (local-imports counts
+them; there are 60 today). If you need a lower layer to reach a higher one, the
+design is wrong — pass a value in, do not import upward.
+
+### File responsibilities
+
+| File | Owns |
+|---|---|
+| `naming.py` | Pure name/type functions: `papyrus_script_name`, `_safe_property_name`, record-type maps. No package imports. |
+| `constants.py` | **Data only.** `COMMAND_ROWS` and the TES4/Papyrus vocabulary tables. |
+| `tes4/lexer.py` | TES4 source → tokens. Column fidelity is load-bearing (see §2). |
+| `tes4/parser.py` | Tokens → AST. **Never raises**; degrades to `Raw`. |
+| `tes4/nodes.py` | The AST dataclasses — the contract every emitter reads. |
+| `tes5/blocks.py` | The single Papyrus-surface classifier (`classify`/`Kind`/`scan`). |
+| `cross_ref.py` | The FormID/EditorID/script graph over exported records. |
+| `symbols.py` | Node-based type inference. **Pure; the model to copy.** |
+| `facts.py` | `ScriptFacts` derived from the **tree** — never from raw source. |
+| `context.py` | `ScriptContext` (per-script state, explicit) + `PluginFacts` (per-run). |
+| `resolve.py` | `Resolver`: name → meaning. Owns `xref` and the property registry. |
+| `udf.py` | OBSE user-function signatures, built from trees during the run. |
+| `emit/api.py` | `EmitCtx` — the **only** surface `emit/` and `commands/` may touch. |
+| `emit/value.py` | `Value`: text + Papyrus type + is_comparison + notes. |
+| `emit/expr.py` | Expression node → `Value`. TES4→TES5 semantics only. |
+| `emit/stmt.py` | Statement node → `Value`. |
+| `emit/script.py` | Body walk + layout: indentation, closers, comment re-attach. |
+| `emit/commands.py` | The row engine and the one command dispatcher. |
+| `commands/*.py` | ~35 handlers that cannot be rows, by domain. |
+| `assemble/*.py` | `script`, `fragment`, `events`, `properties` — the .psc file. |
+| `converter.py` | **The compatibility façade only** (§5). |
+| `pipeline.py` | Jobs, workers, batching, VMAD packing, writing files. |
+
+---
+
+## 2. What the tree already answers — do not re-derive it
+
+The parser owns these. Asking them again in text is the defect this whole
+architecture exists to remove.
+
+- **Nesting and balance.** An `If` node owns its body, its elseif chain and its
+  else. Emitted blocks are closed by construction; there is nothing to repair.
+- **Comment attachment.** A trailing `; ...` rides on `Stmt.comment`, so it can
+  never be emitted mid-expression and comment out the rest of the line.
+- **The author's parentheses.** `Expr.parenthesised` is recorded so output can
+  echo them. Recorded, never interpreted — the tree already encodes precedence.
+- **Receiver vs argument.** `Call.leading_comma` says the argument list opened
+  with a comma, which is the only thing distinguishing `StopCombat, Player`
+  (Player's combat) from an argument. Dropping it acted on the wrong actor.
+- **Argument adjacency.** `SetFactionRank X -1` (a negative argument) versus
+  `GetPos Y - 10000` (subtraction) is decided by **token column adjacency**.
+  This is why lexer column fidelity is load-bearing and why source text must not
+  be reflowed before parsing.
+
+### The typed emission contract
+
+An emitter returns a **`Value`**, never a bare `str`:
+
+```python
+@dataclass(frozen=True)
+class Value:
+    text: str                    # Papyrus source
+    ptype: str = ''              # Bool | Int | Float | ObjectReference | ...
+    is_comparison: bool = False  # a top-level ==/!=/</>/&&/||
+    notes: tuple[str, ...] = ()  # ;NE: / ;TODO: markers
+```
+
+This exists because a `Call` node's emission can **become** a comparison —
+`GetInCell X` is one node that emits `GetParentCell() == X` — and nothing on the
+node records that. Without `Value`, the emitter has to re-read its own output to
+find out what it just produced.
+
+`is_comparison` is derived from the row template **at import** (443 templates,
+once), never from output, so it cannot drift.
+
+🛑 **`notes` is the ONLY channel for `;NE:` / `;TODO:` markers.** Never a mutable
+list on the converter that a caller clears and reads back.
+
+---
+
+## 3. The decision procedure
+
+Run this before writing code. It terminates at exactly one file.
+
+```
+0. Is the change a repair to EMITTED PAPYRUS TEXT?
+     -> FORBIDDEN. Ask instead: what NODE produced that text? Fix it there.
+        Missing information -> add a Value field or a ScriptFacts field.
+        NEVER a pass over lines.
+
+1. A TES4 COMMAND?
+   1a. Fits ONE Papyrus template over the placeholders
+       {ref} {aN} {sN} {bN} {pN} {iN} {cN} {fN} {fmt} {?n}?
+         -> constants.COMMAND_ROWS.  Add a ROW.  WRITE NO CODE.
+   1b. Needs real logic (branches on argument VALUES, emits several lines,
+       consults PluginFacts, synthesises a helper)?
+         -> commands/<domain>.py, one @command handler, (ctx, call) -> Value.
+            Domains: quest dialogue actor faction world ui av anim obse misc.
+            If none fits it is misc.  NEVER an 11th module for one command.
+   1c. No Papyrus equivalent?  -> a row with note=.  Still 1a.
+
+2. A new STATEMENT kind the parser must recognise?
+     -> tes4/nodes.py + tes4/parser.py + emit/stmt.py.
+        EXACTLY three files.  A fourth means you got it wrong.
+
+3. An EXPRESSION rule (operators, comparisons, casts, null-tests)?
+     -> emit/expr.py.  A comparison rewrite is a row in _CMP_RULES,
+        never a new `if` in _binop.
+
+4. "What does this BARE NAME mean?" -- local vs form vs command vs global
+   vs actor value vs cross-script member?
+     -> resolve.py.  Nowhere else may ask.
+
+5. A RECORD or TYPE lookup?
+     -> cross_ref.py   a graph query over exported data
+        naming.py      a pure string/type mapping
+        resolve.py     needs the current script's context to decide
+        NEVER constants.py.
+
+6. A new PER-SCRIPT fact ("this script uses X, so emit Y")?
+     -> facts.py, derived from the PARSE TREE.
+        NEVER a regex over `source`.  If the tree cannot answer it, the parser
+        is missing a node -> go to 2.
+
+7. A new PER-RUN fact (something the pipeline scans once)?
+     -> pipeline builds it, context.PluginFacts carries it, emit reads
+        ctx.plugin.  NEVER a mutable class attribute.
+
+8. A CONSTANT -- a set of names, a map, a threshold, a template?
+     -> constants.py  TES4/Papyrus vocabulary
+        naming.py     a naming rule
+        A module-private tuning value used by exactly ONE function may sit
+        beside it.  Used twice = a constants.py entry.
+        NEVER rebuilt inside a function body.
+        EXCEPTION, and the layer table outranks this step: `tes4/*` is
+        stdlib-only, so a table it shares with a HIGHER layer goes in the
+        LOWEST module both legally reach -- never in constants.py.
+        `lexer.PRECEDENCE` is the worked case (bugs ledger 18).
+
+9. File layout, event headers, property declarations, the poll loop?
+     -> assemble/{script,fragment,events,properties}.py
+
+10. Jobs, workers, batching, VMAD, writing files?
+     -> pipeline.py
+
+11. Changes ScriptConverter's public shape, _property_refs type strings,
+    emitted property/fragment/script NAMES, or a derive_formid key?
+     -> STOP.  That is the compatibility boundary (§5).  Find another way.
+```
+
+### Self-check — where misplaced work belongs
+
+| Symptom | Wrong home | Right home |
+|---|---|---|
+| "`GetInCell` emits a comparison, so `== 1` collapses" | reading emitted text | `Value.is_comparison` |
+| "this script uses a timer" | regex over `source_low` | `facts.py` |
+| "two `Say` calls duplicate" | a post-pass over lines | `commands/dialogue.py` — don't emit the second |
+| "a Float went into an Int variable" | `_coerce_*` over lines | `Value.ptype` at the assignment |
+| "a ref compared to 0" | `_fix_ref_zero` over lines | `emit/expr.py` `_binop` |
+| "UDF arg types are wrong" | re-reading `.psc` files | `udf.py` |
+| "a condition got commented out" | a repair pass | impossible — the comment rides on the node |
+
+---
+
+## 4. Invariants
+
+Measured by `tools/script/arch_fitness.py`; the metric id is in brackets.
+
+1. **Imports point strictly downward**, at any nesting depth. [local-imports]
+2. **No function in `emit/`, `commands/`, `assemble/` or `converter.py` takes
+   emitted Papyrus.** No parameter named `line`/`lines`/`text`/`emitted`/`psc`;
+   no `_fix_*`, `_repair_*`, `_coerce_*`, `_postprocess*`. [text-repair-fns]
+3. **One parse.** Exactly one non-test call site of `parser.parse`; zero
+   references to `emit_source`, `_convert_expression`, `_tree_expression`,
+   `USE_TREE_EXPRESSIONS`. [reparse-round-trip]
+4. **`constants.py` is data**: no parameter named `xref`/`conv`/`ctx`, no
+   `open(`, at most a handful of pure `def`s. [logic-in-constants]
+5. **No module-level I/O at import.** [logic-in-constants]
+6. **No mutable class-level `dict`/`list`/`set`.** [mutable-class-state]
+7. **Zero private reach-in**: `conv._` / `ctx._` absent from `emit/`,
+   `commands/`, `assemble/`. [private-reach-ins]
+8. **One out-channel**: `_line_comments` appears nowhere; emitters return
+   `Value`. [text-repair-fns]
+9. **Per-script state is declared**: `ScriptContext` is a dataclass and there is
+   **no `_reset`** — a new script gets a new instance. [mutable-class-state]
+10. **No source re-scanning after parse** in `assemble/`, `emit/`, `commands/`,
+    `converter.py`. [source-rescans]
+11. **Command knowledge in one table**: `set(COMMAND_ROWS) & set(registry)` is
+    empty; their union defines "known command". [satellite-cmd-sets]
+12. **No satellite per-command flag sets** — flags are fields on the row. [satellite-cmd-sets]
+13. **No `.py` over 1,000 code lines.** [oversized-files]
+14. **The compatibility surface is frozen** (§5).
+15. **Comments compress, knowledge does not.** Prose that must survive moves
+    to a `docs/` file cited by `See:`. [`stray-comments`, `inline-comments`,
+    `dead-citations`, gated per file by `tools/validate/code_rules.py`]
+
+---
+
+## 5. The compatibility boundary — do NOT change
+
+Measured from every importer, tool and test that touches this package.
+
+- `ScriptConverter(xref)` with `convert_standalone(name, source, extends,
+  editor_id)` and `convert_fragment(source, extends) -> list[str]`, which
+  **must preserve `_property_refs` across calls**; `get_property_refs()`;
+  `get_cell_family_helpers()`; `set_scro_aliases()`; `set_music_cues()`.
+- **`._property_refs` is a LIVE attribute.** `tes5_import/dialog_converter.py`
+  reads the private directly (`:222`, `:1352`) and `pipeline._add_scro_ref`
+  both reads and writes it (`:1652`, `:1661`). Implement it as a property over
+  `Resolver.property_refs`.
+- Class attributes `say_durations`, `say_topics`, `topic_unlock_globals`,
+  `message_menus`, `chargen_menus`; module constant `SAY_START_WAIT`;
+  `sctx_onactivate_consumes`.
+- **The `_property_refs` type-string vocabulary, verbatim.** Consumers compare
+  literals (`== 'ActorBase'`, `.startswith('TES4_')`) to pick base-vs-reference
+  FormIDs.
+- Emitted shapes: `Type Property Name Auto` one per line (parsed back by
+  `tools/validate/vmad_property_typecheck.py`); **both** `Fragment_0` and
+  `Fragment_1` per INFO; `Fragment_Stage_NNNN_Item_M`; `TES4Polyfill.<Fn>`
+  matching the hand-written polyfill; `papyrus_script_name(edid)` as ScriptName
+  **and** filename **and** VMAD name.
+- `pipeline.py`'s surface used by `tes5_import/` and
+  `tools/script/convert_scripts_subset.py` (which also reaches six private
+  names).
+
+🛑 **FormID drift is a hard stop.** `derive_formid(site, key)` keys on authored
+data. Changing which properties a command registers can move ids, and moving one
+id breaks every existing save. Measure before shipping; if even one moves, stop
+and ask.
+
+---
+
+## 6. Verification
+
+**The semantic diff is the test of correctness. Not pytest.**
+
+```bash
+# every edit -- 0.6s, no build
+python tools/script/arch_fitness.py --fail-on-regression
+
+# at every stage boundary -- one build at a time
+python convert.py -f Oblivion.esm     --scripts-only
+python convert.py -f Nehrim.esm       --scripts-only     # standalone, OBSE-heavy
+python convert.py -f Knights.esp      --scripts-only
+python convert.py -f Morrowind_ob.esm --scripts-only     # masters, largest corpus
+
+python tools/script/psc_semantic_diff.py compare \
+    -f Oblivion.esm -f Nehrim.esm -f Morrowind_ob.esm -f Knights.esp --show 0
+python tools/validate/vmad_property_typecheck.py
+```
+
+`psc_semantic_diff` compares what each script **does** — properties, locals,
+events, calls-with-arity, literals, writes, `extends` — and ignores spacing,
+temp names, declaration order and parenthesisation. That is what makes it usable
+as the safety net for a rewrite: text is expected to change, behaviour is not.
+
+### Why `long-functions` is 60, not 80
+
+Measured across 7,320 first-party functions: **p50 = 12 lines, p75 = 25,
+p90 = 49, p95 = 75.** A 60-line cap fires on 534 (7.3%); 80 fires on 320
+(4.4%) and 40 on 978 (13.4%).
+
+The deciding argument is not the percentile but the OVERLAP with
+`god-functions`. Median complexity by length runs **10 at 40-59, 14.5 at
+60-79, 19.5 at 80-99 and 25 at 100-119** — so a complexity-25 rule does not
+fire until roughly 100 lines. At an 80-line cap the two rules nearly coincide
+and the length rule adds little; at 60 it catches the shape complexity cannot
+see, a **long straight-line function** (70 lines of sequential assignment at
+complexity 3 — what `measure` was before it was split into phases).
+
+### Why `oversized-files` does not judge `tests/`
+
+Measured across 465 first-party files: **median = 150 code lines**, and only
+26 (5.6%) exceed 1000 — so the cap is not fighting the tree. Six of those 26
+are test files, and they are the extreme tail: `test_import.py` is 4,433 lines
+over **459 functions — 9.7 lines per test**.
+
+The cap exists because ~1000 lines is 25-50 functions at the 20-45 line/function
+density of the source violators, which is where a module stops having one
+describable responsibility. A test file has no such responsibility to split
+along: its length is a COUNT of independent cases, each read by grepping one
+test name, never reasoned about whole. Applying a cognitive-load rule to a flat
+list of 10-line functions charges a cost that is not being paid.
+
+Excluding `tests/` drops the violator count 26 → 20 and leaves the pressure on
+the files where splitting genuinely helps. The threshold stays 1000 for source:
+raising it to 1500 would absolve `record_types/actors.py` (1,101) and
+`pipeline.py` (1,104), which are exactly the marginal cases the rule is for.
+
+Every other rule still judges `tests/` — only `oversized-files` is lifted.
+
+### Splitting a legacy file: sparingly
+
+`oversized-files` is charged only when a file GROWS or CROSSES 1000 (the site
+detail keys `_worsened` by name, so a shrink or a same-size edit is absolved).
+That is deliberate: a file already far over is meant to be chipped at, not
+rewritten to clear the gate.
+
+**Do not split an oversized legacy file as a side effect of an unrelated fix.**
+A wholesale reorganization buries the one-line behavioral change inside a
+thousand lines of movement, so the diff can no longer be reviewed and a
+regression cannot be bisected to it. Land the fix; leave the file long.
+
+Split when the split IS the task, or when the responsibility you are adding
+genuinely belongs in its own module. Otherwise the correct response to a
+1,000-line file you had to touch is to leave it no longer than you found it.
+
+### Length is counted in statements
+
+`long-functions` scores **statements, not physical lines**. A line count is
+gameable by reflow: joining two lines with a `\`, or folding a temp into the
+`return`, drops the number without removing any work — and the rule then
+rewards the less readable edit. One transcript shows a single condition
+rewritten five times (continuation backslash, re-escape, `(motion or {})`,
+revert, folded return) purely to move a line count.
+
+Statements are immune: `ast.walk` counts `ast.stmt` nodes, so every reflow of
+the same code yields the same number and the only way down is to delete work.
+
+**Threshold 35.** Measured over 7,791 first-party functions — p50=7, p75=15,
+p90=30, p95=45. `>35 statements` fires on 599 (7.7%), matching the 562 (7.7%)
+the old 60-physical-line cap fired on, so the pressure is unchanged while the
+metric stops being gameable. 60 statements would have dropped it to 225 (2.9%).
+
+This also stops charging data tables as complex code: `_init_dispatch` in
+`tes5_import/constants.py` is 185 physical lines but **12 statements**.
+
+`oversized-files` still counts `code_lines()`: line and statement counts
+already agree there (20 files vs 22), so it needs no re-baseline.
+
+### What the gate must see
+
+`.claude/hooks/doc_rules_gate.py` blocks a write that would leave a violation on
+the code it owns. Every hole below was reached by running the hook against a
+probe, not by reading it, and each one let a real violation onto disk:
+
+| Hole | Why it passed |
+|---|---|
+| A Write creating a NEW `.py` | `judged()` required `os.path.isfile()`, false before the file exists |
+| `foo.PY` on Windows | `endswith('.py')` is case-sensitive; NTFS is not, so the write lands on `foo.py` |
+| Syntactically invalid Python | `_parse()` returned an empty module on `SyntaxError`, so the file scored zero violations |
+| A report containing `ModuleNotFoundError` | a *substring* test on stderr turned exit 2 into a pass |
+| Non-cp1252 bytes in git output | bare `text=True` decoded with the locale codec; the crash fell into an `except` that returned 0 |
+| `MultiEdit` / `NotebookEdit` | absent from the matcher, or unhandled by `pending_text()` |
+
+Two rules follow from these. **A gate that cannot run must fail closed** — every
+`except` that returned 0 was a silent pass, which is indistinguishable from a
+clean file. And **the gate must never be the write mechanism**: `gate_pending()`
+used to write the candidate over the real file and restore it in `finally`, so
+being killed mid-write (the harness caps the hook at 120s) left unvalidated,
+possibly truncated code on disk. It scores a temp copy instead.
+
+Bash cannot be gated before it runs, because a shell command's effect is not
+predictable. `tools/validate/safe_run.py` is the one allowed entry point: it
+hashes tracked `.py` files, runs the command with the streams inherited,
+re-hashes, and gates whatever changed.
+
+**The routing rule lives in the HOOK, not in `permissions`.** Rules evaluate
+deny, then ask, then allow, and the first match wins — specificity never
+reorders them. So a `deny` cannot carry an allowlist exception: `deny: ["Bash"]`
+with `allow: ["Bash(python tools/validate/safe_run.py:*)"]` blocks the wrapper
+too, and so does `Bash(*)` or even `Bash(python *)`. A hook returning
+`permissionDecision: "allow"` does not lift a deny either. What does work is a
+hook **exit 2**, which is evaluated BEFORE the permission rules — so the hook
+blocks any command that does not name the wrapper, and no deny rule is needed.

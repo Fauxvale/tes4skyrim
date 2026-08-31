@@ -111,25 +111,7 @@ _RACE_HEAD_TXST: dict[str, dict[str, int]] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Skin tone tint layers
-# ---------------------------------------------------------------------------
-# Skyrim colors an NPC's body skin from the tint layer whose race mask type
-# is "Skin Tone" (RACE TINP=6).  An NPC without one renders pale white no
-# matter its race, so every converted NPC gets one.
-#
-# The COLOR comes from Oblivion's own authored data, not from a census of
-# Skyrim: a TES4 RACE record names its skin textures (body/face part ICON
-# paths) and carries its own FGTS vector.  A race either ships its own
-# textures with FGTS all-zero, or shares another race's textures and recolors
-# them with a non-zero FGTS -- which is exactly how High Elf reads gold,
-# Redguard brown and Nord pale while all three point at
-# Characters\Imperial\HeadHuman.dds.  See asset_convert/facegen_egt.py for the
-# reconstruction and docs/npc_skin_tone_conversion.md for the measurements.
-#
-# Per-NPC FGTS is deliberately NOT used: measured across all 2482 Oblivion
-# NPCs it shifts the color by a standard deviation of ~1 unit in 255, so
-# within a race Oblivion NPCs are effectively a single skin tone.
+# See: docs/commentary/asset_convert_facegen.md#skin-tone-tint-layers
 
 _SKIN_RACE_ALIAS = {
     # Must follow RACE_MAP's target Skyrim race -- tint indices are per-race.

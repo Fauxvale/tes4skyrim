@@ -15,7 +15,7 @@ RVAs of the build actually running.
 `string` is how a Papyrus native is located without guessing: the registration
 site does `lea r8, "<Name>"; lea rdx, "<Class>"` back to back, and the
 NativeFunction constructor stores the callback right after (see the SCEN
-finding in docs/dialogue_engine_contracts.md).  `calls` and `vslot` report the
+finding in docs/reference/dialogue_engine_contracts.md).  `calls` and `vslot` report the
 enclosing function start (previous `cc cc` padding) so a hit can be handed
 straight to `skyrim_disasm.py --live --disasm <start>`.
 """

@@ -12,8 +12,8 @@ Two layers:
   * converter unit tests -- fast, no build artifact, always run;
   * built-ESM invariants -- skipped when output/<plugin> has not been built.
 
-Background: docs/ck_vs_game_missing_objects.md and
-docs/ck_reference_init_hang.md.
+Background: docs/commentary/ck_vs_game_missing_objects.md and
+docs/commentary/ck_reference_init_hang.md.
 """
 
 import struct

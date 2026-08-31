@@ -35,12 +35,9 @@ import re
 import shutil
 import struct
 import zlib
-from collections import defaultdict
 from pathlib import Path
 
-from .terrain_lod import (shipped_lod_worldspaces, _master_names,
-                          _find_worldspace_fid, _scan_cell_coords)
-from .lod_gen import _kept_tile_cells_by_level
+from .terrain_lod import (shipped_lod_worldspaces, _master_names)
 
 
 # Shared-folder resolution -- see output_layout. An imported mod's plugins keep

@@ -55,6 +55,7 @@ from .skyrim_overrides import (
     set_voice_type,
 )
 from .navi_builder import NAVI_SINGLETON_FID, build_navi_record
+from . import navm_verify
 from .lava_placement import LavaPlanner
 from .locations import build_marker_locations
 from .record_types.world import (
@@ -2074,7 +2075,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # boundary, so any AI package with an out-of-cell destination starts (the
     # actor stands up) and never moves. Must run after every mesh exists (it
     # needs neighbour NAVM FormIDs + final triangle indices) and before the group
-    # builders serialise them. See docs/world_land_navmesh_notes.md.
+    # builders serialise them. See docs/commentary/tes5_import_navmesh.md.
     # Debug hook: TESCONV_DUMP_NAVM_CACHE=<path> pickles the precomputed cache
     # so the edge-link / split post-passes can be profiled in isolation without
     # paying for a full import each iteration (temp/edge_link_profile.py).
@@ -2193,7 +2194,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # adds land to a MASTER's worldspace never converts a WRLD of its own, so
     # the override rebuilders and the anchor paths are the only consumers that
     # ever see them.  _build_world_groups re-registers for the own-hierarchy
-    # case.  See docs/world_land_navmesh_notes.md.
+    # case.  See docs/commentary/tes5_import_navmesh.md.
     ext_by_wrld = defaultdict(list)
     for cell in by_type.get('CELL', []):
         wrld_fid = get_formid(cell, 'ParentWRLD')
@@ -3105,6 +3106,8 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
 
     n_workers = _navm_worker_count(len(jobs))
     geom_cache = _navmesh_geom_cache(collision_cache)
+    if geom_cache:
+        navm_verify.mark_jobs(jobs, navm_verify.verify_budget())
     # Door panel-centroid cache sits beside the collision cache in export_dir.
     door_centers_cache = (os.path.join(os.path.dirname(collision_cache),
                                        'door_centers_cache.json')
@@ -3174,23 +3177,8 @@ def _precompute_navmeshes(by_type: dict, writer: PluginWriter,
           f"{time.time() - t0:.2f}s ({n_workers} workers, "
           f"{hits} geometry-cache hits)")
 
-    # Report per-cell failures HERE, in the parent. The workers cannot: they run
-    # under pythonw.exe, where stdout goes nowhere, so a cell that failed used to
-    # vanish silently and leave the plugin a navmesh short with nothing in the
-    # log to explain it.
-    failures = [(key, m) for key, (b, m) in cache.items()
-                if b is None and m and m.get('error')]
-    if failures:
-        print(f"    WARNING: {len(failures)} cells produced no navmesh:")
-        for (cell_fid, pgrd_fid), m in failures[:20]:
-            print(f"      cell {cell_fid:08X} pgrd {pgrd_fid:08X}: "
-                  f"{m['error']}")
-        if len(failures) > 20:
-            print(f"      ... and {len(failures) - 20} more")
-    else:
-        # Certify the cache ONLY after a clean, complete pass.  A run with
-        # failed cells left entries missing, so stamping it would advertise a
-        # partial cache as a full one to anyone who downloads it.
+    navm_verify.report_verification(cache, geom_cache)
+    if not navm_verify.report_failures(cache):
         _stamp_navmesh_cache_tag(geom_cache)
     return cache
 
@@ -3652,7 +3640,7 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
     # Forcing the flag made the objects vanish in game while the CK kept
     # showing them: ICMarketBlock03House01 (forced persistent) was invisible
     # where its neighbour ICMarketBlock03House02 (untouched) rendered, same
-    # cell, same mesh family.  See docs/ck_vs_game_missing_objects.md.
+    # cell, same mesh family.  See docs/commentary/ck_vs_game_missing_objects.md.
 
     # Re-home misplaced exterior refs.  Oblivion.esm ships a handful of
     # refs attached to a grid cell that does not match their coordinates (the

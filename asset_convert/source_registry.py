@@ -22,7 +22,7 @@ folder. Listing directories here, per plugin, is what fixes that.
 Path` remains the fallback, so an absent or empty registry reproduces the
 original behaviour byte for byte.
 
-Entry shape (see `docs/mod_archive_ingest_plan.md`):
+Entry shape (see `docs/commentary/asset_convert_mod_ingest.md`):
 
     {
       "version": 1,

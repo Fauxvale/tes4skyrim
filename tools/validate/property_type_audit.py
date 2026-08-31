@@ -10,7 +10,7 @@ in-game as a dead script.
 
 This is how the Imperial City Arena softlock was found: the announcer speaks
 through four XMarker STATs, all of which the `Say` handler had promoted to
-`Actor` -- see docs/papyrus_conversion_notes.md.
+`Actor` -- see docs/commentary/script_convert.md.
 
     # audit a converted plugin
     python tools/validate/property_type_audit.py -f Oblivion.esm

@@ -27,7 +27,7 @@ the point: a UI mod that replaces two named movies conflicts with exactly the
 mods that replace those same movies -- and `--no-cursor` narrows it to one.
 
 The HUD stat bars were built here too and REVERTED: they rendered broken in
-game. See docs/ui_conversion.md for what was measured before that was undone.
+game. See docs/commentary/asset_convert_ui.md for what was measured before that was undone.
 """
 
 import argparse

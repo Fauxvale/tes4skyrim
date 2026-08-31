@@ -1,7 +1,7 @@
 """Regenerate the GUI banner: TESRACT in the Oblivion font, Dwemer brass.
 
 Usage:
-    python tools/generators/make_banner.py [--svg docs/banner.svg] [--png docs/banner.png]
+    python tools/generators/make_banner.py [--svg docs/assets/banner.svg] [--png docs/assets/banner.png]
 
 The title is traced from `references/oblivion-font.ttf` into real SVG outlines
 rather than a `font-family` reference, so the banner renders identically on a
@@ -19,7 +19,7 @@ from fontTools.pens.svgPathPen import SVGPathPen
 from fontTools.ttLib import TTFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-import tools.generators.dwemer_palette  # noqa: E402  (needs the path above)
+from tools.generators import dwemer_palette  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 FONT = ROOT / "references" / "oblivion-font.ttf"

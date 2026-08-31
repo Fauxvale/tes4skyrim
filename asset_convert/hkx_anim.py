@@ -465,6 +465,49 @@ def _resample_track(times, new_times, arr, is_quat: bool):
     return out.astype(np.asarray(arr).dtype)
 
 
+#: Speed-bake resample floor. See: docs/commentary/asset_convert_creature.md#8-ground-speed-baked-not
+MIN_BAKED_FRAMES = 15
+
+
+def speed_bake_targets(clips: dict, attr_speed: int) -> dict:
+    """{clip stem: (target speed u/s, legacy cap)} for the two gait clips.
+
+    Oblivion drove ground speed from the CREA Speed attribute via the GMST
+    formula, ignoring root motion, so the target is that formula's speed.
+    """
+    from asset_convert.hkx_behavior import _clip_state_name
+    if not attr_speed:
+        return {}
+    f_walk = 5.0 + (300.0 - 5.0) * attr_speed / 100.0
+    out = {}
+    for kf_path, formula, cap in (
+            (clips['locomotion'].get('MoveForward'), f_walk, 1.4),
+            (clips.get('run'), f_walk * 3.0, 2.0)):
+        if kf_path:
+            out[_clip_state_name(kf_path)] = (formula, cap)
+    return out
+
+
+def speed_bake_factor(rule, clip, motion, fps: float = 30.0) -> float:
+    """Timescale factor baking `rule`'s target speed into one gait clip.
+
+    Returns >= 1.0, bounded so the resampled clip keeps at least
+    MIN_BAKED_FRAMES frames or the legacy cap, whichever is LARGER — the
+    frame floor may only ever raise a factor, never lower one.
+    See: docs/commentary/asset_convert_creature.md#8-ground-speed-baked-not
+    """
+    if not rule or motion is None or motion.get('translations') is None:
+        return 1.0
+    formula, cap = rule
+    end = motion['translations'][-1]
+    dur = float(clip.duration) or 1.0
+    natural = float(end[0] ** 2 + end[1] ** 2) ** 0.5 / dur
+    if natural <= 1.0:
+        return 1.0
+    cap = max(dur * fps / (MIN_BAKED_FRAMES - 1), cap)
+    return min(max(formula / natural, 1.0), cap)
+
+
 def timescale_clip(clip, motion, factor: float, fps: float = 30.0):
     """Play `clip` `factor`x faster, IN PLACE, resampled onto the fps grid.
 

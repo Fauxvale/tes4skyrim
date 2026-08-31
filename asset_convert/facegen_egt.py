@@ -36,12 +36,7 @@ The reconstruction is  base + SCALE * sum(FGTS[i] * mode_i)  per channel.
 import os
 import struct
 
-# Coefficient scale.  The EGT planes are quantized signed bytes; FGTS
-# coefficients are in FaceGen's normalized units.  Calibrated against the
-# built-in control: Redguard shares HeadHuman.dds and recolors it via race
-# FGTS, and Oblivion ALSO ships a standalone Characters\Redguard body
-# texture at (89,54,35).  The scale that makes the reconstruction agree with
-# that independent texture is ~0.25; see docs/npc_skin_tone_conversion.md.
+# See: docs/commentary/asset_convert_facegen.md#fgts-coefficient-scale
 FGTS_SCALE = 0.25
 
 _EGT_MAGIC = b'FREGT003'

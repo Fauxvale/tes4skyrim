@@ -31,6 +31,9 @@ SENTINEL = -3.0e38          # NIF "no static value" marker (-FLT_MAX)
 SPLINE_DEGREE = 3
 DEFAULT_FPS = 30.0
 
+#: Identity quaternion in this module's (w, x, y, z) component order.
+IDENTITY_QUAT = (1.0, 0.0, 0.0, 0.0)
+
 # NiControllerSequence cycle types
 CYCLE_LOOP = 0
 CYCLE_REVERSE = 1
@@ -549,7 +552,7 @@ def split_root_motion(clip: DecodedClip,
         conj = np.array([q0[0], -q0[1], -q0[2], -q0[3]])
         motion['rotations'] = np.array(
             [_quat_mul(conj, q) for q in best.rotations])
-        best.rotations = np.tile(best.rotations[0], (len(clip.times), 1))
+    best.rotations = np.tile(IDENTITY_QUAT, (len(clip.times), 1))
     return motion
 
 
