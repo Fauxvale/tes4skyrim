@@ -2527,14 +2527,25 @@ Post-rebuild census: of 143 MOVT records, exactly **4** still carry the 74.54
 fallback — `raven` and `kwamaqueen`, the two built creatures that ship no
 forward clip of any spelling. That is the fallback doing its job, not a gap.
 
-**Known separate limitation (pre-existing, not from §9):** the speed bake is
-capped at ×1.4 walk / ×2.0 run, so a creature whose authored `DATA.Speed`
-demands more than its clip's natural speed × 1.4 never reaches its Oblivion
-speed. Measured: nix hound target 87.60, natural 68.36, factor 1.281 — reached
-exactly. Ash vampire target 46.30, natural 15.64 — **capped at 21.90**; ash
-ghoul target 176.10, natural 98.89 — **capped at 138.45**. Raising the cap
-means resampling more aggressively (`timescale_clip`), which is what the cap
-exists to bound; not changed here.
+**The ×1.4/×2.0 cap is GONE (2026-08-30), replaced by a frame floor.** The
+flat factor cap bounded the wrong variable: resampling damage depends on the
+OUTPUT frame count, not the ratio, so a long clip with samples to spare was
+clipped just as hard as a short one. It also had no measured origin — the
+1.4/2.0 were literals carried over from the deleted rate-scaled blend ladder
+(`walk@1.4`, `run@0.75/1.5/2.0`) when `a4fdb47` replaced it with the bake.
+
+`_bake_factor` now caps at `max(dur*fps/(MIN_BAKED_FRAMES-1), cap)` —
+`MIN_BAKED_FRAMES = 15`, the MINIMUM frame count of 30 vanilla creature
+locomotion clips read out of `Skyrim - Animations.bsa` (horse `runforward`
+15 frames / 0.467 s; median 31; max 121 mammoth walk). Keeping the old cap as
+the floor of the ceiling means the change can only ever RAISE a factor — a
+first attempt that dropped it regressed 11 short run clips (imp 2.0→1.429,
+fabricanthulking 2.0→1.086) before being corrected.
+
+Effect: **105 clips across 84 creature folders speed up, 0 regress**
+(Morrowind_ob 44, Nehrim 41, Oblivion 17, ElsweyrAnequina 3; 83 walk / 22
+run). Ash vampire walk now reaches its full 46.30 formula (factor 2.96,
+65→23 frames); mountain lion walk 1.4→6.57; wraith run 2.0→8.57.
 
 ## DEAD END: re-rooting the ragdoll at anim bone 1
 <a id="ragdoll-root-bone1-dead-end"></a>

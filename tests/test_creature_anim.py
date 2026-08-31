@@ -1519,3 +1519,91 @@ class TestRagdollBijection:
             R._is_marker_body = real
         after = R.extract_ragdoll(DOG_SKEL, bones)
         assert len(before) == len(after)
+
+
+ASHVAMP_DIR = os.path.join(REPO, 'export', 'Morrowind_ob.esm', 'meshes',
+                           'morroblivion', 'creatures', 'sixthhouse',
+                           'ashvampire')
+
+
+@needs_assets
+class TestAccumBindPoseLeak:
+    """The accum bone must flatten to IDENTITY, never to its frame-0 pose.
+
+    See: docs/commentary/asset_convert_animation.md#accum-bind-pose-leak
+    """
+
+    @pytest.mark.parametrize('kf,yaw', [('turnleft.kf', 54.18),
+                                        ('stagger.kf', 67.11),
+                                        ('idle.kf', 54.18)])
+    def test_accum_rotation_flattens_to_identity(self, kf, yaw):
+        """The accum track ends identity, though the source carries `yaw`."""
+        from asset_convert.kf_decode import split_root_motion
+        path = os.path.join(ASHVAMP_DIR, kf)
+        if not os.path.exists(path):
+            pytest.skip('ash vampire not exported')
+        clip = decode_kf(path)[0]
+        pre = {t.bone: np.array(t.rotations[0], copy=True)
+               for t in clip.tracks if t.rotations is not None}
+        motion = split_root_motion(clip)
+        assert motion is not None
+        w, x, y, z = pre[motion['bone']]
+        got = np.degrees(np.arctan2(2 * (w * z + x * y),
+                                    1 - 2 * (y * y + z * z)))
+        assert abs(got) == pytest.approx(yaw, abs=0.1)
+        for t in clip.tracks:
+            if t.bone == motion['bone']:
+                assert t.rotations == pytest.approx(
+                    np.tile((1.0, 0.0, 0.0, 0.0), (len(clip.times), 1)))
+
+    def test_accum_translation_is_preserved(self):
+        """Flattening the rotation must not disturb the accum height."""
+        from asset_convert.kf_decode import split_root_motion
+        path = os.path.join(ASHVAMP_DIR, 'turnleft.kf')
+        if not os.path.exists(path):
+            pytest.skip('ash vampire not exported')
+        clip = decode_kf(path)[0]
+        pre = {t.bone: np.array(t.translations[0], copy=True)
+               for t in clip.tracks if t.translations is not None}
+        motion = split_root_motion(clip)
+        for t in clip.tracks:
+            if t.bone == motion['bone'] and t.translations is not None:
+                assert t.translations[0] == pytest.approx(pre[t.bone])
+
+
+@needs_assets
+class TestSpeedBakeFrameFloor:
+    """The bake ceiling is a frame floor, and may only ever RAISE the factor.
+
+    See: docs/commentary/asset_convert_creature.md#8-ground-speed-baked-not
+    """
+
+    def test_ash_vampire_walk_reaches_its_formula_speed(self):
+        """Baked walk speed matches the GMST formula; the old cap clipped
+        it to 21.9 u/s of 46.3."""
+        from asset_convert.hkx_anim import (MIN_BAKED_FRAMES, decode_clip,
+                                            speed_bake_factor)
+        path = os.path.join(ASHVAMP_DIR, 'walkforward.kf')
+        if not os.path.exists(path):
+            pytest.skip('ash vampire not exported')
+        clip, motion = decode_clip(path, 30.0)
+        end = motion['translations'][-1]
+        dur = float(clip.duration)
+        natural = float(end[0] ** 2 + end[1] ** 2) ** 0.5 / dur
+        formula = 5.0 + (300.0 - 5.0) * 14 / 100.0
+        factor = speed_bake_factor((formula, 1.4), clip, motion, 30.0)
+        assert factor > 1.4
+        assert natural * factor == pytest.approx(formula, rel=0.01)
+        assert int(round(dur / factor * 30)) + 1 >= MIN_BAKED_FRAMES
+
+    def test_floor_never_lowers_the_old_cap(self):
+        """A clip too short to keep the floor must still get the old cap."""
+        from asset_convert.hkx_anim import speed_bake_factor
+
+        class _Clip:
+            duration = 0.4
+
+        motion = {'translations': [(0.0, 0.0, 0.0), (0.0, 400.0, 0.0)]}
+        for cap in (1.4, 2.0):
+            got = speed_bake_factor((10000.0, cap), _Clip(), motion, 30.0)
+            assert got == pytest.approx(cap)

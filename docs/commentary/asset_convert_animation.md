@@ -640,3 +640,79 @@ Every one was invisible to structural inspection **and to NifSkope, which render
 - **`hkbCharacterData`'s field list is not what the name suggests** — copy `clutter\beehive\characters\Character00.hkx`: `characterControllerInfo, modelUpMS, modelForwardMS, modelRightMS, characterPropertyInfos, numBonesPerLod, characterPropertyValues (this is where the hkbVariableValueSet hangs), footIkDriverInfo (null POINTER, not an array), handIkDriverInfo (null), stringData, mirroredSkeletonInfo, scale`. There is **no `variableInitialValues` and no `aiControlDriverInfo`**. Getting it wrong made hkxcmd silently drop the `hkbVariableValueSet` — detectable by diffing the packfile's `__classnames__` string table against vanilla's, which is a fast sanity check for any generated hkx.
 - Vanilla lays these files out in the mesh's OWN folder (`clutter\beehive\{behaviors,characters,characterassets}\`), not a `<stem>_behavior\` subfolder; ours nests them so two animated NIFs in one directory cannot collide on `Character01.hkx`. Both work — the paths inside the character file resolve relative to the project file's folder. Our project hkx is byte-identical to vanilla's (880 bytes).
 - Final step is `convert_hkx_to_amd64` on every file: SSE loads only 64-bit packfiles (verified pointer-size byte 8 on all 161×4 outputs).
+
+## Accum-bone bind pose leaks into every clip (user patches, 2026-08-30)
+<a id="accum-bind-pose-leak"></a>
+
+**Code:** `asset_convert/kf_decode.py` `split_root_motion`,
+`asset_convert/hkx_behavior.py` `generate_creature_project`.
+
+Four user patches (`AshVampireFixedAnimations`, `AshCreaturesFixedAnims`,
+`WingedTwilightFixedAnims`, `FixedAshCreatureOrientation`) covering
+ascendedsleeper, ashghoul, ashslave, ashvampire, ashzombie and wingedtwilight.
+102 hkx files; 89 of them differ from our output by 2 or 5 bytes only — a single
+40-bit compressed quaternion (`_read_40bit_quat`, 5 bytes) on **track 1
+(`Bip01 NonAccum`)**, replaced with the identity `01 18 80 01 38`.
+
+### Bug 1 — `split_root_motion` flattens to sample 0, not to identity
+
+`split_root_motion` extracts locomotion, then rewrites the accum track as
+`np.tile(best.rotations[0], ...)` / `np.tile(best.translations[0], ...)`.
+Sample 0 is not identity in Morroblivion KFs: the authored `Bip01 NonAccum`
+frame-0 transform carries the creature's whole bind orientation. That constant
+is baked into the clip as a static rotation and the actor faces the wrong way
+in every state.
+
+Measured frame-0 accum yaw, ashvampire source KFs:
+
+| clip | our static yaw | patched |
+|---|---|---|
+| idle / turnleft / attack / equip / awarevocal / ragdollpose | 54.18° | 0° |
+| stagger | 67.11° | 0° |
+| death | 54.18° | 0° |
+| wingedtwilight cast | 89.99° | 0° |
+| ashslave / ashzombie | 32.67° | 0° |
+
+Only the ROTATION is wrong. The patches keep every accum translation
+(85.17 / 56.547 all preserved) — the creature's height must survive — so the
+fix flattens rotation to identity and leaves translation alone.
+
+Separately, ashvampire `idle.kf` (alone in the corpus) authors a STATIC
+Z 85.17 on `Bip01` itself. Span 0.000, so `split_root_motion` never touches
+it and the height double-counts against NonAccum's own 85.155. The patch
+zeroes it. NOT fixed here — one clip in one creature, no general rule
+established.
+
+Not Oblivion-specific by skeleton — 34/44 Oblivion, 47/64 Morroblivion and
+52/71 Nehrim creature skeletons have a non-identity root node. The
+discriminator is that Morroblivion KFs author a non-identity frame 0 on the
+accum bone itself.
+
+### Bug 2 — the walk speed-bake cap truncates the clip
+
+`generate_creature_project` bakes commanded speed into the walk/run clip with
+`min(max(formula / natural, 1.0), cap)`, cap 1.4 walk / 2.0 run. Ash vampire
+CREA `Speed=14` → formula 46.3 u/s; the clip's natural root-motion speed is
+15.64 u/s, so the required factor is 2.96 and the cap clamps it to 1.4. Our
+`walkforward.hkx` is 47 frames / 1.533 s; the patch is 24 frames / 0.767 s
+(factor 2.71). The cap is the whole defect — the creature walks in place.
+
+### Bug 3 — model axis vectors: NOT A BUG, patch rejected
+
+`FixedAshCreatureOrientation`'s character.hkx swaps `modelForwardMS`
+(offset 576) to (1,0,0,0) and `modelRightMS` (592) to (0,-1,0,0).
+
+**Vanilla uses BOTH conventions**, so neither is universally right — census of
+9 vanilla creature `character.hkx` pulled from `Skyrim - *.bsa`:
+
+| forward / right | count | creatures |
+|---|---|---|
+| (1,0,0,0) / (0,-1,0,0) | 6 | frostbitespider, giant, hagraven, icewraith, mudcrab, wisp |
+| (0,1,0,0) / (1,0,0,0) | 3 | bear, mammoth, skeever |
+
+The value describes THAT skeleton's authored facing, not a constant. Our
+hardcoded (0,1,0,0)/(1,0,0,0) matches vanilla bear/mammoth/skeever exactly.
+Deriving it per-skeleton is the real fix and is NOT built — the vanilla clips
+are in-place (root delta 0,0,0 on all 5 checked), so root motion cannot
+supply the facing and no derivation was established. Left unchanged rather
+than swapping one hardcoded guess for another.
