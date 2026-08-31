@@ -3965,6 +3965,10 @@ def gui_main():
         if prog is not None:
             _set_progress(*prog)
             return
+        _plan = _progressmod.parse_plan(line)
+        if _plan is not None:
+            _set_plan(*_plan)
+            return
         # A pipeline phase banner advances the whole-run bar by one slice.
         if _prog_state['active'] and _PHASE_BANNER_RE.match(line):
             _progress_new_phase()
@@ -4519,13 +4523,18 @@ def gui_main():
         'steps_total': 1, 'phases_started': 0,
         'phase_max': 0.0, 'determinate': False, 'overall': 0.0,
         'active': False,
+        # Per-phase sub-part accounting: plan[label] = declared total (seeded by
+        # @@PLAN, refined to the exact total when that sub-phase first reports),
+        # done[label] = furthest count seen for it.  The phase bar is
+        # sum(done)/sum(plan) -- one 0->100% sweep across all sub-phases.
+        'plan': {}, 'done': {},
     }
     _PHASE_BANNER_RE = re.compile(r'^\s*phase\s+\d+\s*:', re.IGNORECASE)
 
     def _progress_begin(steps_total: int):
         _prog_state.update(steps_total=max(1, steps_total), phases_started=0,
                            phase_max=0.0, determinate=False, overall=0.0,
-                           active=True)
+                           active=True, plan={}, done={})
         phase_prog_var.set("Current Phase")
         overall_prog_var.set("Overall  0%")
         _phase_prog_lbl.grid()
@@ -4558,6 +4567,8 @@ def gui_main():
         _prog_state['phases_started'] += 1
         _prog_state['phase_max'] = 0.0
         _prog_state['determinate'] = False
+        _prog_state['plan'] = {}
+        _prog_state['done'] = {}
         # Counts for the new phase are unknown until its first @@PROG line, so
         # spin the phase bar (count-less phases keep spinning the whole time).
         phase_bar.configure(mode="indeterminate")
@@ -4566,16 +4577,31 @@ def gui_main():
         except tk.TclError:
             pass
 
+    def _set_plan(phase: str, subs: dict):
+        """A @@PLAN line: seed this phase's sub-part totals (see progress.plan).
+
+        Only the FIRST plan of a phase is honoured; a second plugin running the
+        same phase under one banner emits its own plan, which must not reset the
+        accumulated sweep.  `done` was already cleared at the phase banner.
+        """
+        if not _prog_state['active'] or _prog_state['plan']:
+            return
+        _prog_state['plan'] = {k: int(v) for k, v in subs.items() if int(v) > 0}
+
     def _set_progress(label: str, done: int, total: int):
         """Apply one parsed `@@PROG` line to both bars.  UI thread only.
 
-        The per-phase bar is `files-done / files-to-process` for the CURRENT
-        phase, clamped monotonic so it never slips backward: a phase that
-        reports in several batches (multiple plugins, or Import's
-        Records/Landscape/Navmesh under one banner) keeps rising instead of
-        dropping to 0 when the next batch's count restarts.  It resets to 0 only
-        at the next phase banner.  `label` is not shown -- the caption is the
-        literal words "Current phase".
+        CONTRACT: within a single pipeline phase both bars only ever move
+        FORWARD, in ONE 0->100% sweep.  A phase built from several sub-phases
+        (Import = Records + Navmesh + Landscape; Sounds = Voices + Sounds +
+        Music) is combined into that single sweep via the phase's `@@PLAN` line
+        (see `_set_plan`): every sub-part is in the denominator from the start,
+        each contributes `done/total`, the exact total replaces the plan
+        estimate when the sub-part first reports, and the result is `max`-clamped
+        so neither refinement nor a second plugin's count restart can move it
+        backward.  The ONLY reset is at a real phase BANNER, masked by the
+        throbber (see `_progress_new_phase`), never a determinate drop.  `label`
+        is not displayed -- the caption is the literal words "Current Phase".
         """
         if not _prog_state['active']:
             return
@@ -4587,7 +4613,25 @@ def gui_main():
             # First @@PROG of this phase: stop the spinner, switch to a real bar.
             st['determinate'] = True
             phase_bar.configure(mode="determinate")
-        frac = (done / total) if total else 0.0
+        # Combine every sub-phase of this phase into ONE 0->100% sweep.  Each
+        # label contributes done/total; the denominator is the sum of every
+        # sub-part's total (seeded by @@PLAN so later sub-phases already count,
+        # and the estimate is replaced by the exact total the moment that
+        # sub-phase reports).  A label not in the plan appends itself.
+        label = label or ''
+        # The @@PROG total is exact -- replace the @@PLAN estimate with it (a
+        # label absent from the plan appends itself).  Refining the denominator
+        # can only nudge `frac`; the phase_max clamp below keeps it monotonic.
+        st['plan'][label] = int(total)
+        st['done'][label] = max(st['done'].get(label, 0), int(done))
+        denom = sum(st['plan'].values())
+        if denom > 0:
+            num = sum(min(st['done'].get(k, 0), t) for k, t in st['plan'].items())
+            frac = num / denom
+        else:
+            frac = 0.0
+        # Running max => monotonic within the phase, whatever order the
+        # sub-phases report in or however the plan estimate is later refined.
         st['phase_max'] = max(st['phase_max'], frac)
         phase_bar['value'] = st['phase_max'] * 1000
         phase_prog_var.set(f"Current Phase  {int(st['phase_max'] * 100)}%")

@@ -585,6 +585,18 @@ def phase_export(file_name: str, tes4_data: str, export_dir: str,
     print(f"[{file_name}] Exporting...")
     t0 = time.time()
 
+    # Put the phase bar in a DETERMINATE 0% state before the slow header scan
+    # and worker-pool spin-up.  Without this the GUI shows an indeterminate
+    # throbber for that whole gap, and a ttk throbber's block cycles back to the
+    # left each pass -- which reads as the bar "jumping backwards".  The real
+    # per-record @@PROG lines from export_file refine it from here.
+    try:
+        import progress as _progress
+        if _progress:
+            _progress.report('Export', 0, 1, force=True)
+    except Exception:
+        pass
+
     # Header-only scan: format worker processes re-read record data from
     # their own mmap of the source file (see tes4_export.export).
     header, all_records = read_file(source, parse_subs=False)
@@ -679,6 +691,16 @@ def phase_assets(file_name: str, config: dict, output_dir: str = None,
     print(f"[{file_name}] Inferred collision winding steps: "
           f"{'ON' if winding_fix else 'OFF'} ({origin}); "
           f"authored-normal repair: always on")
+
+    # Determinate 0% before the (slow) NIF tree scan + worker spin-up, so the
+    # GUI does not show an oscillating throbber during that gap (see the same
+    # note in phase_export).  batch_convert's real @@PROG refines it.
+    try:
+        import progress as _progress
+        if _progress:
+            _progress.report('Meshes', 0, 1, force=True)
+    except Exception:
+        pass
 
     print(f"[{file_name}] Converting meshes (NIFs + textures)...")
     stats = convert_meshes(
@@ -878,6 +900,37 @@ def phase_sounds(file_name: str, config: dict, output_dir: str = None):
 
     extract_dir = str(SCRIPT_DIR / "export")
     out_dir     = output_dir or str(SCRIPT_DIR / "output")
+
+    # Declare the phase's three sub-parts (Voices -> Sounds -> Music) up front so
+    # the GUI sweeps ONE 0->100% bar across them instead of finishing on Voices.
+    # Counts are rough; the GUI replaces each with the exact total when that
+    # sub-phase reports, so only their non-zero-ness has to be right.
+    try:
+        import progress as _progress
+        if _progress:
+            from output_layout import asset_root
+            from asset_convert.music_convert import _music_sources
+            _root = str(asset_root(extract_dir, file_name))
+            _snd = os.path.join(_root, 'sound')
+
+            def _walk_count(d, skip_name=None):
+                c = 0
+                for r, ds, fs in os.walk(d):
+                    if skip_name and os.path.basename(r).lower() == skip_name:
+                        ds[:] = []
+                        continue
+                    c += len(fs)
+                return c
+
+            _music_dir = os.path.join(_root, 'music')
+            _progress.plan(
+                'Sounds',
+                Voices=_walk_count(os.path.join(_snd, 'Voice')),
+                Sounds=_walk_count(_snd, skip_name='voice'),
+                Music=(len(_music_sources(_music_dir))
+                       if os.path.isdir(_music_dir) else 0))
+    except Exception:
+        pass
 
     print(f"[{file_name}] Converting sounds to XWM...")
     stats = convert_sounds(

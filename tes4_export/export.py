@@ -280,12 +280,18 @@ def _export_per_type_serial(by_type: dict, output_dir: str):
 _FORMAT_CHUNK_BYTES = 8 * 1024 * 1024
 _FORMAT_CHUNK_RECORDS = 4000
 
+# Progress granularity: emit a progress line every this many records.  A chunk
+# arrives whole (thousands of records at once), so without stepping the bar
+# would leap; this walks it up in small increments instead.  Raise it if the
+# extra @@PROG lines ever cost too much (they are cheap parent-side prints).
+_PROGRESS_STEP = 25
+
 # Per-worker-process mmap of the source file (initialized lazily).
 _worker_mm = None
 _worker_path = None
 
 
-def _format_chunk_worker(args: tuple) -> str:
+def _format_chunk_worker(args: tuple) -> tuple:
     """Format one chunk of records; returns the joined text blocks.
 
     args = (source_path, entries) with entries a list of
@@ -311,7 +317,10 @@ def _format_chunk_worker(args: tuple) -> str:
         rec.parent_dial = pd
         rec.is_vwd = vwd
         blocks.append(format_record(rec))
-    return "\n\n".join(blocks)
+    # Return the record count with the text so the parent can advance the
+    # progress bar per record (workers run under pythonw with no stdout of
+    # their own, so only the parent can report).
+    return len(blocks), "\n\n".join(blocks)
 
 
 def _export_per_type_parallel(by_type: dict, output_dir: str, source_path: str):
@@ -364,9 +373,12 @@ def _write_format_results(by_type: dict, output_dir: str, job_sigs: list,
             print(f"    Wrote {_type_filepath(cur_sig, output_dir)} "
                   f"({len(by_type[cur_sig])} records)")
 
-    _etotal = len(job_sigs)
+    # Count in RECORDS, not chunks: a chunk is up to _FORMAT_CHUNK_RECORDS
+    # records, so a per-chunk bar leaps.  Total records is the sum over types.
+    _etotal = sum(len(v) for v in by_type.values())
     _edone = 0
-    for sig, text in zip(job_sigs, results):
+    _emitted = 0            # records at the last emitted progress line
+    for sig, (count, text) in zip(job_sigs, results):
         if sig != cur_sig:
             _close_current()
             cur_sig = sig
@@ -377,9 +389,16 @@ def _write_format_results(by_type: dict, output_dir: str, job_sigs: list,
             cur_file.write("\n\n")
         cur_file.write(text)
         first_chunk = False
-        _edone += 1
-        if _progress:
-            _progress.report('Export', _edone, _etotal)
+        # Walk the bar up through this chunk in _PROGRESS_STEP-record steps so
+        # it moves smoothly instead of jumping a whole chunk at once.
+        if _progress and _etotal:
+            target = _edone + count
+            while _emitted + _PROGRESS_STEP <= target:
+                _emitted += _PROGRESS_STEP
+                _progress.report('Export', _emitted, _etotal, force=True)
+            _edone = target
+        else:
+            _edone += count
     _close_current()
     if _progress:
         _progress.report('Export', _etotal, _etotal, force=True)

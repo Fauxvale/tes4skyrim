@@ -33,6 +33,13 @@ import time
 # label may contain spaces ("SpeedTrees", "Landscape") without ambiguity.
 SENTINEL = "@@PROG"
 
+# A phase made of several sub-phases (Import = Records + Navmesh + Landscape)
+# emits ONE of these at its start, declaring every sub-phase's item count.  It
+# lets the GUI seed the whole-phase denominator up front, so the bar sweeps a
+# single 0->100% across all sub-phases instead of hitting 100% on the first and
+# sticking.  Payload: "@@PLAN <phase>\t<label>=<n>\t<label>=<n>...".
+PLAN_SENTINEL = "@@PLAN"
+
 ENV_VAR = "TESCONV_PROGRESS"
 
 # Per-phase throttle.  0.4s -> at most ~2-3 lines/sec even in the hottest loop.
@@ -70,6 +77,40 @@ def report(phase: str, done: int, total: int, *, force: bool = False) -> None:
         # A closed/broken stdout must never take the conversion down over a
         # cosmetic progress line.
         pass
+
+
+def plan(phase: str, **sub_totals: int) -> None:
+    """Declare a multi-sub-phase phase's sub-part item counts (see PLAN_SENTINEL).
+
+    Emit ONCE at the phase's start, before any sub-phase reports.  No-op unless
+    `TESCONV_PROGRESS=1`.  A zero-count sub-part is fine (it just contributes
+    nothing to the denominator); omit ones that will never run.
+    """
+    if not _on():
+        return
+    parts = "\t".join(f"{k}={int(v)}" for k, v in sub_totals.items())
+    try:
+        sys.stdout.write(f"{PLAN_SENTINEL} {phase}\t{parts}\n")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def parse_plan(line: str) -> tuple[str, dict] | None:
+    """Parse a `@@PLAN` line into `(phase, {label: total})`, or None."""
+    if not line.startswith(PLAN_SENTINEL + " "):
+        return None
+    body = line[len(PLAN_SENTINEL) + 1:].rstrip("\r\n").split("\t")
+    if not body:
+        return None
+    phase, subs = body[0], {}
+    for kv in body[1:]:
+        label, _, val = kv.partition("=")
+        try:
+            subs[label] = int(val)
+        except ValueError:
+            continue
+    return phase, subs
 
 
 def overall_fraction(phases_started: int, frac: float, steps_total: int,

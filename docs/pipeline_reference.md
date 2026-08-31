@@ -142,15 +142,24 @@ conversion: every filesystem step degrades to "no logging" rather than raising.
 
 ### GUI progress bars (`TESCONV_PROGRESS`)
 
-The GUI shows two progress bars during a run: a **per-phase** bar (files done /
-files to process for the current phase, captioned literally "Current Phase",
-reset to 0 only at each new phase banner) and a **whole-run** bar (the former
-throbber, now a determinate fill weighted equally per selected step). Both show
-only a percent — no time estimate (too inaccurate to be worth the arithmetic).
-Both are **clamped monotonic**: a phase reported in several batches (multiple
-plugins, or Import's Records/Landscape/Navmesh under one banner) keeps the
-per-phase bar rising instead of dropping to 0 when the next batch's count
-restarts, so the bar never jumps backward mid-phase.
+The GUI shows two progress bars during a run: a **per-phase** bar (captioned
+literally "Current Phase") and a **whole-run** bar (the former throbber, now a
+determinate fill weighted equally per selected step). Both show only a percent —
+no time estimate (too inaccurate to be worth the arithmetic).
+
+Both are **strictly forward within a phase**: the per-phase bar makes ONE
+0→100% sweep per top-level phase (Export, Extract, Meshes, SpeedTrees,
+Creatures, Import, Sounds, Pack BSAs, Pack Mod Zip) and only resets — through
+the throbber — at the next phase banner. A phase built from several sub-phases
+is combined into that single sweep: the phase emits one `@@PLAN` line at its
+start declaring every sub-part's item count, so the GUI seeds the whole-phase
+denominator before the first sub-phase reports and the bar cannot finish on
+sub-phase 1. Each sub-part contributes `done/total`; the GUI replaces the
+`@@PLAN` estimate with the exact total the moment that sub-part reports, and
+`max`-clamps the result so refinement and multi-plugin count restarts never move
+it backward. Currently `@@PLAN` is emitted by Import (Records + Navmesh +
+Landscape — navmesh estimated as one job per PGRD) and Sounds (Voices + Sounds +
+Music). Single-label phases need no plan: their one component is the whole bar.
 
 The mechanism is a `progress.report(phase, done, total)` call in each phase's
 parent-process aggregator loop (`progress.py`). It prints one throttled
@@ -163,6 +172,12 @@ interleaving and no change to any output artifact. Whole-run progress is stepped
 by the `Phase N:` banners the pipeline already prints; a count-less phase
 (Papyrus compile, LOD) has no `@@PROG` and leaves the per-phase bar spinning
 while the whole-run bar still advances by its step slice.
+
+Export formats records in worker chunks of up to `_FORMAT_CHUNK_RECORDS` (4000),
+which arrive at the parent whole. To avoid the bar leaping a whole chunk at
+once, each worker returns its record count and the parent walks the bar up in
+`_PROGRESS_STEP`-record steps (25 by default; raise it if the extra `@@PROG`
+lines ever cost too much).
 
 <a id="running-off-windows"></a>
 ### Running off Windows (Linux / Mac, via Wine)

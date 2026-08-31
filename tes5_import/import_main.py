@@ -1793,6 +1793,17 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # them in thread-completion order, so record order shuffled between runs. A
     # plain loop keeps the ESM byte-reproducible. (The genuinely heavy
     # conversion work — text parse, LAND, navmeshes — runs in pools elsewhere.)
+    # Declare the whole Import phase's sub-parts up front so the GUI sweeps ONE
+    # 0->100% bar across Records -> Navmesh -> Landscape instead of hitting 100%
+    # on the fast record loop and sticking through the slow navmesh.  Navmesh is
+    # estimated as one job per pathgrid (_gather_navm_jobs yields ~one per PGRD);
+    # the GUI replaces the estimate with the exact count when navmesh reports.
+    if _progress:
+        _progress.plan('Import',
+                       Records=len(work_items),
+                       Navmesh=len(by_type.get('PGRD', [])),
+                       Landscape=len(by_type.get('LAND', [])))
+
     _rtotal = len(work_items)
     for _ridx, (sig, target_sig, rec) in enumerate(work_items, 1):
         if _progress:
