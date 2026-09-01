@@ -1,0 +1,28 @@
+{
+  "__doc__": "Quest objectives that are legitimately open at the same time. The runtime sweep in the generated stage fragments closes any earlier objective the player has seen and moved past; these are exempt because the player can finish them in any order, so an earlier one is still a live task when a later one is displayed. Keyed EditorID -> [objective stage indices]. A quest absent here is swept normally; a miss leaves an objective open, which is the pre-existing behaviour.",
+  "entries": {
+    "MQ11": [
+      40,
+      41,
+      42,
+      43,
+      44,
+      45
+    ],
+    "TGDirections": [
+      10,
+      20,
+      30,
+      40
+    ],
+    "ND02": [
+      100,
+      110,
+      120
+    ],
+    "SE13": [
+      20,
+      30
+    ]
+  }
+}

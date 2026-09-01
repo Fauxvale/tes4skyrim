@@ -16,6 +16,11 @@ from script_convert.constants import (_sanitize_name, _safe_property_name, _reco
                                      UDF_WIDE_TYPES)
 from script_convert.cross_ref import CrossRefGraph, master_names
 from script_convert.converter import ScriptConverter
+from script_convert.objective_completion import (
+    _superseded_stages,
+    objective_lines,
+    sweep_targets,
+)
 from script_convert.symbols import property_declarations, IMPLICIT_NAMES
 from script_convert.tes5.blocks import (
     Kind,
@@ -1169,88 +1174,6 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             stats['errors'].append(f'INFO {formid}: {e}')
 
 
-def _superseded_stages(rec: dict, fragments: list) -> dict:
-    """Work out which objectives each stage FINISHES.
-
-    Oblivion has no "objective completed" concept — its journal is an append-only
-    log — so the completion points have to be recovered from the data.  The
-    signal is the quest TARGETS: every TES4 QSTA carries `GetStage` conditions
-    saying exactly which stages that target's compass marker is live at, which is
-    Oblivion's own encoding of "the player still has this errand to run".
-    (FGC01Rats: Arvena is live at 10/30/55/65/90 — the report-back steps; Pinarus
-    at 40-50 — the hunt; Quill-Weave at 70-80/105 — the stakeout.)
-
-    An objective's step is in progress while its markers are live and is finished
-    at the first stage where they go dark.  So stage N completes objective M iff
-    M's marker set was live at M and is no longer live at N.  Crucially this is
-    NOT "N completes everything numerically below it": an objective whose marker
-    stays live across several stages stays open, so a quest can hold several
-    objectives open at once and side branches are not force-ticked by an
-    unrelated higher-numbered stage.
-
-    Returns {(stage_idx, log_idx): [stage indices this fragment completes]}.
-
-    Fallback: a stage whose objective has no target at all (a marker-less "return
-    when you're ready" entry, or a quest with no QSTA records) has no gate to read.
-    Those are closed by the next objective that fires, which is the best available
-    reading of "the log moved on" and matches Oblivion's linear default.
-    """
-    from tes5_import.dialog_converter import _target_live_at_stage
-
-    # Per-target TES4 stage gates.
-    targets = []
-    t = 0
-    while f'Target[{t}].FormID' in rec:
-        raws = []
-        k = 0
-        while f'Target[{t}].Condition[{k}].Raw' in rec:
-            raws.append(rec[f'Target[{t}].Condition[{k}].Raw'])
-            k += 1
-        targets.append(raws)
-        t += 1
-
-    # Objective-bearing stages, in quest order.
-    obj_frags = [(s, j) for s, j, text, *_ in fragments if text]
-    obj_stages = sorted({s for s, _ in obj_frags})
-
-    def live_set(stage):
-        """Indices of the targets whose marker is live at `stage`."""
-        return frozenset(i for i, raws in enumerate(targets)
-                         if raws and _target_live_at_stage(raws, stage))
-
-    live = {s: live_set(s) for s in obj_stages}
-
-    # For each objective, find the single stage that ends it: the FIRST later
-    # objective-stage at which its markers are no longer live.  Completing an
-    # objective once, at that stage, is what keeps parallel objectives open —
-    # re-emitting it at every subsequent stage would be redundant no-ops, and
-    # sweeping every lower index would force-tick branches that are still live.
-    closed_by = {}
-    for prior in obj_stages:
-        there = live[prior]
-        later = [s for s in obj_stages if s > prior]
-        if there:
-            # Gate-driven: the errand is over at the first stage none of its
-            # markers survive into.
-            end = next((s for s in later if not (there & live[s])), None)
-        else:
-            # No marker to read (a marker-less "return when you're ready" entry,
-            # or a quest with no targets at all) — the log simply moves on.
-            end = later[0] if later else None
-        if end is not None:
-            closed_by[prior] = end
-
-    supersedes = {}
-    for stage, log_idx in obj_frags:
-        # Attach the completions to the first log entry of the stage, so a stage
-        # with several log entries does not emit them once per entry.
-        first_log = min(j for s, j in obj_frags if s == stage)
-        supersedes[(stage, log_idx)] = (
-            sorted(p for p, end in closed_by.items() if end == stage)
-            if log_idx == first_log else [])
-    return supersedes
-
-
 def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 stats: dict, stage_reveals: dict = None):
     """Convert a batch of QUST records into Quest fragment .psc files.
@@ -1314,6 +1237,7 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
         # stage-gates.  (convert_QUST emits one QOBJ per stage index that has log
         # text, so the stage indices here are exactly the objectives on the record.)
         supersedes = _superseded_stages(rec, fragments)
+        sweepable = sweep_targets(rec, fragments, edid)
 
         # Count only fragments that have result scripts for stats
         scripted_count = sum(1 for f in fragments if f[3] and f[3].strip())
@@ -1351,24 +1275,9 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
                     log_text = None
                 elif log_text:
                     objective_emitted.add(stage_idx)
-                # Objective tracking.  Oblivion's journal is an append-only LOG:
-                # setting stage 20 just adds entry 20 under entry 10, and 10 stays
-                # as history — it was never a checkbox, so nothing "completes" it.
-                # Skyrim's journal is a SET of objectives, each independently
-                # Displayed / Completed / Failed, and a Displayed-but-not-Completed
-                # objective renders as an open bullet with a live compass marker.
-                #
-                # So a stage must explicitly close out the step it FINISHES.  Note
-                # this is NOT "complete every lower-numbered objective": a quest can
-                # legitimately hold several objectives open at once (fetch A *and*
-                # talk to B), and side branches are not superseded just because a
-                # higher-numbered stage fired.  An objective is completed only when
-                # the quest actually moves past that specific step — see
-                # _superseded_stages() for how that is derived from the TES4 data.
                 if log_text:
-                    for prior in supersedes.get((stage_idx, log_idx), ()):
-                        out_lines.append(f'  SetObjectiveCompleted({prior}, true)')
-                    out_lines.append(f'  SetObjectiveDisplayed({stage_idx}, true)')
+                    out_lines.extend(objective_lines(
+                        supersedes, sweepable, stage_idx, log_idx))
                 # TES4 QSDT 0x01 is "complete the QUEST" — it is not per-objective,
                 # it marks the stage that ENDS the quest (TES4 has no fail bit; a
                 # quest's success and failure endings are both just flag 0x01, and
