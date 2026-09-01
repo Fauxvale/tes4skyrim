@@ -1018,11 +1018,11 @@ class TestDoorSounds:
             self._top_groups = {'DOOR': records}
 
     def test_slots_resolve_to_descriptors(self):
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
-        dialog_misc.reset_sound_descriptors()
-        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
-        dialog_misc.record_sndr_for_soun(0x0105C424, 0x01190F01)
+        sound.reset_sound_descriptors()
+        sound.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        sound.record_sndr_for_soun(0x0105C424, 0x01190F01)
         w = self._Writer([self._door('D', SNAM=0x0105C423, ANAM=0x0105C424)])
         assert patch_sound_descriptor_slots(
             w, 'DOOR', {0x05C423, 0x05C424}) == 1
@@ -1032,10 +1032,10 @@ class TestDoorSounds:
     def test_slot_without_descriptor_is_dropped(self):
         """A SOUN with no FNAM mints no SNDR; a slot pointing at the SOUN
         would be a wrong-typed reference, so it goes."""
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
-        dialog_misc.reset_sound_descriptors()
-        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        sound.reset_sound_descriptors()
+        sound.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._door('D', SNAM=0x0105C423, BNAM=0x0105C425)])
         assert patch_sound_descriptor_slots(
             w, 'DOOR', {0x05C423, 0x05C425}) == 1
@@ -1045,20 +1045,20 @@ class TestDoorSounds:
         """An override build's DOOR group also holds the master's records,
         whose slots already name the MASTER's SNDRs. Rewriting or dropping
         those would strip door sound out of every dependent plugin."""
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
-        dialog_misc.reset_sound_descriptors()
-        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        sound.reset_sound_descriptors()
+        sound.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._door('M', SNAM=0x00190AAA, ANAM=0x00190AAB)])
         assert patch_sound_descriptor_slots(w, 'DOOR', {0x05C423}) == 0
         assert self._slots(w._top_groups['DOOR'][0]) == {
             'SNAM': 0x00190AAA, 'ANAM': 0x00190AAB}
 
     def test_patch_is_idempotent(self):
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
-        dialog_misc.reset_sound_descriptors()
-        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        sound.reset_sound_descriptors()
+        sound.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._door('D', SNAM=0x0105C423)])
         assert patch_sound_descriptor_slots(w, 'DOOR', {0x05C423}) == 1
         first = w._top_groups['DOOR'][0]
@@ -1142,10 +1142,10 @@ class TestLightSoundDescriptors:
             self._top_groups = {'LIGH': records}
 
     def test_snam_resolves_to_descriptor(self):
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
-        dialog_misc.reset_sound_descriptors()
-        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        sound.reset_sound_descriptors()
+        sound.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._light('L', snam=0x0105C423)])
         assert patch_sound_descriptor_slots(w, 'LIGH', {0x05C423}) == 1
         assert self._snam(w._top_groups['LIGH'][0]) == 0x01190F00
@@ -1154,9 +1154,9 @@ class TestLightSoundDescriptors:
         """A SOUN with no FNAM mints no SNDR; leaving the slot pointing at the
         SOUN is exactly the wrong-typed reference that crashes the audio
         thread, so the slot goes instead."""
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
-        dialog_misc.reset_sound_descriptors()
+        sound.reset_sound_descriptors()
         w = self._Writer([self._light('L', snam=0x0105C425)])
         assert patch_sound_descriptor_slots(w, 'LIGH', {0x05C425}) == 1
         assert self._snam(w._top_groups['LIGH'][0]) is None
@@ -1165,9 +1165,9 @@ class TestLightSoundDescriptors:
         """Morrowind_ob's torches point at Oblivion.esm's AMBTorchMountedLP, a
         SOUN the plugin never overrides. Without the master lookup the largest
         group of lights would lose its ambience — master-export blindness."""
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
-        dialog_misc.reset_sound_descriptors()
+        sound.reset_sound_descriptors()
         w = self._Writer([self._light('L', snam=0x01085837)])
         assert patch_sound_descriptor_slots(
             w, 'LIGH', set(),
@@ -1177,20 +1177,20 @@ class TestLightSoundDescriptors:
     def test_master_override_slot_untouched(self):
         """An override build's LIGH group also holds the master's converted
         records, whose SNAM already names the MASTER's SNDR."""
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
-        dialog_misc.reset_sound_descriptors()
-        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        sound.reset_sound_descriptors()
+        sound.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._light('M', snam=0x0058689D)])
         assert patch_sound_descriptor_slots(
             w, 'LIGH', {0x05C423}, lambda fid: 0) == 0
         assert self._snam(w._top_groups['LIGH'][0]) == 0x0058689D
 
     def test_patch_is_idempotent(self):
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
-        dialog_misc.reset_sound_descriptors()
-        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        sound.reset_sound_descriptors()
+        sound.record_sndr_for_soun(0x0105C423, 0x01190F00)
         w = self._Writer([self._light('L', snam=0x0105C423)])
         assert patch_sound_descriptor_slots(w, 'LIGH', {0x05C423}) == 1
         first = w._top_groups['LIGH'][0]
@@ -1267,7 +1267,7 @@ class TestSoundDescriptorSlotCoverage:
 
     def test_speaker_activator_vnam_survives_the_patch(self):
         """A real synthesized TACT must come through byte-identical."""
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
         from tes5_import.speaker_activators import _pack_tact
 
@@ -1275,8 +1275,8 @@ class TestSoundDescriptorSlotCoverage:
             def __init__(self, groups):
                 self._top_groups = groups
 
-        dialog_misc.reset_sound_descriptors()
-        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        sound.reset_sound_descriptors()
+        sound.record_sndr_for_soun(0x0105C423, 0x01190F00)
         tact = _pack_tact(0x01000001, 'TES4Voice_x', 0x0105C423, 'Speaker')
         w = W({'TACT': [tact]})
         # TACT is not a patched type at all, so the loop never reaches it.
@@ -1286,16 +1286,16 @@ class TestSoundDescriptorSlotCoverage:
         assert self._slot(tact, 'VNAM') == 0x0105C423
 
     def test_activator_and_container_slots_resolve(self):
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
 
         class W:
             def __init__(self, groups):
                 self._top_groups = groups
 
-        dialog_misc.reset_sound_descriptors()
-        dialog_misc.record_sndr_for_soun(0x0105C423, 0x01190F00)
-        dialog_misc.record_sndr_for_soun(0x0105C424, 0x01190F01)
+        sound.reset_sound_descriptors()
+        sound.record_sndr_for_soun(0x0105C423, 0x01190F00)
+        sound.record_sndr_for_soun(0x0105C424, 0x01190F01)
         w = W({'ACTI': [self._rec('ACTI', SNAM=0x0105C423)],
                'CONT': [self._rec('CONT', SNAM=0x0105C423,
                                   QNAM=0x0105C424)]})
@@ -1309,14 +1309,14 @@ class TestSoundDescriptorSlotCoverage:
     def test_master_owned_slots_resolve_through_master(self):
         """Morrowind_ob's containers point at Oblivion.esm sounds it never
         overrides; without the master resolver ~2,400 slots stay wrong-typed."""
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
 
         class W:
             def __init__(self, groups):
                 self._top_groups = groups
 
-        dialog_misc.reset_sound_descriptors()
+        sound.reset_sound_descriptors()
         w = W({'CONT': [self._rec('CONT', SNAM=0x01085837)]})
         n = patch_sound_descriptor_slots(
             w, 'CONT', set(),
@@ -1327,14 +1327,14 @@ class TestSoundDescriptorSlotCoverage:
     def test_unresolvable_master_slot_left_alone(self):
         """An override build's own converted records already hold real SNDR
         ids; rewriting or dropping them would strip sound from the plugin."""
-        from tes5_import.record_types import dialog_misc
+        from tes5_import.record_types import sound
         from tes5_import.record_types.items import patch_sound_descriptor_slots
 
         class W:
             def __init__(self, groups):
                 self._top_groups = groups
 
-        dialog_misc.reset_sound_descriptors()
+        sound.reset_sound_descriptors()
         w = W({'CONT': [self._rec('CONT', SNAM=0x0058689D)]})
         assert patch_sound_descriptor_slots(w, 'CONT', set(),
                                             lambda fid: 0) == 0
@@ -3819,7 +3819,7 @@ class TestWeatherConversion:
 
     def _convert(self, rec):
         """convert_WTHR returns (wthr_bytes, imgs_bytes); most tests want the WTHR."""
-        from tes5_import.record_types.dialog_misc import convert_WTHR
+        from tes5_import.record_types.weather import convert_WTHR
         wthr, _imgs = convert_WTHR(rec)
         return wthr
 
@@ -3960,8 +3960,7 @@ class TestWeatherConversion:
         using 8/9/10 put all the cloud around the horizon instead of over the
         sky.
         """
-        from tes5_import.record_types.dialog_misc import (
-            _wthr_cloud_sig, _WTHR_UPPER_LAYER, _WTHR_LOWER_LAYER)
+        from tes5_import.record_types.weather import _wthr_cloud_sig, _WTHR_UPPER_LAYER, _WTHR_LOWER_LAYER
         assert (_WTHR_UPPER_LAYER, _WTHR_LOWER_LAYER) == (11, 27)
         out = self._convert(self._rec())
         upper = _find_subrecord(out, _wthr_cloud_sig(_WTHR_UPPER_LAYER))
@@ -3974,8 +3973,7 @@ class TestWeatherConversion:
         on the strips (50 of 50 times) and SkyrimCloudsFill on the wash (156
         of 157).  We have neither, so every other layer stays empty rather
         than being padded with a full-dome sheet that would tile wrongly."""
-        from tes5_import.record_types.dialog_misc import (
-            _WTHR_UPPER_LAYER, _WTHR_LOWER_LAYER)
+        from tes5_import.record_types.weather import _WTHR_UPPER_LAYER, _WTHR_LOWER_LAYER
         out = self._convert(self._rec())
         nam1 = struct.unpack('<I', _find_subrecord(out, b'NAM1'))[0]
         enabled = {L for L in range(32) if not (nam1 >> L) & 1}
@@ -4132,7 +4130,7 @@ class TestWeatherConversion:
 
     def test_zero_width_fog_ramp_is_widened(self):
         """A far plane at or inside the near plane snaps fog to full density."""
-        from tes5_import.record_types.dialog_misc import _WTHR_FOG_MIN_RAMP
+        from tes5_import.record_types.weather import _WTHR_FOG_MIN_RAMP
         rec = self._rec(**{'FNAM.FogDayNear': '5000.0',
                            'FNAM.FogDayFar': '5000.0',
                            'FNAM.FogNightNear': '5000.0',
@@ -4149,7 +4147,7 @@ class TestWeatherConversion:
         -0.1..+0.1 as 0x00..0xFE with 0x7F = 0.  So the byte must be rescaled,
         not copied.  `0x7F + speed//2` ran clouds ~10x too fast.
         """
-        from tes5_import.record_types.dialog_misc import _cloud_speed_tes4_to_tes5 as conv
+        from tes5_import.record_types.weather import _cloud_speed_tes4_to_tes5 as conv
 
         def to_float(b):
             return (b - 127) / 127 / 10
@@ -4162,8 +4160,7 @@ class TestWeatherConversion:
 
     def test_cloud_speed_lands_in_rnam_layers(self):
         """Each dome layer drifts with the speed authored for the sheet it came from."""
-        from tes5_import.record_types.dialog_misc import (
-            _WTHR_LOWER_PLAN, _WTHR_UPPER_PLAN)
+        from tes5_import.record_types.weather import _WTHR_LOWER_PLAN, _WTHR_UPPER_PLAN
         rnam = _find_subrecord(self._convert(self._rec()), b'RNAM')
         for layer, _a in _WTHR_UPPER_PLAN:
             assert rnam[layer] == 0x88, layer   # TES4 CloudSpeedUpper 19
@@ -4183,8 +4180,7 @@ class TestWeatherConversion:
         0.50-0.60 on layer 0.  This finding is independent of dome geometry
         and survived the layer-plan revert.
         """
-        from tes5_import.record_types.dialog_misc import (
-            _WTHR_LOWER_PLAN, _WTHR_UPPER_PLAN, _WTHR_UPPER_LAYER)
+        from tes5_import.record_types.weather import _WTHR_LOWER_PLAN, _WTHR_UPPER_PLAN, _WTHR_UPPER_LAYER
         jnam = struct.unpack('<128f', _find_subrecord(self._convert(self._rec()), b'JNAM'))
         placed = set()
         for layer, alphas in _WTHR_UPPER_PLAN + _WTHR_LOWER_PLAN:
@@ -4201,7 +4197,7 @@ class TestWeatherConversion:
         """LNAM/MNAM/NNAM are .SetRequired in xEdit; LNAM=0 allocated no layers."""
         rec = self._convert(self._rec(**{'DATA.Classification': '1',
                                          'DATA.ThunderFrequency': '255'}))
-        from tes5_import.record_types.dialog_misc import _WTHR_LOWER_LAYER
+        from tes5_import.record_types.weather import _WTHR_LOWER_LAYER
         # LNAM is an index clamp into RNAM/QNAM/JNAM, so it must SPAN the
         # highest layer we author or that layer silently reuses layer 0's
         # speed and alpha (SkyrimSE.exe 0x3c5485 / 0x3c54ff / 0x2c1eb0).
@@ -4290,8 +4286,7 @@ class TestWeatherConversion:
     def test_highlights_are_compressed_with_hue_preserved(self):
         """Above the knee, luminance is remapped into knee..ceiling and all
         three channels scale together, so only brightness moves."""
-        from tes5_import.record_types.dialog_misc import (_NAM0_KNEE,
-                                                          _NAM0_KNEE_CEILING)
+        from tes5_import.record_types.weather import _NAM0_KNEE, _NAM0_KNEE_CEILING
         raw = bytearray(160)
         src = (255, 220, 180)            # lum 226, well above the knee
         for time in range(4):
@@ -4348,7 +4343,7 @@ class TestWeatherConversion:
         42.5 (4.55x, where no other slot exceeds 1.7x).  Skyrim's sun
         brightness comes from the glare pass and the imagespace, not this
         colour, so a near-white disc here is a pure bloom source."""
-        from tes5_import.record_types.dialog_misc import _NAM0_SUN_CEILING
+        from tes5_import.record_types.weather import _NAM0_SUN_CEILING
         raw = bytearray(160)
         for time in range(4):
             o = (5 * 4 + time) * 4
@@ -4385,7 +4380,7 @@ class TestWeatherConversion:
         AudioCategorySFX it bypasses the ambience mix/slider and Oblivion's
         weather winds played LOUD over everything.  Vanilla AMBWeather*
         descriptors all use AudioCategoryAMB (0x7F80B)."""
-        from tes5_import.record_types.dialog_misc import convert_SOUN
+        from tes5_import.record_types.sound import convert_SOUN
 
         class W:
             def __init__(self):
@@ -4441,7 +4436,7 @@ class TestClimateConversion:
 
     def test_wlst_entries_are_widened_to_12_bytes(self):
         """TES4's entry is 8 bytes; TES5 appends a Global FormID."""
-        from tes5_import.record_types.dialog_misc import convert_CLMT
+        from tes5_import.record_types.weather import convert_CLMT
         wlst = _find_subrecord(convert_CLMT(self._rec()), b'WLST')
         assert len(wlst) == 24
         w0, c0, g0 = struct.unpack_from('<IiI', wlst, 0)
@@ -4451,7 +4446,7 @@ class TestClimateConversion:
         assert w0 != 0 and w1 != 0
 
     def test_stars_model_and_sun_textures_are_namespaced(self):
-        from tes5_import.record_types.dialog_misc import convert_CLMT
+        from tes5_import.record_types.weather import convert_CLMT
         out = convert_CLMT(self._rec())
         assert _find_subrecord(out, b'MODL') == b'tes4\\Sky\\Stars.nif\x00'
         assert _find_subrecord(out, b'FNAM') == b'tes4\\Sky\\Sun.dds\x00'
@@ -4460,7 +4455,7 @@ class TestClimateConversion:
 
     def test_climate_without_model_still_gets_stars(self):
         """Every vanilla Skyrim climate has a MODL; without one, no stars."""
-        from tes5_import.record_types.dialog_misc import convert_CLMT
+        from tes5_import.record_types.weather import convert_CLMT
         rec = self._rec()
         del rec['Model.MODL']
         assert _find_subrecord(convert_CLMT(rec), b'MODL') == b'tes4\\Sky\\Stars.nif\x00'
@@ -4472,7 +4467,7 @@ class TestClimateConversion:
         locked skies (Sovngarde).  TES4's 0 froze every converted sky on its
         first weather.  The moons byte (195 = 0xC3, Masser+Secunda+phase 3)
         is byte-identical to vanilla SkyrimClimate's."""
-        from tes5_import.record_types.dialog_misc import convert_CLMT
+        from tes5_import.record_types.weather import convert_CLMT
         tnam = _find_subrecord(convert_CLMT(self._rec()), b'TNAM')
         assert tnam == bytes((36, 60, 96, 120, 50, 195))
 
@@ -4531,8 +4526,7 @@ class TestSunlessSkies:
         }
 
     def _register(self, clmt):
-        from tes5_import.record_types.dialog_misc import (
-            record_sunless_climate, reset_sunless_climates)
+        from tes5_import.record_types.weather import record_sunless_climate, reset_sunless_climates
         reset_sunless_climates()
         record_sunless_climate(clmt)
 
@@ -4543,7 +4537,7 @@ class TestSunlessSkies:
     def test_void_sun_climate_writes_vanilla_black(self):
         """Black.dds is a VANILLA path — it must not take the tes4\\ prefix,
         and the GLARE must be black too (VoidGlare.dds is a real sprite)."""
-        from tes5_import.record_types.dialog_misc import convert_CLMT
+        from tes5_import.record_types.weather import convert_CLMT
         out = convert_CLMT(self._clmt())
         assert _find_subrecord(out, b'FNAM') == b'Black.dds\x00'
         assert _find_subrecord(out, b'GNAM') == b'Black.dds\x00'
@@ -4551,14 +4545,14 @@ class TestSunlessSkies:
     def test_climate_with_no_fnam_is_sunless(self):
         """ClimateSigil / MQ14OblivionClimate author no FNAM at all —
         Oblivion draws nothing, which is the same authored intent as Void."""
-        from tes5_import.record_types.dialog_misc import convert_CLMT
+        from tes5_import.record_types.weather import convert_CLMT
         rec = self._clmt()
         del rec['FNAM.SunTexture']
         del rec['GNAM.GlareTexture']
         assert _find_subrecord(convert_CLMT(rec), b'FNAM') == b'Black.dds\x00'
 
     def test_real_sun_climate_is_untouched(self):
-        from tes5_import.record_types.dialog_misc import convert_CLMT
+        from tes5_import.record_types.weather import convert_CLMT
         out = convert_CLMT(self._clmt(**{
             'FNAM.SunTexture': 'Sky\\Sun.dds',
             'GNAM.GlareTexture': 'Sky\\SunGlare.dds'}))
@@ -4568,7 +4562,7 @@ class TestSunlessSkies:
     def test_sunless_weather_zeroes_sun_sunlight_and_glare(self):
         """The whole point: slot 5 (disc), slot 4 (directional light) and
         slot 15 (glare) all go to zero, at every time of day."""
-        from tes5_import.record_types.dialog_misc import _wthr_nam0
+        from tes5_import.record_types.weather import _wthr_nam0
         self._register(self._clmt())
         nam0 = _wthr_nam0(self._wthr())
         for time in range(4):
@@ -4580,7 +4574,7 @@ class TestSunlessSkies:
         """The Deadlands' red fill lives in TES4 Sunlight while the sun
         sprite is voided.  Zeroing it outright (as Blackreach can, being a
         cave) would black out the realm; half of it folds into Ambient."""
-        from tes5_import.record_types.dialog_misc import _wthr_nam0
+        from tes5_import.record_types.weather import _wthr_nam0
         self._register(self._clmt())
         plain = _wthr_nam0(self._wthr(sunlight=(0, 0, 0)))
         folded = _wthr_nam0(self._wthr(sunlight=(200, 100, 60)))
@@ -4596,7 +4590,7 @@ class TestSunlessSkies:
         everything under it stays dim.  Vanilla BlackreachWeather's DALC
         faces track its NAM0 Ambient ~1:1, so vanilla does not compensate
         DALC separately -- it authors Ambient and lets DALC follow."""
-        from tes5_import.record_types.dialog_misc import _wthr_dalc
+        from tes5_import.record_types.weather import _wthr_dalc
         self._register(self._clmt())
         dark = _wthr_dalc(self._wthr(sunlight=(0, 0, 0)))
         lit = _wthr_dalc(self._wthr(sunlight=(200, 100, 60)))
@@ -4607,15 +4601,14 @@ class TestSunlessSkies:
 
     def test_normal_weather_keeps_its_sun(self):
         """A weather not reachable from a sunless climate is untouched."""
-        from tes5_import.record_types.dialog_misc import _wthr_nam0
-        from tes5_import.record_types.dialog_misc import reset_sunless_climates
+        from tes5_import.record_types.weather import _wthr_nam0
+        from tes5_import.record_types.weather import reset_sunless_climates
         reset_sunless_climates()
         nam0 = _wthr_nam0(self._wthr())
         assert self._slot(nam0, 4) != (0, 0, 0)
 
     def test_registry_resets_between_plugins(self):
-        from tes5_import.record_types.dialog_misc import (
-            _SUNLESS_WEATHER_FIDS, reset_sunless_climates)
+        from tes5_import.record_types.weather import _SUNLESS_WEATHER_FIDS, reset_sunless_climates
         self._register(self._clmt())
         assert _SUNLESS_WEATHER_FIDS
         reset_sunless_climates()
@@ -4684,7 +4677,7 @@ class TestRegionWeatherConversion:
         return rec
 
     def test_weather_entries_survive_with_area_and_header(self):
-        from tes5_import.record_types.world import convert_REGN
+        from tes5_import.record_types.region import convert_REGN
         out = convert_REGN(self._rec())
         rdat = _find_subrecord(out, b'RDAT')
         rtype, override, priority = struct.unpack_from('<IBB', rdat, 0)
@@ -4700,20 +4693,20 @@ class TestRegionWeatherConversion:
         assert len(_find_subrecord(out, b'RPLD')) == 32   # 4 points x 8 bytes
 
     def test_non_weather_entries_are_dropped(self):
-        from tes5_import.record_types.world import convert_REGN
+        from tes5_import.record_types.region import convert_REGN
         out = convert_REGN(self._rec())
         # exactly ONE RDAT survives (the weather one); the sound entry is gone
         assert len(_find_all_subrecords(out, b'RDAT')) == 1
 
     def test_region_without_weather_emits_nothing(self):
-        from tes5_import.record_types.world import convert_REGN
+        from tes5_import.record_types.region import convert_REGN
         rec = self._rec(**{'RegionDataCount': '1'})   # only the sound entry
         assert convert_REGN(rec) is None
 
     def test_region_without_area_emits_nothing(self):
         """The engine applies region data only inside RPLD polygons; weather
         with no area can never fire, so don't emit the record at all."""
-        from tes5_import.record_types.world import convert_REGN
+        from tes5_import.record_types.region import convert_REGN
         assert convert_REGN(self._rec(**{'AreaCount': '0'})) is None
 
     def test_cell_xclr_lists_only_emitted_regions(self):
@@ -4724,8 +4717,9 @@ class TestRegionWeatherConversion:
         the sky NEVER changed.  Refs are filtered to regions that actually
         emitted (TES4 lists object/grass/sound regions here too, which we
         drop) and sorted (xEdit wbArrayS)."""
-        from tes5_import.record_types.world import (
-            convert_CELL, convert_REGN, reset_emitted_regions)
+        from tes5_import.record_types.common import reset_emitted_regions
+        from tes5_import.record_types.region import convert_REGN
+        from tes5_import.record_types.world import convert_CELL
         reset_emitted_regions()
         convert_REGN(self._rec())                     # registers 0x00001234
         cell = {
@@ -4921,7 +4915,7 @@ class TestWeatherImageSpace:
         return rec
 
     def _convert(self, rec):
-        from tes5_import.record_types.dialog_misc import convert_WTHR
+        from tes5_import.record_types.weather import convert_WTHR
         return convert_WTHR(rec, self._FakeWriter())
 
     def _hnam(self, imgs_bytes):
@@ -4997,7 +4991,7 @@ class TestWeatherImageSpace:
         sky colour must therefore not move it at all.
         """
         import copy
-        from tes5_import.record_types.dialog_misc import _wthr_imgs
+        from tes5_import.record_types.weather import _wthr_imgs
 
         base = self._rec()
         bright = copy.deepcopy(base)

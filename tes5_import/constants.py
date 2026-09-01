@@ -259,9 +259,7 @@ def _init_dispatch():
         convert_INFO,
         convert_QUST,
     )
-    from .record_types.dialog_misc import (
-        convert_CLMT,
-    )
+    from .record_types.weather import convert_CLMT
     from .record_types.equipment import (
         convert_ALCH,
         convert_AMMO,
@@ -291,16 +289,18 @@ def _init_dispatch():
         convert_STAT,
         convert_TREE,
     )
+    from .record_types.region import (
+        convert_LSCR,
+        convert_REGN,
+        convert_WATR,
+    )
     from .record_types.world import (
         convert_ACHR,
         convert_ACRE,
         convert_CELL,
         convert_EFSH,
         convert_LAND,
-        convert_LSCR,
         convert_REFR,
-        convert_REGN,
-        convert_WATR,
         convert_WRLD,
     )
     from .pgrd_to_navm import convert_PGRD

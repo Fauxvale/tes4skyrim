@@ -563,7 +563,7 @@ def rebuild_sndr_override(master_sndr: bytes, plugin_rec: dict,
     (or reuses, via the writer's SOPM cache) a model for the authored
     distances the same way a fresh conversion would.
     """
-    from .record_types.dialog_misc import convert_SOUN
+    from .record_types.sound import convert_SOUN
     _soun, sndr_bytes, _fid = convert_SOUN(plugin_rec, writer)
     if not sndr_bytes:
         return b''

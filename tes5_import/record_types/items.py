@@ -266,7 +266,7 @@ def patch_sound_descriptor_slots(writer, rectype, own_soun_ids=None,
     descriptor is DROPPED, rather than left pointing at a record of the wrong
     type.
     """
-    from .dialog_misc import sndr_map
+    from .sound import sndr_map
     mapping = sndr_map()
     own = own_soun_ids if own_soun_ids is not None else set(mapping)
     slots = _SNDR_SLOTS[rectype]

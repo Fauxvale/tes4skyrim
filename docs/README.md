@@ -73,12 +73,14 @@ Why the SHIPPED code is the way it is. Named after the code it explains; opens w
 | [performance.md](commentary/performance.md) | the whole pipeline - performance and parallelism |
 | [script_convert.md](commentary/script_convert.md) | script_convert/ - TES4 script to Papyrus |
 | [tes5_import_dialogue.md](commentary/tes5_import_dialogue.md) | tes5_import/dialog_converter.py - dialogue and voice |
+| [tes5_import_landscape.md](commentary/tes5_import_landscape.md) | tes5_import/record_types/region.py - REGN, LSCR and WATR |
 | [tes5_import_magic.md](commentary/tes5_import_magic.md) | tes5_import/record_types/magic.py - magic conversion |
 | [tes5_import_mod_merge.md](commentary/tes5_import_mod_merge.md) | tes5_import/master_manifest.py - merging a mod stack |
 | [tes5_import_navmesh.md](commentary/tes5_import_navmesh.md) | tes5_import/navmesh/ - PGRD to NAVM, LAND and worldspace |
 | [tes5_import_override.md](commentary/tes5_import_override.md) | tes5_import/overrides.py - plugins with masters |
 | [tes5_import_package.md](commentary/tes5_import_package.md) | tes5_import/pack_converter.py - AI packages |
 | [tes5_import_quest.md](commentary/tes5_import_quest.md) | tes5_import/object_scripts.py - quests and quest scripts |
+| [tes5_import_sound.md](commentary/tes5_import_sound.md) | tes5_import/record_types/sound.py - SOUN, SNDR and SOPM |
 | [tes5_import_weather.md](commentary/tes5_import_weather.md) | tes5_import/record_types/world.py - weather and climate |
 
 ## `plans/`
@@ -100,6 +102,7 @@ A dated sweep over a corpus, with counts. Frozen once written; a re-audit is a N
 |---|---|
 | [aggression_faction.md](audits/aggression_faction.md) | Aggression / Ally / Enemy Conversion Audit |
 | [ck_warnings.md](audits/ck_warnings.md) | CK Warnings Audit — Oblivion.esm |
+| [fallout_nv_mesh_conversion.md](audits/fallout_nv_mesh_conversion.md) | Fallout NV / FO3 mesh conversion — what already works, and the particle-NIF defect |
 | [package_conversion.md](audits/package_conversion.md) | PACK Conversion Audit — 2026-08-17 |
 | [quest.md](audits/quest.md) | Quest Completability Audit — Oblivion.esm conversion |
 | [quest_script_conversion.md](audits/quest_script_conversion.md) | Quest Script Conversion Audit |

@@ -192,7 +192,7 @@ class TestRegionMusic(unittest.TestCase):
                         'no region MusicType exported - RDMD was dropped')
 
     def test_convert_regn_emits_rdmo(self):
-        from tes5_import.record_types import world
+        from tes5_import.record_types import common, region
 
         rec = {
             'FormID': '01000001', 'RecordFlags': 0, 'EditorID': 'TestRegion',
@@ -203,18 +203,18 @@ class TestRegionMusic(unittest.TestCase):
             'RegionData[0].Type': 7, 'RegionData[0].Override': 0,
             'RegionData[0].Priority': 50, 'RegionData[0].MusicType': 0,
         }
-        world.register_music_types({0: 0x01ABCDEF})
+        common.register_music_types({0: 0x01ABCDEF})
         try:
-            blob = world.convert_REGN(rec)
+            blob = region.convert_REGN(rec)
         finally:
-            world.register_music_types({})
+            common.register_music_types({})
         self.assertIsNotNone(blob, 'music-only region was dropped entirely')
         self.assertIn(b'RDMO', blob)
         self.assertIn(b'RDAT', blob)
 
     def test_region_with_music_but_no_weather_survives(self):
         """A sound-only region used to be dropped (weather list required)."""
-        from tes5_import.record_types import world
+        from tes5_import.record_types import common, region
 
         rec = {
             'FormID': '01000002', 'RecordFlags': 0, 'EditorID': 'SoundOnly',
@@ -225,11 +225,11 @@ class TestRegionMusic(unittest.TestCase):
             'RegionData[0].Type': 7, 'RegionData[0].Override': 0,
             'RegionData[0].Priority': 50, 'RegionData[0].MusicType': 0,
         }
-        world.register_music_types({0: 0x01ABCDEF})
+        common.register_music_types({0: 0x01ABCDEF})
         try:
-            self.assertIsNotNone(world.convert_REGN(rec))
+            self.assertIsNotNone(region.convert_REGN(rec))
         finally:
-            world.register_music_types({})
+            common.register_music_types({})
 
 
 class TestCityMusicPrecedence(unittest.TestCase):
@@ -253,18 +253,18 @@ class TestCityMusicPrecedence(unittest.TestCase):
     WORLD = 0x0001C318
 
     def _emits_rdmo(self, rdmd, world_snam):
-        from tes5_import.record_types import world
+        from tes5_import.record_types import common, region
         rec = dict(self.BASE)
         rec['RegionData[0].MusicType'] = rdmd
         rec['WNAM.Worldspace'] = '%08X' % self.WORLD
-        world.register_music_types({0: 0x0AAA, 1: 0x0BBB, 2: 0x0CCC})
-        world.register_world_music(
+        common.register_music_types({0: 0x0AAA, 1: 0x0BBB, 2: 0x0CCC})
+        common.register_world_music(
             {self.WORLD: world_snam} if world_snam is not None else {})
         try:
-            blob = world.convert_REGN(rec)
+            blob = region.convert_REGN(rec)
         finally:
-            world.register_music_types({})
-            world.register_world_music({})
+            common.register_music_types({})
+            common.register_world_music({})
         return blob is not None and b'RDMO' in blob
 
     def test_default_rdmd_yields_to_public_worldspace(self):

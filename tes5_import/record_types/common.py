@@ -183,3 +183,53 @@ def _convert_biped_flags(tes4_flags: int) -> int:
             for eb in extra_bits:
                 tes5 |= (1 << eb)
     return tes5
+
+
+#: TES4 music enum -> MUSC FormID, read by the CELL, WRLD and REGN converters.
+_MUSIC_BY_ENUM: dict = {}
+
+#: WRLD FormID -> its authored SNAM music enum, read by convert_REGN.
+_WORLD_MUSIC_ENUM: dict = {}
+
+#: Remapped FormIDs of the regions convert_REGN emitted; convert_CELL filters XCLR against it.
+_EMITTED_REGION_FIDS: set = set()
+
+#: TES4's implicit default when a CELL/WRLD authors no music: enum 0, "Default".
+TES4_DEFAULT_MUSIC_ENUM = 0
+
+
+def register_music_types(by_enum: dict):
+    """Register {tes4 XCMT/SNAM enum -> MUSC FormID} for CELL/WRLD emission."""
+    _MUSIC_BY_ENUM.clear()
+    _MUSIC_BY_ENUM.update(by_enum or {})
+
+
+def register_world_music(by_world: dict):
+    """Register {WRLD FormID -> authored SNAM enum} for convert_REGN."""
+    _WORLD_MUSIC_ENUM.clear()
+    _WORLD_MUSIC_ENUM.update(by_world or {})
+
+
+def music_for_enum(enum_value):
+    """The MUSC FormID registered for `enum_value`, or None."""
+    return _MUSIC_BY_ENUM.get(enum_value)
+
+
+def world_music_enum(wrld_fid):
+    """The authored SNAM music enum for `wrld_fid`, or None."""
+    return _WORLD_MUSIC_ENUM.get(wrld_fid)
+
+
+def reset_emitted_regions():
+    """Called at import start so a multi-plugin run doesn't leak regions."""
+    _EMITTED_REGION_FIDS.clear()
+
+
+def note_emitted_region(fid):
+    """Record that `fid` was emitted, so a CELL may reference it in XCLR."""
+    _EMITTED_REGION_FIDS.add(fid)
+
+
+def region_was_emitted(fid) -> bool:
+    """True when convert_REGN emitted `fid`."""
+    return fid in _EMITTED_REGION_FIDS

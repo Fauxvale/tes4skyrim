@@ -179,7 +179,7 @@ def test_sound_source_dir_is_the_asset_root(tmp_path):
     bare directory path with a trailing separator -- naming no playable file,
     and losing the random-variant behaviour entirely.
     """
-    from tes5_import.record_types import dialog_misc as D
+    from tes5_import.record_types import sound as D
 
     mod = tmp_path / 'export' / 'My Pack'
     d = mod / 'sound' / 'fx' / 'critter'

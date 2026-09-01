@@ -151,7 +151,7 @@ def patch_actor_sounds(writer) -> int:
     (CreatureWolf's `CSDI 016D9202` is `TES4_NPCWolfInjured_SNDR`).  A CSDI
     whose index byte names a MASTER is already resolved and is left alone.
     """
-    from .dialog_misc import sndr_map
+    from .sound import sndr_map
     mapping = sndr_map()
     records = writer._top_groups.get('NPC_') or []
     if not mapping or not records:

@@ -14,6 +14,7 @@ from ..skyrim_overrides import TES4_MARKER_FORMID_TO_SKYRIM
 from .items import get_base_origin_shift
 from ..text_reader import get_hex_bytes, remap_formid
 from .common import (
+    TES4_DEFAULT_MUSIC_ENUM,
     _prefix_path,
     get_float,
     get_formid,
@@ -26,6 +27,8 @@ from .common import (
     pack_string_subrecord,
     pack_subrecord,
     pack_uint8_subrecord,
+    music_for_enum,
+    region_was_emitted,
 )
 
 
@@ -49,34 +52,6 @@ _GRID_LOCATION: dict = {}
 # WRLD FormID -> LCTN FormID, the catch-all location for that worldspace.
 _WORLD_LOCATION: dict = {}
 
-# TES4 music enum value -> the MUSC FormID built from that category's folder.
-# Populated by register_music_types() once the music manifest is converted; an
-# empty dict simply means this plugin shipped no music, and CELL/WRLD then omit
-# the subrecord exactly as they did before.
-_MUSIC_BY_ENUM: dict = {}
-
-
-# TES4's implicit default when a CELL/WRLD authors no music at all: enum 0,
-# "Default", which Oblivion resolves to the Explore set.
-TES4_DEFAULT_MUSIC_ENUM = 0
-
-
-def register_music_types(by_enum: dict):
-    """Register {tes4 XCMT/SNAM enum -> MUSC FormID} for CELL/WRLD emission."""
-    _MUSIC_BY_ENUM.clear()
-    _MUSIC_BY_ENUM.update(by_enum or {})
-
-
-# WRLD FormID -> its authored SNAM music enum.  Regions are converted in
-# Phase 1, BEFORE the WRLD records, so convert_REGN cannot read the worldspace
-# itself and needs this index (populated in Phase 0c).
-_WORLD_MUSIC_ENUM: dict = {}
-
-
-def register_world_music(by_world: dict):
-    """Register {WRLD FormID -> authored SNAM enum} for convert_REGN."""
-    _WORLD_MUSIC_ENUM.clear()
-    _WORLD_MUSIC_ENUM.update(by_world or {})
 
 
 # Door REFR FormID -> (NAVM FormID, triangle index), the reference side of a
@@ -609,7 +584,7 @@ def convert_CELL(rec: dict) -> bytes:
     i = 0
     while f'Region[{i}]' in rec:
         rfid = get_formid(rec, f'Region[{i}]')
-        if rfid in _EMITTED_REGION_FIDS:
+        if region_was_emitted(rfid):
             region_fids.append(rfid)
         i += 1
     if region_fids:
@@ -673,7 +648,7 @@ def convert_CELL(rec: dict) -> bytes:
     if xcmt is None and not is_exterior:
         xcmt = TES4_DEFAULT_MUSIC_ENUM
     if xcmt is not None:
-        musc = _MUSIC_BY_ENUM.get(xcmt)
+        musc = music_for_enum(xcmt)
         if musc:
             subs += pack_formid_subrecord('XCMO', musc)
 
@@ -821,8 +796,8 @@ def convert_WRLD(rec: dict) -> bytes:
     # -- cities are the authored 1/Public cells, and the 33,241 of 33,560
     # Oblivion exterior cells carrying no XCMT at all fall through to here.
     snam = get_int(rec, 'SNAM.Music', None)
-    musc = _MUSIC_BY_ENUM.get(snam if snam is not None
-                              else TES4_DEFAULT_MUSIC_ENUM)
+    musc = music_for_enum(snam if snam is not None
+                          else TES4_DEFAULT_MUSIC_ENUM)
     if musc:
         subs += pack_formid_subrecord('ZNAM', musc)
 
@@ -1274,298 +1249,6 @@ def build_land_layers(rec: dict) -> bytes:
                 subs += pack_subrecord('VTXT', bytes(vtxt_data))
 
     return subs
-
-
-# TES4 REGN data-entry type enum, shared verbatim by TES5 (xEdit
-# wbDefinitionsTES4/TES5): 2 Objects, 3 Weather, 4 Map, 5 Land, 6 Grass,
-# 7 Sound.
-_REGN_DATA_WEATHER = 3
-_REGN_DATA_SOUND = 7
-
-# Remapped FormIDs of the regions convert_REGN actually emitted.  The engine
-# activates a region's weather through the CELL's XCLR region list (verified
-# against Skyrim.esm: WeatherWinterhold appears in 30 cells' XCLR,
-# WeatherCoastFog in 51), so convert_CELL writes XCLR filtered against this
-# set — a cell must never reference a region that was dropped.  Regions are
-# converted in import phase 1, before any CELL is built.
-_EMITTED_REGION_FIDS = set()
-
-
-def reset_emitted_regions():
-    """Called at import start so a multi-plugin run doesn't leak regions."""
-    _EMITTED_REGION_FIDS.clear()
-
-
-def convert_REGN(rec: dict):
-    """REGN — Region, converted for its WEATHER entries only.
-    Returns packed bytes, or None to emit nothing.
-
-    This is where Cyrodiil's weather actually lives: TamrielClimate's WLST is
-    a single Clear weather at 100%, and the variety (rain in the Blackwood,
-    snow around Bruma...) comes from 59 region RDWT weather lists layered over
-    it.  Skyrim uses the identical mechanism for its own coasts and holds
-    (WeatherCoastFog, WeatherWinterhold...), so the data passes through:
-    RDAT header byte-identical, RDWT entries widened 8 -> 12 bytes by the
-    trailing Global FormID, RPLI/RPLD area polygons byte-identical.
-
-    The other data types (objects, grass, sound, map) drive TES4-side
-    generators with no behavioural equivalent here and are dropped.  A region
-    with no weather list — or no area polygon to apply it in — emits nothing.
-
-    TES5 subrecord order (wbDefinitionsTES5): EDID, RCLR, WNAM,
-    [RPLI, RPLD]*, [RDAT, RDWT]*.
-    """
-    n_entries = get_int(rec, 'RegionDataCount')
-    weather_entries = []
-    music_entries = []
-    for i in range(n_entries):
-        # RDMD -- the region's music type.  This is the ONLY authored
-        # per-area music TES4 has, and it is how Skyrim delivers exterior
-        # music as well: vanilla Tamriel's WRLD.ZNAM points at a SILENT
-        # 30-second track (_MUSExploreSILENT30) and every real explore type
-        # reaches the player through REGN.RDMO instead.  Emitting ZNAM alone
-        # therefore leaves the countryside quiet, which is exactly what
-        # "cities have music, outside does not" looks like.
-        mus = get_int(rec, f'RegionData[{i}].MusicType', None)
-        # 🛑 RDMD is almost always the CS's unset default, not a choice:
-        # 126 of Oblivion's 127 values are 0 (Explore) and only
-        # WaitingRoomRegion authors anything else.  Every city region --
-        # Bruma, Chorrol, all 8 IC districts, 21 in total -- says 0 while its
-        # own worldspace says SNAM=1 (Public).  Honouring the region there
-        # pins the whole city to Explore and the track never changes on
-        # entering.  So a DEFAULT-valued RDMD yields to an authored SNAM;
-        # only a region that actually names a non-default type wins.
-        if (mus == TES4_DEFAULT_MUSIC_ENUM
-                and _WORLD_MUSIC_ENUM.get(get_formid(rec, 'WNAM.Worldspace'))
-                not in (None, TES4_DEFAULT_MUSIC_ENUM)):
-            mus = None
-        if mus is not None:
-            music_entries.append((get_int(rec, f'RegionData[{i}].Override'),
-                                  get_int(rec, f'RegionData[{i}].Priority'),
-                                  mus))
-        if get_int(rec, f'RegionData[{i}].Type') != _REGN_DATA_WEATHER:
-            continue
-        wlist = b''
-        for j in range(get_int(rec, f'RegionData[{i}].WeatherCount')):
-            wfid = get_formid(rec, f'RegionData[{i}].Weather[{j}].FormID')
-            if not wfid:
-                continue
-            chance = get_int(rec, f'RegionData[{i}].Weather[{j}].Chance')
-            wlist += struct.pack('<III', wfid, chance, 0)
-        if wlist:
-            weather_entries.append((get_int(rec, f'RegionData[{i}].Override'),
-                                    get_int(rec, f'RegionData[{i}].Priority'),
-                                    wlist))
-
-    # Area polygons: the engine applies region data only inside these.
-    areas = b''
-    for i in range(get_int(rec, 'AreaCount')):
-        points = get_hex_bytes(rec, f'Area[{i}].PointsHex')
-        if not points:
-            continue
-        areas += pack_subrecord(
-            'RPLI', struct.pack('<I', get_int(rec, f'Area[{i}].EdgeFalloff')))
-        areas += pack_subrecord('RPLD', points)
-
-    if not areas or (not weather_entries and not music_entries):
-        return None
-
-    subs = b''
-    edid = get_str(rec, 'EditorID')
-    if edid:
-        subs += pack_string_subrecord('EDID', edid)
-
-    subs += pack_subrecord('RCLR', struct.pack(
-        '<BBBB', get_int(rec, 'RCLR.R'), get_int(rec, 'RCLR.G'),
-        get_int(rec, 'RCLR.B'), 0))
-
-    wnam = get_formid(rec, 'WNAM.Worldspace')
-    if wnam:
-        subs += pack_formid_subrecord('WNAM', wnam)
-
-    subs += areas
-
-    # Sound (type 7) entries first: xEdit sorts Region Data Entries by the
-    # RDAT type key, and vanilla's RDMO regions all carry type 7.
-    for override, priority, mus in music_entries:
-        musc = _MUSIC_BY_ENUM.get(mus)
-        if not musc:
-            continue
-        subs += pack_subrecord('RDAT', struct.pack(
-            '<IBBxx', _REGN_DATA_SOUND, 1 if override else 0,
-            min(255, priority)))
-        subs += pack_formid_subrecord('RDMO', musc)
-
-    for override, priority, wlist in weather_entries:
-        subs += pack_subrecord('RDAT', struct.pack(
-            '<IBBxx', _REGN_DATA_WEATHER, 1 if override else 0,
-            min(255, priority)))
-        subs += pack_subrecord('RDWT', wlist)
-
-    fid = get_formid(rec, 'FormID')
-    _EMITTED_REGION_FIDS.add(fid)
-    return pack_record('REGN', fid, get_int(rec, 'RecordFlags'), subs)
-
-
-def convert_LSCR(rec: dict) -> bytes:
-    """LSCR — Loading Screen. No OBND per xEdit.
-
-    TES5 order: EDID ICON DESC CTDA NNAM SNAM RNAM ONAM XNAM MOD2
-    NNAM is a FormID → STAT (the loading screen 3D model), required.
-    ICON omitted: TES5 loading screens use 3D models, not 2D textures.
-    """
-    subs = b''
-    edid = get_str(rec, 'EditorID')
-    if edid:
-        subs += pack_string_subrecord('EDID', edid)
-    desc = get_str(rec, 'DESC')
-    if desc:
-        subs += pack_string_subrecord('DESC', desc)
-    # NNAM — Loading Screen NIF: FormID → STAT|NULL (required, 4 bytes)
-    # TES4 doesn't have a 3D model ref; use NULL (0)
-    subs += pack_formid_subrecord('NNAM', 0)
-    return pack_record('LSCR', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
-
-
-def convert_WATR(rec: dict) -> bytes:
-    """WATR — Water Type conversion.
-
-    TES5 order: EDID FULL NNAM*3 ANAM FNAM MNAM TNAM SNAM XNAM INAM DATA DNAM
-    GNAM NAM0 NAM1.  DATA is a 2-byte Damage-per-second value; DNAM is the
-    228-byte water-visuals struct (fog/color/specular/noise/depth), restructured
-    from TES4's own 102-byte DATA and NOT offset-compatible with it.
-    """
-    subs = b''
-    edid = get_str(rec, 'EditorID')
-    if edid:
-        subs += pack_string_subrecord('EDID', edid)
-
-    # NNAM — noise map textures.  TES5 takes three (one per noise layer) and
-    # every vanilla record points all three at the same file; TES4 authors a
-    # single surface texture.  Oblivion's is a diffuse surface map, not a
-    # normal/noise map, so feeding it to Skyrim's noise sampler produces
-    # garbage displacement — all 34 vanilla records use DefaultWater.dds and
-    # so do we, letting the DNAM colors carry the look instead.
-    for _ in range(3):
-        subs += pack_string_subrecord('NNAM', r'Data\Textures\Water\DefaultWater.dds')
-
-    # ANAM — Opacity
-    opacity = get_int(rec, 'ANAM.Opacity', 128)
-    subs += pack_uint8_subrecord('ANAM', max(0, min(255, opacity)))
-
-    # FNAM — Flags.  Bit 0 (Causes Damage) means the same thing in both games.
-    # TES4 bit 1 is "Reflective", which TES5 reassigned (bit 3 Enable Flowmap,
-    # bit 4 Blend Normals in SSE), so only bit 0 is carried through — passing
-    # the raw byte would set flowmap/normal-blend bits at random.
-    flags = get_int(rec, 'FNAM.Flags') & 0x01
-    subs += pack_uint8_subrecord('FNAM', flags)
-
-    # MNAM — TES5 marks this "Material ID (Unused)" and every vanilla record
-    # that writes it writes a zero byte array, not the TES4 material string.
-    # TNAM took over as the material reference and is a MATT FormID; Skyrim
-    # ships no lava MATT and only 5 of 34 vanilla records set TNAM at all, so
-    # neither is emitted.
-
-    # SNAM — Sound (open water sound)
-    sound_fid = get_formid(rec, 'SNAM.Sound')
-    if sound_fid:
-        subs += pack_formid_subrecord('SNAM', sound_fid)
-
-    # DATA — Damage Per Second (UInt16).  TES4 carries the damage value at the
-    # tail of its own DATA struct and gates it behind FNAM bit 0 ("Causes
-    # Damage"); OblivionLavaTest01 authors 50/sec that way.  Honour the gate:
-    # a record with a damage value but no flag is not meant to hurt.
-    damage = get_int(rec, 'DATA.Damage', 0) if (flags & 0x01) else 0
-    subs += pack_subrecord('DATA', struct.pack('<H', max(0, min(0xFFFF, damage))))
-
-    # DNAM — Water Data (228 bytes).  TES4's DATA is prefix-compatible with
-    # this struct as far as the color block, but NOT at the same offsets: TES4
-    # carries a Scroll X/Y Speed pair at 28-35 that TES5 dropped, so every
-    # field from Fog Near onward sits 4 bytes earlier here (colors at 40/44/48,
-    # not TES4's 44/48/52).  Writing TES4's offsets straight through is what
-    # used to land the colors in the rain-simulator region, leaving the real
-    # color bytes zeroed and every converted water rendering as undefined
-    # near-black.  Offsets below are derived from the xEdit TES5 definition and
-    # verified field-by-field against Skyrim.esm's DefaultWater, LavaWater and
-    # DefaultVolcanicWater.
-    #
-    # Real vanilla order is EDID NNAM* ANAM FNAM [MNAM] [SNAM] DATA DNAM
-    # [GNAM NAM0 NAM1] — this used to be written with the 228-byte struct
-    # under the 'DATA' tag and a bogus 196-byte block under 'DNAM', which
-    # SSEEdit's background loader flags on every single WATR record
-    # ("unexpected (or out of order) subrecord DATA"/"DNAM").
-    dnam = bytearray(228)
-
-    def _f(off, value):
-        struct.pack_into('<f', dnam, off, value)
-
-    # 0-15: wind/wave. Marked "unused" by TES5 but every vanilla record still
-    # writes the same four constants, so mirror them rather than TES4's values.
-    _f(0, 0.1)
-    _f(4, 90.0)
-    _f(8, 0.5)
-    _f(12, 1.0)
-
-    # 16-27: the surface response TES4 does author.  Sun Power is a 0-50ish
-    # scale in TES4 and a ~1000 scale in TES5 (vanilla: 1021 default water,
-    # 1000 lava), so it is renormalised rather than copied raw; the rest are
-    # 0-1 ratios that mean the same thing in both games.
-    sun_power = get_float(rec, 'DATA.SunPower', 15.0)
-    _f(16, max(0.0, min(4000.0, sun_power * (1021.0 / 15.0))))
-    _f(20, get_float(rec, 'DATA.ReflectivityAmount', 1.0))
-    _f(24, get_float(rec, 'DATA.FresnelAmount', 0.05))
-    _f(28, 0.0)
-
-    # 32-39: above-water fog distance, straight across from TES4.
-    _f(32, get_float(rec, 'DATA.FogNear', 0.0))
-    _f(36, get_float(rec, 'DATA.FogFar', 110.0))
-
-    # 40-52: the color block — the whole visual identity of the water, and the
-    # reason Oblivion's realms came through as ordinary blue.  Alpha is 0 in
-    # every vanilla Skyrim record, so only RGB is carried.
-    for off, key, fallback in ((40, 'ShallowColor', (37, 52, 37)),
-                               (44, 'DeepColor', (5, 16, 5)),
-                               (48, 'ReflectionColor', (103, 122, 117))):
-        for i, chan in enumerate(('R', 'G', 'B')):
-            dnam[off + i] = max(0, min(255, get_int(
-                rec, f'DATA.{key}{chan}', fallback[i])))
-    dnam[52] = max(0, min(255, get_int(rec, 'DATA.TextureBlend', 50)))
-
-    # 56-227: noise, fog-under, specular and depth properties.  TES4 has no
-    # source for any of these — they describe a shader it does not have — so
-    # they take Skyrim's own DefaultWater values, which is what an unedited
-    # record in the CK would carry.  Leaving them zeroed instead produces
-    # water with no noise scale and no depth response.
-    for off, value in (
-            (100, 270.0),                                    # noise falloff
-            (104, 210.0), (108, 225.0), (112, 0.019),        # noise wind dir
-            (116, 0.013), (120, 0.096), (124, 6200.0),       # noise wind speed
-            (128, 0.2),
-            (132, 0.93), (136, 900.0),                       # fog above
-            (140, 0.9), (144, -500.0), (148, 1600.0),        # fog under
-            (152, 9.0),                                      # refraction mag
-            (156, 500.0), (160, 0.0), (164, 10000.0), (168, 10.0),
-            (172, 1920.0), (176, 6703.0), (180, 488.0),      # noise UV scale
-            (184, 0.6957), (188, 0.6304), (192, 0.4746),     # noise amp scale
-            (196, 0.34),                                     # reflection mag
-            (200, 1.7), (204, 3.2),                          # sun sparkle/spec
-            (208, 0.9), (212, 0.5), (216, 0.1), (220, 0.2),  # depth properties
-            (224, 2200.0)):                                  # sun sparkle power
-        _f(off, value)
-    subs += pack_subrecord('DNAM', bytes(dnam))
-
-    # GNAM — Related Waters (daytime/nighttime/underwater).  Required by the
-    # xEdit definition and present on all 34 vanilla records, always zeroed.
-    subs += pack_subrecord('GNAM', b'\x00' * 12)
-
-    # NAM0/NAM1 — linear and angular velocity, required and zero on vanilla
-    # still water.  TES4's Scroll X/Y Speed is the closest analogue to NAM0's
-    # linear velocity, but the units differ by orders of magnitude (TES4
-    # authors 0.0011 where vanilla NAM0 carries 0.22), so it is not carried.
-    subs += pack_subrecord('NAM0', b'\x00' * 12)
-    subs += pack_subrecord('NAM1', b'\x00' * 12)
-
-    return pack_record('WATR', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
 
 # ---------------------------------------------------------------------------

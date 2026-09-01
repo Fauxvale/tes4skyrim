@@ -48,7 +48,7 @@ from .dialog_converter import (
     compute_quest_priorities,
     convert_QUST,
 )
-from .record_types.dialog_misc import convert_SOUN
+from .record_types.sound import convert_SOUN
 from .skyrim_overrides import (
     CUSTOM_VTYP_EDIDS,
     VTYP_EDID_BY_FID,
@@ -879,13 +879,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # which one keeps the bare name, and the STAT must agree with the mesh.
     writer.export_dir = export_dir
 
-    # A TES4 SOUN may name a DIRECTORY of random variants rather than one file;
-    # the SNDR converter enumerates it from the extracted ASSETS, which for an
-    # imported mod are one level above the record text (see
-    # dialog_misc._sound_anam_paths). Passing the record dir made os.listdir
-    # fail, so the ANAM was written as a bare directory path with a trailing
-    # separator -- naming no playable file, and losing the random variants.
-    from .record_types.dialog_misc import set_sound_source_dir
+    from .record_types.sound import set_sound_source_dir
     set_sound_source_dir(str(assets_for(export_dir)))
 
     try:
@@ -1468,47 +1462,23 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     load_door_model_sounds(str(assets_for(export_dir) / 'meshes'), by_type)
     _step_done('door mesh sounds')
 
-    # --- Phase 0f: Generated creature RACE/ARMA/ARMO chains ---
-    # One race per unique (creature folder, body-part set) among CREA records
-    # whose folder was converted by the creature pipeline (creatures step).
-    # convert_CREA then points RNAM at the generated race; NPC_ humanoids
-    # keep the Skyrim playable-race override system.
-    # Actors embed their TES4 SOUN ids and are patched to the real SNDR after
-    # Phase 3 (actors.patch_actor_sounds). Nothing may be allocated here: an
-    # extra Phase 0 allocation shifts every generated FormID and invalidates
-    # anything matched to a previous run by id (it broke the Slot44 patch).
-    from .record_types.dialog_misc import reset_sound_descriptors
+    from .record_types.sound import reset_sound_descriptors
     reset_sound_descriptors()
 
-    # SOUN identity index (EditorID + filename per TES4 SOUN id).  WTHR
-    # converts in Phase 2, before the SOUN phase, so the weather-sound
-    # classifier cannot read the SOUN records themselves.  The MASTER's SOUNs
-    # are indexed first: a dependent plugin's weathers routinely cite
-    # Oblivion.esm's own AMB* beds, and without them every such entry would
-    # classify as unknown and be dropped (CLAUDE.md 'master-export blindness').
-    # Pure indexing — nothing is allocated here.
-    from .record_types.dialog_misc import (reset_soun_identity,
-                                           load_soun_identity)
+    from .record_types.sound import reset_soun_identity, load_soun_identity
     reset_soun_identity()
     if ctx and getattr(ctx, 'master_export', None):
         load_soun_identity([r for r in ctx.master_export.values()
                             if r.get('Signature') == 'SOUN'])
     load_soun_identity(by_type.get('SOUN', []))
 
-    # Region registry: convert_REGN (phase 1) records which weather regions
-    # emitted, and the CELL builders later filter XCLR against it.
-    from .record_types.world import reset_emitted_regions
+    from .record_types.common import reset_emitted_regions
     reset_emitted_regions()
 
     from .creature_races import (build_creature_races,
                                  build_creature_death_piles)
     build_creature_races(by_type, writer, export_dir,
                          ctx.master_export if ctx else None)
-    # Dissolving creatures (ghost/wraith) leave an AUTHORED ectoplasm pile
-    # that asset_convert lifted out of their skeleton; wrap each one in an
-    # ACTI so TES4_GhostDissolve can drop Oblivion's own pile instead of
-    # Skyrim's DefaultAshPileGhost.  Must run BEFORE the CREA pass, which
-    # binds the ACTI into each creature's VMAD.
     n_piles = build_creature_death_piles(writer)
     if n_piles:
         print(f'  Creature death piles: {n_piles} ACTI '
@@ -1680,8 +1650,8 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     try:
         from .record_types.music import (build_music_records,
                                          load_music_manifest)
-        from .record_types.world import (register_music_types,
-                                         register_world_music)
+        from .record_types.common import (register_music_types,
+                                          register_world_music)
         # Regions convert in Phase 1, before WRLD, so index each worldspace's
         # authored SNAM now: convert_REGN needs it to tell an authored region
         # music type from the CS's unset default (see its RDMD note).
@@ -1767,15 +1737,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
         for rec in by_type[sig]:
             work_items.append((sig, target_sig, rec))
 
-    # Sunless-sky registry: a CLMT with a void/absent sun sprite marks every
-    # weather in its WLST as sunless, and convert_WTHR (Phase 2b) zeroes those
-    # weathers' sun slots.  Reset per plugin, then seed from the MASTER export
-    # before Phase 1 runs: an override plugin's climates take the ctx.build()
-    # short-circuit and never reach convert_CLMT, and a plugin may add a
-    # weather to a climate its master owns.  Without the seed those weathers
-    # keep Skyrim's sun over the Deadlands.
-    from .record_types.dialog_misc import (
-        record_sunless_climate, reset_sunless_climates)
+    from .record_types.weather import record_sunless_climate, reset_sunless_climates
     reset_sunless_climates()
     if ctx and getattr(ctx, 'master_export', None):
         for mrec in ctx.master_export.values():
@@ -1865,20 +1827,9 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                 print(f"  ERROR converting LTEX '{get_str(rec, 'EditorID', '?')}': {e}")
                 errors += 1
 
-    # --- Phase 2b: WTHR (creates IMGS companion records) ---
-    # Skyrim has no per-weather HDR field: tone mapping lives in an imagespace
-    # the weather points at, so each converted weather mints four IMGS (one
-    # per time of day) from its TES4 HNAM block.  Serial, like the other
-    # companion-emitting phases, so record order stays deterministic.
-    from .record_types.dialog_misc import convert_WTHR
+    from .record_types.weather import convert_WTHR
     wthr_records = by_type.get('WTHR', [])
     if wthr_records:
-        # NOTE: weather colours used to be normalised against a per-PLUGIN
-        # median computed here, before any weather converted.  That is gone —
-        # the replacement is a per-colour highlight knee (see the block
-        # comment above _NAM0_KNEE in dialog_misc.py), which needs no
-        # population pass and makes a weather convert identically regardless
-        # of what else is in the plugin.
         print(f"  Converting {len(wthr_records)} WTHR records (with IMGS creation)...")
         for rec in wthr_records:
             try:
@@ -1902,7 +1853,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     # --- Phase 3: SOUN (creates SNDR companion records) ---
     def _record_master_sndr(ctx, rec):
         """Map an overridden SOUN to the MASTER's SNDR companion."""
-        from .record_types.dialog_misc import record_sndr_for_soun
+        from .record_types.sound import record_sndr_for_soun
         try:
             for fid in ctx.master_manifest.companions(
                     (rec.get('FormID') or '').upper()):
@@ -2392,11 +2343,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
             writer, _sig, _own_souns, _master_sound_descriptor)
         if _n:
             print(f"  Sound descriptors bound: {_n} {_label}")
-    # WTHR SNAM holds TES4 SOUN ids for the same reason (Phase 2 precedes the
-    # descriptors). TES5 weather sounds are SNDR slots; left as SOUN ids the
-    # engine dereferences a record that carries no descriptor payload and the
-    # sky plays the wrong sound entirely.
-    from .record_types.dialog_misc import patch_weather_sounds
+    from .record_types.weather import patch_weather_sounds
     n_wsnd = patch_weather_sounds(writer, _own_souns)
     if n_wsnd:
         print(f"  Weather sound descriptors bound: {n_wsnd} weathers")
@@ -2417,7 +2364,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     from .creature_footsteps import (build_creature_footsteps,
                                      patch_creature_footsteps)
     from .creature_races import get_creature_arma_folders
-    from .record_types.dialog_misc import get_sndr_for_soun
+    from .record_types.sound import get_sndr_for_soun
     _crea_slots = _creature_sound_slots(export_dir)
     _soun_fid = {get_str(r, 'EditorID'): get_formid(r, 'FormID')
                  for r in by_type.get('SOUN', []) if get_str(r, 'EditorID')}

@@ -326,20 +326,15 @@ def sky_object_type_for(src_path):
         return None
     return _SKY_MESH_TYPES.get(parts[-1])
 
-# Supported source versions — anything else is skipped (not copied to output)
+#: Convertible source versions (Oblivion-era, plus 0x14020007 for FO3/FNV); anything else is skipped, not copied.
 _SUPPORTED_VERSIONS = {
-    0x14000004,  # Gamebryo v20.0.0.4 — primary Oblivion format
-    0x14000005,  # Gamebryo v20.0.0.5
-    0x0a020000,  # Gamebryo v10.2.0.0
-    0x0a01006a,  # Gamebryo v10.1.0.106
-    0x0a000100,  # NetImmerse v10.0.1.0
-    0x0a000102,  # NetImmerse v10.0.1.2
-    0x0a010065,  # Gamebryo v10.1.0.101
+    0x14000004, 0x14000005, 0x0a020000, 0x0a01006a,
+    0x0a000100, 0x0a000102, 0x0a010065, 0x14020007,
 }
 
-# Already-Skyrim versions — copy to output unchanged
+#: Already-Skyrim (version, user_version_2), copied out unchanged; FO3/FNV share the version, differing only in uv2.
 _SKYRIM_VERSIONS = {
-    0x14020007,  # Skyrim SE v20.2.0.7
+    (0x14020007, 83),
 }
 
 # Havok unit scale factor (Oblivion → Skyrim).
@@ -7630,7 +7625,7 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
         result['error'] = 'RD'
         return result
 
-    if data.version in _SKYRIM_VERSIONS:
+    if (data.version, data.user_version_2) in _SKYRIM_VERSIONS:
         # Already Skyrim — copy as-is.  Nothing rewrote its texture paths, so
         # scan the bytes for them; the prune must not drop what this still uses.
         dst_dir = os.path.dirname(dst_path)
