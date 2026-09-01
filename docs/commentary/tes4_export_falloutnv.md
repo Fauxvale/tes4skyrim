@@ -198,3 +198,75 @@ every existing code path keeps working unchanged.
 
 A converted gun reloads with the crossbow's crank animation. Skyrim has no
 other ranged reload, and this is cosmetic — the weapon fires correctly.
+
+## Navmesh: authored, not generated
+
+**Code:** `tes4_export/record_types/falloutnv.py` (`_emit_navm_deltas`,
+`_emit_navi_deltas`), `tes5_import/record_types/navm_falloutnv.py`
+
+### Why FO3/FNV needs a different path
+
+Oblivion has no navmesh. It ships **pathgrids** (PGRD), and the importer
+*generates* navmesh geometry from them — the slowest stage in the pipeline, and
+the reason the shared navmesh cache exists.
+
+FO3/FNV ship real navmeshes. Measured:
+
+| | PGRD | NAVM | NAVI |
+|---|---:|---:|---:|
+| Oblivion.esm | 8,228 | 0 | 0 |
+| FalloutNV.esm | **0** | **4,771** | **1** |
+
+So FalloutNV got no navmesh at all: nothing to generate from, and its authored
+navmeshes were never read. Symptom: NPCs cannot path anywhere.
+
+This is a **read-and-repack**, not a generation problem, so it needs none of
+the pathgrid machinery and none of the cache.
+
+### The format gap
+
+FO3/FNV spread the navmesh across separate subrecords; TES5 packs the whole
+thing into one `NVNM` blob.
+
+| | FO3/FNV | TES5 |
+|---|---|---|
+| Cell + counts | `DATA` (24B) | inside `NVNM` |
+| Vertices | `NVVX`, 12B each | inside `NVNM` |
+| Triangles | `NVTR`, 16B each | inside `NVNM` |
+| Door links | `NVDP`, 8B each | inside `NVNM` |
+| Grid | `NVGD` | rebuilt |
+| Cover triangles | `NVCA` | dropped — Skyrim has no cover system |
+
+The triangle record is the same shape in both: three u16 vertex indices, three
+s16 edge-adjacency indices, then flags. **FO3/FNV already store the edge
+adjacency**, so the importer skips `_compute_adjacency` entirely — the authored
+answer is better than a recomputed one, and cheaper.
+
+`NVGD` is not exported: it is a spatial lookup grid derived from the geometry,
+and `_pack_nvnm` builds its own via `_build_navmesh_grid`.
+
+### What the exporter emits
+
+`NVVX`, `NVTR` and `NVDP` are dumped verbatim as hex; `DATA` is unpacked into
+named fields. NAVI's repeating `NVMI` entries are emitted one per line with an
+ordinal plus a count, since a single record carries thousands.
+
+### Reusing the TES5 serialiser
+
+`tes5_import/pgrd_to_navm.py::_pack_nvnm` already writes the TES5 blob and is
+validated byte-exact against real Skyrim navmeshes. It takes
+`(verts, tris, adj, tri_flags, ...)` — exactly what NVVX/NVTR carry — so the
+FO3/FNV path feeds it authored data where the Oblivion path feeds it generated
+data. One serialiser, two sources.
+
+### Authored edges that name no triangle
+
+Vanilla FalloutNV.esm has **43 edge-adjacency entries across 38 navmeshes**
+that index past the last triangle in their own mesh -- 43 of 674,700, a 0.006%
+defect rate in Bethesda's own data. The first is navmesh 00124991, whose edge
+names triangle 6 in a 6-triangle mesh.
+
+FO3/FNV otherwise use -1 for no" "neighbour exactly as TES5 does (251,745
+occurrences). parse_triangles normalizes an out-of-range edge to -1, because
+navm_split._components indexes comp[e] directly and only guards against -1;
+an unchecked value raises IndexError and kills the whole import.

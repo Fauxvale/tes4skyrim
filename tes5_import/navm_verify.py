@@ -9,6 +9,7 @@ restores the "a wrong cache is slow, never incorrect" guarantee.
 See: docs/commentary/tes5_import_navmesh.md#verifying-a-cache-against-fresh-geometry
 """
 
+import os
 from collections import defaultdict
 
 #: Cells re-built and compared against the cache on every import, by default.
@@ -22,7 +23,6 @@ def verify_budget(explicit: int = None) -> int:
     """How many cells to verify: explicit value, else the env var, else default."""
     if explicit is not None:
         return max(0, explicit)
-    import os
     raw = os.environ.get(VERIFY_ENV_VAR, '').strip()
     if raw:
         try:
@@ -88,7 +88,6 @@ def uncertify(geom_cache) -> bool:
     """
     if not geom_cache:
         return False
-    import os
     try:
         os.remove(os.path.join(geom_cache[0], 'CACHE_TAG'))
         return True
@@ -143,3 +142,147 @@ def report_verification(cache: dict, geom_cache) -> bool:
     print('      Mismatched cells used their FRESH build, so this plugin is '
           'correct; the cache is now marked stale.')
     return True
+
+
+def prove_cache(jobs: list, geom_cache, sample: int, quiet: bool = False):
+    """Rebuild a sample and compare against the STORED payload.  (checked, bad).
+
+    Ignores each entry's stored hash: that hash is exactly what a source change
+    invalidated, so requiring it to match would refuse before comparing a
+    single vertex.  Geometry is the authority on whether a cache still applies.
+    """
+    from . import navm_worker
+    from .pgrd_to_navm import cached_geometry, geom_equal
+    picked = list(jobs)
+    mark_jobs(picked, sample)
+    checked, bad = 0, []
+    for job in [j for j in picked if j.get('verify')]:
+        stored = cached_geometry(geom_cache, *job['key'])
+        if stored is None:
+            continue
+        key, (_b, meta) = navm_worker.run_job(job)
+        fresh = (meta or {}).get('geometry')
+        if fresh is None:
+            continue
+        checked += 1
+        ok = geom_equal(stored, fresh)
+        if not ok:
+            bad.append(key)
+        if not quiet:
+            print('      %08X %s' % (key[0], 'identical' if ok else 'MISMATCH'),
+                  flush=True)
+    return checked, bad
+
+
+def _rekey_one(path: str, want: str) -> bool:
+    """Rewrite one entry's stored hash in place.  True when it changed."""
+    import pickle
+    try:
+        with open(path, 'rb') as fh:
+            blob = pickle.load(fh)
+        if blob.get('hash') == want:
+            return False
+        blob['hash'] = want
+        tmp = '%s.tmp%d' % (path, os.getpid())
+        with open(tmp, 'wb') as fh:
+            pickle.dump(blob, fh, pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def rekey_cache(jobs: list, geom_cache) -> tuple:
+    """Re-key every entry that has a job to the CURRENT tag.  (done, skipped).
+
+    Hashes come from `cell_geom_key`, so no geometry is built.
+    """
+    from . import navm_worker
+    from .pgrd_to_navm import cell_geom_key
+    cache_dir = geom_cache[0]
+    by_key = {j['key']: j for j in jobs}
+    done = skipped = 0
+    for name in sorted(os.listdir(cache_dir)):
+        if not name.endswith('.pkl'):
+            continue
+        try:
+            key = tuple(int(x, 16) for x in name[:-4].split('_'))
+        except ValueError:
+            skipped += 1
+            continue
+        job = by_key.get(key)
+        if job is None:
+            skipped += 1
+            continue
+        fresh = cell_geom_key(job['pgrd_rec'], job['land_rec'],
+                              job['cell_rec'], job['refr_recs'],
+                              navm_worker._BASE_MODEL_BY_FID,
+                              navm_worker._DOOR_FIDS, geom_cache,
+                              job.get('extra_door_refrs'))
+        if not fresh:
+            skipped += 1
+        elif _rekey_one(os.path.join(cache_dir, name), fresh):
+            done += 1
+    return done, skipped
+
+
+def adopt_if_unchanged(jobs: list, geom_cache, sample: int = None) -> bool:
+    """Salvage a stale cache whose geometry still reproduces.  True if adopted.
+
+    Called before the navmesh pool dispatches.  A source edit moves the tag, so
+    every entry misses and an output-neutral refactor costs a FULL
+    regeneration; proving a sample and re-keying makes it a sample plus a hash
+    rewrite.  A cache that does not reproduce is left alone.  False (no work)
+    when CACHE_TAG already matches: that cache is this code's own.
+
+    See: docs/commentary/tes5_import_navmesh.md#verifying-a-cache-against-fresh-geometry
+    """
+    if geom_cache is None:
+        return False
+    budget = verify_budget() if sample is None else sample
+    if budget <= 0:
+        return False
+    cache_dir, tag = geom_cache
+    try:
+        with open(os.path.join(cache_dir, 'CACHE_TAG')) as fh:
+            if fh.read().strip() == tag:
+                return False
+    except OSError:
+        pass
+    if not any(n.endswith('.pkl') for n in os.listdir(cache_dir)):
+        return False
+    print('  Navmesh cache: built by different navmesh code -- checking '
+          'whether its geometry still reproduces (%d cells)...' % budget,
+          flush=True)
+    checked, bad = prove_cache(jobs, geom_cache, budget)
+    if not checked:
+        print('    no comparable entries; regenerating.', flush=True)
+        return False
+    if bad:
+        print('    %d/%d differ -- a real geometry change; regenerating.'
+              % (len(bad), checked), flush=True)
+        return False
+    done, _skipped = rekey_cache(jobs, geom_cache)
+    try:
+        with open(os.path.join(cache_dir, 'CACHE_TAG'), 'w') as fh:
+            fh.write(tag)
+    except OSError:
+        pass
+    print('    %d/%d identical; adopted %d entries instead of regenerating.'
+          % (checked, checked, done), flush=True)
+    for job in jobs:
+        job.pop('verify', None)
+    return True
+
+
+def prepare(jobs: list, geom_cache) -> None:
+    """Ready the navmesh cache for this run: adopt if salvageable, then sample.
+
+    The one call the import makes.  Adoption rescues a cache whose tag moved
+    but whose geometry still reproduces; marking then picks the cells this run
+    re-verifies.
+    """
+    if not geom_cache:
+        return
+    adopt_if_unchanged(jobs, geom_cache)
+    mark_jobs(jobs, verify_budget())

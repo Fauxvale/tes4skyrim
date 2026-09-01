@@ -1145,3 +1145,35 @@ def test_environment_records_what_the_tag_cannot_see():
     env = adopt.environment()
     assert 'python' in env
     assert 'shapely' in env and 'geos' in env
+
+
+def test_adopt_skips_when_the_stamp_already_matches(tmp_path):
+    """A cache this code built needs no adoption; prepare() must not rebuild."""
+    cdir = tmp_path / 'navmesh_geom_cache'
+    cdir.mkdir()
+    (cdir / 'CACHE_TAG').write_text('tag123')
+    (cdir / '00000001_00000002.pkl').write_bytes(b'x')
+    assert navm_verify.adopt_if_unchanged([], (str(cdir), 'tag123')) is False
+
+
+def test_adopt_declines_an_empty_cache(tmp_path):
+    """Nothing to adopt when no entries exist -- the run must regenerate."""
+    cdir = tmp_path / 'navmesh_geom_cache'
+    cdir.mkdir()
+    assert navm_verify.adopt_if_unchanged([], (str(cdir), 'newtag')) is False
+
+
+def test_adopt_declines_when_verification_is_disabled(tmp_path, monkeypatch):
+    """--navmesh-verify 0 opts out of adoption too, not just of re-checking."""
+    cdir = tmp_path / 'navmesh_geom_cache'
+    cdir.mkdir()
+    (cdir / '00000001_00000002.pkl').write_bytes(b'x')
+    monkeypatch.setenv(navm_verify.VERIFY_ENV_VAR, '0')
+    assert navm_verify.adopt_if_unchanged([], (str(cdir), 'newtag')) is False
+
+
+def test_prepare_is_a_noop_without_a_cache():
+    """No geometry cache configured means nothing to prepare."""
+    jobs = [_job('interior', 0)]
+    navm_verify.prepare(jobs, None)
+    assert not any(j.get('verify') for j in jobs)

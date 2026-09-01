@@ -1730,6 +1730,25 @@ exists to replace. `_cell_graph` is shared rather than duplicated precisely
 because a divergence between the two derivations would silently invalidate
 every entry.
 
+**The import adopts a stale cache before it regenerates one.**
+`navm_verify.prepare` runs before the navmesh pool dispatches: when `CACHE_TAG`
+does not match the current tag, it proves a sample against the STORED geometry
+and, if every cell reproduces, re-keys the entries and stamps the new tag. Only
+if a cell genuinely differs does the run regenerate.
+
+This is the case a user hits after editing any navmesh source, and it is the
+one that matters most: the tag moves, every entry misses, and without adoption
+the import rebuilds *all* ~2,900-8,200 cells for geometry that is already
+correct. Measured on a real moved tag: **Morrowind_ob 40/40 identical → 5,239
+entries adopted → 40/40 cache hits, 0 rebuilt**; Nehrim 39/39 → 2,885 adopted.
+With a deliberately corrupted entry the same path refused (1/7 differ) and left
+the stamp uncertified.
+
+Verifying only cells that ALREADY HIT is not enough on its own — that guards a
+cache whose tag matches but whose geometry does not (GEOS drift, a bad adopt),
+and does nothing when the tag has moved, because then nothing hits at all. Both
+halves are needed.
+
 **Adoption needs one process per plugin.**
 <a id="adoption-needs-one-process-per-plugin"></a>
 Per-plugin state lives in module globals: the collision soups
@@ -2540,3 +2559,44 @@ is a single node with only PGRI (cross-seam) links get no navmesh job at all
 (`_gather_navm_jobs` requires in-cell edges); `build_navmesh` produces a valid
 ribbon for them when invoked directly, so the fix is to gate jobs on
 "edges OR PGRI links".
+
+## <a id="ledge-links"></a>Ledge links: both sides, or neither
+
+**Code:** `tes5_import/pgrd_to_navm.py` (`_resolve_ledge_links`)
+
+A DROP-DOWN between disconnected storeys is Skyrim's own mechanism for
+stepping off a ledge — vanilla Skyrim.esm carries 476 Ledge Down / 467 Ledge Up
+across 3,000 navmeshes. Bridging the gap with triangles instead makes actors
+walk on air across the lip.
+
+On each linked triangle the link goes on the edge that has no neighbour and
+faces the other side; vanilla marks it with the per-edge link bit
+(0x0801/2/4).
+
+**A pair is committed only if BOTH directions resolve an open edge.**
+`_open_edge_towards` is evaluated independently per side, and slightly
+asymmetric geometry can make one side find a facing open edge while the other
+does not. A one-sided link is what the CK's own loader flags as *"Bad portal
+navmesh ID/triangle index … the cell needs to be refinalized"*.
+
+Measured: exactly **1 of 234,612** vanilla-verified portal links in a full
+Oblivion.esm conversion came out one-sided this way, in FortRayles. Skipping
+the half-resolved pair leaves that lip un-linked — no fall-through — instead of
+writing a reference the engine's own validator rejects.
+
+## <a id="navm-formid-preallocation"></a>NAVM FormID pre-allocation
+
+**Code:** `tes5_import/import_main.py` (`_assign_navm_formids`)
+
+Navmesh ids derive from the navmesh's SOURCE (cell + pathgrid), never from the
+order jobs happen to be gathered in, so the parallel and serial paths agree.
+
+They are **save-persisted**: measured, 564 NAVM ids appear in a real save's
+FormID array, carrying obstacle and door pathing state. Moving one breaks
+saves.
+
+The master-index offset returned alongside is a `text_reader` module global set
+once in the parent process. Spawned workers start at 0, so it is captured here
+and replayed in each child's init; without it their `get_formid()` calls
+mis-map every PathingCell parent FormID, which the engine meets as a
+navmesh-load null deref.

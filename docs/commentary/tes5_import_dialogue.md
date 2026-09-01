@@ -1033,3 +1033,274 @@ remap changes which funcs fall in the drop set. Instrument the call site.
 **Lesson:** that handler converts any bug in the INFO path into silent data
 loss. When a topic reports `ERROR info under ...`, the INFOs under it are gone,
 not degraded -- get the traceback before theorising.
+
+## <a id="adopting-a-masters-synthesized-records"></a>Adopting a master's synthesized records
+
+**Code:** `tes5_import/import_main.py` (`_adopt_master_special_records`),
+`tes5_import/synth_records.py`
+
+The conversion synthesizes records TES4 has no source for — globals, factions,
+menus, formlists, and one VTYP per voiced race. A **root master** creates them;
+a **dependent plugin** must adopt the master's FormIDs rather than create its
+own, or its VMAD properties point at records in the wrong file.
+
+### The voice-type case, which is the loud one
+
+`create_vtyp_records` is master-only, and it is what calls `set_voice_type`. A
+dependent plugin therefore left `VOICE_TYPE_MAP` EMPTY,
+`build_npc_to_vtyp_map` returned `{}` — "0 NPC->VTYP" in the build log — and
+`convert_NPC_`/`convert_CREA` wrote **no VTCK on any of Morroblivion's 3,607
+actors**.
+
+An actor with no voice type matches no dialogue, so EVERY line in the plugin
+was silent, including Jiub's: the prison-ship intro played out mutely. For
+contrast, Oblivion.esm as a root master has VTCK on 3,396 of 3,838 actors.
+
+The master already wrote these VTYPs, so the fix is to adopt its FormIDs.
+
+### Why the registry is cleared per plugin
+
+`WELL_KNOWN_PROPERTIES` is a module global, and `convert.py` imports several
+plugins in ONE process. Without the reset, a previous plugin's synthesized
+FormIDs would be adopted by the next one. Each run repopulates it — created for
+a root master, adopted from the master's output for a dependent plugin.
+
+## <a id="script-addtopic-and-the-unlock-globals"></a>Script AddTopic and the unlock globals
+
+**Code:** `tes5_import/import_main.py` (the `ScriptConverter.topic_unlock_globals`
+handoff)
+
+A script `AddTopic X` is the third reveal route for a topic, alongside INFO
+fragments and quest stages, and `script_convert` emits the same
+`TES4Unlock_<topic>.SetValue(1)` for it.
+
+Two things must hold or that property binds to nothing:
+
+- **The map must be shared.** The converter pass import_main runs — object and
+  quest VMAD property resolution — must see the SAME topic→global map the
+  script pipeline used. Otherwise it resolves a different property set than the
+  generated `.psc` declares.
+- **The global must be resolvable by name.** `WELL_KNOWN_PROPERTIES` does that
+  for synthesized records with no TES4 counterpart, following the
+  `TES4Fame`/`TES4GoldFenced` pattern.
+
+## <a id="the-synthesized-record-id-window"></a>The synthesized-record id window
+
+Writer ids start well above the highest source FormID so synthesized companion
+records cannot collide with converted ones: real records stop at or below
+`max_formid`, companions start at `+0x1000`, and the chargen menu MESGs take a
+fixed window in the middle of the reserved gap, ahead of the null-LAND repair.
+
+## <a id="the-conversion-owned-globals"></a>The conversion-owned globals
+
+**Code:** `tes5_import/synth_records.py`
+
+Oblivion state that Skyrim exposes no way to read. Each is a GlobalVariable the
+converted scripts read and write, registered in `WELL_KNOWN_PROPERTIES` so VMAD
+builders can bind it by name.
+
+| Global | Type | Replaces |
+|---|---|---|
+| `TES4Fame` | float | `GetPCFame` |
+| `TES4Infamy` | float | `GetPCInfamy` |
+| `TES4GoldFenced` | float | `GetAmountSoldStolen` / `ModAmountSoldStolen` |
+| `TES4ControlsDisabled` | short | `GetPlayerControlsDisabled` |
+
+**`TES4GoldFenced`** tracks the GOLD VALUE of stolen goods fenced — the Thieves
+Guild INFOs literally print "Amount fenced: %.0f gold". Skyrim keeps the
+counter only as a condition function: there is no Papyrus native and no
+matching entry in the stat table, so converted scripts back it with this
+global. Reusing the vanilla "Items Stolen" stat would be wrong twice over — it
+counts items rather than gold, and the engine bumps it on every theft, so the
+TG rank gates would trip without ever visiting a fence.
+
+**`TES4ControlsDisabled`** has no Papyrus native either (checked vanilla
+`Game.psc` and SKSE — only the Disable/Enable writers exist). Flattening the
+read to 0 is not neutral: it makes `== 1` permanently false AND `== 0`
+permanently true, so a script polling the state gets both halves of its own
+sequencing wrong. The converter owns both writers, so the state is shadowed:
+`Game.DisablePlayerControls()` and `Game.EnablePlayerControls()` each also
+write this global, and the read returns it.
+
+### TES4CyrodiilCrimeFaction
+
+Stands in for Oblivion's single global crime faction, and receives most
+converted `GetPCExpelled` / `GotoJail` / crime calls, so it must be a REAL
+crime faction: DATA sets **Can Be Owner (bit 15) + Track Crime (bit 6)**, and
+CRVA carries the vanilla crime values (murder 1000, assault 40, trespass 5,
+pickpocket 25, steal x1.0, escape 100) that all 14 real Skyrim crime factions
+share.
+
+**REVERTED:** it previously set CanBeOwner plus bits 7-11/13/16, which are
+Skyrim's *Ignore* Crimes flags — the opposite of the intent; xEdit decodes the
+old `0x0001AF80` as "IgnoreKills". It also never set Track Crime, without which
+the engine accumulates no crime gold at all, and its CRVA used the wrong struct
+layout, leaving every crime worth 0. See `convert_FACT` in
+`record_types/actors.py` for the layout and the vanilla-census amounts.
+
+## <a id="synthesized-menus-factions-and-formlists"></a>Synthesized menus, factions and formlists
+
+**Code:** `tes5_import/synth_records.py`
+
+### Chargen menus need FIXED ids
+
+`create_chargen_menu_records` allocates from a reserved window rather than
+`derive_formid()`: these ids are a contiguous, order-significant page/button
+block, which a hash cannot give. `writer.chargen_fid_base` sits mid-way into
+the gap `import_plugin` opens above the plugin's highest real FormID — clear of
+real records below, and of the null-LAND repair working down from the gap's
+top. The window is reserved with `reserve_source_ids()` so no derived id can
+hash onto it.
+
+The plan comes from `message_menus.build_chargen_menus`, the SAME function the
+script pipeline runs, so the Message properties in the emitted `.psc` bind to
+exactly these records and the page/button order matches the converter's
+`Show()` chain arithmetic.
+
+**Choice-persistence globals** sit at fixed slots ABOVE the page window
+(`base+0x40`, `+0x41`) so a changed page count can never move them. Menu
+emission writes (picked index + 1) there; the dialogue-condition conversion
+reads it back for `GetIsPlayerBirthsign` / `GetPCIsClass` (see
+`dialog_conditions.set_chargen_choice`). This is what makes the Emperor's
+post-birthsign line match the sign the player actually picked.
+
+### The force-combat faction pair
+
+`TES4 StartCombat` forces a fight regardless of aggression, disposition or
+faction state; Skyrim's combat AI drops a target it has no hostile reaction to.
+So the conversion owns a faction pair with a mutual Enemy reaction, and
+`TES4Polyfill.ForceCombat` puts the two actors on opposite sides.
+
+XNAM is (Faction, Modifier 0, Group Combat Reaction 1 = Enemy); DATA bit 0 is
+Hidden From PC. **REVERTED:** relationship rank -4 was tried as the hostile
+reaction and did not work.
+
+### The GetDestroyed formlist
+
+TES4 keeps a per-reference "destroyed" flag: `SetDestroyed` writes it,
+`getdestroyed` reads it, and the engine's `CloseCurrentOblivionGate` sets it on
+the gate it closes. Skyrim kept only the SETTER — `ObjectReference.psc` has no
+matching getter — so the conversion backs the read with a FormList that
+converted scripts add to and test membership in.
+
+### Message menus
+
+One MESG per button-`MessageBox` call site. The layout matches vanilla
+script-shown boxes (`dunMiddenNamesMenuMSG`): DESC is the message text, INAM is
+a null required leftover, DNAM bit 0 marks Message Box (a modal with buttons,
+not a corner notification), one ITXT per button, and no conditions. `Show()`
+returns the clicked ITXT's index — the same number the TES4 `GetButtonPressed`
+poll compared against.
+
+### <a id="ambient-dialogue-pacing"></a>Ambient-dialogue pacing
+
+Oblivion has no per-package chatter control: its package flags concern doors,
+speed, sneak, equipment and combat, nothing about dialogue (xEdit
+wbPackageFlags; UESP "Oblivion Mod:Mod File Format/PACK"). Pacing lives
+entirely in game settings, and Skyrim runs far faster -- greeting retry 5s vs
+Oblivion's 20s, idle chatter 10s vs Oblivion's authored 100s.
+
+Because GMST is in SKIP_TYPES none of that carried over, so converted NPCs ran
+Skyrim's clock over Oblivion's much larger line pool: the constant-quipping
+defect. The TES4 export's own value wins where the record exists, since that is
+what Oblivion.esm shipped; otherwise the Oblivion.exe engine default recorded in
+AMBIENT_GMST_OVERRIDES is used.
+
+### Force-combat faction ids are fixed
+
+base+0x42 and +0x43 in the reserved gap. Allocating them would shift every
+later id and corrupt saves. Relationship rank -4 was tried as the hostile
+reaction first and silently no-ops between non-unique actors (the CharacterGen
+final assassin); runtime AddToFaction into a record-side Enemy pair is the
+vanilla hostility idiom and works for ANY actors.
+
+### <a id="voice-types-are-created-from-scratch"></a>Voice types are created from scratch
+
+`create_vtyp_records` never references Skyrim.esm VTYPs. Voice files live in
+`Sound/Voice/<plugin>/<EditorID>/` and must match the EditorIDs created here
+(`TES4Male*`, `TES4Female*`). DNAM bit 0 is AllowDefaultDialogue and bit 1 is
+Female, so male voices write DNAM=1 and female DNAM=3.
+
+Two sources, in order:
+
+1. **The fixed Oblivion set** (`CUSTOM_VTYP_EDIDS`), emitted first so its
+   FormIDs never move, and so the `('Imperial', gender)` fallback in
+   `build_npc_to_vtyp_map` always resolves whatever races the plugin ships.
+2. **The plugin's OWN races**, identified by the display name that also names
+   the voice folder on disk.
+
+Oblivion's voice layout is `sound\voice\<plugin>\<RACE FULL>\<gender>\`, and
+in a localised plugin FULL and EditorID diverge: Nehrim's seven `Alemanne*`
+races all read `FULL=Alemanne`, and its `HighElf` race reads `FULL=Hochelf`.
+Keying on the EditorID alone left those folders pointing at voice types no
+record declared, so the lines were unreachable. See `asset_convert.voice_races`,
+which the sound stage resolves through too.
+
+Iteration is sorted because the output ESM must stay byte-reproducible.
+
+## <a id="adopting-a-masters-synthesized-records"></a>Adopting a master's synthesized records
+
+**Code:** `tes5_import/import_main.py` (`_adopt_master_special_records`),
+`tes5_import/synth_records.py`
+
+The conversion synthesizes records TES4 has no source for — globals, factions,
+menus, formlists, and one VTYP per voiced race. A **root master** creates them;
+a **dependent plugin** must adopt the master's FormIDs rather than create its
+own, or its VMAD properties point at records in the wrong file.
+
+### The voice-type case, which is the loud one
+
+`create_vtyp_records` is master-only, and it is what calls `set_voice_type`. A
+dependent plugin therefore left `VOICE_TYPE_MAP` EMPTY,
+`build_npc_to_vtyp_map` returned `{}` — "0 NPC->VTYP" in the build log — and
+`convert_NPC_`/`convert_CREA` wrote **no VTCK on any of Morroblivion's 3,607
+actors**.
+
+An actor with no voice type matches no dialogue, so EVERY line in the plugin
+was silent, including Jiub's: the prison-ship intro played out mutely. For
+contrast, Oblivion.esm as a root master has VTCK on 3,396 of 3,838 actors.
+
+The master already wrote these VTYPs, so the fix is to adopt its FormIDs.
+
+### Why the registry is cleared per plugin
+
+`WELL_KNOWN_PROPERTIES` is a module global, and `convert.py` imports several
+plugins in ONE process. Without the reset, a previous plugin's synthesized
+FormIDs would be adopted by the next one. Each run repopulates it — created for
+a root master, adopted from the master's output for a dependent plugin.
+
+## <a id="script-addtopic-and-the-unlock-globals"></a>Script AddTopic and the unlock globals
+
+**Code:** `tes5_import/import_main.py` (the `ScriptConverter.topic_unlock_globals`
+handoff)
+
+A script `AddTopic X` is the third reveal route for a topic, alongside INFO
+fragments and quest stages, and `script_convert` emits the same
+`TES4Unlock_<topic>.SetValue(1)` for it.
+
+Two things must hold or that property binds to nothing:
+
+- **The map must be shared.** The converter pass import_main runs — object and
+  quest VMAD property resolution — must see the SAME topic→global map the
+  script pipeline used. Otherwise it resolves a different property set than the
+  generated `.psc` declares.
+- **The global must be resolvable by name.** `WELL_KNOWN_PROPERTIES` does that
+  for synthesized records with no TES4 counterpart, following the
+  `TES4Fame`/`TES4GoldFenced` pattern.
+
+## <a id="the-synthesized-record-id-window"></a>The synthesized-record id window
+
+Writer ids start well above the highest source FormID so synthesized companion
+records cannot collide with converted ones: real records stop at or below
+`max_formid`, companions start at `+0x1000`, and the chargen menu MESGs take a
+fixed window in the middle of the reserved gap, ahead of the null-LAND repair.
+
+### Which synthesized records every plugin needs
+
+The ForceCombat enemy-faction pair and the destroyed-reference FormList are
+emitted unconditionally, chargen menus or not: ANY plugin that scripts a
+StartCombat needs the first, and every converted getdestroyed reads the second.
+
+The MESG menus are conditional on a plan, but their registration in
+WELL_KNOWN_PROPERTIES is what resolves the TES4Msg_* Message properties the
+converted .psc files declare -- the same TES4Fame/TES4Unlock binding pattern.

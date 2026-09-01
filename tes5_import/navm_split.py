@@ -53,7 +53,7 @@ from .writer import pack_subrecord, pack_string_subrecord
 from .pgrd_to_navm import (
     _build_navmesh_grid,
     _choose_divisor,
-    _pack_navm_record,
+    pack_navm_record,
     _PATHING_CELL_CRC,
     _PATHING_DOOR_CRC,
     _NVNM_VERSION,
@@ -63,7 +63,7 @@ _TRI_EDGE_LINK_BITS = (0x0001, 0x0002, 0x0004)
 
 
 class _Nvnm:
-    """Full decode of one of OUR interior NVNM blobs (see _pack_nvnm)."""
+    """Full decode of one of OUR interior NVNM blobs (see pack_nvnm)."""
 
     def __init__(self, blob):
         p = 8                                     # version + location CRC
@@ -123,7 +123,7 @@ def _components(tris):
 
 def _pack_component_nvnm(nv, comp_tris, tri_local, comp_fid_of_tri,
                          root_fid):
-    """Serialise one component as an NVNM blob (mirrors _pack_nvnm's layout)."""
+    """Serialise one component as an NVNM blob (mirrors pack_nvnm's layout)."""
     vmap = {}
     verts = []
     out_tris = []
@@ -283,7 +283,7 @@ def split_disconnected_interiors(navm_cache: dict, writer,
             subs += pack_subrecord('NVNM', blob)
             if onam:
                 subs += pack_subrecord('ONAM', onam)
-            rec = _pack_navm_record(fids[c], subs)
+            rec = pack_navm_record(fids[c], subs)
             parts.append((rec, center, link_fids, door_refs, door_local))
 
         # door ref -> (component NAVM fid, local triangle), for XNDP.

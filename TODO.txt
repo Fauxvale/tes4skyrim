@@ -101,3 +101,5 @@ Minor Issues:
 		see: docstring must REQUIRE an anchor
 
 	24 - Bounds + Collision scanning should happen during the Meshes step to avoid having to do it twice
+
+	25 - SKSE dll to automatically merge multiple creature animation projects at runtime

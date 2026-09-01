@@ -11,7 +11,7 @@ See: docs/commentary/tes4_export_falloutnv.md
 import struct
 
 from ..tes4_reader import Record, get_formid_str, get_string, get_subrecord
-from .common import emit_model, emit_script, emit_string
+from .common import emit_model, emit_raw_hex, emit_script, emit_string
 
 #: HEDR.Version reported by FO3/FNV plugins; Oblivion reports 0.8 or 1.0.
 FALLOUT_HEDR_MIN = 1.2
@@ -109,11 +109,54 @@ def _emit_weap_deltas(lines: list, rec: Record):
         lines.append(f"DATA.ClipSize={d[14]}")
 
 
+def _emit_navm_deltas(lines: list, rec: Record):
+    """NAVM's authored geometry: the cell it covers, its vertices and triangles.
+
+    FO3/FNV ship real navmeshes where TES4 has only pathgrids, so this is
+    authored data to repack rather than geometry to generate. NVVX/NVTR/NVDP
+    are dumped verbatim; the importer reinterprets them into TES5's NVNM blob.
+
+    See: docs/commentary/tes4_export_falloutnv.md#navmesh-authored-not-generated
+    """
+    data = get_subrecord(rec, "DATA")
+    if data and len(data.data) >= 24:
+        cell, nvert, ntri, nedge, ncover, ndoor = struct.unpack_from(
+            "<6I", data.data, 0)
+        lines.append(f"DATA.Cell={get_formid_str(cell)}")
+        lines.append(f"DATA.VertexCount={nvert}")
+        lines.append(f"DATA.TriangleCount={ntri}")
+        lines.append(f"DATA.EdgeLinkCount={nedge}")
+        lines.append(f"DATA.CoverTriangleCount={ncover}")
+        lines.append(f"DATA.DoorLinkCount={ndoor}")
+
+    for sig in ("NVVX", "NVTR", "NVDP"):
+        emit_raw_hex(lines, sig, get_subrecord(rec, sig))
+
+
+def _emit_navi_deltas(lines: list, rec: Record):
+    """NAVI's per-navmesh info entries, one NVMI blob per line.
+
+    NVMI repeats thousands of times in a single record, so each is emitted
+    with its ordinal plus a total count.
+
+    See: docs/commentary/tes4_export_falloutnv.md#navmesh-authored-not-generated
+    """
+    index = 0
+    for sub_rec in rec.subrecords:
+        if sub_rec.type != "NVMI":
+            continue
+        lines.append(f"NVMI[{index}]={sub_rec.data.hex().upper()}")
+        index += 1
+    lines.append(f"NVMI.Count={index}")
+
+
 #: Per-type delta emitters, consulted by format_record only for FO3/FNV sources.
 _DELTA_DISPATCH = {
     "CELL": _emit_cell_deltas,
     "REFR": _emit_refr_deltas,
     "WEAP": _emit_weap_deltas,
+    "NAVM": _emit_navm_deltas,
+    "NAVI": _emit_navi_deltas,
 }
 
 #: Types carrying an OBND that TES4 has no field for; Skyrim reads it natively.
@@ -168,7 +211,16 @@ def export_ACTIVATOR_BASE(rec: Record) -> list:
 
 
 #: FO3/FNV base-object types Oblivion lacks -> the exporter that reduces them.
+def export_NAVMESH(rec: Record) -> list:
+    """A navmesh record's identity; export_deltas emits its geometry."""
+    lines = []
+    emit_string(lines, "EditorID", get_subrecord(rec, "EDID"))
+    return lines
+
+
 FALLOUT_BASE_EXPORTERS = {
+    "NAVM": export_NAVMESH,
+    "NAVI": export_NAVMESH,
     "MSTT": export_STATIC_BASE,
     "SCOL": export_STATIC_BASE,
     "PWAT": export_STATIC_BASE,

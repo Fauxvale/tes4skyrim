@@ -283,7 +283,7 @@ def build_edge_links(navm_cache: dict, verbose: bool = True) -> int:
 
     Returns the number of links created.
     """
-    from .pgrd_to_navm import _pack_navm_record
+    from .pgrd_to_navm import pack_navm_record
     from .writer import pack_subrecord
 
     # Decode every exterior mesh once, indexed by (worldspace, grid).
@@ -360,7 +360,7 @@ def build_edge_links(navm_cache: dict, verbose: bool = True) -> int:
             continue
         new_nvnm = pack_subrecord('NVNM', view.pack())
         subs = prefix + new_nvnm + suffix
-        navm_cache[key] = (_pack_navm_record(meta['fid'], subs), meta)
+        navm_cache[key] = (pack_navm_record(meta['fid'], subs), meta)
         rewritten += 1
 
     if verbose:
@@ -377,7 +377,7 @@ def _extract_nvnm(navm_bytes: bytes):
     """Split a packed NAVM record into (nvnm_blob, subs_before, subs_after).
 
     The record is uncompressed at this stage (compression happens in
-    _pack_navm_record), so walk its subrecords directly.
+    pack_navm_record), so walk its subrecords directly.
     """
     import zlib
     header_size = 24

@@ -629,21 +629,103 @@ def _open_edge_towards(verts, tris, adj, ti, other_ti):
     return best[1] if best else None
 
 
-def _pack_nvnm(verts, tris, adj, tri_flags,
+def _resolve_ledge_links(verts, tris, adj, ledges, navm_fid):
+    """Resolve each ledge pair to the open edge an actor steps off.
+
+    Returns (link_bit, link_slot, edge_links). A pair is committed only when
+    BOTH directions resolve an open edge: a one-sided link is what the CK
+    flags as "Bad portal navmesh ID/triangle index", so the lip is left
+    un-linked instead.
+
+    See: docs/commentary/tes5_import_navmesh.md#ledge-links
+    """
+    link_bit = {}
+    link_slot = {}
+    edge_links = []
+    for (hi, lo, _drop) in ledges:
+        if not (0 <= hi < len(tris) and 0 <= lo < len(tris)):
+            continue
+        pending = []
+        for (ti, other, typ) in ((hi, lo, _EDGE_LINK_LEDGE_DOWN),
+                                 (lo, hi, _EDGE_LINK_LEDGE_UP)):
+            slot = _open_edge_towards(verts, tris, adj, ti, other)
+            if slot is None or (ti, slot) in link_slot:
+                pending = None
+                break
+            pending.append((ti, other, typ, slot))
+        if not pending:
+            continue
+        for (ti, other, typ, slot) in pending:
+            link_bit[ti] = link_bit.get(ti, 0) | _TRI_EDGE_LINK[slot]
+            link_slot[(ti, slot)] = len(edge_links)
+            edge_links.append((typ, navm_fid, other))
+    return link_bit, link_slot, edge_links
+
+
+def _pack_bounds_and_grid(verts, tris) -> bytes:
+    """The NVNM tail: bounding box, bucket size, and the spatial lookup grid."""
+    if verts:
+        xs = [v[0] for v in verts]
+        ys = [v[1] for v in verts]
+        zs = [v[2] for v in verts]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        min_z, max_z = min(zs), max(zs)
+    else:
+        min_x = min_y = min_z = max_x = max_y = max_z = 0.0
+
+    span_x = max_x - min_x if max_x > min_x else 1.0
+    span_y = max_y - min_y if max_y > min_y else 1.0
+    divisor = _choose_divisor(span_x, span_y)
+
+    out = bytearray()
+    out += struct.pack('<I', divisor)
+    out += struct.pack('<f', span_x / divisor)
+    out += struct.pack('<f', span_y / divisor)
+    out += struct.pack('<ffffff', min_x, min_y, min_z, max_x, max_y, max_z)
+
+    grid = _build_navmesh_grid(verts, tris, min_x, min_y, max_x, max_y, divisor)
+    for cell_tris in grid:
+        out += struct.pack('<I', len(cell_tris))
+        for ti in cell_tris:
+            out += struct.pack('<h', ti)
+    return bytes(out)
+
+
+def _pack_triangles(tris, adj, tri_flags, door_by_tri, link_bit, link_slot):
+    """The triangle array: verts, neighbours and flags.
+
+    Every triangle carries the base Found flag, as vanilla does. Where an edge
+    carries a link its neighbour field becomes the INDEX into the Edge Links
+    array (xEdit wbEdgeToStr), not a triangle.
+    """
+    out = bytearray()
+    out += struct.pack('<I', len(tris))
+    for ti, (v0, v1, v2) in enumerate(tris):
+        edges3 = list(adj[ti])
+        for slot in range(3):
+            li = link_slot.get((ti, slot))
+            if li is not None:
+                edges3[slot] = li
+        flags = _TRI_FLAG_FOUND | link_bit.get(ti, 0)
+        flags |= (tri_flags[ti] if ti < len(tri_flags) else 0)
+        if ti in door_by_tri:
+            flags |= _TRI_FLAG_DOOR
+        out += struct.pack('<6h2H', v0, v1, v2,
+                           edges3[0], edges3[1], edges3[2], flags, 0)
+    return bytes(out)
+
+
+def pack_nvnm(verts, tris, adj, tri_flags,
                wrld_fid, cell_fid, grid_x, grid_y, is_exterior,
                door_tris=None, ledges=None, navm_fid=0) -> bytes:
     """Serialise an NVNM blob.
 
-    door_tris: list of (triangle_index, door_ref_fid) — emitted as Door
-    Triangles and flagged with _TRI_FLAG_DOOR on the referenced triangle.
+    door_tris: (triangle_index, door_ref_fid) pairs, flagged on the triangle.
+    ledges:    (upper_tri, lower_tri, drop) DROP-DOWNs, emitted as Edge Links
+               naming THIS navmesh since both triangles are in it.
 
-    ledges: list of (upper_tri, lower_tri, drop) — DROP-DOWNs between
-    disconnected storeys, emitted as Edge Links of type Ledge Down (2) on the
-    upper triangle and Ledge Up (1) on the lower.  This is Skyrim's own
-    mechanism for stepping off a ledge (vanilla Skyrim.esm: 476 Ledge Down /
-    467 Ledge Up across 3,000 navmeshes); bridging the gap with triangles
-    instead makes actors walk on air across the lip.  Both links name THIS
-    navmesh (navm_fid), since both triangles are in it.
+    See: docs/commentary/tes5_import_navmesh.md#ledge-links
     """
     door_tris = door_tris or []
     ledges = ledges or []
@@ -654,69 +736,19 @@ def _pack_nvnm(verts, tris, adj, tri_flags,
     buf += struct.pack('<I', _PATHING_CELL_CRC)
     buf += struct.pack('<I', wrld_fid)
     if is_exterior:
-        buf += struct.pack('<hh', grid_y, grid_x)   # Grid Y, then Grid X
+        buf += struct.pack('<hh', grid_y, grid_x)
     else:
         buf += struct.pack('<I', cell_fid)
 
-    # Vertices
     buf += struct.pack('<I', len(verts))
     for x, y, z in verts:
         buf += struct.pack('<fff', x, y, z)
 
-    # Ledge links: pick, on each linked triangle, the edge that has no
-    # neighbour and faces the other side — that is the lip the actor steps
-    # off.  Vanilla marks it with the per-edge link bit (0x0801/2/4).
-    #
-    # A pair is committed only if BOTH directions resolve an open edge.
-    # `_open_edge_towards` is evaluated independently per side, and slightly
-    # asymmetric geometry can make one side find a facing open edge while the
-    # other does not — a one-sided link CK's own loader flags as "Bad portal
-    # navmesh ID/triangle index ... the cell needs to be refinalized" (in-game
-    # confirmed: exactly 1 of 234,612 vanilla-verified portal links in a full
-    # Oblivion.esm conversion came out one-sided this way, in FortRayles).
-    # Skipping the half-resolved pair leaves that lip un-linked (no fall-
-    # through) instead of writing a reference the engine's own validator
-    # rejects.
-    link_bit = {}                       # tri -> edge-link flag bits
-    link_slot = {}                      # (tri, slot) -> link index
-    edge_links = []                     # (type, navm_fid, triangle)
-    for (hi, lo, _drop) in ledges:
-        if not (0 <= hi < len(tris) and 0 <= lo < len(tris)):
-            continue
-        pending = []
-        ok = True
-        for (ti, other, typ) in ((hi, lo, _EDGE_LINK_LEDGE_DOWN),
-                                 (lo, hi, _EDGE_LINK_LEDGE_UP)):
-            slot = _open_edge_towards(verts, tris, adj, ti, other)
-            if slot is None or (ti, slot) in link_slot:
-                ok = False
-                break
-            pending.append((ti, other, typ, slot))
-        if not ok:
-            continue
-        for (ti, other, typ, slot) in pending:
-            link_bit[ti] = link_bit.get(ti, 0) | _TRI_EDGE_LINK[slot]
-            link_slot[(ti, slot)] = len(edge_links)
-            edge_links.append((typ, navm_fid, other))
+    link_bit, link_slot, edge_links = _resolve_ledge_links(
+        verts, tris, adj, ledges, navm_fid)
 
-    # Triangles — base "Found" flag on every tri (matches vanilla), plus water
-    # / door / edge-link bits.  When an edge carries a link, its neighbour
-    # field becomes the INDEX into the Edge Links array (xEdit wbEdgeToStr).
-    buf += struct.pack('<I', len(tris))
-    for ti, (v0, v1, v2) in enumerate(tris):
-        e01, e12, e20 = adj[ti]
-        edges3 = [e01, e12, e20]
-        for slot in range(3):
-            li = link_slot.get((ti, slot))
-            if li is not None:
-                edges3[slot] = li
-        flags = _TRI_FLAG_FOUND
-        flags |= (tri_flags[ti] if ti < len(tri_flags) else 0)
-        if ti in door_by_tri:
-            flags |= _TRI_FLAG_DOOR
-        flags |= link_bit.get(ti, 0)
-        buf += struct.pack('<6h2H', v0, v1, v2,
-                           edges3[0], edges3[1], edges3[2], flags, 0)
+    buf += _pack_triangles(tris, adj, tri_flags, door_by_tri,
+                           link_bit, link_slot)
 
     # Edge Links.  Cross-cell portals are added later by build_edge_links;
     # what we can resolve from the PGRD alone is the DROP-DOWN pair, which is
@@ -735,36 +767,11 @@ def _pack_nvnm(verts, tris, adj, tri_flags,
     # Cover Triangles — none.
     buf += struct.pack('<I', 0)
 
-    # Bounding box
-    if verts:
-        xs = [v[0] for v in verts]
-        ys = [v[1] for v in verts]
-        zs = [v[2] for v in verts]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        min_z, max_z = min(zs), max(zs)
-    else:
-        min_x = min_y = min_z = max_x = max_y = max_z = 0.0
-
-    span_x = max_x - min_x if max_x > min_x else 1.0
-    span_y = max_y - min_y if max_y > min_y else 1.0
-    divisor = _choose_divisor(span_x, span_y)
-
-    buf += struct.pack('<I', divisor)
-    buf += struct.pack('<f', span_x / divisor)   # Max X Distance (bucket width)
-    buf += struct.pack('<f', span_y / divisor)   # Max Y Distance
-    buf += struct.pack('<ffffff', min_x, min_y, min_z, max_x, max_y, max_z)
-
-    grid = _build_navmesh_grid(verts, tris, min_x, min_y, max_x, max_y, divisor)
-    for cell_tris in grid:
-        buf += struct.pack('<I', len(cell_tris))
-        for ti in cell_tris:
-            buf += struct.pack('<h', ti)
-
+    buf += _pack_bounds_and_grid(verts, tris)
     return bytes(buf)
 
 
-def _pack_navm_record(form_id: int, subrecords: bytes) -> bytes:
+def pack_navm_record(form_id: int, subrecords: bytes) -> bytes:
     """Pack a compressed NAVM record (Compressed flag 0x00040000)."""
     import zlib
     uncompressed_size = len(subrecords)
@@ -1247,7 +1254,7 @@ def convert_PGRD(rec: dict, writer=None,
         navm_fid = writer.derive_formid(
             'NAVM', (cell_fid, get_formid(rec, 'FormID')))
 
-    nvnm = _pack_nvnm(verts3d, tris, adj, tri_flags,
+    nvnm = pack_nvnm(verts3d, tris, adj, tri_flags,
                       wrld_fid, cell_fid, grid_x, grid_y, is_exterior,
                       door_tris=door_tris, ledges=ledges, navm_fid=navm_fid)
     subs = b''
@@ -1259,7 +1266,7 @@ def convert_PGRD(rec: dict, writer=None,
         onam = b''.join(struct.pack('<I', b) for b in base_objects)
         subs += pack_subrecord('ONAM', onam)
 
-    navm_bytes = _pack_navm_record(navm_fid, subs)
+    navm_bytes = pack_navm_record(navm_fid, subs)
 
     # Centroid for the NAVI NVMI entry.
     cx = sum(v[0] for v in verts3d) / len(verts3d)

@@ -116,7 +116,7 @@ caching, skipped record types, the export text format, and the directory layout.
 - If the user gives multiple constraints to a bug, your fix MUST satisfy ALL of them
 - If the user asks for a plan or analysis. DO NOT BUILD until you have the goahead. Overeager code development is the opposite of helpful
 - Deletion and Simplification is an IMPORTANT part of the process. A change that removes or only adds a few total lines of code is FAR SUPERIOR to one that adds many lines. More does not equal better. Strive to have as low of a cyclomatic complexity as possible
-- If the hook triggers for old debt, don't try to get around it as fast as possible or line golf. Take the time to examine the surrounding file and fix it properly. You have the time
+- If the hook triggers for old debt, don't try to get around it as fast as possible or line golf. Take the time to examine the entire surrounding file and fix it properly. You have the time. If you need to separate out a file, pull out the RIGHT thing, not necessaryily the thing you are working on.
 - Docstrings should contain real and important function information. Story content only and always belongs in a see: tag. See tags should ALWAYS have an anchor.
 
 ### <a id="regression-read-the-commits"></a>🛑 IF IT IS A REGRESSION, READ THE COMMITS

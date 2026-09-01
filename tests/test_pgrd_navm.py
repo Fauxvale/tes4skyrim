@@ -125,7 +125,7 @@ def test_nvnm_roundtrip_and_adjacency_symmetry():
              (0.0, 100.0, 0.0)]
     tris = [(0, 1, 2), (0, 2, 3)]
     adj = p2n._compute_adjacency(tris)
-    nvnm = p2n._pack_nvnm(verts, tris, adj, [0] * len(tris),
+    nvnm = p2n.pack_nvnm(verts, tris, adj, [0] * len(tris),
                           wrld_fid=0, cell_fid=0x00001234,
                           grid_x=0, grid_y=0, is_exterior=False)
     d = _decode_nvnm(nvnm)
@@ -143,7 +143,7 @@ def test_nvnm_roundtrip_and_adjacency_symmetry():
 def test_nvnm_exterior_writes_grid_y_then_x():
     verts = [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0)]
     tris = [(0, 1, 2)]
-    nvnm = p2n._pack_nvnm(verts, tris, p2n._compute_adjacency(tris), [0],
+    nvnm = p2n.pack_nvnm(verts, tris, p2n._compute_adjacency(tris), [0],
                           wrld_fid=0x0000003C, cell_fid=0,
                           grid_x=7, grid_y=-3, is_exterior=True)
     d = _decode_nvnm(nvnm)
@@ -154,7 +154,7 @@ def test_nvnm_exterior_writes_grid_y_then_x():
 def test_all_triangles_carry_found_flag():
     verts = [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0)]
     tris = [(0, 1, 2)]
-    nvnm = p2n._pack_nvnm(verts, tris, p2n._compute_adjacency(tris), [0],
+    nvnm = p2n.pack_nvnm(verts, tris, p2n._compute_adjacency(tris), [0],
                           wrld_fid=0, cell_fid=1, grid_x=0, grid_y=0,
                           is_exterior=False)
     d = _decode_nvnm(nvnm)
@@ -173,11 +173,11 @@ def test_water_flag_set_below_water_height():
 def test_navm_record_is_compressed():
     verts = [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0)]
     tris = [(0, 1, 2)]
-    nvnm = p2n._pack_nvnm(verts, tris, p2n._compute_adjacency(tris), [0],
+    nvnm = p2n.pack_nvnm(verts, tris, p2n._compute_adjacency(tris), [0],
                           wrld_fid=0, cell_fid=1, grid_x=0, grid_y=0,
                           is_exterior=False)
     from tes5_import.writer import pack_subrecord
-    rec = p2n._pack_navm_record(0x01000801, pack_subrecord('NVNM', nvnm))
+    rec = p2n.pack_navm_record(0x01000801, pack_subrecord('NVNM', nvnm))
     sig, size, flags, formid = struct.unpack_from('<4sIII', rec, 0)
     assert sig == b'NAVM'
     assert flags & 0x00040000, "NAVM must be written compressed"
@@ -226,10 +226,10 @@ def _edge_link_cell(gx, gy, fid, hug_west):
     else:
         verts = [(x1 - 512, y0, 0.0), (x1, y0, 0.0),
                  (x1, y1, 0.0), (x1 - 512, y1, 0.0)]
-    nvnm = p2n._pack_nvnm(verts, [(0, 1, 2), (0, 2, 3)],
+    nvnm = p2n.pack_nvnm(verts, [(0, 1, 2), (0, 2, 3)],
                           [(-1, -1, 1), (0, -1, -1)], [0, 0],
                           0x0100003C, 0, gx, gy, True)
-    rec = p2n._pack_navm_record(fid, pack_subrecord('NVNM', nvnm))
+    rec = p2n.pack_navm_record(fid, pack_subrecord('NVNM', nvnm))
     meta = {'fid': fid, 'wrld_fid': 0x0100003C, 'grid_x': gx, 'grid_y': gy,
             'is_exterior': True}
     return rec, meta
