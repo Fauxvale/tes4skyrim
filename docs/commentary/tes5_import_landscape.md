@@ -95,3 +95,63 @@ interiors are in this state.
 `XCMT`, and stamping every one with an explicit `XCMO` would add ~33k subrecords
 to say what the worldspace's single `ZNAM` already says, and would override any
 future per-region music with a cell-level value.
+
+## OBND: authored bounds, and the int16 clamp
+
+**Code:** `tes5_import/record_types/common.py` (`_resolve_obnd`),
+`tes5_import/writer.py` (`pack_obnd`)
+
+OBND is six **signed 16-bit** ints. Two independent defects met here and
+crashed the game.
+
+### Authored bounds win
+
+FO3/FNV write OBND natively; TES4 has no such field. Measured over the exports:
+
+| | records | carry OBND | types |
+|---|---:|---:|---:|
+| FalloutNV.esm | 465,054 | **15,272** | 23 |
+| Oblivion.esm | 1,167,016 | **0** | 0 |
+
+`_resolve_obnd` consulted only the scanned mesh bounds, discarding the authored
+value. It now prefers the record's own OBND, then mesh bounds, then the
+per-type default. Oblivion authors none, so its fallback chain is untouched.
+
+This also means FO3/FNV need no mesh-bounds scan to get correct OBND — the
+plugin already carries the answer the CK computed.
+
+### The int16 clamp
+
+`pack_obnd` used `struct.pack('<6h', ...)` unguarded. A converted mesh larger
+than 32,767 units raised `struct.error`, the record was **dropped entirely**,
+and every reference to it then pointed at nothing:
+
+```
+ERROR converting ACTI 'NVStripLightsPollition': 'h' format requires -32768 <= number <= 32767
+ERROR converting ACTI 'NVStripLightsPollitionDim': 'h' format requires -32768 <= number <= 32767
+```
+
+Exactly **2 of 1,143** FNV ACTIs were lost this way. The resulting crash:
+
+```
+EXCEPTION_ACCESS_VIOLATION   movzx eax, byte ptr [rcx+0x1A]
+  rcx = 0x0000000000000000
+  RSI: (BGSLocation*) "South Cistern"
+  RSP+1A0: (QueuedPromoteLocationReferencesTask*)
+```
+
+`QueuedPromoteLocationReferencesTask` walked the location's references, hit a
+REFR whose base object had been dropped, and dereferenced null. Both lost ACTIs
+were `NVStripLightsPollition*`, referenced 8 times.
+
+**This is a latent TES4 bug too** — nothing about the overflow is FO3/FNV
+specific, so bounds are now clamped for every game rather than raising. All
+15,272 authored FNV values are already inside int16, so the clamp only ever
+catches our own computed bounds.
+
+### Finding a dangling base
+
+`temp`-style census: walk the output ESM, collect every record FormID, then
+check each REFR/ACHR `NAME`. After these fixes only the FO3/FNV
+engine-hardcoded ids remain unresolved (`0x20`, 851 refs; `0x17`, 71 refs),
+which are not records in any plugin.

@@ -4615,6 +4615,41 @@ class TestSunlessSkies:
         assert not _SUNLESS_WEATHER_FIDS
 
 
+class TestObjectBounds:
+    """OBND is six signed 16-bit ints; FO3/FNV author it, TES4 cannot.
+
+    See: docs/commentary/tes5_import_landscape.md#obnd-authored-bounds-and-the-int16-clamp
+    """
+
+    def _fnv(self):
+        """An FNV ACTI whose authored bounds sit at the int16 extremes."""
+        return {'Signature': 'ACTI', 'FormID': '0017409E',
+                'EditorID': 'NVStripLightsPollitionDim',
+                'Model.MODL': 'architecture\\Strip\\NVStripLightPollutionDim.NIF',
+                'OBND.X1': '-32768', 'OBND.Y1': '-2585', 'OBND.Z1': '-22357',
+                'OBND.X2': '32767', 'OBND.Y2': '-2585', 'OBND.Z2': '27753'}
+
+    def test_oversized_bounds_are_clamped_not_fatal(self):
+        """A mesh over 32767 units raised struct.error, dropping the whole
+        record and leaving every reference to it pointing at nothing."""
+        from tes5_import.writer import pack_obnd
+        vals = struct.unpack('<6h', pack_obnd(-40000, 0, 0, 40000, 0, 0)[6:])
+        assert vals[0] == -32768
+        assert vals[3] == 32767
+
+    def test_authored_bounds_beat_the_mesh_scan(self):
+        """FO3/FNV write OBND natively, so the record's own value wins."""
+        from tes5_import.record_types.common import _resolve_obnd
+        assert _resolve_obnd(self._fnv(), 'ACTI') == (
+            -32768, -2585, -22357, 32767, -2585, 27753)
+
+    def test_tes4_records_author_none(self):
+        """Oblivion has no OBND field, so the fallback chain is unchanged."""
+        from tes5_import.record_types.common import _authored_obnd
+        assert _authored_obnd(
+            {'Signature': 'ACTI', 'EditorID': 'Anvil'}) is None
+
+
 class TestFalloutWeatherColors:
     """FO3/FNV author NAM0 with six times of day; TES4 and TES5 use four.
 

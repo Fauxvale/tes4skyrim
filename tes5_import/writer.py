@@ -731,10 +731,20 @@ def _merge_owned_groups(blob: bytes) -> bytes:
     return bytes(out)
 
 
+#: OBND stores each bound as a signed 16-bit int; a huge mesh overflows it.
+_OBND_MIN, _OBND_MAX = -32768, 32767
+
+
 def pack_obnd(x1: int = 0, y1: int = 0, z1: int = 0,
               x2: int = 0, y2: int = 0, z2: int = 0) -> bytes:
-    """Pack OBND (Object Bounds) subrecord — required on most TES5 records."""
-    data = struct.pack('<6h', x1, y1, z1, x2, y2, z2)
+    """Pack OBND (Object Bounds) subrecord — required on most TES5 records.
+
+    Bounds are clamped to int16: a mesh larger than 32767 units otherwise
+    raises struct.error and the whole record is dropped, leaving every
+    reference to it pointing at nothing.
+    """
+    data = struct.pack('<6h', *(min(_OBND_MAX, max(_OBND_MIN, int(v)))
+                                for v in (x1, y1, z1, x2, y2, z2)))
     return pack_subrecord('OBND', data)
 
 

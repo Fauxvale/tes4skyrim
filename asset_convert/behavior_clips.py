@@ -381,9 +381,11 @@ def classify_clips(creature_dir: str) -> dict:
     _claim_tables(out, kfs, used)
     _claim_by_animgroup(out, kfs, used)
 
+    claimed_paths = {kfs[n] for n in used if n in kfs}
     for name, path in kfs.items():
-        if name in used:
+        if name in used or path in claimed_paths:
             continue
+        claimed_paths.add(path)
         if 'attack' in name:
             out['attacks'].append(path)
         else:

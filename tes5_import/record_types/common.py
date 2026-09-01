@@ -93,14 +93,28 @@ _OBND_DEFAULTS = {
 }
 
 
+#: The six OBND keys, in TES5 subrecord order. FO3/FNV author them; TES4 cannot.
+_OBND_KEYS = ('OBND.X1', 'OBND.Y1', 'OBND.Z1', 'OBND.X2', 'OBND.Y2', 'OBND.Z2')
+
+
+def _authored_obnd(rec: dict) -> tuple:
+    """The record's own OBND, or None when it authors none."""
+    if not any(k in rec for k in _OBND_KEYS):
+        return None
+    return tuple(get_int(rec, k) for k in _OBND_KEYS)
+
+
 def _resolve_obnd(rec: dict, obnd_sig: str) -> tuple:
     """Resolve OBND bounds for a record.
 
-    Tries mesh bounds (from pre-scanned converted NIFs) first; falls back to
-    per-type defaults, then the global default.
+    Authored bounds win; then mesh bounds (from pre-scanned converted NIFs);
+    then per-type defaults, then the global default.
 
     Returns a (x1, y1, z1, x2, y2, z2) int tuple.
     """
+    authored = _authored_obnd(rec)
+    if authored is not None:
+        return authored
     path = get_str(rec, 'Model.MODL')
     if path:
         key = _prefix_path(path).lower().replace('\\', '/')

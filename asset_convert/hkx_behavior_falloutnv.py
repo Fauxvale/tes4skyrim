@@ -16,6 +16,9 @@ LOCOMOTION_DIRS = ('locomotion',)
 #: FO3/FNV movement-type prefix, stripped to recover the TES4 basename.
 _MT_PREFIX = 'mt'
 
+#: Prefixes that may precede `mt`; the swim set is spelled `swimmtforward`.
+_KEPT_PREFIXES = ('swim',)
+
 #: FO3/FNV spellings with no `mt` counterpart, including vanilla's own typos.
 _ALIASES = {
     'mtfoward': 'forward',
@@ -24,12 +27,21 @@ _ALIASES = {
 
 
 def _tes4_name(stem: str) -> str:
-    """The TES4 clip basename an FO3/FNV stem corresponds to, or the stem."""
+    """The TES4 clip basename an FO3/FNV stem corresponds to, or the stem.
+
+    Strips the `mt` movement-type prefix, keeping any leading `swim` so a swim
+    clip still reads as one.
+    """
+    kept = ''
+    for pre in _KEPT_PREFIXES:
+        if stem.startswith(pre):
+            kept, stem = pre, stem[len(pre):]
+            break
     if stem in _ALIASES:
-        return _ALIASES[stem]
+        return kept + _ALIASES[stem]
     if stem.startswith(_MT_PREFIX) and len(stem) > len(_MT_PREFIX):
-        return stem[len(_MT_PREFIX):]
-    return stem
+        return kept + stem[len(_MT_PREFIX):]
+    return kept + stem
 
 
 def alias_clips(creature_dir: str, kfs: dict) -> dict:
