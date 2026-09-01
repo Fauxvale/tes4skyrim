@@ -106,6 +106,7 @@ def read_bsa_files(bsa_path, wanted_names):
 # so it is intentionally not probed here.)
 _EXTRA_BSA_BASES = {
     "nehrim": ["N", "L"],
+    "falloutnv": ["Fallout"],
 }
 
 # GOTY Oblivion.esm has Shivering Isles MERGED INTO IT: every SI record lives
@@ -139,19 +140,12 @@ _SUPPRESSED_BSA_BASES = {
 
 
 def _get_bsa_files(data_path, source_file):
-    """Determine which BSA files to extract for a given source plugin.
+    """Every BSA a source plugin claims, by name, in the game's Data folder.
 
-    Oblivion BSA naming:
-    - Oblivion.esm → Oblivion - Meshes.bsa, Oblivion - Textures - Compressed.bsa,
-                      Oblivion - Sounds.bsa, Oblivion - Misc.bsa
-    - Knights.esp  → Knights.bsa (single BSA for smaller DLCs)
-    - DLCShiveringIsles.esp → DLCShiveringIsles - Meshes.bsa, etc.
+    Candidates come from the plugin stem plus any extra bases the plugin is
+    registered with; a plugin whose archives another already claims gets none.
 
-    Nehrim.esm → N - Meshes/Textures1/Textures2/Sounds/Misc.bsa and
-                 L - Voices/Misc.bsa (see _EXTRA_BSA_BASES).
-
-    DLCShiveringIsles.esp extracts NOTHING: Oblivion.esm already claims the SI
-    BSAs (see _MERGED_DLC_BSA_BASES / _SUPPRESSED_BSA_BASES).
+    See: docs/commentary/asset_convert_mod_ingest.md#bsa-naming-per-game
     """
     data_dir = Path(data_path)
     stem = Path(source_file).stem  # e.g. "Oblivion", "Knights", "Nehrim"
@@ -190,6 +184,7 @@ def _get_bsa_files(data_path, source_file):
             f"{base} - Textures1.bsa",  # Nehrim splits textures across two BSAs
             f"{base} - Textures2.bsa",
             f"{base} - Sounds.bsa",
+            f"{base} - Sound.bsa",
             f"{base} - Misc.bsa",
             f"{base} - Faces.bsa",
             f"{base} - Voices.bsa",

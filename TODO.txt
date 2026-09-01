@@ -99,3 +99,5 @@ Minor Issues:
 		Add local imports prevention rule
 		Should not be able to import a _ method
 		see: docstring must REQUIRE an anchor
+
+	24 - Bounds + Collision scanning should happen during the Meshes step to avoid having to do it twice

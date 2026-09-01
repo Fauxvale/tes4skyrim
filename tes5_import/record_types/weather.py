@@ -22,6 +22,7 @@ from .common import (
     pack_uint32_subrecord,
 )
 from .sound import _SNDR_FOR_SOUN, get_soun_identity
+from .weather_falloutnv import NAM0_SLOTS, TES4_TIMES, to_four_times
 
 
 _DEFAULT_IMGS = 0x00000161
@@ -283,6 +284,20 @@ def _nam0_class_defaults(rec: dict) -> dict:
 
 _TES5_NAM0_SLOTS = 17
 
+#: A source NAM0 shorter than this carries no usable colour table.
+_SRC_NAM0_SIZE = NAM0_SLOTS * TES4_TIMES * 4
+
+
+def _src_nam0(rec: dict) -> bytes:
+    """The record NAM0 table, re-strided to four times if FO3/FNV wrote six."""
+    return to_four_times(get_hex_bytes(rec, 'NAM0.Data'))
+
+
+def _src_rgb(raw: bytes, slot: int, time: int) -> tuple:
+    """The (r, g, b) at one slot/time of a four-time source NAM0 table."""
+    off = (slot * TES4_TIMES + time) * 4
+    return raw[off], raw[off + 1], raw[off + 2]
+
 #: TES5 NAM0 slot indices addressed by name; see _NAM0_SLOT_NAMES for the full map.
 _T5_STARS = 6
 _TES5_CLOUD_LAYERS = 32
@@ -399,7 +414,7 @@ def _wthr_nam0(rec: dict) -> bytes:
 
     Returns 272 bytes: 17 color types x 4 times-of-day x RGBA.
     """
-    raw = get_hex_bytes(rec, 'NAM0.Data')
+    raw = _src_nam0(rec)
     out = bytearray(_TES5_NAM0_SLOTS * 4 * 4)
 
     for slot, per_time in _nam0_class_defaults(rec).items():
@@ -411,7 +426,7 @@ def _wthr_nam0(rec: dict) -> bytes:
         off = (9 * 4 + time) * 4
         out[off:off + 4] = bytes((r, g, b, 0))
 
-    if not raw or len(raw) < 160:
+    if not raw or len(raw) < _SRC_NAM0_SIZE:
         return bytes(out)
 
     for t5_slot, t4_slot in enumerate(_NAM0_TES5_FROM_TES4):
@@ -420,9 +435,8 @@ def _wthr_nam0(rec: dict) -> bytes:
         if t5_slot in (10, 11):
             continue
         for time in range(4):
-            src = (t4_slot * 4 + time) * 4
             dst = (t5_slot * 4 + time) * 4
-            r, g, b = raw[src], raw[src + 1], raw[src + 2]
+            r, g, b = _src_rgb(raw, t4_slot, time)
             if t5_slot in _NAM0_VANILLA_LUM:
                 r, g, b = _normalize_rgb(t5_slot, time, r, g, b)
             out[dst:dst + 3] = bytes((r, g, b))
@@ -451,7 +465,7 @@ def _nam0_kill_sun(out: bytearray, raw: bytes) -> None:
             dst = (slot * 4 + time) * 4
             out[dst:dst + 3] = b'\x00\x00\x00'
 
-    if not raw or len(raw) < 160:
+    if not raw or len(raw) < _SRC_NAM0_SIZE:
         return
 
     for time in range(4):
@@ -472,10 +486,9 @@ def _fold_sunlight_into_ambient(raw: bytes, time: int,
 
     See: docs/commentary/tes5_import_weather.md#sunless-skies--the-oblivion-realms-must-have-no-sun
     """
-    if not raw or len(raw) < 160:
+    if not raw or len(raw) < _SRC_NAM0_SIZE:
         return (ar, ag, ab)
-    src = (_T4_SUNLIGHT * 4 + time) * 4
-    sr, sg, sb = raw[src], raw[src + 1], raw[src + 2]
+    sr, sg, sb = _src_rgb(raw, _T4_SUNLIGHT, time)
     if not (sr or sg or sb):
         return (ar, ag, ab)
     return (min(255, ar + sr // 2), min(255, ag + sg // 2),
@@ -556,15 +569,14 @@ def _wthr_cloud_arrays(rec: dict, layer_plan) -> bytes:
     rnam = bytearray(b'\x7F' * _TES5_CLOUD_LAYERS)
     qnam = bytearray(b'\x7F' * _TES5_CLOUD_LAYERS)
 
-    raw = get_hex_bytes(rec, 'NAM0.Data')
+    raw = _src_nam0(rec)
     pnam = bytearray(_TES5_CLOUD_LAYERS * 4 * 4)
     alphas = [0.0] * (_TES5_CLOUD_LAYERS * 4)
 
     def tint(t4_slot, time):
         """The TES4 cloud tint, highlight-compressed like the sky slots (no time axis)."""
-        src = (t4_slot * 4 + time) * 4
-        return _knee_rgb(raw[src], raw[src + 1], raw[src + 2],
-                         _PNAM_KNEE, _PNAM_KNEE_CEILING)
+        r, g, b = _src_rgb(raw, t4_slot, time)
+        return _knee_rgb(r, g, b, _PNAM_KNEE, _PNAM_KNEE_CEILING)
 
     for layer, texture, layer_alphas in layer_plan:
         if not 0 <= layer < _TES5_CLOUD_LAYERS:
@@ -575,7 +587,7 @@ def _wthr_cloud_arrays(rec: dict, layer_plan) -> bytes:
             t4_speed * _WTHR_CLOUD_X_DRIFT)
         for time in range(4):
             alphas[layer * 4 + time] = layer_alphas[time]
-        if not raw or len(raw) < 160:
+        if not raw or len(raw) < _SRC_NAM0_SIZE:
             continue
         t4_slot = (_T4_CLOUDS_UPPER if texture == upper_cloud
                    else _T4_CLOUDS_LOWER)
@@ -602,14 +614,13 @@ def _wthr_dalc(rec: dict) -> bytes:
 
     See: docs/commentary/tes5_import_weather.md#dalc-directional-ambient-4-x-32-bytes
     """
-    raw = get_hex_bytes(rec, 'NAM0.Data')
+    raw = _src_nam0(rec)
     sunless = get_formid(rec, 'FormID') in _SUNLESS_WEATHER_FIDS
     out = b''
     for time in range(4):
-        if raw and len(raw) >= 160:
-            src = (_T4_AMBIENT * 4 + time) * 4
-            r, g, b = _normalize_rgb(3, time,
-                                     raw[src], raw[src + 1], raw[src + 2])
+        if raw and len(raw) >= _SRC_NAM0_SIZE:
+            r, g, b = _normalize_rgb(
+                3, time, *_src_rgb(raw, _T4_AMBIENT, time))
             if sunless:
                 r, g, b = _fold_sunlight_into_ambient(raw, time, r, g, b)
         else:

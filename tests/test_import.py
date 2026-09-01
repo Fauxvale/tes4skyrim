@@ -4615,6 +4615,56 @@ class TestSunlessSkies:
         assert not _SUNLESS_WEATHER_FIDS
 
 
+class TestFalloutWeatherColors:
+    """FO3/FNV author NAM0 with six times of day; TES4 and TES5 use four.
+
+    See: docs/commentary/tes5_import_weather.md#fo3fnv-nam0-six-times-of-day
+    """
+
+    def _six_time(self):
+        """Ten slots x six times, each slot a distinct ramp; times 4-5 zeroed."""
+        raw = bytearray(10 * 6 * 4)
+        for slot in range(10):
+            for time in range(4):
+                off = (slot * 6 + time) * 4
+                raw[off:off + 3] = bytes((slot * 10 + time, 60, 70))
+        return bytes(raw)
+
+    def test_six_time_blob_is_restrided_to_four(self):
+        """Every slot keeps its four authored times at the TES4 stride."""
+        from tes5_import.record_types.weather_falloutnv import to_four_times
+        out = to_four_times(self._six_time())
+        assert len(out) == 160
+        for slot in range(10):
+            for time in range(4):
+                off = (slot * 4 + time) * 4
+                assert out[off] == slot * 10 + time
+
+    def test_four_time_blob_passes_through_untouched(self):
+        """Oblivion's 160-byte table must survive byte-identical."""
+        from tes5_import.record_types.weather_falloutnv import to_four_times
+        raw = bytes(range(160))
+        assert to_four_times(raw) == raw
+
+    def test_slots_are_not_remapped(self):
+        """FO3/FNV slot meanings already match TES5 — only the stride differs."""
+        from tes5_import.record_types.weather_falloutnv import to_four_times
+        out = to_four_times(self._six_time())
+        assert out[(9 * 4 + 1) * 4] == 91
+        assert out[(2 * 4 + 1) * 4] == 21
+
+    def test_converter_reads_authored_day_colors(self):
+        """The defect: a stride-4 read of a six-time blob lands in the zeroed
+        High Noon padding, leaving fog, sunlight and horizon black at midday."""
+        from tes5_import.record_types.weather import _src_nam0, _src_rgb
+        rec = {'Signature': 'WTHR', 'FormID': '0000015E', 'RecordFlags': '0',
+               'NAM0.Data': self._six_time().hex().upper()}
+        norm = _src_nam0(rec)
+        assert len(norm) == 160
+        for slot in (1, 4, 8):
+            assert _src_rgb(norm, slot, 1) == (slot * 10 + 1, 60, 70)
+
+
 class TestWorldspaceClimate:
     def _rec(self, **over):
         rec = {'Signature': 'WRLD', 'FormID': '0000003C', 'RecordFlags': '0',

@@ -586,3 +586,37 @@ Steps 1–3 make the feature real CLI-first; each step leaves the tree working.
 
 Step 6 lands after step 5 deliberately: the toolbar makes the feature usable,
 and the drop zone is presentation over an already-working import.
+
+
+## BSA naming per game
+
+**Code:** `_get_bsa_files` and `_EXTRA_BSA_BASES` in
+`asset_convert/bsa_extract.py`
+
+Archive discovery builds candidate filenames from the plugin stem, which holds
+for Oblivion but not for every game:
+
+| Plugin | Archives |
+|---|---|
+| `Oblivion.esm` | `Oblivion - Meshes/Textures - Compressed/Sounds/Misc.bsa` |
+| `Knights.esp` | `Knights.bsa` (one archive, smaller DLCs) |
+| `Nehrim.esm` | `N - Meshes/Textures1/Textures2/Sounds/Misc.bsa`, `L - Voices/Misc.bsa` |
+| `FalloutNV.esm` | `Fallout - Meshes/Misc/Sound/Textures/Textures2/Voices1.bsa` |
+
+**FO3/FNV name their archives after the GAME, not the plugin.** The stem
+`FalloutNV` matches nothing, so discovery returned **0 of the 47 BSAs** in a
+Tale of Two Wastelands install and every asset silently went missing --
+`architecture\Strip\Lucky38.NIF` lives in `Fallout - Misc.bsa`, so
+the Lucky 38 exterior had no mesh at all while all 314 of its interior pieces
+converted normally.
+
+`_EXTRA_BSA_BASES` is the fix for exactly this shape of problem: it maps a
+plugin stem to the extra prefixes its archives really use, and FalloutNV
+registers `Fallout` the way Nehrim registers `N` and `L`.
+
+Two pattern notes. FNV uses `Sound.bsa` (singular) where Oblivion and Nehrim
+use `Sounds.bsa`, so both spellings are probed. And the base is deliberately
+NOT extended to the DLC or Tale of Two Wastelands archives (`Anchorage -
+Main.bsa`, `TaleOfTwoWastelands - Main.bsa`, `TTWInteriors_Core -
+Meshes.bsa`, 41 in all): only FalloutNV.esm is being converted, so only its own
+six archives are claimed.

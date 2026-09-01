@@ -2344,3 +2344,59 @@ overlap heavily and say nothing about how a texture will be mapped; the U/V
 spans are what separate a full-dome projection from a tiled band or a sliced
 strip. Copying vanilla's layer set without checking the art it was authored
 for reproduces its geometry, not its appearance.
+
+## FO3/FNV NAM0: six times of day
+
+**Code:** `tes5_import/record_types/weather_falloutnv.py`
+
+FalloutNV authors NAM0 with **six** times of day; TES4 and TES5 use four.
+xEdit's `wbWeatherTimeOfDay` (`Core/wbDefinitionsCommon.pas:7895`) makes this
+explicit — `if wbIsFalloutNV` selects a struct of Sunrise, Day, Sunset, Night,
+**High Noon, Midnight**, and a union decider picks the four-time struct when the
+subrecord is 160 bytes. Ten slots x six times x RGBA = **240 bytes**.
+
+Measured over `export/FalloutNV.esm/WTHR.txt` (63 records): **55 are 240 bytes,
+8 are 160**. Oblivion is uniformly 160 across all 37.
+
+### The defect
+
+`_wthr_nam0`, `_wthr_cloud_colors` and `_wthr_dalc` all index
+`raw[(slot * 4 + time) * 4]`. Against a six-time blob every slot after the
+first reads from the wrong colour, and the daytime index lands in the zeroed
+High Noon / Midnight padding. For `DefaultWeather`, day colours read as:
+
+| slot | shipped (stride 4) | authored (stride 6) |
+|---|---|---|
+| Sky-Upper | (90, 131, 150) | (90, 131, 150) |
+| Fog | **(0, 0, 0)** | (72, 104, 103) |
+| Ambient | (245, 242, 239) | (78, 160, 175) |
+| Sunlight | **(0, 0, 0)** | (244, 206, 149) |
+| Sky-Lower | **(0, 0, 0)** | (138, 170, 172) |
+| Horizon | **(0, 0, 0)** | (129, 152, 140) |
+
+Sky-Upper is correct only because stride 4 and stride 6 coincide at slot 0.
+Symptom: **a near-black sky at midday.**
+
+### Slots are NOT remapped
+
+FO3/FNV slot meanings already match TES5, and differ from TES4 at two indices:
+
+| idx | TES4 | FO3/FNV | TES5 |
+|---|---|---|---|
+| 2 | Clouds-Lower | Unused | Unused |
+| 9 | Clouds-Upper | Effect Lighting | Effect Lighting |
+
+So only the time stride changes. An earlier draft routed FNV through the TES4
+layout and dropped slots 2 and 9 — **wrong**: a census found **51 of 55**
+records carry nonzero data in both, distinct from each other in 51.
+
+### What is dropped, and why that is acceptable
+
+High Noon and Midnight have no TES5 slot. Census of the 55 six-time records:
+
+- **31** have nonzero High Noon, **25** nonzero Midnight.
+- High Noon is byte-identical to Day in **5.6 of 10 slots** on average, and
+  averages only **+6.7 luminance** over it (one record matches in all 10).
+
+They are a mild midday/midnight variant, not independent data; Day and Night
+already carry the look. This is the only information loss in the conversion.
