@@ -40,6 +40,12 @@ MAX_SEE_CHARS = 80
 #: A whole-line citation and NOTHING else, at most MAX_SEE_CHARS wide.
 SEE_ONLY = re.compile(r'^#\s*See:\s*docs/[A-Za-z0-9_./-]+\.md(?:#[A-Za-z0-9-]+)?\s*$')
 
+#: A `docs/` citation in a docstring, as `(path, anchor)`; anchor may be empty.
+DOC_CITATION = re.compile(r'(docs/[A-Za-z0-9_./-]+\.md)(#[A-Za-z0-9-]+)?')
+
+#: Literal displays whose elements may carry a decoding comment.
+LITERAL_NODES = (ast.Dict, ast.Set, ast.List, ast.Tuple)
+
 BRANCH_NODES = (ast.If, ast.For, ast.While, ast.And, ast.Or,
                 ast.ExceptHandler, ast.Assert, ast.comprehension)
 NEST_NODES = (ast.If, ast.For, ast.While, ast.With, ast.Try)
@@ -144,15 +150,41 @@ def comment_tokens(text: str) -> list:
     return out
 
 
-def _scored_comments(path, text: str) -> list:
+def element_lines(tree) -> set:
+    """Lines holding exactly one element of a literal dict/set/list/tuple.
+
+    A trailing comment there DECODES an opaque literal, so it is not prose.
+    Multi-line elements are excluded: only a one-line element can be labelled
+    without the comment drifting from the value it names.
+    See: docs/reference/script_convert_architecture.md#a-literal-element-may-carry-its-decoding
+    """
+    rows, spans = set(), []
+    for node in ast.walk(tree):
+        if not isinstance(node, LITERAL_NODES):
+            continue
+        parts = list(node.keys) if isinstance(node, ast.Dict) else list(node.elts)
+        for item in parts:
+            if item is None:
+                continue
+            spans.append((item.lineno, item.end_lineno))
+            if item.lineno == item.end_lineno:
+                rows.add(item.lineno)
+    straddled = {r for r in rows if any(a < r <= b for a, b in spans)}
+    return rows - straddled
+
+
+def _scored_comments(path, text: str, tree=None) -> list:
     """Comments that are prose: not a shebang, banner, `#:` doc or directive."""
     lines = text.split('\n')
+    spared = element_lines(tree) if tree is not None else set()
     hits = []
     for row, body, own in comment_tokens(text):
         raw = lines[row - 1].strip() if row <= len(lines) else ''
         if raw.startswith('#!') or raw.startswith('#:'):
             continue
         if own and (BANNER_RE.match(raw) or _is_banner_title(lines, row - 1)):
+            continue
+        if not own and row in spared and len(body) < MAX_SEE_CHARS:
             continue
         hits.append((path, row, body[:60]))
     return hits
@@ -161,7 +193,7 @@ def _scored_comments(path, text: str) -> list:
 def inline_comments(path, text: str, tree) -> list:
     """Prose comments inside a function body.  There is no legal reason."""
     spans = function_spans(tree)
-    return [h for h in _scored_comments(path, text)
+    return [h for h in _scored_comments(path, text, tree)
             if any(a <= h[1] <= b for a, b in spans)]
 
 
@@ -175,7 +207,7 @@ def stray_comments(path, text: str, tree) -> list:
     """Prose comments outside every function body, bare citations aside."""
     spans = function_spans(tree)
     lines = text.splitlines()
-    return [h for h in _scored_comments(path, text)
+    return [h for h in _scored_comments(path, text, tree)
             if not any(a <= h[1] <= b for a, b in spans)
             and not _is_citation(lines, h[1])]
 
@@ -276,6 +308,25 @@ def bloated_docstrings(path, text: str, tree) -> list:
     return hits
 
 
+def anchorless_citations(path, tree) -> list:
+    """Function/class docstrings citing a `docs/` file with no `#anchor`.
+
+    A bare path names a whole file, so it names no fact.  Module docstrings
+    are exempt: a module-wide citation really does mean the whole document.
+    See: docs/reference/script_convert_architecture.md#a-citation-must-name-an-anchor
+    """
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, FUNC_NODES + (ast.ClassDef,)):
+            continue
+        doc = ast.get_docstring(node)
+        for ref, anchor in DOC_CITATION.findall(doc or '') if doc else []:
+            if not anchor:
+                hits.append((path, node.lineno,
+                             '%s: cites %s with no #anchor' % (node.name, ref)))
+    return hits
+
+
 def missing_docstrings(path, tree) -> list:
     """Functions carrying no docstring; no exemption for closures."""
     return [(path, n.lineno, n.name) for n in functions(tree)
@@ -295,6 +346,35 @@ def unsectioned_defs(path, text: str, tree) -> list:
             for n in tree.body
             if isinstance(n, FUNC_NODES + (ast.ClassDef,))
             and n.lineno < first]
+
+
+# ---------------------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------------------
+
+
+def _is_private(name: str) -> bool:
+    """True for a single-underscore name, which dunders and `_` itself are not."""
+    return name.startswith('_') and not name.startswith('__') and name != '_'
+
+
+def private_imports(path, tree) -> list:
+    """Imports of another module's underscore-prefixed name.
+
+    The underscore says the name is not an interface, so it may be renamed or
+    deleted without looking outside its file; an importer voids that silently.
+    See: docs/reference/script_convert_architecture.md#a-private-name-belongs-to-its-file
+    """
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        for alias in node.names:
+            if _is_private(alias.name):
+                hits.append((path, node.lineno, '%s: imports %s from %s'
+                             % (alias.asname or alias.name, alias.name,
+                                node.module or '.')))
+    return hits
 
 
 # ---------------------------------------------------------------------------

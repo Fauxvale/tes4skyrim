@@ -395,6 +395,93 @@ This also stops charging data tables as complex code: `_init_dispatch` in
 `oversized-files` still counts `code_lines()`: line and statement counts
 already agree there (20 files vs 22), so it needs no re-baseline.
 
+### A literal element may carry its decoding
+
+A trailing comment on one element of a `dict`/`set`/`list`/`tuple` literal is
+exempt from `inline-comments` and `stray-comments`:
+
+```python
+_SUPPORTED_VERSIONS = {
+    0x14000004,  # Gamebryo v20.0.0.4 — primary Oblivion format
+    0x0a01006a,  # Gamebryo v10.1.0.106
+}
+```
+
+That comment is not prose, it is the **decoding of an opaque literal** — the
+only place `0x14000004` can be tied to a version name, since the value has no
+name of its own. A docstring cannot hold it: listing the seven constants in
+parallel prose puts the label somewhere it can silently drift when an eighth is
+added, which is strictly worse than the comment beside the value.
+
+The exemption is structural, not textual, so it cannot be used to smuggle
+narration into a set literal:
+
+- The comment must be **trailing** — a comment on its own line inside the
+  literal is a heading in disguise, and is still charged.
+- The element must be **one line**. A multi-line element's comment has already
+  drifted from what it labels.
+- It is capped at `MAX_SEE_CHARS` (80). A label is a label; past that it is an
+  argument, and belongs in the docstring.
+
+Assignments are unaffected — `x = compute()  # this is slow because…` is prose
+and stays a violation.
+
+### A citation must name an anchor
+
+A citation naming only a `.md` path, with no `#anchor`, is a violation in a
+function or class docstring. `dead-citations` already checks that an anchor
+*resolves*; `anchorless-citations` requires that one is *present*.
+
+A bare path points at a whole file. `tes5_import_weather.md` is 2,346 lines, so
+a citation to it names no fact and the reader is no better off than with no
+citation at all. This rule exists because a bulk docstring trim once replaced 25
+contracts with a one-line summary plus a bare path, and the loss was invisible
+at review time.
+
+Module docstrings are exempt. A module-wide `See:` genuinely means "this whole
+document", and forcing an anchor there would only invent a fake one.
+
+**Measured debt: 1 site.** Anchored citations already outnumber bare ones 166
+to 1 in function and class docstrings, so this lands as an error with no
+migration.
+
+Not adopted: a **minimum docstring length** before a citation is allowed. It
+does not separate the cases. The broken docstring from that incident was ~62
+chars and its accepted repair was 68 — the fix is *shorter* than the defect,
+because `0x7F = 0, max 254` replaced a sentence of narration. Measured over the
+173 citing docstrings, a floor at 80 charges 74 of them (43%) and 80/90/100 all
+charge the identical 74, because the wall in the distribution is just the width
+of one line of English. Every such floor charges good terse writing, and its
+cheapest remedy is padding — the same gameable-metric failure that
+`long-functions` escaped by counting statements.
+
+### A private name belongs to its file
+
+`_helper()` may only be used in the file that defines it. Importing an
+underscore-prefixed name from another module is `private-imports`.
+
+The leading underscore is the author's statement that a name is not an
+interface: it can be renamed, resplit or deleted without looking outside the
+file. An importer voids that guarantee silently — the definer has no way to see
+the dependency, so the name is now load-bearing while still being spelled as
+though it is not. Either it is an interface (drop the underscore) or it is not
+(do not import it).
+
+**Measured: 537 import statements, 449 distinct `(file, module, name)`, 350
+symbols leaked across 136 files.** 301 of the 537 sit inside a function body.
+The concentration says what it is: `corridor_union.py` takes 41 private names
+from `union_geom`/`union_cdt`, which is a file split that moved code without
+promoting an interface, and `script_convert.constants` leaks 53, which is a
+module that has simply mislabelled its whole public surface.
+
+`tests/` is exempt, for the same reason it is exempt from `oversized-files`: a
+test is allowed to know more than a caller, and testing a helper directly is
+legitimate. That exemption alone removes the largest importers
+(`test_import.py` at 39, `test_asset_convert.py` at 19).
+
+Being `--gate-diff` scoped, none of this debt is payable until someone touches
+the line.
+
 ### What the gate must see
 
 `.claude/hooks/doc_rules_gate.py` blocks a write that would leave a violation on

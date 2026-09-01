@@ -479,3 +479,146 @@ def test_a_shell_command_must_name_the_wrapper():
     code, err = _hook('Bash', {'command': 'python - <<PY\npass\nPY'})
     assert code == 2 and 'safe_run.py' in err
     assert _hook('Bash', {'command': 'python tools/validate/safe_run.py ls'})[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# A literal element may carry its decoding
+# ---------------------------------------------------------------------------
+
+
+VERSIONS = '''"""M."""
+
+_SUPPORTED = {
+    0x14000004,  # Gamebryo v20.0.0.4 - primary Oblivion format
+    0x0a01006a,  # Gamebryo v10.1.0.106
+}
+'''
+
+
+def test_a_literal_element_may_be_decoded():
+    """The version table is the case the prose rule used to get wrong."""
+    assert sites(VERSIONS, 'stray-comments') == []
+
+
+def test_every_literal_display_spares_its_elements():
+    """A dict, list and tuple label their entries the same way a set does."""
+    for open_, close in (('{', '}'), ('[', ']'), ('(', ')')):
+        src = '"""M."""\n\nT = %s\n    1,  # one\n%s\n' % (open_, close)
+        assert sites(src, 'stray-comments') == [], open_
+    pairs = '"""M."""\n\nT = {\n    "XCLC": 12,  # +4 land flags vs TES4\n}\n'
+    assert sites(pairs, 'stray-comments') == []
+
+
+def test_an_own_line_comment_in_a_literal_is_still_prose():
+    """A comment on its own line is a heading in disguise, not a label."""
+    src = '"""M."""\n\nT = {\n    # a heading in disguise\n    1,\n}\n'
+    assert sites(src, 'stray-comments') == [4]
+
+
+def test_a_decoding_comment_is_capped_like_a_citation():
+    """Past the cap the label is an argument, and belongs in the docstring."""
+    over = '"""M."""\n\nT = {\n    1,  # %s\n}\n' % ('x' * D.MAX_SEE_CHARS)
+    assert sites(over, 'stray-comments') == [4]
+
+
+def test_the_exemption_does_not_reach_an_assignment():
+    """Only an ELEMENT is spared; a statement's trailing comment is prose."""
+    src = '"""M."""\n\n\ndef f() -> int:\n    """D."""\n    x = g()  # slow\n    return x\n'
+    assert sites(src, 'inline-comments') == [6]
+
+
+def test_a_multi_line_element_is_not_spared():
+    """Its comment has already drifted from the value it claims to label."""
+    src = '"""M."""\n\nT = [\n    (1,\n     2),  # a pair\n]\n'
+    assert sites(src, 'stray-comments') == [5]
+
+
+# ---------------------------------------------------------------------------
+# A citation must name an anchor
+# ---------------------------------------------------------------------------
+
+
+DOC = 'docs/reference/script_convert_architecture.md'
+
+
+def _cite(target, kind='def f()'):
+    """A function or class whose docstring cites `target`."""
+    return '"""M."""\n\n\n%s:\n    """D.\n\n    See: %s\n    """\n' % (kind, target)
+
+
+def test_a_bare_path_in_a_docstring_is_charged():
+    """A 2,346-line file is not a fact; the anchor is what carries it."""
+    assert sites(_cite(DOC), 'anchorless-citations') == [4]
+
+
+def test_an_anchored_citation_passes():
+    """The rule demands an anchor, never a longer docstring."""
+    assert sites(_cite(DOC + '#length-is-counted-in-statements'),
+                 'anchorless-citations') == []
+
+
+def test_a_class_docstring_is_judged_too():
+    """A class states a contract exactly as a function does."""
+    assert sites(_cite(DOC, 'class Thing'), 'anchorless-citations') == [4]
+
+
+def test_a_module_docstring_may_cite_a_whole_file():
+    """Module-wide really does mean the whole document; an anchor would lie."""
+    assert sites('"""M.\n\nSee: %s\n"""\n' % DOC, 'anchorless-citations') == []
+
+
+def test_a_short_docstring_with_an_anchor_is_never_charged():
+    """No length floor: the accepted repair was SHORTER than the defect."""
+    src = _cite(DOC + '#length-is-counted-in-statements')
+    assert sites(src, 'anchorless-citations') == []
+    assert sites(src, 'bloated-docstrings') == []
+
+
+def test_an_untouched_anchorless_citation_is_not_owed():
+    """Scoped like every other rule: legacy debt waits for whoever edits it."""
+    before = _cite(DOC) + '\n\ndef g():\n    """D."""\n'
+    after = _cite(DOC) + '\n\ndef g():\n    """D."""\n    return 1\n'
+    assert blame(before, after, [12], 'anchorless-citations') == []
+
+
+# ---------------------------------------------------------------------------
+# A private name belongs to its file
+# ---------------------------------------------------------------------------
+
+
+def test_importing_a_private_name_is_charged():
+    """The underscore says the name may be renamed without looking outside."""
+    assert sites('"""M."""\n\nfrom other import _helper\n',
+                 'private-imports') == [3]
+
+
+def test_a_public_name_and_a_dunder_are_not_private():
+    """`__all__` and a public function are interfaces by their spelling."""
+    src = '"""M."""\n\nfrom other import public\nfrom mod import __version__\n'
+    assert sites(src, 'private-imports') == []
+
+
+def test_an_alias_does_not_launder_a_private_import():
+    """Renaming on the way in changes the spelling, not the guarantee."""
+    assert sites('"""M."""\n\nfrom other import _helper as helper\n',
+                 'private-imports') == [3]
+
+
+def test_a_local_import_is_charged_like_a_top_level_one():
+    """301 of 537 measured sites hid inside a function body."""
+    src = ('"""M."""\n\n\ndef f() -> int:\n    """D."""\n'
+           '    from other import _helper\n    return _helper()\n')
+    assert sites(src, 'private-imports') == [6]
+
+
+def test_a_test_file_may_reach_a_private_helper():
+    """A test is allowed to know more than a caller, as with file length."""
+    got = CR.rule_sites(Path(__file__).resolve(), with_tools=False)
+    assert 'private-imports' not in got
+
+
+def test_an_untouched_private_import_is_not_owed():
+    """The 299 measured sites are payable only by whoever edits the line."""
+    before = '"""M."""\n\nfrom other import _helper\n'
+    after = '"""M."""\n\nfrom other import _helper\n\nVALUE = 1\n'
+    assert blame(before, after, [5], 'private-imports') == []

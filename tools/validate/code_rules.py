@@ -75,6 +75,8 @@ EXPLAIN = {
     'dead-imports': 'an unused import, variable, or undefined name',
     'dead-code': 'a symbol or branch nothing in the repo can reach',
     'dead-citations': 'a `docs/` path or anchor that does not exist',
+    'anchorless-citations': 'a docstring citing a `docs/` file with no #anchor',
+    'private-imports': "another module's `_name`, which is not an interface",
     'broken-syntax': 'a file Python cannot parse',
 }
 
@@ -117,6 +119,12 @@ REMEDY = {
         'delete it; unreachable code is a bug that cannot announce itself',
     'dead-citations':
         'fix the path or the anchor -- a citation that lies loses the knowledge',
+    'anchorless-citations':
+        'name the SECTION: a bare path points at a whole file, so it points at '
+        'nothing.  Add `#the-heading-slug`, or write the fact in the docstring',
+    'private-imports':
+        'the leading underscore says this is not an interface -- promote the '
+        'name (drop the underscore) or call a public function that uses it',
     'broken-syntax':
         'fix the syntax error -- an unparsable file scores NO other rule, so '
         'this passing is indistinguishable from a clean file',
@@ -146,7 +154,8 @@ MAGNITUDE = re.compile(r'(\d+)')
 #: Rules sited at the `def` line, so the body blames through the span.
 NODE_SPAN_RULES = frozenset({
     'god-functions', 'long-functions', 'deep-nesting', 'multi-return-fns',
-    'bloated-docstrings', 'missing-docstrings', 'unsectioned-defs'})
+    'bloated-docstrings', 'missing-docstrings', 'unsectioned-defs',
+    'anchorless-citations'})
 
 #: Rules reported at line 1 or file-wide: blamed only on crossing a threshold.
 FILE_RULES = frozenset({'oversized-files', 'broken-syntax'})
@@ -251,10 +260,10 @@ def _citation_sites(path: Path, text: str) -> list:
 
 
 def _is_test(path: Path) -> bool:
-    """True for a file under `tests/`, which `oversized-files` does not judge.
+    """True for a file under `tests/`, exempt from two rules.
 
-    A test file is a flat list of small independent cases, so its length is a
-    COUNT of tests, not a responsibility that can be split.
+    Its length is a COUNT of independent cases, not a responsibility that can
+    be split; and a test may reach a private helper a caller may not.
     See: docs/reference/script_convert_architecture.md#why-oversized-files-does-not-judge-tests
     """
     try:
@@ -279,11 +288,14 @@ def rule_sites(path: Path, text: str = None, with_tools: bool = True,
         'fat-sections': D.fat_sections(path, text),
         'unsectioned-defs': D.unsectioned_defs(path, text, tree),
         'dead-citations': _citation_sites(path, text),
+        'anchorless-citations': D.anchorless_citations(path, tree),
+        'private-imports': D.private_imports(path, tree),
         'broken-syntax': _syntax_sites(path, text),
     }
     checks.update(D.structural_sites(path, text, tree))
     if _is_test(path):
         checks.pop('oversized-files', None)
+        checks.pop('private-imports', None)
     if with_tools:
         checks['dead-imports'] = _ruff_sites(path)
     return {k: v for k, v in checks.items() if v}
