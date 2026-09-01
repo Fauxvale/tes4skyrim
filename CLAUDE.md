@@ -46,6 +46,7 @@ caching, skipped record types, the export text format, and the directory layout.
 - **All fixes must be generic.** Never patch to satisfy a single record or file.
   Oblivion and Nehrim are only the test files — we never know what plugin this
   runs on.
+- 🛑 **FO3/FNV-SPECIFIC CODE GOES IN ITS OWN FILE.** Put it in `<stage>_<game>.py` beside the stage — `tes4_export/export_falloutnv.py` — and leave the main file a call site.
 - **The goal is COMPLETE conversion.** Don't strip things out because the
   conversion would be complicated.
 - **If you don't see the problem described, the test data is not stale** — there
@@ -115,6 +116,8 @@ caching, skipped record types, the export text format, and the directory layout.
 - If the user gives multiple constraints to a bug, your fix MUST satisfy ALL of them
 - If the user asks for a plan or analysis. DO NOT BUILD until you have the goahead. Overeager code development is the opposite of helpful
 - Deletion and Simplification is an IMPORTANT part of the process. A change that removes or only adds a few total lines of code is FAR SUPERIOR to one that adds many lines. More does not equal better. Strive to have as low of a cyclomatic complexity as possible
+- If the hook triggers for old debt, don't try to get around it as fast as possible or line golf. Take the time to examine the surrounding file and fix it properly. You have the time
+- Docstrings should contain real and important function information. Story content only and always belongs in a see: tag. See tags should ALWAYS have an anchor.
 
 ### <a id="regression-read-the-commits"></a>🛑 IF IT IS A REGRESSION, READ THE COMMITS
 
@@ -420,7 +423,9 @@ matches is a broken query, never evidence about the tree.
 REFUSES it, charging the lines you changed plus the comments above them.
 `--gate-file` scores a WHOLE file, including debt you did not write; use it only
 to audit a file before refactoring it. `oversized-files` is a RATCHET: it fires
-only when your edit RAISES the count, never for merely being over.
+only when your edit RAISES the count, never for merely being over. **It counts
+CODE lines — trimming docstrings or comments CANNOT clear it.** Clear it by
+removing or relocating CODE.
 
 - **Prose:** only a docstring, a ONE-line 120-char `#:` attribute doc, or a
   `# ----` heading. A docstring states the CONTRACT, never the why; rationale
@@ -434,6 +439,9 @@ only when your edit RAISES the count, never for merely being over.
   class-level `dict`/`list`/`set`.
 - **No dead code:** no unused import or variable, no undefined name, nothing
   unreachable. `code_rules.py --dead-code` is the whole-program sweep.
+- 🛑 **IMPORTS GO AT MODULE SCOPE.** A function-local import is a code smell —
+  hoist it. Keep one inside a function ONLY to break a real import cycle, and
+  say which one in the docstring.
 - **Compress, never delete:** keep every measured count, script name and
   mechanism; drop the narration. **No dates.**
 - An inline comment means the code cannot state its own intent — fix the code.

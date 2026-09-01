@@ -273,6 +273,39 @@ def _save_manifest(extract_dir, manifest):
         json.dump(manifest, f, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# BSA archive reading
+# ---------------------------------------------------------------------------
+def _read_bsa_directory(data, dir_offset, folder_count, compressed_by_default,
+                        file_compress_flag):
+    """Every file record in a BSA directory, and the offset the name block starts at.
+
+    Returns ([(folder_name, size, offset, is_compressed)], name_block_offset).
+    A record's size carries the per-file compress flag, which INVERTS the
+    archive default rather than setting it.
+    """
+    folders = []
+    pos = dir_offset
+    for _ in range(folder_count):
+        _, f_count, f_offset = struct.unpack_from('<QII', data, pos)
+        folders.append((f_count, f_offset))
+        pos += 16
+
+    file_records = []
+    pos = dir_offset + folder_count * 16
+    for f_count, _ in folders:
+        name_len = data[pos]
+        folder_name = data[pos + 1: pos + name_len].rstrip(b'\x00').decode('latin-1')
+        pos += 1 + name_len
+        for _ in range(f_count):
+            _, f_size, f_offset = struct.unpack_from('<QII', data, pos)
+            pos += 16
+            is_comp = compressed_by_default ^ bool(f_size & file_compress_flag)
+            file_records.append((folder_name, f_size & ~file_compress_flag,
+                                 f_offset, is_comp))
+    return file_records, pos
+
+
 def _iter_bsa(bsa_path):
     """Yield (filepath_str, data_bytes) for every file in an Oblivion BSA.
 
@@ -290,46 +323,24 @@ def _iter_bsa(bsa_path):
       File name block:  null-terminated strings, one per file in folder order
     """
     BSA_MAGIC      = b'BSA\x00'
-    ARCH_COMPRESS  = 0x0004   # default-compress flag in archiveFlags
+    ARCH_COMPRESS  = 0x0004
+    ARCH_EMBED_NAME = 0x0100
     FILE_COMPRESS  = 0x40000000  # per-file size flag that inverts default
 
     data = Path(bsa_path).read_bytes()
     if data[:4] != BSA_MAGIC:
         raise ValueError(f"Not a BSA file: {bsa_path}")
 
-    (_, dir_offset, archive_flags,
+    (version, dir_offset, archive_flags,
      folder_count, _, _, total_file_name_len, _
     ) = struct.unpack_from('<IIIIIIII', data, 4)
 
     compressed_by_default = bool(archive_flags & ARCH_COMPRESS)
+    embedded_names = version >= 104 and bool(archive_flags & ARCH_EMBED_NAME)
 
-    # --- Read folder records ---
-    folders = []   # list of (file_count, data_offset)
-    pos = dir_offset
-    for _ in range(folder_count):
-        _, f_count, f_offset = struct.unpack_from('<QII', data, pos)
-        folders.append((f_count, f_offset))
-        pos += 16
-
-    # --- Read per-folder name+file-record blocks ---
-    # These start immediately after the folder records.
-    file_records = []   # (folder_name, size, offset, is_compressed)
-    pos = dir_offset + folder_count * 16
-    for f_count, _ in folders:
-        name_len = data[pos]
-        folder_name = data[pos + 1: pos + name_len].rstrip(b'\x00').decode('latin-1')
-        pos += 1 + name_len
-        for _ in range(f_count):
-            _, f_size, f_offset = struct.unpack_from('<QII', data, pos)
-            pos += 16
-            per_file_flag = bool(f_size & FILE_COMPRESS)
-            actual_size   = f_size & ~FILE_COMPRESS
-            is_comp       = compressed_by_default ^ per_file_flag
-            file_records.append((folder_name, actual_size, f_offset, is_comp))
-
-    # --- Read file name block ---
-    names_raw = data[pos: pos + total_file_name_len]
-    file_names = names_raw.split(b'\x00')  # last entry may be empty
+    file_records, pos = _read_bsa_directory(
+        data, dir_offset, folder_count, compressed_by_default, FILE_COMPRESS)
+    file_names = data[pos: pos + total_file_name_len].split(b'\x00')
 
     # --- Yield files ---
     for idx, (folder_name, f_size, f_offset, is_comp) in enumerate(file_records):
@@ -338,7 +349,11 @@ def _iter_bsa(bsa_path):
         file_name = file_names[idx].decode('latin-1')
         filepath   = folder_name + '\\' + file_name if folder_name else file_name
 
-        raw = data[f_offset: f_offset + f_size]
+        start, size = f_offset, f_size
+        if embedded_names:
+            start += 1 + data[f_offset]
+            size -= 1 + data[f_offset]
+        raw = data[start: start + size]
         if is_comp:
             try:
                 raw = zlib.decompress(raw[4:])   # first 4 bytes = uncompressed size

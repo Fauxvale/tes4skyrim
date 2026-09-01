@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import mmap
+import struct
 import os
 import sys
 import time
@@ -94,9 +95,12 @@ from .record_types.world import (
     export_ROAD,
     export_WRLD,
 )
+from . import export_falloutnv
 from .tes4_reader import (
     Record,
     _read_record,
+    RECORD_HEADER_SIZE,
+    detect_header_size,
     get_formid_str,
     get_string,
     get_subrecord,
@@ -143,8 +147,14 @@ SKIP_TYPES = set()  # All types now exported
 _WORKER_COUNT = worker_count()
 
 
-def format_record(rec: Record) -> str:
-    """Format a single record as a ---RECORD_BEGIN---...---RECORD_END--- text block."""
+def format_record(rec: Record, hdr_size: int = RECORD_HEADER_SIZE) -> str:
+    """Format one record as a ---RECORD_BEGIN---...---RECORD_END--- block.
+
+    A 24-byte header marks an FO3/FNV source, whose type exporter is
+    followed by that game's extra fields.
+
+    See: docs/commentary/tes4_export_falloutnv.md#a-shared-signature-is-not-a-shared-field
+    """
     lines = ["---RECORD_BEGIN---"]
     lines.append(f"Signature={rec.type}")
     lines.append(f"FormID={get_formid_str(rec.form_id)}")
@@ -167,11 +177,15 @@ def format_record(rec: Record) -> str:
 
     # Type-specific fields
     export_fn = EXPORT_DISPATCH.get(rec.type)
+    if export_fn is None and hdr_size != RECORD_HEADER_SIZE:
+        export_fn = export_falloutnv.base_exporter(rec.type)
     if export_fn:
         type_lines = export_fn(rec)
         # Remove duplicate EditorID if present
         type_lines = [l for l in type_lines if not l.startswith("EditorID=")]
         lines.extend(type_lines)
+        if hdr_size != RECORD_HEADER_SIZE:
+            lines.extend(export_falloutnv.export_lines(rec))
     else:
         # Unknown type - dump subrecord signatures and sizes
         lines.append(f"# Unknown record type: {rec.type}")
@@ -183,11 +197,11 @@ def format_record(rec: Record) -> str:
     return "\n".join(lines)
 
 
-def export_records_for_type(records: list) -> str:
+def export_records_for_type(records: list, hdr_size: int = RECORD_HEADER_SIZE) -> str:
     """Export all records of a given type to a text string."""
     blocks = []
     for rec in records:
-        blocks.append(format_record(rec))
+        blocks.append(format_record(rec, hdr_size))
     return "\n\n".join(blocks) + "\n"
 
 
@@ -243,7 +257,7 @@ def export_file(all_records: list, output_dir: str, type_filter: set = None,
     if source_path:
         _export_per_type_parallel(by_type, output_dir, source_path)
     else:
-        _export_per_type_serial(by_type, output_dir)
+        _export_per_type_serial(by_type, output_dir, _source_header_size(source_path))
 
     t_end = time.time()
     print(f"  Export formatting/write took {t_end-t_start:.2f}s")
@@ -254,12 +268,25 @@ def _type_filepath(sig: str, output_dir: str) -> str:
     return os.path.join(output_dir, f"{sig}{suffix}.txt")
 
 
-def _export_per_type_serial(by_type: dict, output_dir: str):
+def _source_header_size(source_path: str) -> int:
+    """The record header size of a source binary, or the TES4 default without one."""
+    if not source_path or not os.path.exists(source_path):
+        return RECORD_HEADER_SIZE
+    with open(source_path, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            return detect_header_size(mm)
+        finally:
+            mm.close()
+
+
+def _export_per_type_serial(by_type: dict, output_dir: str,
+                            hdr_size: int = RECORD_HEADER_SIZE):
     """Format fully-parsed records in-process (fallback / test path)."""
     for sig, records in by_type.items():
         filepath = _type_filepath(sig, output_dir)
         with open(filepath, "w", encoding="utf-8") as f:
-            f.write(export_records_for_type(records))
+            f.write(export_records_for_type(records, hdr_size))
         print(f"    Wrote {filepath} ({len(records)} records)")
 
 
@@ -280,7 +307,6 @@ _FORMAT_CHUNK_RECORDS = 4000
 _worker_mm = None
 _worker_path = None
 
-
 def _format_chunk_worker(args: tuple) -> str:
     """Format one chunk of records; returns the joined text blocks.
 
@@ -298,15 +324,18 @@ def _format_chunk_worker(args: tuple) -> str:
         _worker_path = source_path
     mm = _worker_mm
     n = len(mm)
+    hdr_size = detect_header_size(mm)
+    if hdr_size != RECORD_HEADER_SIZE:
+        export_falloutnv.prepare_source(mm, n, hdr_size, source_path)
 
     blocks = []
     for off, pw, pc, pd, vwd in entries:
-        rec = _read_record(mm, off, n)
+        rec = _read_record(mm, off, n, hdr_size=hdr_size)
         rec.parent_wrld = pw
         rec.parent_cell = pc
         rec.parent_dial = pd
         rec.is_vwd = vwd
-        blocks.append(format_record(rec))
+        blocks.append(format_record(rec, hdr_size))
     return "\n\n".join(blocks)
 
 
@@ -380,7 +409,6 @@ def export_header(header: Record, output_dir: str):
     lines = []
     hedr = get_subrecord(header, "HEDR")
     if hedr and len(hedr.data) >= 12:
-        import struct
         lines.append(f"HEDR.Version={struct.unpack_from('<f', hedr.data, 0)[0]}")
         lines.append(f"HEDR.NumRecords={struct.unpack_from('<I', hedr.data, 4)[0]}")
         lines.append(f"HEDR.NextObjectID={struct.unpack_from('<I', hedr.data, 8)[0]}")

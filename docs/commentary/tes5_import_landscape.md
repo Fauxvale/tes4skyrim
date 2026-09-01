@@ -69,3 +69,29 @@ record with a damage value but no flag is not meant to hurt.
 TES5 loading screens use a 3D model, not a 2D texture: `NNAM` is a required
 FormID → STAT. TES4 has no 3D model reference, so NULL (0) is written. `ICON` is
 omitted for the same reason — it is the 2D path TES5 no longer uses.
+
+## CELL water and music
+
+**Code:** `_cell_water_and_music` in `tes5_import/record_types/world.py`
+
+`XCWT` is the cell's own water type, overriding the worldspace's `NAM2`. This is
+how Oblivion authors the lava in its realm interiors — 46 of the 162 cells that
+set `XCWT` name a lava record — and dropping it left every one of them on the
+worldspace default. It is emitted after `XLCN` and before ownership to match the
+xEdit CELL subrecord order.
+
+`XCMO` is the music type. TES4 stores only a 3-value enum (`XCMT`: 0 Default,
+1 Public, 2 Dungeon) because Oblivion's engine picks the actual track by scanning
+`Data/Music/<Category>/`; Skyrim needs a `MUSC` FormID instead. Measured source:
+1,104 Dungeon + 767 Public cells in Oblivion.esm, 386 + 227 in Nehrim.esm.
+Vanilla Skyrim.esm sets `XCMO` on 701 cells.
+
+An **interior** with no authored `XCMT` gets the same enum-0 default the engine
+applies (see `convert_WRLD`'s ZNAM note): it has no worldspace to inherit from,
+so leaving the subrecord off makes it silent. 382 Oblivion and 219 Nehrim
+interiors are in this state.
+
+**Exteriors are deliberately left alone** — 33,241 of Oblivion's 33,560 have no
+`XCMT`, and stamping every one with an explicit `XCMO` would add ~33k subrecords
+to say what the worldspace's single `ZNAM` already says, and would override any
+future per-region music with a cell-level value.

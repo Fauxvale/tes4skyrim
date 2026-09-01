@@ -482,6 +482,52 @@ legitimate. That exemption alone removes the largest importers
 Being `--gate-diff` scoped, none of this debt is payable until someone touches
 the line.
 
+### A rename is not an edit
+
+Writing a **new** file gets `touched = None`, which `_blame` reads as "all of
+it is yours" — right for original code, wrong for a **rename**, where the
+author moved a file and wrote nothing. Moving the same content into an
+*existing* file is free, because that file has a git baseline, so the cost
+depended on how the move was performed.
+
+A rename is recognised by an **exact whole-file match against the donor as it
+now stands in the working tree** — not against its baseline. A file that was
+edited and *then* moved carries those edits, so matching the committed copy
+would miss the rename and bill the mover for the donor's in-flight work. On a
+hit the pair is recorded in `.claude/renames.json`, blame is diffed against the
+donor's current content (normally zero lines), and scoring uses the donor's
+baseline, so its existing violations stay its own and only what the move adds
+is charged.
+
+Two traps, both found by running it:
+
+- **The candidate must not be its own donor.** `gate_pending()` stages the
+  candidate as `.gate_candidate_<pid>.py` *beside* the target so git and the
+  rules see the same package — and `repo_files()` walks that directory, so
+  every new file matched its own temp copy perfectly and was absolved. `_donor`
+  takes the staged path and excludes it.
+- **Compare decoded text, not bytes.** Sources here are CRLF; `read_text()`
+  collapses line endings, so re-encoding a candidate yields ~2.5% fewer bytes
+  than the file holds and a byte comparison never matches on Windows. The size
+  filter that prunes candidates therefore accepts a window (`size` to `2*size`)
+  rather than requiring equality.
+
+Exact equality is the whole safety argument. There is no threshold to tune: a
+single added line breaks the match, and the file is then blamed whole exactly
+as before. **Do not replace it with a similarity score.** Two such attempts
+were built and reverted here; both let the judged file choose its own baseline,
+so the more of the original an author kept, the more new debt they could add
+under it. A 60% overlap rule lets `foo_v2.py` inherit `foo.py` and absolve the
+violation that `foo.py` had just been blocked for.
+
+The map is untracked and machine-local: it only bridges a local write and a
+local stage, after which git's own rename detection takes over. It is never
+pruned — that exact rename cannot happen twice.
+
+A **split** is not covered. A part of a file never equals the whole, so it gets
+no record and is blamed whole. That is the known cost of dividing an oversized
+file, and it is paid once, visibly.
+
 ### What the gate must see
 
 `.claude/hooks/doc_rules_gate.py` blocks a write that would leave a violation on

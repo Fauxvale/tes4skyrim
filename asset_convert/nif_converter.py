@@ -75,6 +75,7 @@ from .tri_reconstruct import (clear_match_groups, fix_missing_triangles,
 # Apply all PyFFI patches (time.clock fix, nif.xml condition fixes) before import
 from . import pyffi_monkey_patch as _patch  # noqa: F401
 from .texture_prune import _texture_refs_in  # noqa: E402
+from .nif_flames import convert_flame_nodes
 
 try:
     from pyffi.formats.nif import NifFormat
@@ -326,21 +327,24 @@ def sky_object_type_for(src_path):
         return None
     return _SKY_MESH_TYPES.get(parts[-1])
 
-#: Convertible source versions (Oblivion-era, plus 0x14020007 for FO3/FNV); anything else is skipped, not copied.
+#: Convertible source versions; anything else is skipped, not copied.
 _SUPPORTED_VERSIONS = {
-    0x14000004, 0x14000005, 0x0a020000, 0x0a01006a,
-    0x0a000100, 0x0a000102, 0x0a010065, 0x14020007,
+    0x14000004,  # Gamebryo 20.0.0.4 - the primary Oblivion format
+    0x14000005,  # Gamebryo 20.0.0.5
+    0x14020007,  # Gamebryo 20.2.0.7 - FO3/FNV
+    0x0a020000,  # Gamebryo 10.2.0.0
+    0x0a01006a,  # Gamebryo 10.1.0.106
+    0x0a010065,  # Gamebryo 10.1.0.101
+    0x0a000100,  # NetImmerse 10.0.1.0
+    0x0a000102,  # NetImmerse 10.0.1.2
 }
 
-#: Already-Skyrim (version, user_version_2), copied out unchanged; FO3/FNV share the version, differing only in uv2.
+#: Already-Skyrim (version, user_version_2), copied out unchanged.
 _SKYRIM_VERSIONS = {
-    (0x14020007, 83),
+    (0x14020007, 83),  # FO3/FNV share the version, differing only in uv2
 }
 
-# Havok unit scale factor (Oblivion → Skyrim).
-# Applied to rigid body translations, center of mass, and primitive shape dimensions.
-# Strip mesh vertices use a separate ÷7 factor (hardcoded in _ni_strips_to_packed).
-# This matches the legacy copyover_legacy_nif_animations.py value of 0.1.
+#: Havok unit scale, Oblivion to Skyrim: bodies, mass centres, primitive dims.
 _HAVOK_SCALE = 0.1
 
 # ---------------------------------------------------------------------------
@@ -596,6 +600,28 @@ def _convert_furniture_markers(markers, root):
         ep.right = 1 if seat['entry_flags'] & _ENTRY_RIGHT else 0
         ep.left = 1 if seat['entry_flags'] & _ENTRY_LEFT else 0
     return frn, shift
+
+
+def _bs_pp_texture_slots(prop):
+    """Diffuse, normal and glow paths from an FO3/FNV BSShaderPPLightingProperty.
+
+    FO3/FNV keep their paths in a BSShaderTextureSet on this property rather
+    than on NiTexturingProperty, in the same slot order Skyrim uses: 0 diffuse,
+    1 normal, 2 glow. All three are AUTHORED, so the normal is taken verbatim
+    instead of being derived from the diffuse name.
+
+    See: docs/commentary/asset_convert_nif.md#fo3fnv-shader-properties
+    """
+    tex_set = getattr(prop, 'texture_set', None)
+    if tex_set is None:
+        return b'', b'', b''
+    slots = list(getattr(tex_set, 'textures', ()) or ())
+
+    def slot(i):
+        """The i-th texture path, or empty when absent or blank."""
+        return slots[i] if i < len(slots) and slots[i] else b''
+
+    return slot(0), slot(1), slot(2)
 
 
 def _rewrite_tex_path(raw_bytes):
@@ -1768,6 +1794,133 @@ def _apply_parallax(ts, shader, tex_set, tex_apply_mode, stats):
     stats['parallax_shapes'] = stats.get('parallax_shapes', 0) + 1
 
 
+def _base_texture_path(prop):
+    """The base (diffuse) texture path on a NiTexturingProperty, or empty."""
+    if prop.has_base_texture and prop.base_texture.source:
+        return prop.base_texture.source.file_name
+    return b''
+
+
+def _glow_texture_path(prop):
+    """The glow path a NiTexturingProperty NAMES, or empty.
+
+    Oblivion names its glow map (unlike the normal, which it derives), so this
+    is authored data taken verbatim rather than guessed.
+    """
+    if not getattr(prop, 'has_glow_texture', False):
+        return b''
+    source = getattr(prop.glow_texture, 'source', None)
+    return source.file_name if source is not None and source.file_name else b''
+
+
+def _find_flip_controller(prop):
+    """The NiFlipController on a property, or None.
+
+    Oblivion fire and effect quads animate through multiple NiSourceTexture
+    frames; the controller moves to the NiTriShape so BSEffectShaderProperty
+    can keep the frames through conversion.
+    """
+    ctrl = prop.controller
+    while ctrl is not None:
+        if isinstance(ctrl, NifFormat.NiFlipController):
+            return ctrl
+        ctrl = getattr(ctrl, 'next_controller', None)
+    return None
+
+
+def _has_emissive_animation(prop):
+    """True when a NiMaterialColorController animates the emissive channel.
+
+    The material's static emissive is then only the curve's starting point --
+    frequently (0,0,0) -- so it must not be read as "this surface does not glow".
+    """
+    ctrl = prop.controller
+    while ctrl is not None:
+        if (isinstance(ctrl, NifFormat.NiMaterialColorController) and
+                int(getattr(ctrl, 'target_color', -1)) == _MATERIAL_COLOR_EMISSIVE):
+            return True
+        ctrl = getattr(ctrl, 'next_controller', None)
+    return False
+
+
+class _ShaderInputs:
+    """The shader values harvested from one shape's old NIF properties.
+
+    Defaults describe a shape with no properties at all: no textures, opaque,
+    lit (vertex_lighting_mode 1), and no animation.
+    """
+
+    __slots__ = ('diffuse_path', 'glow_path', 'authored_normal', 'has_double_sided',
+                 'alpha_prop', 'tex_apply_mode', 'emissive_r', 'emissive_g',
+                 'emissive_b', 'material_alpha', 'emissive_animated',
+                 'vertex_lighting_mode', 'flip_ctrl', 'tex_transforms')
+
+    def __init__(self, tex_transforms):
+        self.diffuse_path = b''
+        self.glow_path = b''
+        self.authored_normal = b''
+        self.has_double_sided = False
+        self.alpha_prop = None
+        self.tex_apply_mode = None
+        self.emissive_r = 0.0
+        self.emissive_g = 0.0
+        self.emissive_b = 0.0
+        self.material_alpha = 1.0
+        self.emissive_animated = False
+        self.vertex_lighting_mode = 1
+        self.flip_ctrl = None
+        self.tex_transforms = tex_transforms
+
+
+def _harvest_texturing(prop, out):
+    """Fold one NiTexturingProperty's paths, apply mode and flip controller in."""
+    out.diffuse_path = _base_texture_path(prop) or out.diffuse_path
+    out.glow_path = _glow_texture_path(prop) or out.glow_path
+    out.tex_apply_mode = int(prop.apply_mode)
+    out.flip_ctrl = _find_flip_controller(prop) or out.flip_ctrl
+
+
+def _harvest_material(prop, out):
+    """Fold one NiMaterialProperty's emissive and alpha in."""
+    color = prop.emissive_color
+    out.emissive_r, out.emissive_g, out.emissive_b = color.r, color.g, color.b
+    out.material_alpha = prop.alpha
+    out.emissive_animated = _has_emissive_animation(prop)
+
+
+def _collect_shader_inputs(src, uv_transforms):
+    """Harvest shader inputs from a shape's Oblivion / FO3 properties.
+
+    Oblivion keeps them on NiTexturingProperty and friends; FO3/FNV keep their
+    texture paths in a BSShaderTextureSet on BSShaderPPLightingProperty. Both
+    are read here.
+
+    See: docs/commentary/asset_convert_nif.md#fo3fnv-shader-properties
+    """
+    out = _ShaderInputs(_collect_tex_transform_ctrls(src.properties) + uv_transforms)
+
+    for prop in src.properties:
+        if isinstance(prop, NifFormat.NiTexturingProperty):
+            _harvest_texturing(prop, out)
+            continue
+        if isinstance(prop, NifFormat.NiMaterialProperty):
+            _harvest_material(prop, out)
+            continue
+        if isinstance(prop, NifFormat.BSShaderPPLightingProperty):
+            diffuse, normal, glow = _bs_pp_texture_slots(prop)
+            out.diffuse_path = diffuse
+            out.authored_normal = normal
+            out.glow_path = glow or out.glow_path
+            continue
+        if isinstance(prop, NifFormat.NiVertexColorProperty):
+            out.vertex_lighting_mode = int(prop.lighting_mode)
+        elif isinstance(prop, NifFormat.NiStencilProperty):
+            out.has_double_sided = True
+        elif isinstance(prop, NifFormat.NiAlphaProperty):
+            out.alpha_prop = prop
+    return out
+
+
 def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     """Convert a NiTriStrips or NiTriShape into a ready Skyrim NiTriShape.
 
@@ -1855,76 +2008,21 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
     if tangents is not None and hasattr(ts.data, 'tangents'):
         _set_tangents(ts.data, bitangents, tangents)
 
-    # Collect shader inputs from old Oblivion properties
-    diffuse_path = b''
-    glow_path = b''         # NiTexturingProperty glow slot -> Skyrim slot 2
-    has_double_sided = False
-    alpha_prop = None
-    tex_apply_mode = None   # NiTexturingProperty.apply_mode (detail-overlay detection)
-    emissive_r = 0.0
-    emissive_g = 0.0
-    emissive_b = 0.0
-    material_alpha = 1.0   # NiMaterialProperty.alpha → BSLightingShaderProperty.alpha
-    emissive_animated = False   # NiMaterialColorController drives the emissive
-    # NiVertexColorProperty.lighting_mode: 0 = unlit FX, 1 = lit.  Default to
-    # lit so a shape with no NiVertexColorProperty keeps the lighting shader.
-    vertex_lighting_mode = 1
-    flip_ctrl = None   # NiFlipController on NiTexturingProperty → animated fire quads
-
-    # NiTextureTransformController on NiTexturingProperty → scrolling/scaling UVs
-    # (waterfalls, lava, Oblivion gates, sunbeams).  Harvest BEFORE the old
-    # properties are cleared below; re-attached to the Skyrim shader further down.
-    tex_transforms = _collect_tex_transform_ctrls(src.properties)
-    # NiUVController carries the same UV curves on the GEOMETRY chain instead of
-    # on NiTexturingProperty (Ghostfence).  Harvested above, before
-    # _strip_dead_geometry_controllers removed it — the block type is unknown to
-    # Skyrim and crashes NiStream if left in the file.
-    tex_transforms += uv_transforms
-
-    for prop in src.properties:
-        if isinstance(prop, NifFormat.NiTexturingProperty):
-            if prop.has_base_texture and prop.base_texture.source:
-                diffuse_path = prop.base_texture.source.file_name
-            # Oblivion NAMES its glow map (unlike the normal, which it derives)
-            # -- authored data, so it is taken verbatim rather than guessed.
-            if getattr(prop, 'has_glow_texture', False):
-                _gsrc = getattr(prop.glow_texture, 'source', None)
-                if _gsrc is not None and _gsrc.file_name:
-                    glow_path = _gsrc.file_name
-            tex_apply_mode = int(prop.apply_mode)
-            # Detect NiFlipController: Oblivion fire/effect quads animate through
-            # multiple NiSourceTexture frames.  We'll move this to the NiTriShape
-            # and use BSEffectShaderProperty so the frames survive conversion.
-            ctrl = prop.controller
-            while ctrl is not None:
-                if isinstance(ctrl, NifFormat.NiFlipController):
-                    flip_ctrl = ctrl
-                    break
-                ctrl = getattr(ctrl, 'next_controller', None)
-        elif isinstance(prop, NifFormat.NiMaterialProperty):
-            ec = prop.emissive_color
-            emissive_r = ec.r
-            emissive_g = ec.g
-            emissive_b = ec.b
-            material_alpha = prop.alpha
-            # A NiMaterialColorController on the material ANIMATES a color
-            # channel (target_color 3 = emissive).  The static values above are
-            # then only the curve's starting point -- frequently (0,0,0) -- so
-            # they must not be read as "this surface does not glow".
-            _c = prop.controller
-            while _c is not None:
-                if (isinstance(_c, NifFormat.NiMaterialColorController) and
-                        int(getattr(_c, 'target_color', -1)) ==
-                        _MATERIAL_COLOR_EMISSIVE):
-                    emissive_animated = True
-                _c = getattr(_c, 'next_controller', None)
-        elif isinstance(prop, NifFormat.NiVertexColorProperty):
-            vertex_lighting_mode = int(prop.lighting_mode)
-        elif isinstance(prop, NifFormat.NiStencilProperty):
-            has_double_sided = True
-        elif isinstance(prop, NifFormat.NiAlphaProperty):
-            alpha_prop = prop
-
+    _si = _collect_shader_inputs(src, uv_transforms)
+    diffuse_path = _si.diffuse_path
+    glow_path = _si.glow_path
+    authored_normal = _si.authored_normal
+    has_double_sided = _si.has_double_sided
+    alpha_prop = _si.alpha_prop
+    tex_apply_mode = _si.tex_apply_mode
+    emissive_r = _si.emissive_r
+    emissive_g = _si.emissive_g
+    emissive_b = _si.emissive_b
+    material_alpha = _si.material_alpha
+    emissive_animated = _si.emissive_animated
+    vertex_lighting_mode = _si.vertex_lighting_mode
+    flip_ctrl = _si.flip_ctrl
+    tex_transforms = _si.tex_transforms
     # Clear old properties
     ts.num_properties = 0
     ts.properties.update_size()
@@ -1956,7 +2054,10 @@ def _process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None):
         # first tries the variant's own `_n` and then the one its base name
         # shares across colour variants.
         _norm = base + '_n.dds'
-        if stats is not None:
+        if authored_normal:
+            _norm = (_rewrite_tex_path(authored_normal) if fix_textures
+                     else authored_normal.decode('utf-8', errors='replace'))
+        elif stats is not None:
             _found = _resolve_normal_for(diffuse, stats)
             if _found is None:
                 _norm = _DEFAULT_NORMAL_TEXTURE
@@ -3879,255 +3980,6 @@ def _resolve_geometry_suffix(root, name):
     return shader
 
 
-# ---------------------------------------------------------------------------
-# Flame attachment for "fake" light NIFs
-# ---------------------------------------------------------------------------
-
-# Oblivion marks where a flame should burn with an empty FlameNode* NiNode and
-# attaches a flame NIF there dynamically at runtime (firecandleflame.nif for
-# candles/sconces/lamps, the torch flame for torches).  Skyrim has no such
-# runtime attachment, so we CONVERT: the matching Oblivion flame NIF is run
-# through the full converter once (cached per worker) and its converted
-# subtree is grafted under each FlameNode marker.  This ships Oblivion's own
-# flame visuals — flip-book quads + particle systems — instead of substituting
-# Skyrim's Master-Particle-System flames.
-#
-# (A much earlier graft attempt crashed the engine — that crash was actually
-# the PyFFI NiPSysData 66-vs-70-byte misalignment plus uv_scale=(0,0), both
-# long fixed; the interim BSValueNode/AddonNode substitution is now removed.)
-
-# Which flame burns at a FlameNode<N> socket.
-#
-# THIS IS AUTHORED DATA, read from the plugin -- not inferred.  Oblivion ships
-# one STAT record per socket under WorldObjects/Static, EditorID "FlameNode<N>",
-# whose MODL is the flame NIF the engine attaches there:
-#
-#   FlameNode0  0x0000001E  Fire/FireCandleFlame.NIF
-#   FlameNode1  0x0000001F  Fire/FireTorchSmall.nif
-#   FlameNode2  0x00000020  Fire/FireTorchLarge.nif
-#   FlameNode3  0x00000021  Fire/FireTorchLargeSmoke.nif
-#   FlameNode4  0x00000022  Fire/FireOpenSmall.nif
-#   FlameNode5  0x00000023  Fire/FireOpenSmallSmoke.nif
-#   FlameNode6  0x00000024  Fire/FireOpenMedium.nif
-#   FlameNode7  0x00000025  Fire/FireOpenMediumSmoke.nif
-#   FlameNode8  0x00000026  Fire/FireOpenLarge.nif
-#   FlameNode9  0x00000027  Fire/FireOpenLargeSmoke.nif
-#
-# Those FormIDs are the very keys Oblivion.exe hardcodes: the socket-name table
-# at 0xB06818 ("FlameNode1", "FlameNode2", ... "FlameNode0", "FlameNode10" ...
-# "FlameNode20") is walked in lockstep with a parallel table at 0xB067C0 holding
-# 0x1E..0x32, which are looked up in the form map at 0xB0613C.  So the engine
-# resolves a socket to a STAT and draws that STAT's model -- the plugin owns the
-# mapping, and a mod may repoint it.  FlameNode10-20 exist for custom use and
-# ship no STAT in vanilla.
-#
-# Reading it beats any heuristic: keying on the host FILENAME ("torch" in the
-# name) put the 1.3x2.6-unit candle flame on every lamp in the game --
-# castlelight02 is FlameNode2, i.e. FireTorchLarge (32x64).
-_FLAME_STAT_RE = re.compile(
-    r'EditorID=(FlameNode(\d+))\s.*?Model\.MODL=([^\r\n]+)', re.S)
-# The engine matches socket names EXACTLY against its own table, which holds
-# only unpadded "FlameNode<N>".  A ZERO-PADDED marker therefore matches nothing
-# and no flame is attached -- verified against Oblivion.exe, which contains
-# "FlameNode7" and "FlameNode1" but neither "FlameNode07" nor "FlameNode01".
-# Two vanilla meshes are authored that way and burn nothing in game:
-# clutter/metalsmith/forgeopen01.nif (FlameNode07) and
-# clutter/lecternworkstation1.nif (FlameNode01).  Matching them loosely put a
-# 468-unit FireOpenMediumSmoke on the forge that Oblivion never shows.
-# `[1-9]\d*|0` accepts "0" and "12" but rejects "07".
-_FLAME_SOCKET_RE = re.compile(r'^FlameNode(0|[1-9][0-9]*)(?![0-9])')
-_FLAME_SOCKET_MAP = {}   # export_root_lower -> {index: 'firecandleflame.nif'}
-
-
-def _flame_socket_map(src_path):
-    """{socket index: flame nif basename} from the plugin's FlameNode STATs."""
-    norm = str(src_path).replace('/', os.sep).replace(chr(92), os.sep)
-    key = os.sep + 'meshes' + os.sep
-    i = norm.lower().rfind(key)
-    if i < 0:
-        return {}
-    export_root = norm[:i]
-    ck = export_root.lower()
-    cached = _FLAME_SOCKET_MAP.get(ck)
-    if cached is not None:
-        return cached
-    table = {}
-    stat_txt = os.path.join(export_root, 'STAT.txt')
-    try:
-        with open(stat_txt, 'r', encoding='latin1') as fh:
-            blob = fh.read()
-    except OSError:
-        blob = ''
-    if blob:
-        for rec in blob.split('---RECORD_BEGIN---'):
-            if 'FlameNode' not in rec:
-                continue
-            m = _FLAME_STAT_RE.search(rec)
-            if not m:
-                continue
-            model = m.group(3).strip().replace(chr(92)*2, os.sep)
-            model = model.replace('/', os.sep).replace(chr(92), os.sep)
-            table[int(m.group(2))] = os.path.basename(model).lower()
-    _FLAME_SOCKET_MAP[ck] = table
-    return table
-
-
-def _flame_socket_index(node_name):
-    """The N in a FlameNode<N> marker name, or None.
-
-    Oblivion suffixes duplicates ("FlameNode0@#3", "FlameNode0	"), so match a
-    leading run of digits rather than parsing the whole name.
-    """
-    if isinstance(node_name, bytes):
-        node_name = node_name.decode('latin1', 'replace')
-    m = _FLAME_SOCKET_RE.match(node_name)
-    return int(m.group(1)) if m else None
-
-
-def _flame_nif_for_socket(src_path, index):
-    """Which Oblivion flame NIF burns at a FlameNode<index> socket.
-
-    None when nothing does -- an unmatched socket burns NOTHING in Oblivion,
-    it does not fall back to some default flame.  There is no guessing left in
-    this path: no STAT for the index (FlameNode10-20 ship none) and no flame.
-    """
-    if index is None:
-        return None
-    return _flame_socket_map(src_path).get(index)
-
-
-_FLAME_CACHE = {}   # (meshes_root_lower, flame_name) -> nif bytes | None
-_FLAME_ATLAS_JOBS = {}  # same key -> flip-book atlas jobs from the conversion
-
-
-def _load_converted_flame(src_path, flame_name):
-    """Convert meshes/fire/<flame_name> once per worker; return serialized
-    Skyrim NIF bytes (deep-copies are made by re-reading), or None."""
-    norm = str(src_path).replace('/', os.sep).replace(chr(92), os.sep)
-    key = os.sep + 'meshes' + os.sep
-    i = norm.lower().rfind(key)
-    if i < 0:
-        return None
-    meshes_root = norm[:i + len(key)]
-    cache_key = (meshes_root.lower(), flame_name)
-    if cache_key in _FLAME_CACHE:
-        return _FLAME_CACHE[cache_key]
-    result = None
-    flame_src = meshes_root + 'fire' + os.sep + flame_name
-    if os.path.isfile(flame_src):
-        try:
-            fdata = NifFormat.Data()
-            with open(flame_src, 'rb') as f:
-                fdata.inspect(f)
-                f.seek(0)
-                fdata.read(f)
-            fstats = _convert_nif(fdata, fix_textures=True, src_path=flame_src)
-            buf = _io.BytesIO()
-            fdata.write(buf)
-            result = buf.getvalue()
-            _FLAME_ATLAS_JOBS[cache_key] = fstats.get('_flipbook_atlases', {})
-        except Exception:
-            result = None
-    _FLAME_CACHE[cache_key] = result
-    return result
-
-
-def _convert_flame_nodes(root_node, src_path, stats=None):
-    """Graft the converted Oblivion flame NIF under every empty FlameNode*
-    marker.  Modifies root_node's tree in-place; returns the graft count.
-
-    Marker transform: TRANSLATION, SCALE **and ROTATION** are all kept
-    (Oblivion authored FlameNodes with ~2x scale that the attached flame NIF
-    expects).  The rotation is the authored hook-up between two DIFFERENT model
-    frames and must not be discarded: the flame NIFs are authored +Y-up, and a
-    host authored +Z-up carries exactly the −90°X correction on its marker —
-    uppersilverplatecandles01's FlameNode0 is [1,0,0][0,0,1][0,-1,0], i.e.
-    _BB_AXIS_FIX itself, mapping the flame's +Y onto the plate's +Z.  (That
-    host is a flat plate, extent X=23 Y=23 Z=2, and all 121 of its REFRs use
-    RotX=0 — nothing else would stand the flame up.)  Zeroing it laid the
-    candle flames on their side.  Hosts that are themselves +Y-up author an
-    identity marker and are unaffected.
-    """
-    # Resolved PER MARKER: one mesh can mix socket families (lecternworkstation1
-    # carries both a FlameNode0 candle and a FlameNode1 torch).
-    used_flames = set()
-    count = 0
-
-    def _visit(node):
-        nonlocal count
-        if not isinstance(node, NifFormat.NiNode):
-            return
-        for i in range(len(node.children)):
-            child = node.children[i]
-            if child is None:
-                continue
-            nm = getattr(child, 'name', b'') or b''
-            if isinstance(nm, bytes):
-                nm = nm.decode('latin1')
-            if (nm.startswith('FlameNode')
-                    and isinstance(child, NifFormat.NiNode)
-                    and child.num_children == 0):
-                flame_name = _flame_nif_for_socket(src_path,
-                                                   _flame_socket_index(nm))
-                if flame_name is None:
-                    continue   # no STAT for this socket: burns nothing
-                flame_bytes = _load_converted_flame(src_path, flame_name)
-                if flame_bytes is None:
-                    continue
-                used_flames.add(flame_name)
-                # Deep-copy the converted flame by re-reading its bytes.
-                fdata = NifFormat.Data()
-                buf = _io.BytesIO(flame_bytes)
-                fdata.inspect(buf)
-                buf.seek(0)
-                fdata.read(buf)
-                froot = fdata.roots[0]
-                kids = [c for c in froot.children if c is not None]
-                # Keep the marker's authored rotation — see the docstring:
-                # it is the host-frame -> flame-frame hook-up, and on a +Z-up
-                # host it IS the axis correction the flame needs.
-                child.num_children = len(kids)
-                child.children.update_size()
-                for j, k in enumerate(kids):
-                    child.children[j] = k
-                count += 1
-            else:
-                _visit(child)
-
-    _visit(root_node)
-
-    if count:
-        # The grafted particle systems need per-frame controller updates:
-        # ensure BSXFlags bit 0 (Animated) on the host root.
-        if hasattr(root_node, 'extra_data_list'):
-            for ed in root_node.extra_data_list:
-                if isinstance(ed, NifFormat.BSXFlags):
-                    ed.integer_data |= 0x01
-                    break
-            else:
-                bsx = NifFormat.BSXFlags()
-                bsx.name = b'BSX'
-                bsx.integer_data = 0x01
-                root_node.num_extra_data_list += 1
-                root_node.extra_data_list.update_size()
-                for i in range(root_node.num_extra_data_list - 1, 0, -1):
-                    root_node.extra_data_list[i] = root_node.extra_data_list[i - 1]
-                root_node.extra_data_list[0] = bsx
-        # Propagate the flame's flip-book atlas jobs so convert_nif builds
-        # them into this host's output tree too (idempotent, exists-checked).
-        if stats is not None:
-            norm = str(src_path).replace('/', os.sep).replace(chr(92), os.sep)
-            key = os.sep + 'meshes' + os.sep
-            i = norm.lower().rfind(key)
-            if i >= 0:
-                for _fname in used_flames:
-                    cache_key = (norm[:i + len(key)].lower(), _fname)
-                    jobs = _FLAME_ATLAS_JOBS.get(cache_key, {})
-                    if jobs:
-                        stats.setdefault('_flipbook_atlases', {}).update(jobs)
-
-    return count
-
 
 # Vanilla Skyrim particle-modifier `order` values (slighthousefire.nif census).
 # The engine processes modifiers in ascending order; the BS* rewrites and the
@@ -4355,6 +4207,44 @@ def _skyrimize_modifiers(node):
         node.modifiers[i] = m
 
 
+def _authored_emissive(color):
+    """A material's emissive as a tuple; None when black (no glow authored)."""
+    if color.r > 0.0 or color.g > 0.0 or color.b > 0.0:
+        return (color.r, color.g, color.b)
+    return None
+
+
+def _collect_psys_properties(node):
+    """Texture, flip controller, alpha and authored color from a particle emitter.
+
+    Returns (diffuse_path, flip_ctrl, alpha_prop, emissive, alpha). The emissive
+    is the emitter's authored brightness, taken verbatim so a smoke emitter at
+    (0.35, 0.35, 0.35) is never promoted to white.
+
+    See: docs/commentary/asset_convert_nif.md#fo3fnv-shader-properties
+    """
+    diffuse_path = b''
+    flip_ctrl = None
+    alpha_prop = None
+    emissive = None
+    alpha = 1.0
+    for prop in node.properties:
+        if isinstance(prop, NifFormat.NiTexturingProperty):
+            diffuse_path = _base_texture_path(prop) or diffuse_path
+            flip_ctrl = _find_flip_controller(prop) or flip_ctrl
+            continue
+        if isinstance(prop, NifFormat.BSShaderPPLightingProperty):
+            diffuse_path = _bs_pp_texture_slots(prop)[0]
+            continue
+        if isinstance(prop, NifFormat.NiMaterialProperty):
+            ec = prop.emissive_color
+            emissive = _authored_emissive(ec) or emissive
+            alpha = float(prop.alpha)
+        elif isinstance(prop, NifFormat.NiAlphaProperty):
+            alpha_prop = prop
+    return diffuse_path, flip_ctrl, alpha_prop, emissive, alpha
+
+
 def _convert_particle_system(node, fix_textures):
     """Convert Oblivion NiParticleSystem properties to Skyrim BSEffectShaderProperty.
 
@@ -4387,23 +4277,8 @@ def _convert_particle_system(node, fix_textures):
     # Harvest UV-scroll controllers before the Oblivion properties are cleared.
     tex_transforms = _collect_tex_transform_ctrls(node.properties)
 
-    for prop in node.properties:
-        if isinstance(prop, NifFormat.NiTexturingProperty):
-            if prop.has_base_texture and prop.base_texture.source:
-                diffuse_path = prop.base_texture.source.file_name
-            ctrl = prop.controller
-            while ctrl is not None:
-                if isinstance(ctrl, NifFormat.NiFlipController):
-                    flip_ctrl = ctrl
-                    break
-                ctrl = getattr(ctrl, 'next_controller', None)
-        elif isinstance(prop, NifFormat.NiMaterialProperty):
-            ec = prop.emissive_color
-            if ec.r > 0.0 or ec.g > 0.0 or ec.b > 0.0:
-                psys_emissive = (ec.r, ec.g, ec.b)
-            psys_alpha = float(prop.alpha)
-        elif isinstance(prop, NifFormat.NiAlphaProperty):
-            alpha_prop = prop
+    (diffuse_path, flip_ctrl, alpha_prop,
+     psys_emissive, psys_alpha) = _collect_psys_properties(node)
 
     # Clear old Oblivion properties (NiTexturingProperty, NiMaterialProperty, etc.)
     node.num_properties = 0
@@ -5219,8 +5094,10 @@ def _convert_sound_text_keys(data):
        hkx behavior graph to route through — 38 of the 39 vanilla meshes using
        a `SoundPlay.<name>` key carry `BSBehaviorGraphExtraData`.  Converted
        doors deliberately have NO graph (attaching one to an Open/Close door
-       CTDs it on cell load — see docs/commentary/asset_convert_nif.md), so the
-       rewritten key matched nothing and was dropped.
+       CTDs it on cell load), so the rewritten key matched nothing and was
+       dropped.
+
+    See: docs/commentary/asset_convert_animation.md#sound-text-keys-are-native
 
     Kept as a no-op returning 0 so the call site stays explicit about the
     decision rather than looking like an omission.
@@ -7686,7 +7563,7 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
     # flame's flip-book atlas jobs (merged into stats) are executed below.
     for root in data.roots:
         if root is not None:
-            _convert_flame_nodes(root, src_path, stats)
+            convert_flame_nodes(root, src_path, _convert_nif, stats)
 
     # Build flip-book atlas textures planned by _process_geometry (frame strip
     # for BSEffectShaderPropertyFloatController U-Offset animation).  Output

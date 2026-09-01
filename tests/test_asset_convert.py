@@ -1608,7 +1608,7 @@ class TestFlameNodeConversion:
         if not hasattr(time, '_original_clock'):
             time.clock = time.perf_counter
         from pyffi.formats.nif import NifFormat
-        from asset_convert.nif_converter import _flame_socket_index
+        from asset_convert.nif_flames import _flame_socket_index
 
         src = EXPORT_MESHES / rel
         if not src.exists():
@@ -1671,8 +1671,8 @@ class TestFlameNodeConversion:
         if not hasattr(time, '_original_clock'):
             time.clock = time.perf_counter
         from pyffi.formats.nif import NifFormat
-        from asset_convert.nif_converter import (_flame_socket_map,
-                                                 _flame_socket_index)
+        from asset_convert.nif_flames import (_flame_socket_map,
+                                              _flame_socket_index)
 
         src = EXPORT_MESHES / rel
         if not src.exists():

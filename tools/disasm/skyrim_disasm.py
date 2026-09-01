@@ -413,6 +413,12 @@ def _fmt(binary: Binary, insns, show_targets=False):
     return lines, targets
 
 
+#: The help text and RTTI names carry non-cp1252 characters; keep them printable.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, 'reconfigure'):
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)

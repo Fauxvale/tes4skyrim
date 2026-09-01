@@ -364,7 +364,7 @@ def build_cell_xcll(rec: dict):
     struct.pack_into('<i', xcll, 24, rot_z)
     struct.pack_into('<f', xcll, 28, dir_fade)
     struct.pack_into('<f', xcll, 32, clip_dist)
-    struct.pack_into('<f', xcll, 36, 1.0)  # Fog power
+    struct.pack_into('<f', xcll, 36, get_float(rec, 'XCLL.FogPower', 1.0))
     # Directional ambient: Skyrim's engine lights interiors from these six
     # colors, not the legacy ambient at offset 0.  TES4 has a single flat
     # ambient, so replicate it into all six directions (vanilla cells set
@@ -550,7 +550,8 @@ def convert_CELL(rec: dict) -> bytes:
     x = get_int(rec, 'XCLC.X', None)
     if x is not None:
         y = get_int(rec, 'XCLC.Y')
-        subs += pack_subrecord('XCLC', struct.pack('<iiI', x, y, 0))  # 12 bytes in TES5
+        land = get_int(rec, 'XCLC.LandFlags', 0)
+        subs += pack_subrecord('XCLC', struct.pack('<iiI', x, y, land))
 
     # Interior lighting (XCLL) — shared with the override path
     xcll_payload = build_cell_xcll(rec)
@@ -570,6 +571,10 @@ def convert_CELL(rec: dict) -> bytes:
     xclw_payload = build_cell_xclw(rec)
     if xclw_payload is not None:
         subs += pack_subrecord('XCLW', xclw_payload)
+
+    xnam = get_str(rec, 'XNAM.WaterNoiseTexture')
+    if xnam:
+        subs += pack_string_subrecord('XNAM', _prefix_path(xnam))
 
     # XCLR — the cell's region list.  THIS is how region weather reaches the
     # sky: the engine activates a region's RDWT list only in cells whose XCLR
@@ -620,37 +625,7 @@ def convert_CELL(rec: dict) -> bytes:
     if lctn_fid:
         subs += pack_formid_subrecord('XLCN', lctn_fid)
 
-    # XCWT — the cell's own water type, overriding the worldspace's NAM2.  This
-    # is how Oblivion authors the lava in its realm interiors (46 of the 162
-    # cells that set XCWT name a lava record); dropping it left every one of
-    # them on the worldspace default.  Emitted after XLCN and before ownership
-    # to match the xEdit CELL subrecord order.
-    xcwt = get_formid(rec, 'XCWT.Water')
-    if xcwt:
-        subs += pack_formid_subrecord('XCWT', xcwt)
-
-    # XCMO — music type.  TES4 stores only a 3-value enum (XCMT: 0 Default,
-    # 1 Public, 2 Dungeon) because Oblivion's engine picks the actual track by
-    # scanning Data/Music/<Category>/; Skyrim needs a MUSC FormID instead.
-    # Measured source: 1,104 Dungeon + 767 Public cells in Oblivion.esm,
-    # 386 + 227 in Nehrim.esm.  Vanilla Skyrim.esm sets XCMO on 701 cells.
-    # An INTERIOR with no authored XCMT gets the same enum-0 default the engine
-    # applies (see convert_WRLD's ZNAM note): it has no worldspace to inherit
-    # from, so leaving the subrecord off makes it silent.  382 Oblivion and 219
-    # Nehrim interiors are in this state.
-    #
-    # EXTERIORS are deliberately left alone -- 33,241 of Oblivion's 33,560 have
-    # no XCMT, and stamping every one with an explicit XCMO would add ~33k
-    # subrecords to say what the worldspace's single ZNAM already says, and
-    # would override any future per-region music with a cell-level value.
-    xcmt = get_int(rec, 'XCMT.MusicType', None)
-    is_exterior = get_int(rec, 'XCLC.X', None) is not None
-    if xcmt is None and not is_exterior:
-        xcmt = TES4_DEFAULT_MUSIC_ENUM
-    if xcmt is not None:
-        musc = music_for_enum(xcmt)
-        if musc:
-            subs += pack_formid_subrecord('XCMO', musc)
+    subs += _cell_water_and_music(rec)
 
     return pack_record('CELL', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
@@ -1248,6 +1223,36 @@ def build_land_layers(rec: dict) -> bytes:
                     vtxt_data += struct.pack('<HHf', vpos, 0, opacity)
                 subs += pack_subrecord('VTXT', bytes(vtxt_data))
 
+    return subs
+
+
+# ---------------------------------------------------------------------------
+# CELL water and music
+# ---------------------------------------------------------------------------
+def _cell_water_and_music(rec: dict) -> bytes:
+    """CELL XCWT (own water type) and XCMO (music), in xEdit subrecord order.
+
+    XCWT overrides the worldspace NAM2. TES4 stores music as a 3-value XCMT
+    enum (0 Default, 1 Public, 2 Dungeon); TES5 needs a MUSC FormID, so the
+    enum is resolved through music_for_enum. An interior with no authored XCMT
+    takes the engine default enum; exteriors are left to inherit the
+    worldspace ZNAM.
+
+    See: docs/commentary/tes5_import_landscape.md#cell-water-and-music
+    """
+    subs = b''
+    xcwt = get_formid(rec, 'XCWT.Water')
+    if xcwt:
+        subs += pack_formid_subrecord('XCWT', xcwt)
+
+    xcmt = get_int(rec, 'XCMT.MusicType', None)
+    is_exterior = get_int(rec, 'XCLC.X', None) is not None
+    if xcmt is None and not is_exterior:
+        xcmt = TES4_DEFAULT_MUSIC_ENUM
+    if xcmt is not None:
+        musc = music_for_enum(xcmt)
+        if musc:
+            subs += pack_formid_subrecord('XCMO', musc)
     return subs
 
 

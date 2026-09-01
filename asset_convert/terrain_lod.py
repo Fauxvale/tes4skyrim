@@ -31,6 +31,7 @@ from worker_budget import worker_count  # noqa: E402
 
 # Apply all PyFFI patches (time.clock fix, nif.xml condition fixes) before import
 from . import pyffi_monkey_patch as _patch  # noqa: F401
+from .terrain_lod_falloutnv import edid_keyed_lod_tiles, resolve_edid_keyed
 from output_layout import assets_for  # noqa: E402
 
 try:
@@ -424,6 +425,38 @@ def lod_capable_worldspaces(export_dir: Path, out_root: Path = None,
                 f"on its parent's LOD grid).")
 
 
+def _worldspace_edids(export_dir):
+    """{FormID: EditorID} from this export's WRLD.txt and every master's.
+
+    Masters are scanned too, and resolved through the registry rather than as
+    sibling directories.
+
+    See: docs/commentary/asset_convert_terrain.md#why-the-wrld-scan-includes-masters
+    """
+    edid_by_fid = {}
+
+    def _scan(directory):
+        """Fold one record directory's WRLD EditorIDs into the map."""
+        wrld_txt = directory / 'WRLD.txt'
+        if not wrld_txt.is_file():
+            return
+        cur_fid = None
+        for line in wrld_txt.read_text(encoding='utf-8',
+                                       errors='replace').splitlines():
+            if line.startswith('FormID='):
+                try:
+                    cur_fid = int(line[7:].strip(), 16)
+                except ValueError:
+                    cur_fid = None
+            elif line.startswith('EditorID=') and cur_fid is not None:
+                edid_by_fid.setdefault(cur_fid, line[9:].strip())
+
+    _scan(export_dir)
+    for master in _master_names(export_dir):
+        _scan(_master_record_dir(export_dir, master))
+    return edid_by_fid
+
+
 def shipped_lod_worldspaces(export_dir: Path):
     """Return the worldspace EditorIDs the SOURCE game shipped distant-LOD for.
 
@@ -457,39 +490,11 @@ def shipped_lod_worldspaces(export_dir: Path):
             head = f.name.split('.', 1)[0]
             if head.isdigit():
                 counts[int(head)] += 1
-    if not counts:
+    by_edid = edid_keyed_lod_tiles(export_dir)
+    if not counts and not by_edid:
         return []
 
-    # 2. Map decimal FormID -> EditorID from WRLD.txt.
-    #
-    # An OVERRIDE plugin ships LOD assets for a worldspace it does not itself
-    # define: the GOTY DLCShiveringIsles.esp is an 85-byte header-only stub
-    # (all Shivering Isles records were merged into Oblivion.esm) yet its BSA
-    # supplies every SEWorld LOD tile. So scan this export's WRLD.txt AND each
-    # master's, or the lookup falls through to a raw hex FormID that no
-    # downstream EDID match can ever resolve.
-    edid_by_fid = {}
-
-    def _scan_wrld(d):
-        wrld_txt = d / 'WRLD.txt'
-        if not wrld_txt.is_file():
-            return
-        cur_fid = None
-        for line in wrld_txt.read_text(encoding='utf-8', errors='replace').splitlines():
-            if line.startswith('FormID='):
-                try:
-                    cur_fid = int(line[7:].strip(), 16)
-                except ValueError:
-                    cur_fid = None
-            elif line.startswith('EditorID=') and cur_fid is not None:
-                edid_by_fid.setdefault(cur_fid, line[9:].strip())
-
-    _scan_wrld(export_dir)
-    # A master's records are NOT reliably a sibling directory: an imported
-    # mod's plugins live inside their mod's shared folder, so `.parent` is that
-    # folder rather than export/. Resolve through the registry.
-    for master in _master_names(export_dir):
-        _scan_wrld(_master_record_dir(export_dir, master))
+    edid_by_fid = _worldspace_edids(export_dir)
 
     # The importer renames Oblivion's 'Tamriel' worldspace to 'TES4Tamriel'
     # (tes5_import/record_types/world.py) so it doesn't override Skyrim's
@@ -501,7 +506,8 @@ def shipped_lod_worldspaces(export_dir: Path):
     result = [(_converted_edid(edid_by_fid.get(fid, f'{fid:08X}')), fid)
               for fid in counts]
     result.sort(key=lambda t: -counts[t[1]])
-    return result
+    return result + resolve_edid_keyed(by_edid, edid_by_fid, _converted_edid,
+                                        {fid for _e, fid in result})
 
 
 def _parse_land_records(esm_path: Path, worldspace_edid: str = 'TES4Tamriel',

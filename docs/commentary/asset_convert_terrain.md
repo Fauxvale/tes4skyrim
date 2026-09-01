@@ -282,3 +282,47 @@ animate fine, so it is **not** the blocker it first appears to be.
 
 Guarded by `tests/test_lava_surface.py` (5 tests, each asserting one of the
 silent-failure properties).
+
+
+## FO3/FNV keys LOD by EditorID
+
+**Code:** `asset_convert/terrain_lod_falloutnv.py`
+
+`shipped_lod_worldspaces` treats the source game's own shipped LOD assets as
+the authority on which worldspaces deserve distant LOD. Oblivion and Nehrim key
+those tiles by the worldspace's **decimal FormID**, flat in one directory:
+
+    meshes\landscape\lod\113463.-32.-32.32.nif
+    textures\landscapelod\generated\<formid>.*.dds
+
+FO3/FNV key the same assets by **EditorID**, one directory per worldspace:
+
+    meshes\landscape\lod\wastelandnv\wastelandnv.level4.x-2.y3.nif
+    textures\landscape\lod\freesidefortworld\normals\...
+
+A FormID-only scan therefore finds nothing in a FO3/FNV tree, so
+`lod_capable_worldspaces` returns empty and the LOD dialog offers no
+worldspaces at all. The reported reason -- "ships no distant LOD of its own" --
+is measurably wrong: FalloutNV.esm extracts **4,394** LOD meshes across **18**
+worldspace directories, against Oblivion's 104 files, and `wastelandnv` is
+one of them.
+
+Both layouts are now scanned. The tile count is only a relative weight used to
+rank worldspaces, so every file under a worldspace's directory counts,
+`blocks` and `normals` subfolders included.
+
+
+## Why the WRLD scan includes masters
+
+**Code:** `_worldspace_edids` in `asset_convert/terrain_lod.py`
+
+An OVERRIDE plugin ships LOD assets for a worldspace it does not itself define.
+The GOTY `DLCShiveringIsles.esp` is an 85-byte header-only stub -- every
+Shivering Isles record was merged into Oblivion.esm -- yet its BSA supplies
+every SEWorld LOD tile. Scanning only the plugin's own WRLD.txt leaves the
+FormID lookup falling through to a raw hex id that no downstream EditorID match
+can resolve, so the worldspace silently drops out of the LOD set.
+
+A master's records are also NOT reliably a sibling directory: an imported mod's
+plugins live inside their mod's shared folder, so `.parent` is that folder
+rather than `export/`. Masters resolve through the source registry instead.

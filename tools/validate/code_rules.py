@@ -53,6 +53,9 @@ REFERENCE = re.compile(r'(?i)\b(?:see|per|details?|rationale|documented)\b'
 #: An explicit `<a id="...">` target, used by docs for mid-section anchors.
 EXPLICIT_ANCHOR = re.compile(r'<a\s+id=["\']([^"\']+)["\']')
 
+#: Renames seen before staging; machine-local, since it only bridges to git.
+RENAME_MAP = ROOT / '.claude' / 'renames.json'
+
 #: What each rule MEANS; with REMEDY it is the rule's whole definition.
 EXPLAIN = {
     'inline-comments': 'a prose comment inside a function body',
@@ -112,7 +115,7 @@ REMEDY = {
     'mutable-class-state':
         'a class-level dict/list/set is a global; make it an instance field',
     'oversized-files':
-        'split the file by responsibility (CLAUDE.md: keep files under ~1000)',
+        'split the file by responsibility (CLAUDE.md: keep files under ~1000 CODE lines, comments are NOT counted)',
     'dead-imports':
         'delete it; an unused name is indistinguishable from a mistake',
     'dead-code':
@@ -390,6 +393,41 @@ def _baseline_source(path: Path) -> str:
     return ''
 
 
+def _renames() -> dict:
+    """`{new path: donor path}` for renames seen before this file was staged."""
+    try:
+        return json.loads(RENAME_MAP.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+
+
+def _donor(path: Path, text: str, read: Path = None) -> Path:
+    """The file `text` is an EXACT copy of AS IT NOW STANDS, recording it.
+
+    Working-tree content, not the baseline, so a file edited and THEN moved
+    still maps.  `read` is the candidate's own copy, which must never be its
+    own donor.
+    See: docs/reference/script_convert_architecture.md#a-rename-is-not-an-edit
+    """
+    try:
+        key = path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return None
+    seen = _renames()
+    if key in seen:
+        return ROOT / seen[key]
+    size = len(text.encode('utf-8', 'replace'))
+    for other in repo_files():
+        if other in (path, read) or not size <= other.stat().st_size <= 2 * size:
+            continue
+        if other.read_text(encoding='utf-8', errors='replace') == text:
+            seen[key] = other.resolve().relative_to(ROOT).as_posix()
+            RENAME_MAP.parent.mkdir(parents=True, exist_ok=True)
+            RENAME_MAP.write_text(json.dumps(seen, indent=1), encoding='utf-8')
+            return other
+    return None
+
+
 def _hunk_lines(out: str) -> set:
     """The `+` line numbers named by every hunk header in a unified diff."""
     touched = set()
@@ -398,6 +436,20 @@ def _hunk_lines(out: str) -> set:
         start = int(hunk.group(1))
         touched.update(range(start, start + int(hunk.group(2) or 1)))
     return touched
+
+
+def _moved_lines(donor: Path, text: str) -> set:
+    """Lines a MOVE added to `donor`'s current content, normally none.
+
+    Diffed against the donor AS IT STANDS, not its baseline: an in-flight edit
+    travels with the file, so comparing to the committed copy would bill the
+    mover for changes the donor already carried.
+    See: docs/reference/script_convert_architecture.md#a-rename-is-not-an-edit
+    """
+    import difflib
+    now = donor.read_text(encoding='utf-8', errors='replace')
+    return _hunk_lines('\n'.join(difflib.unified_diff(
+        now.splitlines(), text.splitlines(), n=0, lineterm='')))
 
 
 def _touched_lines(path: Path, candidate: str = None):
@@ -501,11 +553,14 @@ def gate_diff(path: Path, limit: int = 10, source: Path = None) -> int:
     if not read.exists() or read.suffix != '.py':
         return 0
     text, tree = _parse(read)
-    touched = _touched_lines(path, text if source is not None else None)
+    moved = None if _baseline_source(path) else _donor(path, text, read)
+    origin = moved or path
+    touched = (_moved_lines(moved, text) if moved else
+               _touched_lines(path, text if source is not None else None))
     if touched == set():
         return 0
     now = rule_sites(read, text, tree=tree)
-    before = _baseline_source(path)
+    before = _baseline_source(origin)
     was = rule_sites(path, before, with_tools=False) if before else {}
     headline = ('NEW FILE -- all of it is yours' if touched is None
                 else 'YOUR EDIT BROKE RULES')

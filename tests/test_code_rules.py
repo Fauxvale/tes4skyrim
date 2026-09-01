@@ -622,3 +622,91 @@ def test_an_untouched_private_import_is_not_owed():
     before = '"""M."""\n\nfrom other import _helper\n'
     after = '"""M."""\n\nfrom other import _helper\n\nVALUE = 1\n'
     assert blame(before, after, [5], 'private-imports') == []
+
+
+# ---------------------------------------------------------------------------
+# A rename is not an edit
+# ---------------------------------------------------------------------------
+
+
+def _rename_probe(content):
+    """(exit code, stderr) for writing `content` to an unused path."""
+    probe = ROOT / 'tools' / 'validate' / '_rename_test_probe.py'
+    mapping = CR.RENAME_MAP
+    saved = mapping.read_bytes() if mapping.exists() else None
+    try:
+        if mapping.exists():
+            mapping.unlink()
+        code, err = _hook('Write', {'file_path': str(probe),
+                                    'content': content})
+    finally:
+        if probe.exists():
+            probe.unlink()
+        if saved is None:
+            mapping.unlink(missing_ok=True)
+        else:
+            mapping.write_bytes(saved)
+    return code, err
+
+
+def test_a_rename_owes_nothing():
+    """The author moved a file and wrote no code, so nothing is theirs."""
+    donor = (ROOT / 'tools' / 'validate' / 'code_rules_ast.py')
+    assert _rename_probe(CR._baseline_source(donor))[0] == 0
+
+
+def test_one_added_line_breaks_the_match():
+    """Exact equality is the safety property; there is no threshold to tune."""
+    donor = (ROOT / 'tools' / 'validate' / 'code_rules_ast.py')
+    dirty = CR._baseline_source(donor).replace(
+        'MAX_COMPLEXITY = 25', 'MAX_COMPLEXITY = 25  # snuck in', 1)
+    code, err = _rename_probe(dirty)
+    assert code == 2 and 'snuck in' in err
+
+
+def test_an_unrelated_new_file_is_still_scored_whole():
+    """No donor means the rename map never fires, as before it existed."""
+    code, err = _rename_probe('"""M."""\n\n\ndef f() -> int:\n    """D."""\n'
+                              '    x = 1  # bump\n    return x\n')
+    assert code == 2 and 'inline-comments' in err
+
+
+def _with_dirty_donor(mutate):
+    """Run `mutate(on_disk_text)` through the gate with the donor DIRTY.
+
+    The donor carries an unstaged violation, as an in-flight edit would, so a
+    move of it must not bill the mover for what the donor already had.
+    """
+    donor = ROOT / 'tools' / 'validate' / 'code_rules_ast.py'
+    original = donor.read_bytes()
+    try:
+        donor.write_bytes(original.replace(
+            b'MAX_COMPLEXITY = 25', b'MAX_COMPLEXITY = 25  # donor debt', 1))
+        return _rename_probe(mutate(donor.read_text(encoding='utf-8')))
+    finally:
+        donor.write_bytes(original)
+
+
+def test_a_file_edited_then_moved_still_maps():
+    """The copy carries the donor's in-flight edits, so it must still match."""
+    assert _with_dirty_donor(lambda text: text)[0] == 0
+
+
+def test_only_what_the_move_adds_is_charged():
+    """The donor's own debt travels with it; a NEW violation does not."""
+    code, err = _with_dirty_donor(lambda text: text.replace(
+        'MAX_NESTING = 4', 'MAX_NESTING = 4  # added in transit', 1))
+    assert code == 2 and 'added in transit' in err
+
+
+def test_a_candidate_is_never_its_own_donor():
+    """The gate stages a copy beside the file, which matched itself exactly."""
+    src = ROOT / 'tools' / 'validate' / 'safe_run.py'
+    text = src.read_text(encoding='utf-8')
+    probe = ROOT / 'tools' / 'validate' / '.gate_candidate_selftest.py'
+    probe.write_text(text, encoding='utf-8', newline='')
+    try:
+        assert CR._donor(ROOT / 'tools' / 'validate' / '_nope.py',
+                         text, probe) == src
+    finally:
+        probe.unlink()

@@ -558,3 +558,112 @@ python tools/nif/nif_block_scan.py output/<plugin>/meshes \
 ```
 
 Guarded by `tests/test_collision_packed_strips.py`.
+
+## FO3/FNV shader properties
+
+**Code:** `_bs_pp_texture_slots`, the property loops in `_process_geometry` and
+`_convert_particle_system`.
+
+Oblivion keeps texture paths on `NiTexturingProperty`. FO3/FNV keep them in a
+`BSShaderTextureSet` hanging off `BSShaderPPLightingProperty` — nif.xml gates
+that block `versions="#FO3#"`, and `Lighting30ShaderProperty` inherits from it,
+so an isinstance check covers both.
+
+The property loops read only the Oblivion vocabulary, so for FO3/FNV meshes
+`diffuse_path` stayed empty and slot 0 took the `Textures\white.dds` neutral
+fallback — every converted mesh rendered purple in NifSkope. Measured before the
+fix: of the texture references in a 40-mesh output sample, **3 resolved and 107
+did not**, while **149/149** sampled *source* shapes carried a real diffuse path.
+The data was always present and simply never read.
+
+Slot order is identical to Skyrim's (0 diffuse, 1 normal, 2 glow), so the paths
+need no remapping — only `_rewrite_tex_path`, which already normalises
+separators and strips the stray `data\` prefix that FO3 LOD meshes carry.
+
+**The normal map is authored, not derived.** Oblivion rarely ships an `_n`
+beside its diffuse, so the Oblivion path guesses `<base>_n.dds` and falls back to
+a shared flat normal via `_resolve_normal_for`. FO3/FNV name slot 1 outright, so
+an authored value is taken verbatim and the guess is skipped entirely — this is
+the AUTHORED indicator, and it must win over the heuristic.
+
+## Flame attachment: FlameNode sockets
+
+**Code:** `asset_convert/nif_flames.py`
+
+Oblivion marks where a flame should burn with an empty `FlameNode*` NiNode and
+attaches a flame NIF there dynamically at runtime (`firecandleflame.nif` for
+candles/sconces/lamps, the torch flame for torches). Skyrim has no such runtime
+attachment, so we **convert**: the matching Oblivion flame NIF is run through the
+full converter once (cached per worker) and its converted subtree is grafted
+under each `FlameNode` marker. This ships Oblivion's own flame visuals —
+flip-book quads plus particle systems — rather than substituting Skyrim's
+Master-Particle-System flames.
+
+A much earlier graft attempt crashed the engine. That crash was actually the
+PyFFI `NiPSysData` 66-vs-70-byte misalignment plus `uv_scale=(0,0)`, both long
+fixed; the interim `BSValueNode`/`AddonNode` substitution has been removed.
+
+### The socket map is AUTHORED data
+
+Oblivion ships one STAT under WorldObjects/Static per socket, EditorID
+`FlameNode<N>`, whose MODL is the flame NIF the engine attaches:
+
+| Socket | FormID | Model |
+|---|---|---|
+| FlameNode0 | 0x0000001E | Fire/FireCandleFlame.NIF |
+| FlameNode1 | 0x0000001F | Fire/FireTorchSmall.nif |
+| FlameNode2 | 0x00000020 | Fire/FireTorchLarge.nif |
+| FlameNode3 | 0x00000021 | Fire/FireTorchLargeSmoke.nif |
+| FlameNode4 | 0x00000022 | Fire/FireOpenSmall.nif |
+| FlameNode5 | 0x00000023 | Fire/FireOpenSmallSmoke.nif |
+| FlameNode6 | 0x00000024 | Fire/FireOpenMedium.nif |
+| FlameNode7 | 0x00000025 | Fire/FireOpenMediumSmoke.nif |
+| FlameNode8 | 0x00000026 | Fire/FireOpenLarge.nif |
+| FlameNode9 | 0x00000027 | Fire/FireOpenLargeSmoke.nif |
+
+Those FormIDs are the keys Oblivion.exe hardcodes: the socket-name table at
+`0xB06818` is walked in lockstep with a parallel table at `0xB067C0` holding
+`0x1E..0x32`, looked up in the form map at `0xB0613C`. The engine resolves a
+socket to a STAT and draws that STAT's model — **the plugin owns the mapping,
+and a mod may repoint it**. FlameNode10-20 exist for custom use and ship no STAT
+in vanilla.
+
+Reading it beats any heuristic. Keying on the host FILENAME ("torch" in the name)
+put the 1.3x2.6-unit candle flame on every lamp in the game — `castlelight02` is
+`FlameNode2`, i.e. FireTorchLarge (32x64).
+
+### Socket names match exactly, never zero-padded
+
+The engine matches socket names EXACTLY against its own table, which holds only
+unpadded `FlameNode<N>`. A zero-padded marker therefore matches nothing and no
+flame is attached — verified against Oblivion.exe, which contains `FlameNode7`
+and `FlameNode1` but neither `FlameNode07` nor `FlameNode01`. Two vanilla meshes
+are authored that way and burn nothing in game:
+`clutter/metalsmith/forgeopen01.nif` (FlameNode07) and
+`clutter/lecternworkstation1.nif` (FlameNode01). Matching them loosely put a
+468-unit FireOpenMediumSmoke on the forge that Oblivion never shows.
+
+### Grafting details
+
+The socket is resolved **per marker**: one mesh can mix socket families
+(`lecternworkstation1` carries both a FlameNode0 candle and a FlameNode1 torch).
+The marker's authored rotation is kept — it is the host-frame to flame-frame
+hook-up, and on a +Z-up host it *is* the axis correction the flame needs.
+
+Grafted particle systems need per-frame controller updates, so the host root
+gains the `BSX` Animated bit. Flip-book atlas jobs from the flame's own
+conversion propagate to the host's stats so `convert_nif` builds them into this
+host's output tree too (idempotent, exists-checked).
+
+### The marker rotation must not be zeroed
+
+Translation, scale **and rotation** are all kept from the marker (Oblivion
+authored FlameNodes with ~2x scale that the attached flame NIF expects). The
+rotation is the authored hook-up between two DIFFERENT model frames: the flame
+NIFs are authored +Y-up, and a host authored +Z-up carries exactly the −90°X
+correction on its marker. `uppersilverplatecandles01`'s FlameNode0 is
+`[1,0,0][0,0,1][0,-1,0]` — `_BB_AXIS_FIX` itself, mapping the flame's +Y onto the
+plate's +Z. That host is a flat plate (extent X=23 Y=23 Z=2) and all 121 of its
+REFRs use `RotX=0`, so nothing else would stand the flame up. Zeroing it laid the
+candle flames on their side. Hosts that are themselves +Y-up author an identity
+marker and are unaffected.

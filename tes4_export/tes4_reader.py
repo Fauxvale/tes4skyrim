@@ -12,10 +12,23 @@ import struct
 import zlib
 from dataclasses import dataclass, field
 
+#: TES4 record header; FO3/FNV use 24, resolved per file by detect_header_size.
 RECORD_HEADER_SIZE = 20
+#: GRUP header size; 24 for FO3/FNV, resolved per file alongside the record header.
 GROUP_HEADER_SIZE = 20
 SUBRECORD_HEADER_SIZE = 6
 FLAG_COMPRESSED = 0x00040000
+
+#: HEDR sits right after the record header, so probing both offsets identifies the layout.
+_HEADER_SIZES = (20, 24)
+
+
+def detect_header_size(mm) -> int:
+    """The record header size for this file: 20 for TES4, 24 for FO3/FNV."""
+    for size in _HEADER_SIZES:
+        if mm[size:size + 4] == b"HEDR":
+            return size
+    return RECORD_HEADER_SIZE
 
 
 @dataclass
@@ -60,6 +73,30 @@ def parse_subrecords(data: bytes) -> list:
     return subs
 
 
+def read_group_records(mm, size: int, hdr_size: int, label: bytes) -> list:
+    """Every fully-parsed record inside one top-level GRUP, or [] if absent.
+
+    Reads a single group without parsing the whole file, for callers that need
+    one type's whole-file view (FO3/FNV LTEX resolves its texture through the
+    TXST group).
+    """
+    pos = hdr_size + struct.unpack_from("<I", mm, 4)[0]
+    out = []
+    while pos + hdr_size <= size:
+        grup_size = struct.unpack_from("<I", mm, pos + 4)[0]
+        if grup_size <= 0:
+            break
+        if mm[pos:pos + 4] == b"GRUP" and mm[pos + 8:pos + 12] == label:
+            inner, end = pos + hdr_size, pos + grup_size
+            while inner + hdr_size <= end:
+                rec = _read_record(mm, inner, size, hdr_size=hdr_size)
+                out.append(rec)
+                inner += hdr_size + rec.data_size
+            break
+        pos += grup_size
+    return out
+
+
 def read_file(filepath: str, parse_subs: bool = True) -> tuple:
     """
     Read a TES4 ESM/ESP file and return (header_record, records_by_group).
@@ -87,10 +124,10 @@ def _parse_file(mm, parse_subs: bool = True) -> tuple:
     """Parse all records from a memory-mapped file."""
     file_size = len(mm)
     pos = 0
+    hdr_size = detect_header_size(mm)
 
-    # Read TES4 header record first (always fully parsed — it's one record)
-    header = _read_record(mm, pos, file_size)
-    pos += RECORD_HEADER_SIZE + header.data_size
+    header = _read_record(mm, pos, file_size, hdr_size=hdr_size)
+    pos += hdr_size + header.data_size
     all_records = []
 
     # Read top-level groups
@@ -101,7 +138,7 @@ def _parse_file(mm, parse_subs: bool = True) -> tuple:
         if sig != b"GRUP":
             break  # Unexpected non-group at top level
 
-        if pos + GROUP_HEADER_SIZE > file_size:
+        if pos + hdr_size > file_size:
             break
 
         group_size = struct.unpack_from("<I", mm, pos + 4)[0]
@@ -112,7 +149,7 @@ def _parse_file(mm, parse_subs: bool = True) -> tuple:
         struct.unpack_from("<I", mm, pos + 12)[0]
 
         _parse_group(mm, pos, group_end, file_size, all_records, 0, 0, 0,
-                     parse_subs=parse_subs)
+                     parse_subs=parse_subs, hdr_size=hdr_size)
         pos = group_end
 
     return header, all_records
@@ -121,9 +158,9 @@ def _parse_file(mm, parse_subs: bool = True) -> tuple:
 def _parse_group(mm, start: int, end: int, file_size: int,
                  records: list, current_wrld: int, current_cell: int,
                  current_dial: int, is_vwd: bool = False,
-                 parse_subs: bool = True):
+                 parse_subs: bool = True, hdr_size: int = RECORD_HEADER_SIZE):
     """Recursively parse records and sub-groups within a GRUP."""
-    pos = start + GROUP_HEADER_SIZE
+    pos = start + hdr_size
     group_type = struct.unpack_from("<I", mm, start + 12)[0]
     label_bytes = mm[start + 8:start + 12]
 
@@ -146,40 +183,43 @@ def _parse_group(mm, start: int, end: int, file_size: int,
 
         sig = mm[pos:pos + 4]
         if sig == b"GRUP":
-            if pos + GROUP_HEADER_SIZE > file_size:
+            if pos + hdr_size > file_size:
                 break
             sub_size = struct.unpack_from("<I", mm, pos + 4)[0]
             sub_end = pos + sub_size
             _parse_group(mm, pos, sub_end, file_size, records,
                          current_wrld, current_cell, current_dial, is_vwd,
-                         parse_subs=parse_subs)
+                         parse_subs=parse_subs, hdr_size=hdr_size)
             pos = sub_end
-        else:
-            rec = _read_record(mm, pos, file_size, parse_subs)
-            if rec is None:
-                break
-
-            # Set hierarchy info
-            rec.parent_wrld = current_wrld
-            rec.parent_cell = current_cell
-            rec.parent_dial = current_dial
-            rec.is_vwd = is_vwd
-
-            # If this is a CELL, update current_cell for children
-            if rec.type == "CELL":
-                current_cell = rec.form_id
-            elif rec.type == "WRLD":
-                current_wrld = rec.form_id
-            elif rec.type == "DIAL":
-                current_dial = rec.form_id
-
-            records.append(rec)
-            pos += RECORD_HEADER_SIZE + rec.data_size
+            continue
+        rec = _read_record(mm, pos, file_size, parse_subs, hdr_size=hdr_size)
+        if rec is None:
+            break
+        rec.parent_wrld = current_wrld
+        rec.parent_cell = current_cell
+        rec.parent_dial = current_dial
+        rec.is_vwd = is_vwd
+        current_wrld, current_cell, current_dial = _advance_hierarchy(
+            rec, current_wrld, current_cell, current_dial)
+        records.append(rec)
+        pos += hdr_size + rec.data_size
 
 
-def _read_record(mm, pos: int, file_size: int, parse_subs: bool = True) -> Record:
+def _advance_hierarchy(rec, wrld: int, cell: int, dial: int) -> tuple:
+    """The (wrld, cell, dial) context this record establishes for its children."""
+    if rec.type == "CELL":
+        return wrld, rec.form_id, dial
+    if rec.type == "WRLD":
+        return rec.form_id, cell, dial
+    if rec.type == "DIAL":
+        return wrld, cell, rec.form_id
+    return wrld, cell, dial
+
+
+def _read_record(mm, pos: int, file_size: int, parse_subs: bool = True,
+                 hdr_size: int = RECORD_HEADER_SIZE) -> Record:
     """Read a single record (header + subrecords) from the memory-mapped file."""
-    if pos + RECORD_HEADER_SIZE > file_size:
+    if pos + hdr_size > file_size:
         return None
 
     sig = mm[pos:pos + 4].decode("ascii", errors="replace")
@@ -193,7 +233,7 @@ def _read_record(mm, pos: int, file_size: int, parse_subs: bool = True) -> Recor
     if not parse_subs:
         return rec
 
-    data_start = pos + RECORD_HEADER_SIZE
+    data_start = pos + hdr_size
     data_end = data_start + data_size
     if data_end > file_size:
         return rec  # Return with no subrecords

@@ -5192,6 +5192,27 @@ class TestVanillaMgefDataSize:
             magic_effects._cache.clear()
 
 
+def _is_tes4_export(export_dir: str) -> bool:
+    """True when an export tree came from a TES4 plugin rather than FO3/FNV.
+
+    EFFECT_ARCHETYPES covers Oblivion's effect vocabulary; Fallout's chem and
+    radiation effects are out of the converter's scope, so a Fallout tree must
+    not be measured against it. FO3/FNV report HEDR 1.32-1.34, TES4 reports
+    0.8 or 1.0.
+    """
+    header = os.path.join(export_dir, '_HEADER.txt')
+    if not os.path.isfile(header):
+        return True
+    with open(header, encoding='utf-8', errors='replace') as f:
+        for line in f:
+            if line.startswith('HEDR.Version='):
+                try:
+                    return float(line.split('=', 1)[1]) < 1.2
+                except ValueError:
+                    return True
+    return True
+
+
 class TestMgefConversion:
     """MGEF is a CONVERTED record type, not an alias to a vanilla effect.
 
@@ -5223,6 +5244,8 @@ class TestMgefConversion:
             os.path.abspath(__file__))), 'export')
         codes = set()
         for path in glob.glob(os.path.join(root, '*', 'MGEF.txt')):
+            if not _is_tes4_export(os.path.dirname(path)):
+                continue
             with open(path, encoding='utf-8', errors='replace') as f:
                 codes |= set(re.findall(r'^EditorID=(\S+)', f.read(), re.M))
         if not codes:

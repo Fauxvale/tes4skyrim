@@ -504,7 +504,10 @@ def _missing_master_exports(results, export_dir: str, tes4_data: str) -> dict:
 
 
 def get_masters_from_binary(filepath: str) -> list:
-    """Read master list from a TES4 binary file header."""
+    """Read the master list from a TES4/FO3/FNV binary file header.
+
+    FO3/FNV carry 4 more header bytes than TES4; HEDR marks the boundary.
+    """
     import struct as st
     masters = []
     with open(filepath, 'rb') as f:
@@ -512,7 +515,7 @@ def get_masters_from_binary(filepath: str) -> list:
         if sig != b'TES4':
             return masters
         data_size = st.unpack('<I', f.read(4))[0]
-        f.read(12)  # flags + formID + vc
+        f.seek(20 if f.read(16)[12:16] == b'HEDR' else 24)
         data = f.read(data_size)
         pos = 0
         while pos + 6 <= len(data):

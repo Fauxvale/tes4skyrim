@@ -40,3 +40,7 @@ navmesh_cache/*
 # history, not source: committing it would ship one machine's conversion state
 # to every user and make their upgrade check lie.
 .conversion_state.json
+
+# Renames the gate saw before they were staged.  Bridges a local write to a
+# local stage, after which git's own rename detection takes over.
+.claude/renames.json

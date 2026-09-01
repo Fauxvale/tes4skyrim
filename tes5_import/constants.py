@@ -235,6 +235,12 @@ def map_lock_level(tes4_level: int, leveled: bool = False) -> int:
 
 # Populated at end of module after all imports
 IMPORT_DISPATCH = {}
+
+#: FO3/FNV base objects Oblivion lacks -> the Skyrim type they reduce to; a missing one nulls its refs' base.
+FALLOUT_BASE_TYPES = {
+    'MSTT': 'STAT', 'SCOL': 'STAT', 'PWAT': 'STAT', 'IDLM': 'STAT',
+    'ASPC': 'STAT', 'TERM': 'ACTI', 'NOTE': 'ACTI', 'TACT': 'ACTI',
+}
 TYPE_MAP = {}
 SKIP_TYPES = set()
 
@@ -305,6 +311,8 @@ def _init_dispatch():
     )
     from .pgrd_to_navm import convert_PGRD
 
+    IMPORT_DISPATCH.update({sig: (convert_STAT if kind == 'STAT' else convert_ACTI)
+                            for sig, kind in FALLOUT_BASE_TYPES.items()})
     IMPORT_DISPATCH.update({
         # Simple objects
         'STAT': convert_STAT,
