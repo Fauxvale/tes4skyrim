@@ -22,6 +22,7 @@ from pathlib import Path
 from .audio_converter import (
     organize_voice_files,
 )
+import progress
 from worker_budget import worker_count
 
 # Worker count used by all parallel operations in this module.
@@ -480,9 +481,12 @@ def extract_assets_for_file(source_file, data_path, extract_dir, force=False):
     except ImportError:
         asset_dir_name = source_file
 
-    for bsa_file in bsa_files:
+    progress.report('Extract', 0, len(bsa_files), source_file, force=True)
+    for done, bsa_file in enumerate(bsa_files, 1):
         stats = extract_bsa(bsa_file, extract_dir, force=force,
                             source_name=asset_dir_name)
+        progress.report('Extract', done, len(bsa_files), bsa_file.name,
+                        force=True)
         if stats.get('skipped_cached'):
             totals['bsas_cached'] += 1
         else:

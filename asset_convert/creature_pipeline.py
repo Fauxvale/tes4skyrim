@@ -529,6 +529,27 @@ def _manifests_under(meshes_dir: str) -> dict:
     return out
 
 
+def _collect_creatures(futs: dict, projects: dict, errors: dict, log,
+                       total: int) -> None:
+    """Drain the creature pool, logging each result and reporting progress."""
+    from progress import report
+    for done, fut in enumerate(as_completed(futs), 1):
+        name = futs[fut]
+        report('Creatures', done, total, name)
+        try:
+            manifest = fut.result()
+        except Exception as e:
+            errors[name] = f'{type(e).__name__}: {e}'
+            log(f'  [FAIL] {name}: {errors[name]}')
+            continue
+        projects[name] = manifest
+        n_fail = len(manifest['failures']) + len(manifest['nif_failures'])
+        log(f'  [ok] {name}: {len(manifest["clips"])} clips, '
+            f'{len(manifest["bodies"])} body nifs'
+            + (f', {n_fail} failures' if n_fail else ''))
+    report('Creatures', total, total, force=True)
+
+
 def convert_creatures(export_dir: str, out_meshes_dir: str,
                       skyrim_data_path: str = None,
                       names: list = None, workers: int = None,
@@ -631,19 +652,7 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
                             speed_attrs.get(name.lower(), 0),
                             namespace):
                 name for cdir, name in dirs}
-        for fut in as_completed(futs):
-            name = futs[fut]
-            try:
-                manifest = fut.result()
-            except Exception as e:
-                errors[name] = f'{type(e).__name__}: {e}'
-                log(f'  [FAIL] {name}: {errors[name]}')
-                continue
-            projects[name] = manifest
-            n_fail = len(manifest['failures']) + len(manifest['nif_failures'])
-            log(f'  [ok] {name}: {len(manifest["clips"])} clips, '
-                f'{len(manifest["bodies"])} body nifs'
-                + (f', {n_fail} failures' if n_fail else ''))
+        _collect_creatures(futs, projects, errors, log, len(dirs))
 
     # Registration: merged singlefiles (vanilla base + ALL projects on disk).
     # A subset run (--names) must not drop the other creatures' registrations,

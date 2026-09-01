@@ -7,6 +7,7 @@ import os
 import re
 import struct
 
+from progress import track
 from tes5_import.text_reader import parse_export_file
 from worker_budget import worker_count
 
@@ -469,27 +470,26 @@ def convert_all_scripts(export_dir: str, output_dir: str, workers: int = None) -
             + [('qust', c) for c in _chunk(qust_work, 8)])
     if workers <= 1 or len(jobs) <= 2:
         _script_worker_init(*initargs)
-        for job in jobs:
-            _merge_stats(stats, _script_worker_run(job))
+        for part in track('Scripts', map(_script_worker_run, jobs), jobs, lambda j: len(j[1])):
+            _merge_stats(stats, part)
         _WORKER_CTX.clear()
     else:
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=min(workers, len(jobs)),
                                  initializer=_script_worker_init,
                                  initargs=initargs) as ex:
-            for part in ex.map(_script_worker_run, jobs):
+            for part in track('Scripts', ex.map(_script_worker_run, jobs), jobs, lambda j: len(j[1])):
                 _merge_stats(stats, part)
 
     _fix_udf_call_arg_types(output_dir, stats['udf_sigs'],
                             stats['udf_callers'])
 
     total = stats['scpt_ok'] + stats['info_ok'] + stats['qust_ok']
-    errs = stats['scpt_err'] + stats['info_err'] + stats['qust_err']
     print('\n  Script conversion complete:')
     print(f'    SCPT: {stats["scpt_ok"]}/{stats["scpt_total"]} converted')
     print(f'    INFO: {stats["info_ok"]}/{stats["info_total"]} fragments')
     print(f'    QUST: {stats["qust_ok"]}/{stats["qust_total"]} stage scripts')
-    print(f'    Total: {total} converted, {errs} errors, {stats["todo_count"]} TODOs')
+    print(f'    Total: {total} converted, {stats["scpt_err"] + stats["info_err"] + stats["qust_err"]} errors, {stats["todo_count"]} TODOs')
     if stats['errors']:
         # One line per DISTINCT failure, with a count and an example: 2,393
         # identical messages say no more than one does, and hiding them

@@ -481,6 +481,17 @@ def _convert_job(args):
         return (out_name, False, f'{Path(spt_path).name}: {e}')
 
 
+def _consume_spt(results, counts: dict, total: int) -> None:
+    """Tally converted trees as they arrive, reporting each to the GUI."""
+    from progress import report
+    for done, (name, ok, err) in enumerate(results, 1):
+        counts['ok' if ok else 'fail'] += 1
+        if err:
+            print(f'  [SPT] ERROR {err}')
+        report('SpeedTrees', done, total, name)
+    report('SpeedTrees', total, total, force=True)
+
+
 def convert_spt_directory(src_dir: Path, dst_dir: Path,
                           export_dir: Path | None = None,
                           workers: int | None = None,
@@ -572,17 +583,11 @@ def convert_spt_directory(src_dir: Path, dst_dir: Path,
     counts = {'ok': 0, 'fail': 0, 'skip': 0}
 
     if workers == 1:
-        results = (_convert_job(j) for j in jobs)
-        for _name, ok, err in results:
-            counts['ok' if ok else 'fail'] += 1
-            if err:
-                print(f'  [SPT] ERROR {err}')
+        _consume_spt((_convert_job(j) for j in jobs), counts, len(jobs))
     else:
         with ProcessPoolExecutor(max_workers=workers) as pool:
-            for _name, ok, err in pool.map(_convert_job, jobs, chunksize=1):
-                counts['ok' if ok else 'fail'] += 1
-                if err:
-                    print(f'  [SPT] ERROR {err}')
+            _consume_spt(pool.map(_convert_job, jobs, chunksize=1),
+                         counts, len(jobs))
 
     print(f"  [SPT] Done: {counts['ok']} ok, {counts['fail']} fail")
     return counts

@@ -19,6 +19,8 @@ import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
+import progress
+
 from .record_types.actors import (
     export_BSGN,
     export_CLAS,
@@ -276,6 +278,9 @@ def _export_per_type_serial(by_type: dict, output_dir: str):
 _FORMAT_CHUNK_BYTES = 8 * 1024 * 1024
 _FORMAT_CHUNK_RECORDS = 4000
 
+#: Most `@@PROG` lines one Export phase may print; sets the bar's step.
+_EXPORT_BAR_STEPS = 200
+
 # Per-worker-process mmap of the source file (initialized lazily).
 _worker_mm = None
 _worker_path = None
@@ -319,6 +324,7 @@ def _export_per_type_parallel(by_type: dict, output_dir: str, source_path: str):
     """
     jobs = []       # (source_path, entries)
     job_sigs = []   # parallel list: sig of each job
+    job_counts = []
     for sig, records in by_type.items():
         entries = []
         chunk_bytes = 0
@@ -330,28 +336,53 @@ def _export_per_type_parallel(by_type: dict, output_dir: str, source_path: str):
                     or len(entries) >= _FORMAT_CHUNK_RECORDS):
                 jobs.append((source_path, entries))
                 job_sigs.append(sig)
+                job_counts.append(len(entries))
                 entries = []
                 chunk_bytes = 0
         if entries:
             jobs.append((source_path, entries))
             job_sigs.append(sig)
+            job_counts.append(len(entries))
 
     workers = min(_WORKER_COUNT, max(1, len(jobs)))
     if workers <= 1:
         results = map(_format_chunk_worker, jobs)
-        _write_format_results(by_type, output_dir, job_sigs, results)
+        _write_format_results(by_type, output_dir, job_sigs, results,
+                              job_counts)
     else:
         with ProcessPoolExecutor(max_workers=workers) as ex:
             results = ex.map(_format_chunk_worker, jobs)
-            _write_format_results(by_type, output_dir, job_sigs, results)
+            _write_format_results(by_type, output_dir, job_sigs, results,
+                                  job_counts)
+
+
+def _step_export_bar(done: int, count: int, total: int, sig: str) -> int:
+    """Walk the Export bar up `count` records in small steps; new done.
+
+    A chunk of up to 4,000 records arrives whole, so reporting once per
+    chunk makes the bar leap on a small plugin.
+    See: docs/commentary/gui_progress.md#export-chunked-formatting-must-not-leap
+    """
+    end = done + count
+    step = max(1, total // _EXPORT_BAR_STEPS)
+    while done < end:
+        done = min(end, done + step)
+        progress.report('Export', done, total, sig, force=True)
+    return end
 
 
 def _write_format_results(by_type: dict, output_dir: str, job_sigs: list,
-                          results):
-    """Stream ordered chunk texts into per-type files."""
+                          results, job_counts: list):
+    """Stream ordered chunk texts into per-type files.
+
+    `job_counts` carries each chunk's record count, so progress is counted
+    in records rather than in chunks.
+    """
     cur_sig = None
     cur_file = None
     first_chunk = True
+    total = sum(len(v) for v in by_type.values())
+    done = 0
 
     def _close_current():
         if cur_file is not None:
@@ -360,7 +391,7 @@ def _write_format_results(by_type: dict, output_dir: str, job_sigs: list,
             print(f"    Wrote {_type_filepath(cur_sig, output_dir)} "
                   f"({len(by_type[cur_sig])} records)")
 
-    for sig, text in zip(job_sigs, results):
+    for sig, text, count in zip(job_sigs, results, job_counts):
         if sig != cur_sig:
             _close_current()
             cur_sig = sig
@@ -371,7 +402,9 @@ def _write_format_results(by_type: dict, output_dir: str, job_sigs: list,
             cur_file.write("\n\n")
         cur_file.write(text)
         first_chunk = False
+        done = _step_export_bar(done, count, total, sig)
     _close_current()
+    progress.report('Export', total, total, force=True)
 
 
 def export_header(header: Record, output_dir: str):

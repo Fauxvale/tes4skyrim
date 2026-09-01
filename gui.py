@@ -21,6 +21,7 @@ SCRIPT_DIR  = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / "conversion_config.json"
 
 from worker_budget import worker_count, cpu_total, WORKERS_ENV_VAR
+from gui_progress import ProgressBars, PROGRESS_ENV_VAR
 
 # The cache opt-out variable name is owned by tools/navmesh/navmesh_cache.py so the GUI
 # and convert.py cannot drift apart (see test_no_download_env_var_is_shared...).
@@ -636,6 +637,12 @@ def _kill_process_tree(proc):
         pass
 
 
+def _dispatch_line(bars, log, line: str) -> None:
+    """Feed one line of run output to the bars, then log what they left."""
+    if not bars.line(line):
+        log(line)
+
+
 def _run_process(cmd, log_cb, env=None, cancel_event=None):
     """Run cmd as subprocess, streaming output to `log_cb` as bytes arrive.
 
@@ -648,7 +655,7 @@ def _run_process(cmd, log_cb, env=None, cancel_event=None):
     """
     try:
         full_env = os.environ.copy()
-        full_env["PYTHONUNBUFFERED"] = "1"
+        full_env.update({"PYTHONUNBUFFERED": "1", PROGRESS_ENV_VAR: "1"})
         if env:
             full_env.update(env)
 
@@ -3577,22 +3584,6 @@ def gui_main():
     # dialog, so a second entry point to the same panel would just duplicate it
     # — and neither packaging action has anything to choose.
 
-    # Progress bar + status, both pinned to the BOTTOM of the sidebar, OUTSIDE
-    # the scroller: they report what the app is doing right now, so scrolling
-    # them out of view would be worse than the clipping the scroller fixes.
-    #
-    # They sit in `sidebar`'s own grid (rows 1 and 2) under the scroll viewport
-    # in row 0, which takes all the slack. That reproduces what the old
-    # side=BOTTOM pair did -- keep the two together with the spare space above
-    # them, rather than pooling a void between the bar and "Ready".
-    #
-    # Grid, not pack: `sidebar` is grid-managed now, and the two geometry
-    # managers cannot share a parent.
-    prog_bar = ttk.Progressbar(sidebar, mode="indeterminate", length=200)
-    prog_bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14,
-                  pady=(0, 6))
-    prog_bar.grid_remove()
-
     status_row = ttk.Frame(sidebar, style="Panel.TFrame")
     status_row.grid(row=2, column=0, columnspan=2, sticky="ew", padx=14,
                     pady=(0, 10))
@@ -3620,6 +3611,7 @@ def gui_main():
                                     _timer_lbl.winfo_reqheight()))
     status_row.grid_propagate(False)
     status_row.pack_propagate(False)
+    bars = ProgressBars(sidebar, style, CLR, row=1)
 
     # ── Log pane ──────────────────────────────────────────────────────────────
     log_hdr = tk.Frame(log_pane, bg=CLR["panel"], height=34)
@@ -4477,7 +4469,7 @@ def gui_main():
             root.after_cancel(_timer_job[0])
             _timer_job[0] = None
 
-    def _set_running(state: bool):
+    def _set_running(state: bool, steps: int = 1):
         running.set() if state else running.clear()
         if not state:
             cancel_evt.clear()
@@ -4486,17 +4478,11 @@ def gui_main():
                              text="Cancel")
         file_combo.configure(state="disabled" if state else "normal")
         if state:
-            # grid_remove() remembers the cell and its padding, so a bare
-            # grid() puts the bar back exactly where it was configured. It
-            # must NOT re-state the options: an explicit grid(row=...) here
-            # is how the bar used to reappear at the top of the sidebar.
-            prog_bar.grid()
-            prog_bar.start(12)
+            bars.show(steps)
             status_var.set("Running...")
             _start_timer()
         else:
-            prog_bar.stop()
-            prog_bar.grid_remove()
+            bars.hide()
             status_var.set("Ready")
             _stop_timer()
             # The run just rewrote the conversion state, so what is still
@@ -4911,7 +4897,7 @@ def gui_main():
         def _drain():
             try:
                 while True:
-                    _log(q.get_nowait())
+                    _dispatch_line(bars, _log, q.get_nowait())
             except queue.Empty:
                 pass
             if running.is_set():
@@ -5031,7 +5017,7 @@ def gui_main():
             try:
                 while True:
                     line = q.get_nowait()
-                    _log(line)
+                    _dispatch_line(bars, _log, line)
             except queue.Empty:
                 pass
             # Continue draining while running
@@ -5062,7 +5048,7 @@ def gui_main():
         run_env.update(_run_log_env())
 
         def _worker():
-            _set_running(True)
+            _set_running(True, len(steps))
             try:
                 # The one-process fast path fires when the selection IS the
                 # default one. That default now depends on the Pack-by-default

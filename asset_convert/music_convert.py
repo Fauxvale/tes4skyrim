@@ -314,6 +314,25 @@ def scan_music(
     return write_music_manifest(out_root, source_name, tracks)
 
 
+def _tally_music(futs: list, jobs: list, stats: dict,
+                 source_name: str) -> list:
+    """Track entries for every finished music job, reporting each."""
+    from progress import report
+    tracks = []
+    for done, fut in enumerate(as_completed(futs), 1):
+        src, dst, rel, ok, cached, dur, rate, src_kbps = fut.result()
+        report('Music', done, len(jobs), rel.name)
+        if not ok:
+            stats['failed'] += 1
+            print('    FAILED ' + rel.as_posix())
+            continue
+        stats['cached' if cached else 'converted'] += 1
+        tracks.append(_track_entry(rel, source_name, duration=dur,
+                                   src_kbps=src_kbps, bitrate=rate))
+    report('Music', len(jobs), len(jobs), force=True)
+    return tracks
+
+
 def convert_music(
     source_file: str,
     extract_dir: str = 'export',
@@ -367,18 +386,9 @@ def convert_music(
                                                     xwmaencode, rate)
         return src, dst, rel, ok, cached, info['duration'], rate, info['kbps']
 
-    tracks = []
     with ThreadPoolExecutor(max_workers=worker_count()) as pool:
         futs = [pool.submit(_one, j) for j in jobs]
-        for fut in as_completed(futs):
-            src, dst, rel, ok, cached, dur, rate, src_kbps = fut.result()
-            if not ok:
-                stats['failed'] += 1
-                print('    FAILED ' + rel.as_posix())
-                continue
-            stats['cached' if cached else 'converted'] += 1
-            tracks.append(_track_entry(rel, source_name, duration=dur,
-                                       src_kbps=src_kbps, bitrate=rate))
+        tracks = _tally_music(futs, jobs, stats, source_name)
 
     stats['tracks'] = write_music_manifest(out_root, source_name, tracks)
 

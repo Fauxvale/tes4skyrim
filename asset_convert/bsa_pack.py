@@ -49,6 +49,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from subprocess_flags import POPEN_FLAGS, windows_cmd, to_wine_path  # noqa: E402
 from tes5_import.writer import pack_tes4_header  # noqa: E402
+from progress import track
 
 # ---------------------------------------------------------------------------
 # Size limits
@@ -430,7 +431,7 @@ def pack_bsas(
     # its own overflow counter and they share the loader plugins by index.
     loaders_needed = 0
 
-    for subdir_names, bsa_suffix, compress in specs:
+    for subdir_names, bsa_suffix, compress in track('Packing', specs, specs):
         base_name = f"{stem} - {bsa_suffix}.bsa" if bsa_suffix else f"{stem}.bsa"
 
         files = _collect_files(plugin_dir, subdir_names, texture_keep)

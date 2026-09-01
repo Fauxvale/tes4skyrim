@@ -374,6 +374,51 @@ def convert_file_to_xwm(src_path, dst_path, ffmpeg: str,
 # Batch sound conversion
 # ---------------------------------------------------------------------------
 
+def _count_files(root, skip: str = '') -> int:
+    """Files under `root`, ignoring a top-level `skip` subfolder."""
+    root = Path(root)
+    if not root.is_dir():
+        return 0
+    total = 0
+    for dirpath, dirs, files in os.walk(root):
+        if skip and Path(dirpath) == root:
+            dirs[:] = [d for d in dirs if d.lower() != skip]
+        total += len(files)
+    return total
+
+
+def _plan_sound_phase(asset_root, snd_src) -> None:
+    """Declare the Sounds phase's three sub-phase counts before it starts.
+
+    The counts are estimates walked off the export tree; each sub-phase's own
+    report supersedes its entry.
+    See: docs/commentary/gui_progress.md#where-the-plan-counts-come-from
+    """
+    import progress
+    if not progress.enabled():
+        return
+    progress.plan('Sounds',
+                  Voices=_count_files(snd_src / 'voice'),
+                  Sounds=_count_files(snd_src, skip='voice'),
+                  Music=_count_files(Path(asset_root) / 'music'))
+
+
+def _tally_sounds(results, jobs: list) -> tuple:
+    """(transcoded, copied, failed) for the non-voice jobs, reporting each."""
+    from progress import report
+    count = copied = failed = 0
+    for done, ok in enumerate(results, 1):
+        report('Sounds', done, len(jobs), jobs[done - 1][0].name)
+        if ok is None:
+            copied += 1
+        elif ok:
+            count += 1
+        else:
+            failed += 1
+    report('Sounds', len(jobs), len(jobs), force=True)
+    return count, copied, failed
+
+
 def convert_sounds(
     source_file: str,
     extract_dir: str = 'export',
@@ -420,6 +465,7 @@ def convert_sounds(
 
     snd_dst = _out_root(output_dir, source_name, extract_dir) / 'sound' / 'tes4'
     ffmpeg    = find_ffmpeg(ffmpeg_path)
+    _plan_sound_phase(_asset_root(extract_dir, source_name), snd_src)
 
     # ── Voice files: reorganise into TES5 layout ────────────────────────────
     print('\n  [Voice files]')
@@ -502,13 +548,8 @@ def convert_sounds(
 
         # I/O- and subprocess-bound: threads are the right pool here.
         with ThreadPoolExecutor(max_workers=(os.cpu_count() or 4)) as pool:
-            for ok in pool.map(_encode, jobs):
-                if ok is None:
-                    copied += 1
-                elif ok:
-                    count += 1
-                else:
-                    failed += 1
+            count, copied, failed = _tally_sounds(
+                pool.map(_encode, jobs), jobs)
         print(f'  Copied {copied} sounds'
               + (f', transcoded {count} mp3 -> wav' if count else '')
               + (f', {failed} FAILED' if failed else ''))
@@ -709,6 +750,30 @@ def _prune_stale_voice_files(touched_dirs: set, intended: set,
             except OSError as exc:
                 print(f'  WARN could not remove stale {f.name}: {exc}')
     return removed
+
+
+def _tally_voice(result: str, name: str, stats: dict) -> None:
+    """Fold one voice result into `stats`, printing the first few errors."""
+    if result == 'ok':
+        stats['organized'] += 1
+        return
+    stats['errors'] += 1
+    if stats['errors'] > 5:
+        return
+    if result.startswith('exception:'):
+        print(f'    ERROR: {result[10:]}')
+    else:
+        print(f'    ERROR: ffmpeg failed on {name}')
+
+
+def _tally_voices(futures: dict, stats: dict, total: int) -> None:
+    """Drain the voice pool into `stats`, reporting each completion."""
+    from progress import report
+    for done, fut in enumerate(as_completed(futures), 1):
+        name = futures[fut][0].name
+        report('Voices', done, total, name)
+        _tally_voice(fut.result(), name, stats)
+    report('Voices', total, total, force=True)
 
 
 def organize_voice_files(
@@ -991,19 +1056,7 @@ def organize_voice_files(
     try:
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = {pool.submit(_process_one, job): job for job in conversion_jobs}
-            for fut in as_completed(futures):
-                result = fut.result()
-                if result == 'ok':
-                    stats['organized'] += 1
-                elif result == 'error':
-                    stats['errors'] += 1
-                    if stats['errors'] <= 5:
-                        src = futures[fut][0]
-                        print(f'    ERROR: ffmpeg failed on {src.name}')
-                elif result.startswith('exception:'):
-                    stats['errors'] += 1
-                    if stats['errors'] <= 5:
-                        print(f'    ERROR: {result[10:]}')
+            _tally_voices(futures, stats, len(conversion_jobs))
     finally:
         if lip_pool_dir is not None:
             shutil.rmtree(lip_pool_dir, ignore_errors=True)

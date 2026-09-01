@@ -7959,6 +7959,21 @@ def _finish_result(result, stats):
     return result
 
 
+def _batch_status(nif_str, mesh_path, done, total, stats, every):
+    """Report one mesh completion; print a tally line every `every` files."""
+    from progress import report
+    report('Meshes', done, total, Path(nif_str).name)
+    if done % every and done != total:
+        return
+    try:
+        parts = Path(nif_str).relative_to(mesh_path).parts
+        folder = parts[0] if len(parts) > 1 else '.'
+    except ValueError:
+        folder = Path(nif_str).parent.name
+    print(f'  {done}/{total} [{folder}] -- converted={stats["converted"]} '
+          f'copied={stats["copied"]} errors={stats["errors"]}')
+
+
 def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
                   remap_skeleton=None, subdir_filter=None, wearable_plan=None,
                   parallax=False, textures_only=False):
@@ -8044,6 +8059,8 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
     # Collect (rel_path, reason) for every skipped file
     skipped_list = []
 
+    from progress import report
+
     workers = _WORKER_COUNT
     # Resolved once here, not per shape: reading _HEADER.txt in every
     # worker for every mesh would be thousands of redundant opens.
@@ -8103,14 +8120,7 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
                     skipped_list.append((rel, 'EXC'))
                     if stats['errors'] <= 20:
                         print(f'  ERROR: {Path(nif_str).name}: {payload}')
-                if done % 500 == 0 or done == total:
-                    try:
-                        rel_parts = Path(nif_str).relative_to(mesh_path).parts
-                        folder = rel_parts[0] if len(rel_parts) > 1 else '.'
-                    except ValueError:
-                        folder = Path(nif_str).parent.name
-                    print(f'  {done}/{total} [{folder}] -- converted={stats["converted"]} '
-                          f'copied={stats["copied"]} errors={stats["errors"]}')
+                _batch_status(nif_str, mesh_path, done, total, stats, 500)
     else:
         _pyffi_capture_init()
         for i, args in enumerate(work_args):
@@ -8123,15 +8133,9 @@ def batch_convert(mesh_dir, output_dir, *, fix_textures=True,
                 skipped_list.append((rel, 'EXC'))
                 if stats['errors'] <= 20:
                     print(f'  ERROR: {Path(nif_str).name}: {payload}')
-            if (i + 1) % 200 == 0 or i == 0:
-                try:
-                    rel_parts = Path(nif_str).relative_to(mesh_path).parts
-                    folder = rel_parts[0] if len(rel_parts) > 1 else '.'
-                except ValueError:
-                    folder = Path(nif_str).parent.name
-                print(f'  {i + 1}/{total} [{folder}] -- converted={stats["converted"]} '
-                      f'copied={stats["copied"]} errors={stats["errors"]}')
+            _batch_status(nif_str, mesh_path, i + 1, total, stats, 200)
 
+    report('Meshes', total, total, force=True)
     print(f'\nResults: {stats["converted"]} converted, {stats["copied"]} copied, '
           f'{stats["skipped"]} skipped, {stats["errors"]} errors / {total} total')
 

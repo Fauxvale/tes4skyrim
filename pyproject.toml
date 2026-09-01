@@ -12,9 +12,9 @@ requires-python = ">=3.14"
 dev = ["pytest", "ruff", "vulture"]
 
 [tool.setuptools]
-py-modules = ["collision_options", "convert", "gui", "output_layout",
-              "preflight", "process_job", "run_log", "subprocess_flags",
-              "version", "worker_budget"]
+py-modules = ["collision_options", "convert", "gui", "gui_progress",
+              "output_layout", "preflight", "process_job", "progress",
+              "run_log", "subprocess_flags", "version", "worker_budget"]
 
 [tool.setuptools.packages.find]
 include = ["tes4_export*", "tes5_import*", "asset_convert*",

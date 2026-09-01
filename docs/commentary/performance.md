@@ -582,7 +582,11 @@ properly parallel. Two findings:
   results in submission order (`ex.map`, not `as_completed`) and keep record
   EMISSION serial — derived ids no longer depend on call order, but group order
   still does. Verify with `tools/esm/esm_diff.py A.esm B.esm` (distinguishes real
-  diffs from reorders).
+  diffs from reorders). `import_main`'s Phase 1 simple-record loop is serial for
+  exactly this reason, and is only ~1.5 s of GIL-bound Python anyway: under a
+  thread pool the converters that emit companion records (ARMA, aimed-MGEF
+  clones) appended them in thread-completion order and record order shuffled
+  between runs.
 - **Export format workers re-read from mmap**: `tes4_export` scans record
   offsets only (`read_file(..., parse_subs=False)`) and workers re-read/format
   from their own mmap — never pickle `Record` objects across process boundaries.
