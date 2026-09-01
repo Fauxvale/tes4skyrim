@@ -72,10 +72,48 @@ def _emit_refr_deltas(lines: list, rec: Record):
         lines.append(f"XLKR.LinkedRef={get_formid_str(struct.unpack_from('<I', xlkr.data, 0)[0])}")
 
 
+#: FO3/FNV weapon anim type -> the equivalent TES4 DATA.Type.
+_FALLOUT_WEAPON_TYPE = {
+    0: 0, 1: 0, 2: 1, 3: 5, 4: 5, 5: 5, 6: 5,
+    7: 5, 8: 1, 9: 5, 10: 5, 11: 5, 12: 5, 13: 5,
+}
+
+#: FO3/FNV anim types that are firearms rather than melee, by hand count.
+FALLOUT_PISTOL_TYPES = frozenset({3, 4, 10, 11, 12, 13})
+FALLOUT_LONGARM_TYPES = frozenset({5, 6, 7, 9})
+
+
+def _emit_weap_deltas(lines: list, rec: Record):
+    """WEAP's FO3/FNV layout: DATA carries the economy, DNAM the animation.
+
+    TES4 packs both into one DATA; the keys emitted here are the TES4 ones so
+    the importer needs no new vocabulary for the shared fields.
+
+    See: docs/commentary/tes4_export_falloutnv.md#weapons-guns-become-crossbows
+    """
+    dnam = get_subrecord(rec, "DNAM")
+    if dnam and len(dnam.data) >= 12:
+        anim = struct.unpack_from("<I", dnam.data, 0)[0]
+        lines.append(f"DATA.Type={_FALLOUT_WEAPON_TYPE.get(anim, 0)}")
+        lines.append(f"DNAM.FalloutAnimType={anim}")
+        lines.append(f"DATA.Speed={struct.unpack_from('<f', dnam.data, 4)[0]}")
+        lines.append(f"DATA.Reach={struct.unpack_from('<f', dnam.data, 8)[0]}")
+
+    data = get_subrecord(rec, "DATA")
+    if data and len(data.data) >= 15:
+        d = data.data
+        lines.append(f"DATA.Value={struct.unpack_from('<i', d, 0)[0]}")
+        lines.append(f"DATA.Health={struct.unpack_from('<i', d, 4)[0]}")
+        lines.append(f"DATA.Weight={struct.unpack_from('<f', d, 8)[0]}")
+        lines.append(f"DATA.Damage={struct.unpack_from('<h', d, 12)[0]}")
+        lines.append(f"DATA.ClipSize={d[14]}")
+
+
 #: Per-type delta emitters, consulted by format_record only for FO3/FNV sources.
 _DELTA_DISPATCH = {
     "CELL": _emit_cell_deltas,
     "REFR": _emit_refr_deltas,
+    "WEAP": _emit_weap_deltas,
 }
 
 #: Types carrying an OBND that TES4 has no field for; Skyrim reads it natively.

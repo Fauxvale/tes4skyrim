@@ -780,6 +780,9 @@ WEAPON_ANIM_EQUP: dict[int, int] = {
     8: EQUP_RIGHT_HAND,   # Staff
 }
 
+#: Runtime DNAM anim type for a crossbow; Skyrim.esm uses 6=Bow, 7=Crossbow.
+WEAPON_ANIM_CROSSBOW = 7
+
 # ---------------------------------------------------------------------------
 # Per-anim-type weapon defaults — sourced from vanilla Skyrim iron/steel weapons
 # ---------------------------------------------------------------------------

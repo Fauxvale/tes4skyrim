@@ -133,3 +133,68 @@ renders black or falls back to the Skyrim default.
 `landscape\` itself (Oblivion's ICON convention is relative to that
 folder), so the prefix is stripped on the way out rather than teaching the
 importer a second form.
+
+## Weapons: guns become crossbows
+
+**Code:** `tes4_export/record_types/falloutnv.py` (`_emit_weap_deltas`),
+`tes5_import/record_types/equipment.py` (`convert_WEAP`)
+
+### The defect
+
+The FO3/FNV WEAP layout differs from TES4's, so the shared exporter dumped
+none of it. Measured over `export/FalloutNV.esm/WEAP.txt`: **265 weapons, 0
+carrying `DATA.Type`** — only EDID, FULL, MODL, ICON and OBND survived.
+
+With no type, `WEAPON_TYPE_MAP.get(tes4_type, 1)` fell to its default of **1 =
+Sword**, so every gun in the game arrived as a one-handed blade with no damage,
+value, weight or reach.
+
+### Where the fields live
+
+TES4 packs everything into one 30-byte `DATA`. FO3/FNV split it:
+
+| Field | FO3/FNV | TES4 |
+|---|---|---|
+| Animation Type | `DNAM` +0 (u32) | `DATA` +0 |
+| Animation Multiplier (speed) | `DNAM` +4 (f32) | `DATA` +4 |
+| Reach | `DNAM` +8 (f32) | `DATA` +8 |
+| Value | `DATA` +0 (s32) | `DATA` +16 |
+| Health | `DATA` +4 (s32) | `DATA` +20 |
+| Weight | `DATA` +8 (f32) | `DATA` +24 |
+| Base Damage | `DATA` +12 (s16) | `DATA` +28 (u16) |
+| Clip Size | `DATA` +14 (u8) | — |
+
+The exporter emits the **TES4 key names**, so the importer needs no new
+vocabulary for any of the shared fields.
+
+### The animation mapping
+
+FO3/FNV has 14 weapon animation types (`wbWeaponAnimTypeEnum`,
+`Core/wbDefinitionsFNV.pas:2901`); Skyrim has 10
+(`Core/wbDefinitionsTES5.pas:2718`). Skyrim's only ranged animations are
+**Bow (7)** and **Crossbow (9)**, so every firearm maps to Crossbow — it aims
+and fires a projectile flat, where a bow is drawn and arced.
+
+| FO3/FNV | | → Skyrim |
+|---|---|---|
+| 0 | Hand to Hand | HandToHandMelee (0) |
+| 1 | Melee 1 Hand | OneHandSword (1) |
+| 2 | Melee 2 Hand | TwoHandSword (5) |
+| 3, 4 | Pistol — Ballistic / Energy | Crossbow (9) |
+| 5, 6, 7 | Rifle — Ballistic / Automatic / Energy | Crossbow (9) |
+| 8 | Handle (2 Hand) | TwoHandSword (5) |
+| 9 | Launcher (2 Hand) | Crossbow (9) |
+| 10–13 | Grenade / mine / thrown | Crossbow (9) |
+
+Types 10–13 have no Skyrim equivalent at all — a thrown grenade is not an
+animation the engine has. They take Crossbow so they remain usable ranged
+weapons rather than becoming swords.
+
+`DNAM.FalloutAnimType` carries the raw value through so the importer can tell a
+pistol from a rifle; the exporter also writes a TES4-equivalent `DATA.Type` so
+every existing code path keeps working unchanged.
+
+### Reload animation
+
+A converted gun reloads with the crossbow's crank animation. Skyrim has no
+other ranged reload, and this is cosmetic — the weapon fires correctly.

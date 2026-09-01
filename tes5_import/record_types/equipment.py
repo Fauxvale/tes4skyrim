@@ -30,6 +30,7 @@ from ..skyrim_overrides import (
     WEAPON_ANIM_STAGGER,
     WEAPON_ANIM_VNAM,
 )
+from .equipment_falloutnv import refine_anim_type as refine_fallout_anim_type
 from .common import (
     VENDOR_KYWD,
     _common_header_subs,
@@ -265,6 +266,31 @@ def _build_weapon_1stperson_stat(edid: str, model_path: str, stat_fid: int) -> b
     return _build_model_stat('1stPerson_' + edid, model_path, stat_fid)
 
 
+# ---------------------------------------------------------------------------
+# Weapon converters
+# ---------------------------------------------------------------------------
+
+def _weapon_anim_type(rec: dict, tes4_type: int, model: str) -> int:
+    """The TES5 AnimationType this weapon should carry.
+
+    Skyrim's behaviour graph drives equip/draw from the animation type, and it
+    must agree with the NIF's Prn node or the weapon is invisible when drawn:
+    Mace looks at WeaponMace, WarAxe at WeaponAxe, Dagger at WeaponDagger. The
+    mesh-name tests here mirror _remap_prn() in asset_convert/nif_converter.py.
+
+    See: docs/commentary/tes4_export_falloutnv.md#weapons-guns-become-crossbows
+    """
+    anim_type = WEAPON_TYPE_MAP.get(tes4_type, 1)
+    path = model.lower().replace('\\', '/')
+    if tes4_type == 2 and anim_type == 4:
+        if 'waraxe' in path or '/axe' in path or '_axe' in path:
+            anim_type = 3
+    elif tes4_type == 0 and anim_type == 1:
+        if 'dagger' in path.rsplit('/', 1)[-1]:
+            anim_type = 2
+    return refine_fallout_anim_type(rec, anim_type)
+
+
 def convert_WEAP(rec: dict, writer=None) -> bytes:
     """Convert WEAP.
 
@@ -280,30 +306,8 @@ def convert_WEAP(rec: dict, writer=None) -> bytes:
     if enam:
         subs += pack_formid_subrecord('EITM', enam)
 
-    # Resolve anim type early — needed for all per-type lookups
     tes4_type = get_int(rec, 'DATA.Type')
-    anim_type = WEAPON_TYPE_MAP.get(tes4_type, 1)
-
-    # Refine Blunt 1H (TES4 type 2 → default Mace=4) to WarAxe (3) when the
-    # mesh path indicates an axe.  Skyrim's behavior graph uses AnimationType
-    # to drive equip/draw animations: Mace (4) looks for the weapon at the
-    # WeaponMace skeleton node, while WarAxe (3) uses WeaponAxe.  Our NIF
-    # converter already sets Prn=WeaponAxe for axe meshes, so a Mace type
-    # makes the draw animation unable to find the weapon → invisible when held.
-    if tes4_type == 2 and anim_type == 4:  # Blunt 1H
-        modl_lower = model.lower().replace('\\', '/')
-        if 'waraxe' in modl_lower or '/axe' in modl_lower or '_axe' in modl_lower:
-            anim_type = 3  # WarAxe
-
-    # Refine Blade 1H (TES4 type 0 → default Sword=1) to Dagger (2) when the
-    # mesh is a dagger.  The NIF converter sets Prn=WeaponDagger for these
-    # (same filename keyword), and Prn must agree with AnimationType or the
-    # weapon is invisible when drawn.  Shortswords stay Sword/WeaponSword.
-    if tes4_type == 0 and anim_type == 1:
-        # basename only — must mirror _remap_prn() in asset_convert/nif_converter.py
-        basename = model.lower().replace('\\', '/').rsplit('/', 1)[-1]
-        if 'dagger' in basename:
-            anim_type = 2  # Dagger
+    anim_type = _weapon_anim_type(rec, tes4_type, model)
 
     # ETYP — Equipment Type (EQUP FormID): determines which hand slot is used
     subs += pack_formid_subrecord('ETYP', WEAPON_ANIM_EQUP.get(anim_type, 0x00013F42))
