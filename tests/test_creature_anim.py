@@ -343,7 +343,7 @@ class TestCastLane:
     def test_cast_plays_the_aimed_clip_first(self):
         """The engine's entry event carries no delivery, so the chain plays
         the most cast-like gesture available: casttarget over castself."""
-        from asset_convert.hkx_behavior import cast_clip
+        from asset_convert.behavior_clips import cast_clip
         assert os.path.basename(cast_clip(self._clips())).lower() \
             == 'casttarget.kf'
 
@@ -1185,7 +1185,7 @@ class TestAnimGroupFallback:
     """
 
     def test_read_animgroup_is_the_sequence_name(self):
-        from asset_convert.hkx_behavior import read_animgroup
+        from asset_convert.behavior_clips import read_animgroup
         if not os.path.isdir(NIXHOUND_DIR):
             pytest.skip('Morrowind_ob export assets missing')
         assert read_animgroup(
@@ -1194,7 +1194,7 @@ class TestAnimGroupFallback:
             os.path.join(NIXHOUND_DIR, 'walkfastforward.kf')) == 'FastForward'
 
     def test_read_animgroup_rejects_non_nif(self):
-        from asset_convert.hkx_behavior import read_animgroup
+        from asset_convert.behavior_clips import read_animgroup
         assert read_animgroup(__file__) is None
         assert read_animgroup(
             os.path.join(REPO, 'no', 'such', 'file.kf')) is None

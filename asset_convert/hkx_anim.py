@@ -21,6 +21,8 @@ import sys
 
 import numpy as np
 
+from .behavior_clips import clip_state_name
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 
@@ -475,7 +477,6 @@ def speed_bake_targets(clips: dict, attr_speed: int) -> dict:
     Oblivion drove ground speed from the CREA Speed attribute via the GMST
     formula, ignoring root motion, so the target is that formula's speed.
     """
-    from asset_convert.hkx_behavior import _clip_state_name
     if not attr_speed:
         return {}
     f_walk = 5.0 + (300.0 - 5.0) * attr_speed / 100.0
@@ -484,7 +485,7 @@ def speed_bake_targets(clips: dict, attr_speed: int) -> dict:
             (clips['locomotion'].get('MoveForward'), f_walk, 1.4),
             (clips.get('run'), f_walk * 3.0, 2.0)):
         if kf_path:
-            out[_clip_state_name(kf_path)] = (formula, cap)
+            out[clip_state_name(kf_path)] = (formula, cap)
     return out
 
 

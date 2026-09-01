@@ -2576,3 +2576,328 @@ bone 1 -> old root = a 67-unit r=16.8 bar through the whole creature;
 (2) compact hub at the trunk = an exact duplicate of Spine0, doubling trunk
 mass; (3) re-target the existing root body onto bone 1 = trunk frame at the
 feet.  See docs/commentary/asset_convert_creature.md#ragdoll-root-bone1-dead-end.
+
+## The clip claim tables
+
+**Code:** `asset_convert/behavior_clips.py`
+
+Split out of `hkx_behavior.py` — the taxonomy references nothing from the Havok
+XML builders, so the dependency is one-directional.
+
+Each table maps a role to `.kf` basenames in priority order. Claim ORDER is
+load-bearing: every pass marks what it took, so a table matched later cannot
+steal a name an earlier one claimed. `handtohandattackequip` contains `attack`
+and would be mistaken for an attack clip if equip were claimed after the
+attack sweep.
+
+### <a id="forward-blend-layout"></a>The MoveForward and Run blend layouts
+
+**Code:** `asset_convert/behavior_clips.py` — `speed_blend_plan`,
+`run_blend_plan`, `state_defs`.
+
+**The walk blend** is the vanilla MONOLITHIC-creature layout, verbatim from
+`chaurusbehavior`'s `Forward_Blend` (a single-file project like ours): a
+slow-creep child at anchor 5 u/s (the engine's sandbox creep) plus the walk and
+run clips at their NATURAL anchors, all at `playbackSpeed` 1.0. Every vanilla
+top anchor equals the clip's real root-motion speed AND the MOVT commanded
+speed — chaurus 350.267, wolf 555, sabrecat 563.
+
+The slow child keeps its rate-scaled form (chaurus `WalkSlow@0.058` → 5): that
+pair IS how vanilla stops sandbox-creep gliding.
+
+**REVERTED — the rate-scaled ladder.** A 2026-07 attempt used walk@1.4 and
+run@0.75/1.5/2.0 to stretch slow Oblivion gaits up to the attribute-formula
+speed at runtime. It had no vanilla precedent at the top anchor and the lion
+still ran in slow motion in game. Oblivion's higher ground speed is now BAKED
+into the shipped clips instead (`hkx_anim.timescale_clip` in
+`generate_creature_project`), so the speeds reaching these planners are already
+final and rate 1.0 is correct by construction. See
+[§8](#8-ground-speed-baked-not).
+
+**The run blend is its own state**, never mixed with the walk clip. Vanilla
+sabrecat `forwardlocomotion`: `ForwardRunBlend` = `RunSlow@0.75` / `Run@1.15` —
+the SAME clip at two rates — in a `ForwardRunState` separate from the walk/trot
+family, switched by `runStart`/`walkStart`.
+
+**REVERTED — the 3-child single blend.** The first layout (2026-08-22) put the
+stalking walk clip (2.9 s cycle) directly beside the gallop (0.75 s) as its only
+neighbour. Every dip of `SpeedSampled` below the run anchor SYNC-blended a
+phase-warped walk pose into the gallop — the lion's "briefly breaks into a
+sprint then slows again".
+
+### <a id="state-defs-end-events"></a>Clip-end events in `state_defs`
+
+`end_evt` is the clip-END trigger registered in both the graph and the
+animationdata cache. Single-play clips fire `returnToDefault` (vanilla
+convention — the root state machine's global wildcard routes it back to
+`DefaultState`). The completion events the ENGINE listens for —
+`attackStop`/`recoilStop`/`staggerStop` — are state `exitNotify` events, not
+clip triggers.
+
+`CombatStance` is the looping combat-idle clip nested under the standing idle
+switch (`combatStanceStart`/`Stop` local transitions, routed from the engine's
+`ActionDraw`). The `weaponDraw` reply the combat controller waits for is sent by
+the root-level `StartCombat`/`StopCombat` expression-modifier pair (vanilla
+quadruped layout), not by a state.
+
+### <a id="forward-blend-layout"></a>The MoveForward and Run blend layouts
+
+**Code:** `asset_convert/behavior_clips.py` — `speed_blend_plan`,
+`run_blend_plan`, `state_defs`.
+
+**The walk blend** is the vanilla MONOLITHIC-creature layout, verbatim from
+`chaurusbehavior`'s `Forward_Blend` (a single-file project like ours): a
+slow-creep child at anchor 5 u/s (the engine's sandbox creep) plus the walk and
+run clips at their NATURAL anchors, all at `playbackSpeed` 1.0. Every vanilla
+top anchor equals the clip's real root-motion speed AND the MOVT commanded
+speed — chaurus 350.267, wolf 555, sabrecat 563.
+
+The slow child keeps its rate-scaled form (chaurus `WalkSlow@0.058` → 5): that
+pair IS how vanilla stops sandbox-creep gliding.
+
+**REVERTED — the rate-scaled ladder.** A 2026-07 attempt used walk@1.4 and
+run@0.75/1.5/2.0 to stretch slow Oblivion gaits up to the attribute-formula
+speed at runtime. It had no vanilla precedent at the top anchor and the lion
+still ran in slow motion in game. Oblivion's higher ground speed is now BAKED
+into the shipped clips instead (`hkx_anim.timescale_clip` in
+`generate_creature_project`), so the speeds reaching these planners are already
+final and rate 1.0 is correct by construction. See
+[§8](#8-ground-speed-baked-not).
+
+**The run blend is its own state**, never mixed with the walk clip. Vanilla
+sabrecat `forwardlocomotion`: `ForwardRunBlend` = `RunSlow@0.75` / `Run@1.15` —
+the SAME clip at two rates — in a `ForwardRunState` separate from the walk/trot
+family, switched by `runStart`/`walkStart`.
+
+**REVERTED — the 3-child single blend.** The first layout (2026-08-22) put the
+stalking walk clip (2.9 s cycle) directly beside the gallop (0.75 s) as its only
+neighbour. Every dip of `SpeedSampled` below the run anchor SYNC-blended a
+phase-warped walk pose into the gallop — the lion's "briefly breaks into a
+sprint then slows again".
+
+### <a id="state-defs-end-events"></a>Clip-end events in `state_defs`
+
+`end_evt` is the clip-END trigger registered in both the graph and the
+animationdata cache. Single-play clips fire `returnToDefault` (vanilla
+convention — the root state machine's global wildcard routes it back to
+`DefaultState`). The completion events the ENGINE listens for —
+`attackStop`/`recoilStop`/`staggerStop` — are state `exitNotify` events, not
+clip triggers.
+
+`CombatStance` is the looping combat-idle clip nested under the standing idle
+switch (`combatStanceStart`/`Stop` local transitions, routed from the engine's
+`ActionDraw`). The `weaponDraw` reply the combat controller waits for is sent by
+the root-level `StartCombat`/`StopCombat` expression-modifier pair (vanilla
+quadruped layout), not by a state.
+
+### <a id="strafes-are-blends-not-states"></a>Strafes are Direction blends, not states
+
+`LOCOMOTION_STATES` `StrafeLeft`/`StrafeRight` carry no enter/exit event.
+
+Census over 53 vanilla creature folders: `left` 37, `right` 37,
+`handtohandleft`/`right` 30 each — every one was landing in the dead `extra`
+bucket and never reaching the output folder.
+
+They are NOT states and NOT event-entered: no vanilla graph has a
+`moveLeft`/`moveRight` event (census of every cached vanilla behavior —
+quadruped, wolf, chaurus, draugr, falmer, slaughterfish: none). The engine
+writes the `Direction` variable and vanilla blends the gait clips on it
+(slaughterfish/chaurus `DirectionalBlend`), so these clips are children of the
+forward state's Direction blend. As event-entered STATES they never played: the
+forward clip kept running while the MOVT strafe columns moved the actor
+sideways — "scamp slides while strafing instead of moving its legs", in game.
+
+### <a id="swim-clips"></a>Swimming
+
+The engine sends `swimStart`/`swimStop` when the actor enters/leaves deep water
+and (vanilla `quadrupedbehavior`) the graph declares `isSwimming`
+(engine-written) plus a swim MOVEMENT TYPE switched by an expression —
+`iState = cond((isSwimming ==1), iState_BearSwimDefault, iState_BearDefault)`,
+verbatim in the shared quadruped graph.
+
+Oblivion ships a full swim gait set per swimming creature. Vanilla sabrecat
+proves a single looping `SwimForward` is enough for a land animal, but water
+natives (slaughterfish) need the idle/turn/backward states too, so the swim
+sub-machine mirrors the land Default structure driven by the SAME locomotion
+events — the engine keeps sending `moveStart`/`turnLeft`/… while swimming.
+
+### <a id="block-clips"></a>Blocking
+
+The engine sends `blockStart`/`blockStop` when the combat AI raises/drops a
+guard, and `blockHitStart`/`blockHitStop` when a blocked blow lands; the graph
+reports the guard back through `IsBlocking` (vanilla `draugrbehavior`:
+`blockStart` → `<stance>_Block`, `blockHitStart` → `<stance>_BlockHit`,
+`IsBlocking` bound in the block states, `iWantBlock` declared for the engine).
+
+Oblivion ships `blockidle` (the held guard) and `blockhit` (the impact flinch)
+for ~20 creatures; without these states the events fell into the dead `extra`
+bucket and those creatures could never block at all.
+
+Generic names come first, then the stance-prefixed variants — census across all
+exports: `blockhit` 39, `handtohandblockhit` 31, `onehandblockhit` 26. Creatures
+block in ONE stance, so the first authored guard wins.
+
+### <a id="single-play-clips"></a>Single-play interrupts
+
+The clip fires `returnToDefault` at its end (vanilla-verbatim; the transition
+back is the root's `returnToDefault` global wildcard) and the STATE notifies its
+stop event on exit, so the engine's combat/stagger controllers see completion.
+
+`Death` is the exception: no exit notify and no end trigger, because the clip
+holds its last pose (dead on the ground). Ragdoll death is handled by the outer
+wrapper state machine.
+
+### <a id="equip-clips"></a>Weapon draw and sheathe
+
+The engine moves a weapon from its sheath node (`Prn=WeaponMace` etc.) into the
+hand (`WEAPON`) as part of playing the EQUIP animation — it is the graph, not
+the record, that arms an actor.
+
+Vanilla proves the point: the weapon-using creature graphs carry equip states
+and `iRightHandType` (`draugrbehavior` 436 KB, `falmerbehavior` 276 KB), while
+the bare-handed ones do not (`wolfbehavior` 7 KB, `chaurusbehavior` 98 KB). Our
+generated graph had `weaponDraw`/`weaponSheathe` EVENTS but no equip STATE, so
+nothing ever reparented the weapon: it stayed on the sheath node — or, before
+those nodes existed, on the actor root, sliding around at the creature's feet.
+
+### <a id="combat-idle-clips"></a>The combat-ready idle
+
+`COMBAT_IDLE_CANDIDATES` is in weapon-class priority order. Oblivion stores the
+`Idle` AnimGroup once per weapon state and the engine picks by what the actor
+has drawn (CS wiki, Animation tab: the `handtohand*`/`onehand*`/`twohand*`/
+`staff*`/`bow*` filename prefixes select the same group by equipment). ck-cmd
+builds exactly this as a per-weapon movement set with its own idle slot
+(`ConvertNif.cpp:5772` `h2h_move[idle]`, `:5875` `twoh_move[idle]`).
+
+Decoding the minotaur's own KFs proves the point: `idle.kf`, `handtohandidle.kf`
+and `twohandidle.kf` ALL declare sequence name `idle`; they differ only in pose
+(relaxed vs guard-up). We build ONE combat idle, so the most-armed stance
+available wins; plain `idle.kf` is the fallback for creatures that ship no
+stance variant, which is what the graph used unconditionally before.
+
+### <a id="cast-clip-preference"></a>Which cast clip the chain plays
+
+TES4 authored one clip per delivery, but the engine's entry event carries no
+delivery information, so the chain plays the most cast-like gesture available —
+the aimed throw first. Hence `CAST_CLIP_PREFERENCE = ('Target', 'Touch',
+'Self')`.
+
+The `_a`/`_b`/`_c` element variants in `CAST_MODES` are alternates of the same
+delivery, claimed in order.
+
+For the engine-side handshake these clips participate in, see
+[§7 Spellcasting](#7-spellcasting-the-magic-handshake-implemented-2026-08-21).
+
+### Attack clips carry a weapon stance
+
+Oblivion stores ONE AnimGroup per weapon class and the engine picks by what is
+equipped: minotaur `handtohandattackleft` and `twohandattackleft` BOTH declare
+AnimGroup `AttackLeft`.
+
+Ungated, the graph fires whichever attack state the engine's event happens to
+name, so an armed creature plays bare-handed swings — and those clips park the
+animated `Weapon` node ~70 units off the hand, dragging the held weapon with it.
+`ATTACK_STANCE_PREFIXES` recovers the stance from the filename prefix.
+
+### <a id="animgroup-fallback-excludes-swim"></a>What the AnimGroup fallback excludes
+
+Two selection rules keep the fallback from filling a land slot wrongly.
+
+**Swim clips are excluded.** A swim clip declares the SAME AnimGroup as its land
+twin — `swimhandtohandfastforward.kf` is literally named `FastForward`. The
+murkdweller ships a full land gait set AND a full swim set, and without the
+exclusion its land run gait was filled with `swimhandtohandfastforward.kf`.
+Swim clips are claimed by `SWIM_CLIPS` on their stems, and
+`_promote_water_native` moves them into the land slots for a true water native
+— both of which run before this fallback.
+
+**The base gait outranks a weapon-stance variant.** Oblivion stores one
+AnimGroup per weapon state and the engine picks by what is drawn, so nixhound
+`walkforward.kf` and `handtohandforward.kf` BOTH declare `Forward`. The graph
+builds one MoveForward and the relaxed gait is the right base for it — the stem
+tables make the same choice, since plain `forward` outranks every prefixed
+spelling. Without this, alphabetical order handed the slot to
+`handtohandforward.kf`.
+
+Walk gaits are claimed before run gaits, so a `fastforward` cannot take the walk
+slot while a plain `forward` is still available for it; and a run gait is only
+claimed once its walk slot is filled.
+
+### The header-only AnimGroup read
+
+`read_animgroup` decodes only the NIF header: the NiControllerSequence name is
+the first field of block 0, so nothing past the header is parsed — 0.06 ms/file
+versus a full pyffi parse. The walk follows nif.xml's `Header` compound
+verbatim: Export Info and User Version 2 share the `User Version >= 10` gate,
+Block Size starts at 20.2.0.7, and the string table at 20.1.0.3.
+
+Verified against pyffi's own header read on all **3,211 creature KFs** in the
+three test plugins: **zero mismatches**.
+
+### <a id="water-native-promotion"></a>Water natives: swim IS the locomotion
+
+A creature whose ONLY gait is swimming gets its swim set AS the base
+locomotion, with no bolted-on SwimState.
+
+This is vanilla's own structure: `slaughterfishbehavior.hkx` has no land/swim
+split at all — its DefaultBehavior IS the swim gait (Swim_Forward/
+Swim_FastForward blend, canned Swim_Left90/Right90 turns, SwimIdleBehavior),
+with AttackState/StaggerState/RecoilState as ROOT siblings driven by the
+ordinary moveStart/turnStart/attackStart_* events, and a single movement type
+(SlaughterfishSwim_MT).
+
+Without this, a converted water native parked in the SwimState sibling forever
+(the engine sends `swimStart` the moment it spawns in water) and its attack
+transitions — LOCAL to DefaultState — were unreachable: the slaughterfish
+chased the player and never attacked, reported in game.
+
+Promoting the swim clips into the land slots routes everything (attacks, equip,
+stagger, recoil) through the ordinary proven paths, exactly as vanilla
+structures the same animal.
+
+Promotion CLEARS the swim dict, and that is the point: no swim dict means no
+SwimState, no Swim MOVT and no `iState` switch — the Default movement type
+carries the swim speeds directly, exactly as vanilla slaughterfish does.
+
+Amphibians (baliwog, horker, grummite: land + swim sets) are untouched and keep
+the land graph + SwimState split. Telling the two apart needs a stem test that
+ignores spelling — grummite spells its land gait `forwardwalk`, horker
+`walkforward` — so `_LAND_GAIT_MARKERS` matches ANY spelling containing the
+marker.
+
+## FO3/FNV creature clip naming
+
+**Code:** `asset_convert/hkx_behavior_falloutnv.py`
+
+`classify_clips` flat-scans a creature folder for `.kf` files and matches
+bare TES4 basenames (`idle`, `forward`, `turnleft`). FO3/FNV name and nest
+them differently, so every FNV creature failed with
+`ValueError: creature has no idle clip`.
+
+Census over `export/FalloutNV.esm/meshes/creatures` (42 folders) against
+Oblivion's 44:
+
+| | FalloutNV | Oblivion |
+|---|---|---|
+| idle clip named `idle` | **1** | 43 |
+| idle clip named `mtidle` | **39** | 0 |
+| folders with a `locomotion/` subfolder | **24** | 0 |
+| folders with an `idleanims/` subfolder | 35 | 42 |
+| folders shipping no `.kf` at all | 2 | 0 |
+
+Two conventions differ:
+
+- **The `mt` prefix.** FO3/FNV write `mtidle`, `mtforward`, `mtturnleft`
+  where Oblivion writes `idle`, `forward`, `turnleft`. Stripping `mt`
+  recovers the TES4 name for every gait.
+- **The `locomotion/` subfolder.** Gaits live there rather than flat; the flat
+  scan never saw them. `idleanims/` is common to both and is read elsewhere.
+
+Vanilla ships its own misspellings — `mtfoward.kf` (2 folders) and
+`mtfastfoward.kf` (1) — which are aliased explicitly rather than pattern-matched.
+
+The two clipless folders (`failedfevsubject`, `securitron`) have no animation
+to convert and are a separate concern from naming.
+
+**Aliases never overwrite.** `setdefault` means a folder already shipping the
+bare TES4 name keeps it, so Oblivion's 44 folders are untouched.
